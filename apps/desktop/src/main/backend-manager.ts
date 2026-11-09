@@ -84,6 +84,9 @@ export interface DaemonConnection {
 let current: { port: number; auth: DaemonAuth } | null = null
 /** Auth mode of the daemon behind `current`, and only while that connection is usable. */
 let currentAuthMode: DaemonAuthMode | null = null
+/** The token connection behind `current` when it is an enrolment with the
+ * service daemon (M5 B3); null for our own child and a reused legacy daemon. */
+let currentSession: EnrolSession | null = null
 const daemonReadyListeners = new Set<() => void>()
 
 export function getBackendEndpoint(): BackendEndpoint | null {
@@ -112,6 +115,15 @@ export function onDaemonReady(listener: () => void): () => void {
   return () => { daemonReadyListeners.delete(listener) }
 }
 
+/** The enrolment's `elevate`, while the current connection is one with the
+ * service daemon (M5 B3): there a daily token gets `403 presence_required` on
+ * an elevated route, and the grant is asked for on the token connection.
+ * Null otherwise: our own child keeps the host token and asks over HTTP. */
+export function daemonElevation(): EnrolSession['elevate'] | null {
+  const session = currentSession
+  return session ? (request, use) => session.elevate(request, use) : null
+}
+
 /** Auth mode of the current usable connection. Null when nothing can be called. */
 export function daemonAuthMode(): DaemonAuthMode | null {
   return daemonConnection() ? currentAuthMode : null
@@ -123,9 +135,12 @@ function connectionKey(): string | null {
   return `${conn.port}\u0000${conn.authHeaders.Authorization ?? ''}\u0000${currentAuthMode ?? ''}`
 }
 
-function publishConnection(next: { port: number; auth: DaemonAuth } | null, authMode: DaemonAuthMode | null): void {
+function publishConnection(
+  next: { port: number; auth: DaemonAuth } | null, authMode: DaemonAuthMode | null, session: EnrolSession | null = null,
+): void {
   const before = connectionKey()
   current = next
+  currentSession = next ? session : null
   const connected = daemonConnection() !== null
   currentAuthMode = connected ? authMode : null
   const after = connectionKey()
@@ -756,7 +771,7 @@ export class BackendManager {
     this.externalPid = state.pid
     this.lastHealthy = true
     this.enrolledWith = { socketPath, generation }
-    publishConnection({ port: state.port, auth: { kind: 'bearer', token: session.token } }, 'capabilities')
+    publishConnection({ port: state.port, auth: { kind: 'bearer', token: session.token } }, 'capabilities', session)
     this.renewTimer = setInterval(() => { void this.renewEnrolment(session, state.port) }, RENEW_EVERY_MS)
     session.onClose((why) => {
       if (this.enrolment !== session) return
@@ -776,7 +791,7 @@ export class BackendManager {
     if (this.enrolment !== session) return
     try {
       const token = await session.renew()
-      if (this.enrolment === session) publishConnection({ port, auth: { kind: 'bearer', token } }, 'capabilities')
+      if (this.enrolment === session) publishConnection({ port, auth: { kind: 'bearer', token } }, 'capabilities', session)
     } catch {
       // onClose has it.
     }

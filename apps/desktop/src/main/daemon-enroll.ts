@@ -14,6 +14,7 @@
 //
 // No token is ever logged, and no error built here carries one.
 
+import { createHash } from 'node:crypto'
 import net from 'node:net'
 
 export const ENROL_PROTOCOL_V = 1
@@ -25,6 +26,18 @@ export const ENROL_STEP_MS = 5_000
  * cut-off and far under the token's 1-hour TTL. */
 export const RENEW_EVERY_MS = 5 * 60_000
 const NONCE_HEX = /^[0-9a-fA-F]{32}$/
+/** How long an `elevate` waits for the user's answer (enroll.rs ELEVATION_WAIT):
+ * the daemon's challenge lives 60 s. */
+export const ELEVATION_WAIT_MS = 65_000
+/** The daemon refuses a longer `summary` (enroll_endpoint.rs), counted in characters. */
+export const SUMMARY_MAX_CHARS = 200
+/** The header an elevated retry carries its grant in (server.rs). */
+export const ELEVATION_HEADER = 'X-Agent24-Elevation'
+
+/** Lowercase hex SHA-256 of the exact body bytes sent (enroll.rs body_sha256). */
+export function bodySha256(body: string): string {
+  return createHash('sha256').update(body, 'utf8').digest('hex')
+}
 
 /** Codes that mean the daemon will not enrol this build as it is: an unsigned
  * or foreign binary (`identity_rejected`), or a protocol it does not speak. */
@@ -197,12 +210,29 @@ function enrolledToken(frame: Frame, httpPort: number): { token: string; expires
   return { token, expiresIn }
 }
 
+/** One request to elevate: exactly what will be sent (the grant binds method,
+ * path and body), and a line for the confirmation box. */
+export interface ElevateRequest {
+  method: string
+  /** No query string: the daemon refuses a grant on a request that has one. */
+  path: string
+  /** The exact body bytes sent, '' for none. */
+  body: string
+  summary: string
+}
+
 /** The token connection of an enrolled app. */
 export interface EnrolSession {
   /** The current day-to-day token. Replaced by each renew; the old one is void. */
   readonly token: string
   /** Renew on this connection; resolves with the new token. */
   renew(): Promise<string>
+  /** Ask for a one-shot grant for `request` (M5 B3), then run `use` with it
+   * before anything else goes on this connection: the grant is bound to the
+   * current token, so no renew may come between. Waits for the user up to
+   * `ELEVATION_WAIT_MS`. Rejects with an [`EnrolError`]: a daemon `error`
+   * frame (denied, timed out, unavailable) leaves the connection open. */
+  elevate<T>(request: ElevateRequest, use: (grant: string) => Promise<T>): Promise<T>
   /** Called once when the connection ends (the daemon went away, a renew failed, close()). */
   onClose(listener: (why: EnrolError) => void): void
   close(): void
@@ -226,11 +256,24 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
     throw error
   }
   let renewing: Promise<string> | null = null
+  // One exchange at a time: frames are read in order, and the daemon drops
+  // the connection on any input while it waits for the user (enroll_endpoint.rs).
+  let tail: Promise<unknown> = Promise.resolve()
+  const exclusive = <T>(fn: () => Promise<T>): Promise<T> => {
+    const run = tail.then(fn, fn)
+    tail = run.catch(() => {})
+    return run
+  }
+  const broken = (message: string): never => {
+    const error = new EnrolError('bad_frame', message)
+    conn.close(error)
+    throw error
+  }
   return {
     get token() { return current },
     renew() {
       if (renewing) return renewing
-      const attempt = (async () => {
+      const attempt = exclusive(async () => {
         try {
           conn.send({ op: 'renew' })
           const next = enrolledToken(
@@ -243,13 +286,45 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
           conn.close(error)
           throw error
         }
-      })()
+      })
       // Cleared once this attempt settles, and only if it is still the one
       // held: a send that throws at once settles it before it is held
       // (PR-Daemon #1725).
       renewing = attempt
       attempt.then(() => { if (renewing === attempt) renewing = null }, () => { if (renewing === attempt) renewing = null })
       return attempt
+    },
+    elevate(request, use) {
+      return exclusive(async () => {
+        conn.send({
+          op: 'elevate',
+          method: request.method,
+          path: request.path,
+          body_sha256: bodySha256(request.body),
+          summary: Array.from(request.summary).slice(0, SUMMARY_MAX_CHARS).join(''),
+        })
+        const deadline = Date.now() + ELEVATION_WAIT_MS
+        let pending: string | null = null
+        for (;;) {
+          // Timing out closes the connection; an `error` frame rejects and leaves it open.
+          const frame = await conn.next(
+            Math.max(0, deadline - Date.now()),
+            new EnrolError('presence_timeout', 'timed out waiting for the confirmation'),
+          )
+          const id = frame['challenge_id']
+          if (frame['op'] === 'elevation_pending') {
+            if (pending !== null) broken('duplicate elevation_pending frame')
+            if (typeof id !== 'string' || id === '') broken('pending frame carries no challenge id')
+            pending = id as string
+            continue
+          }
+          if (frame['op'] !== 'elevated') broken('unexpected frame while waiting for the confirmation')
+          if (pending === null || id !== pending) broken('elevated frame does not match the pending challenge')
+          const grant = frame['grant']
+          if (typeof grant !== 'string' || grant === '') broken('elevated frame carries no grant')
+          return use(grant as string)
+        }
+      })
     },
     onClose: (listener) => conn.onClose(listener),
     close: () => { conn.close() },
