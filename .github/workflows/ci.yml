@@ -70,7 +70,9 @@ jobs:
     name: Rust (fmt + clippy + test)
     needs: hyphae-linux-x64
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # Successful runs take 14–19 min; at 20 the post-job cache save was being
+    # cancelled after every step had passed (2026-11-09: #1730, #1739).
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -156,7 +158,10 @@ jobs:
     name: Rust macOS (clippy + test)
     needs: hyphae-darwin-arm64
     runs-on: macos-latest
-    timeout-minutes: 30
+    # Warm runs take 18–23 min. A cold cache (a dev-dependency feature change,
+    # #1754) spent 26 min compiling before the first test, and a cancelled job
+    # saves no cache, so a re-run would hit the same wall.
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
