@@ -8,14 +8,11 @@
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::path::Path;
 use tokio_util::sync::CancellationToken;
 
 /// Payload cap shared with component installation (`install::MAX_UNPACKED_BYTES`).
@@ -215,8 +212,9 @@ pub fn digest_reader(
         size += n as u64;
         hash.update(&buffer[..n]);
         // After a chunk is in the hasher, before the next read. Tests park
-        // here; production does not install a hook.
-        note_hash_progress();
+        // here. The call is compiled out of production builds.
+        #[cfg(any(test, feature = "test-support"))]
+        hash_progress::note_hash_progress();
     }
     Ok(FileDigest {
         size,
@@ -224,98 +222,111 @@ pub fn digest_reader(
     })
 }
 
-static HASH_PROGRESS_ON: AtomicBool = AtomicBool::new(false);
-static HASH_PROGRESS_HELD: AtomicBool = AtomicBool::new(false);
-static HASH_PROGRESS: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
-static HASH_PAUSE_PREFIX: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// Pause hook for tests. Production builds do not contain it: every static,
+/// the installer, and both call sites below are behind this cfg.
+#[cfg(any(test, feature = "test-support"))]
+mod hash_progress {
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
-thread_local! {
-    static HASH_PROGRESS_DEPTH: Cell<u32> = const { Cell::new(0) };
-}
+    static HASH_PROGRESS_ON: AtomicBool = AtomicBool::new(false);
+    static HASH_PROGRESS_HELD: AtomicBool = AtomicBool::new(false);
+    static HASH_PROGRESS: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+    static HASH_PAUSE_PREFIX: Mutex<Option<PathBuf>> = Mutex::new(None);
 
-fn note_hash_progress() {
-    if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
-        return;
+    thread_local! {
+        static HASH_PROGRESS_DEPTH: Cell<u32> = const { Cell::new(0) };
     }
-    if HASH_PROGRESS_DEPTH.with(Cell::get) == 0 {
-        return;
-    }
-    let hook = HASH_PROGRESS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone();
-    if let Some(hook) = hook {
-        hook();
-    }
-}
 
-/// Turns the pause hook on for hashes of `root` on this thread. A hash of
-/// any other directory keeps going, so a parallel test does not take this
-/// test's handshake.
-struct HashProgressBind;
-
-impl Drop for HashProgressBind {
-    fn drop(&mut self) {
-        HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
-    }
-}
-
-fn bind_hash_progress(root: &Path) -> Option<HashProgressBind> {
-    if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
-        return None;
-    }
-    let prefix = HASH_PAUSE_PREFIX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clone()?;
-    if !root.starts_with(&prefix) {
-        return None;
-    }
-    HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-    Some(HashProgressBind)
-}
-
-/// Parks the hasher on the next payload chunk. One test holds it at a time.
-/// Drop clears the hook. The guard is `Send` so an async test can keep it
-/// across an `.await`.
-#[doc(hidden)]
-pub struct HashProgressGuard(());
-
-impl Drop for HashProgressGuard {
-    fn drop(&mut self) {
-        *HASH_PROGRESS
+    pub(super) fn note_hash_progress() {
+        if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
+            return;
+        }
+        if HASH_PROGRESS_DEPTH.with(Cell::get) == 0 {
+            return;
+        }
+        let hook = HASH_PROGRESS
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Turns the pause hook on for hashes of `root` on this thread. A hash of
+    /// any other directory keeps going, so a parallel test does not take this
+    /// test's handshake.
+    pub(super) struct HashProgressBind;
+
+    impl Drop for HashProgressBind {
+        fn drop(&mut self) {
+            HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+
+    pub(super) fn bind_hash_progress(root: &Path) -> Option<HashProgressBind> {
+        if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
+            return None;
+        }
+        let prefix = HASH_PAUSE_PREFIX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        if !root.starts_with(&prefix) {
+            return None;
+        }
+        HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Some(HashProgressBind)
+    }
+
+    /// Parks the hasher on the next payload chunk. One test holds it at a time.
+    /// Drop clears the hook. The guard is `Send` so an async test can keep it
+    /// across an `.await`.
+    #[doc(hidden)]
+    pub struct HashProgressGuard(());
+
+    impl Drop for HashProgressGuard {
+        fn drop(&mut self) {
+            *HASH_PROGRESS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *HASH_PAUSE_PREFIX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            HASH_PROGRESS_ON.store(false, Ordering::Release);
+            HASH_PROGRESS_HELD.store(false, Ordering::Release);
+        }
+    }
+
+    /// Install `hook`, invoked after each hashed chunk of a tree under `prefix`.
+    /// The hook runs on the hashing thread and must not call this again.
+    #[doc(hidden)]
+    pub fn install_hash_progress_hook(
+        prefix: &Path,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> HashProgressGuard {
+        while HASH_PROGRESS_HELD
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
         *HASH_PAUSE_PREFIX
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        HASH_PROGRESS_ON.store(false, Ordering::Release);
-        HASH_PROGRESS_HELD.store(false, Ordering::Release);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefix.to_path_buf());
+        *HASH_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+        HASH_PROGRESS_ON.store(true, Ordering::Release);
+        HashProgressGuard(())
     }
 }
 
-/// Install `hook`, invoked after each hashed chunk of a tree under `prefix`.
-/// The hook runs on the hashing thread and must not call this again.
-#[doc(hidden)]
-pub fn install_hash_progress_hook(
-    prefix: &Path,
-    hook: Arc<dyn Fn() + Send + Sync>,
-) -> HashProgressGuard {
-    while HASH_PROGRESS_HELD
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        std::thread::yield_now();
-    }
-    *HASH_PAUSE_PREFIX
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefix.to_path_buf());
-    *HASH_PROGRESS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
-    HASH_PROGRESS_ON.store(true, Ordering::Release);
-    HashProgressGuard(())
-}
+#[cfg(any(test, feature = "test-support"))]
+pub use hash_progress::{HashProgressGuard, install_hash_progress_hook};
 
 /// Declaration rules that do not read the tree: fixed manifest name, digest
 /// shape, no duplicates, executables are a subset, control files stay out of
@@ -571,7 +582,8 @@ pub fn verify_tree(
     control_files: &[&str],
     cancel: &CancellationToken,
 ) -> Result<(), TreeError> {
-    let _hash_progress = bind_hash_progress(root);
+    #[cfg(any(test, feature = "test-support"))]
+    let _hash_progress = hash_progress::bind_hash_progress(root);
     let root_meta = fs::symlink_metadata(root.components().collect::<std::path::PathBuf>())?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TreeError::Violation(
@@ -689,7 +701,8 @@ pub fn collect_payload(
     skip_root_files: &[&str],
     cancel: &CancellationToken,
 ) -> Result<BTreeMap<String, FileDigest>, TreeError> {
-    let _hash_progress = bind_hash_progress(root);
+    #[cfg(any(test, feature = "test-support"))]
+    let _hash_progress = hash_progress::bind_hash_progress(root);
     let root_meta = fs::symlink_metadata(root.components().collect::<std::path::PathBuf>())?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TreeError::Violation(

@@ -685,6 +685,8 @@ fn check_resources(inv: &dyn ModelInventory, required: &[String]) -> ResourceSta
 /// module directory on a slow or network filesystem should not stall the runtime.
 async fn prepare_dir(dir: &Path) -> std::result::Result<(), String> {
     let dir = dir.to_path_buf();
+    #[cfg(test)]
+    let prepared = dir.clone();
     tokio::task::spawn_blocking(move || {
         match std::fs::symlink_metadata(&dir) {
             // A symlink at the module's own directory. Windows junctions are
@@ -714,7 +716,49 @@ async fn prepare_dir(dir: &Path) -> std::result::Result<(), String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
     })
     .await
-    .unwrap_or_else(|e| Err(format!("directory preparation task failed: {e}")))
+    .unwrap_or_else(|e| Err(format!("directory preparation task failed: {e}")))?;
+    #[cfg(test)]
+    note_prepared_dir(&prepared);
+    Ok(())
+}
+
+/// A test cancels the shutdown token once `prepare_dir` has succeeded and
+/// before `mount_package` goes on to register a supervisor.
+#[cfg(test)]
+type PrepareHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static AFTER_PREPARE_DIR: std::sync::Mutex<Option<PrepareHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_prepared_dir(dir: &Path) {
+    let hook = AFTER_PREPARE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(dir);
+    }
+}
+
+/// A test cancels after the supervisor is registered and before the namespace
+/// route is published. `mark_mounted` is the await in that gap; the hook is
+/// how a test stands in it without depending on the lend.
+#[cfg(test)]
+type PublishHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static BEFORE_ROUTE_PUBLISH: std::sync::Mutex<Option<PublishHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_before_route_publish(name: &str) {
+    let hook = BEFORE_ROUTE_PUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(name);
+    }
 }
 
 /// Nest the KERNEL's 503 under `namespace`, for a module that could not be
@@ -2102,6 +2146,19 @@ async fn mount_package(
         agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest, &shutdown)
             .err()
     });
+    // `prepare_dir` and the lends above can outlive the cancel check that
+    // ran before them. A token that fired in that gap must not register a
+    // supervisor or publish the namespace — the same report as that earlier
+    // check. `is_closed` above stays the 503 path; this is the token.
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
     // Started and registered in one step, unless the shutdown has closed the
     // list — which it may have while the directory was being prepared.
     let started = host.supervisors.start_with(|| {
@@ -2151,6 +2208,21 @@ async fn mount_package(
         partitions
             .mark_mounted(partition, &lease.kv, &agent24_memory::SystemClock)
             .await;
+    }
+    // `mark_mounted` awaits. A cancel in that gap has already registered the
+    // supervisor; do not publish the namespace over it. The supervisor stays
+    // in the list for the shutdown to stop. The report matches the token
+    // check before `prepare_dir`: no route.
+    #[cfg(test)]
+    note_before_route_publish(&name);
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
     }
     tracing::info!(
         "domain OS {name:?} started from {} and proxied at {namespace} (grants: {granted_names:?})",
@@ -2764,6 +2836,139 @@ while f.readline():
             host.supervisors.close().is_empty(),
             "a package was started during the shutdown"
         );
+    }
+
+    /// `prepare_dir` has returned and the earlier cancel check has already
+    /// passed. Cancelling in that hook must not register a supervisor or
+    /// publish the namespace.
+    #[tokio::test]
+    async fn a_cancel_after_prepare_dir_registers_nothing_and_publishes_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "afterprep");
+        let host = test_host(tmp.path());
+        let shutdown = host.shutdown.clone();
+        *super::AFTER_PREPARE_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::new(move |dir| {
+                if dir.ends_with("afterprep") {
+                    shutdown.cancel();
+                }
+            }));
+        let _clear = ClearPrepareDir;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("mounted after prepare_dir: {other:?}"),
+        }
+        assert_eq!(reports[0].resources, ResourceStatus::NotChecked);
+        assert!(
+            root.join("afterprep").is_dir(),
+            "prepare_dir did not finish before the cancel"
+        );
+        assert!(
+            host.supervisors.statuses().is_empty(),
+            "a supervisor was registered"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/afterprep/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// The supervisor is already in the list. Cancelling before the route is
+    /// published must leave the namespace unpublished. The supervisor stays
+    /// registered; the shutdown still stops it.
+    #[tokio::test]
+    async fn a_cancel_after_registration_does_not_publish_the_route() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "afterreg");
+        let host = test_host(tmp.path());
+        let shutdown = host.shutdown.clone();
+        *super::BEFORE_ROUTE_PUBLISH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::new(move |name| {
+                if name == "afterreg" {
+                    shutdown.cancel();
+                }
+            }));
+        let _clear = ClearRoutePublish;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("route published after registration: {other:?}"),
+        }
+        assert_eq!(reports[0].resources, ResourceStatus::NotChecked);
+        assert_eq!(
+            host.supervisors.statuses().len(),
+            1,
+            "the supervisor was not registered, so this did not reach the publish check"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/afterreg/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    struct ClearPrepareDir;
+
+    impl Drop for ClearPrepareDir {
+        fn drop(&mut self) {
+            *super::AFTER_PREPARE_DIR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    struct ClearRoutePublish;
+
+    impl Drop for ClearRoutePublish {
+        fn drop(&mut self) {
+            *super::BEFORE_ROUTE_PUBLISH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
     }
 
     // ── T7a/ME-3e: out-of-process capability grants + `_a24/events/emit` ──

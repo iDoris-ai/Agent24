@@ -463,7 +463,9 @@ pub fn supervise(
 enum Run {
     /// A stop was requested; the process has been stopped.
     StopRequested,
-    /// Shutdown cancelled the run before its process existed.
+    /// Shutdown cancelled the run. Either no process was created, or one was
+    /// created in the spawn race and already stopped. No generation was
+    /// installed and the handshake was not started.
     Cancelled,
     /// The run is over: how it failed (FU-57), and when it became ready (if
     /// it did) and when it ended for [`RestartPolicy::ran`]. `ended_at` is taken
@@ -891,6 +893,16 @@ async fn run_once(
             return Ok(failed(failure));
         }
     };
+    // Known boundary: a cancel between the biased `shutdown` poll above and
+    // `launch::spawn` returning can still create this child. Those two polls
+    // are one synchronous `select`, and this slice does not make cancel and
+    // spawn admission the same step, so the window stays open. Stop the child
+    // now — the same `finish` a stop uses, which waits until the group is
+    // gone — and do not install a generation or start the handshake.
+    if shutdown.is_cancelled() {
+        finish(process, timings, &spec.name, status, slot, stop, None).await?;
+        return Ok(Run::Cancelled);
+    }
     // Checked again: a stop sent while the (biased) select above was already
     // past its stop branch lets the spawn finish in the same poll. Stop that
     // process now rather than hand it a generation (review of SUP-4, round 3).
@@ -2744,6 +2756,69 @@ sys.exit(0)
         };
         assert_eq!(reason, "cancelled");
         assert!(starts(f.data.path()).is_empty(), "the module ran");
+        stop(handle).await;
+    }
+
+    /// Cancel lands after the biased `select` has polled the shutdown token
+    /// and before `launch::spawn` returns — the hook runs inside `start`,
+    /// which is that gap. The child exists; it must be reaped, and the run
+    /// must not handshake or publish `Running`.
+    #[tokio::test]
+    async fn a_shutdown_during_spawn_stops_the_child_without_a_handshake() {
+        let mut f = fixture("normal");
+        f.spec.name = "spawn-cancel-window".to_owned();
+        // The mock reports argv as its module name. Keep that equal to
+        // `spec.name`, or a missing cancel check fails the handshake for a
+        // different reason and never shows `Running`.
+        f.spec.command.args[4] = "spawn-cancel-window".to_owned();
+        let current = Current::new(Generation::starting());
+        let shutdown = CancellationToken::new();
+        let seen: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let (flag, seen_hook) = (shutdown.clone(), seen.clone());
+        crate::launch::arm_spawned_for_test(Arc::new(move |name, pid| {
+            if name != "spawn-cancel-window" {
+                return;
+            }
+            *seen_hook.lock().unwrap() = Some(pid);
+            flag.cancel();
+        }));
+        let _clear = crate::launch::ClearSpawnedHook;
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            Offer::none(),
+            fast(),
+            no_package_check(),
+            shutdown,
+        )
+        .expect("the slot is free");
+        let mut rx = handle.subscribe();
+        let status = until(&mut rx, "cancelled during spawn", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Running | Status::Backoff { .. }
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason } = &status else {
+            panic!("entered the handshake after a cancel during spawn: {status:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert_ne!(
+            current.get().state(),
+            crate::drain::DrainState::Running,
+            "a generation was installed and became ready"
+        );
+        let pid = seen
+            .lock()
+            .unwrap()
+            .expect("spawn returned a child before the cancel was noticed");
+        assert!(
+            gone(pid).await,
+            "the child created in the spawn window was not reaped"
+        );
         stop(handle).await;
     }
 

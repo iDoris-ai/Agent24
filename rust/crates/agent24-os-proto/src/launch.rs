@@ -615,14 +615,59 @@ fn start(
             "stderr",
         )));
     }
-    ModuleProcess::new(
+    let process = ModuleProcess::new(
         child,
         Generation::serving_package(upstream, artifact),
         token,
         drains,
         spec.http_path,
     )
-    .map_err(LaunchError::Spawn)
+    .map_err(LaunchError::Spawn)?;
+    // The child exists and `spawn` has not returned. A supervisor racing this
+    // against its shutdown token polls that token before it polls `spawn`, in
+    // the same `select`, so a cancel here is invisible to that poll.
+    #[cfg(test)]
+    note_child_spawned(spec.name, process.pid());
+    Ok(process)
+}
+
+/// One test at a time parks a cancel in [`start`], after the child exists and
+/// before [`spawn`] returns. Other spawns pass a name the hook ignores.
+#[cfg(test)]
+type SpawnedHook = std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>;
+
+#[cfg(test)]
+static SPAWNED_FOR_TEST: std::sync::Mutex<Option<SpawnedHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_child_spawned(name: &str, pid: i32) {
+    let hook = SPAWNED_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(name, pid);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn arm_spawned_for_test(hook: SpawnedHook) {
+    *SPAWNED_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+}
+
+/// Clears [`arm_spawned_for_test`] on drop, including when the test panics.
+#[cfg(test)]
+pub(crate) struct ClearSpawnedHook;
+
+#[cfg(test)]
+impl Drop for ClearSpawnedHook {
+    fn drop(&mut self) {
+        *SPAWNED_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
 }
 
 /// The test binary is its own trampoline: started with `--exact` on
