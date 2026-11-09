@@ -33,6 +33,10 @@ pub enum SdkError {
     Env(EnvError),
     #[error("parsing the manifest: {0}")]
     Manifest(String),
+    #[error("manifest self-check: {0}")]
+    ManifestCheck(#[from] manifest::ManifestCheckError),
+    #[error("manifest self-check: domain-os.yml is missing from the package directory")]
+    ManifestMissing,
     #[error("connecting to the kernel: {0}")]
     Connect(#[from] ConnectError),
     #[error("taking over the inherited listener: {0:?}")]
@@ -114,11 +118,14 @@ impl ModuleBuilder {
             Some(_) => None,
             None => Some(agent24_os_proto::module::take_listener().map_err(SdkError::Listen)?),
         };
+        let kernel_launched = self.env_override.is_none();
         let env = match self.env_override {
             Some(env) => env,
             None => ModuleEnv::from_env().map_err(SdkError::Env)?,
         };
-        let facts = manifest::facts_from_yaml(&self.manifest_yaml).map_err(SdkError::Manifest)?;
+        let published = published_manifest(kernel_launched, Path::new(PUBLISHED_MANIFEST))?;
+        let bytes = manifest::select_manifest(self.manifest_yaml.as_bytes(), published.as_deref())?;
+        let facts = checked_facts(bytes)?;
         let capabilities: Vec<&str> = facts
             .kernel_capabilities
             .iter()
@@ -126,7 +133,7 @@ impl ModuleBuilder {
             .collect();
         let hello = Hello {
             module: &facts.name,
-            manifest_bytes: self.manifest_yaml.as_bytes(),
+            manifest_bytes: bytes,
             capabilities: &capabilities,
             protocol_min: PROTOCOL_MIN,
             protocol_max: PROTOCOL_MAX,
@@ -142,6 +149,29 @@ impl ModuleBuilder {
     }
 }
 
+/// The kernel launches a module with cwd = its package directory.
+const PUBLISHED_MANIFEST: &str = "domain-os.yml";
+
+/// A kernel-launched module must find its package's manifest: every installed
+/// package has one, so a missing file means the module is not running from
+/// its package and the bytes it would send cannot match what the kernel
+/// digests. Only an injected test environment (no package) uses the embedded
+/// manifest alone.
+fn published_manifest(kernel_launched: bool, path: &Path) -> Result<Option<Vec<u8>>, SdkError> {
+    if !kernel_launched {
+        return Ok(None);
+    }
+    manifest::read_published_manifest(path)?
+        .map(Some)
+        .ok_or(SdkError::ManifestMissing)
+}
+
+fn checked_facts(bytes: &[u8]) -> Result<ManifestFacts, SdkError> {
+    let yaml = std::str::from_utf8(bytes)
+        .map_err(|_| SdkError::Manifest("manifest must be UTF-8".into()))?;
+    manifest::facts_from_yaml(yaml).map_err(|_| SdkError::Manifest("invalid manifest facts".into()))
+}
+
 /// A connected out-of-process module: one live callback connection, plus
 /// (in production) the kernel-bound listener to serve HTTP on.
 pub struct Module {
@@ -152,10 +182,13 @@ pub struct Module {
 }
 
 impl Module {
-    /// `manifest_yaml` must be the exact bytes the kernel digests (typically
-    /// `include_str!("../domain-os.yml")`). `Cow` so a test can build a
-    /// manifest at runtime instead of leaking a `String` to get a
-    /// `&'static str`.
+    /// `manifest_yaml` is the compiled semantic baseline (typically
+    /// `include_str!("../domain-os.yml")`). On the production path connect
+    /// reads `domain-os.yml` from cwd (the package directory), requires it to
+    /// equal this baseline once its top-level `integrity` is ignored, and
+    /// digests its exact bytes; a missing file is an error. Only `with_env`
+    /// (tests, no package) uses the embedded bytes alone. `Cow` also permits
+    /// runtime-built test manifests.
     #[must_use]
     pub fn builder(manifest_yaml: impl Into<Cow<'static, str>>) -> ModuleBuilder {
         ModuleBuilder {
@@ -227,6 +260,45 @@ mod tests {
 
     use super::*;
     use crate::testing;
+
+    #[test]
+    fn kernel_launched_module_requires_its_package_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PUBLISHED_MANIFEST);
+        assert!(matches!(
+            published_manifest(true, &path),
+            Err(SdkError::ManifestMissing)
+        ));
+        assert!(published_manifest(false, &path).unwrap().is_none());
+        std::fs::write(&path, b"name: module\n").unwrap();
+        assert_eq!(
+            published_manifest(true, &path).unwrap().unwrap(),
+            b"name: module\n"
+        );
+        // An injected test environment never reads the disk, even when a file exists.
+        assert!(published_manifest(false, &path).unwrap().is_none());
+    }
+
+    #[test]
+    fn invalid_facts_never_echo_values_or_parser_diagnostics() {
+        for (bytes, expected) in [
+            (
+                &b"name: module\nroute_namespace: /module\n#\xff"[..],
+                "manifest must be UTF-8",
+            ),
+            (
+                &b"name: [secret]\nroute_namespace: /module"[..],
+                "invalid manifest facts",
+            ),
+        ] {
+            let error = checked_facts(bytes).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("parsing the manifest: {expected}")
+            );
+            assert!(!format!("{error:?}").contains("secret"));
+        }
+    }
 
     /// A drop guard around a manually-created temp dir. `tempfile::TempDir`
     /// appends its own random suffix on top of our prefix, and these
