@@ -571,7 +571,7 @@ mod tests {
     fn the_tick_loop_and_delivery_pump_are_spawned_after_mount_all() {
         let src = include_str!("server.rs");
         let mount_at = src
-            .find("crate::domain::mount_all(")
+            .find("crate::domain::mount_all_with_refusals(")
             .expect("the mount_all call must exist in server.rs");
         let tick_at = src
             .find("tick_scheduler.run(")

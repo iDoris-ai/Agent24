@@ -231,3 +231,69 @@ fn c_quote(value: &str) -> Result<String, String> {
     out.push('"');
     Ok(out)
 }
+
+#[cfg(test)]
+mod n1_scans {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use std::fs;
+
+    fn manifest(dir: &Path, command: &str) {
+        fs::create_dir_all(dir).unwrap();
+        fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: n1\nversion: \"0.1.0\"\nroute_namespace: /api/v1/n1\n\
+                 event_module: n1\ndata_dir: ~/.agent24/os/n1/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: {command}\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    fn assert_found(root: &Path) {
+        let scan = crate::discovery::scan(root, &tokio_util::sync::CancellationToken::new());
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+        assert!(scan.found[0].manifest.name() == "n1");
+    }
+
+    #[test]
+    fn n1_seal_passes_a_real_discovery_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("pkg");
+        manifest(&dir, "bin/mod");
+        super::native_exit(&dir, "bin/mod").unwrap();
+        seal(&dir, &["bin/mod"]).unwrap();
+        assert_found(root.path());
+    }
+
+    #[test]
+    fn n1_seal_python_script_passes_a_real_discovery_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("pkg");
+        manifest(&dir, "bin/launch");
+        fs::write(dir.join("mod.py"), b"print(1)\n").unwrap();
+        seal_python_script(&dir).unwrap();
+        assert_found(root.path());
+    }
+
+    #[test]
+    fn n1_seal_python_argv_passes_a_real_discovery_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("pkg");
+        manifest(&dir, "bin/launch");
+        fs::write(dir.join("mod.py"), b"print(1)\n").unwrap();
+        seal_python_argv(&dir, &["python3", "-I", "-S", "mod.py"]).unwrap();
+        assert_found(root.path());
+    }
+
+    #[test]
+    fn n1_seal_exit_stub_passes_a_real_discovery_scan() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("pkg");
+        manifest(&dir, "bin/mod");
+        seal_exit_stub(&dir, "bin/mod").unwrap();
+        assert_found(root.path());
+    }
+}

@@ -62,11 +62,103 @@ pub enum IntegrityError {
     },
     /// The caller's token fired before the check finished. Not a hash
     /// mismatch and not a damaged tree: the package must not be discovered
-    /// or spawned.
+    /// or spawned. Not an [`IntegrityReason`].
     Cancelled,
     NotNativeExecutable {
         path: String,
     },
+    /// Reserved for the platform signature check (S1-9 PR-3d). Nothing in
+    /// this crate produces it yet. The mapping in [`IntegrityError::reason`]
+    /// already sends it to [`IntegrityReason::SignatureRejected`].
+    SignatureRejected {
+        detail: String,
+    },
+}
+
+/// Machine-readable integrity refusal. Shutdown cancellation is not one of
+/// these. Callers copy [`IntegrityReason::code`]; they do not parse
+/// [`IntegrityError`]'s display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityReason {
+    ManifestMissing,
+    HashMismatch,
+    ManifestInvalid,
+    SignatureRejected,
+    CheckFailed,
+}
+
+impl IntegrityReason {
+    /// Stable `reason` on `GET /api/v1/components` and the suffix of
+    /// `os_package.<reason>`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "integrity_manifest_missing",
+            Self::HashMismatch => "hash_mismatch",
+            Self::ManifestInvalid => "integrity_manifest_invalid",
+            Self::SignatureRejected => "signature_rejected",
+            Self::CheckFailed => "integrity_check_failed",
+        }
+    }
+
+    /// D6 operation code. `retryable` is always false at the call site.
+    #[must_use]
+    pub const fn operation_code(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "os_package.integrity_manifest_missing",
+            Self::HashMismatch => "os_package.hash_mismatch",
+            Self::ManifestInvalid => "os_package.integrity_manifest_invalid",
+            Self::SignatureRejected => "os_package.signature_rejected",
+            Self::CheckFailed => "os_package.integrity_check_failed",
+        }
+    }
+}
+
+impl IntegrityError {
+    /// The refusal code for this error. [`Self::Cancelled`] is not a refusal.
+    /// [`Self::NotNativeExecutable`] is an illegal manifest
+    /// ([`IntegrityReason::ManifestInvalid`]), the same bucket as a bad set,
+    /// type, or mode.
+    #[must_use]
+    pub const fn reason(&self) -> Option<IntegrityReason> {
+        match self {
+            Self::Missing => Some(IntegrityReason::ManifestMissing),
+            Self::HashMismatch { .. } => Some(IntegrityReason::HashMismatch),
+            Self::ManifestInvalid { .. } | Self::NotNativeExecutable { .. } => {
+                Some(IntegrityReason::ManifestInvalid)
+            }
+            Self::SignatureRejected { .. } => Some(IntegrityReason::SignatureRejected),
+            Self::CheckFailed { .. } => Some(IntegrityReason::CheckFailed),
+            Self::Cancelled => None,
+        }
+    }
+
+    /// Text safe to put on a host-only component row: no absolute path and
+    /// no process stderr. Relative payload names stay, because the operator
+    /// needs to know which file failed.
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Missing => "integrity manifest is missing".to_owned(),
+            Self::HashMismatch { path } => format!("hash_mismatch: {path}"),
+            Self::ManifestInvalid { detail } => public_detail(detail),
+            Self::NotNativeExecutable { path } => format!("not_native_executable: {path}"),
+            Self::SignatureRejected { .. } => "signature_rejected".to_owned(),
+            Self::CheckFailed { .. } => "integrity_check_failed".to_owned(),
+            Self::Cancelled => "cancelled".to_owned(),
+        }
+    }
+}
+
+fn public_detail(detail: &str) -> String {
+    let leaks = detail
+        .split_whitespace()
+        .any(|token| token.starts_with('/') || token.contains('\\') || token.contains("stderr"));
+    if leaks {
+        "integrity manifest is invalid".to_owned()
+    } else {
+        detail.to_owned()
+    }
 }
 
 impl fmt::Display for IntegrityError {
@@ -80,6 +172,7 @@ impl fmt::Display for IntegrityError {
             Self::CheckFailed { detail } => write!(f, "integrity_check_failed: {detail}"),
             Self::Cancelled => f.write_str("cancelled"),
             Self::NotNativeExecutable { path } => write!(f, "not_native_executable: {path}"),
+            Self::SignatureRejected { detail } => write!(f, "signature_rejected: {detail}"),
         }
     }
 }
@@ -232,13 +325,23 @@ pub fn digest_reader(
 mod hash_progress {
     use std::cell::Cell;
     use std::path::{Path, PathBuf};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
     static HASH_PROGRESS_ON: AtomicBool = AtomicBool::new(false);
     static HASH_PROGRESS_HELD: AtomicBool = AtomicBool::new(false);
     static HASH_PROGRESS: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
     static HASH_PAUSE_PREFIX: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// How many trees under the installed prefix have started hashing since
+    /// the hook was installed. Tests pause a later check (the restart hash)
+    /// without parking the ones before it.
+    static HASH_SESSIONS: AtomicU32 = AtomicU32::new(0);
+
+    /// Sessions started under the current hook. Zero before the first bind.
+    #[must_use]
+    pub fn hash_sessions() -> u32 {
+        HASH_SESSIONS.load(Ordering::Acquire)
+    }
 
     thread_local! {
         static HASH_PROGRESS_DEPTH: Cell<u32> = const { Cell::new(0) };
@@ -282,6 +385,7 @@ mod hash_progress {
         if !root.starts_with(&prefix) {
             return None;
         }
+        HASH_SESSIONS.fetch_add(1, Ordering::AcqRel);
         HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
         Some(HashProgressBind)
     }
@@ -318,6 +422,7 @@ mod hash_progress {
         {
             std::thread::yield_now();
         }
+        HASH_SESSIONS.store(0, Ordering::Release);
         *HASH_PAUSE_PREFIX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefix.to_path_buf());
@@ -330,7 +435,7 @@ mod hash_progress {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub use hash_progress::{HashProgressGuard, install_hash_progress_hook};
+pub use hash_progress::{HashProgressGuard, hash_sessions, install_hash_progress_hook};
 
 /// Declaration rules that do not read the tree: fixed manifest name, digest
 /// shape, no duplicates, executables are a subset, control files stay out of
@@ -825,6 +930,22 @@ mod tests {
 
     use super::*;
     use std::io::{self, Read};
+
+    #[test]
+    fn signature_rejected_maps_without_parsing_display_text() {
+        let err = IntegrityError::SignatureRejected {
+            detail: "team id mismatch stderr /tmp/secret".to_owned(),
+        };
+        assert_eq!(err.reason(), Some(IntegrityReason::SignatureRejected));
+        assert_eq!(err.reason().unwrap().code(), "signature_rejected");
+        assert_eq!(
+            err.reason().unwrap().operation_code(),
+            "os_package.signature_rejected"
+        );
+        assert_eq!(err.public_message(), "signature_rejected");
+        assert!(!err.public_message().contains("/tmp"));
+        assert!(!err.public_message().contains("stderr"));
+    }
 
     fn digest(size: u64, fill: u8) -> FileDigest {
         FileDigest {

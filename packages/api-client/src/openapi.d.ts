@@ -1276,7 +1276,7 @@ export interface paths {
         put?: never;
         /**
          * Append one chunk of raw bytes at the given offset
-         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires. An upload that is complete or imported takes no new chunk: 409 `upload_offset_mismatch` with `details.received_offset`, decided before the `total_size` and `Chunk-Sha256` checks (a received chunk still replays). For an upload still receiving, a new chunk that would run past `total_size` is 400 `invalid_request`. An unknown upload, or one 24 h after its last chunk, is 404 `not_found`. A body over 768 KiB is 413 `payload_too_large`.
+         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires. An upload that is complete or imported takes no new chunk: 409 `upload_offset_mismatch` with `details.received_offset`, decided before the `total_size` and `Chunk-Sha256` checks (a received chunk still replays). For an upload still receiving, a new chunk that would run past `total_size` is 400 `invalid_request`. An unknown upload, or one 24 h after its last chunk, is 404 `not_found`. A body over 768 KiB is 413 `payload_too_large`. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. That body is not `DocumentsConflict`, which stays `upload_offset_mismatch`.
          */
         post: operations["documentsAppendUploadChunk"];
         delete?: never;
@@ -2346,7 +2346,7 @@ export interface components {
             /** @enum {string} */
             form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
             provides: components["schemas"]["ComponentProvide"][];
-            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
+            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). An OS package that failed its integrity check is state failed (not absent, not incompatible) with one of integrity_manifest_missing, hash_mismatch, integrity_manifest_invalid, signature_rejected, or integrity_check_failed. State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
             reason?: string;
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
@@ -3141,7 +3141,11 @@ export interface components {
              *     approval_already_resolved, provider_unavailable,
              *     run_not_cancellable (reserved), internal,
              *     admission_refused, module_panicked, module_killed,
-             *     module_owned_schedule, not_a_module_schedule, schedule_conflict
+             *     module_owned_schedule, not_a_module_schedule, schedule_conflict.
+             *     A proxied call whose package failed an integrity re-check uses
+             *     `os_package.<reason>` with HTTP 409 and `details.retryable: false`
+             *     (see OsPackageConflict). `package_changed` remains the 503 code
+             *     only when that re-check has no integrity code.
              */
             code: string;
             message: string;
@@ -3247,7 +3251,18 @@ export interface components {
                 code?: "idempotency_key_reused" | "upload_checksum_mismatch" | "unsupported_format";
             };
         };
-        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. The rule holds wherever this schema is used: the 500 response and, through `DocumentsUnavailable`, the 503 one. */
+        /** @description D6 envelope for an integrity refusal on a proxied call. HTTP 409. Not the old 503 `package_changed` shape. */
+        OsPackageConflictError: components["schemas"]["Error"] & {
+            error?: {
+                code: string;
+                message: string;
+                details: {
+                    /** @constant */
+                    retryable: false;
+                };
+            };
+        };
+        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. The rule holds wherever this schema is used: the 500 response and, through `DocumentsUnavailable`, the 503 one. An integrity refusal of the mounted package is not this schema: it is 409 `OsPackageConflict` (`os_package.<reason>`, `retryable: false`). 503 `package_changed` remains only for a package change with no integrity code. */
         ModuleProxyError: components["schemas"]["Error"] & unknown & {
             error?: {
                 code?: unknown;
@@ -4112,7 +4127,16 @@ export interface components {
                 "application/json": components["schemas"]["DocumentsImportUnprocessableError"];
             };
         };
-        /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
+        /** @description 409 from the kernel proxy when a mounted package fails its integrity re-check. `error.code` is `os_package.<reason>` (`integrity_manifest_missing`, `hash_mismatch`, `integrity_manifest_invalid`, `signature_rejected`, or `integrity_check_failed`) and `error.details.retryable` is false. A re-check with no integrity code, such as shutdown cancellation, stays 503 `package_changed` on the generic envelope, not this response. */
+        OsPackageConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["OsPackageConflictError"];
+            };
+        };
+        /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). An integrity failure of the mounted package is not this 503: it is 409 `os_package.<reason>` (`OsPackageConflict`), `retryable: false`. ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
         DocumentsUnavailable: {
             headers: {
                 [name: string]: unknown;
@@ -6312,6 +6336,7 @@ export interface operations {
                     };
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6342,6 +6367,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6365,6 +6391,7 @@ export interface operations {
                     };
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6396,6 +6423,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6427,7 +6455,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            /** @description Illegal transition */
+            /** @description Illegal transition. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6459,6 +6487,7 @@ export interface operations {
                     };
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6489,7 +6518,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
-            /** @description Same id already exists with different ops */
+            /** @description Same id already exists with different ops. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6522,6 +6551,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6546,7 +6576,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description Proposal not pending */
+            /** @description Proposal not pending. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6591,6 +6621,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6612,6 +6643,7 @@ export interface operations {
                     "application/json": components["schemas"]["DocumentsCapabilities"];
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6641,6 +6673,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["DocumentsBadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6669,6 +6702,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6710,6 +6744,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["DocumentsBadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsUploadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -6787,6 +6822,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsImportUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -6816,6 +6852,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6844,6 +6881,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6872,6 +6910,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6909,6 +6948,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             413: components["responses"]["DocumentsTooLarge"];
             422: components["responses"]["DocumentsRenderUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
@@ -6948,6 +6988,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsReadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -6981,6 +7022,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsReadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -7026,6 +7068,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsExtractUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -7059,6 +7102,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
