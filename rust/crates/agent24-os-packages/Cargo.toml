@@ -24,6 +24,11 @@ rustix = { version = "0.38", features = ["process", "fs"] }
 sha2 = "0.10"
 tokio-util = "0.7"
 
+[features]
+# Fixtures other crates need when they build a package the daemon will scan.
+# Off for a normal build of this library.
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"
 # The hash-pause hook is cfg'd out unless this feature is on. Tests in this

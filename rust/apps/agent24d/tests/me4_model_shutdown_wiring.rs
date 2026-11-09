@@ -79,10 +79,11 @@ fn install(home: &Path) {
         "name: probe\nversion: \"0.1.0\"\nroute_namespace: /api/v1/probe\n\
          event_module: probe\ndata_dir: ~/.agent24/os/probe/\n\
          kernel_capabilities: [models]\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+         spawn:\n  command: bin/launch\n",
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 /// `method path` with the daemon's token and a JSON `body`: `(status, body)`.

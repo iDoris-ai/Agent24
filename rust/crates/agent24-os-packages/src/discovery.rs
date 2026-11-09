@@ -423,6 +423,15 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let mut f = std::fs::File::create(dir.join(MANIFEST_FILE)).unwrap();
         f.write_all(body.as_bytes()).unwrap();
+        // A manifest this loader accepts is sealed with a native stub at
+        // `spawn.command`, so the package stays discoverable once integrity
+        // is required. Unparseable bodies stay as written: those tests want
+        // a refusal, not a sealed tree.
+        if let Ok(manifest) = agent24_domain::DomainOsManifest::from_yaml(body)
+            && let Some(spawn) = manifest.spawn()
+        {
+            crate::test_support::seal_exit_stub(&dir, &spawn.command).unwrap();
+        }
         dir
     }
 
@@ -456,11 +465,27 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let body = manifest_yaml("cos72", "out_of_process_provider");
         let dir = install(root.path(), "cos72", &body);
+        let yml = dir.join(MANIFEST_FILE);
+        // `install` seals, so the digest is of the file on disk, not the
+        // pre-seal text.
+        let sealed = std::fs::read(&yml).unwrap();
         let scan = scan(root.path());
-        assert_eq!(scan.found[0].digest, manifest_digest(body.as_bytes()));
-        // One byte more is another manifest, and another digest.
-        std::fs::write(dir.join(MANIFEST_FILE), format!("{body}\n")).unwrap();
-        assert_ne!(scan_digest(root.path()), manifest_digest(body.as_bytes()));
+        assert_eq!(scan.found[0].digest, manifest_digest(&sealed));
+        // One byte more is another manifest, and another digest. The payload
+        // hash is unchanged; only the manifest bytes move. Mode stays 0400,
+        // which is what a sealed manifest is published as.
+        crate::test_support::make_writable(&yml).unwrap();
+        let mut extra = sealed.clone();
+        extra.push(b'\n');
+        std::fs::write(&yml, &extra).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&yml).unwrap().permissions();
+            permissions.set_mode(0o400);
+            std::fs::set_permissions(&yml, permissions).unwrap();
+        }
+        assert_ne!(scan_digest(root.path()), manifest_digest(&sealed));
     }
 
     fn scan_digest(root: &Path) -> String {
@@ -589,9 +614,28 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("bom");
         std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            manifest_yaml("bom", "out_of_process_provider"),
+        )
+        .unwrap();
+        crate::test_support::seal_exit_stub(&dir, "bin/bom").unwrap();
+        // The BOM is a property of the bytes the loader reads. Prepend it
+        // after seal: the integrity section still names the same files.json,
+        // and the file must stay mode 0400 or the permission check refuses it
+        // for a different reason.
+        let yml = dir.join(MANIFEST_FILE);
+        crate::test_support::make_writable(&yml).unwrap();
         let mut bytes = vec![0xEF, 0xBB, 0xBF];
-        bytes.extend_from_slice(manifest_yaml("bom", "out_of_process_provider").as_bytes());
-        std::fs::write(dir.join(MANIFEST_FILE), &bytes).unwrap();
+        bytes.extend(std::fs::read(&yml).unwrap());
+        std::fs::write(&yml, &bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = std::fs::metadata(&yml).unwrap().permissions();
+            permissions.set_mode(0o400);
+            std::fs::set_permissions(&yml, permissions).unwrap();
+        }
 
         // Control: the fixture must really carry a BOM, or this proves nothing.
         assert_eq!(
@@ -781,8 +825,13 @@ mod tests {
         );
         let old_digest = read_package(&dir).unwrap().digest;
         let new_body = manifest_yaml("cos72", "out_of_process_provider").replace("0.1.0", "0.2.0");
-        std::fs::write(dir.join(MANIFEST_FILE), &new_body).unwrap();
-        let new_digest = manifest_digest(new_body.as_bytes());
+        let yml = dir.join(MANIFEST_FILE);
+        crate::test_support::make_writable(&yml).unwrap();
+        std::fs::write(&yml, &new_body).unwrap();
+        // Reseal so the replacement is still a package recheck can read. The
+        // digest compared below is the sealed file, which is what recheck hashes.
+        crate::test_support::seal(&dir, &["bin/cos72"]).unwrap();
+        let new_digest = manifest_digest(&std::fs::read(&yml).unwrap());
         // Control: the rewrite must actually produce a different digest, or
         // this test would pass even if `recheck` echoed the same value twice.
         assert_ne!(old_digest, new_digest);

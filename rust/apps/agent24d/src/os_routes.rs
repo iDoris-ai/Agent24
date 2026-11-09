@@ -2020,6 +2020,16 @@ mod tests {
             manifest_body,
         )
         .unwrap();
+        // Parseable packages are sealed so a rescan still finds them (and
+        // then applies the admission rule under test). A body that does not
+        // parse stays bare: criterion 14 asserts the scan refusal text.
+        if let Ok(manifest) = agent24_domain::DomainOsManifest::from_yaml(manifest_body) {
+            let executable = manifest
+                .spawn()
+                .map(|spawn| spawn.command.clone())
+                .unwrap_or_else(|| "bin/stub".to_owned());
+            agent24_os_packages::test_support::seal_exit_stub(&dir, &executable).unwrap();
+        }
         dir
     }
 

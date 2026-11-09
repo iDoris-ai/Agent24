@@ -17,6 +17,12 @@ pub mod discovery;
 pub mod install;
 pub mod package_integrity;
 
+/// Test fixtures (native launchers and `files.json`). Compiled into this crate's
+/// own tests, and into other crates' tests when they enable `test-support`.
+/// A production build of the library does not include it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 /// The name of the environment variable that overrides the packages root.
 ///
 /// Exported because the two functions below take the override as an ARGUMENT

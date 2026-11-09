@@ -260,10 +260,11 @@ fn install(home: &Path) {
         "name: blackbox\nversion: \"0.1.0\"\nroute_namespace: /api/v1/blackbox\n\
          event_module: blackbox\ndata_dir: ~/.agent24/os/blackbox/\n\
          kernel_capabilities: [scheduler, memory]\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+         spawn:\n  command: bin/launch\n",
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE_SCRIPT).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 /// One raw HTTP round trip over a plain `TcpStream` — deliberately NOT a

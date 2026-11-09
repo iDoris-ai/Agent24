@@ -69,10 +69,11 @@ fn install(home: &Path) {
         "name: remote\nversion: \"0.1.0\"\nroute_namespace: /api/v1/remote\n\
          event_module: remote\ndata_dir: ~/.agent24/os/remote/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+         spawn:\n  command: bin/launch\n",
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 /// `GET path` with the daemon's token: `(status, body)`, or `None` if the

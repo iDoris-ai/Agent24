@@ -42,9 +42,10 @@ fn write_package(home: &Path) -> String {
         "name: noted\nversion: \"0.1.0\"\nroute_namespace: /api/v1/noted\n\
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: \"false\"\n  args: []\n",
+         spawn:\n  command: bin/mod\n",
     )
     .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
     dir.to_string_lossy().into_owned()
 }
 

@@ -570,8 +570,10 @@ mod tests {
                 pending.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
             }
         }
-        // The walk saw the tree: the package dir, lib/, the manifest and the code.
-        assert_eq!(seen, 4);
+        // The walk saw the sealed tree plus the extra file this test adds after
+        // seal: the package dir, domain-os.yml, files.json, bin/, the native stub,
+        // lib/, and lib/code.js.
+        assert_eq!(seen, 7);
     }
 
     // ---- the instrument, and its own negative controls -----------------------
@@ -695,6 +697,7 @@ mod tests {
         let d = root.join(dir_name);
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join(MANIFEST_FILE), manifest_yaml(manifest_name)).unwrap();
+        crate::test_support::seal_exit_stub(&d, &format!("bin/{manifest_name}")).unwrap();
         d
     }
 

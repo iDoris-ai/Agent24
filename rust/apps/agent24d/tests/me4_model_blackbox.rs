@@ -322,7 +322,7 @@ fn install(home: &Path, name: &str, kernel_capabilities: &str, extra_manifest_li
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
              kernel_capabilities: [{kernel_capabilities}]\n{extra_manifest_lines}\
              impl_kind: out_of_process_provider\n\
-             spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
+             spawn:\n  command: bin/launch\n"
         ),
     )
     .unwrap();
@@ -338,6 +338,7 @@ fn install(home: &Path, name: &str, kernel_capabilities: &str, extra_manifest_li
         .replace("__NAME__", name)
         .replace("__CAPS_JSON__", &caps_json);
     std::fs::write(dir.join("mod.py"), script).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 /// One raw HTTP round trip over a plain `TcpStream`, `connection: close` so a

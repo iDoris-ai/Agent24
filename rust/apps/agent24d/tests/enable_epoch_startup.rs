@@ -18,12 +18,15 @@ fn install(home: &Path) {
         "name: noted\nversion: \"0.1.0\"\nroute_namespace: /api/v1/noted\n\
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: \"false\"\n  args: []\n\
+         spawn:\n  command: bin/mod\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
          output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
     )
     .unwrap();
+    // Exits 1, the same status `false` used to return. The epoch is recorded
+    // from the manifest, before this process has to stay up.
+    agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
 }
 
 /// Start the daemon, wait for its ready line — the observation is made
