@@ -32,6 +32,32 @@ fn workspace_recovery_instant_at(
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
 // defaults `kill -TERM` ends the process within 16.5s, or about 50.6s while a managed iDoris holds the summary open (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
+/// Test seam: park the first enable rescan, and record whether the config
+/// write still holds `os_control`.
+#[cfg(test)]
+pub(crate) struct OsEnableProbe {
+    pub park_first_rescan: std::sync::atomic::AtomicBool,
+    pub rescans: std::sync::atomic::AtomicUsize,
+    pub rescan_entered: tokio::sync::Notify,
+    pub release_rescan: tokio::sync::Notify,
+    pub write_saw_lock: std::sync::atomic::AtomicBool,
+    pub writes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl OsEnableProbe {
+    fn new() -> Self {
+        Self {
+            park_first_rescan: std::sync::atomic::AtomicBool::new(false),
+            rescans: std::sync::atomic::AtomicUsize::new(0),
+            rescan_entered: tokio::sync::Notify::new(),
+            release_rescan: tokio::sync::Notify::new(),
+            write_saw_lock: std::sync::atomic::AtomicBool::new(false),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub token: Arc<String>,
@@ -134,13 +160,18 @@ pub struct AppState {
     /// How module tool decisions are taken; `None` (the default, and always
     /// on an ephemeral daemon) answers every decision 403.
     pub module_grants: Option<crate::consent_routes::GrantSettings>,
-    /// Held across the config write and the hand-off of a hot disable's stop
-    /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
-    /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
-    /// answers with is rendered after, and shows the state then. A module
-    /// tool decision holds it from its checks to its write, and a stop for
-    /// the whole stop, so neither lands inside the other (K1-6a-G §2.1 F7).
+    /// Held across an enable's rescan, refusal-record update, and config
+    /// write (the rescan runs only after the lock is taken), and across a
+    /// disable's config write plus the hand-off of its stop — not across
+    /// the wait that follows — so concurrent toggles run in one order
+    /// (SUP-5, PR-3c). The list a PATCH answers with is rendered after.
+    /// A module tool decision holds it from its checks to its write, and a
+    /// stop for the whole stop (K1-6a-G §2.1 F7).
     pub os_control: Arc<tokio::sync::Mutex<()>>,
+    /// Test seam for "rescan and the config write share one `os_control`
+    /// hold". Production builds do not carry it.
+    #[cfg(test)]
+    pub(crate) os_enable_probe: Arc<OsEnableProbe>,
     /// What `GET /api/v1/shutdown` answers — fixed at start-up (SHUT-1c).
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
@@ -764,6 +795,8 @@ impl AppState {
             module_tool_cards: None,
             module_grants: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            os_enable_probe: Arc::new(OsEnableProbe::new()),
             shutdown_report: Arc::new(crate::lifecycle::report(
                 &crate::lifecycle::Params::default(),
                 &[],

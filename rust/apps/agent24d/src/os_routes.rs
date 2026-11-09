@@ -514,6 +514,20 @@ async fn apply(
 ) -> Result<Applied, String> {
     // K1-6a-G §2.1 F3: grants from before an enable end before it is
     // written; if they cannot, the enable is not.
+    // Same `os_control` hold as the rescan. The test checks; production does not.
+    #[cfg(test)]
+    {
+        if state.os_control.try_lock().is_err() {
+            state
+                .os_enable_probe
+                .write_saw_lock
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        state
+            .os_enable_probe
+            .writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
     if enabled && let Err(e) = state.store.advance_module_enable_epoch(name).await {
         tracing::error!(module = name, error = %e, "an enable could not end the module's grants");
         return Err(format!(
@@ -878,6 +892,10 @@ async fn rescan_disabled_package(
         rescan_disabled_package_on_disk(&packages_root, &name, &dir, &cancel)
     })
     .await;
+    // Still inside the caller's `os_control` hold. A test parks the first
+    // scan here, before the refusal record or os.json is published.
+    #[cfg(test)]
+    note_rescan_finished(state).await;
     match outcome {
         Ok(result) => result,
         Err(e) => {
@@ -888,6 +906,26 @@ async fn rescan_disabled_package(
             tracing::error!("on-demand admission re-check panicked or was cancelled: {e}");
             Err(RescanDeny::Internal)
         }
+    }
+}
+
+#[cfg(test)]
+async fn note_rescan_finished(state: &AppState) {
+    let probe = &state.os_enable_probe;
+    let n = probe
+        .rescans
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    if n == 0
+        && probe
+            .park_first_rescan
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // Subscribe before announcing, so the test's `notify_one` cannot
+        // land in the gap before this wait.
+        let mut release = std::pin::pin!(probe.release_rescan.notified());
+        release.as_mut().enable();
+        probe.rescan_entered.notify_one();
+        release.await;
     }
 }
 
@@ -936,37 +974,38 @@ fn remember_integrity(
 
 /// `Some` blocks enable. `None` lets the write proceed.
 ///
-/// An integrity refusal and a disabled package are both re-read from disk.
-/// Passing clears the refusal (`Disabled`: the package is not running yet,
-/// and the integrity reason must not stick). Still failing stores the fresh
-/// `os_package.<reason>` and does not ask for a daemon restart.
+/// Every installed package (`Mounted`, `Degraded`, `Disabled`, and an
+/// integrity refusal) is re-read from disk. The caller holds `os_control`
+/// and has just read `outcome`. Passing an integrity refusal clears it to
+/// `Disabled`; a passing `Mounted` or `Degraded` package keeps its outcome.
+/// Still failing stores the fresh `os_package.<reason>`. No directory means
+/// a compiled-in module, which is not rescanned.
 async fn admit_enable(
     state: &AppState,
     name: &str,
     outcome: MountOutcome,
     dir: Option<&std::path::Path>,
 ) -> Option<Response> {
-    match outcome {
+    let (dir, clear_integrity) = match outcome {
         MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), why) => {
             let Some(dir) = dir else {
                 return Some(integrity_conflict(reason, &why));
             };
-            match rescan_disabled_package(state, name, dir).await {
-                Ok(()) => {
-                    state.set_os_outcome(name, MountOutcome::Disabled);
-                    None
-                }
-                Err(denied) => Some(deny_enable(state, name, denied)),
-            }
+            (dir, true)
         }
         MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why) => {
-            Some(admission_refused_response(&why))
+            return Some(admission_refused_response(&why));
         }
-        MountOutcome::Disabled => match rescan_disabled_package(state, name, dir?).await {
-            Ok(()) => None,
-            Err(denied) => Some(deny_enable(state, name, denied)),
-        },
-        MountOutcome::Mounted | MountOutcome::Degraded(_) => None,
+        MountOutcome::Disabled | MountOutcome::Mounted | MountOutcome::Degraded(_) => (dir?, false),
+    };
+    match rescan_disabled_package(state, name, dir).await {
+        Ok(()) => {
+            if clear_integrity {
+                state.set_os_outcome(name, MountOutcome::Disabled);
+            }
+            None
+        }
+        Err(denied) => Some(deny_enable(state, name, denied)),
     }
 }
 
@@ -1043,14 +1082,14 @@ async fn patch_os_at(
             );
         }
     };
-    // T8/ME-3g: admission gate, before touching `path`/`os_control` — no point
-    // taking the write lock for a request this is about to refuse. Only ever
-    // engages when this name has EXACTLY ONE `os_reports` entry: a duplicate
-    // name (two catalogue entries claiming it) is left to today's existing
-    // unconditional-allow behavior on purpose (design doc round 3 High 3 —
-    // telling "the one that actually won this name" apart from "a loser
-    // refused only because the name was already taken" needs more provenance
-    // than this gate has, and is out of scope here).
+    // One `os_control` hold covers the outcome read, the rescan, the refusal
+    // record, and the config write. A duplicate name still skips the gate
+    // (design doc round 3 High 3). A refusal returns before the write. The
+    // write and a running module's stop hand-off stay in a task of the
+    // daemon's own, so a client that goes away cannot leave os.json disabling
+    // a module that keeps serving. The lock is released before the wait for
+    // the module to refuse requests (review of SUP-5, round 3).
+    let control = state.os_control.clone().lock_owned().await;
     if update.enabled {
         let admission = {
             let same_name: Vec<&MountReport> =
@@ -1083,13 +1122,6 @@ async fn patch_os_at(
     // A clone for the final `render_at` call below — `path` itself moves into
     // the spawned `apply` task next.
     let path_for_render = path.clone();
-    // The write and the hand-off of a running module's stop are one step
-    // against another toggle, done in a task of the daemon's own: a client
-    // that goes away half-way cannot leave os.json disabling a module that
-    // keeps serving. The lock is released before the wait for the module to
-    // refuse requests, so a slow module does not hold up other toggles
-    // (review of SUP-5, round 3).
-    let control = state.os_control.clone().lock_owned().await;
     let step = tokio::spawn({
         let (state, name) = (state.clone(), name.clone());
         async move {
@@ -3185,5 +3217,161 @@ mod tests {
         assert_ne!(row["state"], "failed");
         assert_ne!(row["reason"], "integrity_manifest_missing");
         assert_ne!(row["reason"], "hash_mismatch");
+    }
+
+    /// Startup left the package `Mounted`. After disable, deleting `files.json`
+    /// and enabling must refuse without rewriting os.json. A `Mounted` arm
+    /// that skips the rescan returns 200 and this goes red.
+    #[tokio::test]
+    async fn enable_after_disable_rescans_a_mounted_package_and_leaves_config_unwritten() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "sin90",
+            &t8_manifest_yaml("sin90", "1.0.0", "out_of_process_provider"),
+        );
+        st.os_reports = std::sync::Arc::new(vec![report("sin90", MountOutcome::Mounted)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "sin90".to_owned(),
+            pkg_dir.clone(),
+        )]));
+
+        let disabled = t8_patch(&st, "sin90", false, Some(path.clone())).await;
+        assert_eq!(
+            disabled.status(),
+            StatusCode::OK,
+            "{:?}",
+            body_json(disabled).await
+        );
+        assert!(
+            !crate::os_config::OsConfig::load(&path)
+                .unwrap()
+                .is_enabled("sin90")
+        );
+        std::fs::remove_file(pkg_dir.join("files.json")).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let res = t8_patch(&st, "sin90", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let j = body_json(res).await;
+        assert_eq!(j["error"]["code"], "os_package.integrity_manifest_missing");
+        assert_eq!(j["error"]["details"]["retryable"], false);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let row = component_row(
+            &crate::component_routes::host_components_json(&st).await,
+            "sin90",
+        );
+        assert_eq!(row["state"], "failed");
+        assert_eq!(row["reason"], "integrity_manifest_missing");
+    }
+
+    /// The first enable scans a package with no `files.json` and parks while
+    /// holding `os_control`. The tree is sealed during that hold. The second
+    /// enable must not scan until the first releases, then write `enabled:
+    /// true` and clear the refusal. A lock that covers only the refusal-map
+    /// insert lets the second scan start while the first is parked.
+    #[tokio::test]
+    async fn concurrent_enables_rescan_after_os_control_and_match_the_config() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "sin90",
+            &t8_manifest_yaml("sin90", "1.0.0", "out_of_process_provider"),
+        );
+        std::fs::remove_file(pkg_dir.join("files.json")).unwrap();
+        st.os_reports = std::sync::Arc::new(vec![report("sin90", MountOutcome::Mounted)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "sin90".to_owned(),
+            pkg_dir.clone(),
+        )]));
+        st.os_enable_probe
+            .park_first_rescan
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let mut entered = std::pin::pin!(st.os_enable_probe.rescan_entered.notified());
+        entered.as_mut().enable();
+        let st_a = st.clone();
+        let path_a = path.clone();
+        let first = tokio::spawn(async move { t8_patch(&st_a, "sin90", true, Some(path_a)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+            .await
+            .expect(
+                "the first enable never rescanned; a Mounted arm that skips the rescan never parks",
+            );
+        assert_eq!(
+            st.os_enable_probe
+                .rescans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let st_b = st.clone();
+        let path_b = path.clone();
+        let second =
+            tokio::spawn(async move { t8_patch(&st_b, "sin90", true, Some(path_b)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            st.os_enable_probe
+                .rescans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second enable scanned before the first released os_control"
+        );
+
+        agent24_os_packages::test_support::make_writable(&pkg_dir.join("bin/sin90")).unwrap();
+        agent24_os_packages::test_support::seal_exit_stub(&pkg_dir, "bin/sin90").unwrap();
+        st.os_enable_probe.release_rescan.notify_one();
+
+        let (first, second) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .expect("the two enables did not finish");
+        let first = first.unwrap();
+        let second = second.unwrap();
+
+        assert_eq!(first.status(), StatusCode::CONFLICT);
+        let denied = body_json(first).await;
+        assert_eq!(
+            denied["error"]["code"],
+            "os_package.integrity_manifest_missing"
+        );
+        assert_eq!(denied["error"]["details"]["retryable"], false);
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "{:?}",
+            body_json(second).await
+        );
+        assert!(path.exists(), "the successful enable did not write os.json");
+        assert!(
+            crate::os_config::OsConfig::load(&path)
+                .unwrap()
+                .is_enabled("sin90"),
+            "final os.json must match the enable that scanned the repaired package"
+        );
+        assert!(
+            st.os_enable_probe
+                .write_saw_lock
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "the config write ran outside the os_control hold that covered the rescan"
+        );
+        assert_eq!(
+            st.os_enable_probe
+                .writes
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the refused enable must not write os.json"
+        );
+        let row = component_row(
+            &crate::component_routes::host_components_json(&st).await,
+            "sin90",
+        );
+        assert_ne!(row["state"], "failed");
+        assert_ne!(row["reason"], "integrity_manifest_missing");
     }
 }
