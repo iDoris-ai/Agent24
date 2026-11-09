@@ -72,14 +72,24 @@ AGENT24_DATA_DIR=/tmp/a24-x agent24 daemon status
   但 CLI / 桌面端只会连上与自己 `AGENT24_DATA_DIR` 相同的那个 daemon。
 - 想回到原数据，去掉这个变量重新启动即可；不需要也不应手动搬动 `agent24.db`。
 
-## 升级后重装 24/7 服务（LaunchAgent）
+## 24/7 服务（LaunchAgent）
 
-发布前加固（PR-B / S-04）起，`agent24 service install` 生成的 plist 会带 `--ready-omit-token`，daemon 的 ready 行不再把 bearer token 写进 `~/.agent24/logs/agent24d.out.log`（token 只在 0600 的 `daemon.json`）；同时 `logs/` 收紧为 0700、日志文件为 0600。
+M5 B1（#1710）起，`agent24 service install` 把守护进程装成**服务模式**：
 
-- **只换二进制的旧安装不会自动获得这些**：已有的 plist 不带该参数，旧日志也仍是原权限，token 会继续写进日志。
-- 升级后请**执行一次 `agent24 service install`**。它是幂等的：重写 plist、收紧 logs 权限，并 `launchctl bootout` + `bootstrap` 重载。
-- `agent24 service status` 在发现 plist 缺少该参数时会多打一行 `note:` 提示。
-- 旧日志里已经落盘的 token 不会被清掉；若担心，重装后删除旧的 `agent24d.out.log`，必要时轮换 token（重启 daemon 即换新）。
+- **运行方式**：plist 运行的是 `agent24d serve --port 0 --auth-mode capabilities --enroll-endpoint`。
+  - `daemon.json` 里没有 token，ready 行和日志里也没有。
+  - 客户端经数据目录下的 `enroll.sock` 登记。
+  - 不再有 legacy 方式的服务。
+- **复制件**：launchd 跑的不是 app 包里的那个 `agent24d`，而是它的一份复制件 `<数据目录>/bin/agent24d`，默认是 `~/.agent24/bin/agent24d`。
+  - 这样 app 移动或升级时，正在跑的守护进程脚下的文件不会变。
+  - install 先停掉旧服务，再替换复制件，再启动新的。
+  - 复制件是按字节写的，不带源文件的扩展属性，包括 quarantine。
+- **升级 app 后**：要再执行一次 `agent24 service install`，复制件才会换成新版本。它是幂等的：重写 plist、替换复制件、收紧 logs 权限，并 `launchctl bootout` + `bootstrap` 重载。由桌面端在启动时自动做，归 M5 B5。
+- **停止**：`daemon.json` 里的 pid 等于 launchd 为服务 job 跑的那个进程时，`agent24 daemon stop` 经 launchd 给这个 job 发 SIGTERM（`launchctl kill`）。守护进程正常退出，退出码是 0；plist 设了 `KeepAlive{SuccessfulExit:false}`，所以 launchd 不会再把它拉起来。pid 不一致时（例如桌面端自己起的 capabilities 守护进程，或另一个数据目录的守护进程），stop 不经 launchd，仍由起它的宿主来停。
+- **卸载**：`agent24 service uninstall` 同时删掉 plist 和复制件。复制件的位置按当前的 `AGENT24_DATA_DIR` 推算，所以安装时设了这个变量，卸载时也要设同一个值。
+- **重装**：install 先停掉旧服务，等 launchd 报告的那个进程退出后才替换复制件。它等的是这个进程，不是数据目录的锁，因为桌面端起的守护进程也可能持着锁。等不到就报错：服务已卸载，复制件保持原样，要重跑 install。复制件所在的 `bin/` 是 0700，如果它是一个符号链接，install 拒绝。
+- **查看**：`agent24 service status` 显示守护进程的认证模式，以及它的登记端点。
+- **日志权限**：`logs/` 是 0700，日志文件是 0600。
 
 ## 需要 jason 决定或动手的事
 
