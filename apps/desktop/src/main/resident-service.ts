@@ -25,9 +25,25 @@ export function bundledDaemonVersion(bin: string): Promise<string | null> {
   })
 }
 
-/** Only two known versions that differ: an unknown one is never a reason to restart. */
+/** `a.b.c`, optionally `-pre` and `+build`; null when it is not one. */
+function semver(v: string | null): [number, number, number, string | null] | null {
+  const m = v === null ? null : /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(v)
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3]), m[4] ?? null] : null
+}
+
+/** Only a newer bundled version: never an older daemon over a store a newer
+ * one migrated (PR-Daemon B5a B1); an unknown version is never a reason. */
 export function upgradeNeeded(bundled: string | null, running: string | null): boolean {
-  return bundled !== null && running !== null && bundled !== running
+  const b = semver(bundled)
+  const r = semver(running)
+  if (!b || !r) return false
+  for (const i of [0, 1, 2] as const) if (b[i] !== r[i]) return b[i] > r[i]
+  return b[3] === null && r[3] !== null
+}
+
+/** Never a dev build or an `AGENT24D_BIN` override (PR-Daemon B5a N3). */
+export function upgradesFromBundle(packaged: boolean, env: NodeJS.ProcessEnv): boolean {
+  return packaged && !env['AGENT24D_BIN']
 }
 
 export function serviceDaemonCopyPath(dataDir: string): string {
@@ -53,7 +69,10 @@ export function copyDaemonIfChanged(src: string, dest: string): 'same' | 'copied
   fs.chmodSync(dir, 0o700)
   // Same bytes in a plain file only: a link there is replaced (Codex B5a C1).
   const there = fs.lstatSync(dest, { throwIfNoEntry: false })
-  if (there?.isFile() && crypto.createHash('sha256').update(bytes).digest('hex') === sha256(dest)) return 'same'
+  if (there?.isFile() && crypto.createHash('sha256').update(bytes).digest('hex') === sha256(dest)) {
+    fs.chmodSync(dest, 0o755) // as copy_daemon, which always rewrites (PR-Daemon B5a N2)
+    return 'same'
+  }
   const temp = path.join(dir, `.agent24d.${process.pid}.tmp`)
   fs.rmSync(temp, { force: true })
   try {
@@ -109,20 +128,23 @@ export interface UpgradeDeps {
   hold: <T>(work: () => Promise<T>) => Promise<T>
 }
 
-/** The service is never left down by a step that did not happen: nothing is
- * started when the shutdown was refused or the old daemon did not exit, and a
- * failed copy still starts the old file, which it left whole. */
+/** Nothing is started when the shutdown was refused. Once it was approved the
+ * service is always started again, since a clean exit is not restarted by
+ * launchd (PR-Daemon B5a N1): from the old file, left whole, when the old
+ * daemon did not exit in time (no copy then) or the copy failed. */
 export function upgradeService(deps: UpgradeDeps): Promise<UpgradeOutcome> {
   return deps.hold(async (): Promise<UpgradeOutcome> => {
     const down = await deps.shutdown()
     if (down.status < 200 || down.status >= 300) return { ok: false, stage: 'shutdown', code: down.code ?? `http_${down.status}` }
-    if (!(await deps.exited())) return { ok: false, stage: 'exit', code: 'still_running' }
+    const gone = await deps.exited()
     let copied = false
     let copyError: string | null = null
-    try {
-      copied = deps.copy() === 'copied'
-    } catch (err) {
-      copyError = (err as NodeJS.ErrnoException).code ?? 'copy_failed'
+    if (gone) {
+      try {
+        copied = deps.copy() === 'copied'
+      } catch (err) {
+        copyError = (err as NodeJS.ErrnoException).code ?? 'copy_failed'
+      }
     }
     try {
       await deps.kickstart()
@@ -130,6 +152,7 @@ export function upgradeService(deps: UpgradeDeps): Promise<UpgradeOutcome> {
       return { ok: false, stage: 'kickstart', code: 'kickstart_failed' }
     }
     if (!(await deps.started())) return { ok: false, stage: 'kickstart', code: 'not_started' }
+    if (!gone) return { ok: false, stage: 'exit', code: 'still_running' }
     return copyError === null ? { ok: true, copied } : { ok: false, stage: 'copy', code: copyError }
   })
 }

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, CrashLoopDetector, jobPid, lastExitCode, LOOP_DOWN_MS, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService,
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, lastExitCode, LOOP_DOWN_MS, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView } from './tray-menu'
@@ -43,6 +43,25 @@ describe('versions', () => {
     expect(upgradeNeeded('0.6.1', null)).toBe(false)
   })
 
+  it('an older app never downgrades the service daemon; numbers compare as numbers (PR-Daemon B5a B1)', () => {
+    expect(upgradeNeeded('0.6.0', '0.6.1')).toBe(false)
+    expect(upgradeNeeded('0.5.9', '0.6.0')).toBe(false)
+    expect(upgradeNeeded('0.10.0', '0.9.9')).toBe(true)
+    expect(upgradeNeeded('1.0.0', '0.99.0')).toBe(true)
+    // A release is newer than its pre-release; two pre-releases are not ordered.
+    expect(upgradeNeeded('0.7.0', '0.7.0-rc.1')).toBe(true)
+    expect(upgradeNeeded('0.7.0-rc.1', '0.7.0')).toBe(false)
+    expect(upgradeNeeded('0.7.0-rc.2', '0.7.0-rc.1')).toBe(false)
+    expect(upgradeNeeded('0.6.1+abc', '0.6.0')).toBe(true)
+    expect(upgradeNeeded('v0.6.1', '0.6.0')).toBe(false)
+  })
+
+  it('only a packaged app with no AGENT24D_BIN upgrades from its bundle (PR-Daemon B5a N3)', () => {
+    expect(upgradesFromBundle(true, {})).toBe(true)
+    expect(upgradesFromBundle(false, {})).toBe(false)
+    expect(upgradesFromBundle(true, { AGENT24D_BIN: '/x/agent24d' })).toBe(false)
+  })
+
   it("launchd's pid for the job is its own line, not a nested one, and none between runs", () => {
     expect(jobPid('gui/501/ai.auraai.agent24 = {\n\tstate = running\n\tpid = 4242\n\tendpoints = {\n\t\tpid = 7\n\t}\n}')).toBe(4242)
     expect(jobPid('gui/501/ai.auraai.agent24 = {\n\tstate = not running\n\tendpoints = {\n\t\tpid = 7\n\t}\n}')).toBeNull()
@@ -62,6 +81,13 @@ describe('copyDaemonIfChanged (as service.rs copy_daemon)', () => {
     expect(fs.statSync(dest).mode & 0o777).toBe(0o755)
     expect(fs.statSync(dir).mode & 0o777).toBe(0o700)
     expect(fs.readdirSync(dir)).toEqual(['agent24d'])
+  })
+
+  it('the same bytes in a file that is not runnable: still "same", made 0755 as copy_daemon does (PR-Daemon B5a N2)', () => {
+    const { src, dest } = files('same', 'same')
+    fs.chmodSync(dest, 0o644)
+    expect(copyDaemonIfChanged(src, dest)).toBe('same')
+    expect(fs.statSync(dest).mode & 0o777).toBe(0o755)
   })
 
   it('makes bin/ when there is none', () => {
@@ -153,7 +179,7 @@ describe('upgradeService', () => {
     upgrader.tick()
     await vi.waitFor(() => expect(upgrader.hint()).toEqual({ kind: 'failed', code: 'kickstart_failed' }))
     setMainLocale('zh')
-    const tray = { status: 'running', external: true, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
+    const tray = { status: 'running', external: true, enrolled: false, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
     expect(buildTrayView({ ...tray, upgrade: upgrader.hint() }).tooltip).toContain('后台服务升级未完成（kickstart_failed）')
   })
 
@@ -166,10 +192,10 @@ describe('upgradeService', () => {
     expect(fs.statSync(dest).mtimeMs).toBe(mtime)
   })
 
-  it('the old daemon still running: nothing copied, nothing started', async () => {
+  it('the old daemon still running: nothing copied, and the service is started again from the old file (PR-Daemon B5a N1)', async () => {
     const { calls, deps } = steps({ exited: async () => { calls.push('exited'); return false } })
     await expect(upgradeService(deps)).resolves.toEqual({ ok: false, stage: 'exit', code: 'still_running' })
-    expect(calls).toEqual(['hold', 'shutdown', 'exited', 'release'])
+    expect(calls).toEqual(['hold', 'shutdown', 'exited', 'kickstart', 'started', 'release'])
   })
 
   it('a failed copy still starts the old file, which it left whole, and says the copy failed', async () => {
@@ -267,7 +293,7 @@ describe('ServiceUpgrader (PM 11-09: asked once per run, after enrolment)', () =
 })
 
 describe('tray text (three languages)', () => {
-  const tray = { status: 'running', external: true, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
+  const tray = { status: 'running', external: true, enrolled: false, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
   it.each([
     ['en', 'restart the background service to finish the upgrade'],
     ['zh', '重启后台服务以完成升级'],
@@ -280,6 +306,8 @@ describe('tray text (three languages)', () => {
     expect(buildTrayView(tray).tooltip).not.toContain(restart)
     expect(failed).toContain('not_started')
     expect(failed).toContain('`agent24 service install`')
+    // Reopening cannot work: with no service daemon nothing asks again (PR-Daemon B5a N1).
+    expect(failed.replace(buildTrayView(tray).tooltip, '')).not.toMatch(/Reopen|重新打开|เปิด Agent24 ใหม่/)
   })
 })
 
@@ -375,7 +403,7 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     ['th', 'รีสตาร์ตซ้ำ'],
   ] as const)('%s: the tray says so and gives the way back', (lang, says) => {
     setMainLocale(lang)
-    const tray = { status: 'running', external: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
+    const tray = { status: 'running', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
     const tip = buildTrayView({ ...tray, crashLoop: true }).tooltip
     expect(tip).toContain(says)
     expect(tip).toContain('`agent24 service uninstall`')
