@@ -208,6 +208,17 @@ describe('schedule conversations (M4 A5)', () => {
       expect(history.list()).toEqual([])
     })
 
+    it('the same, with the first catch-up between the claim and the settle (Codex #1719 r2 C2)', async () => {
+      const m = homes()
+      const summary = await m.record('sch_1', 'run_1')
+      history.delete(summary!.id)
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.catchUp(runs('run_1'))
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list()).toEqual([])
+    })
+
     it('a run to retry, claimed after a restart and given back before the first catch-up, is recorded by it', async () => {
       const appendRun = vi.spyOn(history, 'appendRun').mockImplementationOnce(() => { throw new Error('disk full') })
       await expect(homes().record('sch_1', 'run_1')).rejects.toThrow('disk full')

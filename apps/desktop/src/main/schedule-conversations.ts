@@ -253,10 +253,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
   /** Runs heard of live and not recorded yet, from the moment they are
    *  heard of, before their turn in the queue. */
   const heard = new Set<string>()
-  /** Runs claimed (A6) and not settled yet: whether they were handled
-   *  before the claim, so not A5's to record whatever the caller does, and
-   *  whether they were waiting for the first catch-up to record them. */
-  const claimed = new Map<string, { handledBefore: boolean; pending: boolean }>()
+  /** Runs claimed (A6) and not settled yet: whether, before the claim, A5
+   *  was to record them, so they are given back if the caller cannot. */
+  const claimed = new Map<string, { eligible: boolean }>()
   let queue: Promise<unknown> = Promise.resolve()
   const enqueue = <T>(job: () => Promise<T>): Promise<T> => {
     const done = queue.then(job)
@@ -281,12 +280,15 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
         // neither to retry nor heard of; a live record of it is not made
         // (Codex A6 r3 C1). Given back if the caller cannot record it.
         const handledBefore = state.handled !== null && state.handled.includes(runId)
-        const pending = state.retry.includes(runId) || heard.has(runId)
+        // A5's to record before the claim: not handled yet, or, before the
+        // first catch-up, waiting for it (to retry, or heard of and not
+        // recorded). One recorded live then is not (Codex #1719 C2, r2 C2).
+        const eligible = state.handled !== null ? !handledBefore : state.retry.includes(runId) || heard.has(runId)
         const handled = state.handled === null || handledBefore ? state.handled : [...state.handled, runId]
         write({ ...state, handled, retry: state.retry.filter(id => id !== runId) })
         // Only once on file: a claim that could not be written leaves nothing
         // reserved, and the run is A5's as before (#1719 C2).
-        claimed.set(runId, { handledBefore, pending })
+        claimed.set(runId, { eligible })
         heard.delete(runId)
         return false
       })
@@ -295,17 +297,17 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       return enqueue(async () => {
         const was = claimed.get(runId)
         claimed.delete(runId)
-        if (!was || recorded || was.handledBefore) return
-        // The caller could not record it: it is A5's to record, as now
-        // things stand (Codex A6 r3 C2). Out of `handled`, which the first
-        // catch-up may have put it in while it was claimed (#1719 C1); before
-        // that catch-up, back to retry if it was waiting there, so that it
-        // does not take it as handled. One recorded live before the claim is
-        // not: its conversation, deleted since, stays so (Codex #1719 C2).
+        if (!was || recorded || !was.eligible) return
+        // The caller could not record it, and it was A5's: it is again, as
+        // things stand now (Codex A6 r3 C2). Out of `handled`, which the
+        // first catch-up may have put it in while it was claimed (#1719 C1);
+        // before that catch-up, back to retry, so that it does not take it as
+        // handled. One that was not A5's stays as it is: a conversation the
+        // user deleted is not brought back (Codex #1719 C2, r2 C2).
         const state = read()
         if (state.handled !== null) {
           if (state.handled.includes(runId)) write({ ...state, handled: state.handled.filter(id => id !== runId) })
-        } else if (was.pending && !state.retry.includes(runId)) {
+        } else if (!state.retry.includes(runId)) {
           write({ ...state, retry: [...state.retry, runId] })
         }
       })
