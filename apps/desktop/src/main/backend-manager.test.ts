@@ -2058,6 +2058,26 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     }
   })
 
+  it('while enrolled, the service daemon is the presence target; not once the connection ends or is stopped (M5 B3)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    expect(manager.presenceTarget()).toBeNull()
+    await manager.start()
+    try {
+      expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
+      first.end('daemon_unavailable')
+      expect(manager.presenceTarget()).toBeNull()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
+      manager.stopDaemon()
+      expect(manager.presenceTarget()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('a steady disconnect, then start, attaches to the service daemon again instead of spawning (B3a, PR-Daemon #1726)', async () => {
     vi.useFakeTimers()
     const enrol = vi.fn().mockResolvedValueOnce(session('daily-1')).mockResolvedValueOnce(session('again-1'))

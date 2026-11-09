@@ -562,6 +562,8 @@ export class BackendManager {
   // M5 B2: the token connection to the daemon the LaunchAgent runs, while
   // that daemon is the reused external one, and its renew timer.
   private enrolment: EnrolSession | null = null
+  /** Where `enrolment` was made, for the presence connection (M5 B3). */
+  private enrolledWith: { socketPath: string; generation: string } | null = null
   private renewTimer: NodeJS.Timeout | null = null
   // Set when that connection ends under a live daemon: the next tick
   // enrols again rather than waiting out MAX_HEALTH_FAILURES.
@@ -753,6 +755,7 @@ export class BackendManager {
     this.isExternal = true
     this.externalPid = state.pid
     this.lastHealthy = true
+    this.enrolledWith = { socketPath, generation }
     publishConnection({ port: state.port, auth: { kind: 'bearer', token: session.token } }, 'capabilities')
     this.renewTimer = setInterval(() => { void this.renewEnrolment(session, state.port) }, RENEW_EVERY_MS)
     session.onClose((why) => {
@@ -832,6 +835,7 @@ export class BackendManager {
   private dropEnrolment(): void {
     const session = this.enrolment
     this.enrolment = null
+    this.enrolledWith = null
     if (this.renewTimer) {
       clearInterval(this.renewTimer)
       this.renewTimer = null
@@ -900,6 +904,12 @@ export class BackendManager {
    * rather than spawned (surfaced by the tray so the UI can say so). */
   isExternalDaemon(): boolean {
     return this.isExternal
+  }
+
+  /** The service daemon's enrolment socket and generation while this app is
+   * enrolled with it: the presence connection's target (M5 B3). */
+  presenceTarget(): { socketPath: string; generation: string } | null {
+    return this.enrolledWith
   }
 
   /** pid of the reused external daemon, for tray labels; null when not external. */
