@@ -133,6 +133,38 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
   - 这是桌面替自己作证：能挡住 renderer 和 CLI，挡不住已经被攻破的桌面主进程。强度不如 D7 的 LocalAuthentication helper，是 helper 落地之前的过渡方案。
   - daemon 读一帧时，同一条连接上不会同时下发挑战或取消。桌面只发了半帧时，挑战要等这一帧收齐才下发。5 秒（单帧读超时）内收不齐，daemon 回 `timeout` 并关闭连接，挑战结算为 `Unavailable`。这和令牌连接的单帧超时一致。
 
+### 3.4c 三类操作的批准文字（K-B3b #1715）
+
+服务模式下桌面只留 presence 框（#1738），这些文字就是用户批准前看到的全部内容。口径见 #1715 评论 6732504621、6732795187 和修订 6732823397，实现在 `elevation_summaries.rs`。
+
+- **哪些路由**：`DERIVED_ROUTES` 里 10 条，正是 ApprovalDecision、ScheduleManage、Shutdown 在路由策略里的全部 Elevated 行（测试 `derived_routes_are_the_elevated_rows_of_the_three_operations` 锁住）。**等级表不动**。
+- **怎么生成**：第一次请求在 `presence_required` 分支里被拒时，daemon 先缓冲 body，用和 handler 同一种解析方式解析，再用自己库里的记录拼文字，按「令牌 + method + path + body 哈希」记下。elevate 只认这份文字，客户端自带的 `summary` 不进框。
+- **工具审批** `POST /approvals/{id}`：
+  - `{决定及范围}: approval {id} of run {run_id}, conversation {会话标题}; tool {工具名}; arguments: {参数预览}`。
+  - 决定及范围：`approve once`、`approve for the rest of this session`、`approve always for target {standing_target}`、`deny (with your reason)`、`abort the whole run`。
+  - 工具名按 `tool_call_id` 取 `ToolCall.tool`；标题取 run 所属会话的标题，没有或为空时写 `untitled`。
+  - 参数预览：取 `Approval.payload`，凭据类键（token、secret、password、passwd、api_key、apikey、authorization、credential、cookie、private_key，以及以 `_token`、`_secret`、`_key` 结尾的键，不分大小写）的值逐层换成 `"***"`，序列化成单行 JSON，`shown()` 会拒的字符写成 `\u{XXXX}`，再在字符（和转义）边界上截到 200 字节，截断标记和 `summarize_input` 相同。没有凭据、没有隐藏字符时，预览和 `Approval.summary` 里「`{tool}: `」之后的部分逐字节相同。
+  - 总长超出时先缩短标题（标题最多 120 字），预览不再缩。
+- **模块审批** `POST /module-approvals/{id}`：`{approve|deny} module approval {id}: module {module}, action {action}; target {target}; arguments: {参数预览}`。
+- **模块授权** `POST /module-consents/modules/{module}/tools/{tool}`：`{grant|deny} consent for module {module} tool {tool} until {expires_at}; {N} resource(s) of kind {类别}`，只写资源类别，不写资源内容。
+- **日程**：`create schedule {name} ({cron … in tz | every N s | once at ts}; enabled|disabled)`、`change schedule {name} ({id}): {改动的字段名}`、`delete`、`run … now`、`suspend`、`resume schedule {name} ({id})`。日程的 prompt 和 delivery 不显示。
+- **Shutdown**：固定文案 `stop the Agent24 background service (running work stops)`。
+- **不显示**：run 的输入正文、deny 的 `reason`、日程 prompt、任何凭据类键的值。
+- **fail closed**：以下情况都不存文字，elevate 得到 `not_elevated_operation`，handler 本来也会拒：
+  - 记录查不到或已结算；
+  - 模块授权：本机没开授权，或这个工具没有卡片、卡片不走 grants 协议；
+  - 决定类型未知，或不在 `available_decisions` 里；
+  - `approve_for_target` 没有 `standing_target`；
+  - 查不到 tool call；
+  - 请求带 query；
+  - 路径段带百分号编码；
+  - id、名字等经 `shown()` 被拒；
+  - 整条超出预算（`SUMMARY_MAX_UTF16` 减去 64，留给 `{identifier} (pid N) wants to: ` 前缀）。
+- **已知局限**：文字按第一次被拒时 daemon 查到的数据生成。到批准执行之前，审批或日程如果在别处被改了，grant 仍按 method、path、body 绑定，handler 照常复验状态，但框里的文字可能略旧。
+- **测试开关**（只在 `--features test-enrollment` 下编译，release 构建是 `compile_error`）：
+  - `AGENT24_TEST_PRESENCE=allow|deny`：放行未签名身份，**并且**把提供者换成固定答复。
+  - `AGENT24_TEST_UNSIGNED=1`：只放行未签名身份，提供者不换，挑战照常经在场连接下发。配合 `AGENT24_TEST_ENROLL_IDENTIFIER=ai.auraai.agent24`，构建机上未签名的桌面也能走完「挑战 → 原生框 → 应答」。
+
 ### 3.5 路由等级
 
 沿用冻结稿 §3。`POST /api/v1/attached` = ModuleAdmin = 提升。新增两条 presence 路由进 2a 的路由覆盖门（T1）。
