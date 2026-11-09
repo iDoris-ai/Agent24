@@ -551,6 +551,8 @@ function exited(child: ChildProcess, timeoutMs: number): Promise<boolean> {
 
 export class BackendManager {
   private child: ChildProcess | null = null
+  /** Every daemon this manager spawned: their records are not the service's (M5 B5). */
+  private readonly spawnedPids = new Set<number>()
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
   private readonly kind: BackendKind
@@ -936,6 +938,11 @@ export class BackendManager {
     return this.enrolledWith
   }
 
+  /** Whether this manager spawned `pid` (M5 B5: its restarts are not the service's). */
+  spawned(pid: number): boolean {
+    return this.spawnedPids.has(pid)
+  }
+
   /** The enrolled service daemon's version; null when not enrolled (M5 B5). */
   serviceDaemonVersion(): string | null {
     return this.enrolledWith ? this.serviceVersion : null
@@ -1094,6 +1101,7 @@ export class BackendManager {
     this.foreignPid = null
 
     this.child = this.spawnProcess(this.kind, this.authMode)
+    if (this.child.pid !== undefined) this.spawnedPids.add(this.child.pid)
     this.wireChild(this.child)
     console.log(`[backend:${this.kind}] spawned pid`, this.child.pid)
   }
