@@ -130,22 +130,48 @@ describe('task cards (M4 A4)', () => {
     expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_1/cancel' })
   })
 
-  it('confirms the approval its run waits on, with its first decision other than deny, through main\'s dialog', async () => {
+  it('confirms the approval its run waits on with `approve` only, through main\'s dialog (Knowledge\'s review of #1700)', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
     runs.run_1 = { status: 'awaiting_approval', started_at: at }
-    approvals = [{ id: 'ap_other', run_id: 'run_2', available_decisions: ['approve'] }, { id: 'ap_1', run_id: 'run_1', available_decisions: ['deny', 'allow_once', 'allow_always'] }]
+    // The daemon's own decisions (openapi `Decision`), the broader grants and
+    // abort first: none of them is what "confirm" means.
+    approvals = [
+      { id: 'ap_other', run_id: 'run_2', available_decisions: ['approve'] },
+      { id: 'ap_1', run_id: 'run_1', available_decisions: ['abort', 'approve_for_session', 'approve_for_target', 'deny', 'approve'] },
+    ]
     await show()
     fireEvent.click(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '确认' }))
-    await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'allow_once' }))
+    await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'approve' }))
+    expect(approvalDecide).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    [['approve_for_session', 'deny', 'abort']],
+    [['approve_for_target', 'deny', 'abort']],
+    [['deny', 'abort']],
+  ])('offers no "confirm" for an approval without `approve` (%j): it is decided on the approvals page', async decisions => {
+    store.save(record('chat_a', '周报'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: decisions }]
+    await show()
+    expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('这一项请到审批页处理')
+    expect(within(card('等你确认')).queryByRole('button', { name: '确认' })).toBeNull()
+    expect(within(card('等你确认')).getByRole('button', { name: '停止' })).toBeInTheDocument()
+    expect(approvalDecide).not.toHaveBeenCalled()
   })
 
   it('says so when there is nothing to confirm any more', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
     runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
     await show()
-    fireEvent.click(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '确认' }))
+    const button = await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '确认' })
+    // Decided elsewhere (the approvals page) meanwhile.
+    approvals = []
+    fireEvent.click(button)
     expect(await screen.findByRole('alert')).toHaveTextContent('现在没有要确认的事')
     expect(approvalDecide).not.toHaveBeenCalled()
   })

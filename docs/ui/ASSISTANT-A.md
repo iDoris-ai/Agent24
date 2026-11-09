@@ -68,7 +68,9 @@ A2 已经接上的：Knowledge 那一轮（`pages/chat-knowledge.ts`）。run �
 **进度卡**（`chat/TaskCard.tsx`）。卡片是数据不是消息：不进 `messages`，也不发给模型。当前对话的每个 task（不含 answer）一张，列在对话末尾：
 - 状态与用时：数据来自 `run-status.ts`，跟列表共用一份。先问一次 `GET /api/v1/runs/{id}`，之后按 `/events` 重问，不轮询。用时在本地按秒走，不去问 daemon。窗口关了再开，task 在对话文件里，卡片照样出来，状态重新问。
 - daemon 里没有这个 run：显示「找不到」。
-- 「确认」（`awaiting_approval` 时出现）：按 run_id 在待审批里找到这一条，取第一个不是 deny 的决定，经 main 的确认框（`decideApproval`）提交。拒绝要填理由，仍在审批页做。
+- 「确认」：只在 run 处于 `awaiting_approval`、且它的待审批提供 `approve` 时出现，经 main 的确认框（`decideApproval`）**只提交 `approve`**，也就是只批准这一次。
+  - daemon 的决定是开放集合（openapi `Decision`）。`approve_for_session` 和 `approve_for_target` 会授予更大的范围，`abort` 会结束整个 run，所以这三个都不由「确认」代选（Knowledge 对 #1700 的复核）。
+  - 待审批里没有 `approve` 时，卡片不显示「确认」，提示到审批页处理。拒绝要填理由，现在也在审批页做；A6 删掉审批页时改在卡片里做（#1688）。
 - 「停止」（进行中时出现）：`POST /api/v1/runs/{id}/cancel`。
 - 完成的 run 显示它的回答，**跟聊天里的回答一样过一遍 `grounding`**，用的是 `GET /runs/{id}` 返回的 `knowledge`。run 有知识库记录时显示检索说明；回答里点名、但 run 没读到的来源，标出来，不算来源。
 

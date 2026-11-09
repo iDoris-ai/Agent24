@@ -11,7 +11,7 @@ import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
-import { cancelRun, createRun, decideApproval, listPendingApprovals } from '../agent/api'
+import { cancelRun, createRun, decideApproval, listPendingApprovals, type Approval } from '../agent/api'
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
@@ -32,6 +32,11 @@ export function elapsed(ms: number): string {
   const two = (n: number) => String(n).padStart(2, '0')
   const h = Math.floor(s / 3600)
   return h > 0 ? `${h}:${two(Math.floor((s % 3600) / 60))}:${two(s % 60)}` : `${two(Math.floor(s / 60))}:${two(s % 60)}`
+}
+
+/** The run's pending approval, when it offers `approve`. */
+function approvableOf(list: readonly Approval[], runId: string): Approval | null {
+  return list.find(a => a.run_id === runId && a.available_decisions.includes('approve')) ?? null
 }
 
 /** The tasks of the conversation the page shows. */
@@ -74,13 +79,27 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       askRunAgain(task.run_id)
     }
   }
-  // "Confirm" is the approval's first decision other than deny; denying
-  // takes a reason, given on the approvals page.
+  // "Confirm" is `approve` and nothing else: this one request. The daemon's
+  // decisions are an open set (openapi `Decision`); the others grant more
+  // (`approve_for_session`, `approve_for_target`) or end the run (`abort`),
+  // and denying takes a reason: all of them on the approvals page
+  // (Knowledge's review of #1700). Whether the run's approval offers
+  // `approve` is asked once it waits, and again when it is confirmed.
+  const waiting = status === 'awaiting_approval'
+  const [approvable, setApprovable] = useState<boolean | null>(null)
+  useEffect(() => {
+    setApprovable(null)
+    if (!waiting) return
+    let live = true
+    listPendingApprovals()
+      .then(list => { if (live) setApprovable(approvableOf(list, task.run_id) !== null) })
+      .catch(() => { if (live) setApprovable(false) })
+    return () => { live = false }
+  }, [waiting, task.run_id])
   const confirm = () => act(async () => {
-    const approval = (await listPendingApprovals()).find(a => a.run_id === task.run_id)
-    const decision = approval?.available_decisions.find(d => d !== 'deny')
-    if (!approval || !decision) throw new Error(t('task.noApproval'))
-    await decideApproval(approval.id, { type: decision })
+    const approval = approvableOf(await listPendingApprovals(), task.run_id)
+    if (!approval) throw new Error(t('task.noApproval'))
+    await decideApproval(approval.id, { type: 'approve' })
   })
   const label = t(labelOf(status))
   // A completed run's answer, with only what its record backs (as replies
@@ -102,9 +121,10 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
         </div>
       )}
       <span className="task-card-actions">
-        {status === 'awaiting_approval' && (
+        {waiting && approvable === true && (
           <button type="button" className="btn" disabled={busy} onClick={() => void confirm()}>{t('task.confirm')}</button>
         )}
+        {waiting && approvable === false && <span className="task-card-knowledge" role="note">{t('task.decideOnApprovals')}</span>}
         {active && (
           <button type="button" className="btn" disabled={busy} onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
         )}
