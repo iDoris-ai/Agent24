@@ -50,7 +50,7 @@ pub async fn derive(
             module_approval(state, last_segment(path)?, body).await?
         }
         ("POST", "/api/v1/module-consents/modules/{module}/tools/{tool}") => {
-            module_consent(path, body)?
+            module_consent(state, path, body)?
         }
         ("POST", "/api/v1/schedules") => schedule_create(body)?,
         ("PATCH", "/api/v1/schedules/{id}") => {
@@ -333,10 +333,22 @@ async fn module_approval(state: &AppState, id: &str, body: &[u8]) -> Option<Stri
 }
 
 /// `POST /api/v1/module-consents/modules/{module}/tools/{tool}`.
-fn module_consent(path: &str, body: &[u8]) -> Option<String> {
+/// Like the other two, only for a record the daemon has: decisions open on
+/// this host, and a card for this tool that takes grants (the handler's
+/// `grants_closed`, `no_such_tool` and `protocol_too_old`).
+fn module_consent(state: &AppState, path: &str, body: &[u8]) -> Option<String> {
     let rest = path.strip_prefix("/api/v1/module-consents/modules/")?;
     let (module, tool) = rest.split_once("/tools/")?;
     let (module, tool) = (plain(module)?, plain(tool)?);
+    state.module_grants.as_ref()?;
+    let cards = state.module_tool_cards.as_ref()?;
+    if !cards
+        .tools
+        .get(&(module.to_owned(), tool.to_owned()))?
+        .takes_grants
+    {
+        return None;
+    }
     let request = crate::consent_routes::parse_decision_request(body)?;
     let kinds = request.resource_kinds()?;
     let resources = if kinds.is_empty() {

@@ -48,9 +48,14 @@ struct Daemon {
 }
 
 async fn daemon() -> Daemon {
+    daemon_with(|_| {}).await
+}
+
+async fn daemon_with(configure: impl FnOnce(&mut AppState)) -> Daemon {
     let (mut state, _, _) = tests::capability_state().await;
     let capture = Arc::new(Capture(Mutex::new(Vec::new())));
     state.presence_provider = Some(capture.clone());
+    configure(&mut state);
     let token = state
         .first_party
         .as_ref()
@@ -64,6 +69,47 @@ async fn daemon() -> Daemon {
         router,
         capture,
     }
+}
+
+/// Decisions open, `doc-module.read_document` on the grants protocol and
+/// `old-module.read_document` not.
+fn with_cards(state: &mut AppState) {
+    let summary = agent24_store::ToolPermissionSummary::new(
+        "doc-module",
+        "read_document",
+        "1.0.0",
+        agent24_store::ConsentSource::ManualInstall,
+        None,
+        None,
+        None,
+        agent24_store::HostRiskLevel::High,
+    );
+    let card = |takes_grants| crate::consent_routes::ToolCardSource {
+        summary: summary.clone(),
+        resource_kinds: vec!["path".to_owned(), "url".to_owned()],
+        takes_grants,
+    };
+    state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
+        notice: Arc::new(|_| {
+            Box::pin(async { crate::module_tool_runtime::RevocationStop::NotRunning })
+                as futures::future::BoxFuture<'static, _>
+        }),
+        tools: Arc::new(std::collections::HashMap::from([
+            (
+                ("doc-module".to_owned(), "read_document".to_owned()),
+                card(true),
+            ),
+            (
+                ("old-module".to_owned(), "read_document".to_owned()),
+                card(false),
+            ),
+        ])),
+        artifact: Arc::new(|_: &str| Some("a".to_owned())),
+    });
+    state.module_grants = Some(crate::consent_routes::GrantSettings {
+        max_days: 30_000_000,
+        os_config: std::path::PathBuf::from("/nonexistent/os.json"),
+    });
 }
 
 fn request(
@@ -552,7 +598,7 @@ async fn module_approvals_name_the_module_action_and_arguments() {
 
 #[tokio::test]
 async fn a_module_consent_names_module_tool_expiry_and_resource_kinds_only() {
-    let d = daemon().await;
+    let d = daemon_with(with_cards).await;
     let body = serde_json::json!({
         "decision": "granted", "fingerprint": "f", "module_version": "1.0.0", "artifact": "a",
         "resources": ["path:/Users/someone/SECRET-PATH", "path:/tmp", "url:https://x"],
@@ -574,6 +620,39 @@ async fn a_module_consent_names_module_tool_expiry_and_resource_kinds_only() {
         "{text}"
     );
     assert!(!text.contains("SECRET-PATH"), "{text}");
+}
+
+/// No card, a card off the grants protocol, or decisions closed on this
+/// host: the handler refuses, so there is nothing to approve.
+#[tokio::test]
+async fn a_module_consent_without_a_grants_card_has_nothing_to_approve() {
+    let body = serde_json::json!({
+        "decision": "granted", "fingerprint": "f", "module_version": "1.0.0", "artifact": "a",
+        "resources": [], "expires_at": "2999-01-01T00:00:00Z",
+    })
+    .to_string();
+    let path =
+        |module: &str| format!("/api/v1/module-consents/modules/{module}/tools/read_document");
+    let d = daemon_with(with_cards).await;
+    for module in ["missing", "old-module"] {
+        let r = d.ask("POST", &path(module), &body).await;
+        assert!(
+            matches!(r, Err(EnrollErrorCode::NotElevatedOperation)),
+            "{module}: {r:?}"
+        );
+    }
+    let closed = daemon_with(|state| {
+        with_cards(state);
+        state.module_grants = None;
+    })
+    .await;
+    let r = closed.ask("POST", &path("doc-module"), &body).await;
+    assert!(
+        matches!(r, Err(EnrollErrorCode::NotElevatedOperation)),
+        "{r:?}"
+    );
+    let ok = d.ask("POST", &path("doc-module"), &body).await.unwrap();
+    assert!(ok.contains("no resources"), "{ok}");
 }
 
 #[tokio::test]

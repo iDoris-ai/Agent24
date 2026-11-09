@@ -152,6 +152,7 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - **不显示**：run 的输入正文、deny 的 `reason`、日程 prompt、任何凭据类键的值。
 - **fail closed**：以下情况都不存文字，elevate 得到 `not_elevated_operation`，handler 本来也会拒：
   - 记录查不到或已结算；
+  - 模块授权：本机没开授权，或这个工具没有卡片、卡片不走 grants 协议；
   - 决定类型未知，或不在 `available_decisions` 里；
   - `approve_for_target` 没有 `standing_target`；
   - 查不到 tool call；
