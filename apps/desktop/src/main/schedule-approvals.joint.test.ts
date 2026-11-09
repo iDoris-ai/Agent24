@@ -133,4 +133,42 @@ describe('a schedule\'s run between A5 and A6: one card, none lost (M4 A6, QA #1
     expect(cards()).toBe(1)
     expect(homeOf()).toBe('日程：周报')
   })
+
+  it('N8 A5 could not record it live, A6 claimed it, the first catch-up came between, and A6 could not record it: A5 records it, one card (#1719 C1)', async () => {
+    const a6History = a6FailingOnce()
+    const a5 = createScheduleConversations({ dir, history, scheduleName: async () => '周报', title: n => `日程：${n}` })
+    const a6 = createAssistantApprovals({
+      dir, history: a6History, title: () => '助理发起',
+      // The first catch-up lands while A6 holds the claim.
+      ownerOf: async () => {
+        const mine = await a5.claim('sch_1', RUN)
+        await a5.catchUp(daemonRuns(RUN))
+        return mine ? 'schedule' : 'other'
+      },
+      settled: (id, recorded) => a5.settle(id, recorded),
+    })
+    await a5RecordFails(a5)
+    await expect(a6.route(RUN)).rejects.toThrow('disk full')
+    expect(cards()).toBe(0)
+    await Promise.all([a5.catchUp(daemonRuns(RUN)), a6.catchUp(pending())])
+    expect(cards()).toBe(1)
+    expect(homeOf()).toBe('日程：周报')
+  })
+
+  it('N9 A6\'s claim could not be written: nothing is reserved, A5 records it as before, one card (#1719 C2)', async () => {
+    const { a5, a6 } = wire()
+    await a5.catchUp(daemonRuns())
+    await a5RecordFails(a5)
+    const handledBefore = JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8')).handled
+    // A6 writes nothing before it asks the owner: the next write is the claim's.
+    const write = vi.spyOn(fs, 'writeFileSync').mockImplementationOnce(() => { throw new Error('disk full') })
+    await expect(a6.route(RUN)).rejects.toThrow('disk full')
+    write.mockRestore()
+    expect(JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8')).handled).toEqual(handledBefore)
+    await Promise.all([a5.catchUp(daemonRuns(RUN)), a6.catchUp(pending())])
+    expect(cards()).toBe(1)
+    expect(homeOf()).toBe('日程：周报')
+    await Promise.all([a5.catchUp(daemonRuns(RUN)), a6.catchUp(pending(RUN))])
+    expect(cards()).toBe(1)
+  })
 })
