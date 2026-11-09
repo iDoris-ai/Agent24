@@ -560,14 +560,25 @@ fn apply_documents_catalog(
     }
 }
 
+#[cfg(test)]
 fn documents_from(
     report: Option<&MountReport>,
     live: Option<&Supervised>,
     catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
 ) -> Item {
+    documents_shown(report, report.map(|report| &report.outcome), live, catalog)
+}
+
+fn documents_shown(
+    report: Option<&MountReport>,
+    outcome: Option<&MountOutcome>,
+    live: Option<&Supervised>,
+    catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
+) -> Item {
     let mut item = Item::new("documents", documents_form(), ComponentState::Absent);
     if let Some(report) = report {
-        let (mapped, reason, detail) = documents_mapped(&report.outcome, live);
+        let outcome = outcome.unwrap_or(&report.outcome);
+        let (mapped, reason, detail) = documents_mapped(outcome, live);
         item.state = mapped;
         item.version = Some(report.version.clone());
         item.reason = reason.map(str::to_owned);
@@ -591,14 +602,16 @@ fn documents_item(state: &AppState) -> Item {
     // A package that only borrowed the name (refused as `reserved_component_name`)
     // is not Documents; it is listed on its own row by `os_module_items`.
     let report = documents_report(state);
+    let outcome = report.map(|report| state.os_outcome(&report.name, &report.outcome));
     let live = report.and_then(|_| {
         state
             .module_status
             .get("documents")
             .map(|rx| rx.borrow().clone())
     });
-    documents_from(
+    documents_shown(
         report,
+        outcome.as_ref(),
         live.as_ref(),
         documents_catalog::DocumentsCatalog::embedded(),
     )
@@ -677,7 +690,8 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 .module_status
                 .get(&report.name)
                 .map(|rx| rx.borrow().clone());
-            let (mapped, reason, message) = os_mapped(&report.outcome, live);
+            let outcome = state.os_outcome(&report.name, &report.outcome);
+            let (mapped, reason, message) = os_mapped(&outcome, live);
             let d9 = report.d9.as_ref();
             let provides = d9
                 .map(|d| {
@@ -844,6 +858,13 @@ fn sees_everything(mode: AuthMode, authorization: Option<&Authorization>) -> boo
         (AuthMode::LegacySingleToken, None) => true,
         (AuthMode::Capabilities, None) => false,
     }
+}
+
+/// Host JSON of `GET /api/v1/components`, for tests that drive enable and then
+/// read the row the desktop reads.
+#[cfg(test)]
+pub(crate) async fn host_components_json(state: &AppState) -> Value {
+    render(&collect(state, Instant::now()).await, true)
 }
 
 pub async fn list(

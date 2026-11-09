@@ -280,8 +280,10 @@ fn render_at(state: &AppState, path: Option<std::path::PathBuf>) -> Response {
                 .module_status
                 .get(&r.name)
                 .map(|rx| rx.borrow().clone());
+            let mut shown = r.clone();
+            shown.outcome = state.os_outcome(&r.name, &r.outcome);
             view(
-                r,
+                &shown,
                 cfg.is_enabled(&r.name),
                 registry_error.is_none(),
                 live.as_ref(),
@@ -744,15 +746,37 @@ fn rescan_disabled_package_on_disk(
     name: &str,
     dir: &std::path::Path,
     cancel: &tokio_util::sync::CancellationToken,
-) -> Result<(), String> {
+) -> Result<(), RescanDeny> {
     if let Err(e) = agent24_os_packages::check_packages_root(packages_root) {
-        return Err(format!(
+        return Err(RescanDeny::Message(format!(
             "the directory installed packages live under ({}) does not check out: {e}",
             packages_root.display()
-        ));
+        )));
     }
     let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
     classify_scan(&scan, packages_root, name, dir)
+}
+
+/// Why enable must not write `os.json`. [`RescanDeny::Integrity`] keeps the
+/// typed reason a `why`-only error used to drop.
+enum RescanDeny {
+    Integrity {
+        reason: agent24_components::integrity::IntegrityReason,
+        message: String,
+    },
+    Message(String),
+    /// The blocking task panicked. Not a package refusal.
+    Internal,
+}
+
+impl RescanDeny {
+    #[cfg(test)]
+    fn message(&self) -> &str {
+        match self {
+            Self::Integrity { message, .. } | Self::Message(message) => message,
+            Self::Internal => "the on-demand admission re-check failed",
+        }
+    }
 }
 
 /// The pure part of [`rescan_disabled_package_on_disk`] — given a `Scan`
@@ -766,7 +790,7 @@ fn classify_scan(
     packages_root: &std::path::Path,
     name: &str,
     dir: &std::path::Path,
-) -> Result<(), String> {
+) -> Result<(), RescanDeny> {
     // `check_packages_root` only inspects metadata (symlink/type/ownership/
     // write bits) — it does not itself try `read_dir`, so a root that passes
     // it can still fail here. `scan()` reports that as a `Refused` whose
@@ -777,26 +801,32 @@ fn classify_scan(
         .iter()
         .find(|r| r.dir.as_path() == packages_root)
     {
-        return Err(format!(
+        return Err(RescanDeny::Message(format!(
             "the directory installed packages live under ({}) could not be read: {}",
             packages_root.display(),
             root_refusal.why
-        ));
+        )));
     }
     if let Some(refused) = scan.refused.iter().find(|r| r.dir.as_path() == dir) {
-        return Err(refused.why.clone());
+        return Err(match refused.integrity {
+            Some(reason) => RescanDeny::Integrity {
+                reason,
+                message: refused.why.clone(),
+            },
+            None => RescanDeny::Message(refused.why.clone()),
+        });
     }
     // Shutdown stopped the hash. Not "the package vanished", and not a
     // hash mismatch: enable must not proceed on an unfinished check.
     if scan.cancelled.iter().any(|path| path.as_path() == dir) {
-        return Err("verification cancelled".to_owned());
+        return Err(RescanDeny::Message("verification cancelled".to_owned()));
     }
     let Some(found) = scan.found.iter().find(|d| d.dir.as_path() == dir) else {
-        return Err(format!(
+        return Err(RescanDeny::Message(format!(
             "the package that was installed at {} is no longer there; confirm whether it \
              was uninstalled, or reinstalled somewhere else",
             dir.display()
-        ));
+        )));
     };
     let manifest = &found.manifest;
     // Directory match only proves "this is the package that occupied this
@@ -808,12 +838,12 @@ fn classify_scan(
     // High 1 — an earlier version of this check dropped this comparison
     // entirely and reopened exactly the bug T8 exists to close).
     if manifest.name() != name {
-        return Err(format!(
+        return Err(RescanDeny::Message(format!(
             "the manifest at {} now declares the name {:?}, not {name:?} — it may have been \
              renamed since this module was mounted",
             dir.display(),
             manifest.name()
-        ));
+        )));
     }
     // Mirrors `mount_package`'s own delivery-mode check (domain.rs) verbatim —
     // not a new judgment call, the same question `mount_package` would ask at
@@ -823,11 +853,11 @@ fn classify_scan(
         .filter(|_| !manifest.is_mountable_in_process())
         .is_none()
     {
-        return Err(
+        return Err(RescanDeny::Message(
             "a package on disk must declare an out-of-process provider with a spawn command; \
              in-process modules are compiled in"
                 .to_owned(),
-        );
+        ));
     }
     Ok(())
 }
@@ -839,7 +869,7 @@ async fn rescan_disabled_package(
     state: &AppState,
     name: &str,
     dir: &std::path::Path,
-) -> Option<Response> {
+) -> Result<(), RescanDeny> {
     let packages_root = std::sync::Arc::clone(&state.packages_root);
     let name = name.to_owned();
     let dir = dir.to_owned();
@@ -849,20 +879,94 @@ async fn rescan_disabled_package(
     })
     .await;
     match outcome {
-        Ok(Ok(())) => None,
-        Ok(Err(message)) => Some(rescan_blocked_response(&message)),
+        Ok(result) => result,
         Err(e) => {
             // `JoinError`'s `Display` includes the panic payload when the
             // blocking task panicked — logged for whoever has to debug it,
             // never put in the response: a panic message can carry a path or
             // parsed file content across the API boundary otherwise.
             tracing::error!("on-demand admission re-check panicked or was cancelled: {e}");
-            Some(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                "the on-demand admission re-check failed",
-            ))
+            Err(RescanDeny::Internal)
         }
+    }
+}
+
+fn integrity_conflict(
+    reason: agent24_components::integrity::IntegrityReason,
+    why: &str,
+) -> Response {
+    error_response_d6(
+        StatusCode::CONFLICT,
+        reason.operation_code(),
+        why,
+        Some(
+            "fix the package on disk, then retry enable — this refusal is not \
+             retried automatically",
+        ),
+        false,
+    )
+}
+
+fn deny_enable(state: &AppState, name: &str, denied: RescanDeny) -> Response {
+    match denied {
+        RescanDeny::Integrity { reason, message } => {
+            remember_integrity(state, name, reason, &message)
+        }
+        RescanDeny::Message(message) => rescan_blocked_response(&message),
+        RescanDeny::Internal => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "the on-demand admission re-check failed",
+        ),
+    }
+}
+
+fn remember_integrity(
+    state: &AppState,
+    name: &str,
+    reason: agent24_components::integrity::IntegrityReason,
+    message: &str,
+) -> Response {
+    state.set_os_outcome(
+        name,
+        MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), message.to_owned()),
+    );
+    integrity_conflict(reason, message)
+}
+
+/// `Some` blocks enable. `None` lets the write proceed.
+///
+/// An integrity refusal and a disabled package are both re-read from disk.
+/// Passing clears the refusal (`Disabled`: the package is not running yet,
+/// and the integrity reason must not stick). Still failing stores the fresh
+/// `os_package.<reason>` and does not ask for a daemon restart.
+async fn admit_enable(
+    state: &AppState,
+    name: &str,
+    outcome: MountOutcome,
+    dir: Option<&std::path::Path>,
+) -> Option<Response> {
+    match outcome {
+        MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), why) => {
+            let Some(dir) = dir else {
+                return Some(integrity_conflict(reason, &why));
+            };
+            match rescan_disabled_package(state, name, dir).await {
+                Ok(()) => {
+                    state.set_os_outcome(name, MountOutcome::Disabled);
+                    None
+                }
+                Err(denied) => Some(deny_enable(state, name, denied)),
+            }
+        }
+        MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why) => {
+            Some(admission_refused_response(&why))
+        }
+        MountOutcome::Disabled => match rescan_disabled_package(state, name, dir?).await {
+            Ok(()) => None,
+            Err(denied) => Some(deny_enable(state, name, denied)),
+        },
+        MountOutcome::Mounted | MountOutcome::Degraded(_) => None,
     }
 }
 
@@ -948,34 +1052,22 @@ async fn patch_os_at(
     // refused only because the name was already taken" needs more provenance
     // than this gate has, and is out of scope here).
     if update.enabled {
-        let same_name: Vec<&MountReport> =
-            state.os_reports.iter().filter(|r| r.name == name).collect();
-        if let [only] = same_name.as_slice() {
-            match &only.outcome {
-                MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), why) => {
-                    return error_response_d6(
-                        StatusCode::CONFLICT,
-                        reason.operation_code(),
-                        why,
-                        Some(
-                            "fix the package on disk, then retry enable — this refusal is not \
-                             retried automatically",
-                        ),
-                        false,
-                    );
+        let admission = {
+            let same_name: Vec<&MountReport> =
+                state.os_reports.iter().filter(|r| r.name == name).collect();
+            match same_name.as_slice() {
+                [only] => {
+                    let outcome = state.os_outcome(&name, &only.outcome);
+                    let dir = state.package_dirs.get(&name).cloned();
+                    Some((outcome, dir))
                 }
-                MountOutcome::Refused(why) | MountOutcome::RefusedFor(_, why) => {
-                    return admission_refused_response(why);
-                }
-                MountOutcome::Disabled => {
-                    if let Some(dir) = state.package_dirs.get(&name)
-                        && let Some(blocked) = rescan_disabled_package(&state, &name, dir).await
-                    {
-                        return blocked;
-                    }
-                }
-                MountOutcome::Mounted | MountOutcome::Degraded(_) => {}
+                _ => None,
             }
+        };
+        if let Some((outcome, dir)) = admission
+            && let Some(blocked) = admit_enable(&state, &name, outcome, dir.as_deref()).await
+        {
+            return blocked;
         }
     }
     let path = match path {
@@ -2959,7 +3051,10 @@ mod tests {
             cancelled: Vec::new(),
         };
         let result = classify_scan(&scan, &packages_root, "pkgmod", &pkg_dir);
-        let msg = result.expect_err("a root-level scan.refused entry must block, not allow");
+        let msg = result
+            .expect_err("a root-level scan.refused entry must block, not allow")
+            .message()
+            .to_owned();
         assert!(
             msg.contains("could not be read"),
             "must be attributed to the ROOT, not to the package's own directory: {msg}"
@@ -2983,9 +3078,112 @@ mod tests {
             cancelled: vec![pkg_dir.clone()],
         };
         let msg = classify_scan(&scan, &packages_root, "pkgmod", &pkg_dir)
-            .expect_err("a cancelled scan must block enable");
+            .expect_err("a cancelled scan must block enable")
+            .message()
+            .to_owned();
         assert_eq!(msg, "verification cancelled");
         assert!(!msg.contains("no longer there"), "{msg}");
         assert!(!msg.contains("hash_mismatch"), "{msg}");
+    }
+
+    fn component_row(body: &serde_json::Value, id: &str) -> serde_json::Value {
+        body["components"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == id)
+            .unwrap_or_else(|| panic!("no {id} in {body}"))
+            .clone()
+    }
+
+    /// A disabled package whose `files.json` disappears after startup. Returning
+    /// only `refused.why` as `admission_refused` (no `retryable`) makes the code
+    /// assertion fail.
+    #[tokio::test]
+    async fn enable_of_a_tampered_disabled_package_reports_the_integrity_reason() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "sin90",
+            &t8_manifest_yaml("sin90", "1.0.0", "out_of_process_provider"),
+        );
+        std::fs::remove_file(pkg_dir.join("files.json")).unwrap();
+        st.os_reports = std::sync::Arc::new(vec![report("sin90", MountOutcome::Disabled)]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "sin90".to_owned(),
+            pkg_dir,
+        )]));
+
+        let res = t8_patch(&st, "sin90", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let j = body_json(res).await;
+        assert_eq!(j["error"]["code"], "os_package.integrity_manifest_missing");
+        assert_eq!(j["error"]["details"]["retryable"], false);
+        assert_ne!(j["error"]["code"], "admission_refused");
+        assert!(!path.exists());
+        let row = component_row(
+            &crate::component_routes::host_components_json(&st).await,
+            "sin90",
+        );
+        assert_eq!(row["state"], "failed");
+        assert_eq!(row["reason"], "integrity_manifest_missing");
+    }
+
+    /// Startup still says `hash_mismatch`, but the disk is missing `files.json`
+    /// and is then repaired. Enable must rescan both times: the first answer is
+    /// the fresh reason, and the retry after the repair succeeds without a
+    /// daemon restart. Returning the startup snapshot makes the first code
+    /// `os_package.hash_mismatch`.
+    #[tokio::test]
+    async fn enable_rescans_an_integrity_refusal_and_clears_it_once_the_disk_is_fixed() {
+        let (mut st, _dir, path) = t8_state().await;
+        let root = tempfile::tempdir().unwrap();
+        let pkg_dir = t8_install(
+            root.path(),
+            "sin90",
+            &t8_manifest_yaml("sin90", "1.0.0", "out_of_process_provider"),
+        );
+        std::fs::remove_file(pkg_dir.join("files.json")).unwrap();
+        st.os_reports = std::sync::Arc::new(vec![report(
+            "sin90",
+            MountOutcome::RefusedFor(
+                RefusalReason::PackageIntegrity(
+                    agent24_components::integrity::IntegrityReason::HashMismatch,
+                ),
+                "hash_mismatch: bin/sin90".to_owned(),
+            ),
+        )]);
+        st.packages_root = std::sync::Arc::new(root.path().to_path_buf());
+        st.package_dirs = std::sync::Arc::new(std::collections::HashMap::from([(
+            "sin90".to_owned(),
+            pkg_dir.clone(),
+        )]));
+
+        let res = t8_patch(&st, "sin90", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let j = body_json(res).await;
+        assert_eq!(j["error"]["code"], "os_package.integrity_manifest_missing");
+        assert_eq!(j["error"]["details"]["retryable"], false);
+        assert!(!path.exists());
+
+        // The first seal publishes the stub as mode 0400; reseal has to overwrite it.
+        agent24_os_packages::test_support::make_writable(&pkg_dir.join("bin/sin90")).unwrap();
+        agent24_os_packages::test_support::seal_exit_stub(&pkg_dir, "bin/sin90").unwrap();
+        let res = t8_patch(&st, "sin90", true, Some(path.clone())).await;
+        assert_eq!(res.status(), StatusCode::OK, "{:?}", body_json(res).await);
+        assert!(
+            crate::os_config::OsConfig::load(&path)
+                .unwrap()
+                .is_enabled("sin90")
+        );
+        let row = component_row(
+            &crate::component_routes::host_components_json(&st).await,
+            "sin90",
+        );
+        assert_ne!(row["state"], "failed");
+        assert_ne!(row["reason"], "integrity_manifest_missing");
+        assert_ne!(row["reason"], "hash_mismatch");
     }
 }

@@ -91,9 +91,19 @@ export function useCapabilityStatus(active: boolean) {
     return cap('status.state', { state: component.state })
   }
 
+  // Sin90, Cos72, Documents and any other OS package row share the capability
+  // id with the component id. A failed integrity reason replaces the default
+  // Built-in / Open label. Any other state leaves that label alone.
+  const osPackage = (id: string): string | undefined => {
+    if (list.status !== 'ready') return undefined
+    const component = findComponent(list.components, id)
+    if (!component || component.state !== 'failed') return undefined
+    return packageIntegrityHint(component.reason)
+  }
+
   return (id: string): string | undefined => {
-    if (!TRACKED.has(id)) return undefined
     if (!active) return undefined
+    if (!TRACKED.has(id)) return osPackage(id)
     if (list.status === 'idle' || list.status === 'loading') return cap('status.loading')
     if (list.status === 'error') return cap('status.unavailable')
     if (id === 'localModels') return localModels(findComponent(list.components, 'idoris'))

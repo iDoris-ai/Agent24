@@ -629,8 +629,14 @@ pub fn integrity_refusal_reports(
 ) -> Vec<MountReport> {
     let mut taken: std::collections::BTreeSet<String> =
         existing.iter().map(|report| report.name.clone()).collect();
+    // `documents` is not reserved here. The desktop installs that package
+    // under this name; pre-claiming it renamed the package's own integrity
+    // refusal to `dir-*`, so the official row stayed `absent`. Other builtin
+    // ids stay reserved so a forged `name:` cannot cover them.
     for id in crate::component_routes::BUILTIN_COMPONENT_IDS {
-        taken.insert((*id).to_owned());
+        if *id != "documents" {
+            taken.insert((*id).to_owned());
+        }
     }
     let mut out = Vec::new();
     for refused in refusals {
@@ -638,11 +644,7 @@ pub fn integrity_refusal_reports(
             continue;
         };
         let (name, version) = match &refused.declared {
-            Some((name, version))
-                if agent24_domain::is_valid_module_name(name)
-                    && component_name_allowed(name)
-                    && !taken.contains(name) =>
-            {
+            Some((name, version)) if declared_name_kept(name, &refused.dir, &taken) => {
                 (name.clone(), version.clone())
             }
             _ => {
@@ -670,6 +672,26 @@ pub fn integrity_refusal_reports(
         });
     }
     out
+}
+
+/// Whether a parsed manifest name may be the component id.
+///
+/// A forged builtin name is rejected. `documents` is allowed only when the
+/// package directory itself is `documents` — the copy the app installs. A
+/// manifest in some other directory that says `name: documents` is still a
+/// forgery and keeps a `dir-*` identity.
+fn declared_name_kept(
+    name: &str,
+    dir: &std::path::Path,
+    taken: &std::collections::BTreeSet<String>,
+) -> bool {
+    if !agent24_domain::is_valid_module_name(name)
+        || !component_name_allowed(name)
+        || taken.contains(name)
+    {
+        return false;
+    }
+    name != "documents" || dir.file_name().and_then(|file| file.to_str()) == Some("documents")
 }
 
 /// Whether a package may carry the name `name`. Every builtin component name is

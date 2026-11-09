@@ -4553,6 +4553,67 @@ fn t6_a_forged_or_unreadable_name_uses_a_directory_identity() {
     assert!(names.iter().any(|n| n.starts_with("dir-")));
 }
 
+fn package_yaml(name: &str, version: &str) -> String {
+    format!(
+        "name: {name}\nversion: \"{version}\"\nroute_namespace: /api/v1/{name}\n\
+         event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/{name}\n"
+    )
+}
+
+/// The Documents package the app installs is refused on the `documents` row.
+/// Pre-claiming `documents` in `taken` renames it to `dir-*` and this row
+/// stays `absent`. A forged `name: documents` in another directory, and a
+/// forged builtin name, still use `dir-*`.
+#[tokio::test]
+async fn a_refused_documents_package_is_failed_on_the_documents_row() {
+    let root = tempfile::tempdir().unwrap();
+    let documents = root.path().join("documents");
+    std::fs::create_dir_all(&documents).unwrap();
+    std::fs::write(
+        documents.join("domain-os.yml"),
+        package_yaml("documents", "1.2.3"),
+    )
+    .unwrap();
+    let forged_documents = root.path().join("aaa");
+    std::fs::create_dir_all(&forged_documents).unwrap();
+    std::fs::write(
+        forged_documents.join("domain-os.yml"),
+        package_yaml("documents", "9.9.9"),
+    )
+    .unwrap();
+    let forged_builtin = root.path().join("sneaky");
+    std::fs::create_dir_all(&forged_builtin).unwrap();
+    std::fs::write(
+        forged_builtin.join("domain-os.yml"),
+        package_yaml("idoris", "9.9.9"),
+    )
+    .unwrap();
+
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    let mut state = server_tests::state().await;
+    state.os_reports = Arc::new(reports);
+    let body = render(&collect(&state, std::time::Instant::now()).await, true);
+    let rows = body["components"].as_array().unwrap();
+    let documents_rows: Vec<_> = rows.iter().filter(|row| row["id"] == "documents").collect();
+    assert_eq!(documents_rows.len(), 1);
+    assert_eq!(documents_rows[0]["state"], "failed");
+    assert_eq!(documents_rows[0]["reason"], "integrity_manifest_missing");
+    assert_eq!(documents_rows[0]["version"], "1.2.3");
+    assert!(
+        rows.iter()
+            .all(|row| row["id"] != "idoris" || row["reason"] != "integrity_manifest_missing"),
+        "{body}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["id"].as_str().is_some_and(|id| id.starts_with("dir-"))),
+        "{body}"
+    );
+}
+
 /// T8. Each integrity reason is `failed` for the host and absent from the
 /// redacted row. Dropping `reason`, or copying `detail` into the redacted
 /// view, turns this red.

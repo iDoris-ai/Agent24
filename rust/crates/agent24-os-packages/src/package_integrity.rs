@@ -256,10 +256,12 @@ fn verify_declared(
     integrity::validate_section(section, spawn_command)?;
     let path = dir.join(FILES_JSON_NAME);
     let metadata = fs::symlink_metadata(&path).map_err(|err| {
+        // §4: a missing `files.json` is the same refusal as a missing
+        // `integrity` section. `ManifestInvalid` would surface as
+        // `integrity_manifest_invalid` and the desktop would ask for a reinstall
+        // instead of an upgrade.
         if err.kind() == io::ErrorKind::NotFound {
-            IntegrityError::ManifestInvalid {
-                detail: format!("missing control file: {FILES_JSON_NAME}"),
-            }
+            IntegrityError::Missing
         } else {
             IntegrityError::CheckFailed {
                 detail: format!("{FILES_JSON_NAME}: {err}"),
@@ -1234,6 +1236,38 @@ mod tests {
             Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
         );
     }
+
+    /// §4: an `integrity` section whose `files.json` is absent is
+    /// `integrity_manifest_missing`, not `integrity_manifest_invalid`. Mapping
+    /// the missing file to `ManifestInvalid` turns this red.
+    #[test]
+    fn an_integrity_section_without_files_json_is_manifest_missing() {
+        let (parent, package) = generated("cos72");
+        fs::remove_file(package.join(FILES_JSON_NAME)).unwrap();
+        let missing = verify(&package).unwrap_err();
+        assert_eq!(
+            missing.reason(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+        let scanned = crate::discovery::scan(parent.path(), &CancellationToken::new());
+        let refused = scanned
+            .refused
+            .iter()
+            .find(|refused| refused.dir.ends_with("cos72"))
+            .unwrap();
+        assert_eq!(
+            refused.integrity,
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+        let rechecked =
+            crate::discovery::recheck(&package, "sha256:unused", &CancellationToken::new())
+                .unwrap_err();
+        assert_eq!(
+            rechecked.integrity(),
+            Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+        );
+    }
+
     #[test]
     fn t3_control_directory_special_file_and_non_utf8_boundaries() {
         for name in [DOMAIN_OS_YML, FILES_JSON_NAME, "bin/cos72", "bin"] {

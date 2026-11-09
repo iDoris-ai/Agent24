@@ -88,6 +88,12 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// Enable's rescan replaces one module's startup outcome. `os_reports` is
+    /// shared as an immutable snapshot; this map is the live refusal record
+    /// `/components` and the next enable read. A name absent here still uses
+    /// the snapshot.
+    pub os_outcome_overrides:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::domain::MountOutcome>>>,
     /// Namespaces that were actually mounted (including disabled and degraded).
     /// Capability auth uses this when axum did not record a `MatchedPath`
     /// (`nest_service` / fallback nests). Refused mounts are absent. Empty
@@ -747,6 +753,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            os_outcome_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             module_namespaces: Arc::new(BTreeSet::new()),
             packages_root,
             // Empty for the same reason and until the same moment as `os_reports`
@@ -774,6 +781,28 @@ impl AppState {
 }
 
 impl AppState {
+    /// The outcome enable and `/components` should show. The override wins
+    /// when a rescan has replaced the startup snapshot.
+    pub(crate) fn os_outcome(
+        &self,
+        name: &str,
+        fallback: &crate::domain::MountOutcome,
+    ) -> crate::domain::MountOutcome {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    pub(crate) fn set_os_outcome(&self, name: &str, outcome: crate::domain::MountOutcome) {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), outcome);
+    }
+
     fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
@@ -2954,10 +2983,9 @@ pub async fn serve(
         },
     )
     .await;
-    reports.extend(crate::domain::integrity_refusal_reports(
-        &integrity_refusals,
-        &reports,
-    ));
+    let (refusal_rows, package_dirs) =
+        package_dirs_for_startup(&catalogue, &integrity_refusals, &reports);
+    reports.extend(refusal_rows);
 
     // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
     // tick loop or the delivery pump ever run — set the two handles they and
@@ -3095,20 +3123,9 @@ pub async fn serve(
             .map(|report| report.namespace.clone())
             .collect(),
     );
-    // T8/ME-3g: same ordering reason as `os_reports` just above — `catalogue`
-    // is still in scope (only borrowed by `mount_all`, never moved), so this is
-    // a cheap O(n) derivation, not a second discovery pass.
-    state.package_dirs = Arc::new(
-        catalogue
-            .iter()
-            .filter_map(|entry| match &entry.build {
-                crate::domain::Build::Package(package) => {
-                    Some((entry.name.clone(), package.dir.clone()))
-                }
-                crate::domain::Build::InProcess(_) => None,
-            })
-            .collect(),
-    );
+    // Includes integrity refusals, keyed by the component name, so enable can
+    // rescan a package that never entered the catalogue.
+    state.package_dirs = Arc::new(package_dirs);
     state.module_status = Arc::new(
         host.as_ref()
             .map(|h| h.supervisors.statuses())
@@ -3864,6 +3881,34 @@ struct DiscoveryPass {
     integrity_refusals: Vec<agent24_os_packages::discovery::Refused>,
 }
 
+/// Catalogue directories plus the directory of each integrity refusal, under
+/// the component name [`crate::domain::integrity_refusal_reports`] assigned.
+/// Enable rescans that directory. A mounted name keeps the catalogue path.
+fn package_dirs_for_startup(
+    catalogue: &[crate::domain::Installed],
+    integrity_refusals: &[agent24_os_packages::discovery::Refused],
+    mounted: &[crate::domain::MountReport],
+) -> (
+    Vec<crate::domain::MountReport>,
+    std::collections::HashMap<String, std::path::PathBuf>,
+) {
+    let rows = crate::domain::integrity_refusal_reports(integrity_refusals, mounted);
+    let mut dirs = std::collections::HashMap::new();
+    for entry in catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            dirs.insert(entry.name.clone(), package.dir.clone());
+        }
+    }
+    for (row, refused) in rows
+        .iter()
+        .zip(integrity_refusals.iter().filter(|r| r.integrity.is_some()))
+    {
+        dirs.entry(row.name.clone())
+            .or_insert_with(|| refused.dir.clone());
+    }
+    (rows, dirs)
+}
+
 fn with_discovered(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
@@ -3928,6 +3973,37 @@ fn with_discovered(
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn a_refused_documents_package_is_recorded_under_that_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("documents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            "name: documents\nversion: \"1.2.3\"\nroute_namespace: /api/v1/documents\n\
+             event_module: documents\ndata_dir: ~/.agent24/os/documents/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/documents\n",
+        )
+        .unwrap();
+        let scan = agent24_os_packages::discovery::scan(
+            root.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        );
+        let refusals: Vec<_> = scan
+            .refused
+            .into_iter()
+            .filter(|refused| refused.integrity.is_some() && refused.dir != root.path())
+            .collect();
+        let (rows, dirs) = super::package_dirs_for_startup(&[], &refusals, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "documents");
+        assert_eq!(
+            dirs.get("documents").map(std::path::PathBuf::as_path),
+            Some(dir.as_path())
+        );
+    }
 
     #[test]
     fn workspace_recovery_clock_preserves_fractional_millis() {
