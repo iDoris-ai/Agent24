@@ -23,7 +23,11 @@ import { ELEVATION_HEADER, EnrolError, type EnrolSession } from './daemon-enroll
  * it, with K-B3b's ApprovalDecision summary (decision, run, tool): one box per
  * approval, as with our own child. ApprovalDecide's own box would be a second
  * one with the same facts, so it is skipped. False brings it back (two boxes).
- * Our own child is never affected: no presence asked, its own box stays. */
+ * Our own child is never affected: no presence asked, its own box stays.
+ * This rests on the daemon keeping `POST /approvals/{id}` Elevated
+ * (route_policy.rs), pinned there by rust/apps/agent24d/src/capabilities/
+ * tests/route_policy.rs (`ApprovalDecision` → Elevated, and every row against
+ * the design table): a daemon that lowered it would run approvals unasked. */
 export const SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE = true
 
 /** Does ApprovalDecide show its own box? Always with our own child; in
