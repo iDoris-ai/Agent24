@@ -861,6 +861,38 @@ async fn legacy_and_service_state_have_no_desktop_presence() {
     assert!(state.presence_desktop.is_none());
 }
 
+/// K-B3 #1715: service mode confirms on the presence connection and has no
+/// HTTP challenge routes; a host child keeps HTTP; legacy has neither.
+#[tokio::test]
+async fn each_start_mode_gets_its_own_presence_channel() {
+    use crate::server::StartupMode;
+    let provider_is = |state: &AppState, other: *const ()| {
+        state
+            .presence_provider
+            .as_ref()
+            .is_some_and(|p| std::ptr::eq(Arc::as_ptr(p).cast::<()>(), other))
+    };
+    let mut service = tests::state().await;
+    service.enable_capability_auth(crate::capabilities::CapabilityStore::new("service-test"));
+    service.enable_presence_for(StartupMode::Service);
+    let queue = service.presence_service.clone().unwrap();
+    assert!(provider_is(&service, Arc::as_ptr(&queue).cast()));
+    assert!(service.presence_desktop.is_none());
+
+    let mut child = tests::state().await;
+    child.enable_capability_auth(crate::capabilities::CapabilityStore::new("child-test"));
+    child.enable_presence_for(StartupMode::HostChild);
+    let desktop = child.presence_desktop.clone().unwrap();
+    assert!(provider_is(&child, Arc::as_ptr(&desktop).cast()));
+    assert!(child.presence_service.is_none());
+
+    let mut legacy = tests::state().await;
+    legacy.enable_presence_for(StartupMode::Legacy);
+    assert!(legacy.presence_provider.is_none());
+    assert!(legacy.presence_desktop.is_none());
+    assert!(legacy.presence_service.is_none());
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn http_rejects_and_deletes_token_after_peer_exec() {

@@ -90,6 +90,48 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - 与冻结稿 D7 的差异：子进程模式下桌面是 ProductHost 父进程，不经登记；以 ProductHost 令牌鉴权的主进程通道等价于「已登记桌面主进程的通道」。2f 桌面改走登记后改为 FirstPartyShell + 桌面身份。
 - 同一挑战只接受一次决定；过期挑战决定返回 `410`。
 
+### 3.4b 在场连接（服务模式，K-B3 #1715）
+
+服务模式下 daemon 由 launchd 拉起，桌面不是它的父进程，3.4 的 HTTP 通道（只认 ProductHost）没人轮询。改由桌面主进程在 `enroll.sock` 上另开一条**在场连接**。帧形状在 #1715 评论 6732349252 定稿，实现在 `enroll_endpoint.rs` 的 `serve_presence` 和 `presence_service.rs`。
+
+- **哪种模式用哪条通道**：
+  - 服务模式只用在场连接，`ServicePresence` 就是提供者。
+  - 子进程模式保持 3.4 不变。在场连接会被拒，错误码 `wrong_role`。
+  - legacy 模式不绑定 `enroll.sock`。
+- **握手**：
+  - daemon 照常先发 `challenge`。桌面回 `hello`，比令牌连接多一个 `"role":"presence"`。不带 `role` 的是令牌连接；`role` 取其他值得 `bad_frame`。
+  - daemon 照令牌连接的办法核对代码签名和 audit token，另外要求 identifier **恰好**是 `ai.auraai.agent24`。CLI 的 `agent24`、`agent24d` 都会得到 `identity_rejected`。
+  - 通过后 daemon 回 `{"v":1,"op":"presence_ready","identity":{"kind":"macos_seccode","identifier":"ai.auraai.agent24"}}`。**不签发令牌**，帧里没有 `token`、`http_port`、`expires_in`。
+- **同一时刻只有一条**：
+  - 已有在场连接、而且它的对端进程还活着（audit token 仍然有效），新连接得到 `presence_conflict`。
+  - 对端已经退出、但 daemon 还没读到 EOF 时，新连接直接接替。旧连接的挑战结算为 `Unavailable`，旧连接随后关闭。
+- **挑战**（daemon→桌面）：
+  ```json
+  {"v":1,"op":"presence_challenge","challenge_id":"…","nonce":"<hex32>","operation":"<Operation::action()>","method":"…","path":"…","summary":"<daemon 写的批准文字>","requester":{"identifier":"…","pid":0},"expires_at":0}
+  ```
+  - 同一条连接上最多一个已下发、还没应答的挑战，其余排队。
+  - 排队中过期的挑战直接结算为 `TimedOut`，不会下发。
+  - `summary` 由 daemon 生成，桌面原样显示。elevate 帧里客户端自带的 `summary` 不进这个框。
+- **应答**（桌面→daemon）：
+  - 帧：`{"v":1,"op":"presence_answer","challenge_id":"…","nonce":"<回显>","decision":"allow"|"deny"}`。
+  - daemon 每条都回 `{"v":1,"op":"presence_answered","challenge_id":"…","accepted":true|false}`。
+  - 以下情况回 `accepted:false`，**连接不断**：未知 id、已结算、还在排队没下发、nonce 不符。
+  - `decision` 取其他值得 `bad_frame`，连接关闭。
+  - 每条应答生效前，daemon 都重新核对对端身份（pid 启动时间、代码签名、audit token）。对端 exec 过就得到 `identity_rejected`，连接关闭。
+- **取消**（daemon→桌面）：已下发的挑战在应答前就结算了（发起方的 elevate 连接断开、过期），daemon 发 `{"v":1,"op":"presence_cancel","challenge_id":"…"}`。之后再对它应答，得到 `accepted:false`。
+- **心跳**：
+  - 在场连接不受 10 分钟空闲上限约束。daemon 每 60 秒发一次 `{"v":1,"op":"presence_ping","nonce":"<hex32>"}`，桌面须在 10 秒内回 `{"v":1,"op":"presence_pong","nonce":"<回显>"}`。
+  - 超时、nonce 不符或主动发的 pong，daemon 直接关闭连接。
+- **错误**：
+  - 在场连接上发 `renew`、`elevate`、第二个 `hello`，得到 `wrong_role`。
+  - 令牌连接上发 `presence_answer`、`presence_pong`，也得到 `wrong_role`。
+  - daemon 发出错误帧后关闭连接。
+- **断开**：在场连接断开（包括 daemon 退出）时，已下发的和排队中的挑战都结算为 `Unavailable`，发起方得到 `presence_unavailable`。服务模式下没有在场连接时，elevate 立即得到 `presence_unavailable`，不会排队等桌面连上来。
+- **并发**：在场连接和令牌连接共用 8 条的并发上限。在场连接长期占其中 1 条，令牌连接还剩 7 条。
+- **已知局限**：
+  - 同 UID 的恶意进程占满 7 条令牌连接时，在场连接连不上，提升请求得到 `presence_unavailable`。这在 ADR-031 的威胁边界之内。
+  - 这是桌面替自己作证：能挡住 renderer 和 CLI，挡不住已经被攻破的桌面主进程。强度不如 D7 的 LocalAuthentication helper，是 helper 落地之前的过渡方案。
+
 ### 3.5 路由等级
 
 沿用冻结稿 §3。`POST /api/v1/attached` = ModuleAdmin = 提升。新增两条 presence 路由进 2a 的路由覆盖门（T1）。

@@ -15,6 +15,17 @@ pub const SOCKET_NAME: &str = "enroll.sock";
 const MAX_FRAME: u64 = 16 * 1024;
 const IDLE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 const FRAME_DEADLINE: Duration = Duration::from_secs(5);
+/// A presence connection has no idle limit; the daemon pings it this often
+/// and closes it when no matching pong arrives within [`PONG_DEADLINE`]
+/// (#1715 §5).
+#[cfg(not(test))]
+const PING_EVERY: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const PING_EVERY: Duration = Duration::from_millis(400);
+#[cfg(not(test))]
+const PONG_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const PONG_DEADLINE: Duration = Duration::from_millis(400);
 /// Connections served at once; further ones are closed unanswered so a slow
 /// or hostile peer cannot pile up tasks or exhaust descriptors.
 const MAX_CONCURRENT: usize = 8;
@@ -74,12 +85,20 @@ pub struct EnrollEndpoint {
     /// The daemon's HTTP port, echoed in every `enrolled` frame so the CLI can
     /// refuse a `daemon.json` whose port is not this daemon's (#1446 F1).
     http_port: u16,
+    /// Service mode only: where `hello{role:"presence"}` connections attach
+    /// (K-B3 #1715). `None` refuses that role with `wrong_role`.
+    presence: Option<Arc<crate::presence_service::ServicePresence>>,
 }
 
 #[cfg(unix)]
 impl EnrollEndpoint {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Accept presence connections into `presence` (call before `serve`).
+    pub fn set_presence(&mut self, presence: Arc<crate::presence_service::ServicePresence>) {
+        self.presence = Some(presence);
     }
 
     /// Start accepting. The task ends when `stop` fires. `http_port` is the
@@ -122,6 +141,7 @@ impl EnrollEndpoint {
         };
         let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
         let http_port = self.http_port;
+        let presence = self.presence.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -143,11 +163,12 @@ impl EnrollEndpoint {
                             let generation = generation.clone();
                             let authority = authority.clone();
                             let verifier = verifier.clone();
+                            let presence = presence.clone();
                             tokio::spawn(async move {
                                 let permit = Arc::new(permit);
                                 tokio::select! {
                                     () = stop.cancelled() => {}
-                                    () = serve_connection(stream, audit_token, generation, http_port, authority, verifier, stop.clone(), permit) => {}
+                                    () = serve_connection(stream, audit_token, generation, http_port, authority, verifier, presence, stop.clone(), permit) => {}
                                 }
                             });
                         }
@@ -188,6 +209,11 @@ struct Frame {
     path: Option<String>,
     body_sha256: Option<String>,
     summary: Option<String>,
+    /// `hello` only: absent for a token connection, `"presence"` for the
+    /// presence connection (#1715 §1).
+    role: Option<String>,
+    challenge_id: Option<String>,
+    decision: Option<String>,
 }
 
 async fn read_frame<R: tokio::io::AsyncBufRead + Unpin>(
@@ -399,6 +425,7 @@ async fn answer(
         0,
         authority,
         verifier,
+        None,
         cancel,
         permit,
     )
@@ -414,6 +441,7 @@ async fn serve_connection(
     http_port: u16,
     authority: Arc<dyn EnrollAuthority>,
     verifier: Arc<dyn IdentityVerifier>,
+    presence: Option<Arc<crate::presence_service::ServicePresence>>,
     cancel: CancellationToken,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) {
@@ -478,6 +506,14 @@ async fn serve_connection(
         send_error(&mut write, EnrollErrorCode::GenerationMismatch).await;
         return;
     }
+    let presence_role = match hello.role.as_deref() {
+        None => false,
+        Some("presence") => true,
+        Some(_) => {
+            send_error(&mut write, EnrollErrorCode::BadFrame).await;
+            return;
+        }
+    };
     let first = verifier.clone();
     let identity = match inspect(permit.clone(), move || {
         verify_peer(&*first, pid, audit_token)
@@ -501,6 +537,23 @@ async fn serve_connection(
     .await
     {
         send_error(&mut write, code).await;
+        return;
+    }
+    if presence_role {
+        serve_presence(
+            reader,
+            write,
+            audit_token,
+            PresencePeer {
+                pid,
+                start,
+                identity,
+            },
+            verifier,
+            presence,
+            permit,
+        )
+        .await;
         return;
     }
     let peer = EnrolledPeer {
@@ -691,6 +744,7 @@ async fn serve_connection(
                 }
                 continue;
             }
+            "presence_answer" | "presence_pong" => Err(EnrollErrorCode::WrongRole),
             _ => Err(EnrollErrorCode::BadFrame),
         };
         match result {
@@ -709,6 +763,183 @@ async fn serve_connection(
             Err(code) => {
                 send_error(&mut write, code).await;
                 return;
+            }
+        }
+    }
+}
+
+/// Who a presence connection belongs to, as verified at `hello`.
+#[cfg(unix)]
+struct PresencePeer {
+    pid: i32,
+    start: ProcStart,
+    identity: VerifiedIdentity,
+}
+
+/// The presence connection (K-B3 #1715): no token is issued; the daemon
+/// writes challenges and cancels, the desktop answers them, and a ping keeps
+/// the line honest in place of the idle limit. Ending this function (EOF,
+/// error, missed pong, replaced) drops the attachment, which settles every
+/// challenge as `Unavailable`.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+async fn serve_presence(
+    mut reader: BufReader<tokio::net::unix::OwnedReadHalf>,
+    mut write: tokio::net::unix::OwnedWriteHalf,
+    audit_token: Option<agent24_os_proc::AuditToken>,
+    peer: PresencePeer,
+    verifier: Arc<dyn IdentityVerifier>,
+    presence: Option<Arc<crate::presence_service::ServicePresence>>,
+    permit: Arc<tokio::sync::OwnedSemaphorePermit>,
+) {
+    use crate::presence_service::{Decision, Event};
+    // Only the desktop app vouches for presence; `role` is a request, the
+    // identity is the daemon's own check (#1715 §1).
+    if peer.identity.identifier != crate::knowledge_host::DESKTOP_SHELL_IDENTIFIER {
+        send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
+        return;
+    }
+    let Some(presence) = presence else {
+        // Not service mode: the desktop is this daemon's parent and confirms
+        // over HTTP (`presence_desktop`).
+        send_error(&mut write, EnrollErrorCode::WrongRole).await;
+        return;
+    };
+    let attachment = match presence
+        .attach(move || audit_token.is_some_and(agent24_os_proc::audit_token_is_live))
+    {
+        Ok(attachment) => attachment,
+        Err(crate::presence_service::Conflict) => {
+            send_error(&mut write, EnrollErrorCode::PresenceConflict).await;
+            return;
+        }
+    };
+    if !peer_unchanged(reader.get_ref().as_ref(), audit_token) {
+        send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
+        return;
+    }
+    if send(
+        &mut write,
+        serde_json::json!({"v":1,"op":"presence_ready","identity":{"kind":"macos_seccode","identifier":peer.identity.identifier}}),
+    )
+    .await
+    .is_err()
+    {
+        return;
+    }
+    let mut next_ping = tokio::time::Instant::now() + PING_EVERY;
+    // The nonce of the ping awaiting its pong, and the pong's deadline.
+    let mut ping: Option<(String, tokio::time::Instant)> = None;
+    loop {
+        let wake_at = ping.as_ref().map_or(next_ping, |(_, deadline)| *deadline);
+        tokio::select! {
+            event = attachment.next_event() => {
+                let frame = match event {
+                    Event::Challenge { req, nonce } => serde_json::json!({
+                        "v": 1,
+                        "op": "presence_challenge",
+                        "challenge_id": req.challenge_id,
+                        "nonce": nonce,
+                        "operation": req.operation.action(),
+                        "method": req.method,
+                        "path": req.path,
+                        "summary": req.summary,
+                        "requester": {"identifier": req.requester.identifier, "pid": req.requester.pid},
+                        "expires_at": req.expires_at,
+                    }),
+                    Event::Cancel { challenge_id } => serde_json::json!({
+                        "v": 1, "op": "presence_cancel", "challenge_id": challenge_id,
+                    }),
+                    Event::Replaced => return,
+                };
+                if send(&mut write, frame).await.is_err() {
+                    return;
+                }
+            }
+            () = tokio::time::sleep_until(wake_at) => {
+                if ping.is_some() {
+                    return; // no pong in time
+                }
+                let nonce = random_hex(16);
+                if send(&mut write, serde_json::json!({"v":1,"op":"presence_ping","nonce":nonce})).await.is_err() {
+                    return;
+                }
+                ping = Some((nonce, tokio::time::Instant::now() + PONG_DEADLINE));
+            }
+            filled = reader.fill_buf() => {
+                if matches!(filled, Ok([]) | Err(_)) {
+                    return;
+                }
+                let frame = match next_frame(&mut reader, audit_token).await {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => return,
+                    Err(code) => {
+                        send_error(&mut write, code).await;
+                        return;
+                    }
+                };
+                match frame.op.as_str() {
+                    "presence_answer" => {
+                        let (Some(challenge_id), Some(nonce), Some(decision)) =
+                            (frame.challenge_id, frame.nonce, frame.decision)
+                        else {
+                            send_error(&mut write, EnrollErrorCode::BadFrame).await;
+                            return;
+                        };
+                        let decision = match decision.as_str() {
+                            "allow" => Decision::Allow,
+                            "deny" => Decision::Deny,
+                            _ => {
+                                send_error(&mut write, EnrollErrorCode::BadFrame).await;
+                                return;
+                            }
+                        };
+                        // The peer may have exec'd since `hello`: an answer
+                        // counts only from the process that was verified.
+                        if let Err(code) = recheck(
+                            verifier.clone(),
+                            peer.pid,
+                            peer.start,
+                            peer.identity.clone(),
+                            permit.clone(),
+                        )
+                        .await
+                        {
+                            send_error(&mut write, code).await;
+                            return;
+                        }
+                        if !peer_unchanged(reader.get_ref().as_ref(), audit_token) {
+                            send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
+                            return;
+                        }
+                        let accepted = attachment.answer(&challenge_id, &nonce, decision);
+                        if send(
+                            &mut write,
+                            serde_json::json!({"v":1,"op":"presence_answered","challenge_id":challenge_id,"accepted":accepted}),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    "presence_pong" => match (&ping, frame.nonce) {
+                        (Some((expected, _)), Some(nonce)) if *expected == nonce => {
+                            ping = None;
+                            next_ping = tokio::time::Instant::now() + PING_EVERY;
+                        }
+                        // Unsolicited or wrong nonce: the line is not honest.
+                        _ => return,
+                    },
+                    "hello" | "renew" | "elevate" => {
+                        send_error(&mut write, EnrollErrorCode::WrongRole).await;
+                        return;
+                    }
+                    _ => {
+                        send_error(&mut write, EnrollErrorCode::BadFrame).await;
+                        return;
+                    }
+                }
             }
         }
     }
@@ -796,6 +1027,7 @@ pub fn bind(dir: &Path) -> io::Result<EnrollEndpoint> {
         identity,
         listener: Some(listener),
         http_port: 0,
+        presence: None,
     };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(endpoint)
@@ -809,6 +1041,7 @@ impl EnrollEndpoint {
     pub fn path(&self) -> &Path {
         Path::new("")
     }
+    pub fn set_presence(&mut self, _presence: Arc<crate::presence_service::ServicePresence>) {}
     pub fn serve(
         &mut self,
         _stop: CancellationToken,
@@ -1801,3 +2034,7 @@ pub(crate) mod handshake_tests {
         assert_eq!(peer_allowed(uid, Some(-1)), None);
     }
 }
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "enroll_presence_tests.rs"]
+mod presence_tests;

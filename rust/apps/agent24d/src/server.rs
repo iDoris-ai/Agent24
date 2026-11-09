@@ -51,6 +51,9 @@ pub struct AppState {
     /// CORE-2 AgentEar S3: the desktop confirmation queue behind
     /// `/api/v1/presence/challenges/*`.
     pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
+    /// K-B3 #1715: service mode's presence queue, fed by the desktop's
+    /// `role:"presence"` connection on the enrolment socket.
+    pub presence_service: Option<Arc<crate::presence_service::ServicePresence>>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -725,6 +728,7 @@ impl AppState {
             delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
             knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
             presence_desktop: None,
+            presence_service: None,
             mcp_servers: Arc::new(mcp_servers),
             mcp_roster: Arc::new(crate::mcp::McpRoster::default()),
             router,
@@ -788,6 +792,24 @@ impl AppState {
         let presence = Arc::new(crate::presence_desktop::DesktopPresence::new());
         self.presence_provider = Some(presence.clone());
         self.presence_desktop = Some(presence);
+    }
+
+    /// Service mode: the desktop is not our parent, so presence comes over
+    /// its own connection on the enrolment socket (K-B3 #1715).
+    fn enable_service_presence(&mut self) {
+        let presence = Arc::new(crate::presence_service::ServicePresence::new());
+        self.presence_provider = Some(presence.clone());
+        self.presence_service = Some(presence);
+    }
+
+    /// Where a capability daemon's presence confirmations go, by start mode:
+    /// the parent desktop over HTTP, or the desktop's presence connection.
+    fn enable_presence_for(&mut self, mode: StartupMode) {
+        match mode {
+            StartupMode::HostChild => self.enable_desktop_presence(),
+            StartupMode::Service => self.enable_service_presence(),
+            StartupMode::Legacy => {}
+        }
     }
 
     /// Re-read the override set after the user changed it.
@@ -2474,9 +2496,7 @@ pub async fn serve(
     state.idoris_unavailable = idoris_unavailable;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
-        if mode == StartupMode::HostChild {
-            state.enable_desktop_presence();
-        }
+        state.enable_presence_for(mode);
         state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
             &state_dir,
         )?);
@@ -3247,6 +3267,7 @@ pub async fn serve(
         );
     }
     let enroll_authority = state.first_party.clone();
+    let enroll_presence = state.presence_service.clone();
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
@@ -3343,6 +3364,9 @@ pub async fn serve(
     if let Some(endpoint) = enroll.as_mut()
         && let Some(authority) = enroll_authority
     {
+        if let Some(presence) = enroll_presence {
+            endpoint.set_presence(presence);
+        }
         endpoint.serve(
             cancel.clone(),
             daemon_generation.clone(),
