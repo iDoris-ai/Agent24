@@ -147,6 +147,19 @@ describe('schedule conversations (M4 A5)', () => {
       expect(cards('run_1000')).toBe(1)
     })
 
+    it('a run already in a full conversation, but not handled, gets no second card in the new one (Codex #1719 C1)', async () => {
+      const m = homes()
+      await m.catchUp(async () => [])
+      const full = await filled(1000)
+      // run_5's card is on file in the full one; `handled` never got it.
+      expect(JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8')).handled).not.toContain('run_5')
+      await m.record('sch_1', 'run_1000')
+      await m.catchUp(async () => [{ id: 'run_5', schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' }])
+      expect(history.list().flatMap(c => c.tasks).filter(t => t.run_id === 'run_5')).toHaveLength(1)
+      expect(history.get(full)!.runs.some(r => r.run_id === 'run_5')).toBe(true)
+      expect(JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8')).handled).toContain('run_5')
+    })
+
     it('N7 a catch-up records past a full conversation as a live record does', async () => {
       const full = await filled(1000)
       const m = homes()
@@ -179,6 +192,16 @@ describe('schedule conversations (M4 A5)', () => {
     it('C1 a run handled before the claim stays handled whatever the caller does', async () => {
       const m = homes()
       await m.catchUp(runs('run_1'))
+      expect(await m.claim('sch_1', 'run_1')).toBe(false)
+      await m.settle('run_1', false)
+      await m.catchUp(runs('run_1'))
+      expect(history.list()).toEqual([])
+    })
+
+    it('a run recorded live before the first catch-up, its conversation deleted since, is not brought back when the caller could not record it (Codex #1719 C2)', async () => {
+      const m = homes()
+      const summary = await m.record('sch_1', 'run_1')
+      history.delete(summary!.id)
       expect(await m.claim('sch_1', 'run_1')).toBe(false)
       await m.settle('run_1', false)
       await m.catchUp(runs('run_1'))

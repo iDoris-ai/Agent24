@@ -163,6 +163,17 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       throw err
     }
   }
+  const holds = (conversation: string | undefined, runId: string): boolean => {
+    try {
+      const record = deps.history.get(conversation) as { runs?: { run_id?: unknown }[] } | null
+      return record?.runs?.some(run => run.run_id === runId) ?? false
+    } catch {
+      return false
+    }
+  }
+  const inFormer = (state: State, scheduleId: string, runId: string): boolean =>
+    (state.former[scheduleId] ?? []).some(c => holds(c, runId))
+
   /** A new conversation for the schedule, now its home; `full` is the one it
    *  replaces because it filled up, kept as the schedule's. */
   const startConversation = async (scheduleId: string, full: string | null): Promise<string> => {
@@ -177,6 +188,13 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     return conversation
   }
   const recordIn = async (state: State, scheduleId: string, runId: string): Promise<ChatHistorySummary | null> => {
+    // In one of the full ones already (its card written, `handled` not): only
+    // `handled` is left to do (Codex #1719 C1).
+    if (inFormer(state, scheduleId, runId)) {
+      const now = read()
+      if (now.handled !== null && !now.handled.includes(runId)) write({ ...now, handled: [...now.handled, runId] })
+      return null
+    }
     let conversation = state.bindings[scheduleId]
     if (!onFile(conversation)) conversation = await startConversation(scheduleId, null)
     let summary: ChatHistorySummary | null
@@ -236,8 +254,9 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
    *  heard of, before their turn in the queue. */
   const heard = new Set<string>()
   /** Runs claimed (A6) and not settled yet: whether they were handled
-   *  before the claim, so not A5's to record whatever the caller does. */
-  const claimed = new Map<string, { handledBefore: boolean }>()
+   *  before the claim, so not A5's to record whatever the caller does, and
+   *  whether they were waiting for the first catch-up to record them. */
+  const claimed = new Map<string, { handledBefore: boolean; pending: boolean }>()
   let queue: Promise<unknown> = Promise.resolve()
   const enqueue = <T>(job: () => Promise<T>): Promise<T> => {
     const done = queue.then(job)
@@ -257,25 +276,17 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
       return enqueue(async () => {
         const state = read()
         // In its schedule's conversation, or one of the full ones before it (#1719 F-A).
-        const homes = [state.bindings[scheduleId], ...(state.former[scheduleId] ?? [])]
-        const held = homes.some((home) => {
-          try {
-            const record = deps.history.get(home) as { runs?: { run_id?: unknown }[] } | null
-            return record?.runs?.some(run => run.run_id === runId) ?? false
-          } catch {
-            return false
-          }
-        })
-        if (held) return true
+        if (holds(state.bindings[scheduleId], runId) || inFormer(state, scheduleId, runId)) return true
         // The first catch-up takes it as handled with the rest, once it is
         // neither to retry nor heard of; a live record of it is not made
         // (Codex A6 r3 C1). Given back if the caller cannot record it.
         const handledBefore = state.handled !== null && state.handled.includes(runId)
+        const pending = state.retry.includes(runId) || heard.has(runId)
         const handled = state.handled === null || handledBefore ? state.handled : [...state.handled, runId]
         write({ ...state, handled, retry: state.retry.filter(id => id !== runId) })
         // Only once on file: a claim that could not be written leaves nothing
         // reserved, and the run is A5's as before (#1719 C2).
-        claimed.set(runId, { handledBefore })
+        claimed.set(runId, { handledBefore, pending })
         heard.delete(runId)
         return false
       })
@@ -288,11 +299,13 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
         // The caller could not record it: it is A5's to record, as now
         // things stand (Codex A6 r3 C2). Out of `handled`, which the first
         // catch-up may have put it in while it was claimed (#1719 C1); before
-        // that catch-up, to retry, so that it does not take it as handled.
+        // that catch-up, back to retry if it was waiting there, so that it
+        // does not take it as handled. One recorded live before the claim is
+        // not: its conversation, deleted since, stays so (Codex #1719 C2).
         const state = read()
         if (state.handled !== null) {
           if (state.handled.includes(runId)) write({ ...state, handled: state.handled.filter(id => id !== runId) })
-        } else if (!state.retry.includes(runId)) {
+        } else if (was.pending && !state.retry.includes(runId)) {
           write({ ...state, retry: [...state.retry, runId] })
         }
       })
