@@ -29,7 +29,7 @@ describe('capability registry', () => {
   it('has the agreed unique ids, six nonempty groups and only Assistant fixed', () => {
     expect(CAPABILITIES.map(d => d.id).sort()).toEqual([
       'assistant', 'documents', 'localModels', 'voice', 'knowledgeBase', 'mediaBase',
-      'design', 'create', 'sin90', 'cos72', 'tools', 'memory', 'schedules', 'approvals', 'communication',
+      'design', 'create', 'sin90', 'cos72', 'tools', 'memory', 'schedules', 'communication',
     ].sort())
     expect(new Set(CAPABILITIES.map(d => d.id)).size).toBe(CAPABILITIES.length)
     for (const group of CAPABILITY_GROUPS) expect(CAPABILITIES.some(d => d.group === group)).toBe(true)

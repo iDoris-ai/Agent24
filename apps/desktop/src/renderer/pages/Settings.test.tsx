@@ -485,15 +485,15 @@ describe('Settings sidebar prefs', () => {
     }))
     await renderPrefs(PINS, apply)
     await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Fewer pinned slots' })) })
-    expect(await screen.findByText('Unpinned Schedules, Memory. They are still in Capabilities.')).toBeInTheDocument()
+    expect(await screen.findByText('Unpinned Proactive, Memory. They are still in Capabilities.')).toBeInTheDocument()
     expect(pinOrder()).toEqual(['Documents', 'Design'])
 
     await act(async () => { setLocale('zh') })
-    expect(screen.getByText('已取消固定 调度, 记忆。它们仍在能力中心。')).toBeInTheDocument()
+    expect(screen.getByText('已取消固定 主动, 记忆。它们仍在能力中心。')).toBeInTheDocument()
     expect(pinOrder()).toEqual(['文档', '设计'])
     expect(screen.getByRole('button', { name: '上移 设计' })).toBeEnabled()
     await act(async () => { setLocale('th') })
-    expect(screen.getByText('เลิกปักหมุด ตารางเวลา, ความจำ แล้ว ยังอยู่ใน Capabilities')).toBeInTheDocument()
+    expect(screen.getByText('เลิกปักหมุด เชิงรุก, ความจำ แล้ว ยังอยู่ใน Capabilities')).toBeInTheDocument()
     expect(pinOrder()).toEqual(['เอกสาร', 'ออกแบบ'])
     await act(async () => { setLocale('en') })
 

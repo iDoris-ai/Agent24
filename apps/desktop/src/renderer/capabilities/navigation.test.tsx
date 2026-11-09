@@ -23,7 +23,7 @@ describe('Sidebar', () => {
       </CapabilitiesContext.Provider>,
     )
     expect(screen.getAllByRole('button').map(b => b.textContent)).toEqual([
-      'Overview4', 'Assistant', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities4', 'Settings',
+      'Overview', 'Assistant4', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities', 'Settings',
     ])
     // The group says what it is, not how full it is (David 11-08).
     expect(screen.getByText('Pinned')).toBeInTheDocument()
@@ -165,7 +165,7 @@ describe('capability routing', () => {
     }))
     window.agent24 = { backendProxy } as unknown as Window['agent24']
     render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
-    await waitFor(() => expect(screen.getByRole('button', { name: /Capabilities/ })).toHaveTextContent('2'))
+    await waitFor(() => expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('2'))
     expect(screen.queryByRole('button', { name: 'Hello' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /Capabilities/ }))
     await waitFor(() => expect(within(screen.getByRole('region', { name: 'Domain OS' })).getByRole('button', { name: 'Hello' })).toBeInTheDocument())
@@ -183,10 +183,10 @@ describe('capability routing', () => {
     const view = render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
     try {
       await act(async () => {})
-      expect(screen.getByRole('button', { name: /Capabilities/ })).toHaveTextContent('1')
+      expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('1')
       pending = false
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
-      expect(screen.getByRole('button', { name: 'Capabilities' })).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Assistant' })).toBeInTheDocument()
       expect(backendProxy.mock.calls.filter(([req]) => req.path === '/api/modules')).toHaveLength(2)
       fireEvent.click(screen.getByRole('button', { name: 'Capabilities' }))
       expect(within(screen.getByRole('main')).getByRole('button', { name: 'Documents' })).toBeInTheDocument()

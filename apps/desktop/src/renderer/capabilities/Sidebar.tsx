@@ -19,8 +19,9 @@ export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (p
     aria-current={activeId === id ? 'page' : undefined} onClick={onClick}
   ><span>{label}</span>{badge > 0 && <span className="nav-badge">{badge}</span>}</button>
   return <nav className="sidebar-nav" aria-label={c('navigation')}>
-    {prefs.showOverview && item('home', t('nav.home'), () => navigate('home'), approvalsWaiting)}
-    {item('assistant', c('assistant.name'), () => open('assistant', 'sidebar'))}
+    {prefs.showOverview && item('home', t('nav.home'), () => navigate('home'))}
+    {/* M4 A6: approvals are decided in the assistant now (its task cards). */}
+    {item('assistant', c('assistant.name'), () => open('assistant', 'sidebar'), approvalsWaiting)}
     <ChatHistoryList showChat={() => open('assistant', 'sidebar')} />
     {/* David 11-08: the group says what it is, not how full it is; the
         limit shows only where it stops a pin (Capabilities, Settings). */}
@@ -30,7 +31,7 @@ export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (p
       <button className="nav-pin-more" onClick={() => navigate('capabilities')}>{c('pinMore')}</button>
     )}
     <div className="nav-bottom">
-      {item('capabilities', t('nav.capabilities'), () => navigate('capabilities'), approvalsWaiting)}
+      {item('capabilities', t('nav.capabilities'), () => navigate('capabilities'))}
       {item('settings', t('nav.settings'), () => navigate('settings'))}
     </div>
   </nav>

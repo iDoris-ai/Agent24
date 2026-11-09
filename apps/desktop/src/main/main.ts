@@ -494,6 +494,7 @@ app.whenReady().then(async () => {
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,
+    scheduleConversation: (scheduleId) => scheduleConversations().conversationOf(scheduleId),
     // T1-1/T1-2: what is on disk now. A daemon reads installed packages only
     // when it starts, so the pages compare this with what it serves (§9 Q2).
     documentsModule: () => ({

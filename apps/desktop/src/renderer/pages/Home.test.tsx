@@ -37,7 +37,9 @@ describe('HomePage', () => {
     render(<HomePage backendOk={true} {...props} onNavigate={onNavigate} />)
     fireEvent.click(screen.getByRole('button', { name: /Approval gate/ }))
     fireEvent.click(screen.getByText('Open this page →'))
-    expect(onNavigate).toHaveBeenCalledWith('approvals')
+    // M4 A6: approvals are decided in the assistant; the run store opens
+    // Settings → Activity (the runs page is no more).
+    expect(onNavigate).toHaveBeenLastCalledWith('assistant')
   })
 
   it('follows the global language setting', () => {

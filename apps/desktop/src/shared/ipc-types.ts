@@ -19,6 +19,8 @@ export const IpcChannels = {
   ChatHistoryChanged: 'chat-history:changed',
   // M4 A3: a run's or an approval's change, from the daemon's /events.
   RunEvent: 'run:event',
+  // M4 A6: the conversation a schedule's runs go to (A5), for its page.
+  ScheduleConversation: 'schedule:conversation',
   ChatGroupsGet: 'chat-groups:get',
   ChatGroupsCreate: 'chat-groups:create',
   ChatGroupsRename: 'chat-groups:rename',

@@ -19,7 +19,6 @@ export const CAPABILITIES: readonly CapabilityDef[] = [
   capability('tools', 'tools', 'modules-manager'),
   capability('memory', 'services'),
   capability('schedules', 'services'),
-  capability('approvals', 'services'),
   capability('communication', 'services'),
 ]
 

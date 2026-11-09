@@ -35,7 +35,7 @@ describe('SchedulesPage (English default)', () => {
   it('renders English copy by default', async () => {
     mount([])
     render(<SchedulesPage />)
-    expect(screen.getByText('Schedules')).toBeInTheDocument()
+    expect(screen.getByText('Proactive')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Create' })).toBeInTheDocument()
     expect(await screen.findByText('No schedules yet')).toBeInTheDocument()
   })
