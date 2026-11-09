@@ -714,11 +714,12 @@ def case_w4():
         # Since the CLI enrols on a daemon that offers an endpoint, an unsigned
         # build is told its identity was rejected; either way it gets nothing.
         refused = "host authority unavailable" in said or "rejected this agent24 binary's identity" in said
-        check("W4b", "`agent24 models` 不能借用桌面的 daemon", code not in (0, None)
+        # A signed CLI would enrol and get the daily tier (W4b′, real machine only).
+        check("W4b", "未签名构建：`agent24 models` 不能借用桌面的 daemon", code not in (0, None)
               and refused and host.alive(), f"退出 {code}：{said[-80:]}")
         code, said = cli(NEW, data, "daemon", "stop")
         s, _, _ = call(host.port, "GET", "/api/v1/models", host.token)
-        check("W4c", "`agent24 daemon stop` 停不掉桌面的 daemon", code not in (0, None)
+        check("W4c", "未签名构建：`agent24 daemon stop` 停不掉桌面的 daemon", code not in (0, None)
               and "host authority unavailable" in said and host.alive() and s == 200,
               f"退出 {code}：{said[-80:]}；daemon 仍应答 {s}")
     finally:

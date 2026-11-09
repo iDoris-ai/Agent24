@@ -64,8 +64,10 @@
 | W3c | 同上 | 不指名 binding 建 run | 202，普通用法不受影响 |
 | W3r | 反面对照 | main 的 `agent24 daemon start`，指名 binding 建 run | 202（main 不查）。说明 W3a 的拒绝是这次加的 |
 | W4a | CLI 与桌面托管的 daemon | 按 W1 的方式拉起 daemon，在同一个数据目录上跑 `agent24 daemon status` | 退出 0，说出这个 daemon 的 pid，并说 `shutdown report unavailable: host authority unavailable` |
-| W4b | 同上 | `agent24 models` | 非 0 退出，说 `host authority unavailable`，或者（CLI 会在提供登记端点的 daemon 上先登记）说 `rejected this agent24 binary's identity`：构建机上的 CLI 没有签名；daemon 还在 |
-| W4c | 同上 | `agent24 daemon stop` | 非 0 退出，说 `host authority unavailable`；daemon 还在，宿主仍能调它 |
+| W4b | 同上（未签名构建） | `agent24 models` | 非 0 退出，说 `host authority unavailable`，或者（CLI 会在提供登记端点的 daemon 上先登记）说 `rejected this agent24 binary's identity`：构建机上的 CLI 没有签名，登记被拒；daemon 还在 |
+| W4c | 同上（未签名构建） | `agent24 daemon stop` | 非 0 退出，说 `host authority unavailable`；daemon 还在，宿主仍能调它 |
+| W4b′ | 同上，签名 CLI（脚本不跑，M5 B7 真机补测） | `agent24 models`；再用 CLI 登记得到的令牌改 binding、调 ProductHost 才能用的路由 | `models` 等日常操作成功；改 binding 得 403 `host_authority_required`，ProductHost 路由被拒：借不到宿主权限 |
+| W4c′ | 同上，签名 CLI（脚本不跑，M5 B7 真机补测） | `agent24 daemon stop` | 停不掉。#1760（K-B3b）合入前 elevate 得 `not_elevated_operation`；合入后要桌面在场确认，没确认就是 403 `presence_required`。daemon 一直在 |
 | W4r | 反面对照 | 按 main 上桌面的方式拉起 main 的 `agent24d`，再跑 main 的 `daemon status`、`models`、`daemon stop`。跑 `models` 时把 `AGENT24D_BIN` 指向一个不存在的文件：附着失败时 CLI 会另起一个临时 daemon，这样能堵住这条退路 | 都退出 0，`status` 说出这个 pid，`stop` 之后 daemon 退出。说明 W4 的变化是这次带来的 |
 | W5a | 保留路径段 `host` | 用 W3 的 daemon，`POST /api/v1/attached` 注册名为 `host` 的 attached 模块；再注册一个叫 `kbacceptmod` 的作对照 | `host` 得 400 `invalid_manifest`，消息里有 `reserved`；`kbacceptmod` 得 201 |
 | W5r | 反面对照 | 用 W3r 的 main daemon 注册 `host` | 201（main 不保留这个名字） |
@@ -81,6 +83,18 @@
 | W6c | 同上 | 同样的请求，凭据换成一个错的 | 退出 1，401 `unauthorized`。说明 W6a、W6b 的 200 确实经过了鉴权 |
 | W6r | 对照 | 按 main 上桌面的方式（legacy，W4r 那样）拉起 main 的 daemon，用 main 的 CLI 做 W6a | 同样 200。说明桌面端的文档功能在这次发布前后都能用 |
 | Z1 | 不碰用户数据 | 对比运行前后的 `~/.agent24`，包括它本身是否存在、它的 mtime | 没有变化：原来不存在的，不能被建出来，空目录也不行 |
+
+**W4 里签名与未签名分开（2026-11-10 起）**：
+
+- 桌面托管的子进程模式 daemon 也开登记端点（`docs/agent/CORE-2-ENROLL-DESIGN.md:71`、`:131`、Q5 `:342`），CLI 会先登记。
+- 签了名的 CLI 只自动取得日常级（`CORE-2-ENROLL-DESIGN.md:264`「插件调用合法 CLI」一行：仍可读记忆、建 run、取消 run，这是 ADR-037 已接受的残余）。`GET /models` 是日常级（同文件 `:154`）。
+- 所以「CLI 用不了桌面的 daemon」只对未签名构建成立。W4b、W4c 的原期望是 CORE-2 之前的前提，现在只对未签名构建保留。
+- 签名 CLI 借不到宿主权限、也停不掉 daemon，靠下面这几层运行时拦截，锁定测试为：
+  - 宿主判定只认 ProductHost 和 `ai.auraai.agent24` 的外壳（`knowledge_host.rs` `host_capability`）：`knowledge_host::tests::cli_shells_are_not_knowledge_hosts`，以及 W7g。
+  - 外壳令牌不含在场通道（#1447 F1）：`server::first_party_http_tests::first_party_token_is_not_granted_presence_operations`、`…::first_party_token_cannot_reach_presence_routes`、`presence_desktop::tests::gate_refuses_a_first_party_authorization`。
+  - 服务模式的在场角色只给桌面：`enroll_endpoint::presence_tests::only_the_desktop_app_may_hold_the_presence_role`、`…::outside_service_mode_the_presence_role_is_refused`。
+  - shutdown 的批准文字：#1760 的 `server::elevation_summaries_http_tests::shutdown_has_its_fixed_text`。
+- 构建机没有签名身份，W4b′、W4c′ 由 M5 B7 真机拿到签名包时补测。
 
 **整体反面对照**：把 `--new` 也指向 main 的二进制再跑一遍，下面这些应当 FAIL：
 
