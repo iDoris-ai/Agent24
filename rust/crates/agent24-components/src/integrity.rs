@@ -64,6 +64,9 @@ pub enum IntegrityError {
     /// mismatch and not a damaged tree: the package must not be discovered
     /// or spawned.
     Cancelled,
+    NotNativeExecutable {
+        path: String,
+    },
 }
 
 impl fmt::Display for IntegrityError {
@@ -76,6 +79,7 @@ impl fmt::Display for IntegrityError {
             }
             Self::CheckFailed { detail } => write!(f, "integrity_check_failed: {detail}"),
             Self::Cancelled => f.write_str("cancelled"),
+            Self::NotNativeExecutable { path } => write!(f, "not_native_executable: {path}"),
         }
     }
 }

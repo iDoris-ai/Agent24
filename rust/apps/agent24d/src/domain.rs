@@ -3630,9 +3630,12 @@ raise SystemExit(3)
         assert!(host.supervisors.close().is_empty());
     }
 
-    /// `spawn.command` is a shell marker, not this test binary. `bin/agent24d`
-    /// is a copy of `current_exe` so the manifest lists a real executable
-    /// without depending on a native-format check.
+    /// `bin/mod` is a tiny C program compiled with the system `cc`: a native
+    /// executable for this machine (the package must pass the native-format
+    /// check), far under the payload limit (a copy of this debug test binary
+    /// is over 512 MiB on Linux), and not a platform binary macOS would kill
+    /// when copied (a copy of `/bin/sh` is). It appends one marker line per
+    /// run to `$A24_DATA_DIR/executed` and exits 3.
     fn write_integrity_marker(packages: &Path, name: &str) -> std::path::PathBuf {
         let dir = packages.join(name);
         std::fs::create_dir_all(dir.join("bin")).unwrap();
@@ -3646,21 +3649,26 @@ raise SystemExit(3)
             ),
         )
         .unwrap();
+        let source = packages.join(format!("{name}-mod.c"));
         std::fs::write(
-            dir.join("bin").join("mod"),
-            "#!/bin/sh\nprintf 'ran\\n' >> \"$A24_DATA_DIR/executed\"\nexit 3\n",
+            &source,
+            "#include <stdio.h>\n#include <stdlib.h>\n\
+             int main(void) {\n\
+               const char *d = getenv(\"A24_DATA_DIR\");\n\
+               if (d) { char p[4096]; snprintf(p, sizeof p, \"%s/executed\", d);\n\
+                 FILE *f = fopen(p, \"a\"); if (f) { fputs(\"ran\\n\", f); fclose(f); } }\n\
+               return 3;\n}\n",
         )
         .unwrap();
-        std::fs::copy(
-            std::env::current_exe().unwrap(),
-            dir.join("bin").join("agent24d"),
-        )
-        .unwrap();
-        agent24_os_packages::package_integrity::generate(
-            &dir,
-            &["bin/mod".to_owned(), "bin/agent24d".to_owned()],
-        )
-        .unwrap();
+        let built = std::process::Command::new("cc")
+            .arg("-o")
+            .arg(dir.join("bin").join("mod"))
+            .arg(&source)
+            .status()
+            .expect("these tests need a C compiler (`cc`) to build a native module");
+        assert!(built.success(), "cc failed to build the marker module");
+        std::fs::remove_file(&source).unwrap();
+        agent24_os_packages::package_integrity::generate(&dir, &["bin/mod".to_owned()]).unwrap();
         dir
     }
 

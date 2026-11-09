@@ -35,7 +35,7 @@ RESEARCH 列出的 `proxy.rs` `UnixStream`、`state_dir` 只读 HOME、`command-
 | `tokio::net::Unix*` 还出现在另外 3 个文件 | `kernel_call.rs`、`scheduler_deliver.rs`（测试）、`server.rs` | 与 proxy 同类 |
 | 回调根目录退回到 `/tmp/a24-run-*` | `server.rs:1886 callback_root` | 管道方案下 Windows 不需要这条路径 |
 | 子进程 env 白名单只含 Unix 变量 | `tools/env_whitelist.rs`（shell_exec + MCP）、`launch.rs:50 INHERITED_ENV` | 缺 `SystemRoot`（#549 的教训，§6.2） |
-| Node 参考模块用 `listen({fd: 3})` | `examples/node-module` | Node 在 Windows 上**不支持** listen fd |
+| Node 参考模块改走 attach（原用 `listen({fd: 3})`） | `examples/node-module` | 原生可执行程序；签名按 S1-9 §5 平台策略（Linux/Windows v1 无代码签名）；Node 参考模块改走 A3 附着模式（连接常驻套接字），不再依赖 fd 3 监听 |
 
 `cfg(not(unix))` 分支目前共 5 处：`server.rs:966`、`state_file.rs:244`、`install.rs:332/403/416`。
 
