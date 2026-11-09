@@ -60,6 +60,11 @@ export interface ScheduleConversations {
   record(scheduleId: string, runId: string): Promise<ChatHistorySummary | null>
   /** The schedule's conversation, when it has one on file (A6). */
   conversationOf(scheduleId: string): string | null
+  /** Whether the run is in its schedule's conversation, once the runs
+   *  heard of before are recorded (A6: an approval of a run the first
+   *  catch-up took as handled, or that could not be recorded, has no card
+   *  there; Codex A6 C5). */
+  holds(scheduleId: string, runId: string): Promise<boolean>
   /** Records the schedules' runs among `runs` (the daemon's
    *  `GET /api/v1/runs`) that were not handled yet, oldest first; one that
    *  fails does not stop the others and is tried again next time. The first
@@ -203,6 +208,17 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
     },
     catchUp(runs) {
       return enqueue(() => catchUpNow(runs))
+    },
+    holds(scheduleId, runId) {
+      return enqueue(async () => {
+        const conversation = read().bindings[scheduleId]
+        try {
+          const record = deps.history.get(conversation) as { runs?: { run_id?: unknown }[] } | null
+          return record?.runs?.some(run => run.run_id === runId) ?? false
+        } catch {
+          return false
+        }
+      })
     },
     conversationOf(scheduleId) {
       const conversation = read().bindings[scheduleId]

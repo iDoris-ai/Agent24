@@ -46,6 +46,25 @@ describe('schedule conversations (M4 A5)', () => {
     expect(homes().conversationOf('sch_1')).toBe(first!.id)
   })
 
+  describe('holds (M4 A6, Codex A6 C5)', () => {
+    it('tells whether the run is in its schedule\'s conversation, once the runs heard of before are recorded', async () => {
+      const m = homes()
+      void m.record('sch_1', 'run_1')
+      expect(await m.holds('sch_1', 'run_1')).toBe(true)
+      expect(await m.holds('sch_1', 'run_2')).toBe(false)
+      expect(await m.holds('sch_2', 'run_1')).toBe(false)
+    })
+
+    it('does not hold a run its first catch-up took as handled, nor one in a conversation deleted since', async () => {
+      const m = homes()
+      await m.catchUp(async () => [{ id: 'run_old', schedule_id: 'sch_1', created_at: '2026-11-09T00:00:00Z' }])
+      expect(await m.holds('sch_1', 'run_old')).toBe(false)
+      const summary = await m.record('sch_1', 'run_1')
+      history.delete(summary!.id)
+      expect(await m.holds('sch_1', 'run_1')).toBe(false)
+    })
+  })
+
   it('gives each schedule its own conversation', async () => {
     const a = await homes().record('sch_1', 'run_1')
     const b = await homes().record('sch_2', 'run_2')

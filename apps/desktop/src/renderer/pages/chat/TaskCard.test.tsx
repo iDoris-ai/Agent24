@@ -8,7 +8,7 @@ import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
 import { HandOver, TaskCards, elapsed, resetHandOversForTests } from './TaskCard'
-import { clearConversations, deleteConversation, refreshHistory, resetHistoryStore, saveConversation } from './history'
+import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
 import ChatPage from '../Chat'
@@ -385,20 +385,18 @@ describe('a card is not part of the conversation (QA #1690 N3)', () => {
 describe('deleting a conversation stops its tasks still going on (M4 A6, PR-Daemon #1700 L2)', () => {
   const cancelled = () => proxy.mock.calls.map(([req]) => req.path as string).filter(path => path.endsWith('/cancel'))
 
-  it('stops the tasks of the conversation deleted, and no others', async () => {
+  it('stops each task of the conversation deleted, asking no status first (Codex A6 C4), and no others', async () => {
     store.save(record('chat_a', '周报'))
     store.save(record('chat_b', '对账'))
     for (const id of ['run_1', 'run_2', 'run_3', 'run_done']) store.promoteRun('chat_a', id)
     store.promoteRun('chat_b', 'run_b')
     runs.run_1 = { status: 'running', started_at: at }
-    runs.run_2 = { status: 'queued', started_at: at }
-    runs.run_3 = { status: 'awaiting_approval', started_at: at }
-    runs.run_done = { status: 'completed', started_at: at, ended_at: at }
     runs.run_b = { status: 'running', started_at: at }
-    runs.run_other = { status: 'running', started_at: at }
     await refreshHistory()
+    proxy.mockClear()
     await deleteConversation('chat_a')
-    expect(cancelled().sort()).toEqual(['/api/v1/runs/run_1/cancel', '/api/v1/runs/run_2/cancel', '/api/v1/runs/run_3/cancel'])
+    expect(cancelled().sort()).toEqual(['run_1', 'run_2', 'run_3', 'run_done'].map(id => `/api/v1/runs/${id}/cancel`))
+    expect(proxy.mock.calls.filter(([req]) => req.method !== 'POST')).toEqual([])
     expect(store.get('chat_a')).toBeNull()
     expect(store.get('chat_b')).not.toBeNull()
   })
@@ -408,23 +406,53 @@ describe('deleting a conversation stops its tasks still going on (M4 A6, PR-Daem
     store.save(record('chat_b', '对账'))
     store.promoteRun('chat_a', 'run_1')
     store.promoteRun('chat_b', 'run_b')
-    runs.run_1 = { status: 'running', started_at: at }
-    runs.run_b = { status: 'awaiting_approval', started_at: at }
-    runs.run_other = { status: 'running', started_at: at }
     await refreshHistory()
     await clearConversations()
     expect(cancelled().sort()).toEqual(['/api/v1/runs/run_1/cancel', '/api/v1/runs/run_b/cancel'])
     expect(store.list()).toEqual([])
   })
 
-  it('still deletes when the daemon cannot tell which runs go on', async () => {
+  it('takes a run the daemon no longer has as stopped', async () => {
+    store.save(record('chat_a', '周报'))
+    store.promoteRun('chat_a', 'run_gone')
+    await refreshHistory()
+    proxy.mockResolvedValue({ ok: false, status: 404, data: null })
+    await deleteConversation('chat_a')
+    expect(store.get('chat_a')).toBeNull()
+  })
+
+  it.each([
+    ['refuses', async () => ({ ok: false, status: 503, data: { error: { code: 'backend_not_ready' } } })],
+    ['cannot be reached', async () => { throw new Error('offline') }],
+  ])('deletes nothing when the daemon %s a task\'s cancel, and says so (Codex A6 C1)', async (_, answer) => {
+    store.save(record('chat_a', '周报'))
+    store.save(record('chat_b', '对账'))
+    store.promoteRun('chat_a', 'run_1')
+    store.promoteRun('chat_a', 'run_2')
+    await refreshHistory()
+    proxy.mockImplementation(async (req: { path: string }) => (req.path.includes('run_2') ? answer() : { ok: true, status: 202, data: {} }))
+    await expect(deleteConversation('chat_a')).rejects.toThrow(TASKS_NOT_STOPPED)
+    await expect(clearConversations()).rejects.toThrow(TASKS_NOT_STOPPED)
+    expect(store.get('chat_a')).not.toBeNull()
+    expect(store.get('chat_b')).not.toBeNull()
+  })
+
+  it('starts the new chat of a clearing only once the tasks are stopped (Codex A6 C2)', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
     await refreshHistory()
-    proxy.mockResolvedValue({ ok: false, status: 503, data: { error: { code: 'backend_not_ready' } } })
-    await deleteConversation('chat_a')
-    expect(cancelled()).toEqual([])
-    expect(store.get('chat_a')).toBeNull()
+    const starter = vi.fn()
+    registerChatPage(() => {}, starter)
+    let stop!: () => void
+    proxy.mockImplementation(() => new Promise(resolve => { stop = () => resolve({ ok: true, status: 202, data: {} }) }))
+    const clearing = clearConversations()
+    await vi.waitFor(() => expect(stop).toBeTypeOf('function'))
+    expect(starter).not.toHaveBeenCalled()
+    expect(bridge.clear).not.toHaveBeenCalled()
+    stop()
+    await clearing
+    expect(starter).toHaveBeenCalledTimes(1)
+    expect(store.list()).toEqual([])
   })
 
   it('asks the daemon nothing for a conversation without tasks', async () => {

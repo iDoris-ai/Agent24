@@ -145,14 +145,19 @@ run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
 - **设置 → 活动 = 诊断，不是任务入口**。那里的 run 列表保留，用来查问题；任务都在对话里，以卡片的形式出现。总览上原来打开运行页的「账本」站点，现在打开设置 → 活动；「闸门」站点打开助理。
 - **「日程」改名「主动」**（Proactive / 主动 / เชิงรุก），每条日程带一个打开它的对话的入口（§7）。
 - **待审批计数**从「总览」「能力」移到侧栏的「助理」上。计的是 daemon 所有待审批，不只是当前对话的。
-- **删除、清空对话时先停掉进行中的 task**：确认框写明有几个进行中的 task 会被停掉。确认以后，先用 `GET /api/v1/runs` 查 `queued`/`running`/`awaiting_approval` 的 run，cancel 其中属于这些对话的，再删除。
+- **删除、清空对话时先停掉 task，停完再删**：确认框写明有几个进行中的 task 会被停掉。
+  - 确认以后，对这些对话的每个 task 直接发 `POST /api/v1/runs/{id}/cancel`，一次最多 4 个。daemon 的 cancel 幂等，任何状态都能发（openapi `cancelRun`），所以不先查状态，也就不会漏掉两次查询之间换了状态的 run（Codex A6 C4）。daemon 里已经没有的 run（404）算停了。
+  - 有一个停不下来（daemon 拒绝或连不上）：**什么都不删**，提示「有任务没能停下，所以什么都没删」（Codex A6 C1）。
+  - 清空时，新对话要等 task 都停了才开，所以停 task 期间在新对话里问的话，不会被一起清掉（Codex A6 C2）。
+  - 已知局限（M4 不做，Codex A6 C3）：在停 task 和真正删除之间，main 又往这条对话里追加了 run（例如「助理发起」对话来了新审批），这个 run 不会被停掉，卡片会随对话一起删掉。这段间隔只有几次本机请求那么长。
 - **对话外 run 的审批**（PM 11-09 方案 A，`main/assistant-approvals.ts`）。审批页删掉以后，每个待审批都要在某张卡片上能处理：
   - main 在 `/events` 上听到 `approval.required`，用 `GET /api/v1/runs/{id}` 看这个 run 是谁的：
-    - 带 `schedule_id`：在日程的对话里有卡片（§7），不用管。
+    - 带 `schedule_id`、并且 A5 已经把它记进日程的对话：卡片在那里（§7），不用管。A5 先把排在前面的 run 记完再回答（`holds`）。A5 的首次补录算作处理过的、或者没记进去的日程 run，按下面的「其余」处理（Codex A6 C5）。
     - 它的 session（`GET /api/v1/sessions/{id}`）的 channel 是 `desktop`：是窗口发起的，由页面升格（§3、§4），不用管。
     - 其余的（命令行的 `agent24`、别的 channel、没有 session、session 已经不在）：作为 task 记进一条「助理发起」对话（三语，main-i18n `assistant.conversationTitle`，`title_source = 'assistant'`）。卡片上有确认和拒绝。这条对话第一次用到时用 `create` 新建，之后都记在这里。
   - daemon 说不清（连不上、答复不对）：这个 run 不算处理过，下次补录再分。
   - **断线补录**：每次连上 `/events`，跟 §7 一样补一次，取的是 `GET /api/v1/approvals?status=pending`，把其中没处理过的 run 按上面的规则分。跟 §7 不同的是，**第一次补录也会补**：之前就在等的审批，窗口里没有别的地方可以处理。
   - 「处理过」的 run 记在 `<userData>/assistant-approvals.json`（`agent24.assistant-approvals` v1）的 `handled` 里，最多 5000 条，满了先丢最早的。一个 run 只分一次，同一个 run 的第二个审批不会再记一遍。用户删掉的「助理发起」对话，只有来了没处理过的 run 才会重新建出来。
   - 一次只分一个 run，按听到的顺序。
+  - 「助理发起」对话记满 1000 个 run 时（这条对话里全是 task，没有 answer 可以腾出位置），新建一条「助理发起」对话，之后的 run 都记在新的这条（Codex A6 C6）。
   - 已知局限（M4 不做）：窗口发起的 run，如果页面已经不在等它（例如窗口在等审批时关掉又开），就没有卡片，只能在 `agent24 tui` 里处理；侧栏「助理」的计数仍然算它。

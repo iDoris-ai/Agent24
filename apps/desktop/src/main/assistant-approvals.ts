@@ -11,7 +11,10 @@
 //
 // Which run is whose comes from the daemon: `GET /api/v1/runs/{id}` gives
 // its schedule and session, `GET /api/v1/sessions/{id}` the session's
-// channel (the window's are `desktop`, chat-knowledge.ts).
+// channel (the window's are `desktop`, chat-knowledge.ts). A schedule's run
+// is left to A5 only when A5 has it in the schedule's conversation: one its
+// first catch-up took as handled, or that could not be recorded, comes here
+// (Codex A6 C5). When the conversation is full, a new one is started.
 //
 // The daemon does not replay events, so each time main connects to /events
 // it asks for the pending approvals (`GET /api/v1/approvals?status=pending`)
@@ -37,8 +40,11 @@ const ID = /^[A-Za-z0-9_-]{1,128}$/
  *  it comes back only with a new approval pending, and goes to the
  *  conversation it is in already (appendRun keeps a run once). */
 const MAX_HANDLED = 5000
+/** What chat-history's appendRun throws for a conversation with no room. */
+const FULL = 'Too many chat history runs'
 
-/** Where a run goes, from what the daemon says of it. */
+/** Where a run goes: `schedule` when it is in its schedule's conversation
+ *  already (A5), `desktop` when the window asked it, `other` else. */
 export type RunOwner = 'schedule' | 'desktop' | 'other'
 
 export interface AssistantApprovalsDeps {
@@ -126,7 +132,17 @@ export function createAssistantApprovals(deps: AssistantApprovalsDeps): Assistan
       conversation = deps.history.create({ title: deps.title(), title_source: 'assistant' }).id
       write({ ...state, conversation })
     }
-    const summary = deps.history.appendRun(conversation, runId, 'task')
+    let summary: ChatHistorySummary | null
+    try {
+      summary = deps.history.appendRun(conversation, runId, 'task')
+    } catch (err) {
+      // Full (its runs are all tasks): a new one takes the runs from now on
+      // (Codex A6 C6).
+      if (!(err instanceof Error && err.message === FULL)) throw err
+      conversation = deps.history.create({ title: deps.title(), title_source: 'assistant' }).id
+      write({ ...read(), conversation })
+      summary = deps.history.appendRun(conversation, runId, 'task')
+    }
     // Handled once it is in the conversation; one that could not be is not.
     handle(runId)
     return summary

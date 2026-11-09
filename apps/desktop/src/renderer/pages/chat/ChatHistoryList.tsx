@@ -6,6 +6,7 @@ import {
   clearConversations,
   createGroup,
   deleteConversation,
+  TASKS_NOT_STOPPED,
   deleteGroup,
   getHistoryState,
   moveConversation,
@@ -259,7 +260,11 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const remove = (row: Row) => {
     const count = going(row.item.tasks)
     const ask = count > 0 ? t('history.deleteConfirmTasks', { title: row.title, count: String(count) }) : t('history.deleteConfirm', { title: row.title })
-    if (window.confirm(ask)) return deleteConversation(row.item.id)
+    if (window.confirm(ask)) return deleteConversation(row.item.id).catch(notStopped)
+  }
+  // One that could not stop a task stays, and the user is told (Codex A6 C1).
+  const notStopped = (err: unknown) => {
+    if (err instanceof Error && err.message === TASKS_NOT_STOPPED) window.alert(t('history.tasksNotStopped'))
   }
 
   const [menu, setMenu] = useState<Menu | null>(null)
@@ -435,7 +440,7 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
             {t('history.group.new')}</button>
           <button type="button" className="chat-history-clear" disabled={busy} onClick={() => {
             const count = going(items.flatMap(item => item.tasks))
-            if (window.confirm(count > 0 ? t('history.clearConfirmTasks', { count: String(count) }) : t('history.clearConfirm'))) void clearConversations()
+            if (window.confirm(count > 0 ? t('history.clearConfirmTasks', { count: String(count) }) : t('history.clearConfirm'))) void clearConversations().catch(notStopped)
           }}>{t('history.clear')}</button>
         </>}
       </div>

@@ -207,4 +207,21 @@ describe('deleting asks first, naming the tasks it stops (M4 A6)', () => {
     expect(confirm).toHaveBeenLastCalledWith('删除这台电脑上保存的全部对话？2 个进行中的任务会一并停止。删除后不能恢复。')
     expect(store.list()).toHaveLength(2)
   })
+
+  it('keeps the conversation and says so when a task of it cannot be stopped (Codex A6 C1)', async () => {
+    store.save(record('chat_a', '周报', 4))
+    store.promoteRun('chat_a', 'run_1')
+    runs = { run_1: 'running' }
+    await showList()
+    await waitFor(() => expect(filter(/^进行中/)).toHaveTextContent('进行中(1)'))
+    proxy.mockImplementation(async (req: { path: string }) => (req.path.endsWith('/cancel')
+      ? { ok: false, status: 503, data: null } : { ok: true, status: 200, data: { id: 'run_1', status: 'running' } }))
+    vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const alert = vi.spyOn(window, 'alert').mockImplementation(() => {})
+    deleteFromMenu('周报')
+    await waitFor(() => expect(alert).toHaveBeenCalledWith('有任务没能停下，所以什么都没删。请在助理运行时再试一次。'))
+    fireEvent.click(within(list()).getByRole('button', { name: '清空' }))
+    await waitFor(() => expect(alert).toHaveBeenCalledTimes(2))
+    expect(store.list()).toHaveLength(1)
+  })
 })

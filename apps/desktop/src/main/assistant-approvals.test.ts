@@ -71,6 +71,26 @@ describe('assistant approvals (M4 A6)', () => {
     expect(next!.tasks.map(t => t.run_id)).toEqual(['run_cli2'])
   })
 
+  it('starts a new conversation when the assistant\'s is full, and puts the runs from then on there (Codex A6 C6)', async () => {
+    const first = await approvals().route('run_cli')
+    const full = { ...history, appendRun: vi.fn((id: unknown, runId: unknown, kind: unknown) => {
+      if (id === first!.id) throw new Error('Too many chat history runs')
+      return history.appendRun(id, runId, kind)
+    }) }
+    const next = await approvals({ history: full }).route('run_cli2')
+    expect(next!.id).not.toBe(first!.id)
+    expect(next).toMatchObject({ title: '助理发起', title_source: 'assistant', tasks: [{ run_id: 'run_cli2' }] })
+    owners.run_cli3 = 'other'
+    expect((await approvals({ history: full }).route('run_cli3'))!.id).toBe(next!.id)
+  })
+
+  it('does not start a new conversation for another failure to record', async () => {
+    await approvals().route('run_cli')
+    const broken = { ...history, appendRun: vi.fn(() => { throw new Error('disk full') }) }
+    await expect(approvals({ history: broken }).route('run_cli2')).rejects.toThrow('disk full')
+    expect(history.list()).toHaveLength(1)
+  })
+
   it('routes two runs at once into one new conversation, one at a time', async () => {
     const m = approvals()
     const [a, b] = await Promise.all([m.route('run_cli'), m.route('run_cli2')])
