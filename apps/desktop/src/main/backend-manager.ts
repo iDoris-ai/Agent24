@@ -315,6 +315,8 @@ export interface ExternalDaemonState {
 export interface DaemonHealthProbe {
   ok: boolean
   protocolVersion: number | null
+  /** `/health`'s `version` (the daemon's package version), when it is a string. */
+  version?: string | null
 }
 
 /** Mirrors `agent24_protocol::state_file::state_path()` (Rust), i.e.
@@ -406,7 +408,9 @@ export async function fetchDaemonHealth(endpoint: BackendEndpoint): Promise<Daem
     })
     if (!response.ok) return { ok: false, protocolVersion: null }
     try {
-      return { ok: true, protocolVersion: protocolVersionOf(await response.json()) }
+      const body: unknown = await response.json()
+      const version = (body as { version?: unknown } | null)?.version
+      return { ok: true, protocolVersion: protocolVersionOf(body), version: typeof version === 'string' ? version : null }
     } catch {
       // 200 whose body is not JSON: a process is occupying the port.
       return { ok: true, protocolVersion: null }
@@ -482,7 +486,7 @@ function readyToken(ready: ReadyLine, authMode: DaemonAuthMode): string {
 }
 
 /** Mirrors `agent24-cli`'s `service::plist_path()`. */
-function launchAgentPlistExists(): boolean {
+export function launchAgentPlistExists(): boolean {
   const home = process.env['HOME']
   return home !== undefined && fs.existsSync(path.join(home, 'Library', 'LaunchAgents', 'ai.auraai.agent24.plist'))
 }
@@ -579,6 +583,10 @@ export class BackendManager {
   private enrolment: EnrolSession | null = null
   /** Where `enrolment` was made, for the presence connection (M5 B3). */
   private enrolledWith: { socketPath: string; generation: string } | null = null
+  /** The service daemon's `/health` version, read just before enrolling with it. */
+  private serviceVersion: string | null = null
+  /** M5 B5: while the service daemon restarts, its lock is not ours to take. */
+  private serviceRestart = false
   private renewTimer: NodeJS.Timeout | null = null
   // Set when that connection ends under a live daemon: the next tick
   // enrols again rather than waiting out MAX_HEALTH_FAILURES.
@@ -701,6 +709,7 @@ export class BackendManager {
     }
     if (state.authMode !== 'legacy' && state.enrollEndpoint !== undefined && state.generation !== undefined) {
       this.foreignPid = null
+      this.serviceVersion = health.version ?? null
       return this.enrolExternal(state, state.enrollEndpoint, state.generation, lifecycle)
     }
     this.blockedReason = null
@@ -927,6 +936,23 @@ export class BackendManager {
     return this.enrolledWith
   }
 
+  /** The enrolled service daemon's version; null when not enrolled (M5 B5). */
+  serviceDaemonVersion(): string | null {
+    return this.enrolledWith ? this.serviceVersion : null
+  }
+
+  /** M5 B5: runs `work` (the service daemon's restart) with nothing spawned
+   * meanwhile, then looks for the service daemon again. */
+  async whileServiceRestarts<T>(work: () => Promise<T>): Promise<T> {
+    this.serviceRestart = true
+    try {
+      return await work()
+    } finally {
+      this.serviceRestart = false
+      this.reprobe = true
+    }
+  }
+
   /** pid of the reused external daemon, for tray labels; null when not external. */
   externalDaemonPid(): number | null {
     return this.externalPid
@@ -1055,6 +1081,7 @@ export class BackendManager {
   }
 
   private spawnChild(): void {
+    if (this.serviceRestart) return
     this.dropEnrolment()
     // Our own child from here on: its daemon.json is not the service's to
     // enrol with again (Codex B2 C2).
