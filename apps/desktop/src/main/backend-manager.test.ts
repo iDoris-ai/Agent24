@@ -2129,6 +2129,26 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     }
   })
 
+  it('a tray start while the enrolment is refused leaves nothing behind: once it succeeds it is not redone (B3a)', async () => {
+    vi.useFakeTimers()
+    const s = session('ok-1')
+    const enrol = vi.fn().mockRejectedValueOnce(new EnrolError('identity_rejected', 'unsigned')).mockResolvedValue(s)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      manager.startDaemon()
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer ok-1' })
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(s.close).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('a refused enrolment is tried again at the next tick when the daemon is a new one (B3a)', async () => {
     vi.useFakeTimers()
     let current: ExternalDaemonState = record
