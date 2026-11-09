@@ -60,6 +60,9 @@ pub enum IntegrityError {
     CheckFailed {
         detail: String,
     },
+    NotNativeExecutable {
+        path: String,
+    },
 }
 
 impl fmt::Display for IntegrityError {
@@ -71,6 +74,7 @@ impl fmt::Display for IntegrityError {
                 write!(f, "integrity_manifest_invalid: {detail}")
             }
             Self::CheckFailed { detail } => write!(f, "integrity_check_failed: {detail}"),
+            Self::NotNativeExecutable { path } => write!(f, "not_native_executable: {path}"),
         }
     }
 }
