@@ -15,6 +15,8 @@ const TITLES: Record<TrayStatus, string> = {
 export interface TrayInput {
   status: TrayStatus
   external: boolean
+  /** M5 B6: enrolled with the LaunchAgent's service daemon. */
+  enrolled: boolean
   externalPid: number | null
   foreignPid: number | null
   detail?: BackendStatusDetail | null
@@ -27,7 +29,7 @@ export type TrayItem = { type: 'separator' } | { label: string; enabled: false }
 
 export interface TrayView { title: string; tooltip: string; items: TrayItem[] }
 
-export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = process.platform): TrayView {
+export function buildTrayView(input: TrayInput): TrayView {
   const cliItems: TrayItem[] = []
   const cli = input.cliTool
   if (cli && (cli.state === 'missing' || cli.state === 'outdated' || cli.state === 'unknown')) {
@@ -47,9 +49,8 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
     ? mt('tray.external', { label: base, pid: input.externalPid ?? '?' })
     : input.foreignPid !== null ? mt('tray.foreign', { label: base, pid: input.foreignPid }) : base
   let tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
-  // T1-0: on macOS a reused external daemon is one the LaunchAgent manages;
-  // Knowledge needs this app's own daemon, so say how to get there.
-  if (input.external && platform === 'darwin') tooltip += '\n' + mt('tray.externalKnowledge')
+  // M5 B6: Knowledge works on the service daemon; its bindings ask for presence.
+  if (input.enrolled) tooltip += '\n' + mt('tray.externalKnowledge')
   const summary = protocol
     ? mt('tray.protocolShort', {
       daemonVersion: protocol.daemonVersion ?? mt('tray.protocolUnknown'),

@@ -6,7 +6,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange, resetMainLocaleF
 import { buildTrayView, type TrayInput } from './tray-menu'
 
 const input = (over: Partial<TrayInput> = {}): TrayInput => ({
-  status: 'running', external: false, externalPid: null, foreignPid: null, backendKind: 'rust', ...over,
+  status: 'running', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust', ...over,
 })
 const labels = (view: ReturnType<typeof buildTrayView>) =>
   view.items.flatMap((i) => ('label' in i ? [i.label] : []))
