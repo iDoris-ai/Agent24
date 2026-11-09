@@ -1031,4 +1031,120 @@ mod tests {
         // The supervisor spawns the next run only when this returns Ok.
         assert!(super::recheck(&live.found[0].dir, &digest, &cancel).is_err());
     }
+
+    /// Executable is a copy of this test binary. There is no native-format
+    /// check on this branch; the copy only has to be a real file the hasher
+    /// walks. `bin/{name}` is also `spawn.command`.
+    fn integrity_package(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join(MANIFEST_FILE),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: [events]\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/{name}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), dir.join("bin").join(name)).unwrap();
+        crate::package_integrity::generate(&dir, &[format!("bin/{name}")]).unwrap();
+        dir
+    }
+
+    /// Pauses inside the first hashed chunk, then returns. Later chunks do
+    /// not wait, so one `release` unblocks the walk.
+    fn arm_hash_pause(
+        prefix: &Path,
+    ) -> (
+        agent24_components::integrity::HashProgressGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let once = Arc::new(AtomicBool::new(false));
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let guard = agent24_components::integrity::install_hash_progress_hook(
+            prefix,
+            Arc::new(move || {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = entered_tx.send(());
+                if let Some(rx) = release_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
+            }),
+        );
+        (guard, entered_rx, release_tx)
+    }
+
+    /// Cancel after the hasher has read a chunk, not before it starts.
+    /// The package must not become [`Discovered`], and recheck must not
+    /// return `Ok` (that is what lets a supervisor spawn).
+    #[test]
+    fn a_cancel_during_the_hash_is_not_discovered() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = integrity_package(root.path(), "cos72");
+        let live = super::scan(root.path(), &CancellationToken::new());
+        assert_eq!(live.found.len(), 1, "refused: {:?}", live.refused);
+        let digest = live.found[0].digest.clone();
+
+        let cancel = CancellationToken::new();
+        let scan = {
+            let (_guard, entered, release) = arm_hash_pause(&dir);
+            let scan_root = root.path().to_owned();
+            let scan_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || super::scan(&scan_root, &scan_cancel));
+            entered
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("the startup scan never reached the hash");
+            cancel.cancel();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        };
+        assert!(
+            scan.found.is_empty(),
+            "discovered after a mid-hash cancel: {:?}",
+            scan.found
+                .iter()
+                .map(|d| d.manifest.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            scan.cancelled.iter().any(|path| path == &dir),
+            "cancelled: {:?}",
+            scan.cancelled
+        );
+        assert!(
+            scan.refused
+                .iter()
+                .all(|r| !r.why.contains("hash_mismatch")),
+            "{:?}",
+            scan.refused
+        );
+
+        let cancel = CancellationToken::new();
+        let (_guard, entered, release) = arm_hash_pause(&dir);
+        let recheck_dir = dir.clone();
+        let recheck_cancel = cancel.clone();
+        let worker =
+            std::thread::spawn(move || super::recheck(&recheck_dir, &digest, &recheck_cancel));
+        entered
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("recheck never reached the hash");
+        cancel.cancel();
+        release.send(()).unwrap();
+        let err = worker.join().unwrap().unwrap_err();
+        assert_eq!(err, "cancelled");
+        assert!(!err.contains("hash_mismatch"), "{err}");
+    }
 }

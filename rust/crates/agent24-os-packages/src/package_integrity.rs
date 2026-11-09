@@ -236,21 +236,29 @@ fn verify_declared(
     }
     let bytes = read_bounded(&path, FILES_JSON_NAME, integrity::MAX_FILES_JSON_BYTES)?;
     let expected = integrity::verify_files_json(&bytes, section)?;
-    integrity::verify_tree(
-        dir,
-        &expected,
-        &section.executables,
-        true,
-        &[DOMAIN_OS_YML, FILES_JSON_NAME],
+    // A mismatch (or any other tree error) discovered as the token fires is
+    // still an unfinished check. Cancel wins over the mismatch.
+    tree_result(
         cancel,
+        integrity::verify_tree(
+            dir,
+            &expected,
+            &section.executables,
+            true,
+            &[DOMAIN_OS_YML, FILES_JSON_NAME],
+            cancel,
+        ),
     )
-    .map_err(integrity::map_tree_error)?;
-    // The token can fire after the last byte and before we publish success.
-    // A check that is not still live here did not finish.
+}
+
+fn tree_result(
+    cancel: &CancellationToken,
+    result: Result<(), integrity::TreeError>,
+) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
     }
-    Ok(())
+    result.map_err(integrity::map_tree_error)
 }
 
 fn ensure_real_directory(root: &Path) -> Result<(), IntegrityError> {
@@ -933,5 +941,22 @@ mod tests {
         );
         assert!(reason(&package).contains("not an ordinary file"));
         assert!(generate(&package, &["bin/cos72".into()]).is_err());
+    }
+
+    /// The tree walk already decided this was a mismatch. The token fired
+    /// before that error was published, so the caller must see `cancelled`.
+    /// Dropping the cancel arm in [`tree_result`]'s error path turns this
+    /// into `hash_mismatch`.
+    #[test]
+    fn a_hash_mismatch_while_cancelled_is_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = tree_result(
+            &cancel,
+            Err(integrity::TreeError::HashMismatch("bin/mod".to_owned())),
+        )
+        .unwrap_err();
+        assert!(matches!(err, IntegrityError::Cancelled), "{err}");
+        assert!(!err.to_string().contains("hash_mismatch"), "{err}");
     }
 }

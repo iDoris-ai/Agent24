@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use agent24_domain::SpawnCommand;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::drain::{Current, Generation};
 use crate::endpoint::{self, CallbackDir};
@@ -408,6 +409,7 @@ impl Drop for SupervisorHandle {
 /// # Errors
 ///
 /// [`SlotHeld`] when another supervisor holds `current`.
+#[allow(clippy::too_many_arguments)]
 pub fn supervise(
     spec: ModuleSpec,
     dir: Arc<CallbackDir>,
@@ -416,6 +418,7 @@ pub fn supervise(
     offer: Offer,
     timings: Timings,
     package_check: PackageCheck,
+    shutdown: CancellationToken,
 ) -> Result<SupervisorHandle, SlotHeld> {
     // Cloned before `Slot::claim` consumes `current` — attaching the status
     // feed below needs its own handle to the same slot (design doc, Codex
@@ -445,6 +448,7 @@ pub fn supervise(
         offer,
         timings,
         package_check,
+        shutdown,
         stop_rx,
     ));
     Ok(SupervisorHandle {
@@ -459,6 +463,8 @@ pub fn supervise(
 enum Run {
     /// A stop was requested; the process has been stopped.
     StopRequested,
+    /// Shutdown cancelled the run before its process existed.
+    Cancelled,
     /// The run is over: how it failed (FU-57), and when it became ready (if
     /// it did) and when it ended for [`RestartPolicy::ran`]. `ended_at` is taken
     /// when the run's outcome is known, before the process is stopped: the
@@ -608,6 +614,7 @@ async fn run_loop(
     offer: Offer,
     timings: Timings,
     package_check: PackageCheck,
+    shutdown: CancellationToken,
     mut stop: watch::Receiver<Option<Duration>>,
 ) {
     use crate::stop_record::ProcessAtStop;
@@ -618,9 +625,18 @@ async fn run_loop(
     let mut after = None;
     loop {
         attempt += 1;
+        // The scan already hashed this package. Calling `package_check` here
+        // would hash it again (up to 512 MiB) before the first process exists.
+        // The shutdown token is the same predicate `recheck` uses to return
+        // "cancelled", without that second walk. A cancel that arrives while
+        // `launch::spawn` is still pending is handled inside `run_once`.
+        if attempt == 1 && shutdown.is_cancelled() {
+            end_because_package_changed(&spec, slot, status, record, &mut stop, "cancelled").await;
+            return;
+        }
         status.send_replace(Status::Starting { attempt, after });
         let (failure, ready_at, ended_at) = match run_once(
-            &spec, &dir, slot, &methods, &offer, &timings, &mut stop, status,
+            &spec, &dir, slot, &methods, &offer, &timings, &mut stop, &shutdown, status,
         )
         .await
         {
@@ -642,6 +658,11 @@ async fn run_loop(
             }
             Ok(Run::StopRequested) => {
                 slot.stopped(status);
+                return;
+            }
+            Ok(Run::Cancelled) => {
+                end_because_package_changed(&spec, slot, status, record, &mut stop, "cancelled")
+                    .await;
                 return;
             }
             Ok(Run::Ended {
@@ -694,12 +715,8 @@ async fn run_loop(
                 // whether to spawn again, it does not produce a new run or
                 // a new `RunFailure`.
                 if let Some(reason) = check_package(&package_check, &spec).await {
-                    tracing::error!(module = %spec.name, %reason, "not restarting: package changed");
-                    slot.retire();
-                    status.send_replace(Status::PackageChanged { reason });
-                    stop_requested(&mut stop).await;
-                    saw_stop(record, &stop, ProcessAtStop::None);
-                    slot.stopped(status);
+                    end_because_package_changed(&spec, slot, status, record, &mut stop, reason)
+                        .await;
                     return;
                 }
             }
@@ -726,6 +743,26 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// Package check refused the next process. Same end as a restart whose
+/// recheck returned `cancelled`: [`Status::PackageChanged`], no spawn.
+async fn end_because_package_changed(
+    spec: &ModuleSpec,
+    slot: &Slot,
+    status: &watch::Sender<Status>,
+    record: &crate::stop_record::StopRecordHandle,
+    stop: &mut watch::Receiver<Option<Duration>>,
+    reason: impl Into<String>,
+) {
+    use crate::stop_record::ProcessAtStop;
+    let reason = reason.into();
+    tracing::error!(module = %spec.name, %reason, "not spawning: package check failed");
+    slot.retire();
+    status.send_replace(Status::PackageChanged { reason });
+    stop_requested(stop).await;
+    saw_stop(record, stop, ProcessAtStop::None);
+    slot.stopped(status);
 }
 
 /// Runs `check` off the async task: it does blocking filesystem I/O
@@ -778,6 +815,7 @@ async fn run_once(
     offer: &Offer,
     timings: &Timings,
     stop: &mut watch::Receiver<Option<Duration>>,
+    shutdown: &CancellationToken,
     status: &watch::Sender<Status>,
 ) -> Result<Run, Unconfirmed> {
     use crate::stop_record::ProcessAtStop;
@@ -819,6 +857,12 @@ async fn run_once(
         () = stop_requested(stop) => {
             saw_stop(record, stop, ProcessAtStop::None);
             return Ok(Run::StopRequested);
+        }
+        // `close()` has not run yet, so the stop watch is still empty.
+        // Dropping `spawn` here is safe: its only await is before the child
+        // exists.
+        () = shutdown.cancelled() => {
+            return Ok(Run::Cancelled);
         }
         spawned = launch::spawn(LaunchSpec {
             name: &spec.name,
@@ -1464,6 +1508,7 @@ sys.exit(0)
             Offer::none(),
             timings,
             no_package_check(),
+            CancellationToken::new(),
         )
         .expect("the slot is free")
     }
@@ -1485,6 +1530,7 @@ sys.exit(0)
             Offer::none(),
             timings,
             package_check,
+            CancellationToken::new(),
         )
         .expect("the slot is free")
     }
@@ -1683,6 +1729,7 @@ sys.exit(0)
             Offer::none(),
             fast(),
             no_package_check(),
+            CancellationToken::new(),
         );
         assert_eq!(refused.err(), Some(SlotHeld));
         assert!(
@@ -1765,7 +1812,8 @@ sys.exit(0)
                 no_methods(),
                 Offer::none(),
                 fast(),
-                no_package_check()
+                no_package_check(),
+                CancellationToken::new(),
             )
             .err(),
             Some(SlotHeld),
@@ -1830,6 +1878,7 @@ sys.exit(0)
                 Offer::none(),
                 fast(),
                 no_package_check(),
+                CancellationToken::new(),
             )
             .expect("a stop cancelled after the group was confirmed empty kept the slot");
             stop(next).await;
@@ -2395,7 +2444,8 @@ sys.exit(0)
                 no_methods(),
                 Offer::none(),
                 fast(),
-                no_package_check()
+                no_package_check(),
+                CancellationToken::new(),
             )
             .err(),
             Some(SlotHeld),
@@ -2495,7 +2545,8 @@ sys.exit(0)
                 no_methods(),
                 Offer::none(),
                 fast(),
-                no_package_check()
+                no_package_check(),
+                CancellationToken::new(),
             )
             .err(),
             Some(SlotHeld),
@@ -2656,6 +2707,43 @@ sys.exit(0)
             1,
             "a second handshake attempt was made against the replaced package"
         );
+        stop(handle).await;
+    }
+
+    /// The shutdown token is already cancelled when the supervisor task is
+    /// first polled. `close()` has not run, so the stop watch is empty, and
+    /// `package_check` would allow a spawn. The first run must not write a
+    /// start line, and the reason matches a cancelled recheck.
+    #[tokio::test]
+    async fn a_cancelled_shutdown_does_not_spawn_the_first_run() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            Offer::none(),
+            fast(),
+            no_package_check(),
+            shutdown,
+        )
+        .expect("the slot is free");
+        let mut rx = handle.subscribe();
+        let status = until(&mut rx, "first run settled", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Running | Status::Backoff { .. }
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason } = &status else {
+            panic!("spawned on a cancelled shutdown: {status:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(starts(f.data.path()).is_empty(), "the module ran");
         stop(handle).await;
     }
 

@@ -2235,16 +2235,14 @@ pub async fn serve(
     // Hashing a package is blocking filesystem I/O (up to 512 MiB). The
     // shutdown token stops it; a cancelled package is left out of the
     // catalogue, so it is not registered and not spawned.
-    let catalogue = tokio::task::spawn_blocking({
-        let packages_root = StdArc::clone(&packages_root);
-        let cancel = cancel.clone();
-        move || with_discovered(Vec::new(), packages_root.as_ref(), &cancel)
-    })
-    .await
-    .unwrap_or_else(|err| {
-        tracing::error!("discovering domain OS packages failed: {err}");
-        Vec::new()
-    });
+    let catalogue = catalogue_from_join(
+        tokio::task::spawn_blocking({
+            let packages_root = StdArc::clone(&packages_root);
+            let cancel = cancel.clone();
+            move || with_discovered(Vec::new(), packages_root.as_ref(), &cancel)
+        })
+        .await,
+    )?;
 
     // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
     // their tools. Registered with `with()` so they are dispatchable, while
@@ -2254,23 +2252,14 @@ pub async fn serve(
     let mut tools = agent24_tools::ToolRegistry::builtin(workspace.clone());
     let mut module_registry = agent24_domain::tool::ModuleToolRegistry::new();
     let mut module_operations = std::collections::HashSet::new();
-    for entry in &catalogue {
-        if let crate::domain::Build::Package(package) = &entry.build {
-            if let Err(error) =
-                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
-            {
-                tracing::warn!(module = entry.name, %error, "module tools were refused");
-                continue;
-            }
-            module_operations.extend(
-                package
-                    .manifest
-                    .tools()
-                    .iter()
-                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
-            );
-        }
-    }
+    register_discovered_module_tools(
+        &catalogue,
+        &cancel,
+        &mut module_registry,
+        &mut module_operations,
+    );
+    (module_registry, module_operations) =
+        module_tools_if_live(&cancel, module_registry, module_operations);
     let module_tool_runtime =
         crate::module_tool_runtime::AgentModuleToolRuntime::new(module_operations);
     let module_tool_runtime_dyn: StdArc<dyn agent24_tools::ModuleToolRuntime> =
@@ -3794,6 +3783,66 @@ async fn stop_supervisors(closed: crate::domain::Closed, drain: Duration) {
 /// `mount_all` claims names first-come-first-served, so a disk package cannot
 /// shadow a compiled-in module by taking its name. The second claimant gets an
 /// explicit refusal rather than silently winning.
+/// A panicked scan is not an empty catalogue. An empty catalogue means no
+/// packages were installed; a join failure means startup did not learn that.
+fn catalogue_from_join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, std::io::Error> {
+    joined.map_err(|err| {
+        tracing::error!("discovering domain OS packages failed: {err}");
+        std::io::Error::other(format!("discovering domain OS packages failed: {err}"))
+    })
+}
+
+/// Register package tools unless shutdown has already cancelled the token.
+/// A package the scan accepted is not published after that.
+pub(crate) fn register_discovered_module_tools(
+    catalogue: &[crate::domain::Installed],
+    cancel: &CancellationToken,
+    module_registry: &mut agent24_domain::tool::ModuleToolRegistry,
+    module_operations: &mut std::collections::HashSet<(String, String)>,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!("not registering domain OS tools: shutdown already cancelled");
+        return;
+    }
+    for entry in catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            if let Err(error) =
+                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
+            {
+                tracing::warn!(module = entry.name, %error, "module tools were refused");
+                continue;
+            }
+            module_operations.extend(
+                package
+                    .manifest
+                    .tools()
+                    .iter()
+                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
+            );
+        }
+    }
+}
+
+/// Drop tools filled before the publish point if the token has since fired.
+pub(crate) fn module_tools_if_live(
+    cancel: &CancellationToken,
+    registry: agent24_domain::tool::ModuleToolRegistry,
+    operations: std::collections::HashSet<(String, String)>,
+) -> (
+    agent24_domain::tool::ModuleToolRegistry,
+    std::collections::HashSet<(String, String)>,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!("not publishing domain OS tools: shutdown already cancelled");
+        (
+            agent24_domain::tool::ModuleToolRegistry::new(),
+            std::collections::HashSet::new(),
+        )
+    } else {
+        (registry, operations)
+    }
+}
+
 fn with_discovered(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
@@ -4061,6 +4110,23 @@ pub(crate) mod tests {
                 Err("built-in, not constructed in this test".to_owned())
             })),
         }
+    }
+
+    /// A scan thread that panics is a failed start, not an empty catalogue.
+    /// An empty catalogue is what "no packages installed" looks like.
+    #[tokio::test]
+    async fn a_panicked_package_scan_is_a_startup_error() {
+        let joined = tokio::task::spawn_blocking(|| {
+            panic!("scan blew up");
+        })
+        .await;
+        let err = super::catalogue_from_join(joined).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("discovering domain OS packages failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("panicked"), "{msg}");
     }
 
     /// A shutdown during discovery must not put the package on the catalogue.

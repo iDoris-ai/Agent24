@@ -8,11 +8,14 @@
 use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 /// Payload cap shared with component installation (`install::MAX_UNPACKED_BYTES`).
@@ -201,16 +204,117 @@ pub fn digest_reader(
             return Err(TreeError::Cancelled);
         }
         let n = reader.read(&mut buffer)?;
+        // The token can fire inside the read that returns EOF. Checking only
+        // before `read` then compares a digest the caller did not finish.
+        if cancel.is_cancelled() {
+            return Err(TreeError::Cancelled);
+        }
         if n == 0 {
             break;
         }
         size += n as u64;
         hash.update(&buffer[..n]);
+        // After a chunk is in the hasher, before the next read. Tests park
+        // here; production does not install a hook.
+        note_hash_progress();
     }
     Ok(FileDigest {
         size,
         sha256: format!("{:x}", hash.finalize()),
     })
+}
+
+static HASH_PROGRESS_ON: AtomicBool = AtomicBool::new(false);
+static HASH_PROGRESS_HELD: AtomicBool = AtomicBool::new(false);
+static HASH_PROGRESS: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+static HASH_PAUSE_PREFIX: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+thread_local! {
+    static HASH_PROGRESS_DEPTH: Cell<u32> = const { Cell::new(0) };
+}
+
+fn note_hash_progress() {
+    if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
+        return;
+    }
+    if HASH_PROGRESS_DEPTH.with(Cell::get) == 0 {
+        return;
+    }
+    let hook = HASH_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
+/// Turns the pause hook on for hashes of `root` on this thread. A hash of
+/// any other directory keeps going, so a parallel test does not take this
+/// test's handshake.
+struct HashProgressBind;
+
+impl Drop for HashProgressBind {
+    fn drop(&mut self) {
+        HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+    }
+}
+
+fn bind_hash_progress(root: &Path) -> Option<HashProgressBind> {
+    if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
+        return None;
+    }
+    let prefix = HASH_PAUSE_PREFIX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()?;
+    if !root.starts_with(&prefix) {
+        return None;
+    }
+    HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+    Some(HashProgressBind)
+}
+
+/// Parks the hasher on the next payload chunk. One test holds it at a time.
+/// Drop clears the hook. The guard is `Send` so an async test can keep it
+/// across an `.await`.
+#[doc(hidden)]
+pub struct HashProgressGuard(());
+
+impl Drop for HashProgressGuard {
+    fn drop(&mut self) {
+        *HASH_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        *HASH_PAUSE_PREFIX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        HASH_PROGRESS_ON.store(false, Ordering::Release);
+        HASH_PROGRESS_HELD.store(false, Ordering::Release);
+    }
+}
+
+/// Install `hook`, invoked after each hashed chunk of a tree under `prefix`.
+/// The hook runs on the hashing thread and must not call this again.
+#[doc(hidden)]
+pub fn install_hash_progress_hook(
+    prefix: &Path,
+    hook: Arc<dyn Fn() + Send + Sync>,
+) -> HashProgressGuard {
+    while HASH_PROGRESS_HELD
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        std::thread::yield_now();
+    }
+    *HASH_PAUSE_PREFIX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefix.to_path_buf());
+    *HASH_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    HASH_PROGRESS_ON.store(true, Ordering::Release);
+    HashProgressGuard(())
 }
 
 /// Declaration rules that do not read the tree: fixed manifest name, digest
@@ -467,6 +571,7 @@ pub fn verify_tree(
     control_files: &[&str],
     cancel: &CancellationToken,
 ) -> Result<(), TreeError> {
+    let _hash_progress = bind_hash_progress(root);
     let root_meta = fs::symlink_metadata(root.components().collect::<std::path::PathBuf>())?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TreeError::Violation(
@@ -584,6 +689,7 @@ pub fn collect_payload(
     skip_root_files: &[&str],
     cancel: &CancellationToken,
 ) -> Result<BTreeMap<String, FileDigest>, TreeError> {
+    let _hash_progress = bind_hash_progress(root);
     let root_meta = fs::symlink_metadata(root.components().collect::<std::path::PathBuf>())?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TreeError::Violation(
@@ -874,6 +980,43 @@ mod tests {
             &mut CancelMidway {
                 cancel: &cancel,
                 reads: 0,
+            },
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TreeError::Cancelled), "{err:?}");
+        let mapped = map_tree_error(err);
+        assert!(matches!(mapped, IntegrityError::Cancelled), "{mapped}");
+        assert!(!mapped.to_string().contains("hash_mismatch"), "{mapped}");
+    }
+
+    /// Cancels as the read that ends the file returns. The bytes are not the
+    /// expected digest: a hasher that treats that EOF as a finished read
+    /// returns [`TreeError::HashMismatch`] from the caller. Cancel wins.
+    struct CancelOnEof<'a> {
+        cancel: &'a CancellationToken,
+        sent: bool,
+    }
+
+    impl Read for CancelOnEof<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                self.cancel.cancel();
+                return Ok(0);
+            }
+            self.sent = true;
+            buf[0] = 0xab;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn digest_reader_cancel_on_eof_beats_a_real_hash_mismatch() {
+        let cancel = CancellationToken::new();
+        let err = digest_reader(
+            &mut CancelOnEof {
+                cancel: &cancel,
+                sent: false,
             },
             &cancel,
         )

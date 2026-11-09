@@ -1965,6 +1965,18 @@ async fn mount_package(
     if host.supervisors.is_closed() {
         return degraded(app, SHUTTING_DOWN.to_owned());
     }
+    // Scan finished and the token fired before `close()` took the list.
+    // Do not prepare a data directory, do not start a supervisor, and do
+    // not publish the proxy route. A 503 namespace would still be a route.
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
     let data_dir = manifest.data_dir_under(root);
     if let Err(why) = prepare_dir(&data_dir).await {
         return degraded(app, why);
@@ -2101,6 +2113,7 @@ async fn mount_package(
             offer,
             host.timings,
             package_check,
+            host.shutdown.clone(),
         )
         .map(|handle| Supervised {
             name: name.clone(),
@@ -3271,6 +3284,343 @@ raise SystemExit(3)
             "cancel must not look like a bad hash: {reason}"
         );
 
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// A package whose process appends one line to `executed` in its data
+    /// directory, and which declares one tool so registration is visible.
+    fn write_tooled_package(packages: &Path, name: &str) {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
+                 tools:\n  - operation: list-notes\n    description: lists notes\n    \
+                 input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
+                 output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mod.py"),
+            "import os\n\
+             open(os.path.join(os.environ['A24_DATA_DIR'], 'executed'), 'a').write('ran\\n')\n",
+        )
+        .unwrap();
+    }
+
+    fn catalogue_from_found(
+        found: Vec<agent24_os_packages::discovery::Discovered>,
+    ) -> Vec<Installed> {
+        found
+            .into_iter()
+            .map(|d| Installed {
+                name: d.manifest.name().to_owned(),
+                version: d.manifest.version().to_owned(),
+                build: Build::Package(Box::new(Package {
+                    manifest: d.manifest,
+                    dir: d.dir,
+                    digest: d.digest,
+                })),
+            })
+            .collect()
+    }
+
+    /// Scan has already accepted the package. Cancelling before the first
+    /// spawn must not register its tool, must not publish its route, and
+    /// must not run it. `supervisors.close()` is not what stops it: the
+    /// token is.
+    #[tokio::test]
+    async fn a_cancel_after_scan_registers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_tooled_package(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+        let catalogue = catalogue_from_found(scan.found);
+
+        let mut live = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut live_ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &tokio_util::sync::CancellationToken::new(),
+            &mut live,
+            &mut live_ops,
+        );
+        assert!(
+            live.get("remote.list-notes").is_some(),
+            "the tool was not registered while the token was live"
+        );
+        let (live, _) = crate::server::module_tools_if_live(
+            &tokio_util::sync::CancellationToken::new(),
+            live,
+            live_ops,
+        );
+        assert!(live.get("remote.list-notes").is_some());
+
+        shutdown.cancel();
+        let mut registry = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &shutdown,
+            &mut registry,
+            &mut ops,
+        );
+        assert!(
+            registry.is_empty(),
+            "tools were registered after the scan's token was cancelled"
+        );
+        let (published, published_ops) =
+            crate::server::module_tools_if_live(&shutdown, live, std::collections::HashSet::new());
+        assert!(
+            published.is_empty(),
+            "a filled registry was published after cancel"
+        );
+        assert!(published_ops.is_empty());
+
+        let mut host = test_host(tmp.path());
+        host.shutdown = shutdown;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("mounted after cancel: {other:?}"),
+        }
+        assert!(
+            host.supervisors.statuses().is_empty(),
+            "a supervisor was started"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        assert!(
+            !root.join("remote").join("executed").exists(),
+            "the package ran"
+        );
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// `spawn.command` is a shell marker, not this test binary. `bin/agent24d`
+    /// is a copy of `current_exe` so the manifest lists a real executable
+    /// without depending on a native-format check.
+    fn write_integrity_marker(packages: &Path, name: &str) -> std::path::PathBuf {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/mod\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("bin").join("mod"),
+            "#!/bin/sh\nprintf 'ran\\n' >> \"$A24_DATA_DIR/executed\"\nexit 3\n",
+        )
+        .unwrap();
+        std::fs::copy(
+            std::env::current_exe().unwrap(),
+            dir.join("bin").join("agent24d"),
+        )
+        .unwrap();
+        agent24_os_packages::package_integrity::generate(
+            &dir,
+            &["bin/mod".to_owned(), "bin/agent24d".to_owned()],
+        )
+        .unwrap();
+        dir
+    }
+
+    fn arm_hash_pause(
+        prefix: &std::path::Path,
+    ) -> (
+        agent24_components::integrity::HashProgressGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let once = Arc::new(AtomicBool::new(false));
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let guard = agent24_components::integrity::install_hash_progress_hook(
+            prefix,
+            Arc::new(move || {
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = entered_tx.send(());
+                if let Some(rx) = release_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
+            }),
+        );
+        (guard, entered_rx, release_tx)
+    }
+
+    /// The startup hash is already inside a file when shutdown fires.
+    /// Nothing is discovered and the marker script does not run.
+    #[tokio::test]
+    async fn a_cancel_during_startup_hash_discovers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let scan = {
+            let (_guard, entered, release) = arm_hash_pause(&dir);
+            let scan_root = packages.clone();
+            let scan_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || {
+                agent24_os_packages::discovery::scan(&scan_root, &scan_cancel)
+            });
+            tokio::task::spawn_blocking(move || {
+                entered.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await
+            .unwrap()
+            .expect("startup hash never paused");
+            cancel.cancel();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        };
+        assert!(
+            scan.found.is_empty(),
+            "discovered: {:?}",
+            scan.found
+                .iter()
+                .map(|d| d.manifest.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(scan.cancelled.iter().any(|path| path == &dir));
+        assert!(
+            scan.refused
+                .iter()
+                .all(|r| !r.why.contains("hash_mismatch")),
+            "{:?}",
+            scan.refused
+        );
+        let mut host = test_host(tmp.path());
+        host.shutdown = cancel;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue_from_found(scan.found),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert!(reports.is_empty(), "{reports:?}");
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+    }
+
+    /// Recheck is inside the payload hash, not waiting to start, when the
+    /// token fires. The crash loop must not spawn a second time.
+    #[tokio::test]
+    async fn a_cancel_during_recheck_hash_does_not_spawn_again() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_integrity_marker(&packages, "remote");
+        let mut host = test_host(tmp.path());
+        host.timings.backoff_base = std::time::Duration::from_millis(50);
+        let shutdown = host.shutdown.clone();
+        let catalogue = discovered(&packages);
+        let package_dir = packages.join("remote");
+        let (_guard, entered, release) = arm_hash_pause(&package_dir);
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (_, _, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        tokio::task::spawn_blocking(move || {
+            entered.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("recheck never reached the hash");
+        shutdown.cancel();
+        release.send(()).unwrap();
+        let mut status = host.supervisors.statuses().remove("remote").unwrap();
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::PackageChanged { .. }
+                        | agent24_os_proto::supervisor::Status::Backoff { failures: 2, .. }
+                        | agent24_os_proto::supervisor::Status::Running
+                )
+            }),
+        )
+        .await
+        .expect("never settled")
+        .unwrap()
+        .clone();
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &settled else {
+            panic!("spawned again after the hash was cancelled: {settled:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        let marker =
+            std::fs::read_to_string(root.join("remote").join("executed")).unwrap_or_default();
+        assert_eq!(marker.lines().count(), 1, "runs: {marker:?}");
         for s in host.supervisors.close().running {
             s.handle.stop().await.expect("a clean stop");
         }
