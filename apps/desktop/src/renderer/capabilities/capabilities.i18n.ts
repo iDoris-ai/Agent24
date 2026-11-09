@@ -31,6 +31,7 @@ const messages = defineMessages({
     'next.tools': 'Open Tools',
     'breadcrumb': 'Breadcrumb', 'navigation': 'Main navigation',
     'pinned': 'Pinned', 'pinMore': '+ Pin a capability',
+    'leave.unsaved': 'This page has changes that are not saved. Leave it and lose them?',
   },
   zh: {
     'group.office': '办公', 'group.knowledge': '知识', 'group.creative': '创作',
@@ -62,6 +63,7 @@ const messages = defineMessages({
     'next.tools': '打开工具',
     'breadcrumb': '面包屑', 'navigation': '主导航',
     'pinned': '已固定', 'pinMore': '+ 固定能力',
+    'leave.unsaved': '这一页有没保存的修改。离开的话，这些修改会丢掉。确定离开吗？',
   },
   th: {
     'group.office': 'สำนักงาน', 'group.knowledge': 'ความรู้', 'group.creative': 'งานสร้างสรรค์',
@@ -93,6 +95,7 @@ const messages = defineMessages({
     'next.tools': 'เปิดเครื่องมือ',
     'breadcrumb': 'เส้นทางนำทาง', 'navigation': 'การนำทางหลัก',
     'pinned': 'ปักหมุด', 'pinMore': '+ ปักหมุดความสามารถ',
+    'leave.unsaved': 'หน้านี้มีการแก้ไขที่ยังไม่ได้บันทึก ออกจากหน้านี้แล้วการแก้ไขจะหายไป ต้องการออกหรือไม่',
   },
 })
 
