@@ -34,6 +34,15 @@ pub fn verify_if_present(
     manifest: &DomainOsManifest,
     cancel: &CancellationToken,
 ) -> Result<(), IntegrityError> {
+    verify_if_present_for_arch(dir, manifest, cancel, std::env::consts::ARCH)
+}
+
+fn verify_if_present_for_arch(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+    arch: &str,
+) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
     }
@@ -50,11 +59,21 @@ pub fn verify_if_present(
             executables: declared.executables().to_vec(),
         },
         cancel,
+        arch,
     )
 }
 
 /// Strict read-only check used by `package-integrity verify`.
 pub fn verify(root: &Path) -> Result<(), IntegrityError> {
+    verify_for_arch(root, std::env::consts::ARCH)
+}
+
+/// `package-integrity verify --arch`: the release script's self-check of a
+/// package built for another CPU architecture. Discovery, recheck and
+/// installation never come through here; they always use the host
+/// architecture (`verify_if_present`).
+pub fn verify_for_arch(root: &Path, arch: &str) -> Result<(), IntegrityError> {
+    check_target_arch(arch)?;
     ensure_real_directory(root)?;
     let bytes = read_regular(&root.join(DOMAIN_OS_YML), DOMAIN_OS_YML, YAML_LIMIT)?;
     let text = std::str::from_utf8(&bytes).map_err(|_| IntegrityError::ManifestInvalid {
@@ -68,7 +87,7 @@ pub fn verify(root: &Path) -> Result<(), IntegrityError> {
         None => Err(IntegrityError::Missing),
         // One-shot CLI. The daemon passes its shutdown token through
         // `discovery::scan` / `recheck`, not through this entry.
-        Some(_) => verify_if_present(root, &manifest, &CancellationToken::new()),
+        Some(_) => verify_if_present_for_arch(root, &manifest, &CancellationToken::new(), arch),
     }
 }
 
@@ -81,18 +100,24 @@ pub fn generate(root: &Path, executables: &[String]) -> Result<(), IntegrityErro
     generate_for_arch(root, executables, std::env::consts::ARCH)
 }
 
-/// Generate for a target CPU architecture on the host OS.
-/// Verification and installation always require the host architecture.
-pub fn generate_for_arch(
-    root: &Path,
-    executables: &[String],
-    arch: &str,
-) -> Result<(), IntegrityError> {
+fn check_target_arch(arch: &str) -> Result<(), IntegrityError> {
     if !matches!(arch, "aarch64" | "x86_64") {
         return Err(IntegrityError::ManifestInvalid {
             detail: "unsupported target architecture (expected aarch64 or x86_64)".to_owned(),
         });
     }
+    Ok(())
+}
+
+/// Generate for a target CPU architecture on the host OS.
+/// Daemon-side verification (discovery and recheck) always requires the host
+/// architecture; `os install` copies the package without checking it.
+pub fn generate_for_arch(
+    root: &Path,
+    executables: &[String],
+    arch: &str,
+) -> Result<(), IntegrityError> {
+    check_target_arch(arch)?;
     if !matches!(std::env::consts::OS, "macos" | "linux" | "windows") {
         return Err(IntegrityError::ManifestInvalid {
             detail: "unsupported target OS (expected macos, linux or windows)".to_owned(),
@@ -225,6 +250,7 @@ fn verify_declared(
     spawn_command: Option<&str>,
     section: &IntegritySection,
     cancel: &CancellationToken,
+    arch: &str,
 ) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
@@ -278,7 +304,7 @@ fn verify_declared(
         ),
     )?;
     for executable in &section.executables {
-        check_native_executable(&dir.join(executable), executable)?;
+        check_native_executable_for_arch(&dir.join(executable), executable, arch)?;
     }
     Ok(())
 }
@@ -510,6 +536,7 @@ fn native_reader(reader: &mut (impl Read + Seek), platform: &str, arch: &str) ->
     }
 }
 
+#[cfg(test)]
 fn check_native_executable(path: &Path, rel_path: &str) -> Result<(), IntegrityError> {
     check_native_executable_for_arch(path, rel_path, std::env::consts::ARCH)
 }
@@ -1537,6 +1564,18 @@ mod tests {
         generate_for_arch(dir.path(), &executables, "x86_64").unwrap();
         assert!(matches!(
             verify(dir.path()),
+            Err(IntegrityError::NotNativeExecutable { .. })
+        ));
+        // The release script's explicit cross-arch self-check accepts it ...
+        verify_for_arch(dir.path(), "x86_64").unwrap();
+        // ... but the daemon's entry (discovery / recheck) has no arch
+        // parameter and keeps refusing a foreign-arch package.
+        let manifest = DomainOsManifest::from_yaml(
+            &fs::read_to_string(dir.path().join(DOMAIN_OS_YML)).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_if_present(dir.path(), &manifest, &CancellationToken::new()),
             Err(IntegrityError::NotNativeExecutable { .. })
         ));
     }

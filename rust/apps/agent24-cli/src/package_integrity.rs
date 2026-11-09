@@ -15,7 +15,7 @@ pub enum Action {
         /// 包内相对路径。可重复。必须包含 spawn.command。
         #[arg(long, required = true)]
         executable: Vec<String>,
-        /// 目标包的 CPU 架构；verify/安装时仍按本机架构检查。
+        /// 目标包的 CPU 架构；daemon 扫描与 recheck 仍按本机架构检查。
         #[arg(long, default_value = std::env::consts::ARCH, value_parser = ["aarch64", "x86_64"])]
         arch: String,
     },
@@ -23,6 +23,10 @@ pub enum Action {
     Verify {
         #[arg(long)]
         root: PathBuf,
+        /// 包的目标 CPU 架构（发布脚本自检跨架构包时用）；默认本机。
+        /// daemon 扫描与安装始终按本机架构检查，不经这里。
+        #[arg(long, default_value = std::env::consts::ARCH, value_parser = ["aarch64", "x86_64"])]
+        arch: String,
     },
 }
 
@@ -34,8 +38,9 @@ pub fn run(action: Action) -> Result<(), String> {
             arch,
         } => agent24_os_packages::package_integrity::generate_for_arch(&root, &executable, &arch)
             .map_err(|err| err.to_string()),
-        Action::Verify { root } => {
-            agent24_os_packages::package_integrity::verify(&root).map_err(|err| err.to_string())
+        Action::Verify { root, arch } => {
+            agent24_os_packages::package_integrity::verify_for_arch(&root, &arch)
+                .map_err(|err| err.to_string())
         }
     }
 }

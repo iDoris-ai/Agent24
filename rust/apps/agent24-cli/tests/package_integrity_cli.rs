@@ -125,4 +125,7 @@ fn package_integrity_cli_generates_x86_64_but_verifies_host_arch() {
             .unwrap()
             .contains("not_native_executable: bin/demo")
     );
+    // The release script's self-check of a cross-architecture package.
+    let targeted_verify = run("verify", &["--arch", "x86_64"]);
+    assert!(targeted_verify.status.success(), "{targeted_verify:?}");
 }
