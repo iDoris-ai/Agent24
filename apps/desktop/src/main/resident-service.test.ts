@@ -397,6 +397,25 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     expect(lastExitCode('x = {\n\tlast exit code = (never exited)\n\tlast terminating signal = Segmentation fault: 11\n}')).toBe(-1)
   })
 
+  it('a job that runs again keeps its last exit: not counted while it runs (PR-Daemon B5b B1)', () => {
+    expect(lastExitCode('x = {\n\tstate = running\n\tpid = 947\n\tlast exit code = 1\n}')).toBeNull()
+    expect(lastExitCode('x = {\n\tstate = running\n\tpid = 947\n\tlast terminating signal = Terminated: 15\n}')).toBeNull()
+    // A nested block that runs is not the job.
+    expect(lastExitCode('x = {\n\tstate = not running\n\tlast exit code = 1\n\tsub = {\n\t\tstate = running\n\t}\n}')).toBe(1)
+  })
+
+  it('a healthy service daemon, not enrolled for 40 s, with a stale non-zero exit: not looping (PR-Daemon B5b B1)', async () => {
+    let now = 0
+    const print = 'gui/501/ai.auraai.agent24 = {\n\tstate = running\n\tpid = 947\n\tlast terminating signal = Terminated: 15\n}'
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => false, recordPid: () => 947, lastExit: async () => lastExitCode(print),
+    })
+    await d.sample()
+    now = 40_000
+    await d.sample()
+    expect(d.looping()).toBe(false)
+  })
+
   it.each([
     ['en', 'keeps restarting'],
     ['zh', '后台服务反复重启，可能是迁移失败'],

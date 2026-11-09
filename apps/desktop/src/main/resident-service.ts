@@ -238,8 +238,10 @@ export class ServiceUpgrader {
 }
 
 /** `launchctl print`'s own `last exit code = N`; a signal that ended it counts
- * as not 0 (Codex B5b C2); null when it has not exited or says no number. */
+ * as not 0 (Codex B5b C2); null when it has not exited or says no number, and
+ * while the job runs: launchd keeps the last exit after a restart (PR-Daemon B5b B1). */
 export function lastExitCode(print: string): number | null {
+  if (/^\tstate = running$/m.test(print)) return null
   if (/^\tlast terminating signal = /m.test(print)) return -1
   const code = /^\tlast exit code = (-?\d+)/m.exec(print)?.[1]
   return code === undefined ? null : Number(code)
