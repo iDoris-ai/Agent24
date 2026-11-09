@@ -23,6 +23,7 @@ import {
   daemonCliEndpoint,
   daemonAuthMode,
   daemonConnection,
+  daemonElevation,
   onDaemonReady,
   selectedAuthMode,
   type DaemonAuthMode,
@@ -1781,6 +1782,7 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
       renew: vi.fn(async () => { n += 1; s.token = `daily-${n}`; return s.token }),
       onClose: (l: (why: EnrolError) => void) => { listeners.push(l) },
       close: vi.fn(),
+      turn: vi.fn(async (fn: (elevate: () => Promise<string>, token: string) => Promise<unknown>) => fn(async () => `grant-for-${s.token}`, s.token)),
       end: (code: string) => { for (const l of listeners.splice(0)) l(new EnrolError(code, code)) },
     }
     return s
@@ -2076,6 +2078,32 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     } finally {
       manager.stop()
     }
+  })
+
+  it('while enrolled, daemonElevation elevates on the current token connection; not once it ends or is stopped (M5 B3)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    expect(daemonElevation()).toBeNull()
+    await manager.start()
+    try {
+      const request = { method: 'POST', path: '/api/v1/shutdown', body: '', summary: 's' }
+      await expect(daemonElevation()?.(async (elevate) => elevate(request))).resolves.toBe('grant-for-daily-1')
+      expect(first.turn).toHaveBeenCalledTimes(1)
+      // Renewed: still this connection.
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      await expect(daemonElevation()?.(async (elevate) => elevate(request))).resolves.toBe('grant-for-daily-2')
+      first.end('daemon_unavailable')
+      expect(daemonElevation()).toBeNull()
+      await vi.advanceTimersByTimeAsync(5_000)
+      await expect(daemonElevation()?.(async (elevate) => elevate(request))).resolves.toBe('grant-for-again-1')
+      manager.stopDaemon()
+      expect(daemonElevation()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+    expect(daemonElevation()).toBeNull()
   })
 
   it('a steady disconnect, then start, attaches to the service daemon again instead of spawning (B3a, PR-Daemon #1726)', async () => {
