@@ -252,8 +252,14 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
       return deleteGroup(id)
     }
   }
+  // M4 A6: deleting stops the tasks still going on (history.ts), and the
+  // question says so when the list knows of some.
+  const going = (tasks: readonly { run_id: string }[]) =>
+    tasks.filter(task => ['queued', 'running', 'awaiting_approval'].includes(statuses.get(task.run_id) ?? '')).length
   const remove = (row: Row) => {
-    if (window.confirm(t('history.deleteConfirm', { title: row.title }))) return deleteConversation(row.item.id)
+    const count = going(row.item.tasks)
+    const ask = count > 0 ? t('history.deleteConfirmTasks', { title: row.title, count: String(count) }) : t('history.deleteConfirm', { title: row.title })
+    if (window.confirm(ask)) return deleteConversation(row.item.id)
   }
 
   const [menu, setMenu] = useState<Menu | null>(null)
@@ -428,7 +434,8 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
           <button type="button" className="chat-history-clear chat-history-new-group" onClick={() => setNaming({ group: null, moving: null })}>
             {t('history.group.new')}</button>
           <button type="button" className="chat-history-clear" disabled={busy} onClick={() => {
-            if (window.confirm(t('history.clearConfirm'))) void clearConversations()
+            const count = going(items.flatMap(item => item.tasks))
+            if (window.confirm(count > 0 ? t('history.clearConfirmTasks', { count: String(count) }) : t('history.clearConfirm'))) void clearConversations()
           }}>{t('history.clear')}</button>
         </>}
       </div>

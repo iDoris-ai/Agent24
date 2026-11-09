@@ -8,7 +8,7 @@ import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
 import { HandOver, TaskCards, elapsed, resetHandOversForTests } from './TaskCard'
-import { refreshHistory, resetHistoryStore, saveConversation } from './history'
+import { clearConversations, deleteConversation, refreshHistory, resetHistoryStore, saveConversation } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
 import ChatPage from '../Chat'
@@ -51,6 +51,8 @@ beforeEach(() => {
     const cancel = /^\/api\/v1\/runs\/([^/]+)\/cancel$/.exec(req.path)
     if (cancel) { runs[cancel[1]] = { ...runs[cancel[1]], status: 'cancelled', ended_at: at }; return { ok: true, status: 200, data: {} } }
     if (req.path === '/api/v1/approvals?status=pending') return { ok: true, status: 200, data: { approvals } }
+    const listed = /^\/api\/v1\/runs\?status=(\w+)$/.exec(req.path)
+    if (listed) return { ok: true, status: 200, data: { runs: Object.entries(runs).filter(([, r]) => r.status === listed[1]).map(([id, r]) => ({ id, ...r })) } }
     const id = decodeURIComponent(req.path.replace('/api/v1/runs/', ''))
     return id in runs ? { ok: true, status: 200, data: { id, ...runs[id] } } : { ok: false, status: 404, data: null }
   })
@@ -60,6 +62,7 @@ beforeEach(() => {
   bridge = {
     list: wrap(() => store.list()), get: wrap((id: string) => store.get(id)), save: wrap((r: unknown) => store.save(r)),
     promoteRun: wrap((id: string, runId: string) => store.promoteRun(id, runId)),
+    delete: wrap((id: string) => store.delete(id)), clear: wrap(() => store.clear()),
   }
   Object.defineProperty(window, 'agent24', {
     value: {
@@ -376,6 +379,59 @@ describe('a card is not part of the conversation (QA #1690 N3)', () => {
     // Nor any other request made of the conversation (its title, say).
     for (const body of chat) expect(JSON.stringify(body)).not.toContain('CARD-ANSWER')
     expect(JSON.stringify(turn)).not.toContain('已完成')
+  })
+})
+
+describe('deleting a conversation stops its tasks still going on (M4 A6, PR-Daemon #1700 L2)', () => {
+  const cancelled = () => proxy.mock.calls.map(([req]) => req.path as string).filter(path => path.endsWith('/cancel'))
+
+  it('stops the tasks of the conversation deleted, and no others', async () => {
+    store.save(record('chat_a', '周报'))
+    store.save(record('chat_b', '对账'))
+    for (const id of ['run_1', 'run_2', 'run_3', 'run_done']) store.promoteRun('chat_a', id)
+    store.promoteRun('chat_b', 'run_b')
+    runs.run_1 = { status: 'running', started_at: at }
+    runs.run_2 = { status: 'queued', started_at: at }
+    runs.run_3 = { status: 'awaiting_approval', started_at: at }
+    runs.run_done = { status: 'completed', started_at: at, ended_at: at }
+    runs.run_b = { status: 'running', started_at: at }
+    runs.run_other = { status: 'running', started_at: at }
+    await refreshHistory()
+    await deleteConversation('chat_a')
+    expect(cancelled().sort()).toEqual(['/api/v1/runs/run_1/cancel', '/api/v1/runs/run_2/cancel', '/api/v1/runs/run_3/cancel'])
+    expect(store.get('chat_a')).toBeNull()
+    expect(store.get('chat_b')).not.toBeNull()
+  })
+
+  it('stops the tasks of every conversation when all are deleted', async () => {
+    store.save(record('chat_a', '周报'))
+    store.save(record('chat_b', '对账'))
+    store.promoteRun('chat_a', 'run_1')
+    store.promoteRun('chat_b', 'run_b')
+    runs.run_1 = { status: 'running', started_at: at }
+    runs.run_b = { status: 'awaiting_approval', started_at: at }
+    runs.run_other = { status: 'running', started_at: at }
+    await refreshHistory()
+    await clearConversations()
+    expect(cancelled().sort()).toEqual(['/api/v1/runs/run_1/cancel', '/api/v1/runs/run_b/cancel'])
+    expect(store.list()).toEqual([])
+  })
+
+  it('still deletes when the daemon cannot tell which runs go on', async () => {
+    store.save(record('chat_a', '周报'))
+    store.promoteRun('chat_a', 'run_1')
+    await refreshHistory()
+    proxy.mockResolvedValue({ ok: false, status: 503, data: { error: { code: 'backend_not_ready' } } })
+    await deleteConversation('chat_a')
+    expect(cancelled()).toEqual([])
+    expect(store.get('chat_a')).toBeNull()
+  })
+
+  it('asks the daemon nothing for a conversation without tasks', async () => {
+    store.save(record('chat_a', '问'))
+    await refreshHistory()
+    await deleteConversation('chat_a')
+    expect(proxy).not.toHaveBeenCalled()
   })
 })
 

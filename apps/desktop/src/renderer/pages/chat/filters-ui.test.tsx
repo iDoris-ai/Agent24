@@ -181,3 +181,30 @@ describe('the history list\'s four filters (M4 A3)', () => {
     expect(active).toHaveAttribute('aria-pressed', 'false')
   })
 })
+
+// M4 A6: deleting stops the tasks still going on, and the question says so
+// (PR-Daemon #1700 L2).
+describe('deleting asks first, naming the tasks it stops (M4 A6)', () => {
+  const deleteFromMenu = (title: string) => {
+    fireEvent.click(within(list()).getByRole('button', { name: `对话「${title}」的操作` }))
+    fireEvent.click(within(within(list()).getByRole('menu')).getByRole('menuitem', { name: '删除…' }))
+  }
+
+  it('names the tasks still going on in a conversation to delete', async () => {
+    store.save(record('chat_a', '周报', 4))
+    store.save(record('chat_b', '日报', 3))
+    for (const id of ['run_1', 'run_2', 'run_3']) store.promoteRun('chat_a', id)
+    store.promoteRun('chat_b', 'run_b')
+    runs = { run_1: 'running', run_2: 'awaiting_approval', run_3: 'completed', run_b: 'completed' }
+    await showList()
+    await waitFor(() => expect(filter(/^进行中/)).toHaveTextContent('进行中(1)'))
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    deleteFromMenu('周报')
+    expect(confirm).toHaveBeenLastCalledWith('删除对话「周报」？其中 2 个进行中的任务会一并停止。删除后不能恢复。')
+    deleteFromMenu('日报')
+    expect(confirm).toHaveBeenLastCalledWith('删除对话「日报」？删除后不能恢复。')
+    fireEvent.click(within(list()).getByRole('button', { name: '清空' }))
+    expect(confirm).toHaveBeenLastCalledWith('删除这台电脑上保存的全部对话？2 个进行中的任务会一并停止。删除后不能恢复。')
+    expect(store.list()).toHaveLength(2)
+  })
+})

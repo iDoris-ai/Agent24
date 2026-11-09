@@ -51,7 +51,7 @@ function offersOf(list: readonly Approval[], runId: string): Offers {
     : NO_OFFERS
 }
 /** The run's pending approval, when it offers this decision. */
-function pendingOf(list: readonly Approval[], runId: string, type: 'approve' | 'deny'): Approval | null {
+function pendingOf(list: readonly Approval[], runId: string, type: string): Approval | null {
   return list.find(a => a.run_id === runId && a.available_decisions.includes(type)) ?? null
 }
 
