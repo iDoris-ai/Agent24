@@ -1201,6 +1201,15 @@ impl DomainOsManifest {
         self.integrity.as_ref()
     }
 
+    /// Compare all validated business fields, excluding packaging integrity metadata.
+    pub fn eq_ignoring_integrity(&self, other: &Self) -> bool {
+        let mut left = self.clone();
+        let mut right = other.clone();
+        left.integrity = None;
+        right.integrity = None;
+        left == right
+    }
+
     pub fn is_mountable_in_process(&self) -> bool {
         matches!(self.impl_kind, ImplKind::InProcessCrate)
     }
@@ -2986,6 +2995,24 @@ mod integrity_schema_tests {
     fn an_old_manifest_has_no_integrity_section() {
         let manifest = DomainOsManifest::from_yaml(&base()).unwrap();
         assert!(manifest.integrity().is_none());
+    }
+
+    #[test]
+    fn business_equality_excludes_only_integrity() {
+        let baseline = DomainOsManifest::from_yaml(&base()).unwrap();
+        let disk = DomainOsManifest::from_yaml(&format!(
+            "{}integrity: {{manifest: files.json, sha256: digest, files: [], executables: []}}\n",
+            base()
+        ))
+        .unwrap();
+        assert_ne!(baseline, disk);
+        assert!(baseline.eq_ignoring_integrity(&disk));
+        let mut changed = disk.clone();
+        changed.version.push_str("-changed");
+        assert!(!baseline.eq_ignoring_integrity(&changed));
+        let mut changed = disk;
+        changed.min_daemon_protocol += 1;
+        assert!(!baseline.eq_ignoring_integrity(&changed));
     }
 
     #[test]
