@@ -57,6 +57,8 @@
 - **自己的 child（宿主令牌）**：守护进程不要求 presence。弹的是审批 IPC（ApprovalDecide）自己的原生框，内容是 main 从守护进程读出的审批记录（决定、种类、摘要、run、工具参数）。
 - **服务模式**：`POST /api/v1/approvals/{id}` 是 Elevated 路由。弹的是守护进程的 presence 框，内容是 K-B3b 的 ApprovalDecision 摘要（决定范围、run、工具），grant 60 秒、只能用一次。ApprovalDecide 自己的框跳过：它和 presence 框的信息同源，第二个框只会让用户习惯不看就点。
 
+服务模式下，本地框原来显示的页面附言（reason）和警告文字不再出现（PM 11-09）。附言是页面给的文本，不混进守护进程生成的摘要；警告的意思由 presence 框的标题和按钮表达。附言仍放在请求体（`Decision{type, reason?}`）里发给守护进程。
+
 判定依据：当前连接是服务守护进程的登记（`daemonElevation()` 不为 null）。presence 连接还没连上时，守护进程回 `presence_unavailable`，审批不会生效，页面收到 403。
 
 开关只有一处：`elevated-request.ts` 的 `SKIP_APPROVAL_CONFIRM_IN_SERVICE_MODE`，默认 `true`，也就是默认只确认一次。这个开关只供诊断：改成 `false` 会回到服务模式下两个框。在真守护进程上看过 K-B3b 的摘要后，如果发现缺信息，应补进摘要，而不是回到两个框。
