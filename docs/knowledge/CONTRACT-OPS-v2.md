@@ -1,6 +1,6 @@
 # Knowledge 写操作语义契约 v2 · 规范核心（CONTRACT-OPS-v2）
 
-> **状态**：规范核心 v2 r1（2026-11-09，#1668 KB-CT-03③）。v1（2026-10-20）从未实施，本文由它升主版本而来，变更清单见 §12。仍**没有实施**：Agent24 没有写操作入口，WeKnora 集成模式只放行 ready、search、read 三条路由。实现另开任务（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11。
+> **状态**：规范核心 v2 r2（r1 2026-11-09，#1668 KB-CT-03③；r2 2026-11-09，#1670 补作者读取候选的 schema）。v1（2026-10-20）从未实施，本文由它升主版本而来，变更清单见 §12。仍**没有实施**：Agent24 没有写操作入口，WeKnora 集成模式只放行 ready、search、read 三条路由。实现另开任务（11-11 后）。条款按 READONLY r8 写成，现行 READONLY 为 r11。
 > **日期**：v1 2026-10-20；v2 2026-11-09 · **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md` r8（下称 READONLY，规则写作 R*n.m*）；`CONTRACT-STATE-v1.md`（STATE 规范核心 v1（同批），条款写作 S*n.m*）、`CONTRACT-UI-BRIDGE-v1.md`（UI-BRIDGE 规范核心 v1（同批），条款写作 U*n.m*），依赖登记在 §9· **Issue**：#1013 ③（KB-CT-03）、#1668（v2：知识条目段）。
 > 由完整版 `ab/weknora-03c-ops`（#1075 的分支）压缩而来。本文只写对外行为与不变式；实现机制交给代码与测试证明（§11）。
 
@@ -155,6 +155,7 @@
 - **W8.3** **读面隔离**：
   - 候选不出现在 search、read、文档与分块列表、wiki、标签、任何计数与聚合、ContextPack 里，只能经 `candidate.*` 读到。
   - 作者只能读自己的候选；持有 `candidate.review` 的人只能读目标 KB 在自己授予内的候选；其他情形都是 `not_found`（W1.9 ③(b)）。
+  - 作者读自己的候选（`candidate.propose` 的读取动作，W2.1）由 Provider 发出，请求只带 `request_id`、`generation` 与 `candidate_id`；响应带 `request_id`、`generation`、`authz_version` 与 `candidate`（按 `view`），不带 `details`（schema `get_request`、`get_response`，W8.14；r2）。
   - 审计不记 `title`、`body`、`note`。
 - **W8.4** **候选状态机与并发**：
   - `submitted` 转出只有三条路：`approved`（W8.5）、`returned`（W8.6、W8.7、W1.11）、`withdrawn`（W8.8）。这三个都是终态。
