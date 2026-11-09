@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatHistoryStore, onChatHistoryChange } from './chat-history'
-import { createScheduleConversations, SCHEDULE_CONVERSATIONS_FORMAT, SCHEDULE_CONVERSATIONS_VERSION } from './schedule-conversations'
+import { createScheduleConversations, MAX_HANDLED, SCHEDULE_CONVERSATIONS_FORMAT, SCHEDULE_CONVERSATIONS_VERSION } from './schedule-conversations'
 
 // M4 A5: a schedule's runs go to the schedule's conversation, against the
 // real chat history store.
@@ -108,79 +108,104 @@ describe('schedule conversations (M4 A5)', () => {
     expect(await m.record('sch_1', 'run_2')).toMatchObject({ tasks: [{ run_id: 'run_2', kind: 'schedule' }] })
   })
 
-  describe('catching up on runs started while main was not listening (Codex A5 C1)', () => {
+  describe('catching up on runs started while main was not listening (Codex A5 C1, r2)', () => {
     const file = () => JSON.parse(fs.readFileSync(path.join(dir, 'schedule-conversations.json'), 'utf8'))
-    const row = (id: string, schedule: string | null, minutesFromNow: number) =>
-      ({ id, schedule_id: schedule, created_at: new Date(Date.now() + minutesFromNow * 60_000).toISOString() })
+    let minute = 0
+    const row = (id: string, schedule: string | null) =>
+      ({ id, schedule_id: schedule, created_at: new Date(Date.UTC(2026, 10, 9, 10, minute++)).toISOString() })
+    beforeEach(() => { minute = 0 })
 
-    it('only notes the time the first time: there is nothing to catch up on yet', async () => {
-      const runs = vi.fn(async () => [row('run_old', 'sch_1', -60)])
-      await homes().catchUp(runs)
-      expect(runs).not.toHaveBeenCalled()
+    it('the first time, takes the runs there as handled and brings none of them in', async () => {
+      const m = homes()
+      await m.catchUp(async () => [row('run_old', 'sch_1'), row('run_chat', null)])
       expect(history.list()).toHaveLength(0)
-      expect(Date.parse(file().synced_at)).toBeGreaterThan(Date.now() - 5_000)
+      expect(file().handled).toEqual(['run_old'])
+      // ...and so not later either.
+      await m.catchUp(async () => [row('run_old', 'sch_1')])
+      expect(history.list()).toHaveLength(0)
     })
 
-    it('records the schedules\' runs missed since the last one heard of, oldest first, each once', async () => {
+    it('records the schedules\' runs not handled yet, oldest first, each once', async () => {
       const m = homes()
+      await m.catchUp(async () => [])
       await m.record('sch_1', 'run_1')
       // Cut off; meanwhile sch_1 runs again and a new schedule runs twice.
-      const missed = [row('run_3', 'sch_2', 2), row('run_1', 'sch_1', 0), row('run_chat', null, 1), row('run_2', 'sch_2', 1), row('run_4', 'sch_1', 3)]
+      const [r1, r2, r3, chat, r4] = [row('run_1', 'sch_1'), row('run_2', 'sch_2'), row('run_3', 'sch_2'), row('run_chat', null), row('run_4', 'sch_1')]
+      const missed = [r4, chat, r3, r1, r2]
       await m.catchUp(async () => missed)
       const [one] = history.list().filter(s => s.title === '日程：每日周报')
       const [two] = history.list().filter(s => s.title === '日程：月底对账')
       expect(history.list()).toHaveLength(2)
       expect(history.get(one.id)!.runs.map(r => r.run_id)).toEqual(['run_1', 'run_4'])
       expect(history.get(two.id)!.runs.map(r => r.run_id)).toEqual(['run_2', 'run_3'])
-      // Caught up: the same runs again add nothing.
+      expect(file().handled).toEqual(['run_1', 'run_2', 'run_3', 'run_4'])
       await m.catchUp(async () => missed)
       expect(history.get(one.id)!.runs).toHaveLength(2)
     })
 
-    it('leaves runs from before the last one heard of alone, so a deleted conversation is not brought back', async () => {
-      vi.useFakeTimers({ toFake: ['Date'] })
-      try {
-        const m = homes()
-        vi.setSystemTime(new Date('2026-11-09T10:00:00Z'))
-        await m.catchUp(async () => [])
-        // Heard of live an hour later; then the user deletes the conversation.
-        vi.setSystemTime(new Date('2026-11-09T11:00:00Z'))
-        await m.record('sch_1', 'run_1')
-        history.delete(history.list()[0].id)
-        vi.setSystemTime(new Date('2026-11-09T12:00:00Z'))
-        await m.catchUp(async () => [{ id: 'run_0', schedule_id: 'sch_1', created_at: '2026-11-09T10:30:00Z' }])
-        expect(history.list()).toHaveLength(0)
-      } finally {
-        vi.useRealTimers()
-      }
-    })
-
-    it('tries the same span again after a catch-up that could not ask the daemon', async () => {
-      vi.useFakeTimers({ toFake: ['Date'] })
-      try {
-        const m = homes()
-        vi.setSystemTime(new Date('2026-11-09T10:00:00Z'))
-        await m.catchUp(async () => [])
-        const synced = file().synced_at
-        vi.setSystemTime(new Date('2026-11-09T11:00:00Z'))
-        await expect(m.catchUp(async () => { throw new Error('runs_unavailable_503') })).rejects.toThrow('runs_unavailable_503')
-        expect(file().synced_at).toBe(synced)
-        vi.setSystemTime(new Date('2026-11-09T12:00:00Z'))
-        await m.catchUp(async () => [{ id: 'run_1', schedule_id: 'sch_1', created_at: '2026-11-09T10:30:00Z' }])
-        expect(history.list()).toHaveLength(1)
-      } finally {
-        vi.useRealTimers()
-      }
-    })
-
-    it('skips rows that are not runs', async () => {
+    it('does not bring back a conversation the user deleted, even for the run just heard of (Codex A5 r2 C1)', async () => {
       const m = homes()
       await m.catchUp(async () => [])
-      const rows = [null, 7, { id: 'run_1' }, { id: 'run 2', schedule_id: 'sch_1', created_at: new Date().toISOString() },
-        { id: 'run_3', schedule_id: 'sch_1', created_at: 'not a time' }, row('run_4', 'sch_1', 1)] as never
+      await m.record('sch_1', 'run_1')
+      history.delete(history.list()[0].id)
+      await m.catchUp(async () => [row('run_1', 'sch_1')])
+      expect(history.list()).toHaveLength(0)
+    })
+
+    it('still catches up after a failed catch-up and a run heard of meanwhile (Codex A5 r2 C2)', async () => {
+      const m = homes()
+      await m.catchUp(async () => [])
+      const missed = row('run_missed', 'sch_1')
+      await expect(m.catchUp(async () => { throw new Error('runs_unavailable_503') })).rejects.toThrow('runs_unavailable_503')
+      await m.record('sch_1', 'run_live')
+      await m.catchUp(async () => [missed, row('run_live', 'sch_1')])
+      expect(history.list()).toHaveLength(1)
+      expect(history.get(history.list()[0].id)!.runs.map(r => r.run_id).sort()).toEqual(['run_live', 'run_missed'])
+    })
+
+    it('goes on past a run it cannot record, and tries that one again next time (Codex A5 r2 C5)', async () => {
+      const failures = vi.fn()
+      const m = createScheduleConversations({ dir, history, scheduleName, title: name => `日程：${name}`, onCatchUpFailure: failures })
+      await m.catchUp(async () => [])
+      const append = vi.spyOn(history, 'appendRun')
+      append.mockImplementationOnce(() => { throw new Error('Too many chat history runs') })
+      const rows = [row('run_1', 'sch_1'), row('run_2', 'sch_2')]
+      await m.catchUp(async () => rows)
+      expect(failures).toHaveBeenCalledWith('run_1', expect.objectContaining({ message: 'Too many chat history runs' }))
+      expect(file().handled).toEqual(['run_2'])
+      append.mockRestore()
+      await m.catchUp(async () => rows)
+      expect(file().handled).toEqual(['run_2', 'run_1'])
+    })
+
+    it('compares no clock: runs whose times are off are caught up all the same (Codex A5 r2 C6)', async () => {
+      const m = homes()
+      await m.catchUp(async () => [])
+      await m.record('sch_1', 'run_1')
+      await m.catchUp(async () => [{ id: 'run_0', schedule_id: 'sch_1', created_at: '1999-01-01T00:00:00Z' }, { id: 'run_x', schedule_id: 'sch_1', created_at: 'not a time' }])
+      expect(history.get(history.list()[0].id)!.runs.map(r => r.run_id).sort()).toEqual(['run_0', 'run_1', 'run_x'])
+    })
+
+    it('skips rows that are not schedules\' runs', async () => {
+      const m = homes()
+      await m.catchUp(async () => [])
+      const rows = [null, 7, [], { id: 'run_1' }, { id: 'run 2', schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' },
+        { id: 'run_3', schedule_id: 'sch 1', created_at: '2026-11-09T10:00:00Z' }, { id: 'run_5', schedule_id: 'sch_1' }, row('run_4', 'sch_1')]
       await m.catchUp(async () => rows)
       expect(history.list()).toHaveLength(1)
       expect(history.get(history.list()[0].id)!.runs.map(r => r.run_id)).toEqual(['run_4'])
+    })
+
+    it('keeps the newest handled runs when there are too many', async () => {
+      fs.writeFileSync(path.join(dir, 'schedule-conversations.json'), JSON.stringify({
+        format: SCHEDULE_CONVERSATIONS_FORMAT, version: SCHEDULE_CONVERSATIONS_VERSION, bindings: {},
+        handled: Array.from({ length: MAX_HANDLED }, (_, i) => `run_${i}`),
+      }))
+      await homes().record('sch_1', 'run_new')
+      const handled = file().handled
+      expect(handled).toHaveLength(MAX_HANDLED)
+      expect(handled[0]).toBe('run_1')
+      expect(handled.at(-1)).toBe('run_new')
     })
   })
 })
