@@ -2118,6 +2118,7 @@ paths:
                   directions:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90Direction" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       x-external-contract: iDoris-ai/Sin90
@@ -2142,6 +2143,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Sin90Direction" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/schedule-blocks:
@@ -2162,6 +2164,7 @@ paths:
                   blocks:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       x-external-contract: iDoris-ai/Sin90
@@ -2188,6 +2191,7 @@ paths:
               schema: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/schedule-blocks/{id}:
@@ -2220,7 +2224,10 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Illegal transition
+          description: >-
+            Illegal transition. The kernel proxy may also answer 409
+            `os_package.<reason>` (`OsPackageConflict`, `retryable: false`)
+            when the mounted package fails its integrity re-check.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2244,6 +2251,7 @@ paths:
                   proposals:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90StoredProposal" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       x-external-contract: iDoris-ai/Sin90
@@ -2268,7 +2276,11 @@ paths:
                   status: { type: string, const: pending }
         "400": { $ref: "#/components/responses/BadRequest" }
         "409":
-          description: Same id already exists with different ops
+          description: >-
+            Same id already exists with different ops. The kernel proxy may
+            also answer 409 `os_package.<reason>` (`OsPackageConflict`,
+            `retryable: false`) when the mounted package fails its integrity
+            re-check.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2292,6 +2304,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Sin90StoredProposal" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/proposals/{id}/accept:
@@ -2313,7 +2326,10 @@ paths:
               schema: { $ref: "#/components/schemas/Sin90AppliedProposal" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Proposal not pending
+          description: >-
+            Proposal not pending. The kernel proxy may also answer 409
+            `os_package.<reason>` (`OsPackageConflict`, `retryable: false`)
+            when the mounted package fails its integrity re-check.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2352,6 +2368,7 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90AttentionRow" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /documents/capabilities:
@@ -2365,6 +2382,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DocumentsCapabilities" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2385,6 +2403,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DocumentList" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2405,6 +2424,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentDetail" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2441,6 +2461,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsUpload" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "422": { $ref: "#/components/responses/DocumentsUploadUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2467,7 +2488,10 @@ paths:
         still replays). For an upload still receiving, a new chunk that would
         run past `total_size` is 400 `invalid_request`. An unknown upload, or one
         24 h after its last chunk, is 404 `not_found`. A body over 768 KiB
-        is 413 `payload_too_large`.
+        is 413 `payload_too_large`. The kernel proxy may also answer 409
+        `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when
+        the mounted package fails its integrity re-check. That body is not
+        `DocumentsConflict`, which stays `upload_offset_mismatch`.
       parameters:
         - $ref: "#/components/parameters/UploadId"
         - name: Upload-Offset
@@ -2536,6 +2560,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsImportUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2559,6 +2584,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsJob" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2579,6 +2605,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsJob" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2613,6 +2640,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsJob" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2673,6 +2701,7 @@ paths:
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "413": { $ref: "#/components/responses/DocumentsTooLarge" }
         "422": { $ref: "#/components/responses/DocumentsRenderUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2714,6 +2743,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsReadUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2745,6 +2775,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsReadUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2810,6 +2841,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsExtractUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2843,6 +2875,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsExtraction" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -4588,13 +4621,27 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/DocumentsImportUnprocessableError" }
+    OsPackageConflict:
+      description: >-
+        409 from the kernel proxy when a mounted package fails its integrity
+        re-check. `error.code` is `os_package.<reason>`
+        (`integrity_manifest_missing`, `hash_mismatch`,
+        `integrity_manifest_invalid`, `signature_rejected`, or
+        `integrity_check_failed`) and `error.details.retryable` is false.
+        A re-check with no integrity code, such as shutdown cancellation,
+        stays 503 `package_changed` on the generic envelope, not this response.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/OsPackageConflictError" }
     DocumentsUnavailable:
       description: >-
         Exactly one of: the OS reports `storage_unavailable`,
         `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or
         the kernel proxy reports the module unreachable (`module_not_ready`,
-        `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists
-        which proxy codes are safe to retry.
+        `module_draining`, … in the generic envelope). An integrity failure
+        of the mounted package is not this 503: it is 409
+        `os_package.<reason>` (`OsPackageConflict`), `retryable: false`.
+        ADR-DOC-02 §6 lists which proxy codes are safe to retry.
       content:
         application/json:
           schema:
@@ -6191,7 +6238,11 @@ components:
             approval_already_resolved, provider_unavailable,
             run_not_cancellable (reserved), internal,
             admission_refused, module_panicked, module_killed,
-            module_owned_schedule, not_a_module_schedule, schedule_conflict
+            module_owned_schedule, not_a_module_schedule, schedule_conflict.
+            A proxied call whose package failed an integrity re-check uses
+            `os_package.<reason>` with HTTP 409 and `details.retryable: false`
+            (see OsPackageConflict). `package_changed` remains the 503 code
+            only when that re-check has no integrity code.
         message:
           type: string
         hint:
@@ -6392,6 +6443,26 @@ components:
             error:
               properties:
                 code: { enum: [idempotency_key_reused, upload_checksum_mismatch, unsupported_format] }
+    OsPackageConflictError:
+      description: >-
+        D6 envelope for an integrity refusal on a proxied call. HTTP 409.
+        Not the old 503 `package_changed` shape.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            error:
+              required: [code, message, details]
+              properties:
+                code:
+                  type: string
+                  pattern: "^os_package\\.(integrity_manifest_missing|hash_mismatch|integrity_manifest_invalid|signature_rejected|integrity_check_failed)$"
+                message: { type: string }
+                details:
+                  type: object
+                  required: [retryable]
+                  properties:
+                    retryable: { type: boolean, const: false }
     ModuleProxyError:
       description: >-
         An error produced by the kernel or its proxy: the generic envelope,
@@ -6402,7 +6473,11 @@ components:
         OS's `internal` always has `details.retryable: false`; a kernel
         `internal` may have no details, but an `internal` is never retryable.
         The rule holds wherever this schema is used: the 500 response and,
-        through `DocumentsUnavailable`, the 503 one.
+        through `DocumentsUnavailable`, the 503 one. An integrity refusal of
+        the mounted package is not this schema: it is 409
+        `OsPackageConflict` (`os_package.<reason>`, `retryable: false`).
+        503 `package_changed` remains only for a package change with no
+        integrity code.
       allOf:
         - $ref: "#/components/schemas/Error"
         - if: { properties: { error: { required: [code], properties: { code: { const: internal } } } } }

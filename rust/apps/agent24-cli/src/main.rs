@@ -312,8 +312,8 @@ enum OsAction {
     /// File removal works with the daemon down, same as install. If a daemon is
     /// reachable, a running module of it is also told to stop now (best-effort).
     /// If no daemon was reachable at all, a module of it still running elsewhere
-    /// keeps serving until its own next restart, which will report
-    /// `package_changed` instead of crash-looping. If a daemon WAS reachable but
+    /// keeps serving until its own next restart, which answers
+    /// 409 `os_package.<code>` instead of crash-looping. If a daemon WAS reachable but
     /// could not confirm the stop, `agent24 os list` shows why — that module will
     /// not restart on its own from this.
     Uninstall { name: String },
@@ -1646,9 +1646,9 @@ fn daemon_error_line(body: &serde_json::Value) -> String {
 
 /// Best-effort: tells an already-running daemon to stop serving `name` now,
 /// rather than leaving a healthy module to keep answering until it next
-/// happens to restart (which the daemon's own re-check then reports as
-/// `package_changed` — but only for a module that DOES eventually restart;
-/// for a long-healthy one that could be indefinite). Never starts a daemon
+/// happens to restart (which the daemon's own re-check then answers as
+/// 409 `os_package.<code>` — but only for a module that DOES eventually
+/// restart; for a long-healthy one that could be indefinite). Never starts a daemon
 /// (`attach_only`, not `connect`) and never turns into an `Err` of its own —
 /// `cmd_uninstall`'s result is decided by the removal and the consent
 /// revocation, not by this.
@@ -1657,8 +1657,8 @@ async fn hot_disable_best_effort(name: &str) {
         Ok(Some(ep)) => ep,
         Ok(None) => {
             println!(
-                "  no reachable daemon right now; a module of it running elsewhere will report \
-                 `package_changed` after its own next restart"
+                "  no reachable daemon right now; a module of it running elsewhere will answer \
+                 409 `os_package.<code>` after its own next restart"
             );
             return;
         }
@@ -1702,12 +1702,12 @@ async fn hot_disable_best_effort(name: &str) {
         }
         // Genuinely ambiguous: the request may never have reached the
         // daemon, or it may have applied the change and the response was
-        // lost. Neither "not stopped" nor "will report package_changed" can
+        // lost. Neither "not stopped" nor "will answer os_package.<code>" can
         // be asserted here — say so plainly instead of guessing.
         Err(e) => println!(
             "  could not confirm the daemon received this ({e}) — if it did not, a module of \
-             it still running there will report `package_changed` after its own next restart; \
-             if it did, that module has already been told to stop"
+             it still running there will answer 409 `os_package.<code>` after its own next \
+             restart; if it did, that module has already been told to stop"
         ),
     }
 }

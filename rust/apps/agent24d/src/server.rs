@@ -836,6 +836,14 @@ impl AppState {
             .insert(name.to_owned(), outcome);
     }
 
+    /// Drop a rescan overlay so the startup snapshot shows again.
+    pub(crate) fn clear_os_outcome(&self, name: &str) {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+    }
+
     fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
@@ -2987,7 +2995,7 @@ pub async fn serve(
         events: state.events.clone(),
         timings: state.timings.clone(),
     };
-    let (module_routes, mut reports, partitions) = crate::domain::mount_all(
+    let (module_routes, mut reports, partitions) = crate::domain::mount_all_with_refusals(
         &catalogue,
         &os_root,
         &state.events,
@@ -2996,6 +3004,7 @@ pub async fn serve(
         lease.as_ref(),
         host.as_ref().map_err(String::as_str),
         &state.module_approval_broker,
+        &integrity_refusals,
         crate::domain::CallbackDeps {
             scheduler: state.scheduler.clone(),
             // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
