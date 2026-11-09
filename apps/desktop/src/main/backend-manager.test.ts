@@ -825,6 +825,14 @@ describe('fetchDaemonHealth', () => {
     })
   })
 
+  it("reads /health's version when it is a string (M5 B5)", async () => {
+    const body = (version: unknown) => vi.fn(async () => Response.json({ protocol_version: 1, version }))
+    vi.stubGlobal('fetch', body('0.6.0'))
+    await expect(fetchDaemonHealth({ port: 5555, token: 'tok' })).resolves.toEqual({ ok: true, protocolVersion: 1, version: '0.6.0' })
+    vi.stubGlobal('fetch', body(6))
+    await expect(fetchDaemonHealth({ port: 5555, token: 'tok' })).resolves.toEqual({ ok: true, protocolVersion: 1, version: null })
+  })
+
   it('treats a network failure as absent', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => {
       throw new Error('connect ECONNREFUSED')
@@ -2075,6 +2083,45 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
       expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
       manager.stopDaemon()
       expect(manager.presenceTarget()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it("while enrolled, the service daemon's /health version; null once the connection ends (M5 B5)", async () => {
+    const s = session('daily-1')
+    const fetchHealth = vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION, version: '0.5.9' })
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), fetchHealth }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.serviceDaemonVersion()).toBe('0.5.9')
+      s.end('daemon_unavailable')
+      expect(manager.serviceDaemonVersion()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('while the service daemon restarts, nothing is spawned over it; afterwards it is enrolled with again (M5 B5)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    let alive = true
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, isAlive: () => alive }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      await manager.whileServiceRestarts(async () => {
+        alive = false
+        first.end('daemon_unavailable')
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(spawnProcess).not.toHaveBeenCalled()
+        alive = true
+      })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
     } finally {
       manager.stop()
     }
