@@ -172,23 +172,43 @@ fn exit_stub_bytes() -> Result<Vec<u8>, String> {
     .clone()
 }
 
+/// The launcher runs with the package directory as its cwd, so the path baked
+/// into it must be absolute; and like a shell's PATH search, a non-executable
+/// file earlier on PATH does not hide a usable one later.
 fn resolve_program(name: &str) -> Result<PathBuf, String> {
     let path = Path::new(name);
     let bare = path.components().count() == 1 && !name.contains('/') && !name.contains('\\');
+    let absolute = |candidate: &Path| {
+        std::path::absolute(candidate)
+            .map_err(|err| format!("absolute path of {}: {err}", candidate.display()))
+    };
     if !bare {
-        if path.is_file() {
-            return Ok(path.to_path_buf());
+        if is_executable(path) {
+            return absolute(path);
         }
         return Err(format!("interpreter not found: {name}"));
     }
     let paths = std::env::var_os("PATH").ok_or_else(|| "PATH is unset".to_owned())?;
     for dir in std::env::split_paths(&paths) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Ok(candidate);
+        if is_executable(&candidate) {
+            return absolute(&candidate);
         }
     }
     Err(format!("interpreter {name} is not on PATH"))
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path)
+            .is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        path.is_file()
+    }
 }
 
 fn c_quote(value: &str) -> Result<String, String> {
