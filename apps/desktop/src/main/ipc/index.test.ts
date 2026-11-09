@@ -113,10 +113,12 @@ vi.mock('node:child_process', async (orig) => ({
 }))
 
 const endpoint = { port: 0, token: 'daemon-secret' }
+const elevation: { current: ((r: { method: string; path: string; body: string; summary: string }, use: (grant: string) => Promise<unknown>) => Promise<unknown>) | null } = { current: null }
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: endpoint.port }),
   daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
   daemonCliEndpoint: () => ({ port: endpoint.port, token: endpoint.token }),
+  daemonElevation: () => elevation.current,
 }))
 
 import { IpcChannels } from '../../shared/ipc-types'
@@ -144,6 +146,9 @@ let identityListHasDefault = true
 let identityListFails = false
 // what GET /api/v1/comm/relay answers
 let currentRelays: { relays: string[]; configured: boolean } = { relays: [], configured: false }
+// M5 B3: POST /api/v1/schedules needs a grant, as an Elevated route does for a daily token.
+let presenceGate = false
+let elevationHeaders: (string | undefined)[] = []
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
@@ -152,7 +157,14 @@ beforeAll(async () => {
     req.on('end', () => {
       if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached') && !(req.method === 'GET' && req.url === '/api/v1/comm/relay')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
-      if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
+      if (presenceGate && req.method === 'POST' && req.url === '/api/v1/schedules') {
+        const grant = req.headers['x-agent24-elevation']
+        elevationHeaders.push(typeof grant === 'string' ? grant : undefined)
+        if (grant !== 'grant-1') {
+          res.statusCode = 403
+          res.end(JSON.stringify({ error: { code: 'presence_required', message: 'Presence confirmation required' } }))
+        } else res.end(JSON.stringify({ id: 'sch_1' }))
+      } else if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
         res.end(JSON.stringify({ error: 'unauthorized' }))
       } else if (req.url === '/v1/models' && reflectAuthAsModel) {
@@ -257,6 +269,9 @@ afterAll(() => {
 })
 
 beforeEach(() => {
+  presenceGate = false
+  elevationHeaders = []
+  elevation.current = null
   modelsRequireKey = null
   reflectAuthAsModel = false
   reflectedKeyEncoding = null
@@ -321,6 +336,25 @@ describe('A1 backendProxy allowlist', () => {
     expect(res.status).toBe(403)
     expect(res.data.error.code).toBe('forbidden')
     expect(seen).toHaveLength(0)
+  })
+
+  it('service mode: an elevated write is confirmed on the enrolment once, then retried with the grant (M5 B3)', async () => {
+    presenceGate = true
+    const asked: { method: string; path: string; body: string }[] = []
+    elevation.current = async (r, use) => { asked.push({ method: r.method, path: r.path, body: r.body }); return use('grant-1') }
+    const body = { name: 'daily', cron: '0 9 * * *' }
+    const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body })
+    expect(res).toMatchObject({ ok: true, status: 200, data: { id: 'sch_1' } })
+    expect(asked).toEqual([{ method: 'POST', path: '/api/v1/schedules', body: JSON.stringify(body) }])
+    expect(elevationHeaders).toEqual([undefined, 'grant-1'])
+    expect(seen.map((s) => s.body)).toEqual([JSON.stringify(body), JSON.stringify(body)])
+  })
+
+  it('with our own child (no enrolment) the 403 comes back as it is and nothing is retried (M5 B3)', async () => {
+    presenceGate = true
+    const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body: { name: 'x' } })
+    expect(res).toMatchObject({ ok: false, status: 403, data: { error: { code: 'presence_required' } } })
+    expect(elevationHeaders).toEqual([undefined])
   })
 
   it('forwards an allowed read with the daemon bearer token', async () => {

@@ -10,8 +10,9 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
-import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
-import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint } from '../backend-manager'
+import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import { sendElevating } from '../elevated-request'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
@@ -223,12 +224,12 @@ async function documentsOsEntry(timeoutMs?: number): Promise<{ name?: unknown; e
 function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<BackendProxyResponse> {
   // Port and credential come from the backend's ready line (dynamic port +
   // token for agent24d; fixed 8765 and no credential for the node mock).
-  // Without a usable credential nothing is sent.
-  const conn = daemonConnection()
-  if (!conn) {
-    return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)'))
-  }
-  return proxyRequest(conn, req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
+  // Without a usable credential nothing is sent. With the service daemon an
+  // elevated route is confirmed once and retried (M5 B3, elevated-request.ts).
+  return sendElevating(req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) }, {
+    connection: daemonConnection,
+    elevation: daemonElevation,
+  })
 }
 
 function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {

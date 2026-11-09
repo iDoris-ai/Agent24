@@ -126,6 +126,7 @@ vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: h.endpoint.port }),
   daemonConnection: () => ({ port: h.endpoint.port, authHeaders: { Authorization: `Bearer ${h.endpoint.token}` } }),
   daemonCliEndpoint: () => ({ port: h.endpoint.port, token: h.endpoint.token }),
+  daemonElevation: () => null,
 }))
 
 import { IpcChannels } from '../../shared/ipc-types'
