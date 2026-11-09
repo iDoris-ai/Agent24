@@ -234,6 +234,9 @@ const api = {
     },
     answer: (id: string, confirmed: boolean): Promise<void> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeViewAnswer, id, confirmed),
+    /** M4 A7: dialog `id` is up; `activeId` is the conversation open in the main window, or null. */
+    shown: (id: string, activeId: string | null): Promise<void> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewShown, id, activeId),
   },
   // KB-C2-04b-2 (U7.2): draft attachments the user confirmed into this chat.
   knowledgeDraft: {

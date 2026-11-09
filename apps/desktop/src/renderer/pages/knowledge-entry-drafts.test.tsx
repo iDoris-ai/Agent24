@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
-import { StrictMode } from 'react'
+import { StrictMode, useContext } from 'react'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { KnowledgeEntryDraftSummary, KnowledgeEntryDraftView, KnowledgeEntryFinding, KnowledgeEntryModelOutcome } from '../../shared/ipc-types'
+import { CapabilitiesProvider, useCapabilityRoute } from '../capabilities/providers'
+import { CapabilitiesContext } from '../capabilities/types'
 import { setLocale } from '../i18n'
 import {
   KnowledgeEntryDraftsBar,
@@ -447,3 +449,39 @@ describe('one draft', () => {
   })
 })
 
+describe('M4 A7: leaving the page with unsaved edits', () => {
+  function Pages(): JSX.Element {
+    const { route } = useCapabilityRoute()
+    const { open } = useContext(CapabilitiesContext)
+    return <>
+      <Frame />
+      <button onClick={() => open('documents', 'switcher')}>documents</button>
+      <output aria-label="Route">{route.kind === 'page' ? route.page : route.id}</output>
+    </>
+  }
+
+  it('asks once, in the draft panel\'s words, and stays on no; no edits, no question', async () => {
+    Object.defineProperty(window, 'agent24', {
+      configurable: true,
+      value: { knowledgeEntry: { listDrafts, getDraft, updateDraft, redactDraft, withdrawDraft }, backendProxy: vi.fn().mockResolvedValue({ ok: false }) },
+    })
+    const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+    confirmSpy = confirm
+    render(<CapabilitiesProvider><Pages /></CapabilitiesProvider>)
+    await shown(view())
+    const go = () => fireEvent.click(screen.getByRole('button', { name: 'documents' }))
+    const at = () => screen.getByLabelText('Route').textContent
+    const before = at()
+
+    fireEvent.change(screen.getByLabelText('标题'), { target: { value: '甲改' } })
+    go()
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(confirm).toHaveBeenCalledWith('有未保存的修改，确定放弃？')
+    expect(at()).toBe(before)
+
+    fireEvent.change(screen.getByLabelText('标题'), { target: { value: '甲' } })
+    go()
+    expect(confirm).toHaveBeenCalledTimes(1)
+    expect(at()).toBe('documents')
+  })
+})

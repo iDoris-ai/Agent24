@@ -453,6 +453,60 @@ describe('the drafts as the Knowledge page sees them', () => {
     expect(broken.list()).toEqual([])
   })
 
+  it('M4 A7: a created draft waits in its conversation, and withdrawing it clears that', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    const d = await one(s)
+    expect(pending.set).toHaveBeenCalledTimes(1)
+    expect(pending.set).toHaveBeenCalledWith('chat_abc', d.id, d.title)
+    expect(pending.clear).not.toHaveBeenCalled()
+    expect(s.drafts.withdraw(d.id)).toBe(true)
+    expect(pending.clear).toHaveBeenCalledTimes(1)
+    expect(pending.clear).toHaveBeenCalledWith('chat_abc', d.id)
+    // Nothing withdrawn: nothing cleared.
+    expect(s.drafts.withdraw(d.id)).toBe(false)
+    expect(pending.clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('M4 A7: a withdraw that fails leaves the draft waiting', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    const d = await one(s)
+    for (const withdraw of [() => false, () => { throw new Error('io') }]) {
+      const stuck = knowledgeEntryDrafts({ store: { ...s.store, get: s.store.get, withdraw }, chat: vi.fn(), target: () => TARGET, locale: () => 'zh', pending })
+      expect(stuck.withdraw(d.id)).toBe(false)
+    }
+    expect(s.drafts.get(d.id)).not.toBeNull()
+    expect(pending.clear).not.toHaveBeenCalled()
+  })
+
+  it('M4 A7: an edited or redacted title replaces the waiting item\'s label (Codex C1)', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending, chat: async () => modelDraft({ kind: 'faq', title: '找 dave@example.com', body: '打开人事系统提交。', hints: [] }) })
+    const d = await one(s)
+    expect(pending.set).toHaveBeenLastCalledWith('chat_abc', d.id, '找 dave@example.com')
+    const redacted = s.drafts.redact(d.id)
+    expect(redacted.ok).toBe(true)
+    const [, , label] = pending.set.mock.calls.at(-1)!
+    expect(label).not.toContain('dave@example.com')
+    expect(label).toBe(redacted.ok ? redacted.draft.title : '')
+    expect(s.drafts.update(d.id, { kind: 'faq', title: '请假流程', body: '打开人事系统提交。' }).ok).toBe(true)
+    expect(pending.set).toHaveBeenLastCalledWith('chat_abc', d.id, '请假流程')
+    // A refused edit leaves the label alone.
+    const calls = pending.set.mock.calls.length
+    expect(s.drafts.update(d.id, { kind: 'nope', title: '', body: '' }).ok).toBe(false)
+    expect(pending.set).toHaveBeenCalledTimes(calls)
+  })
+
+  it('M4 A7: a create that fails writes no pending item', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    s.retarget(null)
+    const out = await s.drafts.create(sender(1), s.drafts.issue(secretive(), 1), { from: 0, to: 1 })
+    expect(out).toEqual({ ok: false, reason: 'knowledge_off' })
+    expect(pending.set).not.toHaveBeenCalled()
+  })
+
   it('never hands the renderer a draft’s binding', async () => {
     const s = drafting()
     const d = await one(s)

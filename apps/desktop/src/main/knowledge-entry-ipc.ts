@@ -38,6 +38,7 @@ import { clearFindings, extractEntry, fallbackTitle, findings, SourceTooLong, so
 import { REDACTION_RULES_VERSION } from './knowledge-entry-redact'
 import { clipUnits, ENTRY_SKILL_VERSION } from './knowledge-entry-skill'
 import type { MainLocale } from './main-i18n'
+import type { KnowledgePending } from './knowledge-pending'
 
 /** The longest title the dialog shows before cutting it short. */
 const TITLE_CHARS = 60
@@ -149,6 +150,8 @@ export interface KnowledgeEntryDraftDeps {
   target: () => string | null
   locale: () => MainLocale
   now?: () => number
+  /** M4 A7: a draft waits in the conversation it came from until it is withdrawn; none without it. */
+  pending?: KnowledgePending
 }
 
 /** How long a ticket stays good: long enough to choose a range. */
@@ -223,11 +226,15 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
   }
 
   const saved = (run: () => EntryDraft): KnowledgeEntryDraftSaved => {
+    let draft: EntryDraft
     try {
-      return { ok: true, draft: view(run()) }
+      draft = run()
     } catch {
       return { ok: false, reason: 'invalid' }
     }
+    // M4 A7: the waiting item shows the title as it now is (an edit, or one-click redaction).
+    deps.pending?.set(draft.source.conversation_id, draft.id, draft.title)
+    return { ok: true, draft: view(draft) }
   }
 
   const changeable = (id: unknown): EntryDraft | 'not_found' | 'not_saved' => {
@@ -285,6 +292,7 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
         } catch {
           return { ok: false, reason: 'not_saved' }
         }
+        deps.pending?.set(draft.source.conversation_id, draft.id, draft.title)
         // Hints are only words of the body already (parseModelDraft), and the store keeps the body as given.
         return { ok: true, draft: view(draft), model: extraction.model, hints: extraction.hints }
       } finally {
@@ -331,8 +339,17 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
     },
 
     withdraw(id: unknown): boolean {
+      // A draft that cannot be read is still withdrawn; only its pending item is left.
+      let draft: EntryDraft | null = null
       try {
-        return deps.store.withdraw(id)
+        draft = deps.store.get(id)
+      } catch {
+        draft = null
+      }
+      try {
+        const withdrawn = deps.store.withdraw(id)
+        if (withdrawn && draft) deps.pending?.clear(draft.source.conversation_id, draft.id)
+        return withdrawn
       } catch {
         return false
       }
