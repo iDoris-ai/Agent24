@@ -160,6 +160,21 @@ export function knowledgeEntrySubmission(deps: KnowledgeEntrySubmitDeps) {
     return serverFailure(id, draft, result)
   }
 
+  /**
+   * One submit, status or retract per draft at a time (PR-Daemon #1762 N3):
+   * status reads the candidate before its round trip and writes after it, so a
+   * retract settling in between would be overwritten with the older state.
+   */
+  const exclusive = async (id: string, run: () => Promise<SubmissionAnswer>): Promise<SubmissionAnswer> => {
+    if (busy.has(id)) return { ok: false, reason: 'busy' }
+    busy.add(id)
+    try {
+      return await run()
+    } finally {
+      busy.delete(id)
+    }
+  }
+
   return {
     view(id: string, draft: EntryDraft | null): SubmissionView {
       return view(id, draft)
@@ -231,56 +246,60 @@ export function knowledgeEntrySubmission(deps: KnowledgeEntrySubmitDeps) {
     async status(id: unknown, signal: AbortSignal = new AbortController().signal): Promise<SubmissionAnswer> {
       const draft = draftOf(id)
       if (!draft) return { ok: false, reason: 'not_found' }
-      const record = recordOf(draft.id)
-      if (record === 'unreadable') return { ok: false, reason: 'local_storage' }
-      const candidate = record?.candidate
-      if (!candidate) return { ok: true, submission: view(draft.id, draft) }
-      const gate = bound(draft)
-      if ('ok' in gate) return gate
-      const { provider, target } = gate
-      const got = await getCandidate(provider.deps, provider.generation, candidate.candidate_id, signal)
-      if (!stillCurrent(provider, target)) return dropped(draft.id, draft, false)
-      if (!got.ok) return serverFailure(draft.id, draft, got)
-      try {
-        deps.candidates.updateCandidate(draft.id, {
-          ...candidate,
-          status: got.view.status,
-          return_reason: got.view.returnReason,
-          note: got.view.note,
-          checked_at: now().toISOString(),
-        })
-      } catch {
-        return { ok: false, reason: 'local_storage', submission: view(draft.id, draft) }
-      }
-      return { ok: true, submission: view(draft.id, draft) }
+      return exclusive(draft.id, async () => {
+        const record = recordOf(draft.id)
+        if (record === 'unreadable') return { ok: false, reason: 'local_storage' }
+        const candidate = record?.candidate
+        if (!candidate) return { ok: true, submission: view(draft.id, draft) }
+        const gate = bound(draft)
+        if ('ok' in gate) return gate
+        const { provider, target } = gate
+        const got = await getCandidate(provider.deps, provider.generation, candidate.candidate_id, signal)
+        if (!stillCurrent(provider, target)) return dropped(draft.id, draft, false)
+        if (!got.ok) return serverFailure(draft.id, draft, got)
+        try {
+          deps.candidates.updateCandidate(draft.id, {
+            ...candidate,
+            status: got.view.status,
+            return_reason: got.view.returnReason,
+            note: got.view.note,
+            checked_at: now().toISOString(),
+          })
+        } catch {
+          return { ok: false, reason: 'local_storage', submission: view(draft.id, draft) }
+        }
+        return { ok: true, submission: view(draft.id, draft) }
+      })
     },
 
     /** W8.8: withdraw a `submitted` candidate. The local draft stays. */
     async retract(id: unknown, signal: AbortSignal = new AbortController().signal): Promise<SubmissionAnswer> {
       const draft = draftOf(id)
       if (!draft) return { ok: false, reason: 'not_found' }
-      const record = recordOf(draft.id)
-      if (record === 'unreadable') return { ok: false, reason: 'local_storage' }
-      const candidate = record?.candidate
-      if (!candidate || candidate.status !== 'submitted') return { ok: false, reason: 'not_found', submission: view(draft.id, draft) }
-      const gate = bound(draft)
-      if ('ok' in gate) return gate
-      const { provider, target } = gate
-      // W1.4: withdraw creates no work, so only a disabled key refuses it locally.
-      const admitted = await candidateAdmission(provider.deps, provider.generation, signal, false)
-      if (!admitted.ok) return serverFailure(draft.id, draft, admitted)
-      // Judged again after the ready round trip.
-      if (!stillCurrent(provider, target)) return dropped(draft.id, draft, false)
-      const done = await withdrawCandidate(provider.deps, provider.generation, candidate.candidate_id, signal)
-      // W8.8 is idempotent: a dropped answer is read back by status or withdrawn again.
-      if (!stillCurrent(provider, target)) return dropped(draft.id, draft, true)
-      if (!done.ok) return serverFailure(draft.id, draft, done)
-      try {
-        deps.candidates.updateCandidate(draft.id, { ...candidate, status: 'withdrawn', checked_at: now().toISOString() })
-      } catch {
-        return { ok: false, reason: 'local_storage', submission: view(draft.id, draft) }
-      }
-      return { ok: true, submission: view(draft.id, draft) }
+      return exclusive(draft.id, async () => {
+        const record = recordOf(draft.id)
+        if (record === 'unreadable') return { ok: false, reason: 'local_storage' }
+        const candidate = record?.candidate
+        if (!candidate || candidate.status !== 'submitted') return { ok: false, reason: 'not_found', submission: view(draft.id, draft) }
+        const gate = bound(draft)
+        if ('ok' in gate) return gate
+        const { provider, target } = gate
+        // W1.4: withdraw creates no work, so only a disabled key refuses it locally.
+        const admitted = await candidateAdmission(provider.deps, provider.generation, signal, false)
+        if (!admitted.ok) return serverFailure(draft.id, draft, admitted)
+        // Judged again after the ready round trip.
+        if (!stillCurrent(provider, target)) return dropped(draft.id, draft, false)
+        const done = await withdrawCandidate(provider.deps, provider.generation, candidate.candidate_id, signal)
+        // W8.8 is idempotent: a dropped answer is read back by status or withdrawn again.
+        if (!stillCurrent(provider, target)) return dropped(draft.id, draft, true)
+        if (!done.ok) return serverFailure(draft.id, draft, done)
+        try {
+          deps.candidates.updateCandidate(draft.id, { ...candidate, status: 'withdrawn', checked_at: now().toISOString() })
+        } catch {
+          return { ok: false, reason: 'local_storage', submission: view(draft.id, draft) }
+        }
+        return { ok: true, submission: view(draft.id, draft) }
+      })
     },
   }
 }

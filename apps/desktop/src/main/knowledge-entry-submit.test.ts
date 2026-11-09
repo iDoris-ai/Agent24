@@ -29,7 +29,7 @@ function withoutRequestId(body: Record<string, unknown>): Record<string, unknown
 }
 
 /** A fake WeKnora with S2's three routes and ready. */
-function server(opts: { candidate?: string; submit?: (c: Call) => Response | 'throw'; status?: string; onReady?: () => void } = {}) {
+function server(opts: { candidate?: string; submit?: (c: Call) => Response | 'throw'; status?: string; onReady?: () => void; statusHeld?: Promise<void> } = {}) {
   const calls: Call[] = []
   let ids = 0
   let key: string | null = KEY
@@ -53,6 +53,7 @@ function server(opts: { candidate?: string; submit?: (c: Call) => Response | 'th
         return ok(c, { candidate_id: 'cand-1', status: 'submitted', content_sha256: c.body.content_sha256, submitted_at: '2026-11-09T08:30:00Z' })
       }
       if (c.path === 'candidates/get') {
+        await opts.statusHeld
         return ok(c, { candidate: { candidate_id: c.body.candidate_id, status: opts.status ?? 'returned', kind: 'sop', content_sha256: 'x'.repeat(64).replace(/x/g, 'a'), target_knowledge_base_id: 'kb-2', mode: 'create', return_reason: 'reviewer', note: 'Add the form.', submitted_at: '2026-11-09T08:30:00Z', updated_at: '2026-11-09T09:00:00Z' } })
       }
       if (c.path === 'candidates/withdraw') return ok(c, { candidate_id: c.body.candidate_id, status: 'withdrawn' })
@@ -351,6 +352,24 @@ describe('the identity a pending write goes under (Codex H1 C1, C2, C4, C10)', (
 })
 
 describe('status and withdrawing the submission (W8.3, W8.8, HS6)', () => {
+  it('a status in flight keeps a withdraw of the same draft out, so it cannot overwrite the result (PR-Daemon #1762 N3)', async () => {
+    let release: () => void = () => {}
+    const held = new Promise<void>((resolve) => { release = resolve })
+    const t = setup({ status: 'submitted', statusHeld: held })
+    const d = t.draft()
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: true })
+    const reading = t.submission.status(d.id)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(await t.submission.retract(d.id)).toEqual({ ok: false, reason: 'busy' })
+    expect(await t.submission.submit(d.id, 'kb-2')).toEqual({ ok: false, reason: 'busy' })
+    release()
+    expect(await reading).toMatchObject({ ok: true, submission: { candidate: { status: 'submitted' } } })
+    expect(t.fake.writes().filter((c) => c.path === 'candidates/withdraw')).toHaveLength(0)
+    // Once it is over, the withdraw goes through and nothing writes the older state back.
+    expect(await t.submission.retract(d.id)).toMatchObject({ ok: true, submission: { candidate: { status: 'withdrawn' } } })
+    expect(t.candidates.get(d.id)?.candidate?.status).toBe('withdrawn')
+  })
+
   it('status reads the state, the return reason and the note back', async () => {
     const t = setup({ status: 'returned' })
     const d = t.draft()
