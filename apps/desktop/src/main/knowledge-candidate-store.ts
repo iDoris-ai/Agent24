@@ -5,8 +5,11 @@
 //   and its idempotency key are written to disk BEFORE the request goes out,
 //   and only a definite answer clears them. A retry, after a timeout or a
 //   restart, resends the same key and the same body, within the same binding,
-//   and never under a new key. Past RESEND_WINDOW_MS, or once the binding has
-//   changed, it is not resent: the outcome stays unknown and the user checks.
+//   and never under a new key. Past RESEND_WINDOW_MS, or once the binding or
+//   the credential has changed (W1.5's identity tuple: the idempotency scope
+//   is per principal, W3.2), it is not resent: the outcome stays unknown and
+//   the user checks. The credential is kept only as an HMAC under the local
+//   key below, never as itself.
 // - The candidate the server accepted, and the last state read back (W8.3).
 // - session_ref (W8.2): HMAC-SHA256 under a random key kept only on this
 //   machine (0600), so the server gets an opaque, stable reference it cannot
@@ -36,6 +39,8 @@ export interface PendingSubmit {
   idempotency_key: string
   /** `binding` at the moment the record was made: a resend only goes to the same one. */
   binding: string
+  /** HMAC of the credential it was sent with: a resend only goes under the same one. */
+  credential_ref: string
   body: SubmitBody
   created_at: string
 }
@@ -107,7 +112,8 @@ function parsePending(v: unknown): PendingSubmit | null | undefined {
   const body = parseBody(v.body)
   if (body === null || v.idempotency_key !== body.idempotency_key) return undefined
   if (!isText(v.binding, 2048) || !isUtc(v.created_at)) return undefined
-  return { idempotency_key: body.idempotency_key, binding: v.binding, body, created_at: v.created_at }
+  if (typeof v.credential_ref !== 'string' || !SHA256.test(v.credential_ref)) return undefined
+  return { idempotency_key: body.idempotency_key, binding: v.binding, credential_ref: v.credential_ref, body, created_at: v.created_at }
 }
 
 function parseCandidate(v: unknown): CandidateState | null | undefined {
@@ -218,14 +224,20 @@ export function createCandidateStore(dir: string, now: () => Date = () => new Da
       return createHmac('sha256', sessionKey()).update(`agent24-session-ref-v1\n${conversationId}`, 'utf8').digest('hex')
     },
 
+    /** Which credential a pending write went under, without keeping the credential. */
+    credentialRef(credential: string): string {
+      return createHmac('sha256', sessionKey()).update(`agent24-credential-ref-v1\n${credential}`, 'utf8').digest('hex')
+    },
+
     /**
      * Persist the pending write before sending (W1.5). A failure to persist
      * throws, and then nothing is sent.
      */
-    beginSubmit(draftId: string, binding: string, body: SubmitBody): PendingSubmit {
+    beginSubmit(draftId: string, binding: string, credentialRef: string, body: SubmitBody): PendingSubmit {
       const record = read(draftId)
       if (record?.pending) throw new Error('A submission is already pending')
-      const pending: PendingSubmit = { idempotency_key: body.idempotency_key, binding, body, created_at: now().toISOString() }
+      if (!SHA256.test(credentialRef)) throw new Error('Invalid credential reference')
+      const pending: PendingSubmit = { idempotency_key: body.idempotency_key, binding, credential_ref: credentialRef, body, created_at: now().toISOString() }
       write({
         format: CANDIDATE_RECORD_FORMAT,
         version: CANDIDATE_RECORD_VERSION,
@@ -237,11 +249,11 @@ export function createCandidateStore(dir: string, now: () => Date = () => new Da
     },
 
     /**
-     * Whether a pending write may be resent now (W1.5): same binding, inside
-     * the window. Otherwise it stays pending and unknown.
+     * Whether a pending write may be resent now (W1.5): same binding, same
+     * credential, inside the window. Otherwise it stays pending and unknown.
      */
-    resendable(pending: PendingSubmit, binding: string): boolean {
-      if (pending.binding !== binding) return false
+    resendable(pending: PendingSubmit, binding: string, credentialRef: string | null): boolean {
+      if (pending.binding !== binding || pending.credential_ref !== credentialRef) return false
       return now().getTime() - Date.parse(pending.created_at) < RESEND_WINDOW_MS
     },
 

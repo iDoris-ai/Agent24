@@ -29,20 +29,22 @@ function withoutRequestId(body: Record<string, unknown>): Record<string, unknown
 }
 
 /** A fake WeKnora with S2's three routes and ready. */
-function server(opts: { candidate?: string; submit?: (c: Call) => Response | 'throw'; status?: string } = {}) {
+function server(opts: { candidate?: string; submit?: (c: Call) => Response | 'throw'; status?: string; onReady?: () => void } = {}) {
   const calls: Call[] = []
   let ids = 0
+  let key: string | null = KEY
   const ok = (c: Call, rest: Record<string, unknown>) =>
     new Response(JSON.stringify({ request_id: c.body.request_id, generation: c.body.generation, authz_version: AUTHZ, ...rest }), { status: 200 })
   const deps: CandidateDeps = {
     origin: 'https://kb.example',
-    credential: () => KEY,
+    credential: () => key,
     newRequestId: () => `req-${++ids}`,
     fetch: async (url, init) => {
       const c = { path: url.replace('https://kb.example/api/v1/agent24/knowledge/', ''), body: JSON.parse(String(init.body)) as Record<string, unknown> }
       calls.push(c)
       if (c.path === 'ready') {
-        return new Response(JSON.stringify({ request_id: c.body.request_id, live: true, operations: { candidate: { state: opts.candidate ?? 'ready' } } }), { status: 200 })
+        opts.onReady?.()
+        return new Response(JSON.stringify({ request_id: c.body.request_id, generation: c.body.generation, live: true, operations: { candidate: { state: opts.candidate ?? 'ready' } } }), { status: 200 })
       }
       if (c.path === 'candidates') {
         const custom = opts.submit?.(c)
@@ -57,7 +59,7 @@ function server(opts: { candidate?: string; submit?: (c: Call) => Response | 'th
       throw new Error(`unexpected ${c.path}`)
     },
   }
-  return { deps, calls, writes: () => calls.filter((c) => c.path !== 'ready') }
+  return { deps, calls, writes: () => calls.filter((c) => c.path !== 'ready'), setKey: (k: string | null) => { key = k } }
 }
 
 function setup(opts: Parameters<typeof server>[0] = {}, binding = BINDING) {
@@ -65,12 +67,13 @@ function setup(opts: Parameters<typeof server>[0] = {}, binding = BINDING) {
   const candidates = createCandidateStore(dir)
   const fake = server(opts)
   let target: string | null = binding
+  let generation = 4
   const submission = knowledgeEntrySubmission({
     drafts,
     candidates,
     target: () => target,
     knowledgeBaseIds: () => ['kb-1', 'kb-2'],
-    provider: () => ({ deps: fake.deps, generation: 4 }),
+    provider: () => ({ deps: fake.deps, generation }),
   })
   const draft = (over: Partial<EntryDraft> = {}): EntryDraft => drafts.create({
     binding: BINDING,
@@ -83,7 +86,7 @@ function setup(opts: Parameters<typeof server>[0] = {}, binding = BINDING) {
     body: 'Ask your lead, then file [the form](https://hr.example/form).',
     ...over,
   })
-  return { drafts, candidates, fake, submission, draft, setTarget: (t: string | null) => { target = t } }
+  return { drafts, candidates, fake, submission, draft, setTarget: (t: string | null) => { target = t }, bump: () => { generation++ } }
 }
 
 describe('submit (W8.2)', () => {
@@ -245,6 +248,59 @@ describe('submit (W8.2)', () => {
   })
 })
 
+describe('the identity a pending write goes under (Codex H1 C1, C2, C4, C10)', () => {
+  it('another credential (another principal) is not resent under: the outcome stays unknown', async () => {
+    const t = setup({ submit: () => 'throw' })
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    t.fake.setKey('C-other-principal')
+    expect(t.submission.view(d.id, d)).toMatchObject({ pending: true, stuck: true })
+    const before = t.fake.calls.length
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, reason: 'outcome_unknown' })
+    expect(t.fake.calls).toHaveLength(before)
+    t.fake.setKey(KEY)
+    expect(t.submission.view(d.id, d)).toMatchObject({ pending: true, stuck: false })
+  })
+
+  it('a resend that never left this machine keeps the record', async () => {
+    let fail = true
+    const t = setup({ submit: () => (fail ? 'throw' : undefined as unknown as Response), onReady: () => { if (!fail) t.fake.setKey(null) } })
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const kept = t.candidates.get(d.id)?.pending
+    fail = false
+    // Admitted, then the credential is gone before the write goes out.
+    const out = await t.submission.submit(d.id, 'kb-2')
+    expect(out).toMatchObject({ ok: false, reason: 'server', code: 'unauthorized' })
+    expect(t.fake.writes()).toHaveLength(1)
+    expect(t.candidates.get(d.id)?.pending).toEqual(kept)
+  })
+
+  it('a fresh submit that never left this machine leaves nothing pending', async () => {
+    const t = setup({ onReady: () => t.fake.setKey(null) })
+    const d = t.draft()
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, code: 'unauthorized', unknown: false })
+    expect(t.fake.writes()).toHaveLength(0)
+    expect(t.candidates.get(d.id)?.pending).toBeNull()
+  })
+
+  it('an answer that comes back after the generation moved on is dropped: the record stays, nothing is recorded', async () => {
+    const t = setup({ submit: () => { t.bump(); return undefined as unknown as Response } })
+    const d = t.draft()
+    const out = await t.submission.submit(d.id, 'kb-2')
+    expect(out).toMatchObject({ ok: false, reason: 'server', code: 'cancelled', unknown: true, submission: { pending: true, candidate: null } })
+    expect(t.candidates.get(d.id)?.candidate).toBeNull()
+  })
+
+  it('a record that cannot be read shows as an unknown outcome, not as not submitted', () => {
+    const t = setup()
+    const d = t.draft()
+    fs.mkdirSync(path.join(dir, 'knowledge-candidates'), { recursive: true })
+    fs.writeFileSync(path.join(dir, 'knowledge-candidates', `${d.id}.json`), '{')
+    expect(t.submission.view(d.id, d)).toEqual({ pending: true, stuck: true, candidate: null })
+  })
+})
+
 describe('status and withdrawing the submission (W8.3, W8.8, HS6)', () => {
   it('status reads the state, the return reason and the note back', async () => {
     const t = setup({ status: 'returned' })
@@ -282,6 +338,26 @@ describe('status and withdrawing the submission (W8.3, W8.8, HS6)', () => {
     const before = t.fake.calls.length
     expect(await t.submission.retract(d.id)).toMatchObject({ ok: false, reason: 'not_found', submission: { candidate: { status: 'returned' } } })
     expect(t.fake.calls).toHaveLength(before)
+  })
+
+  it('status and withdraw go only to the draft\'s own binding (Codex H1 C6)', async () => {
+    const t = setup()
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const before = t.fake.calls.length
+    t.setTarget('kbt1:other')
+    expect(await t.submission.status(d.id)).toMatchObject({ ok: false, reason: 'target_changed' })
+    expect(await t.submission.retract(d.id)).toMatchObject({ ok: false, reason: 'target_changed' })
+    expect(t.fake.calls).toHaveLength(before)
+  })
+
+  it('withdraw is a write: the ready key admits it first (Codex H1 C5)', async () => {
+    const t = setup()
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const off = setup({ candidate: 'disabled' })
+    expect(await off.submission.retract(d.id)).toMatchObject({ ok: false, reason: 'server', code: 'unavailable' })
+    expect(off.fake.writes()).toHaveLength(0)
   })
 
   it('there is nothing to withdraw before it is submitted', async () => {
