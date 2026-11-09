@@ -320,7 +320,7 @@ fn loaded() -> bool {
     launchctl(&["print", &format!("gui/{}/{LABEL}", uid())]).is_ok_and(|o| o.status.success())
 }
 
-/// How long `install` waits for the daemon it stopped to let go of its lock:
+/// How long `install` waits for the daemon it stopped to exit:
 /// launchd's own wait before it kills it, and a little more.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(EXIT_TIMEOUT + 5);
 
