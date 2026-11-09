@@ -2,6 +2,8 @@
 
 状态：设计稿，2026-11-05；本片不改代码。核对基线：`ce85cdffc1193195f9aebb93a8cbbf620ccfe526`。
 
+修订记录：r2 2026-11-09——PR-1、Sin90 部分的 PR-2 已完成；新增硬要求「模块发送磁盘清单」（§2，N6）、安装包须原生可执行（§2，N3）、校验缓存（§3，N4）；Cos72 降为基础对齐；§6 改为新顺序并设三个汇报点。
+
 **适用边界：** 包里自带的清单只能发现字节损坏、部分更新，以及挂载之后被人改过。如果攻击者能写包目录，他可以把文件和 `files.json` 一起改，单靠清单拦不住。这种情况靠两样东西：一是 Agent24 自己持有的可信锁（ComponentLock），锁里记着整包归档的 sha256；二是 §5 的签名。详见 §2「信任边界」。
 
 ## 1. 决策与现状依据
@@ -50,9 +52,13 @@ integrity:
 
 规则：`files` 集合必须恰好等于 JSON 的键集合；executables 必填且无重复、是 files 的子集；包的 spawn.command 必须是其中一个包内相对路径，拒绝绝对路径、PATH 查找及外部解释器绕过。辅助可执行文件也须列入。逐平台分别生成清单，不把多平台文件混在同一个包里。
 
+**N3（jason 11-09 选 a）：** 安装包的 spawn.command 必须是包内签名的原生可执行文件；解释器启动的模块（如 `examples/node-module` 的 `command: node`）不能作为安装包，参考/开发用途改走 A3 attach。不提供解释器白名单或旁路。
+
 `domain-os.yml` 和 `files.json` 是仅有的两个控制文件，排除在 payload 的 files 列表之外；不允许其他排除项。这避免自哈希循环：先散列最终 payload → 写 files.json → 把其摘要写入 YAML → 对最终 YAML 算原有 manifest_digest。验证时先用同一次读取的 YAML 解析声明及算摘要，再验证 files.json 原始字节摘要，再校验 payload。两个控制文件本身也必须是普通文件，权限与数据文件一致。
 
 握手算法和字段均不变；清单通过 YAML 中的摘要间接被 manifest_digest 覆盖。只改 JSON 即使其语义相同也失败；同时改 JSON 和 YAML 则冻结的 mount 摘要不匹配。模块必须从最终发布的 YAML 读取摘要，不能把生成前的摘要编译进二进制，以免循环依赖。
+
+**模块发送磁盘清单（N6，新增硬要求）：** generate 会把 integrity 段写进 `domain-os.yml`，内核握手按 manifest_digest 比对磁盘文件，所以模块必须发送包内磁盘 `domain-os.yml` 原文；并且磁盘清单去掉顶层 `integrity` 后必须与模块二进制内嵌清单语义相等，否则模块拒绝启动（缺文件时回退内嵌）。理由：`files.json` 不覆盖 `domain-os.yml`；模块二进制已签名，由它内嵌的基准为清单背书。Sin90 已在自身实现；11-09 jason 拍板下沉到 agent24-os-sdk v0.2.0，所有模块自动获得，Sin90 升级后删除自有实现。
 
 JSON 重复键、非法摘要、负 size、重复路径、未知字段均拒绝；路径遵循共享 D2 检查并拒绝绝对路径、空段、`..`、反斜线、控制字符及非 UTF-8 文件名。生成器按 UTF-8 路径字节排序，固定 JSON 缩进与末尾换行；验证器按原始字节验证，不先规范化 JSON。
 
@@ -62,7 +68,9 @@ JSON 重复键、非法摘要、负 size、重复路径、未知字段均拒绝�
 
 强制上线后，scan 只有在以下全过时才返回 Discovered：现有 manifest 语义校验、必需 integrity、两个控制文件、完整 payload 集合/大小/sha256、权限、D2a 签名要求。失败保留拒绝记录，不创建该包的 provider、路由或工具注册；单包失败不隐藏其他包。
 
-recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使用 mtime、大小或之前成功结果来跳过哈希。结果应保存机器可读原因，避免从错误字符串推断 reason。大文件流式散列，枚举/读取失败也拒绝；清单限制建议 1 MiB、10,000 项，payload 大小使用 D2 安装限制，超限清晰报错。
+recheck 重做同一全量校验，再比较冻结的 manifest_digest；CLI verify 始终全量，不使用任何缓存。
+
+**N4 校验缓存：** 完整性校验接入 daemon 关闭 token，可被取消。daemon 进程内存缓存（按每文件 dev/ino/size/mtime/ctime/mode）在文件未变时跳过重算 sha256，但目录遍历与结构/权限检查每次照做；缓存不落盘。结果应保存机器可读原因，避免从错误字符串推断 reason。大文件流式散列，枚举/读取失败也拒绝；清单限制建议 1 MiB、10,000 项，payload 大小使用 D2 安装限制，超限清晰报错。
 
 | 文件变化 | scan 与 recheck 的一致处理 |
 |---|---|
@@ -112,17 +120,20 @@ agent24 package-integrity verify --root ./dist/sin90
 
 `--executable` 可重复；generate 只操作明确给出的发布 staging，读取已有 domain-os.yml，保留业务字段，拒绝符号链接/特殊文件，规范化权限、扫描全部 payload、生成 files.json 并最后原子替换 YAML；不接收任意 exclude 参数。每个文件使用临时文件加 rename，整个目录须由 release CI 独占；失败退出不能拿半成品发布。重复生成字节一致。verify 只读、始终严格，成功退出 0、失败非零并输出固定原因及相对文件名，不执行包代码。发布工具随 Agent24 版本提供，Sin90/Cos72 CI 固定工具版本与下载摘要，不用浮动 latest。
 
-具体步骤：
+具体步骤（r2 2026-11-09 顺序）：
 
-1. **Agent24 PR-1** 发布工具、共享校验 API 和可选 integrity 解析支持。旧包暂沿用已有行为；出现 integrity 的包立即完整校验并拒绝坏包，不设“验出错仍放行”。这是新包生产的先决兼容支持，不是观测期。旧宿主因 deny_unknown_fields 无法读新字段，先发布支持该字段的 Agent24，并在外仓 release notes 声明最低宿主版本。
-2. **Sin90/Cos72 外仓发布**：在各支持平台 CI 使用固定版本工具；发带清单、符合签名和权限规则的新版本；记录 tag、平台资产摘要及对应最低 Agent24 版本。必须实际下载并解包验过，不能只以 CI 配置已合并作为完成证据。其他被扫描的 OS 包也需清点；同仓随本体包在最终接线 PR 更新其打包产物，保留 D1 的免独立发布锁边界。
-3. **Agent24 PR-3** 在上述资产可获取后打开必需清单拒绝，同步更新发布 pin/可信锁及 UI。缺清单旧包直接拒绝、提示升级；不自动给旧包补清单，不提供 env/feature 绕过。
+0. **已完成：** PR-1 = Agent24 #1614（生成工具 + 可选校验）。PR-2 的 Sin90 部分 = iDoris-ai/Sin90#80（merge e7f11060）：package.sh 在 stage 后 codesign（Hardened Runtime + timestamp）→ notarytool 公证 → `agent24 package-integrity generate --executable bin/sin90` → verify → tar；发布 CI 没有签名凭据，跳过签名、按固定 Agent24 提交安装 CLI；签名正式包在本机构建。旧宿主因 deny_unknown_fields 无法读新字段，外仓 release notes 须声明最低宿主版本。
+1. **三个前置 PR 并行：** N3（安装包须原生可执行，§2）、N4（校验缓存，§3）、N6（agent24-os-sdk v0.2.0 下沉磁盘清单发送，§2）。
+2. **Sin90、Cos72 升 SDK v0.2.0 并发版：** Sin90 升级后删除自有磁盘清单实现；Cos72 同时补签名打包 + 完整性清单（照 Sin90#80）。Cos72（MushroomDAO/Cos72）11-09 由 jason 定为独立项目，业务（含区块链）搁置，只做基础对齐；PR-3 不等 Cos72 业务，只等它的对齐版发出。必须实际下载并解包验过，不能只以 CI 配置已合并作为完成证据。其他被扫描的 OS 包也需清点；同仓随本体包在最终接线 PR 更新其打包产物，保留 D1 的免独立发布锁边界。
+3. **Agent24 PR-3** 在上述资产可获取后打开必需清单拒绝，同步更新发布 pin/可信锁及桌面「包被拒，请升级」提示。缺清单旧包直接拒绝、提示升级；不自动给旧包补清单，不提供 env/feature 绕过。
+
+汇报点：SDK v0.2.0 发版前、Cos72 首个对齐 PR 前、打开强制前，各向 jason 汇报一次。
 
 “打开拒绝”不是改摘要算法，也不是在 `domain.rs:2605` 或 `:2761` 的测试处加开关。现有生产入口是 `discovery.rs:218` 解析成功至 `:219` 构造 Discovered 之间，PR-1 在这里增加可选验证；最终把这里的 `verify_if_present(...)` **替换为** `verify_required(...)`，其 None 分支返回 `IntegrityManifestMissing`。函数名是本设计建议，不是声称现有代码已有此行。`recheck` 的 `read_package` 调用（`:286`）自动继承强制规则；首次 spawn 及重启接线仍需行为测试验证。上线后删除可选入口，不留下可切换的容错模式。
 
 ## 7. 实现拆片与逐项验收
 
-建议三个逻辑 PR；PR-2 是外仓发布集成单元，Sin90、Cos72 各自提交对应 PR，不能假装一个 GitHub PR 可以跨仓。
+建议三个逻辑 PR（PR-1 已合，PR-2 的 Sin90 部分已合，PR-3 前另有 N3/N4/N6 三个前置 PR，见 §6）；PR-2 是外仓发布集成单元，Sin90、Cos72 各自提交对应 PR，不能假装一个 GitHub PR 可以跨仓。
 
 | PR | 内容与验收测试（拟新增） | 故意改坏的正对照 |
 |---|---|---|
