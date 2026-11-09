@@ -9,6 +9,7 @@ import { CapabilitiesContext } from '../capabilities/types'
 import { useT } from '../i18n'
 import { knowledgeViewMessages } from './Knowledge.i18n'
 import { KnowledgeEntryPanel, usePendingEntry } from './chat/knowledge-entry'
+import { KnowledgeEntryDraftsBar, KnowledgeEntryDraftsPanel, useDraftsPanel } from './knowledge-entry-drafts'
 
 function rectOf(el: HTMLElement): { x: number; y: number; width: number; height: number } {
   const rect = el.getBoundingClientRect()
@@ -55,6 +56,9 @@ export default function KnowledgePage(): JSX.Element {
   const [confirmAsk, setConfirmAsk] = useState<Exclude<KnowledgeViewConfirmAsk, null> | null>(null)
   // KB-SOP-01a: a conversation the history list asked about ("沉淀为知识条目").
   const entry = usePendingEntry()
+  // KB-SOP-01b-2: local drafts. Visible only while the three panels above are
+  // closed; under one of them it stays mounted but hidden, so unsaved edits stay.
+  const draftsPanel = useDraftsPanel()
 
   useEffect(() => window.agent24.knowledgeView.onState((next) => setState(next)), [])
   useEffect(() => window.agent24.knowledgeView.onCitation((next) => setCitation(next)), [])
@@ -133,6 +137,9 @@ export default function KnowledgePage(): JSX.Element {
           <button className="btn" type="button" onClick={() => setCitation(null)}>{t('citation.dismiss')}</button>
         </aside>
       )}
+      {/* Kept mounted while another panel is on top, so its unsaved edits stay. */}
+      {draftsPanel && <KnowledgeEntryDraftsPanel hidden={Boolean(entry || confirmAsk || citation)} />}
+      {!entry && !confirmAsk && !citation && !draftsPanel && <KnowledgeEntryDraftsBar />}
     </div>
   )
 }

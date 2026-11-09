@@ -1,11 +1,13 @@
 // @vitest-environment jsdom
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import KnowledgePage from './Knowledge'
 import { CapabilitiesContext } from '../capabilities/types'
 import { setLocale } from '../i18n'
-import type { KnowledgeViewCitation, KnowledgeViewConfirmAsk, KnowledgeViewState } from '../../shared/ipc-types'
+import type { KnowledgeEntryDraftSummary, KnowledgeViewCitation, KnowledgeViewConfirmAsk, KnowledgeViewState } from '../../shared/ipc-types'
+import { requestEntry } from './chat/knowledge-entry'
+import { closeDrafts, openDraft, openDraftList } from './knowledge-entry-drafts'
 
 const show = vi.fn()
 const bounds = vi.fn()
@@ -164,7 +166,7 @@ describe('KnowledgePage', () => {
     render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
     await waitFor(() => expect(show).toHaveBeenCalled())
     act(() => confirmListener?.(ASK))
-    fireEvent.click(screen.getByRole('button', { name: 'Add to chat' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Add to conversation' }))
     expect(answer).toHaveBeenCalledWith(ASK.id, true)
     expect(open).toHaveBeenCalledWith('assistant', 'other')
     expect(answer.mock.invocationCallOrder[0]).toBeLessThan(open.mock.invocationCallOrder[0])
@@ -205,3 +207,103 @@ describe('KnowledgePage', () => {
     expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
   })
 })
+
+const ONE: KnowledgeEntryDraftSummary = {
+  id: 'd1', kind: 'note', title: 'Draft one', updated_at: '2026-01-01T00:00:00.000Z', target: 'same', findings: [],
+}
+
+/** Elements with this text that are not inside a hidden panel. */
+const visible = (text: RegExp): HTMLElement[] => screen.queryAllByText(text).filter((el) => !el.closest('[hidden]'))
+
+describe('knowledge entry drafts on the page', () => {
+  afterEach(() => {
+    act(() => {
+      requestEntry(null)
+      closeDrafts()
+    })
+  })
+
+  function withEntry(knowledgeEntry: object): void {
+    const current = window.agent24
+    Object.defineProperty(window, 'agent24', {
+      configurable: true,
+      value: { ...current, knowledgeEntry },
+    })
+  }
+
+  it('shows the drafts bar when nothing else is open, and nothing when the bridge has no knowledgeEntry', async () => {
+    const first = render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    expect(visible(/Knowledge entry drafts/)).toEqual([])
+    expect(screen.queryByRole('button', { name: 'View' })).toBeNull()
+    first.unmount()
+
+    withEntry({ listDrafts: vi.fn(async () => [ONE, { ...ONE, id: 'd2', title: 'Draft two' }]) })
+    render(<KnowledgePage />)
+    expect(await screen.findByText('Knowledge entry drafts: 2')).toBeTruthy()
+    expect(screen.getByRole('button', { name: 'View' })).toBeTruthy()
+  })
+
+  it('hides the drafts panel and the bar while an entry, a confirmation, or a citation is open', async () => {
+    withEntry({
+      listDrafts: vi.fn(async () => [ONE]),
+      admit: vi.fn(() => new Promise(() => {})),
+    })
+    openDraftList()
+    render(<KnowledgePage />)
+    expect(await screen.findByRole('dialog', { name: 'Knowledge entry drafts' })).toBeTruthy()
+    expect(screen.queryByRole('button', { name: 'View' })).toBeNull()
+
+    act(() => requestEntry('chat_abc'))
+    expect(await screen.findByRole('dialog', { name: 'Knowledge entry' })).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: 'Knowledge entry drafts' })).toBeNull()
+    expect(visible(/Knowledge entry drafts/)).toEqual([])
+
+    act(() => requestEntry(null))
+    expect(await screen.findByRole('dialog', { name: 'Knowledge entry drafts' })).toBeTruthy()
+    act(() => closeDrafts())
+    expect(await screen.findByText('Knowledge entry drafts: 1')).toBeTruthy()
+
+    const ask = { id: 'a'.repeat(22), count: 2, titles: ['Alpha', null] as Array<string | null> }
+    act(() => confirmListener?.(ask))
+    expect(screen.getByText('2 selected')).toBeTruthy()
+    expect(visible(/Knowledge entry drafts/)).toEqual([])
+    expect(screen.queryByRole('dialog', { name: 'Knowledge entry drafts' })).toBeNull()
+    act(() => confirmListener?.(null))
+    expect(await screen.findByText('Knowledge entry drafts: 1')).toBeTruthy()
+
+    act(() => citationListener?.({ title: 'T', text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    expect(screen.getByRole('complementary', { name: 'Citation' })).toBeTruthy()
+    expect(visible(/Knowledge entry drafts/)).toEqual([])
+    expect(screen.queryByRole('dialog', { name: 'Knowledge entry drafts' })).toBeNull()
+  })
+
+  it('hides an open drafts panel while a confirmation or a citation is open, and shows it again after', async () => {
+    withEntry({ listDrafts: vi.fn(async () => [ONE]) })
+    openDraftList()
+    render(<KnowledgePage />)
+    expect(await screen.findByRole('dialog', { name: 'Knowledge entry drafts' })).toBeTruthy()
+    act(() => confirmListener?.({ id: 'b'.repeat(22), count: 1, titles: ['Alpha'] }))
+    expect(screen.getByText('1 selected')).toBeTruthy()
+    expect(screen.queryByRole('dialog', { name: 'Knowledge entry drafts' })).toBeNull()
+    act(() => confirmListener?.(null))
+    expect(await screen.findByRole('dialog', { name: 'Knowledge entry drafts' })).toBeTruthy()
+    act(() => citationListener?.({ title: 'T', text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    expect(screen.queryByRole('dialog', { name: 'Knowledge entry drafts' })).toBeNull()
+  })
+
+  it('keeps unsaved edits in a draft while a citation covers it (Codex C2)', async () => {
+    const draft = { ...ONE, body: 'original', message_from: 0, message_to: 1, conversation_id: 'chat_abc', created_at: ONE.updated_at, content_sha256: 'a'.repeat(64) }
+    withEntry({ listDrafts: vi.fn(async () => [ONE]), getDraft: vi.fn(async () => draft) })
+    act(() => openDraft(ONE.id))
+    render(<KnowledgePage />)
+    const body = await screen.findByLabelText('Body')
+    fireEvent.change(body, { target: { value: 'my unsaved edit' } })
+    act(() => citationListener?.({ title: 'T', text: 'body', ref: { knowledge_base_id: 'kb', knowledge_id: 'k', chunk_id: 'c' } }))
+    expect(screen.queryByRole('dialog', { name: 'Knowledge entry drafts' })).toBeNull()
+    act(() => citationListener?.(null))
+    expect(await screen.findByRole('dialog', { name: 'Knowledge entry drafts' })).toBeTruthy()
+    expect(screen.getByLabelText('Body')).toHaveValue('my unsaved edit')
+  })
+})
+

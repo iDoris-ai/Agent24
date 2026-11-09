@@ -254,7 +254,7 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
   }
   const WITHDRAWN_TMP = /^(ked_[a-z0-9]{22})\.withdrawn\.tmp$/
 
-  /** Ids with a recorded withdrawal; null when the log is there but cannot be read (Codex C1). */
+  /** Ids with a recorded withdrawal; null when the log is there but cannot be read */
   const withdrawnIds = (): Set<string> | null => {
     const ids = new Set<string>()
     let log: string
@@ -318,7 +318,7 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
     }
   }
 
-  /** Before reading one draft directly: put it back if it was left aside unrecorded (Codex C6). */
+  /** Before reading one draft directly: put it back if it was left aside unrecorded */
   const recoverOne = (id: string): void => {
     const name = `${id}.withdrawn.tmp`
     if (fs.existsSync(path.join(root, name))) recoverWithdrawals([name])
@@ -424,13 +424,13 @@ export function createEntryDraftStore(dir: string, now: () => Date = () => new D
         const fd = fs.openSync(eventsFile, 'a+', 0o600)
         try {
           // A torn last line (the app stopped mid-append) must not swallow
-          // this event: start on a line of its own (Codex C2).
+          // this event: start on a line of its own.
           fs.writeFileSync(fd, endsTorn(fd) ? `\n${line}` : line)
         } catch (err) {
           try { fs.closeSync(fd) } catch { /* the write error is the one to report */ }
           throw err
         }
-        // Written: a failed close does not undo it (Codex C7).
+        // Written: a failed close does not undo it.
         try { fs.closeSync(fd) } catch { /* recorded already */ }
       } catch (err) {
         fs.renameSync(aside, fileOf(checked))

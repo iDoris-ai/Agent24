@@ -55,6 +55,9 @@ import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget
 import { createChatHistoryStore } from './chat-history'
 import { daemonFloorReader } from './knowledge-entry-floor'
 import { registerKnowledgeEntryIpc } from './knowledge-entry-ipc'
+import { createEntryDraftStore } from './knowledge-entry-draft'
+import { entryTarget } from './knowledge-entry-extract'
+import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -534,6 +537,20 @@ app.whenReady().then(async () => {
     },
     locale: getMainLocale,
     bound: () => knowledge?.status().active === true,
+  }, {
+    // KB-SOP-01b-2: local drafts, drafted by the local model (no session_id: LocalOnly, no memory, no tools).
+    store: createEntryDraftStore(app.getPath('userData')),
+    chat: (body) => {
+      const conn = daemonConnection()
+      if (!conn) return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready'))
+      return proxyRequest(conn, { method: 'POST', path: '/api/v1/chat', body }, { host: '127.0.0.1', timeoutMs: CHAT_TIMEOUT_MS })
+    },
+    target: () => {
+      if (!knowledge || knowledge.bindingForRun() === null) return null
+      const s = knowledge.status()
+      return entryTarget(s.endpoint, s.knowledgeBaseIds)
+    },
+    locale: getMainLocale,
   })
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
