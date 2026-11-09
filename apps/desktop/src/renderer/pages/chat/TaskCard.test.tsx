@@ -206,6 +206,18 @@ describe('hand it to the assistant (M4 A4)', () => {
     expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_new/cancel' })
   })
 
+  it('starts no run when the daemon gives it no session', async () => {
+    store.save(record('chat_a', '整理周报'))
+    await refreshHistory()
+    const answer = proxy.getMockImplementation() as (req: unknown) => Promise<unknown>
+    proxy.mockImplementation(async (req: { path: string }) =>
+      (req.path === '/api/v1/sessions' ? { ok: false, status: 503, data: { error: { code: 'backend_not_ready' } } } : answer(req)))
+    render(<HandOver conversation="chat_a" prompt="整理周报" />)
+    fireEvent.click(screen.getByRole('button', { name: '交给助理办' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('没能交给助理')
+    expect(proxy).not.toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs' }))
+  })
+
   it('does not record the run it stopped once main can write again (Codex A4 r2 C1)', async () => {
     store.save(record('chat_a', '整理周报'))
     await refreshHistory()
