@@ -429,7 +429,12 @@ class Shell:
             if op == "elevation_pending" and pending is None:
                 pending = frame.get("challenge_id")
             elif op == "elevated" and pending is not None and frame.get("challenge_id") == pending:
-                return frame.get("grant")
+                grant = frame.get("grant")
+                # As enroll.rs: an `elevated` frame without a grant is a bad frame,
+                # so W7d never reports "got a grant" it did not get (PR-Daemon N2).
+                if not isinstance(grant, str) or not grant:
+                    raise EnrolError("bad_frame")
+                return grant
             elif op == "error":
                 raise EnrolError(frame.get("code"))
             else:
