@@ -202,6 +202,17 @@ describe('task cards (M4 A4)', () => {
     expect(card('已完成').querySelectorAll('.task-card-knowledge')).toHaveLength(1)
   })
 
+  it('shows a card for a schedule\'s run in the schedule\'s conversation (M4 A5)', async () => {
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule' })
+    store.appendRun(id, 'run_s1', 'schedule')
+    runs.run_s1 = { status: 'queued', started_at: at }
+    await show(id)
+    await waitFor(() => expect(card('排队中')).toBeInTheDocument())
+    runs.run_s1 = { status: 'running', started_at: at }
+    act(() => emit({ type: 'run.started', run_id: 'run_s1' }))
+    await waitFor(() => expect(card('运行中')).toBeInTheDocument())
+  })
+
   it('says a task the daemon does not have is not found', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_gone')

@@ -38,7 +38,7 @@ pending: { id: string; kind: 'approval' | 'confirm'; run_id?: string; label: str
 | `clearPending(id, pendingId)` | 去掉这一条；不在就什么也不做 | 同上 |
 
 共同规则：
-- 只改已经在磁盘上的对话，不新建对话。
+- 只改已经在磁盘上的对话，不新建对话。新建对话由页面保存，或者用 main 的 `create`（A5，见 §7）。
 - 不动 `messages` 和 `updated_at`，所以不会让列表重新排序。
 - 参数不合法就抛错；超过上限也抛错：`Too many chat history runs` / `Too many chat history pending items`。
 - runs 满了（1000 条）时（A4，PR-Daemon #1696 L1）：要记的是 task，就去掉最早的一条 answer，给它腾地方；要记的是 answer，或者已经没有 answer 可去掉，仍然抛错。task 有进度卡，不能因为问答多了就记不上。
@@ -112,3 +112,18 @@ run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
 - `id` 由调用方自己定，清除时用同一个 id。
 
 只调这些 API，不改 `main/chat-history.ts`。
+
+## 7. 日程的归属对话（A5）
+
+每条日程有一条自己的对话，日程的 run 都记在那里（设计稿 r3 §3.4）。
+
+- **哪些 run 是日程的**：daemon 的 `run.started` 事件带 `schedule_id`，不是日程发起的 run 为 null。日程按时触发和 `run_now` 都会发这个事件；`schedule.fired` 只有按时触发才发，所以不用它。main 在 `/events` 上听（`agentear-events.ts` 的 `parseScheduledRunFrame`），有没有窗口都记。
+- **第一次**：新建一条对话，标题「日程：<日程名>」（三语，main-i18n `schedule.conversationTitle`），`title_source = 'schedule'`。名字取自 `GET /api/v1/schedules/{id}`，拿不到就用日程 id。
+- **之后**：同一条日程的 run 都用 `appendRun(id, runId, 'schedule')` 记进这条对话，进度卡与 A4 相同。
+- **绑定关系**存在 `<userData>/schedule-conversations.json`（`agent24.schedule-conversations` v1，最多 1000 条，满了先丢最早的）：
+  - 对话已被删除，或者文件读不了：下一次 run 时新建一条。
+  - 对话已归档：照常往里记，它仍是这条日程的对话。
+- **记录顺序**：一次只记一条，按到达顺序。所以一个新日程的两个 run 会进同一条新对话。
+- **标题优先级**：用户改名 > 日程名 > 模型标题 > 第一句话。在日程对话里提问不会把标题改掉，用户改名可以改。
+- main 新增 `create({ title, title_source })`：新建一条没有消息的对话，并通知 `onChatHistoryChange`，打开着的窗口会把它列出来。
+- `conversationOf(scheduleId)` 留给 A6：日程页上每条日程的归属对话入口。
