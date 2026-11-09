@@ -73,7 +73,9 @@ function fakeCodesign(app = TEAM_APP, program = RUNTIME, verify: CliResult = { c
 
 function deps(over: Partial<BundledModuleDeps> & { results?: CliResult[] } = {}) {
   const results = [...(over.results ?? [])]
-  const runCli = vi.fn(async (_args: string[]) => results.shift() ?? { code: 0, output: 'installed /x/documents\n' })
+  const runCli = vi.fn(async (args: string[]) => args[0] === 'package-integrity'
+    ? { code: 0, output: '' }
+    : results.shift() ?? { code: 0, output: 'installed /x/documents\n' })
   const codesign = over.codesign ?? fakeCodesign()
   const warn = vi.fn()
   const d: BundledModuleDeps = {
@@ -89,13 +91,64 @@ function deps(over: Partial<BundledModuleDeps> & { results?: CliResult[] } = {})
   return { d, runCli, warn, codesign }
 }
 
+function expectInstallCalls(calls: string[][][], upgrading = false) {
+  const tmp = calls[0]?.[0]?.[3]
+  expect(tmp).toEqual(expect.any(String))
+  expect(calls).toEqual([
+    [['package-integrity', 'generate', '--root', tmp, '--executable', 'bin/agent24-documents', '--executable', 'bin/agent24-documents-pdfkit']],
+    ...(upgrading ? [[['os', 'uninstall', 'documents']]] : []),
+    [['os', 'install', tmp]],
+  ])
+  expect(fs.existsSync(tmp!)).toBe(false)
+}
+
 describe('ensureBundledDocumentsModule', () => {
-  it('not installed → signatures checked, then os install <bundle>', async () => {
+  it('not installed → signatures checked, generate, then os install <copy>', async () => {
     const { d, runCli, warn, codesign } = deps()
     expect(await ensureBundledDocumentsModule(d)).toBe('installed')
-    expect(runCli.mock.calls).toEqual([[['os', 'install', d.bundleDir]]])
+    expectInstallCalls(runCli.mock.calls)
     expect(codesign).toHaveBeenCalled()
     expect(warn).not.toHaveBeenCalled()
+  })
+
+  it('copies into a private temporary directory after signature checks, then cleans up', async () => {
+    const { d, runCli, codesign } = deps()
+    runCli.mockImplementationOnce(async (args) => {
+      expect(codesign).toHaveBeenCalledTimes(6)
+      const tmp = args[3]!
+      expect(tmp).not.toBe(d.bundleDir)
+      expect(fs.statSync(tmp).mode & 0o777).toBe(0o700)
+      expect(sameFiles(d.bundleDir!, tmp)).toBe(true)
+      fs.writeFileSync(path.join(tmp, 'files.json'), '{}')
+      return { code: 0, output: '' }
+    })
+    expect(await ensureBundledDocumentsModule(d)).toBe('installed')
+    expectInstallCalls(runCli.mock.calls)
+    expect(fs.existsSync(path.join(d.bundleDir!, 'files.json'))).toBe(false)
+  })
+
+  it.each([false, true])('generate fails → no install or uninstall; cleanup (upgrade=%s)', async (upgrade) => {
+    const { d, runCli, warn } = deps(upgrade ? { packagesRoot: installed('0.1.0') } : {})
+    runCli.mockResolvedValueOnce({ code: 1, output: 'generation failed' })
+    expect(await ensureBundledDocumentsModule(d)).toBe('install_failed')
+    expect(runCli).toHaveBeenCalledTimes(1)
+    expect(runCli.mock.calls[0]![0].slice(0, 2)).toEqual(['package-integrity', 'generate'])
+    expect(fs.existsSync(runCli.mock.calls[0]![0][3]!)).toBe(false)
+    expect(warn.mock.calls[0]![0]).toContain('generation failed')
+  })
+
+  it('generated metadata and YAML formatting do not trigger reinstall; payload bytes still do', async () => {
+    const b = bundle()
+    const pkgs = installedCopy(b)
+    const copy = path.join(pkgs, 'documents')
+    fs.writeFileSync(path.join(copy, 'files.json'), '{}')
+    fs.writeFileSync(path.join(copy, 'domain-os.yml'), "name: documents\nversion: 0.2.0\nintegrity:\n  manifest: files.json\n  sha256: abc\nspawn: {command: bin/agent24-documents}\n")
+    const { d, runCli } = deps({ bundleDir: b, packagesRoot: pkgs })
+    expect(await ensureBundledDocumentsModule(d)).toBe('up_to_date')
+    expect(runCli).not.toHaveBeenCalled()
+    fs.writeFileSync(path.join(copy, 'bin/agent24-documents-pdfkit'), 'Engine program')
+    expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
+    expectInstallCalls(runCli.mock.calls, true)
   })
 
   it("logs the CLI's `installed <dir>` line, not its trailing hint", async () => {
@@ -119,7 +172,7 @@ describe('ensureBundledDocumentsModule', () => {
     fs.writeFileSync(path.join(b, 'bin', 'agent24-documents'), 'module program, rebuilt')
     const { d, runCli } = deps({ bundleDir: b, packagesRoot: pkgs })
     expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
-    expect(runCli.mock.calls).toEqual([[['os', 'uninstall', 'documents']], [['os', 'install', b]]])
+    expectInstallCalls(runCli.mock.calls, true)
   })
 
   it('compares the directory the CLI installs into: `..` after a symlink is not folded', async () => {
@@ -146,7 +199,7 @@ describe('ensureBundledDocumentsModule', () => {
   it('installed at another version → os uninstall, then os install', async () => {
     const { d, runCli } = deps({ packagesRoot: installed('0.1.0') })
     expect(await ensureBundledDocumentsModule(d)).toBe('upgraded')
-    expect(runCli.mock.calls).toEqual([[['os', 'uninstall', 'documents']], [['os', 'install', d.bundleDir]]])
+    expectInstallCalls(runCli.mock.calls, true)
   })
 
   it('a bad signature on an upgrade → the old module is not uninstalled', async () => {
@@ -160,7 +213,7 @@ describe('ensureBundledDocumentsModule', () => {
   it('the uninstall of an upgrade fails → no install, a warning, no throw', async () => {
     const { d, runCli, warn } = deps({ packagesRoot: installed('0.1.0'), results: [{ code: 1, output: 'consent store unavailable\n' }] })
     expect(await ensureBundledDocumentsModule(d)).toBe('install_failed')
-    expect(runCli).toHaveBeenCalledTimes(1)
+    expect(runCli).toHaveBeenCalledTimes(2)
     expect(warn.mock.calls[0]![0]).toMatch(/replacing 0\.1\.0 with 0\.2\.0: os uninstall failed \(rc=1\): consent store unavailable/)
   })
 
@@ -181,6 +234,7 @@ describe('ensureBundledDocumentsModule', () => {
   it('CLI rc≠0 → install_failed with the last line of its output, never throws', async () => {
     const { d, warn } = deps({ results: [{ code: 2, output: 'line one\nrefusing: packages root is group-writable\n' }] })
     expect(await ensureBundledDocumentsModule(d)).toBe('install_failed')
+    expect(fs.existsSync(vi.mocked(d.runCli).mock.calls[0]![0][3]!)).toBe(false)
     expect(warn.mock.calls[0]![0]).toMatch(/os install failed \(rc=2\): refusing: packages root is group-writable/)
   })
 
@@ -410,12 +464,12 @@ describe('uninstallDocumentsModule', () => {
 })
 
 describe('installBundledDocumentsModule', () => {
-  it('checks signatures, runs os install <bundle>, then clears the marker', async () => {
+  it('checks signatures, generates integrity, installs the copy, then clears the marker', async () => {
     fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
     const { d, runCli, codesign } = deps()
     expect(await installBundledDocumentsModule(d)).toEqual({ ok: true })
     expect(codesign).toHaveBeenCalled()
-    expect(runCli.mock.calls).toEqual([[['os', 'install', d.bundleDir]]])
+    expectInstallCalls(runCli.mock.calls)
     expect(fs.existsSync(path.join(root, MARKER_FILE))).toBe(false)
   })
 
@@ -431,6 +485,16 @@ describe('installBundledDocumentsModule', () => {
     fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
     const { d } = deps({ results: [{ code: 1, output: 'error: consent revocation failed\n' }] })
     expect(await installBundledDocumentsModule(d)).toEqual({ ok: false, code: 'cli_failed', message: 'agent24 os install (rc=1): error: consent revocation failed' })
+    expect(userUninstalled(root)).toBe(true)
+  })
+
+  it('generate fails → marker kept, no install, temporary copy removed', async () => {
+    fs.writeFileSync(path.join(root, MARKER_FILE), '{"uninstalledByUser": true}')
+    const { d, runCli } = deps()
+    runCli.mockRejectedValueOnce(new Error('generate could not run'))
+    expect(await installBundledDocumentsModule(d)).toEqual({ ok: false, code: 'cli_failed', message: 'generate could not run' })
+    expect(runCli).toHaveBeenCalledTimes(1)
+    expect(fs.existsSync(runCli.mock.calls[0]![0][3]!)).toBe(false)
     expect(userUninstalled(root)).toBe(true)
   })
 
@@ -469,6 +533,18 @@ describe('documentsModuleOnDisk', () => {
 })
 
 describe('sameFiles', () => {
+  it.each([
+    'name: documents\nversion: 0.2.0\nspawn: {command: bin/other}\n',
+    'name: documents\nversion: 0.2.0\nversion: 0.2.0\nspawn: {command: bin/agent24-documents}\n',
+    'name: documents\nversion: 0.2.0\n---\nname: documents\n',
+    'name: documents\nversion: 0.2.0\n1: value\n',
+  ])('does not ignore business changes or invalid YAML: %s', (text) => {
+    const b = bundle()
+    const copy = path.join(installedCopy(b), 'documents')
+    fs.writeFileSync(path.join(copy, 'domain-os.yml'), text)
+    expect(sameFiles(b, copy)).toBe(false)
+  })
+
   it('entries and bytes, not modes; a symlink is never the same', () => {
     const b = bundle()
     const copy = path.join(root, 'copy')

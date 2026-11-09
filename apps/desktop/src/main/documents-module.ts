@@ -12,11 +12,8 @@
 //   directory is not touched by either; os.json is not touched, so a module
 //   the user turned off stays off).
 //
-// "The same" is the files, not the manifest's `version`: `os install` copies
-// the package byte for byte (install.rs copy_tree), so an installed copy of
-// this very package is identical to it, and the version was never bumped
-// when the programs changed (0.1.0 through all of DOC-1, so a launch after
-// the 11-02 candidate kept the old programs). The version is for the log.
+// "The same" compares payload bytes and manifest business fields. Installation
+// adds files.json and top-level integrity, and generate reformats the YAML.
 // - The user uninstalled it  → leave it uninstalled (the marker file below;
 //   T1-2 writes it when the user uninstalls and clears it when they install).
 //
@@ -32,10 +29,16 @@
 // programs must carry the app's own team ID and the runtime flag; only an
 // app that is itself ad-hoc signed (an internal test build) settles for a
 // valid signature. An app whose identity cannot be read installs nothing.
+// After verification, generate integrity metadata on a private temporary copy
+// of the signed bytes, never inside the sealed app. The signature is the trust
+// anchor (D1); the generated manifest detects subsequent installed-file changes.
 
 import { execFile } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import os from 'node:os'
+import { isDeepStrictEqual } from 'node:util'
+import { isMap, isScalar, parseDocument } from 'yaml'
 import { joinLiteral } from './data-dir'
 
 export const MODULE = 'documents'
@@ -120,14 +123,32 @@ function listTree(dir: string, rel = ''): string[] | null {
   return out
 }
 
-/** The same entries, each file byte for byte (modes aside: install clears group/other write). */
+/** Parse business fields; reject ambiguous YAML instead of treating it as equal. */
+function businessManifest(bytes: Buffer, installed: boolean): unknown {
+  const doc = parseDocument(bytes.toString('utf8'))
+  if (doc.errors.length || !isMap(doc.contents)
+    || doc.contents.items.some(({ key }) => !isScalar(key) || typeof key.value !== 'string')) {
+    throw new Error('invalid module manifest')
+  }
+  if (installed) doc.delete('integrity')
+  return doc.toJS({ mapAsMap: true })
+}
+
+/** Bundle versus installed copy: ignore installed integrity metadata, compare payload bytes. */
 export function sameFiles(a: string, b: string): boolean {
   const left = listTree(a)
-  const right = listTree(b)
+  const right = listTree(b)?.filter((name) => name !== 'files.json') ?? null
   if (left === null || right === null || left.length !== right.length) return false
   if (left.some((name, i) => name !== right[i])) return false
   try {
-    return left.every((name) => name.endsWith('/') || fs.readFileSync(joinLiteral(a, name)).equals(fs.readFileSync(joinLiteral(b, name))))
+    return left.every((name) => {
+      if (name.endsWith('/')) return true
+      const bundled = fs.readFileSync(joinLiteral(a, name))
+      const installed = fs.readFileSync(joinLiteral(b, name))
+      return name === MANIFEST
+        ? isDeepStrictEqual(businessManifest(bundled, false), businessManifest(installed, true))
+        : bundled.equals(installed)
+    })
   } catch {
     return false
   }
@@ -209,6 +230,28 @@ function lastLine(output: string): string {
   return lines[lines.length - 1] ?? ''
 }
 
+/** Called only after signatures pass. Keep the old installation until generate succeeds. */
+async function installWithIntegrity(bundleDir: string, runCli: RunCli, beforeInstall?: () => Promise<void>): Promise<CliResult> {
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'agent24-documents-'))
+  try {
+    // Copy entries, not the root: preserve mkdtemp's private 0700 directory mode.
+    for (const name of fs.readdirSync(bundleDir)) {
+      fs.cpSync(path.join(bundleDir, name), path.join(tmp, name), { recursive: true })
+    }
+    const generated = await runCli([
+      'package-integrity', 'generate', '--root', tmp,
+      ...PROGRAMS.flatMap((program) => ['--executable', program]),
+    ])
+    if (generated.code !== 0) {
+      throw new Error(`package-integrity generate failed (rc=${generated.code}): ${lastLine(generated.output)}`)
+    }
+    await beforeInstall?.()
+    return await runCli(['os', 'install', tmp])
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
 export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Promise<BundledModuleOutcome> {
   try {
     if (deps.bundleDir === null) return 'no_bundle'
@@ -242,14 +285,13 @@ export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Pro
       deps.warn(`[documents-module] not installing the bundled documents ${want}: ${problem}`)
       return 'signature_invalid'
     }
-    if (upgrading) {
+    const added = await installWithIntegrity(deps.bundleDir, deps.runCli, async () => {
+      if (!upgrading) return
       const removed = await deps.runCli(['os', 'uninstall', MODULE])
       if (removed.code !== 0) {
-        deps.warn(`[documents-module] replacing ${have} with ${want}: os uninstall failed (rc=${removed.code}): ${lastLine(removed.output)}`)
-        return 'install_failed'
+        throw new Error(`replacing ${have} with ${want}: os uninstall failed (rc=${removed.code}): ${lastLine(removed.output)}`)
       }
-    }
-    const added = await deps.runCli(['os', 'install', deps.bundleDir])
+    })
     if (added.code !== 0) {
       deps.warn(`[documents-module] os install failed (rc=${added.code}): ${lastLine(added.output)}`)
       return 'install_failed'
@@ -395,7 +437,14 @@ export async function installBundledDocumentsModule(deps: BundledModuleDeps): Pr
     deps.warn(`[documents-module] not installing the bundled documents: ${problem}`)
     return { ok: false, code: 'signature_invalid', message: problem }
   }
-  const r = await deps.runCli(['os', 'install', deps.bundleDir])
+  let r: CliResult
+  try {
+    r = await installWithIntegrity(deps.bundleDir, deps.runCli)
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    deps.warn(`[documents-module] ${message}`)
+    return { ok: false, code: 'cli_failed', message }
+  }
   if (r.code !== 0) {
     const message = `agent24 os install (rc=${r.code}): ${lastLine(r.output)}`
     deps.warn(`[documents-module] ${message}`)
