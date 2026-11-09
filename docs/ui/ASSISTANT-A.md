@@ -70,7 +70,8 @@ A2 已经接上的：Knowledge 那一轮（`pages/chat-knowledge.ts`）。run �
 - daemon 里没有这个 run：显示「找不到」。
 - 「确认」：只在 run 处于 `awaiting_approval`、且它的待审批提供 `approve` 时出现，经 main 的确认框（`decideApproval`）**只提交 `approve`**，也就是只批准这一次。
   - daemon 的决定是开放集合（openapi `Decision`）。`approve_for_session` 和 `approve_for_target` 会授予更大的范围，`abort` 会结束整个 run，所以这三个都不由「确认」代选（Knowledge 对 #1700 的复核）。
-  - 待审批里没有 `approve` 时，卡片不显示「确认」，提示到审批页处理。拒绝要填理由，现在也在审批页做；A6 删掉审批页时改在卡片里做（#1688）。
+  - 「拒绝」（A6）：只在待审批提供 `deny` 时出现。点了以后在卡片里展开一行理由，**理由不能为空**，空的不发（SPEC-002），发的是 `{ type: 'deny', reason }`，同样经 main 的确认框。拒绝以后模型会收到理由，run 继续。
+  - **已知局限（M4 不做）**：卡片只处理 `approve` 和 `deny` 两种决定。待审批两样都不提供时，卡片不显示按钮，只提示「这一项只能在终端里处理：agent24 tui」。
 - 「停止」（进行中时出现）：`POST /api/v1/runs/{id}/cancel`。
 - 完成的 run 显示它的回答，**跟聊天里的回答一样过一遍 `grounding`**，用的是 `GET /runs/{id}` 返回的 `knowledge`。run 有知识库记录时显示检索说明；回答里点名、但 run 没读到的来源，标出来，不算来源。
 
@@ -136,4 +137,22 @@ run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
   - 已知局限（M4 不做）：`GET /api/v1/runs` 没有分页，也不能按日程过滤，一次返回全部 run 和它们的输入输出。main 自己发的这个请求，上限放宽到 64MB（窗口的请求仍是 8MB）。超过 64MB 时，补录每次都会失败，只记日志。要根治，得让 daemon 支持过滤和分页：内核待办 #1701（`GET /api/v1/runs` 加 `schedule_id`、`session_id` 过滤和游标分页），归内核线。
 - **标题优先级**：用户改名 > main 自己起的名字（日程名 `schedule`，或者 A6「助理发起」对话的 `assistant`，两者同级）> 模型标题 > 第一句话。在这类对话里提问，标题不会被改掉；用户改名可以改。
 - main 新增 `create({ title, title_source })`：新建一条没有消息的对话，并通知 `onChatHistoryChange`，打开着的窗口会把它列出来。
-- `conversationOf(scheduleId)` 留给 A6：日程页上每条日程的归属对话入口。
+- `conversationOf(scheduleId)`：A6 的「主动」页（原日程页）上，每条日程有一个入口，打开它的对话（IPC `schedule:conversation`）。
+
+## 8. 页面合并与对话外 run 的审批（A6）
+
+- **删掉的页面**：运行页（`runs`）和审批页（`approvals`）。审批在 run 的卡片上做（§4）。
+- **设置 → 活动 = 诊断，不是任务入口**。那里的 run 列表保留，用来查问题；任务都在对话里，以卡片的形式出现。总览上原来打开运行页的「账本」站点，现在打开设置 → 活动；「闸门」站点打开助理。
+- **「日程」改名「主动」**（Proactive / 主动 / เชิงรุก），每条日程带一个打开它的对话的入口（§7）。
+- **待审批计数**从「总览」「能力」移到侧栏的「助理」上。计的是 daemon 所有待审批，不只是当前对话的。
+- **删除、清空对话时先停掉进行中的 task**：确认框写明有几个进行中的 task 会被停掉。确认以后，先用 `GET /api/v1/runs` 查 `queued`/`running`/`awaiting_approval` 的 run，cancel 其中属于这些对话的，再删除。
+- **对话外 run 的审批**（PM 11-09 方案 A，`main/assistant-approvals.ts`）。审批页删掉以后，每个待审批都要在某张卡片上能处理：
+  - main 在 `/events` 上听到 `approval.required`，用 `GET /api/v1/runs/{id}` 看这个 run 是谁的：
+    - 带 `schedule_id`：在日程的对话里有卡片（§7），不用管。
+    - 它的 session（`GET /api/v1/sessions/{id}`）的 channel 是 `desktop`：是窗口发起的，由页面升格（§3、§4），不用管。
+    - 其余的（命令行的 `agent24`、别的 channel、没有 session、session 已经不在）：作为 task 记进一条「助理发起」对话（三语，main-i18n `assistant.conversationTitle`，`title_source = 'assistant'`）。卡片上有确认和拒绝。这条对话第一次用到时用 `create` 新建，之后都记在这里。
+  - daemon 说不清（连不上、答复不对）：这个 run 不算处理过，下次补录再分。
+  - **断线补录**：每次连上 `/events`，跟 §7 一样补一次，取的是 `GET /api/v1/approvals?status=pending`，把其中没处理过的 run 按上面的规则分。跟 §7 不同的是，**第一次补录也会补**：之前就在等的审批，窗口里没有别的地方可以处理。
+  - 「处理过」的 run 记在 `<userData>/assistant-approvals.json`（`agent24.assistant-approvals` v1）的 `handled` 里，最多 5000 条，满了先丢最早的。一个 run 只分一次，同一个 run 的第二个审批不会再记一遍。用户删掉的「助理发起」对话，只有来了没处理过的 run 才会重新建出来。
+  - 一次只分一个 run，按听到的顺序。
+  - 已知局限（M4 不做）：窗口发起的 run，如果页面已经不在等它（例如窗口在等审批时关掉又开），就没有卡片，只能在 `agent24 tui` 里处理；侧栏「助理」的计数仍然算它。

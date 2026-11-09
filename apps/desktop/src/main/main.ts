@@ -5,6 +5,7 @@ import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
+import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
@@ -85,7 +86,14 @@ const agentEarBridge = new AgentEarEventBridge(
     if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
   },
   // M4 A3: runs' changes, for the history list's filters.
-  (event) => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.RunEvent, event) },
+  (event) => {
+    if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.RunEvent, event)
+    // M4 A6: an approval of a run no conversation has, to the assistant's.
+    if (event.type === 'approval.required') {
+      assistantApprovals().route(event.run_id)
+        .catch((err) => console.error('[main] approval run not routed', event.run_id, err))
+    }
+  },
   // M4 A5: a schedule's run goes to the schedule's conversation, window or not.
   (run) => {
     scheduleConversations().record(run.schedule_id, run.run_id)
@@ -103,8 +111,44 @@ const agentEarBridge = new AgentEarEventBridge(
       if (!res.ok || !Array.isArray(list)) throw new Error(`runs_unavailable_${res.status}`)
       return list
     }).catch((err) => console.error('[main] schedule runs not caught up', err))
+    assistantApprovals().catchUp(async () => {
+      const res = await daemonGet('/api/v1/approvals?status=pending')
+      const list = (res.data as { approvals?: unknown } | null)?.approvals
+      if (!res.ok || !Array.isArray(list)) throw new Error(`approvals_unavailable_${res.status}`)
+      return list
+    }).catch((err) => console.error('[main] pending approvals not caught up', err))
   },
 )
+
+// M4 A6: made on the first approval, once userData is settled.
+async function daemonGet(apiPath: string) {
+  const conn = daemonConnection()
+  if (!conn) throw new Error('backend_not_ready')
+  return proxyRequest(conn, { method: 'GET', path: apiPath }, { host: '127.0.0.1' })
+}
+let assistantApprovalsStore: AssistantApprovals | null = null
+function assistantApprovals(): AssistantApprovals {
+  assistantApprovalsStore ??= createAssistantApprovals({
+    dir: app.getPath('userData'),
+    history: createChatHistoryStore(app.getPath('userData')),
+    ownerOf: async (runId): Promise<RunOwner> => {
+      const run = await daemonGet(`/api/v1/runs/${encodeURIComponent(runId)}`)
+      const data = run.data as { schedule_id?: unknown; session_id?: unknown } | null
+      if (!run.ok || data === null) throw new Error(`run_unavailable_${run.status}`)
+      if (typeof data.schedule_id === 'string' && data.schedule_id !== '') return 'schedule'
+      if (typeof data.session_id !== 'string' || data.session_id === '') return 'other'
+      const session = await daemonGet(`/api/v1/sessions/${encodeURIComponent(data.session_id)}`)
+      // A session the daemon no longer has is no window's.
+      if (session.status === 404) return 'other'
+      const channel = (session.data as { channel?: unknown } | null)?.channel
+      if (!session.ok || typeof channel !== 'string') throw new Error(`session_unavailable_${session.status}`)
+      return channel === 'desktop' ? 'desktop' : 'other'
+    },
+    title: () => mt('assistant.conversationTitle'),
+    onCatchUpFailure: (runId, err) => console.error('[main] approval run not caught up', runId, err),
+  })
+  return assistantApprovalsStore
+}
 
 // M4 A5: made on the first schedule's run, once userData is settled.
 const RUNS_CATCH_UP_MAX_BYTES = 64 * 1024 * 1024
