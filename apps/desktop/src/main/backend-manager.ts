@@ -746,6 +746,9 @@ export class BackendManager {
       return 'superseded'
     }
     this.blockedReason = null
+    // Enrolled: an earlier failure's backoff does not carry over (Codex B3a C1).
+    this.enrolRetryMs = 0
+    this.refusedBy = null
     this.enrolment = session
     this.isExternal = true
     this.externalPid = state.pid

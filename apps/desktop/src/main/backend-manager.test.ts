@@ -2149,6 +2149,29 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     }
   })
 
+  it('a success clears the backoff: a later failure against the same daemon starts again from one tick (Codex B3a C1)', async () => {
+    vi.useFakeTimers()
+    const ok = session('ok-1')
+    const enrol = vi.fn()
+    for (let i = 0; i < 4; i++) enrol.mockRejectedValueOnce(new EnrolError('timeout', 'slow'))
+    enrol.mockResolvedValueOnce(ok).mockRejectedValueOnce(new EnrolError('timeout', 'slow')).mockResolvedValue(session('again-1'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      // Four failures (0, 5, 15, 35 s) then success at 75 s: the backoff had reached 40 s.
+      await vi.advanceTimersByTimeAsync(80_000)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer ok-1' })
+      ok.end('daemon_unavailable')
+      // Re-enrolled at the next tick: fails once, then is tried again a tick later, not 80 s later.
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(manager.statusDetail()).toMatchObject({ kind: 'enrol_refused', code: 'timeout' })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('a refused enrolment is tried again at the next tick when the daemon is a new one (B3a)', async () => {
     vi.useFakeTimers()
     let current: ExternalDaemonState = record
