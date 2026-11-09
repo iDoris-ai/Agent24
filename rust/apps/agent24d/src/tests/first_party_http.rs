@@ -878,6 +878,13 @@ async fn each_start_mode_gets_its_own_presence_channel() {
     let queue = service.presence_service.clone().unwrap();
     assert!(provider_is(&service, Arc::as_ptr(&queue).cast()));
     assert!(service.presence_desktop.is_none());
+    // Building the router hands the same queue to the enrolment endpoint's
+    // authority, which is where `role:"presence"` connections attach.
+    let authority = service.first_party.clone().unwrap();
+    assert!(authority.presence_connection().is_none());
+    let _router = build_router(service);
+    let attached = authority.presence_connection().unwrap();
+    assert!(Arc::ptr_eq(&attached, &queue));
 
     let mut child = tests::state().await;
     child.enable_capability_auth(crate::capabilities::CapabilityStore::new("child-test"));
@@ -885,6 +892,9 @@ async fn each_start_mode_gets_its_own_presence_channel() {
     let desktop = child.presence_desktop.clone().unwrap();
     assert!(provider_is(&child, Arc::as_ptr(&desktop).cast()));
     assert!(child.presence_service.is_none());
+    let authority = child.first_party.clone().unwrap();
+    let _router = build_router(child);
+    assert!(authority.presence_connection().is_none());
 
     let mut legacy = tests::state().await;
     legacy.enable_presence_for(StartupMode::Legacy);

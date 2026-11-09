@@ -143,6 +143,41 @@ impl ServicePresence {
     fn queued(&self) -> usize {
         self.lock().entries.len()
     }
+
+    /// The nonce a challenge will be delivered with (tests only).
+    #[cfg(test)]
+    fn nonce_of(&self, id: &str) -> Option<String> {
+        self.lock().entries.get(id).map(|e| e.nonce.clone())
+    }
+
+    /// Queue `req` with no `confirm` waiting on it, so nothing settles it
+    /// when it lapses: only the delivery check stands between it and the
+    /// desktop (tests only).
+    #[cfg(test)]
+    fn enqueue_unwatched(&self, req: PresenceRequest) {
+        let mut inner = self.lock();
+        let id = req.challenge_id.clone();
+        inner.entries.insert(
+            id.clone(),
+            Entry {
+                req,
+                nonce: random_nonce(),
+                tx: None,
+            },
+        );
+        inner.queue.push_back(id);
+        drop(inner);
+        self.wake.notify_waiters();
+    }
+
+    /// Move a challenge's deadline (tests only): the wall clock passing it
+    /// while `confirm`'s own timer has not fired yet.
+    #[cfg(test)]
+    fn set_expires_at(&self, id: &str, expires_at: crate::capabilities::UnixSeconds) {
+        if let Some(entry) = self.lock().entries.get_mut(id) {
+            entry.req.expires_at = expires_at;
+        }
+    }
 }
 
 /// The connection's handle on the slot. Dropping it (the connection ended)
@@ -219,6 +254,12 @@ impl Attachment {
         if entry.nonce.len() != nonce.len()
             || !constant_time_eq(entry.nonce.as_bytes(), nonce.as_bytes())
         {
+            return false;
+        }
+        // Past its deadline by the wall clock it was shown with: too late,
+        // even if `confirm`'s timer has not fired yet (as the HTTP channel,
+        // `presence_desktop`). `confirm` settles it as timed out.
+        if entry.req.expires_at <= unix_now() {
             return false;
         }
         conn.delivered = None;
@@ -319,7 +360,11 @@ impl PresenceProvider for ServicePresence {
             id: &id,
         };
         self.wake.notify_waiters();
-        let remaining = Duration::from_secs(expires_at.saturating_sub(unix_now()));
+        // To the wall-clock second itself, not whole seconds from now: a
+        // truncated count would leave up to a second past `expires_at`.
+        let remaining = (std::time::UNIX_EPOCH + Duration::from_secs(expires_at))
+            .duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO);
         tokio::select! {
             outcome = rx => outcome.unwrap_or(PresenceOutcome::Unavailable),
             () = cancel.cancelled() => PresenceOutcome::Unavailable,
@@ -330,7 +375,7 @@ impl PresenceProvider for ServicePresence {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::capabilities::Operation;
     use crate::capabilities::presence::RequesterIdentity;
@@ -359,6 +404,13 @@ mod tests {
             Event::Challenge { req, nonce } => (req, nonce),
             other => panic!("expected a challenge, got {other:?}"),
         }
+    }
+
+    /// The next event, failing (not hanging) if none comes.
+    async fn event(attachment: &Attachment) -> Event {
+        tokio::time::timeout(Duration::from_secs(3), attachment.next_event())
+            .await
+            .expect("an event within 3s")
     }
 
     async fn nothing_for_a_moment(attachment: &Attachment) {
@@ -438,8 +490,11 @@ mod tests {
         let (_, nonce1) = challenge(&attachment).await;
         let second = spawn_confirm(&presence, "c2", 60, CancellationToken::new());
         nothing_for_a_moment(&attachment).await;
-        // The queued one cannot be answered before it is delivered.
-        assert!(!attachment.answer("c2", &nonce1, Decision::Allow));
+        // The queued one cannot be answered before it is delivered, not even
+        // with its own nonce.
+        let queued_nonce = presence.nonce_of("c2").unwrap();
+        assert!(!attachment.answer("c2", &queued_nonce, Decision::Allow));
+        assert!(!second.is_finished());
         assert!(attachment.answer("c1", &nonce1, Decision::Allow));
         let (req, nonce2) = challenge(&attachment).await;
         assert_eq!(req.challenge_id, "c2");
@@ -458,7 +513,7 @@ mod tests {
         cancel.cancel(); // the elevate connection went away
         assert_eq!(waiter.await.unwrap(), PresenceOutcome::Unavailable);
         assert!(matches!(
-            attachment.next_event().await,
+            event(&attachment).await,
             Event::Cancel { challenge_id } if challenge_id == "c1"
         ));
         assert!(!attachment.answer("c1", &nonce, Decision::Allow));
@@ -475,7 +530,7 @@ mod tests {
         let (_, nonce) = challenge(&attachment).await;
         assert_eq!(waiter.await.unwrap(), PresenceOutcome::TimedOut);
         assert!(matches!(
-            attachment.next_event().await,
+            event(&attachment).await,
             Event::Cancel { challenge_id } if challenge_id == "c1"
         ));
         assert!(!attachment.answer("c1", &nonce, Decision::Allow));
@@ -485,20 +540,30 @@ mod tests {
     async fn a_queued_challenge_that_expires_is_never_delivered() {
         let presence = Arc::new(ServicePresence::new());
         let attachment = presence.attach(|| true).unwrap();
-        let first = spawn_confirm(&presence, "c1", 60, CancellationToken::new());
-        let (_, nonce1) = challenge(&attachment).await;
-        let short = spawn_confirm(&presence, "short", 1, CancellationToken::new());
-        assert_eq!(short.await.unwrap(), PresenceOutcome::TimedOut);
-        let third = spawn_confirm(&presence, "c3", 60, CancellationToken::new());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(attachment.answer("c1", &nonce1, Decision::Allow));
-        // Not `short`, and no cancel for it either: it was never shown.
-        let (req, nonce3) = challenge(&attachment).await;
-        assert_eq!(req.challenge_id, "c3");
-        assert!(attachment.answer("c3", &nonce3, Decision::Allow));
-        assert_eq!(first.await.unwrap(), PresenceOutcome::Allowed);
-        assert_eq!(third.await.unwrap(), PresenceOutcome::Allowed);
+        // Lapsed by the wall clock, and nothing has settled it yet.
+        let mut lapsed = request("lapsed", 0);
+        lapsed.expires_at = unix_now() - 1;
+        presence.enqueue_unwatched(lapsed);
         nothing_for_a_moment(&attachment).await;
+        let next = spawn_confirm(&presence, "c2", 60, CancellationToken::new());
+        let (req, nonce) = challenge(&attachment).await;
+        assert_eq!(req.challenge_id, "c2");
+        assert!(attachment.answer("c2", &nonce, Decision::Allow));
+        assert_eq!(next.await.unwrap(), PresenceOutcome::Allowed);
+    }
+
+    #[tokio::test]
+    async fn an_answer_after_the_wall_clock_deadline_is_refused() {
+        let presence = Arc::new(ServicePresence::new());
+        let attachment = presence.attach(|| true).unwrap();
+        let waiter = spawn_confirm(&presence, "c1", 60, CancellationToken::new());
+        let (_, nonce) = challenge(&attachment).await;
+        // The wall clock is past `expires_at`; `confirm`'s timer is not.
+        presence.set_expires_at("c1", unix_now());
+        assert!(!attachment.answer("c1", &nonce, Decision::Allow));
+        assert!(!waiter.is_finished(), "not settled by the refused answer");
+        drop(attachment);
+        assert_eq!(waiter.await.unwrap(), PresenceOutcome::Unavailable);
     }
 
     #[tokio::test]
@@ -534,7 +599,7 @@ mod tests {
         alive.store(false, Ordering::SeqCst);
         let second = presence.attach(|| true).unwrap();
         assert_eq!(waiter.await.unwrap(), PresenceOutcome::Unavailable);
-        assert!(matches!(first.next_event().await, Event::Replaced));
+        assert!(matches!(event(&first).await, Event::Replaced));
         assert!(!first.answer("c1", &nonce, Decision::Allow));
         // The old handle going away later does not free the new slot.
         drop(first);

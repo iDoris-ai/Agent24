@@ -85,20 +85,12 @@ pub struct EnrollEndpoint {
     /// The daemon's HTTP port, echoed in every `enrolled` frame so the CLI can
     /// refuse a `daemon.json` whose port is not this daemon's (#1446 F1).
     http_port: u16,
-    /// Service mode only: where `hello{role:"presence"}` connections attach
-    /// (K-B3 #1715). `None` refuses that role with `wrong_role`.
-    presence: Option<Arc<crate::presence_service::ServicePresence>>,
 }
 
 #[cfg(unix)]
 impl EnrollEndpoint {
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    /// Accept presence connections into `presence` (call before `serve`).
-    pub fn set_presence(&mut self, presence: Arc<crate::presence_service::ServicePresence>) {
-        self.presence = Some(presence);
     }
 
     /// Start accepting. The task ends when `stop` fires. `http_port` is the
@@ -141,7 +133,6 @@ impl EnrollEndpoint {
         };
         let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT));
         let http_port = self.http_port;
-        let presence = self.presence.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -163,12 +154,11 @@ impl EnrollEndpoint {
                             let generation = generation.clone();
                             let authority = authority.clone();
                             let verifier = verifier.clone();
-                            let presence = presence.clone();
                             tokio::spawn(async move {
                                 let permit = Arc::new(permit);
                                 tokio::select! {
                                     () = stop.cancelled() => {}
-                                    () = serve_connection(stream, audit_token, generation, http_port, authority, verifier, presence, stop.clone(), permit) => {}
+                                    () = serve_connection(stream, audit_token, generation, http_port, authority, verifier, stop.clone(), permit) => {}
                                 }
                             });
                         }
@@ -425,7 +415,6 @@ async fn answer(
         0,
         authority,
         verifier,
-        None,
         cancel,
         permit,
     )
@@ -441,7 +430,6 @@ async fn serve_connection(
     http_port: u16,
     authority: Arc<dyn EnrollAuthority>,
     verifier: Arc<dyn IdentityVerifier>,
-    presence: Option<Arc<crate::presence_service::ServicePresence>>,
     cancel: CancellationToken,
     permit: Arc<tokio::sync::OwnedSemaphorePermit>,
 ) {
@@ -550,7 +538,7 @@ async fn serve_connection(
                 identity,
             },
             verifier,
-            presence,
+            authority.presence_connection(),
             permit,
         )
         .await;
@@ -924,7 +912,11 @@ async fn serve_presence(
                         }
                     }
                     "presence_pong" => match (&ping, frame.nonce) {
-                        (Some((expected, _)), Some(nonce)) if *expected == nonce => {
+                        // On time too: a pong that began before the deadline
+                        // and finished after it does not count.
+                        (Some((expected, deadline)), Some(nonce))
+                            if *expected == nonce && tokio::time::Instant::now() <= *deadline =>
+                        {
                             ping = None;
                             next_ping = tokio::time::Instant::now() + PING_EVERY;
                         }
@@ -1027,7 +1019,6 @@ pub fn bind(dir: &Path) -> io::Result<EnrollEndpoint> {
         identity,
         listener: Some(listener),
         http_port: 0,
-        presence: None,
     };
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
     Ok(endpoint)
@@ -1041,7 +1032,6 @@ impl EnrollEndpoint {
     pub fn path(&self) -> &Path {
         Path::new("")
     }
-    pub fn set_presence(&mut self, _presence: Arc<crate::presence_service::ServicePresence>) {}
     pub fn serve(
         &mut self,
         _stop: CancellationToken,

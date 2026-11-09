@@ -115,13 +115,13 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - **应答**（桌面→daemon）：
   - 帧：`{"v":1,"op":"presence_answer","challenge_id":"…","nonce":"<回显>","decision":"allow"|"deny"}`。
   - daemon 每条都回 `{"v":1,"op":"presence_answered","challenge_id":"…","accepted":true|false}`。
-  - 以下情况回 `accepted:false`，**连接不断**：未知 id、已结算、还在排队没下发、nonce 不符。
+  - 以下情况回 `accepted:false`，**连接不断**：未知 id、已结算、还在排队没下发、nonce 不符，以及挂钟已过 `expires_at`（和 3.4 的 HTTP 通道一致；这时 daemon 的计时器即使还没触发，也会按超时结算）。
   - `decision` 取其他值得 `bad_frame`，连接关闭。
   - 每条应答生效前，daemon 都重新核对对端身份（pid 启动时间、代码签名、audit token）。对端 exec 过就得到 `identity_rejected`，连接关闭。
 - **取消**（daemon→桌面）：已下发的挑战在应答前就结算了（发起方的 elevate 连接断开、过期），daemon 发 `{"v":1,"op":"presence_cancel","challenge_id":"…"}`。之后再对它应答，得到 `accepted:false`。
 - **心跳**：
   - 在场连接不受 10 分钟空闲上限约束。daemon 每 60 秒发一次 `{"v":1,"op":"presence_ping","nonce":"<hex32>"}`，桌面须在 10 秒内回 `{"v":1,"op":"presence_pong","nonce":"<回显>"}`。
-  - 超时、nonce 不符或主动发的 pong，daemon 直接关闭连接。
+  - 超时、nonce 不符或主动发的 pong，daemon 直接关闭连接。截止时间按整帧收齐的时刻算：开头在截止前到、换行在截止后才到的 pong 也算超时。
 - **错误**：
   - 在场连接上发 `renew`、`elevate`、第二个 `hello`，得到 `wrong_role`。
   - 令牌连接上发 `presence_answer`、`presence_pong`，也得到 `wrong_role`。
@@ -131,6 +131,7 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - **已知局限**：
   - 同 UID 的恶意进程占满 7 条令牌连接时，在场连接连不上，提升请求得到 `presence_unavailable`。这在 ADR-031 的威胁边界之内。
   - 这是桌面替自己作证：能挡住 renderer 和 CLI，挡不住已经被攻破的桌面主进程。强度不如 D7 的 LocalAuthentication helper，是 helper 落地之前的过渡方案。
+  - daemon 读一帧时，同一条连接上不会同时下发挑战或取消。桌面只发了半帧时，挑战最多晚 5 秒（单帧读超时）才下发。这和令牌连接的单帧超时一致。
 
 ### 3.5 路由等级
 

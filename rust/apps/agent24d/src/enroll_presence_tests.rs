@@ -67,6 +67,9 @@ impl EnrollAuthority for Recording {
     ) -> Result<ElevationGrant, EnrollErrorCode> {
         self.inner.elevate(peer, id, request, pending, cancel).await
     }
+    fn presence_connection(&self) -> Option<Arc<ServicePresence>> {
+        self.inner.presence_connection()
+    }
 }
 
 struct Daemon {
@@ -112,7 +115,7 @@ fn daemon_with(verifier: Arc<dyn IdentityVerifier>, with_presence: bool) -> Daem
     let inner = Arc::new(FirstPartyAuthority::new(CapabilityStore::new(GENERATION)));
     if with_presence {
         inner.set_provider(Some(presence.clone()));
-        endpoint.set_presence(presence.clone());
+        inner.set_presence_connection(Some(presence.clone()));
     }
     let authority = Arc::new(Recording {
         inner,
@@ -521,4 +524,24 @@ async fn an_answer_from_a_peer_that_changed_since_hello_is_refused() {
         crate::capabilities::presence::PresenceOutcome::Unavailable,
         "never Allowed"
     );
+}
+
+#[tokio::test]
+async fn a_pong_that_finishes_after_its_deadline_does_not_count() {
+    let daemon = daemon(DESKTOP, true);
+    let mut presence = presence_connection(&daemon).await;
+    let ping = line(&mut presence).await;
+    assert_eq!(ping["op"], "presence_ping");
+    let pong =
+        serde_json::to_vec(&serde_json::json!({"v":1,"op":"presence_pong","nonce":ping["nonce"]}))
+            .unwrap();
+    let (head, tail) = pong.split_at(pong.len() / 2);
+    // Begun in time, finished late.
+    tokio::time::sleep(PONG_DEADLINE * 3 / 4).await;
+    presence.get_mut().write_all(head).await.unwrap();
+    tokio::time::sleep(PONG_DEADLINE / 2).await;
+    presence.get_mut().write_all(tail).await.unwrap();
+    presence.get_mut().write_all(b"\n").await.unwrap();
+    // Closed at once, not after another ping round.
+    assert!(closed(&mut presence, PING_EVERY / 2).await);
 }

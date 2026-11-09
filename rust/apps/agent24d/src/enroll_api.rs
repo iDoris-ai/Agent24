@@ -156,4 +156,11 @@ pub trait EnrollAuthority: Send + Sync {
         pending: tokio::sync::oneshot::Sender<String>,
         cancel: CancellationToken,
     ) -> Result<ElevationGrant, EnrollErrorCode>;
+    /// Service mode only: where a `hello{role:"presence"}` connection
+    /// attaches (K-B3 #1715). `None` refuses that role with `wrong_role`.
+    fn presence_connection(
+        &self,
+    ) -> Option<std::sync::Arc<crate::presence_service::ServicePresence>> {
+        None
+    }
 }

@@ -1515,6 +1515,7 @@ pub fn build_router(state: AppState) -> Router {
 pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     if let Some(authority) = &state.first_party {
         authority.set_provider(state.presence_provider.clone());
+        authority.set_presence_connection(state.presence_service.clone());
         authority.set_module_surfaces(state.module_surfaces.clone());
     }
     let kernel = Router::new()
@@ -3267,7 +3268,6 @@ pub async fn serve(
         );
     }
     let enroll_authority = state.first_party.clone();
-    let enroll_presence = state.presence_service.clone();
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     // A shutdown that began during startup ends it here, before anything says
@@ -3364,9 +3364,6 @@ pub async fn serve(
     if let Some(endpoint) = enroll.as_mut()
         && let Some(authority) = enroll_authority
     {
-        if let Some(presence) = enroll_presence {
-            endpoint.set_presence(presence);
-        }
         endpoint.serve(
             cancel.clone(),
             daemon_generation.clone(),
