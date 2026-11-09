@@ -1497,7 +1497,7 @@ async fn query_strings_are_not_the_sequence_and_a_grant_cannot_carry_one() {
 
     let (status, response) = send(
         &router,
-        request(Method::PUT, &format!("{BINDING}?seq=1"), &host, None),
+        request(Method::PUT, &format!("{BINDING}?seq=1"), &host, Some(1)),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
@@ -1505,6 +1505,36 @@ async fn query_strings_are_not_the_sequence_and_a_grant_cannot_carry_one() {
     assert!(state.knowledge_host.is_empty());
 
     let body = r#"{"seq":1}"#;
+    // Without a grant the shell gets the same 400, and nothing is kept to
+    // approve: elevating that target is not an elevated operation.
+    let (status, response) = send(
+        &router,
+        with_body(Method::PUT, &format!("{BINDING}?seq=1"), &bearer, body),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{response}");
+    assert!(response.contains("invalid_request"), "{response}");
+    assert!(state.knowledge_host.is_empty());
+    let (pending, _challenge) = tokio::sync::oneshot::channel();
+    let refused = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .elevate(
+            &peer,
+            &token.token_id,
+            ElevateRequest {
+                method: "PUT".into(),
+                path: BINDING.into(),
+                body_sha256: body_digest(body.as_bytes()),
+                client_summary: "ignored".into(),
+            },
+            pending,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(refused.unwrap_err(), EnrollErrorCode::NotElevatedOperation);
+
     let (status, response) = send(&router, with_body(Method::PUT, BINDING, &bearer, body)).await;
     assert!(
         response.contains("presence_required"),

@@ -730,7 +730,8 @@ fn change_response(result: Result<(), ChangeError>) -> Response {
 }
 
 /// Says nothing about which part was wrong: a parse error could quote C.
-fn invalid_request() -> Response {
+/// `server.rs` also uses it for a query on a change that has no grant yet.
+pub(crate) fn invalid_request() -> Response {
     error_response(
         StatusCode::BAD_REQUEST,
         "invalid_request",

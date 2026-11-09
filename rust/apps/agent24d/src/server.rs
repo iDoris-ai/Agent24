@@ -1307,6 +1307,12 @@ async fn authorize(
                                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
                         )
                     ) {
+                        // A query is never part of these routes, and the grant
+                        // gate below refuses one anyway: answer 400 now rather
+                        // than ask the user to approve a request that cannot run.
+                        if req.uri().query().is_some() {
+                            return crate::knowledge_host::invalid_request();
+                        }
                         let request_path = req.uri().path().to_owned();
                         let Ok(bytes) = axum::body::to_bytes(
                             req.into_body(),
