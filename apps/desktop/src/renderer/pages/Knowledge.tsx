@@ -8,6 +8,7 @@ import type { KnowledgeViewCitation, KnowledgeViewConfirmAsk, KnowledgeViewResul
 import { CapabilitiesContext } from '../capabilities/types'
 import { useT } from '../i18n'
 import { knowledgeViewMessages } from './Knowledge.i18n'
+import { getHistoryState } from './chat/history'
 import { KnowledgeEntryPanel, usePendingEntry } from './chat/knowledge-entry'
 import { KnowledgeEntryDraftsBar, KnowledgeEntryDraftsPanel, useDraftsPanel } from './knowledge-entry-drafts'
 
@@ -62,7 +63,11 @@ export default function KnowledgePage(): JSX.Element {
 
   useEffect(() => window.agent24.knowledgeView.onState((next) => setState(next)), [])
   useEffect(() => window.agent24.knowledgeView.onCitation((next) => setCitation(next)), [])
-  useEffect(() => window.agent24.knowledgeView.onConfirm((ask) => setConfirmAsk(ask)), [])
+  useEffect(() => window.agent24.knowledgeView.onConfirm((ask) => {
+    setConfirmAsk(ask)
+    // M4 A7: the dialog waits in the open conversation too (read only, never set here).
+    if (ask) void window.agent24.knowledgeView.shown(ask.id, getHistoryState().activeId)
+  }), [])
 
   useEffect(() => {
     const host = hostRef.current

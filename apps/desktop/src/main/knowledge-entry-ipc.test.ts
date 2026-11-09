@@ -453,6 +453,30 @@ describe('the drafts as the Knowledge page sees them', () => {
     expect(broken.list()).toEqual([])
   })
 
+  it('M4 A7: a created draft waits in its conversation, and withdrawing it clears that', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    const d = await one(s)
+    expect(pending.set).toHaveBeenCalledTimes(1)
+    expect(pending.set).toHaveBeenCalledWith('chat_abc', d.id, d.title)
+    expect(pending.clear).not.toHaveBeenCalled()
+    expect(s.drafts.withdraw(d.id)).toBe(true)
+    expect(pending.clear).toHaveBeenCalledTimes(1)
+    expect(pending.clear).toHaveBeenCalledWith('chat_abc', d.id)
+    // Nothing withdrawn: nothing cleared.
+    expect(s.drafts.withdraw(d.id)).toBe(false)
+    expect(pending.clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('M4 A7: a create that fails writes no pending item', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    s.retarget(null)
+    const out = await s.drafts.create(sender(1), s.drafts.issue(secretive(), 1), { from: 0, to: 1 })
+    expect(out).toEqual({ ok: false, reason: 'knowledge_off' })
+    expect(pending.set).not.toHaveBeenCalled()
+  })
+
   it('never hands the renderer a draft’s binding', async () => {
     const s = drafting()
     const d = await one(s)

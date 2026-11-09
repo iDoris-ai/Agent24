@@ -17,6 +17,13 @@ let stateListener: ((s: KnowledgeViewState) => void) | null = null
 let citationListener: ((c: KnowledgeViewCitation) => void) | null = null
 let confirmListener: ((ask: KnowledgeViewConfirmAsk) => void) | null = null
 const answer = vi.fn()
+const shownAsk = vi.fn()
+// M4 A7: the conversation open in the main window, as the history list keeps it.
+let activeId: string | null = null
+vi.mock('./chat/history', async (original) => ({
+  ...(await original<typeof import('./chat/history')>()),
+  getHistoryState: () => ({ items: [], activeId, busy: false, groups: { groups: [] }, archiving: [] }),
+}))
 let resizeCallback: ResizeObserverCallback | null = null
 
 beforeEach(() => {
@@ -24,6 +31,7 @@ beforeEach(() => {
   stateListener = null
   citationListener = null
   confirmListener = null
+  activeId = null
   setLocale('en')
   show.mockResolvedValue({ ok: true })
   reload.mockResolvedValue({ ok: true })
@@ -37,6 +45,7 @@ beforeEach(() => {
         onCitation: (cb: (c: KnowledgeViewCitation) => void) => { citationListener = cb; return () => { citationListener = null } },
         onConfirm: (cb: (ask: KnowledgeViewConfirmAsk) => void) => { confirmListener = cb; return () => { confirmListener = null } },
         answer,
+        shown: shownAsk,
       },
     },
     configurable: true,
@@ -159,6 +168,20 @@ describe('KnowledgePage', () => {
     expect(screen.getByText('Untitled')).toBeTruthy()
     expect(container.querySelector('.knowledge-page > .knowledge-confirm')).toBeTruthy()
     expect(container.querySelector('.knowledge-host .knowledge-confirm')).toBeNull()
+  })
+
+  it('M4 A7: a dialog that comes up tells main which conversation is open; a null one does not', async () => {
+    activeId = 'chat_open1'
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => confirmListener?.(ASK))
+    expect(shownAsk).toHaveBeenCalledTimes(1)
+    expect(shownAsk).toHaveBeenCalledWith(ASK.id, 'chat_open1')
+    act(() => confirmListener?.(null))
+    expect(shownAsk).toHaveBeenCalledTimes(1)
+    activeId = null
+    act(() => confirmListener?.(ASK))
+    expect(shownAsk).toHaveBeenLastCalledWith(ASK.id, null)
   })
 
   it('accept answers true and opens the main chat, in that order', async () => {

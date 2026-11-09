@@ -133,6 +133,8 @@ export const IpcChannels = {
   // KB-C2-04b-2 (U7.2): the confirmation dialog. null closes it.
   KnowledgeViewConfirm: 'knowledge-view:confirm',
   KnowledgeViewAnswer: 'knowledge-view:answer',
+  // M4 A7: the renderer put a confirm dialog up, and which conversation was open.
+  KnowledgeViewShown: 'knowledge-view:shown',
   // The conversation's draft attachments. Changed is the full list, main → renderer.
   KnowledgeDraftChanged: 'knowledge-draft:changed',
   KnowledgeDraftList: 'knowledge-draft:list',

@@ -57,6 +57,7 @@ import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget
 import { createChatHistoryStore } from './chat-history'
 import { daemonFloorReader } from './knowledge-entry-floor'
 import { registerKnowledgeEntryIpc } from './knowledge-entry-ipc'
+import { knowledgePending } from './knowledge-pending'
 import { createEntryDraftStore } from './knowledge-entry-draft'
 import { entryTarget } from './knowledge-entry-extract'
 import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
@@ -571,7 +572,10 @@ app.whenReady().then(async () => {
   mainWin = createMainWindow()
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
+  // M4 A7: Knowledge's dialogs and drafts in their conversations' pending[].
+  const knowledgeWaiting = knowledgePending(() => createChatHistoryStore(app.getPath('userData')))
   knowledgeView = new KnowledgeViewHost({
+    pending: knowledgeWaiting,
     window: () => mainWin,
     createView: (webPreferences) => new WebContentsView({ webPreferences }),
     sessionFor: (partition) => session.fromPartition(partition, { cache: false }),
@@ -638,6 +642,7 @@ app.whenReady().then(async () => {
       return entryTarget(s.endpoint, s.knowledgeBaseIds)
     },
     locale: getMainLocale,
+    pending: knowledgeWaiting,
   })
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
