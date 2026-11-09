@@ -48,8 +48,10 @@ a config file:
   - [ ] **Schedule**: create a schedule (e.g. `every 3600s`), see its next-fire
         time, and it appears in the list.
   - [ ] **Approval**: trigger a run that needs approval (a `shell_exec` tool
-        call), see the desktop notification + the Approvals page, approve it,
-        and the run completes.
+        call), see the count on the sidebar's Assistant entry and the run's
+        card in its conversation (a run started outside the window goes to the
+        "Started by the assistant" conversation), confirm it there, and the run
+        completes.
 - [ ] **No CLI/Git/network assumptions** — a non-technical user could do all of
       the above.
 

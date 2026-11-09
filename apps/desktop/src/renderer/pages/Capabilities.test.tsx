@@ -16,7 +16,7 @@ import { registerDynamicMessages } from '../capabilities/capabilities.i18n'
 // Shuffled on purpose: group order must follow CAPABILITY_GROUPS, and order
 // inside a group must follow the defs array, not a sort by name.
 const translateKeys = registerDynamicMessages('translate', 'Translate', 'Translate text')
-const DEFS: CapabilityDef[] = ['schedules', 'design', 'assistant', 'translate', 'knowledgeBase', 'sin90', 'documents', 'approvals'].map(id => {
+const DEFS: CapabilityDef[] = ['schedules', 'design', 'assistant', 'translate', 'knowledgeBase', 'sin90', 'documents'].map(id => {
   if (id === 'translate') return { id, group: 'tools', ...translateKeys, builtin: false, page: 'translate' }
   const def = CAPABILITIES.find(def => def.id === id)
   if (!def) throw new Error(`Missing capability ${id}`)
@@ -159,13 +159,10 @@ describe('CapabilitiesPage', () => {
     expect(screen.queryByText(/All sidebar slots are in use/)).not.toBeInTheDocument()
   })
 
-  it('shows the approvals count only on the approvals row, and only when it is positive', () => {
+  it('has no approvals row or count: approvals are decided in the assistant (M4 A6)', () => {
     renderPage({ approvalsWaiting: 4 })
-    expect(within(row('Approvals')).getByRole('status', { name: '4 waiting' })).toHaveTextContent('4')
-    expect(within(row('Documents')).queryByRole('status')).not.toBeInTheDocument()
-
-    renderPage({ approvalsWaiting: 0 })
     expect(screen.queryByRole('status', { name: /waiting/ })).not.toBeInTheDocument()
+    expect(screen.queryByText('Approvals')).not.toBeInTheDocument()
   })
 
   it('labels builtin rows Built-in, other rows Open, and lets statusFor replace either', () => {

@@ -22,6 +22,9 @@ export function isMainLocale(v: unknown): v is MainLocale {
 
 const en = {
   'presence.title': 'Confirm on this computer',
+  // M4 A5: the conversation a schedule's runs go to.
+  'schedule.conversationTitle': 'Schedule: {name}',
+  'assistant.conversationTitle': 'Started by the assistant',
   'presence.message': '{requester} (pid {pid}) is asking for permission: {operation}',
   'presence.detail': '{summary}\n\nOnly allow this if you started it yourself.',
   'presence.allow': 'Allow',
@@ -143,6 +146,8 @@ export type MainMessageKey = keyof typeof en
 
 const zh: Record<MainMessageKey, string> = {
   'presence.title': '请在本机确认',
+  'schedule.conversationTitle': '日程：{name}',
+  'assistant.conversationTitle': '助理发起',
   'presence.message': '{requester}（pid {pid}）请求授权：{operation}',
   'presence.detail': '{summary}\n\n只有确定是你自己发起的操作，才选择允许。',
   'presence.allow': '允许',
@@ -262,6 +267,8 @@ const zh: Record<MainMessageKey, string> = {
 
 const th: Record<MainMessageKey, string> = {
   'presence.title': 'ยืนยันบนเครื่องนี้',
+  'schedule.conversationTitle': 'กำหนดการ: {name}',
+  'assistant.conversationTitle': 'ผู้ช่วยเริ่มเอง',
   'presence.message': '{requester} (pid {pid}) ขออนุญาต: {operation}',
   'presence.detail': '{summary}\n\nอนุญาตเฉพาะเมื่อคุณเป็นผู้เริ่มการดำเนินการนี้เอง',
   'presence.allow': 'อนุญาต',

@@ -18,9 +18,14 @@ type Proxy = Window['agent24']['backendProxy']
 export type KnowledgeTurn =
   | { kind: 'answer'; text: string; knowledge: RunKnowledge | null; runId: string }
   | { kind: 'failed'; code: string; message: string }
+  /** M4 A4: the turn stopped waiting, the run goes on: it is the
+   *  conversation's task from now on, its card shows how it does. */
+  | { kind: 'ongoing'; runId: string; status: string }
 
 export interface TurnDeps {
   proxy: Proxy
+  /** M4 A2: told the run's id once the daemon has made it. */
+  onRunStarted?: (runId: string) => void
   /** Told each time the run waits on an approval, and once it no longer does. */
   onAwaitingApproval?: (waiting: boolean) => void
   sleep?: (ms: number) => Promise<void>
@@ -51,13 +56,16 @@ export async function askWithKnowledge(prompt: string, sessionId: string, deps: 
   const created = await deps.proxy({ method: 'POST', path: '/api/v1/runs', body })
   const runId = (created.data as { id?: unknown } | null)?.id
   if (!created.ok || typeof runId !== 'string') return failure(created.data, 'run_not_started')
+  deps.onRunStarted?.(runId)
   const deadline = now() + MAX_WAIT_MS
   let waiting = false
+  let last: string | null = null
   while (now() < deadline) {
     await sleep(POLL_MS)
     const res = await deps.proxy({ method: 'GET', path: `/api/v1/runs/${encodeURIComponent(runId)}` })
     if (!res.ok) continue
     const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null; knowledge?: RunKnowledge | null }
+    if (typeof run.status === 'string') last = run.status
     const approval = run.status === 'awaiting_approval'
     if (approval !== waiting) {
       waiting = approval
@@ -66,7 +74,9 @@ export async function askWithKnowledge(prompt: string, sessionId: string, deps: 
     if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null, runId }
     if (run.status === 'failed' || run.status === 'cancelled') return failure(run, `run_${run.status}`)
   }
-  // Not left running unseen: the turn gave up on it.
+  // M4 A4: a run still going on is left to go on, as the conversation's
+  // task with a card; one never seen is not left running unseen.
+  if (last === 'queued' || last === 'running' || last === 'awaiting_approval') return { kind: 'ongoing', runId, status: last }
   await deps.proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(runId)}/cancel` })
   return { kind: 'failed', code: 'run_timeout', message: 'run_timeout' }
 }

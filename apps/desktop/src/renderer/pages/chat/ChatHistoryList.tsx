@@ -6,6 +6,7 @@ import {
   clearConversations,
   createGroup,
   deleteConversation,
+  TASKS_NOT_STOPPED,
   deleteGroup,
   getHistoryState,
   moveConversation,
@@ -22,6 +23,8 @@ import { graphemes, oneLine, renameTitle } from './title'
 import { DRAG_TYPE, dropChange, groupOf, targetKey, type DropTarget } from './drop'
 import { HistoryMenu, type MenuEntry } from './HistoryMenu'
 import { useEntryMenu } from './knowledge-entry'
+import { HISTORY_FILTERS, filtersOf, type HistoryFilter } from './filters'
+import { useRunStatuses } from './run-status'
 import type { ChatHistorySummary } from '../../../shared/chat-history'
 
 /** UI-04 T3: with more conversations than this, the list offers a search. */
@@ -150,6 +153,21 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
   const searching = searchable && needle !== ''
   const shown = searching ? rows.filter(row => row.haystack.includes(needle)) : rows
 
+  // M4 A3: the four filters. Each task's status is asked of the daemon and
+  // kept up to date by its events; archived conversations are under "all"
+  // only. Another filter than "all" shows a flat list, searched too.
+  const [filter, setFilter] = useState<HistoryFilter>('all')
+  const taskIds = useMemo(() => live.flatMap(item => item.tasks.map(task => task.run_id)), [live])
+  const statuses = useRunStatuses(taskIds)
+  const under = useMemo(() => new Map(live.map(item => [item.id, filtersOf(item, id => statuses.get(id))])), [live, statuses])
+  const count = (f: HistoryFilter) => live.filter(item => under.get(item.id)?.has(f)).length
+  // Shown only once some conversation has a task or waits on the user:
+  // before that every filter but "all" is empty. Gone, it leaves "all".
+  const hasWork = live.some(item => item.tasks.length > 0 || item.pending.length > 0)
+  useEffect(() => { if (!hasWork) setFilter('all') }, [hasWork])
+  const filtering = hasWork && filter !== 'all'
+  const filtered = filtering ? shown.filter(row => !row.archived && under.get(row.item.id)?.has(filter)) : shown
+
   // The conversation being renamed, the title it had when the box opened,
   // and what has been typed so far. The ref makes Enter followed by the
   // input's blur rename once, not twice.
@@ -235,8 +253,18 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
       return deleteGroup(id)
     }
   }
+  // M4 A6: deleting stops the tasks still going on (history.ts), and the
+  // question says so when the list knows of some.
+  const going = (tasks: readonly { run_id: string }[]) =>
+    tasks.filter(task => ['queued', 'running', 'awaiting_approval'].includes(statuses.get(task.run_id) ?? '')).length
   const remove = (row: Row) => {
-    if (window.confirm(t('history.deleteConfirm', { title: row.title }))) return deleteConversation(row.item.id)
+    const count = going(row.item.tasks)
+    const ask = count > 0 ? t('history.deleteConfirmTasks', { title: row.title, count: String(count) }) : t('history.deleteConfirm', { title: row.title })
+    if (window.confirm(ask)) return deleteConversation(row.item.id).catch(notStopped)
+  }
+  // One that could not stop a task stays, and the user is told (Codex A6 C1).
+  const notStopped = (err: unknown) => {
+    if (err instanceof Error && err.message === TASKS_NOT_STOPPED) window.alert(t('history.tasksNotStopped'))
   }
 
   const [menu, setMenu] = useState<Menu | null>(null)
@@ -411,7 +439,8 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
           <button type="button" className="chat-history-clear chat-history-new-group" onClick={() => setNaming({ group: null, moving: null })}>
             {t('history.group.new')}</button>
           <button type="button" className="chat-history-clear" disabled={busy} onClick={() => {
-            if (window.confirm(t('history.clearConfirm'))) void clearConversations()
+            const count = going(items.flatMap(item => item.tasks))
+            if (window.confirm(count > 0 ? t('history.clearConfirmTasks', { count: String(count) }) : t('history.clearConfirm'))) void clearConversations().catch(notStopped)
           }}>{t('history.clear')}</button>
         </>}
       </div>
@@ -430,10 +459,23 @@ export function ChatHistoryList({ showChat }: { showChat: () => void }) {
             <NameBox label={t('history.group.nameInput')} initial="" onDone={(name, keyboard) => void nameDone(name, keyboard)} />
           </div>
         )}
-        {searching
+        {hasWork && (
+          <div className="chat-history-filters" role="group" aria-label={t('history.filter.label')}>
+            {HISTORY_FILTERS.map(f => {
+              const n = f === 'all' ? 0 : count(f)
+              return (
+                <button key={f} type="button" className="chat-history-filter" aria-pressed={filter === f} onClick={() => setFilter(f)}>
+                  {t(`history.filter.${f}`)}{n > 0 && <span className="chat-history-filter-count">({n})</span>}
+                </button>
+              )
+            })}
+          </div>
+        )}
+        {filtering || searching
           ? <>
-            {shown.length === 0 && <p className="chat-history-empty" role="status">{t('history.noMatch')}</p>}
-            <ul className="chat-history-list">{shown.map(renderRow)}</ul>
+            {filtered.length === 0 && <p className="chat-history-empty" role="status">
+              {t(filtering && !searching ? 'history.filter.empty' : 'history.noMatch')}</p>}
+            <ul className="chat-history-list">{filtered.map(renderRow)}</ul>
           </>
           : <>
             {groups.map(group => {

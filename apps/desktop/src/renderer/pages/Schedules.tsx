@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo, useRef } from 'react'
+import { useState, useEffect, useCallback, useContext, useMemo, useRef, useSyncExternalStore } from 'react'
 import {
   listSchedules,
   createSchedule,
@@ -13,6 +13,8 @@ import {
 import { previewNextFire, formatPreview, type ScheduleSpecInput } from './schedule/cronPreview'
 import { useT, useLocale, type T } from '../i18n'
 import { schedulesMessages } from './Schedules.i18n'
+import { CapabilitiesContext } from '../capabilities/types'
+import { getHistoryState, openConversation, subscribeHistory } from './chat/history'
 
 type SchedKey = keyof typeof schedulesMessages.en
 
@@ -22,6 +24,28 @@ function buildSpec(type: SpecType, expr: string, tz: string, secs: string, ts: s
   if (type === 'cron') return { type: 'cron', expr, tz: tz.trim() || null }
   if (type === 'every') return { type: 'every', secs: Number(secs) }
   return { type: 'at', ts }
+}
+
+/** M4 A6: a schedule's runs go to a conversation of its own (A5, main's
+ *  schedule-conversations.ts); its entry, once it has one. Asked again as
+ *  the list of conversations changes: the first run starts it. */
+function ScheduleHome({ scheduleId, label }: { scheduleId: string; label: string }) {
+  const { open } = useContext(CapabilitiesContext)
+  const { items } = useSyncExternalStore(subscribeHistory, getHistoryState)
+  const [home, setHome] = useState<string | null>(null)
+  useEffect(() => {
+    let live = true
+    void window.agent24?.chatHistory?.ofSchedule?.(scheduleId)
+      .then(id => { if (live) setHome(id) })
+      .catch(() => { if (live) setHome(null) })
+    return () => { live = false }
+  }, [scheduleId, items])
+  if (home === null) return null
+  return (
+    <button className="btn" style={{ fontSize: 11 }} onClick={() => { openConversation(home); open('assistant', 'other') }}>
+      {label}
+    </button>
+  )
 }
 
 export default function SchedulesPage() {
@@ -224,6 +248,7 @@ export default function SchedulesPage() {
                   </span>
                 )}
                 <div style={{ marginLeft: 'auto', display: 'flex', gap: 6 }}>
+                  <ScheduleHome scheduleId={s.id} label={t('item.openConversation')} />
                   <button className="btn" style={{ fontSize: 11 }} onClick={() => onRunNow(s.id)}>
                     {t('item.runNow')}
                   </button>

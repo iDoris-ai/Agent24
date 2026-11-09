@@ -10,7 +10,7 @@ describe('HomePage', () => {
   it('narrates the first stage while the backend is online', () => {
     render(<HomePage backendOk={true} {...props} />)
     expect(screen.getByRole('slider')).toHaveAttribute('aria-valuenow', '1')
-    expect(screen.getByText(/A desktop chat starts a run/)).toBeInTheDocument()
+    expect(screen.getByText(/A desktop conversation starts a run/)).toBeInTheDocument()
     expect(screen.getByText('Running :60128')).toBeInTheDocument()
   })
 
@@ -37,7 +37,17 @@ describe('HomePage', () => {
     render(<HomePage backendOk={true} {...props} onNavigate={onNavigate} />)
     fireEvent.click(screen.getByRole('button', { name: /Approval gate/ }))
     fireEvent.click(screen.getByText('Open this page →'))
-    expect(onNavigate).toHaveBeenCalledWith('approvals')
+    // M4 A6: approvals are decided in the assistant; the run store opens
+    // Settings → Activity (the runs page is no more).
+    expect(onNavigate).toHaveBeenLastCalledWith('assistant')
+  })
+
+  it('opens Settings → Activity for the ledger: the runs page is no more (M4 A6)', () => {
+    const onNavigate = vi.fn()
+    render(<HomePage backendOk={true} {...props} onNavigate={onNavigate} />)
+    fireEvent.click(screen.getByRole('button', { name: /Ledger/ }))
+    fireEvent.click(screen.getByText('Open this page →'))
+    expect(onNavigate).toHaveBeenLastCalledWith('settings/activity')
   })
 
   it('follows the global language setting', () => {
@@ -51,7 +61,7 @@ describe('HomePage', () => {
 
   it('keeps the caption quiet for screen readers while autoplaying, and announces manual steps', () => {
     render(<HomePage backendOk={true} {...props} />)
-    const caption = screen.getByText(/A desktop chat starts a run/)
+    const caption = screen.getByText(/A desktop conversation starts a run/)
     expect(caption).toHaveAttribute('aria-live', 'off')
     act(() => { fireEvent.keyDown(screen.getByRole('slider'), { key: 'ArrowRight' }) })
     expect(screen.getByText(/agent24d creates the run/)).toHaveAttribute('aria-live', 'polite')

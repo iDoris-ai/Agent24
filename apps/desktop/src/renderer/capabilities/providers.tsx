@@ -6,6 +6,7 @@ import {
 import { CAPABILITIES, withDynamicCapabilities } from './registry'
 import { useT } from '../i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
+import { capabilitiesMessages } from './capabilities.i18n'
 
 type Route = { kind: 'page'; page: string; initialTab?: 'general' | 'activity' | 'connections'; key?: number; focus?: 'slots' } | { kind: 'capability'; id: CapabilityId; origin: OpenOrigin }
 const RouteContext = createContext<{ route: Route; navigate: (page: string) => void }>({
@@ -13,25 +14,67 @@ const RouteContext = createContext<{ route: Route; navigate: (page: string) => v
 })
 export const useCapabilityRoute = () => useContext(RouteContext)
 
+/** M4 A6 (#1688): what the pages showing say of unsaved changes. */
+interface LeaveGuard { dirty: () => boolean; message: () => string | undefined }
+const LeaveGuardContext = createContext<Set<LeaveGuard> | null>(null)
+/** For a page with changes it would lose: while it is mounted (shown or
+ *  hidden), going to another page asks first when `dirty` says there are
+ *  some, once however many guards say so, with the first such guard's
+ *  `message` or a plain one (Knowledge #1681). The page showing already is
+ *  not asked about; closing the window or quitting the app is not. */
+export function useLeaveGuard(dirty: boolean | (() => boolean), message?: string): void {
+  const guards = useContext(LeaveGuardContext)
+  const latest = useRef({ dirty, message })
+  latest.current = { dirty, message }
+  useEffect(() => {
+    if (!guards) return
+    const guard: LeaveGuard = {
+      dirty: () => { const d = latest.current.dirty; return typeof d === 'function' ? d() : d },
+      message: () => latest.current.message,
+    }
+    guards.add(guard)
+    return () => { guards.delete(guard) }
+  }, [guards])
+}
+/** Whether `b` shows the page `a` does, as it is: a page given another key
+ *  (Settings, opened again) is mounted anew, and loses what it had (Codex
+ *  #1688 C1). */
+const samePage = (a: Route, b: Route) =>
+  a.kind === b.kind && (a.kind === 'page'
+    ? a.page === (b as typeof a).page && a.key === (b as typeof a).key
+    : a.id === (b as typeof a).id)
+
 export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const [{ defs, moduleInventory }, setRegistry] = useState<Pick<CapabilitiesApi, 'defs' | 'moduleInventory'>>({ defs: CAPABILITIES })
   const [route, setRoute] = useState<Route>({ kind: 'page', page: 'home' })
   const [approvalsWaiting, setApprovalsWaiting] = useState(0)
   const settingsVisit = useRef(0)
-  const navigate = useCallback((page: string) => setRoute({ kind: 'page', page }), [])
+  const t = useT(capabilitiesMessages)
+  const [guards] = useState(() => new Set<LeaveGuard>())
+  const current = useRef(route)
+  current.current = route
+  // Another page is gone to only once the user agrees to lose what a page
+  // there has not saved; the one showing is not asked about (#1688).
+  const go = useCallback((next: Route) => {
+    const dirty = samePage(current.current, next) ? [] : [...guards].filter(g => g.dirty())
+    if (dirty.length > 0 && !window.confirm(dirty.map(g => g.message()).find(Boolean) ?? t('leave.unsaved'))) return
+    setRoute(next)
+  }, [guards, t])
+  const navigate = useCallback((page: string) => go({ kind: 'page', page }), [go])
   const open = useCallback((id: CapabilityId, origin: OpenOrigin, options?: OpenOptions) => {
     if (id === 'settings/general' || id === 'settings/activity' || id === 'settings/connections') {
       // Only an explicit { focus: 'slots' } lands on the pinned-slots row. Other entries stay at the top of the tab.
       // settings/connections: the Knowledge binding, opened from the knowledge page (#1625).
       const focus = id === 'settings/general' ? options?.focus : undefined
-      setRoute({ kind: 'page', page: 'settings', initialTab: id === 'settings/general' ? 'general' : id === 'settings/activity' ? 'activity' : 'connections', key: ++settingsVisit.current, ...(focus ? { focus } : {}) })
+      go({ kind: 'page', page: 'settings', initialTab: id === 'settings/general' ? 'general' : id === 'settings/activity' ? 'activity' : 'connections', key: ++settingsVisit.current, ...(focus ? { focus } : {}) })
     } else if (id === 'capabilities') {
-      setRoute({ kind: 'page', page: 'capabilities' })
-    } else if (defs.some(d => d.id === id)) setRoute({ kind: 'capability', id, origin })
-  }, [defs])
+      go({ kind: 'page', page: 'capabilities' })
+    } else if (defs.some(d => d.id === id)) go({ kind: 'capability', id, origin })
+  }, [defs, go])
   useEffect(() => {
-    if (route.kind === 'capability' && !defs.some(d => d.id === route.id)) navigate('capabilities')
-  }, [defs, route, navigate])
+    // The module is gone, and its page with it: nothing to ask.
+    if (route.kind === 'capability' && !defs.some(d => d.id === route.id)) setRoute({ kind: 'page', page: 'capabilities' })
+  }, [defs, route])
   useEffect(() => {
     let disposed = false
     let modulesBusy = false
@@ -70,7 +113,9 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
     defs, moduleInventory, manifestsLoaded: moduleInventory !== undefined, approvalsWaiting,
     open,
   }}>
-    <RouteContext.Provider value={{ route, navigate }}>{children}</RouteContext.Provider>
+    <RouteContext.Provider value={{ route, navigate }}>
+      <LeaveGuardContext.Provider value={guards}>{children}</LeaveGuardContext.Provider>
+    </RouteContext.Provider>
   </CapabilitiesContext.Provider>
 }
 
