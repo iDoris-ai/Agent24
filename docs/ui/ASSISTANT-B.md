@@ -36,10 +36,13 @@
 哪些操作要确认，只由守护进程的 `route_policy.rs` 决定。日常令牌访问 Elevated 路由时，守护进程回 `403 presence_required`。main 照 CLI 的 `send_elevating` 处理：
 
 1. 先用日常令牌发请求。
-2. 收到 `403 presence_required`，并且当前连接是服务守护进程的登记时，在 token 连接上发 `elevate{method, path, body_sha256, summary}`。守护进程把确认请求转给 presence 连接（见第 2 节），用户同意后回 `elevation_pending{challenge_id}` → `elevated{challenge_id, grant}`。main 最多等 65 秒。
-3. 带 `X-Agent24-Elevation: <grant>` 用同一个请求重试一次。grant 有效期 60 秒、只能用一次，绑定方法、路径和请求体，所以重试发的正是哈希过的那份字节。
+2. 收到 `403 presence_required`，并且当前连接是服务守护进程的登记时，在 token 连接上开一轮（`turn`），这一轮里不会插进 renew。在这一轮里依次：
+   1. 用当前令牌再发一次同一个请求。守护进程在 403 时按令牌记下请求：idoris install、connect 和 attached 的摘要就取自这份请求体。所以如果第一次之后令牌换过，或者同一模板的另一个请求覆盖了记录，这一次会把它重新记上（Codex B3b C1）。这次如果不再是 presence_required，就直接返回它的结果。
+   2. 发 `elevate{method, path, body_sha256, summary}`。守护进程把确认请求转给 presence 连接（见第 2 节），用户同意后回 `elevation_pending{challenge_id}` → `elevated{challenge_id, grant}`。main 最多等 65 秒。
+   3. 带 `X-Agent24-Elevation: <grant>` 用同一个请求重试一次。grant 有效期 60 秒、只能用一次，绑定方法、路径、请求体和令牌，所以重试发的正是哈希过的那份字节。
 
-- elevate 和 renew 在 token 连接上串行执行：守护进程等用户时收到任何输入都会断开；而且 grant 绑定在当前令牌上，所以重试也在同一轮内完成，中间不会插进 renew。
+- elevate 和 renew 在 token 连接上串行执行：守护进程等用户时收到任何输入都会断开；而且 grant 绑定在当前令牌上。在一轮结束之后再调用 elevate，一律被拒绝。
+- 剩下的窗口：在第 2.1 步的应答和 elevate 帧之间，如果另一个同一模板的请求恰好从轮外到达，守护进程记下的会是那个请求，这次 elevate 就会失败（页面收到 403）。这个窗口只有几毫秒。
 - 用户没有确认时（拒绝、超时、没有 presence 连接），页面收到 403，`code` 用守护进程给的错误码。不会再试第二次。
 - 带查询串的请求不提权，守护进程会拒绝这种 grant，所以原样返回 403。
 - 只有 main 设置这个头：页面的请求（`BackendProxyRequest`）不带自定义头，grant 也不离开 `sendElevating`。

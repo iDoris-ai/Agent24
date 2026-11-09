@@ -2,11 +2,12 @@
 // CLI's `send_elevating` (agent24-cli main.rs). The daemon the LaunchAgent
 // runs gave this app a daily FirstPartyShell token; on an Elevated route
 // (route_policy.rs, the only place that decides which) it answers
-// `403 presence_required`. Then, once: ask for a grant on the token
-// connection (the daemon puts the challenge to the presence connection, where
-// main shows the native box), and retry the same request with the grant in
-// `X-Agent24-Elevation`. The grant lives 60 s, is single use and binds
-// method, path and body, so the retry sends exactly the bytes hashed.
+// `403 presence_required`. Then, once, in one turn on the token connection
+// (no renew in it): the request again with the token of now, as the daemon
+// remembers it by token; a grant (the daemon puts the challenge to the
+// presence connection, where main shows the native box); and the retry with
+// the grant in `X-Agent24-Elevation`. The grant lives 60 s, is single use and
+// binds method, path, body and token, so the retry sends exactly the bytes hashed.
 //
 // Only main sets the header: renderer requests carry no headers of their own
 // (BackendProxyRequest), and the grant never leaves this function. With our
@@ -33,8 +34,8 @@ export function approvalConfirmShown(serviceMode: boolean, skip: boolean = SKIP_
 
 export interface ElevatingDeps {
   connection: () => ProxyEndpoint | null
-  /** The enrolment's elevate, or null when there is none (backend-manager `daemonElevation`). */
-  elevation: () => EnrolSession['elevate'] | null
+  /** A turn on the enrolment's token connection, or null when there is none (backend-manager `daemonElevation`). */
+  elevation: () => EnrolSession['turn'] | null
   send?: typeof proxyRequest
 }
 
@@ -62,9 +63,9 @@ export async function sendElevating(
   const conn = deps.connection()
   if (!conn) return proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)')
   const first = await send(conn, req, opts)
-  const elevate = deps.elevation()
+  const turn = deps.elevation()
   // The daemon refuses a grant on a request with a query: it could not be described.
-  if (!elevate || !presenceRequired(first) || /[?#]/.test(req.path)) return first
+  if (!turn || !presenceRequired(first) || /[?#]/.test(req.path)) return first
   // As proxyRequest serializes it, so the hash is of the bytes the retry sends.
   let body: string
   try {
@@ -73,10 +74,15 @@ export async function sendElevating(
     return first
   }
   try {
-    return await elevate({ method: req.method, path: req.path, body, summary: elevationSummary(req) }, async (grant) => {
-      // The token now, under the same exclusive turn as the grant: no renew between.
+    return await turn(async (elevate) => {
+      // A renew may have come since the first try, and another request of the
+      // same template may have been remembered over it: so again, now, with
+      // the token the grant will be bound to (Codex B3b C1).
       const now = deps.connection()
       if (!now) return proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)')
+      const again = await send(now, req, opts)
+      if (!presenceRequired(again)) return again
+      const grant = await elevate({ method: req.method, path: req.path, body, summary: elevationSummary(req) })
       return send({ port: now.port, authHeaders: { ...now.authHeaders, [ELEVATION_HEADER]: grant } }, req, opts)
     })
   } catch (error) {

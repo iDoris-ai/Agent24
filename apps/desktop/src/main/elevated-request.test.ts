@@ -18,16 +18,18 @@ function setup(replies: BackendProxyResponse[], opts: { elevation?: boolean; fai
     sent.push({ endpoint, req })
     return replies.shift() ?? OK
   })
-  const elevate = async <T>(request: ElevateRequest, use: (grant: string) => Promise<T>): Promise<T> => {
-    asked.push(request)
-    if (opts.fail !== undefined) throw opts.fail
-    // A renew right before the turn: the retry must carry the token of now.
+  const turn = async <T>(fn: (elevate: (request: ElevateRequest) => Promise<string>) => Promise<T>): Promise<T> => {
+    // A renew right before the turn: what follows must carry the token of now.
     token = 'daily-2'
-    return use(GRANT)
+    return fn(async (request) => {
+      asked.push(request)
+      if (opts.fail !== undefined) throw opts.fail
+      return GRANT
+    })
   }
   const deps = {
     connection: () => ({ port: 4100, authHeaders: { Authorization: `Bearer ${token}` } }),
-    elevation: () => (opts.elevation === false ? null : elevate),
+    elevation: () => (opts.elevation === false ? null : turn),
     send,
   }
   return { deps, sent, asked }
@@ -36,25 +38,34 @@ function setup(replies: BackendProxyResponse[], opts: { elevation?: boolean; fai
 const schedule: BackendProxyRequest = { method: 'POST', path: '/api/v1/schedules', body: { name: 'daily', cron: '0 9 * * *' }, idempotencyKey: 'k1' }
 
 describe('sendElevating (M5 B3)', () => {
-  it('on 403 presence_required, elevates once with the exact body and retries once with the grant and the current token', async () => {
-    const { deps, sent, asked } = setup([PRESENCE_REQUIRED, OK])
+  it('on 403 presence_required, in one turn: again with the token of now, one elevation with the exact body, one retry with the grant (Codex B3b C1)', async () => {
+    const { deps, sent, asked } = setup([PRESENCE_REQUIRED, PRESENCE_REQUIRED, OK])
     await expect(sendElevating(schedule, { host: '127.0.0.1' }, deps)).resolves.toEqual(OK)
     expect(asked).toEqual([{ method: 'POST', path: '/api/v1/schedules', body: JSON.stringify(schedule.body), summary: elevationSummary(schedule) }])
-    expect(sent).toHaveLength(2)
-    expect(sent[0]?.endpoint.authHeaders).toEqual({ Authorization: 'Bearer daily-1' })
-    expect(sent[1]?.endpoint.authHeaders).toEqual({ Authorization: 'Bearer daily-2', 'X-Agent24-Elevation': GRANT })
-    expect(sent[1]?.req).toBe(schedule)
+    expect(sent.map((s) => s.endpoint.authHeaders)).toEqual([
+      { Authorization: 'Bearer daily-1' },
+      { Authorization: 'Bearer daily-2' },
+      { Authorization: 'Bearer daily-2', 'X-Agent24-Elevation': GRANT },
+    ])
+    expect(sent.every((s) => s.req === schedule)).toBe(true)
   })
 
   it('a retry that is refused again is returned as it is: one elevation, never a second', async () => {
-    const { deps, sent, asked } = setup([PRESENCE_REQUIRED, PRESENCE_REQUIRED])
+    const { deps, sent, asked } = setup([PRESENCE_REQUIRED, PRESENCE_REQUIRED, PRESENCE_REQUIRED])
     await expect(sendElevating(schedule, {}, deps)).resolves.toEqual(PRESENCE_REQUIRED)
     expect(asked).toHaveLength(1)
+    expect(sent).toHaveLength(3)
+  })
+
+  it('the request again in the turn not refused for presence: that answer, nothing elevated', async () => {
+    const { deps, sent, asked } = setup([PRESENCE_REQUIRED, OK])
+    await expect(sendElevating(schedule, {}, deps)).resolves.toEqual(OK)
+    expect(asked).toEqual([])
     expect(sent).toHaveLength(2)
   })
 
   it('hashes no body as the empty string', async () => {
-    const { deps, asked } = setup([PRESENCE_REQUIRED, OK])
+    const { deps, asked } = setup([PRESENCE_REQUIRED, PRESENCE_REQUIRED, OK])
     await sendElevating({ method: 'POST', path: '/api/v1/shutdown' }, {}, deps)
     expect(asked[0]?.body).toBe('')
   })
@@ -78,10 +89,10 @@ describe('sendElevating (M5 B3)', () => {
     [new EnrolError('presence_timeout', 'timed out'), 'presence_timeout'],
     [new Error('boom'), 'internal'],
   ])('a confirmation that does not come answers 403 with its code, and nothing is retried (%s)', async (fail, code) => {
-    const { deps, sent } = setup([PRESENCE_REQUIRED], { fail })
+    const { deps, sent } = setup([PRESENCE_REQUIRED, PRESENCE_REQUIRED], { fail })
     const res = await sendElevating(schedule, {}, deps)
     expect(res).toEqual({ ok: false, status: 403, data: { error: { code, message: 'The action was not confirmed' } } })
-    expect(sent).toHaveLength(1)
+    expect(sent).toHaveLength(2)
   })
 
   it('sends nothing without a connection', async () => {
@@ -92,7 +103,7 @@ describe('sendElevating (M5 B3)', () => {
   })
 
   it('the grant is never in the answer the caller sees', async () => {
-    const { deps } = setup([PRESENCE_REQUIRED, { ok: false, status: 403, data: { error: { code: 'elevation_invalid', message: 'Elevation grant is invalid' } } }])
+    const { deps } = setup([PRESENCE_REQUIRED, PRESENCE_REQUIRED, { ok: false, status: 403, data: { error: { code: 'elevation_invalid', message: 'Elevation grant is invalid' } } }])
     expect(JSON.stringify(await sendElevating(schedule, {}, deps))).not.toContain(GRANT)
   })
 })
