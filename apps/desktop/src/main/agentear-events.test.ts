@@ -348,6 +348,17 @@ describe('parseScheduledRunFrame', () => {
     expect(parseScheduledRunFrame(raw)).toBeNull()
   })
 
+  it('tells onConnected of each connection, the first and every one after a cut', () => {
+    const onConnected = vi.fn()
+    const bridge = new AgentEarEventBridge(() => {}, undefined, undefined, undefined, undefined, onConnected)
+    bridge.start()
+    const socket = (bridge as unknown as { socket: { emit(e: string, d?: unknown): void } }).socket
+    expect(onConnected).not.toHaveBeenCalled()
+    socket.emit('open')
+    expect(onConnected).toHaveBeenCalledTimes(1)
+    bridge.stop()
+  })
+
   it('routes it to onScheduledRun, besides onRunEvent', () => {
     const onRunEvent = vi.fn()
     const onScheduledRun = vi.fn()

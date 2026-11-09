@@ -175,6 +175,9 @@ export class AgentEarEventBridge {
     private readonly onRunEvent?: (event: RunEvent) => void,
     // M4 A5: a schedule's run starting, for its conversation.
     private readonly onScheduledRun?: (run: { schedule_id: string; run_id: string }) => void,
+    // M4 A5: each connection made, the first and every one after a cut: the
+    // daemon does not replay what was missed meanwhile (Codex A5 C1).
+    private readonly onConnected?: () => void,
   ) {}
 
   start(): void {
@@ -215,6 +218,7 @@ export class AgentEarEventBridge {
 
     socket.on('open', () => {
       this.backoffMs = INITIAL_BACKOFF_MS
+      this.onConnected?.()
     })
     socket.on('message', (data: WebSocket.RawData) => {
       const raw = data.toString()

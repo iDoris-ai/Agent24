@@ -4,7 +4,7 @@ import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, n
 import path from 'node:path'
 import { registerIpcHandlers } from './ipc/index'
 import { onChatHistoryChange } from './chat-history'
-import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
+import { createScheduleConversations, type ScheduleConversations, type ScheduleRunRow } from './schedule-conversations'
 import { proxyRequest } from './backend-proxy'
 import { registerCliTool } from './ipc/cli-tool'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
@@ -91,6 +91,17 @@ const agentEarBridge = new AgentEarEventBridge(
   (run) => {
     scheduleConversations().record(run.schedule_id, run.run_id)
       .catch((err) => console.error('[main] schedule run not recorded', run.schedule_id, run.run_id, err))
+  },
+  // ...and those started while main was not listening.
+  () => {
+    scheduleConversations().catchUp(async () => {
+      const conn = daemonConnection()
+      if (!conn) throw new Error('backend_not_ready')
+      const res = await proxyRequest(conn, { method: 'GET', path: '/api/v1/runs' }, { host: '127.0.0.1' })
+      const list = (res.data as { runs?: unknown } | null)?.runs
+      if (!res.ok || !Array.isArray(list)) throw new Error(`runs_unavailable_${res.status}`)
+      return list as ScheduleRunRow[]
+    }).catch((err) => console.error('[main] schedule runs not caught up', err))
   },
 )
 
