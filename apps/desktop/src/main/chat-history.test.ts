@@ -724,4 +724,12 @@ describe('conversations main starts (M4 A5)', () => {
     expect(store.setTitle(id, '模型标题', 'model')).toMatchObject({ title: '日程：周报', title_source: 'schedule' })
     expect(store.setTitle(id, '我的周报', 'user')).toMatchObject({ title: '我的周报', title_source: 'user' })
   })
+
+  it('keeps the assistant\'s conversation\'s name (A6) the same way', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '助理发起', title_source: 'assistant' })
+    expect(store.save({ ...record(id, '2026-11-09T00:00:00.000Z', '问一句'), id })).toMatchObject({ title: '助理发起', title_source: 'assistant' })
+    expect(store.setTitle(id, '模型标题', 'model')).toMatchObject({ title: '助理发起', title_source: 'assistant' })
+    expect(store.setTitle(id, '我的', 'user')).toMatchObject({ title: '我的', title_source: 'user' })
+  })
 })

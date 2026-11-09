@@ -134,6 +134,6 @@ run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
   - 文件坏了、读不了：绑定和 `handled` 都从头来过（日程下一次 run 时新建对话，第一次补录不补历史）。这段时间里漏掉的 run 不再补。
   - 每次补录时，`handled` 只保留 daemon 列表里还有的 run（Codex A5 r3 C1）。它不会比 daemon 存的多，也不按条数截断，所以 daemon 还留着的旧 run 不会被挤出去、再被重记。
   - 已知局限（M4 不做）：`GET /api/v1/runs` 没有分页，也不能按日程过滤，一次返回全部 run 和它们的输入输出。main 自己发的这个请求，上限放宽到 64MB（窗口的请求仍是 8MB）。超过 64MB 时，补录每次都会失败，只记日志。要根治，得让 daemon 支持过滤和分页：内核待办 #1701（`GET /api/v1/runs` 加 `schedule_id`、`session_id` 过滤和游标分页），归内核线。
-- **标题优先级**：用户改名 > 日程名 > 模型标题 > 第一句话。在日程对话里提问不会把标题改掉，用户改名可以改。
+- **标题优先级**：用户改名 > main 自己起的名字（日程名 `schedule`，或者 A6「助理发起」对话的 `assistant`，两者同级）> 模型标题 > 第一句话。在这类对话里提问，标题不会被改掉；用户改名可以改。
 - main 新增 `create({ title, title_source })`：新建一条没有消息的对话，并通知 `onChatHistoryChange`，打开着的窗口会把它列出来。
 - `conversationOf(scheduleId)` 留给 A6：日程页上每条日程的归属对话入口。

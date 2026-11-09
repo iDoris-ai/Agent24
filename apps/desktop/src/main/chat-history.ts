@@ -55,9 +55,10 @@ export function onChatHistoryChange(listener: ChangeListener | null): void {
 }
 
 /** A title replaces the one on file only when its source is at least as
- *  strong: the user's rename over a schedule's name (M4 A5) over the
- *  model's title over the first prompt. */
-const TITLE_RANK: Record<ChatHistoryTitleSource, number> = { prompt: 0, model: 1, schedule: 2, user: 3 }
+ *  strong: the user's rename over main's own name (a schedule's, M4 A5, or
+ *  the assistant's conversation, A6) over the model's title over the first
+ *  prompt. */
+const TITLE_RANK: Record<ChatHistoryTitleSource, number> = { prompt: 0, model: 1, schedule: 2, assistant: 2, user: 3 }
 const isTitleSource = (v: unknown): v is ChatHistoryTitleSource =>
   typeof v === 'string' && (CHAT_HISTORY_TITLE_SOURCES as readonly string[]).includes(v)
 
