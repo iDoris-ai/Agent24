@@ -38,7 +38,7 @@ pending: { id: string; kind: 'approval' | 'confirm'; run_id?: string; label: str
 | `clearPending(id, pendingId)` | 去掉这一条；不在就什么也不做 | 同上 |
 
 共同规则：
-- 只改已经在磁盘上的对话，不新建对话。
+- 只改已经在磁盘上的对话，不新建对话。新建对话由页面保存，或者用 main 的 `create`（A5，见 §7）。
 - 不动 `messages` 和 `updated_at`，所以不会让列表重新排序。
 - 参数不合法就抛错；超过上限也抛错：`Too many chat history runs` / `Too many chat history pending items`。
 - runs 满了（1000 条）时（A4，PR-Daemon #1696 L1）：要记的是 task，就去掉最早的一条 answer，给它腾地方；要记的是 answer，或者已经没有 answer 可去掉，仍然抛错。task 有进度卡，不能因为问答多了就记不上。
@@ -112,3 +112,28 @@ run 的状态怎么来（`renderer/pages/chat/run-status.ts`）：
 - `id` 由调用方自己定，清除时用同一个 id。
 
 只调这些 API，不改 `main/chat-history.ts`。
+
+## 7. 日程的归属对话（A5）
+
+每条日程有一条自己的对话，日程的 run 都记在那里（设计稿 r3 §3.4）。
+
+- **哪些 run 是日程的**：daemon 的 `run.started` 事件带 `schedule_id`，不是日程发起的 run 为 null。日程按时触发和 `run_now` 都会发这个事件；`schedule.fired` 只有按时触发才发，所以不用它。main 在 `/events` 上听（`agentear-events.ts` 的 `parseScheduledRunFrame`），有没有窗口都记。
+- **第一次**：新建一条对话，标题「日程：<日程名>」（三语，main-i18n `schedule.conversationTitle`），`title_source = 'schedule'`。名字取自 `GET /api/v1/schedules/{id}`，拿不到就用日程 id。
+- **之后**：同一条日程的 run 都用 `appendRun(id, runId, 'schedule')` 记进这条对话，进度卡与 A4 相同。
+- **绑定关系**存在 `<userData>/schedule-conversations.json`（`agent24.schedule-conversations` v1，最多 1000 条，满了先丢最早的）：
+  - 对话已被删除，或者文件读不了：下一次 run 时新建一条。
+  - 对话已归档：照常往里记，它仍是这条日程的对话。
+- **记录顺序**：一次只记一条，按到达顺序。所以一个新日程的两个 run 会进同一条新对话。
+- **断线补录**（Codex A5 C1、r2）：daemon 不重放事件。客户端断线，或者因为落后被 daemon 主动断开（`agent24d` events.rs），都要靠 REST 对账。
+  - main 每次连上 `/events`（第一次和每次重连）都取一次 `GET /api/v1/runs`，把其中带 `schedule_id`、但**还没处理过**的 run 按创建时间从旧到新补记。
+  - 「处理过」的 run 记在同一个文件的 `handled` 里：实时收到并记进对话的、补录记进去的，都算。用的是 run id，不比较时间，所以不受时钟影响。
+  - 实时收到的 run 也先查 `handled`（Codex A5 r3 C3）。所以一个 run 不论走哪条路，记过一次就不会再记，用户删掉的对话也不会被重新建出来。
+  - 第一次补录时还没有 `handled`：这时列表里已有的日程 run 都算处理过，不补历史。但有一种例外（Codex A5 r3 C2）：在这之前实时收到、却没记进去的 run，先存在 `retry` 里。第一次补录不把它们算作处理过，而是把它们补记进去。
+  - 某一条记不进去（例如它的对话已满 1000 个 run），这一条跳过、记日志，其余照补；它留在「没处理过」里，下次连上再试。
+  - 取不到 run 列表：这次什么都不改，下次连上再补。
+  - 文件坏了、读不了：绑定和 `handled` 都从头来过（日程下一次 run 时新建对话，第一次补录不补历史）。这段时间里漏掉的 run 不再补。
+  - 每次补录时，`handled` 只保留 daemon 列表里还有的 run（Codex A5 r3 C1）。它不会比 daemon 存的多，也不按条数截断，所以 daemon 还留着的旧 run 不会被挤出去、再被重记。
+  - 已知局限（M4 不做）：`GET /api/v1/runs` 没有分页，也不能按日程过滤，一次返回全部 run 和它们的输入输出。main 自己发的这个请求，上限放宽到 64MB（窗口的请求仍是 8MB）。超过 64MB 时，补录每次都会失败，只记日志。要根治，得让 daemon 支持过滤和分页：内核待办 #1701（`GET /api/v1/runs` 加 `schedule_id`、`session_id` 过滤和游标分页），归内核线。
+- **标题优先级**：用户改名 > main 自己起的名字（日程名 `schedule`，或者 A6「助理发起」对话的 `assistant`，两者同级）> 模型标题 > 第一句话。在这类对话里提问，标题不会被改掉；用户改名可以改。
+- main 新增 `create({ title, title_source })`：新建一条没有消息的对话，并通知 `onChatHistoryChange`，打开着的窗口会把它列出来。
+- `conversationOf(scheduleId)` 留给 A6：日程页上每条日程的归属对话入口。

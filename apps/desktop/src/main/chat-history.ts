@@ -55,8 +55,10 @@ export function onChatHistoryChange(listener: ChangeListener | null): void {
 }
 
 /** A title replaces the one on file only when its source is at least as
- *  strong: the user's rename over the model's title over the first prompt. */
-const TITLE_RANK: Record<ChatHistoryTitleSource, number> = { prompt: 0, model: 1, user: 2 }
+ *  strong: the user's rename over main's own name (a schedule's, M4 A5, or
+ *  the assistant's conversation, A6) over the model's title over the first
+ *  prompt. */
+const TITLE_RANK: Record<ChatHistoryTitleSource, number> = { prompt: 0, model: 1, schedule: 2, assistant: 2, user: 3 }
 const isTitleSource = (v: unknown): v is ChatHistoryTitleSource =>
   typeof v === 'string' && (CHAT_HISTORY_TITLE_SOURCES as readonly string[]).includes(v)
 
@@ -369,6 +371,25 @@ export function createChatHistoryStore(dir: string) {
     },
     get(id: unknown): ChatHistoryRecord | null {
       return current(checkId(id))
+    },
+    /** M4 A5: a new conversation main starts itself (a schedule's), with no
+     *  messages yet. Told to the change listener, so the open window lists
+     *  it. docs/ui/ASSISTANT-A.md. */
+    create(input: { title: string; title_source: ChatHistoryTitleSource }): ChatHistorySummary {
+      if (typeof input?.title !== 'string' || input.title.length > MAX_TITLE_UNITS || !isTitleSource(input.title_source)) {
+        throw new Error('Invalid chat history conversation')
+      }
+      const at = new Date().toISOString()
+      const record: ChatHistoryRecord = {
+        format: CHAT_HISTORY_FORMAT, version: CHAT_HISTORY_VERSION,
+        id: `chat_${Date.now().toString(36)}_${randomBytes(6).toString('hex')}`,
+        title: input.title, title_source: input.title_source, group_id: null, archived_at: null,
+        created_at: at, updated_at: at, messages: [], runs: [], pending: [],
+      }
+      write(record)
+      const summary = summaryOf(record)
+      changeListener?.(summary)
+      return summary
     },
     /** Writes the conversation and returns its summary as written. The page
      *  sends the first prompt's title; a stronger title already on file (a

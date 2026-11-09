@@ -11,7 +11,7 @@ const proxy = vi.fn()
 let saved: Map<string, ChatHistoryRecord>
 const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn(), setTitle: vi.fn() }
 const summary = chatHistorySummary
-const RANK = { prompt: 0, model: 1, user: 2 } as const
+const RANK = { prompt: 0, model: 1, schedule: 2, assistant: 2, user: 3 } as const
 /** Saves as main does: a stronger title on file is kept (main/chat-history.ts). */
 function put(r: ChatHistoryRecord) {
   const before = saved.get(r.id)

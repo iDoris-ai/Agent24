@@ -686,3 +686,50 @@ describe('runs and waiting items (M4 A2)', () => {
     expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual(['chat_a.json'])
   })
 })
+
+// M4 A5: conversations main starts itself, named after a schedule.
+describe('conversations main starts (M4 A5)', () => {
+  it('starts an empty conversation with its title, and tells the window', () => {
+    const store = createChatHistoryStore(dir)
+    const told = vi.fn()
+    onChatHistoryChange(told)
+    try {
+      const summary = store.create({ title: '日程：周报', title_source: 'schedule' })
+      expect(summary).toMatchObject({ title: '日程：周报', title_source: 'schedule', group_id: null, archived_at: null, tasks: [], pending: [] })
+      expect(summary.id).toMatch(/^chat_[a-z0-9_]+$/)
+      expect(store.get(summary.id)).toMatchObject({ messages: [], runs: [] })
+      expect(told).toHaveBeenCalledWith(summary)
+      expect(store.create({ title: 'x', title_source: 'schedule' }).id).not.toBe(summary.id)
+    } finally {
+      onChatHistoryChange(null)
+    }
+  })
+
+  it.each([
+    [{ title: 3, title_source: 'schedule' }],
+    [{ title: 'x', title_source: 'other' }],
+    [{ title: 'x'.repeat(4001), title_source: 'schedule' }],
+  ])('refuses %j', input => {
+    const store = createChatHistoryStore(dir)
+    expect(() => store.create(input as never)).toThrow('Invalid chat history conversation')
+    expect(store.list()).toEqual([])
+  })
+
+  it('keeps the schedule\'s name over the first prompt and the model\'s title, not over the user\'s rename', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule' })
+    // The user asks in it: the page saves with the first prompt's title.
+    const page = { ...record(id, '2026-11-09T00:00:00.000Z', '这周的呢'), id }
+    expect(store.save(page)).toMatchObject({ title: '日程：周报', title_source: 'schedule' })
+    expect(store.setTitle(id, '模型标题', 'model')).toMatchObject({ title: '日程：周报', title_source: 'schedule' })
+    expect(store.setTitle(id, '我的周报', 'user')).toMatchObject({ title: '我的周报', title_source: 'user' })
+  })
+
+  it('keeps the assistant\'s conversation\'s name (A6) the same way', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '助理发起', title_source: 'assistant' })
+    expect(store.save({ ...record(id, '2026-11-09T00:00:00.000Z', '问一句'), id })).toMatchObject({ title: '助理发起', title_source: 'assistant' })
+    expect(store.setTitle(id, '模型标题', 'model')).toMatchObject({ title: '助理发起', title_source: 'assistant' })
+    expect(store.setTitle(id, '我的', 'user')).toMatchObject({ title: '我的', title_source: 'user' })
+  })
+})
