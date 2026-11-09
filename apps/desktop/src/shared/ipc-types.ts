@@ -277,7 +277,7 @@ export type KnowledgeEntryCandidateStatus = 'submitted' | 'approved' | 'returned
 export interface KnowledgeEntrySubmission {
   /** Sent, outcome not known yet (W1.5). */
   pending: boolean
-  /** Pending and not to be resent (the binding changed, or too long ago): the user has to check. */
+  /** Pending and not to be resent (the binding or the credential changed, too long ago, or the record cannot be read): the user has to check. */
   stuck: boolean
   candidate: {
     status: KnowledgeEntryCandidateStatus
