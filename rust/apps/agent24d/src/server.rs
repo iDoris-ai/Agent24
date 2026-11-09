@@ -1363,6 +1363,48 @@ async fn authorize(
                                 &bytes,
                             );
                         }
+                    } else if crate::capabilities::first_party::derived_route(
+                        method.as_str(),
+                        template,
+                    ) {
+                        // K-B3b: an approval decision, a schedule change or
+                        // shutdown. The text comes from the daemon's own
+                        // records and this body. A query is none of what a
+                        // grant binds (refused below), so none is remembered.
+                        let query = req.uri().query().is_some();
+                        let request_path = req.uri().path().to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        if !query
+                            && let Some(authority) = &state.first_party
+                            && let Some(summary) = crate::elevation_summaries::derive(
+                                state,
+                                method.as_str(),
+                                template,
+                                &request_path,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            authority.remember_derived(
+                                &authorization.claims.capability_id,
+                                method.as_str(),
+                                template,
+                                &request_path,
+                                &bytes,
+                                summary,
+                            );
+                        }
                     }
                     return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":format!("{operation:?}")}}))).into_response();
                 }
@@ -1486,6 +1528,10 @@ async fn establish_module_delegation(
 #[cfg(test)]
 #[path = "tests/first_party_http.rs"]
 mod first_party_http_tests;
+
+#[cfg(test)]
+#[path = "tests/elevation_summaries_http.rs"]
+mod elevation_summaries_http_tests;
 
 /// Constant-time comparison — a timing oracle on a localhost token is a small
 /// risk, but the cost of doing it right is one function.
@@ -2505,7 +2551,7 @@ pub async fn serve(
     // Last, so it wins over the desktop provider that HostChild mode installs
     // just above (the e2e daemon runs as a host child). Debug test builds only.
     #[cfg(feature = "test-enrollment")]
-    if crate::enroll_test_support::enabled() {
+    if crate::enroll_test_support::fixed_presence() {
         state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
 

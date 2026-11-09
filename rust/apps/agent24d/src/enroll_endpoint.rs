@@ -1112,6 +1112,60 @@ mod tests {
         ));
     }
 
+    /// K-B3b (PM 11-09): the test switches are read only by
+    /// `tests/support/enroll.rs`, which `main.rs` mounts behind the
+    /// `test-enrollment` cfg (a compile error in release, asserted above). So
+    /// no file under `src/`, which is what a release build compiles, names
+    /// any of them; and the one use in `server.rs` sits behind the same cfg.
+    #[test]
+    fn the_test_switches_are_read_nowhere_a_release_build_compiles() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        // Split so this file does not name them either.
+        let names =
+            ["UNSIGNED", "PRESENCE", "ENROLL_IDENTIFIER"].map(|n| ["AGENT24_TEST_", n].concat());
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        walk(&root.join("src"), &mut files);
+        assert!(files.len() > 50, "walked {} files", files.len());
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for name in &names {
+                assert!(
+                    !text.contains(name.as_str()),
+                    "{} names {name}",
+                    file.display()
+                );
+            }
+        }
+        let support = std::fs::read_to_string(root.join("tests/support/enroll.rs")).unwrap();
+        assert!(names.iter().all(|n| support.contains(n.as_str())));
+        let server = include_str!("server.rs");
+        let server = &server[..server.find("mod tests {").unwrap()];
+        let uses: Vec<usize> = server
+            .match_indices("crate::enroll_test_support::")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(uses.len(), 2, "fixed_presence() + TestPresence only");
+        for at in uses {
+            let gate = server[..at]
+                .rfind("#[cfg(feature = \"test-enrollment\")]")
+                .unwrap();
+            assert!(
+                server[gate..at].lines().count() <= 3,
+                "the cfg gate is right above"
+            );
+        }
+    }
+
     #[test]
     fn a_loose_directory_of_ours_is_tightened_to_0700() {
         let root = tempfile::tempdir().unwrap();

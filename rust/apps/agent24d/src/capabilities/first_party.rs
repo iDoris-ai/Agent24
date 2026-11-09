@@ -209,6 +209,42 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// K-B3b: keep a summary the daemon derived (`crate::elevation_summaries`)
+    /// for an approval decision, a schedule change or shutdown, bound to this
+    /// token and to the exact method, path and body it was derived from.
+    pub fn remember_derived(
+        &self,
+        token_id: &str,
+        method: &str,
+        template: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        // The operation is the route policy's own, never the caller's.
+        let Some(operation) = derived_route(method, template)
+            .then(|| {
+                policies()
+                    .iter()
+                    .find(|p| p.method == method && p.template == template)
+                    .map(|p| p.operation)
+            })
+            .flatten()
+        else {
+            return;
+        };
+        self.remember(
+            token_id,
+            Target {
+                operation,
+                method: method.into(),
+                template: template.into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
@@ -251,7 +287,8 @@ impl FirstPartyAuthority {
                 | "/api/v1/idoris/connect"
                 | "/api/v1/host/knowledge/bindings/{binding_id}"
                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
-        ) {
+        ) || derived_route(&target.method, &target.template)
+        {
             return self
                 .request_summaries
                 .lock()
@@ -558,7 +595,13 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                         "DELETE",
                         "/api/v1/host/knowledge/bindings/{binding_id}/credential"
                     )
-            ));
+            ))
+        // K-B3b: approval decisions, schedule changes and shutdown, each with
+        // a summary the daemon derived from its own records.
+        || (matches!(
+            policy.operation,
+            Operation::ApprovalDecision | Operation::ScheduleManage | Operation::Shutdown
+        ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
     }
@@ -687,7 +730,7 @@ impl EnrollAuthority for FirstPartyAuthority {
 }
 
 /// The longest request-supplied value a presence summary shows.
-const SHOWN_MAX_CHARS: usize = 120;
+pub(crate) const SHOWN_MAX_CHARS: usize = 120;
 
 /// The longest whole dialog summary, in UTF-16 code units. MUST match the
 /// desktop `clip()` limit in `apps/desktop/src/main/presence-poller.ts`: a
@@ -696,7 +739,30 @@ const SHOWN_MAX_CHARS: usize = 120;
 /// the "{identifier} (pid {pid}) wants to: " prefix and for every summary
 /// source (including delegation); `remember()` repeats it on the details
 /// alone as redundancy.
-const SUMMARY_MAX_UTF16: usize = 500;
+pub(crate) const SUMMARY_MAX_UTF16: usize = 500;
+
+/// K-B3b: the routes whose summary `crate::elevation_summaries` derives.
+/// Every one is an Elevated row of the route policy; the level table itself
+/// is unchanged (`derived_routes_are_elevated_rows`).
+pub(crate) const DERIVED_ROUTES: [(&str, &str); 10] = [
+    ("POST", "/api/v1/approvals/{id}"),
+    ("POST", "/api/v1/module-approvals/{id}"),
+    (
+        "POST",
+        "/api/v1/module-consents/modules/{module}/tools/{tool}",
+    ),
+    ("POST", "/api/v1/schedules"),
+    ("PATCH", "/api/v1/schedules/{id}"),
+    ("DELETE", "/api/v1/schedules/{id}"),
+    ("POST", "/api/v1/schedules/{id}/run_now"),
+    ("POST", "/api/v1/schedules/{id}/suspend"),
+    ("POST", "/api/v1/schedules/{id}/resume"),
+    ("POST", "/api/v1/shutdown"),
+];
+
+pub(crate) fn derived_route(method: &str, template: &str) -> bool {
+    DERIVED_ROUTES.contains(&(method, template))
+}
 
 /// Binding id from the request path: the last segment, or the one before
 /// `credential` on a credential route. Empty segments from a leading or
@@ -799,20 +865,22 @@ fn knowledge_summary(
 /// `SHOWN_MAX_CHARS` is refused. The length of the *whole* summary is capped
 /// separately (`SUMMARY_MAX_UTF16`, enforced in `elevate`); this function
 /// alone does not stop a long summary from being clipped by the dialog.
-fn shown(value: &str) -> Option<String> {
-    use unicode_general_category::{GeneralCategory as G, get_general_category};
-    let hidden = |c: char| {
-        matches!(
-            get_general_category(c),
-            G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
-        ) || (c.is_whitespace() && c != ' ')
-            || c == '\u{2800}'
-            || default_ignorable(c)
-    };
+pub(crate) fn shown(value: &str) -> Option<String> {
     if value.chars().count() > SHOWN_MAX_CHARS || value.chars().any(hidden) {
         return None;
     }
     serde_json::to_string(value).ok()
+}
+/// A character [`shown`] refuses: it could be drawn as nothing, or move or
+/// break the text around it.
+pub(crate) fn hidden(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory as G, get_general_category};
+    matches!(
+        get_general_category(c),
+        G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
+    ) || (c.is_whitespace() && c != ' ')
+        || c == '\u{2800}'
+        || default_ignorable(c)
 }
 /// Unicode `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt):
 /// characters a renderer may draw as nothing, so two different ids could

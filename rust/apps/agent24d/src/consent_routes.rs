@@ -492,6 +492,36 @@ pub struct DecisionRequest {
     expires_at: Option<String>,
 }
 
+/// K-B3b: a decision body parsed as [`decide`]'s extractor parses it, for
+/// the presence text. Only what the card shows is read back from it.
+pub(crate) fn parse_decision_request(body: &[u8]) -> Option<DecisionRequest> {
+    serde_json::from_slice(body).ok()
+}
+
+impl DecisionRequest {
+    pub(crate) fn grants(&self) -> bool {
+        matches!(self.decision, Decision::Granted)
+    }
+    pub(crate) fn expires_at(&self) -> Option<&str> {
+        self.expires_at.as_deref()
+    }
+    pub(crate) fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
+    /// The kinds named (`path` of `path:/x`), sorted and once each; never a
+    /// value. `None` when an element has no kind (the handler refuses it).
+    pub(crate) fn resource_kinds(&self) -> Option<Vec<String>> {
+        let mut kinds = self
+            .resources
+            .iter()
+            .map(|r| r.split_once(':').map(|(kind, _)| kind.to_owned()))
+            .collect::<Option<Vec<String>>>()?;
+        kinds.sort();
+        kinds.dedup();
+        Some(kinds)
+    }
+}
+
 /// Why `request` cannot be written for `kinds`, whatever the module is now
 /// running; otherwise its expiry, normalised. A decision lasts no longer
 /// than `max_days` from `now`, and never forever.
