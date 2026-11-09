@@ -378,6 +378,91 @@ describe('elevate on the token connection (M5 B3)', () => {
     expect(ran).toBe(false)
   })
 
+  /** A daemon that enrols, then hands each frame main sends to `script`. */
+  async function scripted(script: (f: Record<string, unknown>, peer: Peer) => Promise<void> | void, opts: { elevationWaitMs?: number } = {}) {
+    const got: Record<string, unknown>[] = []
+    const sock = await fakeDaemon(async (peer) => {
+      peer.write(frame({ op: 'challenge', nonce: NONCE }))
+      await peer.line()
+      peer.write(enrolled())
+      for (;;) {
+        const f = await peer.line()
+        got.push(f)
+        await script(f, peer)
+      }
+    })
+    const session = await enrol({ socketPath: sock, generation: 'g', httpPort: 5555 }, undefined, opts)
+    cleanups.push(() => session.close())
+    return { session, got }
+  }
+
+  it('a second elevate while one is out is refused: one frame only (PR-Daemon #1736 C1)', async () => {
+    const { session, got } = await scripted((f, peer) => { if (f['op'] === 'elevate') for (const l of granted()) peer.write(l) })
+    const second = await session.turn(async (elevate) => {
+      const first = elevate(request)
+      const again = await codeOf(elevate(request))
+      await first
+      return again
+    })
+    expect(second).toBe('busy')
+    expect(got.map((f) => f['op'])).toEqual(['elevate'])
+  })
+
+  it('a turn whose fn returns while an elevate is out ends only once it has settled: a renew waits (C2)', async () => {
+    let answer!: () => void
+    const { session, got } = await scripted(async (f, peer) => {
+      if (f['op'] === 'elevate') {
+        peer.write(frame({ op: 'elevation_pending', challenge_id: 'ch1' }))
+        await new Promise<void>((r) => { answer = r })
+        peer.write(frame({ op: 'elevated', challenge_id: 'ch1', grant: GRANT }))
+      }
+      if (f['op'] === 'renew') peer.write(enrolled('renewed'))
+    })
+    let asked!: Promise<string>
+    let ended = false
+    const turn = session.turn(async (elevate) => { asked = elevate(request) }).then(() => { ended = true })
+    const renewed = session.renew()
+    await vi.waitFor(() => expect(answer).toBeTypeOf('function'))
+    await new Promise((r) => setTimeout(r, 50))
+    expect(ended).toBe(false)
+    expect(got.map((f) => f['op'])).toEqual(['elevate'])
+    answer()
+    await expect(asked).resolves.toBe(GRANT)
+    await turn
+    await expect(renewed).resolves.toBe('renewed')
+    expect(got.map((f) => f['op'])).toEqual(['elevate', 'renew'])
+  })
+
+  it('a grant queued behind a frame that broke the connection is not taken (C4)', async () => {
+    const { session } = await scripted((f, peer) => {
+      if (f['op'] === 'elevate') peer.write(frame({ op: 'elevation_pending', challenge_id: 'ch1' }) + frame({ op: 'elevated', challenge_id: 'ch1', grant: GRANT }) + 'not json\n')
+    })
+    let used = false
+    await new Promise((r) => setTimeout(r, 0))
+    const code = await codeOf(elevateIn(session, request, async () => { used = true }))
+    expect(['closed', 'bad_frame']).toContain(code)
+    expect(used).toBe(false)
+  })
+
+  it('the wait is one deadline for the whole exchange, not per frame (C5)', async () => {
+    const { session } = await scripted(async (f, peer) => {
+      if (f['op'] !== 'elevate') return
+      await new Promise((r) => setTimeout(r, 120))
+      peer.write(frame({ op: 'elevation_pending', challenge_id: 'ch1' }))
+      await new Promise((r) => setTimeout(r, 120))
+      peer.write(frame({ op: 'elevated', challenge_id: 'ch1', grant: GRANT }))
+    }, { elevationWaitMs: 200 })
+    let used = false
+    expect(await codeOf(elevateIn(session, request, async () => { used = true }))).toBe('presence_timeout')
+    expect(used).toBe(false)
+  })
+
+  it('hashes the exact body bytes, whitespace and all', async () => {
+    const { session, got } = await scripted((f, peer) => { if (f['op'] === 'elevate') for (const l of granted()) peer.write(l) })
+    await elevateIn(session, { ...request, body: ' {"a": 1}\n' }, async () => null)
+    expect(got[0]?.['body_sha256']).toBe(createHash('sha256').update(' {"a": 1}\n').digest('hex'))
+  })
+
   it('on a connection already gone, rejects at once and never runs `use`', async () => {
     const { session } = await daemon(() => granted())
     session.close()
