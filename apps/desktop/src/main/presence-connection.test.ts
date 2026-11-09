@@ -109,6 +109,27 @@ describe('presence connection (M5 B3, K-B3 frames)', () => {
     expect(asked[0]).toMatchObject({ challenge_id: 'ch1', method: 'POST', path: '/api/v1/approvals/apr_1', summary: 'Approve run run_1', requester: { identifier: 'ai.auraai.agent24', pid: 42 } })
   })
 
+  it('a late answer the daemon did not take (accepted:false) keeps the connection and is not answered again (R15)', async () => {
+    const lines: Record<string, unknown>[] = []
+    const { sock, connections } = await fakeDaemon(async (peer) => {
+      await handshake(peer)
+      peer.send(challenge())
+      lines.push(await peer.line())
+      peer.send({ op: PRESENCE.answered, challenge_id: 'ch1', accepted: false })
+      peer.send({ op: PRESENCE.ping, nonce: 'p1' })
+      for (;;) lines.push(await peer.line())
+    })
+    let asked = 0
+    const { pc, log } = connection(sock, async () => { asked += 1; return 'allow' })
+    await vi.waitFor(() => expect(lines.map((l) => l['op'])).toEqual([PRESENCE.answer, PRESENCE.pong]))
+    await new Promise((r) => setTimeout(r, 50))
+    expect(lines).toHaveLength(2)
+    expect(asked).toBe(1)
+    expect(connections()).toBe(1)
+    expect(pc.ready).toBe(true)
+    expect(log.mock.calls.flat().join('\n')).toContain('did not take an answer')
+  })
+
   it('a box that fails answers deny', async () => {
     let answer: Record<string, unknown> = {}
     const { sock } = await fakeDaemon(async (peer) => {

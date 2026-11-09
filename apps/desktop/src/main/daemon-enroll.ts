@@ -234,7 +234,10 @@ export interface EnrolSession {
    * has ended (Codex B3b r2 C1). In it, `elevate`
    * asks for a one-shot grant for `request`, waiting for the user up to
    * `ELEVATION_WAIT_MS`; it rejects with an [`EnrolError`], and a daemon
-   * `error` frame (denied, timed out, unavailable) leaves the connection open. */
+   * `error` frame (denied, timed out, unavailable) leaves the connection open.
+   * One `elevate` at a time, and the turn ends only once it has settled
+   * (PR-Daemon #1736 C1/C2). `fn` must settle: renews wait for it, so callers
+   * bound it (sendElevating: each request has its deadline, elevate its wait; C3). */
   turn<T>(fn: (elevate: (request: ElevateRequest) => Promise<string>, token: string) => Promise<T>): Promise<T>
   /** Called once when the connection ends (the daemon went away, a renew failed, close()). */
   onClose(listener: (why: EnrolError) => void): void
@@ -248,8 +251,11 @@ export interface EnrolTarget {
   httpPort: number
 }
 
-/** Enrol as this app's first-party shell. Rejects with an [`EnrolError`]. */
-export async function enrol(target: EnrolTarget, connect: Connect = defaultConnect): Promise<EnrolSession> {
+/** Enrol as this app's first-party shell. Rejects with an [`EnrolError`].
+ * `elevationWaitMs` is for tests only. */
+export async function enrol(
+  target: EnrolTarget, connect: Connect = defaultConnect, { elevationWaitMs = ELEVATION_WAIT_MS } = {},
+): Promise<EnrolSession> {
   const { conn, nonce } = await openEnrolConnection(target.socketPath, connect)
   let current: string
   try {
@@ -301,10 +307,21 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
       return exclusive(async () => {
         if (conn.closed) throw new EnrolError('closed', 'the enrolment connection has ended')
         let inTurn = true
+        let outstanding: Promise<string> | null = null
+        const once = (request: ElevateRequest): Promise<string> => {
+          if (!inTurn) return Promise.reject(new EnrolError('closed', 'elevate outside its turn'))
+          if (outstanding) return Promise.reject(new EnrolError('busy', 'one elevate at a time'))
+          const asked = elevate(request)
+          outstanding = asked
+          asked.then(() => { outstanding = null }, () => { outstanding = null })
+          return asked
+        }
         try {
-          return await fn((request) => (inTurn ? elevate(request) : Promise.reject(new EnrolError('closed', 'elevate outside its turn'))), current)
+          return await fn(once, current)
         } finally {
           inTurn = false
+          // Nothing else may go on the connection while the daemon waits for the user.
+          await (outstanding as Promise<string> | null)?.catch(() => {})
         }
       })
     },
@@ -321,7 +338,7 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
       body_sha256: bodySha256(request.body),
       summary: Array.from(request.summary).slice(0, SUMMARY_MAX_CHARS).join(''),
     })
-    const deadline = Date.now() + ELEVATION_WAIT_MS
+    const deadline = Date.now() + elevationWaitMs
     let pending: string | null = null
     for (;;) {
       // Timing out closes the connection; an `error` frame rejects and leaves it open.
@@ -329,6 +346,14 @@ export async function enrol(target: EnrolTarget, connect: Connect = defaultConne
         Math.max(0, deadline - Date.now()),
         new EnrolError('presence_timeout', 'timed out waiting for the confirmation'),
       )
+      // A frame read from what was queued once the deadline passed or the
+      // connection failed comes too late (PR-Daemon #1736 C4/C5).
+      if (Date.now() >= deadline) {
+        const late = new EnrolError('presence_timeout', 'timed out waiting for the confirmation')
+        conn.close(late)
+        throw late
+      }
+      if (conn.closed) throw new EnrolError('closed', 'the enrolment connection has ended')
       const id = frame['challenge_id']
       if (frame['op'] === 'elevation_pending') {
         if (pending !== null) broken('duplicate elevation_pending frame')
