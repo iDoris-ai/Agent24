@@ -756,7 +756,7 @@ async function askResidentConsent(documentsReady: Promise<unknown>): Promise<voi
       if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
       const { response } = await dialog.showMessageBox(mainWin, {
         type: 'question',
-        buttons: [mt('consent.allow'), mt('consent.later')],
+        buttons: [mt('consent.allow'), mt('consent.deny')],
         defaultId: 0,
         cancelId: 1,
         message: mt('consent.message'),

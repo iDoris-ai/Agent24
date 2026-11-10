@@ -267,8 +267,13 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
 describe('the consent box copy', () => {
   it.each(['en', 'zh', 'th'] as const)('%s has every line, and the failure names its code', (locale) => {
     setMainLocale(locale)
-    for (const key of ['consent.message', 'consent.detail', 'consent.allow', 'consent.later'] as const) expect(mt(key)).not.toBe('')
+    for (const key of ['consent.message', 'consent.detail', 'consent.allow', 'consent.deny'] as const) expect(mt(key)).not.toBe('')
     expect(mt('consent.failed', { code: 'not_started' })).toContain('not_started')
+    // What the box says matches what there is (QA on B4b): no Settings switch
+    // yet (B4c), so the way back is the CLI, and a no is not asked again.
+    expect(mt('consent.detail')).toContain('agent24 service uninstall')
+    expect(mt('consent.detail')).toContain('agent24 service install')
+    expect(mt('consent.detail')).toContain(mt('consent.deny'))
   })
   it('the three languages differ', () => {
     const lines = (['en', 'zh', 'th'] as const).map((l) => { setMainLocale(l); return mt('consent.message') })
