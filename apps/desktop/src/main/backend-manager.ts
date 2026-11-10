@@ -1120,7 +1120,13 @@ export class BackendManager {
     } finally {
       const wanted = this.held.resume
       this.held = null
-      if (wanted && !this.disposed) this.startDaemon()
+      if (wanted && !this.disposed) {
+        // As before the hold: startDaemon() leaves a blocked manager as it is,
+        // so the tick re-probes the peer only when this is undone here
+        // (PR-Daemon B4b B1).
+        this.userStopped = false
+        this.startDaemon()
+      }
     }
   }
 
