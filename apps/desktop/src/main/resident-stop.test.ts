@@ -212,5 +212,7 @@ describe('the tray\'s 「完全退出」', () => {
     expect(mt('tray.serviceNotStopped', { code: 'presence_denied' })).toContain('presence_denied')
     // The way to connect is named as the tray names it.
     expect(mt('tray.serviceNotConnected')).toContain(mt('tray.start'))
+    // And the way out when it never connects (Codex B4c1 R2 C2: a reused pid, a refused enrolment).
+    expect(mt('tray.serviceNotConnected')).toContain('agent24 service uninstall')
   })
 })
