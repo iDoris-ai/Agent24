@@ -12,8 +12,8 @@ async-trait = "0.1"
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = "2"
-# 旧 crate 直接依赖 sysinfo；新主干的探测已挪到 agent24-hw。基准 bin 仍要采样
-# 本进程 RSS，所以只在 onnx-spike 打开时拉进来，默认构建不带它。
+# 旧 crate 直接依赖 sysinfo；新主干的探测已挪到 agent24-hw。onnx spike
+# 集成测试仍要采样本进程 RSS，所以只在 onnx-spike 打开时拉进来，默认构建不带它。
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"], optional = true }
 ort = { version = "=2.0.0-rc.10", optional = true }
 tokenizers = { version = "0.21", optional = true }
@@ -25,11 +25,6 @@ onnx-spike = ["dep:ort", "dep:tokenizers", "dep:sysinfo"]
 [[test]]
 name = "onnx_spike"
 path = "tests/onnx_spike.rs"
-required-features = ["onnx-spike"]
-
-[[bin]]
-name = "onnx_spike_bench"
-path = "src/bin/onnx_spike_bench.rs"
 required-features = ["onnx-spike"]
 
 [dev-dependencies]
