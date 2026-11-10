@@ -777,6 +777,26 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
     }
   })
 
+  it('with the LaunchAgent installed, a legacy daemon that does not go is asked to shut down once, not on every tick (Codex B4a C2)', async () => {
+    vi.useFakeTimers()
+    for (const requestShutdown of [vi.fn().mockResolvedValue(404), vi.fn().mockResolvedValue(202)]) {
+      const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+      const spawnProcess = vi.fn(child)
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      const starting = manager.start()
+      await vi.advanceTimersByTimeAsync(11_000)
+      await starting
+      try {
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(requestShutdown).toHaveBeenCalledTimes(1)
+        expect(spawnProcess).not.toHaveBeenCalled()
+        expect(manager.serviceWaitMs()).not.toBeNull()
+      } finally {
+        manager.stop()
+      }
+    }
+  })
+
   it('a capability-mode record stays foreign: never shut down, never spawned over', async () => {
     const external = cliDaemon({ read: () => ({ ...record, authMode: 'capabilities' }) })
     const { spawnProcess } = await started(external)
@@ -1972,6 +1992,24 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
       expect(waited).not.toBeNull()
       expect(waited!).toBeLessThanOrEqual(5_000)
       expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('waiting, then the service daemon is up but refuses this app: the refusal is shown, not a wait (Codex B4a C3)', async () => {
+    vi.useFakeTimers()
+    let current: ExternalDaemonState | null = null
+    const enrol = vi.fn().mockRejectedValue(new EnrolError('identity_rejected', 'unsigned'))
+    const manager = new BackendManager({ external: serviceDaemon({ read: () => current, enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.serviceWaitMs()).not.toBeNull()
+      current = record
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalled()
+      expect(manager.statusDetail()).toMatchObject({ kind: 'enrol_refused' })
+      expect(manager.serviceWaitMs()).toBeNull()
     } finally {
       manager.stop()
     }

@@ -556,6 +556,10 @@ export class BackendManager {
   private readonly spawnedPids = new Set<number>()
   /** M5 B4a: when this app began waiting for the service daemon, or null. */
   private serviceWaitSince: number | null = null
+  /** M5 B4a (Codex C2): the legacy daemon already asked to shut down. With the
+   * LaunchAgent installed no child of ours replaces its record, so without
+   * this it would be asked again, with its token, on every tick. */
+  private shutdownAsked: number | null = null
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
   private readonly kind: BackendKind
@@ -726,6 +730,7 @@ export class BackendManager {
       // not outlive it here either.
       this.disconnectExternal()
       this.foreignPid = state.pid
+      this.serviceWaitSince = null
       return 'foreign'
     }
     this.foreignPid = null
@@ -734,6 +739,7 @@ export class BackendManager {
     // daemon enrolled above (M5 B6). With the LaunchAgent installed the
     // takeover then waits for the service daemon instead of spawning (M5 B4a).
     if (this.kind === 'rust' && this.authMode === 'capabilities') {
+      if (this.shutdownAsked === state.pid) return 'absent'
       return this.takeoverExternal(state, lifecycle)
     }
     // #1187: /health takes no credential; prove the token on that port first.
@@ -785,6 +791,7 @@ export class BackendManager {
     this.refusedBy = null
     this.enrolment = session
     this.serviceWaitSince = null
+    this.shutdownAsked = null
     this.isExternal = true
     this.externalPid = state.pid
     this.lastHealthy = true
@@ -816,6 +823,8 @@ export class BackendManager {
   }
 
   private refuseEnrolment(state: ExternalDaemonState, code: string): 'incompatible' {
+    // A daemon is up and said why it will not have this app: not a wait (Codex B4a C3).
+    this.serviceWaitSince = null
     const already = this.blockedReason?.kind === 'enrol_refused'
       && this.blockedReason.pid === state.pid && this.blockedReason.code === code
     const sameDaemon = this.refusedBy?.pid === state.pid && this.refusedBy.generation === state.generation
@@ -882,6 +891,7 @@ export class BackendManager {
    * outcome lets the caller spawn; a lock still held is the health loop's. */
   private async takeoverExternal(state: ExternalDaemonState, lifecycle: number): Promise<'absent' | 'superseded'> {
     this.disconnectExternal()
+    this.shutdownAsked = state.pid
     console.log(`[backend:${this.kind}] taking over CLI daemon (pid ${state.pid}, port ${state.port}) so Knowledge can work — asking it to shut down`)
     const status = await this.external.requestShutdown({ port: state.port }, state.token)
     if (lifecycle !== this.lifecycle) return 'superseded'
@@ -902,6 +912,7 @@ export class BackendManager {
 
   /** Live `/health` disagreed. The recorded version is only named in the hint. */
   private refuseExternal(state: ExternalDaemonState, daemonVersion: number | null): 'incompatible' {
+    this.serviceWaitSince = null
     const detail: ProtocolMismatchDetail = {
       kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
       recordedVersion: state.protocolVersion, pid: state.pid,
@@ -1124,6 +1135,7 @@ export class BackendManager {
       return
     }
     this.serviceWaitSince = null
+    this.shutdownAsked = null
 
     this.child = this.spawnProcess(this.kind, this.authMode)
     if (this.child.pid !== undefined) this.spawnedPids.add(this.child.pid)
