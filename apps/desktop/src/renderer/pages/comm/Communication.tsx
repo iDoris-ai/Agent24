@@ -28,6 +28,7 @@ import { translate, useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import './communication.css'
 import { getDefaultRelays } from './relayDefaults'
+import { parseRelayList } from '../../../shared/relay-list'
 import { listComponents, type ComponentView } from '../../components/componentApi'
 
 type HyphaePhase =
@@ -81,11 +82,9 @@ function relayValues(value: string): string[] {
   return value.split(/\r?\n/).map((relay) => relay.trim()).filter(Boolean)
 }
 
-/** Client-side gate only. The server still validates the 1..=8 ws(s) contract. */
+/** Same rules as the main-process IPC gate (1..=8 distinct relays, wss:// or loopback ws://). */
 function hasValidRelayList(value: string): boolean {
-  const relays = relayValues(value)
-  return relays.length >= 1 && relays.length <= 8 &&
-    relays.every((relay) => relay.startsWith('ws://') || relay.startsWith('wss://'))
+  return parseRelayList(relayValues(value)) !== null
 }
 
 /** Daemon states that settle on their own: the page polls until they do. */
@@ -480,6 +479,8 @@ export default function CommunicationPage() {
   const saveRelays = async () => {
     if (pending || !hasValidRelayList(relayDraft)) return
     const token = ++sequence.current
+    // Edits typed while the save is in flight set this again and survive the response.
+    relayDraftDirty.current = false
     setPending('relaySave')
     setActionError(null)
     setNotice(null)
@@ -488,10 +489,11 @@ export default function CommunicationPage() {
       const saved = await setCommRelay(relayValues(relayDraft))
       if (!mounted.current || token !== sequence.current) return
       setRelays(saved)
-      setRelayDraft(saved.relays.join('\n'))
-      relayDraftDirty.current = false
+      if (!relayDraftDirty.current) setRelayDraft(saved.relays.join('\n'))
       setNotice(t('relay.saved'))
     } catch (error) {
+      // Keep the rejected draft on screen; the refresh below must not replace it.
+      relayDraftDirty.current = true
       if (mounted.current && token === sequence.current) setActionError(messageOf(error))
     } finally {
       if (mounted.current) { setPending(null); void refresh() }

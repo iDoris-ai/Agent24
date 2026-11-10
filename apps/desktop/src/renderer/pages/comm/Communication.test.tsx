@@ -799,7 +799,7 @@ describe('CommunicationPage usability', () => {
 
   it('replaces the whole relay list once, then shows the saved relays', async () => {
     success()
-    const updated = { relays: ['wss://one.example', 'ws://two.example'], source: 'config', configured: true }
+    const updated = { relays: ['wss://one.example', 'ws://127.0.0.1:7777'], source: 'config', configured: true }
     vi.mocked(listCommRelays).mockResolvedValueOnce(relayConfig).mockResolvedValue(updated)
     vi.mocked(setCommRelay).mockResolvedValue(updated)
     render(<CommunicationPage />)
@@ -809,15 +809,18 @@ describe('CommunicationPage usability', () => {
     await waitFor(() => expect(setCommRelay).toHaveBeenCalledTimes(1))
     expect(setCommRelay).toHaveBeenCalledWith(updated.relays)
     await waitFor(() => expect(screen.getAllByText('wss://one.example').some((element) => element.tagName === 'LI')).toBe(true))
-    expect(screen.getAllByText('ws://two.example').some((element) => element.tagName === 'LI')).toBe(true)
+    expect(screen.getAllByText('ws://127.0.0.1:7777').some((element) => element.tagName === 'LI')).toBe(true)
   })
 
-  it('does not send an empty, over-limit, or non-ws relay list', async () => {
+  it('does not send a relay list the main-process gate would reject', async () => {
     success()
     render(<CommunicationPage />)
     const input = await screen.findByLabelText('Relay addresses (one per line)')
     const submit = screen.getByRole('button', { name: 'Save relays' })
-    for (const value of ['', Array.from({ length: 9 }, (_, i) => `wss://r${i}.example`).join('\n'), 'https://relay.example']) {
+    for (const value of [
+      '', Array.from({ length: 9 }, (_, i) => `wss://r${i}.example`).join('\n'), 'https://relay.example',
+      'ws://remote.example', 'wss://dup.example\nwss://dup.example', 'wss://relay.example?x=1', 'wss://',
+    ]) {
       fireEvent.change(input, { target: { value } })
       expect(submit).toBeDisabled()
       fireEvent.submit(input.closest('form')!)
@@ -842,6 +845,21 @@ describe('CommunicationPage usability', () => {
     expect((input as HTMLTextAreaElement).value).toBe('wss://new.example')
     expect(screen.getAllByText('wss://relay.example').some((element) => element.tagName === 'LI')).toBe(true)
     expect(screen.queryByText('Relay configuration saved.')).not.toBeInTheDocument()
+  })
+
+  it('keeps edits typed while a relay save is in flight', async () => {
+    success()
+    let resolveSave!: (value: typeof relayConfig) => void
+    vi.mocked(setCommRelay).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve }))
+    render(<CommunicationPage />)
+    const input = await screen.findByLabelText('Relay addresses (one per line)')
+    fireEvent.change(input, { target: { value: 'wss://a.example' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save relays' }))
+    fireEvent.change(input, { target: { value: 'wss://b.example' } })
+    resolveSave({ relays: ['wss://a.example'], source: 'config', configured: true })
+    expect(await screen.findByText('Relay configuration saved.')).toBeInTheDocument()
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)) })
+    expect((input as HTMLTextAreaElement).value).toBe('wss://b.example')
   })
 
   it('drops a relay refresh that resolves after a newer save', async () => {
