@@ -37,7 +37,7 @@
 |---|---|---|---|---|---|---|
 | 架构优化（总纲） | 第 0 期：文档与 ADR 收口 | `docs/p0-*`（已合并） | 订正文档与 ADR，补通讯 ADR、路由约定、跟踪文档 | S0-1～S0-7 DONE；S0-8 BACKLOG | 无 | [方案 §4.1](../2026-11-04/ARCH-OPTIMIZATION-PLAN.md) |
 | 架构优化 | 第 1 期：低风险结构调整 | `main`（逐片分支，已合并） | OpenAPI、签名单源、`daemon.json`、状态映射、OD pin、休眠代码、OS 包完整性 | **全部 DONE**（S1-6、S1-8 CANCELLED） | 无 | 方案 §4.2、S1-9 设计 |
-| 架构优化 | 第 2 期：agent24d 瘦身 | 待定 | 拆 `server.rs`，下沉 iDoris / Knowledge / attach，进程组终止原语，CLI 补齐 | 全部未开始；先清尾巴（§0），然后从 S2-1 起 | S0-5 已合 | 方案 §4.3 |
+| 架构优化 | 第 2 期：agent24d 瘦身 | 待定 | 拆 `server.rs`，下沉 iDoris / Knowledge / attach，进程组终止原语，CLI 补齐 | 2026-11-10 推进：S2-1/2/3/4a 已合，S2-6/S2-7 按拍板降级为文档已合，S2-4b #1794 在审；agent24d 96,032 → 82,276 行（含在审的 #1794） | S0-5 已合 | 方案 §4.3 |
 | 组件统一 | ADR-038 / ADR-039 收尾 | `main` | 组件契约、清单、统一状态面 | C1–C8 DONE（含 C2，见 §2.2）；C9 未排期 | — | [ADR-038](../../adr/ADR-038-component-contract-v1.md) |
 | 通讯（Hyphae） | COMM 系列、X11、X7、好友机制 | `ab/comm`（**2939 落后**（2487），该分支领先 11（11）；最后一次提交 2026-10-21） | 尾巴：X11、X7；好友机制之后 | `ab/comm` 盘点存档：未做（尾巴 2）；ADR-044 DONE | Q12 已定 | [ADR-044](../../adr/ADR-044-communication.md)、[COMM-HYPHAE](../../design/COMM-HYPHAE.md) |
 | 决策模型 | D0–D3 | `ab/decide`（**2914 落后**（2462），分支领先 25（25）） | D0 契约 / 规则后端已有，D1 接线未排期 | `ab/decide` 盘点存档：未做（尾巴 2）；当前排期未核实 | — | [PLAN-DECIDE](../../agent/PLAN-DECIDE.md) |
@@ -102,14 +102,14 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 
 #### 第 2 期：agent24d 瘦身（Q3 = (B)）
 
-前置：S0-5 已合。每片先移动、后修行为，同一 PR 不混。**S2-4 排在 S2-1、S2-2 之后**。**全部未开始**（`git log` 区间内没有 S2 的合并）；jason 2026-11-10 定下的起点是 S2-1。实测基线（`c396478c`）：`server.rs` 9,345 行，`serve()` 起于 1978 行、止于 3513 行（约 1,536 行），agent24d 全部 `.rs` 共 96,032 行（含内联测试）。S2-2 / S2-3 / S2-4 验收里「减约 N 行」是方案 §4.3 的估计，口径与上面不同，开工时重新量。
+前置：S0-5 已合。每片先移动、后修行为，同一 PR 不混。**S2-4 排在 S2-1、S2-2 之后**。**2026-11-10 状态**：S2-1 #1791、S2-2 #1790、S2-3 #1792、S2-4a #1793 已合；S2-4b #1794 在审；S2-6 #1788、S2-7 #1789 按 jason 拍板改为文档。本机 Codex 额度到 11-15，这几片只有独立 Opus 本地评审 + PR-Daemon，Codex 补审记为 FU-113。实测基线（`c396478c`）：`server.rs` 9,345 行，`serve()` 起于 1978 行、止于 3513 行（约 1,536 行），agent24d 全部 `.rs` 共 96,032 行（含内联测试）。S2-2 / S2-3 / S2-4 验收里「减约 N 行」是方案 §4.3 的估计，口径与上面不同，开工时重新量。
 
 | 任务 id | 标题 | 状态 | 负责 | 验收 |
 |---|---|---|---|---|
-| S2-1 | 拆 `server.rs` | READY（次序第一） | Codex / Grok + Opus 收尾 | `serve()` < 300 行；启动黑盒测试全绿；源码断言测试同步更新 |
-| S2-2 | iDoris 托管下沉 `agent24-idoris` | BACKLOG | Codex / Grok | agent24d 减约 2,500 行；idoris 自身测试覆盖原用例 |
-| S2-3 | Knowledge 宿主下沉 `agent24-knowledge` | BACKLOG | Codex / Grok（Opus 评审；凭据类须等 PR-Daemon APPROVE） | agent24d 减约 1,800 行；C5 探测测试原样通过 |
-| S2-4 | attach 新建 `agent24-attach`（排在 S2-1、S2-2 之后） | BACKLOG | Codex / Grok | agent24d 减约 1,500 行；C4 用例原样通过 |
+| S2-1 | 拆 `server.rs` | DONE（#1791，`d76189a6`） | Grok + Opus 收尾 | `serve()` 1,536 → 267 行；启动黑盒测试全绿（含 `test-enrollment` 的 docked_startup）；源码断言测试收紧到等价或更严，带变异对照 |
+| S2-2 | iDoris 托管下沉 `agent24-idoris` | DONE（#1790，`a5096360`） | Grok + Opus 收尾 | agent24d 减 6,056 行（含测试）；77 条用例随迁；用 `IdorisSlot` 打断 models↔idoris 依赖环。R1 C5 未做 → FU-115；可见性收窄 → FU-116 |
+| S2-3 | Knowledge 宿主下沉 `agent24-knowledge` | DONE（#1792，`a8a749bd`） | Grok + Opus 收尾（凭据类，PR-Daemon 已 APPROVE） | agent24d 减 4,447 行；C5 探测测试原样通过；`provider/` 按 jason 拍板冻结；凭据与 endpoint 校验下沉进 registry；knowledge-store CI 改在新 crate 上跑 20 条 |
+| S2-4 | attach 新建 `agent24-attach`（排在 S2-1、S2-2 之后） | S2-4a DONE（#1793，`3e07baf3`）；S2-4b IN REVIEW（#1794） | Grok + Opus 收尾 | 拆两片：4a 在 agent24d 内抽 `AttachGrantBuilder` 等接口，4b 新建 crate 原样搬入；agent24d 减约 4,400 行；C4 用例与 a3_2b/a3_3 黑盒原样通过。过滤未被测试锁住 → FU-118 |
 | S2-5 | 鉴权抽 `agent24-auth` | CANCELLED：Q3 = (B) | — | — |
 | S2-6 | 进程组终止原语统一 → **降级为停止语义盘点**（jason 2026-11-10 (a)） | DONE（#1788） | Codex 盘点 + Opus 成文 | [S2-6-STOP-SEMANTICS.md](S2-6-STOP-SEMANTICS.md) 覆盖 Rust 的进程组停止调用点与桌面侧计划范围内的现状；不做统一实现 |
 | S2-7 | CLI 补齐（Q5 = (b)）→ **改为写明桌面专属例外**（jason 2026-11-10 (a)） | DONE（本 PR） | Opus | Comm 私钥备份恢复、Knowledge 绑定/凭据在 daemon 上只允许桌面（ProductHost）调用，CLI 入口调不通，所以不补；连同 OD 下载、presence 一起写进 `AGENTS.md` 例外。CLI 试做存档在本地分支 `feat/s2-7-cli-parity` |

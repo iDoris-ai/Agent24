@@ -20,7 +20,7 @@
 3. 首期「未编号」的 OS 包完整性（Q15）现编号 **S1-9**，已完成：文件清单与哈希、哈希不对即拒绝、macOS 验签（可 trust-team）、SDK 0.2.0 握手前清单自检均已合入。外仓 Sin90、Cos72 已按新规则出了签名包。详见 MILESTONES §2.1。
 4. **更正首期一处误标**：首期把组件统一的 C2（Hyphae 运行期契约检查）标成 BACKLOG，实际在首期之前就已完成（见 §4）。
 5. 本期发现并订正一处文档不一致：ADR 索引仍把 ADR-038 写成「草案（原文：草案 r3）」，而正文已是「已接受（r5，2026-11-05）」。已在本 PR 修正索引（`docs/adr/README.md` 两处表格），见 §2。
-6. 第 2 期（agent24d 瘦身）尚未开始。jason 2026-11-10 定的次序：先清尾巴（本跟踪文档、旧集成分支盘点、通讯 X11 / X7），再从 S2-1 拆 `server.rs` 开始。
+6. 第 2 期（agent24d 瘦身）2026-11-10 当天推进：尾巴（本跟踪文档、旧集成分支、X11 ① / X7）清完后，S2-1/2/3/4a 合入，S2-6、S2-7 按拍板改为文档，S2-4b #1794 在审；agent24d 从 96,032 行减到 82,276 行（含 #1794）。逐片见 MILESTONES-AND-TASKS 第 2 期表。
 
 ## 1. 架构现状一表
 
@@ -109,10 +109,10 @@ awk 'NR>=1978 && /^}/ {print NR; exit}' rust/apps/agent24d/src/server.rs   # 351
 | 文档位置 | 偏离 | 修正 |
 |---|---|---|
 | `decision.md:1508` vs `CORE-5-MIGRATION-GUARD-DESIGN.md:200` | ADR-037 状态矛盾 | S0-1 已订正索引；这两处正文本期未重新核对，**未核实** |
-| 桌面有业务、CLI 无入口 | Knowledge 绑定 / 凭据、presence、OD 下载启动、Comm 私钥备份恢复（违反 `AGENTS.md` 的 CLI 与桌面共用逻辑要求） | Q5 选 (b)，S2-7 |
+| 桌面有业务、CLI 无入口 | Knowledge 绑定 / 凭据、presence、OD 下载启动、Comm 私钥备份恢复（违反 `AGENTS.md` 的 CLI 与桌面共用逻辑要求） | S2-7（#1789）：四项都写为 `AGENTS.md` 的桌面专属例外；前两类在 daemon 上只允许 ProductHost，CLI 调不通 |
 | 通讯入口 | 外部入口尚未统一走 ADR-041a 准入；nostr-bridge 尚未并入 comm、仍是一条独立身份来源 | X11、X7（尾巴，见 MILESTONES §2.4） |
 | Hyphae 锁平台 | `rust/crates/agent24-comm/hyphae.lock.json` 只有 darwin-arm64、linux-x64 | BACKLOG |
-| `server.rs` | 单文件 9,345 行，`serve()` 约 1,536 行 | S2-1 |
+| `server.rs` | 单文件 9,345 行，`serve()` 约 1,536 行 | S2-1（#1791）已拆：`serve()` 267 行，启动步骤在 `serve_steps.rs` |
 
 **本期已修正**
 
