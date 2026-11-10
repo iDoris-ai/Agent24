@@ -4405,7 +4405,7 @@ async fn an_envelope_code_that_underflows_to_zero_is_not_success() {
 
 #[test]
 fn s1_4_idoris_contract_mismatch_is_incompatible() {
-    use agent24d::idoris_host::Code;
+    use agent24_idoris::idoris_host::Code;
     assert_eq!(
         from_idoris(IdorisState::Failed, false, Some(Code::ContractMismatch)),
         (

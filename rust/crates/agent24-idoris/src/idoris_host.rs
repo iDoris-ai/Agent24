@@ -1,8 +1,9 @@
 //! One owner for managed installation metadata, supervisor and gateway publication.
 use crate::managed_idoris::{
-    ManagedConfig, ManagedIdoris, SecretError, SecretSource, SupervisorReady,
+    GatewayLease, IdorisSlot, ManagedConfig, ManagedIdoris, ModelError, PreparedGateway,
+    SecretError, SecretSource, SupervisorReady,
 };
-use agent24_idoris::{
+use crate::{
     IdorisLock,
     download::VerifiedArchive,
     install::{Codesign, InstalledVersion, SignatureVerifier, VerifyMode},
@@ -14,14 +15,13 @@ use agent24_idoris::{
         SupervisorError,
     },
 };
-use agent24_models::{IdorisGateway, ModelError, router::ModelRouter};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     io::{self, Write},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex as SyncMutex, Weak},
+    sync::{Arc, Mutex as SyncMutex},
     time::Duration,
 };
 use tokio::sync::{Mutex, Notify, OnceCell, watch};
@@ -155,8 +155,8 @@ pub enum Code {
     ReplaceRequired,
 }
 impl Code {
-    pub fn http_status(self) -> axum::http::StatusCode {
-        use axum::http::StatusCode as H;
+    pub fn http_status(self) -> http::StatusCode {
+        use http::StatusCode as H;
         match self {
             Self::NotFound => H::NOT_FOUND,
             Self::ConsentRequired
@@ -285,9 +285,9 @@ pub struct Operation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub setup_code: Option<agent24_idoris::setup::SetupCode>,
+    pub setup_code: Option<crate::setup::SetupCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub download_progress: Option<agent24_idoris::download::DownloadProgress>,
+    pub download_progress: Option<crate::download::DownloadProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationReceipt>,
 }
@@ -304,9 +304,9 @@ pub struct OperationView<'a> {
     error_code: &'a Option<Code>,
     cancellable: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    setup_code: &'a Option<agent24_idoris::setup::SetupCode>,
+    setup_code: &'a Option<crate::setup::SetupCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    download_progress: &'a Option<agent24_idoris::download::DownloadProgress>,
+    download_progress: &'a Option<crate::download::DownloadProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: &'a Option<VerificationReceipt>,
 }
@@ -439,7 +439,7 @@ impl Runtime for SystemRuntime {
                 sha256: String::new(),
             };
             match platform {
-                Some(platform) => agent24_idoris::install::verify_existing_on(
+                Some(platform) => crate::install::verify_existing_on(
                     platform,
                     &dir,
                     &lock,
@@ -447,7 +447,7 @@ impl Runtime for SystemRuntime {
                     signature.as_ref(),
                     VerifyMode::AtRest,
                 ),
-                None => agent24_idoris::install::verify_existing(
+                None => crate::install::verify_existing(
                     &dir,
                     &lock,
                     &archive,
@@ -490,7 +490,7 @@ impl Runtime for SystemRuntime {
         .map_err(|_| Code::StartFailed)?;
         let key = if let Some(id) = &r.omlx_key_id {
             Some(
-                KeychainSource(Arc::new(agent24_idoris::keychain::OmlxKeychain))
+                KeychainSource(Arc::new(crate::keychain::OmlxKeychain))
                     .secret(id)
                     .await
                     .map_err(secret_code)?,
@@ -553,8 +553,8 @@ pub struct IdorisHost {
     runtime: Arc<dyn Runtime>,
     secrets: Arc<dyn SecretSource>,
     managed: Arc<ManagedIdoris>,
-    router: Arc<ModelRouter>,
-    draining: SyncMutex<Option<Weak<IdorisGateway>>>,
+    router: Arc<dyn IdorisSlot>,
+    draining: SyncMutex<Option<GatewayLease>>,
     provisioner: Arc<dyn Provisioner>,
     budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
@@ -597,7 +597,7 @@ impl IdorisHost {
         root: PathBuf,
         install_root: PathBuf,
         managed: Arc<ManagedIdoris>,
-        router: Arc<ModelRouter>,
+        router: Arc<dyn IdorisSlot>,
     ) -> io::Result<Arc<Self>> {
         let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(SystemKeychain)));
         let install_root = canonical_install_root(&install_root)?;
@@ -616,7 +616,7 @@ impl IdorisHost {
     pub fn open(
         root: PathBuf,
         managed: Arc<ManagedIdoris>,
-        router: Arc<ModelRouter>,
+        router: Arc<dyn IdorisSlot>,
         runtime: Arc<dyn Runtime>,
         secrets: Arc<dyn SecretSource>,
     ) -> io::Result<Arc<Self>> {
@@ -663,7 +663,7 @@ impl IdorisHost {
             provisioner: Arc::new(SystemProvisioner),
             budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
-            omlx_keys: Arc::new(agent24_idoris::keychain::OmlxKeychain),
+            omlx_keys: Arc::new(crate::keychain::OmlxKeychain),
             inner: Mutex::new(Inner {
                 installation,
                 state,
@@ -876,9 +876,8 @@ impl IdorisHost {
         }
     }
     fn block_gateway(&self) {
-        if let Ok(gateway) = self.router.idoris_gateway() {
-            *self.draining.lock().unwrap_or_else(|e| e.into_inner()) =
-                Some(Arc::downgrade(&gateway));
+        if let Some(lease) = self.router.published_lease() {
+            *self.draining.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
         }
         self.router.block_idoris("managed iDoris not ready");
     }
@@ -886,7 +885,7 @@ impl IdorisHost {
         &self,
         record: &Installation,
         cancel: &CancellationToken,
-    ) -> Result<(ManagedConfig, IdorisGateway), Code> {
+    ) -> Result<(ManagedConfig, PreparedGateway), Code> {
         let secrets = ClassifiedSecrets {
             source: self.secrets.as_ref(),
             failure: SyncMutex::new(None),
@@ -895,7 +894,7 @@ impl IdorisHost {
             url: format!("http://127.0.0.1:{}", record.data_port),
             key_id: record.key_id.clone().ok_or(Code::NotConfigured)?,
         };
-        ManagedIdoris::prepare(&config, &secrets, cancel)
+        ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
             .await
             .map(|gateway| (config, gateway))
             .map_err(|_| {

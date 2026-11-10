@@ -8,9 +8,15 @@ repository.workspace = true
 [dependencies]
 agent24-components = { path = "../agent24-components" }
 agent24-hw = { path = "../agent24-hw" }
+agent24-protocol = { path = "../agent24-protocol" }
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+http = "1"
+sha2 = "0.10"
 semver = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
@@ -30,10 +36,16 @@ libproc = "0.14"
 keyring = { version = "3.6", default-features = false, features = ["apple-native"] }
 
 [dev-dependencies]
-sha2 = "0.10"
 flate2 = "1"
 tar = { version = "0.4", default-features = false }
 agent24-components = { path = "../agent24-components", features = ["test-support"] }
+# Dev-only: agent24-models already depends on this crate, so the host cannot
+# name ModelRouter in the library graph. Tests still drive the real router.
+agent24-models = { path = "../agent24-models" }
+axum = { version = "0.8", features = ["ws"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+jsonschema = { version = "0.59", default-features = false }
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "test-util"] }
 
 [lints]

@@ -1,11 +1,100 @@
 //! Managed connection state; keychain and supervisor implementations are injected.
-use agent24_models::{IdorisGateway, ModelError, router::ModelRouter};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::{io::Write, path::PathBuf, sync::Arc};
+use std::{any::Any, io::Write, path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
+
+/// Same `Display` text as the three [`agent24_models::ModelError`] variants this
+/// host constructs. `agent24-models` already depends on this crate, so the host
+/// cannot name that error (or `ModelRouter`) without a cycle.
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ModelError {
+    #[error("provider unavailable: {0}")]
+    Unavailable(String),
+    #[error("provider error: {0}")]
+    Provider(String),
+    #[error("cancelled")]
+    Cancelled,
+    /// A gateway error this host does not match on. The string is that error's
+    /// full `Display`, so startup logs stay the same.
+    #[error("{0}")]
+    Other(String),
+}
+
+/// A gateway built by [`IdorisSlot::open_gateway`], still unpublished.
+pub struct PreparedGateway {
+    inner: Box<dyn Any + Send + Sync>,
+}
+
+impl PreparedGateway {
+    pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
+        Self {
+            inner: Box::new(value),
+        }
+    }
+
+    pub fn downcast<T: Send + Sync + 'static>(self) -> Result<T, Self> {
+        match self.inner.downcast::<T>() {
+            Ok(value) => Ok(*value),
+            Err(inner) => Err(Self { inner }),
+        }
+    }
+
+    pub fn downcast_ref<T: Send + Sync + 'static>(&self) -> Option<&T> {
+        self.inner.downcast_ref::<T>()
+    }
+}
+
+/// How many strong references the published gateway still has.
+/// The closure closes over the same `Weak` the router stored.
+pub struct GatewayLease {
+    strong_count: Box<dyn Fn() -> usize + Send + Sync>,
+}
+
+impl GatewayLease {
+    pub fn new(strong_count: impl Fn() -> usize + Send + Sync + 'static) -> Self {
+        Self {
+            strong_count: Box::new(strong_count),
+        }
+    }
+
+    pub fn strong_count(&self) -> usize {
+        (self.strong_count)()
+    }
+}
+
+/// Evidence from one real daily chat, copied so this crate does not name the
+/// gateway type that produces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionCheck {
+    pub model_id: String,
+    pub record_id: String,
+    pub locality: String,
+}
+
+/// What the host used to call on `ModelRouter` / `IdorisGateway`.
+/// Implemented for `ModelRouter` in `agent24-models`.
+#[async_trait]
+pub trait IdorisSlot: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+    fn block_idoris(&self, reason: &str);
+    fn replace_idoris(&self, gateway: PreparedGateway);
+    fn published_lease(&self) -> Option<GatewayLease>;
+    async fn open_gateway(
+        &self,
+        url: &str,
+        secret: Zeroizing<String>,
+        cancel: &CancellationToken,
+    ) -> Result<PreparedGateway, ModelError>;
+    async fn verify_connection(
+        &self,
+        gateway: &PreparedGateway,
+        headroom_confirmed: bool,
+        cancel: &CancellationToken,
+    ) -> Result<ConnectionCheck, ModelError>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -36,7 +125,7 @@ pub struct ManagedDependencies {
 }
 
 pub struct ManagedIdoris {
-    router: Arc<ModelRouter>,
+    router: Arc<dyn IdorisSlot>,
     path: PathBuf,
     update: Mutex<()>,
 }
@@ -46,7 +135,7 @@ fn error(message: &str) -> ModelError {
 }
 
 impl ManagedIdoris {
-    pub fn new(router: Arc<ModelRouter>, path: PathBuf) -> std::io::Result<Self> {
+    pub fn new(router: Arc<dyn IdorisSlot>, path: PathBuf) -> std::io::Result<Self> {
         if path.try_exists()? {
             router.block_idoris("managed iDoris is waiting for supervisor readiness and Keychain");
         }
@@ -84,7 +173,13 @@ impl ManagedIdoris {
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
             result = dependencies.supervisor.wait_ready(cancel) => result?,
         }
-        let gateway = Self::prepare(&config, dependencies.secrets.as_ref(), cancel).await?;
+        let gateway = Self::prepare(
+            &config,
+            dependencies.secrets.as_ref(),
+            cancel,
+            self.router.as_ref(),
+        )
+        .await?;
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
@@ -105,7 +200,7 @@ impl ManagedIdoris {
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
             guard = self.update.lock() => guard,
         };
-        let gateway = Self::prepare(&config, secrets, cancel).await?;
+        let gateway = Self::prepare(&config, secrets, cancel, self.router.as_ref()).await?;
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
@@ -118,7 +213,8 @@ impl ManagedIdoris {
         config: &ManagedConfig,
         secrets: &dyn SecretSource,
         cancel: &CancellationToken,
-    ) -> Result<IdorisGateway, ModelError> {
+        slot: &dyn IdorisSlot,
+    ) -> Result<PreparedGateway, ModelError> {
         if config.key_id.is_empty()
             || config.key_id.len() > 128
             || !config
@@ -136,10 +232,7 @@ impl ManagedIdoris {
                 SecretError::Unavailable => error("iDoris data key unavailable in Keychain"),
             })?,
         };
-        let gateway =
-            IdorisGateway::from_credentials(&config.url, key).map_err(ModelError::Provider)?;
-        gateway.check_health(cancel).await?;
-        Ok(gateway)
+        slot.open_gateway(&config.url, key, cancel).await
     }
 
     pub(crate) fn persist_config(

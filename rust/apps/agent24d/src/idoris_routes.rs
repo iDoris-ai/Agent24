@@ -1,7 +1,7 @@
 //! Host-only managed iDoris lifecycle endpoints.
 
 use crate::server::AppState;
-use agent24d::idoris_host::{
+use agent24_idoris::idoris_host::{
     Action, Code, ConnectRequest, InstallRequest, State as LifecycleState, Status,
 };
 use axum::{
@@ -202,7 +202,7 @@ mod tests {
     }
     #[tokio::test]
     async fn connect_and_install_reject_missing_consent_and_plaintext_credential_fields() {
-        use agent24d::{idoris_host::IdorisHost, managed_idoris::ManagedIdoris};
+        use agent24_idoris::{idoris_host::IdorisHost, managed_idoris::ManagedIdoris};
         use std::sync::Arc;
         let (mut state, host, creative) = crate::server::tests::capability_state().await;
         let temp = tempfile::tempdir().unwrap();

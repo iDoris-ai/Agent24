@@ -1,6 +1,17 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
-use agent24_idoris::install::{InstallError, SignatureVerifier, VerifyMode};
+use crate::install::{InstallError, SignatureVerifier, VerifyMode};
+use agent24_models::router::ModelRouter;
+
+fn router_gateway(
+    host: &IdorisHost,
+) -> Result<std::sync::Arc<agent24_models::IdorisGateway>, agent24_models::ModelError> {
+    host.router
+        .as_any()
+        .downcast_ref::<ModelRouter>()
+        .unwrap()
+        .idoris_gateway()
+}
 use flate2::{Compression, write::GzEncoder};
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -40,7 +51,7 @@ impl SignatureVerifier for Gatekeeper {
     fn verify(
         &self,
         _: &Path,
-        required: &agent24_idoris::install::SigningRequirement,
+        required: &crate::install::SigningRequirement,
     ) -> Result<(), InstallError> {
         if required.notarized && self.0.load(Ordering::SeqCst) {
             Err(InstallError::NotNotarized)
@@ -54,11 +65,7 @@ impl SignatureVerifier for Gatekeeper {
 const TEST_PLATFORM: &str = "darwin-arm64";
 struct AcceptSignature;
 impl SignatureVerifier for AcceptSignature {
-    fn verify(
-        &self,
-        _: &Path,
-        _: &agent24_idoris::install::SigningRequirement,
-    ) -> Result<(), InstallError> {
+    fn verify(&self, _: &Path, _: &crate::install::SigningRequirement) -> Result<(), InstallError> {
         Ok(())
     }
 }
@@ -73,7 +80,7 @@ impl Runtime for FixtureRuntime {
         while self.gate.load(Ordering::SeqCst) {
             tokio::select! { _ = cancel.cancelled() => return Err(Code::Cancelled), _ = tokio::time::sleep(Duration::from_millis(5)) => {} }
         }
-        let installed = agent24_idoris::install::verify_existing_on(
+        let installed = crate::install::verify_existing_on(
             TEST_PLATFORM,
             &r.release_dir,
             &self.lock,
@@ -155,7 +162,7 @@ impl Fixture {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let script = include_str!("../../../../../crates/agent24-idoris/tests/fixtures/idoris.py")
+        let script = include_str!("../../../tests/fixtures/idoris.py")
             .replace(
                 "root = Path(os.environ['IDORIS_COMPONENTS_DIR'])",
                 &format!(
@@ -350,7 +357,7 @@ async fn state_machine_idempotency_busy_and_stop() {
         f.host.submit(Action::Stop, None).await.unwrap().result,
         Some(Outcome::Succeeded)
     );
-    assert!(f.host.router.idoris_gateway().is_err());
+    assert!(router_gateway(&f.host).is_err());
     let attempts = fs::read_to_string(f.host.root.join("data/state/attempts.jsonl")).unwrap();
     assert_eq!(attempts.lines().count(), 1);
     f.assert_clean();
@@ -535,7 +542,7 @@ async fn terminal_child_failure_closes_gateway_and_updates_status() {
     })
     .await
     .unwrap();
-    assert!(f.host.router.idoris_gateway().is_err());
+    assert!(router_gateway(&f.host).is_err());
     f.assert_clean();
 }
 
@@ -545,10 +552,10 @@ async fn stop_blocks_new_gateway_requests_and_drains_retained_snapshot() {
     f.install().await;
     let op = f.host.submit(Action::Start, None).await.unwrap();
     assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
-    let old_request = f.host.router.idoris_gateway().unwrap();
+    let old_request = router_gateway(&f.host).unwrap();
     let stop = f.host.submit(Action::Stop, None).await.unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
-        while f.host.router.idoris_gateway().is_ok() {
+        while router_gateway(&f.host).is_ok() {
             tokio::task::yield_now().await;
         }
     })
@@ -597,7 +604,7 @@ impl Runtime for SmokeRuntime {
 #[tokio::test]
 #[ignore = "requires IDORIS_REAL_V040_DIR; verifies signed v0.4.0 and runs real serve"]
 async fn real_v040_install_existing_start_running_stop() {
-    use agent24_idoris::{
+    use crate::{
         download::{DownloadOptions, download_locked_asset},
         install::{InstallOptions, install_locked_asset},
     };
@@ -907,7 +914,7 @@ async fn keychain_lock_after_readiness_retains_the_stable_error_code() {
         f.complete(&start).await.error_code,
         Some(Code::KeychainLocked)
     );
-    assert!(f.host.router.idoris_gateway().is_err());
+    assert!(router_gateway(&f.host).is_err());
     f.assert_clean();
     f.assert_no_secrets();
 }
@@ -1157,7 +1164,7 @@ async fn stopped_generation_cannot_publish_a_gateway_after_prepare() {
     tokio::time::timeout(Duration::from_secs(60), sender.closed())
         .await
         .unwrap();
-    let blocked = f.host.router.idoris_gateway().is_err();
+    let blocked = router_gateway(&f.host).is_err();
     supervisor.stop().await.unwrap();
     f.host.shutdown().await.unwrap();
     assert!(blocked, "monitor published its prepared gateway after stop");
@@ -1242,7 +1249,7 @@ async fn stop_preserves_an_unverified_live_leftover_without_signalling() {
     assert_eq!(completed.error_code, Some(Code::InstanceConflict));
     assert!(path.exists());
     assert_eq!(owner.host.status().await.state, State::Running);
-    assert!(owner.host.router.idoris_gateway().is_ok());
+    assert!(router_gateway(&owner.host).is_ok());
     owner.host.shutdown().await.unwrap();
 }
 
@@ -1260,7 +1267,7 @@ async fn start_verification_works_offline() {
     // Sanity: the lock demands notarization, and the offline Gatekeeper refuses it.
     assert!(IdorisLock::embedded().component_notarized());
     assert!(matches!(
-        agent24_idoris::install::verify_existing_on(
+        crate::install::verify_existing_on(
             TEST_PLATFORM,
             &f.record.release_dir,
             &f.runtime.lock,

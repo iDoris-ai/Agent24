@@ -13,9 +13,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use agent24_domain::http::{error_response, read_body_or_response};
+use agent24_idoris::idoris_host::{Action, State as IdorisState};
 use agent24_os_proto::drain::DrainState;
 use agent24_os_proto::supervisor::Status as Supervised;
-use agent24d::idoris_host::{Action, State as IdorisState};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
@@ -147,7 +147,7 @@ fn render(items: &[Item], full: bool) -> Value {
 fn from_idoris(
     state: IdorisState,
     installing: bool,
-    error: Option<agent24d::idoris_host::Code>,
+    error: Option<agent24_idoris::idoris_host::Code>,
 ) -> (ComponentState, Option<&'static str>) {
     use ComponentState as S;
     if installing {
@@ -163,7 +163,9 @@ fn from_idoris(
         // contract version, but also a wrong `service`, an empty `instance_id` or dev-no-key.
         // Each means the installed binary is not the one this daemon can drive, so all are
         // `incompatible` rather than a crash.
-        IdorisState::Failed if error == Some(agent24d::idoris_host::Code::ContractMismatch) => {
+        IdorisState::Failed
+            if error == Some(agent24_idoris::idoris_host::Code::ContractMismatch) =>
+        {
             (S::Incompatible, Some("component_contract_mismatch"))
         }
         IdorisState::Failed => (S::Failed, None),

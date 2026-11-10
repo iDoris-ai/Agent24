@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use super::*;
+use agent24_models::router::ModelRouter;
 use axum::{
     Json, Router,
     extract::State,
