@@ -236,3 +236,81 @@ export class ServiceUpgrader {
     return upgradeNeeded(this.deps.bundled(), this.deps.running()) ? { kind: 'needed' } : null
   }
 }
+
+/** `launchctl print`'s own `runs = N`: how many times launchd has started the
+ * job. A job that runs on keeps it; one that keeps failing pushes it up even
+ * when every look finds it running (PR-Daemon B5b B1; Codex on its first fix). */
+export function jobRuns(print: string): number | null {
+  const runs = /^\truns = (\d+)$/m.exec(print)?.[1]
+  return runs === undefined ? null : Number(runs)
+}
+
+export function serviceRuns(uid: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    execFile('launchctl', ['print', `gui/${uid}/${SERVICE_LABEL}`], { timeout: 10_000 }, (err, stdout) => resolve(err ? null : jobRuns(stdout)))
+  })
+}
+
+/** The pid on record when it can be the service's daemon: one with an
+ * enrolment socket (a legacy one has none) that this app did not spawn; our
+ * own child writes the socket too (`server.rs`; Codex B5b C1, R3). */
+export function serviceRecordPid(state: { pid: number; enrollEndpoint?: string } | null, spawned: (pid: number) => boolean): number | null {
+  return state && state.enrollEndpoint !== undefined && !spawned(state.pid) ? state.pid : null
+}
+
+export const LOOP_WINDOW_MS = 60_000
+export const LOOP_PIDS = 3
+export const LOOP_RESTARTS = 2
+const RUNS_CHECK_MS = 10_000
+
+/** M5 B5 ②: the LaunchAgent's daemon keeps exiting and launchd keeps starting
+ * it (a failed migration today: CORE-5 is off). Within a minute, either
+ * several daemons on record, or launchd started the job at least twice more
+ * (one that fails before it writes a record). One restart, such as an upgrade,
+ * is not a loop. Only while the plist is there and this app is not enrolled. */
+export class CrashLoopDetector {
+  private pids: { pid: number; at: number }[] = []
+  private runs: { runs: number; at: number }[] = []
+  private runsAt = -Infinity
+  private era = 0
+
+  constructor(private readonly deps: {
+    now: () => number
+    installed: () => boolean
+    enrolled: () => boolean
+    recordPid: () => number | null
+    runs: () => Promise<number | null>
+  }) {}
+
+  async sample(): Promise<void> {
+    const now = this.deps.now()
+    if (!this.deps.installed() || this.deps.enrolled()) {
+      this.pids = []
+      this.runs = []
+      this.era++
+      return
+    }
+    const pid = this.deps.recordPid()
+    if (pid !== null && this.pids.at(-1)?.pid !== pid) this.pids.push({ pid, at: now })
+    this.pids = this.pids.filter((p) => now - p.at < LOOP_WINDOW_MS)
+    if (now - this.runsAt >= RUNS_CHECK_MS) {
+      this.runsAt = now
+      const era = this.era
+      const runs = await this.deps.runs()
+      // Enrolled meanwhile: what launchd said then is no longer this run (Codex on B1 R2 C2).
+      if (era !== this.era) return
+      if (runs !== null) {
+        // Fewer than before: the job was loaded again, so count from here (Codex on B1 R2 C1).
+        if (runs < (this.runs.at(-1)?.runs ?? runs)) this.runs = []
+        this.runs.push({ runs, at: now })
+      }
+    }
+    this.runs = this.runs.filter((r) => now - r.at < LOOP_WINDOW_MS)
+  }
+
+  looping(): boolean {
+    if (new Set(this.pids.map((p) => p.pid)).size >= LOOP_PIDS) return true
+    const seen = this.runs.map((r) => r.runs)
+    return Math.max(...seen) - Math.min(...seen) >= LOOP_RESTARTS
+  }
+}

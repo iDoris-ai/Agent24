@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, jobPid, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView } from './tray-menu'
@@ -308,5 +308,205 @@ describe('tray text (three languages)', () => {
     expect(failed).toContain('`agent24 service install`')
     // Reopening cannot work: with no service daemon nothing asks again (PR-Daemon B5a N1).
     expect(failed.replace(buildTrayView(tray).tooltip, '')).not.toMatch(/Reopen|重新打开|เปิด Agent24 ใหม่/)
+  })
+})
+
+describe('CrashLoopDetector (M5 B5 ②)', () => {
+  function detector(o: { installed?: boolean; enrolled?: boolean } = {}) {
+    let now = 0
+    let pid: number | null = 100
+    let runs: number | null = 1
+    const runsFn = vi.fn(async () => runs)
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => o.installed ?? true, enrolled: () => o.enrolled ?? false, recordPid: () => pid, runs: runsFn,
+    })
+    return {
+      d, runsFn,
+      at: (ms: number) => { now = ms },
+      pid: (p: number | null) => { pid = p },
+      runs: (r: number | null) => { runs = r },
+    }
+  }
+
+  it('three daemons on record within a minute: looping', async () => {
+    const t = detector()
+    for (const [ms, p] of [[0, 100], [12_000, 101], [24_000, 102]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(true)
+  })
+
+  it('the same three spread over more than a minute: not looping', async () => {
+    const t = detector()
+    for (const [ms, p] of [[0, 100], [40_000, 101], [LOOP_WINDOW_MS + 1_000, 102]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('fails before it writes a record, found running at every look, launchd started it twice more: looping (Codex on B1)', async () => {
+    const t = detector()
+    t.pid(null)
+    for (const [ms, r, want] of [[0, 4, false], [10_000, 5, false], [20_000, 6, true]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(want)
+    }
+  })
+
+  it('one restart (an upgrade), or two more than a minute apart: not looping', async () => {
+    const t = detector()
+    for (const [ms, r] of [[0, 1], [10_000, 2], [20_000, 2], [50_000, 2], [70_000, 3]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+    }
+  })
+
+  it('a healthy service daemon, not enrolled for minutes: launchd started it once, not looping (PR-Daemon B5b B1)', async () => {
+    const t = detector()
+    t.pid(947)
+    t.runs(1)
+    for (let ms = 0; ms <= 3 * LOOP_WINDOW_MS; ms += 2_000) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('launchd cannot be asked: no runs taken, nothing counted', async () => {
+    const t = detector()
+    t.pid(null)
+    t.runs(null)
+    for (const ms of [0, 10_000, 20_000]) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    t.runs(9)
+    t.at(30_000)
+    await t.d.sample()
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('the job loaded again (runs back to 1), then one restart: not looping (Codex on B1 R2 C1)', async () => {
+    const t = detector()
+    t.pid(null)
+    for (const [ms, r] of [[0, 8], [10_000, 1], [20_000, 2]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+    }
+    t.at(30_000)
+    t.runs(3)
+    await t.d.sample()
+    expect(t.d.looping()).toBe(true)
+  })
+
+  it('an answer from launchd that comes back after enrolment is dropped (Codex on B1 R2 C2)', async () => {
+    let enrolled = false
+    let now = 0
+    let answer: (r: number) => void = () => {}
+    let runs: number | Promise<number> = new Promise<number>((r) => { answer = r })
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => enrolled, recordPid: () => null, runs: async () => runs,
+    })
+    const slow = d.sample()
+    enrolled = true
+    now = 4_000
+    await d.sample()
+    answer(1)
+    await slow
+    enrolled = false
+    for (const [ms, r] of [[12_000, 2], [22_000, 3]] as const) {
+      now = ms
+      runs = r
+      await d.sample()
+    }
+    expect(d.looping()).toBe(false)
+  })
+
+  it('asks launchd at most every 10 s', async () => {
+    const t = detector()
+    for (const ms of [0, 4_000, 8_000, 12_000]) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    expect(t.runsFn).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['enrolled with the service daemon', { enrolled: true }],
+    ['no LaunchAgent', { installed: false }],
+  ] as const)('%s: never looping, and what was seen is forgotten', async (_name, o) => {
+    const t = detector(o)
+    for (const [ms, p] of [[0, 100], [10_000, 101], [20_000, 102], [30_000, 103]] as const) {
+      t.at(ms)
+      t.pid(p)
+      t.runs(ms / 1_000)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+    expect(t.runsFn).not.toHaveBeenCalled()
+  })
+
+  it('what was seen before enrolment is forgotten once enrolled', async () => {
+    let enrolled = false
+    let now = 0
+    let runs = 1
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => enrolled, recordPid: () => null, runs: async () => runs,
+    })
+    await d.sample()
+    now = 10_000
+    runs = 2
+    await d.sample()
+    enrolled = true
+    now = 15_000
+    await d.sample()
+    enrolled = false
+    now = 20_000
+    runs = 3
+    await d.sample()
+    expect(d.looping()).toBe(false)
+  })
+
+  it("only the service's daemon on record counts, never one this app spawned, now or before (Codex B5b C1)", () => {
+    const ours = new Set([8, 9])
+    const spawned = (pid: number) => ours.has(pid)
+    const socket = '/data/enroll.sock'
+    expect(serviceRecordPid({ pid: 7, enrollEndpoint: socket }, spawned)).toBe(7)
+    expect(serviceRecordPid({ pid: 8, enrollEndpoint: socket }, spawned)).toBeNull()
+    expect(serviceRecordPid({ pid: 9, enrollEndpoint: socket }, spawned)).toBeNull()
+    // A legacy daemon (`agent24 daemon start`) names no enrolment socket (Codex B5b R3).
+    expect(serviceRecordPid({ pid: 10 }, spawned)).toBeNull()
+    expect(serviceRecordPid(null, spawned)).toBeNull()
+  })
+
+  it("reads the job's own runs, not a nested one", () => {
+    // As `launchctl print` shows a running job (checked on this machine).
+    expect(jobRuns('gui/501/ai.auraai.agent24 = {\n\tstate = running\n\truns = 1\n\tpid = 54386\n\tlast exit code = (never exited)\n}')).toBe(1)
+    expect(jobRuns('x = {\n\tstate = not running\n\truns = 17\n\tlast exit code = 78: EX_CONFIG\n}')).toBe(17)
+    expect(jobRuns('x = {\n\tstate = running\n\tsub = {\n\t\truns = 4\n\t}\n}')).toBeNull()
+    expect(jobRuns('')).toBeNull()
+  })
+
+  it.each([
+    ['en', 'keeps restarting'],
+    ['zh', '后台服务反复重启，可能是迁移失败'],
+    ['th', 'รีสตาร์ตซ้ำ'],
+  ] as const)('%s: the tray says so and gives the way back', (lang, says) => {
+    setMainLocale(lang)
+    const tray = { status: 'running', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
+    const tip = buildTrayView({ ...tray, crashLoop: true }).tooltip
+    expect(tip).toContain(says)
+    expect(tip).toContain('`agent24 service uninstall`')
+    expect(buildTrayView(tray).tooltip).not.toContain(says)
   })
 })

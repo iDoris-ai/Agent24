@@ -10,8 +10,8 @@ import { registerCliTool } from './ipc/cli-tool'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
+import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { bundledDaemonVersion, CrashLoopDetector, serviceRecordPid, serviceRuns, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -80,6 +80,13 @@ const serviceUpgrader = new ServiceUpgrader({
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
     return upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold }))
   },
+})
+const crashLoop = new CrashLoopDetector({
+  now: () => Date.now(),
+  installed: () => process.platform === 'darwin' && launchAgentPlistExists(),
+  enrolled: () => backendManager.presenceTarget() !== null,
+  recordPid: () => serviceRecordPid(readExternalDaemonState(), (pid) => backendManager.spawned(pid)),
+  runs: () => serviceRuns(process.getuid!()),
 })
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches
@@ -719,6 +726,7 @@ app.whenReady().then(async () => {
   // crashes, or is toggled from the menu itself.
   trayTimer = setInterval(() => {
     serviceUpgrader.tick()
+    void crashLoop.sample()
     refreshTray()
     if (++cliCheckTicks % 15 === 0) void cliTool?.refresh()
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
@@ -747,6 +755,7 @@ function refreshTray(): void {
     backendKind: backendManager.backendKind(),
     cliTool: cliTool?.status(),
     upgrade: serviceUpgrader.hint(),
+    crashLoop: crashLoop.looping(),
   })
   if (process.platform === 'darwin') tray.setTitle(view.title)
   tray.setToolTip(view.tooltip)
