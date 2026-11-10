@@ -98,7 +98,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | decide | L3 | hw | — |
 | hw | L3 | （无） | — |
 | idoris | L3 | components, hw, protocol | models |
-| knowledge | L3 | （无） | — |
+| knowledge | L3 | components | — |
 | mcp | L3 | domain, protocol, tools | — |
 | memory | L3 | core, models, store | — |
 | models | L3 | domain, idoris, protocol | — |
