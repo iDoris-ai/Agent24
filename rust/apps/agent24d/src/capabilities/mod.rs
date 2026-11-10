@@ -5,6 +5,7 @@
 
 pub mod delegation;
 pub mod first_party;
+pub mod middleware;
 mod mint;
 mod operations;
 pub mod presence;
