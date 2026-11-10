@@ -395,8 +395,9 @@ function installErrorCode(err: unknown): string {
 }
 
 /** Inside one hold: install, then wait for the service daemon. Any failure
- * uninstalls once (no half-installed plist is left; its own failure is
- * ignored) and the hold's end brings this app's own daemon back. */
+ * uninstalls once, so that no half-installed plist is left; when that
+ * uninstall fails too, its failure is ignored and the plist may stay (known
+ * Low, Codex B4b C4). The hold's end brings this app's own daemon back. */
 export function installService(deps: InstallDeps): Promise<InstallOutcome> {
   return deps.hold(async (): Promise<InstallOutcome> => {
     const failed = async (stage: 'install' | 'start', code: string): Promise<InstallOutcome> => {
