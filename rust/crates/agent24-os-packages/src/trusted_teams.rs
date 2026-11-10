@@ -18,28 +18,35 @@ pub fn builtin() -> BTreeSet<String> {
 /// A symlink, a non-regular file, a file owned by someone else, or a file
 /// group/other can write is the same as a missing file: built-in team only.
 pub fn load(path: &Path) -> BTreeSet<String> {
-    let result = (|| -> io::Result<BTreeSet<String>> {
-        let bytes = read_trust_file(path)?;
-        let teams: BTreeSet<String> = serde_json::from_slice(&bytes)?;
-        if !teams.iter().all(|team| valid_team_id(team)) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid Team ID",
-            ));
-        }
-        Ok(teams)
-    })();
-    let mut teams = match result {
+    let mut teams = match read_user_teams(path) {
         Ok(teams) => teams,
         Err(err) => {
-            if err.kind() != io::ErrorKind::NotFound {
-                tracing::warn!(path = %path.display(), error = %err, "cannot read OS trusted teams; using built-in team only");
-            }
+            tracing::warn!(path = %path.display(), error = %err, "cannot read OS trusted teams; using built-in team only");
             BTreeSet::new()
         }
     };
     teams.extend(builtin());
     teams
+}
+
+/// The user-added teams in the file. A missing file is an empty set; any other
+/// failure is an error. Verification falls back to the built-in team on error
+/// (`load`); an update must refuse instead, or it would rewrite the file from
+/// that fallback and silently drop every team the user had trusted.
+fn read_user_teams(path: &Path) -> io::Result<BTreeSet<String>> {
+    let bytes = match read_trust_file(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(err) => return Err(err),
+    };
+    let teams: BTreeSet<String> = serde_json::from_slice(&bytes)?;
+    if !teams.iter().all(|team| valid_team_id(team)) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid Team ID",
+        ));
+    }
+    Ok(teams)
 }
 
 /// One fd: nofollow open, then fstat, then a bounded read of that same fd.
@@ -127,7 +134,16 @@ fn write_update(path: &Path, team: &str, trusted: bool) -> io::Result<()> {
     }
     let lock = options.open(dir.join("os-trusted-teams.lock"))?;
     lock.lock_exclusive()?;
-    let mut teams = load(path);
+    let mut teams = read_user_teams(path).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!(
+                "the trusted-teams file {} cannot be read safely ({err}); fix or remove it, then retry",
+                path.display()
+            ),
+        )
+    })?;
+    teams.extend(builtin());
     if trusted {
         teams.insert(team.to_owned());
     } else {
@@ -162,6 +178,24 @@ fn write_update(path: &Path, team: &str, trusted: bool) -> io::Result<()> {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    /// PR-Daemon #1780 N1: an update over a file that cannot be read safely must
+    /// fail, not rewrite it from the built-in fallback and drop the user's teams.
+    #[cfg(unix)]
+    #[test]
+    fn an_update_over_an_unsafe_file_fails_and_keeps_it() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        update(&path, "ABCDE12345", true).unwrap();
+        update(&path, "FGHIJ67890", true).unwrap();
+        let before = fs::read(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+        assert!(update(&path, "KLMNO12345", true).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+        // Verification still fails closed: built-in team only.
+        assert_eq!(load(&path), builtin());
+    }
+
     #[test]
     fn trust_roundtrip_builtin_and_corruption() {
         let dir = tempfile::tempdir().unwrap();
