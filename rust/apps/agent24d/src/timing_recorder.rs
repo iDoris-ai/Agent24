@@ -38,7 +38,7 @@ const PRUNE_EVERY: u32 = 200;
 // Single definition lives in `agentear_timings` so the attach-side bridge
 // and this writer share one type. Re-exported here; `model_callback` and
 // `routes` keep importing it from this module.
-pub use crate::agentear_timings::{TimingObservation, TimingSink};
+pub use agent24_attach::agentear_timings::{TimingObservation, TimingSink};
 
 /// Test-only in-memory sink — nothing in the production path constructs it
 /// (production always goes through `TimingRecorder::spawn`'s channel sink).

@@ -3,10 +3,10 @@
 //! place the kernel originates a request on an attached module's connection
 //! instead of merely answering one.
 //!
-//! Everything needed to REACH the module — the live [`crate::attach_registry::AttachRegistry`]
+//! Everything needed to REACH the module — the live [`agent24_attach::attach_registry::AttachRegistry`]
 //! bookkeeping (declared `host_commands`, the current connection's
 //! `KernelCalls` handle, the in-flight cap) — already lives in
-//! `crate::attach_registry` (A3-2b's registry, extended there for this PR);
+//! `agent24_attach::attach_registry` (A3-2b's registry, extended there for this PR);
 //! this file is the axum-facing translation of §6.1's REST mapping table,
 //! nothing more. Sits behind the SAME bearer auth every other kernel route
 //! does (`crate::capabilities::middleware::auth`, applied after this router merges in, same as
@@ -39,8 +39,8 @@ use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value, json};
 
-use crate::attach_registry::{CommandLookupError, CommandRefusal};
 use crate::server::AppState;
+use agent24_attach::attach_registry::{CommandLookupError, CommandRefusal};
 
 /// Shared by both the step ② fail-fast pre-check and `reserve_ready`'s
 /// review-M1 re-check — same status/code/message either way, since from the
@@ -273,7 +273,7 @@ mod tests {
         let state = crate::server::tests::state().await;
         state
             .attach_registry
-            .on_change(&crate::attached::Change::Registered {
+            .on_change(&agent24_attach::attached::Change::Registered {
                 name: "agentear",
                 rotated: false,
                 manifest: &agent24_domain::DomainOsManifest::from_yaml(
@@ -309,7 +309,7 @@ mod tests {
         let state = crate::server::tests::state().await;
         state
             .attach_registry
-            .on_change(&crate::attached::Change::Registered {
+            .on_change(&agent24_attach::attached::Change::Registered {
                 name: "agentear",
                 rotated: false,
                 manifest: &agent24_domain::DomainOsManifest::from_yaml(
@@ -344,7 +344,7 @@ mod tests {
         let state = crate::server::tests::state().await;
         state
             .attach_registry
-            .on_change(&crate::attached::Change::Registered {
+            .on_change(&agent24_attach::attached::Change::Registered {
                 name: "agentear",
                 rotated: false,
                 manifest: &agent24_domain::DomainOsManifest::from_yaml(

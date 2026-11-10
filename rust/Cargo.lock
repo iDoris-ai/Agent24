@@ -54,6 +54,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-attach"
+version = "0.6.0"
+dependencies = [
+ "agent24-domain",
+ "agent24-os-proto",
+ "agent24-protocol",
+ "chrono",
+ "fs2",
+ "libc",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "agent24-cli"
 version = "0.6.0"
 dependencies = [
@@ -589,6 +609,7 @@ name = "agent24d"
 version = "0.6.0"
 dependencies = [
  "agent24-agent",
+ "agent24-attach",
  "agent24-comm",
  "agent24-components",
  "agent24-core",

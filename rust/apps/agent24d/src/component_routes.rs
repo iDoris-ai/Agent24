@@ -37,8 +37,8 @@ mod documents_catalog;
 /// silent desktop (crashed, quit) reads as "not reporting" rather than as a stale `ready`.
 /// There is no connection to watch: the report is a plain HTTP POST.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
-/// Single definition is [`crate::attached::BUILTIN_COMPONENT_IDS`].
-pub(crate) use crate::attached::BUILTIN_COMPONENT_IDS;
+/// Single definition is [`agent24_attach::attached::BUILTIN_COMPONENT_IDS`].
+pub(crate) use agent24_attach::attached::BUILTIN_COMPONENT_IDS;
 /// Components whose state the desktop owns. Anything else is the daemon's to say.
 const DESKTOP_OWNED: &[&str] = &["open-design"];
 
@@ -424,7 +424,7 @@ fn attach_items(state: &AppState) -> Vec<Item> {
     attach_items_from(state.attach_registry.snapshot())
 }
 
-fn attach_items_from(mut modules: Vec<crate::attach_registry::AttachSnap>) -> Vec<Item> {
+fn attach_items_from(mut modules: Vec<agent24_attach::attach_registry::AttachSnap>) -> Vec<Item> {
     // D9 has no catalog for an attached module: no component lock (D2 does
     // not apply), `kernel_capabilities` are `requires` (ADR-039 §4), and
     // `docs/capabilities/REGISTRY.md` is C7. `provides` stays empty.

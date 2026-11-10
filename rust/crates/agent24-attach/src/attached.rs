@@ -85,7 +85,7 @@ impl Facts {
 ///
 /// Single definition. Mount admission calls [`is_reserved_kernel_segment`];
 /// `domain`'s route-equality test imports this slice directly.
-pub(crate) const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
+pub const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "idoris",
     // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module
     // registry lives at `/api/v1/attached`, so no domain OS may be named
@@ -100,8 +100,9 @@ pub(crate) const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     // merged into `module_routes` by `server::serve` itself rather than
     // registered as a literal route inside `build_router_with_modules` — so
     // it does NOT show up in `reserved_segments_match_the_kernel_routes_exactly`'s
-    // scan of that function's source, and that test's `EXTRA_RESERVED` list
-    // (below) carries it instead. Reserved here regardless, so a domain-OS
+    // scan of that function's source. That test lives in the daemon's `domain`
+    // module, and its `EXTRA_RESERVED_NOT_IN_BUILD_ROUTER` list carries `comm`
+    // instead. Reserved here regardless, so a domain-OS
     // package cannot claim `name: comm` and collide with (or, depending on
     // merge order, shadow) the real mount.
     "comm",
@@ -123,9 +124,10 @@ pub(crate) const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "module-consents",
     "models",
     // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
-    // — and the set-equality test below is what forced this entry the moment the
-    // route was added, rather than leaving it to be discovered by whoever shipped
-    // that module.
+    // — and `domain`'s set-equality test
+    // (`reserved_segments_match_the_kernel_routes_exactly`) is what forced this
+    // entry the moment the route was added, rather than leaving it to be
+    // discovered by whoever shipped that module.
     "os",
     // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
     "peer",
@@ -145,7 +147,7 @@ pub(crate) const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
 
 /// Whether `name` is a kernel route segment no module (mounted OR attached,
 /// A3-2a) may claim. `domain` re-exports this for the mount pass.
-pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
+pub fn is_reserved_kernel_segment(name: &str) -> bool {
     RESERVED_KERNEL_SEGMENTS.contains(&name)
 }
 
@@ -154,7 +156,7 @@ pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
 /// `component_routes::attach_items` drops same-named entries from registrations
 /// that predate the rule. Pinned by `a_builtin_component_id_cannot_be_attached`.
 /// Single definition — `component_routes` re-exports it.
-pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
+pub const BUILTIN_COMPONENT_IDS: &[&str] =
     &["idoris", "hyphae", "documents", "knowledge", "open-design"];
 
 /// Parse and validate a submitted `domain-os.yml` as an ATTACHED manifest

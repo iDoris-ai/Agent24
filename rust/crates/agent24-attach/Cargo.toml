@@ -1,0 +1,29 @@
+[package]
+name = "agent24-attach"
+version = "0.6.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Agent24 attached-module registry, handshake listener, and AgentEar timing bridge"
+
+[dependencies]
+agent24-domain = { path = "../agent24-domain" }
+agent24-os-proto = { path = "../agent24-os-proto" }
+agent24-protocol = { path = "../agent24-protocol" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+fs2 = "0.4"
+libc = "0.2"
+rustix = { version = "0.38", features = ["process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "rt", "net", "time", "sync", "io-util"] }
+tokio-util = "0.7"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "time", "sync", "io-util"] }
+
+[lints]
+workspace = true

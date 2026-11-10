@@ -54,7 +54,7 @@ impl EventsHub {
     }
 }
 
-impl crate::agentear_timings::AgentEarEventBus for EventsHub {
+impl agent24_attach::agentear_timings::AgentEarEventBus for EventsHub {
     fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)> {
         EventsHub::subscribe(self)
     }

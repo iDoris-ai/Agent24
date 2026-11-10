@@ -62,7 +62,7 @@ const _: () = assert!(6 * agent24_os_proto::rpc::MAX_ID_BYTES + 64 <= RESULT_ENV
 /// v3 N4: a provider-reported model id longer than this is dropped (`None`),
 /// not truncated — a truncated id would name a model that does not exist.
 /// Defined in `agentear_timings` so AgentEar's reported id strings share it.
-pub use crate::agentear_timings::MODEL_MAX_MODEL_ID_BYTES;
+pub use agent24_attach::agentear_timings::MODEL_MAX_MODEL_ID_BYTES;
 
 // ---- §4.2 params (deny_unknown_fields + _meta) ----
 

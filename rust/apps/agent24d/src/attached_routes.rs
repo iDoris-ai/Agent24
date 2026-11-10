@@ -2,11 +2,11 @@
 //! attached modules (`docs/design/A3-ATTACHED-MODULE.md` §3.2, PR slices
 //! A3-2a/A3-2b).
 //!
-//! Storage and manifest validation live in [`crate::attached`]; this file is
+//! Storage and manifest validation live in [`agent24_attach::attached`]; this file is
 //! the axum-facing translation from that module's `Result`s to the v1 error
 //! envelope, AND (A3-2b) the one place that wires `attached::register`/
 //! `revoke`/`set_disabled`'s `on_commit` hook to
-//! `crate::attach_registry::AttachRegistry::on_change` — see `Change`'s own
+//! `agent24_attach::attach_registry::AttachRegistry::on_change` — see `Change`'s own
 //! doc comment for why that hook must run inside the file-lock critical
 //! section rather than after these handlers' calls return. Bearer auth is the
 //! SAME layer every other kernel route sits behind (`crate::capabilities::middleware::auth`,
@@ -15,7 +15,7 @@
 //!
 //! `GET`/`PATCH /api/v1/attached/*` are NEW endpoints rather than the
 //! augmentation the design doc's §3.2 table describes for the existing
-//! `/api/v1/os` surface — see `crate::attached::list`'s doc comment for why,
+//! `/api/v1/os` surface — see `agent24_attach::attached::list`'s doc comment for why,
 //! and this PR's own report.
 
 use std::path::Path;
@@ -28,8 +28,8 @@ use axum::extract::{Path as AxumPath, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 
-use crate::attached::{self, RegisterError, RegisterOutcome};
 use crate::server::AppState;
+use agent24_attach::attached::{self, RegisterError, RegisterOutcome};
 
 pub async fn post_attached(state: State<AppState>, req: Request<Body>) -> Response {
     let Some(path) = attached::config_path() else {
@@ -478,19 +478,24 @@ mod tests {
         // `state()` below builds an AppState whose `os_reports` we cannot
         // easily seed from here without duplicating `crate::server::tests`'
         // own fixture machinery — so this exercises the 409 branch directly
-        // against `crate::attached::register`'s `name_taken` closure instead,
+        // against `agent24_attach::attached::register`'s `name_taken` closure instead,
         // which is exactly what `post_attached_at` calls it with. The
         // `attached.rs` unit test
         // `a_name_already_claimed_by_another_kind_of_module_is_refused`
         // covers the same branch at the storage layer; this one additionally
         // pins the REST status code and error `code`.
         let path = tmp_path();
-        let err =
-            crate::attached::register(&path, &manifest("sin90"), false, |n| n == "sin90", |_| {})
-                .unwrap_err();
+        let err = agent24_attach::attached::register(
+            &path,
+            &manifest("sin90"),
+            false,
+            |n| n == "sin90",
+            |_| {},
+        )
+        .unwrap_err();
         assert_eq!(
             err,
-            crate::attached::RegisterError::NameTaken("sin90".to_owned())
+            agent24_attach::attached::RegisterError::NameTaken("sin90".to_owned())
         );
     }
 }

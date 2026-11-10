@@ -1053,7 +1053,7 @@ pub(crate) async fn patch_os_at(
     path: Option<std::path::PathBuf>,
 ) -> Response {
     // Deviation handling (A3-2b review): a name ALSO registered as an
-    // attached module (`crate::attached`) is refused here, even if
+    // attached module (`agent24_attach::attached`) is refused here, even if
     // `os_reports` happens to carry an entry for it too — which it will,
     // `Refused`, whenever a package on disk collides with an attach
     // registration (`crate::domain::mount_all`'s own name-clash check, §5.4).
@@ -1063,8 +1063,8 @@ pub(crate) async fn patch_os_at(
     // module — entirely unaffected by that write — keeps serving under the
     // same name. That is exactly the "silently did nothing useful" trap this
     // check closes: the caller is told where the real control surface is.
-    if let Some(attached_path) = crate::attached::config_path()
-        && crate::attached::list(&attached_path)
+    if let Some(attached_path) = agent24_attach::attached::config_path()
+        && agent24_attach::attached::list(&attached_path)
             .is_ok_and(|views| views.iter().any(|v| v.name == name))
     {
         return error_response(
