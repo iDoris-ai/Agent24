@@ -1491,10 +1491,7 @@ async fn install_with_consent(
     // Revoke before `install` creates directories. A busy or docked gate must
     // leave the packages root byte-for-byte unchanged.
     revoke_module_consent(&module, state_dir, online).await?;
-    #[cfg(test)]
-    let signature = agent24_os_packages::test_support::signature_policy();
-    #[cfg(not(test))]
-    let signature = agent24_os_packages::signature::Policy::default();
+    let signature = install_signature_policy();
     match agent24_os_packages::install::install_with_policy(src, packages_root, &signature) {
         Ok(dest) => {
             println!("installed {}", dest.display());
@@ -3272,6 +3269,21 @@ async fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// The signature policy `os install` checks a package against. Unit tests use the
+/// injected test policy; every other build uses the host's (codesign + trusted
+/// teams). Kept down here with the test code: `scripts/tui-coverage.mjs` reads
+/// the CLI source only up to the first `#[cfg(test)]`.
+fn install_signature_policy() -> agent24_os_packages::signature::Policy {
+    #[cfg(test)]
+    {
+        agent24_os_packages::test_support::signature_policy()
+    }
+    #[cfg(not(test))]
+    {
+        agent24_os_packages::signature::Policy::default()
     }
 }
 
