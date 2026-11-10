@@ -812,7 +812,7 @@ function refreshTray(): void {
       // Clear tray ref so win.on('close') guard is skipped and app can quit
       tray = null
       app.quit()
-    },
+    },    'quit-service': () => {}, // STUB (M5 B4c)
   }
   tray.setContextMenu(Menu.buildFromTemplate(view.items.map((item): MenuItemConstructorOptions =>
     'type' in item ? { type: 'separator' }

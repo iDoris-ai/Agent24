@@ -111,6 +111,13 @@ export function kickstartService(uid: number): Promise<void> {
   })
 }
 
+/** The elevated `POST /api/v1/shutdown` (the presence box): its status and,
+ * on a refusal, the daemon's code. */
+export async function elevatedShutdown(): Promise<{ status: number; code?: string }> {
+  const res = await sendElevating({ method: 'POST', path: '/api/v1/shutdown' }, {}, { connection: daemonConnection, elevation: daemonElevation })
+  return { status: res.status, code: (res.data as { error?: { code?: string } } | null)?.error?.code }
+}
+
 export type UpgradeOutcome =
   | { ok: true; copied: boolean }
   | { ok: false; stage: 'shutdown' | 'exit' | 'copy' | 'kickstart'; code: string }
@@ -187,10 +194,7 @@ export function serviceUpgradeDeps(
   sys: UpgradeSystem = realSystem(),
 ): UpgradeDeps {
   return {
-    shutdown: async () => {
-      const res = await sendElevating({ method: 'POST', path: '/api/v1/shutdown' }, {}, { connection: daemonConnection, elevation: daemonElevation })
-      return { status: res.status, code: (res.data as { error?: { code?: string } } | null)?.error?.code }
-    },
+    shutdown: elevatedShutdown,
     // And launchd has not run it again from that file (an exit not 0; Codex B5a C3).
     exited: async () => (await until(() => !sys.alive(o.pid), sys.exitWaitMs)) && (await sys.jobPid()) === null,
     copy: () => copyDaemonIfChanged(o.bin, serviceDaemonCopyPath(o.dataDir)),
@@ -477,4 +481,60 @@ export function serviceInstallDeps(
     }, sys.startWaitMs),
     hold: o.hold,
   }
+}
+
+// ── M5 B4c: stopping the service for good (the tray's 「完全退出」) ─────────
+// Shutdown first, then uninstall: the plist's KeepAlive is
+// {SuccessfulExit:false} (service.rs), so a daemon that exits 0 is not started
+// again and nothing races for the lock (PM r1 ①). A refused or timed-out
+// presence box changes nothing.
+
+export type StopOutcome = { ok: true } | { ok: false; stage: 'shutdown' | 'uninstall'; code: string }
+
+export interface StopDeps {
+  /** The elevated `POST /shutdown` while enrolled with the service daemon;
+   * null when not enrolled (no daemon to ask: the uninstall's bootout stops
+   * whatever launchd runs). */
+  shutdown: (() => Promise<{ status: number; code?: string }>) | null
+  /** Resolves true once the daemon that was shut down has exited; false when
+   * the wait ran out (the bootout then stops it). */
+  exited: () => Promise<boolean>
+  /** `agent24 service uninstall`. */
+  uninstall: () => Promise<void>
+  /** Runs `work` with this app spawning nothing (`whileServiceRestarts`). */
+  hold: <T>(work: () => Promise<T>) => Promise<T>
+  /** Keeps the answer as declined, so the first-launch box is not shown again. */
+  record: () => void
+}
+
+/** Inside one hold: shutdown (when there is a daemon to ask), wait for it to
+ * exit, uninstall, then record. A refused or failed shutdown stops there with
+ * nothing changed; a failed record is ignored (the plist is gone already). */
+export function stopService(deps: StopDeps): Promise<StopOutcome> {
+  return deps.hold(async (): Promise<StopOutcome> => ({ ok: true })) // STUB
+}
+
+/** What the real steps run and read; tests put their own. */
+export interface StopSystem {
+  run: (bin: string, args: string[], env: NodeJS.ProcessEnv) => Promise<void>
+  alive: (pid: number) => boolean
+  shutdown: () => Promise<{ status: number; code?: string }>
+  exitWaitMs: number
+}
+
+const realStopSystem = (): StopSystem => ({
+  run: realInstallSystem(() => false).run,
+  alive: processAlive,
+  shutdown: elevatedShutdown,
+  exitWaitMs: DAEMON_EXIT_WAIT_MS,
+})
+
+/** The real steps for the enrolled service daemon `pid` (null when not
+ * enrolled), with the bundled CLI. */
+export function serviceStopDeps(
+  o: { cli: string; pid: number | null; hold: StopDeps['hold']; record: () => void },
+  sys: StopSystem = realStopSystem(),
+): StopDeps {
+  void sys
+  return { shutdown: null, exited: async () => true, uninstall: async () => {}, hold: o.hold, record: o.record } // STUB
 }

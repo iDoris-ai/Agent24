@@ -29,12 +29,14 @@ export interface TrayInput {
   crashLoop?: boolean
   /** M5 B4a: `BackendManager.serviceWaitMs()`: waiting for the service daemon. */
   serviceWaitMs?: number | null
+  /** M5 B4c: the LaunchAgent's plist is there: offer 「完全退出」. */
+  serviceInstalled?: boolean
 }
 
 /** M5 B4a: after this long waiting, the tray says the service has not started. */
 export const SERVICE_WAIT_HINT_MS = 60_000
 
-export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'cli-settings'
+export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'quit-service' | 'cli-settings'
 export type TrayItem = { type: 'separator' } | { label: string; enabled: false } | { label: string; action: TrayAction }
 
 export interface TrayView { title: string; tooltip: string; items: TrayItem[] }
