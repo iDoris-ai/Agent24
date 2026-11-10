@@ -268,7 +268,7 @@ default = [
     let ci = read("../.github/workflows/ci.yml");
     for step in [
         "cargo clippy -p agent24-knowledge --features knowledge-store --all-targets -- -D warnings",
-        "cargo test -p agent24-knowledge --features knowledge-store --lib store::",
+        "cargo test -p agent24-knowledge --features knowledge-store --lib store::tests",
     ] {
         assert!(ci.contains(step), "ci.yml must run: {step}");
     }

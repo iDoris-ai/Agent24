@@ -138,7 +138,7 @@ jobs:
 
       - name: knowledge-store test (agent24-knowledge)
         working-directory: rust
-        run: cargo test -p agent24-knowledge --features knowledge-store --lib store::
+        run: cargo test -p agent24-knowledge --features knowledge-store --lib store::tests
 
       - name: Real Hyphae unlock
         working-directory: rust
