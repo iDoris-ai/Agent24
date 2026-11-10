@@ -20,6 +20,37 @@ struct LinearHead {
     intercepts: Vec<f32>,
 }
 
+impl LinearHead {
+    fn validate(&self) -> Result<(), String> {
+        let binary = self.classes.len() == 2 && self.coefficients.len() == 1;
+        if self.classes.len() < 2
+            || (!binary && self.coefficients.len() != self.classes.len())
+            || self.intercepts.len() != self.coefficients.len()
+            || self
+                .coefficients
+                .windows(2)
+                .any(|rows| rows[0].len() != rows[1].len())
+        {
+            return Err("classifier head dimensions do not match its classes".into());
+        }
+        Ok(())
+    }
+
+    fn validate_width(&self, width: usize) -> Result<(), String> {
+        if self.coefficients.iter().any(|row| row.len() != width) {
+            return Err("classifier head width does not match encoder output".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_hidden_shape(dims: &[usize], tokens: usize) -> Result<(), String> {
+    if dims.len() != 3 || dims[0] != 1 || dims[1] != tokens {
+        return Err(format!("unexpected encoder output shape: {dims:?}"));
+    }
+    Ok(())
+}
+
 pub struct OnnxEmbeddingClassifier {
     session: Session,
     tokenizer: Tokenizer,
@@ -38,17 +69,7 @@ impl OnnxEmbeddingClassifier {
         let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(display_error)?;
         let head: LinearHead = serde_json::from_slice(&fs::read(head_path).map_err(display_error)?)
             .map_err(display_error)?;
-        let binary_sklearn_head = head.classes.len() == 2 && head.coefficients.len() == 1;
-        if head.classes.len() < 2
-            || (!binary_sklearn_head && head.coefficients.len() != head.classes.len())
-            || head.intercepts.len() != head.coefficients.len()
-            || head
-                .coefficients
-                .windows(2)
-                .any(|rows| rows[0].len() != rows[1].len())
-        {
-            return Err("classifier head dimensions do not match its classes".into());
-        }
+        head.validate()?;
         Ok(Self {
             session,
             tokenizer,
@@ -105,13 +126,9 @@ impl OnnxEmbeddingClassifier {
             .try_extract_array::<f32>()
             .map_err(display_error)?;
         let dims = hidden.shape();
-        if dims.len() != 3 || dims[0] != 1 || dims[1] != len {
-            return Err(format!("unexpected encoder output shape: {dims:?}"));
-        }
+        validate_hidden_shape(dims, len)?;
         let width = dims[2];
-        if self.head.coefficients.iter().any(|row| row.len() != width) {
-            return Err("classifier head width does not match encoder output".into());
-        }
+        self.head.validate_width(width)?;
         let mut embedding = vec![0.0_f32; width];
         let count = mask.iter().filter(|&&value| value != 0).count() as f32;
         for token in 0..len {
@@ -175,4 +192,34 @@ impl OnnxEmbeddingClassifier {
 
 fn display_error(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LinearHead, validate_hidden_shape};
+
+    #[test]
+    fn mismatched_head_class_rows_are_rejected() {
+        let head = LinearHead {
+            classes: vec!["a".into(), "b".into(), "c".into()],
+            coefficients: vec![vec![0.1; 2]],
+            intercepts: vec![0.0],
+        };
+        assert!(head.validate().is_err());
+    }
+
+    #[test]
+    fn non_3d_encoder_output_is_rejected() {
+        assert!(validate_hidden_shape(&[1, 768], 1).is_err());
+    }
+
+    #[test]
+    fn classifier_width_mismatch_is_rejected() {
+        let head = LinearHead {
+            classes: vec!["a".into(), "b".into()],
+            coefficients: vec![vec![0.1; 2]],
+            intercepts: vec![0.0],
+        };
+        assert!(head.validate_width(3).is_err());
+    }
 }
