@@ -238,10 +238,56 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::events::EventsHub;
-    use crate::timing_recorder::MemoryTimingSink;
     use serde_json::json;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
+
+    /// In-memory [`TimingSink`]. The daemon's `MemoryTimingSink` is the same
+    /// shape and stays next to the production writer; this copy exists so the
+    /// bridge test does not depend on the daemon crate.
+    #[derive(Default)]
+    struct MemoryTimingSink(Mutex<Vec<TimingObservation>>);
+
+    impl MemoryTimingSink {
+        fn take(&self) -> Vec<TimingObservation> {
+            std::mem::take(
+                &mut *self
+                    .0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )
+        }
+    }
+
+    impl TimingSink for MemoryTimingSink {
+        fn record(&self, obs: TimingObservation) {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(obs);
+        }
+    }
+
+    /// The slice of `EventsHub` the bridge test broadcasts on.
+    struct EventBus {
+        tx: broadcast::Sender<(String, EventBody)>,
+    }
+
+    impl EventBus {
+        fn new() -> Self {
+            let (tx, _) = broadcast::channel(16);
+            Self { tx }
+        }
+
+        fn broadcast(&self, body: EventBody) {
+            let _ = self.tx.send((String::new(), body));
+        }
+    }
+
+    impl AgentEarEventBus for EventBus {
+        fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)> {
+            self.tx.subscribe()
+        }
+    }
 
     /// The design ask's own fixture shape: a `turn` event, `phase: "idle"`,
     /// every field it names present.
@@ -433,7 +479,7 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_records_through_the_shared_timing_sink_for_a_broadcast_idle_turn_event() {
         let sink = Arc::new(MemoryTimingSink::default());
-        let hub = EventsHub::default();
+        let hub = EventBus::new();
         let _handle = spawn_agentear_timing_bridge(&hub, sink.clone() as Arc<dyn TimingSink>);
 
         hub.broadcast(EventBody::Module(agent24_protocol::ModuleEventPayload {

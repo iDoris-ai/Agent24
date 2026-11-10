@@ -157,7 +157,10 @@ pub async fn run(registry: Arc<AttachRegistry>, path: PathBuf, stop: Cancellatio
     // after an ungraceful exit.
 }
 
-pub(crate) async fn handle_connection(
+/// For the daemon and its tests; the socket directory check and bind live in
+/// [`run`].
+#[doc(hidden)]
+pub async fn handle_connection(
     stream: UnixStream,
     registry: &AttachRegistry,
     stop: CancellationToken,
@@ -454,42 +457,38 @@ mod tests {
 
     // ── Review (Codex A3 follow-up, §5.5): a handshake racing shutdown ──
 
-    /// A `RunTrigger` that never fires — this test only needs a `Scheduler`
-    /// to exist so `AttachDeps` can be built without wiring a real one. Same
-    /// shape as `attach_registry::tests::NoopTrigger` (duplicated
-    /// rather than shared: that one lives in a private `mod tests` in a
-    /// different file).
-    struct NoopTrigger;
+    /// Same stand-in `attach_registry`'s tests use: these two cases drive the
+    /// listener and the on-disk register path, and never dispatch a granted
+    /// method. Duplicated rather than shared — that helper lives in a private
+    /// `mod tests`.
+    struct EventsGrant;
 
-    #[async_trait::async_trait]
-    impl agent24_scheduler::RunTrigger for NoopTrigger {
-        async fn trigger(
+    impl crate::attach_registry::AttachGrantBuilder for EventsGrant {
+        fn build(
             &self,
-            _invocation: &agent24_scheduler::ScheduleInvocation,
-        ) -> agent24_scheduler::FireOutcome {
-            agent24_scheduler::FireOutcome::Deferred {
-                reason: agent24_scheduler::DeferReason::MountPending,
+            _name: &str,
+            manifest: &agent24_domain::DomainOsManifest,
+        ) -> crate::attach_registry::AttachGrant {
+            let provides = if manifest
+                .kernel_capabilities()
+                .contains(&agent24_domain::Capability::Events)
+            {
+                vec!["_a24/events/".to_owned()]
+            } else {
+                Vec::new()
+            };
+            crate::attach_registry::AttachGrant {
+                provides,
+                methods_for: std::sync::Arc::new(|_generation| {
+                    agent24_os_proto::rpc::Methods::none()
+                }),
             }
         }
     }
 
-    async fn test_attach_deps() -> crate::attach_registry::AttachDeps {
-        let store = agent24_store::Store::open_memory().await.unwrap();
-        let events = crate::events::EventsHub::default();
+    fn test_attach_deps() -> crate::attach_registry::AttachDeps {
         crate::attach_registry::AttachDeps {
-            grants: std::sync::Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
-                scheduler: agent24_scheduler::Scheduler::new(
-                    store.clone(),
-                    std::sync::Arc::new(NoopTrigger),
-                    std::sync::Arc::new(|_| {}),
-                ),
-                models: None,
-                approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
-                    store,
-                    events.clone(),
-                ),
-                events,
-            }),
+            grants: std::sync::Arc::new(EventsGrant),
         }
     }
 
@@ -514,7 +513,7 @@ mod tests {
     async fn a_handshake_racing_shutdown_gets_unavailable_not_auth_failed() {
         use tokio::io::AsyncBufReadExt;
 
-        let registry = crate::attach_registry::AttachRegistry::new(test_attach_deps().await);
+        let registry = crate::attach_registry::AttachRegistry::new(test_attach_deps());
 
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("attached.json");
@@ -577,7 +576,7 @@ mod tests {
     /// the check, it would use the new one and this goes red.)
     #[tokio::test]
     async fn a_rotation_between_lookup_and_note_does_not_mark_the_new_registration() {
-        let registry = crate::attach_registry::AttachRegistry::new(test_attach_deps().await);
+        let registry = crate::attach_registry::AttachRegistry::new(test_attach_deps());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("attached.json");
         let yaml = "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\

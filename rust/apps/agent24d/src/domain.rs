@@ -41,7 +41,7 @@
 //!    verified by mutation (swap the two lines and it goes 401 → 200).
 //! 5. **A name that is already a kernel route segment is refused.** axum PANICS on
 //!    an exact route overlap, so a module called `health` would kill the daemon at
-//!    startup rather than lose a routing contest — see [`crate::attached::RESERVED_KERNEL_SEGMENTS`].
+//!    startup rather than lose a routing contest — see [`agent24_attach::attached::RESERVED_KERNEL_SEGMENTS`].
 //!
 //! The pass runs `identity → admission → registry policy → construction → mount`,
 //! and the position of CONSTRUCTION is load-bearing: a module the user switched off
@@ -152,8 +152,8 @@ pub struct CallbackDeps {
 
 // Single definition lives in `attached` so attach validation and mount
 // admission share one list. The mount pass only needs the predicate; the
-// route-equality test imports the slice from `crate::attached` itself.
-pub(crate) use crate::attached::is_reserved_kernel_segment;
+// route-equality test imports the slice from `agent24_attach::attached` itself.
+pub(crate) use agent24_attach::attached::is_reserved_kernel_segment;
 
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
@@ -1403,7 +1403,7 @@ pub async fn mount_all_with_refusals(
     // "Cannot read" and "genuinely empty" are kept apart on purpose (pre-PR
     // review D1): a MISSING file (`config_path()` finding nothing to open,
     // or `list()`'s own "not found" case) is the true empty registry — see
-    // `crate::attached::list`'s doc. A file that EXISTS but fails to parse is
+    // `agent24_attach::attached::list`'s doc. A file that EXISTS but fails to parse is
     // different: silently treating that as "nothing attached" would let a
     // package steal a name this daemon actually has a live attach
     // registration for, the exact contamination this check exists to
@@ -1412,8 +1412,8 @@ pub async fn mount_all_with_refusals(
     // `attached_names` stays whatever it already was (empty, on the first
     // failure), which matches this pass's existing behaviour for a missing
     // file and is no worse than A3-2b not existing at all for this one boot.
-    let attached_names: BTreeSet<String> = match crate::attached::config_path() {
-        Some(path) => match crate::attached::list(&path) {
+    let attached_names: BTreeSet<String> = match agent24_attach::attached::config_path() {
+        Some(path) => match agent24_attach::attached::list(&path) {
             Ok(views) => views.into_iter().map(|v| v.name).collect(),
             Err(e) => {
                 tracing::error!(
@@ -1854,7 +1854,7 @@ struct MountTarget {
 /// is the deliberate contrast: built INSIDE the closure, so a restart always
 /// gets a full bucket.
 ///
-/// `pub(crate)`, not private: `crate::attach_registry` (A3-2b) builds an
+/// `pub(crate)`, not private: `agent24_attach::attach_registry` (A3-2b) builds an
 /// attached module's `Methods` the same way a mounted package's are built —
 /// the closure this returns is agnostic to WHICH kind of `Generation` it is
 /// handed (`Process` or `Attached`), so there is no reason for A3 to grow a
@@ -2446,7 +2446,7 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
-    use crate::attached::RESERVED_KERNEL_SEGMENTS;
+    use agent24_attach::attached::RESERVED_KERNEL_SEGMENTS;
     use agent24_domain::{DomainOsManifest, ModelAccess, Result as DomainResult};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

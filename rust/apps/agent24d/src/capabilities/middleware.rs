@@ -292,8 +292,8 @@ async fn authorize(
                             }
                         };
                         if let Some(authority) = &state.first_party
-                            && let Some(path) = crate::attached::config_path()
-                            && let Ok(registrations) = crate::attached::list(&path)
+                            && let Some(path) = agent24_attach::attached::config_path()
+                            && let Ok(registrations) = agent24_attach::attached::list(&path)
                         {
                             authority.remember_attached_request(
                                 &authorization.claims.capability_id,

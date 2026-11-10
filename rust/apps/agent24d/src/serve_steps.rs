@@ -974,7 +974,7 @@ pub(super) fn spawn_ordered_shutdown(
     idoris_stopping: Option<tokio::task::JoinHandle<Result<(), agent24_idoris::idoris_host::Code>>>,
     marker: Option<crate::lifecycle::MarkerGuard>,
 ) -> (
-    Arc<std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>>,
+    Arc<std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>>>,
     Arc<crate::comm_routes::CommDaemonSlot>,
     tokio::task::JoinHandle<()>,
 ) {
@@ -1001,7 +1001,7 @@ pub(super) fn spawn_ordered_shutdown(
     // empty and has nothing to revoke — the listener that would let a module
     // attach has not started either in that same window).
     let attach_registry_cell: Arc<
-        std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
+        std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>>,
     > = Arc::new(std::sync::OnceLock::new());
     let stopping_attach_registry = Arc::clone(&attach_registry_cell);
     // COMM-4a: the Hyphae daemon supervisor (if comm_routes manages to
@@ -1407,7 +1407,9 @@ pub(super) async fn publish_mount_and_attach(
     report: agent24_protocol::ShutdownReport,
     model_deps: crate::model_callback::ModelCallbackDeps,
     ephemeral: bool,
-    attach_registry_cell: &Arc<std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>>,
+    attach_registry_cell: &Arc<
+        std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>>,
+    >,
     shutdown: &Shutdown,
 ) {
     for p in partitions.partitions() {
@@ -1528,8 +1530,8 @@ pub(super) async fn publish_mount_and_attach(
     // router). Hydrated from `attached.json` BEFORE the listener takes its
     // first connection (`AttachRegistry::hydrate`'s own doc: a handshake
     // racing an unloaded name would otherwise see a spurious `auth_failed`).
-    state.attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
-        crate::attach_registry::AttachDeps {
+    state.attach_registry = Arc::new(agent24_attach::attach_registry::AttachRegistry::new(
+        agent24_attach::attach_registry::AttachDeps {
             grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
                 scheduler: state.scheduler.clone(),
                 models: Some(model_deps),
@@ -1550,7 +1552,7 @@ pub(super) async fn publish_mount_and_attach(
     // simply not offered from an ephemeral daemon; hydration and the
     // listener are both skipped.
     if !ephemeral {
-        if let Some(path) = crate::attached::config_path()
+        if let Some(path) = agent24_attach::attached::config_path()
             && let Err(e) = state.attach_registry.hydrate(&path)
         {
             tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
@@ -1560,8 +1562,8 @@ pub(super) async fn publish_mount_and_attach(
         // [`fill_attach_registry_and_recheck`]'s own doc comment for why the
         // fill is immediately followed by a re-check of `cancel`.
         fill_attach_registry_and_recheck(&attach_registry_cell, &state.attach_registry, &cancel);
-        if let Some(path) = crate::attached::socket_path() {
-            tokio::spawn(crate::attach_listener::run(
+        if let Some(path) = agent24_attach::attached::socket_path() {
+            tokio::spawn(agent24_attach::attach_listener::run(
                 Arc::clone(&state.attach_registry),
                 path,
                 shutdown.child_token(),

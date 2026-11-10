@@ -6,14 +6,10 @@
 #[cfg(all(feature = "test-support", not(debug_assertions)))]
 compile_error!("test-support must not be enabled in release builds");
 
-mod agentear_timings;
 mod approval_callback;
 mod approvals;
 mod attach_commands;
 mod attach_grant;
-mod attach_listener;
-mod attach_registry;
-mod attached;
 mod attached_routes;
 mod authz;
 // Remaining public capability primitives are staged for the next endpoints.

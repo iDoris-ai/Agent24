@@ -503,7 +503,7 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         "idoris",
     ]
     .into_iter()
-    .map(|n| crate::attach_registry::AttachSnap {
+    .map(|n| agent24_attach::attach_registry::AttachSnap {
         name: n.to_owned(),
         version: String::new(),
         disabled: false,
@@ -2737,10 +2737,10 @@ struct Link {
 }
 
 impl Ear {
-    fn apply(&mut self, outcome: crate::attached::RegisterOutcome) {
+    fn apply(&mut self, outcome: agent24_attach::attached::RegisterOutcome) {
         let response = match outcome {
-            crate::attached::RegisterOutcome::Created(response)
-            | crate::attached::RegisterOutcome::Rotated { response, .. } => response,
+            agent24_attach::attached::RegisterOutcome::Created(response)
+            | agent24_attach::attached::RegisterOutcome::Rotated { response, .. } => response,
         };
         self.token = response.token;
         self.digest = response.manifest_digest;
@@ -2748,7 +2748,7 @@ impl Ear {
 
     fn rotate(&mut self) {
         let registry = std::sync::Arc::clone(&self.state.attach_registry);
-        let outcome = crate::attached::register(
+        let outcome = agent24_attach::attached::register(
             &self.path,
             MANIFEST,
             false,
@@ -2763,10 +2763,11 @@ impl Ear {
 
     fn set_disabled(&self, disabled: bool) {
         let registry = std::sync::Arc::clone(&self.state.attach_registry);
-        let found = crate::attached::set_disabled(&self.path, "agentear", disabled, |change| {
-            registry.on_change(change);
-        })
-        .unwrap();
+        let found =
+            agent24_attach::attached::set_disabled(&self.path, "agentear", disabled, |change| {
+                registry.on_change(change);
+            })
+            .unwrap();
         assert!(found);
     }
 }
@@ -2776,7 +2777,7 @@ async fn ear() -> Ear {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attached.json");
     let registry = std::sync::Arc::clone(&state.attach_registry);
-    let outcome = crate::attached::register(
+    let outcome = agent24_attach::attached::register(
         &path,
         MANIFEST,
         false,
@@ -2833,8 +2834,12 @@ async fn open(ear: &Ear, versions: Option<Value>) -> Link {
     let (kernel, mut module) = UnixStream::pair().unwrap();
     let registry = std::sync::Arc::clone(&ear.state.attach_registry);
     let task = tokio::spawn(async move {
-        crate::attach_listener::handle_connection(kernel, &registry, CancellationToken::new())
-            .await;
+        agent24_attach::attach_listener::handle_connection(
+            kernel,
+            &registry,
+            CancellationToken::new(),
+        )
+        .await;
     });
     let mut params = json!({
         "module": "agentear",

@@ -348,7 +348,7 @@ fn register_attached(
 ///
 /// `argv`: `<manifest-file> <socket-path> <module-name> <token> <capabilities-json>`.
 /// The manifest file's bytes are hashed here (`sha256:` + hex) exactly the
-/// way the real registration digest is computed (`crate::attached::manifest_digest`,
+/// way the real registration digest is computed (`agent24_attach::attached::manifest_digest`,
 /// itself `agent24_os_proto::manifest::manifest_digest`) — both sides read
 /// the SAME file, so the digests agree by construction, not by coincidence.
 ///
@@ -1096,7 +1096,7 @@ fn c4_name_clashes_with_a_package_both_directions() {
 }
 
 /// `sha256:` + lowercase hex — the same digest format
-/// `crate::attached::manifest_digest` computes over the exact submitted
+/// `agent24_attach::attached::manifest_digest` computes over the exact submitted
 /// bytes, reimplemented here (not called into) so this file's own
 /// independence from the daemon's internals (module doc: "只按本文 §4 wire
 /// 规格写成") extends to its Rust-side raw-frame helpers too, not just the
@@ -1557,7 +1557,7 @@ fn c8_local_only_never_reaches_the_remote_stub() {
 /// `me4_model_shutdown_wiring.rs::model_shutdown_wiring_lands_the_cancelled_call_in_the_store`
 /// (A1), applied to an attached module (A3) instead of a spawned one, which
 /// is exactly the "same `modules_cut_off()` tree" property `AttachDeps`
-/// (`crate::attach_registry`) exists to give.
+/// (`agent24_attach::attach_registry`) exists to give.
 #[test]
 fn c9_shutdown_with_an_inflight_model_call_lands_a_cancelled_usage_row() {
     let home = tmp_home();

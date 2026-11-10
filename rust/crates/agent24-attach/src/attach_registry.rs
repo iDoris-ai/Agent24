@@ -192,14 +192,14 @@ fn build_grant(name: &str, manifest: &DomainOsManifest, deps: &AttachDeps) -> Gr
 /// ADR-038 D3: the host `detail` for a protocol-range refusal. Named fields
 /// so `expected` and `actual` cannot be swapped at a call site.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ContractMismatch {
+pub struct ContractMismatch {
     pub expected: String,
     pub actual: String,
 }
 
 /// One registered module, as `GET /api/v1/components` reads it.
 #[derive(Debug, Clone)]
-pub(crate) struct AttachSnap {
+pub struct AttachSnap {
     pub name: String,
     pub version: String,
     pub disabled: bool,
@@ -886,40 +886,32 @@ mod tests {
 
     use super::*;
 
-    /// A `RunTrigger` that never fires — this test module never advances a
-    /// schedule, it only needs a `Scheduler` to exist so `AttachDeps` can be
-    /// built without wiring a real one. Same shape as `domain::tests::NoopTrigger`.
-    struct NoopTrigger;
+    /// The slice of `DaemonAttachGrantBuilder` these tests actually observe:
+    /// an `events` capability becomes `_a24/events/` on the offer. Everything
+    /// else the daemon builder wires (scheduler, model callback, approval
+    /// broker, event hub) stays in the daemon and is not reachable from here.
+    struct EventsGrant;
 
-    #[async_trait::async_trait]
-    impl agent24_scheduler::RunTrigger for NoopTrigger {
-        async fn trigger(
-            &self,
-            _invocation: &agent24_scheduler::ScheduleInvocation,
-        ) -> agent24_scheduler::FireOutcome {
-            agent24_scheduler::FireOutcome::Deferred {
-                reason: agent24_scheduler::DeferReason::MountPending,
+    impl AttachGrantBuilder for EventsGrant {
+        fn build(&self, _name: &str, manifest: &DomainOsManifest) -> AttachGrant {
+            let provides = if manifest
+                .kernel_capabilities()
+                .contains(&agent24_domain::Capability::Events)
+            {
+                vec!["_a24/events/".to_owned()]
+            } else {
+                Vec::new()
+            };
+            AttachGrant {
+                provides,
+                methods_for: Arc::new(|_generation| Methods::none()),
             }
         }
     }
 
-    async fn deps() -> AttachDeps {
-        let store = agent24_store::Store::open_memory().await.unwrap();
-        let events = crate::events::EventsHub::default();
+    fn deps() -> AttachDeps {
         AttachDeps {
-            grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
-                scheduler: agent24_scheduler::Scheduler::new(
-                    store.clone(),
-                    Arc::new(NoopTrigger),
-                    Arc::new(|_| {}),
-                ),
-                models: None,
-                approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
-                    store,
-                    events.clone(),
-                ),
-                events,
-            }),
+            grants: Arc::new(EventsGrant),
         }
     }
 
@@ -986,7 +978,7 @@ mod tests {
     /// refusal belongs to the old registration and must not mark the new one.
     #[tokio::test]
     async fn a_mismatch_from_a_rotated_away_token_is_dropped() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, old_token) = register(&registry, "agentear", &["events"]);
         let looked_up = registry.expectation("agentear").unwrap().token_id;
         assert_eq!(looked_up, old_token);
@@ -1003,17 +995,20 @@ mod tests {
 
     #[tokio::test]
     async fn expectation_is_none_for_an_unregistered_name() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         assert!(registry.expectation("nobody").is_none());
     }
 
     #[tokio::test]
     async fn a_registered_name_yields_an_expectation_and_commits() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (digest, token_id) = register(&registry, "agentear", &["events"]);
         let exp = registry.expectation("agentear").expect("registered");
         assert_eq!(exp.manifest_digest, digest);
         assert_eq!(exp.token_id, token_id);
+        // `EventsGrant` is this crate's stand-in builder: this only proves the
+        // registry passes `provides` through. The real grant is pinned by
+        // agent24d's `attach_grant` test and the A3-2b black-box C2 case.
         assert_eq!(exp.offer.provides, vec!["_a24/events/".to_owned()]);
 
         let claim = accepted("agentear", &token_id);
@@ -1026,7 +1021,7 @@ mod tests {
     #[tokio::test]
     async fn a_stale_token_id_at_commit_is_auth_failed() {
         // Simulates a rotation landing between the pure check and commit.
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         register(&registry, "agentear", &["events"]); // rotates, mints a new token_id
         let stale_claim = accepted("agentear", &token_id);
@@ -1038,7 +1033,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_second_commit_while_one_is_live_is_busy() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         let claim = accepted("agentear", &token_id);
         registry.commit(&claim).unwrap();
@@ -1047,7 +1042,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabled_refuses_commit_with_forbidden() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         registry.on_change(&Change::Disabled {
             name: "agentear",
@@ -1063,7 +1058,7 @@ mod tests {
 
     #[tokio::test]
     async fn disabling_a_live_generation_revokes_it() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, _) = registry.commit(&claim).unwrap();
@@ -1076,7 +1071,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoking_the_record_revokes_the_live_generation_and_forgets_the_name() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, _) = registry.commit(&claim).unwrap();
@@ -1088,7 +1083,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_after_eof_clears_the_slot_so_a_reconnect_can_install() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, _) = registry.commit(&claim).unwrap();
@@ -1102,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     async fn rotation_reusing_the_digest_keeps_the_same_grant() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         register(&registry, "agentear", &["events"]);
         let grant_before = {
             let map = registry.inner.lock().unwrap();
@@ -1122,7 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_all_revokes_every_live_generation_and_forgets_every_grant() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, a) = register(&registry, "agentear", &["events"]);
         let (_, b) = register(&registry, "other", &["events"]);
         let ga = registry.commit(&accepted("agentear", &a)).unwrap().1;
@@ -1144,7 +1139,7 @@ mod tests {
     /// blackbox suite (`c9`-adjacent).
     #[tokio::test]
     async fn revoke_all_drops_deps_even_with_no_attached_modules_ever() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         registry.revoke_all();
         let claim = accepted("nobody-was-ever-attached", "tok");
         assert!(matches!(
@@ -1161,7 +1156,7 @@ mod tests {
     /// such module".
     #[tokio::test]
     async fn is_closed_starts_false_and_flips_permanently_on_revoke_all() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         assert!(!registry.is_closed());
         register(&registry, "agentear", &["events"]);
         assert!(
@@ -1183,7 +1178,7 @@ mod tests {
     /// stop reconnecting permanently, per its own §5.6 table).
     #[tokio::test]
     async fn commit_after_revoke_all_is_closed_not_auth_failed() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         registry.revoke_all();
         let claim = accepted("agentear", &token_id);
@@ -1201,7 +1196,7 @@ mod tests {
     /// rather than relying on that being implied by the two tests above.
     #[tokio::test]
     async fn a_commit_that_already_holds_the_lock_is_unaffected_by_a_concurrent_revoke_all() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register(&registry, "agentear", &["events"]);
         let claim = accepted("agentear", &token_id);
         // `commit` and `revoke_all` both take the SAME lock, so there is no
@@ -1220,7 +1215,7 @@ mod tests {
     /// false}`.
     #[tokio::test]
     async fn rotation_preserves_disabled_it_does_not_clear_it() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         register(&registry, "agentear", &["events"]);
         registry.on_change(&Change::Disabled {
             name: "agentear",
@@ -1329,7 +1324,7 @@ mod tests {
 
     #[tokio::test]
     async fn declared_command_checks_existence_then_declaration() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         assert_eq!(
             registry.declared_command("nobody", "speak").unwrap_err(),
             CommandLookupError::UnknownModule
@@ -1354,7 +1349,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_ready_is_not_ready_before_a_connection_and_after_it_ends() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
         assert_eq!(
             registry.reserve_ready("agentear", "speak").unwrap_err(),
@@ -1393,7 +1388,7 @@ mod tests {
 
     #[tokio::test]
     async fn reserve_ready_enforces_the_in_flight_cap_and_releases_on_drop() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, methods) = registry.commit(&claim).unwrap();
@@ -1448,7 +1443,7 @@ mod tests {
     /// out afterwards.
     #[tokio::test]
     async fn a_late_stale_install_never_clobbers_an_already_installed_fresh_one() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
         let claim = accepted("agentear", &token_id);
         let (_, stale_generation, stale_methods) = registry.commit(&claim).unwrap();
@@ -1503,7 +1498,7 @@ mod tests {
     /// the current manifest disowns.
     #[tokio::test]
     async fn reserve_ready_rejects_a_command_the_current_manifest_no_longer_declares() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
 
         // The REST handler's step ② pre-check, at request time: passes.
@@ -1580,7 +1575,7 @@ mod tests {
     async fn revoking_after_reserve_prevents_the_frame_from_ever_being_sent() {
         use tokio::io::AsyncReadExt;
 
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, methods) = registry.commit(&claim).unwrap();
@@ -1660,7 +1655,7 @@ mod tests {
     /// immediately afterwards, with no window left to land in.
     #[tokio::test]
     async fn fu_105_no_notready_window_between_success_frame_and_registry_install() {
-        let registry = AttachRegistry::new(deps().await);
+        let registry = AttachRegistry::new(deps());
         let (_, token_id) = register_with_commands(&registry, "agentear", &["events"], &["speak"]);
         let claim = accepted("agentear", &token_id);
         let (_, generation, methods) = registry.commit(&claim).unwrap();

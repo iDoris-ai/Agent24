@@ -97,8 +97,8 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | components | L3 | os-proc | — |
 | decide | L3 | hw | — |
 | hw | L3 | （无） | — |
-| idoris | L3 | components, hw | — |
-| knowledge | L3 | （无） | — |
+| idoris | L3 | components, hw, protocol | models |
+| knowledge | L3 | components | — |
 | mcp | L3 | domain, protocol, tools | — |
 | memory | L3 | core, models, store | — |
 | models | L3 | domain, idoris, protocol | — |
@@ -109,16 +109,17 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | comm | L3（例外：自带 REST 面） | （无） | components |
 | documents-client | L3（客户端库） | （无） | — |
 | agent | L4 | core, domain, memory, models, protocol, scheduler, store, tools, workspace | policy |
+| attach | L4½ | domain, os-proto, protocol | — |
 | os-fd | L4½ | （无） | — |
-| os-packages | L4½ | domain, os-proto | — |
+| os-packages | L4½ | components, domain, os-proc, os-proto, protocol | — |
 | os-proto | L4½ | domain, os-fd | — |
 | os-sdk | L4½ | os-proto | — |
-| **agent24d** | L5 | agent, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, store, tools, workspace | os-sdk |
+| **agent24d** | L5 | agent, attach, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, store, tools, workspace | os-sdk |
 | documents | L6 | os-sdk | domain, os-proto |
 | sidecar-host | L6 | sidecar-host-protocol | — |
-| cli | L7 | documents-client, hw, mcp, os-packages, protocol, store | — |
+| cli | L7 | documents-client, hw, mcp, os-packages, os-proc, protocol, store | — |
 
-共 32 个 crate（`cargo metadata` 的 workspace member 数）。
+共 33 个 crate（`cargo metadata` 的 workspace member 数）。
 <!-- END GENERATED: layer-deps -->
 
 读表时的几点说明（手写，依赖表变了要回来核对）：

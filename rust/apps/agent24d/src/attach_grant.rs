@@ -5,13 +5,17 @@
 //! Two call sites construct it, and they differ only in `models`:
 //! `server::AppState::new` passes `None` (no `ModelCallbackDeps` exists yet),
 //! and `serve_steps` replaces the registry later with `Some(model_deps)`.
-//! `build` is the old `attach_registry::build_grant` body, moved unchanged.
+//!
+//! `DaemonAttachGrantBuilder::build` holds the admission body. The registry
+//! still has `build_grant`: a thin wrapper that calls this trait and stores
+//! the result as the handshake `Offer` plus the `MethodsFor` reused across
+//! reconnects. That wrapper did not move with the body.
 
 use std::sync::Arc;
 
 use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink, Grants};
 
-use crate::attach_registry::{AttachGrant, AttachGrantBuilder};
+use agent24_attach::attach_registry::{AttachGrant, AttachGrantBuilder};
 
 /// A3 P2 (design §1 "本期只用 `events`、`models`"): the only two capabilities
 /// an attached module may be granted. Deliberately narrower than
@@ -111,7 +115,9 @@ mod tests {
     /// The method names `build_methods_for` registers unconditionally. Both
     /// construction paths install this set; it is not an authorization check
     /// (`build_methods_for` registers all eleven whether or not the capability
-    /// was granted). The frame assertions below are the check.
+    /// was granted). Compared as a sorted list against every name actually registered,
+    /// so one extra method fails the assertion. The frame assertions below
+    /// are the authorization check.
     const METHOD_NAMES: &[&str] = &[
         "_a24/approval/advise",
         "_a24/approval/gate",
@@ -177,12 +183,7 @@ mod tests {
 
     fn method_names(grant: &AttachGrant) -> Vec<String> {
         let generation = Generation::attached();
-        let methods = (grant.methods_for)(&generation);
-        METHOD_NAMES
-            .iter()
-            .filter(|name| registered(&methods, name))
-            .map(|name| (*name).to_owned())
-            .collect()
+        (grant.methods_for)(&generation).names()
     }
 
     /// Send one frame through the grant's real `methods_for` and run the

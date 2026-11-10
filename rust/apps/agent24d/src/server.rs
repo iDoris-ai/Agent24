@@ -204,7 +204,7 @@ pub struct AppState {
     /// "start empty, replace once real data is ready" pattern `os_reports`
     /// uses just below, and for the same reason (this reassignment happens
     /// before `state` is ever cloned into the router).
-    pub attach_registry: Arc<crate::attach_registry::AttachRegistry>,
+    pub attach_registry: Arc<agent24_attach::attach_registry::AttachRegistry>,
     /// M1-T10: the memory base, for `/api/v1/memory/*` — `None` exactly when
     /// `memory_owner` is `None` (memory unavailable; see [`open_memory_base`]).
     /// A SEPARATE handle from the one the run loop got (both are clones of the
@@ -690,7 +690,10 @@ impl AppState {
         // `_a24/model/complete`/`/api/v1/chat` — see `agentear_timings.rs`'s
         // doc comment for why this is NOT wired through the RPC path.
         let _agentear_timing_bridge_handle =
-            crate::agentear_timings::spawn_agentear_timing_bridge(&events, timings.clone());
+            agent24_attach::agentear_timings::spawn_agentear_timing_bridge(
+                &events,
+                timings.clone(),
+            );
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
         let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")
@@ -739,8 +742,8 @@ impl AppState {
         // above (design doc "现状" 4).
         let module_approval_broker =
             crate::module_approval_broker::ModuleApprovalBroker::new(store.clone(), events.clone());
-        let attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
-            crate::attach_registry::AttachDeps {
+        let attach_registry = Arc::new(agent24_attach::attach_registry::AttachRegistry::new(
+            agent24_attach::attach_registry::AttachDeps {
                 // No `ModelCallbackDeps` exists yet at this point (it needs
                 // the `UsageRecorder` `serve` spawns later) — `serve` builds
                 // the real registry once that exists and replaces this one,
@@ -1320,8 +1323,8 @@ pub fn generate_token() -> String {
 /// it (a reverse mutation removing the re-check below must turn those tests
 /// red; see their doc comments).
 fn fill_attach_registry_and_recheck(
-    cell: &std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
-    registry: &Arc<crate::attach_registry::AttachRegistry>,
+    cell: &std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>>,
+    registry: &Arc<agent24_attach::attach_registry::AttachRegistry>,
     cancel: &CancellationToken,
 ) {
     let _ = cell.set(Arc::clone(registry));
@@ -7504,7 +7507,7 @@ pub fn build_router_with_modules() {
         let state = state().await;
         let registry = Arc::clone(&state.attach_registry);
         let cancel = CancellationToken::new();
-        let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
+        let cell: std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>> =
             std::sync::OnceLock::new();
 
         // `stopping`'s own one-shot check, landing before the fill: shutdown
@@ -7538,7 +7541,7 @@ pub fn build_router_with_modules() {
         let state = state().await;
         let registry = Arc::clone(&state.attach_registry);
         let cancel = CancellationToken::new();
-        let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
+        let cell: std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>> =
             std::sync::OnceLock::new();
 
         assert!(!cancel.is_cancelled());
