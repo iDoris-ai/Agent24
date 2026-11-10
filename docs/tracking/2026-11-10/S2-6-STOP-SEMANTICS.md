@@ -34,7 +34,7 @@ grep -rn 'killpg\|kill(-\|SIGTERM\|SIGKILL\|Signal::SIGTERM\|setpgid\|process_gr
 | `rust/crates/agent24-idoris/src/supervisor.rs:730` finish | 已回收 leader 后，验证后代归属，KILL；确认组空；归属未知则失败 | 组确认 5s |
 | `rust/crates/agent24-idoris/src/supervisor.rs:837` Drop | best effort 有归属才 KILL | 不等回收 |
 | `rust/crates/agent24-os-proto/src/supervise.rs:775` Drop | 撤销 permit；尚未回收的 leader 固定 PID；KILL 并记录结果 | 不等回收 |
-| `rust/apps/agent24-sidecar-host/src/posix.rs:234,242,304,479` | terminate 发 TERM；独立 force 请求发 KILL；独立 reap；Drop 转交 permit | host 默认 graceful 5s、force 10s；posix leader 退出 5s、reap 5s、组空 5s |
+| `rust/apps/agent24-sidecar-host/src/posix.rs:234,242,304,479,488` | terminate 发 TERM；独立 force 请求发 KILL；独立 reap；Drop（:479）在 leader 尚未回收时先组 SIGKILL（:488，不等待），再转交 child、group 和 permit | host 默认 graceful 5s、force 10s；posix leader 退出 5s、reap 5s、组空 5s |
 | `rust/apps/agent24-cli/src/service.rs:380` | launchctl kill SIGTERM 服务任务 | 不在此等待/KILL |
 | `rust/apps/agent24d/tests/me3f_blackbox.rs:230` 等测试清理 | 对 daemon 单 PID TERM，等待后 child.kill | 测试自有窗口 |
 
@@ -46,6 +46,6 @@ grep -rn 'killpg\|kill(-\|SIGTERM\|SIGKILL\|Signal::SIGTERM\|setpgid\|process_gr
 |---|---|
 | `apps/desktop/src/main/backend-manager.ts:1016` killChild | 单个 child SIGTERM；立即清空引用，无 KILL、无等待 |
 | `apps/desktop/src/main/creative-serve-web.ts:724` terminateOwnedChild | checkout child TERM，exit 事件完成；5s 后 child SIGKILL 并完成，不等强杀确认 |
-| creative-serve-web packaged 路径 → SidecarManager / `open-design-sidecar.ts:177` | 当前源码是 launcher 单 PID TERM（避免连同服务同时 TERM），15s 后组 KILL，并确认组空；这与“TERM 整组”的计划简称有差异，本次不改行为 |
+| creative-serve-web packaged 路径 → SidecarManager / `open-design-sidecar.ts:177` | 当前源码是 launcher 单 PID TERM（避免连同服务同时 TERM），15s 后组 KILL，并确认组空；这与“TERM 整组”的计划简称有差异。另有启动失败清理（`open-design-sidecar.ts:354`）：写 PGID 文件失败时立即组 SIGKILL，不先 TERM、不等待、不确认组空 |
 
 若以后统一，必须显式区分“只 TERM 不等待”、checkout 的 5s、packaged 的 15s 及 PID/PGID 目标。
