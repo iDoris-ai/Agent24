@@ -823,6 +823,31 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
     }
   })
 
+  it('a tray Restart while the shutdown is in flight: that ask is superseded, so the next probe asks again, once (PR-Daemon B4a N2)', async () => {
+    vi.useFakeTimers()
+    let answer!: (status: number) => void
+    const requestShutdown = vi.fn()
+      .mockImplementationOnce(() => new Promise<number>((r) => { answer = r }))
+      .mockResolvedValue(404)
+    const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(11_000)
+    try {
+      expect(requestShutdown).toHaveBeenCalledTimes(1)
+      manager.restart()
+      answer(404)
+      await vi.advanceTimersByTimeAsync(1_000)
+      await starting
+      await vi.advanceTimersByTimeAsync(90_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(2)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('a tray Stop then Start after a refused shutdown asks once more, not on every tick (PR-Daemon B4a N2)', async () => {
     vi.useFakeTimers()
     const requestShutdown = vi.fn().mockResolvedValue(404)
