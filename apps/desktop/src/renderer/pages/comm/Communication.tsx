@@ -75,7 +75,18 @@ function hyphaeLabel(component: ComponentView, t: (key: keyof typeof communicati
   return component.state
 }
 
-type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send' | 'restore'
+type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send' | 'restore' | 'relaySave' | 'relayProbe'
+
+function relayValues(value: string): string[] {
+  return value.split(/\r?\n/).map((relay) => relay.trim()).filter(Boolean)
+}
+
+/** Client-side gate only. The server still validates the 1..=8 ws(s) contract. */
+function hasValidRelayList(value: string): boolean {
+  const relays = relayValues(value)
+  return relays.length >= 1 && relays.length <= 8 &&
+    relays.every((relay) => relay.startsWith('ws://') || relay.startsWith('wss://'))
+}
 
 /** Daemon states that settle on their own: the page polls until they do. */
 const TRANSITIONAL_STATES = ['starting', 'backoff']
@@ -173,6 +184,8 @@ export default function CommunicationPage() {
   const [contactNpub, setContactNpub] = useState('')
   const [contactRole, setContactRole] = useState('')
   const [contactError, setContactError] = useState<string | null>(null)
+  const [relayDraft, setRelayDraft] = useState('')
+  const relayDraftDirty = useRef(false)
   const [messageTo, setMessageTo] = useState('')
   const [messageText, setMessageText] = useState('')
   const contactNameRef = useRef<HTMLInputElement>(null)
@@ -208,7 +221,11 @@ export default function CommunicationPage() {
     else fail('error.identities', results[0].reason)
     if (results[1].status === 'fulfilled') setContacts(results[1].value)
     else fail('error.contacts', results[1].reason)
-    if (results[2].status === 'fulfilled') setRelays(results[2].value)
+    if (results[2].status === 'fulfilled') {
+      setRelays(results[2].value)
+      // A save or an in-progress edit owns the textarea; a late read must not wipe it.
+      if (!relayDraftDirty.current) setRelayDraft(results[2].value.relays.join('\n'))
+    }
     else fail('error.relays', results[2].reason)
     if (results[3].status === 'fulfilled') setDaemon(results[3].value)
     else fail('error.process', results[3].reason)
@@ -460,6 +477,46 @@ export default function CommunicationPage() {
     }
   }
 
+  const saveRelays = async () => {
+    if (pending || !hasValidRelayList(relayDraft)) return
+    const token = ++sequence.current
+    setPending('relaySave')
+    setActionError(null)
+    setNotice(null)
+    setExportedPath(null)
+    try {
+      const saved = await setCommRelay(relayValues(relayDraft))
+      if (!mounted.current || token !== sequence.current) return
+      setRelays(saved)
+      setRelayDraft(saved.relays.join('\n'))
+      relayDraftDirty.current = false
+      setNotice(t('relay.saved'))
+    } catch (error) {
+      if (mounted.current && token === sequence.current) setActionError(messageOf(error))
+    } finally {
+      if (mounted.current) { setPending(null); void refresh() }
+    }
+  }
+
+  const probeRelay = async () => {
+    if (pending) return
+    const token = ++sequence.current
+    setPending('relayProbe')
+    setActionError(null)
+    setNotice(null)
+    setExportedPath(null)
+    try {
+      const probe = await probeCommRelay()
+      if (mounted.current && token === sequence.current) {
+        setNotice(probe.connected ? t('relay.probeOk') : t('relay.probeFailed'))
+      }
+    } catch (error) {
+      if (mounted.current && token === sequence.current) setActionError(messageOf(error))
+    } finally {
+      if (mounted.current) { setPending(null); void refresh() }
+    }
+  }
+
   const submitContact = async () => {
     if (pending) return
     const npubValue = contactNpub.trim()
@@ -681,6 +738,24 @@ export default function CommunicationPage() {
           <p>{t('relay.source', { source: relays.source, status: relays.configured ? t('value.configured') : t('value.notConfigured') })}</p>
           {relays.relays.length ? <ul>{relays.relays.map((relay) => <li key={relay}>{relay}</li>)}</ul> : <p className="comm-muted">{t('empty.relay')}</p>}
         </>}
+        <form className="comm-relay-form" onSubmit={(event) => {
+          event.preventDefault()
+          if (!hasValidRelayList(relayDraft)) return
+          void saveRelays()
+        }}>
+          <label>{t('relay.lines')}<textarea rows={4} value={relayDraft} onChange={(event) => {
+            relayDraftDirty.current = true
+            setRelayDraft(event.target.value)
+          }} /></label>
+          <div className="comm-actions">
+            <button type="submit" disabled={pending !== null || !hasValidRelayList(relayDraft)}>
+              {pending === 'relaySave' ? t('relay.saving') : t('relay.save')}
+            </button>
+            <button type="button" onClick={() => void probeRelay()} disabled={pending !== null}>
+              {pending === 'relayProbe' ? t('relay.probing') : t('relay.probe')}
+            </button>
+          </div>
+        </form>
       </section>
 
       <section className="comm-card">

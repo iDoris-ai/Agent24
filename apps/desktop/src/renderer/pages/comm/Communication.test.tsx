@@ -7,7 +7,7 @@ import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
   addCommContact, sendCommMessage, listCommHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
-  revealCommExport,
+  revealCommExport, setCommRelay, probeCommRelay,
   CommApiError, type CommDaemonStatus,
 } from './api'
 import { listComponents, type ComponentView } from '../../components/componentApi'
@@ -35,6 +35,7 @@ vi.mock('./api', async (importActual) => {
     startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
     addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
     revealCommExport: vi.fn().mockResolvedValue(undefined),
+    setCommRelay: vi.fn(), probeCommRelay: vi.fn(),
   }
 })
 
@@ -70,6 +71,8 @@ function success() {
   vi.mocked(stopCommDaemon).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
   vi.mocked(unlockComm).mockResolvedValue({ unlocked: true, remembered: false })
   vi.mocked(listCommHistory).mockResolvedValue([])
+  vi.mocked(setCommRelay).mockResolvedValue(relayConfig)
+  vi.mocked(probeCommRelay).mockResolvedValue({ url: 'wss://relay.example', connected: true, error: null })
 }
 const lockedStatus: CommDaemonStatus = { ...status, process: { ...status.process, state: 'locked', reason: 'password_rejected' } }
 
@@ -792,6 +795,91 @@ describe('CommunicationPage usability', () => {
     const unknown = await stopFor(null)
     expect(unknown).toBeDisabled()
     expect(unknown).toHaveAttribute('title', expect.stringContaining('unavailable'))
+  })
+
+  it('replaces the whole relay list once, then shows the saved relays', async () => {
+    success()
+    const updated = { relays: ['wss://one.example', 'ws://two.example'], source: 'config', configured: true }
+    vi.mocked(listCommRelays).mockResolvedValueOnce(relayConfig).mockResolvedValue(updated)
+    vi.mocked(setCommRelay).mockResolvedValue(updated)
+    render(<CommunicationPage />)
+    const input = await screen.findByLabelText('Relay addresses (one per line)')
+    fireEvent.change(input, { target: { value: updated.relays.join('\n') } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save relays' }))
+    await waitFor(() => expect(setCommRelay).toHaveBeenCalledTimes(1))
+    expect(setCommRelay).toHaveBeenCalledWith(updated.relays)
+    await waitFor(() => expect(screen.getAllByText('wss://one.example').some((element) => element.tagName === 'LI')).toBe(true))
+    expect(screen.getAllByText('ws://two.example').some((element) => element.tagName === 'LI')).toBe(true)
+  })
+
+  it('does not send an empty, over-limit, or non-ws relay list', async () => {
+    success()
+    render(<CommunicationPage />)
+    const input = await screen.findByLabelText('Relay addresses (one per line)')
+    const submit = screen.getByRole('button', { name: 'Save relays' })
+    for (const value of ['', Array.from({ length: 9 }, (_, i) => `wss://r${i}.example`).join('\n'), 'https://relay.example']) {
+      fireEvent.change(input, { target: { value } })
+      expect(submit).toBeDisabled()
+      fireEvent.submit(input.closest('form')!)
+    }
+    expect(setCommRelay).not.toHaveBeenCalled()
+  })
+
+  it('allows one pending relay save and keeps the draft when the save fails', async () => {
+    success()
+    let rejectSave!: (error: Error) => void
+    vi.mocked(setCommRelay).mockReturnValueOnce(new Promise((_resolve, reject) => { rejectSave = reject }))
+    render(<CommunicationPage />)
+    const input = await screen.findByLabelText('Relay addresses (one per line)')
+    fireEvent.change(input, { target: { value: 'wss://new.example' } })
+    const submit = screen.getByRole('button', { name: 'Save relays' })
+    fireEvent.click(submit)
+    fireEvent.click(submit)
+    expect(setCommRelay).toHaveBeenCalledTimes(1)
+    expect(submit).toBeDisabled()
+    rejectSave(new Error('relay write rejected'))
+    expect(await screen.findByRole('alert')).toHaveTextContent('relay write rejected')
+    expect((input as HTMLTextAreaElement).value).toBe('wss://new.example')
+    expect(screen.getAllByText('wss://relay.example').some((element) => element.tagName === 'LI')).toBe(true)
+    expect(screen.queryByText('Relay configuration saved.')).not.toBeInTheDocument()
+  })
+
+  it('drops a relay refresh that resolves after a newer save', async () => {
+    success()
+    let resolveOld!: (value: typeof relayConfig) => void
+    const updated = { relays: ['wss://new.example'], source: 'config', configured: true }
+    vi.mocked(listCommRelays)
+      .mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
+      .mockResolvedValue(updated)
+    vi.mocked(setCommRelay).mockResolvedValue(updated)
+    render(<CommunicationPage />)
+    const input = await screen.findByLabelText('Relay addresses (one per line)')
+    fireEvent.change(input, { target: { value: updated.relays.join('\n') } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save relays' }))
+    await waitFor(() => expect(screen.getAllByText('wss://new.example').some((element) => element.tagName === 'LI')).toBe(true))
+    resolveOld(relayConfig)
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 20)) })
+    expect(screen.getAllByText('wss://new.example').some((element) => element.tagName === 'LI')).toBe(true)
+    expect(screen.queryAllByText('wss://relay.example').some((element) => element.tagName === 'LI')).toBe(false)
+  })
+
+  it('probes only after an explicit click and leaves catch-up wording alone', async () => {
+    success()
+    vi.mocked(getCommStatus).mockResolvedValueOnce(status).mockResolvedValue({
+      ...status,
+      relay_probe: { url: 'wss://relay.example', connected: false, at_ms: 200, error: 'offline' },
+      catch_up: { state: 'incomplete', last_incomplete_at_ms: 150 },
+    })
+    vi.mocked(probeCommRelay).mockResolvedValue({ url: 'wss://relay.example', connected: false, error: 'offline' })
+    render(<CommunicationPage />)
+    await screen.findByLabelText('Relay addresses (one per line)')
+    expect(probeCommRelay).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: 'Probe relay' }))
+    await waitFor(() => expect(probeCommRelay).toHaveBeenCalledTimes(1))
+    expect(probeCommRelay).toHaveBeenCalledWith()
+    expect(await screen.findByText('Last handshake failed')).toBeInTheDocument()
+    expect(screen.getByText('Incomplete catch-up detected')).toBeInTheDocument()
+    expect(screen.queryByText(/补收完成|已送达/)).not.toBeInTheDocument()
   })
 
   it('enables Stop while the service is running, starting, or backing off, and disables it once stopped', async () => {

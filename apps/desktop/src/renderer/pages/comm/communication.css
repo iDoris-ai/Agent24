@@ -46,5 +46,9 @@
 .comm-unlock-explain { flex-basis: 100%; margin: 0; }
 .comm-unlock-error { flex-basis: 100%; margin: 0; color: var(--danger, #d94f4f); font-size: 13px; }
 .comm-setup-form textarea { padding: 8px; max-width: 100%; min-width: 260px; font: inherit; }
+.comm-relay-form { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.comm-relay-form label { display: flex; flex: 1 1 320px; flex-direction: column; gap: 6px; font-size: 13px; }
+.comm-relay-form textarea { min-width: 240px; padding: 8px; font: inherit; }
+.comm-relay-form .comm-actions { margin-top: 0; }
 .comm-history { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 13px; }
 .comm-history li { border-bottom: 1px solid var(--border); padding-bottom: 6px; overflow-wrap: anywhere; }
