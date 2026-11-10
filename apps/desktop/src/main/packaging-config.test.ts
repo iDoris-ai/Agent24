@@ -106,11 +106,13 @@ describe('installer excludes development bridges (ADR-044 T3)', () => {
       .not.toMatch(/(?:packages[\\/]|@agent24[\\/])[^"\s]*-bridge/)
   })
 
-  it('release scripts never stage bridge packages', () => {
+  it('build, staging and workflow scripts never stage bridge packages', () => {
     const desktop = path.join(__dirname, '..', '..')
     const repo = path.join(desktop, '..', '..')
     for (const dir of [path.join(desktop, 'scripts'), path.join(repo, 'scripts'), path.join(repo, '.github', 'workflows')]) {
-      for (const name of fs.readdirSync(dir).filter((name) => name.startsWith('release'))) {
+      for (const name of fs.readdirSync(dir, { withFileTypes: true })
+        .filter((entry) => entry.isFile() && !/\.test\.[cm]?[jt]s$/.test(entry.name))
+        .map((entry) => entry.name)) {
         expect(fs.readFileSync(path.join(dir, name), 'utf8'))
           .not.toMatch(/(?:packages[\\/]|@agent24[\\/])[^"\s]*-bridge/)
       }
