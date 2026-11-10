@@ -334,21 +334,43 @@ export function consentPath(dataDir: string): string {
 /** The kept answer; null when there is none, or it is not one this version
  * wrote (a broken or older file is asked again). */
 export function readConsent(file: string): ConsentRecord | null {
-  void file
-  return null // STUB
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+    const { version, answer, at } = value as { version: unknown; answer: unknown; at: unknown }
+    if (version !== CONSENT_VERSION || (answer !== 'allow' && answer !== 'declined') || typeof at !== 'string') return null
+    return { version: CONSENT_VERSION, answer, at }
+  } catch {
+    return null
+  }
 }
 
 /** Written next to the target and renamed over it, owner-only (0600) in a
  * directory created when missing. */
 export function writeConsent(file: string, answer: ConsentAnswer, now: Date): void {
-  void file; void answer; void now // STUB
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const temp = path.join(path.dirname(file), `.resident-consent.${process.pid}.tmp`)
+  fs.rmSync(temp, { force: true })
+  try {
+    const fd = fs.openSync(temp, 'wx', 0o600)
+    try {
+      fs.writeFileSync(fd, JSON.stringify({ version: CONSENT_VERSION, answer, at: now.toISOString() }))
+      fs.fchmodSync(fd, 0o600)
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
+    fs.renameSync(temp, file)
+  } catch (err) {
+    fs.rmSync(temp, { force: true })
+    throw err
+  }
 }
 
 /** Only a packaged macOS app that ships its own daemon (`upgradesFromBundle`),
  * with no LaunchAgent yet and no kept answer. */
 export function shouldAskConsent(o: { platform: NodeJS.Platform; fromBundle: boolean; installed: boolean; consent: ConsentRecord | null }): boolean {
-  void o
-  return true // STUB
+  return o.platform === 'darwin' && o.fromBundle && !o.installed && o.consent === null
 }
 
 export type InstallOutcome = { ok: true } | { ok: false; stage: 'install' | 'start'; code: string }
@@ -364,11 +386,31 @@ export interface InstallDeps {
   hold: <T>(work: () => Promise<T>) => Promise<T>
 }
 
+function installErrorCode(err: unknown): string {
+  if (typeof err === 'object' && err !== null && 'code' in err) {
+    if (typeof err.code === 'string') return err.code
+    if (typeof err.code === 'number') return `exit_${err.code}`
+  }
+  return 'install_failed'
+}
+
 /** Inside one hold: install, then wait for the service daemon. Any failure
  * uninstalls once (no half-installed plist is left; its own failure is
  * ignored) and the hold's end brings this app's own daemon back. */
 export function installService(deps: InstallDeps): Promise<InstallOutcome> {
-  return deps.hold(async (): Promise<InstallOutcome> => ({ ok: true })) // STUB
+  return deps.hold(async (): Promise<InstallOutcome> => {
+    const failed = async (stage: 'install' | 'start', code: string): Promise<InstallOutcome> => {
+      try { await deps.uninstall() } catch { /* its own failure is ignored */ }
+      return { ok: false, stage, code }
+    }
+    try {
+      await deps.install()
+    } catch (err) {
+      return failed('install', installErrorCode(err))
+    }
+    if (!(await deps.started())) return failed('start', 'not_started')
+    return { ok: true }
+  })
 }
 
 export type ConsentOutcome = 'declined' | 'installed' | { failed: string }
@@ -380,8 +422,14 @@ export async function runConsent(deps: {
   install: () => Promise<InstallOutcome>
   record: (answer: ConsentAnswer) => void
 }): Promise<ConsentOutcome> {
-  void deps
-  return 'declined' // STUB
+  let answer: ConsentAnswer
+  try { answer = await deps.ask() } catch { return { failed: 'ask_failed' } }
+  if (answer === 'declined') { deps.record('declined'); return 'declined' }
+  let outcome: InstallOutcome
+  try { outcome = await deps.install() } catch { return { failed: 'install_failed' } }
+  if (!outcome.ok) return { failed: outcome.code }
+  deps.record('allow')
+  return 'installed'
 }
 
 /** What the real steps run and read; tests put their own. */
@@ -410,6 +458,14 @@ export function serviceInstallDeps(
   o: { cli: string; daemonBin: string; hold: InstallDeps['hold']; spawned: (pid: number) => boolean },
   sys: InstallSystem = realInstallSystem(o.spawned),
 ): InstallDeps {
-  void sys
-  return { install: async () => {}, started: async () => true, uninstall: async () => {}, hold: o.hold } // STUB
+  const env = { ...process.env, AGENT24D_BIN: o.daemonBin }
+  return {
+    install: () => sys.run(o.cli, ['service', 'install'], env),
+    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], env),
+    started: () => until(() => {
+      const state = sys.record()
+      return state !== null && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)
+    }, sys.startWaitMs),
+    hold: o.hold,
+  }
 }
