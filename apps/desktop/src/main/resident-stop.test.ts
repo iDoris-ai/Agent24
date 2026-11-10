@@ -50,6 +50,14 @@ describe('stopService', () => {
     expect(await stopService(deps)).toEqual({ ok: false, stage: 'shutdown', code: 'http_504' })
   })
 
+  it('only a 2xx is a yes: a redirect or an informational status changes nothing', async () => {
+    for (const status of [101, 302]) {
+      const { deps, calls } = fakeStop({ shutdown: async () => ({ status }) })
+      expect(await stopService(deps)).toEqual({ ok: false, stage: 'shutdown', code: `http_${status}` })
+      expect(calls).toEqual(['hold', 'shutdown held=true', 'release'])
+    }
+  })
+
   it('a shutdown that throws (a timed-out box, no connection) changes nothing', async () => {
     const { deps, calls } = fakeStop({ shutdown: () => Promise.reject(new Error('timeout')) })
     expect(await stopService(deps)).toEqual({ ok: false, stage: 'shutdown', code: 'shutdown_failed' })
