@@ -314,3 +314,102 @@ export class CrashLoopDetector {
     return Math.max(...seen) - Math.min(...seen) >= LOOP_RESTARTS
   }
 }
+
+// ── M5 B4b: first-launch consent and `agent24 service install` ──────────────
+// David 11-10 (a): asked once, installed only on yes. The answer is kept in
+// `<data_dir>/desktop/resident-consent.json` (asked / answer / time, nothing
+// else: N4). A yes whose install fails is not kept, so the next launch asks
+// again (PM r1 ②).
+
+export const CONSENT_VERSION = 1
+export const INSTALL_START_WAIT_MS = 30_000
+
+export type ConsentAnswer = 'allow' | 'declined'
+export interface ConsentRecord { version: typeof CONSENT_VERSION; answer: ConsentAnswer; at: string }
+
+export function consentPath(dataDir: string): string {
+  return path.join(dataDir, 'desktop', 'resident-consent.json')
+}
+
+/** The kept answer; null when there is none, or it is not one this version
+ * wrote (a broken or older file is asked again). */
+export function readConsent(file: string): ConsentRecord | null {
+  void file
+  return null // STUB
+}
+
+/** Written next to the target and renamed over it, owner-only (0600) in a
+ * directory created when missing. */
+export function writeConsent(file: string, answer: ConsentAnswer, now: Date): void {
+  void file; void answer; void now // STUB
+}
+
+/** Only a packaged macOS app that ships its own daemon (`upgradesFromBundle`),
+ * with no LaunchAgent yet and no kept answer. */
+export function shouldAskConsent(o: { platform: NodeJS.Platform; fromBundle: boolean; installed: boolean; consent: ConsentRecord | null }): boolean {
+  void o
+  return true // STUB
+}
+
+export type InstallOutcome = { ok: true } | { ok: false; stage: 'install' | 'start'; code: string }
+
+export interface InstallDeps {
+  /** `agent24 service install`; rejects when it fails. */
+  install: () => Promise<void>
+  /** Resolves true once the service daemon is on record (within INSTALL_START_WAIT_MS). */
+  started: () => Promise<boolean>
+  /** `agent24 service uninstall`; idempotent. */
+  uninstall: () => Promise<void>
+  /** Runs `work` with this app's own daemon stopped and nothing spawned (`whileStopped`). */
+  hold: <T>(work: () => Promise<T>) => Promise<T>
+}
+
+/** Inside one hold: install, then wait for the service daemon. Any failure
+ * uninstalls once (no half-installed plist is left; its own failure is
+ * ignored) and the hold's end brings this app's own daemon back. */
+export function installService(deps: InstallDeps): Promise<InstallOutcome> {
+  return deps.hold(async (): Promise<InstallOutcome> => ({ ok: true })) // STUB
+}
+
+export type ConsentOutcome = 'declined' | 'installed' | { failed: string }
+
+/** Ask, then: no → kept as declined; yes → install, kept as allow only when it
+ * worked. */
+export async function runConsent(deps: {
+  ask: () => Promise<ConsentAnswer>
+  install: () => Promise<InstallOutcome>
+  record: (answer: ConsentAnswer) => void
+}): Promise<ConsentOutcome> {
+  void deps
+  return 'declined' // STUB
+}
+
+/** What the real steps run and read; tests put their own. */
+export interface InstallSystem {
+  run: (bin: string, args: string[], env: NodeJS.ProcessEnv) => Promise<void>
+  record: () => { pid: number; enrollEndpoint?: string } | null
+  alive: (pid: number) => boolean
+  spawned: (pid: number) => boolean
+  startWaitMs: number
+}
+
+const realInstallSystem = (spawned: (pid: number) => boolean): InstallSystem => ({
+  run: (bin, args, env) => new Promise((resolve, reject) => {
+    execFile(bin, args, { env, timeout: 60_000 }, (err) => (err ? reject(err) : resolve()))
+  }),
+  record: readExternalDaemonState,
+  alive: processAlive,
+  spawned,
+  startWaitMs: INSTALL_START_WAIT_MS,
+})
+
+/** The real steps: the bundled CLI with `AGENT24D_BIN` set to the bundled
+ * daemon (so the copy launchd runs is this app's). Started means a live
+ * daemon on record with an enrolment socket that this app did not spawn. */
+export function serviceInstallDeps(
+  o: { cli: string; daemonBin: string; hold: InstallDeps['hold']; spawned: (pid: number) => boolean },
+  sys: InstallSystem = realInstallSystem(o.spawned),
+): InstallDeps {
+  void sys
+  return { install: async () => {}, started: async () => true, uninstall: async () => {}, hold: o.hold } // STUB
+}
