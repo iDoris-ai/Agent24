@@ -493,9 +493,14 @@ export type StopOutcome = { ok: true } | { ok: false; stage: 'shutdown' | 'unins
 
 export interface StopDeps {
   /** The elevated `POST /shutdown` while enrolled with the service daemon;
-   * null when not enrolled (no daemon to ask: the uninstall's bootout stops
-   * whatever launchd runs). */
+   * null when not enrolled. */
   shutdown: (() => Promise<{ status: number; code?: string }>) | null
+  /** Not enrolled, yet a live service daemon is on record (the tray's
+   * disconnect, a refused enrolment): it is not stopped without the presence
+   * box (Codex B4c1 C1), so nothing changes until this app is enrolled again.
+   * Not enrolled and none on record (a crash loop, waiting): the uninstall's
+   * bootout stops whatever launchd runs. */
+  unreachable: () => boolean
   /** Resolves true once the daemon that was shut down has exited; false when
    * the wait ran out (the bootout then stops it). */
   exited: () => Promise<boolean>
@@ -512,6 +517,7 @@ export interface StopDeps {
  * nothing changed; a failed record is ignored (the plist is gone already). */
 export function stopService(deps: StopDeps): Promise<StopOutcome> {
   return deps.hold(async (): Promise<StopOutcome> => {
+    if (!deps.shutdown && deps.unreachable()) return { ok: false, stage: 'shutdown', code: 'not_connected' }
     if (deps.shutdown) {
       let down: { status: number; code?: string }
       try { down = await deps.shutdown() } catch { return { ok: false, stage: 'shutdown', code: 'shutdown_failed' } }
@@ -527,6 +533,7 @@ export function stopService(deps: StopDeps): Promise<StopOutcome> {
 /** What the real steps run and read; tests put their own. */
 export interface StopSystem {
   run: (bin: string, args: string[], env: NodeJS.ProcessEnv) => Promise<void>
+  record: () => { pid: number; enrollEndpoint?: string } | null
   alive: (pid: number) => boolean
   shutdown: () => Promise<{ status: number; code?: string }>
   exitWaitMs: number
@@ -534,6 +541,7 @@ export interface StopSystem {
 
 const realStopSystem = (): StopSystem => ({
   run: realInstallSystem(() => false).run,
+  record: readExternalDaemonState,
   alive: processAlive,
   shutdown: elevatedShutdown,
   exitWaitMs: DAEMON_EXIT_WAIT_MS,
@@ -542,12 +550,16 @@ const realStopSystem = (): StopSystem => ({
 /** The real steps for the enrolled service daemon `pid` (null when not
  * enrolled), with the bundled CLI. */
 export function serviceStopDeps(
-  o: { cli: string; pid: number | null; hold: StopDeps['hold']; record: () => void },
+  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void },
   sys: StopSystem = realStopSystem(),
 ): StopDeps {
   const pid = o.pid
   return {
     shutdown: pid === null ? null : sys.shutdown,
+    unreachable: () => {
+      const other = pid === null ? serviceRecordPid(sys.record(), o.spawned) : null
+      return other !== null && sys.alive(other)
+    },
     exited: () => until(() => pid === null || !sys.alive(pid), sys.exitWaitMs),
     uninstall: () => sys.run(o.cli, ['service', 'uninstall'], process.env),
     hold: o.hold,

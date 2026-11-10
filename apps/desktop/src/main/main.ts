@@ -791,6 +791,7 @@ async function quitStoppingService(): Promise<void> {
     const outcome = await stopService(serviceStopDeps({
       cli: resolveBundledRustBinary('agent24', app.isPackaged),
       pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
+      spawned: (pid) => backendManager.spawned(pid),
       hold: (work) => backendManager.whileServiceRestarts(work),
       record: () => {
         const dataDir = tryDataDir()
@@ -798,12 +799,15 @@ async function quitStoppingService(): Promise<void> {
       },
     }))
     if (outcome.ok) {
+      // Nothing spawned while the quit runs (Open Design's stop can take
+      // seconds): the hold ended with the uninstall (Codex B4c1 C2).
+      backendManager.stop()
       tray = null
       app.quit()
       return
     }
     console.warn('[main] background service not stopped:', outcome.stage, outcome.code)
-    void dialog.showMessageBox({ type: 'warning', message: mt('tray.serviceNotStopped', { code: outcome.code }) })
+    void dialog.showMessageBox({ type: 'warning', message: mt(outcome.code === 'not_connected' ? 'tray.serviceNotConnected' : 'tray.serviceNotStopped', { code: outcome.code }) })
   } finally {
     quittingService = false
   }

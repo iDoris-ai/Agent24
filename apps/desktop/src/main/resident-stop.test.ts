@@ -12,6 +12,7 @@ function fakeStop(o: {
   exited?: boolean
   uninstall?: () => Promise<void>
   record?: () => void
+  unreachable?: boolean
 } = {}) {
   const calls: string[] = []
   let held = false
@@ -20,6 +21,7 @@ function fakeStop(o: {
       calls.push(`shutdown held=${held}`)
       return o.shutdown ? o.shutdown() : { status: 202 }
     },
+    unreachable: () => o.unreachable ?? false,
     exited: async () => { calls.push(`exited held=${held}`); return o.exited ?? true },
     uninstall: async () => { calls.push(`uninstall held=${held}`); await o.uninstall?.() },
     hold: async (work) => {
@@ -76,6 +78,18 @@ describe('stopService', () => {
     expect(calls).toEqual(['hold', 'uninstall held=true', 'record held=true', 'release'])
   })
 
+  it('not enrolled, yet a live service daemon on record (the tray\'s disconnect): not stopped without the presence box (Codex B4c1 C1)', async () => {
+    const { deps, calls } = fakeStop({ enrolled: false, unreachable: true })
+    expect(await stopService(deps)).toEqual({ ok: false, stage: 'shutdown', code: 'not_connected' })
+    expect(calls).toEqual(['hold', 'release'])
+  })
+
+  it('enrolled, the presence box is asked whatever the record says', async () => {
+    const { deps, calls } = fakeStop({ unreachable: true })
+    expect(await stopService(deps)).toEqual({ ok: true })
+    expect(calls[1]).toBe('shutdown held=true')
+  })
+
   it('a failed uninstall is reported and nothing is recorded', async () => {
     const { deps, calls } = fakeStop({ uninstall: () => Promise.reject(Object.assign(new Error('rm'), { code: 'EACCES' })) })
     expect(await stopService(deps)).toEqual({ ok: false, stage: 'uninstall', code: 'EACCES' })
@@ -95,11 +109,12 @@ describe('stopService', () => {
 })
 
 describe('serviceStopDeps (the real steps over a fake system)', () => {
-  function system(pid: number | null, o: Partial<StopSystem> = {}) {
+  function system(pid: number | null, o: Partial<StopSystem> = {}, spawned: (pid: number) => boolean = () => false) {
     const runs: { bin: string; args: string[] }[] = []
     let shutdowns = 0
     const sys: StopSystem = {
       run: async (bin, args) => { runs.push({ bin, args }) },
+      record: () => null,
       alive: () => false,
       shutdown: async () => { shutdowns++; return { status: 202 } },
       exitWaitMs: 0,
@@ -107,7 +122,7 @@ describe('serviceStopDeps (the real steps over a fake system)', () => {
     }
     const hold: StopDeps['hold'] = (work) => work()
     const record = () => {}
-    const deps = serviceStopDeps({ cli: '/App/backend/agent24', pid, hold, record }, sys)
+    const deps = serviceStopDeps({ cli: '/App/backend/agent24', pid, spawned, hold, record }, sys)
     return { deps, runs, hold, record, shutdowns: () => shutdowns }
   }
 
@@ -119,6 +134,22 @@ describe('serviceStopDeps (the real steps over a fake system)', () => {
     const s = system(4242)
     expect(await s.deps.shutdown!()).toEqual({ status: 202 })
     expect(s.shutdowns()).toBe(1)
+  })
+
+  it('unreachable: not enrolled, and a live daemon with an enrolment socket that this app did not spawn is on record', () => {
+    const live = { record: () => ({ pid: 5151, enrollEndpoint: '/tmp/enroll.sock' }), alive: () => true }
+    expect(system(null, live).deps.unreachable()).toBe(true)
+  })
+
+  it.each([
+    ['enrolled (the box is asked)', 4242, {}, () => false],
+    ['nothing on record (a crash loop, waiting)', null, { record: () => null, alive: () => true }, () => false],
+    ['a dead daemon on record', null, { record: () => ({ pid: 5151, enrollEndpoint: '/tmp/e.sock' }), alive: () => false }, () => false],
+    ['a legacy record (no enrolment socket)', null, { record: () => ({ pid: 5151 }), alive: () => true }, () => false],
+    ['our own child on record', null, { record: () => ({ pid: 5151, enrollEndpoint: '/tmp/e.sock' }), alive: () => true }, () => true],
+  ] as const)('not unreachable: %s', (_name, pid, o, spawned) => {
+    const live = { record: () => ({ pid: 5151, enrollEndpoint: '/tmp/e.sock' }), alive: () => true }
+    expect(system(pid, { ...live, ...o }, spawned).deps.unreachable()).toBe(false)
   })
 
   it('exited: true once the pid is gone', async () => {
@@ -179,5 +210,7 @@ describe('the tray\'s 「完全退出」', () => {
     const item = buildTrayView({ ...base, serviceInstalled: true }).items.find((i) => 'action' in i && i.action === 'quit-service')
     expect(item && 'label' in item ? item.label : null).toBe(label)
     expect(mt('tray.serviceNotStopped', { code: 'presence_denied' })).toContain('presence_denied')
+    // The way to connect is named as the tray names it.
+    expect(mt('tray.serviceNotConnected')).toContain(mt('tray.start'))
   })
 })
