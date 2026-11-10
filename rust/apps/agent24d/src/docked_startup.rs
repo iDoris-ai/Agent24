@@ -593,7 +593,8 @@ mod tests {
             "ManagedIdoris::new(",
             "host.restore().await",
             "open_memory_base(ephemeral)",
-            "with_discovered(Vec::new()",
+            "with_discovered_policy(",
+            "os_signature_policy()",
             "restore_pending_approvals",
             "sweep_orphan_runs",
             ".spawn_scan(",
@@ -648,6 +649,12 @@ mod tests {
                     "{name} runs before the hook and must not contain `{marker}`"
                 );
             }
+        }
+        for marker in business {
+            assert!(
+                !before.contains(marker),
+                "serve() itself must not reach `{marker}` before the hook"
+            );
         }
 
         // `guard_enabled` is the coordinator switch, nothing else.
