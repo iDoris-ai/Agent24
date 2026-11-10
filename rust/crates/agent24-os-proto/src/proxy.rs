@@ -6,7 +6,7 @@
 //! namespace to it.
 //!
 //! **Forwarding is not proxying.** The kernel authenticates with
-//! `Authorization: Bearer` (`agent24d::server::auth`). A verbatim forward hands
+//! `Authorization: Bearer` (`agent24d::capabilities::middleware::auth`). A verbatim forward hands
 //! that bearer to the module, which can then call every kernel API rather than
 //! only its own namespace — the exact opposite of "a module never sees kernel
 //! credentials". So both directions are filtered, and this module is that filter.

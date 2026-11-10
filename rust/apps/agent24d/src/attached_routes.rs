@@ -9,7 +9,7 @@
 //! `crate::attach_registry::AttachRegistry::on_change` — see `Change`'s own
 //! doc comment for why that hook must run inside the file-lock critical
 //! section rather than after these handlers' calls return. Bearer auth is the
-//! SAME layer every other kernel route sits behind (`crate::server::auth`,
+//! SAME layer every other kernel route sits behind (`crate::capabilities::middleware::auth`,
 //! applied in `build_router_with_modules` after this router merges in) —
 //! nothing here re-checks it.
 //!
