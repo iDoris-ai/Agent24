@@ -771,7 +771,10 @@ function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutco
     hold: (work) => backendManager.whileStopped(work),
     spawned: (pid) => backendManager.spawned(pid),
     installed: launchAgentPlistExists,
-  })), () => backendManager.presenceTarget() !== null, 10_000))
+  })),
+  // Enrolled at the next tick (≤ 5 s), the presence connection up at its next
+  // look (≤ 5 s more): then a stop can ask (Codex B4c3 R2 C1).
+  () => backendManager.presenceTarget() !== null && presenceConnection?.ready === true, 15_000))
 }
 
 function residentStop(): Promise<StopOutcome> {
