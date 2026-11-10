@@ -240,6 +240,38 @@ default = [
         !daemon.contains("mod knowledge_store;"),
         "the store must not be compiled into the default daemon"
     );
+    // agent24d only forwards the feature; it adds nothing of its own.
+    assert!(
+        read("apps/agent24d/Cargo.toml")
+            .contains("knowledge-store = [\"agent24-knowledge/knowledge-store\"]"),
+        "apps/agent24d/Cargo.toml: knowledge-store must only forward to agent24-knowledge"
+    );
+    // No dependency line may switch the store on behind the defaults' back.
+    for dir in ["apps", "crates"] {
+        for entry in fs::read_dir(rust_root().join(dir)).unwrap() {
+            let manifest = entry.unwrap().path().join("Cargo.toml");
+            let Ok(toml) = fs::read_to_string(&manifest) else {
+                continue;
+            };
+            for line in toml.lines() {
+                let code = line.split('#').next().unwrap_or("");
+                assert!(
+                    !(code.contains("agent24-knowledge") && code.contains("\"knowledge-store\"")),
+                    "{}: a dependency on agent24-knowledge must not enable knowledge-store",
+                    manifest.display()
+                );
+            }
+        }
+    }
+    // CI must build and run the store where it now lives, or the 20 store
+    // tests silently become 0 (#1792 review M1).
+    let ci = read("../.github/workflows/ci.yml");
+    for step in [
+        "cargo clippy -p agent24-knowledge --features knowledge-store --all-targets -- -D warnings",
+        "cargo test -p agent24-knowledge --features knowledge-store --lib store::",
+    ] {
+        assert!(ci.contains(step), "ci.yml must run: {step}");
+    }
 }
 
 #[test]
