@@ -1,3 +1,5 @@
+//! 冻结（jason 2026-11-10）：无生产调用，与 agent24d 下沉的 host registry 并行，接线另立项。
+//!
 //! The host-side KnowledgeProvider (KB-C1-04, CONTRACT-STATE-v1), built up in
 //! slices: the state judgements (`state`), one binding's generation and calls
 //! in flight (`gate`), its connection phase and probe rounds (`connection`),

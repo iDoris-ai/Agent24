@@ -1,7 +1,7 @@
 //! `knowledge.db` (KB-C1-04 6d-1, design F2): the Provider's log and seal
 //! (CONTRACT-STATE-v1 A.1–A.3) in a database of their own under
 //! `<state_dir>/knowledge/`. A record is one atomic write of the changes
-//! `agent24_knowledge::provider::stored` encodes, or the void of its number.
+//! `crate::provider::stored` encodes, or the void of its number.
 //! The store decides nothing: it keeps what the Provider hands it and gives
 //! it back, and what it cannot give back exactly reads as damaged (S1.8).
 //!
@@ -18,9 +18,9 @@
 use std::path::Path;
 use std::time::Duration;
 
-use agent24_knowledge::provider::recover::Seal;
-use agent24_knowledge::provider::replay::{Damaged, Entry, Record, Replayed, replay};
-use agent24_knowledge::provider::stored::{self, StoredIds};
+use crate::provider::recover::Seal;
+use crate::provider::replay::{Damaged, Entry, Record, Replayed, replay};
+use crate::provider::stored::{self, StoredIds};
 use sqlx::SqlitePool;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 

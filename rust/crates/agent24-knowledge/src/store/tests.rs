@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use agent24_knowledge::provider::record::{Change, Ids, Of};
+use crate::provider::record::{Change, Ids, Of};
 
 use super::*;
 

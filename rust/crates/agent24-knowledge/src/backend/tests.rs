@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use agent24_knowledge::TransportResponse;
-use agent24_knowledge::tool::call::{self, Refused};
+use crate::TransportResponse;
+use crate::tool::call::{self, Refused};
 use serde_json::{Value, json};
 
 use super::*;
-use crate::knowledge_host::{Change, Endpoint};
+use crate::host::{Change, Endpoint};
 
 const HOST: &str = "host-cap";
 const BINDING: &str = "b1";
@@ -241,10 +241,7 @@ async fn the_knowledge_bases_named_are_cut_to_the_binding_and_none_left_sends_no
     let Err(Failure::Envelope(envelope)) = outside else {
         panic!("{outside:?}");
     };
-    assert_eq!(
-        envelope.error.code(),
-        agent24_knowledge::ErrorCode::Forbidden
-    );
+    assert_eq!(envelope.error.code(), crate::ErrorCode::Forbidden);
     assert_eq!(s.server.sent.lock().unwrap().len(), 1);
 }
 
@@ -469,10 +466,7 @@ async fn the_server_error_envelope_reaches_the_tool() {
     let Err(Failure::Envelope(envelope)) = result else {
         panic!("{result:?}");
     };
-    assert_eq!(
-        envelope.error.code(),
-        agent24_knowledge::ErrorCode::Unauthorized
-    );
+    assert_eq!(envelope.error.code(), crate::ErrorCode::Unauthorized);
 }
 
 #[tokio::test]

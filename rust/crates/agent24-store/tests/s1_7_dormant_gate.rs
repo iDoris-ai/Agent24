@@ -127,23 +127,27 @@ fn store_dormant_chains_are_feature_gated_not_deleted() {
 
 #[test]
 fn knowledge_store_is_feature_gated_not_deleted() {
-    let cargo = read("apps/agent24d/Cargo.toml");
-    assert!(cargo.contains("knowledge-store = []"));
-    let main = read("apps/agent24d/src/main.rs");
-    let start = main
-        .find("mod knowledge_store;")
-        .expect("knowledge_store module");
-    let window = &main[start.saturating_sub(240)..start];
+    // S2-3 moved the module into agent24-knowledge. The feature stays off.
+    let cargo = read("crates/agent24-knowledge/Cargo.toml");
+    assert!(cargo.contains("knowledge-store = [\"dep:sqlx\"]"));
+    assert!(
+        !cargo.contains("default = [\"knowledge-store\"]"),
+        "knowledge-store must not be a default feature"
+    );
+    let lib = read("crates/agent24-knowledge/src/lib.rs");
+    let start = lib.find("mod store;").expect("store module");
+    let window = &lib[start.saturating_sub(240)..start];
     assert!(window.contains("#[cfg(feature = \"knowledge-store\")]"));
     assert!(window.contains("knowledge-store has no production caller"));
     assert!(
-        !main.contains("allow(dead_code)] // Wired at start"),
-        "knowledge_store must not sit under a dead_code allow"
-    );
-    assert!(
         rust_root()
-            .join("apps/agent24d/src/knowledge_store.rs")
+            .join("crates/agent24-knowledge/src/store/mod.rs")
             .is_file()
+    );
+    let daemon = read("apps/agent24d/src/main.rs");
+    assert!(
+        !daemon.contains("mod knowledge_store;"),
+        "the store must not be compiled into the default daemon"
     );
 }
 
