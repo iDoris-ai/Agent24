@@ -7,11 +7,12 @@ import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
+import { registerResidentService } from './ipc/resident-service'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, shouldAskConsent, stopService, upgradeService, upgradesFromBundle, writeConsent } from './resident-service'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -603,6 +604,23 @@ app.whenReady().then(async () => {
     },
   })
   void cliTool.refresh()
+  // M5 B4c2: Settings → General → background service.
+  const residentAvailable = () => process.platform === 'darwin' && upgradesFromBundle(app.isPackaged, process.env)
+  registerResidentService({
+    guard,
+    status: () => ({ available: residentAvailable(), installed: launchAgentPlistExists() }),
+    set: async (on) => {
+      if (!residentAvailable()) return { ok: false, stage: 'unavailable', code: 'unavailable' }
+      const result = await setResident(on, {
+        installed: launchAgentPlistExists,
+        install: () => residentInstall(documentsModuleReady),
+        stop: residentStop,
+        record: recordConsent,
+      })
+      refreshTray()
+      return result
+    },
+  })
   mainWin = createMainWindow()
   void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
@@ -741,6 +759,34 @@ app.whenReady().then(async () => {
   app.on('activate', () => showOrCreateWindow())
 })
 
+// M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
+// Settings switch and the tray's 「完全退出」.
+function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutcome> {
+  return installService(serviceInstallDeps({
+    cli: resolveBundledRustBinary('agent24', app.isPackaged),
+    daemonBin: resolveRustBinary(app.isPackaged),
+    ready: documentsReady,
+    hold: (work) => backendManager.whileStopped(work),
+    spawned: (pid) => backendManager.spawned(pid),
+    installed: launchAgentPlistExists,
+  }))
+}
+
+function residentStop(): Promise<StopOutcome> {
+  return stopService(serviceStopDeps({
+    cli: resolveBundledRustBinary('agent24', app.isPackaged),
+    pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
+    spawned: (pid) => backendManager.spawned(pid),
+    hold: (work) => backendManager.whileServiceRestarts(work),
+    record: () => recordConsent('declined'),
+  }))
+}
+
+function recordConsent(answer: ConsentAnswer): void {
+  const dataDir = tryDataDir()
+  if (dataDir !== null) writeConsent(consentPath(dataDir), answer, new Date())
+}
+
 // M5 B4b: asked once, with the window up. Allow installs the LaunchAgent,
 // after the bundled documents module's launch install, with this app's own
 // daemon stopped meanwhile; a failed install is undone and not
@@ -764,13 +810,7 @@ async function askResidentConsent(documentsReady: Promise<unknown>): Promise<voi
       })
       return response === 0 ? 'allow' : 'declined'
     },
-    install: () => installService(serviceInstallDeps({
-      cli: resolveBundledRustBinary('agent24', app.isPackaged),
-      daemonBin: resolveRustBinary(app.isPackaged),
-      ready: documentsReady,
-      hold: (work) => backendManager.whileStopped(work),
-      spawned: (pid) => backendManager.spawned(pid),
-    })),
+    install: () => residentInstall(documentsReady),
     record: (answer) => writeConsent(file, answer, new Date()),
   })
   if (typeof outcome === 'object') {
@@ -788,16 +828,7 @@ async function quitStoppingService(): Promise<void> {
   if (quittingService) return
   quittingService = true
   try {
-    const outcome = await stopService(serviceStopDeps({
-      cli: resolveBundledRustBinary('agent24', app.isPackaged),
-      pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
-      spawned: (pid) => backendManager.spawned(pid),
-      hold: (work) => backendManager.whileServiceRestarts(work),
-      record: () => {
-        const dataDir = tryDataDir()
-        if (dataDir !== null) writeConsent(consentPath(dataDir), 'declined', new Date())
-      },
-    }))
+    const outcome = await residentStop()
     if (outcome.ok) {
       // Nothing spawned while the quit runs (Open Design's stop can take
       // seconds): the hold ended with the uninstall (Codex B4c1 C2).
@@ -807,7 +838,7 @@ async function quitStoppingService(): Promise<void> {
       return
     }
     console.warn('[main] background service not stopped:', outcome.stage, outcome.code)
-    void dialog.showMessageBox({ type: 'warning', message: mt(outcome.code === 'not_connected' ? 'tray.serviceNotConnected' : 'tray.serviceNotStopped', { code: outcome.code }) })
+    void dialog.showMessageBox({ type: 'warning', message: mt(stopFailureKey(outcome), { code: outcome.code }) })
   } finally {
     quittingService = false
   }
