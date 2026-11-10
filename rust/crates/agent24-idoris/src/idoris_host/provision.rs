@@ -1,6 +1,6 @@
 //! Install/connect transactions. Only non-sensitive intent and compensation IDs reach disk.
 use super::*;
-use agent24_idoris::{
+use crate::{
     download::{DownloadOptions, DownloadProgress, download_locked_asset},
     install::{InstallError, InstallOptions, OperationLock, install_locked_asset, operation_lock},
     keys::{KeyError, Keys},
@@ -113,7 +113,7 @@ impl Provisioner for SystemProvisioner {
     ) -> Result<VerifiedArchive, Code> {
         download_locked_asset(
             IdorisLock::embedded(),
-            agent24_idoris::host_triple().ok_or(Code::NotInstalled)?,
+            crate::host_triple().ok_or(Code::NotInstalled)?,
             &root.join("cache"),
             &DownloadOptions {
                 progress: Some(progress),
@@ -123,8 +123,8 @@ impl Provisioner for SystemProvisioner {
         )
         .await
         .map_err(|e| match e {
-            agent24_idoris::download::DownloadError::Cancelled => Code::Cancelled,
-            agent24_idoris::download::DownloadError::Busy => Code::Busy,
+            crate::download::DownloadError::Cancelled => Code::Cancelled,
+            crate::download::DownloadError::Busy => Code::Busy,
             _ => Code::NotInstalled,
         })
     }
@@ -139,7 +139,7 @@ impl Provisioner for SystemProvisioner {
         options.child_args = vec!["__idoris-install-child".into()];
         install_locked_asset(
             IdorisLock::embedded(),
-            agent24_idoris::host_triple().ok_or(Code::NotInstalled)?,
+            crate::host_triple().ok_or(Code::NotInstalled)?,
             archive,
             &options,
             Codesign,
@@ -150,7 +150,7 @@ impl Provisioner for SystemProvisioner {
     }
     async fn prepare_state(&self, root: &Path) -> Result<(), Code> {
         let root = root.to_owned();
-        tokio::task::spawn_blocking(move || agent24_idoris::install::prepare_state_dirs(&root))
+        tokio::task::spawn_blocking(move || crate::install::prepare_state_dirs(&root))
             .await
             .map_err(|_| Code::NotInstalled)?
             .map_err(install_code)
@@ -158,7 +158,7 @@ impl Provisioner for SystemProvisioner {
     async fn verify(&self, r: &Installation, mode: VerifyMode) -> Result<InstalledVersion, Code> {
         let r = r.clone();
         tokio::task::spawn_blocking(move || {
-            agent24_idoris::install::verify_existing(
+            crate::install::verify_existing(
                 &r.release_dir,
                 IdorisLock::embedded(),
                 &VerifiedArchive {
@@ -179,8 +179,8 @@ impl Provisioner for SystemProvisioner {
             .map_err(|_| Code::KeyUnavailable)?
             .map(Some)
             .or_else(|e| match e {
-                agent24_idoris::omlx_probe::SettingsError::NotFound
-                | agent24_idoris::omlx_probe::SettingsError::MissingKey => Ok(None),
+                crate::omlx_probe::SettingsError::NotFound
+                | crate::omlx_probe::SettingsError::MissingKey => Ok(None),
                 _ => Err(Code::KeyUnavailable),
             })
     }
@@ -859,7 +859,7 @@ impl IdorisHost {
                 source: self.secrets.as_ref(),
                 failure: SyncMutex::new(None),
             };
-            let gateway = ManagedIdoris::prepare(&config, &secrets, cancel)
+            let gateway = ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
                 .await
                 .map_err(|_| {
                     if cancel.is_cancelled() {
@@ -873,8 +873,9 @@ impl IdorisHost {
                             .unwrap_or(Code::VerifyFailed)
                     }
                 })?;
-            let verification = gateway
-                .verify_connection(false, cancel)
+            let verification = self
+                .router
+                .verify_connection(&gateway, false, cancel)
                 .await
                 .map_err(|_| {
                     if cancel.is_cancelled() {

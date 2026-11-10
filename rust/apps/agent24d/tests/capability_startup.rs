@@ -261,7 +261,7 @@ fn idoris_restore_persistence_failure_does_not_prevent_daemon_startup() {
         .path()
         .join("Library/Application Support/Agent24/idoris");
     std::fs::create_dir_all(&root).unwrap();
-    let record = agent24d::idoris_host::Installation {
+    let record = agent24_idoris::idoris_host::Installation {
         version: "0.4.0".into(),
         release_dir: root.join("release"),
         archive_path: root.join("archive.tar.gz"),

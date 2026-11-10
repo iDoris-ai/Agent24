@@ -81,13 +81,13 @@ pub struct AppState {
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
-    pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
+    pub idoris_host: Option<Arc<agent24_idoris::idoris_host::IdorisHost>>,
     pub idoris_unavailable: bool,
     /// Where the Hyphae daemon supervisor lives, once `serve` has one (`/api/v1/components`).
     pub comm_slot: Option<Arc<crate::comm_routes::CommDaemonSlot>>,
     /// What the desktop reported about the components it owns (ADR-038 D5).
     pub component_reports: Arc<crate::component_routes::ComponentReports>,
-    pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
+    pub managed_idoris: Option<Arc<agent24_idoris::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
     /// because the two need the SAME object — the registry resolves against it
@@ -301,7 +301,7 @@ impl Shutdown {
         if self.idoris_budget.load(std::sync::atomic::Ordering::SeqCst) {
             deadlines.persist = deadlines
                 .persist
-                .max(began + agent24d::idoris_host::SHUTDOWN_BUDGET);
+                .max(began + agent24_idoris::idoris_host::SHUTDOWN_BUDGET);
             deadlines.watchdog =
                 deadlines.http.max(deadlines.persist) + crate::lifecycle::WATCHDOG_MARGIN;
         }
@@ -1983,7 +1983,7 @@ pub async fn serve(
     enroll_endpoint: bool,
     ready_omit_token: bool,
     cancel: CancellationToken,
-    idoris_dependencies: Option<agent24d::managed_idoris::ManagedDependencies>,
+    idoris_dependencies: Option<agent24_idoris::managed_idoris::ManagedDependencies>,
 ) -> Result<(), std::io::Error> {
     let startup = std::time::Instant::now();
     tracing::debug!(ephemeral, "startup: serve");
@@ -2222,7 +2222,7 @@ pub async fn serve(
         let path = agent24_protocol::state_file::state_dir()
             .ok_or_else(|| std::io::Error::other("HOME not set"))?
             .join("idoris-connection.json");
-        let managed = Arc::new(agent24d::managed_idoris::ManagedIdoris::new(
+        let managed = Arc::new(agent24_idoris::managed_idoris::ManagedIdoris::new(
             router.clone(),
             path,
         )?);
@@ -2238,7 +2238,7 @@ pub async fn serve(
     };
     let mut idoris_unavailable = false;
     let mut idoris_host = if let Some(managed) = &managed_idoris {
-        match agent24d::idoris_host::IdorisHost::system(
+        match agent24_idoris::idoris_host::IdorisHost::system(
             idoris_root,
             idoris_install_root,
             managed.clone(),

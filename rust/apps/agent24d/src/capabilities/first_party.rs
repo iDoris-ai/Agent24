@@ -122,7 +122,7 @@ impl FirstPartyAuthority {
         let summary = match template {
             "/api/v1/idoris/install" => {
                 let Ok(body) =
-                    serde_json::from_slice::<agent24d::idoris_host::InstallRequest>(bytes)
+                    serde_json::from_slice::<agent24_idoris::idoris_host::InstallRequest>(bytes)
                 else {
                     return;
                 };
@@ -133,7 +133,7 @@ impl FirstPartyAuthority {
             }
             "/api/v1/idoris/connect" => {
                 let Ok(body) =
-                    serde_json::from_slice::<agent24d::idoris_host::ConnectRequest>(bytes)
+                    serde_json::from_slice::<agent24_idoris::idoris_host::ConnectRequest>(bytes)
                 else {
                     return;
                 };
