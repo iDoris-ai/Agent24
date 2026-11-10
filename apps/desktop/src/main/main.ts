@@ -756,6 +756,7 @@ function refreshTray(): void {
     cliTool: cliTool?.status(),
     upgrade: serviceUpgrader.hint(),
     crashLoop: crashLoop.looping(),
+    serviceWaitMs: backendManager.serviceWaitMs(),
   })
   if (process.platform === 'darwin') tray.setTitle(view.title)
   tray.setToolTip(view.tooltip)

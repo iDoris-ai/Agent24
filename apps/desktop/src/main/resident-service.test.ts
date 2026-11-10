@@ -7,7 +7,7 @@ import {
   copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
-import { buildTrayView } from './tray-menu'
+import { buildTrayView, SERVICE_WAIT_HINT_MS } from './tray-menu'
 import { resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
 const sha = (file: string) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
@@ -508,5 +508,36 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     expect(tip).toContain(says)
     expect(tip).toContain('`agent24 service uninstall`')
     expect(buildTrayView(tray).tooltip).not.toContain(says)
+  })
+
+  const idle = { status: 'starting', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
+
+  it.each([
+    ['en', 'Waiting for the background service', 'has not started'],
+    ['zh', '正在等待后台服务启动', '后台服务没有启动'],
+    ['th', 'กำลังรอให้บริการเบื้องหลัง', 'ยังไม่เริ่มทำงาน'],
+  ] as const)('%s: waiting for the service daemon, then after a minute that it has not started, with the way back (M5 B4a)', (lang, waiting, notStarted) => {
+    setMainLocale(lang)
+    const early = buildTrayView({ ...idle, serviceWaitMs: SERVICE_WAIT_HINT_MS - 1 }).tooltip
+    expect(early).toContain(waiting)
+    expect(early).not.toContain(notStarted)
+    expect(early).not.toContain('`agent24 service uninstall`')
+    const late = buildTrayView({ ...idle, serviceWaitMs: SERVICE_WAIT_HINT_MS }).tooltip
+    expect(late).toContain(notStarted)
+    expect(late).not.toContain(waiting)
+    expect(late).toContain('`agent24 service uninstall`')
+    for (const tip of [buildTrayView({ ...idle, serviceWaitMs: null }).tooltip, buildTrayView(idle).tooltip]) {
+      expect(tip).not.toContain(waiting)
+      expect(tip).not.toContain(notStarted)
+    }
+  })
+
+  it('a crash loop and a wait at once: only the crash loop is said, with one way back (M5 B4a)', () => {
+    setMainLocale('en')
+    const tip = buildTrayView({ ...idle, crashLoop: true, serviceWaitMs: SERVICE_WAIT_HINT_MS * 2 }).tooltip
+    expect(tip).toContain('keeps restarting')
+    expect(tip).not.toContain('has not started')
+    expect(tip).not.toContain('Waiting for the background service')
+    expect(tip.split('`agent24 service uninstall`').length - 1).toBe(1)
   })
 })
