@@ -113,7 +113,7 @@ recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使�
 
 适用：Sin90/Cos72 是独立发布的可执行 OS 包，不应因进入 packages 目录而减弱组件校验。macOS 使用共享 SignatureVerifier，逐个验证 executables，要求受宿主发布策略/可信锁指定的 Team ID、Developer ID、Hardened Runtime、公证；不能让包任意自选信任团队。纯数据仅校验哈希；Linux/Windows v1 沿用 D2a 的摘要和可复现构建规则，不新造签名体系（`docs/adr/ADR-038-component-contract-v1.md:167`）。
 
-签名必须在生成清单之前完成，因为签名改变字节；外部 CI 顺序为构建 → 签名/公证及所有会改字节的处理 → 生成清单 → 校验 → 打包 → 计算最终归档 sha256 → 发布并更新可信锁。安装与启动采用 D2a 各自模式，不另定公证离线容错策略。由于 macOS 签名只保护被签的代码，配置及清单的发布来源仍靠外部可信归档摘要，而不是签名替代文件哈希。
+签名必须在生成清单之前完成，因为签名改变字节；外部 CI 顺序为构建 → 签名/公证及所有会改字节的处理 → 生成清单 → 校验 → 打包 → 计算最终归档 sha256 → 发布并更新可信锁。安装与启动采用 D2a 各自模式，不另定公证离线容错策略。**r3（jason 2026-11-10 拍板）：OS 包 `os install` 与 scan/recheck 一样只做离线验签（Developer ID + 受信 Team ID + Hardened Runtime，`VerifyMode::AtRest`），不在线查询公证**——否则离线机器无法安装、刚公证的裸二进制在票据传播前会被误判，且桌面 documents 升级是先卸载后安装，公证查询失败会丢失模块；下载包的公证由 macOS Gatekeeper 首次运行时检查。由于 macOS 签名只保护被签的代码，配置及清单的发布来源仍靠外部可信归档摘要，而不是签名替代文件哈希。
 
 ## 6. 生成工具与 A 的上线顺序
 

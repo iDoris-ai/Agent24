@@ -414,11 +414,14 @@ mod macos_tests {
         assert_eq!(one.found.len(), 1, "{:?}", one.refused);
         let installed = temp.path().join("installed");
         crate::install::install_with_policy(&package, &installed, &policy).unwrap();
-        assert_eq!(*recorder.calls.lock().unwrap(), [false, false, false, true]);
+        // Install is offline too (jason 11-10): no Gatekeeper notarization query.
+        assert_eq!(
+            *recorder.calls.lock().unwrap(),
+            [false, false, false, false]
+        );
         recorder.reject.store(true, Ordering::SeqCst);
         let refused = temp.path().join("refused");
-        let error = crate::install::install_with_policy(&package, &refused, &policy).unwrap_err();
-        assert!(error.to_string().contains("刚公证"));
+        crate::install::install_with_policy(&package, &refused, &policy).unwrap_err();
         assert!(
             !refused.exists(),
             "failed install must clean staging and created root"

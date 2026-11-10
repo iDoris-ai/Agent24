@@ -195,13 +195,20 @@ pub fn install_with_policy(
         undo_root();
     })?;
 
+    // Offline check, the same one discovery runs (`AtRest`: Developer ID, a
+    // trusted Team ID, Hardened Runtime). Not `Install`: that also asks
+    // Gatekeeper online about notarization, so an offline machine could not
+    // install at all, and a just-notarized bare binary can read as
+    // unnotarized until its ticket propagates — and the desktop's documents
+    // upgrade uninstalls the old package before this runs. Notarization of a
+    // downloaded package is Gatekeeper's own first-run check (jason 11-10).
     let verified = read_manifest(&staging).and_then(|copied| {
         crate::package_integrity::verify_with_policy(
             &staging,
             &copied,
             &tokio_util::sync::CancellationToken::new(),
             policy,
-            agent24_components::sign::VerifyMode::Install,
+            agent24_components::sign::VerifyMode::AtRest,
         )
         .map_err(|error| InstallError::Source(error.to_string()))
     });
