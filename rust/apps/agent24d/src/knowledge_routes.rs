@@ -32,8 +32,7 @@
 
 use agent24_domain::http::read_body_or_response;
 use agent24_knowledge::host::{
-    Change, ChangeError, Credential, Endpoint, MAX_BINDING_ID_BYTES, MAX_CREDENTIAL_BYTES,
-    MAX_KNOWLEDGE_BASE_ID_CHARS, MAX_KNOWLEDGE_BASES, RunBinding,
+    Change, ChangeError, Credential, Endpoint, MAX_BINDING_ID_BYTES, RunBinding,
 };
 use agent24_protocol::state_file::AuthMode;
 use axum::body::Body;
@@ -43,7 +42,7 @@ use axum::http::{Method, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 
-use crate::capabilities::{Audience, Authorization, UnixSeconds, unix_now};
+use crate::capabilities::{Audience, Authorization, UnixSeconds};
 use crate::server::{AppState, error_response};
 
 /// The capability id of the ProductHost making this request. Legacy mode has
@@ -98,6 +97,9 @@ fn change_response(result: Result<(), ChangeError>) -> Response {
             "knowledge_host_unavailable",
             "Knowledge host state is unavailable",
         ),
+        // Same answer as a body the handler could not read. The rule name
+        // stays in the registry; this response does not repeat it.
+        Err(ChangeError::Invalid(_)) => return invalid_request(),
     };
     error_response(status, code, message)
 }
@@ -256,19 +258,11 @@ struct ActivateBody {
     knowledge_base_ids: Vec<String>,
 }
 
-/// The activation body `{"endpoint", "knowledge_base_ids"}`: an API base the
-/// HTTP transport accepts (`https`, or `http` to a loopback IP) and 1 to
-/// [`MAX_KNOWLEDGE_BASES`] distinct, non-blank ids.
+/// The activation body `{"endpoint", "knowledge_base_ids"}`. The registry
+/// checks the URL and the ids; a body that is not this shape is refused here.
 fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
     let body: ActivateBody = serde_json::from_slice(body).ok()?;
-    agent24_knowledge::validate_base_url(&body.endpoint).ok()?;
-    let ids = &body.knowledge_base_ids;
-    let id_ok =
-        |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
-    let distinct = ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len();
-    let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
-    let ok = ids_ok && ids.iter().all(id_ok);
-    ok.then_some(Endpoint {
+    Some(Endpoint {
         base_url: body.endpoint,
         knowledge_base_ids: body.knowledge_base_ids,
     })
@@ -330,13 +324,6 @@ pub async fn push_credential(
     let Ok(body) = serde_json::from_slice::<CredentialBody>(&body) else {
         return invalid_request();
     };
-    // Visible ASCII only: C goes into a request header as it is.
-    let value_ok = !body.value.is_empty()
-        && body.value.len() <= MAX_CREDENTIAL_BYTES
-        && body.value.bytes().all(|b| b.is_ascii_graphic());
-    if !value_ok || body.expires_at <= unix_now() {
-        return invalid_request();
-    }
     let credential = match body.kind {
         CredentialKind::Bearer => Credential::Bearer(body.value),
         CredentialKind::ApiKey => Credential::ApiKey(body.value),

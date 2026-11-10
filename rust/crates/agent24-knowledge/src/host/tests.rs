@@ -239,6 +239,97 @@ fn debug_output_never_carries_the_credential() {
     assert!(!printed.contains("SECRET"), "{printed}");
 }
 
+fn active(registry: &KnowledgeHostRegistry, binding: &str) {
+    registry
+        .apply("host", binding, 1, Change::Activate)
+        .unwrap();
+}
+
+#[test]
+fn push_credential_rejects_an_empty_value_and_stores_nothing() {
+    let registry = KnowledgeHostRegistry::default();
+    // Before the binding is active, so a check that ran second would say
+    // `BindingInactive` instead.
+    assert_eq!(
+        registry.push_credential("host", "b1", 1, bearer(""), unix_now() + 60),
+        Err(ChangeError::Invalid("empty"))
+    );
+    assert_eq!(registry.record("host", "b1"), None);
+}
+
+#[test]
+fn push_credential_rejects_a_value_that_contains_a_control_character() {
+    let registry = KnowledgeHostRegistry::default();
+    active(&registry, "b1");
+    let err = registry
+        .push_credential("host", "b1", 2, bearer("SECRET\n"), unix_now() + 60)
+        .unwrap_err();
+    assert_eq!(err, ChangeError::Invalid("not_graphic"));
+    assert!(!format!("{err:?}").contains("SECRET"));
+    assert_eq!(registry.record("host", "b1"), Some((true, 1)));
+    assert_eq!(registry.credential("host", "b1", unix_now()), None);
+}
+
+#[test]
+fn push_credential_rejects_a_value_past_the_byte_cap() {
+    let registry = KnowledgeHostRegistry::default();
+    active(&registry, "b1");
+    let too_long = "x".repeat(MAX_CREDENTIAL_BYTES + 1);
+    assert_eq!(
+        registry.push_credential("host", "b1", 2, bearer(&too_long), unix_now() + 60),
+        Err(ChangeError::Invalid("too_long"))
+    );
+    assert_eq!(registry.record("host", "b1"), Some((true, 1)));
+}
+
+#[test]
+fn push_credential_rejects_a_credential_that_has_already_expired() {
+    let registry = KnowledgeHostRegistry::default();
+    active(&registry, "b1");
+    assert_eq!(
+        registry.push_credential("host", "b1", 2, Credential::ApiKey("k".into()), unix_now()),
+        Err(ChangeError::Invalid("expired"))
+    );
+    assert_eq!(registry.record("host", "b1"), Some((true, 1)));
+    assert_eq!(registry.credential("host", "b1", unix_now()), None);
+}
+
+#[test]
+fn activate_rejects_a_base_url_the_transport_would_refuse() {
+    let registry = KnowledgeHostRegistry::default();
+    assert_eq!(
+        registry.activate(
+            "host",
+            "b1",
+            1,
+            Endpoint {
+                base_url: "http://kb.example/api/v1".into(),
+                knowledge_base_ids: vec!["kb-a".into()],
+            },
+        ),
+        Err(ChangeError::Invalid("base_url"))
+    );
+    assert_eq!(registry.record("host", "b1"), None);
+}
+
+#[test]
+fn activate_rejects_a_knowledge_base_id_that_is_blank() {
+    let registry = KnowledgeHostRegistry::default();
+    assert_eq!(
+        registry.activate(
+            "host",
+            "b1",
+            1,
+            Endpoint {
+                base_url: "https://kb.example/api/v1".into(),
+                knowledge_base_ids: vec![" ".into()],
+            },
+        ),
+        Err(ChangeError::Invalid("knowledge_base_id"))
+    );
+    assert_eq!(registry.record("host", "b1"), None);
+}
+
 // ── run binding (PR-C) ────────────────────────────────────────────────────────
 
 fn pin(host: &str, binding: &str, generation: u64) -> RunBinding {

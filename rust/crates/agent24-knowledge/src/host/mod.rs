@@ -30,7 +30,7 @@
 //! pin could not match again wherever it was kept, and a run that names a
 //! binding but has no pin is refused, never bound anew.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
@@ -175,6 +175,9 @@ pub enum ChangeError {
     BindingInactive,
     TooManyBindings,
     Unavailable,
+    /// A credential or endpoint value failed a check. The text names the rule
+    /// and never the value.
+    Invalid(&'static str),
 }
 
 /// Records keyed by (host capability id, binding id).
@@ -239,6 +242,54 @@ pub enum ContractGate {
     NoDeclaration,
 }
 
+fn credential_value(credential: &Credential) -> &str {
+    match credential {
+        Credential::Bearer(value) | Credential::ApiKey(value) => value,
+    }
+}
+
+/// Empty, then longer than [`MAX_CREDENTIAL_BYTES`], then not visible ASCII,
+/// then already expired. That is the order the host route used, and each
+/// failure is its own rule. Nothing here is logged.
+fn validate_credential(
+    credential: &Credential,
+    expires_at: UnixSeconds,
+) -> Result<(), ChangeError> {
+    let value = credential_value(credential);
+    if value.is_empty() {
+        return Err(ChangeError::Invalid("empty"));
+    }
+    if value.len() > MAX_CREDENTIAL_BYTES {
+        return Err(ChangeError::Invalid("too_long"));
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ChangeError::Invalid("not_graphic"));
+    }
+    if expires_at <= unix_now() {
+        return Err(ChangeError::Invalid("expired"));
+    }
+    Ok(())
+}
+
+/// The base URL the HTTP transport accepts, then 1 to [`MAX_KNOWLEDGE_BASES`]
+/// distinct ids, each non-blank and at most [`MAX_KNOWLEDGE_BASE_ID_CHARS`]
+/// characters. Same order as the host route: a bad URL is reported before
+/// the ids are looked at.
+fn validate_endpoint(endpoint: &Endpoint) -> Result<(), ChangeError> {
+    if crate::validate_base_url(&endpoint.base_url).is_err() {
+        return Err(ChangeError::Invalid("base_url"));
+    }
+    let ids = &endpoint.knowledge_base_ids;
+    let distinct = ids.iter().collect::<HashSet<_>>().len() == ids.len();
+    let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
+    let id_ok =
+        |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
+    if !(ids_ok && ids.iter().all(id_ok)) {
+        return Err(ChangeError::Invalid("knowledge_base_id"));
+    }
+    Ok(())
+}
+
 impl KnowledgeHostRegistry {
     pub fn apply(
         &self,
@@ -267,7 +318,8 @@ impl KnowledgeHostRegistry {
     }
 
     /// Activates `binding` with the endpoint its calls use; like
-    /// [`Change::Activate`] otherwise.
+    /// [`Change::Activate`] otherwise. The endpoint is checked before the
+    /// sequence, so a bad one is refused on its own and nothing is stored.
     pub fn activate(
         &self,
         host: &str,
@@ -275,6 +327,7 @@ impl KnowledgeHostRegistry {
         seq: u64,
         endpoint: Endpoint,
     ) -> Result<(), ChangeError> {
+        validate_endpoint(&endpoint)?;
         self.change(host, binding, seq, |entry| {
             entry.active = true;
             entry.activated_seq = seq;
@@ -303,7 +356,9 @@ impl KnowledgeHostRegistry {
         })
     }
 
-    /// Pushes or replaces C of an active binding.
+    /// Pushes or replaces C of an active binding. The value is checked before
+    /// the sequence, so a bad C is refused whether or not the binding would
+    /// have taken it, and nothing is stored.
     pub fn push_credential(
         &self,
         host: &str,
@@ -312,6 +367,7 @@ impl KnowledgeHostRegistry {
         credential: Credential,
         expires_at: UnixSeconds,
     ) -> Result<(), ChangeError> {
+        validate_credential(&credential, expires_at)?;
         self.change(host, binding, seq, |entry| {
             if !entry.active {
                 return Err(ChangeError::BindingInactive);

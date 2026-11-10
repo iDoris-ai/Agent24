@@ -5,7 +5,11 @@ use axum::http::{Request, header};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-use agent24_knowledge::host::{KnowledgeRefusal, RunBinding};
+use agent24_knowledge::host::{
+    KnowledgeRefusal, MAX_CREDENTIAL_BYTES, MAX_KNOWLEDGE_BASES, RunBinding,
+};
+
+use crate::capabilities::unix_now;
 
 use super::*;
 use crate::server::build_router;
