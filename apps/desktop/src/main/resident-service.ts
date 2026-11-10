@@ -608,20 +608,21 @@ export function stopFailureKey(outcome: { stage: 'shutdown' | 'uninstall'; code:
 
 // M5 B4c3 (PR-Daemon #1783 N1/N2): the install and the stop, whoever asks
 // (the first-launch box, the Settings switch, the tray's 「完全退出」), run one
-// at a time. One asked while the same kind is queued or running gets that
-// one's outcome, not a second presence box or uninstall; the other kind waits
-// its turn, so the plist and the consent answer end as the last run left them.
+// at a time. One asked while the last one queued (or running) is the same kind
+// gets that one's outcome, not a second presence box or uninstall; any other
+// waits its turn, so the plist and the consent answer end as the last asked
+// left them (a stop, an install, a stop: the third runs, after the install;
+// R1 C1 and QA).
 // `work` is called only when its turn comes, so what it reads (the enrolled
 // pid) is read then.
 export interface ResidentOutcomes { install: InstallOutcome; stop: StopOutcome }
 export function residentOps(): <K extends keyof ResidentOutcomes>(op: K, work: () => Promise<ResidentOutcomes[K]>) => Promise<ResidentOutcomes[K]> {
   let tail: Promise<unknown> = Promise.resolve()
-  const pending = new Map<keyof ResidentOutcomes, Promise<unknown>>()
+  let last: { op: keyof ResidentOutcomes; run: Promise<unknown> } | null = null
   return <K extends keyof ResidentOutcomes>(op: K, work: () => Promise<ResidentOutcomes[K]>) => {
-    const same = pending.get(op) as Promise<ResidentOutcomes[K]> | undefined
-    if (same) return same
-    const run: Promise<ResidentOutcomes[K]> = tail.then(() => work()).finally(() => { if (pending.get(op) === run) pending.delete(op) })
-    pending.set(op, run)
+    if (last?.op === op) return last.run as Promise<ResidentOutcomes[K]>
+    const run: Promise<ResidentOutcomes[K]> = tail.then(() => work()).finally(() => { if (last?.run === run) last = null })
+    last = { op, run }
     tail = run.catch(() => {})
     return run
   }

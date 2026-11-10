@@ -176,6 +176,34 @@ describe('residentOps: the install and the stop one at a time (PR-Daemon #1783 N
     expect(calls).toEqual(['install', 'stop'])
   })
 
+  it('a stop, an install, a stop: the third is not given the first one\'s outcome but runs after the install (R1 C1, QA)', async () => {
+    const op = residentOps()
+    const calls: string[] = []
+    const g = gate<StopOutcome>()
+    const a = op('stop', () => { calls.push('stop'); return g.p })
+    const b = op('install', async () => { calls.push('install'); return installed })
+    const c = op('stop', async () => { calls.push('stop again'); return { ok: false, stage: 'shutdown', code: 'refused' } })
+    g.open(stopped)
+    expect(await a).toBe(stopped)
+    await b
+    expect(await c).toEqual({ ok: false, stage: 'shutdown', code: 'refused' })
+    expect(calls).toEqual(['stop', 'install', 'stop again'])
+  })
+
+  it('an install, a stop, an install: the last wish is the one left (QA)', async () => {
+    const op = residentOps()
+    const calls: string[] = []
+    const g = gate<InstallOutcome>()
+    const a = op('install', () => { calls.push('install'); return g.p })
+    const b = op('stop', async () => { calls.push('stop'); return stopped })
+    const c = op('install', async () => { calls.push('install again'); return installed })
+    g.open(installed)
+    await a
+    await b
+    await c
+    expect(calls).toEqual(['install', 'stop', 'install again'])
+  })
+
   it('once one has ended, the same kind runs again', async () => {
     const op = residentOps()
     const work = vi.fn(async () => stopped)
