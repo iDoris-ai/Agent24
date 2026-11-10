@@ -570,8 +570,9 @@ mod tests {
     ///
     /// S2-1: `mount_all_with_refusals` lives in `mount_domain_os` and the two
     /// `.run(` spawns live in `arm_scheduler_after_mount`. `serve` must call
-    /// mount first, and that arm function must still be the only place those
-    /// two `.run(` loops are spawned.
+    /// mount first. Across `serve()` and all of `serve_steps.rs` (comments
+    /// stripped) there are still exactly two `.run(` calls, both in that arm
+    /// function.
     #[test]
     fn the_tick_loop_and_delivery_pump_are_spawned_after_mount_all() {
         let server = include_str!("server.rs");
@@ -628,14 +629,15 @@ mod tests {
         // spawns while leaving a stray `.run(`-shaped call sitting around,
         // would slip past the two `find`-based checks above, which only look
         // for the FIRST occurrence of each marker).
-        // Review round 2, L-d: strip `//` line comments first — otherwise an
+        // Review round 2, L-d: strip `//` comments first — otherwise an
         // EXPLANATORY comment mentioning a third `.run(`-shaped call (a
         // perfectly normal thing to write while explaining why something is
         // NOT spawned, say) would inflate this count and make the test
-        // falsely red for a change that never touched real code.
+        // falsely red for a change that never touched real code. Inline
+        // comments are cut at `//` too, for the same reason.
         let count_runs = |src: &str| {
             src.lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.split("//").next().unwrap_or(""))
                 .collect::<Vec<_>>()
                 .join("\n")
                 .matches(".run(")
@@ -647,11 +649,11 @@ mod tests {
             "arm_scheduler_after_mount must spawn exactly two `.run(` loops (the tick scheduler \
              and the delivery pump) — found {arm_runs}"
         );
-        let serve_runs = count_runs(serve_body);
+        let combined = count_runs(serve_body) + count_runs(steps);
         assert_eq!(
-            serve_runs, 0,
-            "serve() itself must not spawn a `.run(` loop; both live in arm_scheduler_after_mount \
-             — found {serve_runs}"
+            combined, 2,
+            "serve() plus serve_steps.rs must contain exactly two `.run(` calls, both in \
+             arm_scheduler_after_mount — found {combined}"
         );
     }
 }

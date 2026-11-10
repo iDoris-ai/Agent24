@@ -32,8 +32,8 @@
 //!   ([`strips_from_request`]). Nothing makes that automatic. **So a
 //!   kernel-private header MUST be named `X-A24-*`** — that convention, and not
 //!   this code, is what keeps a header added next year from reaching modules.
-//!   Written here because the person adding it will be reading `server.rs`, not
-//!   this file.
+//!   Written here because the person adding it will be reading
+//!   `rust/apps/agent24d/src/capabilities/middleware.rs`, not this file.
 //!
 //! # Not in this slice
 //!

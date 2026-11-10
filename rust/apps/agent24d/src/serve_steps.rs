@@ -1,11 +1,7 @@
-// `needless_borrow` / `ptr_arg`: each step borrows what `serve` still owns, so
-// a `&` written against the original owned local is one reference deeper here.
-#![allow(
-    clippy::too_many_arguments,
-    clippy::type_complexity,
-    clippy::needless_borrow,
-    clippy::ptr_arg
-)]
+// Each step borrows what `serve` still owns. `too_many_arguments` and
+// `type_complexity` stay file-wide: splitting the signatures would change the
+// step boundaries. `needless_borrow` / `ptr_arg` are allowed per function.
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
 use std::sync::Arc;
 use std::sync::Arc as StdArc;
@@ -281,6 +277,7 @@ pub(super) fn mint_startup_credentials(
     ))
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn open_store_workspace_and_idoris(
     ephemeral: bool,
     startup: &std::time::Instant,
@@ -388,6 +385,7 @@ pub(super) async fn open_store_workspace_and_idoris(
     ))
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn open_guardian_and_memory(
     ephemeral: bool,
     router: &Arc<ModelRouter>,
@@ -482,6 +480,7 @@ pub(super) async fn discover_packages(
     Ok((state_dir, packages_root, catalogue, integrity_refusals))
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn register_startup_tools(
     workspace: std::path::PathBuf,
     store: &Store,
@@ -645,6 +644,7 @@ pub(super) async fn register_startup_tools(
     )
 }
 
+#[allow(clippy::needless_borrow, clippy::ptr_arg)]
 pub(super) async fn assemble_app_state(
     token: &String,
     router: Arc<ModelRouter>,
@@ -747,6 +747,7 @@ pub(super) async fn assemble_app_state(
     Ok((report, state))
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn recover_durable_runs(
     state: &AppState,
     ephemeral: bool,
@@ -860,6 +861,7 @@ pub(super) async fn recover_durable_runs(
     Ok(os_config)
 }
 
+#[allow(clippy::needless_borrow, clippy::ptr_arg)]
 pub(super) async fn prepare_os_mount(
     ephemeral: bool,
     state_dir: &std::path::PathBuf,
@@ -942,6 +944,7 @@ pub(super) async fn bind_loopback(
     Ok((listener, local))
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) fn start_process_host(
     ephemeral: bool,
     os_root: &std::path::PathBuf,
@@ -1282,6 +1285,7 @@ pub(super) fn start_usage_and_model_deps(
     (usage_recorder, usage_writer, model_deps)
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn mount_domain_os(
     catalogue: &[crate::domain::Installed],
     os_root: &std::path::Path,
@@ -1389,6 +1393,7 @@ pub(super) fn arm_scheduler_after_mount(
     tokio::spawn(pump.run(StdArc::new(agent24_scheduler::SystemClock), pump_cancel));
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn publish_mount_and_attach(
     state: &mut AppState,
     partitions: &crate::os_memory::OsMemoryCatalog,
@@ -1599,6 +1604,7 @@ pub(super) fn fill_module_surfaces(state: &mut AppState, catalogue: &[crate::dom
     }
 }
 
+#[allow(clippy::needless_borrow)]
 pub(super) async fn advertise_readiness(
     cancel: &CancellationToken,
     stopping: tokio::task::JoinHandle<()>,

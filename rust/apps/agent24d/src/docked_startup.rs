@@ -528,7 +528,10 @@ mod tests {
     /// handlers, and before every business start `serve` makes.
     ///
     /// S2-1 moved those starts into `serve_steps`. The order is the call order
-    /// in `serve` plus the original text inside each step.
+    /// in `serve` plus the original text inside each step. Steps `serve` calls
+    /// before `pre_start` are read back out of that call text — not a fixed
+    /// list — and their bodies, comments stripped, must not contain a business
+    /// start the original `serve` scan required to sit after the hook.
     #[test]
     fn serve_hook_precedes_every_business_start() {
         let server = include_str!("server.rs");
@@ -579,6 +582,74 @@ mod tests {
         let scan_at = at(recover, ".spawn_scan(");
         assert!(restore_at < orphans_at && orphans_at < scan_at);
         assert!(body("bind_loopback").contains("TcpListener::bind"));
+
+        // The original `serve` scan: each of these had to occur after
+        // `pre_start(`. A step that now runs before the hook must not have
+        // absorbed one. Names come from calls in `serve` before the hook
+        // (`serve_steps::xxx(` or a bare `xxx(` that is a step), in order.
+        let business = [
+            "Store::open(&dir.join",
+            "spawn_startup_snapshot",
+            "ManagedIdoris::new(",
+            "host.restore().await",
+            "open_memory_base(ephemeral)",
+            "with_discovered(Vec::new()",
+            "restore_pending_approvals",
+            "sweep_orphan_runs",
+            ".spawn_scan(",
+            "TcpListener::bind",
+            "build_router_with_modules(",
+        ];
+        let strip = |src: &str| -> String {
+            src.lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = strip(&serve[..hook]);
+        let mut pre_hook = Vec::new();
+        let mut prefixed_calls = 0usize;
+        let mut rest = before.as_str();
+        while let Some(paren) = rest.find('(') {
+            let head = &rest[..paren];
+            let start = head
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let name = &head[start..];
+            let prefixed = head[..start].ends_with("serve_steps::");
+            let defined = !name.is_empty() && steps.contains(&format!("fn {name}("));
+            if prefixed {
+                prefixed_calls += 1;
+                assert!(
+                    defined,
+                    "serve() calls serve_steps::{name} before the hook, but serve_steps.rs has no such function"
+                );
+            }
+            if defined && !pre_hook.iter().any(|seen: &String| seen == name) {
+                pre_hook.push(name.to_string());
+            }
+            rest = &rest[paren + 1..];
+        }
+        assert_eq!(
+            prefixed_calls,
+            before.matches("serve_steps::").count(),
+            "every serve_steps:: call before the hook must be scanned"
+        );
+        assert!(
+            !pre_hook.is_empty(),
+            "serve() must call at least one step before the hook"
+        );
+        for name in &pre_hook {
+            let code = strip(body(name));
+            for marker in business {
+                assert!(
+                    !code.contains(marker),
+                    "{name} runs before the hook and must not contain `{marker}`"
+                );
+            }
+        }
+
         // `guard_enabled` is the coordinator switch, nothing else.
         let g = &include_str!("docked_startup.rs");
         assert!(g.contains("    crate::migration_coordinator::ENABLED\n}"));

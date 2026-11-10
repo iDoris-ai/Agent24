@@ -1,4 +1,5 @@
-//! HTTP server: router, auth middleware, ready line, graceful shutdown.
+//! HTTP server: router, ready line, graceful shutdown.
+//! Bearer auth middleware lives in `capabilities/middleware.rs`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -2301,7 +2302,8 @@ pub(crate) mod tests {
     /// #1202 G6 (Codex A5c-2a round 2): `serve` builds each module tool's
     /// authorization through `tool_authorization`, which refuses a module
     /// not on the grants protocol, never `store_authorization` directly,
-    /// which would let a grant from an older daemon hold. Scanned with
+    /// which would let a grant from an older daemon hold. S2-1: that absence
+    /// covers `serve()` itself and all of `serve_steps.rs`. Scanned with
     /// `//`-comments stripped, as
     /// `stop_usage_writer_is_called_after_the_supervisors_have_stopped`.
     #[test]
@@ -2331,19 +2333,25 @@ pub(crate) mod tests {
                 .expect("function must be brace-terminated")]
                 .to_owned()
         };
-        let code = |src: String| {
+        let code = |src: &str| {
             src.lines()
-                .filter(|line| !line.trim_start().starts_with("//"))
+                .map(|line| line.split("//").next().unwrap_or(""))
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        let tools = code(step("register_startup_tools"));
-        let publish = code(step("publish_mount_and_attach"));
+        let tools = code(&step("register_startup_tools"));
+        let publish = code(&step("publish_mount_and_attach"));
         assert!(tools.contains("crate::module_tool_runtime::tool_authorization("));
-        assert!(!tools.contains("store_authorization("));
-        assert!(!publish.contains("store_authorization("));
         // The notifier asks the same cards (A5c-2b).
         assert!(publish.contains("cards.on_grants_protocol(module)"));
+        assert!(
+            !code(serve).contains("store_authorization("),
+            "serve() must not call store_authorization directly"
+        );
+        assert!(
+            !code(steps).contains("store_authorization("),
+            "serve_steps must not call store_authorization directly"
+        );
     }
 
     /// #1202 G6 (A5c-2b): a module is on the grants protocol when a tool of
