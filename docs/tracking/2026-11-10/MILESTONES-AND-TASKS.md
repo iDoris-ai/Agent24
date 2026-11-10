@@ -112,7 +112,7 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 | S2-4 | attach 新建 `agent24-attach`（排在 S2-1、S2-2 之后） | S2-4a DONE（#1793，`3e07baf3`）；S2-4b IN REVIEW（#1794） | Grok + Opus 收尾 | 拆两片：4a 在 agent24d 内抽 `AttachGrantBuilder` 等接口，4b 新建 crate 原样搬入；agent24d 减约 4,400 行；C4 用例与 a3_2b/a3_3 黑盒原样通过。过滤未被测试锁住 → FU-118 |
 | S2-5 | 鉴权抽 `agent24-auth` | CANCELLED：Q3 = (B) | — | — |
 | S2-6 | 进程组终止原语统一 → **降级为停止语义盘点**（jason 2026-11-10 (a)） | DONE（#1788） | Codex 盘点 + Opus 成文 | [S2-6-STOP-SEMANTICS.md](S2-6-STOP-SEMANTICS.md) 覆盖 Rust 的进程组停止调用点与桌面侧计划范围内的现状；不做统一实现 |
-| S2-7 | CLI 补齐（Q5 = (b)）→ **改为写明桌面专属例外**（jason 2026-11-10 (a)） | DONE（本 PR） | Opus | Comm 私钥备份恢复、Knowledge 绑定/凭据在 daemon 上只允许桌面（ProductHost）调用，CLI 入口调不通，所以不补；连同 OD 下载、presence 一起写进 `AGENTS.md` 例外。CLI 试做存档在本地分支 `feat/s2-7-cli-parity` |
+| S2-7 | CLI 补齐（Q5 = (b)）→ **改为写明桌面专属例外**（jason 2026-11-10 (a)） | DONE（#1789） | Opus | Comm 私钥备份恢复、Knowledge 绑定/凭据在 daemon 上只允许桌面（ProductHost）调用，CLI 入口调不通，所以不补；连同 OD 下载、presence 一起写进 `AGENTS.md` 例外。CLI 试做存档在本地分支 `feat/s2-7-cli-parity` |
 
 ### 2.2 组件统一（ADR-038）
 
