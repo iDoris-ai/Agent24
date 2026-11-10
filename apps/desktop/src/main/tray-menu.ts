@@ -27,7 +27,12 @@ export interface TrayInput {
   upgrade?: UpgradeHint
   /** M5 B5: the LaunchAgent's daemon keeps exiting and being started again. */
   crashLoop?: boolean
+  /** M5 B4a: `BackendManager.serviceWaitMs()`: waiting for the service daemon. */
+  serviceWaitMs?: number | null
 }
+
+/** M5 B4a: after this long waiting, the tray says the service has not started. */
+export const SERVICE_WAIT_HINT_MS = 60_000
 
 export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'cli-settings'
 export type TrayItem = { type: 'separator' } | { label: string; enabled: false } | { label: string; action: TrayAction }
@@ -59,6 +64,10 @@ export function buildTrayView(input: TrayInput): TrayView {
   const upgrade = input.upgrade
   if (upgrade) tooltip += '\n' + (upgrade.kind === 'needed' ? mt('tray.serviceUpgrade') : mt('tray.serviceUpgradeFailed', { code: upgrade.code }))
   if (input.crashLoop) tooltip += '\n' + mt('tray.serviceCrashLoop')
+  // M5 B4a: the crash loop already says it and gives the way back: one line at a time.
+  else if (input.serviceWaitMs !== undefined && input.serviceWaitMs !== null) {
+    tooltip += '\n' + mt(input.serviceWaitMs >= SERVICE_WAIT_HINT_MS ? 'tray.serviceNotStarted' : 'tray.serviceWaiting')
+  }
   const summary = protocol
     ? mt('tray.protocolShort', {
       daemonVersion: protocol.daemonVersion ?? mt('tray.protocolUnknown'),

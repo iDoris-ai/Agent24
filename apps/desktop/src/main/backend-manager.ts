@@ -368,9 +368,10 @@ export interface ExternalDaemonSource {
   checkHealth(endpoint: BackendEndpoint | null): Promise<boolean>
   /** Body of `GET /api/v1/health`, including the protocol version. */
   fetchHealth(endpoint: BackendEndpoint): Promise<DaemonHealthProbe>
-  /** True while `agent24 service install`'s LaunchAgent plist exists. Only a
-   * conservative "do not take over" signal, not proof of who started it. */
-  serviceManaged(): boolean
+  /** True while `agent24 service install`'s LaunchAgent plist exists: launchd
+   * starts the service daemon, so this app waits for it and never spawns its
+   * own (M5 B4a). Not proof of who started a daemon that is up. */
+  serviceInstalled(): boolean
   /** `GET /api/v1/os` with the record's token answers 200 with a `modules` array. */
   acceptsToken(endpoint: BackendEndpoint, token: string): Promise<boolean>
   /** `POST /api/v1/shutdown` with the record's token, as `agent24 daemon stop`
@@ -524,7 +525,7 @@ const defaultExternalDaemonSource: ExternalDaemonSource = {
   read: readExternalDaemonState,
   checkHealth,
   fetchHealth: fetchDaemonHealth,
-  serviceManaged: launchAgentPlistExists,
+  serviceInstalled: launchAgentPlistExists,
   acceptsToken: daemonAcceptsToken,
   requestShutdown: requestDaemonShutdown,
   isAlive: processAlive,
@@ -553,6 +554,12 @@ export class BackendManager {
   private child: ChildProcess | null = null
   /** Every daemon this manager spawned: their records are not the service's (M5 B5). */
   private readonly spawnedPids = new Set<number>()
+  /** M5 B4a: when this app began waiting for the service daemon, or null. */
+  private serviceWaitSince: number | null = null
+  /** M5 B4a (Codex C2): the legacy daemon already asked to shut down. With the
+   * LaunchAgent installed no child of ours replaces its record, so without
+   * this it would be asked again, with its token, on every tick. */
+  private shutdownAsked: number | null = null
   private healthTimer: NodeJS.Timeout | null = null
   private failureCount = 0
   private readonly kind: BackendKind
@@ -723,14 +730,16 @@ export class BackendManager {
       // not outlive it here either.
       this.disconnectExternal()
       this.foreignPid = state.pid
+      this.serviceWaitSince = null
       return 'foreign'
     }
     this.foreignPid = null
-    // T1-0: Knowledge needs a capability-mode daemon this app hosts. A
-    // LaunchAgent-managed one is left alone: launchd would only restart it.
-    // Only a legacy daemon gets here; the service daemon enrolled above (M5 B6).
-    // B4 removes serviceManaged together with waiting for the service daemon.
-    if (this.kind === 'rust' && this.authMode === 'capabilities' && !this.external.serviceManaged()) {
+    // T1-0: Knowledge needs a capability-mode daemon this app hosts, so a
+    // legacy one is taken over. Only a legacy daemon gets here; the service
+    // daemon enrolled above (M5 B6). With the LaunchAgent installed the
+    // takeover then waits for the service daemon instead of spawning (M5 B4a).
+    if (this.kind === 'rust' && this.authMode === 'capabilities') {
+      if (this.shutdownAsked === state.pid) return 'absent'
       return this.takeoverExternal(state, lifecycle)
     }
     // #1187: /health takes no credential; prove the token on that port first.
@@ -741,6 +750,7 @@ export class BackendManager {
       this.disconnectExternal()
       return 'absent'
     }
+    this.serviceWaitSince = null
     this.isExternal = true
     this.externalPid = state.pid
     publishConnection({ port: state.port, auth: { kind: 'bearer', token: state.token } }, state.authMode)
@@ -780,6 +790,8 @@ export class BackendManager {
     this.enrolRetryMs = 0
     this.refusedBy = null
     this.enrolment = session
+    this.serviceWaitSince = null
+    this.shutdownAsked = null
     this.isExternal = true
     this.externalPid = state.pid
     this.lastHealthy = true
@@ -811,6 +823,8 @@ export class BackendManager {
   }
 
   private refuseEnrolment(state: ExternalDaemonState, code: string): 'incompatible' {
+    // A daemon is up and said why it will not have this app: not a wait (Codex B4a C3).
+    this.serviceWaitSince = null
     const already = this.blockedReason?.kind === 'enrol_refused'
       && this.blockedReason.pid === state.pid && this.blockedReason.code === code
     const sameDaemon = this.refusedBy?.pid === state.pid && this.refusedBy.generation === state.generation
@@ -877,9 +891,14 @@ export class BackendManager {
    * outcome lets the caller spawn; a lock still held is the health loop's. */
   private async takeoverExternal(state: ExternalDaemonState, lifecycle: number): Promise<'absent' | 'superseded'> {
     this.disconnectExternal()
+    this.shutdownAsked = state.pid
     console.log(`[backend:${this.kind}] taking over CLI daemon (pid ${state.pid}, port ${state.port}) so Knowledge can work — asking it to shut down`)
     const status = await this.external.requestShutdown({ port: state.port }, state.token)
-    if (lifecycle !== this.lifecycle) return 'superseded'
+    // Stopped meanwhile: this ask is not the one that counts (PR-Daemon B4a N2).
+    if (lifecycle !== this.lifecycle) {
+      if (this.shutdownAsked === state.pid) this.shutdownAsked = null
+      return 'superseded'
+    }
     if (status === null || status < 200 || status > 299) {
       console.warn(`[backend:${this.kind}] CLI daemon refused shutdown (${status ?? 'no answer'}); starting our own anyway`)
       return 'absent'
@@ -897,6 +916,7 @@ export class BackendManager {
 
   /** Live `/health` disagreed. The recorded version is only named in the hint. */
   private refuseExternal(state: ExternalDaemonState, daemonVersion: number | null): 'incompatible' {
+    this.serviceWaitSince = null
     const detail: ProtocolMismatchDetail = {
       kind: 'protocol_mismatch', daemonVersion, clientVersion: CLIENT_PROTOCOL_VERSION,
       recordedVersion: state.protocolVersion, pid: state.pid,
@@ -921,6 +941,14 @@ export class BackendManager {
       )
     }
     return 'incompatible'
+  }
+
+  /** M5 B4a: how long this app has been waiting for the LaunchAgent's service
+   * daemon instead of spawning its own (milliseconds), or null when it is not
+   * waiting: no LaunchAgent, a daemon is attached or spawned, or the user
+   * stopped it from the tray. */
+  serviceWaitMs(): number | null {
+    return this.serviceWaitSince === null ? null : Date.now() - this.serviceWaitSince
   }
 
   /** pid of another host's capability-mode daemon while it blocks this app. */
@@ -1017,6 +1045,9 @@ export class BackendManager {
    * pins the tray to "stopped" and suspends the health loop, exactly as a
    * real stop would, but the external process itself is left untouched. */
   stopDaemon(): void {
+    this.serviceWaitSince = null
+    // A Start after this asks the legacy daemon again, once (PR-Daemon B4a N2).
+    this.shutdownAsked = null
     if (this.held) this.held.resume = false
     this.lifecycle += 1
     this.userStopped = true
@@ -1101,6 +1132,16 @@ export class BackendManager {
     this.isExternal = false
     this.externalPid = null
     this.foreignPid = null
+    // M5 B4a: launchd starts the service daemon; spawning ours would race it
+    // for the singleton lock. Wait, and look for it again on the next tick
+    // (the connection to a daemon that died is already let go above).
+    if (this.external.serviceInstalled()) {
+      this.serviceWaitSince ??= Date.now()
+      this.reprobe = true
+      return
+    }
+    this.serviceWaitSince = null
+    this.shutdownAsked = null
 
     this.child = this.spawnProcess(this.kind, this.authMode)
     if (this.child.pid !== undefined) this.spawnedPids.add(this.child.pid)
