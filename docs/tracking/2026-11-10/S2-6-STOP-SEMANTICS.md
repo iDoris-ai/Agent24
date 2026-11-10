@@ -20,6 +20,8 @@ grep -rn 'killpg\|kill(-\|SIGTERM\|SIGKILL\|Signal::SIGTERM\|setpgid\|process_gr
 
 探测用的信号 0、`process_group(0)`（创建隔离组）、测试夹具和注释不算停止调用，不列入下表。
 
+下表只收**进程组**停止。对单个子进程的 `child.kill()`（例如 `agent24-cli/src/main.rs:859`、`:1035` 停掉自己拉起的 agent24d，`agent24-components/src/install.rs:470`、`:477`，`agent24-hw/src/probe.rs:263`、`:270`，`agent24-idoris/src/keys.rs:401`，`agent24-sidecar-host/src/posix.rs:174`）不在本盘点范围内，上面的检索也找不到它们。
+
 | 调用点（main `bed5ef4c` 行号） | 停止序列 | 超时 |
 |---|---|---|
 | `rust/crates/agent24-os-proto/src/supervise.rs:632` terminate | TERM；peek leader 不回收；即使 leader 退出也 KILL；wait leader；确认整组 | 入参 grace（库默认 3s，可由 owner 覆盖）；KILL 后 leader 5s；回收后组确认另 5s |
