@@ -1,8 +1,7 @@
 //! `agent24 package-integrity` — generate and verify an OS package file manifest.
 //!
-//! Signature checks are intentionally absent. External CI signs executables
-//! before `generate`. PR-3 is what starts refusing packages that omit the
-//! manifest.
+//! Release self-checks verify hashes and native format. Host checks additionally
+//! enforce the host signature policy after verifying package contents.
 
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
@@ -33,7 +32,29 @@ pub fn verify_required(
     manifest: &DomainOsManifest,
     cancel: &CancellationToken,
 ) -> Result<(), IntegrityError> {
-    verify_required_for_arch(dir, manifest, cancel, std::env::consts::ARCH)
+    verify_with_policy(
+        dir,
+        manifest,
+        cancel,
+        &crate::signature::Policy::default(),
+        agent24_components::sign::VerifyMode::AtRest,
+    )
+}
+
+pub fn verify_with_policy(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+    policy: &crate::signature::Policy,
+    mode: agent24_components::sign::VerifyMode,
+) -> Result<(), IntegrityError> {
+    verify_contents(
+        dir,
+        manifest,
+        cancel,
+        std::env::consts::ARCH,
+        Some((policy, mode)),
+    )
 }
 
 fn verify_required_for_arch(
@@ -42,10 +63,25 @@ fn verify_required_for_arch(
     cancel: &CancellationToken,
     arch: &str,
 ) -> Result<(), IntegrityError> {
+    verify_contents(dir, manifest, cancel, arch, None)
+}
+
+fn verify_contents(
+    dir: &Path,
+    manifest: &DomainOsManifest,
+    cancel: &CancellationToken,
+    arch: &str,
+    signature: Option<(
+        &crate::signature::Policy,
+        agent24_components::sign::VerifyMode,
+    )>,
+) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
     }
     let Some(declared) = manifest.integrity() else {
+        // Integrity is required. A package with `spawn.command` and no
+        // manifest is `Missing`; signature policy is not a substitute.
         return Err(IntegrityError::Missing);
     };
     verify_declared(
@@ -59,6 +95,7 @@ fn verify_required_for_arch(
         },
         cancel,
         arch,
+        signature,
     )
 }
 
@@ -108,7 +145,7 @@ fn check_target_arch(arch: &str) -> Result<(), IntegrityError> {
 
 /// Generate for a target CPU architecture on the host OS.
 /// Daemon-side verification (discovery and recheck) always requires the host
-/// architecture; `os install` copies the package without checking it.
+/// architecture, including installation.
 pub fn generate_for_arch(
     root: &Path,
     executables: &[String],
@@ -248,6 +285,10 @@ fn verify_declared(
     section: &IntegritySection,
     cancel: &CancellationToken,
     arch: &str,
+    signature: Option<(
+        &crate::signature::Policy,
+        agent24_components::sign::VerifyMode,
+    )>,
 ) -> Result<(), IntegrityError> {
     if cancel.is_cancelled() {
         return Err(IntegrityError::Cancelled);
@@ -303,9 +344,17 @@ fn verify_declared(
         ),
     )?;
     for executable in &section.executables {
-        check_native_executable_for_arch(&dir.join(executable), executable, arch)?;
+        prefer_cancel(
+            cancel,
+            check_native_executable_for_arch(&dir.join(executable), executable, arch),
+        )?;
     }
-    Ok(())
+    if let Some((policy, mode)) = signature {
+        for executable in &section.executables {
+            policy.verify(dir, executable, mode, cancel)?;
+        }
+    }
+    prefer_cancel(cancel, Ok(()))
 }
 
 fn tree_result(
@@ -795,8 +844,8 @@ mod tests {
         let root = packages.path().join("packages");
         fs::create_dir(&root).unwrap();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-        crate::install::install(staging.path(), &root).unwrap();
-        let scan = crate::discovery::scan(&root, &CancellationToken::new());
+        crate::test_support::install(staging.path(), &root).unwrap();
+        let scan = crate::test_support::scan(&root, &CancellationToken::new());
         assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
     }
 
@@ -951,7 +1000,7 @@ mod tests {
     }
 
     fn scan_why(parent: &Path, name: &str) -> String {
-        let scan = crate::discovery::scan(parent, &CancellationToken::new());
+        let scan = crate::test_support::scan(parent, &CancellationToken::new());
         scan.refused
             .iter()
             .find(|refused| refused.dir.ends_with(name))

@@ -64,6 +64,16 @@ pub enum IntegrityError {
     /// mismatch and not a damaged tree: the package must not be discovered
     /// or spawned. Not an [`IntegrityReason`].
     Cancelled,
+    SignatureInvalid {
+        path: String,
+    },
+    NotarizationFailed {
+        path: String,
+    },
+    UntrustedTeam {
+        path: String,
+        team: String,
+    },
     NotNativeExecutable {
         path: String,
     },
@@ -127,7 +137,10 @@ impl IntegrityError {
             Self::ManifestInvalid { .. } | Self::NotNativeExecutable { .. } => {
                 Some(IntegrityReason::ManifestInvalid)
             }
-            Self::SignatureRejected { .. } => Some(IntegrityReason::SignatureRejected),
+            Self::SignatureInvalid { .. }
+            | Self::NotarizationFailed { .. }
+            | Self::UntrustedTeam { .. }
+            | Self::SignatureRejected { .. } => Some(IntegrityReason::SignatureRejected),
             Self::CheckFailed { .. } => Some(IntegrityReason::CheckFailed),
             Self::Cancelled => None,
         }
@@ -143,10 +156,34 @@ impl IntegrityError {
             Self::HashMismatch { path } => format!("hash_mismatch: {path}"),
             Self::ManifestInvalid { detail } => public_detail(detail),
             Self::NotNativeExecutable { path } => format!("not_native_executable: {path}"),
-            Self::SignatureRejected { .. } => "signature_rejected".to_owned(),
+            // Non-host and D6 text. No path and no codesign output. The host
+            // log line for an untrusted team is [`Display`], which may name
+            // the Team ID and the `trust-team` command.
+            Self::SignatureInvalid { .. }
+            | Self::NotarizationFailed { .. }
+            | Self::SignatureRejected { .. } => "signature_rejected".to_owned(),
+            Self::UntrustedTeam { team, .. } => match public_team(team) {
+                Some(team) => format!(
+                    "signature_rejected: {team}; 如信任该开发者：agent24 os trust-team {team}"
+                ),
+                None => "signature_rejected".to_owned(),
+            },
             Self::CheckFailed { .. } => "integrity_check_failed".to_owned(),
             Self::Cancelled => "cancelled".to_owned(),
         }
+    }
+}
+
+/// A Team ID is the only signature detail a non-host message may carry.
+fn public_team(team: &str) -> Option<&str> {
+    if team.len() == 10
+        && team
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        Some(team)
+    } else {
+        None
     }
 }
 
@@ -164,6 +201,18 @@ fn public_detail(detail: &str) -> String {
 impl fmt::Display for IntegrityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SignatureInvalid { path } => write!(
+                f,
+                "signature_invalid: {path} (requires Developer ID and Hardened Runtime)"
+            ),
+            Self::NotarizationFailed { path } => write!(
+                f,
+                "notarization_failed: {path}; Gatekeeper could not confirm notarization; 刚公证的包可能需几分钟，请稍后重试"
+            ),
+            Self::UntrustedTeam { path, team } => write!(
+                f,
+                "untrusted_team: {path}: {team}; 如信任该开发者：agent24 os trust-team {team}"
+            ),
             Self::Missing => f.write_str("integrity_manifest_missing"),
             Self::HashMismatch { path } => write!(f, "hash_mismatch: {path}"),
             Self::ManifestInvalid { detail } => {
@@ -945,6 +994,61 @@ mod tests {
         assert_eq!(err.public_message(), "signature_rejected");
         assert!(!err.public_message().contains("/tmp"));
         assert!(!err.public_message().contains("stderr"));
+    }
+
+    /// The three macOS signature failures share `signature_rejected`.
+    /// Restoring a distinct reason, or copying a path / codesign line into
+    /// the public message, turns this red. The host `Display` of an
+    /// untrusted team may still name the Team ID and `trust-team`.
+    #[test]
+    fn macos_signature_failures_share_signature_rejected() {
+        let cases = [
+            IntegrityError::SignatureInvalid {
+                path: "bin/run".into(),
+            },
+            IntegrityError::NotarizationFailed {
+                path: "/tmp/secret stderr".into(),
+            },
+            IntegrityError::UntrustedTeam {
+                path: "bin/run".into(),
+                team: "ABCDE12345".into(),
+            },
+        ];
+        for err in &cases {
+            assert_eq!(err.reason(), Some(IntegrityReason::SignatureRejected));
+            assert_eq!(err.reason().unwrap().code(), "signature_rejected");
+            assert_eq!(
+                err.reason().unwrap().operation_code(),
+                "os_package.signature_rejected"
+            );
+            let public = err.public_message();
+            assert!(public.starts_with("signature_rejected"), "{public}");
+            assert!(!public.contains('/'), "{public}");
+            assert!(!public.contains("stderr"), "{public}");
+            assert!(!public.contains("codesign"), "{public}");
+        }
+        let untrusted = IntegrityError::UntrustedTeam {
+            path: "bin/run".into(),
+            team: "ABCDE12345".into(),
+        };
+        let public = untrusted.public_message();
+        assert!(public.contains("ABCDE12345"), "{public}");
+        assert!(public.contains("trust-team"), "{public}");
+        let shown = untrusted.to_string();
+        assert!(shown.contains("ABCDE12345"), "{shown}");
+        assert!(shown.contains("trust-team"), "{shown}");
+        let leaked = IntegrityError::UntrustedTeam {
+            path: "bin/run".into(),
+            team: "/tmp/not-a-team".into(),
+        };
+        assert_eq!(leaked.public_message(), "signature_rejected");
+        assert_eq!(
+            IntegrityError::SignatureInvalid {
+                path: "/var/run stderr".into(),
+            }
+            .public_message(),
+            "signature_rejected"
+        );
     }
 
     fn digest(size: u64, fill: u8) -> FileDigest {

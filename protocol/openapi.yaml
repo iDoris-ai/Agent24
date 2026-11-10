@@ -624,6 +624,101 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /os/trusted-teams:
+    get:
+      operationId: listTrustedTeams
+      tags: [system]
+      summary: List trusted Developer ID teams
+      responses:
+        "200":
+          description: Current trusted teams, including the built-in team
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustedTeams"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Trust store unavailable or trust operation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+
+  /os/trusted-teams/{team}:
+    put:
+      operationId: trustTeam
+      tags: [system]
+      summary: Trust a Developer ID team
+      description: Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+      parameters:
+        - name: team
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Z0-9]{10}$"
+      responses:
+        "200":
+          description: Current trusted teams, including the built-in team
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustedTeams"
+        "400":
+          description: Invalid team, built-in team removal, or trust store update failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Trust store unavailable or trust operation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+    delete:
+      operationId: untrustTeam
+      tags: [system]
+      summary: Remove trust for a Developer ID team
+      description: Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+      parameters:
+        - name: team
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Z0-9]{10}$"
+      responses:
+        "200":
+          description: Current trusted teams, including the built-in team
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustedTeams"
+        "400":
+          description: Invalid team, built-in team removal, or trust store update failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Trust store unavailable or trust operation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+
   /os/{name}:
     patch:
       operationId: updateDomainOs
@@ -4862,6 +4957,35 @@ components:
           description: "Open enum: ok | missing | unknown | not_checked."
         restart_required:
           type: boolean
+    TrustTeamError:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [trust_store_unavailable, trust_team_failed]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          const: false
+
+    TrustedTeams:
+      type: object
+      required: [teams]
+      properties:
+        teams:
+          type: array
+          items:
+            type: object
+            required: [team_id, builtin]
+            properties:
+              team_id:
+                type: string
+                pattern: "^[A-Z0-9]{10}$"
+              builtin:
+                type: boolean
+
     DomainOsList:
       type: object
       required: [modules]

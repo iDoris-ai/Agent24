@@ -194,6 +194,9 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | DELETE | /attached/{name} | ModuleAdmin | 提升 |
 | PATCH | /attached/{name} | ModuleAdmin | 提升 |
 | GET | /os | ModuleRead | 日常 |
+| GET | /os/trusted-teams | ModuleRead | 日常 |
+| PUT | /os/trusted-teams/{team} | ModuleAdmin | 提升 |
+| DELETE | /os/trusted-teams/{team} | ModuleAdmin | 提升 |
 | PATCH | /os/{name} | ModuleAdmin | 提升 |
 | POST | /os/{name}/stop | ModuleAdmin | 提升 |
 | POST | /os/{name}/commands/{command} | ModuleAdmin | 提升 |

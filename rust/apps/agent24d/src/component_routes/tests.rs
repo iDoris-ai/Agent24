@@ -4475,7 +4475,7 @@ fn t6_old_package_is_failed_and_a_sealed_sibling_stays_available() {
     )
     .unwrap();
     agent24_os_packages::test_support::seal_exit_stub(&good, "bin/mod").unwrap();
-    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let scan = agent24_os_packages::test_support::scan(root.path(), &CancellationToken::new());
     assert_eq!(
         scan.found
             .iter()
@@ -4513,7 +4513,7 @@ fn t6_old_package_is_failed_and_a_sealed_sibling_stays_available() {
 
     agent24_os_packages::test_support::seal_exit_stub(&root.path().join("oldmod"), "bin/mod")
         .unwrap();
-    let again = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let again = agent24_os_packages::test_support::scan(root.path(), &CancellationToken::new());
     assert!(
         again.refused.iter().all(|r| !r.dir.ends_with("oldmod")),
         "reinstall left the refusal: {:?}",

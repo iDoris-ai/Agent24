@@ -151,6 +151,13 @@ pub struct Scan {
 /// live may be discovered; the caller must not register its tools or spawn
 /// it otherwise.
 pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
+    scan_with_policy(root, cancel, &crate::signature::Policy::default())
+}
+pub fn scan_with_policy(
+    root: &Path,
+    cancel: &CancellationToken,
+    policy: &crate::signature::Policy,
+) -> Scan {
     let mut out = Scan::default();
     let entries = match std::fs::read_dir(root) {
         Ok(e) => e,
@@ -248,7 +255,7 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
             out.cancelled.extend(rest);
             return out;
         }
-        match read_package(&dir, cancel) {
+        match read_package_with_policy(&dir, cancel, policy) {
             PackageRead::Found(found) => out.found.push(*found),
             PackageRead::Refused {
                 why,
@@ -278,6 +285,16 @@ pub fn scan(root: &Path, cancel: &CancellationToken) -> Scan {
 /// "no longer there"); a symlink or non-directory is refused as [`scan`]
 /// refuses it.
 pub fn scan_one(dir: &Path, cancel: &CancellationToken) -> Scan {
+    scan_one_with_policy(dir, cancel, &crate::signature::Policy::default())
+}
+
+/// [`scan_one`] with the caller's signature policy. `enable` passes the
+/// daemon policy so the rescan verifies signatures, not only the hash.
+pub fn scan_one_with_policy(
+    dir: &Path,
+    cancel: &CancellationToken,
+    policy: &crate::signature::Policy,
+) -> Scan {
     let mut out = Scan::default();
     match std::fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return out,
@@ -307,7 +324,7 @@ pub fn scan_one(dir: &Path, cancel: &CancellationToken) -> Scan {
         }
         Ok(_) => {}
     }
-    match read_package(dir, cancel) {
+    match read_package_with_policy(dir, cancel, policy) {
         PackageRead::Found(found) => out.found.push(*found),
         PackageRead::Refused {
             why,
@@ -345,7 +362,15 @@ fn refused_integrity(err: IntegrityError, declared: Option<(String, String)>) ->
 }
 
 /// Read and validate one package directory.
+#[cfg(test)]
 fn read_package(dir: &Path, cancel: &CancellationToken) -> PackageRead {
+    read_package_with_policy(dir, cancel, &crate::test_support::signature_policy())
+}
+fn read_package_with_policy(
+    dir: &Path,
+    cancel: &CancellationToken,
+    policy: &crate::signature::Policy,
+) -> PackageRead {
     if cancel.is_cancelled() {
         return PackageRead::Cancelled;
     }
@@ -460,9 +485,16 @@ fn read_package(dir: &Path, cancel: &CancellationToken) -> PackageRead {
         }
     };
     let declared = Some((manifest.name().to_owned(), manifest.version().to_owned()));
-    // Integrity is required. Cancel is not success and not a hash mismatch:
-    // the package stays off `found` so nothing registers its tools or spawns it.
-    match crate::package_integrity::verify_required(dir, &manifest, cancel) {
+    // Integrity is required. Hash and native-format checks run inside
+    // `verify_with_policy` before the signature policy. Cancel is not success
+    // and not a hash mismatch: the package stays off `found`.
+    match crate::package_integrity::verify_with_policy(
+        dir,
+        &manifest,
+        cancel,
+        policy,
+        agent24_components::sign::VerifyMode::AtRest,
+    ) {
         Ok(()) => {}
         Err(IntegrityError::Cancelled) => {
             return PackageRead::Cancelled;
@@ -519,8 +551,17 @@ pub fn build_tool_registry(found: &[Discovered]) -> (ModuleToolRegistry, Vec<Ref
 /// not finish, so this restart is not a success. The full tree is still
 /// hashed whenever the token is live. A digest that no longer matches the
 /// frozen one is [`IntegrityReason::HashMismatch`] even when the new tree
-/// is internally consistent.
+/// is internally consistent. Signature policy runs after the hash, the same
+/// way [`scan`] does.
 pub fn recheck(dir: &Path, expected: &str, cancel: &CancellationToken) -> Result<(), RecheckError> {
+    recheck_with_policy(dir, expected, cancel, &crate::signature::Policy::default())
+}
+pub fn recheck_with_policy(
+    dir: &Path,
+    expected: &str,
+    cancel: &CancellationToken,
+    policy: &crate::signature::Policy,
+) -> Result<(), RecheckError> {
     // The metadata branches below return before `read_package`, so its
     // cancel check never runs for a missing, linked, or non-directory path.
     if cancel.is_cancelled() {
@@ -553,7 +594,7 @@ pub fn recheck(dir: &Path, expected: &str, cancel: &CancellationToken) -> Result
             ));
         }
     }
-    match read_package(dir, cancel) {
+    match read_package_with_policy(dir, cancel, policy) {
         PackageRead::Found(found) if found.digest == expected => Ok(()),
         PackageRead::Found(found) => Err(failed(
             Some(IntegrityReason::HashMismatch),
@@ -587,7 +628,7 @@ mod tests {
 
     /// Live token. Tests of cancellation call [`super::scan`] directly.
     fn scan(root: &Path) -> Scan {
-        super::scan(root, &CancellationToken::new())
+        crate::test_support::scan(root, &CancellationToken::new())
     }
 
     fn recheck(dir: &Path, expected: &str) -> Result<(), super::RecheckError> {
@@ -1254,7 +1295,7 @@ mod tests {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        let scan = super::scan(root.path(), &cancel);
+        let scan = crate::test_support::scan(root.path(), &cancel);
         assert!(
             scan.found.is_empty(),
             "cancelled package was discovered: {:?}",
@@ -1279,7 +1320,7 @@ mod tests {
         assert_eq!(registry.len(), 0, "a cancelled package registered a tool");
         assert!(refused.is_empty(), "{refused:?}");
 
-        let live = super::scan(root.path(), &CancellationToken::new());
+        let live = crate::test_support::scan(root.path(), &CancellationToken::new());
         assert_eq!(live.found.len(), 1, "refused: {:?}", live.refused);
         assert_eq!(live.found[0].manifest.name(), "cos72");
         assert_eq!(live.refused.len(), 1, "{:?}", live.refused);
@@ -1300,7 +1341,7 @@ mod tests {
             "cancel must not look like a bad hash: {err}"
         );
         // The supervisor spawns the next run only when this returns Ok.
-        assert!(super::recheck(&live.found[0].dir, &digest, &cancel).is_err());
+        assert!(crate::test_support::recheck(&live.found[0].dir, &digest, &cancel).is_err());
     }
 
     /// The directory is already gone, and the token is already cancelled.
@@ -1384,7 +1425,7 @@ mod tests {
     fn a_cancel_during_the_hash_is_not_discovered() {
         let root = tempfile::tempdir().unwrap();
         let dir = integrity_package(root.path(), "cos72");
-        let live = super::scan(root.path(), &CancellationToken::new());
+        let live = crate::test_support::scan(root.path(), &CancellationToken::new());
         assert_eq!(live.found.len(), 1, "refused: {:?}", live.refused);
         let digest = live.found[0].digest.clone();
 
@@ -1393,7 +1434,8 @@ mod tests {
             let (_guard, entered, release) = arm_hash_pause(&dir);
             let scan_root = root.path().to_owned();
             let scan_cancel = cancel.clone();
-            let worker = std::thread::spawn(move || super::scan(&scan_root, &scan_cancel));
+            let worker =
+                std::thread::spawn(move || crate::test_support::scan(&scan_root, &scan_cancel));
             entered
                 .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the startup scan never reached the hash");
@@ -1426,8 +1468,9 @@ mod tests {
         let (_guard, entered, release) = arm_hash_pause(&dir);
         let recheck_dir = dir.clone();
         let recheck_cancel = cancel.clone();
-        let worker =
-            std::thread::spawn(move || super::recheck(&recheck_dir, &digest, &recheck_cancel));
+        let worker = std::thread::spawn(move || {
+            crate::test_support::recheck(&recheck_dir, &digest, &recheck_cancel)
+        });
         entered
             .recv_timeout(std::time::Duration::from_secs(30))
             .expect("recheck never reached the hash");

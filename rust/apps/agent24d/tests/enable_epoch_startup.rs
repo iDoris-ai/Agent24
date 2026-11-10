@@ -5,9 +5,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 fn install(home: &Path) {
@@ -32,8 +35,7 @@ fn install(home: &Path) {
 /// Start the daemon, wait for its ready line — the observation is made
 /// before it — and stop it.
 fn start_and_stop(home: &Path) {
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut daemon = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .args(["serve", "--port", "0"])

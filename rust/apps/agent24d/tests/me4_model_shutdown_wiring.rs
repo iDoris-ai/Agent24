@@ -27,6 +27,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -135,8 +138,7 @@ struct Daemon {
 }
 
 fn start(home: &Path, omlx_port: u16) -> Daemon {
-    let daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let daemon = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))

@@ -567,13 +567,19 @@ impl RefusalReason {
 pub fn retain_rechecked(
     catalogue: &mut Vec<Installed>,
     cancel: &tokio_util::sync::CancellationToken,
+    policy: &agent24_os_packages::signature::Policy,
 ) -> Vec<agent24_os_packages::discovery::Refused> {
     let mut dropped = Vec::new();
     catalogue.retain(|entry| {
         let Build::Package(package) = &entry.build else {
             return true;
         };
-        match agent24_os_packages::discovery::recheck(&package.dir, &package.digest, cancel) {
+        match agent24_os_packages::discovery::recheck_with_policy(
+            &package.dir,
+            &package.digest,
+            cancel,
+            policy,
+        ) {
             Ok(()) => true,
             Err(agent24_os_packages::discovery::RecheckError::Cancelled) => false,
             Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message }) => {
@@ -1073,6 +1079,7 @@ pub struct Package {
 /// What the daemon lends every out-of-process module: where their callback
 /// sockets live, how to start them, and how long to wait for them.
 pub struct ProcessHost {
+    pub signature: agent24_os_packages::signature::Policy,
     pub callback_dir: Arc<agent24_os_proto::endpoint::CallbackDir>,
     pub trampoline: agent24_os_proto::launch::Trampoline,
     pub timings: agent24_os_proto::supervisor::Timings,
@@ -2365,11 +2372,13 @@ async fn mount_package(
     // finished check: the supervisor must not spawn. A shutdown is not a
     // hash mismatch, and a matching stat is not a reason to skip the hash.
     let shutdown = host.shutdown.clone();
+    let signature = host.signature.clone();
     let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(move |spec| {
-        match agent24_os_packages::discovery::recheck(
+        match agent24_os_packages::discovery::recheck_with_policy(
             &spec.package_dir,
             &spec.manifest_digest,
             &shutdown,
+            &signature,
         ) {
             Ok(()) => None,
             Err(agent24_os_packages::discovery::RecheckError::Cancelled) => {
@@ -2403,8 +2412,11 @@ async fn mount_package(
         let dir = spec.package_dir.clone();
         let digest = spec.manifest_digest.clone();
         let shutdown = host.shutdown.clone();
+        let signature = host.signature.clone();
         tokio::task::spawn_blocking(move || {
-            agent24_os_packages::discovery::recheck(&dir, &digest, &shutdown)
+            agent24_os_packages::discovery::recheck_with_policy(
+                &dir, &digest, &shutdown, &signature,
+            )
         })
         .await
     };
@@ -2981,19 +2993,22 @@ while f.readline():
 
     /// The catalogue entries `serve` would make of `packages`.
     fn discovered(packages: &Path) -> Vec<Installed> {
-        agent24_os_packages::discovery::scan(packages, &tokio_util::sync::CancellationToken::new())
-            .found
-            .into_iter()
-            .map(|d| Installed {
-                name: d.manifest.name().to_owned(),
-                version: d.manifest.version().to_owned(),
-                build: Build::Package(Box::new(Package {
-                    manifest: d.manifest,
-                    dir: d.dir,
-                    digest: d.digest,
-                })),
-            })
-            .collect()
+        agent24_os_packages::test_support::scan(
+            packages,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .found
+        .into_iter()
+        .map(|d| Installed {
+            name: d.manifest.name().to_owned(),
+            version: d.manifest.version().to_owned(),
+            build: Build::Package(Box::new(Package {
+                manifest: d.manifest,
+                dir: d.dir,
+                digest: d.digest,
+            })),
+        })
+        .collect()
     }
 
     /// A process host for tests: a callback directory under a short path, and
@@ -3009,6 +3024,7 @@ while f.readline():
         .unwrap();
         std::fs::set_permissions(&trampoline, std::fs::Permissions::from_mode(0o755)).unwrap();
         ProcessHost {
+            signature: agent24_os_packages::test_support::signature_policy(),
             callback_dir: Arc::new(agent24_os_proto::endpoint::CallbackDir::create(tmp).unwrap()),
             trampoline: agent24_os_proto::launch::Trampoline {
                 program: trampoline,
@@ -3271,7 +3287,7 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package_with(&packages, "typo", "[events, telepthy]", PACKAGE_MODULE);
-        let scan = agent24_os_packages::discovery::scan(
+        let scan = agent24_os_packages::test_support::scan(
             &packages,
             &tokio_util::sync::CancellationToken::new(),
         );
@@ -3853,7 +3869,7 @@ raise SystemExit(3)
         let packages = tmp.path().join("packages");
         write_tooled_package(&packages, "remote");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        let scan = agent24_os_packages::test_support::scan(&packages, &shutdown);
         assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
         let catalogue = catalogue_from_found(scan.found);
 
@@ -4019,7 +4035,7 @@ raise SystemExit(3)
             let scan_root = packages.clone();
             let scan_cancel = cancel.clone();
             let worker = std::thread::spawn(move || {
-                agent24_os_packages::discovery::scan(&scan_root, &scan_cancel)
+                agent24_os_packages::test_support::scan(&scan_root, &scan_cancel)
             });
             tokio::task::spawn_blocking(move || {
                 entered.recv_timeout(std::time::Duration::from_secs(30))
@@ -4159,7 +4175,8 @@ raise SystemExit(3)
         let packages = tmp.path().join("packages");
         let dir = write_integrity_marker(&packages, "remote");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        let policy = agent24_os_packages::test_support::signature_policy();
+        let scan = agent24_os_packages::test_support::scan(&packages, &shutdown);
         assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
         let mut catalogue = catalogue_from_found(scan.found);
         let bin = dir.join("bin/mod");
@@ -4168,7 +4185,7 @@ raise SystemExit(3)
         bytes.push(0);
         std::fs::write(&bin, bytes).unwrap();
 
-        let dropped = retain_rechecked(&mut catalogue, &shutdown);
+        let dropped = retain_rechecked(&mut catalogue, &shutdown, &policy);
         assert!(
             catalogue.is_empty(),
             "a tampered package stayed on the catalogue"
@@ -4233,9 +4250,10 @@ raise SystemExit(3)
         let packages = tmp.path().join("packages");
         let dir = write_integrity_marker(&packages, "remote");
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let scan = agent24_os_packages::discovery::scan(&packages, &shutdown);
+        let policy = agent24_os_packages::test_support::signature_policy();
+        let scan = agent24_os_packages::test_support::scan(&packages, &shutdown);
         let mut catalogue = catalogue_from_found(scan.found);
-        assert!(retain_rechecked(&mut catalogue, &shutdown).is_empty());
+        assert!(retain_rechecked(&mut catalogue, &shutdown, &policy).is_empty());
         let bin = dir.join("bin/mod");
         agent24_os_packages::test_support::make_writable(&bin).unwrap();
         let mut bytes = std::fs::read(&bin).unwrap();
@@ -6440,7 +6458,7 @@ raise SystemExit(3)
     fn discover_pass(
         packages: &Path,
     ) -> (Vec<Installed>, Vec<agent24_os_packages::discovery::Refused>) {
-        let scan = agent24_os_packages::discovery::scan(
+        let scan = agent24_os_packages::test_support::scan(
             packages,
             &tokio_util::sync::CancellationToken::new(),
         );

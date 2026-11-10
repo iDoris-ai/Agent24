@@ -5,6 +5,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -141,8 +144,7 @@ struct Daemon {
 }
 
 fn start(home: &Path) -> Daemon {
-    let daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let daemon = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         // These tests are about the shutdown sequence at a short budget (and, through
@@ -505,8 +507,7 @@ fn an_ephemeral_daemon_leaves_the_shutdown_evidence_alone() {
     // reads it — an ephemeral daemon must not even read it.
     std::fs::write(run.join("daemon.alive"), b"sentinel").unwrap();
     std::fs::write(run.join("last-shutdown.json"), b"old summary").unwrap();
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut daemon = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home.path())
         .args(["serve", "--port", "0", "--ephemeral"])

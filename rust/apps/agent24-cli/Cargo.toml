@@ -10,7 +10,12 @@ description = "Agent24 CLI — talks the v1 protocol to agent24d (attached via ~
 name = "agent24"
 path = "src/main.rs"
 
+[features]
+# Only for native ad-hoc package fixtures in macOS black-box tests. Never ship this feature.
+test-support = ["agent24-os-packages/test-support"]
+
 [dependencies]
+agent24-os-proc = { path = "../../crates/agent24-os-proc" }
 # `documents render --out`: the page comes as base64 in the JSON result.
 base64 = "0.22"
 # `documents render --out`: the page goes into a file of its own beside the

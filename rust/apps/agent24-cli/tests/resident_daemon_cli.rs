@@ -5,10 +5,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::{Arc, Mutex};
 
 fn tmp_home() -> tempfile::TempDir {
@@ -37,8 +40,7 @@ fn cli(home: &Path, args: &[&str]) -> Output {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("TMPDIR", home.join("tmp"))

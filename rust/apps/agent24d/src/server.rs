@@ -60,6 +60,7 @@ impl OsEnableProbe {
 
 #[derive(Clone)]
 pub struct AppState {
+    pub os_signature: agent24_os_packages::signature::Policy,
     pub token: Arc<String>,
     /// Legacy and capability authority are mutually exclusive. Tests and
     /// existing callers continue to construct legacy state through
@@ -752,6 +753,7 @@ impl AppState {
             },
         ));
         Self {
+            os_signature: os_signature_policy(),
             risk_overrides,
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
@@ -1693,6 +1695,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
         .route(
+            "/api/v1/os/trusted-teams",
+            get(crate::os_routes::trusted_teams),
+        )
+        .route(
+            "/api/v1/os/trusted-teams/{team}",
+            axum::routing::put(crate::os_routes::trust_team).delete(crate::os_routes::untrust_team),
+        )
+        .route(
             "/api/v1/os/{name}/delegation",
             post(establish_module_delegation),
         )
@@ -2310,11 +2320,14 @@ pub async fn serve(
             let packages_root = StdArc::clone(&packages_root);
             let cancel = cancel.clone();
             move || {
-                let mut pass = with_discovered(Vec::new(), packages_root.as_ref(), &cancel);
+                let policy = os_signature_policy();
+                let mut pass =
+                    with_discovered_policy(Vec::new(), packages_root.as_ref(), &cancel, &policy);
                 // Same check `mount_package` repeats before routes. Doing it
                 // here is what keeps a package that changed after scan off
-                // the tool registry.
-                let dropped = crate::domain::retain_rechecked(&mut pass.catalogue, &cancel);
+                // the tool registry. The policy is the one the scan just used.
+                let dropped =
+                    crate::domain::retain_rechecked(&mut pass.catalogue, &cancel, &policy);
                 pass.integrity_refusals.extend(dropped);
                 pass
             }
@@ -3757,6 +3770,7 @@ fn process_host(
     // new one, or fails to start — upgrading the daemon means restarting it.
     let program = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
     Ok(crate::domain::ProcessHost {
+        signature: os_signature_policy(),
         callback_dir: StdArc::new(callback_dir),
         trampoline: agent24_os_proto::launch::Trampoline {
             program,
@@ -3916,6 +3930,17 @@ pub(crate) fn module_tools_if_live(
     }
 }
 
+fn os_signature_policy() -> agent24_os_packages::signature::Policy {
+    #[cfg(test)]
+    {
+        agent24_os_packages::test_support::signature_policy()
+    }
+    #[cfg(not(test))]
+    {
+        agent24_os_packages::signature::Policy::default()
+    }
+}
+
 struct DiscoveryPass {
     catalogue: Vec<crate::domain::Installed>,
     /// Integrity refusals whose directory is a package, not the packages root.
@@ -3951,10 +3976,19 @@ fn package_dirs_for_startup(
     (rows, dirs)
 }
 
+#[cfg(test)]
 fn with_discovered(
+    catalogue: Vec<crate::domain::Installed>,
+    packages_root: &std::path::Path,
+    cancel: &CancellationToken,
+) -> DiscoveryPass {
+    with_discovered_policy(catalogue, packages_root, cancel, &os_signature_policy())
+}
+fn with_discovered_policy(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
     cancel: &CancellationToken,
+    signature: &agent24_os_packages::signature::Policy,
 ) -> DiscoveryPass {
     // FU-41. Checked HERE, at the one place packages are read, rather than at
     // startup: a check somewhere else can be true when it runs and false when
@@ -3971,7 +4005,7 @@ fn with_discovered(
             integrity_refusals: Vec::new(),
         };
     }
-    let scan = agent24_os_packages::discovery::scan(packages_root, cancel);
+    let scan = agent24_os_packages::discovery::scan_with_policy(packages_root, cancel, signature);
     let mut integrity_refusals = Vec::new();
     for dir in &scan.cancelled {
         tracing::info!(

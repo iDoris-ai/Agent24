@@ -40,6 +40,22 @@ pub fn compile_c(dir: &Path, rel: &str, source: &str) -> Result<(), String> {
         .map_err(|err| format!("spawn cc: {err}"))?;
     let _ = fs::remove_file(&source_path);
     if output.status.success() {
+        // Apple Silicon's linker signs implicitly; Intel's may not. Fixtures
+        // must be ad-hoc signed on both, since unsigned code stays refused.
+        #[cfg(target_os = "macos")]
+        {
+            let signed = Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-"])
+                .arg(&dest)
+                .output()
+                .map_err(|err| format!("sign fixture: {err}"))?;
+            if !signed.status.success() {
+                return Err(format!(
+                    "sign fixture: {}",
+                    String::from_utf8_lossy(&signed.stderr)
+                ));
+            }
+        }
         Ok(())
     } else {
         Err(format!(
@@ -232,11 +248,55 @@ fn c_quote(value: &str) -> Result<String, String> {
     Ok(out)
 }
 
+/// Explicit injection for native, ad-hoc signed test fixtures only.
+pub fn signature_policy() -> crate::signature::Policy {
+    struct Accept;
+    impl agent24_components::sign::SignatureVerifier for Accept {
+        fn team_id(
+            &self,
+            _: &std::path::Path,
+        ) -> Result<String, agent24_components::install::InstallError> {
+            Ok(agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned())
+        }
+        fn verify(
+            &self,
+            _: &std::path::Path,
+            _: &agent24_components::sign::SigningRequirement,
+        ) -> Result<(), agent24_components::install::InstallError> {
+            Ok(())
+        }
+    }
+    crate::signature::Policy {
+        verifier: std::sync::Arc::new(Accept),
+        trust_file: None,
+    }
+}
+pub fn scan(
+    root: &std::path::Path,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> crate::discovery::Scan {
+    crate::discovery::scan_with_policy(root, cancel, &signature_policy())
+}
+pub fn recheck(
+    dir: &std::path::Path,
+    expected: &str,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), crate::discovery::RecheckError> {
+    crate::discovery::recheck_with_policy(dir, expected, cancel, &signature_policy())
+}
+pub fn install(
+    src: &std::path::Path,
+    root: &std::path::Path,
+) -> Result<std::path::PathBuf, crate::install::InstallError> {
+    crate::install::install_with_policy(src, root, &signature_policy())
+}
+
 #[cfg(test)]
 mod n1_scans {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::fs;
+    use std::path::Path;
 
     fn manifest(dir: &Path, command: &str) {
         fs::create_dir_all(dir).unwrap();

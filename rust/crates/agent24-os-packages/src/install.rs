@@ -111,6 +111,13 @@ fn read_manifest(src: &Path) -> Result<DomainOsManifest, InstallError> {
 /// a test passing here says nothing about their disk. Hence `same_device` is
 /// checked at runtime, not merely covered by a test.
 pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError> {
+    install_with_policy(src, packages_root, &crate::signature::Policy::default())
+}
+pub fn install_with_policy(
+    src: &Path,
+    packages_root: &Path,
+    policy: &crate::signature::Policy,
+) -> Result<PathBuf, InstallError> {
     let manifest = read_manifest(src)?;
 
     let dest = packages_root.join(manifest.name());
@@ -187,6 +194,29 @@ pub fn install(src: &Path, packages_root: &Path) -> Result<PathBuf, InstallError
         remove_quietly(&staging);
         undo_root();
     })?;
+
+    // Offline check, the same one discovery runs (`AtRest`: Developer ID, a
+    // trusted Team ID, Hardened Runtime). Not `Install`: that also asks
+    // Gatekeeper online about notarization, so an offline machine could not
+    // install at all, and a just-notarized bare binary can read as
+    // unnotarized until its ticket propagates — and the desktop's documents
+    // upgrade uninstalls the old package before this runs. Notarization of a
+    // downloaded package is Gatekeeper's own first-run check (jason 11-10).
+    let verified = read_manifest(&staging).and_then(|copied| {
+        crate::package_integrity::verify_with_policy(
+            &staging,
+            &copied,
+            &tokio_util::sync::CancellationToken::new(),
+            policy,
+            agent24_components::sign::VerifyMode::AtRest,
+        )
+        .map_err(|error| InstallError::Source(error.to_string()))
+    });
+    if let Err(error) = verified {
+        remove_quietly(&staging);
+        undo_root();
+        return Err(error);
+    }
 
     // NOTE, so nobody mistakes where the guarantee comes from: today's atomicity
     // comes from staging being CONSTRUCTED inside the destination's parent, not
@@ -457,6 +487,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::test_support::install;
     use std::collections::BTreeSet;
 
     /// An installed package is writable by its owner only, whatever the source
@@ -551,9 +582,11 @@ mod tests {
         let src = src_pkg(t.path(), "src", "shared");
         std::fs::create_dir_all(src.join("lib")).unwrap();
         std::fs::write(src.join("lib/code.js"), "// code\n").unwrap();
+        crate::test_support::seal(&src, &["bin/shared"]).unwrap();
+        // Keep the sealed owner-read bit; inject only the write bits the copier strips.
         std::fs::set_permissions(
             src.join("lib/code.js"),
-            std::fs::Permissions::from_mode(0o666),
+            std::fs::Permissions::from_mode(0o422),
         )
         .unwrap();
         std::fs::set_permissions(src.join("lib"), std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -570,8 +603,7 @@ mod tests {
                 pending.extend(std::fs::read_dir(&p).unwrap().map(|e| e.unwrap().path()));
             }
         }
-        // The walk saw the sealed tree plus the extra file this test adds after
-        // seal: the package dir, domain-os.yml, files.json, bin/, the native stub,
+        // The walk saw the complete sealed tree: the package dir, domain-os.yml, files.json, bin/, the native stub,
         // lib/, and lib/code.js.
         assert_eq!(seen, 7);
     }
@@ -852,10 +884,12 @@ mod tests {
 
         let big = src_pkg(t.path(), "big", "beta");
         std::fs::create_dir_all(big.join("many")).unwrap();
-        const FILES: usize = 4000;
+        // Include every file in integrity while staying below the 64 KiB YAML limit.
+        const FILES: usize = 3000;
         for i in 0..FILES {
             std::fs::write(big.join("many").join(format!("f{i}")), b"x").unwrap();
         }
+        crate::test_support::seal(&big, &["bin/beta"]).unwrap();
         let small = src_pkg(t.path(), "small", "alpha");
 
         let (p1, p2) = (pkgs.clone(), pkgs.clone());

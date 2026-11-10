@@ -332,6 +332,47 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/os/trusted-teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List trusted Developer ID teams */
+        get: operations["listTrustedTeams"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/trusted-teams/{team}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Trust a Developer ID team
+         * @description Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+         */
+        put: operations["trustTeam"];
+        post?: never;
+        /**
+         * Remove trust for a Developer ID team
+         * @description Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+         */
+        delete: operations["untrustTeam"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/os/{name}": {
         parameters: {
             query?: never;
@@ -2276,6 +2317,19 @@ export interface components {
             /** @description Open enum: ok | missing | unknown | not_checked. */
             resources: string;
             restart_required: boolean;
+        };
+        TrustTeamError: {
+            /** @enum {string} */
+            code: "trust_store_unavailable" | "trust_team_failed";
+            message: string;
+            /** @constant */
+            retryable: false;
+        };
+        TrustedTeams: {
+            teams: {
+                team_id: string;
+                builtin: boolean;
+            }[];
         };
         DomainOsList: {
             modules: components["schemas"]["DomainOsView"][];
@@ -4747,6 +4801,121 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listTrustedTeams: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current trusted teams, including the built-in team */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedTeams"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Trust store unavailable or trust operation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+        };
+    };
+    trustTeam: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current trusted teams, including the built-in team */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedTeams"];
+                };
+            };
+            /** @description Invalid team, built-in team removal, or trust store update failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Trust store unavailable or trust operation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+        };
+    };
+    untrustTeam: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current trusted teams, including the built-in team */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedTeams"];
+                };
+            };
+            /** @description Invalid team, built-in team removal, or trust store update failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Trust store unavailable or trust operation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
                 };
             };
         };
