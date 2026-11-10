@@ -6,33 +6,83 @@
 //! understand any module's payload schema — that stays true here. This file
 //! doesn't sit in the RPC path at all; it's a passive OBSERVER on the same
 //! WS broadcast bus every connected client already receives
-//! (`crate::events::EventsHub`), recognizing exactly ONE shape — AgentEar's
-//! own `agentear.event/1` `turn` event, on `phase: idle|failed`, carrying a
-//! `timings` object of per-step millisecond durations — and turning it into
-//! `model_call_timings` rows, one per present `*_ms` field. This is a
-//! narrow, explicitly-documented exception (same posture as the `module`
-//! wire type's own "one declared exemption" in `agent24-protocol/events.rs`),
-//! not a precedent for the kernel understanding module payloads generally.
+//! ([`AgentEarEventBus`], implemented by the daemon's event hub), recognizing
+//! exactly ONE shape — AgentEar's own `agentear.event/1` `turn` event, on
+//! `phase: idle|failed`, carrying a `timings` object of per-step millisecond
+//! durations — and turning it into `model_call_timings` rows, one per present
+//! `*_ms` field. This is a narrow, explicitly-documented exception (same
+//! posture as the `module` wire type's own "one declared exemption" in
+//! `agent24-protocol/events.rs`), not a precedent for the kernel understanding
+//! module payloads generally.
 //!
 //! Never reads or stores transcript/prompt/reply text: only numbers, the
 //! closed set of field names below, `session_id`/`seq` (opaque correlation
 //! ids, not content), and `model`/`tier`/`llm_via`.
 //!
 //! Review M2: this bridge no longer writes `agent24-store` directly. It
-//! builds [`crate::timing_recorder::TimingObservation`]s (the SAME type
-//! `model_callback.rs`/`routes.rs` build) and hands them to the SAME
+//! builds [`TimingObservation`]s (the SAME type `model_callback.rs`/`routes.rs`
+//! build, re-exported from the timing recorder) and hands them to the SAME
 //! `Arc<dyn TimingSink>` writer — one channel, one writer task, so every
 //! `model_call_timings` write is serialized through it, the retention prune
 //! counter counts AgentEar's rows too, and this file has no `Store`/SQL
 //! dependency of its own any more.
 
+use std::sync::Arc;
+
 use agent24_protocol::EventBody;
 use serde_json::{Map, Value};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
-use crate::events::EventsHub;
-use crate::model_callback::MODEL_MAX_MODEL_ID_BYTES;
-use crate::timing_recorder::{TimingObservation, TimingSink};
+/// v3 N4: a provider-reported model id longer than this is dropped (`None`),
+/// not truncated — a truncated id would name a model that does not exist.
+/// Also the ceiling on AgentEar's reported `model` / `llm_via` / `session_id`.
+/// `model_callback` re-exports this; one definition.
+pub const MODEL_MAX_MODEL_ID_BYTES: usize = 256;
+
+/// One completed model call's timing facts — content-free BY CONSTRUCTION:
+/// there is no field here a prompt, a reply, or a transcript could end up
+/// in (mirrors `agent24_protocol::ModelCallPayload`'s same guarantee for the
+/// WS event this shares its call sites with).
+///
+/// Defined here so the attach-side bridge and the timing recorder share one
+/// type. The recorder re-exports it.
+#[derive(Debug, Clone, Default)]
+pub struct TimingObservation {
+    /// `"chat"` (`/api/v1/chat`) or `"module:<name>"` (`_a24/model/complete`).
+    pub source: String,
+    pub model_id: Option<String>,
+    /// `"local"` | `"remote"`, or `None` when no provider ever answered.
+    pub tier: Option<String>,
+    pub served_by: Option<String>,
+    pub ok: bool,
+    pub error_kind: Option<String>,
+    /// A module's own finer-grained sub-step (AgentEar's asr/tts/…), when it
+    /// reports one — set by this module, `None` from every other call site.
+    pub step: Option<String>,
+    /// AgentEar's own per-turn correlation ids (opaque identifiers, never
+    /// content) — set by this module only; every other call site leaves both
+    /// `None` (neither `_a24/model/complete` nor `/api/v1/chat` is turn-scoped).
+    pub session_id: Option<String>,
+    pub seq: Option<u64>,
+    pub first_token_ms: Option<u64>,
+    pub total_ms: u64,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+}
+
+/// Where a completed call's timing goes. Synchronous and non-blocking by
+/// contract, same as `model_callback.rs`'s `UsageSink` — it may be called
+/// from a context that must never await. The timing recorder re-exports this.
+pub trait TimingSink: Send + Sync {
+    fn record(&self, obs: TimingObservation);
+}
+
+/// The slice of the daemon event hub this bridge needs: subscribe, before
+/// the task is spawned, to the same `(timestamp, body)` bus clients receive.
+pub trait AgentEarEventBus: Send + Sync {
+    fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)>;
+}
 
 pub const AGENTEAR_MODULE: &str = "agentear";
 const AGENTEAR_EVENT_KIND: &str = "agentear.event";
@@ -157,8 +207,8 @@ pub fn extract_agentear_timing_rows(
 /// too. Best-effort, same posture as `timing_recorder.rs`: a lagged/closed
 /// bus just ends this task quietly.
 pub fn spawn_agentear_timing_bridge(
-    events: EventsHub,
-    timings: std::sync::Arc<dyn TimingSink>,
+    events: &impl AgentEarEventBus,
+    timings: Arc<dyn TimingSink>,
 ) -> JoinHandle<()> {
     // Subscribed HERE, synchronously, before this function returns — not
     // inside the spawned task. `tokio::spawn` only SCHEDULES the task; if
@@ -188,6 +238,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::events::EventsHub;
     use crate::timing_recorder::MemoryTimingSink;
     use serde_json::json;
     use std::sync::Arc;
@@ -383,8 +434,7 @@ mod tests {
     async fn the_bridge_records_through_the_shared_timing_sink_for_a_broadcast_idle_turn_event() {
         let sink = Arc::new(MemoryTimingSink::default());
         let hub = EventsHub::default();
-        let _handle =
-            spawn_agentear_timing_bridge(hub.clone(), sink.clone() as Arc<dyn TimingSink>);
+        let _handle = spawn_agentear_timing_bridge(&hub, sink.clone() as Arc<dyn TimingSink>);
 
         hub.broadcast(EventBody::Module(agent24_protocol::ModuleEventPayload {
             module: AGENTEAR_MODULE.to_owned(),

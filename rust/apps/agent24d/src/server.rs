@@ -690,7 +690,7 @@ impl AppState {
         // `_a24/model/complete`/`/api/v1/chat` — see `agentear_timings.rs`'s
         // doc comment for why this is NOT wired through the RPC path.
         let _agentear_timing_bridge_handle =
-            crate::agentear_timings::spawn_agentear_timing_bridge(events.clone(), timings.clone());
+            crate::agentear_timings::spawn_agentear_timing_bridge(&events, timings.clone());
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
         let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")
@@ -741,15 +741,17 @@ impl AppState {
             crate::module_approval_broker::ModuleApprovalBroker::new(store.clone(), events.clone());
         let attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
             crate::attach_registry::AttachDeps {
-                scheduler: scheduler.clone(),
                 // No `ModelCallbackDeps` exists yet at this point (it needs
                 // the `UsageRecorder` `serve` spawns later) — `serve` builds
                 // the real registry once that exists and replaces this one,
                 // hydrated from `attached.json` (see this field's own doc on
                 // `AppState`).
-                models: None,
-                approval_broker: module_approval_broker.clone(),
-                events: events.clone(),
+                grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
+                    scheduler: scheduler.clone(),
+                    models: None,
+                    approval_broker: module_approval_broker.clone(),
+                    events: events.clone(),
+                }),
             },
         ));
         Self {

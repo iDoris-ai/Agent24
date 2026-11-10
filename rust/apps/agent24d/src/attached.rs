@@ -4,7 +4,7 @@
 //! `agent24_domain::DomainOsManifest` validation in A3-2b, §10).
 //!
 //! **This is the STORAGE layer.** It persists what the REST endpoints in
-//! [`crate::attached_routes`] add/rotate/revoke: the manifest text, its
+//! `attached_routes` add/rotate/revoke: the manifest text, its
 //! digest, and the sha256 of the handshake token — never the plaintext
 //! (§3.3, judgement C1). The listening socket, the handshake, and the live
 //! `Generation`/`AttachSlot` bookkeeping live in [`crate::attach_registry`]
@@ -54,16 +54,117 @@ impl Facts {
     }
 }
 
+/// Names a module may not take, because the kernel already serves
+/// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
+///
+/// ```text
+/// Overlapping method route. Handler for `GET /api/v1/health` already exists
+/// ```
+///
+/// A module called `health` with a route at `/` would therefore kill the daemon
+/// AT STARTUP — a third-party domain OS could brick the process by choosing a
+/// name. Refusing it here turns that into one refused module and a running
+/// daemon. (A FALLBACK-ONLY nested router does not shadow kernel routes —
+/// verified: a degraded module named `runs` leaves `/api/v1/runs/{id}` answering
+/// from the kernel. A module with an explicit STATIC route can still outrank a
+/// dynamic kernel one, e.g. `/api/v1/runs/foo` over `/api/v1/runs/{id}`; the
+/// reservation below is what prevents that, not axum's precedence rules.)
+///
+/// This list must track `server::build_router_with_modules`, and
+/// `reserved_segments_match_the_kernel_routes_exactly` fails if it drifts EITHER
+/// way — a missing entry reappears as a startup panic, a stale one silently
+/// refuses a legitimate module. That test scans literal `/api/v1/<segment>`
+/// strings in that function's source, so it catches how routes are written here
+/// today; it is a heuristic, not a proof (see its own doc for what it cannot
+/// see).
+///
+/// The structural alternative is to namespace domain OSes under `/api/v1/os/<name>`,
+/// which makes the collision unrepresentable rather than checked. That is the
+/// better shape, but the namespace is fixed by ADR-029 / SPEC-MD-ME §2, so it is
+/// raised there rather than changed here.
+///
+/// Single definition. Mount admission calls [`is_reserved_kernel_segment`];
+/// `domain`'s route-equality test imports this slice directly.
+pub(crate) const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
+    "idoris",
+    // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module
+    // registry lives at `/api/v1/attached`, so no domain OS may be named
+    // `attached` — same reservation mechanism as every other kernel segment
+    // below, and `reserved_segments_match_the_kernel_routes_exactly` pins it
+    // against `server::build_router_with_modules` the same way.
+    "attached",
+    "approvals",
+    "capabilities",
+    "chat",
+    // COMM-2a: `/api/v1/comm/*` (`comm_routes::build`) is kernel code,
+    // merged into `module_routes` by `server::serve` itself rather than
+    // registered as a literal route inside `build_router_with_modules` — so
+    // it does NOT show up in `reserved_segments_match_the_kernel_routes_exactly`'s
+    // scan of that function's source, and that test's `EXTRA_RESERVED` list
+    // (below) carries it instead. Reserved here regardless, so a domain-OS
+    // package cannot claim `name: comm` and collide with (or, depending on
+    // merge order, shadow) the real mount.
+    "comm",
+    // ADR-038 C3: `/api/v1/components` (status of every component) and its report route.
+    "components",
+    // D0-3 (`docs/agent/PLAN-DECIDE.md` §1.1): `/api/v1/decide/profile` is
+    // kernel code. A domain OS named `decide` would collide with it.
+    "decide",
+    "events",
+    "health",
+    // KB-HOST-01: `/api/v1/host/knowledge/*`, the desktop host's private interface.
+    "host",
+    // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
+    // `/api/v1/memory/settings` — the personal-memory REST surface.
+    "memory",
+    // T7b/ME-3e: `/api/v1/module-approvals`.
+    "module-approvals",
+    // K1-6a.4: `/api/v1/module-consents` management endpoints.
+    "module-consents",
+    "models",
+    // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
+    // — and the set-equality test below is what forced this entry the moment the
+    // route was added, rather than leaving it to be discovered by whoever shipped
+    // that module.
+    "os",
+    // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
+    "peer",
+    // CORE-2 AgentEar S3: `/api/v1/presence/challenges/*`, the desktop confirmation channel.
+    "presence",
+    "runs",
+    "schedules",
+    "sessions",
+    "shutdown",
+    "standing-grants",
+    // ME4-desktop-model-ui: `/api/v1/timings` + `/api/v1/timings/summary`.
+    "timings",
+    "tool-overrides",
+    "tools",
+    "usage",
+];
+
+/// Whether `name` is a kernel route segment no module (mounted OR attached,
+/// A3-2a) may claim. `domain` re-exports this for the mount pass.
+pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
+    RESERVED_KERNEL_SEGMENTS.contains(&name)
+}
+
+/// The ids of the components this daemon lists itself. No attached module may
+/// take one: [`register`] refuses them for new registrations, and
+/// `component_routes::attach_items` drops same-named entries from registrations
+/// that predate the rule. Pinned by `a_builtin_component_id_cannot_be_attached`.
+/// Single definition — `component_routes` re-exports it.
+pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
+    &["idoris", "hyphae", "documents", "knowledge", "open-design"];
+
 /// Parse and validate a submitted `domain-os.yml` as an ATTACHED manifest
 /// (§3.1): full `agent24_domain::DomainOsManifest` validation (A3-1 added
 /// `ImplKind::AttachedProcess`/`host_commands` to that type), plus the two
 /// checks specific to this endpoint that the domain crate cannot make on its
 /// own — `impl_kind` must actually be `attached_process` (a well-formed
 /// manifest for a DIFFERENT impl_kind is not a valid registration here), and
-/// the name must not be a reserved kernel route segment (§3.2 M7; the domain
-/// crate's own `RESERVED_KERNEL_SEGMENTS` equivalent lives in `crate::domain`
-/// and is exposed via `is_reserved_kernel_segment` for exactly this call
-/// site, which has no manifest-mount pass of its own to run it inside).
+/// the name must not be a reserved kernel route segment (§3.2 M7;
+/// [`is_reserved_kernel_segment`]).
 fn parse_manifest(yaml: &str) -> Result<agent24_domain::DomainOsManifest, String> {
     let manifest = agent24_domain::DomainOsManifest::from_yaml(yaml).map_err(|e| e.to_string())?;
     if manifest.impl_kind() != agent24_domain::ImplKind::AttachedProcess {
@@ -72,7 +173,7 @@ fn parse_manifest(yaml: &str) -> Result<agent24_domain::DomainOsManifest, String
             manifest.impl_kind()
         ));
     }
-    if crate::domain::is_reserved_kernel_segment(manifest.name()) {
+    if is_reserved_kernel_segment(manifest.name()) {
         return Err(format!(
             "module name {:?} is reserved for the kernel's own routes",
             manifest.name()
@@ -560,7 +661,7 @@ pub fn register(
     // A NEW registration may not take a built-in component's id. Deliberately not in
     // `parse_manifest`, which also reads records already on disk: a same-named record from
     // before this rule must still parse so it can be revoked (`/api/v1/components` hides it).
-    if crate::component_routes::BUILTIN_COMPONENT_IDS.contains(&manifest.name()) {
+    if BUILTIN_COMPONENT_IDS.contains(&manifest.name()) {
         return Err(RegisterError::InvalidManifest(format!(
             "module name {:?} is the id of a built-in component",
             manifest.name()
@@ -806,7 +907,7 @@ pub fn load_all(path: &Path) -> Result<Vec<(String, StoredEntry)>, String> {
 ///
 /// `attach_status`/`generation` are always the disk-only default
 /// (`"detached"`/`None`) here — this function knows nothing about a live
-/// registry. [`crate::attached_routes::list_attached_at`] overlays the real
+/// registry. `attached_routes::list_attached_at` overlays the real
 /// values from [`crate::attach_registry::AttachRegistry::status_of`] before
 /// this is ever sent to a client.
 pub fn list(path: &Path) -> Result<Vec<AttachedView>, String> {
@@ -1104,10 +1205,10 @@ mod tests {
         // The list is pinned here so adding a component to `/api/v1/components` is a
         // deliberate edit of both.
         assert_eq!(
-            crate::component_routes::BUILTIN_COMPONENT_IDS,
+            BUILTIN_COMPONENT_IDS,
             ["idoris", "hyphae", "documents", "knowledge", "open-design"]
         );
-        for name in crate::component_routes::BUILTIN_COMPONENT_IDS {
+        for name in BUILTIN_COMPONENT_IDS {
             let dir = tmp();
             let path = dir.join("attached.json");
             let err =

@@ -1642,7 +1642,7 @@ fn c9_shutdown_with_an_inflight_model_call_lands_a_cancelled_usage_row() {
 
     // The cancelled call landed in the store BEFORE the process exited
     // (`stop_usage_writer` awaited, same J19 property A1 already proves —
-    // `AttachDeps.models` is the SAME `ModelCallbackDeps` clone, so the same
+    // the grant builder's `models` is the SAME `ModelCallbackDeps` clone, so the same
     // ordering guarantee applies here).
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

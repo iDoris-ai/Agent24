@@ -31,7 +31,7 @@ use std::collections::hash_map::Entry as MapEntry;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink, Grants};
+use agent24_domain::DomainOsManifest;
 use agent24_os_proto::attach::AttachSlot;
 use agent24_os_proto::attach_mux::{KernelCalls, MAX_KERNEL_CALLS_IN_FLIGHT};
 use agent24_os_proto::drain::{DrainState, Generation};
@@ -141,36 +141,29 @@ struct LiveCalls {
     in_flight: Arc<AtomicUsize>,
 }
 
-/// A3 P2 (design §1 "本期只用 `events`、`models`"): the only two capabilities
-/// an attached module may be granted. Deliberately narrower than
-/// `crate::domain::KERNEL_OOP_GRANTS` — `memory`/`scheduler`/`approval` have
-/// no attach-side story yet (no partition-allocation pass runs for an
-/// attached module, and `host_commands` — A3's own reverse channel — is not
-/// one of `agent24_domain::Capability`'s variants), so granting them here
-/// would be scope no judgement or design section asks for. A manifest MAY
-/// still declare them (`kernel_capabilities` is an open list at the manifest
-/// layer); `Grants::granting`'s intersection with this list is what refuses
-/// them, the same "asking gains nothing" rule every other grant list in this
-/// daemon already documents.
-const ATTACH_OOP_GRANTS: &[Capability] = &[Capability::Events, Capability::Models];
+/// What one manifest admission builds: the handshake `provides` list and the
+/// `MethodsFor` reused across reconnects that keep the same digest.
+pub struct AttachGrant {
+    pub provides: Vec<String>,
+    pub methods_for: MethodsFor,
+}
 
-/// Daemon-level handles an attach registration needs to build a module's
-/// `Methods`/`ModelGrant`/`EventSink` — a small, `Clone`-friendly MIRROR of
-/// `crate::domain::CallbackDeps`, which is deliberately NOT `Clone` (see its
-/// own doc comment: `mount_all` relies on being the only place that struct is
-/// ever dropped). This is what design §5.5 (M2) calls "AppState 持有
-/// AttachRegistry（含 CallbackDeps 克隆）" — the clone lives here, one level
-/// down, rather than on `AppState` directly.
-#[derive(Clone)]
+/// Builds an admission's grant. The registry stores one `Arc` of this and
+/// drops it in `revoke_all`; the implementor owns the daemon handles
+/// (scheduler, model deps, approval broker, event hub) so that drop is what
+/// releases them.
+pub trait AttachGrantBuilder: Send + Sync {
+    fn build(&self, name: &str, manifest: &DomainOsManifest) -> AttachGrant;
+}
+
+/// The grant builder for this registry. Design §5.5 (M2) calls this "AppState
+/// 持有 AttachRegistry（含 CallbackDeps 克隆）" — the handles live inside the
+/// builder, one level down, rather than on `AppState` directly.
+///
+/// Not `Clone`: this is the registry's only owner of those handles, and
+/// `revoke_all` releases them by dropping it.
 pub struct AttachDeps {
-    pub scheduler: Arc<agent24_scheduler::Scheduler>,
-    /// `None` when this daemon has no model deps to hand out — same meaning,
-    /// same reason, as `CallbackDeps.models` (design §2.4/§10.1): an attach
-    /// registration requesting `models` while this is `None` gets no grant,
-    /// same outcome as not holding the capability.
-    pub models: Option<crate::model_callback::ModelCallbackDeps>,
-    pub approval_broker: Arc<crate::module_approval_broker::ModuleApprovalBroker>,
-    pub events: crate::events::EventsHub,
+    pub grants: Arc<dyn AttachGrantBuilder>,
 }
 
 /// Everything built once per manifest ADMISSION (a first-time registration,
@@ -178,53 +171,21 @@ pub struct AttachDeps {
 /// every reconnect that keeps the same digest (a token-only rotation, or a
 /// plain reconnect after a dropped connection): the `Offer` a handshake
 /// answers with, and the `MethodsFor` closure that turns a fresh
-/// `Generation` into that generation's `Methods` — the same `MethodsFor`
-/// shape `crate::domain::build_methods_for` already gives a mounted
-/// package's supervisor, called here once per commit instead of once per
-/// process restart.
+/// `Generation` into that generation's `Methods`. The closure is the same
+/// shape a mounted package's supervisor gets, called here once per commit
+/// instead of once per process restart.
 struct Grant {
     offer: Offer,
     methods_for: MethodsFor,
 }
 
 fn build_grant(name: &str, manifest: &DomainOsManifest, deps: &AttachDeps) -> Grant {
-    let granted = Grants::granting(manifest.kernel_capabilities(), ATTACH_OOP_GRANTS);
-    let broadcast: Arc<dyn EventBroadcast> =
-        Arc::new(crate::domain::HubBroadcast(deps.events.clone()));
-    let event_sink = granted
-        .has(Capability::Events)
-        .then(|| Arc::new(EventSink::new(manifest, broadcast)));
-    // §4.3 C2's positive control: `_a24/model/` is listed in `provides` only
-    // when `model_grant` actually built (deps present AND the capability was
-    // granted) — never merely because the manifest asked for `models`.
-    let model_grant = crate::model_callback::model_grant(
-        name,
-        manifest.model_access(),
-        &granted,
-        deps.models.as_ref(),
-    );
-    let mut provides = Vec::new();
-    if granted.has(Capability::Events) {
-        provides.push("_a24/events/".to_owned());
-    }
-    if model_grant.is_some() {
-        provides.push("_a24/model/".to_owned());
-    }
-    let methods_for = crate::domain::build_methods_for(
-        name.to_owned(),
-        granted,
-        event_sink,
-        deps.approval_broker.clone(),
-        // A3 P2 has no memory story (see `ATTACH_OOP_GRANTS`'s doc) — every
-        // attached module gets `MemoryEntitlement::NONE`, same as a mounted
-        // package that was never granted `Memory` or whose lend failed.
-        crate::os_memory::MemoryEntitlement::NONE,
-        deps.scheduler.clone(),
-        model_grant,
-    );
+    let built = deps.grants.build(name, manifest);
     Grant {
-        offer: Offer { provides },
-        methods_for,
+        offer: Offer {
+            provides: built.provides,
+        },
+        methods_for: built.methods_for,
     }
 }
 
@@ -296,7 +257,7 @@ struct Entry {
 /// long as the `Arc<AttachRegistry>` itself does — i.e. until the whole
 /// process exits, since `AppState`/the router keep a clone. That meant an
 /// `AttachRegistry` with ZERO attached modules still held a live
-/// `ModelCallbackDeps` (via `deps.models`) for the rest of the process's
+/// `ModelCallbackDeps` (inside the grant builder) for the rest of the process's
 /// life, and `stop_usage_writer` waits for every clone of that struct's
 /// `usage` sender to drop before it will finish — so every shutdown, even
 /// with nothing ever attached, blocked on the writer's hard-stop deadline
@@ -689,7 +650,7 @@ impl AttachRegistry {
     /// §5.5 (M2), called from the `stopping` task BEFORE `stop_usage_writer`:
     /// revoke every live generation (in-flight `model/complete` calls are
     /// cancelled by the same `modules_cut_off` cancellation tree a mounted
-    /// package's calls are, since `AttachDeps.models` is the SAME
+    /// package's calls are, since the grant builder's `models` is the SAME
     /// `ModelCallbackDeps` clone), DROP every entry outright — not merely
     /// revoke its slot, since an entry's `grant` carries its OWN
     /// `ModelCallbackDeps` clone via `ModelGrant` — and (review M1) take the
@@ -927,7 +888,7 @@ mod tests {
 
     /// A `RunTrigger` that never fires — this test module never advances a
     /// schedule, it only needs a `Scheduler` to exist so `AttachDeps` can be
-    /// built without wiring a real one. Same shape as `crate::domain::tests::NoopTrigger`.
+    /// built without wiring a real one. Same shape as `domain::tests::NoopTrigger`.
     struct NoopTrigger;
 
     #[async_trait::async_trait]
@@ -944,18 +905,21 @@ mod tests {
 
     async fn deps() -> AttachDeps {
         let store = agent24_store::Store::open_memory().await.unwrap();
+        let events = crate::events::EventsHub::default();
         AttachDeps {
-            scheduler: agent24_scheduler::Scheduler::new(
-                store.clone(),
-                Arc::new(NoopTrigger),
-                Arc::new(|_| {}),
-            ),
-            models: None,
-            approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
-                store,
-                crate::events::EventsHub::default(),
-            ),
-            events: crate::events::EventsHub::default(),
+            grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
+                scheduler: agent24_scheduler::Scheduler::new(
+                    store.clone(),
+                    Arc::new(NoopTrigger),
+                    Arc::new(|_| {}),
+                ),
+                models: None,
+                approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
+                    store,
+                    events.clone(),
+                ),
+                events,
+            }),
         }
     }
 

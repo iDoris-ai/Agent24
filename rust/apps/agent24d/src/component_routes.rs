@@ -37,11 +37,8 @@ mod documents_catalog;
 /// silent desktop (crashed, quit) reads as "not reporting" rather than as a stale `ready`.
 /// There is no connection to watch: the report is a plain HTTP POST.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
-/// The ids of the components this daemon lists itself. No attached module may take one:
-/// `attached::register` refuses them for new registrations, and [`attach_items`] drops same-named entries
-/// from registrations that predate the rule. Pinned by a test.
-pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
-    &["idoris", "hyphae", "documents", "knowledge", "open-design"];
+/// Single definition is [`crate::attached::BUILTIN_COMPONENT_IDS`].
+pub(crate) use crate::attached::BUILTIN_COMPONENT_IDS;
 /// Components whose state the desktop owns. Anything else is the daemon's to say.
 const DESKTOP_OWNED: &[&str] = &["open-design"];
 

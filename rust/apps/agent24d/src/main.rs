@@ -10,6 +10,7 @@ mod agentear_timings;
 mod approval_callback;
 mod approvals;
 mod attach_commands;
+mod attach_grant;
 mod attach_listener;
 mod attach_registry;
 mod attached;
