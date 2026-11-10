@@ -1,7 +1,7 @@
 // M5 B4c2: the Settings switch (resident-service.ts setResident) and the
 // tray's message for a failed 「完全退出」 (stopFailureKey).
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { installService, residentOps, serviceInstallDeps, setResident, stopFailureKey, type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem, type StopOutcome } from './resident-service'
+import { installedAndEnrolled, installService, residentOps, serviceInstallDeps, setResident, stopFailureKey, type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem, type StopOutcome } from './resident-service'
 import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
 afterEach(() => { resetMainLocaleForTest() })
@@ -193,5 +193,28 @@ describe('residentOps: the install and the stop one at a time (PR-Daemon #1783 N
     await expect(a).rejects.toThrow('boom')
     expect(await b).toBe(stopped)
     expect(await op('install', async () => installed)).toBe(installed)
+  })
+})
+
+describe('installedAndEnrolled (Codex B4c3 C2)', () => {
+  it('an install is done once this app is enrolled with the new service daemon', async () => {
+    let enrolled = false
+    let done = false
+    const run = installedAndEnrolled(async () => ({ ok: true }), () => enrolled, 5_000).then((o) => { done = true; return o })
+    await new Promise((r) => setTimeout(r, 300))
+    expect(done).toBe(false)
+    enrolled = true
+    expect(await run).toEqual({ ok: true })
+  })
+
+  it('not enrolled in time: done anyway, as installed', async () => {
+    expect(await installedAndEnrolled(async () => ({ ok: true }), () => false, 50)).toEqual({ ok: true })
+  })
+
+  it('a failed install is not waited on', async () => {
+    const enrolled = vi.fn(() => false)
+    const failed: InstallOutcome = { ok: false, stage: 'install', code: 'ENOENT' }
+    expect(await installedAndEnrolled(async () => failed, enrolled, 60_000)).toBe(failed)
+    expect(enrolled).not.toHaveBeenCalled()
   })
 })

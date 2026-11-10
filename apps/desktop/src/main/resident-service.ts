@@ -626,3 +626,14 @@ export function residentOps(): <K extends keyof ResidentOutcomes>(op: K, work: (
     return run
   }
 }
+
+/** M5 B4c3 (Codex C2): an install is done once this app is enrolled with the
+ * new service daemon (at the next tick, ≤ 5 s after the hold), so that a stop
+ * right after it (queued, or the switch turned off again) has the presence
+ * box to ask instead of `not_connected`. Not enrolled within `ms` (refused,
+ * slow), it is done anyway: the service is installed and running. */
+export async function installedAndEnrolled(install: () => Promise<InstallOutcome>, enrolled: () => boolean, ms: number): Promise<InstallOutcome> {
+  const outcome = await install()
+  if (outcome.ok) await until(enrolled, ms)
+  return outcome
+}

@@ -12,7 +12,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -764,14 +764,14 @@ app.whenReady().then(async () => {
 const residentOp = residentOps()
 
 function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutcome> {
-  return residentOp('install', () => installService(serviceInstallDeps({
+  return residentOp('install', () => installedAndEnrolled(() => installService(serviceInstallDeps({
     cli: resolveBundledRustBinary('agent24', app.isPackaged),
     daemonBin: resolveRustBinary(app.isPackaged),
     ready: documentsReady,
     hold: (work) => backendManager.whileStopped(work),
     spawned: (pid) => backendManager.spawned(pid),
     installed: launchAgentPlistExists,
-  })))
+  })), () => backendManager.presenceTarget() !== null, 10_000))
 }
 
 function residentStop(): Promise<StopOutcome> {
