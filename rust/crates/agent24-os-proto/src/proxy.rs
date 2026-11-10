@@ -6,7 +6,7 @@
 //! namespace to it.
 //!
 //! **Forwarding is not proxying.** The kernel authenticates with
-//! `Authorization: Bearer` (`agent24d::server::auth`). A verbatim forward hands
+//! `Authorization: Bearer` (`agent24d::capabilities::middleware::auth`). A verbatim forward hands
 //! that bearer to the module, which can then call every kernel API rather than
 //! only its own namespace — the exact opposite of "a module never sees kernel
 //! credentials". So both directions are filtered, and this module is that filter.
@@ -32,8 +32,8 @@
 //!   ([`strips_from_request`]). Nothing makes that automatic. **So a
 //!   kernel-private header MUST be named `X-A24-*`** — that convention, and not
 //!   this code, is what keeps a header added next year from reaching modules.
-//!   Written here because the person adding it will be reading `server.rs`, not
-//!   this file.
+//!   Written here because the person adding it will be reading
+//!   `rust/apps/agent24d/src/capabilities/middleware.rs`, not this file.
 //!
 //! # Not in this slice
 //!

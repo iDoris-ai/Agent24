@@ -565,58 +565,95 @@ mod tests {
     /// AFTER `mount_all` returns (design §4.6/§3.2, S1-6) — a structural
     /// scan of `server.rs`'s own source, the same heuristic-but-forcing style
     /// `domain.rs`'s `reserved_segments_match_the_kernel_routes_exactly`
-    /// already uses. Mutation: swap the two blocks in `server.rs` — this
+    /// already uses. Mutation: swap the two step calls in `serve` — this
     /// assertion goes red.
+    ///
+    /// S2-1: `mount_all_with_refusals` lives in `mount_domain_os` and the two
+    /// `.run(` spawns live in `arm_scheduler_after_mount`. `serve` must call
+    /// mount first. Across `serve()` and all of `serve_steps.rs` (comments
+    /// stripped) there are still exactly two `.run(` calls, both in that arm
+    /// function.
     #[test]
     fn the_tick_loop_and_delivery_pump_are_spawned_after_mount_all() {
-        let src = include_str!("server.rs");
-        let mount_at = src
-            .find("crate::domain::mount_all_with_refusals(")
-            .expect("the mount_all call must exist in server.rs");
-        let tick_at = src
-            .find("tick_scheduler.run(")
-            .expect("the tick loop spawn must exist in server.rs");
-        let pump_at = src
-            .find("DeliveryPump::new(")
-            .expect("the delivery pump spawn must exist in server.rs");
-        assert!(
-            tick_at > mount_at,
-            "the scheduler tick loop must be spawned after mount_all (design §4.6)"
-        );
-        assert!(
-            pump_at > mount_at,
-            "the delivery pump must be spawned after mount_all (design §4.6)"
-        );
-
-        // Review round 1, L5: also pin exactly how many `.run(` spawns exist
-        // inside `serve` itself — the tick loop's and the pump's, and no
-        // more, no fewer (a regression that spawns the pump twice, or drops
-        // one of the two spawns while leaving a stray `.run(`-shaped call
-        // sitting around, would slip past the two `find`-based checks above,
-        // which only look for the FIRST occurrence of each marker).
-        let serve_start = src
+        let server = include_str!("server.rs");
+        let steps = include_str!("serve_steps.rs");
+        let serve_start = server
             .find("pub async fn serve(")
             .expect("serve must exist in server.rs");
-        let serve_body = &src[serve_start..];
+        let serve_body = &server[serve_start..];
         let serve_end = serve_body
             .find("\n}\n")
             .expect("serve must be brace-terminated");
         let serve_body = &serve_body[..serve_end];
-        // Review round 2, L-d: strip `//` line comments first — otherwise an
+        let mount_call = serve_body
+            .find("mount_domain_os(")
+            .expect("serve must call mount_domain_os");
+        let arm_call = serve_body
+            .find("arm_scheduler_after_mount(")
+            .expect("serve must call arm_scheduler_after_mount");
+        assert!(
+            arm_call > mount_call,
+            "the scheduler tick loop must be spawned after mount_all (design §4.6)"
+        );
+
+        let step = |name: &str| {
+            let marker = format!("fn {name}(");
+            let start = steps
+                .find(&marker)
+                .unwrap_or_else(|| panic!("{name} must exist in serve_steps.rs"));
+            let rest = &steps[start..];
+            &rest[..rest
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("{name} must be brace-terminated"))]
+        };
+        let mount = step("mount_domain_os");
+        assert!(
+            mount.contains("crate::domain::mount_all_with_refusals("),
+            "the mount_all call must exist in mount_domain_os"
+        );
+        let arm = step("arm_scheduler_after_mount");
+        let tick_at = arm
+            .find("tick_scheduler.run(")
+            .expect("the tick loop spawn must exist in arm_scheduler_after_mount");
+        let pump_at = arm
+            .find("DeliveryPump::new(")
+            .expect("the delivery pump spawn must exist in arm_scheduler_after_mount");
+        assert!(
+            pump_at > tick_at,
+            "the delivery pump must be spawned after the tick loop, both after mount_all"
+        );
+
+        // Review round 1, L5: also pin exactly how many `.run(` spawns exist
+        // — the tick loop's and the pump's, and no more, no fewer (a
+        // regression that spawns the pump twice, or drops one of the two
+        // spawns while leaving a stray `.run(`-shaped call sitting around,
+        // would slip past the two `find`-based checks above, which only look
+        // for the FIRST occurrence of each marker).
+        // Review round 2, L-d: strip `//` comments first — otherwise an
         // EXPLANATORY comment mentioning a third `.run(`-shaped call (a
         // perfectly normal thing to write while explaining why something is
         // NOT spawned, say) would inflate this count and make the test
-        // falsely red for a change that never touched real code.
-        let serve_body_no_comments: String = serve_body
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let run_spawns = serve_body_no_comments.matches(".run(").count();
+        // falsely red for a change that never touched real code. Inline
+        // comments are cut at `//` too, for the same reason.
+        let count_runs = |src: &str| {
+            src.lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+                .matches(".run(")
+                .count()
+        };
+        let arm_runs = count_runs(arm);
         assert_eq!(
-            run_spawns, 2,
-            "serve() must spawn exactly two `.run(` loops (the tick scheduler and the delivery \
-             pump) — found {run_spawns}"
+            arm_runs, 2,
+            "arm_scheduler_after_mount must spawn exactly two `.run(` loops (the tick scheduler \
+             and the delivery pump) — found {arm_runs}"
+        );
+        let combined = count_runs(serve_body) + count_runs(steps);
+        assert_eq!(
+            combined, 2,
+            "serve() plus serve_steps.rs must contain exactly two `.run(` calls, both in \
+             arm_scheduler_after_mount — found {combined}"
         );
     }
 }

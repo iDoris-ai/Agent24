@@ -9,7 +9,7 @@
 //! `crate::attach_registry` (A3-2b's registry, extended there for this PR);
 //! this file is the axum-facing translation of §6.1's REST mapping table,
 //! nothing more. Sits behind the SAME bearer auth every other kernel route
-//! does (`crate::server::auth`, applied after this router merges in, same as
+//! does (`crate::capabilities::middleware::auth`, applied after this router merges in, same as
 //! `crate::attached_routes`) — an attached module's OWN token (minted at
 //! `POST /api/v1/attached`) is never accepted here; the two are not the same
 //! credential (§3.2).
