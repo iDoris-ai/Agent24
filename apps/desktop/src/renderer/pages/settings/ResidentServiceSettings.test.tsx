@@ -139,3 +139,24 @@ it('reads in Chinese and Thai', async () => {
   render(<ResidentServiceSettings />)
   expect(await screen.findByRole('checkbox', { name: 'ทำงานเบื้องหลังและเริ่มเมื่อเข้าสู่ระบบ' })).toBeInTheDocument()
 })
+
+it('a status read that fails later keeps the switch and the failure shown (PR-Daemon #1784 N2)', async () => {
+  set.mockResolvedValue({ ok: false, stage: 'uninstall', code: 'exit_1' })
+  status.mockResolvedValue({ available: true, installed: true })
+  render(<ResidentServiceSettings />)
+  const box = await screen.findByLabelText(label)
+  status.mockRejectedValue(new Error('main busy'))
+  fireEvent.click(box)
+  await waitFor(() => expect(screen.getByRole('alert').textContent).toContain('exit_1'))
+  await waitFor(() => expect(status).toHaveBeenCalledTimes(2))
+  expect(screen.getByLabelText(label)).toBeChecked()
+  expect(screen.getByRole('alert').textContent).toContain('exit_1')
+})
+
+it('not connected: the way out by the CLI is named too (PR-Daemon #1784 N3)', async () => {
+  set.mockResolvedValue({ ok: false, stage: 'shutdown', code: 'not_connected' })
+  status.mockResolvedValue({ available: true, installed: true })
+  render(<ResidentServiceSettings />)
+  fireEvent.click(await screen.findByLabelText(label))
+  expect((await screen.findByRole('alert')).textContent).toContain('agent24 service uninstall')
+})

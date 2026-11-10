@@ -14,7 +14,9 @@ export function ResidentServiceSettings() {
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<Extract<ResidentServiceResult, { ok: false }> | null>(null)
   async function refresh() {
-    try { setStatus(await window.agent24.residentServiceStatus()) } catch { setStatus(null) }
+    // A read that fails keeps the last one: the switch and a failure shown
+    // stay put (PR-Daemon #1784 N2). Never read: nothing is shown.
+    try { setStatus(await window.agent24.residentServiceStatus()) } catch { /* keep the last status */ }
   }
   useEffect(() => {
     // Also as the first-launch box, the tray or another window change it (Codex B4c2 C3).
