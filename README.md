@@ -237,7 +237,7 @@ agent24 mcp                           # 把 agent24d 自己变成 MCP server —
                                       # 可以把任务跑在你的 agent24 上，风险动作仍在本机审批
 ```
 
-渠道：微信桥（`packages/wechat-bridge`）、Nostr 桥（`packages/nostr-bridge`，NIP-44 加密，驱动 agent-speaker 二进制，含入站活性探针）。
+渠道：Nostr 通信由 comm 管理，身份位于 `<data>/comm/hyphae-home`；旧 `nostr-bridge` 已移除，见 [ADR-044 X7](docs/adr/ADR-044-communication.md)。微信桥仅为开发工具，不进产品。
 约定（**是约定，不是运行时强制**）：能力模块应经注入的 LLM Gateway 调模型而不直连外部 API（[ADR-019](docs/decision.md)）。今天 node-daemon 不阻止模块自己 `fetch` 出去——模块是普通 npm 包，`require()` 进来后顶层代码就在宿主进程里跑；清单里的 permissions 目前只做结构校验与安装同意摘要，**不参与 dispatch 时的权限强制**。
 
 ---

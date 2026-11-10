@@ -99,3 +99,21 @@ describe('mac installer carries the documents module (T1-1)', () => {
     expect(pkg.scripts['build:linux']).not.toMatch(/documents/)
   })
 })
+
+describe('installer excludes development bridges (ADR-044 T3)', () => {
+  it('packaging, scripts and runtime dependencies never reference bridge packages', () => {
+    expect(JSON.stringify({ build: pkg.build, scripts: pkg.scripts, dependencies: pkg.dependencies }))
+      .not.toMatch(/(?:packages[\\/]|@agent24[\\/])[^"\s]*-bridge/)
+  })
+
+  it('release scripts never stage bridge packages', () => {
+    const desktop = path.join(__dirname, '..', '..')
+    const repo = path.join(desktop, '..', '..')
+    for (const dir of [path.join(desktop, 'scripts'), path.join(repo, 'scripts'), path.join(repo, '.github', 'workflows')]) {
+      for (const name of fs.readdirSync(dir).filter((name) => name.startsWith('release'))) {
+        expect(fs.readFileSync(path.join(dir, name), 'utf8'))
+          .not.toMatch(/(?:packages[\\/]|@agent24[\\/])[^"\s]*-bridge/)
+      }
+    }
+  })
+})
