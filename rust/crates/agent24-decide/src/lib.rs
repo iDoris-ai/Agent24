@@ -38,6 +38,8 @@ pub mod backend;
 pub mod catalog;
 pub mod hw;
 pub mod log;
+#[cfg(feature = "onnx-spike")]
+pub mod onnx;
 pub mod points;
 pub mod service;
 pub mod threshold;

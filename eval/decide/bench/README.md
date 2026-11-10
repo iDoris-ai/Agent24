@@ -175,4 +175,19 @@ uv run --isolated --with 'optimum[onnxruntime]>=1.20,<2.2' --with 'transformers<
 
 输出 `onnx_export_report.json`：fp32/int8 文件体积、加载+量化耗时、周期
 采样的峰值 RSS（不是单次前后差——D0-6 §9.4 已经指出那种测法在内存压力下
-不可靠）、在三份评测集上重新训头后的准确率与 P50/P95 延迟。
+不可靠）、在评测集上重新训头后的准确率与 P50/P95 延迟。脚本同时在
+`int8/` 保存分类头系数及逐条 Python 参考概率；模型、tokenizer 和头文件都
+留在输出目录，不进仓库。
+
+Rust D1-1 spike 默认不需要模型资产，集成测试会跳过。配置 `int8/` 路径后
+对 221 条 `recall_gate` 样本逐条对照：标签一致率 ≥99%，最大类别概率绝对误差
+≤0.02；标签分歧只能发生在 Python 与 Rust 概率都处于 0.5 ±0.02 的决策边界
+带内。Rust 单独进程的 RSS 与 P50/P95 可用以下命令测量：
+
+```bash
+export CARGO_TARGET_DIR=$HOME/Dev/auraai/Agent24/rust/target
+export agent24_onnx_spike_dir=/tmp/onnx-e5-base/int8
+cd rust
+cargo test -p agent24-decide --features onnx-spike --test onnx_spike
+cargo run -p agent24-decide --features onnx-spike --bin onnx_spike_bench
+```
