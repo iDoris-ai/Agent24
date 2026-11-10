@@ -468,7 +468,7 @@ const realInstallSystem = (spawned: (pid: number) => boolean): InstallSystem => 
  * record with an enrolment socket that this app did not spawn and that was
  * not the one on record before the install (Codex B4b C3). */
 export function serviceInstallDeps(
-  o: { cli: string; daemonBin: string; ready: Promise<unknown>; hold: InstallDeps['hold']; spawned: (pid: number) => boolean; installed?: () => boolean },
+  o: { cli: string; daemonBin: string; ready: Promise<unknown>; hold: InstallDeps['hold']; spawned: (pid: number) => boolean; installed: () => boolean },
   sys: InstallSystem = realInstallSystem(o.spawned),
 ): InstallDeps {
   const env = { ...process.env, AGENT24D_BIN: o.daemonBin }
@@ -604,4 +604,25 @@ export function stopFailureKey(outcome: { stage: 'shutdown' | 'uninstall'; code:
   if (outcome.code === 'not_connected') return 'tray.serviceNotConnected'
   if (outcome.stage === 'uninstall') return 'tray.serviceStoppedNotRemoved'
   return 'tray.serviceNotStopped'
+}
+
+// M5 B4c3 (PR-Daemon #1783 N1/N2): the install and the stop, whoever asks
+// (the first-launch box, the Settings switch, the tray's 「完全退出」), run one
+// at a time. One asked while the same kind is queued or running gets that
+// one's outcome, not a second presence box or uninstall; the other kind waits
+// its turn, so the plist and the consent answer end as the last run left them.
+// `work` is called only when its turn comes, so what it reads (the enrolled
+// pid) is read then.
+export interface ResidentOutcomes { install: InstallOutcome; stop: StopOutcome }
+export function residentOps(): <K extends keyof ResidentOutcomes>(op: K, work: () => Promise<ResidentOutcomes[K]>) => Promise<ResidentOutcomes[K]> {
+  let tail: Promise<unknown> = Promise.resolve()
+  const pending = new Map<keyof ResidentOutcomes, Promise<unknown>>()
+  return <K extends keyof ResidentOutcomes>(op: K, work: () => Promise<ResidentOutcomes[K]>) => {
+    const same = pending.get(op) as Promise<ResidentOutcomes[K]> | undefined
+    if (same) return same
+    const run: Promise<ResidentOutcomes[K]> = tail.then(() => work()).finally(() => { if (pending.get(op) === run) pending.delete(op) })
+    pending.set(op, run)
+    tail = run.catch(() => {})
+    return run
+  }
 }

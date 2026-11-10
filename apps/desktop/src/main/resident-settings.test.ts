@@ -1,7 +1,7 @@
 // M5 B4c2: the Settings switch (resident-service.ts setResident) and the
 // tray's message for a failed 「完全退出」 (stopFailureKey).
-import { afterEach, describe, expect, it } from 'vitest'
-import { installService, serviceInstallDeps, setResident, stopFailureKey, type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem, type StopOutcome } from './resident-service'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { installService, residentOps, serviceInstallDeps, setResident, stopFailureKey, type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem, type StopOutcome } from './resident-service'
 import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
 afterEach(() => { resetMainLocaleForTest() })
@@ -135,5 +135,63 @@ describe('installService looks at the plist again once the hold has begun (Codex
     const sys: InstallSystem = { run: async () => {}, record: () => null, alive: () => true, spawned: () => false, startWaitMs: 0 }
     const deps = serviceInstallDeps({ cli: '/a', daemonBin: '/b', ready: Promise.resolve(), hold: (w) => w(), spawned: () => false, installed }, sys)
     expect(deps.installed).toBe(installed)
+  })
+})
+
+describe('residentOps: the install and the stop one at a time (PR-Daemon #1783 N1/N2)', () => {
+  function gate<T>() {
+    let open: (v: T) => void = () => {}
+    let fail: (e: unknown) => void = () => {}
+    const p = new Promise<T>((resolve, reject) => { open = resolve; fail = reject })
+    return { p, open, fail }
+  }
+  const stopped: StopOutcome = { ok: true }
+  const installed: InstallOutcome = { ok: true }
+
+  it('a stop asked while one runs gets that one\'s outcome: one presence box, one uninstall', async () => {
+    const op = residentOps()
+    const g = gate<StopOutcome>()
+    const work = vi.fn(() => g.p)
+    const a = op('stop', work)
+    const b = op('stop', work)
+    await Promise.resolve()
+    expect(work).toHaveBeenCalledTimes(1)
+    g.open(stopped)
+    expect(await a).toBe(stopped)
+    expect(await b).toBe(stopped)
+    expect(work).toHaveBeenCalledTimes(1)
+  })
+
+  it('the other kind waits its turn, and its work is only called then', async () => {
+    const op = residentOps()
+    const calls: string[] = []
+    const g = gate<InstallOutcome>()
+    const a = op('install', () => { calls.push('install'); return g.p })
+    const b = op('stop', async () => { calls.push('stop'); return stopped })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(calls).toEqual(['install'])
+    g.open(installed)
+    await a
+    expect(await b).toBe(stopped)
+    expect(calls).toEqual(['install', 'stop'])
+  })
+
+  it('once one has ended, the same kind runs again', async () => {
+    const op = residentOps()
+    const work = vi.fn(async () => stopped)
+    await op('stop', work)
+    await op('stop', work)
+    expect(work).toHaveBeenCalledTimes(2)
+  })
+
+  it('one that rejects frees its kind and does not hold up the next', async () => {
+    const op = residentOps()
+    const g = gate<InstallOutcome>()
+    const a = op('install', () => g.p)
+    const b = op('stop', async () => stopped)
+    g.fail(new Error('boom'))
+    await expect(a).rejects.toThrow('boom')
+    expect(await b).toBe(stopped)
+    expect(await op('install', async () => installed)).toBe(installed)
   })
 })
