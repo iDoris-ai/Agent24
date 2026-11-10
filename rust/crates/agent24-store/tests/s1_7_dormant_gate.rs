@@ -18,6 +18,63 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {rel}: {err}"))
 }
 
+/// Names in the `[features]` table's `default` array. No `default` key means
+/// an empty list. A `#` comment, including one that spells the array, is not
+/// a feature.
+fn feature_defaults(toml: &str) -> Vec<String> {
+    let Some(rest) = toml.split("[features]").nth(1) else {
+        return Vec::new();
+    };
+    let section = rest.split("\n[").next().unwrap_or(rest);
+    let mut buf = String::new();
+    let mut collecting = false;
+    for line in section.lines() {
+        let code = line.split('#').next().unwrap_or(line);
+        let code = code.split("//").next().unwrap_or(code);
+        if !collecting {
+            let trimmed = code.trim();
+            let Some(rest) = trimmed.strip_prefix("default") else {
+                continue;
+            };
+            if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                continue;
+            }
+            let Some(after_eq) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            collecting = true;
+            buf.push_str(after_eq);
+            if buf.contains(']') {
+                break;
+            }
+        } else {
+            buf.push('\n');
+            buf.push_str(code);
+            if code.contains(']') {
+                break;
+            }
+        }
+    }
+    if !collecting {
+        return Vec::new();
+    }
+    let inside = buf
+        .split_once('[')
+        .map(|(_, rest)| rest.split(']').next().unwrap_or(""))
+        .unwrap_or("");
+    inside
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim().trim_matches('"');
+            if part.is_empty() {
+                None
+            } else {
+                Some(part.to_owned())
+            }
+        })
+        .collect()
+}
+
 fn member_list(toml: &str, key: &str) -> Vec<String> {
     let marker = format!("{key} = [");
     let start = toml
@@ -127,24 +184,94 @@ fn store_dormant_chains_are_feature_gated_not_deleted() {
 
 #[test]
 fn knowledge_store_is_feature_gated_not_deleted() {
-    let cargo = read("apps/agent24d/Cargo.toml");
-    assert!(cargo.contains("knowledge-store = []"));
-    let main = read("apps/agent24d/src/main.rs");
-    let start = main
-        .find("mod knowledge_store;")
-        .expect("knowledge_store module");
-    let window = &main[start.saturating_sub(240)..start];
+    // S2-3 moved the module into agent24-knowledge. The feature stays off
+    // for both crates that can turn it on. The array is parsed, so a longer
+    // `default` list cannot hide `knowledge-store` inside it.
+    let multiline = "\
+[features]
+# default = [\"knowledge-store\"]
+knowledge-store = [\"dep:sqlx\"]
+default = [
+    \"other\",
+    \"knowledge-store\",
+]
+";
+    assert!(
+        feature_defaults(multiline)
+            .iter()
+            .any(|name| name == "knowledge-store")
+    );
+    let commented = "[features]\n# default = [\"knowledge-store\"]\nknowledge-store = []\n";
+    assert!(
+        !feature_defaults(commented)
+            .iter()
+            .any(|name| name == "knowledge-store")
+    );
+    for rel in [
+        "crates/agent24-knowledge/Cargo.toml",
+        "apps/agent24d/Cargo.toml",
+    ] {
+        let cargo = read(rel);
+        assert!(
+            !feature_defaults(&cargo)
+                .iter()
+                .any(|name| name == "knowledge-store"),
+            "{rel}: knowledge-store must not be a default feature"
+        );
+    }
+    let cargo = read("crates/agent24-knowledge/Cargo.toml");
+    assert!(cargo.contains("knowledge-store = [\"dep:sqlx\"]"));
+    let lib = read("crates/agent24-knowledge/src/lib.rs");
+    let start = lib.find("mod store;").expect("store module");
+    let window = &lib[start.saturating_sub(240)..start];
     assert!(window.contains("#[cfg(feature = \"knowledge-store\")]"));
     assert!(window.contains("knowledge-store has no production caller"));
     assert!(
-        !main.contains("allow(dead_code)] // Wired at start"),
+        !window.contains("allow(dead_code)"),
         "knowledge_store must not sit under a dead_code allow"
     );
     assert!(
         rust_root()
-            .join("apps/agent24d/src/knowledge_store.rs")
+            .join("crates/agent24-knowledge/src/store/mod.rs")
             .is_file()
     );
+    let daemon = read("apps/agent24d/src/main.rs");
+    assert!(
+        !daemon.contains("mod knowledge_store;"),
+        "the store must not be compiled into the default daemon"
+    );
+    // agent24d only forwards the feature; it adds nothing of its own.
+    assert!(
+        read("apps/agent24d/Cargo.toml")
+            .contains("knowledge-store = [\"agent24-knowledge/knowledge-store\"]"),
+        "apps/agent24d/Cargo.toml: knowledge-store must only forward to agent24-knowledge"
+    );
+    // No dependency line may switch the store on behind the defaults' back.
+    for dir in ["apps", "crates"] {
+        for entry in fs::read_dir(rust_root().join(dir)).unwrap() {
+            let manifest = entry.unwrap().path().join("Cargo.toml");
+            let Ok(toml) = fs::read_to_string(&manifest) else {
+                continue;
+            };
+            for line in toml.lines() {
+                let code = line.split('#').next().unwrap_or("");
+                assert!(
+                    !(code.contains("agent24-knowledge") && code.contains("\"knowledge-store\"")),
+                    "{}: a dependency on agent24-knowledge must not enable knowledge-store",
+                    manifest.display()
+                );
+            }
+        }
+    }
+    // CI must build and run the store where it now lives, or the 20 store
+    // tests silently become 0 (#1792 review M1).
+    let ci = read("../.github/workflows/ci.yml");
+    for step in [
+        "cargo clippy -p agent24-knowledge --features knowledge-store --all-targets -- -D warnings",
+        "cargo test -p agent24-knowledge --features knowledge-store --lib store::tests",
+    ] {
+        assert!(ci.contains(step), "ci.yml must run: {step}");
+    }
 }
 
 #[test]

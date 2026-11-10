@@ -1572,8 +1572,8 @@ fn redacted_components_omit_the_health_summary() {
 // ---- Knowledge capabilities probe (ADR-038 C5) -----------------------------------------
 
 use crate::capabilities::unix_now;
-use crate::knowledge_host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
-use crate::knowledge_probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
+use agent24_knowledge::host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
+use agent24_knowledge::probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -3730,7 +3730,7 @@ async fn the_ready_probe_waits_for_a_compatible_declaration() {
 /// is not sent again: the stale answer is dropped and the snapshot retaken.
 #[tokio::test]
 async fn the_ready_probe_rechecks_the_credential_before_sending() {
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-moves-secret");
     let targets = registry.probe_targets(unix_now());
@@ -3738,7 +3738,7 @@ async fn the_ready_probe_rechecks_the_credential_before_sending() {
     // Valid for the capabilities request, revoked by the time §8 would go.
     let calls = AtomicUsize::new(0);
     let current =
-        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
+        |_: &agent24_knowledge::probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
     let assessed = cache.assess(&targets, Instant::now(), &current).await;
     assert!(assessed.stale);
     assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
@@ -3780,8 +3780,8 @@ async fn a_target_that_failed_the_recheck_is_probed_again_not_dropped() {
 
 #[tokio::test]
 async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed() {
-    use crate::knowledge_host::assess_until_fresh;
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::host::assess_until_fresh;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = configured(&fake.base);
     let targets = registry.probe_targets(unix_now());
@@ -3824,7 +3824,7 @@ async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed(
 
 #[tokio::test]
 async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-gate-secret");
     let url = fake.base.as_str();
@@ -3860,7 +3860,7 @@ async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
 
 #[tokio::test]
 async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let t0 = Instant::now();
     let incompatible =
         ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]");
@@ -3918,7 +3918,7 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
 /// goes to another binding's good endpoint, and its own calls are still refused.
 #[tokio::test]
 async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let t0 = Instant::now();
     let good = serve(Script::Reply(200, ready_body())).await;
     let down = serve(Script::Reply(500, "x".into())).await;
@@ -3960,8 +3960,8 @@ async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
 /// M2: a failed reading closes the gate for a few seconds, not for a whole TTL.
 #[tokio::test]
 async fn a_failed_reading_is_reprobed_after_a_short_ttl_not_the_full_one() {
-    use crate::knowledge_host::ContractGate;
-    use crate::knowledge_probe::KNOWLEDGE_PROBE_FAILED_TTL;
+    use agent24_knowledge::host::ContractGate;
+    use agent24_knowledge::probe::KNOWLEDGE_PROBE_FAILED_TTL;
     let up = Arc::new(AtomicBool::new(false));
     let fake = serve(Script::Switch(Arc::clone(&up), ready_body())).await;
     let registry = configured(&fake.base);
@@ -4368,7 +4368,7 @@ async fn a_float_at_two_to_the_53_is_not_read_as_an_integer() {
 /// L2: the key moves while the §8 request is out. Its answer must not be used.
 #[tokio::test]
 async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale() {
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-during-secret");
     let targets = registry.probe_targets(unix_now());
@@ -4376,7 +4376,7 @@ async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale
     // Valid before the capabilities request and before §8; revoked after it.
     let calls = AtomicUsize::new(0);
     let current =
-        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
+        |_: &agent24_knowledge::probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
     let assessed = cache.assess(&targets, Instant::now(), &current).await;
     assert_eq!(fake.ready_hits(), 1, "§8 went out");
     assert!(assessed.stale, "its answer was used although the key moved");

@@ -128,13 +128,17 @@ jobs:
         working-directory: rust
         run: cargo test -p agent24-store --features dormant-workspace
 
-      - name: knowledge-store clippy (agent24d)
+      - name: knowledge-store clippy (agent24-knowledge)
+        working-directory: rust
+        run: cargo clippy -p agent24-knowledge --features knowledge-store --all-targets -- -D warnings
+
+      - name: knowledge-store clippy (agent24d forwards the feature)
         working-directory: rust
         run: cargo clippy -p agent24d --features knowledge-store --all-targets -- -D warnings
 
-      - name: knowledge-store test (agent24d)
+      - name: knowledge-store test (agent24-knowledge)
         working-directory: rust
-        run: cargo test -p agent24d --features knowledge-store --bin agent24d knowledge_store
+        run: cargo test -p agent24-knowledge --features knowledge-store --lib store::tests
 
       - name: Real Hyphae unlock
         working-directory: rust

@@ -73,8 +73,8 @@ pub struct AppState {
     pub module_surfaces: Arc<Vec<crate::capabilities::delegation::ModuleSurface>>,
     pub delegations: Arc<crate::capabilities::delegation::Delegations>,
     /// KB-HOST-01: the Knowledge bindings the product host activated, in
-    /// memory only (see `crate::knowledge_host`).
-    pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
+    /// memory only (see `agent24_knowledge::host`).
+    pub knowledge_host: Arc<agent24_knowledge::host::KnowledgeHostRegistry>,
     /// CORE-2 AgentEar S3: the desktop confirmation queue behind
     /// `/api/v1/presence/challenges/*`.
     pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
@@ -764,7 +764,7 @@ impl AppState {
             presence_provider: None,
             module_surfaces: Arc::new(Vec::new()),
             delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
-            knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
+            knowledge_host: Arc::new(agent24_knowledge::host::KnowledgeHostRegistry::default()),
             presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
             mcp_roster: Arc::new(crate::mcp::McpRoster::default()),
@@ -997,12 +997,13 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         // raw path, so never decode or normalize the path before routing.
         .route(
             "/api/v1/host/knowledge/bindings/{binding_id}",
-            axum::routing::put(crate::knowledge_host::change).delete(crate::knowledge_host::change),
+            axum::routing::put(crate::knowledge_routes::change)
+                .delete(crate::knowledge_routes::change),
         )
         .route(
             "/api/v1/host/knowledge/bindings/{binding_id}/credential",
-            axum::routing::put(crate::knowledge_host::push_credential)
-                .delete(crate::knowledge_host::revoke_credential),
+            axum::routing::put(crate::knowledge_routes::push_credential)
+                .delete(crate::knowledge_routes::revoke_credential),
         )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))

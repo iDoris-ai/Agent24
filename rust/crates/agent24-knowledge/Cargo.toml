@@ -6,16 +6,27 @@ license.workspace = true
 repository.workspace = true
 description = "Agent24 Knowledge v1 wire types (docs/knowledge/CONTRACT-READONLY-v1.md, protocol/knowledge/v1) — KB-C1-02a"
 
+[features]
+# `knowledge.db`. No production caller; this slice does not turn it on.
+knowledge-store = ["dep:sqlx"]
+# Record inspectors the daemon's HTTP tests read. Off unless those tests build.
+test-support = []
+
 [dependencies]
+agent24-components = { path = "../agent24-components" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+uuid = { version = "1", features = ["v4"] }
 async-trait = "0.1"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["time"] }
+sqlx = { version = "0.8", optional = true, default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+tokio = { version = "1", features = ["time", "sync"] }
 url = "2"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync"] }
 
 [lints]
 workspace = true

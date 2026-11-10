@@ -47,11 +47,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures::future::join_all;
 
-use agent24_components::ComponentState;
-use agent24_knowledge::{
+use crate::{
     Credential, HttpConfigError, HttpTransport, HttpTransportConfig, KnowledgeOperation,
     KnowledgeTransport, TransportError,
 };
+use agent24_components::ComponentState;
 use serde_json::{Map, Number, Value, json};
 use tokio::sync::watch;
 
@@ -102,7 +102,7 @@ const READY_PROBE_GENERATION: u64 = 1;
 /// `credential_epoch`. Two bindings can reuse a sequence number; the binding
 /// id keeps their answers apart. The epoch is not a secret, and the credential
 /// itself is not part of the key.
-pub(crate) struct ProbeTarget {
+pub struct ProbeTarget {
     pub host: String,
     pub binding: String,
     pub base_url: String,
@@ -112,7 +112,7 @@ pub(crate) struct ProbeTarget {
 
 /// What `GET /api/v1/components` shows for Knowledge.
 #[derive(Clone, Debug)]
-pub(crate) struct ProbeView {
+pub struct ProbeView {
     pub state: ComponentState,
     pub reason: Option<String>,
     pub version: Option<String>,
@@ -190,7 +190,7 @@ enum ParseError {
 /// What [`KnowledgeProbeCache::assess`] hands back. `stale` means a target
 /// failed the re-check before it was sent, so `view` rests on a snapshot that
 /// no longer holds. It was not cached; the caller takes a new snapshot.
-pub(crate) struct Assessed {
+pub struct Assessed {
     pub view: ProbeView,
     /// One answer per probed base URL, for the caller that needs a single
     /// endpoint's reading (the D3 gate) instead of the folded `view`.
@@ -256,7 +256,7 @@ struct CacheInner {
 /// leader only removes its flight. It does not publish a failure; waiters
 /// enter `assess` again.
 #[derive(Default)]
-pub(crate) struct KnowledgeProbeCache {
+pub struct KnowledgeProbeCache {
     inner: Mutex<CacheInner>,
 }
 
@@ -291,7 +291,7 @@ impl Drop for FlightGuard<'_> {
 
 impl KnowledgeProbeCache {
     #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn assess(
+    pub async fn assess(
         &self,
         targets: &[ProbeTarget],
         now: Instant,
@@ -384,7 +384,7 @@ impl KnowledgeProbeCache {
 
     /// Receivers parked on the current flight. Tests use this to abort the
     /// leader only after a waiter has subscribed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn inflight_receivers(&self) -> usize {
         let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard

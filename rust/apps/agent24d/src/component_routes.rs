@@ -808,7 +808,7 @@ fn dedupe_component_ids(items: &mut [Item]) {
 /// Knowledge, remote subset (ADR-038 D5, C5). No endpoint is `stopped`. A
 /// configured binding is whatever the cached `/system/capabilities` probe said.
 async fn knowledge_item(
-    registry: &crate::knowledge_host::KnowledgeHostRegistry,
+    registry: &agent24_knowledge::host::KnowledgeHostRegistry,
     now: Instant,
 ) -> Item {
     let view = registry.component_status(now).await;

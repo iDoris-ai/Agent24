@@ -1,6 +1,6 @@
 //! The Knowledge tools `knowledge_search` and `knowledge_read` (#1087 b): the
 //! crate's call layer (`agent24_knowledge::tool::call`) over the daemon's
-//! backend (`crate::knowledge_backend`). Only a run that names a Knowledge
+//! backend (`agent24_knowledge::backend`). Only a run that names a Knowledge
 //! binding is offered them (`Tool::needs_knowledge_binding`); a call from any
 //! other run is refused by the backend as `knowledge_unbound`.
 //!
@@ -22,8 +22,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::knowledge_backend::{DaemonKnowledgeBackend, RunSelector};
-use crate::knowledge_host::KnowledgeHostRegistry;
+use agent24_knowledge::backend::{DaemonKnowledgeBackend, RunSelector};
+use agent24_knowledge::host::KnowledgeHostRegistry;
 
 /// A read may follow a cut chunk over several pages, each its own request.
 const TIMEOUT: Duration = Duration::from_secs(60);
@@ -44,7 +44,7 @@ pub struct KnowledgeTool {
 
 /// Where the host says these tools' results came from
 /// ([`agent24_tools::ToolResultSource::unknown`]).
-pub(crate) const KNOWLEDGE_ORIGINS: [&str; 2] = ["tool:knowledge_search", "tool:knowledge_read"];
+pub(crate) use agent24_knowledge::host::KNOWLEDGE_ORIGINS;
 
 /// Both tools over one backend, for the registry.
 pub fn tools(

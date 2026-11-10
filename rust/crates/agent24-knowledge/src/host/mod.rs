@@ -30,38 +30,40 @@
 //! pin could not match again wherever it was kept, and a run that names a
 //! binding but has no pin is refused, never bound anew.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
 use std::time::Instant;
 
 use agent24_components::ComponentState;
-use agent24_protocol::state_file::AuthMode;
-use axum::body::Body;
-use axum::extract::rejection::{PathRejection, QueryRejection};
-use axum::extract::{Extension, Path, Query, State};
-use axum::http::{Method, Request, StatusCode};
-use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
 
-use crate::capabilities::{Audience, Authorization, UnixSeconds, unix_now};
-use crate::knowledge_probe::{Assessed, KnowledgeProbeCache, ProbeTarget, ProbeView};
-use agent24_domain::http::read_body_or_response;
+use crate::probe::{Assessed, KnowledgeProbeCache, ProbeTarget, ProbeView};
 
-use crate::server::{AppState, error_response};
+/// Seconds since the unix epoch. The daemon's `capabilities::UnixSeconds` is
+/// the same alias; this copy keeps the registry from depending on agent24d.
+pub type UnixSeconds = u64;
 
-/// Bindings one host may hold records for, deactivated ones included.
+pub fn unix_now() -> UnixSeconds {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+/// Where the host says these tools' results came from
+/// (`agent24_tools::ToolResultSource::unknown`).
+pub const KNOWLEDGE_ORIGINS: [&str; 2] = ["tool:knowledge_search", "tool:knowledge_read"];
+
 pub const MAX_BINDINGS_PER_HOST: usize = 1024;
-const MAX_BINDING_ID_BYTES: usize = 256;
+pub const MAX_BINDING_ID_BYTES: usize = 256;
 /// Run pins kept; the oldest goes first, and its run is then refused.
 const MAX_PINNED_RUNS: usize = 4096;
 /// Session pins kept. None is ever dropped (see `pin_session`); past this
 /// many, a session not yet pinned is refused until the daemon restarts.
 const MAX_PINNED_SESSIONS: usize = 65_536;
-const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
+pub const MAX_CREDENTIAL_BYTES: usize = 16 * 1024;
 /// Knowledge bases one activation may name.
 pub const MAX_KNOWLEDGE_BASES: usize = 64;
-const MAX_KNOWLEDGE_BASE_ID_CHARS: usize = 256;
+pub const MAX_KNOWLEDGE_BASE_ID_CHARS: usize = 256;
 
 /// How the Knowledge service expects C to be presented. `Debug` never prints
 /// the secret.
@@ -125,8 +127,6 @@ pub struct RunBinding {
 }
 
 /// Why a run has no usable binding; Knowledge tools refuse with its code.
-// Consumed by the Knowledge tools (PR-E).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnowledgeRefusal {
     /// The run names no binding.
@@ -137,7 +137,6 @@ pub enum KnowledgeRefusal {
 }
 
 impl KnowledgeRefusal {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn code(self) -> &'static str {
         match self {
             Self::Unbound => "knowledge_unbound",
@@ -173,6 +172,9 @@ pub enum ChangeError {
     BindingInactive,
     TooManyBindings,
     Unavailable,
+    /// A credential or endpoint value failed a check. The text names the rule
+    /// and never the value.
+    Invalid(&'static str),
 }
 
 /// Records keyed by (host capability id, binding id).
@@ -199,7 +201,7 @@ const SNAPSHOT_ATTEMPTS: usize = 3;
 /// Probes `targets`; whenever one failed its re-check, `retake` supplies a new
 /// snapshot, up to [`SNAPSHOT_ATTEMPTS`] tries in all. `gate_url` is passed to
 /// the cache (see `KnowledgeProbeCache::assess_for`).
-pub(crate) async fn assess_until_fresh(
+pub async fn assess_until_fresh(
     cache: &KnowledgeProbeCache,
     targets: &[ProbeTarget],
     now: Instant,
@@ -229,12 +231,60 @@ pub(crate) async fn assess_until_fresh(
 
 /// Whether a business call may leave (`KnowledgeHostRegistry::contract_gate`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContractGate {
+pub enum ContractGate {
     Open,
     /// The declaration says the contract does not fit, or lacks the operation.
     Incompatible,
     /// No declaration has been obtained.
     NoDeclaration,
+}
+
+fn credential_value(credential: &Credential) -> &str {
+    match credential {
+        Credential::Bearer(value) | Credential::ApiKey(value) => value,
+    }
+}
+
+/// Empty, then longer than [`MAX_CREDENTIAL_BYTES`], then not visible ASCII,
+/// then already expired. That is the order the host route used, and each
+/// failure is its own rule. Nothing here is logged.
+fn validate_credential(
+    credential: &Credential,
+    expires_at: UnixSeconds,
+) -> Result<(), ChangeError> {
+    let value = credential_value(credential);
+    if value.is_empty() {
+        return Err(ChangeError::Invalid("empty"));
+    }
+    if value.len() > MAX_CREDENTIAL_BYTES {
+        return Err(ChangeError::Invalid("too_long"));
+    }
+    if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(ChangeError::Invalid("not_graphic"));
+    }
+    if expires_at <= unix_now() {
+        return Err(ChangeError::Invalid("expired"));
+    }
+    Ok(())
+}
+
+/// The base URL the HTTP transport accepts, then 1 to [`MAX_KNOWLEDGE_BASES`]
+/// distinct ids, each non-blank and at most [`MAX_KNOWLEDGE_BASE_ID_CHARS`]
+/// characters. Same order as the host route: a bad URL is reported before
+/// the ids are looked at.
+fn validate_endpoint(endpoint: &Endpoint) -> Result<(), ChangeError> {
+    if crate::validate_base_url(&endpoint.base_url).is_err() {
+        return Err(ChangeError::Invalid("base_url"));
+    }
+    let ids = &endpoint.knowledge_base_ids;
+    let distinct = ids.iter().collect::<HashSet<_>>().len() == ids.len();
+    let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
+    let id_ok =
+        |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
+    if !(ids_ok && ids.iter().all(id_ok)) {
+        return Err(ChangeError::Invalid("knowledge_base_id"));
+    }
+    Ok(())
 }
 
 impl KnowledgeHostRegistry {
@@ -265,7 +315,8 @@ impl KnowledgeHostRegistry {
     }
 
     /// Activates `binding` with the endpoint its calls use; like
-    /// [`Change::Activate`] otherwise.
+    /// [`Change::Activate`] otherwise. The endpoint is checked before the
+    /// sequence, so a bad one is refused on its own and nothing is stored.
     pub fn activate(
         &self,
         host: &str,
@@ -273,6 +324,7 @@ impl KnowledgeHostRegistry {
         seq: u64,
         endpoint: Endpoint,
     ) -> Result<(), ChangeError> {
+        validate_endpoint(&endpoint)?;
         self.change(host, binding, seq, |entry| {
             entry.active = true;
             entry.activated_seq = seq;
@@ -301,7 +353,9 @@ impl KnowledgeHostRegistry {
         })
     }
 
-    /// Pushes or replaces C of an active binding.
+    /// Pushes or replaces C of an active binding. The value is checked before
+    /// the sequence, so a bad C is refused whether or not the binding would
+    /// have taken it, and nothing is stored.
     pub fn push_credential(
         &self,
         host: &str,
@@ -310,6 +364,7 @@ impl KnowledgeHostRegistry {
         credential: Credential,
         expires_at: UnixSeconds,
     ) -> Result<(), ChangeError> {
+        validate_credential(&credential, expires_at)?;
         self.change(host, binding, seq, |entry| {
             if !entry.active {
                 return Err(ChangeError::BindingInactive);
@@ -326,8 +381,6 @@ impl KnowledgeHostRegistry {
     /// C of an active binding of `host`, unless it has expired by `now`; an
     /// expired C is dropped here. Only an active binding holds one: a push
     /// needs the binding active, and deactivation drops it.
-    // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn credential(
         &self,
         host: &str,
@@ -434,8 +487,6 @@ impl KnowledgeHostRegistry {
     /// The binding a run may use now: the one it names in its persisted input
     /// (`selector`), still active under the host and generation it was pinned
     /// to. Nothing else is looked up, so a run never moves to a new binding.
-    // Consumed by the Knowledge tools (PR-E).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve_run(
         &self,
         run_id: &str,
@@ -462,7 +513,7 @@ impl KnowledgeHostRegistry {
     /// greatest `(host, binding)`. `HashMap` iteration order is not the rule.
     /// A poisoned `entries` lock still yields the records (`into_inner`); an
     /// empty list would show a configured binding as `stopped`.
-    pub(crate) fn probe_targets(&self, now: UnixSeconds) -> Vec<ProbeTarget> {
+    pub fn probe_targets(&self, now: UnixSeconds) -> Vec<ProbeTarget> {
         let entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
         struct Choice {
             epoch: u64,
@@ -483,8 +534,8 @@ impl KnowledgeHostRegistry {
                 .filter(|current| current.expires_at > now);
             let epoch = current.as_ref().map(|current| current.seq).unwrap_or(0);
             let credential = current.map(|current| match current.credential {
-                Credential::Bearer(token) => agent24_knowledge::Credential::Bearer(token),
-                Credential::ApiKey(key) => agent24_knowledge::Credential::ApiKey(key),
+                Credential::Bearer(token) => crate::Credential::Bearer(token),
+                Credential::ApiKey(key) => crate::Credential::ApiKey(key),
             });
             let base_url = endpoint.base_url.clone();
             let replace = match by_url.get(&base_url) {
@@ -539,13 +590,13 @@ impl KnowledgeHostRegistry {
     }
 
     /// How many component reads are waiting on the current capabilities flight.
-    #[cfg(test)]
-    pub(crate) fn inflight_receivers(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn inflight_receivers(&self) -> usize {
         self.probes.inflight_receivers()
     }
 
     /// D5 remote subset for Knowledge, from a cached capabilities probe.
-    pub(crate) async fn component_status(&self, now: Instant) -> ProbeView {
+    pub async fn component_status(&self, now: Instant) -> ProbeView {
         let targets = self.probe_targets(unix_now());
         self.assess_snapshot(&targets, now).await
     }
@@ -556,7 +607,7 @@ impl KnowledgeHostRegistry {
     /// endpoint that fails now): the snapshot is taken again. If the bindings
     /// keep moving through every retry, the answer is `failed`
     /// (`binding_changed`), never a stale `ready` or `stopped`.
-    pub(crate) async fn assess_snapshot(&self, targets: &[ProbeTarget], now: Instant) -> ProbeView {
+    pub async fn assess_snapshot(&self, targets: &[ProbeTarget], now: Instant) -> ProbeView {
         self.assess_snapshot_for(targets, now, None).await.view
     }
 
@@ -582,7 +633,7 @@ impl KnowledgeHostRegistry {
     /// the same singleflight) but looks only at `base_url`, the endpoint this
     /// call goes to: another binding's failure or mismatch does not refuse it.
     /// `operation` is `search` or `read`.
-    pub(crate) async fn contract_gate(
+    pub async fn contract_gate(
         &self,
         base_url: &str,
         operation: &str,
@@ -620,8 +671,6 @@ impl KnowledgeHostRegistry {
     }
 
     /// Whether `host` has `binding` active.
-    // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_active(&self, host: &str, binding: &str) -> bool {
         self.entries.lock().is_ok_and(|entries| {
             entries
@@ -631,308 +680,26 @@ impl KnowledgeHostRegistry {
     }
 }
 
-/// The capability id of the ProductHost making this request. Legacy mode has
-/// no such authority (its shared token also reaches every other route), and a
-/// Creative runtime is not the host, so both get `None`.
-fn host_capability(
-    state: &AppState,
-    authorization: Option<Extension<Authorization>>,
-) -> Option<String> {
-    match (state.auth_mode, authorization) {
-        (AuthMode::Capabilities, Some(Extension(authorization)))
-            if authorization.claims.audience == Audience::ProductHost =>
-        {
-            Some(authorization.claims.capability_id)
-        }
-        _ => None,
+#[cfg(any(test, feature = "test-support"))]
+#[allow(clippy::unwrap_used)]
+impl KnowledgeHostRegistry {
+    /// (active, high-water mark) of one record.
+    pub fn record(&self, host: &str, binding: &str) -> Option<(bool, u64)> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(&(host.to_owned(), binding.to_owned()))?;
+        Some((entry.active, entry.seq))
     }
-}
 
-/// Opaque, but never a path: an encoded `/` or `\` in the URL must not turn
-/// into one after routing, and `.` and `..` are no ids either.
-fn valid_binding_id(value: &str) -> bool {
-    !value.is_empty()
-        && value != "."
-        && value != ".."
-        && value.len() <= MAX_BINDING_ID_BYTES
-        && !value
-            .chars()
-            .any(|c| c.is_control() || c == '/' || c == '\\')
-}
-
-fn change_response(result: Result<(), ChangeError>) -> Response {
-    let (status, code, message) = match result {
-        Ok(()) => return StatusCode::NO_CONTENT.into_response(),
-        Err(ChangeError::StaleSequence) => (
-            StatusCode::CONFLICT,
-            "stale_sequence",
-            "A later change for this binding was already applied",
-        ),
-        Err(ChangeError::BindingInactive) => (
-            StatusCode::CONFLICT,
-            "binding_inactive",
-            "The binding is not active",
-        ),
-        Err(ChangeError::TooManyBindings) => (
-            StatusCode::CONFLICT,
-            "too_many_bindings",
-            "Too many Knowledge bindings",
-        ),
-        Err(ChangeError::Unavailable) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            "knowledge_host_unavailable",
-            "Knowledge host state is unavailable",
-        ),
-    };
-    error_response(status, code, message)
-}
-
-/// Says nothing about which part was wrong: a parse error could quote C.
-fn invalid_request() -> Response {
-    error_response(
-        StatusCode::BAD_REQUEST,
-        "invalid_request",
-        "Malformed request",
-    )
-}
-
-#[derive(Deserialize)]
-pub struct SeqQuery {
-    seq: u64,
-}
-
-/// Why a request was refused before it reached the registry.
-pub enum Refused {
-    NotHost,
-    Malformed,
-    Inactive,
-    /// The session's earlier runs were bound to another activation, or took
-    /// in Knowledge results from one it can no longer tell.
-    SessionRebound,
-    /// The session's tool result origins could not be read.
-    SourcesUnavailable,
-}
-
-impl IntoResponse for Refused {
-    fn into_response(self) -> Response {
-        match self {
-            Self::NotHost => error_response(
-                StatusCode::FORBIDDEN,
-                "host_authority_required",
-                "Only the product host may use this interface",
-            ),
-            Self::Malformed => invalid_request(),
-            Self::Inactive => error_response(
-                StatusCode::CONFLICT,
-                "knowledge_binding_inactive",
-                "The product host has no active Knowledge binding by that id",
-            ),
-            Self::SessionRebound => error_response(
-                StatusCode::CONFLICT,
-                "knowledge_session_rebound",
-                "This session's runs used another activation of that Knowledge binding; start a new session",
-            ),
-            Self::SourcesUnavailable => error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "source_policy_unavailable",
-                "This session's sources could not be read",
-            ),
-        }
+    pub fn is_empty(&self) -> bool {
+        self.entries.lock().unwrap().is_empty()
     }
-}
 
-/// The host making the request, the binding and the change's sequence number.
-/// An id that is not UTF-8 gets the same answer as any other malformed one.
-fn host_and_seq(
-    state: &AppState,
-    authorization: Option<Extension<Authorization>>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
-) -> Result<(String, String, u64), Refused> {
-    let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
-    match (path, query) {
-        (Ok(Path(binding_id)), Ok(Query(SeqQuery { seq })))
-            if seq > 0 && valid_binding_id(&binding_id) =>
-        {
-            Ok((host, binding_id, seq))
-        }
-        _ => Err(Refused::Malformed),
+    /// The host of the only record there is.
+    pub fn only_host(&self) -> String {
+        let entries = self.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        entries.keys().next().unwrap().0.clone()
     }
-}
-
-/// Checks a run's `knowledge_binding_id` at creation and returns what to pin
-/// the run to: only the product host may name a binding, only one it has
-/// active, and in a session only the activation its earlier runs had.
-pub async fn bind_run(
-    state: &AppState,
-    authorization: Option<Extension<Authorization>>,
-    binding_id: &str,
-    session_id: Option<&str>,
-) -> Result<RunBinding, Refused> {
-    let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
-    if !valid_binding_id(binding_id) {
-        return Err(Refused::Malformed);
-    }
-    let generation = state
-        .knowledge_host
-        .generation(&host, binding_id)
-        .ok_or(Refused::Inactive)?;
-    let binding = RunBinding {
-        host,
-        binding: binding_id.to_owned(),
-        generation,
-    };
-    if let Some(session_id) = session_id {
-        // Read before the pin is taken; a run that adds such results has
-        // pinned the session before it executes.
-        let took_knowledge = state
-            .store
-            .session_tool_result_origins(session_id)
-            .await
-            .map_err(|_| Refused::SourcesUnavailable)?
-            .iter()
-            .any(|origin| crate::knowledge_tools::KNOWLEDGE_ORIGINS.contains(&origin.as_str()));
-        if !state
-            .knowledge_host
-            .pin_session(session_id, &binding, took_knowledge)
-        {
-            return Err(Refused::SessionRebound);
-        }
-    }
-    Ok(binding)
-}
-
-/// `PUT /api/v1/host/knowledge/bindings/{binding_id}?seq=n` activates the
-/// binding, with `{"endpoint", "knowledge_base_ids"}` for its calls or with
-/// no body (then every call is refused); `DELETE` of the same deactivates it.
-pub async fn change(
-    State(state): State<AppState>,
-    authorization: Option<Extension<Authorization>>,
-    method: Method,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
-    req: Request<Body>,
-) -> Response {
-    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
-        Ok(found) => found,
-        Err(refused) => return refused.into_response(),
-    };
-    let registry = &state.knowledge_host;
-    if method != Method::PUT {
-        return change_response(registry.apply(&host, &binding_id, seq, Change::Deactivate));
-    }
-    let body = match read_body_or_response(req).await {
-        Ok(body) => body,
-        Err(refused) => return refused,
-    };
-    if body.is_empty() {
-        return change_response(registry.apply(&host, &binding_id, seq, Change::Activate));
-    }
-    let Some(endpoint) = endpoint_of(&body) else {
-        return invalid_request();
-    };
-    change_response(registry.activate(&host, &binding_id, seq, endpoint))
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActivateBody {
-    endpoint: String,
-    knowledge_base_ids: Vec<String>,
-}
-
-/// The activation body `{"endpoint", "knowledge_base_ids"}`: an API base the
-/// HTTP transport accepts (`https`, or `http` to a loopback IP) and 1 to
-/// [`MAX_KNOWLEDGE_BASES`] distinct, non-blank ids.
-fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
-    let body: ActivateBody = serde_json::from_slice(body).ok()?;
-    agent24_knowledge::validate_base_url(&body.endpoint).ok()?;
-    let ids = &body.knowledge_base_ids;
-    let id_ok =
-        |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
-    let distinct = ids.iter().collect::<std::collections::HashSet<_>>().len() == ids.len();
-    let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
-    let ok = ids_ok && ids.iter().all(id_ok);
-    ok.then_some(Endpoint {
-        base_url: body.endpoint,
-        knowledge_base_ids: body.knowledge_base_ids,
-    })
-}
-
-/// `DELETE /api/v1/host/knowledge/bindings/{binding_id}/credential?seq=n`
-/// drops C at once. Accepted for a binding this host never activated too, so
-/// it can be sent before the push it overtakes.
-pub async fn revoke_credential(
-    State(state): State<AppState>,
-    authorization: Option<Extension<Authorization>>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
-) -> Response {
-    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
-        Ok(found) => found,
-        Err(refused) => return refused.into_response(),
-    };
-    change_response(
-        state
-            .knowledge_host
-            .apply(&host, &binding_id, seq, Change::RevokeCredential),
-    )
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum CredentialKind {
-    Bearer,
-    ApiKey,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CredentialBody {
-    kind: CredentialKind,
-    value: String,
-    expires_at: UnixSeconds,
-}
-
-/// `PUT /api/v1/host/knowledge/bindings/{binding_id}/credential?seq=n` with
-/// `{"kind": "bearer"|"api_key", "value", "expires_at"}` pushes or replaces C.
-pub async fn push_credential(
-    State(state): State<AppState>,
-    authorization: Option<Extension<Authorization>>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<SeqQuery>, QueryRejection>,
-    req: Request<Body>,
-) -> Response {
-    let (host, binding_id, seq) = match host_and_seq(&state, authorization, path, query) {
-        Ok(found) => found,
-        Err(refused) => return refused.into_response(),
-    };
-    // The kernel's body cap and its 413 envelope, like every other handler.
-    let body = match read_body_or_response(req).await {
-        Ok(body) => body,
-        Err(refused) => return refused,
-    };
-    let Ok(body) = serde_json::from_slice::<CredentialBody>(&body) else {
-        return invalid_request();
-    };
-    // Visible ASCII only: C goes into a request header as it is.
-    let value_ok = !body.value.is_empty()
-        && body.value.len() <= MAX_CREDENTIAL_BYTES
-        && body.value.bytes().all(|b| b.is_ascii_graphic());
-    if !value_ok || body.expires_at <= unix_now() {
-        return invalid_request();
-    }
-    let credential = match body.kind {
-        CredentialKind::Bearer => Credential::Bearer(body.value),
-        CredentialKind::ApiKey => Credential::ApiKey(body.value),
-    };
-    change_response(state.knowledge_host.push_credential(
-        &host,
-        &binding_id,
-        seq,
-        credential,
-        body.expires_at,
-    ))
 }
 
 #[cfg(test)]

@@ -496,7 +496,7 @@ pub(super) async fn register_startup_tools(
     std::collections::HashMap<(String, String), StdArc<dyn agent24_tools::ModuleToolAuthorization>>,
     crate::consent_routes::ModuleToolCards,
     StdArc<dyn agent24_domain::tool::ModuleToolAdvertView>,
-    StdArc<crate::knowledge_host::KnowledgeHostRegistry>,
+    StdArc<agent24_knowledge::host::KnowledgeHostRegistry>,
     Vec<Arc<agent24_mcp::McpServer>>,
     Arc<crate::mcp::McpRoster>,
 ) {
@@ -602,9 +602,9 @@ pub(super) async fn register_startup_tools(
     // #1087 b: the Knowledge tools, offered only to a run that names a
     // binding. They read the private host interface's registry, which the
     // state takes over below, so both see the same activations and C.
-    let knowledge_host = StdArc::new(crate::knowledge_host::KnowledgeHostRegistry::default());
-    let knowledge_runs: StdArc<dyn crate::knowledge_backend::RunSelector> =
-        StdArc::new(store.clone());
+    let knowledge_host = StdArc::new(agent24_knowledge::host::KnowledgeHostRegistry::default());
+    let knowledge_runs: StdArc<dyn agent24_knowledge::backend::RunSelector> =
+        StdArc::new(crate::knowledge_backend::StoreRuns(store.clone()));
     for tool in crate::knowledge_tools::tools(StdArc::clone(&knowledge_host), knowledge_runs) {
         tools = tools.with(tool);
     }
@@ -663,7 +663,7 @@ pub(super) async fn assemble_app_state(
         Option<crate::lifecycle::Summary>,
     )>,
     state_dir: &std::path::PathBuf,
-    knowledge_host: StdArc<crate::knowledge_host::KnowledgeHostRegistry>,
+    knowledge_host: StdArc<agent24_knowledge::host::KnowledgeHostRegistry>,
     managed_idoris: Option<Arc<agent24_idoris::managed_idoris::ManagedIdoris>>,
     idoris_host: Option<Arc<agent24_idoris::idoris_host::IdorisHost>>,
     idoris_unavailable: bool,
