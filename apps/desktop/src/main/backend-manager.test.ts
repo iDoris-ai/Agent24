@@ -1841,6 +1841,26 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     expect(daemonConnection()).toBeNull()
   })
 
+  it('the service daemon is enrolled whatever serviceManaged says: never taken over, never spawned over (M5 B6)', async () => {
+    for (const managed of [true, false]) {
+      const s = session()
+      const external = serviceDaemon({ serviceManaged: () => managed, enrol: vi.fn().mockResolvedValue(s) })
+      const spawnProcess = vi.fn(child)
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      await manager.start()
+      try {
+        expect(external.enrol).toHaveBeenCalledTimes(1)
+        expect(external.requestShutdown).not.toHaveBeenCalled()
+        expect(external.acceptsToken).not.toHaveBeenCalled()
+        expect(spawnProcess).not.toHaveBeenCalled()
+        expect(manager.isExternalDaemon()).toBe(true)
+        expect(logged()).not.toContain('taking over CLI daemon')
+      } finally {
+        manager.stop()
+      }
+    }
+  })
+
   it('renews before the daemon idles the connection out, and publishes each new token', async () => {
     vi.useFakeTimers()
     const s = session()

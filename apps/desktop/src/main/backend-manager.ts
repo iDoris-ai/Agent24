@@ -728,6 +728,8 @@ export class BackendManager {
     this.foreignPid = null
     // T1-0: Knowledge needs a capability-mode daemon this app hosts. A
     // LaunchAgent-managed one is left alone: launchd would only restart it.
+    // Only a legacy daemon gets here; the service daemon enrolled above (M5 B6).
+    // B4 removes serviceManaged together with waiting for the service daemon.
     if (this.kind === 'rust' && this.authMode === 'capabilities' && !this.external.serviceManaged()) {
       return this.takeoverExternal(state, lifecycle)
     }
