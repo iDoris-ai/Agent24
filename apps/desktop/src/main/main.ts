@@ -11,7 +11,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, ServiceUpgrader, serviceUpgradeDeps, shouldAskConsent, upgradeService, upgradesFromBundle, writeConsent } from './resident-service'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, shouldAskConsent, stopService, upgradeService, upgradesFromBundle, writeConsent } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -780,6 +780,35 @@ async function askResidentConsent(documentsReady: Promise<unknown>): Promise<voi
   refreshTray()
 }
 
+// M5 B4c: 「完全退出」: the service stopped (the presence box while enrolled),
+// its LaunchAgent removed and the answer kept as declined, then quit. A
+// refused or timed-out box changes nothing and says so (PM r1 ①).
+let quittingService = false
+async function quitStoppingService(): Promise<void> {
+  if (quittingService) return
+  quittingService = true
+  try {
+    const outcome = await stopService(serviceStopDeps({
+      cli: resolveBundledRustBinary('agent24', app.isPackaged),
+      pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
+      hold: (work) => backendManager.whileServiceRestarts(work),
+      record: () => {
+        const dataDir = tryDataDir()
+        if (dataDir !== null) writeConsent(consentPath(dataDir), 'declined', new Date())
+      },
+    }))
+    if (outcome.ok) {
+      tray = null
+      app.quit()
+      return
+    }
+    console.warn('[main] background service not stopped:', outcome.stage, outcome.code)
+    void dialog.showMessageBox({ type: 'warning', message: mt('tray.serviceNotStopped', { code: outcome.code }) })
+  } finally {
+    quittingService = false
+  }
+}
+
 // Rebuild the tray title, tooltip, and context menu from the live daemon status
 // and the current UI language. Cheap and idempotent — safe to call on a timer,
 // and called again whenever the language changes.
@@ -797,6 +826,7 @@ function refreshTray(): void {
     upgrade: serviceUpgrader.hint(),
     crashLoop: crashLoop.looping(),
     serviceWaitMs: backendManager.serviceWaitMs(),
+    serviceInstalled: process.platform === 'darwin' && launchAgentPlistExists(),
   })
   if (process.platform === 'darwin') tray.setTitle(view.title)
   tray.setToolTip(view.tooltip)
@@ -812,7 +842,8 @@ function refreshTray(): void {
       // Clear tray ref so win.on('close') guard is skipped and app can quit
       tray = null
       app.quit()
-    },    'quit-service': () => {}, // STUB (M5 B4c)
+    },
+    'quit-service': () => { void quitStoppingService() },
   }
   tray.setContextMenu(Menu.buildFromTemplate(view.items.map((item): MenuItemConstructorOptions =>
     'type' in item ? { type: 'separator' }

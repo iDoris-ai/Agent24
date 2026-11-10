@@ -511,7 +511,17 @@ export interface StopDeps {
  * exit, uninstall, then record. A refused or failed shutdown stops there with
  * nothing changed; a failed record is ignored (the plist is gone already). */
 export function stopService(deps: StopDeps): Promise<StopOutcome> {
-  return deps.hold(async (): Promise<StopOutcome> => ({ ok: true })) // STUB
+  return deps.hold(async (): Promise<StopOutcome> => {
+    if (deps.shutdown) {
+      let down: { status: number; code?: string }
+      try { down = await deps.shutdown() } catch { return { ok: false, stage: 'shutdown', code: 'shutdown_failed' } }
+      if (down.status < 200 || down.status >= 300) return { ok: false, stage: 'shutdown', code: down.code ?? `http_${down.status}` }
+      await deps.exited()
+    }
+    try { await deps.uninstall() } catch (err) { return { ok: false, stage: 'uninstall', code: installErrorCode(err) } }
+    try { deps.record() } catch { /* the plist is gone already */ }
+    return { ok: true }
+  })
 }
 
 /** What the real steps run and read; tests put their own. */
@@ -535,6 +545,12 @@ export function serviceStopDeps(
   o: { cli: string; pid: number | null; hold: StopDeps['hold']; record: () => void },
   sys: StopSystem = realStopSystem(),
 ): StopDeps {
-  void sys
-  return { shutdown: null, exited: async () => true, uninstall: async () => {}, hold: o.hold, record: o.record } // STUB
+  const pid = o.pid
+  return {
+    shutdown: pid === null ? null : sys.shutdown,
+    exited: () => until(() => pid === null || !sys.alive(pid), sys.exitWaitMs),
+    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], process.env),
+    hold: o.hold,
+    record: o.record,
+  }
 }

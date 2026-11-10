@@ -115,6 +115,7 @@ export function buildTrayView(input: TrayInput): TrayView {
       ...daemonItems,
       { type: 'separator' },
       { label: mt('tray.quit'), action: 'quit' },
+      ...(input.serviceInstalled ? [{ label: mt('tray.quitService'), action: 'quit-service' } satisfies TrayItem] : []),
     ],
   }
 }
