@@ -41,7 +41,7 @@
 //!    verified by mutation (swap the two lines and it goes 401 → 200).
 //! 5. **A name that is already a kernel route segment is refused.** axum PANICS on
 //!    an exact route overlap, so a module called `health` would kill the daemon at
-//!    startup rather than lose a routing contest — see [`RESERVED_KERNEL_SEGMENTS`].
+//!    startup rather than lose a routing contest — see [`crate::attached::RESERVED_KERNEL_SEGMENTS`].
 //!
 //! The pass runs `identity → admission → registry policy → construction → mount`,
 //! and the position of CONSTRUCTION is load-bearing: a module the user switched off
@@ -151,12 +151,9 @@ pub struct CallbackDeps {
 }
 
 // Single definition lives in `attached` so attach validation and mount
-// admission share one list. Re-exported so this module's docs, the mount
-// check, and `reserved_segments_match_the_kernel_routes_exactly` keep the name.
-pub(crate) use crate::attached::{RESERVED_KERNEL_SEGMENTS, is_reserved_kernel_segment};
-// The equality test is the other reader. This keeps the re-export live in the
-// bin, which does not compile that test.
-const _: &[&str] = RESERVED_KERNEL_SEGMENTS;
+// admission share one list. The mount pass only needs the predicate; the
+// route-equality test imports the slice from `crate::attached` itself.
+pub(crate) use crate::attached::is_reserved_kernel_segment;
 
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
@@ -2449,6 +2446,7 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::attached::RESERVED_KERNEL_SEGMENTS;
     use agent24_domain::{DomainOsManifest, ModelAccess, Result as DomainResult};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

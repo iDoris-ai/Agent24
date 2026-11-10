@@ -90,7 +90,7 @@ mod tests {
     use std::sync::Arc;
 
     use agent24_os_proto::drain::Generation;
-    use agent24_os_proto::rpc::{Dispatch, Methods, code};
+    use agent24_os_proto::rpc::{Dispatch, ErrorKind, Methods, RpcError, code};
 
     use super::*;
 
@@ -109,8 +109,9 @@ mod tests {
     }
 
     /// The method names `build_methods_for` registers unconditionally. Both
-    /// construction paths (models present / absent) must hand back this set;
-    /// capability gating stays inside the handlers.
+    /// construction paths install this set; it is not an authorization check
+    /// (`build_methods_for` registers all eleven whether or not the capability
+    /// was granted). The frame assertions below are the check.
     const METHOD_NAMES: &[&str] = &[
         "_a24/approval/advise",
         "_a24/approval/gate",
@@ -184,17 +185,72 @@ mod tests {
             .collect()
     }
 
-    /// Locks the two production constructions (`models: None` in
-    /// `AppState::new`, `models: Some` in `serve_steps`) to the old
-    /// `build_grant` output: `provides` order, and the unconditional method set.
+    /// Send one frame through the grant's real `methods_for` and run the
+    /// handler `dispatch` selects. Same shape as the frame+`dispatch` calls
+    /// in `domain`'s scheduler/model restart tests.
+    async fn call_granted(
+        grant: &AttachGrant,
+        id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, RpcError> {
+        let generation = Generation::attached();
+        let methods = (grant.methods_for)(&generation);
+        let frame = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": method,
+            "params": params,
+        }))
+        .unwrap();
+        match agent24_os_proto::rpc::dispatch(&frame, &methods, &|_| false) {
+            Dispatch::Call {
+                handler, params, ..
+            } => handler.call(params).await,
+            Dispatch::Respond(resp) => resp.outcome,
+            Dispatch::Cancel { .. } | Dispatch::Ignore => {
+                panic!("unexpected dispatch outcome for {method}")
+            }
+        }
+    }
+
+    /// Unauthorized is application `-32000` / `forbidden`. A missing
+    /// registration would be `METHOD_NOT_FOUND` (`-32601`) instead — these
+    /// methods are registered unconditionally, and the refusal lives in the
+    /// handler.
+    fn assert_forbidden(method: &str, err: &RpcError) {
+        assert_eq!(
+            (err.code, err.kind),
+            (code::APPLICATION, Some(ErrorKind::Forbidden)),
+            "{method} must be refused as unauthorized, not METHOD_NOT_FOUND ({code}): {err:?}",
+            code = code::METHOD_NOT_FOUND,
+        );
+    }
+
+    /// Locks this implementation's authorization semantics for both production
+    /// constructions (`models: None` in `AppState::new`, `models: Some` in
+    /// `serve_steps`): `provides` order, the `ATTACH_OOP_GRANTS` filter, and
+    /// the refusal a real frame gets from `methods_for`.
     #[tokio::test]
-    async fn both_construction_paths_match_the_previous_grant() {
+    async fn both_construction_paths_lock_this_implementations_authorization() {
         let bare = builder(false).await;
         let wired = builder(true).await;
         let events_and_models = manifest("events, models");
+        let also_unbacked = manifest("events, models, memory, scheduler, approval");
         let events_only = manifest("events");
         let models_only = manifest("models");
         let neither = manifest("");
+
+        // `ATTACH_OOP_GRANTS` drops memory/scheduler/approval, so asking for
+        // them changes nothing `provides` records.
+        assert_eq!(
+            bare.build("agentear", &also_unbacked).provides,
+            bare.build("agentear", &events_and_models).provides,
+        );
+        assert_eq!(
+            wired.build("agentear", &also_unbacked).provides,
+            wired.build("agentear", &events_and_models).provides,
+        );
 
         let bare_both = bare.build("agentear", &events_and_models);
         assert_eq!(bare_both.provides, vec!["_a24/events/".to_owned()]);
@@ -229,5 +285,53 @@ mod tests {
             !registered(&methods, "_a24/not-a-method"),
             "an unknown method must stay unregistered"
         );
+
+        let emit_params = serde_json::json!({"kind": "task.transitioned", "payload": {}});
+        for (label, grant) in [
+            ("bare", bare.build("agentear", &neither)),
+            ("wired", wired.build("agentear", &neither)),
+        ] {
+            let err = call_granted(&grant, "e1", "_a24/events/emit", emit_params.clone())
+                .await
+                .expect_err("events was not granted");
+            assert_forbidden(&format!("{label} _a24/events/emit"), &err);
+        }
+
+        let complete_params = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        let err = call_granted(
+            &bare.build("agentear", &events_and_models),
+            "m1",
+            "_a24/model/complete",
+            complete_params,
+        )
+        .await
+        .expect_err("models: None grants no model access");
+        assert_forbidden("bare _a24/model/complete", &err);
+
+        let memory_calls = [
+            (
+                "_a24/memory/private/remember",
+                serde_json::json!({"kind": "note", "body": {}}),
+            ),
+            (
+                "_a24/memory/private/recall",
+                serde_json::json!({"query": "note", "page_size": 1}),
+            ),
+            (
+                "_a24/memory/private/recent",
+                serde_json::json!({"page_size": 1}),
+            ),
+        ];
+        for (label, grant) in [
+            ("bare", bare.build("agentear", &also_unbacked)),
+            ("wired", wired.build("agentear", &also_unbacked)),
+        ] {
+            for (method, params) in &memory_calls {
+                let err = call_granted(&grant, "mem", method, params.clone())
+                    .await
+                    .expect_err("MemoryEntitlement::NONE");
+                assert_forbidden(&format!("{label} {method}"), &err);
+            }
+        }
     }
 }

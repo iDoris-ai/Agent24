@@ -83,8 +83,8 @@ impl Facts {
 /// better shape, but the namespace is fixed by ADR-029 / SPEC-MD-ME §2, so it is
 /// raised there rather than changed here.
 ///
-/// Single definition. `domain` re-exports it so mount admission and that test
-/// keep the name they already use.
+/// Single definition. Mount admission calls [`is_reserved_kernel_segment`];
+/// `domain`'s route-equality test imports this slice directly.
 pub(crate) const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "idoris",
     // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module

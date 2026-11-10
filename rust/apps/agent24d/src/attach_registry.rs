@@ -158,9 +158,10 @@ pub trait AttachGrantBuilder: Send + Sync {
 
 /// The grant builder for this registry. Design §5.5 (M2) calls this "AppState
 /// 持有 AttachRegistry（含 CallbackDeps 克隆）" — the handles live inside the
-/// builder, one level down, rather than on `AppState` directly. `Clone`
-/// clones the `Arc`, not the handles.
-#[derive(Clone)]
+/// builder, one level down, rather than on `AppState` directly.
+///
+/// Not `Clone`: this is the registry's only owner of those handles, and
+/// `revoke_all` releases them by dropping it.
 pub struct AttachDeps {
     pub grants: Arc<dyn AttachGrantBuilder>,
 }
