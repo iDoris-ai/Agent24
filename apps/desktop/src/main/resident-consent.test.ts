@@ -8,6 +8,7 @@ import {
   type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem,
 } from './resident-service'
 import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
+import { residentServiceMessages } from '../shared/resident-service.i18n'
 
 let root = ''
 afterEach(() => {
@@ -269,10 +270,10 @@ describe('the consent box copy', () => {
     setMainLocale(locale)
     for (const key of ['consent.message', 'consent.detail', 'consent.allow', 'consent.deny'] as const) expect(mt(key)).not.toBe('')
     expect(mt('consent.failed', { code: 'not_started' })).toContain('not_started')
-    // What the box says matches what there is (QA on B4b): no Settings switch
-    // yet (B4c), so the way back is the CLI, and a no is not asked again.
-    expect(mt('consent.detail')).toContain('agent24 service uninstall')
-    expect(mt('consent.detail')).toContain('agent24 service install')
+    // What the box says matches what there is (QA on B4b), and a no is not asked again.
+    // M5 B4c2: the way back is the Settings switch, named as Settings names it.
+    expect(mt('consent.detail')).toContain(residentServiceMessages[locale].label)
+    expect(mt('consent.detail')).not.toContain('agent24 service')
     expect(mt('consent.detail')).toContain(mt('consent.deny'))
   })
   it('the three languages differ', () => {
