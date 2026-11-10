@@ -42,6 +42,8 @@ grep -rn 'killpg\|kill(-\|SIGTERM\|SIGKILL\|Signal::SIGTERM\|setpgid\|process_gr
 
 ## 桌面（TS）侧
 
+本节只覆盖 S2-6 原计划要统一的模块（backend-manager、creative-serve-web / Open Design），不是桌面全部的进程停止点。
+
 | 现状 | 行为 |
 |---|---|
 | `apps/desktop/src/main/backend-manager.ts:1016` killChild | 单个 child SIGTERM；立即清空引用，无 KILL、无等待 |
@@ -49,3 +51,8 @@ grep -rn 'killpg\|kill(-\|SIGTERM\|SIGKILL\|Signal::SIGTERM\|setpgid\|process_gr
 | creative-serve-web packaged 路径 → SidecarManager / `open-design-sidecar.ts:177` | 当前源码是 launcher 单 PID TERM（避免连同服务同时 TERM），15s 后组 KILL，并确认组空；这与“TERM 整组”的计划简称有差异。另有启动失败清理（`open-design-sidecar.ts:354`）：写 PGID 文件失败时立即组 SIGKILL，不先 TERM、不等待、不确认组空 |
 
 若以后统一，必须显式区分“只 TERM 不等待”、checkout 的 5s、packaged 的 15s 及 PID/PGID 目标。
+
+计划范围之外、盘点时顺带看到的两处：
+
+- `apps/desktop/src/main/ipc/index.ts:625` OmlxStop：先对自有 child 发 SIGTERM，再在非 Windows 上 `pkill -f 'omlx serve'`。后者也会匹配用户自己启动的 omlx，无等待、无 KILL 升级、无退出确认。**列为待办**：停止时只应针对本应用启动的进程。
+- `apps/desktop/src/main/cli-tool.ts:56` CLI 版本探测：`execFile` 3 秒超时，超时直接对单个子进程 SIGKILL，不涉及进程组。
