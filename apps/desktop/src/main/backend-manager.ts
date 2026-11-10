@@ -627,6 +627,8 @@ export class BackendManager {
   private disposed = false
   /** Set while whileStopped() runs: whether to bring the daemon back after. */
   private held: { resume: boolean } | null = null
+  /** The last whileStopped() call's end; null when none is pending. */
+  private stoppedQueue: Promise<void> | null = null
   // T1-1: what start() waits for before it reuses or spawns anything (the
   // bundled documents module is installed first, so the daemon mounts it).
   // While it is pending, the tray's start / restart / stop only record what
@@ -1092,7 +1094,17 @@ export class BackendManager {
    * `attach_only` → offline store → busy). A reused external daemon is not
    * ours to stop: `work` just runs, and the CLI reaches it as it can.
    */
-  async whileStopped<T>(work: () => Promise<T>, exitTimeoutMs = DAEMON_EXIT_WAIT_MS): Promise<T> {
+  whileStopped<T>(work: () => Promise<T>, exitTimeoutMs = DAEMON_EXIT_WAIT_MS): Promise<T> {
+    // One hold at a time: `held` belongs to one (Codex B4b C1, the first-launch
+    // install and a module action at once). The first runs at once, as before.
+    const prior = this.stoppedQueue
+    const run = prior ? prior.then(() => this.holdStopped(work, exitTimeoutMs)) : this.holdStopped(work, exitTimeoutMs)
+    const tail: Promise<void> = run.then(() => {}, () => {}).then(() => { if (this.stoppedQueue === tail) this.stoppedQueue = null })
+    this.stoppedQueue = tail
+    return run
+  }
+
+  private async holdStopped<T>(work: () => Promise<T>, exitTimeoutMs: number): Promise<T> {
     if (this.isExternal || this.disposed) return work()
     const resume = !this.userStopped
     const child = this.child
@@ -1108,7 +1120,13 @@ export class BackendManager {
     } finally {
       const wanted = this.held.resume
       this.held = null
-      if (wanted && !this.disposed) this.startDaemon()
+      if (wanted && !this.disposed) {
+        // As before the hold: startDaemon() leaves a blocked manager as it is,
+        // so the tick re-probes the peer only when this is undone here
+        // (PR-Daemon B4b B1).
+        this.userStopped = false
+        this.startDaemon()
+      }
     }
   }
 

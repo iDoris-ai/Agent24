@@ -314,3 +314,167 @@ export class CrashLoopDetector {
     return Math.max(...seen) - Math.min(...seen) >= LOOP_RESTARTS
   }
 }
+
+// ── M5 B4b: first-launch consent and `agent24 service install` ──────────────
+// David 11-10 (a): asked once, installed only on yes. The answer is kept in
+// `<data_dir>/desktop/resident-consent.json` (asked / answer / time, nothing
+// else: N4). A yes whose install fails is not kept, so the next launch asks
+// again (PM r1 ②).
+
+export const CONSENT_VERSION = 1
+export const INSTALL_START_WAIT_MS = 30_000
+
+export type ConsentAnswer = 'allow' | 'declined'
+export interface ConsentRecord { version: typeof CONSENT_VERSION; answer: ConsentAnswer; at: string }
+
+export function consentPath(dataDir: string): string {
+  return path.join(dataDir, 'desktop', 'resident-consent.json')
+}
+
+/** The kept answer; null when there is none, or it is not one this version
+ * wrote (a broken or older file is asked again). */
+export function readConsent(file: string): ConsentRecord | null {
+  try {
+    const value: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
+    const { version, answer, at } = value as { version: unknown; answer: unknown; at: unknown }
+    if (version !== CONSENT_VERSION || (answer !== 'allow' && answer !== 'declined') || typeof at !== 'string') return null
+    return { version: CONSENT_VERSION, answer, at }
+  } catch {
+    return null
+  }
+}
+
+/** Written next to the target and renamed over it, owner-only (0600) in a
+ * directory created when missing. */
+export function writeConsent(file: string, answer: ConsentAnswer, now: Date): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true })
+  const temp = path.join(path.dirname(file), `.resident-consent.${process.pid}.tmp`)
+  fs.rmSync(temp, { force: true })
+  try {
+    const fd = fs.openSync(temp, 'wx', 0o600)
+    try {
+      fs.writeFileSync(fd, JSON.stringify({ version: CONSENT_VERSION, answer, at: now.toISOString() }))
+      fs.fchmodSync(fd, 0o600)
+      fs.fsyncSync(fd)
+    } finally {
+      fs.closeSync(fd)
+    }
+    fs.renameSync(temp, file)
+  } catch (err) {
+    fs.rmSync(temp, { force: true })
+    throw err
+  }
+}
+
+/** Only a packaged macOS app that ships its own daemon (`upgradesFromBundle`),
+ * with no LaunchAgent yet and no kept answer. */
+export function shouldAskConsent(o: { platform: NodeJS.Platform; fromBundle: boolean; installed: boolean; consent: ConsentRecord | null }): boolean {
+  return o.platform === 'darwin' && o.fromBundle && !o.installed && o.consent === null
+}
+
+export type InstallOutcome = { ok: true } | { ok: false; stage: 'install' | 'start'; code: string }
+
+export interface InstallDeps {
+  /** `agent24 service install`; rejects when it fails. */
+  install: () => Promise<void>
+  /** Resolves true once the service daemon is on record (within INSTALL_START_WAIT_MS). */
+  started: () => Promise<boolean>
+  /** `agent24 service uninstall`; idempotent. */
+  uninstall: () => Promise<void>
+  /** Runs `work` with this app's own daemon stopped and nothing spawned (`whileStopped`). */
+  hold: <T>(work: () => Promise<T>) => Promise<T>
+}
+
+function installErrorCode(err: unknown): string {
+  if (typeof err === 'object' && err !== null && 'code' in err) {
+    if (typeof err.code === 'string') return err.code
+    if (typeof err.code === 'number') return `exit_${err.code}`
+  }
+  return 'install_failed'
+}
+
+/** Inside one hold: install, then wait for the service daemon. Any failure
+ * uninstalls once, so that no half-installed plist is left; when that
+ * uninstall fails too, its failure is ignored and the plist may stay (known
+ * Low, Codex B4b C4). The hold's end brings this app's own daemon back. */
+export function installService(deps: InstallDeps): Promise<InstallOutcome> {
+  return deps.hold(async (): Promise<InstallOutcome> => {
+    const failed = async (stage: 'install' | 'start', code: string): Promise<InstallOutcome> => {
+      try { await deps.uninstall() } catch { /* its own failure is ignored */ }
+      return { ok: false, stage, code }
+    }
+    try {
+      await deps.install()
+    } catch (err) {
+      return failed('install', installErrorCode(err))
+    }
+    if (!(await deps.started())) return failed('start', 'not_started')
+    return { ok: true }
+  })
+}
+
+export type ConsentOutcome = 'declined' | 'installed' | { failed: string }
+
+/** Ask, then: no → kept as declined; yes → install, kept as allow only when it
+ * worked. */
+export async function runConsent(deps: {
+  ask: () => Promise<ConsentAnswer>
+  install: () => Promise<InstallOutcome>
+  record: (answer: ConsentAnswer) => void
+}): Promise<ConsentOutcome> {
+  let answer: ConsentAnswer
+  try { answer = await deps.ask() } catch { return { failed: 'ask_failed' } }
+  if (answer === 'declined') { deps.record('declined'); return 'declined' }
+  let outcome: InstallOutcome
+  try { outcome = await deps.install() } catch { return { failed: 'install_failed' } }
+  if (!outcome.ok) return { failed: outcome.code }
+  deps.record('allow')
+  return 'installed'
+}
+
+/** What the real steps run and read; tests put their own. */
+export interface InstallSystem {
+  run: (bin: string, args: string[], env: NodeJS.ProcessEnv) => Promise<void>
+  record: () => { pid: number; enrollEndpoint?: string } | null
+  alive: (pid: number) => boolean
+  spawned: (pid: number) => boolean
+  startWaitMs: number
+}
+
+const realInstallSystem = (spawned: (pid: number) => boolean): InstallSystem => ({
+  run: (bin, args, env) => new Promise((resolve, reject) => {
+    execFile(bin, args, { env, timeout: 60_000 }, (err) => (err ? reject(err) : resolve()))
+  }),
+  record: readExternalDaemonState,
+  alive: processAlive,
+  spawned,
+  startWaitMs: INSTALL_START_WAIT_MS,
+})
+
+/** The real steps: the bundled CLI with `AGENT24D_BIN` set to the bundled
+ * daemon (so the copy launchd runs is this app's), once `ready` (the bundled
+ * documents module's launch install) is done: the service daemon starts as
+ * soon as it is bootstrapped (Codex B4b C2). Started means a live daemon on
+ * record with an enrolment socket that this app did not spawn and that was
+ * not the one on record before the install (Codex B4b C3). */
+export function serviceInstallDeps(
+  o: { cli: string; daemonBin: string; ready: Promise<unknown>; hold: InstallDeps['hold']; spawned: (pid: number) => boolean },
+  sys: InstallSystem = realInstallSystem(o.spawned),
+): InstallDeps {
+  const env = { ...process.env, AGENT24D_BIN: o.daemonBin }
+  let before: number | null = null
+  return {
+    install: async () => {
+      await o.ready.catch(() => {})
+      before = sys.record()?.pid ?? null
+      await sys.run(o.cli, ['service', 'install'], env)
+    },
+    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], env),
+    started: () => until(() => {
+      const state = sys.record()
+      return state !== null && state.pid !== before && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)
+    }, sys.startWaitMs),
+    hold: o.hold,
+  }
+}

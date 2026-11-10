@@ -415,6 +415,44 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
     })
 
+    it('two at once run one after the other, and the daemon comes back once, after both (Codex B4b C1)', async () => {
+      const first = fakeChild(111)
+      const second = fakeChild(222)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second).mockReturnValue(fakeChild(333))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      const seen: string[] = []
+      let finishA!: () => void
+      const a = manager.whileStopped(() => new Promise<string>((r) => { seen.push('a'); finishA = () => r('A') }))
+      const b = manager.whileStopped(async () => { seen.push(`b spawned=${spawnProcess.mock.calls.length}`); return 'B' })
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finishA).toBeDefined())
+      await Promise.resolve()
+      expect(seen).toEqual(['a'])
+      finishA()
+      expect(await a).toBe('A')
+      // A's end brought the daemon back (222); B stops it again and waits for it.
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      await vi.waitFor(() => expect(second.kill).toHaveBeenCalledWith('SIGTERM'))
+      ;(second as unknown as EventEmitter).emit('exit', 0)
+      expect(await b).toBe('B')
+      expect(seen).toEqual(['a', 'b spawned=2'])
+      expect(spawnProcess).toHaveBeenCalledTimes(3)
+      manager.stop()
+    })
+
+    it('one failing does not stop the next from running', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      manager.stopDaemon()
+      const a = manager.whileStopped(async () => { throw new Error('boom') })
+      const b = manager.whileStopped(async () => 'ran')
+      await expect(a).rejects.toThrow('boom')
+      expect(await b).toBe('ran')
+      manager.stop()
+    })
+
     it('a reused external daemon is not stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
@@ -1264,6 +1302,55 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       expect(manager.externalDaemonPid()).toBe(4242)
       expect(getBackendEndpoint()).toEqual({ port: 5555 })
       expect(manager.statusDetail()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('blocked, then a hold whose work fails (a rolled-back install): supervision comes back, so the occupant going lets a later tick spawn (PR-Daemon B4b B1)', async () => {
+    vi.useFakeTimers()
+    let health: { ok: boolean; protocolVersion: number | null } = { ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION + 1 }
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth: vi.fn(async () => health),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(manager.status()).toBe('error')
+      await expect(manager.whileStopped(async () => { throw new Error('not_started') })).rejects.toThrow('not_started')
+      expect(manager.status()).toBe('error')
+      health = { ok: false, protocolVersion: null }
+      await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).not.toBe('stopped')
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray stop while blocked is kept through a hold: still stopped afterwards', async () => {
+    vi.useFakeTimers()
+    let health: { ok: boolean; protocolVersion: number | null } = { ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION + 1 }
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth: vi.fn(async () => health),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      manager.stopDaemon()
+      expect(await manager.whileStopped(async () => 'ran')).toBe('ran')
+      health = { ok: false, protocolVersion: null }
+      // The occupant gone: only a manager the user had not stopped spawns now.
+      await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS * 3)
+      expect(spawnProcess).not.toHaveBeenCalled()
     } finally {
       manager.stop()
     }

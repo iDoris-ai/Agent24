@@ -10,8 +10,8 @@ import { registerCliTool } from './ipc/cli-tool'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, CrashLoopDetector, serviceRecordPid, serviceRuns, ServiceUpgrader, serviceUpgradeDeps, upgradeService, upgradesFromBundle } from './resident-service'
+import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, ServiceUpgrader, serviceUpgradeDeps, shouldAskConsent, upgradeService, upgradesFromBundle, writeConsent } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -604,6 +604,7 @@ app.whenReady().then(async () => {
   })
   void cliTool.refresh()
   mainWin = createMainWindow()
+  void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   knowledgeView = new KnowledgeViewHost({
@@ -739,6 +740,45 @@ app.whenReady().then(async () => {
   // macOS: re-open window when dock icon clicked with no windows open
   app.on('activate', () => showOrCreateWindow())
 })
+
+// M5 B4b: asked once, with the window up. Allow installs the LaunchAgent,
+// after the bundled documents module's launch install, with this app's own
+// daemon stopped meanwhile; a failed install is undone and not
+// kept, so the next launch asks again (PM r1 ②).
+async function askResidentConsent(documentsReady: Promise<unknown>): Promise<void> {
+  const dataDir = tryDataDir()
+  if (dataDir === null) return
+  const file = consentPath(dataDir)
+  const fromBundle = upgradesFromBundle(app.isPackaged, process.env)
+  if (!shouldAskConsent({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
+  const outcome = await runConsent({
+    ask: async () => {
+      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
+      const { response } = await dialog.showMessageBox(mainWin, {
+        type: 'question',
+        buttons: [mt('consent.allow'), mt('consent.deny')],
+        defaultId: 0,
+        cancelId: 1,
+        message: mt('consent.message'),
+        detail: mt('consent.detail'),
+      })
+      return response === 0 ? 'allow' : 'declined'
+    },
+    install: () => installService(serviceInstallDeps({
+      cli: resolveBundledRustBinary('agent24', app.isPackaged),
+      daemonBin: resolveRustBinary(app.isPackaged),
+      ready: documentsReady,
+      hold: (work) => backendManager.whileStopped(work),
+      spawned: (pid) => backendManager.spawned(pid),
+    })),
+    record: (answer) => writeConsent(file, answer, new Date()),
+  })
+  if (typeof outcome === 'object') {
+    console.warn('[main] resident service not installed:', outcome.failed)
+    if (mainWin && !mainWin.isDestroyed()) void dialog.showMessageBox(mainWin, { type: 'warning', message: mt('consent.failed', { code: outcome.failed }) })
+  }
+  refreshTray()
+}
 
 // Rebuild the tray title, tooltip, and context menu from the live daemon status
 // and the current UI language. Cheap and idempotent — safe to call on a timer,
