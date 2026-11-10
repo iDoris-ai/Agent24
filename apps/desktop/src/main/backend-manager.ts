@@ -894,7 +894,11 @@ export class BackendManager {
     this.shutdownAsked = state.pid
     console.log(`[backend:${this.kind}] taking over CLI daemon (pid ${state.pid}, port ${state.port}) so Knowledge can work — asking it to shut down`)
     const status = await this.external.requestShutdown({ port: state.port }, state.token)
-    if (lifecycle !== this.lifecycle) return 'superseded'
+    // Stopped meanwhile: this ask is not the one that counts (PR-Daemon B4a N2).
+    if (lifecycle !== this.lifecycle) {
+      if (this.shutdownAsked === state.pid) this.shutdownAsked = null
+      return 'superseded'
+    }
     if (status === null || status < 200 || status > 299) {
       console.warn(`[backend:${this.kind}] CLI daemon refused shutdown (${status ?? 'no answer'}); starting our own anyway`)
       return 'absent'
@@ -1042,6 +1046,8 @@ export class BackendManager {
    * real stop would, but the external process itself is left untouched. */
   stopDaemon(): void {
     this.serviceWaitSince = null
+    // A Start after this asks the legacy daemon again, once (PR-Daemon B4a N2).
+    this.shutdownAsked = null
     if (this.held) this.held.resume = false
     this.lifecycle += 1
     this.userStopped = true

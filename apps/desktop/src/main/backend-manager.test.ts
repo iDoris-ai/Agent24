@@ -797,6 +797,52 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
     }
   })
 
+  it('a tray Stop while the shutdown is in flight, then Start: the legacy daemon is asked again, once (PR-Daemon B4a N2)', async () => {
+    vi.useFakeTimers()
+    let answer!: (status: number) => void
+    const requestShutdown = vi.fn()
+      .mockImplementationOnce(() => new Promise<number>((r) => { answer = r }))
+      .mockResolvedValue(404)
+    const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(11_000)
+    try {
+      expect(requestShutdown).toHaveBeenCalledTimes(1)
+      manager.stopDaemon()
+      answer(202)
+      await vi.advanceTimersByTimeAsync(1_000)
+      await starting
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(90_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(2)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray Stop then Start after a refused shutdown asks once more, not on every tick (PR-Daemon B4a N2)', async () => {
+    vi.useFakeTimers()
+    const requestShutdown = vi.fn().mockResolvedValue(404)
+    const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+    const manager = new BackendManager({ external, spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(11_000)
+    await starting
+    try {
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(1)
+      manager.stopDaemon()
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(2)
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('a capability-mode record stays foreign: never shut down, never spawned over', async () => {
     const external = cliDaemon({ read: () => ({ ...record, authMode: 'capabilities' }) })
     const { spawnProcess } = await started(external)
