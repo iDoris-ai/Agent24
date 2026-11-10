@@ -18,6 +18,63 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {rel}: {err}"))
 }
 
+/// Names in the `[features]` table's `default` array. No `default` key means
+/// an empty list. A `#` comment, including one that spells the array, is not
+/// a feature.
+fn feature_defaults(toml: &str) -> Vec<String> {
+    let Some(rest) = toml.split("[features]").nth(1) else {
+        return Vec::new();
+    };
+    let section = rest.split("\n[").next().unwrap_or(rest);
+    let mut buf = String::new();
+    let mut collecting = false;
+    for line in section.lines() {
+        let code = line.split('#').next().unwrap_or(line);
+        let code = code.split("//").next().unwrap_or(code);
+        if !collecting {
+            let trimmed = code.trim();
+            let Some(rest) = trimmed.strip_prefix("default") else {
+                continue;
+            };
+            if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                continue;
+            }
+            let Some(after_eq) = rest.trim_start().strip_prefix('=') else {
+                continue;
+            };
+            collecting = true;
+            buf.push_str(after_eq);
+            if buf.contains(']') {
+                break;
+            }
+        } else {
+            buf.push('\n');
+            buf.push_str(code);
+            if code.contains(']') {
+                break;
+            }
+        }
+    }
+    if !collecting {
+        return Vec::new();
+    }
+    let inside = buf
+        .split_once('[')
+        .map(|(_, rest)| rest.split(']').next().unwrap_or(""))
+        .unwrap_or("");
+    inside
+        .split(',')
+        .filter_map(|part| {
+            let part = part.trim().trim_matches('"');
+            if part.is_empty() {
+                None
+            } else {
+                Some(part.to_owned())
+            }
+        })
+        .collect()
+}
+
 fn member_list(toml: &str, key: &str) -> Vec<String> {
     let marker = format!("{key} = [");
     let start = toml
@@ -127,18 +184,52 @@ fn store_dormant_chains_are_feature_gated_not_deleted() {
 
 #[test]
 fn knowledge_store_is_feature_gated_not_deleted() {
-    // S2-3 moved the module into agent24-knowledge. The feature stays off.
+    // S2-3 moved the module into agent24-knowledge. The feature stays off
+    // for both crates that can turn it on. The array is parsed, so a longer
+    // `default` list cannot hide `knowledge-store` inside it.
+    let multiline = "\
+[features]
+# default = [\"knowledge-store\"]
+knowledge-store = [\"dep:sqlx\"]
+default = [
+    \"other\",
+    \"knowledge-store\",
+]
+";
+    assert!(
+        feature_defaults(multiline)
+            .iter()
+            .any(|name| name == "knowledge-store")
+    );
+    let commented = "[features]\n# default = [\"knowledge-store\"]\nknowledge-store = []\n";
+    assert!(
+        !feature_defaults(commented)
+            .iter()
+            .any(|name| name == "knowledge-store")
+    );
+    for rel in [
+        "crates/agent24-knowledge/Cargo.toml",
+        "apps/agent24d/Cargo.toml",
+    ] {
+        let cargo = read(rel);
+        assert!(
+            !feature_defaults(&cargo)
+                .iter()
+                .any(|name| name == "knowledge-store"),
+            "{rel}: knowledge-store must not be a default feature"
+        );
+    }
     let cargo = read("crates/agent24-knowledge/Cargo.toml");
     assert!(cargo.contains("knowledge-store = [\"dep:sqlx\"]"));
-    assert!(
-        !cargo.contains("default = [\"knowledge-store\"]"),
-        "knowledge-store must not be a default feature"
-    );
     let lib = read("crates/agent24-knowledge/src/lib.rs");
     let start = lib.find("mod store;").expect("store module");
     let window = &lib[start.saturating_sub(240)..start];
     assert!(window.contains("#[cfg(feature = \"knowledge-store\")]"));
     assert!(window.contains("knowledge-store has no production caller"));
+    assert!(
+        !window.contains("allow(dead_code)"),
+        "knowledge_store must not sit under a dead_code allow"
+    );
     assert!(
         rust_root()
             .join("crates/agent24-knowledge/src/store/mod.rs")

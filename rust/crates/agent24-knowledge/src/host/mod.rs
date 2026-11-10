@@ -127,8 +127,6 @@ pub struct RunBinding {
 }
 
 /// Why a run has no usable binding; Knowledge tools refuse with its code.
-// Consumed by the Knowledge tools (PR-E).
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnowledgeRefusal {
     /// The run names no binding.
@@ -139,7 +137,6 @@ pub enum KnowledgeRefusal {
 }
 
 impl KnowledgeRefusal {
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn code(self) -> &'static str {
         match self {
             Self::Unbound => "knowledge_unbound",
@@ -384,8 +381,6 @@ impl KnowledgeHostRegistry {
     /// C of an active binding of `host`, unless it has expired by `now`; an
     /// expired C is dropped here. Only an active binding holds one: a push
     /// needs the binding active, and deactivation drops it.
-    // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn credential(
         &self,
         host: &str,
@@ -492,8 +487,6 @@ impl KnowledgeHostRegistry {
     /// The binding a run may use now: the one it names in its persisted input
     /// (`selector`), still active under the host and generation it was pinned
     /// to. Nothing else is looked up, so a run never moves to a new binding.
-    // Consumed by the Knowledge tools (PR-E).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn resolve_run(
         &self,
         run_id: &str,
@@ -597,6 +590,7 @@ impl KnowledgeHostRegistry {
     }
 
     /// How many component reads are waiting on the current capabilities flight.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn inflight_receivers(&self) -> usize {
         self.probes.inflight_receivers()
     }
@@ -677,8 +671,6 @@ impl KnowledgeHostRegistry {
     }
 
     /// Whether `host` has `binding` active.
-    // Consumed by run binding (PR-C) and the Provider (KB-C1-01).
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn is_active(&self, host: &str, binding: &str) -> bool {
         self.entries.lock().is_ok_and(|entries| {
             entries

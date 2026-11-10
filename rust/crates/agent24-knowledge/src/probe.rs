@@ -384,6 +384,7 @@ impl KnowledgeProbeCache {
 
     /// Receivers parked on the current flight. Tests use this to abort the
     /// leader only after a waiter has subscribed.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn inflight_receivers(&self) -> usize {
         let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard
