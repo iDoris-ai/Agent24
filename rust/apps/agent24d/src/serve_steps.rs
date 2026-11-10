@@ -1530,10 +1530,12 @@ pub(super) async fn publish_mount_and_attach(
     // racing an unloaded name would otherwise see a spurious `auth_failed`).
     state.attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
         crate::attach_registry::AttachDeps {
-            scheduler: state.scheduler.clone(),
-            models: Some(model_deps),
-            approval_broker: state.module_approval_broker.clone(),
-            events: state.events.clone(),
+            grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
+                scheduler: state.scheduler.clone(),
+                models: Some(model_deps),
+                approval_broker: state.module_approval_broker.clone(),
+                events: state.events.clone(),
+            }),
         },
     ));
     // Review H1: an EPHEMERAL daemon (`agent24 ...` without a resident

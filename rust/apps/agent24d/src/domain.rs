@@ -150,99 +150,13 @@ pub struct CallbackDeps {
     pub models: Option<crate::model_callback::ModelCallbackDeps>,
 }
 
-/// Names a module may not take, because the kernel already serves
-/// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
-///
-/// ```text
-/// Overlapping method route. Handler for `GET /api/v1/health` already exists
-/// ```
-///
-/// A module called `health` with a route at `/` would therefore kill the daemon
-/// AT STARTUP — a third-party domain OS could brick the process by choosing a
-/// name. Refusing it here turns that into one refused module and a running
-/// daemon. (A FALLBACK-ONLY nested router does not shadow kernel routes —
-/// verified: a degraded module named `runs` leaves `/api/v1/runs/{id}` answering
-/// from the kernel. A module with an explicit STATIC route can still outrank a
-/// dynamic kernel one, e.g. `/api/v1/runs/foo` over `/api/v1/runs/{id}`; the
-/// reservation below is what prevents that, not axum's precedence rules.)
-///
-/// This list must track [`crate::server::build_router_with_modules`], and
-/// `reserved_segments_match_the_kernel_routes_exactly` fails if it drifts EITHER
-/// way — a missing entry reappears as a startup panic, a stale one silently
-/// refuses a legitimate module. That test scans literal `/api/v1/<segment>`
-/// strings in that function's source, so it catches how routes are written here
-/// today; it is a heuristic, not a proof (see its own doc for what it cannot
-/// see).
-///
-/// The structural alternative is to namespace domain OSes under `/api/v1/os/<name>`,
-/// which makes the collision unrepresentable rather than checked. That is the
-/// better shape, but the namespace is fixed by ADR-029 / SPEC-MD-ME §2, so it is
-/// raised there rather than changed here.
-const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
-    "idoris",
-    // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module
-    // registry lives at `/api/v1/attached`, so no domain OS may be named
-    // `attached` — same reservation mechanism as every other kernel segment
-    // below, and `reserved_segments_match_the_kernel_routes_exactly` pins it
-    // against `crate::server::build_router_with_modules` the same way.
-    "attached",
-    "approvals",
-    "capabilities",
-    "chat",
-    // COMM-2a: `/api/v1/comm/*` (`crate::comm_routes::build`) is kernel code,
-    // merged into `module_routes` by `server::serve` itself rather than
-    // registered as a literal route inside `build_router_with_modules` — so
-    // it does NOT show up in `reserved_segments_match_the_kernel_routes_exactly`'s
-    // scan of that function's source, and that test's `EXTRA_RESERVED` list
-    // (below) carries it instead. Reserved here regardless, so a domain-OS
-    // package cannot claim `name: comm` and collide with (or, depending on
-    // merge order, shadow) the real mount.
-    "comm",
-    // ADR-038 C3: `/api/v1/components` (status of every component) and its report route.
-    "components",
-    // D0-3 (`docs/agent/PLAN-DECIDE.md` §1.1): `/api/v1/decide/profile` is
-    // kernel code. A domain OS named `decide` would collide with it.
-    "decide",
-    "events",
-    "health",
-    // KB-HOST-01: `/api/v1/host/knowledge/*`, the desktop host's private interface.
-    "host",
-    // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
-    // `/api/v1/memory/settings` — the personal-memory REST surface.
-    "memory",
-    // T7b/ME-3e: `/api/v1/module-approvals`.
-    "module-approvals",
-    // K1-6a.4: `/api/v1/module-consents` management endpoints.
-    "module-consents",
-    "models",
-    // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
-    // — and the set-equality test below is what forced this entry the moment the
-    // route was added, rather than leaving it to be discovered by whoever shipped
-    // that module.
-    "os",
-    // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
-    "peer",
-    // CORE-2 AgentEar S3: `/api/v1/presence/challenges/*`, the desktop confirmation channel.
-    "presence",
-    "runs",
-    "schedules",
-    "sessions",
-    "shutdown",
-    "standing-grants",
-    // ME4-desktop-model-ui: `/api/v1/timings` + `/api/v1/timings/summary`.
-    "timings",
-    "tool-overrides",
-    "tools",
-    "usage",
-];
-
-/// Whether `name` is a kernel route segment no module (mounted OR attached,
-/// A3-2a) may claim. Exposed for [`crate::attached`], which has no manifest
-/// mount pass of its own to run this check inside — it validates a name at
-/// `POST /api/v1/attached` time, before ever touching the registry file.
-pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
-    RESERVED_KERNEL_SEGMENTS.contains(&name)
-}
+// Single definition lives in `attached` so attach validation and mount
+// admission share one list. Re-exported so this module's docs, the mount
+// check, and `reserved_segments_match_the_kernel_routes_exactly` keep the name.
+pub(crate) use crate::attached::{RESERVED_KERNEL_SEGMENTS, is_reserved_kernel_segment};
+// The equality test is the other reader. This keeps the re-export live in the
+// bin, which does not compile that test.
+const _: &[&str] = RESERVED_KERNEL_SEGMENTS;
 
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
@@ -1618,7 +1532,7 @@ pub async fn mount_all_with_refusals(
         // otherwise CONCEAL it: turning it back on would fail in a way the earlier
         // report gave no hint of. It also stops two truths at once — an entry named
         // `health` reported Disabled while `/api/v1/health` answered 200.
-        if RESERVED_KERNEL_SEGMENTS.contains(&name.as_str()) {
+        if is_reserved_kernel_segment(&name) {
             refuse(
                 format!(
                     "the name {name:?} is a kernel route segment; mounting it would \

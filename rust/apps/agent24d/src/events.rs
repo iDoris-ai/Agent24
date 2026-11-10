@@ -54,6 +54,12 @@ impl EventsHub {
     }
 }
 
+impl crate::agentear_timings::AgentEarEventBus for EventsHub {
+    fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)> {
+        EventsHub::subscribe(self)
+    }
+}
+
 fn pre_upgrade_receiver(hub: &EventsHub) -> broadcast::Receiver<(String, EventBody)> {
     hub.subscribe()
 }

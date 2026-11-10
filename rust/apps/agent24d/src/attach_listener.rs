@@ -42,7 +42,7 @@ const HANDSHAKE_DEADLINE: Duration = Duration::from_secs(5);
 ///
 /// A human-readable reason; the caller does not bind and the attach
 /// listener degrades (same posture as a package whose supervisor host
-/// failed to start, `crate::domain::mount_package`'s own `degraded` path).
+/// failed to start, `domain::mount_package`'s own `degraded` path).
 fn ensure_private_dir(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     std::fs::DirBuilder::new()
@@ -121,7 +121,7 @@ async fn bind(path: &Path) -> Result<UnixListener, String> {
 /// and end this task WITHOUT taking the daemon down — an attach listener that
 /// cannot start degrades attached-module support, exactly like a package
 /// whose supervisor host failed to start degrades out-of-process packages
-/// (`crate::domain::mount_package`'s own `degraded` path).
+/// (`domain::mount_package`'s own `degraded` path).
 pub async fn run(registry: Arc<AttachRegistry>, path: PathBuf, stop: CancellationToken) {
     let listener = match bind(&path).await {
         Ok(l) => l,
@@ -456,7 +456,7 @@ mod tests {
 
     /// A `RunTrigger` that never fires — this test only needs a `Scheduler`
     /// to exist so `AttachDeps` can be built without wiring a real one. Same
-    /// shape as `crate::attach_registry::tests::NoopTrigger` (duplicated
+    /// shape as `attach_registry::tests::NoopTrigger` (duplicated
     /// rather than shared: that one lives in a private `mod tests` in a
     /// different file).
     struct NoopTrigger;
@@ -475,18 +475,21 @@ mod tests {
 
     async fn test_attach_deps() -> crate::attach_registry::AttachDeps {
         let store = agent24_store::Store::open_memory().await.unwrap();
+        let events = crate::events::EventsHub::default();
         crate::attach_registry::AttachDeps {
-            scheduler: agent24_scheduler::Scheduler::new(
-                store.clone(),
-                std::sync::Arc::new(NoopTrigger),
-                std::sync::Arc::new(|_| {}),
-            ),
-            models: None,
-            approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
-                store,
-                crate::events::EventsHub::default(),
-            ),
-            events: crate::events::EventsHub::default(),
+            grants: std::sync::Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
+                scheduler: agent24_scheduler::Scheduler::new(
+                    store.clone(),
+                    std::sync::Arc::new(NoopTrigger),
+                    std::sync::Arc::new(|_| {}),
+                ),
+                models: None,
+                approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
+                    store,
+                    events.clone(),
+                ),
+                events,
+            }),
         }
     }
 
