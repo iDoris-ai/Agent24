@@ -415,6 +415,44 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
     })
 
+    it('two at once run one after the other, and the daemon comes back once, after both (Codex B4b C1)', async () => {
+      const first = fakeChild(111)
+      const second = fakeChild(222)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second).mockReturnValue(fakeChild(333))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      const seen: string[] = []
+      let finishA!: () => void
+      const a = manager.whileStopped(() => new Promise<string>((r) => { seen.push('a'); finishA = () => r('A') }))
+      const b = manager.whileStopped(async () => { seen.push(`b spawned=${spawnProcess.mock.calls.length}`); return 'B' })
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finishA).toBeDefined())
+      await Promise.resolve()
+      expect(seen).toEqual(['a'])
+      finishA()
+      expect(await a).toBe('A')
+      // A's end brought the daemon back (222); B stops it again and waits for it.
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      await vi.waitFor(() => expect(second.kill).toHaveBeenCalledWith('SIGTERM'))
+      ;(second as unknown as EventEmitter).emit('exit', 0)
+      expect(await b).toBe('B')
+      expect(seen).toEqual(['a', 'b spawned=2'])
+      expect(spawnProcess).toHaveBeenCalledTimes(3)
+      manager.stop()
+    })
+
+    it('one failing does not stop the next from running', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      manager.stopDaemon()
+      const a = manager.whileStopped(async () => { throw new Error('boom') })
+      const b = manager.whileStopped(async () => 'ran')
+      await expect(a).rejects.toThrow('boom')
+      expect(await b).toBe('ran')
+      manager.stop()
+    })
+
     it('a reused external daemon is not stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {

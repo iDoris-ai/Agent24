@@ -174,7 +174,7 @@ describe('runConsent', () => {
 })
 
 describe('serviceInstallDeps (the real steps over a fake system)', () => {
-  function system(o: Partial<InstallSystem> = {}) {
+  function system(o: Partial<InstallSystem> = {}, ready: Promise<unknown> = Promise.resolve()) {
     const runs: { bin: string; args: string[]; env: NodeJS.ProcessEnv }[] = []
     const sys: InstallSystem = {
       run: async (bin, args, env) => { runs.push({ bin, args, env }) },
@@ -185,7 +185,7 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
       ...o,
     }
     const hold: InstallDeps['hold'] = (work) => work()
-    const deps = serviceInstallDeps({ cli: '/App/backend/agent24', daemonBin: '/App/backend/agent24d', hold, spawned: sys.spawned }, sys)
+    const deps = serviceInstallDeps({ cli: '/App/backend/agent24', daemonBin: '/App/backend/agent24d', ready, hold, spawned: sys.spawned }, sys)
     return { deps, runs, hold }
   }
 
@@ -228,6 +228,34 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
     const { deps } = system({ record: () => (++looks < 3 ? null : { pid: 4242, enrollEndpoint: '/tmp/enroll.sock' }), startWaitMs: 5_000 })
     expect(await deps.started()).toBe(true)
     expect(looks).toBe(3)
+  })
+
+  it('install waits for the documents module launch install first (Codex B4b C2), and runs when that failed too', async () => {
+    let open!: () => void
+    const { deps, runs } = system({}, new Promise<void>((r) => { open = r }))
+    const installing = deps.install()
+    await new Promise((r) => setTimeout(r, 10))
+    expect(runs).toEqual([])
+    open()
+    await installing
+    expect(runs).toHaveLength(1)
+    const failed = system({}, Promise.reject(new Error('codesign')))
+    await failed.deps.install()
+    expect(failed.runs).toHaveLength(1)
+  })
+
+  it('not started: the daemon that was on record before the install, even alive with a socket (Codex B4b C3)', async () => {
+    const { deps } = system({ record: () => ({ pid: 4242, enrollEndpoint: '/tmp/old.sock' }) })
+    await deps.install()
+    expect(await deps.started()).toBe(false)
+  })
+
+  it('started: a new daemon on record after one that was there before', async () => {
+    let pid = 4242
+    const { deps } = system({ record: () => ({ pid, enrollEndpoint: '/tmp/enroll.sock' }) })
+    await deps.install()
+    pid = 5151
+    expect(await deps.started()).toBe(true)
   })
 
   it('the hold is the one given', () => {

@@ -452,19 +452,27 @@ const realInstallSystem = (spawned: (pid: number) => boolean): InstallSystem => 
 })
 
 /** The real steps: the bundled CLI with `AGENT24D_BIN` set to the bundled
- * daemon (so the copy launchd runs is this app's). Started means a live
- * daemon on record with an enrolment socket that this app did not spawn. */
+ * daemon (so the copy launchd runs is this app's), once `ready` (the bundled
+ * documents module's launch install) is done: the service daemon starts as
+ * soon as it is bootstrapped (Codex B4b C2). Started means a live daemon on
+ * record with an enrolment socket that this app did not spawn and that was
+ * not the one on record before the install (Codex B4b C3). */
 export function serviceInstallDeps(
-  o: { cli: string; daemonBin: string; hold: InstallDeps['hold']; spawned: (pid: number) => boolean },
+  o: { cli: string; daemonBin: string; ready: Promise<unknown>; hold: InstallDeps['hold']; spawned: (pid: number) => boolean },
   sys: InstallSystem = realInstallSystem(o.spawned),
 ): InstallDeps {
   const env = { ...process.env, AGENT24D_BIN: o.daemonBin }
+  let before: number | null = null
   return {
-    install: () => sys.run(o.cli, ['service', 'install'], env),
+    install: async () => {
+      await o.ready.catch(() => {})
+      before = sys.record()?.pid ?? null
+      await sys.run(o.cli, ['service', 'install'], env)
+    },
     uninstall: () => sys.run(o.cli, ['service', 'uninstall'], env),
     started: () => until(() => {
       const state = sys.record()
-      return state !== null && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)
+      return state !== null && state.pid !== before && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)
     }, sys.startWaitMs),
     hold: o.hold,
   }

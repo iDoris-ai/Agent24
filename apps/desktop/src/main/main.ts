@@ -604,7 +604,7 @@ app.whenReady().then(async () => {
   })
   void cliTool.refresh()
   mainWin = createMainWindow()
-  void askResidentConsent().catch((err) => console.error('[main] resident consent', err))
+  void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   knowledgeView = new KnowledgeViewHost({
@@ -741,10 +741,11 @@ app.whenReady().then(async () => {
   app.on('activate', () => showOrCreateWindow())
 })
 
-// M5 B4b: asked once, with the window up. Allow installs the LaunchAgent with
-// this app's own daemon stopped meanwhile; a failed install is undone and not
+// M5 B4b: asked once, with the window up. Allow installs the LaunchAgent,
+// after the bundled documents module's launch install, with this app's own
+// daemon stopped meanwhile; a failed install is undone and not
 // kept, so the next launch asks again (PM r1 ②).
-async function askResidentConsent(): Promise<void> {
+async function askResidentConsent(documentsReady: Promise<unknown>): Promise<void> {
   const dataDir = tryDataDir()
   if (dataDir === null) return
   const file = consentPath(dataDir)
@@ -766,6 +767,7 @@ async function askResidentConsent(): Promise<void> {
     install: () => installService(serviceInstallDeps({
       cli: resolveBundledRustBinary('agent24', app.isPackaged),
       daemonBin: resolveRustBinary(app.isPackaged),
+      ready: documentsReady,
       hold: (work) => backendManager.whileStopped(work),
       spawned: (pid) => backendManager.spawned(pid),
     })),
