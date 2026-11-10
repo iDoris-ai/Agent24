@@ -415,6 +415,7 @@ impl Methods {
 
     /// Registered method names, sorted. Callers that pin the set compare this
     /// to an expected list, so one extra registration fails the comparison.
+    #[doc(hidden)]
     #[must_use]
     pub fn names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.map.keys().cloned().collect();

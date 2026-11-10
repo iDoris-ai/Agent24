@@ -1006,6 +1006,9 @@ mod tests {
         let exp = registry.expectation("agentear").expect("registered");
         assert_eq!(exp.manifest_digest, digest);
         assert_eq!(exp.token_id, token_id);
+        // `EventsGrant` is this crate's stand-in builder: this only proves the
+        // registry passes `provides` through. The real grant is pinned by
+        // agent24d's `attach_grant` test and the A3-2b black-box C2 case.
         assert_eq!(exp.offer.provides, vec!["_a24/events/".to_owned()]);
 
         let claim = accepted("agentear", &token_id);

@@ -115,7 +115,7 @@ mod tests {
     /// The method names `build_methods_for` registers unconditionally. Both
     /// construction paths install this set; it is not an authorization check
     /// (`build_methods_for` registers all eleven whether or not the capability
-    /// was granted). Compared as a set against every name actually registered,
+    /// was granted). Compared as a sorted list against every name actually registered,
     /// so one extra method fails the assertion. The frame assertions below
     /// are the authorization check.
     const METHOD_NAMES: &[&str] = &[

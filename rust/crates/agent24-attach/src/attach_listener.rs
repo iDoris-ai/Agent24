@@ -157,6 +157,9 @@ pub async fn run(registry: Arc<AttachRegistry>, path: PathBuf, stop: Cancellatio
     // after an ungraceful exit.
 }
 
+/// For the daemon and its tests; the socket directory check and bind live in
+/// [`run`].
+#[doc(hidden)]
 pub async fn handle_connection(
     stream: UnixStream,
     registry: &AttachRegistry,
