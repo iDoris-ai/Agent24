@@ -92,14 +92,14 @@ impl IdorisSlot for ModelRouter {
 #[test]
 fn matches_the_production_impl_in_agent24_models() {
     fn body(source: &str, own_crate: &str) -> Vec<String> {
-        let start = source
-            .find("fn host_error(")
-            .expect("host_error is the first item");
+        let Some(start) = source.find("fn host_error(") else {
+            panic!("host_error is the first item");
+        };
         source[start..]
             .lines()
             .map(|line| line.replace(own_crate, "crate::").trim().to_owned())
             .filter(|line| !line.is_empty() && !line.starts_with("//"))
-            .take_while(|line| !line.starts_with("#[test]"))
+            .take_while(|line| !line.starts_with("#[test]") && !line.starts_with("#[cfg(test)]"))
             .collect()
     }
     let test = body(include_str!("test_slot.rs"), "agent24_models::");

@@ -88,3 +88,62 @@ impl IdorisSlot for ModelRouter {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use agent24_idoris::managed_idoris::IdorisSlot;
+
+    fn gateway() -> IdorisGateway {
+        IdorisGateway::from_credentials("http://127.0.0.1:9/", Zeroizing::new("idk_test".into()))
+            .expect("a loopback URL is accepted")
+    }
+
+    #[test]
+    fn errors_keep_the_text_the_host_showed_before() {
+        let rejected = crate::ModelError::Rejected {
+            status: 400,
+            message: "bad".into(),
+        };
+        let before = rejected.to_string();
+        let after = host_error(rejected);
+        assert!(matches!(after, HostError::Provider(ref m) if m == "bad"));
+        assert_eq!(after.to_string(), before);
+
+        let busy = crate::ModelError::IdorisSupervisorBusy;
+        let before = busy.to_string();
+        let after = host_error(busy);
+        assert!(matches!(after, HostError::Other(_)));
+        assert_eq!(after.to_string(), before);
+
+        assert!(matches!(
+            host_error(crate::ModelError::Cancelled),
+            HostError::Cancelled
+        ));
+    }
+
+    #[test]
+    fn the_lease_follows_the_published_gateway() {
+        let router = ModelRouter::idoris_unavailable("starting");
+        assert!(IdorisSlot::published_lease(&router).is_none());
+
+        IdorisSlot::replace_idoris(&router, PreparedGateway::new(gateway()));
+        let lease = IdorisSlot::published_lease(&router).expect("a published gateway");
+        assert_eq!(lease.strong_count(), 1);
+        let reader = router.idoris_gateway().expect("published");
+        assert_eq!(lease.strong_count(), 2);
+        drop(reader);
+
+        IdorisSlot::block_idoris(&router, "stopping");
+        assert_eq!(lease.strong_count(), 0);
+        assert!(router.idoris_gateway().is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "did not build")]
+    fn a_gateway_the_slot_did_not_build_is_refused() {
+        let router = ModelRouter::idoris_unavailable("starting");
+        IdorisSlot::replace_idoris(&router, PreparedGateway::new(42_u8));
+    }
+}
