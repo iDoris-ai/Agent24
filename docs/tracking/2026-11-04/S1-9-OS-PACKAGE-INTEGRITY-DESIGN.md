@@ -145,7 +145,7 @@ agent24 package-integrity verify --root ./dist/sin90
 |---|---|---|
 | PR-1：共享模型、工具及兼容读取 | T1：共享 D2 类型序列化往返，JSON 键与 files 一致、摘要链包含 JSON；T2：两次 generate 字节一致，verify 接受有效包；T3：参数化覆盖增/删/改文件、链接、权限、非法路径、重复 JSON 键及上限；T4：旧包可读，新声明但损坏的包拒绝 | 去掉 JSON 摘要验证使 T1 红；引入不稳定顺序使 T2 红；逐个移除集合、摘要、链接或权限检查使对应 T3 红；把损坏新包当作旧包放行使 T4 红 |
 | PR-2：外仓 CI 和新版本（Sin90；Cos72 仅基础对齐：SDK 0.2.0 + 签名打包 + 完整性清单） | T5：各平台从真实 release 下载解包后 verify 成功；最终 YAML 可用于原协议握手；macOS 全 executables 验签；配置、脚本和资源全在清单 | 发布 fixture 中漏文件、签名后再改二进制、漏辅助 exe，各对应验收失败；把握手改为生成前摘要，握手测试红 |
-| PR-3：强制接线及 UI | T6：新鲜 daemon 缺清单旧包 failed/指定 reason，其余有效包正常；T7：scan 后首次 spawn 前的 recheck 前及自动重启前的 recheck 前分别改文件（recheck 之后的替换为已知边界，不在此验收），执行标记始终未创建、没有该包可用路由/工具；T8：表中每种原因在 host/非 host/桌面各有 fixture，重装清原因；T9：改清单并改 YAML 后 recheck 仍拒绝，macOS 错团队/缺公证拒绝 | 恢复 optional 让 T6 红；旁路首次及重启检查分别让 T7 红；丢 reason/泄漏 detail/删升级提示使 T8 红；取消冻结摘要比较或签名校验使对应 T9 红 |
+| PR-3：强制接线及 UI | T6：新鲜 daemon 缺清单旧包 failed/指定 reason，其余有效包正常；T7：scan 后首次 spawn 前的 recheck 前及自动重启前的 recheck 前分别改文件（recheck 之后的替换为已知边界，不在此验收），执行标记始终未创建、没有该包可用路由/工具；T8：表中每种原因在 host/非 host/桌面各有 fixture，重装清原因；T9：改清单并改 YAML 后 recheck 仍拒绝，macOS 错团队/无效签名/缺 Hardened Runtime 拒绝（公证不由 Agent24 检查，见 §5 r3） | 恢复 optional 让 T6 红；旁路首次及重启检查分别让 T7 红；丢 reason/泄漏 detail/删升级提示使 T8 红；取消冻结摘要比较或签名校验使对应 T9 红 |
 | N3：安装包须原生可执行 | N3 测：spawn.command 为 `node` 等解释器、脚本伪装成可执行文件均被拒绝，Mach-O/ELF/PE 原生文件通过 | 放宽为只看权限位使脚本伪装用例红；加解释器白名单使解释器用例红 |
 | N4：校验可取消 | N4 测：散列中途触发关闭 token，不产生 Discovered、不注册路由/工具、不 spawn，且原因不是 hash_mismatch；完整完成才成功 | 取消后仍返回 Discovered，或把取消映射为 hash_mismatch，各使对应断言红 |
 | N6：SDK 读取磁盘清单 | N6 测：语义差异（含重复键、多文档、非字符串顶层键）拒绝，未知键不回显；内核拉起（`A24_LISTEN_FD`）缺文件失败；非内核 attach 回退内嵌；握手 manifest_digest 与磁盘原始字节一致 | 内核拉起也回退、比较时不去 integrity、改用内嵌字节算摘要，各使对应测试红 |
