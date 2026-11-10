@@ -104,7 +104,7 @@ uv run bench --check-overlap --sets tool_risk       # 只查一个点
 
 PLAN-DECIDE D0-8 要求按「同一系列、多尺寸」补测，覆盖中/英/泰三语，并给
 每个候选许可证结论。完整结论见
-[`../../research/DECISION-MODELS.md`](../../research/DECISION-MODELS.md)
+[`../../../docs/research/DECISION-MODELS.md`](../../../docs/research/DECISION-MODELS.md)
 §10；本节只记代码层面的东西。
 
 ### 按语言分指标
