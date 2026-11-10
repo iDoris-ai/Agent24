@@ -10,40 +10,15 @@ code never reads.
 
 from __future__ import annotations
 
-import json
 import time
-from pathlib import Path
 
 from ..overlap import check_overlap, render_overlap_report
 from ..render import render_item_text
+from ..train_data import load_train_rows as _load_train_rows
 from ..types import LABELS, EvalItem, Point, Prediction
 from .base import Candidate, CandidateUnavailable
 
 _REVISION = "5617a9f61b028005a4858fdac845db406aefb181"  # BAAI/bge-m3, pinned 2026-10-07
-
-# eval/decide/bench/src/decide_bench/adapters/setfit_bgem3.py -> eval/decide/bench
-_BENCH_DIR = Path(__file__).resolve().parents[3]
-_TRAIN_DIR = _BENCH_DIR / "train_data"
-
-_TRAIN_FILES: dict[Point, str] = {
-    "retain_intent": "retain_intent_train.jsonl",
-    "recall_gate": "recall_gate_train.jsonl",
-    "tool_risk": "tool_risk_train.jsonl",
-}
-
-
-def _load_train_rows(point: Point) -> list[dict]:
-    path = _TRAIN_DIR / _TRAIN_FILES[point]
-    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    eval_texts = set()
-    from ..data import load_set
-
-    for item in load_set(point):
-        eval_texts.add(render_item_text(item))
-    overlap = eval_texts & {r["text"] for r in rows}
-    if overlap:
-        raise AssertionError(f"train/eval overlap for {point}: {overlap!r} — train_data must stay disjoint from eval")
-    return rows
 
 
 class SetFitBgeM3Candidate(Candidate):
