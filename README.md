@@ -253,7 +253,7 @@ agent24 mcp                           # 把 agent24d 自己变成 MCP server —
 | **M-C** 发布 | v0.1.0 → v0.2.0 → v0.3.0 → **v0.4.0**（当前） | ✅ |
 | **M-H** 人机边界 | 审批门 · payload 哈希 · durable resume · plan mode · 安装同意摘要 · Fake 渠道 harness | ✅ |
 | **M-D** 记忆重做 | 权威+投影 · 真双时相 · 治理写门 · Condenser · 巩固循环 · FTS/向量缝——**crate 层的库原语与迁移已落地，daemon 尚未端到端消费**（巩固只有调用方驱动的 `run_once` 无后台循环；新 condenser 未接管现有 session 路径；`OmlxEmbedder` 只有 seam 无实现）。逐行状态与判据见 [`SPEC-MD-ME.md`](docs/specs/SPEC-MD-ME.md) §0 上方那张表（**本文不复制**）。今天**没有任何一行是 ✅**：MD-2 🟡（`EventLog` 接了、`ArtifactStore` 没接），其余全 🟢 | 🟡 |
-| **M-F** 渠道 | F3 微信 ✅ · F4 Nostr ✅ 桥侧代码与契约完成（含入站活性探针；依赖外部 `agent-speaker` daemon，加密 keystore 无法 headless 解锁——挂账在上游）· F1b 托盘常驻 ✅ · **F5 7×24 泡测 🔲** | 🟡 |
+| **M-F** 渠道 | F3 微信 ✅ · F4 Nostr：旧 `nostr-bridge` 已删除（X7，2026-11-10），Nostr 通信改由 comm（Hyphae）承担；入站自动执行待「入站准入」里程碑经 ADR-041a 重做· F1b 托盘常驻 ✅ · **F5 7×24 泡测 🔲** | 🟡 |
 | **M-E → ME-3** 进程外领域 OS | `DomainModule`+`KernelCtx`（in-process，已无生产实现）✅ · 配置注册表 + `os` CLI ✅ · **进程外 Provider（挂载/代理/回调通道/包安装）✅ 已交付**（ADR-031，T11 已把 Sin90 迁出内核） | ✅ |
 | **ME-4** 内核回调面 + SDK + AgentEar 附着 | 调度回调 `_a24/scheduler/*` ✅ · 推理回调 `_a24/model/complete` ✅ · SDK 原型 `agent24-os-sdk` 0.1.0 ✅ · ADR-032/A3 AgentEar 附着 P0–P2 ✅（插队线，见 `tasks.md`）· Cos72 骨架/第二个进程外领域 OS 🔲（`PLAN-ME4-OS-CAPABILITIES.md` ME4-5.3.x，v0.5.0 范围） | 🟡 |
 | **P4** 生态 / 分发 | 模块市场后端 ✅（npm 发现 + 浏览过滤）· 跨用户分发 / 模块签名 / 跨设备记忆同步 🔲 | 🟡 |
