@@ -35,7 +35,7 @@
 
 | 编号 | 标题 | 状态 | 位置 | 一句话决策 | 关联 |
 |---|---|---|---|---|---|
-| ADR-038 | [组件契约 v1](ADR-038-component-contract-v1.md) | 草案（原文：草案 r3） | adr/ | 组件是能力的安装包；定义清单（provides / requires / assurance）、签名验证与能力 id 规则 | ADR-039、ADR-K1-01、ADR-K1-03；[可进化性评估](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md)；ADR-040 |
+| ADR-038 | [组件契约 v1](ADR-038-component-contract-v1.md) | 已接受（r5，2026-11-05） | adr/ | 组件是能力的安装包；定义清单（provides / requires / assurance）、签名验证与能力 id 规则 | ADR-039、ADR-K1-01、ADR-K1-03；[可进化性评估](../architecture/EVOLVABILITY-ASSESSMENT-2026-11-01.md)；ADR-040 |
 | ADR-040 | [技能契约 v1](ADR-040-skill-contract-v1.md) | 已接受（作为设计约束） | adr/ | 技能有版本、过评测才能激活、改动经审批可回滚；不持有权限 | ADR-039、ADR-038、ADR-041；[演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md)；ADR-037、ADR-043、ADR-K1-03、ADR-K1-04、ADR-MEMORY-P1 |
 | ADR-029 | [内核 ↔ 领域 OS 边界与 DomainModule 挂载缝](../decision.md) | 已接受（原文：采纳（边界原则）；挂载缝已实现） | 日志 | 领域系统可换且不改内核；原进程内编译方案已推翻，改走进程外 | ADR-030、ADR-031、ADR-039；ADR-026、ADR-028 |
 | ADR-031 | [ME-3 进程外模块的协议，按「缝」分别裁决](../decision.md) | 已接受（原文：采纳（裁决 FU-14，解除 ME-3 的开工前置）） | 日志 | 模块挂载缝不用会话协议，只定义出站回调；外壳那条缝本篇不裁 | ADR-029、ADR-K1-01；ADR-030 |
@@ -128,7 +128,7 @@ ADR-040 至 ADR-043 来自 [Super Agent 演进终稿](../research/deepseek-super
 
 | 编号 | 标题 | 状态 | 所在节 |
 |---|---|---|---|
-| ADR-038 | [组件契约 v1](ADR-038-component-contract-v1.md) | 草案（原文：草案 r3） | 组件与扩展 |
+| ADR-038 | [组件契约 v1](ADR-038-component-contract-v1.md) | 已接受（r5，2026-11-05） | 组件与扩展 |
 | ADR-040 | [技能契约 v1](ADR-040-skill-contract-v1.md) | 已接受（作为设计约束） | 组件与扩展 |
 | ADR-041a | [入站事件与准入](ADR-041-inbound-events-admission-and-work-items.md) | 已接受（拆分后的 041a） | 内核与权限 |
 | ADR-041b | [工单、授权依据与订阅](ADR-041-inbound-events-admission-and-work-items.md) | 提议（拆分后的 041b） | 内核与权限 |
@@ -196,6 +196,7 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 - 037、028、MEMORY-P1、R05 改已接受；KB-01、041 各拆两条；040 接受为设计约束；042、043 部分接受（Q9）。
 - 日志 ADR-012、014、015 和 docs/ADR-016 改被替代并写明取代者；006、016、024 改部分被替代或实现路线被替换；001、005、008、009、013、021 改废弃；DOC-03 改搁置。
 - ADR-038 的状态由 #1592（S0-2）改为已接受，本次不动；索引里 038 的行以 #1592 为准。
+- 2026-11-10：#1592 把 ADR-038 正文改为已接受（r5）时没有同步索引，两处表格仍写「草案（原文：草案 r3）」，现订正为「已接受（r5，2026-11-05）」，与文首一致。
 - 本表每一行的状态与对应文件文首一致。
 
 以下是 2026-11-01 的核对记录：
