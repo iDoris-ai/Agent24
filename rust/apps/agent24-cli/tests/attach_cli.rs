@@ -15,9 +15,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 fn tmp_home() -> tempfile::TempDir {
@@ -48,8 +51,7 @@ fn agent24d_bin() -> std::path::PathBuf {
 /// valid JSON on stdout.
 fn run(home: &Path, args: &[&str]) -> (bool, String, String) {
     eprintln!("start CLI {} {args:?}", home.display());
-    let out = Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    let out = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGENT24D_BIN", agent24d_bin())
@@ -96,8 +98,7 @@ struct Daemon(Child);
 
 impl Daemon {
     fn start(home: &Path) -> Self {
-        let mut child = Command::new(agent24d_bin())
-            .env_clear()
+        let mut child = signature_command::clear_command(agent24d_bin())
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", home)
             .args(["serve", "--port", "0"])

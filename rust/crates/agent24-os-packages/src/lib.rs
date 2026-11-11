@@ -13,9 +13,20 @@
 //! that installs a module depend on the process that only notices it next time it
 //! boots.
 
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("test-support must not be enabled in release builds");
+
 pub mod discovery;
 pub mod install;
 pub mod package_integrity;
+pub mod signature;
+pub mod trusted_teams;
+
+/// Test fixtures (native launchers and `files.json`). Compiled into this crate's
+/// own tests, and into other crates' tests when they enable `test-support`.
+/// A production build of the library does not include it.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 /// The name of the environment variable that overrides the packages root.
 ///

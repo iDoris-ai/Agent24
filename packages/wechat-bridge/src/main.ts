@@ -1,7 +1,7 @@
 // F3 WeChat bridge entry point.
 //
 //   agent24 daemon start            # the daemon this bridge drives
-//   pnpm --filter @agent24/wechat-bridge bridge
+//   A24_DEV_TOOL=1 pnpm --filter @agent24/wechat-bridge bridge
 //
 // First run prints a QR: scan it in WeChat to add the bot. After that, messages
 // you send the bot become agent24d runs, and replies (and approval requests)
@@ -17,6 +17,9 @@ import { FileSessionStore } from './session-store.js'
 import { CONFIG, discoverDaemon } from './config.js'
 
 async function main(): Promise<void> {
+  if (process.env.A24_DEV_TOOL !== '1') {
+    throw new Error('微信桥仅限开发工具，产品环境禁止启动；开发时请显式设置 A24_DEV_TOOL=1。入站执行将经 ADR-041a 准入重做。')
+  }
   let daemon: ReturnType<typeof discoverDaemon>
   try {
     daemon = discoverDaemon()

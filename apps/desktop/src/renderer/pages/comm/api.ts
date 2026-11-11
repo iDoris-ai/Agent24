@@ -302,9 +302,14 @@ export const createCommIdentity = (nickname: string) =>
 export const setCommRelay = (relays: string[]) =>
   viaIpc(() => window.agent24.commRelaySet(relays), isRelayConfig)
 
-export const probeCommRelay = (url: string) =>
+/**
+ * Manual probe only. Omitting `url` sends `{}` so the server probes its
+ * configured relay; a named url probes that address instead.
+ */
+export const probeCommRelay = (url?: string) =>
   request('POST', '/api/v1/comm/relay/probe', (value): value is { url: string | null; connected: boolean; error: string | null } =>
-    isRecord(value) && nullableString(value['url']) && typeof value['connected'] === 'boolean' && nullableString(value['error']), { url })
+    isRecord(value) && nullableString(value['url']) && typeof value['connected'] === 'boolean' && nullableString(value['error']),
+    url ? { url } : {})
 
 /** Elevated writes go through dedicated, validated IPC in main, never the generic proxy. */
 async function viaIpc<T>(call: () => Promise<unknown>, validate: (value: unknown) => value is T): Promise<T> {

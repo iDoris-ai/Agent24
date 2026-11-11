@@ -1,8 +1,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::process::{Command, Output};
 
 fn run(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agent24"))
+    signature_command::command(env!("CARGO_BIN_EXE_agent24"))
         .args(args)
         .env("A24_HW_BUDGET_CAP_GB", "8")
         .env_remove("IDORIS_ALLOCATED_BUDGET_BYTES")

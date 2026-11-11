@@ -973,6 +973,9 @@ mod tests {
                                 // debug-only seam behind `--features test-enrollment`
                                 // (a compile_error in release); never set in a LaunchAgent
                                     | "AGENT24_TEST_MIGRATION_GUARD"
+                                // debug-only black-box fixture signatures, never persisted
+                                // into a service environment or compiled into release.
+                                    | "A24_TEST_ACCEPT_ADHOC_SIGNATURES"
                             )
                         {
                             found.push(name);

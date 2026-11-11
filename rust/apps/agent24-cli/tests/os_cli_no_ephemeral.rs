@@ -4,8 +4,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::path::Path;
-use std::process::Command;
 
 fn tmp_home() -> tempfile::TempDir {
     let home = tempfile::Builder::new()
@@ -24,8 +26,7 @@ fn each_test_home_has_an_existing_private_temp_dir() {
 }
 
 fn cli(home: &Path, daemon_bin: &Path, args: &[&str]) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("TMPDIR", home.join("tmp"))
@@ -35,8 +36,8 @@ fn cli(home: &Path, daemon_bin: &Path, args: &[&str]) -> std::process::Output {
         .unwrap()
 }
 
-fn install_package(home: &Path, daemon_bin: &Path) {
-    let package = home.join("m205demo");
+fn install_package(home: &Path) {
+    let package = home.join(".agent24/packages/m205demo");
     std::fs::create_dir_all(&package).unwrap();
     std::fs::write(
         package.join("domain-os.yml"),
@@ -45,13 +46,9 @@ fn install_package(home: &Path, daemon_bin: &Path) {
          kernel_capabilities: []\nimpl_kind: attached_process\n",
     )
     .unwrap();
-    let path = package.to_string_lossy();
-    let out = cli(home, daemon_bin, &["os", "install", &path]);
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    // Attached packages have no spawn. The stub is only there so the
+    // integrity manifest has a native executable; the daemon does not run it.
+    agent24_os_packages::test_support::seal_exit_stub(&package, "bin/stub").unwrap();
 }
 
 fn fake_daemon(home: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -88,7 +85,7 @@ fn output_text(out: &std::process::Output) -> String {
 fn os_list_without_daemon_reports_offline_and_spawns_nothing() {
     let home = tmp_home();
     let (daemon, marker) = fake_daemon(home.path());
-    install_package(home.path(), &daemon);
+    install_package(home.path());
 
     let out = cli(home.path(), &daemon, &["os", "list"]);
     let text = output_text(&out);
@@ -112,7 +109,7 @@ fn os_list_without_daemon_reports_offline_and_spawns_nothing() {
 fn os_disable_without_daemon_fails_with_os_json_edit_hint_and_spawns_nothing() {
     let home = tmp_home();
     let (daemon, marker) = fake_daemon(home.path());
-    install_package(home.path(), &daemon);
+    install_package(home.path());
 
     let out = cli(home.path(), &daemon, &["os", "disable", "m205demo"]);
     let text = output_text(&out);

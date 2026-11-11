@@ -99,3 +99,27 @@ describe('mac installer carries the documents module (T1-1)', () => {
     expect(pkg.scripts['build:linux']).not.toMatch(/documents/)
   })
 })
+
+describe('installer excludes development bridges (ADR-044 T3)', () => {
+  it('packaging, scripts and runtime dependencies never reference bridge packages', () => {
+    expect(JSON.stringify({ build: pkg.build, scripts: pkg.scripts, dependencies: pkg.dependencies }))
+      .not.toMatch(/(?:packages[\\/]|@agent24[\\/])[^"\s]*-bridge/)
+  })
+
+  it('build, staging and workflow scripts never stage bridge packages', () => {
+    const desktop = path.join(__dirname, '..', '..')
+    const repo = path.join(desktop, '..', '..')
+    const files = (dir: string): string[] => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) return entry.name === 'node_modules' ? [] : files(full)
+      return entry.isFile() && !/\.test\.[cm]?[jt]s$/.test(entry.name) ? [full] : []
+    })
+    const scanned = [path.join(desktop, 'scripts'), path.join(repo, 'scripts'), path.join(repo, '.github', 'workflows')].flatMap(files)
+    expect(scanned.length).toBeGreaterThan(0)
+    for (const file of scanned) {
+      // Path, package name, or a bare `pnpm --filter wechat-bridge` all count.
+      expect(fs.readFileSync(file, 'utf8'), file)
+        .not.toMatch(/(?:packages[\\/]|@agent24[\\/])[^"\s]*-bridge|\b(?:wechat|nostr)-bridge\b/)
+    }
+  })
+})

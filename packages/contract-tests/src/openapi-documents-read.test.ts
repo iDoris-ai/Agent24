@@ -38,7 +38,9 @@ const FIND = '/documents/documents/{document_id}/find'
 const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
 describe('read routes', () => {
-  const proxy = { '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure' }
+  // 409 os_package.<reason>: the kernel proxy refuses a package that failed its
+  // integrity check (S1-9). A route with its own 409 keeps that one (see `errors`).
+  const proxy = { '409': 'OsPackageConflict', '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure' }
   const routes: Array<[string, string, string, Record<string, string>]> = [
     [TEXT, 'get', 'documentsReadText', { '400': 'DocumentsBadRequest', '404': 'DocumentsNotFound', '422': 'DocumentsReadUnprocessable' }],
     [FIND, 'post', 'documentsFind', { '400': 'DocumentsBadRequest', '404': 'DocumentsNotFound', '422': 'DocumentsReadUnprocessable' }],
@@ -50,8 +52,8 @@ describe('read routes', () => {
       expect(op?.operationId, path).toBe(operationId)
       expect(op.tags).toEqual(['documents'])
       const declared = Object.keys(op.responses).filter((k) => !k.startsWith('2')).sort()
-      expect(declared, path).toEqual(Object.keys({ ...errors, ...proxy }).sort())
-      for (const [status, response] of Object.entries({ ...errors, ...proxy })) {
+      expect(declared, path).toEqual(Object.keys({ ...proxy, ...errors }).sort())
+      for (const [status, response] of Object.entries({ ...proxy, ...errors })) {
         expect(op.responses[status].$ref, `${path} ${status}`).toBe(`#/components/responses/${response}`)
       }
     }

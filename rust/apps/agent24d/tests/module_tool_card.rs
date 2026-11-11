@@ -4,10 +4,14 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+use std::process::Command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 /// A package module that shakes hands with its own manifest's digest and
@@ -38,7 +42,7 @@ fn install(home: &Path) {
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
          min_daemon_protocol: 4\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n\
+         spawn:\n  command: bin/launch\n\
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
          output_privacy: local_only\n    resource_kinds: [note]\n    \
@@ -46,35 +50,37 @@ fn install(home: &Path) {
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
     // On the grants protocol but never running: no identity, so no card.
-    let dir = home.join(".agent24/packages/idle");
-    std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(
-        dir.join("domain-os.yml"),
-        "name: idle\nversion: \"0.1.0\"\nroute_namespace: /api/v1/idle\n\
-         event_module: idle\ndata_dir: ~/.agent24/os/idle/\n\
-         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         min_daemon_protocol: 4\n\
-         spawn:\n  command: \"false\"\n  args: []\n\
-         tools:\n  - operation: list-notes\n    description: lists notes\n    \
-         input_schema: {type: object, properties: {}}\n    risk: read\n    \
-         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
-    )
-    .unwrap();
+    // Exit 1, the same status `false` used to return.
+    seal_idle(home, "idle", true);
     // A tool module on an older protocol (§2.6): never a card.
-    let dir = home.join(".agent24/packages/plain");
+    seal_idle(home, "plain", false);
+}
+
+fn seal_idle(home: &Path, name: &str, grants_protocol: bool) {
+    let dir = home.join(".agent24/packages").join(name);
     std::fs::create_dir_all(&dir).unwrap();
+    let protocol = if grants_protocol {
+        "min_daemon_protocol: 4\n"
+    } else {
+        ""
+    };
     std::fs::write(
         dir.join("domain-os.yml"),
-        "name: plain\nversion: \"0.1.0\"\nroute_namespace: /api/v1/plain\n\
-         event_module: plain\ndata_dir: ~/.agent24/os/plain/\n\
-         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: \"false\"\n  args: []\n\
-         tools:\n  - operation: list-notes\n    description: lists notes\n    \
-         input_schema: {type: object, properties: {}}\n    risk: read\n    \
-         output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n",
+        format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             {protocol}\
+             spawn:\n  command: bin/mod\n\
+             tools:\n  - operation: list-notes\n    description: lists notes\n    \
+             input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
+             output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n"
+        ),
     )
     .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
 }
 
 struct Daemon {
@@ -91,9 +97,8 @@ impl Drop for Daemon {
 }
 
 fn daemon(home: &Path, env: &[(&str, &str)], args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    let mut command = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     command
-        .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .envs(env.iter().copied())
@@ -316,4 +321,35 @@ fn a_bound_past_ninety_days_stops_the_start() {
     assert!(error.starts_with("A24_MODULE_GRANT_MAX_DAYS"), "{error}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("A24_MODULE_GRANT_MAX_DAYS"), "{stderr}");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn discovery_signature_opt_in_is_explicit_in_the_real_daemon() {
+    let home = tempfile::tempdir().unwrap();
+    install(home.path());
+    let refused = start_with(
+        home.path(),
+        &[("A24_TEST_ACCEPT_ADHOC_SIGNATURES", "0")],
+        &[],
+    );
+    let (status, body) = get(&refused, CARD);
+    assert_ne!(status, 200, "{body}");
+    // Refused at discovery: the package is not mounted at all. (The typed
+    // refusal reason on /api/v1/components arrives with S1-9 PR-3c.)
+    let (_, modules) = get(&refused, "/api/v1/os");
+    // PR-3c lists an integrity refusal on /os instead of omitting the row.
+    // The detail is the reason code plus the public message; both are
+    // `signature_rejected` for an ad-hoc fixture when the opt-in is off.
+    let rows = modules["modules"].as_array().expect("modules");
+    assert_eq!(rows.len(), 3, "{modules}");
+    for row in rows {
+        assert_eq!(row["state"], "refused", "{row}");
+        let detail = row["detail"].as_str().unwrap_or("");
+        assert!(detail.starts_with("signature_rejected"), "{detail}");
+        assert!(!detail.contains("codesign"), "{detail}");
+    }
+    drop(refused);
+    let accepted = start(home.path());
+    running_card(&accepted);
 }

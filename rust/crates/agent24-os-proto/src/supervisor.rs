@@ -30,6 +30,7 @@ use std::time::Duration;
 
 use agent24_domain::SpawnCommand;
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
 use crate::drain::{Current, Generation};
 use crate::endpoint::{self, CallbackDir};
@@ -53,17 +54,45 @@ pub struct ModuleSpec {
     pub trampoline: Trampoline,
 }
 
-/// Re-checks a module's installed package right before restarting it
-/// (FU-61): does `spec.package_dir` still hold a package whose manifest
-/// digests to `spec.manifest_digest`? `None` if yes; `Some(reason)`
-/// (human-readable, goes straight into [`Status::PackageChanged`]) if not.
-/// Synchronous and does blocking filesystem I/O — the caller in `run_loop`
-/// runs it through `spawn_blocking`, not directly on the async task. Built
-/// in `agent24d` (the crate that depends on `agent24-os-packages` and knows
-/// the on-disk package format) and handed in as an opaque `Fn`, so this
-/// crate keeps not knowing what a "package" is beyond the `path` + `digest`
-/// it was handed once at mount time.
-pub type PackageCheck = Arc<dyn Fn(&ModuleSpec) -> Option<String> + Send + Sync>;
+/// Why a package check refused the next process.
+///
+/// `code` is one of the integrity reason codes, copied from the typed
+/// error. It is `None` for shutdown cancellation and for a failure that is
+/// not an integrity refusal. Callers must not parse `message` to recover it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageFailure {
+    pub message: String,
+    pub code: Option<&'static str>,
+}
+
+impl PackageFailure {
+    #[must_use]
+    pub fn cancelled() -> Self {
+        Self {
+            message: "cancelled".to_owned(),
+            code: None,
+        }
+    }
+
+    #[must_use]
+    pub fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: None,
+        }
+    }
+}
+
+/// Re-checks a module's installed package before the first spawn and again
+/// right before every restart (FU-61, S1-9): does `spec.package_dir` still
+/// hold a package whose manifest digests to `spec.manifest_digest`?
+/// `None` if yes. Synchronous and does blocking filesystem I/O — the caller
+/// in `run_loop` runs it through `spawn_blocking`, not directly on the async
+/// task. Built in `agent24d` (the crate that depends on `agent24-os-packages`
+/// and knows the on-disk package format) and handed in as an opaque `Fn`, so
+/// this crate keeps not knowing what a "package" is beyond the `path` +
+/// `digest` it was handed once at mount time.
+pub type PackageCheck = Arc<dyn Fn(&ModuleSpec) -> Option<PackageFailure> + Send + Sync>;
 
 /// How long the supervisor waits for things. Production uses [`Timings::default`];
 /// tests shorten them so a crash loop runs in milliseconds.
@@ -138,10 +167,15 @@ pub enum Status {
     /// manifest/digest that no longer matches what is on disk: for a
     /// missing directory that restart could only fail to spawn; for a
     /// changed digest it could only fail the handshake's `manifest_mismatch`
-    /// check. Either way it is not a run that backoff can fix. `reason`:
-    /// what [`PackageCheck`] said. The loop waits for its stop and then
-    /// says `Stopped`, same shape as `GaveUp`.
-    PackageChanged { reason: String },
+    /// check. Either way it is not a run that backoff can fix. `reason` is
+    /// the human text. `code` is the integrity reason when there is one,
+    /// copied from the typed error, never parsed out of `reason`.
+    /// Cancellation uses `code: None` and `reason == "cancelled"`. The loop
+    /// waits for its stop and then says `Stopped`, same shape as `GaveUp`.
+    PackageChanged {
+        reason: String,
+        code: Option<&'static str>,
+    },
     /// Ended on request. Any process it ran is confirmed gone.
     Stopped,
     /// A run's process could not be confirmed gone: its stop failed, and the
@@ -408,6 +442,7 @@ impl Drop for SupervisorHandle {
 /// # Errors
 ///
 /// [`SlotHeld`] when another supervisor holds `current`.
+#[allow(clippy::too_many_arguments)]
 pub fn supervise(
     spec: ModuleSpec,
     dir: Arc<CallbackDir>,
@@ -416,6 +451,7 @@ pub fn supervise(
     offer: Offer,
     timings: Timings,
     package_check: PackageCheck,
+    shutdown: CancellationToken,
 ) -> Result<SupervisorHandle, SlotHeld> {
     // Cloned before `Slot::claim` consumes `current` — attaching the status
     // feed below needs its own handle to the same slot (design doc, Codex
@@ -445,6 +481,7 @@ pub fn supervise(
         offer,
         timings,
         package_check,
+        shutdown,
         stop_rx,
     ));
     Ok(SupervisorHandle {
@@ -459,6 +496,10 @@ pub fn supervise(
 enum Run {
     /// A stop was requested; the process has been stopped.
     StopRequested,
+    /// Shutdown cancelled the run. Either no process was created, or one was
+    /// created in the spawn race and already stopped. No generation was
+    /// installed and the handshake was not started.
+    Cancelled,
     /// The run is over: how it failed (FU-57), and when it became ready (if
     /// it did) and when it ended for [`RestartPolicy::ran`]. `ended_at` is taken
     /// when the run's outcome is known, before the process is stopped: the
@@ -608,6 +649,7 @@ async fn run_loop(
     offer: Offer,
     timings: Timings,
     package_check: PackageCheck,
+    shutdown: CancellationToken,
     mut stop: watch::Receiver<Option<Duration>>,
 ) {
     use crate::stop_record::ProcessAtStop;
@@ -618,9 +660,36 @@ async fn run_loop(
     let mut after = None;
     loop {
         attempt += 1;
+        // The shutdown token is the same predicate `recheck` uses to return
+        // "cancelled", without a hash. A cancel that arrives while
+        // `launch::spawn` is still pending is handled inside `run_once`.
+        // The spawn backstop is `run_once`'s shutdown `select`. This check is
+        // earlier: `run_once` binds a socket pair before that `select`.
+        if attempt == 1 && shutdown.is_cancelled() {
+            end_because_package_changed(
+                &spec,
+                slot,
+                status,
+                record,
+                &mut stop,
+                PackageFailure::cancelled(),
+            )
+            .await;
+            return;
+        }
+        // S1-9: the scan hash is not a proof of the bytes that will run.
+        // Recheck again before the first process exists, and the restart
+        // path below checks again after backoff. Skipping this call lets a
+        // file changed in the scan → spawn gap run.
+        if attempt == 1
+            && let Some(failure) = check_package(&package_check, &spec).await
+        {
+            end_because_package_changed(&spec, slot, status, record, &mut stop, failure).await;
+            return;
+        }
         status.send_replace(Status::Starting { attempt, after });
         let (failure, ready_at, ended_at) = match run_once(
-            &spec, &dir, slot, &methods, &offer, &timings, &mut stop, status,
+            &spec, &dir, slot, &methods, &offer, &timings, &mut stop, &shutdown, status,
         )
         .await
         {
@@ -642,6 +711,18 @@ async fn run_loop(
             }
             Ok(Run::StopRequested) => {
                 slot.stopped(status);
+                return;
+            }
+            Ok(Run::Cancelled) => {
+                end_because_package_changed(
+                    &spec,
+                    slot,
+                    status,
+                    record,
+                    &mut stop,
+                    PackageFailure::cancelled(),
+                )
+                .await;
                 return;
             }
             Ok(Run::Ended {
@@ -693,13 +774,9 @@ async fn run_loop(
                 // `RestartPolicy` failure: it skips the decision of
                 // whether to spawn again, it does not produce a new run or
                 // a new `RunFailure`.
-                if let Some(reason) = check_package(&package_check, &spec).await {
-                    tracing::error!(module = %spec.name, %reason, "not restarting: package changed");
-                    slot.retire();
-                    status.send_replace(Status::PackageChanged { reason });
-                    stop_requested(&mut stop).await;
-                    saw_stop(record, &stop, ProcessAtStop::None);
-                    slot.stopped(status);
+                if let Some(failure) = check_package(&package_check, &spec).await {
+                    end_because_package_changed(&spec, slot, status, record, &mut stop, failure)
+                        .await;
                     return;
                 }
             }
@@ -728,6 +805,33 @@ async fn run_loop(
     }
 }
 
+/// Package check refused the next process. Same end as a restart whose
+/// recheck returned `cancelled`: [`Status::PackageChanged`], no spawn.
+async fn end_because_package_changed(
+    spec: &ModuleSpec,
+    slot: &Slot,
+    status: &watch::Sender<Status>,
+    record: &crate::stop_record::StopRecordHandle,
+    stop: &mut watch::Receiver<Option<Duration>>,
+    failure: PackageFailure,
+) {
+    use crate::stop_record::ProcessAtStop;
+    tracing::error!(
+        module = %spec.name,
+        reason = %failure.message,
+        code = failure.code,
+        "not spawning: package check failed"
+    );
+    slot.retire();
+    status.send_replace(Status::PackageChanged {
+        reason: failure.message,
+        code: failure.code,
+    });
+    stop_requested(stop).await;
+    saw_stop(record, stop, ProcessAtStop::None);
+    slot.stopped(status);
+}
+
 /// Runs `check` off the async task: it does blocking filesystem I/O
 /// (`symlink_metadata`, a bounded read, a YAML parse) — bounded but not
 /// appropriate on a Tokio worker. `ModuleSpec` is `Clone`; cloning it and
@@ -735,12 +839,16 @@ async fn run_loop(
 /// itself. A panicked closure is reported as a package-changed reason
 /// rather than propagated — this check must never bring the supervisor
 /// loop down.
-async fn check_package(check: &PackageCheck, spec: &ModuleSpec) -> Option<String> {
+async fn check_package(check: &PackageCheck, spec: &ModuleSpec) -> Option<PackageFailure> {
     let check = check.clone();
     let spec = spec.clone();
     tokio::task::spawn_blocking(move || check(&spec))
         .await
-        .unwrap_or_else(|e| Some(format!("the package check panicked: {e}")))
+        .unwrap_or_else(|e| {
+            Some(PackageFailure::message(format!(
+                "the package check panicked: {e}"
+            )))
+        })
 }
 
 /// A run's process could not be confirmed gone: its stop failed.
@@ -778,6 +886,7 @@ async fn run_once(
     offer: &Offer,
     timings: &Timings,
     stop: &mut watch::Receiver<Option<Duration>>,
+    shutdown: &CancellationToken,
     status: &watch::Sender<Status>,
 ) -> Result<Run, Unconfirmed> {
     use crate::stop_record::ProcessAtStop;
@@ -820,6 +929,13 @@ async fn run_once(
             saw_stop(record, stop, ProcessAtStop::None);
             return Ok(Run::StopRequested);
         }
+        // `close()` has not run yet, so the stop watch is still empty.
+        // Dropping `spawn` here is safe: its only await is before the child
+        // exists. The check after `spawn` returns only reaps a child that
+        // already exists; a restart has no attempt-1 check above this.
+        () = shutdown.cancelled() => {
+            return Ok(Run::Cancelled);
+        }
         spawned = launch::spawn(LaunchSpec {
             name: &spec.name,
             command: &spec.command,
@@ -847,6 +963,16 @@ async fn run_once(
             return Ok(failed(failure));
         }
     };
+    // Known boundary: a cancel between the biased `shutdown` poll above and
+    // `launch::spawn` returning can still create this child. Those two polls
+    // are one synchronous `select`, and this slice does not make cancel and
+    // spawn admission the same step, so the window stays open. Stop the child
+    // now — the same `finish` a stop uses, which waits until the group is
+    // gone — and do not install a generation or start the handshake.
+    if shutdown.is_cancelled() {
+        finish(process, timings, &spec.name, status, slot, stop, None).await?;
+        return Ok(Run::Cancelled);
+    }
     // Checked again: a stop sent while the (biased) select above was already
     // past its stop branch lets the spawn finish in the same poll. Stop that
     // process now rather than hand it a generation (review of SUP-4, round 3).
@@ -1464,6 +1590,7 @@ sys.exit(0)
             Offer::none(),
             timings,
             no_package_check(),
+            CancellationToken::new(),
         )
         .expect("the slot is free")
     }
@@ -1485,6 +1612,7 @@ sys.exit(0)
             Offer::none(),
             timings,
             package_check,
+            CancellationToken::new(),
         )
         .expect("the slot is free")
     }
@@ -1683,6 +1811,7 @@ sys.exit(0)
             Offer::none(),
             fast(),
             no_package_check(),
+            CancellationToken::new(),
         );
         assert_eq!(refused.err(), Some(SlotHeld));
         assert!(
@@ -1765,7 +1894,8 @@ sys.exit(0)
                 no_methods(),
                 Offer::none(),
                 fast(),
-                no_package_check()
+                no_package_check(),
+                CancellationToken::new(),
             )
             .err(),
             Some(SlotHeld),
@@ -1830,6 +1960,7 @@ sys.exit(0)
                 Offer::none(),
                 fast(),
                 no_package_check(),
+                CancellationToken::new(),
             )
             .expect("a stop cancelled after the group was confirmed empty kept the slot");
             stop(next).await;
@@ -2395,7 +2526,8 @@ sys.exit(0)
                 no_methods(),
                 Offer::none(),
                 fast(),
-                no_package_check()
+                no_package_check(),
+                CancellationToken::new(),
             )
             .err(),
             Some(SlotHeld),
@@ -2495,7 +2627,8 @@ sys.exit(0)
                 no_methods(),
                 Offer::none(),
                 fast(),
-                no_package_check()
+                no_package_check(),
+                CancellationToken::new(),
             )
             .err(),
             Some(SlotHeld),
@@ -2567,7 +2700,8 @@ sys.exit(0)
         };
         let package_dir = f.spec.package_dir.clone();
         let package_check: PackageCheck = Arc::new(move |spec| {
-            (!spec.package_dir.exists()).then(|| "the package directory is gone".to_owned())
+            (!spec.package_dir.exists())
+                .then(|| PackageFailure::message("the package directory is gone"))
         });
         let handle = sup_checked(
             f.spec.clone(),
@@ -2618,7 +2752,7 @@ sys.exit(0)
         let package_check: PackageCheck = Arc::new(move |spec| {
             let current = std::fs::read_to_string(spec.package_dir.join("digest.txt")).ok();
             (current.as_deref() != Some("sha256:original"))
-                .then(|| "the manifest changed".to_owned())
+                .then(|| PackageFailure::message("the manifest changed"))
         });
         let current = Current::new(Generation::starting());
         let timings = Timings {
@@ -2655,6 +2789,232 @@ sys.exit(0)
             starts(f.data.path()).len(),
             1,
             "a second handshake attempt was made against the replaced package"
+        );
+        stop(handle).await;
+    }
+
+    /// The shutdown token is already cancelled when the supervisor task is
+    /// first polled. `close()` has not run, so the stop watch is empty, and
+    /// `package_check` would allow a spawn. The first run must not write a
+    /// start line, and the reason matches a cancelled recheck.
+    #[tokio::test]
+    async fn a_cancelled_shutdown_does_not_spawn_the_first_run() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let shutdown = CancellationToken::new();
+        shutdown.cancel();
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            Offer::none(),
+            fast(),
+            no_package_check(),
+            shutdown,
+        )
+        .expect("the slot is free");
+        let mut rx = handle.subscribe();
+        let status = until(&mut rx, "first run settled", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Running | Status::Backoff { .. }
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason, code } = &status else {
+            panic!("spawned on a cancelled shutdown: {status:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
+        assert!(starts(f.data.path()).is_empty(), "the module ran");
+        // `run_once` binds this pair before its shutdown `select`. The
+        // attempt-1 check is what keeps the bind from happening; the select
+        // only stops the spawn. Dropping the attempt-1 check leaves this at 1
+        // even though no start line was written.
+        assert_eq!(
+            f.dir.generations_issued(),
+            0,
+            "a cancelled first attempt bound a socket pair"
+        );
+        stop(handle).await;
+    }
+
+    /// T7. The package check fails before any process exists. Removing the
+    /// `attempt == 1` check lets this fixture reach `Running` or write a
+    /// start line.
+    #[tokio::test]
+    async fn t7_a_failing_check_on_the_first_attempt_does_not_spawn() {
+        let f = fixture("normal");
+        let current = Current::new(Generation::starting());
+        let package_check: PackageCheck = Arc::new(|_| {
+            Some(PackageFailure {
+                message: "hash_mismatch: bin/mod".to_owned(),
+                code: Some("hash_mismatch"),
+            })
+        });
+        let handle = sup_checked(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            fast(),
+            package_check,
+        );
+        let mut rx = handle.subscribe();
+        let status = until(&mut rx, "first check settled", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Running | Status::Backoff { .. }
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason, code } = &status else {
+            panic!("spawned despite the first check: {status:?}");
+        };
+        assert_eq!(reason, "hash_mismatch: bin/mod");
+        assert_eq!(*code, Some("hash_mismatch"));
+        assert!(starts(f.data.path()).is_empty(), "the module ran");
+        assert_eq!(f.dir.generations_issued(), 0);
+        stop(handle).await;
+    }
+
+    /// The first run has already passed the attempt-1 check and is in
+    /// backoff. Shutdown fires before the restart's `select`. `package_check`
+    /// would allow a spawn. The biased shutdown arm must return without
+    /// creating a child. The witness is the hook inside `launch::start`: it
+    /// runs after the child exists and before `spawn` returns, so the
+    /// post-spawn reap cannot hide that spawn. The start file is not that
+    /// witness — `finish` can kill the process before the mock writes it.
+    #[tokio::test]
+    async fn a_cancelled_shutdown_during_backoff_does_not_spawn_the_restart() {
+        let mut f = fixture("early");
+        f.spec.name = "backoff-cancel".to_owned();
+        let spawned = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let spawned_hook = spawned.clone();
+        let _clear = crate::launch::arm_spawned_for_test(Arc::new(move |name, _pid| {
+            if name == "backoff-cancel" {
+                spawned_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }));
+        let current = Current::new(Generation::starting());
+        let shutdown = CancellationToken::new();
+        let timings = Timings {
+            backoff_base: Duration::from_secs(5),
+            ..fast()
+        };
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current,
+            no_methods(),
+            Offer::none(),
+            timings,
+            no_package_check(),
+            shutdown.clone(),
+        )
+        .expect("the slot is free");
+        let mut rx = handle.subscribe();
+        until(&mut rx, "the first backoff", |s| {
+            matches!(s, Status::Backoff { failures: 1, .. })
+        })
+        .await;
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failing run did not spawn"
+        );
+        shutdown.cancel();
+        let status = until(&mut rx, "cancelled restart", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. }
+                    | Status::Backoff { failures: 2, .. }
+                    | Status::Running
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason, code } = &status else {
+            panic!("restarted after shutdown: {status:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
+        assert_eq!(
+            spawned.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the restart spawned a child"
+        );
+        stop(handle).await;
+    }
+
+    /// Cancel lands after the biased `select` has polled the shutdown token
+    /// and before `launch::spawn` returns — the hook runs inside `start`,
+    /// which is that gap. The child exists; it must be reaped, and the run
+    /// must not handshake or publish `Running`.
+    #[tokio::test]
+    async fn a_shutdown_during_spawn_stops_the_child_without_a_handshake() {
+        let mut f = fixture("normal");
+        f.spec.name = "spawn-cancel-window".to_owned();
+        // The mock reports argv as its module name. Keep that equal to
+        // `spec.name`, or a missing cancel check fails the handshake for a
+        // different reason and never shows `Running`.
+        f.spec.command.args[4] = "spawn-cancel-window".to_owned();
+        let current = Current::new(Generation::starting());
+        let shutdown = CancellationToken::new();
+        let seen: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let (flag, seen_hook) = (shutdown.clone(), seen.clone());
+        let _clear = crate::launch::arm_spawned_for_test(Arc::new(move |name, pid| {
+            if name != "spawn-cancel-window" {
+                return;
+            }
+            *seen_hook.lock().unwrap() = Some(pid);
+            flag.cancel();
+        }));
+        let handle = supervise(
+            f.spec.clone(),
+            f.dir.clone(),
+            current.clone(),
+            no_methods(),
+            Offer::none(),
+            fast(),
+            no_package_check(),
+            shutdown,
+        )
+        .expect("the slot is free");
+        let mut rx = handle.subscribe();
+        let status = until(&mut rx, "cancelled during spawn", |s| {
+            matches!(
+                s,
+                Status::PackageChanged { .. } | Status::Running | Status::Backoff { .. }
+            )
+        })
+        .await;
+        let Status::PackageChanged { reason, code } = &status else {
+            panic!("entered the handshake after a cancel during spawn: {status:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
+        assert_ne!(
+            current.get().state(),
+            crate::drain::DrainState::Running,
+            "a generation was installed and became ready"
+        );
+        let pid = seen
+            .lock()
+            .unwrap()
+            .expect("spawn returned a child before the cancel was noticed");
+        assert!(
+            gone(pid).await,
+            "the child created in the spawn window was not reaped"
         );
         stop(handle).await;
     }

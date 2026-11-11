@@ -11,11 +11,12 @@
 #   bin/agent24-documents          (cargo build --release -p agent24-documents)
 #   bin/agent24-documents-pdfkit   (engines/pdfkit/build.sh; macOS only)
 #
-# No SHA256SUMS goes in: electron-builder re-signs every Mach-O in the app
+# No files.json or SHA256SUMS goes in: electron-builder re-signs every Mach-O in the app
 # (codesign --force), which changes their bytes, and nothing can be written
 # into the app after it is signed. The app checks the two programs' code
-# signatures before installing them instead (main/documents-module.ts; the
-# rule ADR-038 sets for macOS executables). The sha256 printed at the end is
+# signatures, then generates integrity metadata on a private temporary copy
+# at installation time (main/documents-module.ts; ADR-038 and D1). The signed
+# app stays untouched; installed copies carry files.json. The sha256 below is
 # a build record of what was staged, before signing.
 #
 # Usage: stage-documents-module.sh [<cargo release dir>]

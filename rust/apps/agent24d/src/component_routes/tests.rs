@@ -503,7 +503,7 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         "idoris",
     ]
     .into_iter()
-    .map(|n| crate::attach_registry::AttachSnap {
+    .map(|n| agent24_attach::attach_registry::AttachSnap {
         name: n.to_owned(),
         version: String::new(),
         disabled: false,
@@ -1572,8 +1572,8 @@ fn redacted_components_omit_the_health_summary() {
 // ---- Knowledge capabilities probe (ADR-038 C5) -----------------------------------------
 
 use crate::capabilities::unix_now;
-use crate::knowledge_host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
-use crate::knowledge_probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
+use agent24_knowledge::host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
+use agent24_knowledge::probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -2737,10 +2737,10 @@ struct Link {
 }
 
 impl Ear {
-    fn apply(&mut self, outcome: crate::attached::RegisterOutcome) {
+    fn apply(&mut self, outcome: agent24_attach::attached::RegisterOutcome) {
         let response = match outcome {
-            crate::attached::RegisterOutcome::Created(response)
-            | crate::attached::RegisterOutcome::Rotated { response, .. } => response,
+            agent24_attach::attached::RegisterOutcome::Created(response)
+            | agent24_attach::attached::RegisterOutcome::Rotated { response, .. } => response,
         };
         self.token = response.token;
         self.digest = response.manifest_digest;
@@ -2748,7 +2748,7 @@ impl Ear {
 
     fn rotate(&mut self) {
         let registry = std::sync::Arc::clone(&self.state.attach_registry);
-        let outcome = crate::attached::register(
+        let outcome = agent24_attach::attached::register(
             &self.path,
             MANIFEST,
             false,
@@ -2763,10 +2763,11 @@ impl Ear {
 
     fn set_disabled(&self, disabled: bool) {
         let registry = std::sync::Arc::clone(&self.state.attach_registry);
-        let found = crate::attached::set_disabled(&self.path, "agentear", disabled, |change| {
-            registry.on_change(change);
-        })
-        .unwrap();
+        let found =
+            agent24_attach::attached::set_disabled(&self.path, "agentear", disabled, |change| {
+                registry.on_change(change);
+            })
+            .unwrap();
         assert!(found);
     }
 }
@@ -2776,7 +2777,7 @@ async fn ear() -> Ear {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attached.json");
     let registry = std::sync::Arc::clone(&state.attach_registry);
-    let outcome = crate::attached::register(
+    let outcome = agent24_attach::attached::register(
         &path,
         MANIFEST,
         false,
@@ -2833,8 +2834,12 @@ async fn open(ear: &Ear, versions: Option<Value>) -> Link {
     let (kernel, mut module) = UnixStream::pair().unwrap();
     let registry = std::sync::Arc::clone(&ear.state.attach_registry);
     let task = tokio::spawn(async move {
-        crate::attach_listener::handle_connection(kernel, &registry, CancellationToken::new())
-            .await;
+        agent24_attach::attach_listener::handle_connection(
+            kernel,
+            &registry,
+            CancellationToken::new(),
+        )
+        .await;
     });
     let mut params = json!({
         "module": "agentear",
@@ -3432,6 +3437,7 @@ fn documents_d9_states_stay_in_the_resident_subset() {
             MountOutcome::Mounted,
             Some(Supervised::PackageChanged {
                 reason: "digest".into(),
+                code: None,
             }),
             ComponentState::Failed,
             Some("package_changed"),
@@ -3729,7 +3735,7 @@ async fn the_ready_probe_waits_for_a_compatible_declaration() {
 /// is not sent again: the stale answer is dropped and the snapshot retaken.
 #[tokio::test]
 async fn the_ready_probe_rechecks_the_credential_before_sending() {
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-moves-secret");
     let targets = registry.probe_targets(unix_now());
@@ -3737,7 +3743,7 @@ async fn the_ready_probe_rechecks_the_credential_before_sending() {
     // Valid for the capabilities request, revoked by the time §8 would go.
     let calls = AtomicUsize::new(0);
     let current =
-        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
+        |_: &agent24_knowledge::probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
     let assessed = cache.assess(&targets, Instant::now(), &current).await;
     assert!(assessed.stale);
     assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
@@ -3779,8 +3785,8 @@ async fn a_target_that_failed_the_recheck_is_probed_again_not_dropped() {
 
 #[tokio::test]
 async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed() {
-    use crate::knowledge_host::assess_until_fresh;
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::host::assess_until_fresh;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = configured(&fake.base);
     let targets = registry.probe_targets(unix_now());
@@ -3823,7 +3829,7 @@ async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed(
 
 #[tokio::test]
 async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-gate-secret");
     let url = fake.base.as_str();
@@ -3859,7 +3865,7 @@ async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
 
 #[tokio::test]
 async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let t0 = Instant::now();
     let incompatible =
         ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]");
@@ -3917,7 +3923,7 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
 /// goes to another binding's good endpoint, and its own calls are still refused.
 #[tokio::test]
 async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let t0 = Instant::now();
     let good = serve(Script::Reply(200, ready_body())).await;
     let down = serve(Script::Reply(500, "x".into())).await;
@@ -3959,8 +3965,8 @@ async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
 /// M2: a failed reading closes the gate for a few seconds, not for a whole TTL.
 #[tokio::test]
 async fn a_failed_reading_is_reprobed_after_a_short_ttl_not_the_full_one() {
-    use crate::knowledge_host::ContractGate;
-    use crate::knowledge_probe::KNOWLEDGE_PROBE_FAILED_TTL;
+    use agent24_knowledge::host::ContractGate;
+    use agent24_knowledge::probe::KNOWLEDGE_PROBE_FAILED_TTL;
     let up = Arc::new(AtomicBool::new(false));
     let fake = serve(Script::Switch(Arc::clone(&up), ready_body())).await;
     let registry = configured(&fake.base);
@@ -4367,7 +4373,7 @@ async fn a_float_at_two_to_the_53_is_not_read_as_an_integer() {
 /// L2: the key moves while the §8 request is out. Its answer must not be used.
 #[tokio::test]
 async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale() {
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-during-secret");
     let targets = registry.probe_targets(unix_now());
@@ -4375,7 +4381,7 @@ async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale
     // Valid before the capabilities request and before §8; revoked after it.
     let calls = AtomicUsize::new(0);
     let current =
-        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
+        |_: &agent24_knowledge::probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
     let assessed = cache.assess(&targets, Instant::now(), &current).await;
     assert_eq!(fake.ready_hits(), 1, "§8 went out");
     assert!(assessed.stale, "its answer was used although the key moved");
@@ -4404,7 +4410,7 @@ async fn an_envelope_code_that_underflows_to_zero_is_not_success() {
 
 #[test]
 fn s1_4_idoris_contract_mismatch_is_incompatible() {
-    use agent24d::idoris_host::Code;
+    use agent24_idoris::idoris_host::Code;
     assert_eq!(
         from_idoris(IdorisState::Failed, false, Some(Code::ContractMismatch)),
         (
@@ -4438,5 +4444,216 @@ fn s1_4_components_render_hyphae_lifecycle() {
             json!(reason),
             "{process}"
         );
+    }
+}
+
+fn unsealed_package(root: &std::path::Path, name: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("domain-os.yml"),
+        format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/mod\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// T6. A fresh scan refuses an old package that has no integrity section and
+/// keeps a sealed sibling. Restoring the optional "no integrity means pass"
+/// path puts `oldmod` in `found` and this test goes red.
+#[test]
+fn t6_old_package_is_failed_and_a_sealed_sibling_stays_available() {
+    let root = tempfile::tempdir().unwrap();
+    unsealed_package(root.path(), "oldmod");
+    let good = root.path().join("goodmod");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::write(
+        good.join("domain-os.yml"),
+        "name: goodmod\nversion: \"0.1.0\"\nroute_namespace: /api/v1/goodmod\n\
+         event_module: goodmod\ndata_dir: ~/.agent24/os/goodmod/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/mod\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&good, "bin/mod").unwrap();
+    let scan = agent24_os_packages::test_support::scan(root.path(), &CancellationToken::new());
+    assert_eq!(
+        scan.found
+            .iter()
+            .map(|d| d.manifest.name())
+            .collect::<Vec<_>>(),
+        vec!["goodmod"]
+    );
+    let old = scan.refused.iter().find(|r| r.dir.ends_with("oldmod"));
+    assert!(old.is_some(), "old package was accepted");
+    let old = old.unwrap();
+    assert_eq!(
+        old.integrity,
+        Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+    );
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].name, "oldmod");
+    let (state, reason, _) = os_mapped(&reports[0].outcome, None);
+    assert_eq!(state, ComponentState::Failed);
+    assert_eq!(reason, Some("integrity_manifest_missing"));
+    let item = Item::new("oldmod", Form::Resident, state).with(|i| {
+        i.version = Some("0.1.0".to_owned());
+        i.reason = reason.map(str::to_owned);
+        i.provides.clear();
+    });
+    let full = render(std::slice::from_ref(&item), true);
+    assert_eq!(full["components"][0]["state"], "failed");
+    assert_eq!(
+        full["components"][0]["reason"],
+        "integrity_manifest_missing"
+    );
+    let redacted = render(&[item], false);
+    assert!(redacted["components"][0].get("reason").is_none());
+    assert!(redacted["components"][0].get("detail").is_none());
+
+    agent24_os_packages::test_support::seal_exit_stub(&root.path().join("oldmod"), "bin/mod")
+        .unwrap();
+    let again = agent24_os_packages::test_support::scan(root.path(), &CancellationToken::new());
+    assert!(
+        again.refused.iter().all(|r| !r.dir.ends_with("oldmod")),
+        "reinstall left the refusal: {:?}",
+        again.refused
+    );
+    assert!(again.found.iter().any(|d| d.manifest.name() == "oldmod"));
+}
+
+/// A manifest too damaged to trust, or one that forges a builtin name, does
+/// not take that name and does not publish its provides.
+#[test]
+fn t6_a_forged_or_unreadable_name_uses_a_directory_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let forged = root.path().join("sneaky");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(
+        forged.join("domain-os.yml"),
+        "name: idoris\nversion: \"9.9.9\"\nroute_namespace: /api/v1/idoris\n\
+         event_module: idoris\ndata_dir: ~/.agent24/os/idoris/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/mod\nprovides:\n  - id: model-gateway\n    tools: []\n",
+    )
+    .unwrap();
+    let broken = root.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("domain-os.yml"), "name: [").unwrap();
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.iter().all(|n| *n != "idoris"), "{names:?}");
+    assert!(reports.iter().all(|r| r.d9.is_none()));
+    assert!(
+        reports
+            .iter()
+            .all(|r| r.version.is_empty() || r.name != "idoris")
+    );
+    assert!(names.iter().any(|n| n.starts_with("dir-")));
+}
+
+fn package_yaml(name: &str, version: &str) -> String {
+    format!(
+        "name: {name}\nversion: \"{version}\"\nroute_namespace: /api/v1/{name}\n\
+         event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/{name}\n"
+    )
+}
+
+/// The Documents package the app installs is refused on the `documents` row.
+/// Pre-claiming `documents` in `taken` renames it to `dir-*` and this row
+/// stays `absent`. A forged `name: documents` in another directory, and a
+/// forged builtin name, still use `dir-*`.
+#[tokio::test]
+async fn a_refused_documents_package_is_failed_on_the_documents_row() {
+    let root = tempfile::tempdir().unwrap();
+    let documents = root.path().join("documents");
+    std::fs::create_dir_all(&documents).unwrap();
+    std::fs::write(
+        documents.join("domain-os.yml"),
+        package_yaml("documents", "1.2.3"),
+    )
+    .unwrap();
+    let forged_documents = root.path().join("aaa");
+    std::fs::create_dir_all(&forged_documents).unwrap();
+    std::fs::write(
+        forged_documents.join("domain-os.yml"),
+        package_yaml("documents", "9.9.9"),
+    )
+    .unwrap();
+    let forged_builtin = root.path().join("sneaky");
+    std::fs::create_dir_all(&forged_builtin).unwrap();
+    std::fs::write(
+        forged_builtin.join("domain-os.yml"),
+        package_yaml("idoris", "9.9.9"),
+    )
+    .unwrap();
+
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    let mut state = server_tests::state().await;
+    state.os_reports = Arc::new(reports);
+    let body = render(&collect(&state, std::time::Instant::now()).await, true);
+    let rows = body["components"].as_array().unwrap();
+    let documents_rows: Vec<_> = rows.iter().filter(|row| row["id"] == "documents").collect();
+    assert_eq!(documents_rows.len(), 1);
+    assert_eq!(documents_rows[0]["state"], "failed");
+    assert_eq!(documents_rows[0]["reason"], "integrity_manifest_missing");
+    assert_eq!(documents_rows[0]["version"], "1.2.3");
+    assert!(
+        rows.iter()
+            .all(|row| row["id"] != "idoris" || row["reason"] != "integrity_manifest_missing"),
+        "{body}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["id"].as_str().is_some_and(|id| id.starts_with("dir-"))),
+        "{body}"
+    );
+}
+
+/// T8. Each integrity reason is `failed` for the host and absent from the
+/// redacted row. Dropping `reason`, or copying `detail` into the redacted
+/// view, turns this red.
+#[test]
+fn t8_each_integrity_reason_is_host_only() {
+    use crate::domain::RefusalReason;
+    use agent24_components::integrity::IntegrityReason;
+    for reason in [
+        IntegrityReason::ManifestMissing,
+        IntegrityReason::HashMismatch,
+        IntegrityReason::ManifestInvalid,
+        IntegrityReason::SignatureRejected,
+        IntegrityReason::CheckFailed,
+    ] {
+        let outcome = MountOutcome::RefusedFor(
+            RefusalReason::PackageIntegrity(reason),
+            format!("detail /tmp/secret stderr {}", reason.code()),
+        );
+        let (state, code, message) = os_mapped(&outcome, None);
+        assert_eq!(state, ComponentState::Failed);
+        assert_eq!(code, Some(reason.code()));
+        let item = Item::new("pkg", Form::Resident, state).with(|i| {
+            i.version = Some("1".to_owned());
+            i.reason = code.map(str::to_owned);
+            i.detail = message.map(|text| json!({"message": text}));
+        });
+        let full = render(std::slice::from_ref(&item), true);
+        assert_eq!(full["components"][0]["state"], "failed");
+        assert_eq!(full["components"][0]["reason"], reason.code());
+        assert_ne!(full["components"][0]["state"], "absent");
+        assert_ne!(full["components"][0]["state"], "incompatible");
+        let redacted = render(&[item], false).to_string();
+        assert!(!redacted.contains("reason"), "{redacted}");
+        assert!(!redacted.contains("detail"), "{redacted}");
+        assert!(!redacted.contains("/tmp"), "{redacted}");
+        assert!(!redacted.contains("stderr"), "{redacted}");
     }
 }

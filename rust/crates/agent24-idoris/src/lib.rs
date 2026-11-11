@@ -9,7 +9,12 @@ pub mod setup;
 pub mod supervisor;
 
 pub mod download;
+pub mod idoris_host;
 pub mod install;
+pub mod managed_idoris;
+
+#[cfg(test)]
+mod test_slot;
 
 use agent24_components::lock::{ComponentLock, LockError as ComponentLockError};
 use semver::Version;

@@ -122,7 +122,7 @@ impl FirstPartyAuthority {
         let summary = match template {
             "/api/v1/idoris/install" => {
                 let Ok(body) =
-                    serde_json::from_slice::<agent24d::idoris_host::InstallRequest>(bytes)
+                    serde_json::from_slice::<agent24_idoris::idoris_host::InstallRequest>(bytes)
                 else {
                     return;
                 };
@@ -133,7 +133,7 @@ impl FirstPartyAuthority {
             }
             "/api/v1/idoris/connect" => {
                 let Ok(body) =
-                    serde_json::from_slice::<agent24d::idoris_host::ConnectRequest>(bytes)
+                    serde_json::from_slice::<agent24_idoris::idoris_host::ConnectRequest>(bytes)
                 else {
                     return;
                 };
@@ -234,6 +234,18 @@ impl FirstPartyAuthority {
                     .strip_prefix("/api/v1/idoris/operations/")?
                     .strip_suffix("/cancel")?;
                 return Some(format!("cancel iDoris operation {}", shown(id)?));
+            }
+            "/api/v1/os/trusted-teams/{team}" => {
+                let team = target.path.strip_prefix("/api/v1/os/trusted-teams/")?;
+                if team.contains('/') {
+                    return None;
+                }
+                let team = shown(team)?;
+                return Some(match target.method.as_str() {
+                    "PUT" => format!("trust OS package team {team}"),
+                    "DELETE" => format!("stop trusting OS package team {team}"),
+                    _ => return None,
+                });
             }
             _ => {}
         }
@@ -480,10 +492,12 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
     // Full CORE-2 will enable elevated operations individually; each must first
     // have a daemon-generated summary derived from its actual request body.
     let supported = (policy.operation == Operation::ModuleAdmin
-        && method == Method::POST
         && matches!(
-            policy.template,
-            "/api/v1/attached" | "/api/v1/os/{name}/delegation"
+            (method.as_str(), policy.template),
+            ("POST", "/api/v1/attached")
+                | ("POST", "/api/v1/os/{name}/delegation")
+                | ("PUT", "/api/v1/os/trusted-teams/{team}")
+                | ("DELETE", "/api/v1/os/trusted-teams/{team}")
         ))
         // I-1: the iDoris lifecycle, each with a daemon-derived summary.
         || (policy.operation == Operation::IdorisLifecycle
@@ -1277,6 +1291,36 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// Dropping the trusted-team templates from `resolve_target`'s supported
+    /// set turns the PUT/DELETE assertions into `NotElevatedOperation`.
+    #[test]
+    fn trusted_team_writes_are_elevatable_and_reads_are_not() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        assert_eq!(
+            resolve_target(&idoris("GET", "/api/v1/os/trusted-teams", b"")).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
+        let put =
+            resolve_target(&idoris("PUT", "/api/v1/os/trusted-teams/ABCDE12345", b"")).unwrap();
+        assert_eq!(put.operation, Operation::ModuleAdmin);
+        let summary = authority.target_summary("id", &put).unwrap();
+        assert!(summary.contains("ABCDE12345"), "{summary}");
+        assert!(summary.contains("trust OS package team"), "{summary}");
+        let with_body =
+            resolve_target(&idoris("PUT", "/api/v1/os/trusted-teams/ABCDE12345", b"{}")).unwrap();
+        assert!(authority.target_summary("id", &with_body).is_none());
+        let del = resolve_target(&idoris(
+            "DELETE",
+            "/api/v1/os/trusted-teams/ABCDE12345",
+            b"",
+        ))
+        .unwrap();
+        assert_eq!(del.operation, Operation::ModuleAdmin);
+        let summary = authority.target_summary("id", &del).unwrap();
+        assert!(summary.contains("ABCDE12345"), "{summary}");
+        assert!(summary.contains("stop trusting"), "{summary}");
     }
 
     #[test]

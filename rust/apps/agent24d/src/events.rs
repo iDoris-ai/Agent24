@@ -54,6 +54,12 @@ impl EventsHub {
     }
 }
 
+impl agent24_attach::agentear_timings::AgentEarEventBus for EventsHub {
+    fn subscribe(&self) -> broadcast::Receiver<(String, EventBody)> {
+        EventsHub::subscribe(self)
+    }
+}
+
 fn pre_upgrade_receiver(hub: &EventsHub) -> broadcast::Receiver<(String, EventBody)> {
     hub.subscribe()
 }
@@ -167,5 +173,49 @@ mod tests {
                 run_id: "run_before_client_loop".to_owned(),
             })
         );
+    }
+
+    /// S2-4b moved the AgentEar timing bridge into `agent24-attach`, whose own
+    /// test uses a stand-in bus. This one keeps the daemon's real wiring under
+    /// test: `EventsHub`'s `AgentEarEventBus` impl and the shared sink.
+    #[tokio::test]
+    async fn the_agentear_timing_bridge_records_from_the_real_hub() {
+        use crate::timing_recorder::{MemoryTimingSink, TimingSink};
+        use agent24_attach::agentear_timings::{AGENTEAR_MODULE, spawn_agentear_timing_bridge};
+        use std::sync::Arc;
+
+        let sink = Arc::new(MemoryTimingSink::default());
+        let hub = EventsHub::default();
+        let _handle = spawn_agentear_timing_bridge(&hub, sink.clone() as Arc<dyn TimingSink>);
+
+        let payload = serde_json::json!({
+            "schema": "agentear.event/1",
+            "event_id": "evt_1",
+            "session_id": "ses_1",
+            "seq": 7,
+            "type": "turn",
+            "payload": {
+                "phase": "idle",
+                "model": "m",
+                "tier": "local",
+                "timings": { "record_ms": 300, "total_ms": 3500 }
+            }
+        });
+        hub.broadcast(EventBody::Module(agent24_protocol::ModuleEventPayload {
+            module: AGENTEAR_MODULE.to_owned(),
+            kind: "agentear.event".to_owned(),
+            payload: payload.as_object().unwrap().clone(),
+        }));
+
+        let mut recorded = Vec::new();
+        for _ in 0..50 {
+            recorded = sink.take();
+            if recorded.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(recorded.len(), 2, "one row per *_ms field");
+        assert!(recorded.iter().all(|o| o.source == "module:agentear"));
     }
 }

@@ -5,11 +5,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(unix)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -40,8 +43,7 @@ fn data_dir() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn spawn(data: &Path, args: &[&str]) -> Daemon {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", data.parent().unwrap())
         .env("AGENT24_DATA_DIR", data)

@@ -2,73 +2,73 @@
 'use strict';
 
 /**
- * Agent24 out-of-process domain OS — minimal Node.js reference module.
+ * Agent24 attached domain OS — minimal Node.js reference module.
  *
- * This file was written ONLY against docs/specs/WIRE-OOP-MODULE.md — it does
- * NOT import, require, or read anything from this repository's Rust protocol
- * crates (agent24-os-proto / agent24-os-sdk). That is the point of it: it is
- * the "does the document alone let a third party in another language build a
- * working module" proof for ME4-5.4.1 / T14.
+ * This file was written ONLY against docs/specs/WIRE-OOP-MODULE.md and
+ * docs/design/A3-ATTACHED-MODULE.md — it does NOT import, require, or read
+ * anything from this repository's Rust protocol crates (agent24-os-proto /
+ * agent24-os-sdk).
  *
  * Node.js standard library only. No npm dependencies.
  *
  * What it does, end to end:
- *   1. Reads the A24_* environment variables the kernel launches it with.
- *   2. Takes over fd 3 (the pre-bound, listening Unix-domain-socket the
- *      kernel handed it) as an HTTP server for its own namespace's routes.
- *   3. Connects to the callback Unix-domain-socket named by
- *      A24_CALLBACK_SOCK and completes the `initialize` handshake.
- *   4. Emits one `task.transitioned` event right after the handshake.
- *   5. On the first HTTP request that reaches it through the kernel's proxy,
- *      calls `_a24/memory/private/remember` and then
- *      `_a24/memory/private/recall`, and serves a small JSON status page
- *      showing what it just did — this is what the black-box test
- *      (rust/apps/agent24d/tests/me4_node_module_blackbox.rs) reads back.
- *   6. Exits promptly when it reads EOF on the callback socket (SPEC-ME3
- *      §3's D1: "the callback connection is this generation's lifeline").
+ *   1. Reads socket path and auth token from environment variables or CLI arguments.
+ *   2. Connects to the attached Unix-domain-socket and completes the `initialize`
+ *      handshake requesting the `events` capability.
+ *   3. Emits one `task.transitioned` event right after the handshake.
+ *   4. Writes `startup_probe.json` snapshot atomically to its data directory.
+ *   5. Keeps running and answers reverse commands if invoked.
+ *   6. Exits promptly and gracefully when it reads EOF on the attached socket.
  */
 
 const net = require('node:net');
-const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
+const crypto = require('node:crypto');
+const { StringDecoder } = require('node:string_decoder');
 
 // ---------------------------------------------------------------------------
-// 1. Environment contract (WIRE-OOP-MODULE.md §2 "Launch environment")
+// 1. Environment & arguments contract
 // ---------------------------------------------------------------------------
 
-function requiredEnv(name) {
-  const value = process.env[name];
-  if (!value) {
-    process.stderr.write(`node-ref: missing required env var ${name}\n`);
-    process.exit(1);
-  }
-  return value;
+function resolveArgOrEnv(argIdx, envName) {
+  if (process.argv[argIdx]) return process.argv[argIdx];
+  if (envName && process.env[envName]) return process.env[envName];
+  return undefined;
 }
 
-const LISTEN_FD = Number(requiredEnv('A24_LISTEN_FD'));
-const CALLBACK_SOCK = requiredEnv('A24_CALLBACK_SOCK');
-const HANDSHAKE_TOKEN = requiredEnv('A24_HANDSHAKE_TOKEN');
-const DATA_DIR = requiredEnv('A24_DATA_DIR');
+const CALLBACK_SOCK = resolveArgOrEnv(2, 'A24_ATTACH_SOCK');
+if (!CALLBACK_SOCK) {
+  process.stderr.write('node-ref: missing required argument or env var (A24_ATTACH_SOCK)\n');
+  process.exit(1);
+}
+
+const HANDSHAKE_TOKEN = resolveArgOrEnv(3, 'A24_ATTACH_TOKEN');
+if (!HANDSHAKE_TOKEN) {
+  process.stderr.write('node-ref: missing required argument or env var (A24_ATTACH_TOKEN)\n');
+  process.exit(1);
+}
+
+// 探针目录必须显式给（参数或 A24_DATA_DIR）；没给就不落盘（不写 ~/.agent24），连接失败也不写 error.txt 到默认目录
+const DATA_DIR = resolveArgOrEnv(4, 'A24_DATA_DIR') || null;
 
 const MODULE_NAME = 'node-ref';
 const MANIFEST_PATH = path.join(__dirname, 'domain-os.yml');
 
 function manifestDigest() {
-  const crypto = require('node:crypto');
   const bytes = fs.readFileSync(MANIFEST_PATH);
   return `sha256:${crypto.createHash('sha256').update(bytes).digest('hex')}`;
 }
 
 function probePath(name) {
-  return path.join(DATA_DIR, name);
+  return DATA_DIR ? path.join(DATA_DIR, name) : null;
 }
 
 /** Write-to-temp + rename: atomic on the same filesystem (POSIX rename(2)),
  * so a concurrent reader (the black-box test) never observes a truncated or
- * partially written file — same technique the Rust ME-3f blackbox module
- * uses (rust/apps/agent24d/tests/me3f_blackbox.rs `dump_atomic`). */
+ * partially written file. */
 function writeProbeAtomic(name, value) {
+  if (!DATA_DIR) return;
   fs.mkdirSync(DATA_DIR, { recursive: true });
   const target = probePath(name);
   const tmp = `${target}.tmp`;
@@ -77,14 +77,17 @@ function writeProbeAtomic(name, value) {
 }
 
 // ---------------------------------------------------------------------------
-// 2. NDJSON framing + a tiny JSON-RPC client over the callback socket
-//    (WIRE-OOP-MODULE.md §4 "Frame format & RPC")
+// 2. NDJSON framing + a tiny JSON-RPC client over the attached socket
+//    (A3-ATTACHED-MODULE.md §4 "Frame format & RPC")
 // ---------------------------------------------------------------------------
 
 class CallbackChannel {
   constructor(socket) {
     this.socket = socket;
     this.buffer = '';
+    // A multi-byte UTF-8 character can be split across two socket chunks;
+    // the decoder holds the partial bytes until the rest arrive.
+    this.decoder = new StringDecoder('utf8');
     this.nextId = 1;
     this.pending = new Map(); // id -> {resolve, reject}
     this.closed = false;
@@ -95,7 +98,7 @@ class CallbackChannel {
   }
 
   _onData(chunk) {
-    this.buffer += chunk.toString('utf8');
+    this.buffer += this.decoder.write(chunk);
     let idx;
     // NDJSON: one JSON value per line, newline-terminated.
     while ((idx = this.buffer.indexOf('\n')) !== -1) {
@@ -117,10 +120,10 @@ class CallbackChannel {
     const id = msg.id;
     const waiter = id === null || id === undefined ? null : this.pending.get(id);
     if (!waiter) {
-      // Not a response we're waiting on (e.g. a kernel-initiated request
-      // such as a fired scheduler delivery arrives on the HTTP side, not
-      // here — so in this minimal module there should be none, but a
-      // stray/duplicate response must not crash the process).
+      // Check if this is a kernel-originated request (has method and string id)
+      if (msg.method && id !== null && id !== undefined) {
+        this._handleKernelRequest(msg);
+      }
       return;
     }
     this.pending.delete(id);
@@ -131,27 +134,61 @@ class CallbackChannel {
     }
   }
 
+  _handleKernelRequest(msg) {
+    if (msg.method === '_a24/command/invoke') {
+      const { name, body } = msg.params || {};
+      if (name !== 'echo') {
+        const frame =
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32602, message: `Unknown command: ${name}` },
+          }) + '\n';
+        this.socket.write(frame);
+        return;
+      }
+      if (!body || typeof body !== 'object' || typeof body.message !== 'string') {
+        const frame =
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: msg.id,
+            error: { code: -32602, message: 'Invalid params: body.message (string) is required' },
+          }) + '\n';
+        this.socket.write(frame);
+        return;
+      }
+      const frame =
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: msg.id,
+          result: { echo: body.message },
+        }) + '\n';
+      this.socket.write(frame);
+      return;
+    }
+    const frame =
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        error: { code: -32601, message: 'Method not found' },
+      }) + '\n';
+    this.socket.write(frame);
+  }
+
   _onClose() {
     if (this.closed) return;
     this.closed = true;
     for (const waiter of this.pending.values()) {
-      waiter.reject(new Error('callback socket closed'));
+      waiter.reject(new Error('attached socket closed'));
     }
     this.pending.clear();
-    // SPEC-ME3 §3 "允许的连接数" (D1): the callback connection is this
-    // generation's lifeline. Reading EOF on it means the kernel is done
-    // with this run — the module MUST exit, not attempt to reconnect (the
-    // same generation is never allowed a second connection, and a
-    // reconnecting module would risk racing a brand-new daemon instance
-    // over the same data directory). Exit code 0: this is expected,
-    // graceful shutdown, not a crash.
-    process.stderr.write('node-ref: callback socket closed by kernel, exiting\n');
+    process.stderr.write('node-ref: attached socket closed by kernel, exiting\n');
     process.exit(0);
   }
 
   /** Send one JSON-RPC request, return a Promise of its `result`. */
   call(method, params) {
-    if (this.closed) return Promise.reject(new Error('callback socket closed'));
+    if (this.closed) return Promise.reject(new Error('attached socket closed'));
     const id = String(this.nextId++);
     const frame = JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n';
     return new Promise((resolve, reject) => {
@@ -163,32 +200,32 @@ class CallbackChannel {
 
 class CallbackError extends Error {
   constructor(errorObject) {
-    super(errorObject.message || 'callback error');
-    this.code = errorObject.code;
-    this.kind = errorObject.data && errorObject.data.kind;
-    this.data = errorObject.data;
+    const kindPrefix =
+      errorObject && errorObject.data && errorObject.data.kind
+        ? `[${errorObject.data.kind}] `
+        : '';
+    super(`${kindPrefix}${(errorObject && errorObject.message) || 'callback error'}`);
+    this.code = errorObject && errorObject.code;
+    this.kind = errorObject && errorObject.data && errorObject.data.kind;
+    this.data = errorObject && errorObject.data;
   }
 }
 
 // ---------------------------------------------------------------------------
-// 3. `initialize` handshake (WIRE-OOP-MODULE.md §3)
+// 3. `initialize` handshake (A3-ATTACHED-MODULE.md §4.3)
 // ---------------------------------------------------------------------------
 
 function connectAndHandshake() {
   return new Promise((resolve, reject) => {
     const socket = net.createConnection(CALLBACK_SOCK, () => {
       const channel = new CallbackChannel(socket);
-      // The handshake IS the first call on the channel: it is sent the same
-      // way as any other RPC (CallbackChannel.call takes care of framing
-      // and id bookkeeping), the kernel just requires it to be the first
-      // line on the wire.
       channel
         .call('initialize', {
           protocol_versions: { min: 1, max: 1 },
           module: MODULE_NAME,
           manifest_digest: manifestDigest(),
           auth_token: HANDSHAKE_TOKEN,
-          capabilities: ['events', 'memory'],
+          capabilities: ['events'],
         })
         .then((result) => resolve({ channel, result }))
         .catch(reject);
@@ -198,90 +235,34 @@ function connectAndHandshake() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. HTTP server on the inherited fd 3 (WIRE-OOP-MODULE.md §2)
-// ---------------------------------------------------------------------------
-
-function startHttpServer(channel) {
-  const server = http.createServer((req, res) => {
-    handleRequest(channel, req, res).catch((err) => {
-      process.stderr.write(`node-ref: request handler failed: ${err}\n`);
-      if (!res.headersSent) {
-        res.writeHead(500, { 'content-type': 'application/json' });
-      }
-      res.end(JSON.stringify({ error: String(err && err.message ? err.message : err) }));
-    });
-  });
-  // Node's net/http servers accept an already-bound, already-listening fd
-  // via `listen({ fd })` — no `fd.open`/`socket()` call needed, the kernel
-  // did that part; this just starts accepting connections on it.
-  server.listen({ fd: LISTEN_FD }, () => {
-    process.stderr.write('node-ref: serving on inherited fd 3\n');
-  });
-  server.on('error', (err) => {
-    process.stderr.write(`node-ref: http server error: ${err}\n`);
-  });
-  return server;
-}
-
-async function handleRequest(channel, req, res) {
-  // The path the kernel forwards is the FULL path including the
-  // `/api/v1/<ns>` prefix (WIRE-OOP-MODULE.md §6) — this module's own
-  // router must match against that, not a stripped path.
-  const url = new URL(req.url, 'http://node-ref.invalid');
-
-  if (url.pathname === '/api/v1/node-ref/hello') {
-    const remembered = await channel.call('_a24/memory/private/remember', {
-      kind: 'node-ref-note',
-      body: { text: 'hello from the node reference module', at: new Date().toISOString() },
-    });
-    const recalled = await channel.call('_a24/memory/private/recall', {
-      query: 'node-ref-note',
-      page_size: 10,
-    });
-    await channel.call('_a24/events/emit', {
-      kind: 'task.transitioned',
-      payload: { probe: 'node-ref', path: url.pathname },
-    });
-    writeProbeAtomic('callback_probe.json', {
-      remembered,
-      recalled,
-    });
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, remembered, recalled }));
-    return;
-  }
-
-  res.writeHead(404, { 'content-type': 'application/json' });
-  res.end(JSON.stringify({ error: 'not_found', path: url.pathname }));
-}
-
-// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 async function main() {
   const { channel, result } = await connectAndHandshake();
-  process.stderr.write(`node-ref: handshake ok, protocol_version=${result.protocol_version}, offer=${JSON.stringify(result.offer)}\n`);
+  process.stderr.write(
+    `node-ref: handshake ok, protocol_version=${result.protocol_version}, offer=${JSON.stringify(result.offer)}\n`
+  );
 
-  // One real callback round trip right after the handshake, independent of
-  // any HTTP request — proves the module can use its connection-authority
-  // credential for background work, not only inside a proxied request
-  // (SPEC-ME3 §3 "后台任务只能写自己的私有分区").
+  // Emit one real callback round trip right after the handshake
   const emitResult = await channel.call('_a24/events/emit', {
     kind: 'task.transitioned',
     payload: { probe: 'node-ref', phase: 'startup' },
   });
   writeProbeAtomic('startup_probe.json', { offer: result.offer, emit: emitResult });
-
-  startHttpServer(channel);
 }
 
 main().catch((err) => {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(path.join(DATA_DIR, 'error.txt'), String(err && err.stack ? err.stack : err));
-  } catch {
-    // best effort
+  if (DATA_DIR) {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+      fs.writeFileSync(
+        path.join(DATA_DIR, 'error.txt'),
+        String(err && err.stack ? err.stack : err)
+      );
+    } catch {
+      // best effort
+    }
   }
   process.stderr.write(`node-ref: fatal: ${err && err.stack ? err.stack : err}\n`);
   process.exit(1);

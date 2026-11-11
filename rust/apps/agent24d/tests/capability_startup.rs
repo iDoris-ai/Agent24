@@ -1,8 +1,11 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::time::{Duration, Instant};
 struct CapabilityDaemon {
     child: Child,
@@ -22,9 +25,8 @@ fn start(home: &std::path::Path) -> (CapabilityDaemon, u16, String) {
 }
 
 fn start_with_mode(home: &std::path::Path, ephemeral: bool) -> (CapabilityDaemon, u16, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    let mut command = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     command
-        .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home);
     command.args([
@@ -259,7 +261,7 @@ fn idoris_restore_persistence_failure_does_not_prevent_daemon_startup() {
         .path()
         .join("Library/Application Support/Agent24/idoris");
     std::fs::create_dir_all(&root).unwrap();
-    let record = agent24d::idoris_host::Installation {
+    let record = agent24_idoris::idoris_host::Installation {
         version: "0.4.0".into(),
         release_dir: root.join("release"),
         archive_path: root.join("archive.tar.gz"),

@@ -266,6 +266,13 @@ impl CallbackDir {
         })
     }
 
+    /// Generations handed out by [`Self::open_generation`]. Stays at zero when
+    /// a cancelled first attempt returns before `run_once`.
+    #[cfg(test)]
+    pub(crate) fn generations_issued(&self) -> u64 {
+        self.last.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Listen at `<dir>/<n>.sock`. Private: a caller-chosen number is what
     /// [`CallbackDir::listen_next`] exists to rule out.
     fn listen_at(&self, n: u64) -> Result<CallbackListener, EndpointError> {

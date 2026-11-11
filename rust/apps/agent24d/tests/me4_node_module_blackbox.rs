@@ -1,45 +1,37 @@
 //! ME4-5.4.1 / T14 — the black-box acceptance test for
-//! `docs/specs/WIRE-OOP-MODULE.md`: **does the document alone let a
-//! different-language implementation work, without looking at this repo's
-//! own Rust protocol code?**
+//! `docs/specs/WIRE-OOP-MODULE.md` & `docs/design/A3-ATTACHED-MODULE.md`:
+//! **does the document alone let a different-language implementation work,
+//! without looking at this repo's own Rust protocol code?**
 //!
-//! `examples/node-module/` was written ONLY against WIRE-OOP-MODULE.md — it
-//! does not `require`/`import` any crate from this repository. This test
-//! drives it exactly the way `me3f_blackbox.rs` (#262, ME-3f) drives its
-//! Python mock module: build the daemon once, install the package OUTSIDE
-//! anything the daemon was compiled with, restart, and prove mount → routing
-//! proxy → event forwarding → memory read/write all round-trip for real over
+//! `examples/node-module/` was written ONLY against WIRE-OOP-MODULE.md and
+//! A3-ATTACHED-MODULE.md — it does not `require`/`import` any crate from this
+//! repository. Per task N3, installed packages must be signed native executables,
+//! so interpreter-based modules (such as Node.js) attach to the daemon via the
+//! A3 attach route (`POST /api/v1/attached`).
+//!
+//! This test drives the Node reference module as an attached module: build the
+//! daemon once, register the module's manifest via the REST attach API, launch
+//! the Node process independently to connect to the attach socket, and prove
+//! handshake, event emission, and probe persistence all round-trip for real over
 //! the wire.
 //!
-//! **Scope, deliberately narrower than ME-3f**: PLAN-ME4-OS-CAPABILITIES.md
-//! §五 T14's acceptance criterion also mentions a scheduler upsert/fired round
-//! trip. The reference module in `examples/node-module/` only declares and
-//! uses `events`/`memory` (ME4-5.4.1's task brief: "原型，最小可用" — prototype,
-//! minimal viable), so this file does not attempt scheduler or model or
-//! approval — those three method families are documented to the same level
-//! of detail in WIRE-OOP-MODULE.md §5.3–§5.5 but not exercised here. Recorded
-//! as `docs/agent/followups.md` FU-104.
-//!
-//! **`node` availability**: unlike this crate's Python-based black-box tests
-//! (which treat a missing `python3` as a hard failure — see
-//! `a3_3_host_commands_blackbox.rs`), this repo has never depended on `node`
-//! being on `PATH` before ME4-5.4.1 added it. So a missing `node` here is a
-//! SKIP with an explicit printed reason, not a panic — per the task's own
-//! instruction. On any machine that does have `node` (this one does,
-//! confirmed `v24.21.0` at authoring time), the test runs for real.
+//! **`node` availability**: a missing `node` is a SKIP with an explicit printed
+//! reason, not a panic.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+#[path = "support/signature_command.rs"]
+mod signature_command;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// The root of the git checkout, computed from this crate's own manifest
-/// directory (`rust/apps/agent24d`) rather than assumed — `CARGO_MANIFEST_DIR`
-/// is set by cargo for every test binary, so this does not depend on the
-/// process's current working directory when `cargo test` was invoked.
+/// directory (`rust/apps/agent24d`) rather than assumed.
 fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent() // rust/apps
@@ -49,58 +41,69 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// `Some(reason)` if `node` is not runnable on this machine — printed and
-/// used to skip, per this task's explicit instruction (unlike this crate's
-/// Python-based black-box tests, which hard-fail on a missing interpreter).
+/// `Some(reason)` if `node` is not runnable on this machine (only `NotFound` skips).
 fn missing_node() -> Option<String> {
     match Command::new("node").arg("--version").output() {
         Ok(out) if out.status.success() => None,
-        Ok(out) => Some(format!(
-            "`node --version` exited non-zero: {}",
+        Ok(out) => panic!(
+            "`node --version` exited non-zero ({}): {}",
+            out.status,
             String::from_utf8_lossy(&out.stderr)
-        )),
-        Err(e) => Some(format!("`node` is not runnable on PATH: {e}")),
+        ),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("`node` is not runnable on PATH: {e}"))
+        }
+        Err(e) => panic!("`node --version` failed: {e}"),
     }
 }
 
-/// Install `examples/node-module/` under `<home>/.agent24/packages/node-ref/`
-/// — the same on-disk shape `agent24 os install` produces, and the exact
-/// three files this repo ships in `examples/node-module/` (not an inline
-/// copy that could silently drift from what a real user would install).
-fn install(home: &Path) {
-    let src = repo_root().join("examples/node-module");
-    let dst = home.join(".agent24/packages/node-ref");
-    std::fs::create_dir_all(&dst).unwrap();
-    for name in ["domain-os.yml", "index.js", "package.json"] {
-        let from = src.join(name);
-        std::fs::copy(&from, dst.join(name))
-            .unwrap_or_else(|e| panic!("copying {}: {e}", from.display()));
-    }
+fn raw_request(
+    port: u16,
+    token: &str,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> Option<(u16, String)> {
+    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {token}\r\n\
+         connection: close\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body.as_bytes());
+    s.write_all(&req).ok()?;
+    let mut raw = Vec::new();
+    s.read_to_end(&mut raw).ok()?;
+    let raw = String::from_utf8_lossy(&raw).into_owned();
+    let (head, resp_body) = raw.split_once("\r\n\r\n").unwrap_or((raw.as_str(), ""));
+    let status: u16 = head
+        .split("\r\n")
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    Some((status, resp_body.to_owned()))
 }
 
 fn get(port: u16, token: &str, path: &str) -> Option<(u16, String)> {
-    let mut s = TcpStream::connect(("127.0.0.1", port)).ok()?;
-    s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
-    write!(
-        s,
-        "GET {path} HTTP/1.1\r\nhost: 127.0.0.1:{port}\r\nauthorization: Bearer {token}\r\nconnection: close\r\n\r\n"
-    )
-    .ok()?;
-    let mut raw = String::new();
-    s.read_to_string(&mut raw).ok()?;
-    let status = raw.split(' ').nth(1)?.parse().ok()?;
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_owned())?;
-    Some((status, body))
+    raw_request(port, token, "GET", path, "")
 }
 
-/// The daemon — graceful-first on every exit path, same reasoning as
-/// `me3f_blackbox.rs`'s `Running`: a bare `std::process::Child` dropped by an
-/// early panic does not terminate the OS process, and unconditional SIGKILL
-/// was empirically found (there, Codex review) to orphan the mock module.
+fn post(port: u16, token: &str, path: &str, body: &serde_json::Value) -> (u16, String) {
+    raw_request(port, token, "POST", path, &body.to_string())
+        .unwrap_or((0, "connection failed".into()))
+}
+
+/// The daemon or subprocess — graceful-first on drop.
 struct Running(std::process::Child);
 
 impl Drop for Running {
     fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_some() {
+            return;
+        }
         #[allow(clippy::cast_possible_wrap)]
         if let Some(pid) = rustix::process::Pid::from_raw(self.0.id() as i32)
             && rustix::process::kill_process(pid, rustix::process::Signal::Term).is_ok()
@@ -129,11 +132,9 @@ impl Daemon {
     }
 }
 
-/// Start the already-built `agent24d` binary against `home` — no `cargo
-/// build` here or anywhere else in this file, same as `me3f_blackbox.rs`.
+/// Start the already-built `agent24d` binary against `home`.
 fn start(home: &Path) -> Daemon {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .args(["serve", "--port", "0"])
@@ -174,8 +175,9 @@ fn stop(d: Daemon) {
     drop(d);
 }
 
-fn os_list_entry(port: u16, token: &str, name: &str) -> serde_json::Value {
-    let (status, body) = get(port, token, "/api/v1/os").expect("the daemon answered /api/v1/os");
+fn attached_list_entry(port: u16, token: &str, name: &str) -> serde_json::Value {
+    let (status, body) =
+        get(port, token, "/api/v1/attached").expect("the daemon answered /api/v1/attached");
     assert_eq!(status, 200, "{body}");
     let list: serde_json::Value = serde_json::from_str(&body).expect("the list");
     list["modules"]
@@ -184,21 +186,21 @@ fn os_list_entry(port: u16, token: &str, name: &str) -> serde_json::Value {
         .iter()
         .find(|m| m["name"] == name)
         .cloned()
-        .unwrap_or_else(|| panic!("{name} in the list: {body}"))
+        .unwrap_or_else(|| panic!("{name} in the attached list: {body}"))
 }
 
+static HOME_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 fn tmp_home() -> tempfile::TempDir {
+    let n = HOME_COUNTER.fetch_add(1, Ordering::Relaxed);
     tempfile::Builder::new()
-        .prefix("a24-node-ref")
+        .prefix(&format!("a24node-{n}-"))
+        .rand_bytes(4)
         .tempdir_in("/tmp")
         .unwrap()
 }
 
-/// Connect to the real `GET /api/v1/events` WS endpoint — identical to
-/// `me3f_blackbox.rs`'s `spawn_ws_subscriber`, see that file's doc comment
-/// for why the retry-based consumption pattern at the one call site below is
-/// needed (the function returning is not proof the server has subscribed
-/// yet, and the hub has no replay).
+/// Connect to the real `GET /api/v1/events` WS endpoint.
 fn spawn_ws_subscriber(port: u16, token: &str) -> std::sync::mpsc::Receiver<serde_json::Value> {
     use tokio_tungstenite::tungstenite;
     use tungstenite::client::IntoClientRequest;
@@ -235,13 +237,12 @@ fn spawn_ws_subscriber(port: u16, token: &str) -> std::sync::mpsc::Receiver<serd
     rx
 }
 
-/// **ME4-5.4.1 / T14 — the acceptance test.** A daemon starts with nothing
-/// installed, the Node reference module is installed OUTSIDE anything the
-/// daemon was compiled with while it is down, and the daemon is started
-/// again — a real second process, no rebuild — after which mount, routing
-/// proxy, event forwarding, and memory read/write all round-trip for real
-/// over the wire, driven by a module written only against
-/// `docs/specs/WIRE-OOP-MODULE.md`.
+/// **ME4-5.4.1 / T14 (Task N3) — the acceptance test.**
+/// Proves that the Node reference module in `examples/node-module/`, written
+/// strictly against the wire specifications without Rust crate dependencies,
+/// attaches successfully to `agent24d` via `POST /api/v1/attached`, completes
+/// the `initialize` handshake, and successfully executes a callback round trip
+/// (`_a24/events/emit`) whose result is durably observed on the WS subscriber.
 #[test]
 fn a_node_module_written_only_against_the_wire_doc() {
     if let Some(reason) = missing_node() {
@@ -252,11 +253,10 @@ fn a_node_module_written_only_against_the_wire_doc() {
     }
 
     let home = tmp_home();
+    let d = start(home.path());
 
-    // First lifetime: nothing installed yet — proves the mount that follows
-    // is caused by the install-then-restart sequence below.
-    let d1 = start(home.path());
-    let empty = get(d1.port, &d1.token, "/api/v1/os").expect("the daemon answered");
+    // ── 1. Initial state: nothing attached ──────────────────────────────
+    let empty = get(d.port, &d.token, "/api/v1/attached").expect("the daemon answered");
     assert_eq!(empty.0, 200, "{}", empty.1);
     let list: serde_json::Value = serde_json::from_str(&empty.1).unwrap();
     assert!(
@@ -265,132 +265,89 @@ fn a_node_module_written_only_against_the_wire_doc() {
             .unwrap()
             .iter()
             .all(|m| m["name"] != "node-ref"),
-        "node-ref must not exist before it has even been installed: {}",
+        "node-ref must not exist before it has been registered: {}",
         empty.1
     );
-    stop(d1);
 
-    // Install the Node module OUTSIDE anything the daemon was compiled
-    // with, while it is down.
-    install(home.path());
-
-    // Second lifetime: a real restart, same binary, same $HOME.
-    let d2 = start(home.path());
-
-    // Subscribe to the real WS event consumer BEFORE triggering any request
-    // that makes the module emit — see `spawn_ws_subscriber`'s doc for why
-    // this alone does not close the race, and why the trigger below retries.
-    let events = spawn_ws_subscriber(d2.port, &d2.token);
-
-    // ── 1. Mount + 2. Routing proxy ──────────────────────────────────────
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let (status, body) = loop {
-        if let Some((status, body)) = get(d2.port, &d2.token, "/api/v1/node-ref/hello")
-            && (status == 200 || Instant::now() >= deadline)
-        {
-            break (status, body);
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the node module never answered through the real proxy; daemon stderr:\n{}",
-            d2.recent_stderr()
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
+    // ── 2. Attach registration via REST ─────────────────────────────────
+    let manifest_path = repo_root().join("examples/node-module/domain-os.yml");
+    let manifest_yaml = std::fs::read_to_string(&manifest_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", manifest_path.display()));
+    let (status, reg_body) = post(
+        d.port,
+        &d.token,
+        "/api/v1/attached",
+        &serde_json::json!({
+            "manifest": manifest_yaml,
+            "allow_relax": false,
+        }),
+    );
     assert_eq!(
         status,
-        200,
-        "body={body} daemon stderr:\n{}",
-        d2.recent_stderr()
+        201,
+        "registration failed: {status} {reg_body} — daemon stderr:\n{}",
+        d.recent_stderr()
     );
-    let first_response: serde_json::Value =
-        serde_json::from_str(&body).unwrap_or_else(|e| panic!("{e}: {body}"));
-    assert_eq!(first_response["ok"], true, "{first_response}");
-    assert_eq!(
-        os_list_entry(d2.port, &d2.token, "node-ref")["state"],
-        "mounted"
-    );
+    let reg: serde_json::Value =
+        serde_json::from_str(&reg_body).expect("the registration response");
+    assert_eq!(reg["name"], "node-ref");
+    let socket_path = reg["socket_path"].as_str().unwrap().to_owned();
+    let auth_token = reg["token"].as_str().unwrap().to_owned();
 
-    // ── 3. Event forwarding, observed at the real consumer boundary ─────
-    // The startup emit happens right after the handshake, independent of
-    // any HTTP request; the hello-route emit happens inside the handler
-    // above. Either is an acceptable sighting — the retry loop below fires
-    // additional requests (each one emits again) until the WS subscriber,
-    // which may have raced the module's very first emit, actually observes
-    // one — same reasoning and same shape as `me3f_blackbox.rs`.
-    let overall_deadline = Instant::now() + Duration::from_secs(30);
-    let mut next_retry_at = Instant::now() + Duration::from_secs(3);
+    // Before connecting, status is detached
+    let entry = attached_list_entry(d.port, &d.token, "node-ref");
+    assert_eq!(entry["attach_status"], "detached", "{entry}");
+
+    // ── 3. Subscribe to the real WS event consumer ──────────────────────
+    let events = spawn_ws_subscriber(d.port, &d.token);
+
+    // ── 4. Launch Node reference module process ─────────────────────────
+    let script = repo_root().join("examples/node-module/index.js");
+    let node_data_dir = home.path().join(".agent24/os/node-ref");
+    let node_child = Command::new("node")
+        .arg(&script)
+        .arg(&socket_path)
+        .arg(&auth_token)
+        .arg(&node_data_dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning node reference module");
+    let mut node_run = Running(node_child);
+
+    // ── 5. Event forwarding, observed at the real WS consumer boundary ──
+    let overall_deadline = Instant::now() + Duration::from_secs(15);
     let event = loop {
         let remaining = overall_deadline.saturating_duration_since(Instant::now());
         assert!(
             !remaining.is_zero(),
-            "the WS subscriber connected before the request never received \
-             the node module's event after retrying the trigger; daemon stderr:\n{}",
-            d2.recent_stderr()
+            "the WS subscriber never received the node module's event; daemon stderr:\n{}",
+            d.recent_stderr()
         );
-        if Instant::now() >= next_retry_at {
-            let (port, token) = (d2.port, d2.token.clone());
-            std::thread::spawn(move || {
-                let _ = get(port, &token, "/api/v1/node-ref/hello");
-            });
-            next_retry_at = Instant::now() + Duration::from_secs(3);
-        }
-        let step = overall_deadline
-            .saturating_duration_since(Instant::now())
-            .min(next_retry_at.saturating_duration_since(Instant::now()));
-        match events.recv_timeout(step) {
-            Ok(event) if event["type"] == "module" => break event,
+        match events.recv_timeout(Duration::from_millis(200)) {
+            Ok(event) if event["type"] == "module" && event["payload"]["module"] == "node-ref" => {
+                break event;
+            }
             Ok(_) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 panic!(
                     "the WS subscriber thread ended; daemon stderr:\n{}",
-                    d2.recent_stderr()
+                    d.recent_stderr()
                 )
             }
         }
     };
     assert_eq!(event["payload"]["module"], "node-ref", "{event}");
     assert_eq!(event["payload"]["kind"], "task.transitioned", "{event}");
+    assert_eq!(event["payload"]["payload"]["phase"], "startup", "{event}");
 
-    // ── 4. Memory read/write, correlated by ID and body ─────────────────
-    // Read straight from the HTTP response body captured above (round trip
-    // 1/2), which already carries the real remember+recall result — no need
-    // to also read the probe file, though the module writes one too.
-    let remembered_id = first_response["remembered"]["id"].clone();
-    assert!(
-        remembered_id.as_str().is_some_and(|s| !s.is_empty()),
-        "a real _a24/memory/private/remember call must return a non-empty string id: {first_response}"
-    );
-    let items = first_response["recalled"]["items"]
-        .as_array()
-        .unwrap_or_else(|| panic!("recall result must have an items array: {first_response}"));
-    let recalled = items
-        .iter()
-        .find(|i| i["id"] == remembered_id)
-        .unwrap_or_else(|| {
-            panic!("recall must contain the EXACT record just remembered (by id): {first_response}")
-        });
-    assert_eq!(recalled["kind"], "node-ref-note", "{first_response}");
-    assert_eq!(
-        recalled["body"]["text"], "hello from the node reference module",
-        "{first_response}"
-    );
-
-    // Cross-check against the atomic probe file the module also writes —
-    // proves the write-to-temp-then-rename mechanism (used by the module for
-    // its own diagnostics, same technique as `me3f_blackbox.rs`'s
-    // `dump_atomic`) produces a real, internally-consistent snapshot.
-    //
-    // NOT compared for equality against `remembered_id` above: the retry
-    // loop in round trip 3 may have fired additional `/hello` requests after
-    // the first one, and each overwrites this file with a FRESH
-    // remember+recall pair — so by the time this reads the file, it may
-    // reflect a later request than the one `first_response` came from. What
-    // must hold regardless of which request last wrote it is internal
-    // consistency: the id it just remembered is also present in the SAME
-    // response's recall.
-    let probe_path = home.path().join(".agent24/os/node-ref/callback_probe.json");
+    // ── 6. Verification of the probe snapshot file ───────────────────────
+    let probe_path = node_data_dir.join("startup_probe.json");
     let deadline = Instant::now() + Duration::from_secs(10);
     let probe = loop {
         if let Ok(text) = std::fs::read_to_string(&probe_path)
@@ -400,24 +357,221 @@ fn a_node_module_written_only_against_the_wire_doc() {
         }
         assert!(
             Instant::now() < deadline,
-            "callback_probe.json never appeared/parsed at {}; daemon stderr:\n{}",
+            "startup_probe.json never appeared at {}; daemon stderr:\n{}",
             probe_path.display(),
-            d2.recent_stderr()
+            d.recent_stderr()
         );
         std::thread::sleep(Duration::from_millis(50));
     };
-    let probe_id = probe["remembered"]["id"].clone();
-    assert!(
-        probe_id.as_str().is_some_and(|s| !s.is_empty()),
-        "the probe file's remember must be a non-empty id: {probe}"
-    );
-    let probe_items = probe["recalled"]["items"]
+    let provides = probe["offer"]["provides"]
         .as_array()
-        .unwrap_or_else(|| panic!("probe recall result must have an items array: {probe}"));
+        .expect("offer.provides array");
     assert!(
-        probe_items.iter().any(|i| i["id"] == probe_id),
-        "the probe file's own recall must contain the id it just remembered: {probe}"
+        provides.iter().any(|p| p == "_a24/events/"),
+        "offer must include _a24/events/: {probe}"
     );
 
-    stop(d2);
+    // ── 7. Host command echo round-trip over real REST API ──────────────
+    let (status, echo_resp) = post(
+        d.port,
+        &d.token,
+        "/api/v1/os/node-ref/commands/echo",
+        &serde_json::json!({"message": "hello from node module"}),
+    );
+    assert_eq!(status, 200, "echo failed: {status} {echo_resp}");
+    let echo_json: serde_json::Value = serde_json::from_str(&echo_resp).unwrap();
+    assert_eq!(echo_json["result"]["echo"], "hello from node module");
+
+    // Invalid parameters -> mapped to 502 module_error with rpc_code -32602
+    let (bad_status, bad_resp) = post(
+        d.port,
+        &d.token,
+        "/api/v1/os/node-ref/commands/echo",
+        &serde_json::json!({"invalid_arg": 123}),
+    );
+    assert_eq!(bad_status, 502, "{bad_resp}");
+    let bad_json: serde_json::Value = serde_json::from_str(&bad_resp).unwrap();
+    assert_eq!(bad_json["error"]["code"], "module_error");
+    assert_eq!(bad_json["error"]["details"]["rpc_code"], -32602);
+
+    // ── 8. Verify attached state in /api/v1/attached & /api/v1/os ──────
+    let attached_entry = attached_list_entry(d.port, &d.token, "node-ref");
+    assert_eq!(
+        attached_entry["attach_status"], "attached",
+        "{attached_entry}"
+    );
+    let current_generation = attached_entry["generation"].as_u64().unwrap_or(0);
+    assert!(current_generation >= 1);
+
+    let (os_status, os_body) = get(d.port, &d.token, "/api/v1/os").expect("/api/v1/os response");
+    assert_eq!(os_status, 200, "{os_body}");
+    let os_view: agent24_protocol::DomainOsList =
+        serde_json::from_str(&os_body).expect("valid DomainOsList JSON from /api/v1/os");
+    let os_modules = &os_view.modules;
+    // os_routes contract: dynamic attached modules are managed under /api/v1/attached,
+    // not present in state.os_reports (installed packages & compiled-in modules).
+    assert!(
+        os_modules.iter().all(|m| m.name != "node-ref"),
+        "node-ref must not be present in /api/v1/os modules: {os_view:?}"
+    );
+    assert!(
+        os_view.registry_error.is_none(),
+        "registry_error must be null: {os_view:?}"
+    );
+
+    // Disconnect the module and verify detached state & generation
+    drop(node_run.0.kill());
+    let _ = node_run.0.wait();
+
+    let by = Instant::now() + Duration::from_secs(5);
+    let detached_entry = loop {
+        let entry = attached_list_entry(d.port, &d.token, "node-ref");
+        if entry["attach_status"] == "detached" {
+            break entry;
+        }
+        assert!(
+            Instant::now() < by,
+            "status never transitioned to detached: {entry}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(detached_entry["attach_status"], "detached");
+    assert!(
+        detached_entry["generation"].is_null(),
+        "generation must be null when detached: {detached_entry}"
+    );
+
+    let (os_after_status, os_after_body) =
+        get(d.port, &d.token, "/api/v1/os").expect("/api/v1/os response");
+    assert_eq!(os_after_status, 200, "{os_after_body}");
+    let os_after_view: agent24_protocol::DomainOsList =
+        serde_json::from_str(&os_after_body).expect("valid DomainOsList JSON after disconnect");
+    let os_after_modules = &os_after_view.modules;
+    assert!(
+        os_after_modules.iter().all(|m| m.name != "node-ref"),
+        "node-ref must remain absent from /api/v1/os modules: {os_after_view:?}"
+    );
+    assert!(
+        os_after_view.registry_error.is_none(),
+        "registry_error must be null after disconnect: {os_after_view:?}"
+    );
+
+    stop(d);
+}
+
+/// Guard test & mutation positive control:
+/// When an invalid handshake token is passed to the Node module, the attach
+/// handshake MUST fail with `auth_failed`, the process must exit, and no event
+/// may reach the WS subscriber.
+#[test]
+fn wrong_token_handshake_is_rejected() {
+    if let Some(reason) = missing_node() {
+        eprintln!("SKIP me4_node_module_blackbox::wrong_token_handshake_is_rejected: {reason}");
+        return;
+    }
+
+    let home = tmp_home();
+    let d = start(home.path());
+
+    let manifest_path = repo_root().join("examples/node-module/domain-os.yml");
+    let manifest_yaml = std::fs::read_to_string(&manifest_path).unwrap();
+    let (status, reg_body) = post(
+        d.port,
+        &d.token,
+        "/api/v1/attached",
+        &serde_json::json!({
+            "manifest": manifest_yaml,
+            "allow_relax": false,
+        }),
+    );
+    assert_eq!(status, 201, "{reg_body}");
+    let reg: serde_json::Value = serde_json::from_str(&reg_body).unwrap();
+    let socket_path = reg["socket_path"].as_str().unwrap().to_owned();
+
+    let events = spawn_ws_subscriber(d.port, &d.token);
+
+    let script = repo_root().join("examples/node-module/index.js");
+    let node_data_dir = home.path().join(".agent24/os/node-ref");
+    let mut node_child = Command::new("node")
+        .arg(&script)
+        .arg(&socket_path)
+        .arg("wrong-auth-token-for-guard-test")
+        .arg(&node_data_dir)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning node reference module with wrong token");
+    let stderr_pipe = node_child.stderr.take().unwrap();
+    let node_stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = node_stderr_lines.clone();
+    let stderr_reader_handle = std::thread::spawn(move || {
+        for line in BufReader::new(stderr_pipe).lines().map_while(Result::ok) {
+            sink.lock().unwrap().push(line);
+        }
+    });
+    let mut node_run = Running(node_child);
+
+    // The node process must exit quickly due to handshake rejection
+    let by = Instant::now() + Duration::from_secs(10);
+    let mut exited = false;
+    while Instant::now() < by {
+        if let Ok(Some(exit_status)) = node_run.0.try_wait() {
+            assert!(
+                !exit_status.success(),
+                "node process must fail when token is invalid"
+            );
+            exited = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(exited, "node child never exited on rejected handshake");
+    let _ = node_run.0.wait();
+    stderr_reader_handle
+        .join()
+        .expect("join stderr reader thread");
+
+    // 收集 node 的 stderr，明确断言是鉴权失败（auth_failed）而不是任意非零退出
+    let collected_stderr = node_stderr_lines.lock().unwrap().join("\n");
+    assert!(
+        collected_stderr.contains("auth_failed"),
+        "expected auth_failed in node stderr, got:\n{collected_stderr}"
+    );
+
+    // 在完整观察窗口里过滤全部 node-ref 事件，确认没有任何事件
+    let window_deadline = Instant::now() + Duration::from_secs(1);
+    while Instant::now() < window_deadline {
+        match events.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => {
+                assert!(
+                    event["type"] != "module" || event["payload"]["module"] != "node-ref",
+                    "unexpected node-ref event arrived during observation window: {event}"
+                );
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("WS subscriber disconnected unexpectedly during observation window");
+            }
+        }
+    }
+
+    // 确认状态仍为 detached
+    let entry = attached_list_entry(d.port, &d.token, "node-ref");
+    assert_eq!(
+        entry["attach_status"], "detached",
+        "state must remain detached after failed auth: {entry}"
+    );
+
+    // Startup probe file must NOT exist
+    let probe_path = node_data_dir.join("startup_probe.json");
+    assert!(
+        !probe_path.exists(),
+        "probe file must not be created on rejected handshake"
+    );
+
+    stop(d);
 }
