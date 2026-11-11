@@ -257,23 +257,6 @@ const MEMORY_WRITE_BUDGET: std::time::Duration = std::time::Duration::from_secs(
 /// scheduled run must still be answerable the next morning.
 pub const RESUME_TTL: std::time::Duration = std::time::Duration::from_secs(72 * 3600);
 
-/// Derive prompt provenance only from durable run metadata. Scheduled runs are
-/// conservative: self-wake prompts ultimately originate in model output and
-/// cannot authorize qualified personal memory.
-fn run_prompt_origin(run: &Run) -> Origin {
-    if run.schedule_id.is_some() {
-        Origin {
-            source: "scheduler".into(),
-            trust: Trust::Model,
-        }
-    } else {
-        Origin {
-            source: "agent_loop".into(),
-            trust: Trust::UserSaid,
-        }
-    }
-}
-
 /// A [`Summarizer`] backed by the model router.
 ///
 /// Session compaction currently folds with `LocalOnly`: source tags are
@@ -618,6 +601,46 @@ pub struct RunManager {
     /// terminal state. tokio::sync::Mutex — no poisoning, so a panicked task
     /// can never silently disable cancellation (review C2).
     cancels: Mutex<HashMap<String, CancellationToken>>,
+    /// Run ids started by [`RunManager::start_run_inbound`]. `execute` reads
+    /// the entry once and tags that run's user message `Unknown`. Ordinary
+    /// `start_run` never inserts here. Process-local: a restart does not
+    /// resume `execute` (orphan sweep cancels the run).
+    inbound_origins: Mutex<HashMap<String, String>>,
+}
+
+/// Process-local origin for [`RunManager::start_run_inbound`]. Not a field of
+/// [`RunCreate`]: HTTP deserialization cannot mint it.
+#[derive(Debug, Clone)]
+pub struct InboundOrigin {
+    pub event_id: String,
+    /// Session `channel` for the new session this message gets.
+    pub channel: String,
+}
+
+/// [`RunManager::start_run_inbound`] either armed one run or found the event
+/// already linked. The second case committed nothing.
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Run is moved once; boxing it would allocate on every inbound start"
+)]
+pub enum InboundRunStart {
+    Started(Run),
+    AlreadyLinked,
+}
+
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Run is moved once; boxing it would allocate on every ordinary start"
+)]
+enum RunStart {
+    Ready(Run),
+    InboundAlreadyLinked,
+}
+
+enum PersistOutcome {
+    Stored,
+    InboundAlreadyLinked,
 }
 
 enum ParkedCallStop {
@@ -741,6 +764,7 @@ impl RunManager {
             test_egress_policy: None,
             shutdown,
             cancels: Mutex::new(HashMap::new()),
+            inbound_origins: Mutex::new(HashMap::new()),
         })
     }
 
@@ -851,6 +875,7 @@ impl RunManager {
                 self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
                     run_id: run_id.to_owned(),
                 }));
+                self.note_inbound_terminal(run_id).await;
             }
             Ok(RunTerminalTransition::Conflict) => {
                 tracing::warn!("run {run_id}: recovery cancel conflicted");
@@ -1113,31 +1138,77 @@ impl RunManager {
     /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
     /// (`remember_exchange`, used as-is — not duplicated), exposed for the
     /// `/api/v1/chat` surface. `source: "chat"` distinguishes this turn's
-    /// provenance from the agent loop's `"agent_loop"` in the audit trail;
-    /// trust is `UserSaid` for the same reason `drive_new`'s non-scheduled
-    /// branch uses it — this prompt came directly from the chat caller, not
-    /// from model/scheduler-originated text. Retain/log failures emit
+    /// provenance from the agent loop's `"agent_loop"` in the audit trail.
+    /// Trust is `UserSaid` unless the session channel is an inbound source
+    /// ([`INBOUND_SOURCE_CHANNELS`]) or one of its runs is linked in
+    /// `inbound_runs`. A missing session row has no inbound channel, so it
+    /// stays `UserSaid`. Any other channel (`desktop`, `cli`, `tui`,
+    /// `creative`, or an unknown name) is the account owner. A failed lookup
+    /// is `Model` — retain then skips the qualified assertion. A failed
+    /// lookup of an explicit remember also emits `memory.write_skipped` with
+    /// reason `origin_unavailable`. Retain/log failures emit
     /// `memory.write_failed` and otherwise never propagate — the chat
     /// response the caller already has must still reach its client. Returns
     /// the LIVE [`MemoryWriteOutcome`] — see [`RunManager::remember_exchange`].
+    /// `run_id` is the transient id `/chat` already put on `run.started`, so
+    /// the skip event lines up with that call.
     pub async fn chat_remember_turn(
         &self,
+        run_id: &str,
         session_id: &str,
         prompt: &str,
         answer: &str,
         source_ref: agent24_store::AssertionSourceRef,
     ) -> MemoryWriteOutcome {
-        self.remember_exchange(
-            Some(session_id),
-            prompt,
-            answer,
-            Origin {
+        let origin = match self.chat_session_external(session_id).await {
+            Ok(false) => Origin {
                 source: "chat".into(),
                 trust: Trust::UserSaid,
             },
-            source_ref,
-        )
-        .await
+            Ok(true) => Origin {
+                source: "chat".into(),
+                trust: Trust::Model,
+            },
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    session_id,
+                    error = %err,
+                    "chat prompt origin lookup failed; not recording the prompt as the user"
+                );
+                self.note_origin_unavailable(run_id, Some(session_id), prompt);
+                Origin {
+                    source: "chat".into(),
+                    trust: Trust::Model,
+                }
+            }
+        };
+        self.remember_exchange(Some(session_id), prompt, answer, origin, source_ref)
+            .await
+    }
+
+    /// `true` when `/chat` must not treat this session's prompt as the account
+    /// owner. No session row is not evidence of an external channel.
+    async fn chat_session_external(&self, session_id: &str) -> Result<bool, StoreError> {
+        let Some(session) = self.store.get_session(session_id).await? else {
+            return Ok(false);
+        };
+        if Self::inbound_source_channel(&session.channel) {
+            return Ok(true);
+        }
+        self.store.session_has_inbound_run(session_id).await
+    }
+
+    /// Session channels that name an inbound source. Same set as `agent24d`'s
+    /// X11-2f route allowlist `ALLOWLIST_SOURCES`
+    /// (`rust/apps/agent24d/src/inbound/routes.rs`): `hyphae`, `wechat`,
+    /// `remote`. `scheduler` and `self` are not on that list. A channel
+    /// outside this set is the person at this machine unless `inbound_runs`
+    /// links one of the session's runs.
+    const INBOUND_SOURCE_CHANNELS: &[&str] = &["hyphae", "wechat", "remote"];
+
+    fn inbound_source_channel(channel: &str) -> bool {
+        Self::INBOUND_SOURCE_CHANNELS.contains(&channel)
     }
 
     /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): the classification a memory
@@ -1156,6 +1227,97 @@ impl RunManager {
                 .into_iter()
                 .map(|source| (source.source_id, source.classification)),
         )
+    }
+
+    /// Derive prompt provenance only from durable run metadata. Scheduled runs
+    /// are conservative: self-wake prompts ultimately originate in model output
+    /// and cannot authorize qualified personal memory.
+    ///
+    /// An external prompt is also not the account owner. The durable signals
+    /// are a non-Ordinary `UserInput` tag (the general case) and an
+    /// `inbound_runs` row (the inbound case, including a resume that never
+    /// repopulates the process map). Either one, or a failed lookup, yields
+    /// [`Trust::Model`]. Retain commits a qualified assertion only for
+    /// [`Trust::UserSaid`], and there is no separate external trust tier. A
+    /// lookup error must not fall through to `UserSaid`. The same origin is
+    /// what the session log stores for the user message, so that turn is not
+    /// recorded as `UserSaid` either. When that error also drops an explicit
+    /// remember, the skip is `memory.write_skipped` / `origin_unavailable`.
+    async fn run_prompt_origin(&self, run: &Run) -> Origin {
+        if run.schedule_id.is_some() {
+            return Origin {
+                source: "scheduler".into(),
+                trust: Trust::Model,
+            };
+        }
+        match self.external_user_prompt(&run.id).await {
+            Ok(false) => Origin {
+                source: "agent_loop".into(),
+                trust: Trust::UserSaid,
+            },
+            Ok(true) => Origin {
+                source: "inbound".into(),
+                trust: Trust::Model,
+            },
+            Err(err) => {
+                tracing::warn!(
+                    run_id = %run.id,
+                    error = %err,
+                    "prompt origin lookup failed; not recording the prompt as the user"
+                );
+                self.note_origin_unavailable(&run.id, run.session_id.as_deref(), &run.input.prompt);
+                Origin {
+                    source: "agent_loop".into(),
+                    trust: Trust::Model,
+                }
+            }
+        }
+    }
+
+    /// The qualified assertion was not written because provenance could not
+    /// be read. Ordinary turns have no assertion to skip, so they only warn
+    /// at the call site.
+    fn note_origin_unavailable(&self, run_id: &str, session_id: Option<&str>, prompt: &str) {
+        if retain::explicit_remember(prompt).is_none() {
+            return;
+        }
+        self.sink
+            .emit(EventBody::MemoryWriteSkipped(MemoryWriteSkippedPayload {
+                run_id: run_id.to_owned(),
+                session_id: session_id.map(str::to_owned),
+                reason: "origin_unavailable".to_owned(),
+            }));
+    }
+
+    /// `true` when this run's user prompt must not be treated as the account
+    /// owner. A non-Ordinary `UserInput` tag is the general signal; an
+    /// `inbound_runs` row covers an inbound run whose tag is not visible yet.
+    async fn external_user_prompt(&self, run_id: &str) -> Result<bool, StoreError> {
+        let tags = self.store.list_run_source_tags(run_id).await?;
+        let user_input_not_ordinary = tags.iter().any(|tag| {
+            tag.source.kind == agent24_store::SourceKind::UserInput
+                && tag.source.classification != agent24_store::SourceClassification::Ordinary
+        });
+        if user_input_not_ordinary {
+            return Ok(true);
+        }
+        Ok(self.store.inbound_event_id_for_run(run_id).await?.is_some())
+    }
+
+    /// Fail closed: a store error is external, so the caller does not tag the
+    /// prompt Ordinary or inject the paused-memory notice.
+    async fn persisted_external_prompt(&self, run_id: &str) -> bool {
+        match self.external_user_prompt(run_id).await {
+            Ok(external) => external,
+            Err(err) => {
+                tracing::warn!(
+                    run_id,
+                    error = %err,
+                    "inbound prompt lookup failed; tagging the prompt as external"
+                );
+                true
+            }
+        }
     }
 
     /// The source tag for what `tool` returned on call `tool_call_id`.
@@ -1300,7 +1462,10 @@ impl RunManager {
         create: RunCreate,
         schedule_id: Option<String>,
     ) -> Result<Run, AgentError> {
-        self.start_run_inner(create, schedule_id, |_| {}).await
+        self.ready_run(
+            self.start_run_inner(create, schedule_id, |_| {}, None)
+                .await?,
+        )
     }
 
     /// As [`start_run`], with `before_execute` called once the run is stored
@@ -1311,7 +1476,40 @@ impl RunManager {
         create: RunCreate,
         before_execute: impl FnOnce(&Run),
     ) -> Result<Run, AgentError> {
-        self.start_run_inner(create, None, before_execute).await
+        self.ready_run(
+            self.start_run_inner(create, None, before_execute, None)
+                .await?,
+        )
+    }
+
+    /// Start a run for one inbound event. `origin` is not part of [`RunCreate`].
+    ///
+    /// The session, the run, and `inbound_runs` commit in one transaction
+    /// ([`agent24_store::Store::insert_session_run_for_inbound`]).
+    /// `persist_new_run` commits on its own, so this path does not call it.
+    /// `execute` tags the user message [`agent24_store::SourceRef::inbound_external`].
+    /// A second call for the same event links nothing and starts nothing.
+    pub async fn start_run_inbound(
+        self: &Arc<Self>,
+        create: RunCreate,
+        origin: InboundOrigin,
+    ) -> Result<InboundRunStart, AgentError> {
+        match self
+            .start_run_inner(create, None, |_| {}, Some(origin))
+            .await?
+        {
+            RunStart::Ready(run) => Ok(InboundRunStart::Started(run)),
+            RunStart::InboundAlreadyLinked => Ok(InboundRunStart::AlreadyLinked),
+        }
+    }
+
+    fn ready_run(&self, started: RunStart) -> Result<Run, AgentError> {
+        match started {
+            RunStart::Ready(run) => Ok(run),
+            RunStart::InboundAlreadyLinked => Err(AgentError::Store(StoreError::Conflict(
+                "ordinary start linked an inbound event".to_owned(),
+            ))),
+        }
     }
 
     async fn start_run_inner(
@@ -1319,8 +1517,12 @@ impl RunManager {
         create: RunCreate,
         schedule_id: Option<String>,
         before_execute: impl FnOnce(&Run),
-    ) -> Result<Run, AgentError> {
-        if let Some(session_id) = &create.session_id
+        inbound: Option<InboundOrigin>,
+    ) -> Result<RunStart, AgentError> {
+        // Inbound creates the session in the same transaction as the run.
+        // Checking first would always miss it.
+        if inbound.is_none()
+            && let Some(session_id) = &create.session_id
             && self.store.get_session(session_id).await?.is_none()
         {
             return Err(AgentError::SessionNotFound(session_id.clone()));
@@ -1358,10 +1560,36 @@ impl RunManager {
             .lock()
             .await
             .insert(run.id.clone(), token.clone());
-        let persist = self.persist_new_run(&run).await;
-        if let Err(err) = persist {
+        let persisted = match self.persist_created_run(&run, inbound.as_ref()).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                self.cancels.lock().await.remove(&run.id);
+                return Err(err);
+            }
+        };
+        if matches!(persisted, PersistOutcome::InboundAlreadyLinked) {
             self.cancels.lock().await.remove(&run.id);
-            return Err(err);
+            return Ok(RunStart::InboundAlreadyLinked);
+        }
+        if let Some(origin) = &inbound {
+            // Before spawn, so execute cannot finish (and try to mark done)
+            // while the row is still `starting`.
+            self.inbound_origins
+                .lock()
+                .await
+                .insert(run.id.clone(), origin.event_id.clone());
+            match self.store.mark_inbound_started(&origin.event_id).await {
+                Ok(true) => {}
+                Ok(false) => tracing::warn!(
+                    event_id = %origin.event_id,
+                    "inbound mark started matched no starting row"
+                ),
+                Err(err) => tracing::warn!(
+                    event_id = %origin.event_id,
+                    error = %err,
+                    "inbound mark started failed"
+                ),
+            }
         }
         before_execute(&run);
 
@@ -1394,7 +1622,46 @@ impl RunManager {
             manager.cancels.lock().await.remove(&run_id);
         });
 
-        Ok(run)
+        Ok(RunStart::Ready(run))
+    }
+
+    async fn persist_created_run(
+        &self,
+        run: &Run,
+        inbound: Option<&InboundOrigin>,
+    ) -> Result<PersistOutcome, AgentError> {
+        let Some(origin) = inbound else {
+            self.persist_new_run(run).await?;
+            return Ok(PersistOutcome::Stored);
+        };
+        let session_id = run.session_id.clone().ok_or_else(|| {
+            AgentError::Store(StoreError::Conflict(
+                "inbound run requires a session".to_owned(),
+            ))
+        })?;
+        if origin.channel.is_empty() || origin.event_id.is_empty() {
+            return Err(AgentError::Store(StoreError::Conflict(
+                "inbound origin is empty".to_owned(),
+            )));
+        }
+        let session = agent24_protocol::Session {
+            id: session_id,
+            title: String::new(),
+            channel: origin.channel.clone(),
+            workspace_id: None,
+            created_at: run.created_at.clone(),
+            updated_at: run.created_at.clone(),
+        };
+        match self
+            .store
+            .insert_session_run_for_inbound(&session, run, &origin.event_id)
+            .await?
+        {
+            agent24_store::InboundRunLink::Linked => Ok(PersistOutcome::Stored),
+            agent24_store::InboundRunLink::AlreadyLinked => {
+                Ok(PersistOutcome::InboundAlreadyLinked)
+            }
+        }
     }
 
     /// Idempotent cancellation: any state, any time. Terminal runs are
@@ -1498,6 +1765,10 @@ impl RunManager {
                     self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
                         run_id: run_id.clone(),
                     }));
+                    // The run never returns to `finish_cancelled`. Without this,
+                    // a restarted approval timeout leaves the inbound row in
+                    // `started` and the sender's in-flight slot stays taken.
+                    self.note_inbound_terminal(&run_id).await;
                     cancelled += 1;
                 }
                 Ok(false) => {
@@ -2008,6 +2279,13 @@ impl RunManager {
         cancel: CancellationToken,
         idoris_headroom_confirmed: bool,
     ) {
+        // Taken once, before any return, so a cancelled start does not leave
+        // the id in the map. The map is only a hint: `execute` also runs for a
+        // path that never called `start_run_inner`. `inbound_runs` and a
+        // non-Ordinary user-input tag are the durable signal. A lookup error
+        // is external, so the tag cannot fall through to Ordinary.
+        let mapped_inbound = self.inbound_origins.lock().await.remove(&run_id).is_some();
+        let inbound_external = mapped_inbound || self.persisted_external_prompt(&run_id).await;
         // Cancelled before starting? queued → cancelled directly.
         if cancel.is_cancelled() {
             self.finish_cancelled(&run_id).await;
@@ -2071,17 +2349,23 @@ impl RunManager {
         // open on the NOTICE only — the real write gate inside `persist`
         // fails closed independently; this is belt-and-braces, not load-
         // bearing).
-        let write_skipped = match self.memory.as_ref() {
-            Some(memory) if retain::explicit_remember(&run.input.prompt).is_some() => {
-                match memory.kv().memory_enabled(memory.owner()).await {
-                    Ok(enabled) => !enabled,
-                    Err(err) => {
-                        tracing::warn!(run_id = %run_id, error = %err, "memory pause check failed; assuming enabled");
-                        false
+        // An inbound "记住" is not the account owner asking. The pause notice
+        // would tell the model to report that the user's memory was skipped.
+        let write_skipped = if inbound_external {
+            false
+        } else {
+            match self.memory.as_ref() {
+                Some(memory) if retain::explicit_remember(&run.input.prompt).is_some() => {
+                    match memory.kv().memory_enabled(memory.owner()).await {
+                        Ok(enabled) => !enabled,
+                        Err(err) => {
+                            tracing::warn!(run_id = %run_id, error = %err, "memory pause check failed; assuming enabled");
+                            false
+                        }
                     }
                 }
+                _ => false,
             }
-            _ => false,
         };
 
         // D1: a session's prior (compacted) context precedes this turn, so a
@@ -2221,7 +2505,16 @@ impl RunManager {
             return;
         }
         // K1-6b.1 (ADR-K1-02 §6, §2.1): tag the run's user input at entry.
-        let user_source_tag = agent24_store::SourceRef::user_input(&run_id, now_iso8601());
+        // Inbound text is Unknown for the whole prompt. Ordinary runs stay
+        // user_input / Ordinary. Resume does not call execute, so it does not
+        // retag. `inbound_external` is the map hint or the durable
+        // `inbound_runs` / non-Ordinary user-input signal, so a caller that
+        // reaches here without `start_run_inner` does not land Ordinary.
+        let user_source_tag = if inbound_external {
+            agent24_store::SourceRef::inbound_external(&run_id, now_iso8601())
+        } else {
+            agent24_store::SourceRef::user_input(&run_id, now_iso8601())
+        };
         if let Err(err) = self
             .store
             .tag_run_source(&run_id, user_msg_seq, &user_source_tag, &now_iso8601())
@@ -2726,11 +3019,12 @@ impl RunManager {
                 let memory_persisted = tokio::select! {
                     outcome = async {
                         let source_ref = self.run_assertion_source_ref(&run_id).await;
+                        let prompt_origin = self.run_prompt_origin(&run).await;
                         self.remember_exchange(
                             run.session_id.as_deref(),
                             &run.input.prompt,
                             &text,
-                            run_prompt_origin(&run),
+                            prompt_origin,
                             source_ref,
                         )
                         .await
@@ -2771,11 +3065,12 @@ impl RunManager {
                 {
                     Ok(_) => {
                         self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
-                            run_id,
+                            run_id: run_id.clone(),
                             output: RunOutputPayload { text },
                             usage: usage_total,
                             memory_persisted,
                         }));
+                        self.note_inbound_terminal(&run_id).await;
                     }
                     Err(err) => tracing::error!("run completion persist failed: {err}"),
                 }
@@ -3236,7 +3531,7 @@ impl RunManager {
         mut patch: RunPatch,
         _ended_at: &str,
     ) -> Result<Run, AgentError> {
-        match self.store.active_workspace_run_lease_id(run_id).await? {
+        let run = match self.store.active_workspace_run_lease_id(run_id).await? {
             None => Ok(self.store.transition_run(run_id, to, patch).await?),
             Some(lease_id) => {
                 let ended_at = workspace_now()?;
@@ -3253,6 +3548,22 @@ impl RunManager {
                     )),
                 }
             }
+        }?;
+        Ok(run)
+    }
+
+    /// Drop a linked inbound row out of the in-flight index.
+    ///
+    /// Called after the terminal event is emitted. An await between the status
+    /// write and that emit lets a waiter observe the terminal run first.
+    /// No link is a no-op. A failure leaves the row for startup reconcile.
+    async fn note_inbound_terminal(&self, run_id: &str) {
+        if let Err(err) = self.store.mark_inbound_done_for_run(run_id).await {
+            tracing::warn!(
+                run_id,
+                error = %err,
+                "inbound run_state was not marked done"
+            );
         }
     }
 
@@ -3275,15 +3586,18 @@ impl RunManager {
             )
             .await
         {
-            Ok(_) => self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
-                run_id: run_id.to_owned(),
-                output: RunOutputPayload {
-                    text: text.to_owned(),
-                },
-                usage,
-                // This path never attempts a memory write, so none failed.
-                memory_persisted: Some(true),
-            })),
+            Ok(_) => {
+                self.sink.emit(EventBody::RunCompleted(RunCompletedPayload {
+                    run_id: run_id.to_owned(),
+                    output: RunOutputPayload {
+                        text: text.to_owned(),
+                    },
+                    usage,
+                    // This path never attempts a memory write, so none failed.
+                    memory_persisted: Some(true),
+                }));
+                self.note_inbound_terminal(run_id).await;
+            }
             Err(err) => tracing::error!("run completion persist failed: {err}"),
         }
     }
@@ -3310,10 +3624,13 @@ impl RunManager {
             )
             .await
         {
-            Ok(_) => self.sink.emit(EventBody::RunFailed(RunFailedPayload {
-                run_id: run_id.to_owned(),
-                error: body,
-            })),
+            Ok(_) => {
+                self.sink.emit(EventBody::RunFailed(RunFailedPayload {
+                    run_id: run_id.to_owned(),
+                    error: body,
+                }));
+                self.note_inbound_terminal(run_id).await;
+            }
             Err(err) => tracing::error!("run failure persist failed: {err}"),
         }
     }
@@ -3335,9 +3652,12 @@ impl RunManager {
             )
             .await
         {
-            Ok(_) => self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
-                run_id: run_id.to_owned(),
-            })),
+            Ok(_) => {
+                self.sink.emit(EventBody::RunCancelled(RunCancelledPayload {
+                    run_id: run_id.to_owned(),
+                }));
+                self.note_inbound_terminal(run_id).await;
+            }
             Err(err) => tracing::debug!("run cancel persist skipped: {err}"),
         }
     }
@@ -3948,6 +4268,47 @@ pub(crate) mod tests {
         summarizer: Arc<dyn Summarizer>,
     ) -> (Arc<RunManager>, Store, KvStore) {
         manager_with_memory_and_tools(provider, summarizer, ToolRegistry::new()).await
+    }
+
+    struct EventLog(StdMutex<Vec<EventBody>>);
+
+    impl EventSink for EventLog {
+        fn emit(&self, body: EventBody) {
+            self.0.lock().unwrap().push(body);
+        }
+    }
+
+    fn skipped_reasons(log: &EventLog) -> Vec<MemoryWriteSkippedPayload> {
+        log.0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|body| match body {
+                EventBody::MemoryWriteSkipped(payload) => Some(payload.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Same as [`manager_with_memory`], but the sink keeps event bodies.
+    async fn manager_with_memory_log(
+        provider: Arc<dyn ModelProvider>,
+    ) -> (Arc<RunManager>, Store, KvStore, Arc<EventLog>) {
+        let store = Store::open_memory().await.unwrap();
+        let log = Arc::new(EventLog(StdMutex::new(vec![])));
+        let kv = KvStore::open_memory().await.unwrap();
+        let manager = RunManager::with_memory(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![(provider, Tier::Local)])),
+            Arc::new(ToolRegistry::new()),
+            log.clone(),
+            CancellationToken::new(),
+            Some(
+                SessionMemory::new(kv.clone(), Arc::new(UnusedSummarizer))
+                    .with_owner("test-owner".into()),
+            ),
+        );
+        (manager, store, kv, log)
     }
 
     async fn manager_with_memory_and_tools(
@@ -5293,7 +5654,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let outcome = manager
-            .chat_remember_turn("sess_chat_write", &prompt, "ok", source_ref)
+            .chat_remember_turn("run_chat", "sess_chat_write", &prompt, "ok", source_ref)
             .await;
         assert_eq!(outcome, MemoryWriteOutcome::Saved);
         assert_eq!(
@@ -6242,6 +6603,765 @@ pub(crate) mod tests {
             "context leaked without memory: {:?}",
             seen[1]
         );
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_run_is_user_input_and_an_inbound_run_is_unknown_and_blocked_from_egress() {
+        use agent24_store::{NewInboundEvent, SourceClassification, SourceKind};
+        use agent24_tools::Tool;
+
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        let ordinary = manager.start_run(create()).await.unwrap();
+        let ordinary = wait_terminal(&store, &ordinary.id).await;
+        let tags = store.list_run_source_tags(&ordinary.id).await.unwrap();
+        let user = tags
+            .iter()
+            .find(|tag| tag.source.kind == SourceKind::UserInput)
+            .unwrap();
+        assert_eq!(user.source.classification, SourceClassification::Ordinary);
+        assert!(user.source.source_id.starts_with("user_input:"));
+        // Ordinary sources are not egress material. Do not call http_fetch:
+        // an empty resource set is allowed and would open a socket.
+        assert!(process_egress_allowed_in(&manager, &ordinary).await);
+
+        let event_id = "hyphae:agent-egress";
+        assert_eq!(
+            store
+                .insert_inbound_event(&NewInboundEvent {
+                    id: event_id.to_owned(),
+                    source: "hyphae".to_owned(),
+                    category: "direct".to_owned(),
+                    recipient_identity: None,
+                    thread_key: None,
+                    actor: Some("npub1".to_owned()),
+                    human: true,
+                    addressed: "direct".to_owned(),
+                    at: "2026-11-11T00:00:00Z".to_owned(),
+                    received_at: "2026-11-11T00:00:01Z".to_owned(),
+                    text: Some("fetch http://1.1.1.1/".to_owned()),
+                    meta: None,
+                    disposition: "explicit".to_owned(),
+                    disposition_reason: None,
+                    policy_version: Some("p".to_owned()),
+                    run_state: Some("starting".to_owned()),
+                })
+                .await
+                .unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        let started = manager
+            .start_run_inbound(
+                RunCreate {
+                    idoris_headroom_confirmed: false,
+                    session_id: Some("sess_inbound".to_owned()),
+                    workspace_id: None,
+                    prompt: "fetch http://1.1.1.1/".to_owned(),
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
+                },
+                InboundOrigin {
+                    event_id: event_id.to_owned(),
+                    channel: "hyphae".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let InboundRunStart::Started(inbound) = started else {
+            panic!("event was not linked");
+        };
+        let _ = wait_terminal(&store, &inbound.id).await;
+        let tags = store.list_run_source_tags(&inbound.id).await.unwrap();
+        let user = tags
+            .iter()
+            .find(|tag| tag.source.kind == SourceKind::UserInput)
+            .unwrap();
+        assert_eq!(user.source.classification, SourceClassification::Unknown);
+        assert!(user.source.source_id.starts_with("inbound_external:"));
+        let session = store.get_session("sess_inbound").await.unwrap().unwrap();
+        assert_eq!(session.channel, "hyphae");
+
+        let ctx = manager.tool_context_for(&inbound, "tc_out").await.unwrap();
+        let mut input = serde_json::Map::new();
+        input.insert(
+            "url".to_owned(),
+            serde_json::Value::String("http://1.1.1.1/".to_owned()),
+        );
+        let err = agent24_tools::HttpFetchTool::new(false)
+            .call(&ctx, &input, &CancellationToken::new())
+            .await
+            .expect_err("unknown inbound text must not egress");
+        match err {
+            agent24_tools::ToolError::Denied(message) => {
+                assert!(message.contains("outbound policy unavailable"), "{message}");
+            }
+            other => panic!("expected denial before the request, got {other}"),
+        }
+    }
+
+    const PIN_PROMPT: &str = "记住 my bank pin is 1234";
+
+    async fn assertion_count(kv: &KvStore) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM mem_assertions")
+            .fetch_one(agent24_memory::test_hooks::pool(kv))
+            .await
+            .unwrap()
+    }
+
+    async fn user_event_origin(kv: &KvStore, content: &str) -> Vec<(String, String)> {
+        use sqlx::Row;
+        let rows = sqlx::query(
+            "SELECT origin_source, origin_trust FROM mem_events \
+             WHERE kind = 'message' AND json_extract(payload, '$.role') = 'user' \
+               AND json_extract(payload, '$.content') = ?",
+        )
+        .bind(content)
+        .fetch_all(agent24_memory::test_hooks::pool(kv))
+        .await
+        .unwrap();
+        rows.iter()
+            .map(|row| (row.get("origin_source"), row.get("origin_trust")))
+            .collect()
+    }
+
+    fn inbound_event(id: &str, text: &str) -> agent24_store::NewInboundEvent {
+        agent24_store::NewInboundEvent {
+            id: id.to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub1".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: "2026-11-11T00:00:00Z".to_owned(),
+            received_at: "2026-11-11T00:00:01Z".to_owned(),
+            text: Some(text.to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some("starting".to_owned()),
+        }
+    }
+
+    async fn start_inbound(
+        manager: &Arc<RunManager>,
+        store: &Store,
+        event_id: &str,
+        session_id: &str,
+        prompt: &str,
+    ) -> Run {
+        assert_eq!(
+            store
+                .insert_inbound_event(&inbound_event(event_id, prompt))
+                .await
+                .unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        let started = manager
+            .start_run_inbound(
+                RunCreate {
+                    idoris_headroom_confirmed: false,
+                    session_id: Some(session_id.to_owned()),
+                    workspace_id: None,
+                    prompt: prompt.to_owned(),
+                    model_override: None,
+                    mode: agent24_protocol::RunMode::Normal,
+                    knowledge_binding_id: None,
+                },
+                InboundOrigin {
+                    event_id: event_id.to_owned(),
+                    channel: "hyphae".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let InboundRunStart::Started(run) = started else {
+            panic!("event {event_id} was not linked");
+        };
+        run
+    }
+
+    #[tokio::test]
+    async fn an_empty_inbound_origin_is_refused() {
+        // Mutation: drop the empty channel / event_id guard and both calls
+        // link a run. The event rows exist, so the foreign key does not refuse them.
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        assert_eq!(
+            store
+                .insert_inbound_event(&inbound_event("hyphae:empty-channel", "hello"))
+                .await
+                .unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        let mut blank = inbound_event("", "hello");
+        blank.actor = Some("npub-blank".to_owned());
+        assert_eq!(
+            store.insert_inbound_event(&blank).await.unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+
+        let err = manager
+            .start_run_inbound(
+                inbound_create("sess_empty_channel"),
+                InboundOrigin {
+                    event_id: "hyphae:empty-channel".to_owned(),
+                    channel: String::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::Store(StoreError::Conflict(ref message))
+                    if message == "inbound origin is empty"
+            ),
+            "{err:?}"
+        );
+
+        let err = manager
+            .start_run_inbound(
+                inbound_create("sess_empty_event"),
+                InboundOrigin {
+                    event_id: String::new(),
+                    channel: "hyphae".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::Store(StoreError::Conflict(ref message))
+                    if message == "inbound origin is empty"
+            ),
+            "{err:?}"
+        );
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    fn inbound_create(session_id: &str) -> RunCreate {
+        RunCreate {
+            idoris_headroom_confirmed: false,
+            session_id: Some(session_id.to_owned()),
+            workspace_id: None,
+            prompt: "hello".to_owned(),
+            model_override: None,
+            mode: agent24_protocol::RunMode::Normal,
+            knowledge_binding_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_remember_is_not_a_user_assertion() {
+        let (manager, store, kv) =
+            manager_with_memory(Arc::new(FixedProvider), Arc::new(UnusedSummarizer)).await;
+        let inbound = start_inbound(
+            &manager,
+            &store,
+            "hyphae:pin",
+            "sess_inbound_pin",
+            PIN_PROMPT,
+        )
+        .await;
+        let inbound = wait_terminal(&store, &inbound.id).await;
+        assert_eq!(inbound.status, RunStatus::Completed, "{:?}", inbound.error);
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("inbound".to_owned(), "model".to_owned())]
+        );
+
+        seed_session(&store, "sess_owner").await;
+        let ordinary = run_in_session(&manager, &store, "sess_owner", PIN_PROMPT).await;
+        assert_eq!(
+            ordinary.status,
+            RunStatus::Completed,
+            "{:?}",
+            ordinary.error
+        );
+        assert_eq!(assertion_count(&kv).await, 1);
+        let mut origins = user_event_origin(&kv, PIN_PROMPT).await;
+        origins.sort();
+        assert_eq!(
+            origins,
+            vec![
+                ("agent_loop".to_owned(), "user_said".to_owned()),
+                ("inbound".to_owned(), "model".to_owned()),
+            ]
+        );
+    }
+
+    /// Which user-input tag a resumed run already has. `Ordinary` is a damaged
+    /// tag: the row exists, but it is not `Unknown`.
+    enum PinnedUserTag {
+        Unknown,
+        Ordinary,
+    }
+
+    /// The manager never called `start_run_inbound`, so its in-process map is
+    /// empty. Resume still reaches `remember_exchange` through `run_loop`.
+    /// `link` writes `inbound_runs`; `tag` is the only user-input tag.
+    async fn resume_pinned_remember(link: bool, tag: PinnedUserTag) -> (Store, KvStore) {
+        let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+            agent24_tools::ToolResultSource::ordinary("reader"),
+        )));
+        let (manager, store, kv) = manager_with_memory_and_tools(
+            Arc::new(ScriptedProvider::new(vec![])),
+            Arc::new(UnusedSummarizer),
+            tools,
+        )
+        .await;
+        let now = now_iso8601();
+        seed_session(&store, "sess_resume_pin").await;
+        let run = Run {
+            id: "run_resume_pin".to_owned(),
+            session_id: Some("sess_resume_pin".to_owned()),
+            workspace_id: None,
+            status: RunStatus::AwaitingApproval,
+            input: RunInput {
+                prompt: PIN_PROMPT.to_owned(),
+                workspace_id: None,
+                model_override: None,
+                mode: RunMode::Normal,
+                knowledge_binding_id: None,
+            },
+            output: None,
+            error: None,
+            usage: zero_usage(),
+            schedule_id: None,
+            created_at: now.clone(),
+            started_at: Some(now.clone()),
+            ended_at: None,
+        };
+        store.insert_run(&run).await.unwrap();
+        let call = serde_json::json!([{
+            "id": "call_1",
+            "name": "reader",
+            "arguments": "{}"
+        }]);
+        store
+            .append_originated_run_messages(
+                &run.id,
+                &[
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "user".into(),
+                            content: Some(PIN_PROMPT.into()),
+                            tool_calls: serde_json::json!([]),
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::UserPrompt,
+                    },
+                    OriginatedRunMessage {
+                        message: agent24_store::PendingRunMessage {
+                            role: "assistant".into(),
+                            content: None,
+                            tool_calls: call,
+                            tool_call_id: None,
+                        },
+                        origin: MessageOrigin::Assistant,
+                    },
+                ],
+                &now,
+            )
+            .await
+            .unwrap();
+        let source = match tag {
+            PinnedUserTag::Unknown => {
+                agent24_store::SourceRef::inbound_external(&run.id, now.clone())
+            }
+            PinnedUserTag::Ordinary => agent24_store::SourceRef::user_input(&run.id, now.clone()),
+        };
+        store
+            .tag_run_source(&run.id, 0, &source, &now)
+            .await
+            .unwrap();
+        if link {
+            let mut event = inbound_event("hyphae:resume", PIN_PROMPT);
+            event.run_state = Some("started".to_owned());
+            assert_eq!(
+                store.insert_inbound_event(&event).await.unwrap(),
+                agent24_store::InboundInsert::Inserted
+            );
+            store
+                .insert_inbound_run(&run.id, "hyphae:resume")
+                .await
+                .unwrap();
+        }
+        store
+            .insert_approval(&Approval {
+                id: "apr_resume_pin".to_owned(),
+                run_id: run.id.clone(),
+                tool_call_id: "call_1".to_owned(),
+                kind: "exec".to_owned(),
+                summary: "read".to_owned(),
+                payload: serde_json::Map::new(),
+                available_decisions: vec!["approve".into(), "deny".into(), "abort".into()],
+                standing_target: None,
+                status: ApprovalStatus::Approved,
+                decision: Some(Decision {
+                    kind: "approve".to_owned(),
+                    reason: None,
+                    extra: serde_json::Map::new(),
+                }),
+                expires_at: now.clone(),
+                created_at: now.clone(),
+                decided_at: Some(now),
+            })
+            .await
+            .unwrap();
+
+        manager
+            .resume_run(run.id.clone(), "apr_resume_pin".to_owned())
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed, "{:?}", done.error);
+        (store, kv)
+    }
+
+    #[tokio::test]
+    async fn resumed_inbound_remember_is_not_a_user_assertion() {
+        let (_store, kv) = resume_pinned_remember(true, PinnedUserTag::Unknown).await;
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("inbound".to_owned(), "model".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_link_without_unknown_tag_is_not_a_user_assertion() {
+        // The user-input tag is Ordinary (damaged, or simply not Unknown).
+        // `inbound_runs` alone must still refuse the qualified assertion.
+        let (_store, kv) = resume_pinned_remember(true, PinnedUserTag::Ordinary).await;
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("inbound".to_owned(), "model".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tag_without_inbound_link_is_not_a_user_assertion() {
+        let (_store, kv) = resume_pinned_remember(false, PinnedUserTag::Unknown).await;
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("inbound".to_owned(), "model".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_remember_does_not_inject_the_paused_notice() {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let (manager, store, kv) =
+            manager_with_memory(provider.clone(), Arc::new(UnusedSummarizer)).await;
+        kv.set_memory_enabled("test-owner", false).await.unwrap();
+        let inbound = start_inbound(
+            &manager,
+            &store,
+            "hyphae:paused",
+            "sess_inbound_paused",
+            PIN_PROMPT,
+        )
+        .await;
+        let inbound = wait_terminal(&store, &inbound.id).await;
+        assert_eq!(inbound.status, RunStatus::Completed, "{:?}", inbound.error);
+        let inbound_thread = store.list_run_messages(&inbound.id).await.unwrap();
+        assert!(
+            inbound_thread
+                .iter()
+                .all(|message| message.content.as_deref() != Some(retain::PAUSED_WRITE_NOTICE)),
+            "{inbound_thread:?}"
+        );
+
+        seed_session(&store, "sess_paused_owner").await;
+        let ordinary = run_in_session(&manager, &store, "sess_paused_owner", PIN_PROMPT).await;
+        assert_eq!(
+            ordinary.status,
+            RunStatus::Completed,
+            "{:?}",
+            ordinary.error
+        );
+        let ordinary_thread = store.list_run_messages(&ordinary.id).await.unwrap();
+        assert!(
+            ordinary_thread
+                .iter()
+                .any(|message| message.content.as_deref() == Some(retain::PAUSED_WRITE_NOTICE)),
+            "{ordinary_thread:?}"
+        );
+        assert_eq!(assertion_count(&kv).await, 0);
+        let _ = provider;
+    }
+
+    #[tokio::test]
+    async fn prompt_origin_lookup_failure_is_not_user_said() {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        struct HoldProvider {
+            entered: Arc<tokio::sync::Notify>,
+            release: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait]
+        impl ModelProvider for HoldProvider {
+            fn name(&self) -> &str {
+                "hold"
+            }
+            async fn complete(
+                &self,
+                _req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(CompletionResponse {
+                    message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                    usage: usage_one(),
+                    model_id: None,
+                })
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(HoldProvider {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        }))
+        .await;
+        seed_session(&store, "sess_origin_fail").await;
+        let run = manager
+            .start_run(RunCreate {
+                idoris_headroom_confirmed: false,
+                session_id: Some("sess_origin_fail".to_owned()),
+                workspace_id: None,
+                prompt: PIN_PROMPT.to_owned(),
+                model_override: None,
+                mode: RunMode::Normal,
+                knowledge_binding_id: None,
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("model call did not start");
+        sqlx::raw_sql("DROP TABLE run_source_tags")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        release.notify_one();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed, "{:?}", done.error);
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("agent_loop".to_owned(), "model".to_owned())]
+        );
+        let skipped = skipped_reasons(&log);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].reason, "origin_unavailable");
+        assert_eq!(skipped[0].run_id, run.id);
+        assert_eq!(skipped[0].session_id.as_deref(), Some("sess_origin_fail"));
+    }
+
+    async fn seed_channel(store: &Store, id: &str, channel: &str) {
+        let now = now_iso8601();
+        store
+            .insert_session(&agent24_protocol::Session {
+                id: id.to_owned(),
+                title: "t".to_owned(),
+                channel: channel.to_owned(),
+                workspace_id: None,
+                created_at: now.clone(),
+                updated_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    fn chat_source() -> agent24_store::AssertionSourceRef {
+        agent24_store::AssertionSourceRef::from_sources([(
+            "user_input:chat".to_owned(),
+            agent24_store::SourceClassification::Ordinary,
+        )])
+    }
+
+    #[tokio::test]
+    async fn chat_remember_on_a_local_channel_stays_user_said() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        for (id, channel) in [("s_desk", "desktop"), ("s_cli", "cli"), ("s_tui", "tui")] {
+            seed_channel(&store, id, channel).await;
+            let outcome = manager
+                .chat_remember_turn("run_local", id, PIN_PROMPT, "ok", chat_source())
+                .await;
+            assert_eq!(outcome, MemoryWriteOutcome::Saved, "{channel}");
+        }
+        // Same object, content-addressed: one assertion, three turns.
+        assert_eq!(assertion_count(&kv).await, 1);
+        let origins = user_event_origin(&kv, PIN_PROMPT).await;
+        assert_eq!(origins.len(), 3, "{origins:?}");
+        assert!(
+            origins
+                .iter()
+                .all(|origin| origin == &("chat".to_owned(), "user_said".to_owned())),
+            "{origins:?}"
+        );
+        assert!(skipped_reasons(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_remember_without_a_session_row_stays_user_said() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        assert!(store.get_session("s_absent").await.unwrap().is_none());
+        let outcome = manager
+            .chat_remember_turn("run_absent", "s_absent", PIN_PROMPT, "ok", chat_source())
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::Saved);
+        assert_eq!(assertion_count(&kv).await, 1);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("chat".to_owned(), "user_said".to_owned())]
+        );
+        assert!(skipped_reasons(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_remember_on_a_creative_channel_stays_user_said() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        seed_channel(&store, "s_creative", "creative").await;
+        let outcome = manager
+            .chat_remember_turn(
+                "run_creative",
+                "s_creative",
+                PIN_PROMPT,
+                "ok",
+                chat_source(),
+            )
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::Saved);
+        assert_eq!(assertion_count(&kv).await, 1);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("chat".to_owned(), "user_said".to_owned())]
+        );
+        assert!(skipped_reasons(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_remember_on_an_inbound_source_channel_is_not_user_said() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        for (id, channel) in [("s_hy", "hyphae"), ("s_wx", "wechat"), ("s_rm", "remote")] {
+            seed_channel(&store, id, channel).await;
+            let outcome = manager
+                .chat_remember_turn("run_ext", id, PIN_PROMPT, "ok", chat_source())
+                .await;
+            assert_eq!(outcome, MemoryWriteOutcome::NotApplicable, "{channel}");
+        }
+        assert_eq!(assertion_count(&kv).await, 0);
+        let mut origins = user_event_origin(&kv, PIN_PROMPT).await;
+        origins.sort();
+        assert_eq!(
+            origins,
+            vec![
+                ("chat".to_owned(), "model".to_owned()),
+                ("chat".to_owned(), "model".to_owned()),
+                ("chat".to_owned(), "model".to_owned()),
+            ]
+        );
+        assert!(skipped_reasons(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_remember_in_a_session_with_an_inbound_run_is_not_user_said() {
+        let (manager, store, kv, _) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        seed_channel(&store, "s_mix", "desktop").await;
+        let now = now_iso8601();
+        store
+            .insert_run(&Run {
+                id: "run_mix".to_owned(),
+                session_id: Some("s_mix".to_owned()),
+                workspace_id: None,
+                status: RunStatus::Queued,
+                input: RunInput {
+                    prompt: "hi".to_owned(),
+                    workspace_id: None,
+                    model_override: None,
+                    mode: RunMode::Normal,
+                    knowledge_binding_id: None,
+                },
+                output: None,
+                error: None,
+                usage: zero_usage(),
+                schedule_id: None,
+                created_at: now.clone(),
+                started_at: None,
+                ended_at: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .insert_inbound_event(&inbound_event("hyphae:mix", "hi"))
+                .await
+                .unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        store
+            .insert_inbound_run("run_mix", "hyphae:mix")
+            .await
+            .unwrap();
+        let outcome = manager
+            .chat_remember_turn("run_mix_chat", "s_mix", PIN_PROMPT, "ok", chat_source())
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::NotApplicable);
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("chat".to_owned(), "model".to_owned())]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_origin_lookup_failure_skips_the_remember() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        seed_channel(&store, "s_fail", "desktop").await;
+        sqlx::raw_sql("DROP TABLE inbound_runs")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let outcome = manager
+            .chat_remember_turn("run_fail", "s_fail", PIN_PROMPT, "ok", chat_source())
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::NotApplicable);
+        assert_eq!(assertion_count(&kv).await, 0);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("chat".to_owned(), "model".to_owned())]
+        );
+        let skipped = skipped_reasons(&log);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0].reason, "origin_unavailable");
+        assert_eq!(skipped[0].run_id, "run_fail");
+        assert_eq!(skipped[0].session_id.as_deref(), Some("s_fail"));
     }
 
     pub(crate) fn create() -> RunCreate {
@@ -8793,6 +9913,77 @@ mod approval_tests {
             1
         );
         assert!(!seen.iter().any(|event| event.as_str() == "run.started"));
+    }
+
+    #[tokio::test]
+    async fn timed_out_inbound_approval_marks_the_inbound_row_done() {
+        let dir = tempfile::tempdir().unwrap();
+        let h = resume_harness(dir.path().to_path_buf()).await;
+        h.store
+            .insert_run(&run_in("run_inbound_timeout", RunStatus::AwaitingApproval))
+            .await
+            .unwrap();
+        let mut approval = seed_approval(
+            "apr_inbound_timeout",
+            "run_inbound_timeout",
+            "tc_inbound_timeout",
+            serde_json::Map::new(),
+        );
+        approval.status = ApprovalStatus::TimedOut;
+        approval.decided_at = Some(now_iso8601());
+        h.store.insert_approval(&approval).await.unwrap();
+        let event = agent24_store::NewInboundEvent {
+            id: "hyphae:timeout".to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub1".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: "2026-11-11T00:00:00Z".to_owned(),
+            received_at: "2026-11-11T00:00:01Z".to_owned(),
+            text: Some("parked".to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some("started".to_owned()),
+        };
+        assert_eq!(
+            h.store.insert_inbound_event(&event).await.unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        h.store
+            .insert_inbound_run("run_inbound_timeout", "hyphae:timeout")
+            .await
+            .unwrap();
+
+        // A fresh manager: the in-process inbound map from the previous
+        // process is gone. Recovery still has to release the inbound row.
+        assert_eq!(
+            h.manager.recover_timed_out_approval_runs().await.unwrap(),
+            1
+        );
+        assert_eq!(
+            h.store
+                .get_run("run_inbound_timeout")
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            h.store
+                .get_inbound_event("hyphae:timeout")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("done")
+        );
     }
 
     #[tokio::test]

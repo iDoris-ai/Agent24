@@ -120,7 +120,7 @@ async fn run_tier(tier: Tier) {
         }
         let answer = synth(&mut rng, alen);
         let outcome = m
-            .chat_remember_turn(&sid, &prompt, &answer, test_source_ref())
+            .chat_remember_turn("run_cap", &sid, &prompt, &answer, test_source_ref())
             .await;
         let want = if remembers {
             MemoryWriteOutcome::Saved
