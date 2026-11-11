@@ -43,7 +43,19 @@
 //! that the store can see, so [`InboundScrubSession::memory_not_after`] tells
 //! the memory layer where the inbound part ends; newer events keep the whole
 //! session's memory (the run copies are still cleared). That is the same
-//! outcome as a session shared with another run.
+//! outcome as a session shared with another run. The memory layer also keeps
+//! a session that holds a `/chat` turn recognised by its origin (`chat`), so a
+//! turn written while the inbound run was still running (its time is older
+//! than the run's end) is kept too.
+//!
+//! Where this errs. Both memory rules err towards keeping text: a write that
+//! outlived its cancelled caller, or a run with no `ended_at` (the end time then
+//! falls back to the start time), can make a session look younger than it is.
+//! The cost is inbound text that stays in memory, never user text that goes.
+//!
+//! Keys. `runs` has no owner column, so runs are matched to sessions by
+//! session id alone; session ids are ULIDs, so a collision between two owners'
+//! sessions is not realistic (and the memory side does filter by owner).
 //!
 //! Which runs. Only runs linked through `inbound_runs` to an expired event.
 //! A run that no `inbound_runs` row names is never touched, whatever its
@@ -263,8 +275,10 @@ impl Store {
     /// is kept.
     ///
     /// `memory_handled` is `Some(sessions)` when session memory exists: the
-    /// sessions whose memory this pass has purged (or found nothing to purge
-    /// in). An event with a run in a session that is exclusive right now and
+    /// sessions whose memory this pass has handled: purged, found empty, or
+    /// KEPT because the user wrote into them (`kept_newer`). A kept session
+    /// must be in the set too, or its event would be deferred on every pass.
+    /// An event with a run in a session that is exclusive right now and
     /// not in that set is left unstamped and counted in `deferred` (see the
     /// module docs). `None` skips that check: there is no memory to leave text
     /// in. A second call over the same data returns an empty report.

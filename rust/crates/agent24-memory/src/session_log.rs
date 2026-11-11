@@ -283,14 +283,30 @@ impl SessionLog {
     /// and the legacy blob (without that, the next read would import the old
     /// text back). One transaction; deleting nothing is a success.
     ///
-    /// `not_after` is where the part to be expired ends (spelled like
-    /// `mem_events.at`). If the session holds any event with a LATER `at`,
-    /// somebody wrote into it after that point (for instance `/chat` turns,
-    /// which go into a caller-named session without making a run), and that
-    /// is the user's own conversation: nothing is deleted and `kept_newer` is
-    /// set. The test runs inside the same `BEGIN IMMEDIATE` transaction as the
-    /// delete, so a write cannot slip in between. An empty `not_after` keeps
-    /// everything.
+    /// The session is kept whole (nothing deleted, `kept_newer` set) when
+    /// somebody other than the run loop wrote into it. `/chat` turns go into a
+    /// caller-named session without making a run, and are recognised two ways,
+    /// both tested inside the same `BEGIN IMMEDIATE` transaction as the delete
+    /// so no write can slip in between:
+    ///
+    /// * `origin_source = 'chat'`: the user turn `chat_remember_turn` writes
+    ///   (`agent24-agent` `lib.rs`, `Origin { source: "chat" }`). A run's own
+    ///   turn is written as `agent_loop` (`run_prompt_origin`) or `scheduler`,
+    ///   never `chat`, so this holds even for a chat turn written while the
+    ///   inbound run was still running (its `at` is then older than the run's
+    ///   end).
+    /// * `at > not_after`: any event after the end of the part to be expired,
+    ///   for writers that do not say `chat`.
+    ///
+    /// `not_after` is spelled like `mem_events.at`. An EMPTY `not_after` means
+    /// the caller could not date the runs: the call returns at once with
+    /// `kept_newer` and deletes nothing at all (events, gaps and the legacy
+    /// blob alike).
+    ///
+    /// Both rules err towards keeping. A write that outlived its cancelled
+    /// caller, or a run whose end time was unset (the store then falls back to
+    /// its start time), can make a session look younger than it is; the cost
+    /// is text that stays, never text of the user's that goes.
     ///
     /// This is the sanctioned exception to the append-only rule, used for
     /// retention (inbound text expiry). The quota triggers on `mem_events`
@@ -316,10 +332,17 @@ impl SessionLog {
         session: &str,
         not_after: &str,
     ) -> Result<SessionPurge> {
+        if not_after.is_empty() {
+            return Ok(SessionPurge {
+                kept_newer: true,
+                ..SessionPurge::default()
+            });
+        }
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let newer: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM mem_events \
-             WHERE scope_owner=? AND scope_session=? AND at > ?)",
+             WHERE scope_owner=? AND scope_session=? \
+               AND (origin_source = 'chat' OR at > ?))",
         )
         .bind(owner)
         .bind(session)

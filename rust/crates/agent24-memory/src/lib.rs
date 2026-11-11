@@ -2989,6 +2989,62 @@ mod session_log_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn purge_session_keeps_a_chat_turn_written_while_the_run_was_still_running() -> Result<()>
+    {
+        // The /chat turn is OLDER than `not_after` (the run ended hours
+        // later), so only its origin can tell it apart from the run's own.
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "s", 0, "inbound-q", "inbound-a").await?;
+        log.append_turn(
+            "o",
+            "s",
+            1,
+            &Msg::user("chat-q"),
+            Origin {
+                source: "chat".into(),
+                trust: Trust::UserSaid,
+            },
+            &assistant("chat-a"),
+            Origin {
+                source: "agent_loop".into(),
+                trust: Trust::Model,
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        let kept = log.purge_session("o", "s", "2026-01-02T00:00:00Z").await?;
+        assert!(kept.kept_newer);
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+
+        // Positive control: the same session without the chat turn goes.
+        append(&log, "o", "t", 0, "x", "y").await?;
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        let purged = log.purge_session("o", "t", "2026-01-02T00:00:00Z").await?;
+        assert!(!purged.kept_newer);
+        assert_eq!(purged.events, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_session_with_an_empty_bound_deletes_nothing_at_all() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "s", 0, "q", "a").await?;
+        kv.put("session", "s", &CanonicalSession::new("s")).await?;
+        let report = log.purge_session("o", "s", "").await?;
+        assert!(report.kept_newer);
+        assert_eq!((report.events, report.gaps, report.legacy_blob), (0, 0, 0));
+        assert_eq!(events(&kv, "o", "s").await?.len(), 2);
+        assert!(CanonicalSession::load(&kv, "s").await?.is_some());
+        Ok(())
+    }
+
     fn turn_id(o: &str, s: &str, n: u64, role: &str) -> Result<String> {
         use sha2::{Digest, Sha256};
         Ok(format!(
