@@ -388,6 +388,10 @@ export interface InstallDeps {
   uninstall: () => Promise<void>
   /** Runs `work` with this app's own daemon stopped and nothing spawned (`whileStopped`). */
   hold: <T>(work: () => Promise<T>) => Promise<T>
+  /** The plist is there already, looked at once the hold has begun: another
+   * install queued ahead did it, and installing again would bootout that
+   * service daemon with no presence box (Codex B4c2 C1). */
+  installed?: () => boolean
 }
 
 function installErrorCode(err: unknown): string {
@@ -404,6 +408,7 @@ function installErrorCode(err: unknown): string {
  * Low, Codex B4b C4). The hold's end brings this app's own daemon back. */
 export function installService(deps: InstallDeps): Promise<InstallOutcome> {
   return deps.hold(async (): Promise<InstallOutcome> => {
+    if (deps.installed?.()) return { ok: true }
     const failed = async (stage: 'install' | 'start', code: string): Promise<InstallOutcome> => {
       try { await deps.uninstall() } catch { /* its own failure is ignored */ }
       return { ok: false, stage, code }
@@ -463,7 +468,7 @@ const realInstallSystem = (spawned: (pid: number) => boolean): InstallSystem => 
  * record with an enrolment socket that this app did not spawn and that was
  * not the one on record before the install (Codex B4b C3). */
 export function serviceInstallDeps(
-  o: { cli: string; daemonBin: string; ready: Promise<unknown>; hold: InstallDeps['hold']; spawned: (pid: number) => boolean },
+  o: { cli: string; daemonBin: string; ready: Promise<unknown>; hold: InstallDeps['hold']; spawned: (pid: number) => boolean; installed?: () => boolean },
   sys: InstallSystem = realInstallSystem(o.spawned),
 ): InstallDeps {
   const env = { ...process.env, AGENT24D_BIN: o.daemonBin }
@@ -480,6 +485,7 @@ export function serviceInstallDeps(
       return state !== null && state.pid !== before && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)
     }, sys.startWaitMs),
     hold: o.hold,
+    installed: o.installed,
   }
 }
 
@@ -565,4 +571,37 @@ export function serviceStopDeps(
     hold: o.hold,
     record: o.record,
   }
+}
+
+// ── M5 B4c2: the Settings switch ──────────────────────────────────────────
+
+/** On: install (as the first-launch Allow), kept as allow. Off: stop (as
+ * 「完全退出」 without the quit; it keeps declined). Already in that state:
+ * nothing to do. A failed record is ignored (the plist says what is true). */
+export async function setResident(on: boolean, deps: {
+  installed: () => boolean
+  install: () => Promise<InstallOutcome>
+  stop: () => Promise<StopOutcome>
+  record: (answer: ConsentAnswer) => void
+}): Promise<{ ok: true } | { ok: false; stage: 'install' | 'start' | 'shutdown' | 'uninstall'; code: string }> {
+  if (on) {
+    if (deps.installed()) return { ok: true }
+    let outcome: InstallOutcome
+    try { outcome = await deps.install() } catch { return { ok: false, stage: 'install', code: 'install_failed' } }
+    if (!outcome.ok) return { ok: false, stage: outcome.stage, code: outcome.code }
+    try { deps.record('allow') } catch { /* the plist says it is on */ }
+    return { ok: true }
+  }
+  if (!deps.installed()) return { ok: true }
+  let outcome: StopOutcome
+  try { outcome = await deps.stop() } catch { return { ok: false, stage: 'shutdown', code: 'shutdown_failed' } }
+  return outcome.ok ? { ok: true } : { ok: false, stage: outcome.stage, code: outcome.code }
+}
+
+/** The tray's message for a failed 「完全退出」 (QA on B4c1): not connected;
+ * stopped but the plist is still there; or not stopped at all. */
+export function stopFailureKey(outcome: { stage: 'shutdown' | 'uninstall'; code: string }): 'tray.serviceNotConnected' | 'tray.serviceStoppedNotRemoved' | 'tray.serviceNotStopped' {
+  if (outcome.code === 'not_connected') return 'tray.serviceNotConnected'
+  if (outcome.stage === 'uninstall') return 'tray.serviceStoppedNotRemoved'
+  return 'tray.serviceNotStopped'
 }
