@@ -276,6 +276,22 @@ impl SourceRef {
         }
     }
 
+    /// External inbound text (X11-2c). The whole prompt is one `Unknown`
+    /// block. Only `RunManager::start_run_inbound` mints this; HTTP `RunCreate`
+    /// cannot. Mode stays `LocalOnly`, same as [`Self::user_input`].
+    pub fn inbound_external(run_id: &str, created_at: impl Into<String>) -> Self {
+        SourceRef {
+            source_id: format!("inbound_external:{run_id}"),
+            kind: SourceKind::UserInput,
+            classification: SourceClassification::Unknown,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
     /// A fresh, unclassified tag for a selected material. No current entry
     /// point calls this (see [`SourceKind::SelectedMaterial`]'s docs); kept
     /// public so the contract already covers it when one lands. Also
