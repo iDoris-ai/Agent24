@@ -1127,13 +1127,14 @@ impl RunManager {
     /// (`remember_exchange`, used as-is — not duplicated), exposed for the
     /// `/api/v1/chat` surface. `source: "chat"` distinguishes this turn's
     /// provenance from the agent loop's `"agent_loop"` in the audit trail.
-    /// Trust is `UserSaid` only when this session is a local owner channel
-    /// (`desktop` / `cli` / `tui`, SPEC-002) and none of its runs are linked
-    /// in `inbound_runs`. A missing session row has no external channel, so
-    /// it stays `UserSaid`. Any other channel, an inbound link, or a failed
-    /// lookup is `Model` — retain then skips the qualified assertion. A
-    /// failed lookup of an explicit remember also emits `memory.write_skipped`
-    /// with reason `origin_unavailable`. Retain/log failures emit
+    /// Trust is `UserSaid` unless the session channel is an inbound source
+    /// ([`INBOUND_SOURCE_CHANNELS`]) or one of its runs is linked in
+    /// `inbound_runs`. A missing session row has no inbound channel, so it
+    /// stays `UserSaid`. Any other channel (`desktop`, `cli`, `tui`,
+    /// `creative`, or an unknown name) is the account owner. A failed lookup
+    /// is `Model` — retain then skips the qualified assertion. A failed
+    /// lookup of an explicit remember also emits `memory.write_skipped` with
+    /// reason `origin_unavailable`. Retain/log failures emit
     /// `memory.write_failed` and otherwise never propagate — the chat
     /// response the caller already has must still reach its client. Returns
     /// the LIVE [`MemoryWriteOutcome`] — see [`RunManager::remember_exchange`].
@@ -1180,10 +1181,22 @@ impl RunManager {
         let Some(session) = self.store.get_session(session_id).await? else {
             return Ok(false);
         };
-        if !Self::local_owner_channel(&session.channel) {
+        if Self::inbound_source_channel(&session.channel) {
             return Ok(true);
         }
         self.store.session_has_inbound_run(session_id).await
+    }
+
+    /// Session channels that name an inbound source. Same set as `agent24d`'s
+    /// X11-2f route allowlist `ALLOWLIST_SOURCES`
+    /// (`rust/apps/agent24d/src/inbound/routes.rs`): `hyphae`, `wechat`,
+    /// `remote`. `scheduler` and `self` are not on that list. A channel
+    /// outside this set is the person at this machine unless `inbound_runs`
+    /// links one of the session's runs.
+    const INBOUND_SOURCE_CHANNELS: &[&str] = &["hyphae", "wechat", "remote"];
+
+    fn inbound_source_channel(channel: &str) -> bool {
+        Self::INBOUND_SOURCE_CHANNELS.contains(&channel)
     }
 
     /// K1-6b.4b (ADR-K1-02 §2.1.1 item 4): the classification a memory
@@ -1262,12 +1275,6 @@ impl RunManager {
                 session_id: session_id.map(str::to_owned),
                 reason: "origin_unavailable".to_owned(),
             }));
-    }
-
-    /// SPEC-002 local owner clients. Anything else (`hyphae`, `wechat`,
-    /// `schedule`, …) is not the person at this machine.
-    fn local_owner_channel(channel: &str) -> bool {
-        matches!(channel, "desktop" | "cli" | "tui")
     }
 
     /// `true` when this run's user prompt must not be treated as the account
@@ -7226,9 +7233,31 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn chat_remember_on_a_non_local_channel_is_not_user_said() {
+    async fn chat_remember_on_a_creative_channel_stays_user_said() {
         let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
-        for (id, channel) in [("s_hy", "hyphae"), ("s_sch", "schedule")] {
+        seed_channel(&store, "s_creative", "creative").await;
+        let outcome = manager
+            .chat_remember_turn(
+                "run_creative",
+                "s_creative",
+                PIN_PROMPT,
+                "ok",
+                chat_source(),
+            )
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::Saved);
+        assert_eq!(assertion_count(&kv).await, 1);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("chat".to_owned(), "user_said".to_owned())]
+        );
+        assert!(skipped_reasons(&log).is_empty());
+    }
+
+    #[tokio::test]
+    async fn chat_remember_on_an_inbound_source_channel_is_not_user_said() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        for (id, channel) in [("s_hy", "hyphae"), ("s_wx", "wechat"), ("s_rm", "remote")] {
             seed_channel(&store, id, channel).await;
             let outcome = manager
                 .chat_remember_turn("run_ext", id, PIN_PROMPT, "ok", chat_source())
@@ -7241,6 +7270,7 @@ pub(crate) mod tests {
         assert_eq!(
             origins,
             vec![
+                ("chat".to_owned(), "model".to_owned()),
                 ("chat".to_owned(), "model".to_owned()),
                 ("chat".to_owned(), "model".to_owned()),
             ]
