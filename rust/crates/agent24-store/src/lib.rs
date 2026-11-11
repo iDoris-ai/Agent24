@@ -138,7 +138,9 @@ pub use decision_log::{
 pub use inbound::{
     InboundEvent, InboundInsert, InboundReconcile, NewInboundEvent, format_inbound_timestamp,
 };
-pub use inbound_scrub::{INBOUND_SCRUB_PLACEHOLDER, InboundScrubReport};
+pub use inbound_scrub::{
+    INBOUND_SCRUB_PLACEHOLDER, InboundScrubReport, InboundScrubSession, MEMORY_GRACE_SECS,
+};
 pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
 };

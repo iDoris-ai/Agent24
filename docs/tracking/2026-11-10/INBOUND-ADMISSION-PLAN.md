@@ -133,11 +133,18 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 ### 3.2 正文清理
 
 - **保留什么**：整行保留（发送者、时间、类别、准入结果、策略版本）；清 `text`、`meta`，写 `text_scrubbed_at`。
-- **放哪**：`agent24-store` 新增 `scrub_expired_inbound_text(cutoff, now)`，同构于 `decision_log.rs:307` 的 `scrub_expired_decision_log`，幂等。
+- **放哪**：`agent24-store` 新增 `scrub_expired_inbound(cutoff, now, batch, memory_handled)`（2a 的 `scrub_expired_inbound_text` 只留作测试），同构于 `decision_log.rs:307` 的 `scrub_expired_decision_log`，幂等。
 - **谁定时**：`agent24d` 后台任务，形态照 `memory_maintenance.rs`，在 `serve_steps.rs` 启动（参照 `:409-414`）；启动先扫一次，之后每 6 小时。
 - **为什么要真调用方**：`decision_log` 的清理函数目前只有测试调用（`decision_log.rs:306` 注释自述无人调用）。
 - 按 `received_at` 算 180 天。
 - **范围（已拍板 §7-3，jason 2026-11-11）**：按推荐，同一任务里一并清掉这些事件对应 run 的 `runs.input`、run 消息快照、会话记忆里来自该事件的内容，否则「180 天删正文」名不副实。**这会碰旧表**，2d 的规模和风险按此重估；落地方式（置空 vs 级联删）开片前读 `run_messages`、记忆写入路径再定。
+- **已知限制（2d 落地时如实记录）**：
+  - 会话记忆按会话整体清理，且只在该会话里的 run 全部是到期入站 run 时才清。会话混入了非入站 run（用户在 UI 里接着聊）时，该会话的记忆按设计不清（记忆里无法区分哪些来自入站），入站原文留在记忆里；run 与消息快照等副本仍照清。
+  - `/chat` 不写 run，却把轮次写进调用方给的会话。清理时记忆层检查会话里是否有晚于入站 run 终态（加 1 秒宽限）的事件，有就整段保留，与上一条同一结局。
+  - 「记住」类断言不由 2d 清理，依赖 X11-2c 在源头禁止入站 run 写断言。
+  - 审计链（`audit_log`）里的 `approval.required` 条目带审批摘要与负载，哈希链不可改，不清。
+  - 入站 run 创建的自唤醒日程：其 prompt（`schedules.action`）不清，唤醒 run 没有 `inbound_runs` 关联，会让该会话变成非独占，会话记忆也留下。
+  - 不覆盖：`tool_calls.tool` 名称、记忆派生表（`mem_consolidations`、向量、trace）、非对象形态的 `runs.input`；写入缺口与遗留 kv 快照按会话 id 删除。
 
 ### 3.3 准入判定（确定性，优先级自上而下，第一条命中即结果）
 

@@ -2933,7 +2933,9 @@ mod session_log_tests {
         kv.put("session", "gone", &CanonicalSession::new("gone"))
             .await?;
 
-        let purge = log.purge_session("o", "gone").await?;
+        let purge = log
+            .purge_session("o", "gone", "9999-01-01T00:00:00Z")
+            .await?;
         assert_eq!(purge.events, 4);
         assert_eq!(purge.legacy_blob, 1);
         assert!(events(&kv, "o", "gone").await?.is_empty());
@@ -2949,7 +2951,41 @@ mod session_log_tests {
                 .await?;
         assert_eq!(counted, 2);
         // Repeating it deletes nothing.
-        assert!(log.purge_session("o", "gone").await?.is_empty());
+        assert!(
+            log.purge_session("o", "gone", "9999-01-01T00:00:00Z")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_session_keeps_a_session_the_user_wrote_into_later() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "s", 0, "inbound-q", "inbound-a").await?;
+        // Pretend the first turn happened long ago and a /chat turn is new.
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        append(&log, "o", "s", 1, "chat-q", "chat-a").await?;
+
+        // Events after `not_after` (the chat turn): nothing is deleted.
+        let kept = log.purge_session("o", "s", "2026-01-01T00:00:01Z").await?;
+        assert!(kept.kept_newer);
+        assert_eq!(kept.events, 0);
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+
+        // Positive control: with no later event the whole session goes.
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        let purged = log.purge_session("o", "s", "2026-01-01T00:00:01Z").await?;
+        assert!(!purged.kept_newer);
+        assert_eq!(purged.events, 4);
+        // An empty bound keeps everything.
+        append(&log, "o", "t", 0, "x", "y").await?;
+        assert!(log.purge_session("o", "t", "").await?.kept_newer);
         Ok(())
     }
 

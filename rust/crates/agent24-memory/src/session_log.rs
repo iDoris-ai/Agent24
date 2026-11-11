@@ -24,6 +24,9 @@ pub struct TurnIds {
 /// Rows [`SessionLog::purge_session`] removed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SessionPurge {
+    /// The session holds events newer than `not_after`: someone carried on in
+    /// it after the run(s) that were being expired. Nothing was deleted.
+    pub kept_newer: bool,
     /// `mem_events` rows of the session (messages, summaries, import marker).
     pub events: u64,
     /// `mem_session_gaps` rows of the session.
@@ -280,9 +283,19 @@ impl SessionLog {
     /// and the legacy blob (without that, the next read would import the old
     /// text back). One transaction; deleting nothing is a success.
     ///
+    /// `not_after` is where the part to be expired ends (spelled like
+    /// `mem_events.at`). If the session holds any event with a LATER `at`,
+    /// somebody wrote into it after that point (for instance `/chat` turns,
+    /// which go into a caller-named session without making a run), and that
+    /// is the user's own conversation: nothing is deleted and `kept_newer` is
+    /// set. The test runs inside the same `BEGIN IMMEDIATE` transaction as the
+    /// delete, so a write cannot slip in between. An empty `not_after` keeps
+    /// everything.
+    ///
     /// This is the sanctioned exception to the append-only rule, used for
     /// retention (inbound text expiry). The quota triggers on `mem_events`
-    /// keep the owner usage counters right.
+    /// keep the owner usage counters right. Callers that also write the
+    /// session (the run loop) should hold that session's lock around this.
     ///
     /// It does NOT touch `mem_assertions`. Retracting would be wrong and
     /// would not delete the text anyway: an assertion id is a hash of owner
@@ -290,14 +303,35 @@ impl SessionLog {
     /// user shares the row, and a retracted row keeps its `object`. The
     /// guarantee that an inbound run never writes an assertion is made at the
     /// source (X11-2c: inbound runs are not allowed through
-    /// `retain::persist`), and this purge DEPENDS on it.
+    /// `retain::persist`), and this purge DEPENDS on it. Tables derived from
+    /// events (`mem_consolidations`, embeddings, trace) are not cleared either.
     ///
     /// `mem_session_gaps` is keyed by session id only (no owner column), so
     /// its delete below is by session id alone. Inbound sessions are fresh
     /// per message, so a collision with another owner's session id is not
     /// expected.
-    pub async fn purge_session(&self, owner: &str, session: &str) -> Result<SessionPurge> {
+    pub async fn purge_session(
+        &self,
+        owner: &str,
+        session: &str,
+        not_after: &str,
+    ) -> Result<SessionPurge> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let newer: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM mem_events \
+             WHERE scope_owner=? AND scope_session=? AND at > ?)",
+        )
+        .bind(owner)
+        .bind(session)
+        .bind(not_after)
+        .fetch_one(&mut *tx)
+        .await?;
+        if newer {
+            return Ok(SessionPurge {
+                kept_newer: true,
+                ..SessionPurge::default()
+            });
+        }
         let events = sqlx::query("DELETE FROM mem_events WHERE scope_owner=? AND scope_session=?")
             .bind(owner)
             .bind(session)
@@ -316,6 +350,7 @@ impl SessionLog {
             .rows_affected();
         tx.commit().await?;
         Ok(SessionPurge {
+            kept_newer: false,
             events,
             gaps,
             legacy_blob,

@@ -18,6 +18,32 @@
 //! | `tool_calls.input` / `output_summary` | `'{}'` / placeholder             |
 //! | `approvals.summary` / `payload`       | placeholder / `'{}'`             |
 //! | `sessions.title`                      | placeholder, exclusive sessions  |
+//! | session memory (`memory.db`)          | whole session deleted, see below |
+//!
+//! NOT covered, on purpose or for now:
+//!
+//! * `audit_log`. An `approval.required` entry carries the approval's summary
+//!   and payload, and the log is hash-chained, so a row cannot be edited
+//!   without breaking verification. Approval text in the audit chain stays.
+//! * A self-wake schedule created by an inbound run. Its prompt (model
+//!   written, in `schedules.action`) and the wake run's session are not
+//!   linked through `inbound_runs`, so neither is cleared, and the wake run
+//!   makes the session non-exclusive, so that session's memory stays too.
+//! * `mem_assertions` (see `SessionLog::purge_session`), and the memory
+//!   tables derived from events: `mem_consolidations`, embeddings, trace.
+//! * `tool_calls.tool` (the tool name) is kept; only its input and output
+//!   summary are cleared. Memory write gaps and the legacy session blob are
+//!   deleted by session id alone (the memory layer has no owner column there).
+//! * `runs.input` is cleared through `$.prompt`; a stored input that is not
+//!   an object (not produced by the daemon) would not be changed by that.
+//!
+//! Memory the user added later. `/chat` writes its turns into whatever session
+//! the caller names, with no run, so a user who carries on in an inbound
+//! session leaves memory events newer than the inbound runs. The runs are all
+//! that the store can see, so [`InboundScrubSession::memory_not_after`] tells
+//! the memory layer where the inbound part ends; newer events keep the whole
+//! session's memory (the run copies are still cleared). That is the same
+//! outcome as a session shared with another run.
 //!
 //! Which runs. Only runs linked through `inbound_runs` to an expired event.
 //! A run that no `inbound_runs` row names is never touched, whatever its
@@ -58,6 +84,24 @@ pub const INBOUND_SCRUB_PLACEHOLDER: &str = "[expired inbound text]";
 
 /// Statuses after which nothing reads a run's text again for recovery.
 const TERMINAL: &str = "('completed', 'failed', 'cancelled')";
+
+/// A session whose memory the caller should purge, and how far back that
+/// memory may reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundScrubSession {
+    pub id: String,
+    /// Memory events newer than this are not the inbound runs' own: the user
+    /// carried on in the session (`/chat` writes turns into a caller-given
+    /// session without making a run). It is the latest end time of the
+    /// session's runs plus [`MEMORY_GRACE_SECS`]. An empty string means a run
+    /// time could not be read, which keeps the memory (every event is newer).
+    pub memory_not_after: String,
+}
+
+/// Slack between a run's recorded end and its own last memory write. A run
+/// writes its turn just before it is marked terminal, and times are whole
+/// seconds, so one second absorbs the ordering and the rounding.
+pub const MEMORY_GRACE_SECS: i64 = 1;
 
 /// Counts from one [`Store::scrub_expired_inbound`] call.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -140,6 +184,22 @@ fn exclusive_sessions_sql(pending_only: bool) -> String {
     )
 }
 
+/// Latest of `times` plus the grace, in the stored spelling; empty when any
+/// time cannot be read (then no memory event can be called the runs' own).
+fn memory_not_after(times: &[String]) -> String {
+    let mut latest = None;
+    for time in times {
+        let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(time) else {
+            return String::new();
+        };
+        let parsed = parsed.with_timezone(&chrono::Utc);
+        latest = Some(latest.map_or(parsed, |l: chrono::DateTime<chrono::Utc>| l.max(parsed)));
+    }
+    latest.map_or_else(String::new, |t| {
+        crate::inbound::format_inbound_timestamp(t + chrono::Duration::seconds(MEMORY_GRACE_SECS))
+    })
+}
+
 async fn exec(tx: &mut Transaction<'_, Sqlite>, sql: &str, ids_json: &str) -> Result<u64> {
     Ok(sqlx::query(sql)
         .bind(INBOUND_SCRUB_PLACEHOLDER)
@@ -157,13 +217,27 @@ impl Store {
     ///
     /// # Errors
     /// Storage, or a `cutoff` that is not `format_inbound_timestamp` output.
-    pub async fn inbound_scrub_sessions(&self, cutoff: &str) -> Result<Vec<String>> {
+    pub async fn inbound_scrub_sessions(&self, cutoff: &str) -> Result<Vec<InboundScrubSession>> {
         require_inbound_timestamp("cutoff", cutoff)?;
         let sql = format!("{} ORDER BY s.id", exclusive_sessions_sql(true));
-        Ok(sqlx::query_scalar(&sql)
+        let ids: Vec<String> = sqlx::query_scalar(&sql)
             .bind(cutoff)
             .fetch_all(self.pool())
-            .await?)
+            .await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            let times: Vec<String> = sqlx::query_scalar(
+                "SELECT COALESCE(ended_at, started_at, created_at) FROM runs WHERE session_id = ?",
+            )
+            .bind(&id)
+            .fetch_all(self.pool())
+            .await?;
+            out.push(InboundScrubSession {
+                memory_not_after: memory_not_after(&times),
+                id,
+            });
+        }
+        Ok(out)
     }
 
     /// Whether `session` is still one that [`Self::inbound_scrub_sessions`]
@@ -577,6 +651,7 @@ mod tests {
             .unwrap();
         let listed = store.inbound_scrub_sessions(CUTOFF).await.unwrap();
         assert!(listed.is_empty(), "a live run keeps the session out");
+        let listed: Vec<String> = listed.into_iter().map(|s| s.id).collect();
 
         sqlx::query("UPDATE runs SET status = 'completed' WHERE id = 'run-r'")
             .execute(pool)
@@ -591,7 +666,9 @@ mod tests {
 
         // The next pass lists it, handles it, and only then is it stamped.
         let listed = store.inbound_scrub_sessions(CUTOFF).await.unwrap();
-        assert_eq!(listed, vec!["s-r".to_owned()]);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "s-r");
+        let listed: Vec<String> = listed.into_iter().map(|s| s.id).collect();
         let report = store
             .scrub_expired_inbound(CUTOFF, NOW, 10, Some(&listed))
             .await
@@ -632,5 +709,95 @@ mod tests {
             .await
             .unwrap();
         assert!(report.is_empty(), "{report:?}");
+    }
+
+    async fn put_in_session(store: &Store, run: &str, session: &str) {
+        let pool = crate::test_hooks::pool(store);
+        sqlx::query(
+            "INSERT OR IGNORE INTO sessions (id, title, channel, created_at, updated_at) \
+             VALUES (?, 't', 'hyphae', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+        )
+        .bind(session)
+        .execute(pool)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE runs SET session_id = ? WHERE id = ?")
+            .bind(session)
+            .bind(run)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_live_run_defers_its_event_until_it_is_terminal() {
+        let store = Store::open_memory().await.unwrap();
+        event_with_run(&store, "live", "2026-01-01T00:00:00Z", "running").await;
+        let report = store
+            .scrub_expired_inbound(CUTOFF, NOW, 10, None)
+            .await
+            .unwrap();
+        assert!(report.is_empty(), "{report:?}");
+        assert_eq!(prompt_of(&store, "live").await, "p");
+        sqlx::query("UPDATE runs SET status = 'completed' WHERE id = 'run-live'")
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let report = store
+            .scrub_expired_inbound(CUTOFF, NOW, 10, None)
+            .await
+            .unwrap();
+        assert_eq!(report.events, 1);
+        assert_eq!(prompt_of(&store, "live").await, INBOUND_SCRUB_PLACEHOLDER);
+    }
+
+    #[tokio::test]
+    async fn a_session_shared_with_a_plain_run_is_not_listed() {
+        let store = Store::open_memory().await.unwrap();
+        event_with_run(&store, "in", "2026-01-01T00:00:00Z", "completed").await;
+        put_in_session(&store, "run-in", "s-shared").await;
+        assert_eq!(store.inbound_scrub_sessions(CUTOFF).await.unwrap().len(), 1);
+        sqlx::query(
+            "INSERT INTO runs (id, session_id, status, input, usage, created_at) \
+             VALUES ('run-plain', 's-shared', 'completed', '{}', '{}', '2026-01-02T00:00:00Z')",
+        )
+        .execute(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert!(
+            store
+                .inbound_scrub_sessions(CUTOFF)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .inbound_scrub_session_pending(CUTOFF, "s-shared")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn memory_not_after_is_the_latest_run_end_plus_the_grace() {
+        let store = Store::open_memory().await.unwrap();
+        event_with_run(&store, "a", "2026-01-01T00:00:00Z", "completed").await;
+        put_in_session(&store, "run-a", "s-a").await;
+        sqlx::query("UPDATE runs SET ended_at = '2026-01-01T00:00:10Z' WHERE id = 'run-a'")
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let listed = store.inbound_scrub_sessions(CUTOFF).await.unwrap();
+        assert_eq!(listed[0].memory_not_after, "2026-01-01T00:00:11Z");
+
+        // A time that cannot be read keeps the memory: empty is older than
+        // every event, so every event counts as newer.
+        sqlx::query("UPDATE runs SET ended_at = 'garbage' WHERE id = 'run-a'")
+            .execute(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let listed = store.inbound_scrub_sessions(CUTOFF).await.unwrap();
+        assert_eq!(listed[0].memory_not_after, "");
     }
 }
