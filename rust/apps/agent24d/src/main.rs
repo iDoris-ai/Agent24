@@ -45,6 +45,7 @@ mod hardware;
 mod host_bootstrap;
 mod hyphae_install;
 mod idoris_routes;
+mod inbound;
 mod knowledge_backend;
 mod knowledge_routes;
 mod knowledge_tools;
