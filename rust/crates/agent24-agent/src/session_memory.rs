@@ -253,6 +253,23 @@ impl SessionMemory {
         Arc::clone(locks.entry(sid.to_owned()).or_default())
     }
 
+    /// Expire one session's memory for inbound text retention
+    /// ([`agent24_memory::session_log::SessionLog::purge_session`]), under THIS
+    /// session's lock. A turn write that outlived its cancelled caller holds
+    /// the same lock until its commit is confirmed, so the purge cannot run
+    /// before such a write and leave it behind. `not_after` is where the
+    /// inbound part of the session ends; later events keep the session.
+    pub async fn purge_session(
+        &self,
+        sid: &str,
+        not_after: &str,
+    ) -> agent24_memory::Result<agent24_memory::session_log::SessionPurge> {
+        self.check_owner()?;
+        let lock = self.session_lock(sid).await;
+        let _guard = lock.lock().await;
+        self.log.purge_session(&self.owner, sid, not_after).await
+    }
+
     fn check_owner(&self) -> agent24_memory::Result<()> {
         if self.owner.trim().is_empty() {
             return Err(MemoryError::Io(
