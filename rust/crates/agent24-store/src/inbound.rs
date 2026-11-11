@@ -1511,6 +1511,107 @@ mod tests {
         assert!(!store.session_has_inbound_run("sess_two").await.unwrap());
     }
 
+    #[tokio::test]
+    async fn a_mismatched_session_is_refused_before_the_link() {
+        // Mutation: drop the session-id guard and the null session_id call
+        // returns Linked, while a different id fails the sessions FK instead
+        // of this Conflict.
+        let store = Store::open_memory().await.unwrap();
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample(
+                    "hyphae:mismatch",
+                    "npub1",
+                    "explicit",
+                    Some("starting"),
+                ))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        let session = inbound_session("sess_one");
+        let other = inbound_run("run_other", "sess_other");
+        let err = store
+            .insert_session_run_for_inbound(&session, &other, "hyphae:mismatch")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run session does not match"),
+            "{err:?}"
+        );
+
+        let mut missing = inbound_run("run_missing", "sess_one");
+        missing.session_id = None;
+        let err = store
+            .insert_session_run_for_inbound(&session, &missing, "hyphae:mismatch")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run session does not match"),
+            "{err:?}"
+        );
+        assert_eq!(table_count(&store, "sessions").await, 0);
+        assert_eq!(table_count(&store, "runs").await, 0);
+        assert_eq!(table_count(&store, "inbound_runs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_binding_is_refused_before_the_link() {
+        // Mutation: drop the workspace guard and both calls miss this
+        // Conflict (the workspace FK, or a committed link).
+        let store = Store::open_memory().await.unwrap();
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample("hyphae:ws", "npub1", "explicit", Some("starting")))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        let workspace =
+            agent24_protocol::WorkspaceId::parse("ws_0123456789ABCDEFGHJKMNPQRS").unwrap();
+
+        let mut session = inbound_session("sess_ws");
+        session.workspace_id = Some(workspace.clone());
+        let run = inbound_run("run_ws_session", "sess_ws");
+        let err = store
+            .insert_session_run_for_inbound(&session, &run, "hyphae:ws")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run is not workspace-bound"),
+            "{err:?}"
+        );
+
+        let plain = inbound_session("sess_plain");
+        let mut bound = inbound_run("run_ws_run", "sess_plain");
+        bound.workspace_id = Some(workspace.clone());
+        bound.input.workspace_id = Some(workspace);
+        let err = store
+            .insert_session_run_for_inbound(&plain, &bound, "hyphae:ws")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run is not workspace-bound"),
+            "{err:?}"
+        );
+        assert_eq!(table_count(&store, "sessions").await, 0);
+        assert_eq!(table_count(&store, "runs").await, 0);
+        assert_eq!(table_count(&store, "inbound_runs").await, 0);
+    }
+
+    async fn table_count(store: &Store, table: &str) -> i64 {
+        let sql = match table {
+            "sessions" => "SELECT COUNT(*) FROM sessions",
+            "runs" => "SELECT COUNT(*) FROM runs",
+            "inbound_runs" => "SELECT COUNT(*) FROM inbound_runs",
+            other => panic!("unexpected table {other}"),
+        };
+        sqlx::query_scalar(sql)
+            .fetch_one(crate::test_hooks::pool(store))
+            .await
+            .unwrap()
+    }
+
     fn inbound_session(id: &str) -> agent24_protocol::Session {
         agent24_protocol::Session {
             id: id.to_owned(),
