@@ -7137,6 +7137,130 @@ pub fn build_router_with_modules() {
         }
     }
 
+    fn scheduler_for(
+        store: Store,
+        runs: Arc<agent24_agent::RunManager>,
+    ) -> Arc<agent24_scheduler::Scheduler> {
+        agent24_scheduler::Scheduler::new(
+            store,
+            Arc::new(kernel_trigger_for_tests(runs)),
+            Arc::new(|_| {}),
+        )
+    }
+
+    /// Acceptance ④: one schedule tick writes one `internal` inbound row and
+    /// the run still starts.
+    #[tokio::test]
+    async fn scheduler_tick_records_an_internal_inbound_row_and_still_starts_the_run() {
+        let store = Store::open_memory().await.unwrap();
+        let runs = agent24_agent::RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![])),
+            Arc::new(agent24_tools::ToolRegistry::new()),
+            Arc::new(crate::events::EventsHub::default()) as Arc<dyn agent24_agent::EventSink>,
+            CancellationToken::new(),
+        );
+        let scheduler = scheduler_for(store.clone(), runs);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let created = scheduler
+            .create(
+                agent24_protocol::ScheduleCreate {
+                    name: "ping".into(),
+                    enabled: true,
+                    spec: agent24_protocol::ScheduleSpec::Every { secs: 60 },
+                    action: agent24_protocol::ScheduleAction::AgentRun {
+                        prompt: "ping".into(),
+                        session_id: None,
+                        model_override: None,
+                    },
+                    delivery: vec![],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            scheduler
+                .tick(now + chrono::Duration::seconds(61))
+                .await
+                .unwrap(),
+            1
+        );
+
+        let started = store.list_runs(None).await.unwrap();
+        assert_eq!(started.len(), 1);
+        assert_eq!(started[0].schedule_id.as_deref(), Some(created.id.as_str()));
+        let row = store
+            .get_inbound_event(&format!("scheduler:{}:2026-07-24T10:01:00Z", created.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.source, "scheduler");
+        assert_eq!(row.category, "internal");
+        assert_eq!(row.disposition, "internal");
+        assert_eq!(row.actor.as_deref(), Some(created.id.as_str()));
+        assert_eq!(row.text.as_deref(), Some("ping"));
+        assert!(row.run_state.is_none());
+    }
+
+    /// The record is best-effort: a failed insert does not stop the run.
+    #[tokio::test]
+    async fn scheduler_tick_still_starts_the_run_when_the_inbound_record_fails() {
+        let store = Store::open_memory().await.unwrap();
+        let runs = agent24_agent::RunManager::new(
+            store.clone(),
+            Arc::new(ModelRouter::with_defaults(vec![])),
+            Arc::new(agent24_tools::ToolRegistry::new()),
+            Arc::new(crate::events::EventsHub::default()) as Arc<dyn agent24_agent::EventSink>,
+            CancellationToken::new(),
+        );
+        let scheduler = scheduler_for(store.clone(), runs);
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-24T10:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        scheduler
+            .create(
+                agent24_protocol::ScheduleCreate {
+                    name: "ping".into(),
+                    enabled: true,
+                    spec: agent24_protocol::ScheduleSpec::Every { secs: 60 },
+                    action: agent24_protocol::ScheduleAction::AgentRun {
+                        prompt: "ping".into(),
+                        session_id: None,
+                        model_override: None,
+                    },
+                    delivery: vec![],
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        sqlx::raw_sql(
+            "CREATE TRIGGER inbound_events_abort BEFORE INSERT ON inbound_events \
+             BEGIN SELECT RAISE(ABORT, 'blocked'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+        assert_eq!(
+            scheduler
+                .tick(now + chrono::Duration::seconds(61))
+                .await
+                .unwrap(),
+            1
+        );
+        let started = store.list_runs(None).await.unwrap();
+        assert_eq!(started.len(), 1, "the run still starts");
+        let inbound: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_events")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(inbound, 0);
+    }
+
     /// A model-created self-wake prompt is untrusted input even after the
     /// real scheduler has delivered it as a run. Exercise the actual tool,
     /// scheduler tick, KernelTrigger, run loop, and production Retain path.
