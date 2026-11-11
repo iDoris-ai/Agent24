@@ -74,6 +74,27 @@ beforeEach(() => {
 afterEach(() => { vi.restoreAllMocks() })
 
 describe('the proactive entries in the app (M6 C2)', () => {
+  it('a press on the banner marks the conversation seen when it is the one open already, after a mark that failed (Codex C2 R1 C1)', async () => {
+    const asked = { ...scheduleRecord('chat_sch_1', 'run_1'), unseen: [] as string[],
+      messages: [{ role: 'user' as const, content: '这周的呢', at, delivered: true }] }
+    records.set('chat_sch_1', { ...asked, unseen: ['run_1'] })
+    await act(async () => { render(<App />) })
+    await act(async () => { fireEvent.click(await screen.findByRole('button', { name: /助理有 1 件事/ })) })
+    await waitFor(() => expect(screen.getByText('这周的呢')).toBeInTheDocument())
+    await waitFor(() => expect(screen.queryByRole('button', { name: /助理有 \d+ 件事/ })).toBeNull())
+    // A run comes while it is open; marking it seen fails once.
+    chatHistory.markSeen.mockRejectedValueOnce(new Error('EIO'))
+    const before = chatHistory.markSeen.mock.calls.length
+    records.set('chat_sch_1', { ...scheduleRecord('chat_sch_1', 'run_1', 'run_2'), messages: asked.messages, unseen: ['run_2'] })
+    await act(async () => { changed?.(chatHistorySummary(records.get('chat_sch_1')!)) })
+    await waitFor(() => expect(chatHistory.markSeen).toHaveBeenCalledTimes(before + 1))
+    const banner = await screen.findByRole('button', { name: /助理有 1 件事/ })
+    // The banner's target is the one open: a press marks it seen.
+    await act(async () => { fireEvent.click(banner) })
+    await waitFor(() => expect(chatHistory.markSeen).toHaveBeenCalledTimes(before + 2))
+    await waitFor(() => expect(screen.queryByRole('button', { name: /助理有 \d+ 件事/ })).toBeNull())
+  })
+
   it('shows the banner on top of the main chat; a press opens the conversation, which is then seen', async () => {
     records.set('chat_sch_1', scheduleRecord('chat_sch_1', 'run_1', 'run_2'))
     await act(async () => { render(<App />) })

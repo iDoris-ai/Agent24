@@ -239,6 +239,25 @@ describe('the sidebar\'s "Needs you" (M6 C2, T-1)', () => {
     await waitFor(() => expect(assistant()).toHaveTextContent(/^助理$/))
   })
 
+  it('counts a conversation once, however many of its tasks wait on an approval (§7.2a, Codex C2 R1 C2)', async () => {
+    const cli = store.create({ title: '助理发起', title_source: 'assistant', initiator: 'assistant' }).id
+    store.appendRun(cli, 'run_cli1', 'task')
+    store.appendRun(cli, 'run_cli2', 'task')
+    runs.run_cli1 = 'awaiting_approval'
+    runs.run_cli2 = 'awaiting_approval'
+    await refreshHistory()
+    renderSidebar()
+    await waitFor(() => expect(assistant()).toHaveTextContent(/^助理1$/))
+    // One decided, the other still waits: still one.
+    runs.run_cli1 = 'running'
+    act(() => emit({ type: 'approval.resolved', run_id: 'run_cli1' }))
+    await act(async () => { await new Promise(r => setTimeout(r, 50)) })
+    expect(assistant()).toHaveTextContent(/^助理1$/)
+    runs.run_cli2 = 'completed'
+    act(() => emit({ type: 'run.completed', run_id: 'run_cli2' }))
+    await waitFor(() => expect(assistant()).toHaveTextContent(/^助理$/))
+  })
+
   it('asks the daemon no more for pending approvals: the badge is the list\'s (no /api/v1/approvals poll)', async () => {
     await refreshHistory()
     renderSidebar()
