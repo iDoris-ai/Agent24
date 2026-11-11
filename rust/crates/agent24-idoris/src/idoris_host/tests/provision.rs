@@ -476,7 +476,7 @@ async fn connect_rejects_oversized_or_unsafe_verification_model_id_without_commi
         assert!(x.f.host.status().await.verification.is_none());
         assert!(!x.f.host.root.join("connection.json").exists());
         assert!(!x.f.host.root.join("pending-connect.json").exists());
-        assert!(router_gateway(&x.f.host).is_err());
+        assert!(router_gateway(&x.f.router).is_err());
         assert_eq!(x.keys()[0]["status"], "revoked");
         assert!(x.data.entries.lock().unwrap().is_empty());
         let persisted: serde_json::Value =
@@ -554,7 +554,7 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
         serde_json::to_value(&done).unwrap()["verification"],
         *receipt
     );
-    assert!(router_gateway(&x.f.host).is_ok());
+    assert!(router_gateway(&x.f.router).is_ok());
     assert_eq!(x.keys().len(), 1);
     assert_eq!(x.keys()[0]["allowed_roles"], json!(["daily"]));
     assert!(x.upstream.entries.lock().unwrap().is_empty());
@@ -1065,7 +1065,7 @@ async fn stale_generation_monitor_cannot_withdraw_replacement_gateway() {
             .await
             .unwrap();
     assert_eq!(x.f.complete(&second).await.result, Some(Outcome::Succeeded));
-    assert!(router_gateway(&x.f.host).is_ok());
+    assert!(router_gateway(&x.f.router).is_ok());
     let mut available = Vec::new();
     for ready in [false, true] {
         let (sender, signal) = watch::channel(!ready);
@@ -1088,7 +1088,7 @@ async fn stale_generation_monitor_cannot_withdraw_replacement_gateway() {
         })
         .await
         .unwrap();
-        available.push(router_gateway(&x.f.host).is_ok());
+        available.push(router_gateway(&x.f.router).is_ok());
     }
     let state = x.f.host.status().await.state;
     x.f.host.shutdown().await.unwrap();
@@ -1356,6 +1356,139 @@ async fn connect_cancel_interrupts_pending_upstream_credential_read() {
     assert_eq!(completed.result, Some(Outcome::Cancelled));
     assert!(x.keys().is_empty());
     x.f.assert_clean();
+}
+
+/// A provisioner whose only observable behavior is the upstream key it returns.
+struct FixedUpstream(&'static str);
+#[async_trait]
+impl Provisioner for FixedUpstream {
+    async fn download(
+        &self,
+        _: &Path,
+        _: &CancellationToken,
+        _: watch::Sender<crate::download::DownloadProgress>,
+    ) -> Result<VerifiedArchive, Code> {
+        Err(Code::NotInstalled)
+    }
+    async fn install(
+        &self,
+        _: &Path,
+        _: &VerifiedArchive,
+        _: &CancellationToken,
+    ) -> Result<InstalledVersion, Code> {
+        Err(Code::NotInstalled)
+    }
+    async fn verify(&self, _: &Installation, _: VerifyMode) -> Result<InstalledVersion, Code> {
+        Err(Code::NotInstalled)
+    }
+    async fn upstream_key(&self) -> Result<Option<ApiKey>, Code> {
+        Ok(Some(ApiKey::new(Zeroizing::new(self.0.into())).unwrap()))
+    }
+    async fn budget(&self, core: Option<u64>) -> Result<SetupBudget, Code> {
+        SystemProvisioner.budget(core).await
+    }
+}
+
+#[tokio::test]
+async fn inputs_reads_the_injected_upstream_key() {
+    use axum::{Json, Router, routing::get};
+    const KEY: &str = "sk-injected-fixed";
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/v1/models",
+            get(|headers: axum::http::HeaderMap| async move {
+                if headers
+                    .get("authorization")
+                    .is_some_and(|v| v == "Bearer sk-injected-fixed")
+                {
+                    (
+                        axum::http::StatusCode::OK,
+                        Json(json!({
+                            "data": [{
+                                "id": "real-model",
+                                "object": "model",
+                                "owned_by": "omlx"
+                            }]
+                        })),
+                    )
+                } else {
+                    (
+                        axum::http::StatusCode::UNAUTHORIZED,
+                        Json(json!({"error": "auth required"})),
+                    )
+                }
+            }),
+        )
+        .route(
+            "/openapi.json",
+            get(|| async {
+                Json(json!({
+                    "openapi": "3.1.0",
+                    "info": {"title": "oMLX API"},
+                    "paths": {
+                        "/v1/models": {"get": {}},
+                        "/health": {"get": {}},
+                        "/api/status": {"get": {}}
+                    }
+                }))
+            }),
+        );
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_owned();
+    let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(MemoryKeychain {
+        locked: AtomicBool::new(false),
+    })));
+    let runtime = Arc::new(SystemRuntime::new(secrets.clone()));
+    let router = Arc::new(ModelRouter::idoris_unavailable("inputs"));
+    let managed =
+        Arc::new(ManagedIdoris::new(router.clone(), root.join("connection.json")).unwrap());
+    let host = IdorisHost::open(root, managed, router, runtime.clone(), secrets).unwrap();
+    let omlx = Arc::new(Store::default());
+    let host = host
+        .with_provisioner(
+            Arc::new(FixedUpstream(KEY)),
+            Arc::new(Store::default()),
+            omlx.clone(),
+        )
+        .unwrap();
+    let mut record = Installation {
+        version: "0.4.0".into(),
+        release_dir: dir.path().join("release"),
+        archive_path: dir.path().join("archive.tar.gz"),
+        components_dir: None,
+        key_id: None,
+        data_port: 9,
+        admin_port: 9,
+        roles: vec![],
+        core_reserved_bytes: Some(0),
+        omlx_url: Some(endpoint),
+        omlx_key_id: None,
+        desired_running: false,
+        verification: None,
+        install_root: None,
+        notarized_verified_at: None,
+    };
+    let inputs = runtime.inputs(&record).await.unwrap();
+    assert_eq!(inputs.omlx_key.as_ref().map(|key| key.as_str()), Some(KEY));
+
+    omlx.put("omlx_saved", KEY).unwrap();
+    let host = host
+        .with_provisioner(
+            Arc::new(FixedUpstream("sk-not-the-injected-key")),
+            Arc::new(Store::default()),
+            omlx,
+        )
+        .unwrap();
+    record.omlx_key_id = Some("omlx_saved".into());
+    let inputs = runtime.inputs(&record).await.unwrap();
+    assert_eq!(inputs.omlx_key.as_ref().map(|key| key.as_str()), Some(KEY));
+    drop(host);
+    server.abort();
 }
 
 #[tokio::test]

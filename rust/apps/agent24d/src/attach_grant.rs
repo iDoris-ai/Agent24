@@ -335,4 +335,50 @@ mod tests {
             }
         }
     }
+
+    /// FU-118: `build` never writes `_a24/scheduler/` or `_a24/approval/` into
+    /// `provides`, so deleting the `ATTACH_OOP_GRANTS` intersection leaves the
+    /// `provides` equality in
+    /// `both_construction_paths_lock_this_implementations_authorization` green.
+    /// The refusal is the handler `methods_for` actually runs. A manifest that
+    /// declares `scheduler` and `approval` must still get `forbidden` here.
+    /// Granting the requested set with no intersection makes this red: the
+    /// handler then gets past the capability check.
+    #[tokio::test]
+    async fn declared_scheduler_and_approval_are_refused_through_methods_for() {
+        let declared = manifest("events, models, memory, scheduler, approval");
+        let calls = [
+            ("_a24/scheduler/list", serde_json::json!({})),
+            (
+                "_a24/scheduler/delete",
+                serde_json::json!({"key": "probe.key"}),
+            ),
+            (
+                "_a24/scheduler/upsert",
+                serde_json::json!({"key": "probe.key", "spec": {"type": "every", "secs": 3600}}),
+            ),
+            (
+                "_a24/approval/status",
+                serde_json::json!({"approval_id": "appr_missing"}),
+            ),
+            (
+                "_a24/approval/advise",
+                serde_json::json!({
+                    "action": "note",
+                    "payload": {},
+                    "request_id": "req-1",
+                    "approval_token": "tok",
+                }),
+            ),
+        ];
+        for (label, with_models) in [("bare", false), ("wired", true)] {
+            let grant = builder(with_models).await.build("agentear", &declared);
+            for (method, params) in &calls {
+                let err = call_granted(&grant, "fu118", method, params.clone())
+                    .await
+                    .expect_err("ATTACH_OOP_GRANTS drops scheduler and approval");
+                assert_forbidden(&format!("{label} {method}"), &err);
+            }
+        }
+    }
 }
