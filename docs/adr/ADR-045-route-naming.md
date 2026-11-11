@@ -146,11 +146,11 @@ N5 的「单数还是复数」无法由机器判断，归评审；其余规则�
 | `/documents/documents/{document_id}/revisions/{revision}/text` | `{revision}` |
 | `/documents/documents/{document_id}/revisions/{revision}/pages/{page}` | `{revision}`、`{page}` |
 
-### 4.4 N10：顶级前缀（冻结的 30 个）
+### 4.4 N10：顶级前缀（31 个）
 
-`approvals`、`attached`、`capabilities`、`chat`、`comm`、`components`、`decide`、`diagnostics`、`documents`、`events`、`health`、`host`、`idoris`、`memory`、`models`、`module-approvals`、`module-consents`、`os`、`peer`、`presence`、`runs`、`schedules`、`sessions`、`shutdown`、`sin90`、`standing-grants`、`timings`、`tool-overrides`、`tools`、`usage`。
+`approvals`、`attached`、`capabilities`、`chat`、`comm`、`components`、`decide`、`diagnostics`、`documents`、`events`、`health`、`host`、`idoris`、`inbound`、`memory`、`models`、`module-approvals`、`module-consents`、`os`、`peer`、`presence`、`runs`、`schedules`、`sessions`、`shutdown`、`sin90`、`standing-grants`、`timings`、`tool-overrides`、`tools`、`usage`。
 
-其中 `capabilities`、`events`、`host`、`presence` 只在代码里、不在 OpenAPI（`server.rs:4120` 起的 `UNDOCUMENTED_KERNEL_ROUTES`）。
+其中 `capabilities`、`events`、`host`、`presence` 只在代码里、不在 OpenAPI（`server.rs:4120` 起的 `UNDOCUMENTED_KERNEL_ROUTES`）。`inbound` 是 X11-2f 按 N10「先改本 ADR」加进白名单的前缀（名单、接受模式、事件列表），写在 OpenAPI 里。
 
 ### 4.5 不进门禁、仅登记的旧写法
 

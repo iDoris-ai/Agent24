@@ -662,6 +662,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-general-category",
+ "unicode-normalization",
  "uuid",
  "zeroize",
 ]

@@ -68,6 +68,9 @@ form_urlencoded = "1"
 sha2 = "0.10"
 # I-1 L1: presence summaries refuse format/separator characters.
 unicode-general-category = "1.1"
+# X11-2f: allowlist `(source, actor)` is NFC-normalized before dedup.
+# Same crate agent24-comm already depends on; not a new workspace dependency.
+unicode-normalization = "0.1"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }

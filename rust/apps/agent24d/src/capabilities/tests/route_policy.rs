@@ -215,6 +215,48 @@ fn section_3_rows_match_operation_and_level() {
         level: AssuranceLevel::Everyday,
     });
 
+    // X11-2f: read and write stay separate operations. One operation at both
+    // levels makes assurance_level() return None.
+    for (method, path, operation, level) in [
+        (
+            "GET",
+            "/inbound/allowlist",
+            "InboundRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "PUT",
+            "/inbound/allowlist",
+            "InboundWrite",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "GET",
+            "/inbound/policy",
+            "InboundRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "PUT",
+            "/inbound/policy",
+            "InboundWrite",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "GET",
+            "/inbound/events",
+            "InboundRead",
+            AssuranceLevel::Everyday,
+        ),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: operation.into(),
+            level,
+        });
+    }
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(
@@ -392,6 +434,22 @@ fn method_splits_shutdown_and_memory_settings() {
     );
     assert_eq!(
         Operation::ApprovalDecision.assurance_level(),
+        Some(AssuranceLevel::Elevated)
+    );
+    assert_eq!(
+        required_operation(&Method::GET, "/api/v1/inbound/events"),
+        Some(Operation::InboundRead)
+    );
+    assert_eq!(
+        required_operation(&Method::PUT, "/api/v1/inbound/allowlist"),
+        Some(Operation::InboundWrite)
+    );
+    assert_eq!(
+        Operation::InboundRead.assurance_level(),
+        Some(AssuranceLevel::Everyday)
+    );
+    assert_eq!(
+        Operation::InboundWrite.assurance_level(),
         Some(AssuranceLevel::Elevated)
     );
 }

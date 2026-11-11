@@ -77,6 +77,12 @@ tags:
       with provenance, retract one, and the persistent pause switch. Personal
       space only; `owner` is injected by the daemon from session identity and
       is never a request parameter.
+  - name: inbound
+    description: >-
+      X11-2f: who may start a run from an external message, the stored accept
+      mode, and the inbound event list. Writes are ProductHost only. The list
+      returns metadata and the first 50 characters of the body. It is not
+      pushed on the WebSocket events stream.
   - name: sin90
     description: The Sin90 Personal-OS module (own store; degrades independently).
   - name: documents
@@ -2190,6 +2196,177 @@ paths:
                 $ref: "#/components/schemas/Error"
         "503":
           description: Personal memory is not available on this daemon
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /inbound/allowlist:
+    get:
+      operationId: getInboundAllowlist
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Read the inbound allowlist
+      description: >-
+        Everyday read. Returns every `(source, actor)` the host has stored,
+        plus `policy_version`. An empty list is `entries: []`. An unknown
+        query parameter is 400.
+      responses:
+        "200":
+          description: The stored allowlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundAllowlist"
+        "400":
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      operationId: putInboundAllowlist
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Replace the inbound allowlist
+      description: >-
+        ProductHost only. Legacy mode and every other audience get 403.
+        Last writer wins: the body replaces the whole list. There is no
+        `expected_policy_version`, and this round does not do optimistic
+        concurrency. A `(source, actor)` that is already stored keeps its
+        `added_at`; a new pair is stamped by the daemon. A repeated
+        `(source, actor)` in one body is 400. `scheduler` and `self` are
+        not allowlist sources.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboundAllowlistWrite"
+      responses:
+        "200":
+          description: The stored allowlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundAllowlist"
+        "400":
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not the desktop ProductHost credential
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /inbound/policy:
+    get:
+      operationId: getInboundPolicy
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Read the inbound accept mode
+      description: >-
+        Everyday read. No stored row yet answers `accept_mode: observe` and
+        `updated_at: null`. `policy_version` is the admit hash. It changes
+        when the mode or the allowlist changes, and it does not depend on
+        `updated_at`. An unknown query parameter is 400.
+      responses:
+        "200":
+          description: The stored accept mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundPolicy"
+        "400":
+          description: Unknown query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      operationId: putInboundPolicy
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Set the inbound accept mode
+      description: >-
+        ProductHost only. Legacy mode and every other audience get 403.
+        Last writer wins: there is no `expected_policy_version`, and this
+        round does not do optimistic concurrency. `accept_mode` is stored
+        and is not consulted by admission in this milestone.
+        `policy_version` changes when the stored mode changes, and stays
+        the same when the same mode is written again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboundPolicyWrite"
+      responses:
+        "200":
+          description: The stored accept mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundPolicy"
+        "400":
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not the desktop ProductHost credential
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /inbound/events:
+    get:
+      operationId: listInboundEvents
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: List inbound events without the full body
+      description: >-
+        Everyday read. Newest `at` first, then `id`. Each item is metadata
+        plus `text_preview`, the first 50 characters of `text`. The full body
+        and `meta` are not returned. This list is not pushed on
+        `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above
+        100 are 400. `before_at` and `before_id` page backward and must be
+        sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`. An unknown
+        query parameter, including a misspelled `limit`, is 400.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: before_at
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: before_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of inbound event metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundEventPage"
+        "400":
+          description: Invalid query
           content:
             application/json:
               schema:
@@ -6350,6 +6527,142 @@ components:
             The persistent personal-memory switch. `false` stops new writes
             and cross-session recall; existing assertions are kept, and the
             setting survives a daemon restart.
+
+    InboundAllowEntry:
+      type: object
+      required: [source, actor, added_at]
+      properties:
+        source:
+          type: string
+          enum: [hyphae, wechat, remote]
+          description: >-
+            External sources that go through admission. `scheduler` and
+            `self` are not allowlist sources.
+        actor:
+          type: string
+        added_at:
+          type: string
+          description: >-
+            UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`. Kept when the same
+            `(source, actor)` is written again. A new pair is stamped at
+            that write.
+        note:
+          type: [string, "null"]
+    InboundAllowlist:
+      type: object
+      required: [entries, policy_version]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboundAllowEntry"
+        policy_version:
+          type: string
+          description: >-
+            Admit hash: sha256 of the sorted allowlist, the accept mode, and
+            the admit rule version. 64 lowercase hex digits. It does not
+            depend on `updated_at`.
+    InboundAllowlistWrite:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            required: [source, actor]
+            additionalProperties: false
+            properties:
+              source:
+                type: string
+                enum: [hyphae, wechat, remote]
+              actor:
+                type: string
+              note:
+                type: [string, "null"]
+    InboundPolicy:
+      type: object
+      required: [accept_mode, policy_version]
+      properties:
+        accept_mode:
+          type: string
+          enum: [off, observe, auto]
+        updated_at:
+          type: [string, "null"]
+          description: Null until the first write.
+        policy_version:
+          type: string
+    InboundPolicyWrite:
+      type: object
+      required: [accept_mode]
+      properties:
+        accept_mode:
+          type: string
+          enum: [off, observe, auto]
+    InboundEventSummary:
+      type: object
+      required:
+        - id
+        - source
+        - category
+        - human
+        - addressed
+        - at
+        - received_at
+        - disposition
+      properties:
+        id:
+          type: string
+        source:
+          type: string
+        category:
+          type: string
+        recipient_identity:
+          type: [string, "null"]
+        thread_key:
+          type: [string, "null"]
+        actor:
+          type: [string, "null"]
+        human:
+          type: boolean
+        addressed:
+          type: string
+          enum: [none, mention, direct]
+        at:
+          type: string
+        received_at:
+          type: string
+        text_preview:
+          type: [string, "null"]
+          description: First 50 characters of the body, or null when the body is gone.
+        text_scrubbed_at:
+          type: [string, "null"]
+        disposition:
+          type: string
+        disposition_reason:
+          type: [string, "null"]
+        policy_version:
+          type: [string, "null"]
+        run_state:
+          type: [string, "null"]
+    InboundEventPage:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboundEventSummary"
+        next:
+          type: [object, "null"]
+          required: [before_at, before_id]
+          properties:
+            before_at:
+              type: string
+            before_id:
+              type: string
+          description: Present when another older page exists. Send both values back as query parameters.
 
     ErrorBody:
       type: object

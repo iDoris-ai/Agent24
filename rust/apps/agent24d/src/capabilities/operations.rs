@@ -53,6 +53,12 @@ pub enum Operation {
     // allowlist; report is the desktop's (ProductHost only, enforced at the route).
     ComponentsRead,
     ComponentsReport,
+    // X11-2f: inbound allowlist / policy / event list. Read and write are
+    // separate so `assurance_level()` stays a single level. One operation
+    // used at both Everyday and Elevated returns None and the elevation
+    // check never fires.
+    InboundRead,
+    InboundWrite,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +146,8 @@ impl Operation {
             Self::DiagnosticRead => "diagnostic.read",
             Self::ComponentsRead => "components.read",
             Self::ComponentsReport => "components.report",
+            Self::InboundRead => "inbound.read",
+            Self::InboundWrite => "inbound.write",
         }
     }
 
@@ -190,6 +198,8 @@ impl Operation {
             "diagnostic.read" => Self::DiagnosticRead,
             "components.read" => Self::ComponentsRead,
             "components.report" => Self::ComponentsReport,
+            "inbound.read" => Self::InboundRead,
+            "inbound.write" => Self::InboundWrite,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,

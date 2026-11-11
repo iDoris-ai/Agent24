@@ -628,8 +628,12 @@ impl Store {
     /// Replace the allowlist in one transaction and return that transaction's
     /// view (the rows just written, plus the mode already stored).
     ///
-    /// An empty slice clears the table. `added_at` is the caller's
-    /// [`format_inbound_timestamp`], the same stamp on every inserted row.
+    /// Last writer wins. The caller does not pass `expected_policy_version`,
+    /// and this round does not do optimistic concurrency. An empty slice
+    /// clears the table. `added_at` is the caller's
+    /// [`format_inbound_timestamp`] for a `(source, actor)` that was not
+    /// already stored. A pair that survives keeps the `added_at` it had;
+    /// the note is the one in this write.
     ///
     /// # Errors
     /// Storage, or an `added_at` that is not [`format_inbound_timestamp`].
@@ -640,17 +644,27 @@ impl Store {
     ) -> Result<InboundAdmissionView> {
         require_inbound_timestamp("added_at", added_at)?;
         let mut tx = self.pool().begin().await?;
+        let existing = sqlx::query("SELECT source, actor, added_at FROM inbound_allowlist")
+            .fetch_all(&mut *tx)
+            .await?;
+        let mut kept_at = std::collections::HashMap::<(String, String), String>::new();
+        for row in existing {
+            kept_at.insert((row.get("source"), row.get("actor")), row.get("added_at"));
+        }
         sqlx::query("DELETE FROM inbound_allowlist")
             .execute(&mut *tx)
             .await?;
         for entry in entries {
+            let stamp = kept_at
+                .get(&(entry.source.clone(), entry.actor.clone()))
+                .map_or(added_at, String::as_str);
             sqlx::query(
                 "INSERT INTO inbound_allowlist (source, actor, added_at, note) \
                  VALUES (?, ?, ?, ?)",
             )
             .bind(&entry.source)
             .bind(&entry.actor)
-            .bind(added_at)
+            .bind(stamp)
             .bind(&entry.note)
             .execute(&mut *tx)
             .await?;
@@ -773,7 +787,9 @@ pub struct InboundAllowEntry {
     pub note: Option<String>,
 }
 
-/// A row the allowlist replace writes. `added_at` is supplied once for the batch.
+/// A row the allowlist replace writes. A new `(source, actor)` is stamped
+/// with the `added_at` passed to [`Store::replace_inbound_allowlist`]. A pair
+/// that is already stored keeps its old stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundAllowWrite {
     pub source: String,
@@ -2108,7 +2124,11 @@ mod tests {
         }
         let page = store.list_inbound_event_summaries(2, None).await.unwrap();
         assert_eq!(page.len(), 1);
+        // `substr(text, 1, 50)` is what caps this. The route clips again,
+        // but this call does not go through it. Changing the `50` (or
+        // dropping the `substr`) turns the equality red.
         let preview = page[0].text_preview.as_deref().unwrap();
+        assert_eq!(preview, "你".repeat(50));
         assert_eq!(preview.chars().count(), 50);
         assert!(!preview.contains("SECRET-TAIL"));
         let stored = store
@@ -2118,5 +2138,203 @@ mod tests {
             .unwrap();
         assert!(stored.text.unwrap().contains("SECRET-TAIL"));
         assert_eq!(stored.meta.as_deref(), Some("META-SECRET"));
+    }
+
+    /// Three rows share `at`. Page size 2, then the cursor of the last row.
+    /// Changing `id < ?2` to `id <= ?2` repeats that cursor row on the next
+    /// page and this test goes red.
+    #[tokio::test]
+    async fn event_page_with_tied_at_follows_the_cursor_without_repeat_or_gap() {
+        let store = Store::open_memory().await.unwrap();
+        let at = "2026-11-11T02:00:00Z";
+        for id in ["id-a", "id-c", "id-b"] {
+            let mut event = sample(id, id, "ignore", None);
+            event.at = at.to_owned();
+            event.text = Some(format!("body-{id}"));
+            assert_eq!(
+                store.insert_inbound_event(&event).await.unwrap(),
+                InboundInsert::Inserted
+            );
+        }
+        let page1 = store.list_inbound_event_summaries(2, None).await.unwrap();
+        let ids1: Vec<&str> = page1.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids1, ["id-c", "id-b"]);
+        let cursor = page1.last().unwrap();
+        let page2 = store
+            .list_inbound_event_summaries(2, Some((cursor.at.as_str(), cursor.id.as_str())))
+            .await
+            .unwrap();
+        let ids2: Vec<&str> = page2.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids2, ["id-a"]);
+        let mut seen = Vec::new();
+        seen.extend(ids1);
+        seen.extend(ids2);
+        seen.sort_unstable();
+        assert_eq!(seen, ["id-a", "id-b", "id-c"]);
+        let tail = page2.last().unwrap();
+        let page3 = store
+            .list_inbound_event_summaries(2, Some((tail.at.as_str(), tail.id.as_str())))
+            .await
+            .unwrap();
+        assert!(page3.is_empty());
+    }
+
+    /// A repeated `(source, actor)` in one replace fails the primary key
+    /// inside the same transaction. Committing the `DELETE` before the
+    /// inserts drops the old row and this test goes red.
+    #[tokio::test]
+    async fn a_duplicate_allowlist_entry_rolls_back_the_whole_replace() {
+        let store = Store::open_memory().await.unwrap();
+        let stamp = "2026-11-11T03:00:00Z";
+        store
+            .replace_inbound_allowlist(
+                &[InboundAllowWrite {
+                    source: "hyphae".into(),
+                    actor: "npub-keep".into(),
+                    note: Some("desk".into()),
+                }],
+                stamp,
+            )
+            .await
+            .unwrap();
+        let rejected = store
+            .replace_inbound_allowlist(
+                &[
+                    InboundAllowWrite {
+                        source: "wechat".into(),
+                        actor: "uid-new".into(),
+                        note: None,
+                    },
+                    InboundAllowWrite {
+                        source: "wechat".into(),
+                        actor: "uid-new".into(),
+                        note: Some("dup".into()),
+                    },
+                ],
+                "2026-11-11T03:00:01Z",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(rejected, StoreError::Sqlx(_)), "{rejected:?}");
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "hyphae");
+        assert_eq!(listed[0].actor, "npub-keep");
+        assert_eq!(listed[0].note.as_deref(), Some("desk"));
+        assert_eq!(listed[0].added_at, stamp);
+    }
+
+    /// A `(source, actor)` that is written again keeps its original
+    /// `added_at`. A new pair gets the stamp of this replace. Stamping
+    /// every inserted row with the new time turns the kept assertion red.
+    #[tokio::test]
+    async fn replace_keeps_added_at_for_a_source_actor_that_survives() {
+        let store = Store::open_memory().await.unwrap();
+        let first = "2026-11-11T01:00:00Z";
+        let second = "2026-11-11T02:00:00Z";
+        store
+            .replace_inbound_allowlist(
+                &[
+                    InboundAllowWrite {
+                        source: "hyphae".into(),
+                        actor: "npub-keep".into(),
+                        note: Some("old".into()),
+                    },
+                    InboundAllowWrite {
+                        source: "wechat".into(),
+                        actor: "uid-drop".into(),
+                        note: None,
+                    },
+                ],
+                first,
+            )
+            .await
+            .unwrap();
+        let replaced = store
+            .replace_inbound_allowlist(
+                &[
+                    InboundAllowWrite {
+                        source: "remote".into(),
+                        actor: "host-new".into(),
+                        note: None,
+                    },
+                    InboundAllowWrite {
+                        source: "hyphae".into(),
+                        actor: "npub-keep".into(),
+                        note: Some("new".into()),
+                    },
+                ],
+                second,
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.entries.len(), 2);
+        let keep = replaced
+            .entries
+            .iter()
+            .find(|entry| entry.actor == "npub-keep")
+            .unwrap();
+        assert_eq!(keep.added_at, first);
+        assert_eq!(keep.note.as_deref(), Some("new"));
+        let fresh = replaced
+            .entries
+            .iter()
+            .find(|entry| entry.actor == "host-new")
+            .unwrap();
+        assert_eq!(fresh.added_at, second);
+        assert_eq!(fresh.source, "remote");
+        assert!(
+            replaced
+                .entries
+                .iter()
+                .all(|entry| entry.actor != "uid-drop")
+        );
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert_eq!(listed, replaced.entries);
+    }
+
+    /// `substr` of NULL is NULL in SQLite, so deleting the `CASE` stays
+    /// green. Changing `THEN NULL` to `THEN ''` makes the preview `Some("")`
+    /// and this test goes red.
+    #[tokio::test]
+    async fn a_scrubbed_body_has_a_null_preview() {
+        let store = Store::open_memory().await.unwrap();
+        let mut scrubbed = sample("hyphae:scrub", "npub1", "ignore", None);
+        scrubbed.text = Some("visible-body".into());
+        scrubbed.meta = Some("visible-meta".into());
+        scrubbed.received_at = "2026-11-01T00:00:00Z".into();
+        assert_eq!(
+            store.insert_inbound_event(&scrubbed).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let mut live = sample("hyphae:live", "npub2", "ignore", None);
+        live.text = Some("still-here".into());
+        live.received_at = "2026-11-11T03:00:00Z".into();
+        assert_eq!(
+            store.insert_inbound_event(&live).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let cleared = store
+            .scrub_expired_inbound_text("2026-11-10T00:00:00Z", "2026-11-11T04:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(cleared, 1);
+        let page = store.list_inbound_event_summaries(10, None).await.unwrap();
+        let scrubbed_row = page.iter().find(|row| row.id == "hyphae:scrub").unwrap();
+        assert!(scrubbed_row.text_preview.is_none(), "{scrubbed_row:?}");
+        assert_eq!(
+            scrubbed_row.text_scrubbed_at.as_deref(),
+            Some("2026-11-11T04:00:00Z")
+        );
+        let live_row = page.iter().find(|row| row.id == "hyphae:live").unwrap();
+        assert_eq!(live_row.text_preview.as_deref(), Some("still-here"));
+        assert!(live_row.text_scrubbed_at.is_none());
+        let stored = store
+            .get_inbound_event("hyphae:scrub")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.text.is_none());
+        assert!(stored.meta.is_none());
     }
 }

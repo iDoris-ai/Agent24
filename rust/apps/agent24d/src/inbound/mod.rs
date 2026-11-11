@@ -1,9 +1,16 @@
-//! Inbound admission, daemon side. This file only lists submodules; each one
-//! owns its own piece (X11-2b/2c/2d/2f).
+//! Inbound HTTP surface (X11-2f), admission (X11-2b) and text expiry (X11-2d).
+//!
+//! `admit` is the pure policy hash and the §3.3 table. `routes` serves HTTP.
+//! X11-2c wires `admit` into the event path. `policy_version` is already
+//! called from `routes`. Items that only the table uses carry
+//! `cfg_attr(not(test), expect(dead_code))`: the bin does not call them yet,
+//! and the admit tests do, so a module-level expect is unfulfilled there.
 
-#[expect(dead_code, reason = "X11-2c 接线")]
 mod admit;
 mod maintenance;
+mod routes;
+
+pub(crate) use routes::{get_allowlist, get_events, get_policy, put_allowlist, put_policy};
 
 use agent24_agent::RunManager;
 use agent24_store::Store;
