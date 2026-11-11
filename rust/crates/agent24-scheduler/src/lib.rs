@@ -676,28 +676,27 @@ impl Scheduler {
             trigger: FireTrigger::RunNow,
             target: InvocationTarget::AgentRun(action),
         };
+        // Before trigger: the row records that this planned fire came due.
+        // A trigger failure leaves it in place.
+        self.note_internal_inbound(&schedule.id, &invocation).await;
         let outcome = self.trigger.trigger(&invocation).await;
         match agent_run_result(outcome) {
-            Ok(run_id) => {
-                self.note_internal_inbound(&schedule.id, &invocation, &run_id)
-                    .await;
-                Ok(RunNowOutcome::Run { run_id })
-            }
+            Ok(run_id) => Ok(RunNowOutcome::Run { run_id }),
             Err(err) => Err(ScheduleError::Invalid(err)),
         }
     }
 
-    /// One record row beside a schedule or self-wake run (X11-2a, §3).
+    /// One record row beside a schedule or self-wake fire (X11-2a, §3).
+    /// Written before `trigger`. It records that this planned fire came due,
+    /// and it stays when the trigger fails — it does not mean a run started.
     /// `schedule_source_origin` marks a self-wake (`source = self`); a user
-    /// schedule has no such row (`source = scheduler`). A store failure is
-    /// logged and does not change the fire. Module deliveries do not start
-    /// an agent run, so they are not recorded here.
-    async fn note_internal_inbound(
-        &self,
-        schedule_id: &str,
-        invocation: &ScheduleInvocation,
-        run_id: &str,
-    ) {
+    /// schedule has no such row (`source = scheduler`). The id is
+    /// `{source}:{schedule_id}:{scheduled_for}`, with `scheduled_for` from
+    /// [`agent24_store::format_inbound_timestamp`]. A retry of the same
+    /// planned fire collides on that id and comes back `Duplicate`: no second
+    /// row. A store failure is logged and does not change the fire. Module
+    /// deliveries do not start an agent run, so they are not recorded here.
+    async fn note_internal_inbound(&self, schedule_id: &str, invocation: &ScheduleInvocation) {
         let InvocationTarget::AgentRun(agent24_protocol::ScheduleAction::AgentRun {
             prompt, ..
         }) = &invocation.target
@@ -709,13 +708,14 @@ impl Scheduler {
             Ok(None) => "scheduler",
             Err(err) => {
                 tracing::warn!(
-                    "schedule {schedule_id} inbound source lookup failed: {err}; run {run_id} still started"
+                    "schedule {schedule_id} inbound source lookup failed: {err}; the fire continues"
                 );
                 return;
             }
         };
+        let scheduled_for = agent24_store::format_inbound_timestamp(invocation.scheduled_for);
         let event = agent24_store::NewInboundEvent {
-            id: format!("{source}:{run_id}"),
+            id: format!("{source}:{schedule_id}:{scheduled_for}"),
             source: source.to_owned(),
             category: "internal".to_owned(),
             recipient_identity: None,
@@ -723,7 +723,7 @@ impl Scheduler {
             actor: Some(schedule_id.to_owned()),
             human: false,
             addressed: "none".to_owned(),
-            at: agent24_store::format_inbound_timestamp(invocation.scheduled_for),
+            at: scheduled_for,
             received_at: agent24_store::format_inbound_timestamp(invocation.fired_at),
             text: Some(prompt.clone()),
             meta: None,
@@ -734,7 +734,7 @@ impl Scheduler {
         };
         if let Err(err) = self.store.insert_inbound_event(&event).await {
             tracing::warn!(
-                "schedule {schedule_id} inbound record failed: {err}; run {run_id} still started"
+                "schedule {schedule_id} inbound record failed: {err}; the fire continues"
             );
         }
     }
@@ -948,10 +948,11 @@ impl Scheduler {
             trigger: FireTrigger::Tick,
             target: InvocationTarget::AgentRun(action),
         };
+        // Before trigger, same as `run_now`: a failed trigger still keeps
+        // the row, and a retry of this slot collides on its id.
+        self.note_internal_inbound(&schedule.id, &invocation).await;
         match agent_run_result(self.trigger.trigger(&invocation).await) {
             Ok(run_id) => {
-                self.note_internal_inbound(&schedule.id, &invocation, &run_id)
-                    .await;
                 if schedule.consecutive_failures != 0 {
                     // The row's next_run_at/last_run_at were just set by the
                     // pre-advance above — that is what this CAS must pin. A
@@ -1705,7 +1706,10 @@ mod tests {
         assert_eq!(user_row.text.as_deref(), Some("do it"));
         assert_eq!(user_row.at, "2026-07-24T10:01:00Z");
         assert_eq!(user_row.received_at, "2026-07-24T10:01:05Z");
-        assert!(user_row.id.starts_with("scheduler:run_"), "{}", user_row.id);
+        assert_eq!(
+            user_row.id,
+            format!("scheduler:{}:2026-07-24T10:01:00Z", user.id)
+        );
 
         let wake_id: String = sqlx::query_scalar("SELECT id FROM inbound_events WHERE actor = ?")
             .bind(&wake.id)
@@ -1715,21 +1719,62 @@ mod tests {
         let wake_row = store.get_inbound_event(&wake_id).await.unwrap().unwrap();
         assert_eq!(wake_row.source, "self");
         assert_eq!(wake_row.disposition, "internal");
-        assert!(wake_row.id.starts_with("self:run_"), "{}", wake_row.id);
+        assert_eq!(
+            wake_row.id,
+            format!("self:{}:2026-07-24T10:01:00Z", wake.id)
+        );
     }
 
     #[tokio::test]
-    async fn a_failed_schedule_trigger_writes_no_inbound_row() {
+    async fn a_failed_schedule_trigger_still_writes_an_internal_row() {
         let trig = RecordingTrigger::always_failing();
         let (sched, _events, store) =
             scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
-        sched
+        let created = sched
             .create(every_create(60), utc("2026-07-24T10:00:00Z"))
             .await
             .unwrap();
         assert_eq!(sched.tick(utc("2026-07-24T10:01:05Z")).await.unwrap(), 1);
         assert_eq!(trig.count(), 0);
-        assert_eq!(inbound_count(&store).await, 0);
+        assert_eq!(inbound_count(&store).await, 1);
+        let row = store
+            .get_inbound_event(&format!("scheduler:{}:2026-07-24T10:01:00Z", created.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.category, "internal");
+        assert_eq!(row.disposition, "internal");
+    }
+
+    #[tokio::test]
+    async fn the_same_scheduled_for_fires_twice_and_records_one_inbound_row() {
+        // A retry of the same planned slot collides on the inbound id
+        // (`Duplicate`) and must not add a second row.
+        let trig = RecordingTrigger::new();
+        let (sched, _events, store) =
+            scheduler_with(Arc::clone(&trig) as Arc<dyn RunTrigger>).await;
+        let created = sched
+            .create(every_create(60), utc("2026-07-24T10:00:00Z"))
+            .await
+            .unwrap();
+        let now = utc("2026-07-24T10:01:05Z");
+        assert_eq!(sched.tick(now).await.unwrap(), 1);
+        sqlx::query("UPDATE schedules SET next_run_at = ? WHERE id = ?")
+            .bind("2026-07-24T10:01:00Z")
+            .bind(&created.id)
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(sched.tick(now).await.unwrap(), 1);
+        assert_eq!(trig.count(), 2);
+        assert_eq!(inbound_count(&store).await, 1);
+        let row = store
+            .get_inbound_event(&format!("scheduler:{}:2026-07-24T10:01:00Z", created.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.disposition, "internal");
+        assert_eq!(row.at, "2026-07-24T10:01:00Z");
     }
 
     #[tokio::test]
@@ -1772,9 +1817,10 @@ mod tests {
         let RunNowOutcome::Run { run_id } = outcome else {
             panic!("a user schedule run_now starts a run");
         };
+        assert!(run_id.starts_with("run_"), "{run_id}");
         assert_eq!(trig.count(), 1);
         let row = store
-            .get_inbound_event(&format!("scheduler:{run_id}"))
+            .get_inbound_event(&format!("scheduler:{}:2026-07-24T12:00:00Z", created.id))
             .await
             .unwrap()
             .unwrap();

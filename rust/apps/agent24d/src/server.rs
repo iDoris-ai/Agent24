@@ -7193,7 +7193,7 @@ pub fn build_router_with_modules() {
         assert_eq!(started.len(), 1);
         assert_eq!(started[0].schedule_id.as_deref(), Some(created.id.as_str()));
         let row = store
-            .get_inbound_event(&format!("scheduler:{}", started[0].id))
+            .get_inbound_event(&format!("scheduler:{}:2026-07-24T10:01:00Z", created.id))
             .await
             .unwrap()
             .unwrap();
