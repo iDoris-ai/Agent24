@@ -65,9 +65,8 @@ AGENT24_DATA_DIR=/tmp/a24-x agent24 daemon status
 
 - 隔离实例**看不到原数据**：会话、记忆、已装模块、`attach` 注册都在新目录里从零开始；原 `~/.agent24` 不会被迁移、复制或删除。
 - 还有少数调用点没有跟随这个开关，会继续读写原 `~/.agent24`（因此覆盖目录**不是**完整隔离）：
-  桌面端的 Open Design 组件（`apps/desktop/src/main/open-design-component.ts`，`~/.agent24/components`），
-  以及 `nostr-bridge` / `wechat-bridge` 的 `daemon.json` 与 token（`packages/*/src/config.ts`）——
-  它们会去连原始数据目录里的那个 daemon。
+  桌面端的 Open Design 组件（`apps/desktop/src/main/open-design-component.ts`，`~/.agent24/components`）。
+  微信开发工具的 `daemon.json` 与 token 已通过共享 data-dir 跟随覆盖目录；旧 `nostr-bridge` 已移除，见 ADR-044 X7。
 - 两个数据目录各有自己的 daemon 单例锁和 `daemon.json`，可以同时运行（端口由各自 daemon 决定）；
   但 CLI / 桌面端只会连上与自己 `AGENT24_DATA_DIR` 相同的那个 daemon。
 - 想回到原数据，去掉这个变量重新启动即可；不需要也不应手动搬动 `agent24.db`。

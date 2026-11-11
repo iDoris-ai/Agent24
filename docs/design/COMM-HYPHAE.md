@@ -376,14 +376,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 | T2 zero-run（进程内） | `agent24-comm` | 假二进制在 `history inbox` / `storage outbox list` 中返回六类样本；假 daemon 每 100 ms 打一行日志。**计数后端**：照 `me4_model_blackbox.rs` 的做法，起一个计数 HTTP stub（Python `http.server`，找不到 python3 时测试直接失败，不跳过），并把 `OLLAMA_URL`、`OPENAI_BASE_URL`、`A24_BASE_URL` 都指向它。启动 daemon、各读接口轮询 20 次、stop 之后，断言 stub 请求数为 0 |
 | T3 正对照与真实二进制黑盒 | `apps/agent24d/tests/comm_blackbox.rs` | 运行真实 agent24d，模型后端用同一个计数 stub。(a) 对 F4b 实际使用的 HTTP 路径（`POST /api/v1/sessions` 加 `POST /api/v1/runs`）发一条 plain 消息，断言 stub 请求数 ≥1，且 `GET /api/v1/runs` 条数加 1；**正对照为 0 则整个测试判失败**。(b) `A24_HYPHAE_BIN` 指向 CI 按 lock 构建出的真实 linux-x64 二进制，再起一个 `hyphae-relay`、一个对端 Hyphae：对端向 A 发送六类样本，A 收齐后断言 runs 条数加 0、stub 请求数为 0 |
 
-**F4b 冻结**（H5，COMM-5a）：
-- **只拦截分派这一步**：在 `InboundBridge.handle` 开头检查 `A24_NOSTR_F4B_INBOUND=1`，未设置就直接返回，不调用 `runToCompletion`。`pollOnce` 的轮询和 `liveness.observe` 照常运行，否则 FU-32 的 canary 永远无法被确认。
-- **迁移提示**：启动时如果配置了 `A24_NOSTR_ALLOWED_NPUBS` 却没设 flag，打印一条醒目 warn：「F4b 入站执行已冻结（默认关闭）。已授权的 N 个对端消息将只被读取、不执行；如需旧行为请设置 A24_NOSTR_F4B_INBOUND=1」。
-- **测试**：`inbound.test.ts` 用 spy 替换 `runToCompletion`：
-  - 默认配置下，已授权消息使 spy 计数为 0，canary 仍被 `observe` 确认；
-  - 设置 flag 后，spy 计数为 1（正对照）。
-- **文档改动列为 COMM-5a 的实现内容**：`CHANGELOG.md`、`docs/SOAK-F5.md`（soak 若要验证入站执行，需加 flag）、`docs/specs/F4-nostr-channel.md`（§F4b 标注冻结）。
-- **单一消费者**：COMM 不消费入站。F4b 开启时它是唯一的执行消费者。
+**F4b 已移除**（2026-11-10）：旧 `nostr-bridge` 及其入站执行开关已删除，见 ADR-044 X7。Nostr 身份由 comm 管理，入站执行将在 ADR-041a 准入里程碑重做，不再提供旧桥启动或解冻步骤。
 
 ## 8. 任务表
 

@@ -526,30 +526,137 @@ mod tests {
 
     /// The hook sits behind the guard switch, after the lock and the signal
     /// handlers, and before every business start `serve` makes.
+    ///
+    /// S2-1 moved those starts into `serve_steps`. The order is the call order
+    /// in `serve` plus the original text inside each step. Steps `serve` calls
+    /// before `pre_start` are read back out of that call text — not a fixed
+    /// list — and their bodies, comments stripped, must not contain a business
+    /// start the original `serve` scan required to sit after the hook.
     #[test]
     fn serve_hook_precedes_every_business_start() {
-        let src = include_str!("server.rs");
-        let serve = &src[src.find("pub async fn serve(").unwrap()..];
-        let at = |needle: &str| serve.find(needle).unwrap_or_else(|| panic!("{needle}"));
-        let hook = at("docked_startup::pre_start(");
+        let server = include_str!("server.rs");
+        let steps = include_str!("serve_steps.rs");
+        let serve = &server[server.find("pub async fn serve(").unwrap()..];
+        let serve = &serve[..serve.find("\n}\n").unwrap()];
+        let at = |hay: &str, needle: &str| hay.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let hook = at(serve, "docked_startup::pre_start(");
         assert!(serve[hook..hook + 120].contains("guard_enabled()"));
-        assert!(at("signal(SignalKind::terminate())") < hook);
-        assert!(at("try_acquire_singleton()") < hook);
-        for business in [
+        let mut prev = 0;
+        for call in [
+            "install_shutdown_controller(",
+            "acquire_singleton(",
+            "docked_startup::pre_start(",
+            "open_store_workspace_and_idoris(",
+            "open_guardian_and_memory(",
+            "discover_packages(",
+            "recover_durable_runs(",
+            "bind_loopback(",
+            "build_router_with_modules(",
+        ] {
+            let i = at(serve, call);
+            assert!(prev < i, "{call} must follow the previous startup step");
+            prev = i;
+        }
+        let body = |name: &str| {
+            let marker = format!("fn {name}(");
+            let start = steps.find(&marker).unwrap_or_else(|| panic!("{name}"));
+            let rest = &steps[start..];
+            &rest[..rest.find("\n}\n").unwrap_or_else(|| panic!("{name} end"))]
+        };
+        assert!(body("install_shutdown_controller").contains("signal(SignalKind::terminate())"));
+        assert!(body("acquire_singleton").contains("try_acquire_singleton()"));
+        let open = body("open_store_workspace_and_idoris");
+        let store_at = at(open, "Store::open(&dir.join");
+        let snap_at = at(open, "spawn_startup_snapshot");
+        let managed_at = at(open, "ManagedIdoris::new(");
+        let restore_host = at(open, "host.restore().await");
+        assert!(snap_at < store_at && store_at < managed_at && managed_at < restore_host);
+        assert!(body("open_guardian_and_memory").contains("open_memory_base(ephemeral)"));
+        let discovered = body("discover_packages");
+        assert!(
+            at(discovered, "os_signature_policy()") < at(discovered, "with_discovered_policy(")
+        );
+        let recover = body("recover_durable_runs");
+        let restore_at = at(recover, "restore_pending_approvals");
+        let orphans_at = at(recover, "sweep_orphan_runs");
+        let scan_at = at(recover, ".spawn_scan(");
+        assert!(restore_at < orphans_at && orphans_at < scan_at);
+        assert!(body("bind_loopback").contains("TcpListener::bind"));
+
+        // The original `serve` scan: each of these had to occur after
+        // `pre_start(`. A step that now runs before the hook must not have
+        // absorbed one. Names come from calls in `serve` before the hook
+        // (`serve_steps::xxx(` or a bare `xxx(` that is a step), in order.
+        let business = [
             "Store::open(&dir.join",
             "spawn_startup_snapshot",
             "ManagedIdoris::new(",
             "host.restore().await",
             "open_memory_base(ephemeral)",
-            "with_discovered(Vec::new()",
+            "with_discovered_policy(",
+            "os_signature_policy()",
             "restore_pending_approvals",
             "sweep_orphan_runs",
             ".spawn_scan(",
             "TcpListener::bind",
             "build_router_with_modules(",
-        ] {
-            assert!(hook < at(business), "{business} must come after the hook");
+        ];
+        let strip = |src: &str| -> String {
+            src.lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let before = strip(&serve[..hook]);
+        let mut pre_hook = Vec::new();
+        let mut prefixed_calls = 0usize;
+        let mut rest = before.as_str();
+        while let Some(paren) = rest.find('(') {
+            let head = &rest[..paren];
+            let start = head
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            let name = &head[start..];
+            let prefixed = head[..start].ends_with("serve_steps::");
+            let defined = !name.is_empty() && steps.contains(&format!("fn {name}("));
+            if prefixed {
+                prefixed_calls += 1;
+                assert!(
+                    defined,
+                    "serve() calls serve_steps::{name} before the hook, but serve_steps.rs has no such function"
+                );
+            }
+            if defined && !pre_hook.iter().any(|seen: &String| seen == name) {
+                pre_hook.push(name.to_string());
+            }
+            rest = &rest[paren + 1..];
         }
+        assert_eq!(
+            prefixed_calls,
+            before.matches("serve_steps::").count(),
+            "every serve_steps:: call before the hook must be scanned"
+        );
+        assert!(
+            !pre_hook.is_empty(),
+            "serve() must call at least one step before the hook"
+        );
+        for name in &pre_hook {
+            let code = strip(body(name));
+            for marker in business {
+                assert!(
+                    !code.contains(marker),
+                    "{name} runs before the hook and must not contain `{marker}`"
+                );
+            }
+        }
+        for marker in business {
+            assert!(
+                !before.contains(marker),
+                "serve() itself must not reach `{marker}` before the hook"
+            );
+        }
+
         // `guard_enabled` is the coordinator switch, nothing else.
         let g = &include_str!("docked_startup.rs");
         assert!(g.contains("    crate::migration_coordinator::ENABLED\n}"));

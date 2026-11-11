@@ -4,12 +4,15 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::Output;
 
 fn agent24(home: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agent24"))
-        .env_clear()
+    signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
+        .env_remove("A24_TEST_ACCEPT_ADHOC_SIGNATURES")
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("TMPDIR", home.join("tmp"))
@@ -42,10 +45,17 @@ fn write_package(home: &Path) -> String {
         "name: noted\nversion: \"0.1.0\"\nroute_namespace: /api/v1/noted\n\
          event_module: noted\ndata_dir: ~/.agent24/os/noted/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: \"false\"\n  args: []\n",
+         spawn:\n  command: bin/mod\n",
     )
     .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
     dir.to_string_lossy().into_owned()
+}
+
+fn stage_package(home: &Path, src: &str) {
+    let packages = home.join(".agent24/packages");
+    std::fs::create_dir_all(&packages).unwrap();
+    std::fs::rename(src, packages.join("noted")).unwrap();
 }
 
 fn assert_fails_on_grants(out: &Output) {
@@ -69,7 +79,7 @@ fn an_uninstall_whose_grants_cannot_be_revoked_fails_every_time() {
     // CORE-5a: a package that is not installed never opens the store, so the
     // revocation is only reached for an installed one.
     let src = write_package(home.path());
-    assert_ok(&agent24(home.path(), &["os", "install", &src]));
+    stage_package(home.path(), &src);
     let db = break_store(home.path());
     for _ in 0..2 {
         assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "noted"]));
@@ -85,7 +95,7 @@ fn an_uninstall_whose_grants_cannot_be_revoked_fails_every_time() {
 fn an_uninstall_that_cannot_revoke_keeps_the_files_and_retries() {
     let home = tmp_home();
     let src = write_package(home.path());
-    assert_ok(&agent24(home.path(), &["os", "install", &src]));
+    stage_package(home.path(), &src);
     let installed = home.path().join(".agent24/packages/noted");
     assert!(installed.exists());
     let db = home.path().join(".agent24/agent24.db");
@@ -102,7 +112,8 @@ fn an_uninstall_that_cannot_revoke_keeps_the_files_and_retries() {
 
 /// An install whose grants cannot be revoked never lands (CORE-5a: the
 /// revocation precedes `install`), so installing again retries it rather than
-/// finding the package already there.
+/// finding the package already there. On macOS the retry reaches signature
+/// verification and rejects this unsigned fixture without publishing it.
 #[test]
 fn an_install_whose_grants_cannot_be_revoked_is_undone() {
     let home = tmp_home();
@@ -114,7 +125,14 @@ fn an_install_whose_grants_cannot_be_revoked_is_undone() {
     assert!(!stdout.contains("installed"), "{stdout}");
     assert!(!home.path().join(".agent24/packages/noted").exists());
     std::fs::remove_dir(&db).unwrap();
-    assert_ok(&agent24(home.path(), &["os", "install", &src]));
+    let out = agent24(home.path(), &["os", "install", &src]);
+    if cfg!(target_os = "macos") {
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("signature_invalid"));
+        assert!(!home.path().join(".agent24/packages/noted").exists());
+    } else {
+        assert_ok(&out);
+    }
 }
 
 /// A store that opens but cannot write the revocation fails the command
@@ -123,7 +141,7 @@ fn an_install_whose_grants_cannot_be_revoked_is_undone() {
 fn an_uninstall_whose_revocation_cannot_be_written_fails() {
     let home = tmp_home();
     let src = write_package(home.path());
-    assert_ok(&agent24(home.path(), &["os", "install", &src]));
+    stage_package(home.path(), &src);
     tokio::runtime::Runtime::new().unwrap().block_on(async {
         let db = home.path().join(".agent24/agent24.db");
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
@@ -139,8 +157,9 @@ fn an_uninstall_whose_revocation_cannot_be_written_fails() {
     assert_fails_on_grants(&agent24(home.path(), &["os", "uninstall", "noted"]));
 }
 
-/// No HOME, no store to reach: the install and the uninstall stand, and say
-/// any grants were not revoked rather than nothing (ADR-K1-03 §3, review G3;
+/// No HOME, no store to reach: install/uninstall say
+/// grants were not revoked. macOS still rejects the unsigned install fixture
+/// (ADR-K1-03 §3, review G3;
 /// failing them would break the `A24_OS_PACKAGES` install the CLI documents
 /// for containers).
 #[test]
@@ -150,8 +169,8 @@ fn an_install_and_uninstall_without_home_say_there_was_no_store() {
     let packages = home.path().join("packages");
     std::fs::create_dir(&packages).unwrap();
     let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_agent24"))
-            .env_clear()
+        signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
+            .env_remove("A24_TEST_ACCEPT_ADHOC_SIGNATURES")
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("TMPDIR", home.path().join("tmp"))
             .env("A24_OS_PACKAGES", &packages)
@@ -164,9 +183,33 @@ fn an_install_and_uninstall_without_home_say_there_was_no_store() {
         vec!["os", "uninstall", "noted"],
     ] {
         let out = run(&args);
-        assert_ok(&out);
+        if cfg!(target_os = "macos") && args[1] == "install" {
+            assert!(!out.status.success());
+            assert!(String::from_utf8_lossy(&out.stderr).contains("signature_invalid"));
+            assert!(!packages.join("noted").exists());
+            std::fs::rename(&src, packages.join("noted")).unwrap();
+        } else {
+            assert_ok(&out);
+        }
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("were not revoked"), "{args:?}: {stderr}");
     }
     assert!(!packages.join("noted").exists());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn real_cli_accepts_adhoc_only_with_explicit_debug_opt_in() {
+    let home = tmp_home();
+    let src = write_package(home.path());
+    let refused = agent24(home.path(), &["os", "install", &src]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("signature_invalid"));
+    let accepted = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
+        .env("HOME", home.path())
+        .args(["os", "install", &src])
+        .output()
+        .unwrap();
+    assert_ok(&accepted);
+    assert!(home.path().join(".agent24/packages/noted").exists());
 }

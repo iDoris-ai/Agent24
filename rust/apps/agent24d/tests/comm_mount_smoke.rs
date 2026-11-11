@@ -10,9 +10,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::Duration;
 
 /// Kills and reaps the wrapped `agent24d` child on drop, including when a
@@ -91,12 +94,11 @@ fn spawn_daemon(
         .prefix("a24-comm-smoke")
         .tempdir_in("/tmp")
         .unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     // `env_clear` is the point: no `A24_HYPHAE_BIN`/`A24_SPEAKER_BIN` unless
     // `extra_env` adds them back, the same shape a real operator who has
     // never set up comm would run in.
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home.path());
     for (k, v) in extra_env {
         cmd.env(k, v);

@@ -97,8 +97,8 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | components | L3 | os-proc | — |
 | decide | L3 | hw | — |
 | hw | L3 | （无） | — |
-| idoris | L3 | components, hw | — |
-| knowledge | L3 | （无） | — |
+| idoris | L3 | components, hw, protocol | models |
+| knowledge | L3 | components | — |
 | mcp | L3 | domain, protocol, tools | — |
 | memory | L3 | core, models, store | — |
 | models | L3 | domain, idoris, protocol | — |
@@ -109,16 +109,17 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | comm | L3（例外：自带 REST 面） | （无） | components |
 | documents-client | L3（客户端库） | （无） | — |
 | agent | L4 | core, domain, memory, models, protocol, scheduler, store, tools, workspace | policy |
+| attach | L4½ | domain, os-proto, protocol | — |
 | os-fd | L4½ | （无） | — |
-| os-packages | L4½ | domain, os-proto | — |
+| os-packages | L4½ | components, domain, os-proc, os-proto, protocol | — |
 | os-proto | L4½ | domain, os-fd | — |
 | os-sdk | L4½ | os-proto | — |
-| **agent24d** | L5 | agent, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, store, tools, workspace | os-sdk |
+| **agent24d** | L5 | agent, attach, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, store, tools, workspace | os-sdk |
 | documents | L6 | os-sdk | domain, os-proto |
 | sidecar-host | L6 | sidecar-host-protocol | — |
-| cli | L7 | documents-client, hw, mcp, os-packages, protocol, store | — |
+| cli | L7 | documents-client, hw, mcp, os-packages, os-proc, protocol, store | — |
 
-共 32 个 crate（`cargo metadata` 的 workspace member 数）。
+共 33 个 crate（`cargo metadata` 的 workspace member 数）。
 <!-- END GENERATED: layer-deps -->
 
 读表时的几点说明（手写，依赖表变了要回来核对）：
@@ -278,7 +279,7 @@ agent24d 非测试代码 27,915 行（`163dd2d3` 上用 R1 的 `loc.py` 重算�
 - **packages/**：
   - `api-client`：由 OpenAPI 生成的 TS 客户端；
   - `contract-tests`：契约测试；
-  - `nostr-bridge` / `wechat-bridge`：通信桥（nostr-bridge 不再是 agent 的 Nostr 身份来源，身份以 `<data>/comm/hyphae-home` 的钥匙库为准，以后并入 comm，Q12 X7 / Q6）；
+  - `wechat-bridge`：开发工具，不进产品；旧 `nostr-bridge` 已移除，见 ADR-044 X7，Nostr 身份由 comm 管理；
   - `data-dir`：平台数据目录解析（ADR-037，镜像 `agent24-protocol` 的 `data_dir.rs`）；`documents-accept`：Documenting 验收 harness；
   - `node-daemon`：**开发用的旧 API mock**，只实现 124 个 v1 op 中的 4 个（`GET /health`、`/models`、`/usage`、`POST /chat`，`v1/routes.ts:60-89`），其余返回 404，另带一组非 v1 的旧接口；打包构建强制使用 Rust 后端（`backend-manager.ts:173-176`）。**不是客户端**，也不能当 v1 参考实现（R1 §7.4）。
 

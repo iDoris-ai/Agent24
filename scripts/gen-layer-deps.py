@@ -55,6 +55,7 @@ LAYER = {
     "os-fd": "L4½",
     "os-packages": "L4½",
     "os-sdk": "L4½",
+    "attach": "L4½",
     "agent24d": "L5",
     "documents": "L6",
     "sidecar-host": "L6",

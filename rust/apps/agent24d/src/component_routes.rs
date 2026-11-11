@@ -13,9 +13,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use agent24_domain::http::{error_response, read_body_or_response};
+use agent24_idoris::idoris_host::{Action, State as IdorisState};
 use agent24_os_proto::drain::DrainState;
 use agent24_os_proto::supervisor::Status as Supervised;
-use agent24d::idoris_host::{Action, State as IdorisState};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
@@ -37,11 +37,8 @@ mod documents_catalog;
 /// silent desktop (crashed, quit) reads as "not reporting" rather than as a stale `ready`.
 /// There is no connection to watch: the report is a plain HTTP POST.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
-/// The ids of the components this daemon lists itself. No attached module may take one:
-/// `attached::register` refuses them for new registrations, and [`attach_items`] drops same-named entries
-/// from registrations that predate the rule. Pinned by a test.
-pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
-    &["idoris", "hyphae", "documents", "knowledge", "open-design"];
+/// Single definition is [`agent24_attach::attached::BUILTIN_COMPONENT_IDS`].
+pub(crate) use agent24_attach::attached::BUILTIN_COMPONENT_IDS;
 /// Components whose state the desktop owns. Anything else is the daemon's to say.
 const DESKTOP_OWNED: &[&str] = &["open-design"];
 
@@ -147,7 +144,7 @@ fn render(items: &[Item], full: bool) -> Value {
 fn from_idoris(
     state: IdorisState,
     installing: bool,
-    error: Option<agent24d::idoris_host::Code>,
+    error: Option<agent24_idoris::idoris_host::Code>,
 ) -> (ComponentState, Option<&'static str>) {
     use ComponentState as S;
     if installing {
@@ -163,7 +160,9 @@ fn from_idoris(
         // contract version, but also a wrong `service`, an empty `instance_id` or dev-no-key.
         // Each means the installed binary is not the one this daemon can drive, so all are
         // `incompatible` rather than a crash.
-        IdorisState::Failed if error == Some(agent24d::idoris_host::Code::ContractMismatch) => {
+        IdorisState::Failed
+            if error == Some(agent24_idoris::idoris_host::Code::ContractMismatch) =>
+        {
             (S::Incompatible, Some("component_contract_mismatch"))
         }
         IdorisState::Failed => (S::Failed, None),
@@ -191,7 +190,9 @@ fn from_supervised(status: &Supervised) -> (ComponentState, Option<&'static str>
         Supervised::Stopped => (S::Stopped, None),
         Supervised::Backoff { .. } => (S::Failed, Some("restarting")),
         Supervised::GaveUp { .. } => (S::Failed, Some("gave_up")),
-        Supervised::PackageChanged { .. } => (S::Failed, Some("package_changed")),
+        Supervised::PackageChanged { code, .. } => {
+            (S::Failed, Some(code.unwrap_or("package_changed")))
+        }
         Supervised::StopFailed { .. } => (S::Failed, Some("stop_failed")),
         Supervised::Panicked => (S::Failed, Some("panicked")),
         Supervised::Killed => (S::Failed, Some("killed")),
@@ -423,7 +424,7 @@ fn attach_items(state: &AppState) -> Vec<Item> {
     attach_items_from(state.attach_registry.snapshot())
 }
 
-fn attach_items_from(mut modules: Vec<crate::attach_registry::AttachSnap>) -> Vec<Item> {
+fn attach_items_from(mut modules: Vec<agent24_attach::attach_registry::AttachSnap>) -> Vec<Item> {
     // D9 has no catalog for an attached module: no component lock (D2 does
     // not apply), `kernel_capabilities` are `requires` (ADR-039 §4), and
     // `docs/capabilities/REGISTRY.md` is C7. `provides` stays empty.
@@ -558,14 +559,25 @@ fn apply_documents_catalog(
     }
 }
 
+#[cfg(test)]
 fn documents_from(
     report: Option<&MountReport>,
     live: Option<&Supervised>,
     catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
 ) -> Item {
+    documents_shown(report, report.map(|report| &report.outcome), live, catalog)
+}
+
+fn documents_shown(
+    report: Option<&MountReport>,
+    outcome: Option<&MountOutcome>,
+    live: Option<&Supervised>,
+    catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
+) -> Item {
     let mut item = Item::new("documents", documents_form(), ComponentState::Absent);
     if let Some(report) = report {
-        let (mapped, reason, detail) = documents_mapped(&report.outcome, live);
+        let outcome = outcome.unwrap_or(&report.outcome);
+        let (mapped, reason, detail) = documents_mapped(outcome, live);
         item.state = mapped;
         item.version = Some(report.version.clone());
         item.reason = reason.map(str::to_owned);
@@ -589,14 +601,16 @@ fn documents_item(state: &AppState) -> Item {
     // A package that only borrowed the name (refused as `reserved_component_name`)
     // is not Documents; it is listed on its own row by `os_module_items`.
     let report = documents_report(state);
+    let outcome = report.map(|report| state.os_outcome(&report.name, &report.outcome));
     let live = report.and_then(|_| {
         state
             .module_status
             .get("documents")
             .map(|rx| rx.borrow().clone())
     });
-    documents_from(
+    documents_shown(
         report,
+        outcome.as_ref(),
         live.as_ref(),
         documents_catalog::DocumentsCatalog::embedded(),
     )
@@ -675,7 +689,8 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 .module_status
                 .get(&report.name)
                 .map(|rx| rx.borrow().clone());
-            let (mapped, reason, message) = os_mapped(&report.outcome, live);
+            let outcome = state.os_outcome(&report.name, &report.outcome);
+            let (mapped, reason, message) = os_mapped(&outcome, live);
             let d9 = report.d9.as_ref();
             let provides = d9
                 .map(|d| {
@@ -699,7 +714,13 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 }
             });
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
-                i.version = Some(report.version.clone());
+                // An integrity refusal with no trusted version is unknown,
+                // not the empty string.
+                i.version = if report.version.is_empty() {
+                    None
+                } else {
+                    Some(report.version.clone())
+                };
                 i.provides = provides;
                 i.reason = reason.map(str::to_owned);
                 let mut detail = json!({
@@ -787,7 +808,7 @@ fn dedupe_component_ids(items: &mut [Item]) {
 /// Knowledge, remote subset (ADR-038 D5, C5). No endpoint is `stopped`. A
 /// configured binding is whatever the cached `/system/capabilities` probe said.
 async fn knowledge_item(
-    registry: &crate::knowledge_host::KnowledgeHostRegistry,
+    registry: &agent24_knowledge::host::KnowledgeHostRegistry,
     now: Instant,
 ) -> Item {
     let view = registry.component_status(now).await;
@@ -836,6 +857,13 @@ fn sees_everything(mode: AuthMode, authorization: Option<&Authorization>) -> boo
         (AuthMode::LegacySingleToken, None) => true,
         (AuthMode::Capabilities, None) => false,
     }
+}
+
+/// Host JSON of `GET /api/v1/components`, for tests that drive enable and then
+/// read the row the desktop reads.
+#[cfg(test)]
+pub(crate) async fn host_components_json(state: &AppState) -> Value {
+    render(&collect(state, Instant::now()).await, true)
 }
 
 pub async fn list(

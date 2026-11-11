@@ -2,6 +2,8 @@
 
 状态：设计稿，2026-11-05；本片不改代码。核对基线：`ce85cdffc1193195f9aebb93a8cbbf620ccfe526`。
 
+修订记录：r2 2026-11-09——PR-1 已完成、Sin90 打包实现已合（合格资产尚未发布）；新增硬要求「模块读取磁盘清单」（§2，N6）、安装包须原生可执行（§2，N3）、校验可取消（§3，N4）；Cos72 降为基础对齐；§6 改为新顺序并设三个汇报点。
+
 **适用边界：** 包里自带的清单只能发现字节损坏、部分更新，以及挂载之后被人改过。如果攻击者能写包目录，他可以把文件和 `files.json` 一起改，单靠清单拦不住。这种情况靠两样东西：一是 Agent24 自己持有的可信锁（ComponentLock），锁里记着整包归档的 sha256；二是 §5 的签名。详见 §2「信任边界」。
 
 ## 1. 决策与现状依据
@@ -50,9 +52,17 @@ integrity:
 
 规则：`files` 集合必须恰好等于 JSON 的键集合；executables 必填且无重复、是 files 的子集；包的 spawn.command 必须是其中一个包内相对路径，拒绝绝对路径、PATH 查找及外部解释器绕过。辅助可执行文件也须列入。逐平台分别生成清单，不把多平台文件混在同一个包里。
 
+**N3（jason 11-09 选 a）：** 所有平台要求 spawn.command 指向包内原生可执行文件（目标平台的 Mach-O/ELF/PE），签名按 §5 平台策略执行；原生格式与签名是两件事，分开检查。解释器启动的模块（如 `examples/node-module` 的 `command: node`）及脚本伪装成可执行文件的包一律拒绝，参考/开发用途改走 A3 attach。不提供解释器白名单或旁路。
+
 `domain-os.yml` 和 `files.json` 是仅有的两个控制文件，排除在 payload 的 files 列表之外；不允许其他排除项。这避免自哈希循环：先散列最终 payload → 写 files.json → 把其摘要写入 YAML → 对最终 YAML 算原有 manifest_digest。验证时先用同一次读取的 YAML 解析声明及算摘要，再验证 files.json 原始字节摘要，再校验 payload。两个控制文件本身也必须是普通文件，权限与数据文件一致。
 
 握手算法和字段均不变；清单通过 YAML 中的摘要间接被 manifest_digest 覆盖。只改 JSON 即使其语义相同也失败；同时改 JSON 和 YAML 则冻结的 mount 摘要不匹配。模块必须从最终发布的 YAML 读取摘要，不能把生成前的摘要编译进二进制，以免循环依赖。
+
+**模块读取磁盘清单（N6，新增硬要求）：** generate 会把 integrity 段写进 `domain-os.yml`，内核握手按 manifest_digest 比对磁盘文件，所以模块的摘要必须来自包内磁盘文件。握手协议不变，仍只发 manifest_digest；SDK 读取包内 `domain-os.yml` 原始字节，用同一份字节完成语义校验、解析 facts 并计算 manifest_digest。磁盘清单去掉顶层 `integrity` 后必须与模块二进制内嵌清单语义相等，否则模块拒绝启动；比较规则：重复键、多文档、非字符串顶层键均拒绝。理由：`files.json` 不覆盖 `domain-os.yml`；模块二进制已签名，由它内嵌的基准为清单背书。Sin90 已在自身实现；11-09 jason 拍板下沉到 agent24-os-sdk v0.2.0，所有模块自动获得，Sin90 升级后删除自有实现。
+
+回退规则：由内核拉起（存在 `A24_LISTEN_FD` 等内核注入的启动环境）时，包根即内核设定的 cwd，缺 `domain-os.yml` 一律失败；只有非内核拉起的 attach/开发运行才允许回退内嵌清单。NotFound 以外的读取错误、解析错误一律拒绝。
+
+作用范围：N6 只保证业务字段与签名二进制内嵌清单一致；比较前去掉了 integrity，所以不认证 payload 摘要。发布来源仍由可信锁及 §5 平台签名策略保证（Linux/Windows v1 无代码签名）。
 
 JSON 重复键、非法摘要、负 size、重复路径、未知字段均拒绝；路径遵循共享 D2 检查并拒绝绝对路径、空段、`..`、反斜线、控制字符及非 UTF-8 文件名。生成器按 UTF-8 路径字节排序，固定 JSON 缩进与末尾换行；验证器按原始字节验证，不先规范化 JSON。
 
@@ -63,6 +73,8 @@ JSON 重复键、非法摘要、负 size、重复路径、未知字段均拒绝�
 强制上线后，scan 只有在以下全过时才返回 Discovered：现有 manifest 语义校验、必需 integrity、两个控制文件、完整 payload 集合/大小/sha256、权限、D2a 签名要求。失败保留拒绝记录，不创建该包的 provider、路由或工具注册；单包失败不隐藏其他包。
 
 recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使用 mtime、大小或之前成功结果来跳过哈希。结果应保存机器可读原因，避免从错误字符串推断 reason。大文件流式散列，枚举/读取失败也拒绝；清单限制建议 1 MiB、10,000 项，payload 大小使用 D2 安装限制，超限清晰报错。
+
+**N4 校验可取消：** 完整性校验接入 daemon 关闭 token。取消必须终止该包的发现/启动：不得返回 Discovered、不得注册能力/路由/工具、不得 spawn；取消不是 hash_mismatch。只有完整完成的校验才算成功。
 
 | 文件变化 | scan 与 recheck 的一致处理 |
 |---|---|
@@ -76,6 +88,8 @@ recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使�
 运行数据、日志、缓存写到包外 data_dir，不能边运行边修改发布树。生成工具在 staging 中规范化权限，安装器保留上述权限；禁止为了消除错误在运行时重新生成清单。
 
 首次 spawn 之前也必须 recheck，封闭 scan → spawn 的时间间隔；现有 `domain.rs:2083` 闭包继续负责重启检查，但不能以“已有重启检查”为由遗漏首次启动。后续任何自动重启、手动重试和升级后启动都走相同检查。运行中不增加后台轮询；重启前发现变更即停止重启链，不执行篡改后的文件。仍有同 uid TOCTOU 窗口，不能描述为执行字节的原子证明。
+
+**已知边界：** recheck 之后、spawn 之前的替换是 v1 已知边界；recheck 只缩短窗口，不封闭窗口。要防它需另行设计验证对象与执行对象的绑定。
 
 ## 4. 拒绝状态与桌面
 
@@ -99,7 +113,7 @@ recheck 重做同一全量校验，再比较冻结的 manifest_digest；不使�
 
 适用：Sin90/Cos72 是独立发布的可执行 OS 包，不应因进入 packages 目录而减弱组件校验。macOS 使用共享 SignatureVerifier，逐个验证 executables，要求受宿主发布策略/可信锁指定的 Team ID、Developer ID、Hardened Runtime、公证；不能让包任意自选信任团队。纯数据仅校验哈希；Linux/Windows v1 沿用 D2a 的摘要和可复现构建规则，不新造签名体系（`docs/adr/ADR-038-component-contract-v1.md:167`）。
 
-签名必须在生成清单之前完成，因为签名改变字节；外部 CI 顺序为构建 → 签名/公证及所有会改字节的处理 → 生成清单 → 校验 → 打包 → 计算最终归档 sha256 → 发布并更新可信锁。安装与启动采用 D2a 各自模式，不另定公证离线容错策略。由于 macOS 签名只保护被签的代码，配置及清单的发布来源仍靠外部可信归档摘要，而不是签名替代文件哈希。
+签名必须在生成清单之前完成，因为签名改变字节；外部 CI 顺序为构建 → 签名/公证及所有会改字节的处理 → 生成清单 → 校验 → 打包 → 计算最终归档 sha256 → 发布并更新可信锁。安装与启动采用 D2a 各自模式，不另定公证离线容错策略。**r3（jason 2026-11-10 拍板）：OS 包 `os install` 与 scan/recheck 一样只做离线验签（Developer ID + 受信 Team ID + Hardened Runtime，`VerifyMode::AtRest`），不在线查询公证**——否则离线机器无法安装、刚公证的裸二进制在票据传播前会被误判，且桌面 documents 升级是先卸载后安装，公证查询失败会丢失模块；下载包的公证由 macOS Gatekeeper 首次运行时检查。由于 macOS 签名只保护被签的代码，配置及清单的发布来源仍靠外部可信归档摘要，而不是签名替代文件哈希。
 
 ## 6. 生成工具与 A 的上线顺序
 
@@ -112,23 +126,29 @@ agent24 package-integrity verify --root ./dist/sin90
 
 `--executable` 可重复；generate 只操作明确给出的发布 staging，读取已有 domain-os.yml，保留业务字段，拒绝符号链接/特殊文件，规范化权限、扫描全部 payload、生成 files.json 并最后原子替换 YAML；不接收任意 exclude 参数。每个文件使用临时文件加 rename，整个目录须由 release CI 独占；失败退出不能拿半成品发布。重复生成字节一致。verify 只读、始终严格，成功退出 0、失败非零并输出固定原因及相对文件名，不执行包代码。发布工具随 Agent24 版本提供，Sin90/Cos72 CI 固定工具版本与下载摘要，不用浮动 latest。
 
-具体步骤：
+具体步骤（r2 2026-11-09 顺序）：
 
-1. **Agent24 PR-1** 发布工具、共享校验 API 和可选 integrity 解析支持。旧包暂沿用已有行为；出现 integrity 的包立即完整校验并拒绝坏包，不设“验出错仍放行”。这是新包生产的先决兼容支持，不是观测期。旧宿主因 deny_unknown_fields 无法读新字段，先发布支持该字段的 Agent24，并在外仓 release notes 声明最低宿主版本。
-2. **Sin90/Cos72 外仓发布**：在各支持平台 CI 使用固定版本工具；发带清单、符合签名和权限规则的新版本；记录 tag、平台资产摘要及对应最低 Agent24 版本。必须实际下载并解包验过，不能只以 CI 配置已合并作为完成证据。其他被扫描的 OS 包也需清点；同仓随本体包在最终接线 PR 更新其打包产物，保留 D1 的免独立发布锁边界。
-3. **Agent24 PR-3** 在上述资产可获取后打开必需清单拒绝，同步更新发布 pin/可信锁及 UI。缺清单旧包直接拒绝、提示升级；不自动给旧包补清单，不提供 env/feature 绕过。
+0. **已完成：** PR-1 = Agent24 #1614（生成工具 + 可选校验）。Sin90 打包实现已合（Sin90#80，merge e7f11060）：package.sh 在 stage 后 codesign（Hardened Runtime + timestamp）→ notarytool 公证 → `agent24 package-integrity generate --executable bin/sin90` → verify → tar；发布 CI 没有签名凭据，跳过签名、按固定 Agent24 提交安装 CLI；签名正式包在本机构建。合格资产（升级 SDK v0.2.0 后的签名正式包）尚未发布，PR-3 的 T5 必须基于真实下载的资产，macOS 未签名 CI 产物不能作为完成证据。旧宿主因 deny_unknown_fields 无法读新字段，外仓 release notes 须声明最低宿主版本。
+1. **三个前置 PR 并行：** N3（安装包须原生可执行，§2）、N4（校验可取消，§3）、N6（agent24-os-sdk v0.2.0 下沉 SDK 读取磁盘清单，§2）。
+2. **Sin90、Cos72 升 SDK v0.2.0 并发版：** Sin90 升级后删除自有磁盘清单实现；Cos72 同时补签名打包 + 完整性清单（照 Sin90#80）。Cos72（MushroomDAO/Cos72）11-09 由 jason 定为独立项目，业务（含区块链）搁置，只做基础对齐；PR-3 不等 Cos72 业务，只等它的对齐版发出。必须实际下载并解包验过，不能只以 CI 配置已合并作为完成证据。其他被扫描的 OS 包也需清点；同仓随本体包在最终接线 PR 更新其打包产物，保留 D1 的免独立发布锁边界。
+3. **Agent24 PR-3** 在上述资产可获取后打开必需清单拒绝，同步更新发布 pin/可信锁及桌面「包被拒，请升级」提示。缺清单旧包直接拒绝、提示升级；不自动给旧包补清单，不提供 env/feature 绕过。
+
+汇报点：SDK v0.2.0 发版前、Cos72 首个对齐 PR 前、打开强制前，各向 jason 汇报一次。
 
 “打开拒绝”不是改摘要算法，也不是在 `domain.rs:2605` 或 `:2761` 的测试处加开关。现有生产入口是 `discovery.rs:218` 解析成功至 `:219` 构造 Discovered 之间，PR-1 在这里增加可选验证；最终把这里的 `verify_if_present(...)` **替换为** `verify_required(...)`，其 None 分支返回 `IntegrityManifestMissing`。函数名是本设计建议，不是声称现有代码已有此行。`recheck` 的 `read_package` 调用（`:286`）自动继承强制规则；首次 spawn 及重启接线仍需行为测试验证。上线后删除可选入口，不留下可切换的容错模式。
 
 ## 7. 实现拆片与逐项验收
 
-建议三个逻辑 PR；PR-2 是外仓发布集成单元，Sin90、Cos72 各自提交对应 PR，不能假装一个 GitHub PR 可以跨仓。
+建议三个逻辑 PR（PR-1 已合，Sin90 打包实现已合，PR-3 前另有 N3/N4/N6 三个前置 PR，见 §6）；PR-2 是外仓发布集成单元，Sin90、Cos72 各自提交对应 PR，不能假装一个 GitHub PR 可以跨仓。
 
 | PR | 内容与验收测试（拟新增） | 故意改坏的正对照 |
 |---|---|---|
 | PR-1：共享模型、工具及兼容读取 | T1：共享 D2 类型序列化往返，JSON 键与 files 一致、摘要链包含 JSON；T2：两次 generate 字节一致，verify 接受有效包；T3：参数化覆盖增/删/改文件、链接、权限、非法路径、重复 JSON 键及上限；T4：旧包可读，新声明但损坏的包拒绝 | 去掉 JSON 摘要验证使 T1 红；引入不稳定顺序使 T2 红；逐个移除集合、摘要、链接或权限检查使对应 T3 红；把损坏新包当作旧包放行使 T4 红 |
-| PR-2：外仓 CI 和新版本 | T5：各平台从真实 release 下载解包后 verify 成功；最终 YAML 可用于原协议握手；macOS 全 executables 验签；配置、脚本和资源全在清单 | 发布 fixture 中漏文件、签名后再改二进制、漏辅助 exe，各对应验收失败；把握手改为生成前摘要，握手测试红 |
-| PR-3：强制接线及 UI | T6：新鲜 daemon 缺清单旧包 failed/指定 reason，其余有效包正常；T7：scan 后首次 spawn 前及自动重启前分别改文件，执行标记始终未创建、没有该包可用路由/工具；T8：表中每种原因在 host/非 host/桌面各有 fixture，重装清原因；T9：改清单并改 YAML 后 recheck 仍拒绝，macOS 错团队/缺公证拒绝 | 恢复 optional 让 T6 红；旁路首次及重启检查分别让 T7 红；丢 reason/泄漏 detail/删升级提示使 T8 红；取消冻结摘要比较或签名校验使对应 T9 红 |
+| PR-2：外仓 CI 和新版本（Sin90；Cos72 仅基础对齐：SDK 0.2.0 + 签名打包 + 完整性清单） | T5：各平台从真实 release 下载解包后 verify 成功；最终 YAML 可用于原协议握手；macOS 全 executables 验签；配置、脚本和资源全在清单 | 发布 fixture 中漏文件、签名后再改二进制、漏辅助 exe，各对应验收失败；把握手改为生成前摘要，握手测试红 |
+| PR-3：强制接线及 UI | T6：新鲜 daemon 缺清单旧包 failed/指定 reason，其余有效包正常；T7：scan 后首次 spawn 前的 recheck 前及自动重启前的 recheck 前分别改文件（recheck 之后的替换为已知边界，不在此验收），执行标记始终未创建、没有该包可用路由/工具；T8：表中每种原因在 host/非 host/桌面各有 fixture，重装清原因；T9：改清单并改 YAML 后 recheck 仍拒绝，macOS 错团队/无效签名/缺 Hardened Runtime 拒绝（公证不由 Agent24 检查，见 §5 r3） | 恢复 optional 让 T6 红；旁路首次及重启检查分别让 T7 红；丢 reason/泄漏 detail/删升级提示使 T8 红；取消冻结摘要比较或签名校验使对应 T9 红 |
+| N3：安装包须原生可执行 | N3 测：spawn.command 为 `node` 等解释器、脚本伪装成可执行文件均被拒绝，Mach-O/ELF/PE 原生文件通过 | 放宽为只看权限位使脚本伪装用例红；加解释器白名单使解释器用例红 |
+| N4：校验可取消 | N4 测：散列中途触发关闭 token，不产生 Discovered、不注册路由/工具、不 spawn，且原因不是 hash_mismatch；完整完成才成功 | 取消后仍返回 Discovered，或把取消映射为 hash_mismatch，各使对应断言红 |
+| N6：SDK 读取磁盘清单 | N6 测：语义差异（含重复键、多文档、非字符串顶层键）拒绝，未知键不回显；内核拉起（`A24_LISTEN_FD`）缺文件失败；非内核 attach 回退内嵌；握手 manifest_digest 与磁盘原始字节一致 | 内核拉起也回退、比较时不去 integrity、改用内嵌字节算摘要，各使对应测试红 |
 
 每条测试先在未实现行为上验证失败，再恢复正确实现验证通过；故意改坏校验器是测试敏感性的正对照，不能只拿“坏输入被拒绝”冒充已做 mutation 对照。实现 PR 记录命令、退出码和具体失败测试；必须测试实际 spawn/路由/桌面结果，不能只断言 helper 返回 Err。
 

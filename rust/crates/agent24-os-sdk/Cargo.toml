@@ -1,6 +1,6 @@
 [package]
 name = "agent24-os-sdk"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -18,6 +18,7 @@ tracing = "0.1"
 [dev-dependencies]
 agent24-os-sdk = { path = ".", features = ["test-util"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 

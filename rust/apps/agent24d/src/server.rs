@@ -1,19 +1,19 @@
-//! HTTP server: router, auth middleware, ready line, graceful shutdown.
+//! HTTP server: router, ready line, graceful shutdown.
+//! Bearer auth middleware lives in `capabilities/middleware.rs`.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use agent24_models::router::ModelRouter;
-use agent24_protocol::Health;
 use agent24_protocol::state_file::AuthMode;
 use agent24_store::Store;
 use axum::Router;
 use axum::body::Body;
-use axum::extract::{Extension, MatchedPath, Path, State};
-use axum::http::{Method, Request, StatusCode, header};
+use axum::extract::State;
+use axum::http::{Request, StatusCode, header};
 use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Json, Response};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use rand::RngCore;
 use std::sync::Arc as StdArc;
@@ -32,8 +32,35 @@ fn workspace_recovery_instant_at(
 // watchdog after all of them — live in `crate::lifecycle` (SHUT-1b). At the
 // defaults `kill -TERM` ends the process within 16.5s, or about 50.6s while a managed iDoris holds the summary open (ADR-038 D5 raised the stop grace to 15s; TASKS B2's 2s now holds only with a lowered grace).
 
+/// Test seam: park the first enable rescan, and record whether the config
+/// write still holds `os_control`.
+#[cfg(test)]
+pub(crate) struct OsEnableProbe {
+    pub park_first_rescan: std::sync::atomic::AtomicBool,
+    pub rescans: std::sync::atomic::AtomicUsize,
+    pub rescan_entered: tokio::sync::Notify,
+    pub release_rescan: tokio::sync::Notify,
+    pub write_saw_lock: std::sync::atomic::AtomicBool,
+    pub writes: std::sync::atomic::AtomicUsize,
+}
+
+#[cfg(test)]
+impl OsEnableProbe {
+    fn new() -> Self {
+        Self {
+            park_first_rescan: std::sync::atomic::AtomicBool::new(false),
+            rescans: std::sync::atomic::AtomicUsize::new(0),
+            rescan_entered: tokio::sync::Notify::new(),
+            release_rescan: tokio::sync::Notify::new(),
+            write_saw_lock: std::sync::atomic::AtomicBool::new(false),
+            writes: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
+    pub os_signature: agent24_os_packages::signature::Policy,
     pub token: Arc<String>,
     /// Legacy and capability authority are mutually exclusive. Tests and
     /// existing callers continue to construct legacy state through
@@ -46,21 +73,21 @@ pub struct AppState {
     pub module_surfaces: Arc<Vec<crate::capabilities::delegation::ModuleSurface>>,
     pub delegations: Arc<crate::capabilities::delegation::Delegations>,
     /// KB-HOST-01: the Knowledge bindings the product host activated, in
-    /// memory only (see `crate::knowledge_host`).
-    pub knowledge_host: Arc<crate::knowledge_host::KnowledgeHostRegistry>,
+    /// memory only (see `agent24_knowledge::host`).
+    pub knowledge_host: Arc<agent24_knowledge::host::KnowledgeHostRegistry>,
     /// CORE-2 AgentEar S3: the desktop confirmation queue behind
     /// `/api/v1/presence/challenges/*`.
     pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
-    pub idoris_host: Option<Arc<agent24d::idoris_host::IdorisHost>>,
+    pub idoris_host: Option<Arc<agent24_idoris::idoris_host::IdorisHost>>,
     pub idoris_unavailable: bool,
     /// Where the Hyphae daemon supervisor lives, once `serve` has one (`/api/v1/components`).
     pub comm_slot: Option<Arc<crate::comm_routes::CommDaemonSlot>>,
     /// What the desktop reported about the components it owns (ADR-038 D5).
     pub component_reports: Arc<crate::component_routes::ComponentReports>,
-    pub managed_idoris: Option<Arc<agent24d::managed_idoris::ManagedIdoris>>,
+    pub managed_idoris: Option<Arc<agent24_idoris::managed_idoris::ManagedIdoris>>,
     pub tools: Arc<agent24_tools::ToolRegistry>,
     /// H2: the user's risk overrides. Held here as well as inside the registry
     /// because the two need the SAME object — the registry resolves against it
@@ -88,6 +115,12 @@ pub struct AppState {
     /// `agent24 os enable` needs a name to act on and a module that only appeared
     /// once it was already on could never be turned on.
     pub os_reports: Arc<Vec<crate::domain::MountReport>>,
+    /// Enable's rescan replaces one module's startup outcome. `os_reports` is
+    /// shared as an immutable snapshot; this map is the live refusal record
+    /// `/components` and the next enable read. A name absent here still uses
+    /// the snapshot.
+    pub os_outcome_overrides:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, crate::domain::MountOutcome>>>,
     /// Namespaces that were actually mounted (including disabled and degraded).
     /// Capability auth uses this when axum did not record a `MatchedPath`
     /// (`nest_service` / fallback nests). Refused mounts are absent. Empty
@@ -128,13 +161,18 @@ pub struct AppState {
     /// How module tool decisions are taken; `None` (the default, and always
     /// on an ephemeral daemon) answers every decision 403.
     pub module_grants: Option<crate::consent_routes::GrantSettings>,
-    /// Held across the config write and the hand-off of a hot disable's stop
-    /// in `PATCH /api/v1/os/{name}` — not across the wait that follows — so
-    /// concurrent toggles are applied in one order (SUP-5). The list a PATCH
-    /// answers with is rendered after, and shows the state then. A module
-    /// tool decision holds it from its checks to its write, and a stop for
-    /// the whole stop, so neither lands inside the other (K1-6a-G §2.1 F7).
+    /// Held across an enable's rescan, refusal-record update, and config
+    /// write (the rescan runs only after the lock is taken), and across a
+    /// disable's config write plus the hand-off of its stop — not across
+    /// the wait that follows — so concurrent toggles run in one order
+    /// (SUP-5, PR-3c). The list a PATCH answers with is rendered after.
+    /// A module tool decision holds it from its checks to its write, and a
+    /// stop for the whole stop (K1-6a-G §2.1 F7).
     pub os_control: Arc<tokio::sync::Mutex<()>>,
+    /// Test seam for "rescan and the config write share one `os_control`
+    /// hold". Production builds do not carry it.
+    #[cfg(test)]
+    pub(crate) os_enable_probe: Arc<OsEnableProbe>,
     /// What `GET /api/v1/shutdown` answers — fixed at start-up (SHUT-1c).
     pub shutdown_report: Arc<agent24_protocol::ShutdownReport>,
     pub runs: Arc<agent24_agent::RunManager>,
@@ -166,7 +204,7 @@ pub struct AppState {
     /// "start empty, replace once real data is ready" pattern `os_reports`
     /// uses just below, and for the same reason (this reassignment happens
     /// before `state` is ever cloned into the router).
-    pub attach_registry: Arc<crate::attach_registry::AttachRegistry>,
+    pub attach_registry: Arc<agent24_attach::attach_registry::AttachRegistry>,
     /// M1-T10: the memory base, for `/api/v1/memory/*` — `None` exactly when
     /// `memory_owner` is `None` (memory unavailable; see [`open_memory_base`]).
     /// A SEPARATE handle from the one the run loop got (both are clones of the
@@ -263,7 +301,7 @@ impl Shutdown {
         if self.idoris_budget.load(std::sync::atomic::Ordering::SeqCst) {
             deadlines.persist = deadlines
                 .persist
-                .max(began + agent24d::idoris_host::SHUTDOWN_BUDGET);
+                .max(began + agent24_idoris::idoris_host::SHUTDOWN_BUDGET);
             deadlines.watchdog =
                 deadlines.http.max(deadlines.persist) + crate::lifecycle::WATCHDOG_MARGIN;
         }
@@ -652,7 +690,10 @@ impl AppState {
         // `_a24/model/complete`/`/api/v1/chat` — see `agentear_timings.rs`'s
         // doc comment for why this is NOT wired through the RPC path.
         let _agentear_timing_bridge_handle =
-            crate::agentear_timings::spawn_agentear_timing_bridge(events.clone(), timings.clone());
+            agent24_attach::agentear_timings::spawn_agentear_timing_bridge(
+                &events,
+                timings.clone(),
+            );
         // Approval broker: emits onto the same WS hub; timeout from env
         // (A24_APPROVAL_TIMEOUT_SECS, default 300s)
         let timeout = std::env::var("A24_APPROVAL_TIMEOUT_SECS")
@@ -701,20 +742,23 @@ impl AppState {
         // above (design doc "现状" 4).
         let module_approval_broker =
             crate::module_approval_broker::ModuleApprovalBroker::new(store.clone(), events.clone());
-        let attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
-            crate::attach_registry::AttachDeps {
-                scheduler: scheduler.clone(),
+        let attach_registry = Arc::new(agent24_attach::attach_registry::AttachRegistry::new(
+            agent24_attach::attach_registry::AttachDeps {
                 // No `ModelCallbackDeps` exists yet at this point (it needs
                 // the `UsageRecorder` `serve` spawns later) — `serve` builds
                 // the real registry once that exists and replaces this one,
                 // hydrated from `attached.json` (see this field's own doc on
                 // `AppState`).
-                models: None,
-                approval_broker: module_approval_broker.clone(),
-                events: events.clone(),
+                grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
+                    scheduler: scheduler.clone(),
+                    models: None,
+                    approval_broker: module_approval_broker.clone(),
+                    events: events.clone(),
+                }),
             },
         ));
         Self {
+            os_signature: os_signature_policy(),
             risk_overrides,
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
@@ -723,7 +767,7 @@ impl AppState {
             presence_provider: None,
             module_surfaces: Arc::new(Vec::new()),
             delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
-            knowledge_host: Arc::new(crate::knowledge_host::KnowledgeHostRegistry::default()),
+            knowledge_host: Arc::new(agent24_knowledge::host::KnowledgeHostRegistry::default()),
             presence_desktop: None,
             mcp_servers: Arc::new(mcp_servers),
             mcp_roster: Arc::new(crate::mcp::McpRoster::default()),
@@ -747,6 +791,7 @@ impl AppState {
             // assignment is ordered ahead of router construction rather than left
             // to chance.
             os_reports: Arc::new(Vec::new()),
+            os_outcome_overrides: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             module_namespaces: Arc::new(BTreeSet::new()),
             packages_root,
             // Empty for the same reason and until the same moment as `os_reports`
@@ -757,6 +802,8 @@ impl AppState {
             module_tool_cards: None,
             module_grants: None,
             os_control: Arc::new(tokio::sync::Mutex::new(())),
+            #[cfg(test)]
+            os_enable_probe: Arc::new(OsEnableProbe::new()),
             shutdown_report: Arc::new(crate::lifecycle::report(
                 &crate::lifecycle::Params::default(),
                 &[],
@@ -774,6 +821,36 @@ impl AppState {
 }
 
 impl AppState {
+    /// The outcome enable and `/components` should show. The override wins
+    /// when a rescan has replaced the startup snapshot.
+    pub(crate) fn os_outcome(
+        &self,
+        name: &str,
+        fallback: &crate::domain::MountOutcome,
+    ) -> crate::domain::MountOutcome {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| fallback.clone())
+    }
+
+    pub(crate) fn set_os_outcome(&self, name: &str, outcome: crate::domain::MountOutcome) {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name.to_owned(), outcome);
+    }
+
+    /// Drop a rescan overlay so the startup snapshot shows again.
+    pub(crate) fn clear_os_outcome(&self, name: &str) {
+        self.os_outcome_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name);
+    }
+
     fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
@@ -805,586 +882,16 @@ impl AppState {
 
 pub use agent24_domain::http::{error_response, error_response_with_hint};
 
-async fn health(State(state): State<AppState>) -> Json<Health> {
-    let store = match state.store.latest_applied_migration().await {
-        Ok(version) => version,
-        Err(err) => {
-            tracing::warn!("health: run database migration watermark: {err}");
-            0
-        }
-    };
-    let memory = match &state.memory_kv {
-        Some(kv) => match kv.latest_applied_migration().await {
-            Ok(version) => version,
-            Err(err) => {
-                tracing::warn!("health: memory database migration watermark: {err}");
-                0
-            }
-        },
-        None => 0,
-    };
-    Json(Health {
-        status: "ok".to_owned(),
-        version: env!("CARGO_PKG_VERSION").to_owned(),
-        backend: "rust".to_owned(),
-        protocol_version: agent24_protocol::PROTOCOL_VERSION,
-        migrations: agent24_protocol::HealthMigrations { store, memory },
-    })
-}
+#[path = "handlers.rs"]
+mod handlers;
 
-/// Authenticated shutdown (bearer token proves the caller owns this daemon —
-/// unlike a pid from a possibly-stale state file, this can never kill an
-/// unrelated reused-pid process). Used by `agent24 daemon stop`.
-async fn shutdown_handler(State(state): State<AppState>) -> Response {
-    state.shutdown.request();
-    tracing::info!("shutdown requested via /api/v1/shutdown");
-    (
-        StatusCode::ACCEPTED,
-        Json(serde_json::json!({ "ok": true })),
-    )
-        .into_response()
-}
-
-/// `GET /api/v1/shutdown` (SHUT-1c): the shutdown budgets in effect, what
-/// was warned about them, and the daemon before this one.
-async fn shutdown_report(State(state): State<AppState>) -> Json<agent24_protocol::ShutdownReport> {
-    Json((*state.shutdown_report).clone())
-}
+use crate::capabilities::middleware::auth;
+use handlers::{
+    health, mint_creative_capability, revoke_capability, shutdown_handler, shutdown_report,
+};
 
 async fn fallback() -> Response {
     error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
-}
-
-#[derive(serde::Deserialize)]
-struct MintCreativeBody {
-    workspace_id: String,
-    #[serde(alias = "attachment_id")]
-    creative_attachment_id: String,
-    #[serde(alias = "principal_id")]
-    creative_principal_id: String,
-    #[serde(alias = "sidecar_instance_id")]
-    sidecar_generation: String,
-    #[serde(default = "default_creative_ttl")]
-    ttl_seconds: u64,
-    #[serde(default)]
-    allowed_operations: Option<Vec<String>>,
-}
-
-const fn default_creative_ttl() -> u64 {
-    300
-}
-
-fn valid_scope_id(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
-}
-
-fn operation_name(operation: crate::capabilities::Operation) -> &'static str {
-    operation.action()
-}
-
-async fn mint_creative_capability(
-    State(state): State<AppState>,
-    authorization: Option<Extension<crate::capabilities::Authorization>>,
-    Json(body): Json<MintCreativeBody>,
-) -> Response {
-    let Some(store) = state.capabilities.as_ref() else {
-        return error_response(
-            StatusCode::CONFLICT,
-            "capability_mode_required",
-            "Creative capabilities require capability auth mode",
-        );
-    };
-    let Some(Extension(authorization)) = authorization else {
-        return error_response(
-            StatusCode::FORBIDDEN,
-            "forbidden",
-            "Host authority required",
-        );
-    };
-    if body.ttl_seconds == 0
-        || body.ttl_seconds > crate::capabilities::MAX_CREATIVE_TTL_SECONDS
-        || !valid_scope_id(&body.workspace_id)
-        || !valid_scope_id(&body.creative_attachment_id)
-        || !valid_scope_id(&body.creative_principal_id)
-        || !valid_scope_id(&body.sidecar_generation)
-    {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_capability_scope",
-            "Invalid capability scope or TTL",
-        );
-    }
-
-    let mut request = crate::capabilities::CreativeMintRequest::new(
-        body.workspace_id,
-        body.creative_attachment_id,
-        body.creative_principal_id,
-        body.sidecar_generation,
-        Duration::from_secs(body.ttl_seconds),
-        crate::capabilities::unix_now(),
-    );
-    if let Some(actions) = body.allowed_operations {
-        let allowlist = crate::capabilities::Operation::creative_allowlist();
-        let mut operations = Vec::with_capacity(actions.len());
-        for action in actions {
-            let Some(operation) = crate::capabilities::Operation::from_action(&action) else {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_capability_operation",
-                    "Unknown capability operation",
-                );
-            };
-            if !allowlist.contains(&operation) {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_capability_operation",
-                    "Operation is not available to Creative runtimes",
-                );
-            }
-            operations.push(operation);
-        }
-        request = request.with_allowed_operations(operations);
-    }
-
-    let minted = match store.mint_creative_authorized(&authorization, request) {
-        Ok(minted) => minted,
-        Err(_) => {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "Host authority required",
-            );
-        }
-    };
-    let (token, capability_id, claims) = minted.into_bearer_parts();
-    let allowed_operations = claims
-        .allowed_operations
-        .iter()
-        .copied()
-        .map(operation_name)
-        .collect::<Vec<_>>();
-    (
-        StatusCode::CREATED,
-        Json(serde_json::json!({
-            "capability_id": capability_id,
-            "token": token,
-            "audience": "creative_runtime",
-            "workspace_id": claims.workspace_id,
-            "creative_attachment_id": claims.attachment_id,
-            "creative_principal_id": claims.principal_id,
-            "daemon_generation": claims.daemon_generation,
-            "host_generation": claims.host_generation,
-            "sidecar_generation": claims.sidecar_generation,
-            "created_at": claims.created_at,
-            "expires_at": claims.expires_at,
-            "allowed_operations": allowed_operations,
-        })),
-    )
-        .into_response()
-}
-
-async fn revoke_capability(
-    State(state): State<AppState>,
-    Path(capability_id): Path<String>,
-) -> Response {
-    let Some(store) = state.capabilities.as_ref() else {
-        return error_response(
-            StatusCode::CONFLICT,
-            "capability_mode_required",
-            "Capability revocation requires capability auth mode",
-        );
-    };
-    if !valid_scope_id(&capability_id) {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "invalid_capability_id",
-            "Invalid capability id",
-        );
-    }
-    // Deliberately do not expose whether the ID existed or was already
-    // revoked. The endpoint is idempotent and is not a capability oracle.
-    let _ = store.revoke_by_id(&capability_id);
-    Json(serde_json::json!({
-        "capability_id": capability_id,
-        "state": "revoked",
-    }))
-    .into_response()
-}
-
-/// Bearer-token gate for everything except `GET /api/v1/health`
-/// (SPEC-002 §4: health is the only unauthenticated endpoint — method
-/// included, so a future POST on the same path never silently bypasses auth).
-///
-/// # If you are adding a kernel-private header, name it `X-A24-*`
-///
-/// An out-of-process module is reached through
-/// [`agent24_os_proto::proxy`](../../../crates/agent24-os-proto/src/proxy.rs),
-/// which strips every `X-A24-*` header in both directions by PREFIX, and strips
-/// `Authorization` / `Cookie` from a hand-written list. The prefix rule keeps up
-/// on its own; the list does not. A kernel-private header introduced here under
-/// any other name reaches modules verbatim, and nothing will report it.
-///
-/// This note lives beside the auth middleware rather than beside the proxy
-/// because the person adding such a header is reading this file
-/// (SPEC-ME3-OUT-OF-PROCESS §2.1).
-async fn auth(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
-    tracing::debug!(path = %req.uri().path(), "request received");
-    if req.method() == Method::GET && req.uri().path() == "/api/v1/health" {
-        return next.run(req).await;
-    }
-    match state.auth_mode {
-        AuthMode::LegacySingleToken => legacy_auth(state, req, next).await,
-        AuthMode::Capabilities => capability_auth(state, req, next).await,
-    }
-}
-
-/// Routes that only the desktop's ProductHost may call, in any auth mode.
-/// Private-key backup and restore. Export lets the caller choose the password
-/// that encrypts the key, and restore plants a key of the caller's choosing as
-/// one of the user's identities, so a bearer that merely proves "same user, same machine" (the
-/// legacy shared token, any FirstPartyShell or Creative token) must not reach
-/// it: it would let any local process produce a backup it can decrypt.
-fn host_only_route(method: &Method, path: &str) -> bool {
-    method == Method::POST
-        && (matches!(
-            path,
-            "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
-        ) || is_component_report(path))
-}
-
-/// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
-fn is_component_report(path: &str) -> bool {
-    path.strip_prefix("/api/v1/components/")
-        .and_then(|rest| rest.strip_suffix("/report"))
-        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-}
-
-/// Single shared token. Does not consult the route catalog or assurance levels,
-/// except for [`host_only_route`]s, which are refused outright.
-async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
-    let bearer = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    if bearer
-        .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
-    {
-        if host_only_route(req.method(), req.uri().path()) {
-            return error_response(
-                StatusCode::FORBIDDEN,
-                "forbidden",
-                "Operation not allowed in this auth mode",
-            );
-        }
-        next.run(req).await
-    } else {
-        error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        )
-    }
-}
-
-/// Method + matched template → operation. Levels are metadata: they are not a
-/// deny input (2b). Unknown paths are answered here so a fallback cannot run
-/// unauthenticated. HEAD uses the GET row inside [`crate::capabilities::decide`].
-/// 404 and 405 come after the bearer is live, so a missing, unknown, or revoked
-/// token cannot enumerate routes. Explicit public routes skip that check.
-async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
-    let method = req.method().clone();
-    let path = req.uri().path().to_owned();
-    let matched = req
-        .extensions()
-        .get::<MatchedPath>()
-        .map(|matched| matched.as_str().to_owned());
-    match crate::capabilities::decide(&method, matched.as_deref(), &path, &state.module_namespaces)
-    {
-        crate::capabilities::RouteDecision::UnknownPath => {
-            if let Some(denied) = capability_token_rejected(&state, &req) {
-                return denied;
-            }
-            error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
-        }
-        crate::capabilities::RouteDecision::MethodNotAllowed => {
-            if let Some(denied) = capability_token_rejected(&state, &req) {
-                return denied;
-            }
-            next.run(req).await
-        }
-        crate::capabilities::RouteDecision::Mapped(policy)
-            if policy.level == crate::capabilities::AssuranceLevel::Public =>
-        {
-            next.run(req).await
-        }
-        crate::capabilities::RouteDecision::Mapped(policy) => {
-            authorize(
-                &state,
-                req,
-                next,
-                policy.operation,
-                policy.template,
-                &method,
-            )
-            .await
-        }
-        crate::capabilities::RouteDecision::Module { operation, .. } => {
-            let template = matched.as_deref().unwrap_or("");
-            authorize(&state, req, next, operation, template, &method).await
-        }
-    }
-}
-
-/// Missing, unparseable, unknown, revoked, expired, or stale bearers are 401.
-/// A live token returns `None` so the caller can answer 404 or 405.
-fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<Response> {
-    let Some(store) = state.capabilities.as_ref() else {
-        return Some(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "host_authority_unavailable",
-            "Capability authority unavailable",
-        ));
-    };
-    let Some(bearer) = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-    else {
-        return Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        ));
-    };
-    match store.require_live_bearer(bearer, crate::capabilities::unix_now()) {
-        Ok(()) => None,
-        Err(_) => Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        )),
-    }
-}
-
-async fn authorize(
-    state: &AppState,
-    mut req: Request<Body>,
-    next: Next,
-    operation: crate::capabilities::Operation,
-    template: &str,
-    method: &Method,
-) -> Response {
-    let Some(store) = state.capabilities.as_ref() else {
-        return error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "host_authority_unavailable",
-            "Capability authority unavailable",
-        );
-    };
-    let Some(bearer) = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-    else {
-        return error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        );
-    };
-    match store.validate_bearer(
-        bearer,
-        operation,
-        &crate::capabilities::Resource::global(),
-        crate::capabilities::unix_now(),
-    ) {
-        Ok(authorization) => {
-            if host_only_route(method, req.uri().path())
-                && authorization.claims.audience != crate::capabilities::Audience::ProductHost
-            {
-                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
-            }
-            // R5: a Creative token that validates still cannot call a route
-            // this mapping newly exposed. Resource scope is not this gate.
-            if authorization.claims.audience == crate::capabilities::Audience::CreativeRuntime
-                && !crate::capabilities::creative_route_permitted(method, template)
-            {
-                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
-            }
-            // §10 R1 guards daily first-party tokens. ProductHost is the
-            // parent's full authority and must keep reaching module routes
-            // (desktop documents/knowledge) without a delegation record.
-            if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell
-                && operation == crate::capabilities::Operation::ModuleRoute
-                && method != Method::GET
-                && method != Method::HEAD
-            {
-                let path = req.uri().path();
-                let delegated = state
-                    .module_surfaces
-                    .iter()
-                    .find(|surface| {
-                        path.strip_prefix(&surface.namespace)
-                            .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
-                    })
-                    .is_some_and(|surface| state.delegations.permits(surface));
-                if !delegated {
-                    return error_response(
-                        StatusCode::FORBIDDEN,
-                        "module_delegation_required",
-                        "Module surface requires delegation",
-                    );
-                }
-            }
-            if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell {
-                let elevated = operation.assurance_level()
-                    == Some(crate::capabilities::AssuranceLevel::Elevated);
-                let grant = req
-                    .headers()
-                    .get("X-Agent24-Elevation")
-                    .map(|v| v.to_str().unwrap_or("").to_owned());
-                if elevated && grant.is_none() {
-                    if method == Method::POST
-                        && matches!(
-                            template,
-                            "/api/v1/idoris/install" | "/api/v1/idoris/connect"
-                        )
-                    {
-                        // I-1: the presence summary comes from this body.
-                        let Ok(bytes) = axum::body::to_bytes(
-                            req.into_body(),
-                            agent24_domain::http::MAX_BODY_BYTES,
-                        )
-                        .await
-                        else {
-                            return error_response(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                "payload_too_large",
-                                "Request body exceeds limit",
-                            );
-                        };
-                        if let Some(authority) = &state.first_party {
-                            authority.remember_idoris_request(
-                                &authorization.claims.capability_id,
-                                template,
-                                &bytes,
-                            );
-                        }
-                    } else if method == Method::POST && template == "/api/v1/attached" {
-                        let bytes = match axum::body::to_bytes(
-                            req.into_body(),
-                            agent24_domain::http::MAX_BODY_BYTES,
-                        )
-                        .await
-                        {
-                            Ok(bytes) => bytes,
-                            Err(_) => {
-                                return error_response(
-                                    StatusCode::PAYLOAD_TOO_LARGE,
-                                    "payload_too_large",
-                                    "Request body exceeds limit",
-                                );
-                            }
-                        };
-                        if let Some(authority) = &state.first_party
-                            && let Some(path) = crate::attached::config_path()
-                            && let Ok(registrations) = crate::attached::list(&path)
-                        {
-                            authority.remember_attached_request(
-                                &authorization.claims.capability_id,
-                                &bytes,
-                                &registrations,
-                            );
-                        }
-                    }
-                    return (StatusCode::FORBIDDEN, axum::Json(serde_json::json!({"error":{"code":"presence_required","message":"Presence confirmation required","operation":format!("{operation:?}")}}))).into_response();
-                }
-                if let Some(grant) = grant {
-                    let (parts, body) = req.into_parts();
-                    // A grant binds method, path and body; a query string is
-                    // none of those, so the approved text could not describe
-                    // it (`/candidates?endpoint=` would reach another port).
-                    // No CLI request carries one: refuse before consuming.
-                    if parts.uri.query().is_some() {
-                        return error_response(
-                            StatusCode::FORBIDDEN,
-                            "elevation_invalid",
-                            "Elevation grant is invalid",
-                        );
-                    }
-                    let bytes = match axum::body::to_bytes(
-                        body,
-                        agent24_domain::http::MAX_BODY_BYTES,
-                    )
-                    .await
-                    {
-                        Ok(bytes) => bytes,
-                        Err(_) => {
-                            return error_response(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                "payload_too_large",
-                                "Request body exceeds limit",
-                            );
-                        }
-                    };
-                    let target = crate::capabilities::first_party::Target {
-                        operation,
-                        method: method.to_string(),
-                        template: template.to_owned(),
-                        path: parts.uri.path().to_owned(),
-                        body_sha256: crate::capabilities::first_party::body_digest(&bytes),
-                    };
-                    // Revalidate after buffering, immediately before the atomic
-                    // consume. A process may exit while supplying a slow body.
-                    let bearer = parts
-                        .headers
-                        .get(header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| v.strip_prefix("Bearer "))
-                        .unwrap_or("");
-                    if store
-                        .validate_bearer(
-                            bearer,
-                            operation,
-                            &crate::capabilities::Resource::global(),
-                            crate::capabilities::unix_now(),
-                        )
-                        .is_err()
-                        || !state.first_party.as_ref().is_some_and(|authority| {
-                            authority.consume(
-                                &grant,
-                                &authorization.claims.capability_id,
-                                &target,
-                                crate::capabilities::unix_now(),
-                            )
-                        })
-                    {
-                        return error_response(
-                            StatusCode::FORBIDDEN,
-                            "elevation_invalid",
-                            "Elevation grant is invalid",
-                        );
-                    }
-                    req = Request::from_parts(parts, Body::from(bytes));
-                }
-            }
-            req.extensions_mut().insert(authorization);
-            next.run(req).await
-        }
-        Err(
-            crate::capabilities::CapabilityError::OperationDenied
-            | crate::capabilities::CapabilityError::ResourceDenied
-            | crate::capabilities::CapabilityError::HostRequired,
-        ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
-        Err(_) => error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        ),
-    }
 }
 
 async fn establish_module_delegation(
@@ -1422,15 +929,6 @@ async fn establish_module_delegation(
 #[cfg(test)]
 #[path = "tests/first_party_http.rs"]
 mod first_party_http_tests;
-
-/// Constant-time comparison — a timing oracle on a localhost token is a small
-/// risk, but the cost of doing it right is one function.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
 
 /// The kernel router with NO domain OS mounted. Test-only since ME-1b: the real
 /// startup path always goes through [`build_router_with_modules`], and a
@@ -1502,12 +1000,13 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         // raw path, so never decode or normalize the path before routing.
         .route(
             "/api/v1/host/knowledge/bindings/{binding_id}",
-            axum::routing::put(crate::knowledge_host::change).delete(crate::knowledge_host::change),
+            axum::routing::put(crate::knowledge_routes::change)
+                .delete(crate::knowledge_routes::change),
         )
         .route(
             "/api/v1/host/knowledge/bindings/{binding_id}/credential",
-            axum::routing::put(crate::knowledge_host::push_credential)
-                .delete(crate::knowledge_host::revoke_credential),
+            axum::routing::put(crate::knowledge_routes::push_credential)
+                .delete(crate::knowledge_routes::revoke_credential),
         )
         .route("/api/v1/usage", get(crate::routes::get_usage))
         .route("/api/v1/timings", get(crate::routes::get_timings))
@@ -1622,6 +1121,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         // Domain-OS registry (ME-2b). The daemon owns `os.json`; see `os_routes`.
         .route("/api/v1/os", get(crate::os_routes::list_os))
+        .route(
+            "/api/v1/os/trusted-teams",
+            get(crate::os_routes::trusted_teams),
+        )
+        .route(
+            "/api/v1/os/trusted-teams/{team}",
+            axum::routing::put(crate::os_routes::trust_team).delete(crate::os_routes::untrust_team),
+        )
         .route(
             "/api/v1/os/{name}/delegation",
             post(establish_module_delegation),
@@ -1816,8 +1323,8 @@ pub fn generate_token() -> String {
 /// it (a reverse mutation removing the re-check below must turn those tests
 /// red; see their doc comments).
 fn fill_attach_registry_and_recheck(
-    cell: &std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
-    registry: &Arc<crate::attach_registry::AttachRegistry>,
+    cell: &std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>>,
+    registry: &Arc<agent24_attach::attach_registry::AttachRegistry>,
     cancel: &CancellationToken,
 ) {
     let _ = cell.set(Arc::clone(registry));
@@ -1891,6 +1398,9 @@ impl std::fmt::Display for AlreadyRunning {
 
 impl std::error::Error for AlreadyRunning {}
 
+#[path = "serve_steps.rs"]
+mod serve_steps;
+
 #[allow(
     clippy::too_many_arguments,
     reason = "startup options include both enrollment and injected iDoris dependencies"
@@ -1903,192 +1413,30 @@ pub async fn serve(
     enroll_endpoint: bool,
     ready_omit_token: bool,
     cancel: CancellationToken,
-    idoris_dependencies: Option<agent24d::managed_idoris::ManagedDependencies>,
+    idoris_dependencies: Option<agent24_idoris::managed_idoris::ManagedDependencies>,
 ) -> Result<(), std::io::Error> {
     let startup = std::time::Instant::now();
     tracing::debug!(ephemeral, "startup: serve");
-    let mode = validate_auth_startup(auth_mode, host_bootstrap_stdio, enroll_endpoint, ephemeral)?;
-    let module_grants = crate::consent_routes::grant_settings(
-        std::env::var("A24_MODULE_TOOL_GRANTS").ok().as_deref(),
-        std::env::var("A24_MODULE_GRANT_MAX_DAYS").ok().as_deref(),
+    let (
+        mode,
+        module_grants,
+        mut host_ready,
+        params,
+        mut config_warnings,
+        shutdown,
+        idoris_root,
+        idoris_install_root,
+    ) = serve_steps::install_shutdown_controller(
+        auth_mode,
+        host_bootstrap_stdio,
+        enroll_endpoint,
         ephemeral,
-        crate::os_config::config_path(),
-    )
-    .map_err(|why| std::io::Error::new(std::io::ErrorKind::InvalidInput, why))?;
-    // Only the host-child mode owns the trusted pipes (and so the parent-EOF
-    // lease). Service mode has neither: it is not a child of anything.
-    let (mut host_ready, parent_liveness) = if mode == StartupMode::HostChild {
-        let (writer, liveness) = crate::host_bootstrap::open_stdio()?;
-        (Some(writer), Some(liveness))
-    } else {
-        (None, None)
-    };
-    // The shutdown controller, and the signals that request it, before
-    // anything else: a SIGTERM during startup — which can take seconds (the
-    // store, MCP servers, model probing) — runs this bounded shutdown rather
-    // than the default action, which ends the daemon as signal-killed, a crash
-    // to a supervisor such as launchd (review of SUP-4, round 6).
-    // The modules' budgets, read first — no I/O, and a bad value is only a
-    // warning (SHUT-1b): the shutdown controller's deadlines follow them.
-    let (params, config_warnings) = crate::lifecycle::Params::from_process_env();
-    let mut config_warnings = config_warnings;
-    let shutdown = Shutdown::with_params(cancel.clone(), params);
-    let idoris_root =
-        agent24_idoris::install::default_install_root().map_err(std::io::Error::other)?;
-    // ADR-038 D1: releases live under <data dir>/components/idoris; the legacy
-    // root above keeps only state and any not-yet-migrated release.
-    let idoris_install_root = agent24_idoris::install::managed_root(
-        &agent24_protocol::state_file::state_dir()
-            .ok_or_else(|| std::io::Error::other("data directory is unavailable"))?,
-    );
-    if !ephemeral {
-        shutdown
-            .idoris_budget
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    if let Some(parent_liveness) = parent_liveness {
-        let parent_shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            parent_liveness.closed().await;
-            parent_shutdown.request();
-            tracing::info!("trusted host bootstrap closed; shutting down capability daemon");
-        });
-    }
-    // Signal handling: SIGTERM (process managers) + SIGINT (Ctrl+C in dev).
-    // Registered HERE — before any module process can be started — and
-    // synchronously: a SIGTERM arriving while packages start must run this
-    // shutdown, which stops them, not the default action, which ends the daemon
-    // and leaves them running (review of SUP-4, round 1).
-    // A registration that fails is fatal HERE, before any module runs: a
-    // daemon that cannot hear SIGTERM cannot stop its modules when asked to
-    // (review of SUP-4, round 2).
-    #[cfg(unix)]
-    let (mut sigterm, mut sigint) = {
-        use tokio::signal::unix::{SignalKind, signal};
-        (
-            signal(SignalKind::terminate())?,
-            signal(SignalKind::interrupt())?,
-        )
-    };
-    // The one shutdown deadline. A signal fixes it BEFORE it cancels, so it is
-    // the moment of the signal; any other way shutdown starts (an HTTP
-    // shutdown, the server ending) fixes it at the first look after the cancel
-    // — a scheduling delay later, which the watchdog below bounds (review of
-    // SUP-4, round 3).
-    let signal_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        #[cfg(unix)]
-        tokio::select! {
-            _ = sigterm.recv() => {},
-            _ = sigint.recv() => {},
-        }
-        #[cfg(not(unix))]
-        if let Err(err) = tokio::signal::ctrl_c().await {
-            tracing::error!("SIGINT handler failed: {err}");
-            std::future::pending::<()>().await;
-        }
-        // The request first; the log line last — a stalled stderr must not be
-        // what keeps the shutdown from starting.
-        signal_shutdown.request();
-        tracing::info!("shutdown signal received");
-    });
-    // Logged only now, with the signals registered: a stalled stderr must not
-    // widen the window in which a SIGTERM takes the default action (review of
-    // SHUT-1b, round 1).
-    for warning in &config_warnings {
-        tracing::warn!("{warning}");
-    }
-    tracing::info!(
-        drain_ms = params.drain.as_millis(),
-        stop_grace_ms = params.stop_grace.as_millis(),
-        exit_bound_ms = params.exit_bound().as_millis(),
-        "shutdown budgets for out-of-process modules; a SIGTERM ends this daemon within {}ms \
-         (2000ms at the defaults)",
-        params.exit_bound().as_millis()
-    );
-    // For a token cancelled other than through `Shutdown::request` (a child
-    // token's owner, say): the watchdog is armed at the first look after it.
-    {
-        let observed = shutdown.clone();
-        tokio::spawn(async move {
-            observed.token().cancelled().await;
-            observed.request();
-        });
-    }
-
-    // Non-ephemeral daemons are singletons: hold an exclusive lifetime lock so
-    // a concurrently-started second daemon fails fast instead of leaking as an
-    // untracked process (review B6). Ephemeral instances skip both the lock
-    // and the discovery file — they are private to one CLI invocation.
-    let _singleton = if ephemeral {
-        None
-    } else {
-        match agent24_protocol::state_file::try_acquire_singleton()? {
-            Some(guard) => Some(guard),
-            None => return Err(std::io::Error::other(AlreadyRunning)),
-        }
-    };
-    // SHUT-1b: what the previous daemon left, then this one's marker — right
-    // after the lock, before the shutdown's task exists, so a shutdown always
-    // finds it. A start-up that fails from here drops the guard, which removes
-    // it: a start that failed is not a shutdown that did not finish. (A
-    // shutdown requested before this point — during the lock — can still be
-    // ended by the watchdog before the marker exists; that daemon never got
-    // as far as starting anything, and leaves no evidence.) A marker that
-    // cannot be written still gets its run a summary; the warning is kept.
-    // Ephemeral daemons neither read nor write either file.
-    let mut evidence = None;
-    let marker = if ephemeral {
-        None
-    } else {
-        agent24_protocol::state_file::state_dir().map(|state| {
-            let run = crate::lifecycle::run_dir(&state);
-            // FU-67: this process now holds the singleton lock, so any temp
-            // file a prior life of this same daemon left behind is safe to
-            // sweep here — but a predecessor's shutdown `persist` can still
-            // be mid-write for a while after it dropped the lock (its own
-            // timeout, worst case tens of seconds under a raised budget), so
-            // the sweep itself age-gates what it touches; see
-            // `lifecycle::ORPHAN_MIN_AGE`, not "nothing else can be writing
-            // one" — that was never quite true.
-            crate::lifecycle::sweep_orphaned_temp_files(&run);
-            let (previous, last) = crate::lifecycle::evidence(&run);
-            if let Some(warning) = previous.warning(&run) {
-                tracing::warn!("{warning}");
-            }
-            evidence = Some((run.clone(), previous, last));
-            let (guard, warning) = crate::lifecycle::MarkerGuard::create(&run);
-            if let Some(warning) = warning {
-                tracing::warn!("{warning}");
-                config_warnings.push(warning);
-            }
-            guard
-        })
-    };
-
-    let daemon_generation = generate_token();
-    let (token, capability_store, product_host_token) = match auth_mode {
-        AuthMode::LegacySingleToken => (generate_token(), None, None),
-        AuthMode::Capabilities => {
-            let store = crate::capabilities::CapabilityStore::new(daemon_generation.clone());
-            // CORE-2 R5: a service has no trusted parent pipe to hand a host
-            // credential to, so it mints none (and nothing secret is ever
-            // published for it).
-            let bearer = if !mints_product_host(mode) {
-                None
-            } else {
-                let minted = store
-                    .mint_product_host(
-                        generate_token(),
-                        Duration::from_secs(u64::MAX),
-                        crate::capabilities::unix_now(),
-                    )
-                    .map_err(std::io::Error::other)?;
-                Some(minted.into_bearer_parts().0)
-            };
-            (String::new(), Some(store), bearer)
-        }
-    };
+        &cancel,
+    )?;
+    let _singleton = serve_steps::acquire_singleton(ephemeral)?;
+    let (evidence, marker) = serve_steps::install_run_marker(ephemeral, &mut config_warnings);
+    let (daemon_generation, token, capability_store, product_host_token) =
+        serve_steps::mint_startup_credentials(auth_mode, mode)?;
     // CORE-5 5f-3: a marker or an unfinished upgrade docks here, before any
     // store, task or listener of the business daemon exists. `ENABLED` is
     // false, so this is skipped and startup is exactly the code below.
@@ -2113,1053 +1461,126 @@ pub async fn serve(
         };
         return crate::docked_startup::serve_docked(launch, docking).await;
     }
-    // Store: file-backed under ~/.agent24 (ephemeral instances get :memory:)
-    let store = if ephemeral {
-        Store::open_memory().await.map_err(std::io::Error::other)?
-    } else {
-        let dir = agent24_protocol::state_file::state_dir()
-            .ok_or_else(|| std::io::Error::other("HOME not set"))?;
-        // HW-1: one hardware probe per start, persisted to hardware.json.
-        // Best-effort and off the startup path.
-        crate::hardware::spawn_startup_snapshot(dir.clone());
-        Store::open(&dir.join("agent24.db"))
-            .await
-            .map_err(std::io::Error::other)?
-    };
-    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: store");
-    // NOTE: the startup sweeps (durable-resume restore + orphan cancel) run
-    // AFTER the state is built, below — the restore sweep needs the run manager.
-    // Tool workspace: the fs whitelist root + shell cwd. Created up front so
-    // the canonicalized whitelist is non-empty from the first request.
-    let workspace = agent24_protocol::state_file::state_dir()
-        .ok_or_else(|| std::io::Error::other("HOME not set"))?
-        .join("workspace");
-    std::fs::create_dir_all(&workspace)?;
-    let router = Arc::new(ModelRouter::from_env());
-    let managed_idoris = if ephemeral {
-        None
-    } else {
-        let path = agent24_protocol::state_file::state_dir()
-            .ok_or_else(|| std::io::Error::other("HOME not set"))?
-            .join("idoris-connection.json");
-        let managed = Arc::new(agent24d::managed_idoris::ManagedIdoris::new(
-            router.clone(),
-            path,
-        )?);
-        if managed.is_configured()?
-            && let Some(dependencies) = idoris_dependencies.as_ref()
-        {
-            managed
-                .restore(dependencies, &cancel)
-                .await
-                .map_err(std::io::Error::other)?;
-        }
-        Some(managed)
-    };
-    let mut idoris_unavailable = false;
-    let mut idoris_host = if let Some(managed) = &managed_idoris {
-        match agent24d::idoris_host::IdorisHost::system(
-            idoris_root,
-            idoris_install_root,
-            managed.clone(),
-            router.clone(),
-        ) {
-            Ok(host) => Some(host),
-            Err(error) => {
-                tracing::warn!(%error, "iDoris lifecycle unavailable; daemon startup continues");
-                idoris_unavailable = true;
-                router.block_idoris("iDoris lifecycle unavailable");
-                None
-            }
-        }
-    } else {
-        None
-    };
-    // Registered before restore can spawn a process, including startup cancellation.
-    let idoris_stopping = idoris_host
-        .as_ref()
-        .map(|host| host.stop_on_shutdown(cancel.clone()));
-    if let Some(host) = &idoris_host
-        && let Err(code) = host.restore().await
-    {
-        tracing::warn!(
-            ?code,
-            "iDoris restore unavailable; daemon startup continues"
-        );
-        idoris_unavailable = true;
-        router.block_idoris("iDoris restore unavailable");
-        idoris_host = None;
-    }
-    let guardian = build_guardian(&router);
-    // D1 session memory: a KV file next to the main store (ephemeral daemons get
-    // an in-memory one). A failure here degrades to no memory rather than
-    // refusing to start — sessions simply don't remember, as before.
-    let memory_base = open_memory_base(ephemeral).await;
-    // P1-02c-c5: bound memory.db's WAL — idle-time wal_checkpoint(TRUNCATE),
-    // tracing-only results, stops with the daemon-wide token. In-memory
-    // (ephemeral) bases have no WAL and spawn nothing. Detached on purpose:
-    // it owns its own connection and ends on `cancel`.
-    if let Some(kv) = &memory_base {
-        let _ = crate::memory_maintenance::spawn(
-            kv,
-            agent24_memory::wal_maintenance::WalMaintenanceConfig::default(),
-            cancel.clone(),
-        )
-        .await;
-    }
-    tracing::debug!(
-        elapsed_ms = startup.elapsed().as_millis(),
-        "startup: memory_base"
-    );
-    let memory = match memory_base.clone() {
-        Some(kv) => match session_memory(kv, &router, &cancel).await {
-            Ok(memory) => Some(memory),
-            Err(err) => {
-                tracing::warn!(
-                    error = %err,
-                    "could not initialize the personal session memory partition; sessions will not remember"
-                );
-                None
-            }
-        },
-        None => None,
-    };
 
-    tracing::debug!(
-        elapsed_ms = startup.elapsed().as_millis(),
-        "startup: session_memory"
-    );
-    let state_dir = agent24_protocol::state_file::state_dir()
-        .ok_or_else(|| std::io::Error::other("HOME not set"))?;
-    let packages_root = Arc::new(agent24_os_packages::packages_root(&state_dir, ephemeral));
-    let catalogue = with_discovered(Vec::new(), &packages_root);
-
-    // M-E/E1b: mount external MCP servers from ~/.agent24/mcp.json and register
-    // their tools. Registered with `with()` so they are dispatchable, while
-    // McpTool sets requires_approval = true so EVERY call still goes through the
-    // C4 gate — the whitelist decides "may be dispatched", the gate decides
-    // "may run this time". A broken server is logged and skipped, never fatal.
-    let mut tools = agent24_tools::ToolRegistry::builtin(workspace.clone());
-    let mut module_registry = agent24_domain::tool::ModuleToolRegistry::new();
-    let mut module_operations = std::collections::HashSet::new();
-    for entry in &catalogue {
-        if let crate::domain::Build::Package(package) = &entry.build {
-            if let Err(error) =
-                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
-            {
-                tracing::warn!(module = entry.name, %error, "module tools were refused");
-                continue;
-            }
-            module_operations.extend(
-                package
-                    .manifest
-                    .tools()
-                    .iter()
-                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
-            );
-        }
-    }
-    let module_tool_runtime =
-        crate::module_tool_runtime::AgentModuleToolRuntime::new(module_operations);
-    let module_tool_runtime_dyn: StdArc<dyn agent24_tools::ModuleToolRuntime> =
-        module_tool_runtime.clone();
-    let module_tool_supervisors = module_tool_runtime.supervisors_slot();
-    let mut module_authorizations: std::collections::HashMap<
-        (String, String),
-        StdArc<dyn agent24_tools::ModuleToolAuthorization>,
-    > = std::collections::HashMap::new();
-    let mut card_sources = std::collections::HashMap::new();
-    for (_, registered) in module_registry.iter() {
-        let module = registered.module().to_owned();
-        let declaration = registered.declaration();
-        let operation = declaration.operation().to_owned();
-        let entry = catalogue.iter().find(|entry| entry.name == module);
-        // K1-6a-G §2.1: the card and the gate are made from one summary, so
-        // a grant's fingerprint and the gate's agree byte for byte.
-        let source = crate::consent_routes::ToolCardSource {
-            summary: agent24_policy::tool_summary::module_tool_summary(
-                &module,
-                &entry.map_or_else(String::new, |entry| entry.version.clone()),
-                declaration,
-            ),
-            resource_kinds: declaration.resource_kinds().to_vec(),
-            takes_grants: entry.is_some_and(|entry| {
-                matches!(&entry.build, crate::domain::Build::Package(p) if p.manifest.takes_grants())
-            }),
-        };
-        let authorization = crate::module_tool_runtime::tool_authorization(
-            &source,
-            &store,
-            module_tool_runtime.artifact_source(),
-        );
-        card_sources.insert((module.clone(), operation.clone()), source);
-        if let Some(authorization) = authorization {
-            module_authorizations.insert((module, operation), authorization);
-        }
-    }
-    let module_tool_cards = crate::consent_routes::ModuleToolCards {
-        tools: StdArc::new(card_sources),
-        artifact: module_tool_runtime.artifact_source(),
-        notice: {
-            let runtime = module_tool_runtime.clone();
-            StdArc::new(move |end: crate::module_tool_runtime::GrantEnd| {
-                let runtime = runtime.clone();
-                Box::pin(async move {
-                    runtime
-                        .notify_revoked(&end, crate::module_tool_runtime::REVOCATION_NOTICE_WITHIN)
-                        .await
-                }) as futures::future::BoxFuture<'static, _>
-            })
-        },
-    };
-    let advert_view = crate::module_tool_runtime::AgentModuleToolAdvertView::new(
-        StdArc::clone(&module_tool_runtime),
-        module_authorizations.clone(),
-    );
-    let advert_view_dyn: StdArc<dyn agent24_domain::tool::ModuleToolAdvertView> = advert_view;
-    crate::module_tool_runtime::register_module_tools(
-        &mut tools,
-        &module_registry,
-        &module_authorizations,
-        &advert_view_dyn,
-        &module_tool_runtime_dyn,
-        &store,
-    );
-    // H9: register the read-only explorer subagent. It runs against a registry
-    // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,
-    // execute, or recurse — the guarantees are structural, not policy-checked.
-    let explorer_tools = StdArc::new(agent24_tools::ToolRegistry::read_only(workspace));
-    tools = tools.with(StdArc::new(
-        agent24_agent::subagent::ExplorerSubagent::new_with_store(
-            Arc::clone(&router),
-            explorer_tools,
-            store.clone(),
-        ),
-    ));
-    // H5: register self-wake. It creates one-shot schedules in the same store the
-    // scheduler reads, so an agent can schedule its own follow-ups; the woken run
-    // is gated like any other (see self_wake module docs).
-    tools = tools.with(StdArc::new(agent24_agent::self_wake::SelfWakeTool::new(
-        store.clone(),
-    )));
-    // #1087 b: the Knowledge tools, offered only to a run that names a
-    // binding. They read the private host interface's registry, which the
-    // state takes over below, so both see the same activations and C.
-    let knowledge_host = StdArc::new(crate::knowledge_host::KnowledgeHostRegistry::default());
-    let knowledge_runs: StdArc<dyn crate::knowledge_backend::RunSelector> =
-        StdArc::new(store.clone());
-    for tool in crate::knowledge_tools::tools(StdArc::clone(&knowledge_host), knowledge_runs) {
-        tools = tools.with(tool);
-    }
-    let (mcp_servers, mcp_roster) = match crate::mcp::config_path() {
-        Some(path) => match crate::mcp::load_config(&path) {
-            Ok(cfg) => {
-                let targets = cfg.targets();
-                if targets.is_empty() {
-                    (Vec::new(), Arc::new(crate::mcp::McpRoster::default()))
-                } else {
-                    let (servers, mcp_tools, roster) = crate::mcp::mount(&targets, &cancel).await;
-                    for tool in mcp_tools {
-                        tools = tools.with(tool);
-                    }
-                    (servers, roster)
-                }
-            }
-            Err(err) => {
-                tracing::error!("ignoring {}: {err}", path.display());
-                (Vec::new(), Arc::new(crate::mcp::McpRoster::default()))
-            }
-        },
-        None => (Vec::new(), Arc::new(crate::mcp::McpRoster::default())),
-    };
-
-    // H2: load the user's risk overrides before the registry is frozen, so the
-    // first dispatch already resolves against them. A read failure is logged
-    // and treated as "no overrides" — which fails CLOSED (every tool keeps its
-    // declared, more restrictive class), never open.
-    let risk_overrides = StdArc::new(
-        match agent24_policy::overrides::RiskOverrideStore::load(&store).await {
-            Ok(loaded) => loaded,
-            Err(err) => {
-                tracing::error!("could not load risk overrides ({err}); continuing with none");
-                agent24_policy::overrides::RiskOverrideStore::from_rows(Vec::new())
-            }
-        },
-    );
-    let report = crate::lifecycle::report(
-        &params,
-        &config_warnings,
-        evidence
-            .as_ref()
-            .map(|(dir, previous, last)| (dir.as_path(), previous, last.clone())),
-    );
-    // T8/ME-3g: moved ahead of `AppState::new` (it used to be computed much
-    // later, alongside the catalogue) so it can be injected through `AppDeps`
-    // the same way every other dependency is — neither of these two lines
-    // needs anything `AppState::new` builds, so there is no ordering hazard in
-    // moving them here; the `catalogue`/`with_discovered` call below reuses
-    // this same `packages_root`, not a second one.
-    #[cfg(unix)]
-    let workspace_service = if ephemeral {
-        None
-    } else {
-        Some(StdArc::new(
-            agent24_workspace::WorkspaceService::compose(store.clone(), &state_dir)
-                .map_err(std::io::Error::other)?,
-        ))
-    };
-    #[cfg(not(unix))]
-    let workspace_service = None;
-    let mut state = AppState::new(AppDeps {
-        token: token.clone(),
+    let (
+        store,
+        workspace,
+        router,
+        managed_idoris,
+        idoris_unavailable,
+        idoris_host,
+        idoris_stopping,
+    ) = serve_steps::open_store_workspace_and_idoris(
+        ephemeral,
+        &startup,
+        idoris_root,
+        idoris_install_root,
+        &idoris_dependencies,
+        &cancel,
+    )
+    .await?;
+    let (guardian, memory_base, memory) =
+        serve_steps::open_guardian_and_memory(ephemeral, &router, &cancel, &startup).await;
+    let (state_dir, packages_root, catalogue, integrity_refusals) =
+        serve_steps::discover_packages(ephemeral, &cancel).await?;
+    let (
+        tools,
+        module_registry,
+        module_tool_runtime,
+        _module_tool_runtime_dyn,
+        module_tool_supervisors,
+        _module_authorizations,
+        module_tool_cards,
+        _advert_view_dyn,
+        knowledge_host,
+        mcp_servers,
+        mcp_roster,
+    ) = serve_steps::register_startup_tools(workspace, &store, &router, &catalogue, &cancel).await;
+    let (report, mut state) = serve_steps::assemble_app_state(
+        &token,
         router,
         tools,
         store,
-        risk_overrides,
-        shutdown: shutdown.clone(),
+        &shutdown,
         guardian,
         memory,
-        workspace_service,
         mcp_servers,
-        packages_root: Arc::clone(&packages_root),
-    });
-    // Before any clone into the router. `AppState::new` starts this empty so
-    // tests that never mount MCP keep an empty roster.
-    state.mcp_roster = mcp_roster;
-    state.knowledge_host = knowledge_host;
-    state.managed_idoris = managed_idoris;
-    state.idoris_host = idoris_host;
-    state.idoris_unavailable = idoris_unavailable;
-    if let Some(capability_store) = capability_store {
-        state.enable_capability_auth(capability_store);
-        if mode == StartupMode::HostChild {
-            state.enable_desktop_presence();
-        }
-        state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
-            &state_dir,
-        )?);
-    }
-    // Last, so it wins over the desktop provider that HostChild mode installs
-    // just above (the e2e daemon runs as a host child). Debug test builds only.
-    #[cfg(feature = "test-enrollment")]
-    if crate::enroll_test_support::enabled() {
-        state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
-    }
-
-    // M7 durable expiry recovery runs before durable-resume: a stale approval
-    // must become timed_out before anything can re-broadcast it or preflight its
-    // authority. The orphan sweeps below then own cancellation of its parked run.
-    let approval_now = agent24_core::util::now_iso8601();
-    let expired = state
-        .broker
-        .timeout_expired(&approval_now)
-        .await
-        .map_err(std::io::Error::other)?;
-    if expired > 0 {
-        tracing::warn!("timed out {expired} expired approval(s) during startup recovery");
-    }
-    let recovered_timeouts = state
-        .runs
-        .recover_timed_out_approval_runs()
-        .await
-        .map_err(std::io::Error::other)?;
-    if recovered_timeouts > 0 {
-        tracing::warn!(
-            "cancelled {recovered_timeouts} token-less run(s) after startup approval timeout"
-        );
-    }
-
-    // H3 durable-resume startup, BEFORE accepting any request and BEFORE the
-    // orphan sweep: restore restorable parked approvals (re-broadcast + keep
-    // pending) so their runs survive to be resumed when answered, and abort the
-    // rest fail-closed. The orphan sweep then cancels every still-non-terminal
-    // run whose approval did NOT survive — so the restore MUST come first.
-    let (restored, aborted) = state
-        .runs
-        .restore_pending_approvals()
-        .await
-        .map_err(std::io::Error::other)?;
-    if restored > 0 || aborted > 0 {
-        tracing::info!(
-            "durable resume: {restored} approval(s) restored, {aborted} aborted from a previous process"
-        );
-    }
-    let now = agent24_core::util::now_iso8601();
-    let orphans = state
-        .store
-        .sweep_orphan_runs(&now)
-        .await
-        .map_err(std::io::Error::other)?;
-    if orphans > 0 {
-        tracing::warn!("cancelled {orphans} orphan non-terminal runs from a previous process");
-    }
-    let workspace_now = workspace_recovery_instant_at(std::time::SystemTime::now())?;
-    let workspace_orphans = state
-        .store
-        .sweep_workspace_orphan_runs(&workspace_now)
-        .await
-        .map_err(std::io::Error::other)?;
-    if workspace_orphans.released_leases > 0 {
-        tracing::warn!(
-            "cancelled {} workspace-bound orphan run(s) from a previous process",
-            workspace_orphans.released_leases
-        );
-    }
-
-    // M7: approvals can outlive the task that originally armed their in-memory
-    // timeout. Keep durable expiry/recovery active for the daemon lifetime; a
-    // shutdown child token stops the loop cleanly, and each interval is also the
-    // retry mechanism for transient store or recovery-cancel failures.
-    spawn_approval_recovery_scan(
-        Arc::clone(&state.broker),
-        Arc::clone(&state.runs),
-        cancel.child_token(),
-    );
-
-    // ME4-1.3.1 (design §3.2/§4.6, S1-6): the scheduler's tick loop AND
-    // delivery pump are spawned AFTER `mount_all` returns, below — not here.
-    // Before `mount_all` there is no `ProcessHost`/`Supervisors` for a module
-    // fire to be delivered into, and no `InstalledOwners` catalogue for the
-    // tick to gate delivery-row recording on; starting either loop first
-    // would let a tick land on a module row before either exists.
-
-    // T7b/ME-3e: the periodic module-approval timeout scan (design doc
-    // decision 5) — a plain periodic task, not a per-row timer, on the same
-    // `CancellationToken`/`tokio::spawn` pattern as the scheduler above.
-    state
-        .module_approval_broker
-        .spawn_scan(cancel.child_token());
-
-    let os_config_path =
-        crate::os_config::config_path().ok_or_else(|| std::io::Error::other("HOME not set"))?;
-    let os_config = crate::os_config::OsConfig::load(&os_config_path);
-    if let Err(why) = &os_config {
-        tracing::error!("os.json could not be read ({why}); every admissible domain OS will 503");
-    }
-    // K1-6a-G §2.1 F3: what this start sees of each module with tools,
-    // before a grant of it can hold. A module this fails for keeps none;
-    // an ephemeral daemon sees none, so honours no grant (F6).
-    if !ephemeral && let Ok(config) = &os_config {
-        crate::module_tool_runtime::observe_enable_epochs(
-            &state.store,
-            &module_tool_runtime,
-            config,
-            &os_config_path,
-            module_registry.iter().map(|(_, r)| r.module()),
-        )
-        .await;
-    }
-
-    // An ephemeral daemon gets a throwaway root, NOT `~/.agent24/os`. The mounter
-    // creates a directory for every module it mounts, and an in-memory module will
-    // never writes into it — but an ephemeral instance's STORES were all in memory
-    // before ME-1b-b, and quietly starting to create per-module directories under
-    // the user's state dir would erode that. (It does still create
-    // `~/.agent24/workspace` for tools; this is about not ADDING to what an
-    // ephemeral run touches.) Keyed by pid so two concurrent ephemeral daemons
-    // cannot collide.
-    let os_root = if ephemeral {
-        std::env::temp_dir().join(format!("agent24-ephemeral-{}", std::process::id()))
-    } else {
-        state_dir.join("os")
-    };
-    // Probe only if some module that could actually mount declares a model.
-    // Checking `enabled` too means disabling the one module that needs a model
-    // also removes the startup cost of looking for it.
-    //
-    // This DUPLICATES admission logic that `mount_all` applies again, on purpose,
-    // and the duplication is safe in both directions because it is an
-    // OPTIMISATION, not a decision: if this predicate is too permissive we probe
-    // when nobody needed it (wasted time), and if it is too strict a module that
-    // does need the check gets `Unknown` instead of a definite answer (less
-    // information, never wrong information). Neither can change what mounts.
-    // A model declaration lives in a manifest. Packages carry that manifest
-    // already (it was read at discovery), so a package that declares a model can
-    // be known without constructing anything: probe if any does. Compiled-in
-    // modules still cannot say without being built, and none in this build
-    // declares one.
-    let needs_models = catalogue.iter().any(|e| {
-        matches!(&e.build, crate::domain::Build::Package(p) if !p.manifest.requires_models().is_empty())
-            && os_config.as_ref().is_ok_and(|c| c.is_enabled(&e.name))
-    });
-    let inventory = if needs_models {
-        ModelCatalog::probe(&state.router, &cancel).await
-    } else {
-        ModelCatalog::skipped()
-    };
-    // A module gets memory only if the base actually opened. No base, no lease,
-    // no handle — rather than a handle that fails on every call.
-    let lease = match memory_base {
-        Some(kv) => crate::domain::MemoryLease::open(LOCAL_USER, kv).await,
-        None => None,
-    };
-    // SUP-4: what out-of-process modules are started with. Its callback
-    // sockets live under the state directory — or, for an ephemeral daemon,
-    // under its throwaway root. Directories left by daemons that are gone are
-    // cleared first (FU-56). A daemon that cannot set this up still runs; its
-    // packages degrade, with the reason.
-    // 127.0.0.1 only — never a public bind (SPEC-001 §9). Bound BEFORE any
-    // module is started: a port that is taken fails startup here, rather than
-    // after packages are running, on a path that would leave them to the
-    // runtime's teardown instead of the ordered stop (review of SUP-4, round 4).
-    tracing::debug!(
-        elapsed_ms = startup.elapsed().as_millis(),
-        "startup: before_bind"
-    );
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: bound");
-    let local = listener.local_addr()?;
-
-    let host = process_host(
-        if ephemeral { &os_root } else { &state_dir },
-        params.stop_grace,
-    );
-    if let Ok(host) = &host {
-        let _ = module_tool_supervisors.set(StdArc::clone(&host.supervisors));
-    }
-    if let Err(why) = &host {
-        tracing::error!("out-of-process domain OS modules cannot be started: {why}");
-    }
-    // Modules are owned by the shutdown from the moment each starts — this
-    // task exists before the first one does — so a shutdown that begins while
-    // later packages are still being mounted stops the earlier ones, within
-    // the same bound (review of SUP-4, round 3). It drains and then stops
-    // them, alongside the HTTP drain, by the modules' deadline (TASKS B2): a
-    // module still stopping at the deadline is dropped with its supervisor,
-    // which SIGKILLs its group — and a module reads EOF on its callback
-    // connection as the end of its run (D1), so one that outlives this
-    // process exits on its own.
-    let registry = host.as_ref().ok().map(|h| h.supervisors.clone());
-    let stop_shutdown = shutdown.clone();
-    // Handed over here, synchronously, before the task exists: from now on
-    // only a summary on disk removes the marker (SHUT-1b).
-    let marker = marker.map(crate::lifecycle::MarkerGuard::into_stopping);
-    // A3-2b (design §5.5, M2): the REAL attach registry (with model deps)
-    // does not exist yet at this point in `serve` — it needs the
-    // `UsageRecorder` built further down. This cell is filled in once it is,
-    // right before the attach listener starts; the `stopping` task below only
-    // ever reads it AFTER a shutdown was requested, which cannot happen
-    // before that fill (a shutdown racing in during startup finds the cell
-    // empty and has nothing to revoke — the listener that would let a module
-    // attach has not started either in that same window).
-    let attach_registry_cell: Arc<
-        std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>>,
-    > = Arc::new(std::sync::OnceLock::new());
-    let stopping_attach_registry = Arc::clone(&attach_registry_cell);
-    // COMM-4a: the Hyphae daemon supervisor (if comm_routes manages to
-    // build one) is, like the attach registry above, only known once
-    // `comm_routes::build` runs — AFTER this task is spawned. PR #626
-    // review, High #1: unlike the attach registry's plain `OnceLock`, this
-    // is a `CommDaemonSlot` — a lock `comm_routes::build_ready_state`
-    // registers into BEFORE any autostart attempt, synchronized with this
-    // same task's own `close()` below, so a shutdown that begins mid-`build`
-    // can never let an autostart spawn a Hyphae daemon nothing will ever be
-    // told to stop. See `comm_routes::CommDaemonSlot`'s own doc comment.
-    let comm_daemon_slot: Arc<crate::comm_routes::CommDaemonSlot> =
-        Arc::new(crate::comm_routes::CommDaemonSlot::new());
-    let stopping_comm_daemon = Arc::clone(&comm_daemon_slot);
-    let stopping = tokio::spawn(async move {
-        stop_shutdown.token().cancelled().await;
-        // Whoever cancelled, the shutdown has begun: fixed here if nothing
-        // fixed it yet (SHUT-1b).
-        stop_shutdown.request();
-        // §5.5: revoke every attached module's live generation and drop its
-        // grants (the last `ModelCallbackDeps` clone with it) in the SAME
-        // phase the out-of-process supervisors' `close()` runs in, below —
-        // and, transitively, before `stop_usage_writer` (every call site of
-        // it awaits THIS task first).
-        if let Some(registry) = stopping_attach_registry.get() {
-            registry.revoke_all();
-        }
-        let deadlines = stop_shutdown.deadlines();
-        // The discovery state goes first, off this task: a watchdog exit later
-        // must not leave a state file pointing at a daemon that is gone. (The
-        // singleton lock is held until the process exits, so no second daemon
-        // can start in the meantime.)
-        if !ephemeral {
-            let pid = std::process::id();
-            // A thread of its own rather than the blocking pool, which a
-            // package-tree scan can have busy. Best effort all the same: on a
-            // stalled filesystem nothing can promise it before the watchdog,
-            // and a reader of a stale file still checks that its pid is alive.
-            let _ = std::thread::Builder::new()
-                .name("state-file-cleanup".to_owned())
-                .spawn(move || agent24_protocol::state_file::remove_if_owner(pid));
-        }
-        let closed = registry.map(|r| r.close()).unwrap_or_default();
-        // What each stop records, taken before the stops consume their
-        // handles; read again at the modules' deadline (SHUT-1b).
-        let tracked: Vec<_> = closed
-            .running
-            .iter()
-            .map(|s| {
-                (
-                    s.name.clone(),
-                    crate::lifecycle::Reason::Shutdown,
-                    s.handle.stop_record(),
-                )
-            })
-            .chain(closed.disabling.iter().map(|d| {
-                (
-                    d.name.clone(),
-                    crate::lifecycle::Reason::Disable,
-                    d.record.clone(),
-                )
-            }))
-            .collect();
-        let params = stop_shutdown.params();
-        // COMM-4a §6.2 / PR #626 review, High #2: comm's stop shares the
-        // SAME absolute deadline every other out-of-process module's stop
-        // does, and runs CONCURRENTLY with them — it used to run
-        // sequentially, AFTER this `timeout_at` had already elapsed, under
-        // its own unvalidated ~5s-default grace (vs. SHUT-1b's validated
-        // 500ms default): a Hyphae daemon that ignored SIGTERM could then
-        // have `agent24d` hit the watchdog and exit before Hyphae was ever
-        // sent SIGKILL or a shutdown record was written for it.
-        // `HyphaeDaemonSupervisor::shutdown` queues its `Cmd::Shutdown`
-        // (channel `send`) before this `.await` ever starts waiting on the
-        // reply, so if the shared deadline is hit below, the actor task
-        // keeps running the stop (TERM, grace, KILL, reap) to completion on
-        // its own schedule regardless of whether anything here is still
-        // waiting on its result.
-        let comm_shutdown = async {
-            // PR #626 review, High #1: `close()`, not a plain read — see
-            // `CommDaemonSlot`'s doc comment; this is the one call that may
-            // ever close this slot. High #2: `deadlines.modules` is the
-            // SAME absolute instant the `timeout_at` below races this
-            // against, handed straight into the actor (not just this
-            // await) so an in-flight config-change restart's own stop of
-            // an OLD generation picks it up on its very next grace-loop
-            // poll, and nothing may spawn past it from here on.
-            match stopping_comm_daemon.close() {
-                Some(daemon) => Some(daemon.shutdown(deadlines.modules).await),
-                None => None,
-            }
-        };
-        let (supervisors_result, comm_result, idoris_result) = tokio::join!(
-            tokio::time::timeout_at(deadlines.modules, stop_supervisors(closed, params.drain)),
-            tokio::time::timeout_at(deadlines.modules, comm_shutdown),
-            tokio::time::timeout_at(deadlines.persist - crate::lifecycle::PERSIST, async move {
-                match idoris_stopping {
-                    Some(task) => task.await,
-                    None => Ok(Ok(())),
-                }
-            }),
-        );
-        if !matches!(idoris_result, Ok(Ok(Ok(())))) {
-            tracing::warn!("managed iDoris shutdown failed or exceeded the host budget");
-        }
-        if supervisors_result.is_err() {
-            tracing::warn!(
-                "out-of-process modules were still stopping at the deadline; their supervisors \
-                 were dropped (SIGKILL attempted, exit unconfirmed)"
-            );
-        }
-        let mut records: Vec<_> = tracked
-            .iter()
-            .map(|(name, reason, record)| (name.clone(), *reason, record.snapshot()))
-            .collect();
-        // COMM-4a §6.2: comm's stop is folded into this same module-stop
-        // phase, recorded as `comm.hyphae` in `last-shutdown.json`'s
-        // `records[]`. `agent24-comm` never depends on
-        // `agent24-os-proto` (COMM-HYPHAE.md §7's zero-run boundary), so the
-        // translation from its own neutral `DaemonShutdownOutcome` into this
-        // crate's `StopRecord` happens here, not there.
-        match comm_result {
-            Ok(None) => {}
-            Ok(Some(outcome)) => {
-                let leader = outcome.leader.map(|l| match l {
-                    agent24_comm::ShutdownLeader::GoneBeforeTerm => {
-                        agent24_os_proto::stop_record::Leader::GoneBeforeTerm
-                    }
-                    agent24_comm::ShutdownLeader::ExitedInGrace => {
-                        agent24_os_proto::stop_record::Leader::ExitedInGrace
-                    }
-                    agent24_comm::ShutdownLeader::KilledAfterGrace => {
-                        agent24_os_proto::stop_record::Leader::KilledAfterGrace
-                    }
-                });
-                // `StopRecord` has two private fields (`drain_began`,
-                // `abandoning`) not meant for a caller outside
-                // `agent24-os-proto` to set, so `..Default::default()` is
-                // unavailable here — plain field assignment on a
-                // `Default::default()` value only touches the public ones
-                // this comm translation actually has an opinion about.
-                let mut record = agent24_os_proto::stop_record::StopRecord::default();
-                record.process = Some(if outcome.had_process {
-                    agent24_os_proto::stop_record::ProcessAtStop::Running
-                } else {
-                    agent24_os_proto::stop_record::ProcessAtStop::None
-                });
-                record.leader = leader;
-                // PR #642 review round 3, Medium #1: `group` now comes
-                // straight from `kill_group_gracefully`'s own final
-                // post-KILL probe (`group_confirmed_gone`), not from
-                // inferring it off how the LEADER alone ended. The previous
-                // version recorded `Gone` for ANY leader outcome other than
-                // `KilledAfterGrace` — including `ExitedInGrace`, where the
-                // leader exiting on TERM says nothing about whether a
-                // helper the leader left behind (still `Ok`/`EPERM` after
-                // its own SIGKILL and the bounded post-KILL probe) was ever
-                // actually confirmed gone. `Failed` (not `KillAttempted`,
-                // which `stop_record.rs` reserves for a stop that was
-                // dropped/cut off before ever reaching this probe) is the
-                // correct fact here: this call always ran to completion and
-                // always sent the KILL — it just could not confirm the
-                // group empty afterwards.
-                record.group = outcome.group_confirmed_gone.map(|confirmed| {
-                    if confirmed {
-                        agent24_os_proto::stop_record::GroupEnd::Gone
-                    } else {
-                        agent24_os_proto::stop_record::GroupEnd::Failed
-                    }
-                });
-                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::Stopped);
-                records.push((
-                    "comm.hyphae".to_owned(),
-                    crate::lifecycle::Reason::Shutdown,
-                    record,
-                ));
-            }
-            Err(_) => {
-                // The shared deadline was hit before comm's own stop
-                // replied. Its process group is still being cleaned up on
-                // the actor's own task either way (see the comment above) —
-                // this only means the OUTCOME could not be confirmed in
-                // time to record accurately, so the record says exactly
-                // that rather than guessing `Gone`.
-                tracing::warn!(
-                    "comm: the hyphae daemon's stop did not complete by the shared modules \
-                     deadline; its process group is still being cleaned up on the \
-                     supervisor's own task, but the outcome could not be confirmed in time \
-                     to record"
-                );
-                let mut record = agent24_os_proto::stop_record::StopRecord::default();
-                record.process = Some(agent24_os_proto::stop_record::ProcessAtStop::Running);
-                record.supervisor = Some(agent24_os_proto::stop_record::SupervisorEnd::CutOff);
-                records.push((
-                    "comm.hyphae".to_owned(),
-                    crate::lifecycle::Reason::Shutdown,
-                    record,
-                ));
-            }
-        }
-        let summary = crate::lifecycle::Summary::new(
-            marker
-                .as_ref()
-                .map_or("ephemeral", crate::lifecycle::StoppingMarker::instance_id),
-            &params,
-            deadlines.began.elapsed(),
-            &records,
-        );
-        // Every evidence line names its state directory (review of SHUT-1b,
-        // round 3): two daemons with different HOMEs log side by side.
-        let evidence = marker
-            .as_ref()
-            .map_or_else(|| "ephemeral".to_owned(), |m| m.dir().display().to_string());
-        tracing::info!(evidence = %evidence, "{}", summary.describe());
-        if let Some(marker) = marker {
-            let job =
-                tokio::task::spawn_blocking(move || crate::lifecycle::persist(&summary, &marker));
-            match tokio::time::timeout_at(deadlines.persist, job).await {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => tracing::error!(
-                    "the shutdown summary could not be written in {evidence} ({e}); the next \
-                     start will not be able to confirm this shutdown"
-                ),
-                Ok(Err(e)) => {
-                    tracing::error!("writing the shutdown summary in {evidence} failed: {e}");
-                }
-                Err(_) => tracing::error!(
-                    "the shutdown summary was not on disk in {evidence} by its deadline; the \
-                     next start will not be able to confirm this shutdown"
-                ),
-            }
-        }
-    });
-    // ME4-4.2.3b (design §6.3): the production usage sink. `hard_stop`
-    // mirrors `modules_cut_off()`'s own shape — the shutdown token cancelled,
-    // then the SAME `deadlines().modules` instant (cut-off + `CONFIRM`) —
-    // rather than reusing `modules_cut_off()` itself: that future is a fresh
-    // "began" read the FIRST time it's polled, and this recorder's hard stop
-    // must line up with `stop_usage_writer`'s own `deadlines().modules` call
-    // below, not with whenever this particular future happens to be polled.
-    // `deadlines()` itself is idempotent (`Shutdown::began` is a `OnceLock`),
-    // so both reads agree regardless.
-    let usage_hard_stop = {
-        let shutdown = shutdown.clone();
-        async move {
-            shutdown.token().cancelled().await;
-            tokio::time::sleep_until(shutdown.deadlines().calls + crate::lifecycle::CONFIRM).await;
-        }
-    };
-    let (usage_recorder, usage_writer) =
-        crate::usage_recorder::UsageRecorder::spawn(state.store.clone(), usage_hard_stop);
-    // A3-2b (design §5.5, M2): built ONCE here — not a second, structurally
-    // equivalent copy — so the attach registry's model calls are cancelled by
-    // the EXACT SAME `modules_cut_off()` cancellation tree a mounted
-    // package's calls are ("同一棵树"), and so its `usage` sender is the same
-    // `Arc` `stop_usage_writer` waits to see dropped. Cloned (not moved) into
-    // `CallbackDeps` below — `ModelCallbackDeps` is `Clone` by design for
-    // exactly this "more than one grantor needs the same deps" case.
-    let model_deps = crate::model_callback::ModelCallbackDeps {
-        router: state.router.clone(),
-        usage: usage_recorder.clone(),
-        cancel_root: crate::model_callback::spawn_cancel_root(shutdown.calls_cut_off()),
-        admission: crate::model_callback::ModelAdmission::new(
-            crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
-            crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
-        ),
-        events: state.events.clone(),
-        timings: state.timings.clone(),
-    };
-    let (module_routes, reports, partitions) = crate::domain::mount_all(
+        &packages_root,
+        &params,
+        &config_warnings,
+        &evidence,
+        &state_dir,
+        knowledge_host,
+        managed_idoris,
+        idoris_host,
+        idoris_unavailable,
+        capability_store,
+        mode,
+        mcp_roster,
+        ephemeral,
+    )
+    .await?;
+    let os_config = serve_steps::recover_durable_runs(
+        &state,
+        ephemeral,
+        &cancel,
+        &module_tool_runtime,
+        &module_registry,
+    )
+    .await?;
+    let (os_root, inventory, lease) = serve_steps::prepare_os_mount(
+        ephemeral,
+        &state_dir,
         &catalogue,
-        &os_root,
-        &state.events,
-        os_config.as_ref().map_err(String::as_str),
-        &inventory,
-        lease.as_ref(),
-        host.as_ref().map_err(String::as_str),
-        &state.module_approval_broker,
-        crate::domain::CallbackDeps {
-            scheduler: state.scheduler.clone(),
-            // ME4-4.2.2b2 (design §2.4/§10.1): `router` is the SAME kernel
-            // router `/api/v1/chat` uses — each grant takes its own
-            // `with_separate_health()` view of it (v2 H2), never routing
-            // through it directly. `cancel_root` fires at
-            // `modules_cut_off()`, not at the start of shutdown (§3.3): a
-            // module's in-flight inference lives exactly as long as its own
-            // drain allows. ME4-4.2.3b: the usage sink is now the real
-            // `UsageRecorder` — `serve` waits for its writer below, AFTER the
-            // supervisors have stopped, via `stop_usage_writer`. Cloned (not
-            // moved) here: `serve` keeps its own `usage_recorder` binding
-            // alive to pass to `stop_usage_writer` later — that function
-            // itself is what drops the LAST reference, right before it
-            // awaits the writer's join (its own doc comment explains why
-            // that ordering matters).
-            models: Some(model_deps.clone()),
-        },
+        &os_config,
+        &state,
+        &cancel,
+        memory_base,
     )
     .await;
-
-    // ME4-1.3.1 (design §4.6): right after `mount_all` returns — before the
-    // tick loop or the delivery pump ever run — set the two handles they and
-    // `KernelTrigger`'s `Module` arm depend on.
-    //
-    // `InstalledOwners` gets every name `mount_all` was given (mounted,
-    // disabled in os.json, refused — anything the catalogue discovered), NOT
-    // only what mounted successfully (design v2, M5): a disabled entry is
-    // still "installed" and its schedules must keep pre-advancing even though
-    // no delivery row is recorded for them.
-    state
-        .scheduler
-        .installed_owners()
-        .set(catalogue.iter().map(|entry| entry.name.clone()).collect());
-    // `host` being `Err` means this daemon cannot start out-of-process
-    // modules at all (design §4.6, v2 L5): the deliverer's `OnceLock` is left
-    // unset, so every module fire stays `Deferred(MountPending)` until its
-    // 24h TTL — the tick loop below still starts unconditionally, so AgentRun
-    // rows are unaffected.
-    if let Ok(h) = &host {
-        state.deliverer.set_supervisors(h.supervisors.clone());
-    }
-
-    // Scheduler tick loop: polls due schedules, pre-advances, and fires
-    // AgentRun rows / records module deliveries. Cadence from
-    // A24_SCHEDULER_TICK_SECS (default 10s; finest schedule granularity is a
-    // minute, so a few seconds' latency is invisible).
-    let tick_secs = std::env::var("A24_SCHEDULER_TICK_SECS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|s| *s > 0)
-        .unwrap_or(10);
-    let tick_scheduler = Arc::clone(&state.scheduler);
-    let tick_cancel = cancel.clone();
-    tokio::spawn(tick_scheduler.run(
-        StdArc::new(agent24_scheduler::SystemClock),
-        Duration::from_secs(tick_secs),
-        tick_cancel,
-    ));
-    // ME4-1.3.1 (design §5.4): the delivery pump — independent of the tick,
-    // its own cadence, driven by the same real clock. Cancelled by the SAME
-    // `CancellationToken` the tick loop uses: on shutdown, an attempt still in
-    // flight is aborted (its `JoinSet` is dropped) rather than awaited, and
-    // its delivery row is left `pending`/`deferred` for the next start
-    // (design §4.6/§5.4, judgement C4.12).
-    let pump = agent24_scheduler::deliveries::DeliveryPump::new(Arc::clone(&state.scheduler));
-    let pump_cancel = cancel.clone();
-    tokio::spawn(pump.run(StdArc::new(agent24_scheduler::SystemClock), pump_cancel));
-
-    for p in partitions.partitions() {
-        tracing::info!(
-            "domain OS {} was lent a memory partition for user {}",
-            p.module,
-            p.user
-        );
-    }
-    // From the DURABLE catalog, not from what mounted just now, and not by
-    // matching keys — which is the whole reason the catalog exists. This number
-    // deliberately includes partitions belonging to modules that are disabled or
-    // no longer installed: those are the ones an operator would otherwise never
-    // learn about, and the ones an export or erase path must not miss.
-    if let Some(l) = lease.as_ref() {
-        match crate::os_memory::OsMemoryCatalog::durable_for_org(&l.kv, &l.org).await {
-            Ok(rows) if !rows.is_empty() => {
-                // By physical KEY, not by module name. After a key-version change a
-                // mounted module gets a NEW partition while its historical rows keep
-                // the same module name — matching on the name would report those as
-                // live and hide exactly the leftovers this log exists to surface.
-                let live: std::collections::HashSet<&str> = partitions
-                    .partitions()
-                    .iter()
-                    .map(|p| p.key.as_str())
-                    .collect();
-                let dormant = rows
-                    .iter()
-                    .filter(|r| !live.contains(r.owner_key.as_str()))
-                    .count();
-                // "not mounted now" describes the PARTITION, not the module. The
-                // comment above already said why and the message used to
-                // contradict it: after a re-key, the leftover row keeps the same
-                // module name while that module is mounted perfectly well under
-                // its new key, so calling those rows "modules not mounted" is
-                // false exactly where an operator most needs the truth.
-                tracing::info!(
-                    "org {} owns {} domain-OS memory partition(s) besides {LOCAL_USER}'s \
-                     own memory; {dormant} of them are not mounted under that key now \
-                     (a disabled or uninstalled module, a rename, or an older key version)",
-                    l.org.as_str(),
-                    rows.len()
-                );
-            }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("could not read the domain-OS memory catalog: {e}"),
-        }
-    }
-    for r in &reports {
-        tracing::info!(
-            "domain OS {} at {}: {:?} (grants: {:?})",
-            r.name,
-            r.namespace,
-            r.outcome,
-            r.granted
-        );
-        match &r.resources {
-            crate::domain::ResourceStatus::NotChecked
-            | crate::domain::ResourceStatus::Satisfied => {}
-            crate::domain::ResourceStatus::MissingModels(missing) => tracing::warn!(
-                "domain OS {} declares models that are not available: {:?} — it is \
-                 mounted, but features needing them will fail",
-                r.name,
-                missing
-            ),
-            crate::domain::ResourceStatus::Unknown(why) => tracing::warn!(
-                "could not check {}'s declared models ({why}); NOT reporting them \
-                 as missing, because an unreachable provider is not a missing model",
-                r.name
-            ),
-        }
-    }
-    // Hand the verdicts to the state BEFORE the router clones it, so `/api/v1/os`
-    // can report what the mounter actually decided rather than re-deriving it.
-    state.os_reports = Arc::new(reports);
-    state.module_namespaces = Arc::new(
-        state
-            .os_reports
-            .iter()
-            .filter(|report| {
-                matches!(
-                    report.outcome,
-                    crate::domain::MountOutcome::Mounted
-                        | crate::domain::MountOutcome::Disabled
-                        | crate::domain::MountOutcome::Degraded(_)
-                )
-            })
-            .map(|report| report.namespace.clone())
-            .collect(),
+    let (listener, local) = serve_steps::bind_loopback(&startup, port).await?;
+    let host = serve_steps::start_process_host(
+        ephemeral,
+        &os_root,
+        &state_dir,
+        params,
+        &shutdown,
+        &module_tool_supervisors,
     );
-    // T8/ME-3g: same ordering reason as `os_reports` just above — `catalogue`
-    // is still in scope (only borrowed by `mount_all`, never moved), so this is
-    // a cheap O(n) derivation, not a second discovery pass.
-    state.package_dirs = Arc::new(
-        catalogue
-            .iter()
-            .filter_map(|entry| match &entry.build {
-                crate::domain::Build::Package(package) => {
-                    Some((entry.name.clone(), package.dir.clone()))
-                }
-                crate::domain::Build::InProcess(_) => None,
-            })
-            .collect(),
-    );
-    state.module_status = Arc::new(
-        host.as_ref()
-            .map(|h| h.supervisors.statuses())
-            .unwrap_or_default(),
-    );
-    state.supervisors = host.as_ref().ok().map(|h| h.supervisors.clone());
-    // K1-6a-G §2.5 (A5b), §2.5.1: told once the modules run, so a grant
-    // that expired, or an end not told, while the daemon was down reaches
-    // the run that is up now.
-    tokio::spawn(crate::grant_expiry::run(
-        state.store.clone(),
-        module_tool_cards.notice.clone(),
-        {
-            let cards = module_tool_cards.clone();
-            StdArc::new(move |module: &str| cards.on_grants_protocol(module))
-        },
-        cancel.child_token(),
-    ));
-    state.module_tool_cards = Some(module_tool_cards);
-    state.module_grants = module_grants;
-    state.shutdown_report = Arc::new(report);
-    // A3-2b (design §4/§5): the real attach registry — same "start empty,
-    // replace once real data is ready" pattern as `os_reports` above, and for
-    // the same ordering reason (this runs before `state` is cloned into the
-    // router). Hydrated from `attached.json` BEFORE the listener takes its
-    // first connection (`AttachRegistry::hydrate`'s own doc: a handshake
-    // racing an unloaded name would otherwise see a spurious `auth_failed`).
-    state.attach_registry = Arc::new(crate::attach_registry::AttachRegistry::new(
-        crate::attach_registry::AttachDeps {
-            scheduler: state.scheduler.clone(),
-            models: Some(model_deps),
-            approval_broker: state.module_approval_broker.clone(),
-            events: state.events.clone(),
-        },
-    ));
-    // Review H1: an EPHEMERAL daemon (`agent24 ...` without a resident
-    // daemon, or an `os_local` helper spawning one just for one CLI call)
-    // must NOT touch `~/.agent24/attach/agent24d.sock` at all — that path is
-    // the REAL, resident daemon's. A short-lived daemon hydrating it and
-    // binding the real socket would make the resident daemon's own listener
-    // degrade (`bind`'s own "already accepting connections" check), or worse
-    // — if the resident daemon is not up yet — actually WIN the bind, so a
-    // real AgentEar connects to a process that exits moments later, silently
-    // losing every event/usage row it would have recorded. Attach support is
-    // simply not offered from an ephemeral daemon; hydration and the
-    // listener are both skipped.
-    if !ephemeral {
-        if let Some(path) = crate::attached::config_path()
-            && let Err(e) = state.attach_registry.hydrate(&path)
-        {
-            tracing::error!("could not hydrate the attach registry from {path:?}: {e}");
-        }
-        // Filled before the listener starts (see the cell's own comment
-        // above): the `stopping` task's `revoke_all` can now find it. See
-        // [`fill_attach_registry_and_recheck`]'s own doc comment for why the
-        // fill is immediately followed by a re-check of `cancel`.
-        fill_attach_registry_and_recheck(&attach_registry_cell, &state.attach_registry, &cancel);
-        if let Some(path) = crate::attached::socket_path() {
-            tokio::spawn(crate::attach_listener::run(
-                Arc::clone(&state.attach_registry),
-                path,
-                shutdown.child_token(),
-            ));
-        } else {
-            tracing::error!("attach listener not started: HOME is not set, no socket path to bind");
-        }
-    }
+    let (attach_registry_cell, comm_daemon_slot, stopping) =
+        serve_steps::spawn_ordered_shutdown(&shutdown, &host, ephemeral, idoris_stopping, marker);
+    let (usage_recorder, usage_writer, model_deps) =
+        serve_steps::start_usage_and_model_deps(&shutdown, &state);
+    let (module_routes, reports, partitions, package_dirs) = serve_steps::mount_domain_os(
+        &catalogue,
+        &os_root,
+        &state,
+        &os_config,
+        &inventory,
+        &lease,
+        &host,
+        &integrity_refusals,
+        &model_deps,
+    )
+    .await;
+    serve_steps::arm_scheduler_after_mount(&mut state, &catalogue, &host, &cancel);
+    serve_steps::publish_mount_and_attach(
+        &mut state,
+        &partitions,
+        &lease,
+        reports,
+        package_dirs,
+        &host,
+        module_tool_cards,
+        &cancel,
+        module_grants,
+        report,
+        model_deps,
+        ephemeral,
+        &attach_registry_cell,
+        &shutdown,
+    )
+    .await;
     // COMM-2a: `/api/v1/comm/*` — merged into `module_routes` (not a literal
     // route inside `build_router_with_modules` itself) so this stays behind
     // kernel auth exactly like every other module route, and so the wiring
@@ -3173,213 +1594,41 @@ pub async fn serve(
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
     state.comm_slot = Some(Arc::clone(&comm_daemon_slot));
-    if state.auth_mode == AuthMode::Capabilities {
-        // Package modules register an ANY-method proxy for their namespace.
-        // Bind that registered surface and the exact manifest, not enabled flags.
-        // In-process modules have no route inventory API and remain undelegated.
-        state.module_surfaces = Arc::new(
-            catalogue
-                .iter()
-                .filter_map(|entry| {
-                    let crate::domain::Build::Package(package) = &entry.build else {
-                        return None;
-                    };
-                    let report = state.os_reports.iter().find(|r| {
-                        r.name == package.manifest.name()
-                            && matches!(r.outcome, crate::domain::MountOutcome::Mounted)
-                    })?;
-                    Some(crate::capabilities::delegation::ModuleSurface {
-                        name: report.name.clone(),
-                        version: report.version.clone(),
-                        namespace: report.namespace.clone(),
-                        routes_sha256: crate::capabilities::first_party::body_digest(
-                            format!(
-                                "ANY {}\nANY {}/{{*rest}}\n{}",
-                                report.namespace, report.namespace, package.digest
-                            )
-                            .as_bytes(),
-                        ),
-                    })
-                })
-                .collect(),
-        );
-    }
+
+    serve_steps::fill_module_surfaces(&mut state, &catalogue);
     let enroll_authority = state.first_party.clone();
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
-    // A shutdown that began during startup ends it here, before anything says
-    // this daemon is ready: its modules are stopped, and no state file or
-    // ready line advertises a daemon that is about to exit (review of SUP-4,
-    // round 4). Checked again, atomically, before the ready line below.
-    if cancel.is_cancelled() {
-        let _ = stopping.await;
-        crate::usage_recorder::stop_usage_writer(
-            usage_recorder,
-            usage_writer,
-            shutdown.deadlines().modules,
-        )
-        .await;
+    let still = serve_steps::advertise_readiness(
+        &cancel,
+        stopping,
+        usage_recorder,
+        usage_writer,
+        &shutdown,
+        ephemeral,
+        mode,
+        &state_dir,
+        auth_mode,
+        local,
+        &token,
+        &daemon_generation,
+        enroll_authority,
+        ready_omit_token,
+        &startup,
+        product_host_token,
+        &mut host_ready,
+    )
+    .await?;
+    let Some(still) = still else {
         return Ok(());
-    }
-
-    // SPEC-002 §4 ready line: legacy parsers scan stdout; capability mode first
-    // proves stdin/stdout are parent-owned pipes and binds lifetime to stdin.
-    // stdout carries nothing else in either mode (logs go to stderr), except
-    // a `failed` line in place of the ready line when the start fails first.
-    // Discovery state file BEFORE the ready line: a CLI that has seen the
-    // ready line may immediately rely on attached-mode discovery.
-    let daemon_pid = std::process::id();
-    // CORE-2e (D5): lock -> migration -> bind the enrolment endpoint -> only
-    // then publish daemon.json and the ready line. A bind or (service mode)
-    // publish failure ends this start; nothing half-ready is advertised.
-    let mut enroll = None;
-    let mut publish_error = None;
-    if !ephemeral {
-        let bound = if mode == StartupMode::Legacy {
-            Ok(None)
-        } else {
-            crate::enroll_endpoint::bind(&state_dir).map(Some)
-        };
-        match bound {
-            Ok(endpoint) => enroll = endpoint,
-            Err(err) => {
-                publish_error = Some(std::io::Error::other(format!(
-                    "cannot bind the enrolment endpoint: {err}"
-                )))
-            }
-        }
-    }
-    if publish_error.is_none() && !ephemeral {
-        let discovery = match auth_mode {
-            AuthMode::LegacySingleToken => agent24_protocol::state_file::DaemonState::new_legacy(
-                local.port(),
-                token.clone(),
-                daemon_pid,
-                env!("CARGO_PKG_VERSION"),
-                daemon_generation.clone(),
-            ),
-            AuthMode::Capabilities => agent24_protocol::state_file::DaemonState::new_capabilities(
-                local.port(),
-                daemon_pid,
-                env!("CARGO_PKG_VERSION"),
-                daemon_generation.clone(),
-            ),
-        }
-        .map_err(std::io::Error::other)?;
-        let discovery = match &enroll {
-            Some(endpoint) => {
-                discovery.with_enroll_endpoint(endpoint.path().to_string_lossy().into_owned())
-            }
-            None => discovery,
-        };
-        if let Err(err) = agent24_protocol::state_file::write(&discovery) {
-            if mode == StartupMode::Service {
-                // Revises facts §8.3 for the service path only: a service
-                // nobody can discover is a failed start.
-                publish_error = Some(err);
-            } else {
-                tracing::warn!("could not write daemon state file: {err}");
-            }
-        }
-    }
-    if let Some(err) = publish_error {
-        tracing::error!("daemon start failed before ready: {err}");
-        shutdown.request();
-        tracing::info!("stopping modules after a failed start");
-        let _ = stopping.await;
-        crate::usage_recorder::stop_usage_writer(
-            usage_recorder,
-            usage_writer,
-            shutdown.deadlines().modules,
-        )
-        .await;
-        if !ephemeral {
-            agent24_protocol::state_file::remove_if_owner(daemon_pid);
-        }
-        return Err(err);
-    }
-    if let Some(endpoint) = enroll.as_mut()
-        && let Some(authority) = enroll_authority
-    {
-        endpoint.serve(
-            cancel.clone(),
-            daemon_generation.clone(),
-            local.port(),
-            authority,
-        );
-    }
-
-    // The state file is written; now readiness and a shutdown request race
-    // for one atomic flag. Lost to a shutdown: take the file back — the
-    // cleanup at the shutdown's start may have run before it existed — and
-    // print no ready line.
-    if !shutdown.commit_ready() {
-        if !ephemeral {
-            agent24_protocol::state_file::remove_if_owner(daemon_pid);
-        }
-        let _ = stopping.await;
-        crate::usage_recorder::stop_usage_writer(
-            usage_recorder,
-            usage_writer,
-            shutdown.deadlines().modules,
-        )
-        .await;
-        return Ok(());
-    }
-    tracing::debug!(elapsed_ms = startup.elapsed().as_millis(), "startup: ready");
-    let ready = match auth_mode {
-        AuthMode::LegacySingleToken => {
-            legacy_ready_line(local.port(), &token, ready_omit_token, &daemon_generation)
-        }
-        AuthMode::Capabilities if mode == StartupMode::Service => serde_json::json!({
-            "type": "ready",
-            "port": local.port(),
-            "auth_mode": "capabilities",
-            "generation": daemon_generation,
-            "version": env!("CARGO_PKG_VERSION"),
-            "enroll_endpoint": enroll.as_ref().map(|e| e.path().to_string_lossy().into_owned()),
-        }),
-        AuthMode::Capabilities => {
-            let product_host_token = product_host_token.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "capability startup lost its host credential",
-                )
-            })?;
-            serde_json::json!({
-                "type": "ready",
-                "port": local.port(),
-                // This secret crosses only the inherited ready pipe to the
-                // spawning trusted host. It is never written to daemon.json.
-                "product_host_token": product_host_token,
-                "auth_mode": "capabilities",
-                "generation": daemon_generation,
-                "version": env!("CARGO_PKG_VERSION"),
-            })
-        }
     };
-    match auth_mode {
-        AuthMode::LegacySingleToken => println!("{ready}"),
-        AuthMode::Capabilities if mode == StartupMode::Service => println!("{ready}"),
-        AuthMode::Capabilities => {
-            let host_ready = host_ready.as_mut().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "capability startup lost its private ready pipe",
-                )
-            })?;
-            host_ready.send(&ready).await?;
-        }
-    }
-    // SPEC-002 §4: nothing follows the ready line, so `main` writes no
-    // `failed` line after this. Only review guards this store: no test can
-    // fail a start between the line and here (review of #1332).
-    READY_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
-    // In capability mode `ready` is the only temporary owner of the raw host
-    // bearer after the private write completes. Do not retain it for daemon
-    // lifetime; the authority store keeps only its digest.
-    drop(ready);
-
+    let serve_steps::StillUp {
+        stopping,
+        usage_recorder,
+        usage_writer,
+        daemon_pid,
+        enroll: _enroll,
+    } = still;
     let graceful_cancel = cancel.clone();
     let router = guard_host_origin(router, local.port());
     let server = axum::serve(listener, router)
@@ -3649,6 +1898,7 @@ fn fallback_dir_hash(root: &std::path::Path) -> u64 {
 fn process_host(
     root: &std::path::Path,
     stop_grace: Duration,
+    shutdown: CancellationToken,
 ) -> Result<crate::domain::ProcessHost, String> {
     let root = &callback_root(root)?;
     for gone in agent24_os_proto::endpoint::remove_stale(root) {
@@ -3681,6 +1931,7 @@ fn process_host(
     // new one, or fails to start — upgrading the daemon means restarting it.
     let program = std::env::current_exe().map_err(|e| format!("this binary's path: {e}"))?;
     Ok(crate::domain::ProcessHost {
+        signature: os_signature_policy(),
         callback_dir: StdArc::new(callback_dir),
         trampoline: agent24_os_proto::launch::Trampoline {
             program,
@@ -3691,6 +1942,7 @@ fn process_host(
             ..agent24_os_proto::supervisor::Timings::default()
         },
         supervisors: StdArc::new(crate::domain::Supervisors::default()),
+        shutdown,
     })
 }
 
@@ -3779,10 +2031,126 @@ async fn stop_supervisors(closed: crate::domain::Closed, drain: Duration) {
 /// `mount_all` claims names first-come-first-served, so a disk package cannot
 /// shadow a compiled-in module by taking its name. The second claimant gets an
 /// explicit refusal rather than silently winning.
+/// A panicked scan is not an empty catalogue. An empty catalogue means no
+/// packages were installed; a join failure means startup did not learn that.
+fn catalogue_from_join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, std::io::Error> {
+    joined.map_err(|err| {
+        tracing::error!("discovering domain OS packages failed: {err}");
+        std::io::Error::other(format!("discovering domain OS packages failed: {err}"))
+    })
+}
+
+/// Register package tools unless shutdown has already cancelled the token.
+/// A package the scan accepted is not published after that.
+pub(crate) fn register_discovered_module_tools(
+    catalogue: &[crate::domain::Installed],
+    cancel: &CancellationToken,
+    module_registry: &mut agent24_domain::tool::ModuleToolRegistry,
+    module_operations: &mut std::collections::HashSet<(String, String)>,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!("not registering domain OS tools: shutdown already cancelled");
+        return;
+    }
+    for entry in catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            if let Err(error) =
+                module_registry.register_module(entry.name.as_str(), package.manifest.tools())
+            {
+                tracing::warn!(module = entry.name, %error, "module tools were refused");
+                continue;
+            }
+            module_operations.extend(
+                package
+                    .manifest
+                    .tools()
+                    .iter()
+                    .map(|tool| (entry.name.clone(), tool.operation().to_owned())),
+            );
+        }
+    }
+}
+
+/// Drop tools filled before the publish point if the token has since fired.
+pub(crate) fn module_tools_if_live(
+    cancel: &CancellationToken,
+    registry: agent24_domain::tool::ModuleToolRegistry,
+    operations: std::collections::HashSet<(String, String)>,
+) -> (
+    agent24_domain::tool::ModuleToolRegistry,
+    std::collections::HashSet<(String, String)>,
+) {
+    if cancel.is_cancelled() {
+        tracing::info!("not publishing domain OS tools: shutdown already cancelled");
+        (
+            agent24_domain::tool::ModuleToolRegistry::new(),
+            std::collections::HashSet::new(),
+        )
+    } else {
+        (registry, operations)
+    }
+}
+
+fn os_signature_policy() -> agent24_os_packages::signature::Policy {
+    #[cfg(test)]
+    {
+        agent24_os_packages::test_support::signature_policy()
+    }
+    #[cfg(not(test))]
+    {
+        agent24_os_packages::signature::Policy::default()
+    }
+}
+
+struct DiscoveryPass {
+    catalogue: Vec<crate::domain::Installed>,
+    /// Integrity refusals whose directory is a package, not the packages root.
+    /// The root's own unreadability stays a log line: it is not a component.
+    integrity_refusals: Vec<agent24_os_packages::discovery::Refused>,
+}
+
+/// Catalogue directories plus the directory of each integrity refusal, under
+/// the component name [`crate::domain::integrity_refusal_reports`] assigned.
+/// Enable rescans that directory. A mounted name keeps the catalogue path.
+fn package_dirs_for_startup(
+    catalogue: &[crate::domain::Installed],
+    integrity_refusals: &[agent24_os_packages::discovery::Refused],
+    mounted: &[crate::domain::MountReport],
+) -> (
+    Vec<crate::domain::MountReport>,
+    std::collections::HashMap<String, std::path::PathBuf>,
+) {
+    let rows = crate::domain::integrity_refusal_reports(integrity_refusals, mounted);
+    let mut dirs = std::collections::HashMap::new();
+    for entry in catalogue {
+        if let crate::domain::Build::Package(package) = &entry.build {
+            dirs.insert(entry.name.clone(), package.dir.clone());
+        }
+    }
+    for (row, refused) in rows
+        .iter()
+        .zip(integrity_refusals.iter().filter(|r| r.integrity.is_some()))
+    {
+        dirs.entry(row.name.clone())
+            .or_insert_with(|| refused.dir.clone());
+    }
+    (rows, dirs)
+}
+
+#[cfg(test)]
 fn with_discovered(
+    catalogue: Vec<crate::domain::Installed>,
+    packages_root: &std::path::Path,
+    cancel: &CancellationToken,
+) -> DiscoveryPass {
+    with_discovered_policy(catalogue, packages_root, cancel, &os_signature_policy())
+}
+fn with_discovered_policy(
     mut catalogue: Vec<crate::domain::Installed>,
     packages_root: &std::path::Path,
-) -> Vec<crate::domain::Installed> {
+    cancel: &CancellationToken,
+    signature: &agent24_os_packages::signature::Policy,
+) -> DiscoveryPass {
     // FU-41. Checked HERE, at the one place packages are read, rather than at
     // startup: a check somewhere else can be true when it runs and false when
     // the directory is used, and this is the moment of use.
@@ -3793,15 +2161,28 @@ fn with_discovered(
     // somebody else can write decides what this process executes.
     if let Err(e) = agent24_os_packages::ensure_packages_root(packages_root) {
         tracing::error!("{e}; no disk packages will be loaded this run");
-        return catalogue;
+        return DiscoveryPass {
+            catalogue,
+            integrity_refusals: Vec::new(),
+        };
     }
-    let scan = agent24_os_packages::discovery::scan(packages_root);
+    let scan = agent24_os_packages::discovery::scan_with_policy(packages_root, cancel, signature);
+    let mut integrity_refusals = Vec::new();
+    for dir in &scan.cancelled {
+        tracing::info!(
+            "domain OS package at {} was not loaded: verification cancelled",
+            dir.display()
+        );
+    }
     for r in &scan.refused {
         tracing::warn!(
             "domain OS package at {} was not loaded: {}",
             r.dir.display(),
             r.why
         );
+        if r.integrity.is_some() && r.dir.as_path() != packages_root {
+            integrity_refusals.push(r.clone());
+        }
     }
     for d in scan.found {
         let name = d.manifest.name().to_owned();
@@ -3820,12 +2201,46 @@ fn with_discovered(
             })),
         });
     }
-    catalogue
+    DiscoveryPass {
+        catalogue,
+        integrity_refusals,
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    #[test]
+    fn a_refused_documents_package_is_recorded_under_that_name() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("documents");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            "name: documents\nversion: \"1.2.3\"\nroute_namespace: /api/v1/documents\n\
+             event_module: documents\ndata_dir: ~/.agent24/os/documents/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/documents\n",
+        )
+        .unwrap();
+        let scan = agent24_os_packages::discovery::scan(
+            root.path(),
+            &tokio_util::sync::CancellationToken::new(),
+        );
+        let refusals: Vec<_> = scan
+            .refused
+            .into_iter()
+            .filter(|refused| refused.integrity.is_some() && refused.dir != root.path())
+            .collect();
+        let (rows, dirs) = super::package_dirs_for_startup(&[], &refusals, &[]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].name, "documents");
+        assert_eq!(
+            dirs.get("documents").map(std::path::PathBuf::as_path),
+            Some(dir.as_path())
+        );
+    }
 
     #[test]
     fn workspace_recovery_clock_preserves_fractional_millis() {
@@ -3866,13 +2281,22 @@ pub(crate) mod tests {
         // `build_router_with_modules` scan below: find the function, cut at
         // the first column-zero `}` (every brace inside a rustfmt'd function
         // body is indented).
-        let src = include_str!("server.rs");
-        let start = src.find("pub async fn serve(").expect("serve must exist");
-        let body = &src[start..];
-        let end = body
+        let server = include_str!("server.rs");
+        let steps = include_str!("serve_steps.rs");
+        let serve = &server[server
+            .find("pub async fn serve(")
+            .expect("serve must exist")..];
+        let serve = &serve[..serve.find("\n}\n").expect("serve must be brace-terminated")];
+        assert!(
+            serve.contains("start_usage_and_model_deps("),
+            "serve() must build model deps through start_usage_and_model_deps"
+        );
+        let marker = "fn start_usage_and_model_deps(";
+        let start = steps.find(marker).expect("start_usage_and_model_deps");
+        let body = &steps[start..];
+        let body = &body[..body
             .find("\n}\n")
-            .expect("function must be brace-terminated");
-        let body = &body[..end];
+            .expect("function must be brace-terminated")];
         assert!(
             body.contains("spawn_cancel_root(shutdown.calls_cut_off())"),
             "serve() must build ModelCallbackDeps.cancel_root as \
@@ -3884,26 +2308,56 @@ pub(crate) mod tests {
     /// #1202 G6 (Codex A5c-2a round 2): `serve` builds each module tool's
     /// authorization through `tool_authorization`, which refuses a module
     /// not on the grants protocol, never `store_authorization` directly,
-    /// which would let a grant from an older daemon hold. Scanned with
+    /// which would let a grant from an older daemon hold. S2-1: that absence
+    /// covers `serve()` itself and all of `serve_steps.rs`. Scanned with
     /// `//`-comments stripped, as
     /// `stop_usage_writer_is_called_after_the_supervisors_have_stopped`.
     #[test]
     fn serve_authorizes_module_tools_by_protocol() {
-        let src = include_str!("server.rs");
-        let start = src.find("pub async fn serve(").expect("serve must exist");
-        let body = &src[start..];
-        let end = body
-            .find("\n}\n")
-            .expect("function must be brace-terminated");
-        let code: String = body[..end]
-            .lines()
-            .filter(|line| !line.trim_start().starts_with("//"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(code.contains("crate::module_tool_runtime::tool_authorization("));
-        assert!(!code.contains("store_authorization("));
+        let server = include_str!("server.rs");
+        let steps = include_str!("serve_steps.rs");
+        let serve = &server[server
+            .find("pub async fn serve(")
+            .expect("serve must exist")..];
+        let serve = &serve[..serve.find("\n}\n").expect("serve must be brace-terminated")];
+        let tools_call = serve
+            .find("register_startup_tools(")
+            .expect("serve must register tools");
+        let publish_call = serve
+            .find("publish_mount_and_attach(")
+            .expect("serve must publish the mount");
+        assert!(
+            tools_call < publish_call,
+            "tool authorization is built before the grant-expiry notifier"
+        );
+        let step = |name: &str| {
+            let marker = format!("fn {name}(");
+            let start = steps.find(&marker).unwrap_or_else(|| panic!("{name}"));
+            let rest = &steps[start..];
+            rest[..rest
+                .find("\n}\n")
+                .expect("function must be brace-terminated")]
+                .to_owned()
+        };
+        let code = |src: &str| {
+            src.lines()
+                .map(|line| line.split("//").next().unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let tools = code(&step("register_startup_tools"));
+        let publish = code(&step("publish_mount_and_attach"));
+        assert!(tools.contains("crate::module_tool_runtime::tool_authorization("));
         // The notifier asks the same cards (A5c-2b).
-        assert!(code.contains("cards.on_grants_protocol(module)"));
+        assert!(publish.contains("cards.on_grants_protocol(module)"));
+        assert!(
+            !code(serve).contains("store_authorization("),
+            "serve() must not call store_authorization directly"
+        );
+        assert!(
+            !code(steps).contains("store_authorization("),
+            "serve_steps must not call store_authorization directly"
+        );
     }
 
     /// #1202 G6 (A5c-2b): a module is on the grants protocol when a tool of
@@ -4008,6 +2462,7 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
+        agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/mod").unwrap();
     }
 
     /// Readiness and a shutdown request cannot both win: requested first, the
@@ -4041,6 +2496,37 @@ pub(crate) mod tests {
         }
     }
 
+    /// A scan thread that panics is a failed start, not an empty catalogue.
+    /// An empty catalogue is what "no packages installed" looks like.
+    #[tokio::test]
+    async fn a_panicked_package_scan_is_a_startup_error() {
+        let joined = tokio::task::spawn_blocking(|| {
+            panic!("scan blew up");
+        })
+        .await;
+        let err = super::catalogue_from_join(joined).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("discovering domain OS packages failed"),
+            "{msg}"
+        );
+        assert!(msg.contains("panicked"), "{msg}");
+    }
+
+    /// A shutdown during discovery must not put the package on the catalogue.
+    /// Passing `CancellationToken::new()` instead of the caller's token
+    /// discovers `cos72` and turns this red.
+    #[test]
+    fn a_cancelled_discovery_does_not_catalogue_the_package() {
+        let root = tempfile::tempdir().unwrap();
+        pkg(root.path(), "cos72");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out = super::with_discovered(vec![built_in("sin90")], root.path(), &cancel);
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["sin90"]);
+    }
+
     #[test]
     fn a_package_placed_after_the_build_reaches_the_catalogue() {
         // The scanner having found it is not the same claim as the daemon having
@@ -4049,8 +2535,12 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         pkg(root.path(), "cos72");
 
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
 
@@ -4069,8 +2559,12 @@ pub(crate) mod tests {
         pkg(root.path(), "cos72");
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
 
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(
             names,
             vec!["sin90"],
@@ -4082,8 +2576,12 @@ pub(crate) mod tests {
         // unreadable for some other reason, which would make this test pass for
         // a reason that has nothing to do with FU-41.
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
-        let names: Vec<&str> = out.iter().map(|i| i.name.as_str()).collect();
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
+        let names: Vec<&str> = out.catalogue.iter().map(|i| i.name.as_str()).collect();
         assert_eq!(names, vec!["sin90", "cos72"]);
     }
 
@@ -4097,10 +2595,21 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         pkg(root.path(), "sin90");
 
-        let out = super::with_discovered(vec![built_in("sin90")], root.path());
-        assert_eq!(out.len(), 2, "both entries exist; the mounter decides");
-        assert_eq!(out[0].version, "9.9.9", "the built-in must come FIRST");
-        assert_eq!(out[1].version, "0.1.0");
+        let out = super::with_discovered(
+            vec![built_in("sin90")],
+            root.path(),
+            &CancellationToken::new(),
+        );
+        assert_eq!(
+            out.catalogue.len(),
+            2,
+            "both entries exist; the mounter decides"
+        );
+        assert_eq!(
+            out.catalogue[0].version, "9.9.9",
+            "the built-in must come FIRST"
+        );
+        assert_eq!(out.catalogue[1].version, "0.1.0");
     }
 
     #[test]
@@ -4110,12 +2619,14 @@ pub(crate) mod tests {
         let out = super::with_discovered(
             vec![built_in("sin90")],
             std::path::Path::new("/nonexistent/agent24-packages"),
+            &CancellationToken::new(),
         );
-        assert_eq!(out.len(), 1);
-        assert_eq!(out[0].name, "sin90");
+        assert_eq!(out.catalogue.len(), 1);
+        assert_eq!(out.catalogue[0].name, "sin90");
     }
 
     use super::*;
+    use axum::http::Method;
     use http_body_util::BodyExt;
     use tower::ServiceExt;
 
@@ -8158,9 +6669,22 @@ pub fn build_router_with_modules() {
 
     #[test]
     fn startup_recovers_timed_out_runs_before_strict_workspace_orphan_sweep() {
-        let src = include_str!("server.rs");
-        let start = src.find("pub async fn serve(").expect("serve must exist");
-        let body = &src[start..];
+        let server = include_str!("server.rs");
+        let steps = include_str!("serve_steps.rs");
+        let serve = &server[server
+            .find("pub async fn serve(")
+            .expect("serve must exist")..];
+        let serve = &serve[..serve.find("\n}\n").expect("serve must be brace-terminated")];
+        assert!(
+            serve.contains("recover_durable_runs("),
+            "serve must run durable recovery"
+        );
+        let marker = "fn recover_durable_runs(";
+        let start = steps.find(marker).expect("recover_durable_runs");
+        let body = &steps[start..];
+        let body = &body[..body
+            .find("\n}\n")
+            .expect("function must be brace-terminated")];
         let timeout = body
             .find(".timeout_expired(&approval_now)")
             .expect("startup must time out expired approvals");
@@ -8377,6 +6901,7 @@ pub fn build_router_with_modules() {
 
     #[test]
     fn constant_time_eq_basics() {
+        use crate::capabilities::middleware::constant_time_eq;
         assert!(constant_time_eq(b"abc", b"abc"));
         assert!(!constant_time_eq(b"abc", b"abd"));
         assert!(!constant_time_eq(b"abc", b"ab"));
@@ -8836,7 +7361,7 @@ pub fn build_router_with_modules() {
         let fallback = hashed_fallback_path(&alias);
 
         // Exercise the real directory creation and bind, not only the length check.
-        let host = process_host(&alias, Duration::from_secs(1)).unwrap();
+        let host = process_host(&alias, Duration::from_secs(1), CancellationToken::new()).unwrap();
         let listener = host.callback_dir.listen_next().unwrap();
         assert!(listener.path().as_os_str().len() <= agent24_os_proto::endpoint::MAX_SOCKET_PATH);
         drop(listener);
@@ -8982,7 +7507,7 @@ pub fn build_router_with_modules() {
         let state = state().await;
         let registry = Arc::clone(&state.attach_registry);
         let cancel = CancellationToken::new();
-        let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
+        let cell: std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>> =
             std::sync::OnceLock::new();
 
         // `stopping`'s own one-shot check, landing before the fill: shutdown
@@ -9016,7 +7541,7 @@ pub fn build_router_with_modules() {
         let state = state().await;
         let registry = Arc::clone(&state.attach_registry);
         let cancel = CancellationToken::new();
-        let cell: std::sync::OnceLock<Arc<crate::attach_registry::AttachRegistry>> =
+        let cell: std::sync::OnceLock<Arc<agent24_attach::attach_registry::AttachRegistry>> =
             std::sync::OnceLock::new();
 
         assert!(!cancel.is_cancelled());

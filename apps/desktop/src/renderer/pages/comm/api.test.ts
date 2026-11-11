@@ -13,6 +13,7 @@ import {
   getCommStatus,
   importCommHome,
   setCommRelay,
+  probeCommRelay,
   installComm,
   listCommContacts,
   listCommIdentities,
@@ -185,6 +186,15 @@ describe('COMM typed backend API', () => {
     await expect(setCommRelay(['wss://r.example'])).resolves.toEqual(config)
     expect(commRelaySet).toHaveBeenCalledWith(['wss://r.example'])
     expect(proxy).not.toHaveBeenCalled()
+  })
+
+  it('probes the configured relay when the caller omits a url, and sends the url when one is named', async () => {
+    const probe = { url: 'wss://one.example', connected: true, error: null }
+    const proxy = setProxy((() => successful(probe)) as never)
+    await expect(probeCommRelay()).resolves.toEqual(probe)
+    expect(proxy.mock.calls[0][0]).toEqual({ method: 'POST', path: '/api/v1/comm/relay/probe', body: {} })
+    await probeCommRelay('wss://one.example')
+    expect(proxy.mock.calls[1][0]).toEqual({ method: 'POST', path: '/api/v1/comm/relay/probe', body: { url: 'wss://one.example' } })
   })
 })
 

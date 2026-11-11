@@ -4,7 +4,7 @@
 
 ## 实现与接口
 
-`rust/apps/agent24d/src/idoris_host.rs` 持有安装记录、生命周期操作、IL-07 supervisor 与 IL-09 网关。`idoris_routes.rs` 提供以下宿主接口，能力操作统一为 `idoris.lifecycle`，仅 ProductHost 或 legacy bearer 可访问。
+`rust/crates/agent24-idoris/src/idoris_host.rs`（S2-2 起从 agent24d 下沉至此）持有安装记录、生命周期操作、IL-07 supervisor 与 IL-09 网关。`rust/apps/agent24d/src/idoris_routes.rs` 提供以下宿主接口，能力操作统一为 `idoris.lifecycle`，仅 ProductHost 或 legacy bearer 可访问。
 
 | 方法 | 路径 | 结果 |
 | --- | --- | --- |

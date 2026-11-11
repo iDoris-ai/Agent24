@@ -54,6 +54,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-attach"
+version = "0.6.0"
+dependencies = [
+ "agent24-domain",
+ "agent24-os-proto",
+ "agent24-protocol",
+ "chrono",
+ "fs2",
+ "libc",
+ "rustix 0.38.44",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "agent24-cli"
 version = "0.6.0"
 dependencies = [
@@ -61,6 +81,7 @@ dependencies = [
  "agent24-hw",
  "agent24-mcp",
  "agent24-os-packages",
+ "agent24-os-proc",
  "agent24-protocol",
  "agent24-store",
  "base64",
@@ -219,9 +240,17 @@ version = "0.1.0"
 dependencies = [
  "agent24-components",
  "agent24-hw",
+ "agent24-models",
+ "agent24-protocol",
+ "async-trait",
+ "axum",
  "base64",
+ "chrono",
  "flate2",
  "fs2",
+ "futures",
+ "http",
+ "jsonschema",
  "keyring",
  "libc",
  "libproc",
@@ -231,12 +260,14 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serde_yaml",
  "sha2 0.10.9",
  "tar",
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tokio-util",
+ "tracing",
  "url",
  "uuid",
  "zeroize",
@@ -246,12 +277,17 @@ dependencies = [
 name = "agent24-knowledge"
 version = "0.6.0"
 dependencies = [
+ "agent24-components",
  "async-trait",
+ "futures",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -336,12 +372,18 @@ version = "0.6.0"
 dependencies = [
  "agent24-components",
  "agent24-domain",
+ "agent24-os-proc",
  "agent24-os-proto",
+ "agent24-protocol",
+ "fs2",
+ "object",
  "rustix 0.38.44",
+ "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -385,13 +427,14 @@ dependencies = [
 
 [[package]]
 name = "agent24-os-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "agent24-os-proto",
  "agent24-os-sdk",
  "axum",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tower",
@@ -566,6 +609,7 @@ name = "agent24d"
 version = "0.6.0"
 dependencies = [
  "agent24-agent",
+ "agent24-attach",
  "agent24-comm",
  "agent24-components",
  "agent24-core",
@@ -2977,6 +3021,15 @@ checksum = "33fafba39597d6dc1fb709123dfa8289d39406734be322956a69f0931c73bb15"
 dependencies = [
  "libc",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "object"
+version = "0.36.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

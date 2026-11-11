@@ -33,6 +33,8 @@ describe('page render', () => {
     expect(op.tags).toEqual(['documents'])
     const errors: Record<string, string> = {
       '400': 'DocumentsBadRequest', '404': 'DocumentsNotFound', '413': 'DocumentsTooLarge', '422': 'DocumentsRenderUnprocessable',
+      // 409: the kernel proxy's os_package.<reason> integrity refusal (S1-9).
+      '409': 'OsPackageConflict',
       '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure',
     }
     expect(Object.keys(op.responses).filter((k) => !k.startsWith('2')).sort()).toEqual(Object.keys(errors).sort())

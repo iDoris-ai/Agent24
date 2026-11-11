@@ -1,4 +1,3 @@
-//! Injectable managed iDoris connection lifecycle for the daemon.
-pub mod managed_idoris;
-
-pub mod idoris_host;
+//! Daemon library target. Managed iDoris lives in `agent24-idoris`.
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("test-support must not be enabled in release builds");

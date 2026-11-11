@@ -412,6 +412,16 @@ impl Methods {
     fn get(&self, name: &str) -> Option<Arc<dyn Handler>> {
         self.map.get(name).cloned()
     }
+
+    /// Registered method names, sorted. Callers that pin the set compare this
+    /// to an expected list, so one extra registration fails the comparison.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.map.keys().cloned().collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 /// What to do with one frame.

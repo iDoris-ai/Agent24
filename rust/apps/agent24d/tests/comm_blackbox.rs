@@ -11,6 +11,9 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -322,9 +325,8 @@ fn spawn_agent24d(
     model_url: &str,
     hyphae: &Path,
 ) -> (DaemonGuard, u16, String) {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent24d"));
+    let mut command = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     command
-        .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home.path())
         .env("A24_COMM_PASSWORD_STORE", "memory")

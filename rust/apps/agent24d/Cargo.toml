@@ -7,11 +7,13 @@ repository.workspace = true
 description = "Agent24 Rust daemon — v1 protocol server (B2: skeleton — health, auth handshake, graceful shutdown)"
 
 [features]
+# Only for native ad-hoc package fixtures in macOS black-box tests. Never ship this feature.
+test-support = ["agent24-os-packages/test-support"]
 # Unsigned binaries and automatic presence are exclusively for integration tests.
 test-enrollment = []
-# `knowledge.db` has no production caller. S2-3 sinks the Knowledge host and
-# turns this on; the module stays in the tree until then (S1-7).
-knowledge-store = []
+# `knowledge.db` has no production caller. S2-3 moved the store into
+# `agent24-knowledge` and left the feature off; this only forwards.
+knowledge-store = ["agent24-knowledge/knowledge-store"]
 
 [dependencies]
 agent24-os-proc = { path = "../../crates/agent24-os-proc" }
@@ -19,6 +21,7 @@ thiserror = "2"
 tower = { version = "0.5", features = ["util"] }
 agent24-components = { path = "../../crates/agent24-components" }
 agent24-agent = { path = "../../crates/agent24-agent" }
+agent24-attach = { path = "../../crates/agent24-attach" }
 # COMM-2a: `/api/v1/comm/*` — see `src/comm_routes.rs`.
 agent24-comm = { path = "../../crates/agent24-comm" }
 agent24-core = { path = "../../crates/agent24-core" }
@@ -93,10 +96,11 @@ libc = "0.2"
 # only carries the three fields a MODULE needs); read directly rather than
 # adding a fourth field to that shared reader for one caller.
 serde_yaml = "0.9"
-# KB-C1-04 6d: the Provider's records and their stored shape
-# (`knowledge_store.rs`).
+# KB-C1-04 6d: the Knowledge host registry, probe, backend and (behind
+# `knowledge-store`) the store, all in `agent24-knowledge` since S2-3.
 agent24-knowledge = { path = "../../crates/agent24-knowledge" }
-# KB-C1-04 6d-1: `knowledge.db` (`knowledge_store.rs`). Tests also use it
+# The daemon's own SQLite access (e.g. `migration_coordinator.rs`; `knowledge.db`
+# moved to `agent24-knowledge/src/store` in S2-3). Tests also use it
 # (T7b/ME-3e) to force a transient `Store` error in the timeout-scan test by
 # dropping `module_approvals` out from under a live pool — there is no
 # fault-injectable `Store` trait to mock instead.
@@ -109,6 +113,12 @@ agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
 tempfile = "3"
 
 [dev-dependencies]
+# The hash-pause hook is cfg'd out unless this feature is on. Unit tests in
+# this binary call it; `cargo build --release` does not enable it.
+agent24-components = { path = "../../crates/agent24-components", features = ["test-support"] }
+# Native launchers and `files.json` for packages these tests hand to discovery.
+# Off for `cargo build` of the daemon.
+agent24-os-packages = { path = "../../crates/agent24-os-packages", features = ["test-support"] }
 agent24-comm = { path = "../../crates/agent24-comm", features = ["test-lock-override"] }
 jsonschema = { version = "0.59", default-features = false }
 flate2 = "1"
@@ -117,6 +127,9 @@ tar = { version = "0.4", default-features = false }
 # handlers' own `h.call` fixtures, on `agent24-os-proto`'s in-memory fake
 # kernel (forwarded through the SDK's `test-util` feature, L8).
 agent24-os-sdk = { path = "../../crates/agent24-os-sdk", features = ["test-util"] }
+# Registry inspectors (`record`, `only_host`, `is_empty`) the Knowledge HTTP
+# tests read. Unified onto test builds only.
+agent24-knowledge = { path = "../../crates/agent24-knowledge", features = ["test-support"] }
 # A paused clock, for deadlines asserted exactly rather than with slack.
 tokio = { version = "1", features = ["test-util"] }
 # T9/ME-3f: the black-box test observes event forwarding at the real

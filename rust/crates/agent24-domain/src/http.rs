@@ -20,6 +20,7 @@ use axum::Json;
 use axum::body::{Body, Bytes};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
+use serde_json::{Map, Value};
 
 /// The body cap for handlers that use [`read_body_or_response`] — every one in
 /// the kernel today, and the limit a module is expected to adopt.
@@ -60,6 +61,28 @@ pub fn error_response_with_hint(
             message: message.to_owned(),
             hint: Some(hint.to_owned()),
             details: None,
+        },
+    };
+    (status, Json(body)).into_response()
+}
+
+/// D6 envelope: `{ code, message, details.retryable }`, plus the optional hint.
+/// Integrity refusals use `os_package.<reason>` and `retryable: false`.
+pub fn error_response_d6(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    hint: Option<&str>,
+    retryable: bool,
+) -> Response {
+    let mut details = Map::new();
+    details.insert("retryable".to_owned(), Value::Bool(retryable));
+    let body = ErrorEnvelope {
+        error: ErrorBody {
+            code: code.to_owned(),
+            message: message.to_owned(),
+            hint: hint.map(str::to_owned),
+            details: Some(details),
         },
     };
     (status, Json(body)).into_response()

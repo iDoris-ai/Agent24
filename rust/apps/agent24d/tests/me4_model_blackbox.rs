@@ -62,6 +62,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
@@ -322,7 +325,7 @@ fn install(home: &Path, name: &str, kernel_capabilities: &str, extra_manifest_li
              event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
              kernel_capabilities: [{kernel_capabilities}]\n{extra_manifest_lines}\
              impl_kind: out_of_process_provider\n\
-             spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
+             spawn:\n  command: bin/launch\n"
         ),
     )
     .unwrap();
@@ -338,6 +341,7 @@ fn install(home: &Path, name: &str, kernel_capabilities: &str, extra_manifest_li
         .replace("__NAME__", name)
         .replace("__CAPS_JSON__", &caps_json);
     std::fs::write(dir.join("mod.py"), script).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 /// One raw HTTP round trip over a plain `TcpStream`, `connection: close` so a
@@ -532,9 +536,8 @@ impl Daemon {
 /// `agent24-models/src/router.rs:261`/`:263`, which is not what a real smoke
 /// run against the operator's own oMLX server wants).
 fn start(home: &Path, omlx_url: &str, ollama_url: &str, extra_env: &[(&str, &str)]) -> Daemon {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("OMLX_URL", omlx_url)
         .env("OLLAMA_URL", ollama_url);
