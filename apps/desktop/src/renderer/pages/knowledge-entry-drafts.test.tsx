@@ -586,6 +586,22 @@ describe('H2: submitting a draft for review', () => {
     expect(button('重新提交')).toBeNull()
   })
 
+  it('keeps the first unknown submission visible when its resend is refused (M1)', async () => {
+    render(<KnowledgeEntryDraftsPanel />)
+    await shown(ready({ submission: sub({ pending: true }) }))
+    submit.mockResolvedValueOnce({ ok: false, reason: 'server', code: 'forbidden', serverReason: 'empty_scope', unknown: true, submission: sub({ pending: true }) })
+    fireEvent.click(screen.getByRole('button', { name: '重新提交' }))
+    expect(await screen.findByText('没有收到明确答复，提交可能送达也可能没有。重新提交是安全的，发出的是同一份提交。')).toBeTruthy()
+    expect(screen.getByText(/^已发出，但还不知道是否送达。/)).toBeTruthy()
+    expect(button('提交审阅')).toBeNull()
+    expect(button('重新提交')).not.toBeDisabled()
+    // Reopening must not turn a still-pending submission into a fresh submit.
+    act(() => closeDrafts())
+    await shown(ready({ submission: sub({ pending: true }) }))
+    expect(button('提交审阅')).toBeNull()
+    expect(button('重新提交')).not.toBeDisabled()
+  })
+
   it('shows approved, returned with reason and note, and withdrawn', async () => {
     render(<KnowledgeEntryDraftsPanel />)
     await shown(ready({ submission: sub({ candidate: candidate({ status: 'approved', edited: true }) }) }))

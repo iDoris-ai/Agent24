@@ -240,6 +240,88 @@ describe('submit (W8.2)', () => {
     expect(t.candidates.get(d.id)?.pending).toBeNull()
   })
 
+  it.each([
+    ['forbidden', 'operation_not_allowed'],
+    ['forbidden', 'empty_scope'],
+    ['forbidden', 'operation_disabled'],
+    ['not_found', undefined],
+    ['unauthorized', 'credential_invalid'],
+    ['invalid_request', 'idempotency_key_reused'],
+  ] as const)('a refused resend (%s/%s) cannot settle the first unknown write (M1)', async (code, reason) => {
+    const received = new Map<unknown, Record<string, unknown>>()
+    let attempt = 0
+    const t = setup({ submit: (c) => {
+      if (++attempt === 1) {
+        // The server committed, but its answer never reached the caller.
+        received.set(c.body.idempotency_key, withoutRequestId(c.body))
+        return 'throw'
+      }
+      return new Response(JSON.stringify({ error: { code, message: 'refused', details: {
+        request_id: c.body.request_id, generation: c.body.generation, retryable: false,
+        ...(reason === undefined ? {} : { reason }),
+      } } }), { status: code === 'not_found' ? 404 : code === 'unauthorized' ? 401 : code === 'invalid_request' ? 400 : 403 })
+    } })
+    const d = t.draft()
+    expect(await t.submission.submit(d.id, 'kb-2')).toMatchObject({ unknown: true })
+    const kept = t.candidates.get(d.id)?.pending
+    expect(kept).toBeTruthy()
+    const out = await t.submission.submit(d.id, 'kb-1')
+    // Both ready calls passed and the second write really reached the server.
+    expect(t.fake.calls.map((c) => c.path)).toEqual(['ready', 'candidates', 'ready', 'candidates'])
+    expect(t.fake.writes().map((c) => withoutRequestId(c.body))).toEqual([received.get(kept?.idempotency_key), received.get(kept?.idempotency_key)])
+    expect(received.size).toBe(1)
+    expect(t.candidates.get(d.id)).toMatchObject({ pending: kept, candidate: null })
+    expect(out).toMatchObject({ ok: false, reason: 'server', code, unknown: true, submission: { pending: true, stuck: false, candidate: null } })
+    if (reason !== undefined) expect(out).toMatchObject({ serverReason: reason })
+  })
+
+  it('after a refused resend and a restart, recovery still uses the first key and body (M1)', async () => {
+    const received = new Map<unknown, Record<string, unknown>>()
+    let attempt = 0
+    const t = setup({ submit: (c) => {
+      if (++attempt === 1) {
+        received.set(c.body.idempotency_key, withoutRequestId(c.body))
+        return 'throw'
+      }
+      if (attempt === 2) return new Response(JSON.stringify({ error: { code: 'forbidden', message: 'refused', details: {
+        request_id: c.body.request_id, generation: c.body.generation, retryable: false, reason: 'empty_scope',
+      } } }), { status: 403 })
+      const original = received.get(c.body.idempotency_key)
+      // Do not hide a new-key regression behind an unconditional fake success.
+      if (!original || JSON.stringify(original) !== JSON.stringify(withoutRequestId(c.body))) return 'throw'
+      return new Response(JSON.stringify({ request_id: c.body.request_id, generation: c.body.generation, authz_version: AUTHZ,
+        candidate_id: 'cand-first', status: 'submitted', content_sha256: original.content_sha256,
+        submitted_at: '2026-11-09T08:30:00Z', details: { replayed: true },
+      }), { status: 200 })
+    } })
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const original = t.candidates.get(d.id)?.pending
+    await t.submission.submit(d.id, 'kb-2')
+    t.drafts.update(d.id, { title: 'An edited draft' })
+    const candidates = createCandidateStore(dir)
+    const restarted = knowledgeEntrySubmission({
+      drafts: createEntryDraftStore(dir), candidates, target: () => BINDING,
+      knowledgeBaseIds: () => ['kb-1', 'kb-2'], provider: () => ({ deps: t.fake.deps, generation: 4 }),
+    })
+    expect(await restarted.submit(d.id, 'kb-1')).toMatchObject({ ok: true, submission: { pending: false, candidate: { target_knowledge_base_id: 'kb-2', edited: true } } })
+    expect(candidates.get(d.id)?.candidate?.candidate_id).toBe('cand-first')
+    expect(candidates.get(d.id)?.pending).toBeNull()
+    expect(t.fake.writes()[2].body.idempotency_key).toBe(original?.idempotency_key)
+    expect(received.size).toBe(1)
+  })
+
+  it.each(['disabled', 'not_ready'])('a resend stopped by ready=%s still has an unknown earlier outcome (M1)', async (candidate) => {
+    const t = setup({ submit: () => 'throw' })
+    const d = t.draft()
+    await t.submission.submit(d.id, 'kb-2')
+    const kept = t.candidates.get(d.id)?.pending
+    const stopped = setup({ candidate })
+    expect(await stopped.submission.submit(d.id, 'kb-2')).toMatchObject({ ok: false, reason: 'server', unknown: true, submission: { pending: true } })
+    expect(stopped.fake.calls.map((c) => c.path)).toEqual(['ready'])
+    expect(stopped.candidates.get(d.id)?.pending).toEqual(kept)
+  })
+
   it('a record that cannot be read refuses the submit and sends nothing (never read as "none")', async () => {
     const t = setup()
     const d = t.draft()
