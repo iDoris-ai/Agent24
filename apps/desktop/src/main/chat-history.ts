@@ -165,6 +165,15 @@ export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
   const pending = Array.from(v.pending as unknown[], parsePending)
   if (new Set(runs.map(r => r.run_id)).size !== runs.length
     || new Set(pending.map(p => p.id)).size !== pending.length) invalid()
+  // M6 C1: who started it, and the unseen runs: each one of its runs, none
+  // twice, none when the user started it.
+  if (!isInitiator(v.initiator) || !Array.isArray(v.unseen)) invalid()
+  const runIds = new Set(runs.map(r => r.run_id))
+  const unseen = Array.from(v.unseen, (item): string => {
+    if (!isItemId(item) || !runIds.has(item)) invalid()
+    return item
+  })
+  if (new Set(unseen).size !== unseen.length || (v.initiator === 'user' && unseen.length > 0)) invalid()
   return {
     format: CHAT_HISTORY_FORMAT,
     version: CHAT_HISTORY_VERSION,
@@ -178,10 +187,8 @@ export function parseChatHistoryRecord(v: unknown): ChatHistoryRecord {
     messages: Array.from(v.messages as unknown[], parseMessage),
     runs,
     pending,
-    // GROK: validate both as the comment above says (refuse with invalid()),
-    // then return the checked values; these casts are placeholders.
-    initiator: v.initiator as ChatHistoryInitiator,
-    unseen: v.unseen as string[],
+    initiator: v.initiator,
+    unseen,
   }
 }
 
@@ -366,13 +373,12 @@ export function createChatHistoryStore(dir: string) {
         if (oldest < 0 || kind === 'answer') throw new Error('Too many chat history runs')
         runs = runs.filter((_, i) => i !== oldest)
       }
-      // GROK (M6 C1, docs/ui/ASSISTANT-C.md §3): in this same write, a run
-      // new to a conversation the user did not start (`initiator` not
-      // 'user'), of a kind other than 'answer', goes at the end of `unseen`.
-      // A run known already (the branch above) never does, also when an
-      // answer becomes a task. A run that made room above leaves `unseen`
-      // too (answers are never in it, but keep `unseen` a subset of `runs`).
-      return { ...record, runs: [...runs, { run_id: runId, kind, started_at: new Date().toISOString() }] }
+      // M6 C1: a new run, other than an answer, of a conversation the user
+      // did not start is unseen; one that made room above leaves `unseen`.
+      const kept = new Set(runs.map(r => r.run_id))
+      const unseen = record.unseen.filter(id => kept.has(id))
+      if (record.initiator !== 'user' && kind !== 'answer') unseen.push(runId)
+      return { ...record, runs: [...runs, { run_id: runId, kind, started_at: new Date().toISOString() }], unseen }
     })
   }
   return {
@@ -395,8 +401,9 @@ export function createChatHistoryStore(dir: string) {
      *  change listener, so the open window lists it. docs/ui/ASSISTANT-A.md,
      *  ASSISTANT-C.md §2. */
     create(input: { title: string; title_source: ChatHistoryTitleSource; initiator: ChatHistoryInitiator }): ChatHistorySummary {
-      // GROK: also refuse an initiator that is not one, or is 'user'.
-      if (typeof input?.title !== 'string' || input.title.length > MAX_TITLE_UNITS || !isTitleSource(input.title_source)) {
+      // Main's conversations are a schedule's or the assistant's, never the user's.
+      if (typeof input?.title !== 'string' || input.title.length > MAX_TITLE_UNITS || !isTitleSource(input.title_source)
+        || !isInitiator(input.initiator) || input.initiator === 'user') {
         throw new Error('Invalid chat history conversation')
       }
       const at = new Date().toISOString()
@@ -436,9 +443,9 @@ export function createChatHistoryStore(dir: string) {
       // Its runs and what waits on the user are main's too (M4 A2): the save
       // keeps those on file and adds only the runs of the replies it carries.
       record = { ...record, runs: withAnswerRuns(before?.runs ?? [], record.messages), pending: before?.pending ?? [] }
-      // GROK (M6 C1): who started it and what is unseen are main's as well:
-      // keep both from the file; a conversation not on file yet is the
-      // user's, with nothing unseen (whatever the page sent).
+      // Who started it and what of it is unseen are main's too (M6 C1): kept
+      // from the file; one not on file yet is the user's, with nothing unseen.
+      record = { ...record, initiator: before?.initiator ?? 'user', unseen: before?.unseen ?? [] }
       write(record)
       return summaryOf(record)
     },
@@ -473,10 +480,8 @@ export function createChatHistoryStore(dir: string) {
      *  of them again does not make it unseen again. Nothing is written (and
      *  nothing told) when nothing was unseen. docs/ui/ASSISTANT-C.md §4. */
     markSeen(id: unknown): ChatHistorySummary | null {
-      // GROK: checkId, then change() that empties `unseen` (null when it is
-      // empty already).
-      void id
-      throw new Error('not implemented')
+      const own = checkId(id)
+      return change(own, r => (r.unseen.length > 0 ? { ...r, unseen: [] } : null))
     },
     /** Takes it off; nothing to do when it is not there. */
     clearPending(id: unknown, pendingId: unknown): ChatHistorySummary | null {

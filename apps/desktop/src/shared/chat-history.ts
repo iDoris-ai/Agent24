@@ -227,7 +227,7 @@ export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
  *  start. Which conversations to give (archived ones or not) is the
  *  caller's. docs/ui/ASSISTANT-C.md §3. */
 export function unseenCount(items: readonly Pick<ChatHistorySummary, 'initiator' | 'unseen'>[]): number {
-  // GROK: implement (sum of unseen.length over items whose initiator is not 'user').
-  void items
-  throw new Error('not implemented')
+  let count = 0
+  for (const item of items) if (item.initiator !== 'user') count += item.unseen.length
+  return count
 }

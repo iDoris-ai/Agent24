@@ -335,10 +335,15 @@ export async function loadConversation(id: string): Promise<ChatHistoryRecord | 
  *  has no markSeen or the call fails, it stays unseen until it is opened
  *  again; a conversation deleted or cleared meanwhile stays gone. */
 export async function markConversationSeen(id: string): Promise<void> {
-  // GROK: implement as the comment says, like `retitle` updates the list
-  // (seq / removedSince / publishedAt / byNewest). Never rejects: the page
-  // calls it with `void`. (Stub: does nothing yet.)
-  void id
+  // As `retitle` does: the list takes main's answer, unless the conversation
+  // was deleted or everything cleared since; a failure leaves it unseen.
+  const history = api()
+  if (!history || typeof history.markSeen !== 'function') return
+  const mine = ++seq
+  const summary = await history.markSeen(id).catch(() => null)
+  if (!summary || removedSince(id, mine)) return
+  publishedAt.set(id, ++seq)
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
 }
 
 export function setActiveConversation(id: string | null): void {
