@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { createChatHistoryStore, onChatHistoryChange, parseChatHistoryRecord } from './chat-history'
-import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../shared/chat-history'
+import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, unseenCount, type ChatHistoryRecord } from '../shared/chat-history'
 
 let dir: string
 beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'chat-history-')) })
@@ -15,7 +15,7 @@ function record(id: string, updated: string, title = id): ChatHistoryRecord {
     version: CHAT_HISTORY_VERSION,
     id,
     title,
-    title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
+    title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [], initiator: 'user', unseen: [],
     created_at: '2026-11-08T00:00:00.000Z',
     updated_at: updated,
     messages: [
@@ -43,7 +43,7 @@ describe('chat history on disk', () => {
     createChatHistoryStore(dir).save(record('chat_a', '2026-11-08T01:00:00.000Z'))
     const raw = JSON.parse(fs.readFileSync(path.join(dir, 'chat-history', 'chat_a.json'), 'utf8'))
     expect(raw.format).toBe('agent24.desktop.chat-history')
-    expect(raw.version).toBe(2)
+    expect(raw.version).toBe(3)
     expect(raw.messages.every((m: { at?: string }) => typeof m.at === 'string')).toBe(true)
   })
 
@@ -53,8 +53,8 @@ describe('chat history on disk', () => {
     store.save(record('chat_a', '2026-11-08T03:00:00.000Z', 'renamed'))
     store.save(record('chat_b', '2026-11-08T02:00:00.000Z'))
     expect(store.list()).toEqual([
-      { id: 'chat_a', title: 'renamed', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z', first_prompt: '你好', tasks: [], pending: [] },
-      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z', first_prompt: '你好', tasks: [], pending: [] },
+      { id: 'chat_a', title: 'renamed', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T03:00:00.000Z', first_prompt: '你好', tasks: [], pending: [], initiator: 'user', unseen: [] },
+      { id: 'chat_b', title: 'chat_b', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T02:00:00.000Z', first_prompt: '你好', tasks: [], pending: [], initiator: 'user', unseen: [] },
     ])
     store.delete('chat_a')
     expect(store.get('chat_a')).toBeNull()
@@ -72,8 +72,11 @@ describe('chat history on disk', () => {
   })
 
   it.each([
-    ['another version', { version: 3 }],
+    ['another version', { version: 4 }],
     ['version 1', { version: 1 }],
+    ['version 2 (M6 C1)', { version: 2 }],
+    ['no initiator (M6 C1)', { initiator: undefined }],
+    ['no unseen (M6 C1)', { unseen: undefined }],
     ['no title source', { title_source: undefined }],
     ['no group', { group_id: undefined }],
     ['no archive mark', { archived_at: undefined }],
@@ -219,7 +222,7 @@ describe('chat history titles (UI-04)', () => {
 
   it('a save returns the summary as written', () => {
     expect(createChatHistoryStore(dir).save(record('chat_a', at, '问'))).toEqual(
-      { id: 'chat_a', title: '问', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: at, first_prompt: '你好', tasks: [], pending: [] })
+      { id: 'chat_a', title: '问', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: at, first_prompt: '你好', tasks: [], pending: [], initiator: 'user', unseen: [] })
   })
 
   it('a rename is kept over every later save of the first prompt\'s title', () => {
@@ -334,7 +337,7 @@ describe('chat history groups and archive (UI-06)', () => {
   const later = '2026-11-08T02:00:00.000Z'
   const onDisk = (id: string) => JSON.parse(fs.readFileSync(path.join(dir, 'chat-history', `${id}.json`), 'utf8'))
 
-  it('lists a file without group_id or archived_at as no conversation: version 2 has them all', () => {
+  it('lists a file without group_id or archived_at as no conversation: this version has them all', () => {
     const old: Partial<ChatHistoryRecord> = record('chat_a', at)
     delete old.group_id
     delete old.archived_at
@@ -694,21 +697,25 @@ describe('conversations main starts (M4 A5)', () => {
     const told = vi.fn()
     onChatHistoryChange(told)
     try {
-      const summary = store.create({ title: '日程：周报', title_source: 'schedule' })
+      const summary = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
       expect(summary).toMatchObject({ title: '日程：周报', title_source: 'schedule', group_id: null, archived_at: null, tasks: [], pending: [] })
       expect(summary.id).toMatch(/^chat_[a-z0-9_]+$/)
       expect(store.get(summary.id)).toMatchObject({ messages: [], runs: [] })
       expect(told).toHaveBeenCalledWith(summary)
-      expect(store.create({ title: 'x', title_source: 'schedule' }).id).not.toBe(summary.id)
+      expect(store.create({ title: 'x', title_source: 'schedule', initiator: 'schedule' }).id).not.toBe(summary.id)
     } finally {
       onChatHistoryChange(null)
     }
   })
 
   it.each([
-    [{ title: 3, title_source: 'schedule' }],
-    [{ title: 'x', title_source: 'other' }],
-    [{ title: 'x'.repeat(4001), title_source: 'schedule' }],
+    [{ title: 3, title_source: 'schedule', initiator: 'schedule' }],
+    [{ title: 'x', title_source: 'other', initiator: 'schedule' }],
+    [{ title: 'x'.repeat(4001), title_source: 'schedule', initiator: 'schedule' }],
+    // M6 C1: main's conversations are never the user's; the page's start with a save.
+    [{ title: 'x', title_source: 'schedule' }],
+    [{ title: 'x', title_source: 'schedule', initiator: 'robot' }],
+    [{ title: 'x', title_source: 'schedule', initiator: 'user' }],
   ])('refuses %j', input => {
     const store = createChatHistoryStore(dir)
     expect(() => store.create(input as never)).toThrow('Invalid chat history conversation')
@@ -717,7 +724,7 @@ describe('conversations main starts (M4 A5)', () => {
 
   it('keeps the schedule\'s name over the first prompt and the model\'s title, not over the user\'s rename', () => {
     const store = createChatHistoryStore(dir)
-    const { id } = store.create({ title: '日程：周报', title_source: 'schedule' })
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
     // The user asks in it: the page saves with the first prompt's title.
     const page = { ...record(id, '2026-11-09T00:00:00.000Z', '这周的呢'), id }
     expect(store.save(page)).toMatchObject({ title: '日程：周报', title_source: 'schedule' })
@@ -727,9 +734,204 @@ describe('conversations main starts (M4 A5)', () => {
 
   it('keeps the assistant\'s conversation\'s name (A6) the same way', () => {
     const store = createChatHistoryStore(dir)
-    const { id } = store.create({ title: '助理发起', title_source: 'assistant' })
+    const { id } = store.create({ title: '助理发起', title_source: 'assistant', initiator: 'assistant' })
     expect(store.save({ ...record(id, '2026-11-09T00:00:00.000Z', '问一句'), id })).toMatchObject({ title: '助理发起', title_source: 'assistant' })
     expect(store.setTitle(id, '模型标题', 'model')).toMatchObject({ title: '助理发起', title_source: 'assistant' })
     expect(store.setTitle(id, '我的', 'user')).toMatchObject({ title: '我的', title_source: 'user' })
+  })
+})
+
+// M6 C1: who started a conversation, and what of it the user has not seen
+// yet (docs/ui/ASSISTANT-C.md).
+describe('who started a conversation and what of it is unseen (M6 C1)', () => {
+  const at = '2026-11-08T01:00:00.000Z'
+  const later = '2026-11-08T02:00:00.000Z'
+  const onDisk = (id: string) => JSON.parse(fs.readFileSync(path.join(dir, 'chat-history', `${id}.json`), 'utf8'))
+  const run = (run_id: string, kind: 'answer' | 'task' | 'schedule' = 'schedule') => ({ run_id, kind, started_at: at })
+  /** The page's save of a conversation, with one reply that ran as `runId`. */
+  const withReply = (id: string, runId: string): ChatHistoryRecord => {
+    const r = record(id, later, '问一句')
+    return { ...r, messages: [r.messages[0], { role: 'assistant', content: '好', at, run_id: runId, latency: null }] }
+  }
+
+  it.each(['schedule', 'assistant'] as const)('a conversation main starts says who started it (%s), with nothing unseen yet', initiator => {
+    const store = createChatHistoryStore(dir)
+    const summary = store.create({ title: '日程：周报', title_source: initiator, initiator })
+    expect(summary).toMatchObject({ initiator, unseen: [] })
+    expect(onDisk(summary.id)).toMatchObject({ version: 3, initiator, unseen: [] })
+  })
+
+  it('a page save of a conversation not on file yet makes it the user\'s, whatever the page sent', () => {
+    const store = createChatHistoryStore(dir)
+    expect(store.save({ ...record('chat_a', at), initiator: 'assistant' })).toMatchObject({ initiator: 'user', unseen: [] })
+    expect(onDisk('chat_a')).toMatchObject({ initiator: 'user', unseen: [] })
+  })
+
+  it('a save keeps who started it and what is unseen from the file (the page sends the user and nothing)', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    store.appendRun(id, 'run_1', 'schedule')
+    expect(store.save({ ...record(id, later, '这周的呢'), id })).toMatchObject({ initiator: 'schedule', unseen: ['run_1'] })
+    expect(onDisk(id)).toMatchObject({ initiator: 'schedule', unseen: ['run_1'] })
+    // Nor does a rename make it the user's.
+    expect(store.setTitle(id, '我的周报', 'user')).toMatchObject({ title_source: 'user', initiator: 'schedule', unseen: ['run_1'] })
+  })
+
+  it('a run new to a conversation main started is unseen, in the same write, and the window hears of it', () => {
+    const store = createChatHistoryStore(dir)
+    const told = vi.fn()
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    onChatHistoryChange(told)
+    try {
+      const first = store.appendRun(id, 'run_1', 'schedule')
+      expect(first).toMatchObject({ unseen: ['run_1'] })
+      expect(told).toHaveBeenLastCalledWith(first)
+      expect(store.appendRun(id, 'run_2', 'schedule')).toMatchObject({ unseen: ['run_1', 'run_2'] })
+      expect(onDisk(id).unseen).toEqual(['run_1', 'run_2'])
+    } finally {
+      onChatHistoryChange(null)
+    }
+    const assistant = store.create({ title: '助理发起', title_source: 'assistant', initiator: 'assistant' }).id
+    expect(store.appendRun(assistant, 'run_cli', 'task')).toMatchObject({ unseen: ['run_cli'] })
+  })
+
+  it('nothing of a conversation the user started is unseen: not a task, not an answer handed over', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(withReply('chat_a', 'run_a'))
+    expect(store.promoteRun('chat_a', 'run_a')).toMatchObject({ tasks: [{ run_id: 'run_a', kind: 'task' }], unseen: [] })
+    expect(store.appendRun('chat_a', 'run_b', 'task')).toMatchObject({ unseen: [] })
+    expect(store.promoteRun('chat_a', 'run_c')).toMatchObject({ unseen: [] })
+    expect(onDisk('chat_a').unseen).toEqual([])
+  })
+
+  it('an answer in a conversation main started is not unseen, nor once it becomes a task: the user asked it there', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    store.save(withReply(id, 'run_x'))
+    expect(store.appendRun(id, 'run_x', 'task')).toMatchObject({ tasks: [{ run_id: 'run_x', kind: 'task' }], unseen: [] })
+    expect(store.appendRun(id, 'run_y', 'answer')).toMatchObject({ unseen: [] })
+  })
+
+  it('a run recorded again (a catch-up) is not unseen twice, nor again once seen', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    store.appendRun(id, 'run_1', 'schedule')
+    const told = vi.fn()
+    onChatHistoryChange(told)
+    try {
+      expect(store.appendRun(id, 'run_1', 'schedule')).toMatchObject({ unseen: ['run_1'] })
+      expect(told).not.toHaveBeenCalled()
+      store.markSeen(id)
+      told.mockClear()
+      expect(store.appendRun(id, 'run_1', 'schedule')).toMatchObject({ tasks: [{ run_id: 'run_1' }], unseen: [] })
+      expect(told).not.toHaveBeenCalled()
+    } finally {
+      onChatHistoryChange(null)
+    }
+    expect(onDisk(id).unseen).toEqual([])
+  })
+
+  it('markSeen empties what is unseen and keeps the rest: runs, messages, updated_at; 0o600, no temporary file, the window hears', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    store.save({ ...record(id, later, '这周的呢'), id })
+    store.appendRun(id, 'run_1', 'schedule')
+    store.appendRun(id, 'run_2', 'schedule')
+    const before = store.get(id)!
+    const told = vi.fn()
+    onChatHistoryChange(told)
+    try {
+      const summary = store.markSeen(id)
+      expect(summary).toMatchObject({ id, unseen: [], tasks: [{ run_id: 'run_1' }, { run_id: 'run_2' }], updated_at: later })
+      expect(told).toHaveBeenCalledWith(summary)
+    } finally {
+      onChatHistoryChange(null)
+    }
+    expect(store.get(id)).toEqual({ ...before, unseen: [] })
+    expect(fs.statSync(path.join(dir, 'chat-history', `${id}.json`)).mode & 0o777).toBe(0o600)
+    expect(fs.readdirSync(path.join(dir, 'chat-history'))).toEqual([`${id}.json`])
+  })
+
+  it('markSeen with nothing unseen writes nothing and tells nothing', () => {
+    const store = createChatHistoryStore(dir)
+    store.save(record('chat_a', at))
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    const rename = vi.spyOn(fs, 'renameSync')
+    const told = vi.fn()
+    onChatHistoryChange(told)
+    try {
+      expect(store.markSeen('chat_a')).toMatchObject({ id: 'chat_a', unseen: [] })
+      expect(store.markSeen(id)).toMatchObject({ id, unseen: [] })
+    } finally {
+      onChatHistoryChange(null)
+    }
+    expect(rename).not.toHaveBeenCalled()
+    expect(told).not.toHaveBeenCalled()
+  })
+
+  it('markSeen: null for a conversation not on file (never creates one); refuses an id that is not one', () => {
+    const store = createChatHistoryStore(dir)
+    expect(store.markSeen('chat_none')).toBeNull()
+    expect(store.list()).toEqual([])
+    expect(() => store.markSeen('../x')).toThrow('Invalid chat history id')
+  })
+
+  it('a full conversation main started keeps what is unseen within its runs when the oldest answer makes room', () => {
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    store.save(withReply(id, 'run_ans'))
+    for (let i = 0; i < 999; i++) store.appendRun(id, `run_${i}`, 'schedule')
+    expect(store.get(id)!.runs).toHaveLength(1000)
+    const summary = store.appendRun(id, 'run_new', 'schedule')!
+    expect(summary.unseen).toHaveLength(1000)
+    expect(summary.unseen.at(-1)).toBe('run_new')
+    const after = store.get(id)!
+    expect(after.runs.some(r => r.run_id === 'run_ans')).toBe(false)
+    expect(after.unseen.every(u => after.runs.some(r => r.run_id === u))).toBe(true)
+    // Full of the schedule's runs: refused, and nothing unseen changes.
+    expect(() => store.appendRun(id, 'run_more', 'schedule')).toThrow('Too many chat history runs')
+    expect(store.get(id)!.unseen).toEqual(after.unseen)
+  })
+
+  it.each([
+    ['an unknown initiator', { initiator: 'robot' }],
+    ['a null initiator', { initiator: null }],
+    ['unseen that is not an array', { unseen: 'run_1' }],
+    ['an unseen run the conversation does not have', { initiator: 'schedule', unseen: ['run_9'] }],
+    ['an unseen run twice', { initiator: 'schedule', unseen: ['run_1', 'run_1'] }],
+    ['an unseen id that is not one', { initiator: 'schedule', unseen: ['../x'] }],
+    ['a hole in unseen', { initiator: 'schedule', unseen: new Array(1) }],
+    ['something unseen in a conversation the user started', { initiator: 'user', unseen: ['run_1'] }],
+  ])('refuses a record with %s', (_name, patch) => {
+    expect(() => parseChatHistoryRecord({ ...record('chat_a', at), runs: [run('run_1')], ...patch })).toThrow('Invalid chat history record')
+  })
+
+  it('reads a conversation main started with its unseen runs, oldest first', () => {
+    const parsed = parseChatHistoryRecord({ ...record('chat_a', at), runs: [run('run_1'), run('run_2')], initiator: 'schedule', unseen: ['run_2', 'run_1'] })
+    expect(parsed).toMatchObject({ initiator: 'schedule', unseen: ['run_2', 'run_1'] })
+  })
+
+  it('does not read a version 2 file, nor migrate it (there is nothing of it to keep)', () => {
+    const v2 = { ...record('chat_a', at), version: 2 } as Partial<ChatHistoryRecord>
+    delete v2.initiator
+    delete v2.unseen
+    fs.mkdirSync(path.join(dir, 'chat-history'))
+    const file = path.join(dir, 'chat-history', 'chat_a.json')
+    fs.writeFileSync(file, JSON.stringify(v2))
+    const store = createChatHistoryStore(dir)
+    expect(store.get('chat_a')).toBeNull()
+    expect(store.list()).toEqual([])
+    expect(store.markSeen('chat_a')).toBeNull()
+    expect(JSON.parse(fs.readFileSync(file, 'utf8')).version).toBe(2)
+  })
+
+  it('unseenCount: the unseen runs of the conversations the user did not start', () => {
+    expect(unseenCount([])).toBe(0)
+    expect(unseenCount([
+      { initiator: 'schedule', unseen: ['a', 'b'] },
+      { initiator: 'assistant', unseen: ['c'] },
+      { initiator: 'user', unseen: ['d'] },
+      { initiator: 'schedule', unseen: [] },
+    ])).toBe(3)
   })
 })

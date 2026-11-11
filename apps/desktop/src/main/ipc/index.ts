@@ -664,6 +664,7 @@ export function registerIpcHandlers(options: {
     chatHistory().setTitle(id, title, source))
   handle(IpcChannels.ChatHistoryOrganize, (_event, id: unknown, patch: unknown) => chatHistory().organize(id, patch))
   handle(IpcChannels.ChatHistoryPromoteRun, (_event, id: unknown, runId: unknown) => chatHistory().promoteRun(id, runId))
+  handle(IpcChannels.ChatHistoryMarkSeen, (_event, id: unknown) => chatHistory().markSeen(id))
   handle(IpcChannels.ScheduleConversation, (_event, scheduleId: unknown) =>
     (typeof scheduleId === 'string' ? options.scheduleConversation?.(scheduleId) ?? null : null))
   handle(IpcChannels.ChatGroupsGet, () => chatHistory().groups())

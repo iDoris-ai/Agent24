@@ -23,7 +23,7 @@ let groupsBridge: Record<string, ReturnType<typeof vi.fn>>
 function record(id: string, prompt: string, at = '2026-11-08T01:00:00.000Z'): ChatHistoryRecord {
   return {
     format: CHAT_HISTORY_FORMAT, version: CHAT_HISTORY_VERSION, id, title: prompt, title_source: 'prompt',
-    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [],
+    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [], initiator: 'user', unseen: [],
     messages: [{ role: 'user', content: prompt, at, delivered: true }],
   }
 }

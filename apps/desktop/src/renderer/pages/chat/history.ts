@@ -329,6 +329,18 @@ export async function loadConversation(id: string): Promise<ChatHistoryRecord | 
   return record && !removedSince(id, mark) ? record : null
 }
 
+/** M6 C1 (docs/ui/ASSISTANT-C.md §4): the page opened a saved conversation,
+ *  so nothing of it is unseen any more: main is asked to mark it seen, and
+ *  the list takes the summary main answers. Best effort: when the bridge
+ *  has no markSeen or the call fails, it stays unseen until it is opened
+ *  again; a conversation deleted or cleared meanwhile stays gone. */
+export async function markConversationSeen(id: string): Promise<void> {
+  // GROK: implement as the comment says, like `retitle` updates the list
+  // (seq / removedSince / publishedAt / byNewest). Never rejects: the page
+  // calls it with `void`. (Stub: does nothing yet.)
+  void id
+}
+
 export function setActiveConversation(id: string | null): void {
   if (state.activeId !== id) set({ activeId: id })
 }

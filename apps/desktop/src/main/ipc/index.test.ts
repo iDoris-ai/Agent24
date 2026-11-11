@@ -1913,13 +1913,13 @@ describe('UI-02 chat history IPC', () => {
   it('saves, lists, reads, deletes and clears through the guarded handlers', async () => {
     fs.rmSync(path.join(settingsDir, 'chat-history'), { recursive: true, force: true })
     const record = {
-      format: 'agent24.desktop.chat-history', version: 2, id: 'chat_ipc_1', title: '你好',
-      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
+      format: 'agent24.desktop.chat-history', version: 3, id: 'chat_ipc_1', title: '你好',
+      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [], initiator: 'user', unseen: [],
       created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z',
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [] }
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [], initiator: 'user', unseen: [] }
     expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])
     expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual(record)
@@ -1927,6 +1927,10 @@ describe('UI-02 chat history IPC', () => {
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '模型', 'model')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     await expect(call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '名', 'prompt')).rejects.toThrow('Invalid chat history title source')
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_none', '名', 'user')).toBeNull()
+    // M6 C1: marking a conversation seen goes through the same guarded handlers.
+    expect(await call(IpcChannels.ChatHistoryMarkSeen, 'chat_ipc_1')).toEqual({ ...summary, title: '问候', title_source: 'user' })
+    expect(await call(IpcChannels.ChatHistoryMarkSeen, 'chat_ipc_none')).toBeNull()
+    await expect(call(IpcChannels.ChatHistoryMarkSeen, '../x')).rejects.toThrow('Invalid chat history id')
     // UI-06: groups and archiving go through the same guarded handlers.
     const { groups: [group] } = await call(IpcChannels.ChatGroupsCreate, '工作') as { groups: Array<{ id: string; name: string }> }
     expect(group).toMatchObject({ name: '工作', collapsed: false })

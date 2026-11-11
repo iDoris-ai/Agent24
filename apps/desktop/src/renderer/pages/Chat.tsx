@@ -13,7 +13,7 @@ import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHisto
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
-  forgetPromotion, getHistoryState, historyAvailable, loadConversation, promoteRun, registerChatPage, restoreConversation, saveConversation,
+  forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
 } from './chat/history'
 
@@ -63,8 +63,9 @@ function toRecord(id: string, messages: Message[], stamps: readonly string[]): C
     // Main keeps the group and the archive mark on file (UI-06).
     group_id: null,
     archived_at: null,
-    // And its runs and what waits on the user (M4 A2).
-    runs: [], pending: [],
+    // And its runs and what waits on the user (M4 A2), who started it and
+    // what of it is unseen (M6 C1).
+    runs: [], pending: [], initiator: 'user', unseen: [],
     created_at: stamps[0] ?? '',
     updated_at: stamps.slice(0, messages.length).reduce((a, b) => (b > a ? b : a), ''),
     messages: messages.map((m, i) => m.role === 'user'
@@ -240,6 +241,8 @@ export default function ChatPage() {
     setSessionId(record.id)
     runSession.current = null
     setActiveConversation(record.id)
+    // M6 C1: opened, so nothing of it is unseen any more.
+    void markConversationSeen(record.id)
   }
   useEffect(() => registerChatPage(id => void openSaved(id), newChat))
 
