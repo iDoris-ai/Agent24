@@ -13,18 +13,19 @@ import { SidebarPrefs } from '../pages/settings/SidebarPrefs'
 import { setLocale } from '../i18n'
 
 describe('Sidebar', () => {
-  it('renders fixed entries, ordered pins, a "+ Pin" row while there is room, hidden Overview and approval badges', () => {
+  it('renders fixed entries, ordered pins, a "+ Pin" row while there is room, and hidden Overview', () => {
     const open = vi.fn()
     const navigate = vi.fn()
     const { rerender } = render(
-      <CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open, approvalsWaiting: 4 }}>
+      <CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open }}>
         <NavPrefsContext.Provider value={{ prefs: { pinned: ['voice', 'documents'], slotCount: 3, showOverview: true }, setPrefs: vi.fn() }}>
           <Sidebar activeId="voice" navigate={navigate} />
         </NavPrefsContext.Provider>
       </CapabilitiesContext.Provider>,
     )
     expect(screen.getAllByRole('button').map(b => b.textContent)).toEqual([
-      'Overview', 'Assistant4', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities', 'Settings',
+      // M6 C2: the assistant's count is the list's "Needs you" (proactive.test.tsx).
+      'Overview', 'Assistant', 'Voice', 'Documents', '+ Pin a capability', 'Capabilities', 'Settings',
     ])
     // The group says what it is, not how full it is (David 11-08).
     expect(screen.getByText('Pinned')).toBeInTheDocument()
@@ -307,11 +308,11 @@ describe('capability routing', () => {
 
   it('polls manifests through backendProxy, lists dynamic UI in domainOs and never auto-pins it', async () => {
     const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, data:
-      path === '/api/modules' ? [{ id: 'hello', type: 'ui', enabled: true, name: 'Hello' }] : { approvals: [{}, {}] },
+      path === '/api/modules' ? [{ id: 'hello', type: 'ui', enabled: true, name: 'Hello' }] : null,
     }))
     window.agent24 = { backendProxy } as unknown as Window['agent24']
     render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
-    await waitFor(() => expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('2'))
+    await waitFor(() => expect(backendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/modules' }))
     expect(screen.queryByRole('button', { name: 'Hello' })).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: /Capabilities/ }))
     await waitFor(() => expect(within(screen.getByRole('region', { name: 'Domain OS' })).getByRole('button', { name: 'Hello' })).toBeInTheDocument())
@@ -319,31 +320,17 @@ describe('capability routing', () => {
     expect(backendProxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/modules' })
   })
 
-  it('counts on Assistant every pending approval, also of a run no conversation has a card for (QA N6)', async () => {
-    const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve(
-      path === '/api/modules' ? { ok: false, status: 404 } : { ok: true, data: { approvals: [{ id: 'apr_1', run_id: 'run_desk' }, { id: 'apr_2', run_id: 'run_cli' }] } },
-    ))
-    window.agent24 = { backendProxy } as unknown as Window['agent24']
-    const view = render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
-    try {
-      await waitFor(() => expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('2'))
-    } finally {
-      view.unmount()
-    }
-  })
+  // M6 C2: the assistant's count is the list's "Needs you" now, not the
+  // daemon's pending approvals (an approval no conversation has a card for
+  // goes to the assistant's own, M4 A6): pages/chat/proactive.test.tsx.
 
-  it('refreshes every five seconds, clears settled approval badges and tolerates unavailable manifests', async () => {
+  it('refreshes every five seconds and tolerates unavailable manifests', async () => {
     vi.useFakeTimers()
-    let pending = true
-    const backendProxy = vi.fn().mockImplementation(({ path }: { path: string }) => Promise.resolve(
-      path === '/api/modules' ? { ok: false, status: 404 } : { ok: true, data: { approvals: pending ? [{ id: 'a' }] : [] } },
-    ))
+    const backendProxy = vi.fn().mockImplementation(() => Promise.resolve({ ok: false, status: 404 }))
     window.agent24 = { backendProxy } as unknown as Window['agent24']
     const view = render(<CapabilitiesProvider><NavPrefsProvider><RouteView /></NavPrefsProvider></CapabilitiesProvider>)
     try {
       await act(async () => {})
-      expect(screen.getByRole('button', { name: /Assistant/ })).toHaveTextContent('1')
-      pending = false
       await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
       expect(screen.getByRole('button', { name: 'Assistant' })).toBeInTheDocument()
       expect(backendProxy.mock.calls.filter(([req]) => req.path === '/api/modules')).toHaveLength(2)
@@ -678,7 +665,7 @@ describe('NavPrefsProvider', () => {
   it('loads persisted preferences and clamps before saving, returning the unpinned ids', async () => {
     const setNavPrefs = vi.fn().mockResolvedValue(undefined)
     window.agent24 = { getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['memory'], slotCount: 4, showOverview: true }), setNavPrefs } as unknown as Window['agent24']
-    render(<CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn(), approvalsWaiting: 0 }}><NavPrefsProvider><PrefsEditor /></NavPrefsProvider></CapabilitiesContext.Provider>)
+    render(<CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn() }}><NavPrefsProvider><PrefsEditor /></NavPrefsProvider></CapabilitiesContext.Provider>)
     await waitFor(() => expect(screen.getByRole('status')).toHaveTextContent('memory'))
     fireEvent.click(screen.getByText('Save'))
     await waitFor(() => expect(document.title).toBe('memory'))
@@ -710,7 +697,7 @@ describe('NavPrefsProvider', () => {
       api = useContext(NavPrefsContext)
       return <output>{JSON.stringify(api.prefs)}</output>
     }
-    render(<CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn(), approvalsWaiting: 0 }}><NavPrefsProvider><Editor /></NavPrefsProvider></CapabilitiesContext.Provider>)
+    render(<CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn() }}><NavPrefsProvider><Editor /></NavPrefsProvider></CapabilitiesContext.Provider>)
     const editor = api
     if (!editor) throw new Error('Missing preferences context')
     await act(async () => {

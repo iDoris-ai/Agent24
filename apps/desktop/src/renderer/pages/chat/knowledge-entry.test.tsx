@@ -40,7 +40,7 @@ beforeEach(() => {
 
 describe('the history list action', () => {
   const wrapper = (open = vi.fn()) => function Wrapper({ children }: { children: ReactNode }) {
-    return <CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 } as CapabilitiesApi}>{children}</CapabilitiesContext.Provider>
+    return <CapabilitiesContext.Provider value={{ defs: [], open } as CapabilitiesApi}>{children}</CapabilitiesContext.Provider>
   }
 
   it('is one item, keyed knowledge-entry, that hands the conversation to the Knowledge page', async () => {
