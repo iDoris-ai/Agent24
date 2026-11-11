@@ -67,6 +67,9 @@ const api = {
       ipcRenderer.invoke(IpcChannels.ChatHistoryOrganize, id, patch),
     promoteRun: (id: string, runId: string): Promise<ChatHistorySummary | null> =>
       ipcRenderer.invoke(IpcChannels.ChatHistoryPromoteRun, id, runId),
+    /** M6 C1: the conversation is open: nothing of it is unseen any more. */
+    markSeen: (id: string): Promise<ChatHistorySummary | null> =>
+      ipcRenderer.invoke(IpcChannels.ChatHistoryMarkSeen, id),
     /** M4 A6: the conversation a schedule's runs go to, if it has one yet. */
     ofSchedule: (scheduleId: string): Promise<string | null> =>
       ipcRenderer.invoke(IpcChannels.ScheduleConversation, scheduleId),

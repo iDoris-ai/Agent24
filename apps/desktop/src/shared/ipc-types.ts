@@ -17,6 +17,9 @@ export const IpcChannels = {
   // runs and waiting items, pushed to the window.
   ChatHistoryPromoteRun: 'chat-history:promote-run',
   ChatHistoryChanged: 'chat-history:changed',
+  // M6 C1: the user opened a conversation (or has it open): nothing of it
+  // is unseen any more (docs/ui/ASSISTANT-C.md §4).
+  ChatHistoryMarkSeen: 'chat-history:mark-seen',
   // M4 A3: a run's or an approval's change, from the daemon's /events.
   RunEvent: 'run:event',
   // M4 A6: the conversation a schedule's runs go to (A5), for its page.

@@ -28,7 +28,7 @@ function record(id: string, prompt: string, hour: number): ChatHistoryRecord {
   const at = `2026-11-09T${String(hour).padStart(2, '0')}:00:00.000Z`
   return {
     format: CHAT_HISTORY_FORMAT, version: CHAT_HISTORY_VERSION, id, title: prompt, title_source: 'prompt',
-    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [],
+    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [], initiator: 'user', unseen: [],
     messages: [{ role: 'user', content: prompt, at, delivered: true }],
   }
 }

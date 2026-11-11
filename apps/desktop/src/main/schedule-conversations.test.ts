@@ -452,3 +452,36 @@ describe('schedule conversations (M4 A5)', () => {
     })
   })
 })
+
+// M6 C1: a schedule's conversation is the schedule's, and each run recorded
+// in it is unseen until the user opens it (docs/ui/ASSISTANT-C.md §3).
+describe('what of a schedule\'s conversation is unseen (M6 C1)', () => {
+  const runs = (...ids: string[]) => async () => ids.map(id => ({ id, schedule_id: 'sch_1', created_at: '2026-11-09T10:00:00Z' }))
+
+  it('starts the conversation as the schedule\'s; each run recorded is unseen, once', async () => {
+    const m = homes()
+    const first = await m.record('sch_1', 'run_1')
+    expect(first).toMatchObject({ initiator: 'schedule', unseen: ['run_1'] })
+    expect(await m.record('sch_1', 'run_2')).toMatchObject({ unseen: ['run_1', 'run_2'] })
+    // The same run heard of again (a catch-up after a cut-off) adds nothing.
+    await m.record('sch_1', 'run_2')
+    expect(history.get(first!.id)!.unseen).toEqual(['run_1', 'run_2'])
+  })
+
+  it('a run recorded again once the conversation was opened stays seen; a new one is unseen', async () => {
+    const m = homes()
+    const { id } = (await m.record('sch_1', 'run_1'))!
+    history.markSeen(id)
+    await m.record('sch_1', 'run_1')
+    await m.catchUp(runs('run_1'))
+    expect(history.get(id)!.unseen).toEqual([])
+    await m.catchUp(runs('run_1', 'run_2'))
+    expect(history.get(id)!.unseen).toEqual(['run_2'])
+  })
+
+  it('the runs its first catch-up takes as handled (from before) are not unseen: they are not recorded', async () => {
+    const m = homes()
+    await m.catchUp(runs('run_old'))
+    expect(history.list()).toEqual([])
+  })
+})
