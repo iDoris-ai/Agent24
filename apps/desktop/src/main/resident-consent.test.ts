@@ -188,7 +188,7 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
       ...o,
     }
     const hold: InstallDeps['hold'] = (work) => work()
-    const deps = serviceInstallDeps({ cli: '/App/backend/agent24', daemonBin: '/App/backend/agent24d', ready, hold, spawned: sys.spawned }, sys)
+    const deps = serviceInstallDeps({ cli: '/App/backend/agent24', daemonBin: '/App/backend/agent24d', ready, hold, spawned: sys.spawned, installed: () => false }, sys)
     return { deps, runs, hold }
   }
 
