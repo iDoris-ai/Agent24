@@ -480,7 +480,7 @@ describe('App navigation integration', () => {
     }
   })
 
-  it('shows approval badges and known iDoris and Hyphae status in the center', async () => {
+  it('shows known iDoris and Hyphae status in the center', async () => {
     mockBackendProxy.mockImplementation(({ path }: { path: string }) => Promise.resolve({ ok: true, status: 200, data:
       path.includes('/approvals?') ? { approvals: [{ id: 'one' }, { id: 'two' }] }
         : path === '/api/v1/components' ? {
@@ -500,8 +500,9 @@ describe('App navigation integration', () => {
         } } : { status: 'ok' },
     }))
     await act(async () => { render(<App />) })
-    // M4 A6: approvals are decided in the assistant; their count is on it.
-    expect(nav().getByRole('button', { name: /Assistant\s*2/ })).toHaveTextContent('2')
+    // M6 C2: the assistant's count is the list's "Needs you", not the
+    // daemon's pending approvals (pages/chat/proactive.test.tsx).
+    expect(nav().getByRole('button', { name: 'Assistant' })).toBeInTheDocument()
     center()
     await waitFor(() => expect(row('Local models').getByText('Installed · not connected')).toBeInTheDocument())
     expect(row('Communication').getByText('Running')).toBeInTheDocument()

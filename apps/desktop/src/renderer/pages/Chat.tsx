@@ -228,7 +228,12 @@ export default function ChatPage() {
     const gen = ++switchGen.current
     // Already open: nothing to load (the page may be newer than the file);
     // the bump above still drops any other conversation's load under way.
-    if (id === sessionId && messages.length > 0) return
+    // Asked to open it, the user sees it: what is unseen is marked seen, also
+    // after a mark that failed while it was open (M6 C2, Codex C2 R1 C1).
+    if (id === sessionId && messages.length > 0) {
+      void markConversationSeen(id)
+      return
+    }
     const record = await loadConversation(id)
     if (!record || requestInFlight.current || gen !== switchGen.current) return
     const restored = fromRecord(record)

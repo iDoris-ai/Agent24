@@ -4,9 +4,12 @@ import { appMessages } from '../App.i18n'
 import { capabilitiesMessages } from './capabilities.i18n'
 import { CapabilitiesContext, NavPrefsContext } from './types'
 import { ChatHistoryList } from '../pages/chat/ChatHistoryList'
+import { useMineCount } from '../pages/chat/proactive'
 
 export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (page: string) => void }) {
-  const { defs, open, approvalsWaiting } = useContext(CapabilitiesContext)
+  const { defs, open } = useContext(CapabilitiesContext)
+  // M6 C2 (T-1): the conversations under the list's "Needs you".
+  const needsYou = useMineCount()
   const { prefs, pinnedCount = prefs.pinned.length } = useContext(NavPrefsContext)
   const t = useT(appMessages)
   const c = useT(capabilitiesMessages)
@@ -21,7 +24,7 @@ export function Sidebar({ activeId, navigate }: { activeId: string; navigate: (p
   return <nav className="sidebar-nav" aria-label={c('navigation')}>
     {prefs.showOverview && item('home', t('nav.home'), () => navigate('home'))}
     {/* M4 A6: approvals are decided in the assistant now (its task cards). */}
-    {item('assistant', c('assistant.name'), () => open('assistant', 'sidebar'), approvalsWaiting)}
+    {item('assistant', c('assistant.name'), () => open('assistant', 'sidebar'), needsYou)}
     <ChatHistoryList showChat={() => open('assistant', 'sidebar')} />
     {/* David 11-08: the group says what it is, not how full it is; the
         limit shows only where it stops a pin (Capabilities, Settings). */}
