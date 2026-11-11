@@ -244,13 +244,17 @@ impl InboundService {
             None => AcceptMode::Observe,
         };
         let mut entries = Vec::new();
-        for (source, actor) in self.store.list_inbound_allowlist().await? {
-            let Some(source) = parse_source(&source) else {
+        for entry in self.store.list_inbound_allowlist().await? {
+            let Some(source) = parse_source(&entry.source) else {
                 return Err(IngestError::Invalid(format!(
-                    "allowlist source {source} is not a known source"
+                    "allowlist source {} is not a known source",
+                    entry.source
                 )));
             };
-            entries.push(AllowlistEntry { source, actor });
+            entries.push(AllowlistEntry {
+                source,
+                actor: entry.actor,
+            });
         }
         let version = policy_version(&entries, mode);
         let allowlisted = self
