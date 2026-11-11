@@ -51,6 +51,7 @@ unseen: string[]   // 未看的 run_id，最早的在前
 - 只有 `appendRun` **真正新加了一个 run**，并且这条对话的 `initiator` 不是 `user`、run 的 kind 不是 `answer`，才把它的 `run_id` 记到 `unseen` 末尾。
 - 已经在的 run 再来一次（补录、重连后的 catch-up），`appendRun` 不改记录，`unseen` 也不变，所以补录是幂等的。
 - answer 升格为 task（用户在对话里问出来的 run），即使发生在日程对话里，也不记：那是用户自己问的。
+- 页面的 `promoteRun` 一律不记，不管文件里有没有这个 run。它只由页面经 IPC 调用，碰到的只会是用户在当前对话里问出来的 run；这个 run 可能在回答保存之前就转入等审批或后台任务，那时文件里还没有它（Codex C1 R1）。main 的模块（日程、助理发起）只调 `appendRun`。
 - 对话满了、最早的 answer 让位时，它不会在 `unseen` 里（answer 从来不记）；`unseen` 始终是 `runs` 的子集。
 - 对话已满、全是 task 或日程 run 时，`appendRun` 照旧报错，`unseen` 不变；日程和「助理发起」模块会换一条新对话，新对话的 `initiator` 跟原来一样。
 

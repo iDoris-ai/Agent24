@@ -354,7 +354,9 @@ export function createChatHistoryStore(dir: string) {
     if (typeof id !== 'string' || !CHAT_GROUP_ID.test(id)) throw new Error('Invalid chat group id')
     return id
   }
-  const appendRun = (id: unknown, runId: unknown, kind: unknown): ChatHistorySummary | null => {
+  /** `asked`: the user asked the run in this conversation (promoteRun, the
+   *  page's): never unseen, also one the conversation did not know yet. */
+  const recordRun = (id: unknown, runId: unknown, kind: unknown, asked: boolean): ChatHistorySummary | null => {
     const own = checkId(id)
     if (!isItemId(runId)) throw new Error('Invalid chat history run')
     if (!isRunKind(kind)) throw new Error('Invalid chat history run kind')
@@ -373,14 +375,16 @@ export function createChatHistoryStore(dir: string) {
         if (oldest < 0 || kind === 'answer') throw new Error('Too many chat history runs')
         runs = runs.filter((_, i) => i !== oldest)
       }
-      // M6 C1: a new run, other than an answer, of a conversation the user
-      // did not start is unseen; one that made room above leaves `unseen`.
+      // M6 C1: a new run, other than an answer or one the user asked, of a
+      // conversation the user did not start is unseen; one that made room
+      // above leaves `unseen`.
       const kept = new Set(runs.map(r => r.run_id))
       const unseen = record.unseen.filter(id => kept.has(id))
-      if (record.initiator !== 'user' && kind !== 'answer') unseen.push(runId)
+      if (record.initiator !== 'user' && kind !== 'answer' && !asked) unseen.push(runId)
       return { ...record, runs: [...runs, { run_id: runId, kind, started_at: new Date().toISOString() }], unseen }
     })
   }
+  const appendRun = (id: unknown, runId: unknown, kind: unknown): ChatHistorySummary | null => recordRun(id, runId, kind, false)
   return {
     /** Newest first. */
     list(): ChatHistorySummary[] {
@@ -459,9 +463,11 @@ export function createChatHistoryStore(dir: string) {
     appendRun,
     /** An answer run becomes a task (`promotionDue`, or the user handed it
      *  over); recorded first when the conversation did not know it yet. A
-     *  task or a schedule's run stays what it is. */
+     *  task or a schedule's run stays what it is. Only the page calls it,
+     *  for a run the user asked in this conversation: never unseen (M6 C1,
+     *  Codex C1 R1), whoever started the conversation. */
     promoteRun(id: unknown, runId: unknown): ChatHistorySummary | null {
-      return appendRun(id, runId, 'task')
+      return recordRun(id, runId, 'task', true)
     },
     /** Adds what waits on the user, or replaces the one with the same id. */
     setPending(id: unknown, item: unknown): ChatHistorySummary | null {

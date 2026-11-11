@@ -812,6 +812,17 @@ describe('who started a conversation and what of it is unseen (M6 C1)', () => {
     expect(store.appendRun(id, 'run_y', 'answer')).toMatchObject({ unseen: [] })
   })
 
+  it('a run the page hands over in a conversation main started is never unseen, also one not recorded yet (Codex C1 R1)', () => {
+    // The user asked it there: it waits on an approval, or goes on after the
+    // page stopped waiting, before its reply was saved (Chat.tsx).
+    const store = createChatHistoryStore(dir)
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
+    expect(store.promoteRun(id, 'run_q')).toMatchObject({ tasks: [{ run_id: 'run_q', kind: 'task' }], unseen: [] })
+    store.appendRun(id, 'run_s', 'schedule')
+    expect(store.promoteRun(id, 'run_r')).toMatchObject({ unseen: ['run_s'] })
+    expect(onDisk(id).unseen).toEqual(['run_s'])
+  })
+
   it('a run recorded again (a catch-up) is not unseen twice, nor again once seen', () => {
     const store = createChatHistoryStore(dir)
     const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
