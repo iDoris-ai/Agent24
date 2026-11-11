@@ -7,10 +7,12 @@
 //! that sender. The caller turns the third outcome into `ignore` /
 //! `rate_limited` and inserts that row under the original id.
 
+use agent24_protocol::{Run, Session};
 use chrono::{DateTime, Utc};
 use sqlx::Row;
 use sqlx::sqlite::SqliteRow;
 
+use crate::repo::insert_run_tx;
 use crate::{Result, Store, StoreError};
 
 /// SQLite extended result code `SQLITE_CONSTRAINT_UNIQUE`.
@@ -101,6 +103,17 @@ pub struct InboundEvent {
     pub disposition_reason: Option<String>,
     pub policy_version: Option<String>,
     pub run_state: Option<String>,
+}
+
+/// What [`Store::insert_session_run_for_inbound`] did.
+///
+/// `Linked` committed the session, the run, and `inbound_runs` together.
+/// `AlreadyLinked` rolled that transaction back: `event_id` already had a run.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InboundRunLink {
+    Linked,
+    AlreadyLinked,
 }
 
 /// `starting` rows split by whether `inbound_runs` already names them.
@@ -204,7 +217,9 @@ impl Store {
     ///
     /// The `WHERE` allows only `starting` → `started`, `starting` →
     /// `interrupted`, `starting` → `start_failed`, and `started` → `done`.
-    /// A missing id, the wrong current state, or any other target returns
+    /// `start_failed` also requires that `inbound_runs` has no row for this
+    /// event, so a start error cannot overwrite an event that already has a
+    /// run. A missing id, the wrong current state, or any other target returns
     /// `false` and writes nothing.
     ///
     /// # Errors
@@ -213,13 +228,17 @@ impl Store {
         let affected = sqlx::query(
             "UPDATE inbound_events SET run_state = ? \
              WHERE id = ? AND ( \
-                 (run_state = 'starting' AND ? IN ('started', 'interrupted', 'start_failed')) \
+                 (run_state = 'starting' AND ? IN ('started', 'interrupted')) \
+                 OR (run_state = 'starting' AND ? = 'start_failed' \
+                     AND NOT EXISTS (SELECT 1 FROM inbound_runs WHERE event_id = ?)) \
                  OR (run_state = 'started' AND ? = 'done') \
              )",
         )
         .bind(state)
         .bind(id)
         .bind(state)
+        .bind(state)
+        .bind(id)
         .bind(state)
         .execute(self.pool())
         .await?
@@ -303,6 +322,270 @@ impl Store {
         .await?
         .rows_affected();
         Ok(affected)
+    }
+
+    /// How many rows for `source` + `actor` have `received_at >= since`.
+    ///
+    /// Counts every disposition except `filtered`, and every category except
+    /// `protocol`, including `ignore` / `rate_limited`. The row being admitted
+    /// is not in the table yet. `since` is a [`format_inbound_timestamp`] value.
+    ///
+    /// # Errors
+    /// Storage, or a `since` that is not [`format_inbound_timestamp`].
+    pub async fn count_inbound_window(
+        &self,
+        source: &str,
+        actor: &str,
+        since: &str,
+    ) -> Result<i64> {
+        require_inbound_timestamp("since", since)?;
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM inbound_events \
+             WHERE source = ? AND actor = ? AND received_at >= ? \
+               AND category <> 'protocol' AND disposition <> 'filtered'",
+        )
+        .bind(source)
+        .bind(actor)
+        .bind(since)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(count)
+    }
+
+    /// Whether `(source, actor)` is on `inbound_allowlist`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_actor_allowlisted(&self, source: &str, actor: &str) -> Result<bool> {
+        let hit: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM inbound_allowlist WHERE source = ? AND actor = ?")
+                .bind(source)
+                .bind(actor)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(hit.is_some())
+    }
+
+    /// Stored `accept_mode`, or `None` when the policy row has not been written.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_accept_mode(&self) -> Result<Option<String>> {
+        let mode: Option<String> =
+            sqlx::query_scalar("SELECT accept_mode FROM inbound_policy WHERE id = 1")
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(mode)
+    }
+
+    /// `activated_at` for `source`, if that source has a watermark row.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_watermark_activated_at(&self, source: &str) -> Result<Option<String>> {
+        let at: Option<String> = sqlx::query_scalar(
+            "SELECT activated_at FROM inbound_source_watermark WHERE source = ?",
+        )
+        .bind(source)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(at)
+    }
+
+    /// Insert `session`, `run`, and `inbound_runs` in one `BEGIN IMMEDIATE`.
+    ///
+    /// [`crate::Store::insert_run`] commits on its own, so it cannot share a
+    /// transaction with the link. A clash on `inbound_runs.event_id` rolls the
+    /// session and the run back and returns [`InboundRunLink::AlreadyLinked`].
+    ///
+    /// # Errors
+    /// Storage, a workspace-bound run (this path does not admit one), a session
+    /// id that does not match the run, or a constraint other than that
+    /// `event_id` unique index.
+    pub async fn insert_session_run_for_inbound(
+        &self,
+        session: &Session,
+        run: &Run,
+        event_id: &str,
+    ) -> Result<InboundRunLink> {
+        if run.session_id.as_deref() != Some(session.id.as_str()) {
+            return Err(StoreError::Conflict(
+                "inbound run session does not match".to_owned(),
+            ));
+        }
+        if run.workspace_id.is_some() || session.workspace_id.is_some() {
+            return Err(StoreError::Conflict(
+                "inbound run is not workspace-bound".to_owned(),
+            ));
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        sqlx::query(
+            "INSERT INTO sessions (id, title, channel, workspace_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&session.id)
+        .bind(&session.title)
+        .bind(&session.channel)
+        .bind(session.workspace_id.as_ref().map(|id| id.as_str()))
+        .bind(&session.created_at)
+        .bind(&session.updated_at)
+        .execute(&mut *tx)
+        .await?;
+        insert_run_tx(&mut tx, run).await?;
+        let linked = sqlx::query("INSERT INTO inbound_runs (run_id, event_id) VALUES (?, ?)")
+            .bind(&run.id)
+            .bind(event_id)
+            .execute(&mut *tx)
+            .await;
+        match linked {
+            Ok(_) => {
+                tx.commit().await?;
+                Ok(InboundRunLink::Linked)
+            }
+            Err(sqlx::Error::Database(err)) if is_inbound_run_event_conflict(err.as_ref()) => {
+                tx.rollback().await?;
+                Ok(InboundRunLink::AlreadyLinked)
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    /// `runs.status` for the run linked to `event_id`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_linked_run_status(&self, event_id: &str) -> Result<Option<String>> {
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT r.status FROM inbound_runs ir \
+             JOIN runs r ON r.id = ir.run_id \
+             WHERE ir.event_id = ?",
+        )
+        .bind(event_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(status)
+    }
+
+    /// `started` events whose run row is gone.
+    ///
+    /// Deleting `runs` cascades `inbound_runs`, so the event stays `started`
+    /// with nothing left to resume and still occupies the in-flight index.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_started_unlinked_event_ids(&self) -> Result<Vec<String>> {
+        let ids = sqlx::query_scalar(
+            "SELECT id FROM inbound_events e \
+             WHERE e.run_state = 'started' \
+               AND NOT EXISTS (SELECT 1 FROM inbound_runs r WHERE r.event_id = e.id) \
+             ORDER BY e.id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids)
+    }
+
+    /// `started` events whose run has already ended.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_started_terminal_event_ids(&self) -> Result<Vec<String>> {
+        let ids = sqlx::query_scalar(
+            "SELECT e.id FROM inbound_events e \
+             JOIN inbound_runs ir ON ir.event_id = e.id \
+             JOIN runs r ON r.id = ir.run_id \
+             WHERE e.run_state = 'started' \
+               AND r.status IN ('completed', 'failed', 'cancelled') \
+             ORDER BY e.id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(ids)
+    }
+
+    /// The run id linked to `event_id`, if any.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_run_id_for_event(&self, event_id: &str) -> Result<Option<String>> {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT run_id FROM inbound_runs WHERE event_id = ?")
+                .bind(event_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(id)
+    }
+
+    /// The inbound event linked to `run_id`, if any.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_event_id_for_run(&self, run_id: &str) -> Result<Option<String>> {
+        let id: Option<String> =
+            sqlx::query_scalar("SELECT event_id FROM inbound_runs WHERE run_id = ?")
+                .bind(run_id)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(id)
+    }
+
+    /// Whether any run in `session_id` is linked from an inbound event.
+    ///
+    /// A session with no runs, or only unlinked runs, is `false`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn session_has_inbound_run(&self, session_id: &str) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM runs \
+             WHERE session_id = ? \
+               AND EXISTS (SELECT 1 FROM inbound_runs ir WHERE ir.run_id = runs.id) \
+             LIMIT 1",
+        )
+        .bind(session_id)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(found.is_some())
+    }
+
+    /// Move the event linked to `run_id` to `done` from `starting` or `started`.
+    ///
+    /// A run can reach a terminal status before `mark_inbound_started` lands.
+    /// Leaving the row at `starting` would keep the in-flight index. Returns
+    /// whether this call changed a row. No link, or any other state, is `false`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn mark_inbound_done_for_run(&self, run_id: &str) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE inbound_events SET run_state = 'done' \
+             WHERE run_state IN ('starting', 'started') \
+               AND id = (SELECT event_id FROM inbound_runs WHERE run_id = ?)",
+        )
+        .bind(run_id)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    /// Move `event_id` to `done` from `starting` or `started`.
+    ///
+    /// Same edge as [`Self::mark_inbound_done_for_run`], for startup reconcile
+    /// when the run is already terminal.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn mark_inbound_done_by_event(&self, event_id: &str) -> Result<bool> {
+        let affected = sqlx::query(
+            "UPDATE inbound_events SET run_state = 'done' \
+             WHERE id = ? AND run_state IN ('starting', 'started')",
+        )
+        .bind(event_id)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
     }
 
     /// Every allowlist row, ordered by `(source, actor)`.
@@ -470,6 +753,15 @@ impl Store {
         .await?;
         Ok(rows.into_iter().map(summary_from_row).collect())
     }
+}
+
+fn is_inbound_run_event_conflict(err: &dyn sqlx::error::DatabaseError) -> bool {
+    if err.kind() != sqlx::error::ErrorKind::UniqueViolation
+        || err.code().as_deref() != Some(SQLITE_CONSTRAINT_UNIQUE)
+    {
+        return false;
+    }
+    err.message().contains("inbound_runs.event_id")
 }
 
 /// One allowlist row as stored.
@@ -1227,6 +1519,53 @@ mod tests {
                 .unwrap()
         );
 
+        // A start error must not clobber an event that already has a run.
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample(
+                    "hyphae:linked",
+                    "npub-linked",
+                    "explicit",
+                    Some("starting"),
+                ))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at) \
+             VALUES ('run_linked', 'queued', '{}', '{}', '2026-11-11T00:00:00Z')",
+        )
+        .execute(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        store
+            .insert_inbound_run("run_linked", "hyphae:linked")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .mark_inbound_run_state("hyphae:linked", "start_failed")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:linked")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("starting")
+        );
+        assert!(
+            store
+                .mark_inbound_run_state("hyphae:linked", "started")
+                .await
+                .unwrap()
+        );
+
         let after = store.inbound_reconcile().await.unwrap();
         assert!(after.linked.is_empty());
         assert!(after.unlinked.is_empty());
@@ -1346,6 +1685,336 @@ mod tests {
         assert!(index_sql.contains("UNIQUE"));
         assert!(index_sql.contains("starting"));
         assert!(index_sql.contains("started"));
+    }
+
+    #[tokio::test]
+    async fn window_count_includes_ignore_and_skips_protocol_and_filtered() {
+        let store = Store::open_memory().await.unwrap();
+        let mut rows = [
+            sample("hyphae:in-ignore", "npub1", "ignore", None),
+            sample("hyphae:in-limited", "npub1", "ignore", None),
+            sample("hyphae:in-explicit", "npub1", "explicit", Some("done")),
+        ];
+        rows[1].disposition_reason = Some("rate_limited".to_owned());
+        let mut protocol = sample("hyphae:proto", "npub1", "ignore", None);
+        protocol.category = "protocol".to_owned();
+        let filtered = sample("hyphae:filtered", "npub1", "filtered", None);
+        let other_actor = sample("hyphae:other", "npub2", "ignore", None);
+        let mut old = sample("hyphae:old-window", "npub1", "ignore", None);
+        old.received_at = "2026-11-10T00:00:00Z".to_owned();
+        // Same actor and the same `received_at` as the counted rows, other source.
+        // Mutation: drop `source = ?` (and its bind) and this row is counted, so 3 becomes 4.
+        let mut other_source = sample("wechat:same-actor", "npub1", "ignore", None);
+        other_source.source = "wechat".to_owned();
+        for event in rows
+            .iter()
+            .chain([&protocol, &filtered, &other_actor, &old, &other_source])
+        {
+            assert_eq!(
+                store.insert_inbound_event(event).await.unwrap(),
+                InboundInsert::Inserted
+            );
+        }
+        assert_eq!(
+            store
+                .count_inbound_window("hyphae", "npub1", "2026-11-11T00:00:00Z")
+                .await
+                .unwrap(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn linking_an_event_twice_keeps_one_run() {
+        // The second call rolls its session and run back. Mutation: commit the
+        // run before the link, and this count becomes 2.
+        let store = Store::open_memory().await.unwrap();
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample(
+                    "hyphae:link",
+                    "npub1",
+                    "explicit",
+                    Some("starting"),
+                ))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        let first = inbound_run("run_one", "sess_one");
+        let first_session = inbound_session("sess_one");
+        assert_eq!(
+            store
+                .insert_session_run_for_inbound(&first_session, &first, "hyphae:link")
+                .await
+                .unwrap(),
+            InboundRunLink::Linked
+        );
+        let second = inbound_run("run_two", "sess_two");
+        let second_session = inbound_session("sess_two");
+        assert_eq!(
+            store
+                .insert_session_run_for_inbound(&second_session, &second, "hyphae:link")
+                .await
+                .unwrap(),
+            InboundRunLink::AlreadyLinked
+        );
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(runs, 1);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(crate::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(sessions, 1);
+        assert_eq!(
+            store
+                .inbound_run_id_for_event("hyphae:link")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("run_one")
+        );
+        assert!(store.session_has_inbound_run("sess_one").await.unwrap());
+        assert!(!store.session_has_inbound_run("sess_two").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_session_is_refused_before_the_link() {
+        // Mutation: drop the session-id guard and the null session_id call
+        // returns Linked, while a different id fails the sessions FK instead
+        // of this Conflict.
+        let store = Store::open_memory().await.unwrap();
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample(
+                    "hyphae:mismatch",
+                    "npub1",
+                    "explicit",
+                    Some("starting"),
+                ))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        let session = inbound_session("sess_one");
+        let other = inbound_run("run_other", "sess_other");
+        let err = store
+            .insert_session_run_for_inbound(&session, &other, "hyphae:mismatch")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run session does not match"),
+            "{err:?}"
+        );
+
+        let mut missing = inbound_run("run_missing", "sess_one");
+        missing.session_id = None;
+        let err = store
+            .insert_session_run_for_inbound(&session, &missing, "hyphae:mismatch")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run session does not match"),
+            "{err:?}"
+        );
+        assert_eq!(table_count(&store, "sessions").await, 0);
+        assert_eq!(table_count(&store, "runs").await, 0);
+        assert_eq!(table_count(&store, "inbound_runs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_workspace_binding_is_refused_before_the_link() {
+        // Mutation: drop the workspace guard and both calls miss this
+        // Conflict (the workspace FK, or a committed link).
+        let store = Store::open_memory().await.unwrap();
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample("hyphae:ws", "npub1", "explicit", Some("starting")))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        let workspace =
+            agent24_protocol::WorkspaceId::parse("ws_0123456789ABCDEFGHJKMNPQRS").unwrap();
+
+        let mut session = inbound_session("sess_ws");
+        session.workspace_id = Some(workspace.clone());
+        let run = inbound_run("run_ws_session", "sess_ws");
+        let err = store
+            .insert_session_run_for_inbound(&session, &run, "hyphae:ws")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run is not workspace-bound"),
+            "{err:?}"
+        );
+
+        let plain = inbound_session("sess_plain");
+        let mut bound = inbound_run("run_ws_run", "sess_plain");
+        bound.workspace_id = Some(workspace.clone());
+        bound.input.workspace_id = Some(workspace);
+        let err = store
+            .insert_session_run_for_inbound(&plain, &bound, "hyphae:ws")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message == "inbound run is not workspace-bound"),
+            "{err:?}"
+        );
+        assert_eq!(table_count(&store, "sessions").await, 0);
+        assert_eq!(table_count(&store, "runs").await, 0);
+        assert_eq!(table_count(&store, "inbound_runs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_only_an_unlinked_run_is_not_inbound() {
+        // The session exists and has a run. That run is not in `inbound_runs`.
+        // Mutation: drop the `inbound_runs` EXISTS and this becomes true.
+        let store = Store::open_memory().await.unwrap();
+        let session = inbound_session("sess_plain");
+        store.insert_session(&session).await.unwrap();
+        let run = inbound_run("run_plain", "sess_plain");
+        store.insert_run(&run).await.unwrap();
+        assert!(!store.session_has_inbound_run("sess_plain").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn started_terminal_event_ids_cover_each_terminal_status() {
+        // Each terminal status is load-bearing: drop `completed`, `failed`, or
+        // `cancelled` from the IN list and that id disappears. A still-running
+        // started row is not terminal. Mutation: drop `starting` from
+        // `mark_inbound_done_for_run` and the last call returns false.
+        let store = Store::open_memory().await.unwrap();
+        for (event_id, actor, run_id, status) in [
+            (
+                "hyphae:term-cancelled",
+                "npub-c",
+                "run_cancelled",
+                "cancelled",
+            ),
+            (
+                "hyphae:term-completed",
+                "npub-d",
+                "run_completed",
+                "completed",
+            ),
+            ("hyphae:term-failed", "npub-f", "run_failed", "failed"),
+            ("hyphae:still-running", "npub-r", "run_running", "running"),
+        ] {
+            assert_eq!(
+                store
+                    .insert_inbound_event(&sample(event_id, actor, "explicit", Some("starting"),))
+                    .await
+                    .unwrap(),
+                InboundInsert::Inserted
+            );
+            seed_run(&store, run_id).await;
+            sqlx::query("UPDATE runs SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(run_id)
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            store.insert_inbound_run(run_id, event_id).await.unwrap();
+            assert!(store.mark_inbound_started(event_id).await.unwrap());
+        }
+        assert_eq!(
+            store.inbound_started_terminal_event_ids().await.unwrap(),
+            vec![
+                "hyphae:term-cancelled".to_owned(),
+                "hyphae:term-completed".to_owned(),
+                "hyphae:term-failed".to_owned(),
+            ]
+        );
+
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample(
+                    "hyphae:from-starting",
+                    "npub-s",
+                    "explicit",
+                    Some("starting"),
+                ))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        seed_run(&store, "run_from_starting").await;
+        store
+            .insert_inbound_run("run_from_starting", "hyphae:from-starting")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_inbound_done_for_run("run_from_starting")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:from-starting")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("done")
+        );
+    }
+
+    async fn table_count(store: &Store, table: &str) -> i64 {
+        let sql = match table {
+            "sessions" => "SELECT COUNT(*) FROM sessions",
+            "runs" => "SELECT COUNT(*) FROM runs",
+            "inbound_runs" => "SELECT COUNT(*) FROM inbound_runs",
+            other => panic!("unexpected table {other}"),
+        };
+        sqlx::query_scalar(sql)
+            .fetch_one(crate::test_hooks::pool(store))
+            .await
+            .unwrap()
+    }
+
+    fn inbound_session(id: &str) -> agent24_protocol::Session {
+        agent24_protocol::Session {
+            id: id.to_owned(),
+            title: String::new(),
+            channel: "hyphae".to_owned(),
+            workspace_id: None,
+            created_at: "2026-11-11T00:00:00Z".to_owned(),
+            updated_at: "2026-11-11T00:00:00Z".to_owned(),
+        }
+    }
+
+    fn inbound_run(id: &str, session: &str) -> agent24_protocol::Run {
+        agent24_protocol::Run {
+            id: id.to_owned(),
+            session_id: Some(session.to_owned()),
+            workspace_id: None,
+            status: agent24_protocol::RunStatus::Queued,
+            input: agent24_protocol::RunInput {
+                prompt: "hello".to_owned(),
+                workspace_id: None,
+                model_override: None,
+                mode: agent24_protocol::RunMode::Normal,
+                knowledge_binding_id: None,
+            },
+            output: None,
+            error: None,
+            usage: agent24_protocol::Usage {
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+            },
+            schedule_id: None,
+            created_at: "2026-11-11T00:00:00Z".to_owned(),
+            started_at: None,
+            ended_at: None,
+        }
     }
 
     #[tokio::test]

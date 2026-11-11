@@ -137,7 +137,8 @@ pub use decision_log::{
 };
 pub use inbound::{
     InboundAdmissionView, InboundAllowEntry, InboundAllowWrite, InboundEvent, InboundEventSummary,
-    InboundInsert, InboundPolicy, InboundReconcile, NewInboundEvent, format_inbound_timestamp,
+    InboundInsert, InboundPolicy, InboundReconcile, InboundRunLink, NewInboundEvent,
+    format_inbound_timestamp,
 };
 pub use inbound_scrub::{
     INBOUND_SCRUB_PLACEHOLDER, InboundScrubReport, InboundScrubSession, MEMORY_GRACE_SECS,
