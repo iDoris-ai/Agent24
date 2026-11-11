@@ -1104,6 +1104,15 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/schedules/{id}/resume",
             axum::routing::post(crate::schedules::resume_schedule),
         )
+        .route(
+            "/api/v1/inbound/allowlist",
+            get(crate::inbound::get_allowlist).put(crate::inbound::put_allowlist),
+        )
+        .route(
+            "/api/v1/inbound/policy",
+            get(crate::inbound::get_policy).put(crate::inbound::put_policy),
+        )
+        .route("/api/v1/inbound/events", get(crate::inbound::get_events))
         .route("/api/v1/events", get(crate::events::ws_events))
         // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2): register/rotate,
         // list and revoke attached modules. `attached` is reserved in

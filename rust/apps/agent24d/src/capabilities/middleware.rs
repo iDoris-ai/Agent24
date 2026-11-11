@@ -41,17 +41,22 @@ pub(crate) async fn auth(
 }
 
 /// Routes that only the desktop's ProductHost may call, in any auth mode.
-/// Private-key backup and restore. Export lets the caller choose the password
-/// that encrypts the key, and restore plants a key of the caller's choosing as
-/// one of the user's identities, so a bearer that merely proves "same user, same machine" (the
-/// legacy shared token, any FirstPartyShell or Creative token) must not reach
-/// it: it would let any local process produce a backup it can decrypt.
+/// Private-key backup and restore, and the inbound allowlist / accept-mode
+/// writes (X11-2f). Export lets the caller choose the password that encrypts
+/// the key, and restore plants a key of the caller's choosing as one of the
+/// user's identities, so a bearer that merely proves "same user, same
+/// machine" (the legacy shared token, any FirstPartyShell or Creative token)
+/// must not reach it: it would let any local process produce a backup it can
+/// decrypt. The inbound writes are the same kind of host action: a shell
+/// token, even one that could elevate, must not change who is admitted.
 fn host_only_route(method: &Method, path: &str) -> bool {
-    method == Method::POST
+    (method == Method::POST
         && (matches!(
             path,
             "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
-        ) || is_component_report(path))
+        ) || is_component_report(path)))
+        || (method == Method::PUT
+            && matches!(path, "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy"))
 }
 
 /// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).

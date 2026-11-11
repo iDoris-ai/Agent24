@@ -45,6 +45,17 @@ impl Source {
             Self::Self_ => "self",
         }
     }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        Some(match value {
+            "hyphae" => Self::Hyphae,
+            "wechat" => Self::Wechat,
+            "remote" => Self::Remote,
+            "scheduler" => Self::Scheduler,
+            "self" => Self::Self_,
+            _ => return None,
+        })
+    }
 }
 
 /// Wire `category`. Machine protocol (f4/1 envelope, ack, `hyphae-behavior`
@@ -52,6 +63,7 @@ impl Source {
 /// [`Category::Protocol`]; the adapter classifies them (X11-2e). [`admit`]
 /// does not inspect the body. [`Category::Internal`] is the scheduler / self
 /// path and must be routed before [`admit`].
+#[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Category {
     Direct,
@@ -65,6 +77,7 @@ pub(crate) enum Category {
 
 impl Category {
     /// §3.1 `category` wire values.
+    #[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Direct => "direct",
@@ -79,6 +92,7 @@ impl Category {
 }
 
 /// Wire `addressed`.
+#[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Addressed {
     None,
@@ -88,6 +102,7 @@ pub(crate) enum Addressed {
 
 impl Addressed {
     /// §3.1 `addressed` wire values.
+    #[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -112,6 +127,15 @@ impl AcceptMode {
             Self::Observe => "observe",
             Self::Auto => "auto",
         }
+    }
+
+    pub(crate) fn from_wire(value: &str) -> Option<Self> {
+        Some(match value {
+            "off" => Self::Off,
+            "observe" => Self::Observe,
+            "auto" => Self::Auto,
+            _ => return None,
+        })
     }
 }
 
@@ -159,6 +183,7 @@ pub(crate) struct AdmitInput {
 /// `explicit` carries no reason. `ignore` always does. [`Disposition::Filtered`]
 /// and [`Disposition::Internal`] are wire values (§3.1) and are not produced
 /// here (`internal` is the scheduler / self path, which skips admission).
+#[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Disposition {
     Explicit,
@@ -169,6 +194,7 @@ pub(crate) enum Disposition {
 
 impl Disposition {
     /// §3.1 `disposition` wire values.
+    #[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
@@ -193,6 +219,7 @@ pub(crate) enum Reason {
 }
 
 impl Reason {
+    #[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Protocol => "protocol",
@@ -232,6 +259,7 @@ impl Decision {
 /// Caller must already have routed `source` [`Source::Scheduler`] /
 /// [`Source::Self_`] and [`Category::Internal`] elsewhere (§3.4). Those are
 /// not rows of this table; `debug_assert!` rejects them in debug builds.
+#[cfg_attr(not(test), expect(dead_code, reason = "X11-2c 接线"))]
 pub(crate) fn admit(input: &AdmitInput) -> Decision {
     debug_assert!(
         !matches!(input.source, Source::Scheduler | Source::Self_),

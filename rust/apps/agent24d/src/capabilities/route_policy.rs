@@ -174,6 +174,13 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}", Operation::CommRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry", Operation::CommWrite, AssuranceLevel::Elevated),
     row("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept", Operation::CommWrite, AssuranceLevel::Elevated),
+    // X11-2f. Read and write are two operations: a shared one would mix
+    // Everyday and Elevated, and assurance_level() would return None.
+    row("GET", "/api/v1/inbound/allowlist", Operation::InboundRead, AssuranceLevel::Everyday),
+    row("PUT", "/api/v1/inbound/allowlist", Operation::InboundWrite, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/inbound/policy", Operation::InboundRead, AssuranceLevel::Everyday),
+    row("PUT", "/api/v1/inbound/policy", Operation::InboundWrite, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/inbound/events", Operation::InboundRead, AssuranceLevel::Everyday),
 ];
 
 pub fn policies() -> &'static [RoutePolicy] {

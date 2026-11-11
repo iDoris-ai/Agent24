@@ -1113,6 +1113,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/inbound/allowlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the inbound allowlist
+         * @description Everyday read. Returns every `(source, actor)` the host has stored, plus `policy_version`. An empty list is `entries: []`.
+         */
+        get: operations["getInboundAllowlist"];
+        /**
+         * Replace the inbound allowlist
+         * @description ProductHost only. Legacy mode and every other audience get 403. Replaces the whole list. `added_at` is set by the daemon. A repeated `(source, actor)` in one body is 400.
+         */
+        put: operations["putInboundAllowlist"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/inbound/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the inbound accept mode
+         * @description Everyday read. No stored row yet answers `accept_mode: observe` and `updated_at: null`. `policy_version` is the admit hash. It changes when the mode or the allowlist changes, and it does not depend on `updated_at`.
+         */
+        get: operations["getInboundPolicy"];
+        /**
+         * Set the inbound accept mode
+         * @description ProductHost only. Legacy mode and every other audience get 403. `accept_mode` is stored and is not consulted by admission in this milestone. `policy_version` changes when the stored mode changes, and stays the same when the same mode is written again.
+         */
+        put: operations["putInboundPolicy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/inbound/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List inbound events without the full body
+         * @description Everyday read. Newest `at` first, then `id`. Each item is metadata plus `text_preview`, the first 50 characters of `text`. The full body and `meta` are not returned. This list is not pushed on `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above 100 are 400. `before_at` and `before_id` page backward and must be sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`.
+         */
+        get: operations["listInboundEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sin90/directions": {
         parameters: {
             query?: never;
@@ -3188,6 +3256,66 @@ export interface components {
         MemorySettings: {
             /** @description The persistent personal-memory switch. `false` stops new writes and cross-session recall; existing assertions are kept, and the setting survives a daemon restart. */
             enabled: boolean;
+        };
+        InboundAllowEntry: {
+            /** @enum {string} */
+            source: "hyphae" | "wechat" | "remote" | "scheduler" | "self";
+            actor: string;
+            /** @description UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`, set by the daemon. */
+            added_at: string;
+            note?: string | null;
+        };
+        InboundAllowlist: {
+            entries: components["schemas"]["InboundAllowEntry"][];
+            /** @description Admit hash: sha256 of the sorted allowlist, the accept mode, and the admit rule version. 64 lowercase hex digits. It does not depend on `updated_at`. */
+            policy_version: string;
+        };
+        InboundAllowlistWrite: {
+            entries: {
+                /** @enum {string} */
+                source: "hyphae" | "wechat" | "remote" | "scheduler" | "self";
+                actor: string;
+                note?: string | null;
+            }[];
+        };
+        InboundPolicy: {
+            /** @enum {string} */
+            accept_mode: "off" | "observe" | "auto";
+            /** @description Null until the first write. */
+            updated_at?: string | null;
+            policy_version: string;
+        };
+        InboundPolicyWrite: {
+            /** @enum {string} */
+            accept_mode: "off" | "observe" | "auto";
+        };
+        InboundEventSummary: {
+            id: string;
+            source: string;
+            category: string;
+            recipient_identity?: string | null;
+            thread_key?: string | null;
+            actor?: string | null;
+            human: boolean;
+            /** @enum {string} */
+            addressed: "none" | "mention" | "direct";
+            at: string;
+            received_at: string;
+            /** @description First 50 characters of the body, or null when the body is gone. */
+            text_preview?: string | null;
+            text_scrubbed_at?: string | null;
+            disposition: string;
+            disposition_reason?: string | null;
+            policy_version?: string | null;
+            run_state?: string | null;
+        };
+        InboundEventPage: {
+            events: components["schemas"]["InboundEventSummary"][];
+            /** @description Present when another older page exists. Send both values back as query parameters. */
+            next?: {
+                before_at: string;
+                before_id: string;
+            } | null;
         };
         ErrorBody: {
             /**
@@ -6476,6 +6604,172 @@ export interface operations {
             };
             /** @description Personal memory is not available on this daemon */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getInboundAllowlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundAllowlist"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    putInboundAllowlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InboundAllowlistWrite"];
+            };
+        };
+        responses: {
+            /** @description The stored allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundAllowlist"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not the desktop ProductHost credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getInboundPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored accept mode */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundPolicy"];
+                };
+            };
+        };
+    };
+    putInboundPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InboundPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description The stored accept mode */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundPolicy"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not the desktop ProductHost credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listInboundEvents: {
+        parameters: {
+            query?: {
+                limit?: number;
+                before_at?: string;
+                before_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of inbound event metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundEventPage"];
+                };
+            };
+            /** @description Invalid query */
+            400: {
                 headers: {
                     [name: string]: unknown;
                 };
