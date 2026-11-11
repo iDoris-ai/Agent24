@@ -15,9 +15,7 @@ export interface BannerProps {
 }
 
 export function Banner(props: BannerProps) {
-  // GROK: <div className="banner"><button type="button" className="banner-action"
-  //   onClick={props.onActivate} disabled={props.disabled}
-  //   aria-label={props.label}>{props.text}</button></div>
-  void props
-  return null
+  return <div className="banner"><button type="button" className="banner-action"
+    onClick={props.onActivate} disabled={props.disabled}
+    aria-label={props.label}>{props.text}</button></div>
 }

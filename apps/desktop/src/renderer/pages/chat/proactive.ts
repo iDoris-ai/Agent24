@@ -22,16 +22,12 @@ const live = (items: readonly ChatHistorySummary[]) => items.filter(item => item
 
 /** The banner's n: the unseen runs of the conversations not archived. */
 export function bannerCount(items: readonly ChatHistorySummary[]): number {
-  // GROK: unseenCount over the items not archived.
-  void items; void live; void unseenCount
-  return 0 // stub
+  return unseenCount(live(items))
 }
 
 /** How the banner writes n: as it is up to BANNER_CAP, "99+" past it. */
 export function bannerNumber(n: number): string {
-  // GROK: String(n) when n <= BANNER_CAP, else `${BANNER_CAP}+`.
-  void n
-  return '' // stub
+  return n <= BANNER_CAP ? String(n) : `${BANNER_CAP}+`
 }
 
 /** Where the banner goes: the conversation (not archived, not the user's)
@@ -39,19 +35,29 @@ export function bannerNumber(n: number): string {
  *  conversation's tasks; on a tie the smaller id. Null when nothing is
  *  unseen. */
 export function bannerTarget(items: readonly ChatHistorySummary[]): string | null {
-  // GROK: implement as the comment says. An unseen run not found in `tasks`
-  // (it should not happen: unseen runs are never answers) counts as the
-  // conversation's own `updated_at`, so it is still reachable.
-  void items
-  return null // stub
+  // An unseen run not found in `tasks` counts as the conversation's `updated_at`.
+  let best: ChatHistorySummary | undefined
+  let bestAt = Infinity
+  for (const item of live(items)) {
+    if (item.initiator === 'user' || item.unseen.length === 0) continue
+    let at = Infinity
+    for (const runId of item.unseen) {
+      const started = item.tasks.find(task => task.run_id === runId)?.started_at ?? item.updated_at
+      const parsed = Date.parse(started)
+      if (parsed < at) at = parsed
+    }
+    if (best === undefined || at < bestAt || (at === bestAt && item.id < best.id)) {
+      best = item
+      bestAt = at
+    }
+  }
+  return best?.id ?? null
 }
 
 /** The sidebar's count: the conversations not archived under "Needs you",
  *  as the list's own count of that filter (ChatHistoryList.tsx). */
 export function mineCount(items: readonly ChatHistorySummary[], status: (runId: string) => RunStatus | undefined): number {
-  // GROK: live(items) filtered by filtersOf(item, status).has('mine'), counted.
-  void items; void status; void filtersOf
-  return 0 // stub
+  return live(items).filter(item => filtersOf(item, status).has('mine')).length
 }
 
 /** The sidebar's count, kept up to date: the list's conversations, and the
@@ -75,13 +81,15 @@ export function useMineCount(): number {
 export function useSeeingOpenConversation(shown: boolean): void {
   const { items, activeId } = useSyncExternalStore(subscribeHistory, getHistoryState)
   const [focused, setFocused] = useState(() => typeof document !== 'undefined' && document.hasFocus())
-  // GROK: listen to window 'focus' / 'blur' (set `focused`), removed on
-  // unmount, as CliToolSettings.tsx does.
-  useEffect(() => { void setFocused }, [])
+  useEffect(() => {
+    const onFocus = () => setFocused(true)
+    const onBlur = () => setFocused(false)
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('blur', onBlur)
+    return () => { window.removeEventListener('focus', onFocus); window.removeEventListener('blur', onBlur) }
+  }, [])
   const unseen = items.find(item => item.id === activeId)?.unseen.length ?? 0
   useEffect(() => {
-    // GROK: when shown && focused && activeId !== null && unseen > 0, call
-    // `void markConversationSeen(activeId)`.
-    void markConversationSeen
+    if (shown && focused && activeId !== null && unseen > 0) void markConversationSeen(activeId)
   }, [shown, focused, activeId, unseen])
 }
