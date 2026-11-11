@@ -2472,6 +2472,39 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     }
   })
 
+  it('overlapping service holds: nothing is spawned until the last one ends (PR-Daemon #1783 N1)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    let alive = true
+    let plist = true
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, isAlive: () => alive, serviceInstalled: () => plist }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      let endSecond = () => {}
+      const second = new Promise<void>((resolve) => { endSecond = resolve })
+      let held: Promise<void> | null = null
+      await manager.whileServiceRestarts(async () => {
+        held = manager.whileServiceRestarts(() => second)
+        // A stop: the service daemon gone, its LaunchAgent removed.
+        alive = false
+        plist = false
+        first.end('daemon_unavailable')
+      })
+      // The first has ended; the second still holds.
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      endSecond()
+      await held
+      await vi.advanceTimersByTimeAsync(30_000)
+      // Then, with no LaunchAgent, this app runs its own again.
+      expect(spawnProcess).toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('while enrolled, daemonElevation elevates on the current token connection; not once it ends or is stopped (M5 B3)', async () => {
     vi.useFakeTimers()
     const first = session('daily-1')

@@ -1,7 +1,7 @@
 // M5 B4c2: the Settings switch (resident-service.ts setResident) and the
 // tray's message for a failed 「完全退出」 (stopFailureKey).
-import { afterEach, describe, expect, it } from 'vitest'
-import { installService, serviceInstallDeps, setResident, stopFailureKey, type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem, type StopOutcome } from './resident-service'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { installedAndEnrolled, installService, residentOps, serviceInstallDeps, setResident, stopFailureKey, type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem, type StopOutcome } from './resident-service'
 import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
 afterEach(() => { resetMainLocaleForTest() })
@@ -135,5 +135,114 @@ describe('installService looks at the plist again once the hold has begun (Codex
     const sys: InstallSystem = { run: async () => {}, record: () => null, alive: () => true, spawned: () => false, startWaitMs: 0 }
     const deps = serviceInstallDeps({ cli: '/a', daemonBin: '/b', ready: Promise.resolve(), hold: (w) => w(), spawned: () => false, installed }, sys)
     expect(deps.installed).toBe(installed)
+  })
+})
+
+describe('residentOps: the install and the stop one at a time (PR-Daemon #1783 N1/N2)', () => {
+  function gate<T>() {
+    let open: (v: T) => void = () => {}
+    let fail: (e: unknown) => void = () => {}
+    const p = new Promise<T>((resolve, reject) => { open = resolve; fail = reject })
+    return { p, open, fail }
+  }
+  const stopped: StopOutcome = { ok: true }
+  const installed: InstallOutcome = { ok: true }
+
+  it('a stop asked while one runs gets that one\'s outcome: one presence box, one uninstall', async () => {
+    const op = residentOps()
+    const g = gate<StopOutcome>()
+    const work = vi.fn(() => g.p)
+    const a = op('stop', work)
+    const b = op('stop', work)
+    await Promise.resolve()
+    expect(work).toHaveBeenCalledTimes(1)
+    g.open(stopped)
+    expect(await a).toBe(stopped)
+    expect(await b).toBe(stopped)
+    expect(work).toHaveBeenCalledTimes(1)
+  })
+
+  it('the other kind waits its turn, and its work is only called then', async () => {
+    const op = residentOps()
+    const calls: string[] = []
+    const g = gate<InstallOutcome>()
+    const a = op('install', () => { calls.push('install'); return g.p })
+    const b = op('stop', async () => { calls.push('stop'); return stopped })
+    await new Promise((r) => setTimeout(r, 0))
+    expect(calls).toEqual(['install'])
+    g.open(installed)
+    await a
+    expect(await b).toBe(stopped)
+    expect(calls).toEqual(['install', 'stop'])
+  })
+
+  it('a stop, an install, a stop: the third is not given the first one\'s outcome but runs after the install (R1 C1, QA)', async () => {
+    const op = residentOps()
+    const calls: string[] = []
+    const g = gate<StopOutcome>()
+    const a = op('stop', () => { calls.push('stop'); return g.p })
+    const b = op('install', async () => { calls.push('install'); return installed })
+    const c = op('stop', async () => { calls.push('stop again'); return { ok: false, stage: 'shutdown', code: 'refused' } })
+    g.open(stopped)
+    expect(await a).toBe(stopped)
+    await b
+    expect(await c).toEqual({ ok: false, stage: 'shutdown', code: 'refused' })
+    expect(calls).toEqual(['stop', 'install', 'stop again'])
+  })
+
+  it('an install, a stop, an install: the last wish is the one left (QA)', async () => {
+    const op = residentOps()
+    const calls: string[] = []
+    const g = gate<InstallOutcome>()
+    const a = op('install', () => { calls.push('install'); return g.p })
+    const b = op('stop', async () => { calls.push('stop'); return stopped })
+    const c = op('install', async () => { calls.push('install again'); return installed })
+    g.open(installed)
+    await a
+    await b
+    await c
+    expect(calls).toEqual(['install', 'stop', 'install again'])
+  })
+
+  it('once one has ended, the same kind runs again', async () => {
+    const op = residentOps()
+    const work = vi.fn(async () => stopped)
+    await op('stop', work)
+    await op('stop', work)
+    expect(work).toHaveBeenCalledTimes(2)
+  })
+
+  it('one that rejects frees its kind and does not hold up the next', async () => {
+    const op = residentOps()
+    const g = gate<InstallOutcome>()
+    const a = op('install', () => g.p)
+    const b = op('stop', async () => stopped)
+    g.fail(new Error('boom'))
+    await expect(a).rejects.toThrow('boom')
+    expect(await b).toBe(stopped)
+    expect(await op('install', async () => installed)).toBe(installed)
+  })
+})
+
+describe('installedAndEnrolled (Codex B4c3 C2)', () => {
+  it('an install is done once this app is enrolled with the new service daemon', async () => {
+    let enrolled = false
+    let done = false
+    const run = installedAndEnrolled(async () => ({ ok: true }), () => enrolled, 5_000).then((o) => { done = true; return o })
+    await new Promise((r) => setTimeout(r, 300))
+    expect(done).toBe(false)
+    enrolled = true
+    expect(await run).toEqual({ ok: true })
+  })
+
+  it('not enrolled in time: done anyway, as installed', async () => {
+    expect(await installedAndEnrolled(async () => ({ ok: true }), () => false, 50)).toEqual({ ok: true })
+  })
+
+  it('a failed install is not waited on', async () => {
+    const enrolled = vi.fn(() => false)
+    const failed: InstallOutcome = { ok: false, stage: 'install', code: 'ENOENT' }
+    expect(await installedAndEnrolled(async () => failed, enrolled, 60_000)).toBe(failed)
+    expect(enrolled).not.toHaveBeenCalled()
   })
 })

@@ -12,7 +12,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, installService, readConsent, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -760,26 +760,31 @@ app.whenReady().then(async () => {
 })
 
 // M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
-// Settings switch and the tray's 「完全退出」.
+// Settings switch and the tray's 「完全退出」, one at a time (B4c3).
+const residentOp = residentOps()
+
 function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutcome> {
-  return installService(serviceInstallDeps({
+  return residentOp('install', () => installedAndEnrolled(() => installService(serviceInstallDeps({
     cli: resolveBundledRustBinary('agent24', app.isPackaged),
     daemonBin: resolveRustBinary(app.isPackaged),
     ready: documentsReady,
     hold: (work) => backendManager.whileStopped(work),
     spawned: (pid) => backendManager.spawned(pid),
     installed: launchAgentPlistExists,
-  }))
+  })),
+  // Enrolled at the next tick (≤ 5 s), the presence connection up at its next
+  // look (≤ 5 s more): then a stop can ask (Codex B4c3 R2 C1).
+  () => backendManager.presenceTarget() !== null && presenceConnection?.ready === true, 15_000))
 }
 
 function residentStop(): Promise<StopOutcome> {
-  return stopService(serviceStopDeps({
+  return residentOp('stop', () => stopService(serviceStopDeps({
     cli: resolveBundledRustBinary('agent24', app.isPackaged),
     pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
-  }))
+  })))
 }
 
 function recordConsent(answer: ConsentAnswer): void {
