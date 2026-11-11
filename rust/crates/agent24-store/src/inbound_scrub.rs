@@ -54,8 +54,10 @@
 //! The cost is inbound text that stays in memory, never user text that goes.
 //!
 //! Keys. `runs` has no owner column, so runs are matched to sessions by
-//! session id alone; session ids are ULIDs, so a collision between two owners'
-//! sessions is not realistic (and the memory side does filter by owner).
+//! session id alone. Inbound sessions are daemon-minted ULIDs, so a collision
+//! with another owner's session is not realistic; `/chat` lets a caller name
+//! its own session, which this does not cover (the memory side does filter by
+//! owner).
 //!
 //! Which runs. Only runs linked through `inbound_runs` to an expired event.
 //! A run that no `inbound_runs` row names is never touched, whatever its
