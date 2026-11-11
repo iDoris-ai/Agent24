@@ -67,6 +67,7 @@ mod allocation_types;
 mod audit;
 mod conn_phase;
 mod decision_log;
+mod inbound;
 mod legacy_recovery;
 mod message_origin;
 mod model_call_timings;
@@ -132,6 +133,9 @@ pub use audit::AuditEntry;
 pub use decision_log::{
     DecisionLogExportRow, DecisionLogRow, DecisionOutcomeRow, NewDecisionLogEntry,
     NewDecisionOutcome,
+};
+pub use inbound::{
+    InboundEvent, InboundInsert, InboundReconcile, NewInboundEvent, format_inbound_timestamp,
 };
 pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
