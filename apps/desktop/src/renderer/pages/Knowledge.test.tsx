@@ -316,7 +316,7 @@ describe('knowledge entry drafts on the page', () => {
   })
 
   it('keeps unsaved edits in a draft while a citation covers it (Codex C2)', async () => {
-    const draft = { ...ONE, body: 'original', message_from: 0, message_to: 1, conversation_id: 'chat_abc', created_at: ONE.updated_at, content_sha256: 'a'.repeat(64) }
+    const draft = { ...ONE, body: 'original', message_from: 0, message_to: 1, conversation_id: 'chat_abc', created_at: ONE.updated_at, content_sha256: 'a'.repeat(64), format: null, submission: { pending: false, stuck: false, candidate: null }, knowledge_base_ids: [] }
     withEntry({ listDrafts: vi.fn(async () => [ONE]), getDraft: vi.fn(async () => draft) })
     act(() => openDraft(ONE.id))
     render(<KnowledgePage />)
