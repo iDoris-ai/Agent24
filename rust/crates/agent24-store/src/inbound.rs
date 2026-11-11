@@ -1443,4 +1443,133 @@ mod tests {
         assert!(stored.text.unwrap().contains("SECRET-TAIL"));
         assert_eq!(stored.meta.as_deref(), Some("META-SECRET"));
     }
+
+    /// Three rows share `at`. Page size 2, then the cursor of the last row.
+    /// Changing `id < ?2` to `id <= ?2` repeats that cursor row on the next
+    /// page and this test goes red.
+    #[tokio::test]
+    async fn event_page_with_tied_at_follows_the_cursor_without_repeat_or_gap() {
+        let store = Store::open_memory().await.unwrap();
+        let at = "2026-11-11T02:00:00Z";
+        for id in ["id-a", "id-c", "id-b"] {
+            let mut event = sample(id, id, "ignore", None);
+            event.at = at.to_owned();
+            event.text = Some(format!("body-{id}"));
+            assert_eq!(
+                store.insert_inbound_event(&event).await.unwrap(),
+                InboundInsert::Inserted
+            );
+        }
+        let page1 = store.list_inbound_event_summaries(2, None).await.unwrap();
+        let ids1: Vec<&str> = page1.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids1, ["id-c", "id-b"]);
+        let cursor = page1.last().unwrap();
+        let page2 = store
+            .list_inbound_event_summaries(2, Some((cursor.at.as_str(), cursor.id.as_str())))
+            .await
+            .unwrap();
+        let ids2: Vec<&str> = page2.iter().map(|row| row.id.as_str()).collect();
+        assert_eq!(ids2, ["id-a"]);
+        let mut seen = Vec::new();
+        seen.extend(ids1);
+        seen.extend(ids2);
+        seen.sort_unstable();
+        assert_eq!(seen, ["id-a", "id-b", "id-c"]);
+        let tail = page2.last().unwrap();
+        let page3 = store
+            .list_inbound_event_summaries(2, Some((tail.at.as_str(), tail.id.as_str())))
+            .await
+            .unwrap();
+        assert!(page3.is_empty());
+    }
+
+    /// A repeated `(source, actor)` in one replace fails the primary key
+    /// inside the same transaction. Committing the `DELETE` before the
+    /// inserts drops the old row and this test goes red.
+    #[tokio::test]
+    async fn a_duplicate_allowlist_entry_rolls_back_the_whole_replace() {
+        let store = Store::open_memory().await.unwrap();
+        let stamp = "2026-11-11T03:00:00Z";
+        store
+            .replace_inbound_allowlist(
+                &[InboundAllowWrite {
+                    source: "hyphae".into(),
+                    actor: "npub-keep".into(),
+                    note: Some("desk".into()),
+                }],
+                stamp,
+            )
+            .await
+            .unwrap();
+        let rejected = store
+            .replace_inbound_allowlist(
+                &[
+                    InboundAllowWrite {
+                        source: "wechat".into(),
+                        actor: "uid-new".into(),
+                        note: None,
+                    },
+                    InboundAllowWrite {
+                        source: "wechat".into(),
+                        actor: "uid-new".into(),
+                        note: Some("dup".into()),
+                    },
+                ],
+                "2026-11-11T03:00:01Z",
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(rejected, StoreError::Sqlx(_)), "{rejected:?}");
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].source, "hyphae");
+        assert_eq!(listed[0].actor, "npub-keep");
+        assert_eq!(listed[0].note.as_deref(), Some("desk"));
+        assert_eq!(listed[0].added_at, stamp);
+    }
+
+    /// `substr` of NULL is NULL in SQLite, so deleting the `CASE` stays
+    /// green. Changing `THEN NULL` to `THEN ''` makes the preview `Some("")`
+    /// and this test goes red.
+    #[tokio::test]
+    async fn a_scrubbed_body_has_a_null_preview() {
+        let store = Store::open_memory().await.unwrap();
+        let mut scrubbed = sample("hyphae:scrub", "npub1", "ignore", None);
+        scrubbed.text = Some("visible-body".into());
+        scrubbed.meta = Some("visible-meta".into());
+        scrubbed.received_at = "2026-11-01T00:00:00Z".into();
+        assert_eq!(
+            store.insert_inbound_event(&scrubbed).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let mut live = sample("hyphae:live", "npub2", "ignore", None);
+        live.text = Some("still-here".into());
+        live.received_at = "2026-11-11T03:00:00Z".into();
+        assert_eq!(
+            store.insert_inbound_event(&live).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let cleared = store
+            .scrub_expired_inbound_text("2026-11-10T00:00:00Z", "2026-11-11T04:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(cleared, 1);
+        let page = store.list_inbound_event_summaries(10, None).await.unwrap();
+        let scrubbed_row = page.iter().find(|row| row.id == "hyphae:scrub").unwrap();
+        assert!(scrubbed_row.text_preview.is_none(), "{scrubbed_row:?}");
+        assert_eq!(
+            scrubbed_row.text_scrubbed_at.as_deref(),
+            Some("2026-11-11T04:00:00Z")
+        );
+        let live_row = page.iter().find(|row| row.id == "hyphae:live").unwrap();
+        assert_eq!(live_row.text_preview.as_deref(), Some("still-here"));
+        assert!(live_row.text_scrubbed_at.is_none());
+        let stored = store
+            .get_inbound_event("hyphae:scrub")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.text.is_none());
+        assert!(stored.meta.is_none());
+    }
 }

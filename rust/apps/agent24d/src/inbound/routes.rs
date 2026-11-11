@@ -895,6 +895,13 @@ mod tests {
     #[test]
     fn actor_rejects_controls_and_unicode_format_characters() {
         assert!(valid_actor("npub1"));
+        assert!(valid_actor(&"a".repeat(256)));
+        assert!(!valid_actor(""));
+        assert!(!valid_actor(" npub1"));
+        assert!(!valid_actor("npub1 "));
+        assert!(!valid_actor("   "));
+        assert!(!valid_actor("\u{00A0}npub1"));
+        assert!(!valid_actor(&"a".repeat(257)));
         assert!(!valid_actor("a\nb"));
         assert!(!valid_actor("a\u{200B}b"));
         assert!(!valid_actor("a\u{200C}b"));
@@ -902,6 +909,138 @@ mod tests {
         assert!(!valid_actor("a\u{202E}b"));
         assert!(!valid_actor("a\u{2066}b"));
         assert!(!valid_actor("a\u{FEFF}b"));
+    }
+
+    /// `source` is the five-value enum. `actor` is `valid_actor`. Empty,
+    /// surrounding whitespace, over-long, controls, and Unicode format (Cf)
+    /// never reach the store: the kept row is still there afterwards.
+    /// Dropping the `SOURCES` check or the `valid_actor` return turns the
+    /// matching assertion red.
+    #[tokio::test]
+    async fn source_and_actor_shape_is_rejected_before_the_store() {
+        let (app_state, host, _creative) = capability_state().await;
+        let shell = shell_bearer(&app_state);
+        let app = crate::server::build_router(app_state);
+        let (status, json) = call(
+            &app,
+            "PUT",
+            "/api/v1/inbound/allowlist",
+            &host,
+            Some(r#"{"entries":[{"source":"hyphae","actor":"npub-keep"}]}"#),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+
+        let source_msg = "source must be hyphae, wechat, remote, scheduler, or self";
+        let actor_msg = "actor must be 1 to 256 characters without control or format characters";
+        let long_source = "s".repeat(257);
+        let long_actor = "a".repeat(257);
+        let cases = [
+            (
+                json!({ "entries": [{ "source": "", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": " hyphae", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae ", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": " ", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": &long_source, "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae\n", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae\u{0001}", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae\u{200B}", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "\u{200B}hyphae", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "Hyphae", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": " npub1" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "npub1 " }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "   " }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "\u{00A0}npub1" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": &long_actor }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\nb" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\u{0001}b" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\u{200C}b" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\u{FEFF}b" }] }),
+                actor_msg,
+            ),
+        ];
+        for (body, message) in cases {
+            let raw = body.to_string();
+            let (status, json) =
+                call(&app, "PUT", "/api/v1/inbound/allowlist", &host, Some(&raw)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{message} {json} {raw}");
+            assert_eq!(error_code(&json), "invalid_request", "{message} {json}");
+            assert_eq!(json["error"]["message"], message, "{raw} {json}");
+        }
+        let (status, json) = call(&app, "GET", "/api/v1/inbound/allowlist", &shell, None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["entries"].as_array().unwrap().len(), 1, "{json}");
+        assert_eq!(json["entries"][0]["actor"], "npub-keep", "{json}");
+
+        let max_actor = "b".repeat(256);
+        let (status, json) = call(
+            &app,
+            "PUT",
+            "/api/v1/inbound/allowlist",
+            &host,
+            Some(&json!({ "entries": [{ "source": "hyphae", "actor": max_actor }] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["entries"][0]["actor"], max_actor, "{json}");
     }
 
     #[tokio::test]
