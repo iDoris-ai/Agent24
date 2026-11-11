@@ -133,6 +133,14 @@ impl InboundService {
         let received_at = format_inbound_timestamp(now);
         let decision = self.decide(&prepared, now).await?;
         let explicit = decision.disposition == Disposition::Explicit;
+        // Refuse before the insert: a stored `starting` row with nothing to run
+        // would hold this actor's in-flight slot until the next startup.
+        if explicit && prepared.text.as_deref().is_none_or(str::is_empty) {
+            return Err(IngestError::Invalid(format!(
+                "event {} has no text",
+                prepared.id
+            )));
+        }
         let row = NewInboundEvent {
             id: prepared.id.clone(),
             source: prepared.source.as_str().to_owned(),
@@ -1192,6 +1200,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(links, 0);
+    }
+
+    #[tokio::test]
+    async fn ingest_refuses_an_explicit_message_with_no_text_before_storing_it() {
+        // Mutation: drop the pre-insert guard in `ingest` and the row is stored
+        // as `starting`, holding npub1's in-flight slot until the next startup.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        allow(&store, "hyphae", "npub1").await;
+        watermark(&store, "hyphae", &stamp(120)).await;
+        let err = svc
+            .ingest(message("hyphae:empty", "npub1", &stamp(30), ""))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("no text")),
+            "{err:?}"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:empty")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let next = svc
+            .ingest(message("hyphae:after", "npub1", &stamp(31), "hi"))
+            .await
+            .unwrap();
+        assert!(matches!(next, IngestOutcome::Started { .. }), "{next:?}");
     }
 
     #[tokio::test]
