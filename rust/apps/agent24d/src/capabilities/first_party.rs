@@ -367,13 +367,19 @@ impl FirstPartyAuthority {
                     // challenges: a first-party shell must never reach it,
                     // or an enrolled CLI could approve itself (#1447 F1).
                     // `presence_desktop::gate` is the second, independent layer.
+                    // `InboundWrite` is ProductHost-only the same way.
+                    // `host_only_route` is the request gate; leaving the
+                    // operation off this token means a later inbound write
+                    // route that forgets that gate still stays closed.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
                     } else {
                         policies()
                             .iter()
                             .map(|p| p.operation)
-                            .filter(|op| !op.is_presence_channel())
+                            .filter(|op| {
+                                !op.is_presence_channel() && *op != Operation::InboundWrite
+                            })
                             .chain([Operation::ModuleRoute])
                             .collect()
                     },
@@ -783,6 +789,34 @@ mod tests {
                 )
                 .is_ok(),
             "control: a normal token still reaches more"
+        );
+    }
+
+    /// Dropping `InboundWrite` from the filter in `issue` turns the first
+    /// assertion red. `InboundRead` is the control: this is a normal shell
+    /// grant, not an empty one.
+    #[test]
+    fn shell_token_is_not_granted_inbound_write() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let parsed = CapabilityToken::parse_bearer(&token.secret).unwrap();
+        let allowed = store.shared.state.lock().unwrap().records[&digest(&parsed)]
+            .claims
+            .allowed_operations
+            .clone();
+        assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
+        assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
+        assert!(
+            store
+                .validate_bearer(
+                    &token.secret,
+                    Operation::InboundWrite,
+                    &Resource::global(),
+                    unix_now(),
+                )
+                .is_err()
         );
     }
     #[tokio::test(start_paused = true)]

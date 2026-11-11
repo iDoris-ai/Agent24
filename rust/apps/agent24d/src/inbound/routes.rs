@@ -11,8 +11,15 @@
 //! `policy_version` is [`super::admit::policy_version`]: sha256 of the sorted
 //! allowlist, the accept mode, and the admit-table version. `updated_at` is
 //! not an input to that hash.
+//!
+//! `PUT` allowlist is last writer wins. The body is the whole list. It does
+//! not carry `expected_policy_version`, and this round does not do optimistic
+//! concurrency. A `(source, actor)` that is already stored keeps its
+//! `added_at`; a new pair is stamped now.
 
-use agent24_store::{InboundAdmissionView, InboundAllowWrite, format_inbound_timestamp};
+use agent24_store::{
+    InboundAdmissionView, InboundAllowWrite, InboundEventSummary, format_inbound_timestamp,
+};
 use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
 use axum::extract::{RawQuery, State};
 use axum::http::StatusCode;
@@ -21,11 +28,15 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use unicode_general_category::{GeneralCategory, get_general_category};
+use unicode_normalization::UnicodeNormalization;
 
 use super::admit::{AcceptMode, AllowlistEntry, Source};
 use crate::server::{AppState, error_response};
 
-const SOURCES: &[&str] = &["hyphae", "wechat", "remote", "scheduler", "self"];
+/// Sources that go through admission. `scheduler` and `self` do not
+/// (plan §3.4) and are not allowlist sources.
+const ALLOWLIST_SOURCES: &[&str] = &["hyphae", "wechat", "remote"];
+const SOURCE_ERROR: &str = "source must be hyphae, wechat, or remote";
 const MAX_ACTOR_CHARS: usize = 256;
 const MAX_NOTE_CHARS: usize = 500;
 const MAX_ENTRIES: usize = 200;
@@ -33,13 +44,23 @@ const DEFAULT_EVENT_LIMIT: usize = 50;
 const MAX_EVENT_LIMIT: usize = 100;
 const TEXT_PREVIEW_CHARS: usize = 50;
 
-pub(crate) async fn get_allowlist(State(state): State<AppState>) -> Response {
+pub(crate) async fn get_allowlist(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    if let Err(message) = reject_query(raw.as_deref()) {
+        return invalid(message);
+    }
     match read_admission(&state).await {
         Ok(view) => allowlist_response(&view),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
+/// Replace the allowlist. Last writer wins: the body is the whole list,
+/// there is no `expected_policy_version`, and this round does not do
+/// optimistic concurrency. A `(source, actor)` already stored keeps its
+/// `added_at`. A new pair is stamped now.
 pub(crate) async fn put_allowlist(
     State(state): State<AppState>,
     body: Result<Json<PutAllowlist>, JsonRejection>,
@@ -60,13 +81,18 @@ pub(crate) async fn put_allowlist(
     allowlist_response(&view)
 }
 
-pub(crate) async fn get_policy(State(state): State<AppState>) -> Response {
+pub(crate) async fn get_policy(State(state): State<AppState>, RawQuery(raw): RawQuery) -> Response {
+    if let Err(message) = reject_query(raw.as_deref()) {
+        return invalid(message);
+    }
     match read_admission(&state).await {
         Ok(view) => policy_response(&view),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
+/// Replace the stored accept mode. Last writer wins: there is no
+/// `expected_policy_version`, and this round does not do optimistic concurrency.
 pub(crate) async fn put_policy(
     State(state): State<AppState>,
     body: Result<Json<PutPolicy>, JsonRejection>,
@@ -110,27 +136,7 @@ pub(crate) async fn get_events(State(state): State<AppState>, RawQuery(raw): Raw
     let events: Vec<Value> = fetched
         .into_iter()
         .take(query.limit)
-        .map(|row| {
-            let preview = row.text_preview.as_deref().map(clip_preview);
-            json!({
-                "id": row.id,
-                "source": row.source,
-                "category": row.category,
-                "recipient_identity": row.recipient_identity,
-                "thread_key": row.thread_key,
-                "actor": row.actor,
-                "human": row.human,
-                "addressed": row.addressed,
-                "at": row.at,
-                "received_at": row.received_at,
-                "text_preview": preview,
-                "text_scrubbed_at": row.text_scrubbed_at,
-                "disposition": row.disposition,
-                "disposition_reason": row.disposition_reason,
-                "policy_version": row.policy_version,
-                "run_state": row.run_state,
-            })
-        })
+        .map(event_json)
         .collect();
     let next = if more {
         let last = events.last().and_then(Value::as_object);
@@ -153,6 +159,7 @@ pub(crate) struct PutAllowlist {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AllowEntryIn {
     source: String,
     actor: String,
@@ -225,10 +232,12 @@ fn store_failed(what: &str, err: &agent24_store::StoreError) -> Response {
     }
 }
 
-async fn read_admission(state: &AppState) -> Result<InboundAdmissionView, Response> {
+/// `Box<Response>`: clippy `result_large_err` (1.98+, denied in CI) flags a
+/// `Response`-sized `Err` on an `async fn`. One `Result` in this file.
+async fn read_admission(state: &AppState) -> Result<InboundAdmissionView, Box<Response>> {
     match state.store.read_inbound_admission().await {
         Ok(view) => Ok(view),
-        Err(err) => Err(store_failed("read inbound admission", &err)),
+        Err(err) => Err(Box::new(store_failed("read inbound admission", &err))),
     }
 }
 
@@ -297,19 +306,22 @@ fn checked_entries(entries: &[AllowEntryIn]) -> Result<Vec<InboundAllowWrite>, &
     let mut seen = std::collections::BTreeSet::new();
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
-        if !SOURCES.contains(&entry.source.as_str()) {
-            return Err("source must be hyphae, wechat, remote, scheduler, or self");
+        // NFC before the duplicate check, so `e` + U+0301 and U+00E9 are one actor.
+        let source: String = entry.source.nfc().collect();
+        let actor: String = entry.actor.nfc().collect();
+        if !ALLOWLIST_SOURCES.contains(&source.as_str()) {
+            return Err(SOURCE_ERROR);
         }
-        if !valid_actor(&entry.actor) {
+        if !valid_actor(&actor) {
             return Err("actor must be 1 to 256 characters without control or format characters");
         }
-        if !seen.insert((entry.source.as_str(), entry.actor.as_str())) {
+        if !seen.insert((source.clone(), actor.clone())) {
             return Err("duplicate source and actor");
         }
         let note = match entry.note.as_deref() {
             None => None,
-            Some(note) if note.chars().any(char::is_control) => {
-                return Err("note must not contain control characters");
+            Some(note) if has_control_or_format(note) => {
+                return Err("note must not contain control or format characters");
             }
             Some(note) if note.chars().count() > MAX_NOTE_CHARS => {
                 return Err("note is too long");
@@ -324,21 +336,28 @@ fn checked_entries(entries: &[AllowEntryIn]) -> Result<Vec<InboundAllowWrite>, &
             }
         };
         out.push(InboundAllowWrite {
-            source: entry.source.clone(),
-            actor: entry.actor.clone(),
+            source,
+            actor,
             note,
         });
     }
     Ok(out)
 }
 
+/// Cc (including C1 such as U+0085) and Cf. `is_ascii_control` would let
+/// U+0085 through.
+fn has_control_or_format(text: &str) -> bool {
+    text.chars()
+        .any(|ch| ch.is_control() || get_general_category(ch) == GeneralCategory::Format)
+}
+
 fn valid_actor(actor: &str) -> bool {
     let count = actor.chars().count();
     (1..=MAX_ACTOR_CHARS).contains(&count)
         && actor == actor.trim()
-        && !actor
-            .chars()
-            .any(|ch| ch.is_control() || get_general_category(ch) == GeneralCategory::Format)
+        && !has_control_or_format(actor)
+        // U+2028 / U+2029 are line separators (Zl / Zp), not Cc or Cf.
+        && !actor.chars().any(|ch| matches!(ch, '\u{2028}' | '\u{2029}'))
 }
 
 fn parse_event_query(raw: Option<&str>) -> Result<EventQuery, &'static str> {
@@ -373,7 +392,7 @@ fn parse_event_query(raw: Option<&str>) -> Result<EventQuery, &'static str> {
                 }
                 before_id = Some(fresh);
             }
-            _ => {}
+            _ => return Err("unknown query parameter"),
         }
     }
     match (&before_at, &before_id) {
@@ -397,6 +416,38 @@ fn canonical_stamp(value: &str) -> bool {
         .map(|dt| format_inbound_timestamp(dt.with_timezone(&Utc)))
         .as_deref()
         == Some(value)
+}
+
+fn reject_query(raw: Option<&str>) -> Result<(), &'static str> {
+    if form_urlencoded::parse(raw.unwrap_or("").as_bytes())
+        .next()
+        .is_some()
+    {
+        Err("unknown query parameter")
+    } else {
+        Ok(())
+    }
+}
+
+fn event_json(row: InboundEventSummary) -> Value {
+    json!({
+        "id": row.id,
+        "source": row.source,
+        "category": row.category,
+        "recipient_identity": row.recipient_identity,
+        "thread_key": row.thread_key,
+        "actor": row.actor,
+        "human": row.human,
+        "addressed": row.addressed,
+        "at": row.at,
+        "received_at": row.received_at,
+        "text_preview": row.text_preview.as_deref().map(clip_preview),
+        "text_scrubbed_at": row.text_scrubbed_at,
+        "disposition": row.disposition,
+        "disposition_reason": row.disposition_reason,
+        "policy_version": row.policy_version,
+        "run_state": row.run_state,
+    })
 }
 
 fn clip_preview(text: &str) -> String {
@@ -706,7 +757,15 @@ mod tests {
             (too_many.as_str(), "allowlist has too many entries"),
             (
                 r#"{"entries":[{"source":"email","actor":"npub1"}]}"#,
-                "source must be hyphae, wechat, remote, scheduler, or self",
+                SOURCE_ERROR,
+            ),
+            (
+                r#"{"entries":[{"source":"scheduler","actor":"npub1"}]}"#,
+                SOURCE_ERROR,
+            ),
+            (
+                r#"{"entries":[{"source":"self","actor":"npub1"}]}"#,
+                SOURCE_ERROR,
             ),
             (
                 r#"{"entries":[{"source":"hyphae","actor":"npub1"},{"source":"hyphae","actor":"npub1"}]}"#,
@@ -714,7 +773,15 @@ mod tests {
             ),
             (
                 "{\"entries\":[{\"source\":\"hyphae\",\"actor\":\"npub1\",\"note\":\"a\\nb\"}]}",
-                "note must not contain control characters",
+                "note must not contain control or format characters",
+            ),
+            (
+                "{\"entries\":[{\"source\":\"hyphae\",\"actor\":\"npub1\",\"note\":\"a\\u0085b\"}]}",
+                "note must not contain control or format characters",
+            ),
+            (
+                "{\"entries\":[{\"source\":\"hyphae\",\"actor\":\"npub1\",\"note\":\"a\\u200Bb\"}]}",
+                "note must not contain control or format characters",
             ),
             (long_body.as_str(), "note is too long"),
         ];
@@ -770,6 +837,7 @@ mod tests {
                 "before_at=2026-11-11T00:00:00Z&before_id=hyphae:1&before_id=hyphae:2",
                 "at most one before_id query parameter is allowed",
             ),
+            ("limt=5", "unknown query parameter"),
         ];
         for (query, message) in queries {
             let (status, json) = call(
@@ -782,6 +850,15 @@ mod tests {
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{query} {json}");
             assert_eq!(json["error"]["message"], message, "{query} {json}");
+        }
+        for uri in [
+            "/api/v1/inbound/allowlist?limt=5",
+            "/api/v1/inbound/policy?limt=5",
+        ] {
+            let (status, json) = call(&app, "GET", uri, &shell, None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {json}");
+            assert_eq!(error_code(&json), "invalid_request", "{uri}");
+            assert_eq!(json["error"]["message"], "unknown query parameter", "{uri}");
         }
     }
 
@@ -903,19 +980,24 @@ mod tests {
         assert!(!valid_actor("\u{00A0}npub1"));
         assert!(!valid_actor(&"a".repeat(257)));
         assert!(!valid_actor("a\nb"));
+        // U+0085 is Cc but not an ASCII control. `is_ascii_control` turns this red.
+        assert!(!valid_actor("a\u{0085}b"));
         assert!(!valid_actor("a\u{200B}b"));
         assert!(!valid_actor("a\u{200C}b"));
         assert!(!valid_actor("a\u{200D}b"));
         assert!(!valid_actor("a\u{202E}b"));
         assert!(!valid_actor("a\u{2066}b"));
         assert!(!valid_actor("a\u{FEFF}b"));
+        assert!(!valid_actor("a\u{2028}b"));
+        assert!(!valid_actor("a\u{2029}b"));
     }
 
-    /// `source` is the five-value enum. `actor` is `valid_actor`. Empty,
-    /// surrounding whitespace, over-long, controls, and Unicode format (Cf)
-    /// never reach the store: the kept row is still there afterwards.
-    /// Dropping the `SOURCES` check or the `valid_actor` return turns the
-    /// matching assertion red.
+    /// `source` is the three external sources that go through admission.
+    /// `scheduler` and `self` are refused. `actor` is `valid_actor`. Empty,
+    /// surrounding whitespace, over-long, controls, Unicode format (Cf), and
+    /// U+2028 / U+2029 never reach the store: the kept row is still there
+    /// afterwards. Dropping the allowlist-source check or the `valid_actor`
+    /// return turns the matching assertion red.
     #[tokio::test]
     async fn source_and_actor_shape_is_rejected_before_the_store() {
         let (app_state, host, _creative) = capability_state().await;
@@ -931,7 +1013,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
 
-        let source_msg = "source must be hyphae, wechat, remote, scheduler, or self";
+        let source_msg = SOURCE_ERROR;
         let actor_msg = "actor must be 1 to 256 characters without control or format characters";
         let long_source = "s".repeat(257);
         let long_actor = "a".repeat(257);
@@ -977,6 +1059,14 @@ mod tests {
                 source_msg,
             ),
             (
+                json!({ "entries": [{ "source": "scheduler", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "self", "actor": "npub1" }] }),
+                source_msg,
+            ),
+            (
                 json!({ "entries": [{ "source": "hyphae", "actor": "" }] }),
                 actor_msg,
             ),
@@ -1006,6 +1096,18 @@ mod tests {
             ),
             (
                 json!({ "entries": [{ "source": "hyphae", "actor": "a\u{0001}b" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\u{0085}b" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\u{2028}b" }] }),
+                actor_msg,
+            ),
+            (
+                json!({ "entries": [{ "source": "hyphae", "actor": "a\u{2029}b" }] }),
                 actor_msg,
             ),
             (
@@ -1125,6 +1227,10 @@ mod tests {
                 r#"{"entries":[],"extra":true}"#,
             ),
             (
+                "/api/v1/inbound/allowlist",
+                r#"{"entries":[{"source":"hyphae","actor":"npub1","nots":"x"}]}"#,
+            ),
+            (
                 "/api/v1/inbound/policy",
                 r#"{"accept_mode":"observe","extra":true}"#,
             ),
@@ -1155,6 +1261,117 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{json}");
         assert_eq!(error_code(&json), "payload_too_large");
+    }
+
+    /// `MAX_ENTRIES` is 200. Raising it lets 201 through; lowering it rejects 200.
+    #[tokio::test]
+    async fn allowlist_accepts_two_hundred_entries_and_rejects_two_hundred_one() {
+        let (app_state, host, _creative) = capability_state().await;
+        let shell = shell_bearer(&app_state);
+        let app = crate::server::build_router(app_state);
+        let sources = ["hyphae", "wechat", "remote"];
+        let mut entries = Vec::new();
+        for i in 0..200 {
+            entries.push(json!({
+                "source": sources[i % 3],
+                "actor": format!("actor-{i}"),
+            }));
+        }
+        let (status, json) = call(
+            &app,
+            "PUT",
+            "/api/v1/inbound/allowlist",
+            &host,
+            Some(&json!({ "entries": entries }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["entries"].as_array().unwrap().len(), 200, "{json}");
+
+        entries.push(json!({ "source": "hyphae", "actor": "actor-200" }));
+        let (status, json) = call(
+            &app,
+            "PUT",
+            "/api/v1/inbound/allowlist",
+            &host,
+            Some(&json!({ "entries": entries }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["message"], "allowlist has too many entries");
+        let (status, json) = call(&app, "GET", "/api/v1/inbound/allowlist", &shell, None).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["entries"].as_array().unwrap().len(), 200, "{json}");
+    }
+
+    /// NFC before dedup: `e` + U+0301 and U+00E9 are one actor. A single NFD
+    /// actor is stored as NFC. Skipping `.nfc()` turns both assertions red.
+    #[tokio::test]
+    async fn allowlist_normalizes_to_nfc_before_dedup() {
+        let (app_state, host, _creative) = capability_state().await;
+        let app = crate::server::build_router(app_state);
+        let nfd = "e\u{0301}";
+        let nfc = "\u{00e9}";
+        assert_ne!(nfd, nfc);
+        let (status, json) = call(
+            &app,
+            "PUT",
+            "/api/v1/inbound/allowlist",
+            &host,
+            Some(
+                &json!({
+                    "entries": [
+                        {"source": "hyphae", "actor": nfd},
+                        {"source": "hyphae", "actor": nfc},
+                    ]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["message"], "duplicate source and actor");
+
+        let (status, json) = call(
+            &app,
+            "PUT",
+            "/api/v1/inbound/allowlist",
+            &host,
+            Some(&json!({ "entries": [{ "source": "hyphae", "actor": nfd }] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["entries"][0]["actor"], nfc, "{json}");
+    }
+
+    /// The store preview here is already longer than 50, so `substr` is not
+    /// what caps it. Dropping `clip_preview` in `event_json` turns this red.
+    /// The store test locks the SQL `substr(..., 50)` on its own.
+    #[test]
+    fn route_clips_an_overlong_preview_the_store_did_not() {
+        let overlong = format!("{}SECRET-TAIL", "你".repeat(50));
+        assert!(overlong.chars().count() > TEXT_PREVIEW_CHARS);
+        let item = event_json(InboundEventSummary {
+            id: "hyphae:long".into(),
+            source: "hyphae".into(),
+            category: "direct".into(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: None,
+            human: true,
+            addressed: "direct".into(),
+            at: "2026-11-11T03:00:00Z".into(),
+            received_at: "2026-11-11T03:00:01Z".into(),
+            text_preview: Some(overlong),
+            text_scrubbed_at: None,
+            disposition: "ignore".into(),
+            disposition_reason: None,
+            policy_version: None,
+            run_state: None,
+        });
+        let preview = item["text_preview"].as_str().unwrap();
+        assert_eq!(preview, "你".repeat(50));
+        assert!(!item.to_string().contains("SECRET-TAIL"));
     }
 
     async fn call_with(

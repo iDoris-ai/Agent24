@@ -1122,12 +1122,12 @@ export interface paths {
         };
         /**
          * Read the inbound allowlist
-         * @description Everyday read. Returns every `(source, actor)` the host has stored, plus `policy_version`. An empty list is `entries: []`.
+         * @description Everyday read. Returns every `(source, actor)` the host has stored, plus `policy_version`. An empty list is `entries: []`. An unknown query parameter is 400.
          */
         get: operations["getInboundAllowlist"];
         /**
          * Replace the inbound allowlist
-         * @description ProductHost only. Legacy mode and every other audience get 403. Replaces the whole list. `added_at` is set by the daemon. A repeated `(source, actor)` in one body is 400.
+         * @description ProductHost only. Legacy mode and every other audience get 403. Last writer wins: the body replaces the whole list. There is no `expected_policy_version`, and this round does not do optimistic concurrency. A `(source, actor)` that is already stored keeps its `added_at`; a new pair is stamped by the daemon. A repeated `(source, actor)` in one body is 400. `scheduler` and `self` are not allowlist sources.
          */
         put: operations["putInboundAllowlist"];
         post?: never;
@@ -1146,12 +1146,12 @@ export interface paths {
         };
         /**
          * Read the inbound accept mode
-         * @description Everyday read. No stored row yet answers `accept_mode: observe` and `updated_at: null`. `policy_version` is the admit hash. It changes when the mode or the allowlist changes, and it does not depend on `updated_at`.
+         * @description Everyday read. No stored row yet answers `accept_mode: observe` and `updated_at: null`. `policy_version` is the admit hash. It changes when the mode or the allowlist changes, and it does not depend on `updated_at`. An unknown query parameter is 400.
          */
         get: operations["getInboundPolicy"];
         /**
          * Set the inbound accept mode
-         * @description ProductHost only. Legacy mode and every other audience get 403. `accept_mode` is stored and is not consulted by admission in this milestone. `policy_version` changes when the stored mode changes, and stays the same when the same mode is written again.
+         * @description ProductHost only. Legacy mode and every other audience get 403. Last writer wins: there is no `expected_policy_version`, and this round does not do optimistic concurrency. `accept_mode` is stored and is not consulted by admission in this milestone. `policy_version` changes when the stored mode changes, and stays the same when the same mode is written again.
          */
         put: operations["putInboundPolicy"];
         post?: never;
@@ -1170,7 +1170,7 @@ export interface paths {
         };
         /**
          * List inbound events without the full body
-         * @description Everyday read. Newest `at` first, then `id`. Each item is metadata plus `text_preview`, the first 50 characters of `text`. The full body and `meta` are not returned. This list is not pushed on `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above 100 are 400. `before_at` and `before_id` page backward and must be sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`.
+         * @description Everyday read. Newest `at` first, then `id`. Each item is metadata plus `text_preview`, the first 50 characters of `text`. The full body and `meta` are not returned. This list is not pushed on `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above 100 are 400. `before_at` and `before_id` page backward and must be sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`. An unknown query parameter, including a misspelled `limit`, is 400.
          */
         get: operations["listInboundEvents"];
         put?: never;
@@ -3258,10 +3258,13 @@ export interface components {
             enabled: boolean;
         };
         InboundAllowEntry: {
-            /** @enum {string} */
-            source: "hyphae" | "wechat" | "remote" | "scheduler" | "self";
+            /**
+             * @description External sources that go through admission. `scheduler` and `self` are not allowlist sources.
+             * @enum {string}
+             */
+            source: "hyphae" | "wechat" | "remote";
             actor: string;
-            /** @description UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`, set by the daemon. */
+            /** @description UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`. Kept when the same `(source, actor)` is written again. A new pair is stamped at that write. */
             added_at: string;
             note?: string | null;
         };
@@ -3273,7 +3276,7 @@ export interface components {
         InboundAllowlistWrite: {
             entries: {
                 /** @enum {string} */
-                source: "hyphae" | "wechat" | "remote" | "scheduler" | "self";
+                source: "hyphae" | "wechat" | "remote";
                 actor: string;
                 note?: string | null;
             }[];
@@ -6700,6 +6703,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InboundPolicy"];
+                };
+            };
+            /** @description Unknown query parameter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };

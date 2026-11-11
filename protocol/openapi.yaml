@@ -2209,7 +2209,8 @@ paths:
       summary: Read the inbound allowlist
       description: >-
         Everyday read. Returns every `(source, actor)` the host has stored,
-        plus `policy_version`. An empty list is `entries: []`.
+        plus `policy_version`. An empty list is `entries: []`. An unknown
+        query parameter is 400.
       responses:
         "200":
           description: The stored allowlist
@@ -2230,8 +2231,12 @@ paths:
       summary: Replace the inbound allowlist
       description: >-
         ProductHost only. Legacy mode and every other audience get 403.
-        Replaces the whole list. `added_at` is set by the daemon. A repeated
-        `(source, actor)` in one body is 400.
+        Last writer wins: the body replaces the whole list. There is no
+        `expected_policy_version`, and this round does not do optimistic
+        concurrency. A `(source, actor)` that is already stored keeps its
+        `added_at`; a new pair is stamped by the daemon. A repeated
+        `(source, actor)` in one body is 400. `scheduler` and `self` are
+        not allowlist sources.
       requestBody:
         required: true
         content:
@@ -2268,7 +2273,7 @@ paths:
         Everyday read. No stored row yet answers `accept_mode: observe` and
         `updated_at: null`. `policy_version` is the admit hash. It changes
         when the mode or the allowlist changes, and it does not depend on
-        `updated_at`.
+        `updated_at`. An unknown query parameter is 400.
       responses:
         "200":
           description: The stored accept mode
@@ -2276,6 +2281,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/InboundPolicy"
+        "400":
+          description: Unknown query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
     put:
       operationId: putInboundPolicy
       x-milestone: X11-2f
@@ -2283,9 +2294,11 @@ paths:
       summary: Set the inbound accept mode
       description: >-
         ProductHost only. Legacy mode and every other audience get 403.
-        `accept_mode` is stored and is not consulted by admission in this
-        milestone. `policy_version` changes when the stored mode changes, and
-        stays the same when the same mode is written again.
+        Last writer wins: there is no `expected_policy_version`, and this
+        round does not do optimistic concurrency. `accept_mode` is stored
+        and is not consulted by admission in this milestone.
+        `policy_version` changes when the stored mode changes, and stays
+        the same when the same mode is written again.
       requestBody:
         required: true
         content:
@@ -2324,7 +2337,8 @@ paths:
         and `meta` are not returned. This list is not pushed on
         `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above
         100 are 400. `before_at` and `before_id` page backward and must be
-        sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`.
+        sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`. An unknown
+        query parameter, including a misspelled `limit`, is 400.
       parameters:
         - name: limit
           in: query
@@ -6520,12 +6534,18 @@ components:
       properties:
         source:
           type: string
-          enum: [hyphae, wechat, remote, scheduler, self]
+          enum: [hyphae, wechat, remote]
+          description: >-
+            External sources that go through admission. `scheduler` and
+            `self` are not allowlist sources.
         actor:
           type: string
         added_at:
           type: string
-          description: UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`, set by the daemon.
+          description: >-
+            UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`. Kept when the same
+            `(source, actor)` is written again. A new pair is stamped at
+            that write.
         note:
           type: [string, "null"]
     InboundAllowlist:
@@ -6552,10 +6572,11 @@ components:
           items:
             type: object
             required: [source, actor]
+            additionalProperties: false
             properties:
               source:
                 type: string
-                enum: [hyphae, wechat, remote, scheduler, self]
+                enum: [hyphae, wechat, remote]
               actor:
                 type: string
               note:
