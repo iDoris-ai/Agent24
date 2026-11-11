@@ -183,6 +183,24 @@ describe('registerKnowledgeEntryIpc', () => {
     expect(guard).toHaveBeenCalledTimes(7)
   })
 
+  it('KB-SOP-01b: with submitting, also the three submit channels; only the draft id and one KB id reach it (HS-N1)', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    const handle = (channel: string, f: (...args: unknown[]) => unknown) => { handlers.set(channel, f) }
+    const submit = vi.fn(async () => ({ ok: false, reason: 'not_found' }) as const)
+    const status = vi.fn(async () => ({ ok: false, reason: 'not_found' }) as const)
+    const retract = vi.fn(async () => ({ ok: false, reason: 'not_found' }) as const)
+    const guard = vi.fn(<F,>(f: F) => f)
+    registerKnowledgeEntryIpc({ handle } as never, guard as never, admitDeps, draftDeps(), { submit, status, retract, view: vi.fn() } as never)
+    expect([...handlers.keys()].slice(-3)).toEqual([IpcChannels.KnowledgeEntrySubmit, IpcChannels.KnowledgeEntrySubmitStatus, IpcChannels.KnowledgeEntrySubmitRetract])
+    expect(guard).toHaveBeenCalledTimes(10)
+    await handlers.get(IpcChannels.KnowledgeEntrySubmit)!(sender(1), 'ked_x', 'kb1', { approved: true, author: 'mallory', session_ref: 'f'.repeat(64) })
+    expect(submit).toHaveBeenCalledWith('ked_x', 'kb1')
+    await handlers.get(IpcChannels.KnowledgeEntrySubmitStatus)!(sender(1), 'ked_x', { approved: true })
+    expect(status).toHaveBeenCalledWith('ked_x')
+    await handlers.get(IpcChannels.KnowledgeEntrySubmitRetract)!(sender(1), 'ked_x', { approved: true })
+    expect(retract).toHaveBeenCalledWith('ked_x')
+  })
+
   it('answers an admission with a ticket and the judged record’s messages, and a refusal as it was', async () => {
     const handlers = new Map<string, (...args: unknown[]) => unknown>()
     const handle = (channel: string, f: (...args: unknown[]) => unknown) => { handlers.set(channel, f) }
@@ -505,6 +523,22 @@ describe('the drafts as the Knowledge page sees them', () => {
     const out = await s.drafts.create(sender(1), s.drafts.issue(secretive(), 1), { from: 0, to: 1 })
     expect(out).toEqual({ ok: false, reason: 'knowledge_off' })
     expect(pending.set).not.toHaveBeenCalled()
+  })
+
+  it('KB-SOP-01b: the view lists the binding’s KBs only for the same target, says what the format check finds, and the submission', async () => {
+    const seen: string[] = []
+    const s = drafting({ knowledgeBaseIds: () => ['kb1'], submission: (id) => { seen.push(id); return { pending: true, stuck: false, candidate: null } } })
+    const d = await one(s)
+    const v = s.drafts.get(d.id)
+    expect(v).toMatchObject({ knowledge_base_ids: ['kb1'], format: null, submission: { pending: true, stuck: false, candidate: null } })
+    expect(seen).toContain(d.id)
+    expect(s.drafts.update(d.id, { kind: 'faq', title: '请假', body: '点 <b>这里</b>' })).toMatchObject({ ok: true })
+    expect(s.drafts.get(d.id)?.format).toMatchObject({ line: 1 })
+    s.retarget(entryTarget('https://kb.example', ['kb2']))
+    expect(s.drafts.get(d.id)?.knowledge_base_ids).toEqual([])
+    const broken = drafting({ submission: () => { throw new Error('io') } })
+    const b = await one(broken)
+    expect(broken.drafts.get(b.id)?.submission).toEqual({ pending: false, stuck: false, candidate: null })
   })
 
   it('never hands the renderer a draft’s binding', async () => {
