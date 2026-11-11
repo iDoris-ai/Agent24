@@ -153,12 +153,14 @@ describe('the banner on top of the main chat (M6 C2)', () => {
     expect(open).toHaveBeenCalledWith(first)
   })
 
-  it('caps what it shows at 99+, and keeps the exact number in its name (Q3)', async () => {
-    scheduleWith(...Array.from({ length: 120 }, (_, i) => `run_${i}`))
+  it.each([[100], [120]])('caps what it shows at 99+, and keeps the exact number in its name and title (Q3): n = %i', async n => {
+    scheduleWith(...Array.from({ length: n }, (_, i) => `run_${i}`))
     await refreshHistory()
     render(<ProactiveBanner />)
-    const banner = await screen.findByRole('button', { name: '助理有 120 件事你还没看，打开最早的一件' })
+    const label = `助理有 ${n} 件事你还没看，打开最早的一件`
+    const banner = await screen.findByRole('button', { name: label })
     expect(banner).toHaveTextContent('助理有话说 (99+)')
+    expect(banner).toHaveAttribute('title', label)
   })
 
   it('leaves archived conversations out (Q1)', async () => {

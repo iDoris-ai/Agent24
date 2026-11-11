@@ -5,8 +5,8 @@
 export interface BannerProps {
   /** What it says, as shown. */
   text: string
-  /** Its accessible name, when it says more than `text` (an exact count
-   *  the text caps). */
+  /** Its accessible name and its tooltip (`title`), when it says more
+   *  than `text` (an exact count the text caps). */
   label?: string
   /** Where a press takes the user. */
   onActivate: () => void
@@ -17,5 +17,5 @@ export interface BannerProps {
 export function Banner(props: BannerProps) {
   return <div className="banner"><button type="button" className="banner-action"
     onClick={props.onActivate} disabled={props.disabled}
-    aria-label={props.label}>{props.text}</button></div>
+    aria-label={props.label} title={props.label}>{props.text}</button></div>
 }
