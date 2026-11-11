@@ -6,12 +6,17 @@
 //! admits under every stored mode (ADR-041 D4); this slice simply does not
 //! branch on the mode.
 //!
+//! 调用方必须先分流：`source` 为 [`Source::Scheduler`] / [`Source::Self_`]，
+//! 或 `category` 为 [`Category::Internal`]，都不进 [`admit`]（§3.4 写
+//! `disposition = internal`）。函数开头用 `debug_assert!` 卡住这三条。
+//!
 //! 评审 N2：本函数只判断滑动窗口速率（[`AdmitInput::window_count`] 与
 //! [`AdmitInput::rate_limit`]）。「同一 `source+actor` 在途最多 1 个 explicit」
 //! 不在这里判断，由 `inbound_events` 的部分唯一索引 `idx_inbound_events_inflight`
 //!（`disposition = 'explicit' AND run_state IN ('starting','started')`）强制。
 //! 撞上该索引后由服务改写成 `ignore(rate_limited)`（§3.4，X11-2c 接线）。
-//! 调用方不要把在途个数加进 `window_count`。
+//! [`AdmitInput`] 没有在途字段；调用方不要把在途个数加进 `window_count`。
+//! 字段清单由测试里的穷尽解构钉住，加字段会编译失败。
 
 use sha2::{Digest, Sha256};
 
@@ -45,7 +50,8 @@ impl Source {
 /// Wire `category`. Machine protocol (f4/1 envelope, ack, `hyphae-behavior`
 /// query/response, canary) and friend-protocol messages are both
 /// [`Category::Protocol`]; the adapter classifies them (X11-2e). [`admit`]
-/// does not inspect the body.
+/// does not inspect the body. [`Category::Internal`] is the scheduler / self
+/// path and must be routed before [`admit`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Category {
     Direct,
@@ -57,12 +63,38 @@ pub(crate) enum Category {
     Internal,
 }
 
+impl Category {
+    /// §3.1 `category` wire values.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Group => "group",
+            Self::GroupMention => "group_mention",
+            Self::Stranger => "stranger",
+            Self::DevBridge => "dev_bridge",
+            Self::Protocol => "protocol",
+            Self::Internal => "internal",
+        }
+    }
+}
+
 /// Wire `addressed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Addressed {
     None,
     Mention,
     Direct,
+}
+
+impl Addressed {
+    /// §3.1 `addressed` wire values.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Mention => "mention",
+            Self::Direct => "direct",
+        }
+    }
 }
 
 /// Stored on `inbound_policy`. Not read by [`admit`] (§3.4 F5).
@@ -93,7 +125,7 @@ pub(crate) struct AllowlistEntry {
 /// Everything [`admit`] needs. Membership and the window count are already
 /// resolved; this slice does not look at the X11-2a store types.
 ///
-/// Times are unix seconds. `arrived_unix_secs` is the event time compared
+/// Times are unix seconds. `event_at_unix_secs` is the event time compared
 /// with the source watermark and with `now_unix_secs` (§3.3 row 2).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AdmitInput {
@@ -104,16 +136,19 @@ pub(crate) struct AdmitInput {
     pub addressed: Addressed,
     /// Caller-resolved: actor is in `inbound_allowlist` for `source`.
     pub allowlisted: bool,
-    pub arrived_unix_secs: i64,
+    /// 传事件时间（store 的 `at` 列，即发送方的 created_at），不要传 `received_at`。
+    pub event_at_unix_secs: i64,
     /// Source activation watermark (`activated_at`). Strictly earlier is stale.
     pub activated_unix_secs: i64,
-    /// Max delay. Age strictly greater than this is stale. The 10-minute
-    /// placeholder in §3.4 is chosen by the caller (X11-2c), not here.
+    /// Max delay, both directions. Age strictly greater than this is stale,
+    /// and an event time strictly after `now + max_age_secs` is stale too.
+    /// The 10-minute placeholder in §3.4 is chosen by the caller (X11-2c),
+    /// not here.
     pub max_age_secs: u64,
     pub now_unix_secs: i64,
-    /// Events for this `source+actor` already inside the sliding window,
-    /// excluding the one being judged (it is not inserted yet). Not an
-    /// in-flight count. See the module comment (评审 N2).
+    /// 同 source+actor 在窗口内的全部入站行（含 ignore，含 rate_limited），不含
+    /// category=protocol 与 disposition=filtered。持续刷屏的人会一直被限住，这是有意的。
+    /// 不含正在判定的这一行（尚未插入）。不是在途个数。见模块注释（评审 N2）。
     pub window_count: u32,
     /// Window cap. `window_count >= rate_limit` is over the cap (a cap of 3
     /// rejects when 3 are already in the window). The "3 per minute"
@@ -121,13 +156,27 @@ pub(crate) struct AdmitInput {
     pub rate_limit: u32,
 }
 
-/// `explicit` carries no reason. `ignore` always does. `filtered` and
-/// `internal` are not produced here (`internal` is the scheduler path, which
-/// skips admission).
+/// `explicit` carries no reason. `ignore` always does. [`Disposition::Filtered`]
+/// and [`Disposition::Internal`] are wire values (§3.1) and are not produced
+/// here (`internal` is the scheduler / self path, which skips admission).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Disposition {
     Explicit,
     Ignore,
+    Filtered,
+    Internal,
+}
+
+impl Disposition {
+    /// §3.1 `disposition` wire values.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::Ignore => "ignore",
+            Self::Filtered => "filtered",
+            Self::Internal => "internal",
+        }
+    }
 }
 
 /// Reasons [`admit`] can emit. Names are the §3.1 / §3.3 wire values.
@@ -179,14 +228,27 @@ impl Decision {
 }
 
 /// First matching §3.3 row wins.
+///
+/// Caller must already have routed `source` [`Source::Scheduler`] /
+/// [`Source::Self_`] and [`Category::Internal`] elsewhere (§3.4). Those are
+/// not rows of this table; `debug_assert!` rejects them in debug builds.
 pub(crate) fn admit(input: &AdmitInput) -> Decision {
+    debug_assert!(
+        !matches!(input.source, Source::Scheduler | Source::Self_),
+        "caller must route Scheduler and Self_ before admit"
+    );
+    debug_assert!(
+        input.category != Category::Internal,
+        "caller must route category Internal before admit"
+    );
     // 1. Protocol, including a friend-protocol message labeled as such.
     if input.category == Category::Protocol {
         return Decision::ignore(Reason::Protocol);
     }
-    // 2. Before this source's watermark, or older than the max delay.
-    //    Equal to the watermark is not "早于". Age equal to the cap is not "超过".
-    if input.arrived_unix_secs < input.activated_unix_secs || exceeds_max_age(input) {
+    // 2. Before this source's watermark, older than the max delay, or further
+    //    in the future than the same cap. Equal to the watermark is not "早于".
+    //    Age equal to the cap is not "超过". `event_at == now + max_age` is not stale.
+    if input.event_at_unix_secs < input.activated_unix_secs || exceeds_max_age(input) {
         return Decision::ignore(Reason::Stale);
     }
     // 3. Non-human. No `inferred` in this milestone.
@@ -251,8 +313,11 @@ pub(crate) fn policy_version(entries: &[AllowlistEntry], mode: AcceptMode) -> St
 }
 
 fn exceeds_max_age(input: &AdmitInput) -> bool {
-    let age = i128::from(input.now_unix_secs) - i128::from(input.arrived_unix_secs);
-    age > i128::from(input.max_age_secs)
+    let event_at = i128::from(input.event_at_unix_secs);
+    let now = i128::from(input.now_unix_secs);
+    let max_age = i128::from(input.max_age_secs);
+    // i128 so i64::MIN/MAX never overflow the subtraction or the future bound.
+    now - event_at > max_age || event_at > now + max_age
 }
 
 fn hex32(bytes: &[u8]) -> String {
@@ -277,7 +342,7 @@ mod tests {
             human: true,
             addressed: Addressed::Direct,
             allowlisted: true,
-            arrived_unix_secs: 1_700_000_000,
+            event_at_unix_secs: 1_700_000_000,
             activated_unix_secs: 1_700_000_000,
             max_age_secs: 600,
             now_unix_secs: 1_700_000_000,
@@ -321,7 +386,7 @@ mod tests {
             // 2 stale — watermark
             case(
                 "2 hit arrived before watermark",
-                |input| input.arrived_unix_secs -= 1,
+                |input| input.event_at_unix_secs -= 1,
                 Decision::ignore(Reason::Stale),
             ),
             case("2 miss equal to watermark is not 早于", |_| {}, explicit),
@@ -334,6 +399,16 @@ mod tests {
             case(
                 "2 miss age equal to max_age_secs is not 超过",
                 |input| input.now_unix_secs += 600,
+                explicit,
+            ),
+            case(
+                "2 hit future skew beyond max_age_secs",
+                |input| input.event_at_unix_secs += 601,
+                Decision::ignore(Reason::Stale),
+            ),
+            case(
+                "2 miss future skew equal to max_age_secs is not stale",
+                |input| input.event_at_unix_secs += 600,
                 explicit,
             ),
             // 3 bot
@@ -435,7 +510,7 @@ mod tests {
         input.category = Category::Protocol;
         input.human = false;
         input.allowlisted = true;
-        input.arrived_unix_secs -= 86_400;
+        input.event_at_unix_secs -= 86_400;
         input.window_count = 100;
         input.addressed = Addressed::None;
         let got = admit(&input);
@@ -446,7 +521,7 @@ mod tests {
     #[test]
     fn earlier_rows_beat_later_ones() {
         let stale_and_bot_and_off_list = apply(|input| {
-            input.arrived_unix_secs -= 1;
+            input.event_at_unix_secs -= 1;
             input.human = false;
             input.allowlisted = false;
         });
@@ -479,34 +554,44 @@ mod tests {
         );
     }
 
-    /// 评审 N2：没有在途入参。窗口未满时即使调用方那边另有在途，纯函数仍放行。
+    /// 评审 N2：没有在途入参。穷尽解构在编译期钉住字段清单；窗口未满时纯函数仍放行。
     #[test]
     fn inflight_is_not_an_admit_input() {
         let under_cap = apply(|input| {
             input.window_count = 0;
             input.rate_limit = 3;
         });
+        let AdmitInput {
+            source: _,
+            actor: _,
+            category: _,
+            human: _,
+            addressed: _,
+            allowlisted: _,
+            event_at_unix_secs: _,
+            activated_unix_secs: _,
+            max_age_secs: _,
+            now_unix_secs: _,
+            window_count: _,
+            rate_limit: _,
+        } = under_cap.clone();
         assert_eq!(admit(&under_cap), Decision::explicit());
-        assert!(
-            !format!("{under_cap:?}").contains("inflight"),
-            "AdmitInput must not grow an in-flight field"
-        );
     }
 
     #[test]
     fn clock_extremes_do_not_panic() {
         let mut at_bounds = baseline();
-        at_bounds.arrived_unix_secs = i64::MIN;
+        at_bounds.event_at_unix_secs = i64::MIN;
         at_bounds.activated_unix_secs = i64::MIN;
         at_bounds.now_unix_secs = i64::MAX;
         at_bounds.max_age_secs = u64::MAX;
         assert_eq!(admit(&at_bounds), Decision::explicit());
 
         let mut future = baseline();
-        future.arrived_unix_secs = i64::MAX;
+        future.event_at_unix_secs = i64::MAX;
         future.activated_unix_secs = i64::MIN;
         future.now_unix_secs = i64::MIN;
-        assert_eq!(admit(&future), Decision::explicit());
+        assert_eq!(admit(&future), Decision::ignore(Reason::Stale));
     }
 
     #[test]
@@ -585,10 +670,77 @@ mode:observe
         let input = baseline();
         let decision = admit(&input);
         assert_eq!(decision, Decision::explicit());
-        // Three stored modes, one decision: mode is not on AdmitInput.
+        let entries = [entry(Source::Hyphae, "npub1alice")];
+        let mut versions = Vec::new();
         for mode in [AcceptMode::Off, AcceptMode::Observe, AcceptMode::Auto] {
-            let _ = policy_version(&[], mode);
+            assert_eq!(admit(&input), decision, "{mode:?}");
+            versions.push(policy_version(&entries, mode));
         }
-        assert_eq!(admit(&input), decision);
+        assert_ne!(versions[0], versions[1], "off vs observe");
+        assert_ne!(versions[1], versions[2], "observe vs auto");
+        assert_ne!(versions[0], versions[2], "off vs auto");
+    }
+
+    #[test]
+    fn wire_names_match_section_3_1() {
+        assert_eq!(
+            [
+                Disposition::Explicit.as_str(),
+                Disposition::Ignore.as_str(),
+                Disposition::Filtered.as_str(),
+                Disposition::Internal.as_str(),
+            ],
+            ["explicit", "ignore", "filtered", "internal"]
+        );
+        assert_eq!(
+            [
+                Category::Direct.as_str(),
+                Category::Group.as_str(),
+                Category::GroupMention.as_str(),
+                Category::Stranger.as_str(),
+                Category::DevBridge.as_str(),
+                Category::Protocol.as_str(),
+                Category::Internal.as_str(),
+            ],
+            [
+                "direct",
+                "group",
+                "group_mention",
+                "stranger",
+                "dev_bridge",
+                "protocol",
+                "internal",
+            ]
+        );
+        assert_eq!(
+            [
+                Addressed::None.as_str(),
+                Addressed::Mention.as_str(),
+                Addressed::Direct.as_str(),
+            ],
+            ["none", "mention", "direct"]
+        );
+    }
+
+    /// debug 构建下，未分流的 scheduler/self 与 internal 直接 panic。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "caller must route Scheduler and Self_ before admit")]
+    fn unrouted_scheduler_panics_in_debug() {
+        let _ = admit(&apply(|input| input.source = Source::Scheduler));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "caller must route Scheduler and Self_ before admit")]
+    fn unrouted_self_panics_in_debug() {
+        let _ = admit(&apply(|input| input.source = Source::Self_));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "caller must route category Internal before admit")]
+    fn unrouted_internal_category_panics_in_debug() {
+        let _ = admit(&apply(|input| input.category = Category::Internal));
     }
 }

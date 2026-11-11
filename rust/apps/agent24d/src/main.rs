@@ -45,7 +45,6 @@ mod hardware;
 mod host_bootstrap;
 mod hyphae_install;
 mod idoris_routes;
-#[allow(dead_code, reason = "X11-2c 接线")]
 mod inbound;
 mod knowledge_backend;
 mod knowledge_routes;
