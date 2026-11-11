@@ -594,8 +594,10 @@ export class BackendManager {
   private enrolledWith: { socketPath: string; generation: string } | null = null
   /** The service daemon's `/health` version, read just before enrolling with it. */
   private serviceVersion: string | null = null
-  /** M5 B5: while the service daemon restarts, its lock is not ours to take. */
-  private serviceRestart = false
+  /** M5 B5: while the service daemon restarts, its lock is not ours to take.
+   * A count, not a flag: overlapping holds (an upgrade, the Settings switch,
+   * the tray's 「完全退出」) keep it until the last ends (PR-Daemon #1783 N1). */
+  private serviceRestarts = 0
   private renewTimer: NodeJS.Timeout | null = null
   // Set when that connection ends under a live daemon: the next tick
   // enrols again rather than waiting out MAX_HEALTH_FAILURES.
@@ -983,11 +985,11 @@ export class BackendManager {
   /** M5 B5: runs `work` (the service daemon's restart) with nothing spawned
    * meanwhile, then looks for the service daemon again. */
   async whileServiceRestarts<T>(work: () => Promise<T>): Promise<T> {
-    this.serviceRestart = true
+    this.serviceRestarts++
     try {
       return await work()
     } finally {
-      this.serviceRestart = false
+      this.serviceRestarts--
       this.reprobe = true
     }
   }
@@ -1139,7 +1141,7 @@ export class BackendManager {
   }
 
   private spawnChild(): void {
-    if (this.serviceRestart) return
+    if (this.serviceRestarts > 0) return
     this.dropEnrolment()
     // Our own child from here on: its daemon.json is not the service's to
     // enrol with again (Codex B2 C2).
