@@ -709,6 +709,7 @@ pub(super) async fn assemble_app_state(
     };
     #[cfg(not(unix))]
     let workspace_service = None;
+    let has_memory = memory.is_some();
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
@@ -722,6 +723,15 @@ pub(super) async fn assemble_app_state(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    // X11-2d: expire inbound message text (and its run/memory copies) after
+    // 180 days. The purge goes through the run manager (it owns the session
+    // memory and its locks). Detached on purpose: it ends on the shutdown token.
+    drop(crate::inbound::spawn_text_expiry(
+        &state.store,
+        has_memory.then(|| state.runs.clone()),
+        ephemeral,
+        shutdown.child_token(),
+    ));
     // Before any clone into the router. `AppState::new` starts this empty so
     // tests that never mount MCP keep an empty roster.
     state.mcp_roster = mcp_roster;

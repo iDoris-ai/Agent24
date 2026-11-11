@@ -1098,6 +1098,18 @@ impl RunManager {
         ))
     }
 
+    /// Expire a session's memory (inbound text retention) under the session's
+    /// lock; `None` when this manager has no session memory. See
+    /// [`SessionMemory::purge_session`].
+    pub async fn purge_session_memory(
+        &self,
+        session_id: &str,
+        not_after: &str,
+    ) -> Option<agent24_memory::Result<agent24_memory::session_log::SessionPurge>> {
+        let memory = self.memory.as_ref()?;
+        Some(memory.purge_session(session_id, not_after).await)
+    }
+
     /// M1-T12: the SAME post-answer commit `drive_new`'s run loop performs
     /// (`remember_exchange`, used as-is — not duplicated), exposed for the
     /// `/api/v1/chat` surface. `source: "chat"` distinguishes this turn's
