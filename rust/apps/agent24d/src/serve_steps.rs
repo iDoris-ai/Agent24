@@ -824,6 +824,19 @@ pub(super) async fn recover_durable_runs(
             workspace_orphans.released_leases
         );
     }
+    // After both orphan sweeps, so a cancelled inbound run is already terminal
+    // and its row can leave the in-flight index (`started` → `done`).
+    let inbound = crate::inbound::reconcile_inbound_runs(&state.store)
+        .await
+        .map_err(std::io::Error::other)?;
+    if inbound.started > 0 || inbound.done > 0 || inbound.interrupted > 0 {
+        tracing::warn!(
+            started = inbound.started,
+            done = inbound.done,
+            interrupted = inbound.interrupted,
+            "reconciled inbound runs from a previous process"
+        );
+    }
 
     // M7: approvals can outlive the task that originally armed their in-memory
     // timeout. Keep durable expiry/recovery active for the daemon lifetime; a
