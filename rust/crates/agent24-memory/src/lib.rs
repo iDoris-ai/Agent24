@@ -2922,6 +2922,37 @@ mod session_log_tests {
             .await?;
         Ok(())
     }
+    #[tokio::test]
+    async fn purge_session_removes_one_session_whole_and_keeps_others() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "gone", 0, "u0", "a0").await?;
+        append(&log, "o", "gone", 1, "u1", "a1").await?;
+        append(&log, "o", "kept", 0, "k0", "ka0").await?;
+        append(&log, "other", "gone", 0, "x0", "xa0").await?;
+        kv.put("session", "gone", &CanonicalSession::new("gone"))
+            .await?;
+
+        let purge = log.purge_session("o", "gone").await?;
+        assert_eq!(purge.events, 4);
+        assert_eq!(purge.legacy_blob, 1);
+        assert!(events(&kv, "o", "gone").await?.is_empty());
+        assert!(CanonicalSession::load(&kv, "gone").await?.is_none());
+        // Another session of the same owner, and the same session id under
+        // another owner, are untouched.
+        assert_eq!(events(&kv, "o", "kept").await?.len(), 2);
+        assert_eq!(events(&kv, "other", "gone").await?.len(), 2);
+        // Usage counters follow the delete.
+        let counted: i64 =
+            sqlx::query_scalar("SELECT row_count FROM mem_owner_usage WHERE owner = 'o'")
+                .fetch_one(&kv.pool)
+                .await?;
+        assert_eq!(counted, 2);
+        // Repeating it deletes nothing.
+        assert!(log.purge_session("o", "gone").await?.is_empty());
+        Ok(())
+    }
+
     fn turn_id(o: &str, s: &str, n: u64, role: &str) -> Result<String> {
         use sha2::{Digest, Sha256};
         Ok(format!(

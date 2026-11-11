@@ -24,13 +24,13 @@ const SQLITE_CONSTRAINT_UNIQUE: &str = "2067";
 /// Second precision, `Z`, no fractional seconds. Subseconds on `dt` are
 /// truncated, matching the scheduler's previous `%Y-%m-%dT%H:%M:%SZ`
 /// spelling. String order is chronological only for this spelling, which is
-/// what [`Store::scrub_expired_inbound_text`] compares. Insert and scrub
+/// what `scrub_expired_inbound_text` compares. Insert and scrub
 /// reject any other spelling.
 pub fn format_inbound_timestamp(dt: DateTime<Utc>) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn require_inbound_timestamp(field: &str, value: &str) -> Result<()> {
+pub(crate) fn require_inbound_timestamp(field: &str, value: &str) -> Result<()> {
     let parsed = DateTime::parse_from_rfc3339(value).ok();
     let canonical = parsed.map(|dt| format_inbound_timestamp(dt.with_timezone(&Utc)));
     if canonical.as_deref() != Some(value) {
@@ -59,7 +59,8 @@ pub enum InboundInsert {
 ///
 /// `at` and `received_at` are [`format_inbound_timestamp`] values. Insert
 /// rejects any other spelling. `text_scrubbed_at` is not a caller field:
-/// only [`Store::scrub_expired_inbound_text`] sets it.
+/// only the scrub paths set it: [`Store::scrub_expired_inbound`] in production
+/// and `scrub_expired_inbound_text` in tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInboundEvent {
     pub id: String,
@@ -271,6 +272,11 @@ impl Store {
     /// Null `text` and `meta` on rows received before `cutoff` that have not
     /// been scrubbed, and stamp `text_scrubbed_at = now`.
     ///
+    /// Test-only. It stamps rows without looking at whether their run has
+    /// ended and leaves every copy (runs, messages, memory) in place, so a
+    /// caller outside this crate would hide expired text from the real task.
+    /// Production code uses [`Store::scrub_expired_inbound`].
+    ///
     /// Idempotent: a row that already has `text_scrubbed_at` is skipped, so a
     /// second call returns 0 and does not rewrite the stamp. Sender, time,
     /// category, and disposition stay. This does not touch runs or memory.
@@ -282,7 +288,8 @@ impl Store {
     ///
     /// # Errors
     /// Storage, or a `cutoff` / `now` that is not [`format_inbound_timestamp`].
-    pub async fn scrub_expired_inbound_text(&self, cutoff: &str, now: &str) -> Result<u64> {
+    #[cfg(test)]
+    pub(crate) async fn scrub_expired_inbound_text(&self, cutoff: &str, now: &str) -> Result<u64> {
         require_inbound_timestamp("cutoff", cutoff)?;
         require_inbound_timestamp("now", now)?;
         let affected = sqlx::query(

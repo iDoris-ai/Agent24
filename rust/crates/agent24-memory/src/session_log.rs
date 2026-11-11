@@ -21,6 +21,24 @@ pub struct TurnIds {
     pub user: EventId,
     pub assistant: EventId,
 }
+/// Rows [`SessionLog::purge_session`] removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SessionPurge {
+    /// `mem_events` rows of the session (messages, summaries, import marker).
+    pub events: u64,
+    /// `mem_session_gaps` rows of the session.
+    pub gaps: u64,
+    /// Legacy `kv` blob (`session` namespace) that would be re-imported.
+    pub legacy_blob: u64,
+}
+
+impl SessionPurge {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ImportOutcome {
     Imported { events: usize },
@@ -256,6 +274,52 @@ impl SessionLog {
         .await?;
         tx.commit().await?;
         Ok(seq)
+    }
+
+    /// Delete one whole session of one owner: its events, its write-gap rows
+    /// and the legacy blob (without that, the next read would import the old
+    /// text back). One transaction; deleting nothing is a success.
+    ///
+    /// This is the sanctioned exception to the append-only rule, used for
+    /// retention (inbound text expiry). The quota triggers on `mem_events`
+    /// keep the owner usage counters right.
+    ///
+    /// It does NOT touch `mem_assertions`. Retracting would be wrong and
+    /// would not delete the text anyway: an assertion id is a hash of owner
+    /// and text, so a later, legitimate "remember" of the same sentence by the
+    /// user shares the row, and a retracted row keeps its `object`. The
+    /// guarantee that an inbound run never writes an assertion is made at the
+    /// source (X11-2c: inbound runs are not allowed through
+    /// `retain::persist`), and this purge DEPENDS on it.
+    ///
+    /// `mem_session_gaps` is keyed by session id only (no owner column), so
+    /// its delete below is by session id alone. Inbound sessions are fresh
+    /// per message, so a collision with another owner's session id is not
+    /// expected.
+    pub async fn purge_session(&self, owner: &str, session: &str) -> Result<SessionPurge> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let events = sqlx::query("DELETE FROM mem_events WHERE scope_owner=? AND scope_session=?")
+            .bind(owner)
+            .bind(session)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let gaps = sqlx::query("DELETE FROM mem_session_gaps WHERE session_id=?")
+            .bind(session)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        let legacy_blob = sqlx::query("DELETE FROM kv WHERE namespace='session' AND key=?")
+            .bind(session)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        tx.commit().await?;
+        Ok(SessionPurge {
+            events,
+            gaps,
+            legacy_blob,
+        })
     }
 
     pub async fn load_view(&self, owner: &str, session: &str) -> Result<SessionView> {
