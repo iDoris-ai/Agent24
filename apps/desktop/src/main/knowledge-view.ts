@@ -936,6 +936,11 @@ export class KnowledgeViewHost {
       }
       return
     }
+    if (event.kind === 'ops_dropped') {
+      // #1670 c2: the server listed ops this host does not know; the session goes on.
+      this.log(`[knowledge-view] UI exchange dropped ${event.count} op(s) outside the host's closed set`)
+      return
+    }
     if (event.kind === 'rebuild') {
       // View-level handling: a new instance, new vph; not a crash.
       this.log('[knowledge-view] session rejected; rebuilding the view')
