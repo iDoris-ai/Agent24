@@ -931,6 +931,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dispatch_refuses_a_row_that_is_not_explicit() {
+        // Mutation: drop the disposition guard and this ignore row starts a run.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        let ignored = NewInboundEvent {
+            id: "hyphae:ignored".to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub1".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: stamp(30),
+            received_at: stamp(0),
+            text: Some("no".to_owned()),
+            meta: None,
+            disposition: "ignore".to_owned(),
+            disposition_reason: Some("not_allowlisted".to_owned()),
+            policy_version: None,
+            run_state: None,
+        };
+        assert_eq!(
+            store.insert_inbound_event(&ignored).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let err = svc.dispatch("hyphae:ignored").await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("not explicit")),
+            "{err:?}"
+        );
+        assert_eq!(run_count(&store).await, 0);
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:ignored")
+                .await
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "ignore"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bad_allowlist_source_refuses_the_ingest() {
+        // Mutation: skip the bad allowlist row instead of returning, and the
+        // hyphae entry still admits this message.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        allow(&store, "hyphae", "npub1").await;
+        allow(&store, "carrier-pigeon", "npub1").await;
+        watermark(&store, "hyphae", &stamp(120)).await;
+        let err = svc
+            .ingest(message("hyphae:bad-list", "npub1", &stamp(30), "hi"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("allowlist source")),
+            "{err:?}"
+        );
+        assert_eq!(event_count(&store).await, 0);
+        assert_eq!(run_count(&store).await, 0);
+    }
+
+    #[tokio::test]
+    async fn an_empty_message_id_is_refused() {
+        // Mutation: drop the empty-id guard and this is no longer
+        // Invalid("id is empty"). The row is inserted, then start fails
+        // because the event id is empty.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        allow(&store, "hyphae", "npub1").await;
+        watermark(&store, "hyphae", &stamp(120)).await;
+        let err = svc
+            .ingest(message("", "npub1", &stamp(30), "hi"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message == "id is empty"),
+            "{err:?}"
+        );
+        assert_eq!(event_count(&store).await, 0);
+        assert_eq!(run_count(&store).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_non_canonical_or_unparseable_timestamp_is_refused() {
+        // Mutation: accept a failed parse, or skip the canonical check, and
+        // these calls are no longer IngestError::Invalid from prepare.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        allow(&store, "hyphae", "npub1").await;
+        watermark(&store, "hyphae", &stamp(120)).await;
+        for (id, at) in [
+            ("hyphae:bad-at", "not-a-time"),
+            ("hyphae:offset", "2026-11-11T00:00:00+00:00"),
+            ("hyphae:fraction", "2026-11-11T00:00:00.000Z"),
+        ] {
+            let err = svc
+                .ingest(message(id, "npub1", at, "hi"))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, IngestError::Invalid(ref message) if message.contains(at)),
+                "{at}: {err:?}"
+            );
+        }
+        assert_eq!(event_count(&store).await, 0);
+        assert_eq!(run_count(&store).await, 0);
+    }
+
+    async fn event_count(store: &Store) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM inbound_events")
+            .fetch_one(agent24_store::test_hooks::pool(store))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
     async fn startup_reconcile_marks_a_linked_live_run_started_and_an_unlinked_one_interrupted() {
         let store = Store::open_memory().await.unwrap();
         insert_event(&store, "hyphae:live", "npub1", "starting").await;
