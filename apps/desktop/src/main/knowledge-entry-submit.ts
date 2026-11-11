@@ -115,7 +115,9 @@ export function knowledgeEntrySubmission(deps: KnowledgeEntrySubmitDeps) {
     ({ ok: false, reason: 'server', code: 'cancelled', unknown, submission: view(id, draft) })
 
   const serverFailure = (id: string, draft: EntryDraft, f: CandidateFailure): SubmissionAnswer => {
-    const answer: SubmissionAnswer = { ok: false, reason: 'server', code: f.code, unknown: f.unknown, submission: view(id, draft) }
+    const submission = view(id, draft)
+    // A refusal of this attempt cannot settle an earlier unknown write (W1.5).
+    const answer: SubmissionAnswer = { ok: false, reason: 'server', code: f.code, unknown: f.unknown || submission.pending, submission }
     if (f.reason !== undefined) answer.serverReason = f.reason
     return answer
   }
@@ -150,11 +152,10 @@ export function knowledgeEntrySubmission(deps: KnowledgeEntrySubmitDeps) {
       try { deps.candidates.settleSubmit(id, state) } catch { return { ok: false, reason: 'local_storage', submission: view(id, draft) } }
       return { ok: true, submission: view(id, draft) }
     }
-    // A definite refusal from the server clears the record (nothing was saved,
-    // W1.9). An unknown outcome keeps it, to be resent with the same key and
-    // body; so does a resend that never left this machine (no credential,
-    // cancelled first): the earlier attempt may still have landed.
-    if (!result.unknown && !(resend && result.local)) {
+    // Only a fresh attempt's definite refusal proves nothing was saved.
+    // A resend can be refused before idempotency replay (W1.9), so any failed
+    // resend keeps the first attempt's unknown outcome and its exact key/body.
+    if (!resend && !result.unknown) {
       try { deps.candidates.settleSubmit(id, null) } catch { /* the record stays; it is resent, not lost */ }
     }
     return serverFailure(id, draft, result)
