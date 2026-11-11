@@ -39,7 +39,6 @@ const ROOMY: NavPrefs = { pinned: ['documents'], slotCount: 3, showOverview: tru
 function renderPage(opts: {
   defs?: readonly CapabilityDef[]
   prefs?: NavPrefs
-  approvalsWaiting?: number
   statusFor?: (id: string) => string | undefined
   onOpenSettings?: () => void
 } = {}) {
@@ -49,7 +48,7 @@ function renderPage(opts: {
   const onOpenSettings = opts.onOpenSettings ?? vi.fn()
   const prefs = opts.prefs ?? ROOMY
   render(
-    <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open, approvalsWaiting: opts.approvalsWaiting ?? 0 }}>
+    <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open }}>
       <NavPrefsContext.Provider value={{ prefs, setPrefs: next => setPrefs(typeof next === 'function' ? next(prefs) : next) }}>
         <CapabilitiesPage statusFor={opts.statusFor} onOpenSettings={onOpenSettings} />
       </NavPrefsContext.Provider>
@@ -160,7 +159,7 @@ describe('CapabilitiesPage', () => {
   })
 
   it('has no approvals row or count: approvals are decided in the assistant (M4 A6)', () => {
-    renderPage({ approvalsWaiting: 4 })
+    renderPage()
     expect(screen.queryByRole('status', { name: /waiting/ })).not.toBeInTheDocument()
     expect(screen.queryByText('Approvals')).not.toBeInTheDocument()
   })
