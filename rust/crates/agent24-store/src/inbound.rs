@@ -109,11 +109,14 @@ pub struct InboundEvent {
 ///
 /// `Linked` committed the session, the run, and `inbound_runs` together.
 /// `AlreadyLinked` rolled that transaction back: `event_id` already had a run.
+/// `NotStarting` rolled it back with no link: the event is missing or its
+/// `run_state` is not `starting`, so this call did not start another run.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InboundRunLink {
     Linked,
     AlreadyLinked,
+    NotStarting,
 }
 
 /// `starting` rows split by whether `inbound_runs` already names them.
@@ -395,8 +398,12 @@ impl Store {
     /// Insert `session`, `run`, and `inbound_runs` in one `BEGIN IMMEDIATE`.
     ///
     /// [`crate::Store::insert_run`] commits on its own, so it cannot share a
-    /// transaction with the link. A clash on `inbound_runs.event_id` rolls the
-    /// session and the run back and returns [`InboundRunLink::AlreadyLinked`].
+    /// transaction with the link. The same transaction reads `run_state`.
+    /// Only `starting` may link. Anything else rolls back: an existing link is
+    /// [`InboundRunLink::AlreadyLinked`], and no link is
+    /// [`InboundRunLink::NotStarting`] (an `interrupted` or `start_failed`
+    /// row must not gain a run that sits outside the in-flight index). A clash
+    /// on `inbound_runs.event_id` is also [`InboundRunLink::AlreadyLinked`].
     ///
     /// # Errors
     /// Storage, a workspace-bound run (this path does not admit one), a session
@@ -419,6 +426,30 @@ impl Store {
             ));
         }
         let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let existing = sqlx::query(
+            "SELECT e.run_state AS run_state, \
+                    (SELECT ir.run_id FROM inbound_runs ir WHERE ir.event_id = e.id) AS run_id \
+             FROM inbound_events e WHERE e.id = ?",
+        )
+        .bind(event_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let run_state = existing
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("run_state"));
+        let linked_run = existing
+            .as_ref()
+            .and_then(|row| row.get::<Option<String>, _>("run_id"));
+        // Same write lock as the inserts below. A row that has left `starting`
+        // (or was never stored) cannot gain a session and a run.
+        if run_state.as_deref() != Some("starting") {
+            tx.rollback().await?;
+            return if linked_run.is_some() {
+                Ok(InboundRunLink::AlreadyLinked)
+            } else {
+                Ok(InboundRunLink::NotStarting)
+            };
+        }
         sqlx::query(
             "INSERT INTO sessions (id, title, channel, workspace_id, created_at, updated_at) \
              VALUES (?, ?, ?, ?, ?, ?)",
@@ -1795,6 +1826,33 @@ mod tests {
         );
         assert!(store.session_has_inbound_run("sess_one").await.unwrap());
         assert!(!store.session_has_inbound_run("sess_two").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_row_that_is_not_starting_does_not_link() {
+        // Mutation: drop the `run_state = 'starting'` check in
+        // `insert_session_run_for_inbound` and both calls return Linked.
+        let store = Store::open_memory().await.unwrap();
+        for (id, state) in [
+            ("hyphae:cut", Some("interrupted")),
+            ("hyphae:broke", Some("start_failed")),
+        ] {
+            assert_eq!(
+                store
+                    .insert_inbound_event(&sample(id, id, "explicit", state))
+                    .await
+                    .unwrap(),
+                InboundInsert::Inserted
+            );
+            let outcome = store
+                .insert_session_run_for_inbound(&inbound_session(id), &inbound_run(id, id), id)
+                .await
+                .unwrap();
+            assert_eq!(outcome, InboundRunLink::NotStarting);
+        }
+        assert_eq!(table_count(&store, "runs").await, 0);
+        assert_eq!(table_count(&store, "sessions").await, 0);
+        assert_eq!(table_count(&store, "inbound_runs").await, 0);
     }
 
     #[tokio::test]

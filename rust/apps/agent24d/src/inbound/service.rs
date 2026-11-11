@@ -74,9 +74,17 @@ pub(crate) struct InboundMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum IngestOutcome {
     Duplicate,
-    Ignored { reason: String },
-    Started { run_id: String },
-    AlreadyLinked { run_id: String },
+    Ignored {
+        reason: String,
+    },
+    Started {
+        run_id: String,
+    },
+    /// `run_id` is `None` when the link row is already gone. An empty string
+    /// is not a run id.
+    AlreadyLinked {
+        run_id: Option<String>,
+    },
 }
 
 #[derive(Debug)]
@@ -201,11 +209,18 @@ impl InboundService {
                 "inbound source {channel} is not a session channel"
             )));
         }
+        // `None` is a missing body. `unwrap_or_default` used to start a run
+        // whose prompt was empty.
+        let Some(prompt) = event.text else {
+            return Err(IngestError::Invalid(format!(
+                "event {event_id} has no text"
+            )));
+        };
         let create = RunCreate {
             idoris_headroom_confirmed: false,
             session_id: Some(format!("sess_{}", ulid())),
             workspace_id: None,
-            prompt: event.text.unwrap_or_default(),
+            prompt,
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
@@ -216,14 +231,12 @@ impl InboundService {
         };
         match self.runs.start_run_inbound(create, origin).await {
             Ok(InboundRunStart::Started(run)) => Ok(IngestOutcome::Started { run_id: run.id }),
-            Ok(InboundRunStart::AlreadyLinked) => {
-                let run_id = self
-                    .store
-                    .inbound_run_id_for_event(event_id)
-                    .await?
-                    .unwrap_or_default();
-                Ok(IngestOutcome::AlreadyLinked { run_id })
-            }
+            Ok(InboundRunStart::AlreadyLinked) => Ok(already_linked_outcome(
+                self.store.inbound_run_id_for_event(event_id).await?,
+            )),
+            Ok(InboundRunStart::NotStarting) => Err(IngestError::Invalid(format!(
+                "event {event_id} is not starting"
+            ))),
             Err(err) => {
                 // The event is already `starting` and holds the in-flight
                 // index. The link commits in the same transaction as the run,
@@ -415,6 +428,11 @@ fn parse_addressed(raw: &str) -> Option<Addressed> {
         "direct" => Addressed::Direct,
         _ => return None,
     })
+}
+
+/// `None` stays `None`. Filling it with `""` would name a run that is not there.
+fn already_linked_outcome(run_id: Option<String>) -> IngestOutcome {
+    IngestOutcome::AlreadyLinked { run_id }
 }
 
 fn parse_mode(raw: &str) -> Result<AcceptMode, IngestError> {
@@ -931,7 +949,7 @@ mod tests {
         assert_eq!(
             again,
             IngestOutcome::AlreadyLinked {
-                run_id: run_id.clone()
+                run_id: Some(run_id.clone())
             }
         );
         assert_eq!(run_count(&store).await, 1);
@@ -1128,6 +1146,140 @@ mod tests {
                 .disposition,
             "ignore"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_does_not_restart_an_interrupted_or_start_failed_row() {
+        // Mutation: drop the `run_state = 'starting'` check in
+        // `insert_session_run_for_inbound` and both calls start a run.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        for (id, actor, state) in [
+            ("hyphae:cut", "npub-cut", "interrupted"),
+            ("hyphae:broke", "npub-broke", "start_failed"),
+        ] {
+            let row = NewInboundEvent {
+                id: id.to_owned(),
+                source: "hyphae".to_owned(),
+                category: "direct".to_owned(),
+                recipient_identity: None,
+                thread_key: None,
+                actor: Some(actor.to_owned()),
+                human: true,
+                addressed: "direct".to_owned(),
+                at: stamp(30),
+                received_at: stamp(0),
+                text: Some("again".to_owned()),
+                meta: None,
+                disposition: "explicit".to_owned(),
+                disposition_reason: None,
+                policy_version: Some("p".to_owned()),
+                run_state: Some(state.to_owned()),
+            };
+            assert_eq!(
+                store.insert_inbound_event(&row).await.unwrap(),
+                InboundInsert::Inserted
+            );
+            let err = svc.dispatch(id).await.unwrap_err();
+            assert!(
+                matches!(err, IngestError::Invalid(ref message) if message.contains("not starting")),
+                "{err:?}"
+            );
+            assert_eq!(state_of(&store, id).await, state);
+        }
+        assert_eq!(run_count(&store).await, 0);
+        let links: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM inbound_runs")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(links, 0);
+    }
+
+    #[tokio::test]
+    async fn dispatch_refuses_an_explicit_row_with_no_text() {
+        // Mutation: drop the `event.text` guard and this starts a run whose
+        // prompt is empty.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        let row = NewInboundEvent {
+            id: "hyphae:blank".to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub-blank".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: stamp(30),
+            received_at: stamp(0),
+            text: None,
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some("starting".to_owned()),
+        };
+        assert_eq!(
+            store.insert_inbound_event(&row).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let err = svc.dispatch("hyphae:blank").await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("no text")),
+            "{err:?}"
+        );
+        assert_eq!(run_count(&store).await, 0);
+        assert_eq!(state_of(&store, "hyphae:blank").await, "starting");
+    }
+
+    #[tokio::test]
+    async fn an_already_linked_outcome_keeps_a_missing_run_id_absent() {
+        // The follow-up read found no `inbound_runs` row. Mutation:
+        // `unwrap_or_default` makes this `Some("")`.
+        assert_eq!(
+            already_linked_outcome(None),
+            IngestOutcome::AlreadyLinked { run_id: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_of_a_linked_terminal_row_names_that_run() {
+        // The link is still there, so the id is `Some`. A second dispatch
+        // does not insert another run.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        let row = NewInboundEvent {
+            id: "hyphae:named".to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub-named".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: stamp(30),
+            received_at: stamp(0),
+            text: Some("hi".to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some("started".to_owned()),
+        };
+        assert_eq!(
+            store.insert_inbound_event(&row).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        insert_run(&store, "run_named", "completed").await;
+        store
+            .insert_inbound_run("run_named", "hyphae:named")
+            .await
+            .unwrap();
+        let again = svc.dispatch("hyphae:named").await.unwrap();
+        assert_eq!(
+            again,
+            IngestOutcome::AlreadyLinked {
+                run_id: Some("run_named".to_owned())
+            }
+        );
+        assert_eq!(run_count(&store).await, 1);
     }
 
     #[tokio::test]

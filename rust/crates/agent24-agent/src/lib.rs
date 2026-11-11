@@ -627,6 +627,8 @@ pub struct InboundOrigin {
 pub enum InboundRunStart {
     Started(Run),
     AlreadyLinked,
+    /// The event is not `starting` and has no link. Nothing was committed.
+    NotStarting,
 }
 
 #[allow(
@@ -636,11 +638,13 @@ pub enum InboundRunStart {
 enum RunStart {
     Ready(Run),
     InboundAlreadyLinked,
+    InboundNotStarting,
 }
 
 enum PersistOutcome {
     Stored,
     InboundAlreadyLinked,
+    InboundNotStarting,
 }
 
 enum ParkedCallStop {
@@ -1501,6 +1505,7 @@ impl RunManager {
         {
             RunStart::Ready(run) => Ok(InboundRunStart::Started(run)),
             RunStart::InboundAlreadyLinked => Ok(InboundRunStart::AlreadyLinked),
+            RunStart::InboundNotStarting => Ok(InboundRunStart::NotStarting),
         }
     }
 
@@ -1509,6 +1514,9 @@ impl RunManager {
             RunStart::Ready(run) => Ok(run),
             RunStart::InboundAlreadyLinked => Err(AgentError::Store(StoreError::Conflict(
                 "ordinary start linked an inbound event".to_owned(),
+            ))),
+            RunStart::InboundNotStarting => Err(AgentError::Store(StoreError::Conflict(
+                "ordinary start saw an inbound event that is not starting".to_owned(),
             ))),
         }
     }
@@ -1568,9 +1576,16 @@ impl RunManager {
                 return Err(err);
             }
         };
-        if matches!(persisted, PersistOutcome::InboundAlreadyLinked) {
-            self.cancels.lock().await.remove(&run.id);
-            return Ok(RunStart::InboundAlreadyLinked);
+        match persisted {
+            PersistOutcome::Stored => {}
+            PersistOutcome::InboundAlreadyLinked => {
+                self.cancels.lock().await.remove(&run.id);
+                return Ok(RunStart::InboundAlreadyLinked);
+            }
+            PersistOutcome::InboundNotStarting => {
+                self.cancels.lock().await.remove(&run.id);
+                return Ok(RunStart::InboundNotStarting);
+            }
         }
         if let Some(origin) = &inbound {
             // Before spawn, so execute cannot finish (and try to mark done)
@@ -1662,6 +1677,7 @@ impl RunManager {
             agent24_store::InboundRunLink::AlreadyLinked => {
                 Ok(PersistOutcome::InboundAlreadyLinked)
             }
+            agent24_store::InboundRunLink::NotStarting => Ok(PersistOutcome::InboundNotStarting),
         }
     }
 
@@ -3586,6 +3602,10 @@ impl RunManager {
     /// [`Self::finish_cancelled`] notes only when the transition lands. A
     /// run that is already terminal, or a status write that does not apply,
     /// still has to leave `started` (#1813 L1).
+    ///
+    /// This runs for every run, inbound or not. An ordinary run whose move
+    /// to Running fails is cancelled here. It used to stay non-terminal until
+    /// the next restart swept it. The end state is the same; this lands it now.
     async fn release_inbound_after_abandoned_start(&self, run_id: &str) {
         self.finish_cancelled(run_id).await;
         self.note_inbound_terminal(run_id).await;
@@ -6974,6 +6994,40 @@ pub(crate) mod tests {
         assert_eq!(
             store.get_run("run_stuck").await.unwrap().unwrap().status,
             RunStatus::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_running_transition_cancels_and_releases_the_slot() {
+        // The trigger refuses only `NEW.status = 'running'`, so
+        // `finish_cancelled` can still write `cancelled`. Mutation: drop
+        // `finish_cancelled` from `release_inbound_after_abandoned_start`
+        // and this run stays `queued` with no `run.cancelled`.
+        let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_started_inbound(&store, "run_abandon", "queued").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_running BEFORE UPDATE OF status ON runs \
+             WHEN NEW.status = 'running' \
+             BEGIN SELECT RAISE(ABORT, 'no-running'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        manager
+            .execute("run_abandon".to_owned(), CancellationToken::new(), false)
+            .await;
+        assert_eq!(
+            store.get_run("run_abandon").await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|event| event == "run.cancelled"),
+            "{events:?}"
+        );
+        assert_eq!(
+            inbound_run_state(&store, "hyphae:run_abandon").await,
+            "done"
         );
     }
 

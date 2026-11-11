@@ -1893,6 +1893,9 @@ mod tests {
     /// Restart through `recover_durable_runs`, which is the production call
     /// after the orphan sweeps. Mutation: drop `reconcile_inbound_runs` from
     /// that function and every row below stays at its seeded `run_state`.
+    /// Moving that call to before the orphan sweeps leaves `hyphae:running`
+    /// at `started`: the run is still `running` then, so reconcile does not
+    /// mark it `done`.
     #[tokio::test]
     async fn startup_reconcile_converges_the_four_restart_shapes() {
         let store = Store::open_memory().await.unwrap();
@@ -1901,6 +1904,7 @@ mod tests {
             ("hyphae:none", "a-none", "starting"),
             ("hyphae:ended", "a-ended", "started"),
             ("hyphae:gone", "a-gone", "started"),
+            ("hyphae:running", "a-running", "started"),
         ] {
             assert_eq!(
                 store
@@ -1913,6 +1917,7 @@ mod tests {
         insert_run(&store, "run_live", "awaiting_approval").await;
         insert_run(&store, "run_ended", "completed").await;
         insert_run(&store, "run_gone", "completed").await;
+        insert_run(&store, "run_running", "running").await;
         store
             .insert_inbound_run("run_live", "hyphae:live")
             .await
@@ -1923,6 +1928,10 @@ mod tests {
             .unwrap();
         store
             .insert_inbound_run("run_gone", "hyphae:gone")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_running", "hyphae:running")
             .await
             .unwrap();
         let now = agent24_core::util::now_iso8601();
@@ -1985,6 +1994,11 @@ mod tests {
         assert_eq!(run_state(&store, "hyphae:none").await, "interrupted");
         assert_eq!(run_state(&store, "hyphae:ended").await, "done");
         assert_eq!(run_state(&store, "hyphae:gone").await, "done");
+        assert_eq!(run_state(&store, "hyphae:running").await, "done");
+        assert_eq!(
+            store.get_run("run_running").await.unwrap().unwrap().status,
+            agent24_protocol::RunStatus::Cancelled
+        );
         assert!(
             store
                 .inbound_run_id_for_event("hyphae:gone")
