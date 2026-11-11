@@ -277,7 +277,7 @@ struct RegistryState {
     deps: Option<AttachDeps>,
 }
 
-/// The live registry: one [`Entry`] per name in `attached.json`, guarded by
+/// The live registry: one `Entry` per name in `attached.json`, guarded by
 /// one lock — see the module doc for why that lock is never held across an
 /// `await`.
 pub struct AttachRegistry {
@@ -657,7 +657,7 @@ impl AttachRegistry {
     /// REGISTRY's own `deps` too, so a registry that never had any attached
     /// modules at all still drops its `ModelCallbackDeps` clone here rather
     /// than whenever the `Arc<AttachRegistry>` itself finally does (see
-    /// [`RegistryState`]'s own doc for why that distinction is the whole
+    /// `RegistryState`'s own doc for why that distinction is the whole
     /// point of this review round).
     pub fn revoke_all(&self) {
         let mut state = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
