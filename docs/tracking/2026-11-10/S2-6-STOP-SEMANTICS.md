@@ -56,5 +56,5 @@ grep -rn 'killpg\|kill(-\|SIGTERM\|SIGKILL\|Signal::SIGTERM\|setpgid\|process_gr
 
 计划范围之外、盘点时顺带看到的两处：
 
-- `apps/desktop/src/main/ipc/index.ts:625` OmlxStop：先对自有 child 发 SIGTERM，再在非 Windows 上 `pkill -f 'omlx serve'`。后者也会匹配用户自己启动的 omlx，无等待、无 KILL 升级、无退出确认。**列为待办**：停止时只应针对本应用启动的进程。
+- `apps/desktop/src/main/ipc/index.ts` OmlxStop（**FU-114 已修**）：只停止本应用 `execFile` 拉起并记在 `omlxProcess` 上的那个 child。没有记录时什么都不杀，直接返回 `{ ok: true }`。停止序列是 SIGTERM，最多等 `OMLX_STOP_GRACE_MS`（5s，与 creative-serve-web checkout 的 `CHECKOUT_STOP_TIMEOUT_MS` 相同），仍未退出则对该 PID SIGKILL，等到 `exit` 再返回。不再执行 `pkill -f 'omlx serve'`，因此不会误杀用户在终端自己启动的 omlx。仍是单个 PID，没有改成进程组：本仓库没有 omlx 会派生子进程的证据，而组杀需要 `detached` 加上 PGID 复用校验，这次没有做。
 - `apps/desktop/src/main/cli-tool.ts:56` CLI 版本探测：`execFile` 3 秒超时，超时直接对单个子进程 SIGKILL，不涉及进程组。
