@@ -1695,9 +1695,13 @@ mod tests {
         let other_actor = sample("hyphae:other", "npub2", "ignore", None);
         let mut old = sample("hyphae:old-window", "npub1", "ignore", None);
         old.received_at = "2026-11-10T00:00:00Z".to_owned();
+        // Same actor and the same `received_at` as the counted rows, other source.
+        // Mutation: drop `source = ?` (and its bind) and this row is counted, so 3 becomes 4.
+        let mut other_source = sample("wechat:same-actor", "npub1", "ignore", None);
+        other_source.source = "wechat".to_owned();
         for event in rows
             .iter()
-            .chain([&protocol, &filtered, &other_actor, &old])
+            .chain([&protocol, &filtered, &other_actor, &old, &other_source])
         {
             assert_eq!(
                 store.insert_inbound_event(event).await.unwrap(),
@@ -1856,6 +1860,102 @@ mod tests {
         assert_eq!(table_count(&store, "sessions").await, 0);
         assert_eq!(table_count(&store, "runs").await, 0);
         assert_eq!(table_count(&store, "inbound_runs").await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_session_with_only_an_unlinked_run_is_not_inbound() {
+        // The session exists and has a run. That run is not in `inbound_runs`.
+        // Mutation: drop the `inbound_runs` EXISTS and this becomes true.
+        let store = Store::open_memory().await.unwrap();
+        let session = inbound_session("sess_plain");
+        store.insert_session(&session).await.unwrap();
+        let run = inbound_run("run_plain", "sess_plain");
+        store.insert_run(&run).await.unwrap();
+        assert!(!store.session_has_inbound_run("sess_plain").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn started_terminal_event_ids_cover_each_terminal_status() {
+        // Each terminal status is load-bearing: drop `completed`, `failed`, or
+        // `cancelled` from the IN list and that id disappears. A still-running
+        // started row is not terminal. Mutation: drop `starting` from
+        // `mark_inbound_done_for_run` and the last call returns false.
+        let store = Store::open_memory().await.unwrap();
+        for (event_id, actor, run_id, status) in [
+            (
+                "hyphae:term-cancelled",
+                "npub-c",
+                "run_cancelled",
+                "cancelled",
+            ),
+            (
+                "hyphae:term-completed",
+                "npub-d",
+                "run_completed",
+                "completed",
+            ),
+            ("hyphae:term-failed", "npub-f", "run_failed", "failed"),
+            ("hyphae:still-running", "npub-r", "run_running", "running"),
+        ] {
+            assert_eq!(
+                store
+                    .insert_inbound_event(&sample(event_id, actor, "explicit", Some("starting"),))
+                    .await
+                    .unwrap(),
+                InboundInsert::Inserted
+            );
+            seed_run(&store, run_id).await;
+            sqlx::query("UPDATE runs SET status = ? WHERE id = ?")
+                .bind(status)
+                .bind(run_id)
+                .execute(crate::test_hooks::pool(&store))
+                .await
+                .unwrap();
+            store.insert_inbound_run(run_id, event_id).await.unwrap();
+            assert!(store.mark_inbound_started(event_id).await.unwrap());
+        }
+        assert_eq!(
+            store.inbound_started_terminal_event_ids().await.unwrap(),
+            vec![
+                "hyphae:term-cancelled".to_owned(),
+                "hyphae:term-completed".to_owned(),
+                "hyphae:term-failed".to_owned(),
+            ]
+        );
+
+        assert_eq!(
+            store
+                .insert_inbound_event(&sample(
+                    "hyphae:from-starting",
+                    "npub-s",
+                    "explicit",
+                    Some("starting"),
+                ))
+                .await
+                .unwrap(),
+            InboundInsert::Inserted
+        );
+        seed_run(&store, "run_from_starting").await;
+        store
+            .insert_inbound_run("run_from_starting", "hyphae:from-starting")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .mark_inbound_done_for_run("run_from_starting")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:from-starting")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("done")
+        );
     }
 
     async fn table_count(store: &Store, table: &str) -> i64 {
