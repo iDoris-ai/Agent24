@@ -1258,12 +1258,10 @@ async fn start_verification_works_offline() {
     let f = Fixture::new().await;
     let gatekeeper = Gatekeeper::default();
     gatekeeper.0.store(true, Ordering::SeqCst); // no network: Gatekeeper cannot answer
-    let runtime = SystemRuntime {
-        secrets: Arc::new(KeychainSource(f.keychain.clone())),
-        signature: Arc::new(gatekeeper.clone()),
-        lock: Arc::new(f.runtime.lock.clone()),
-        platform: Some(TEST_PLATFORM),
-    };
+    let mut runtime = SystemRuntime::new(Arc::new(KeychainSource(f.keychain.clone())));
+    runtime.signature = Arc::new(gatekeeper.clone());
+    runtime.lock = Arc::new(f.runtime.lock.clone());
+    runtime.platform = Some(TEST_PLATFORM);
     // Sanity: the lock demands notarization, and the offline Gatekeeper refuses it.
     assert!(IdorisLock::embedded().component_notarized());
     assert!(matches!(

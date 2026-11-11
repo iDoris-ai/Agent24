@@ -276,6 +276,7 @@ impl IdorisHost {
         omlx_keys: Arc<dyn Keychain>,
     ) -> Result<Arc<Self>, Code> {
         let host = Arc::get_mut(&mut self).ok_or(Code::Busy)?;
+        host.runtime.rebind(provisioner.clone(), omlx_keys.clone());
         host.provisioner = provisioner;
         host.secrets = Arc::new(KeychainSource(data_keys.clone()));
         host.data_keys = data_keys;

@@ -395,6 +395,8 @@ pub trait Runtime: Send + Sync {
         cancel: CancellationToken,
     ) -> Result<StartConfig, Code>;
     async fn inputs(&self, record: &Installation) -> Result<LaunchInputs, Code>;
+    /// `IdorisHost::with_provisioner` installs the sources [`SystemRuntime::inputs`] reads.
+    fn rebind(&self, _provisioner: Arc<dyn Provisioner>, _omlx_keys: Arc<dyn Keychain>) {}
 }
 pub struct SystemRuntime {
     pub secrets: Arc<dyn SecretSource>,
@@ -405,6 +407,9 @@ pub struct SystemRuntime {
     /// Platform key whose asset is verified. `None` (production) means this host's
     /// platform; tests inject `darwin-arm64` so they behave the same on every OS.
     pub(crate) platform: Option<&'static str>,
+    /// Replaced by `IdorisHost::with_provisioner` before the host is shared.
+    provisioner: SyncMutex<Arc<dyn Provisioner>>,
+    omlx_keys: SyncMutex<Arc<dyn Keychain>>,
 }
 impl SystemRuntime {
     pub fn new(secrets: Arc<dyn SecretSource>) -> Self {
@@ -413,6 +418,8 @@ impl SystemRuntime {
             signature: Arc::new(Codesign),
             lock: Arc::new(IdorisLock::embedded().clone()),
             platform: None,
+            provisioner: SyncMutex::new(Arc::new(SystemProvisioner)),
+            omlx_keys: SyncMutex::new(Arc::new(crate::keychain::OmlxKeychain)),
         }
     }
 }
@@ -480,6 +487,10 @@ impl Runtime for SystemRuntime {
         config.shutdown = cancel;
         Ok(config)
     }
+    fn rebind(&self, provisioner: Arc<dyn Provisioner>, omlx_keys: Arc<dyn Keychain>) {
+        *self.provisioner.lock().unwrap_or_else(|e| e.into_inner()) = provisioner;
+        *self.omlx_keys.lock().unwrap_or_else(|e| e.into_inner()) = omlx_keys;
+    }
     async fn inputs(&self, r: &Installation) -> Result<LaunchInputs, Code> {
         let core = r.core_reserved_bytes.ok_or(Code::NotConfigured)?;
         let budget = tokio::task::spawn_blocking(move || {
@@ -489,17 +500,19 @@ impl Runtime for SystemRuntime {
         .await
         .map_err(|_| Code::StartFailed)?;
         let key = if let Some(id) = &r.omlx_key_id {
-            Some(
-                KeychainSource(Arc::new(crate::keychain::OmlxKeychain))
-                    .secret(id)
-                    .await
-                    .map_err(secret_code)?,
-            )
+            let keys = self
+                .omlx_keys
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            Some(KeychainSource(keys).secret(id).await.map_err(secret_code)?)
         } else {
-            SystemProvisioner
-                .upstream_key()
-                .await?
-                .map(ApiKey::into_secret)
+            let provisioner = self
+                .provisioner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            provisioner.upstream_key().await?.map(ApiKey::into_secret)
         };
         {
             let url = r.omlx_url.as_deref().ok_or(Code::NotConfigured)?;
