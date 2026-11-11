@@ -345,21 +345,6 @@ impl Store {
         Ok(count)
     }
 
-    /// `inbound_allowlist` rows as `(source, actor)`.
-    ///
-    /// # Errors
-    /// Storage.
-    pub async fn list_inbound_allowlist(&self) -> Result<Vec<(String, String)>> {
-        let rows =
-            sqlx::query("SELECT source, actor FROM inbound_allowlist ORDER BY source, actor")
-                .fetch_all(self.pool())
-                .await?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get("source"), row.get("actor")))
-            .collect())
-    }
-
     /// Whether `(source, actor)` is on `inbound_allowlist`.
     ///
     /// # Errors
@@ -595,6 +580,172 @@ impl Store {
         .rows_affected();
         Ok(affected > 0)
     }
+
+    /// Every allowlist row, ordered by `(source, actor)`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn list_inbound_allowlist(&self) -> Result<Vec<InboundAllowEntry>> {
+        let rows = sqlx::query(
+            "SELECT source, actor, added_at, note FROM inbound_allowlist \
+             ORDER BY source, actor",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| InboundAllowEntry {
+                source: row.get("source"),
+                actor: row.get("actor"),
+                added_at: row.get("added_at"),
+                note: row.get("note"),
+            })
+            .collect())
+    }
+
+    /// The allowlist and the effective accept mode, read in one transaction.
+    ///
+    /// No policy row means `accept_mode` is `observe` and `updated_at` is
+    /// `None`. A caller that hashes `policy_version` uses this so the names
+    /// and the mode cannot come from two different commits.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn read_inbound_admission(&self) -> Result<InboundAdmissionView> {
+        let mut tx = self.pool().begin().await?;
+        let view = admission_view(&mut tx).await?;
+        tx.commit().await?;
+        Ok(view)
+    }
+
+    /// Replace the allowlist in one transaction and return that transaction's
+    /// view (the rows just written, plus the mode already stored).
+    ///
+    /// An empty slice clears the table. `added_at` is the caller's
+    /// [`format_inbound_timestamp`], the same stamp on every inserted row.
+    ///
+    /// # Errors
+    /// Storage, or an `added_at` that is not [`format_inbound_timestamp`].
+    pub async fn replace_inbound_allowlist(
+        &self,
+        entries: &[InboundAllowWrite],
+        added_at: &str,
+    ) -> Result<InboundAdmissionView> {
+        require_inbound_timestamp("added_at", added_at)?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("DELETE FROM inbound_allowlist")
+            .execute(&mut *tx)
+            .await?;
+        for entry in entries {
+            sqlx::query(
+                "INSERT INTO inbound_allowlist (source, actor, added_at, note) \
+                 VALUES (?, ?, ?, ?)",
+            )
+            .bind(&entry.source)
+            .bind(&entry.actor)
+            .bind(added_at)
+            .bind(&entry.note)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let view = admission_view(&mut tx).await?;
+        tx.commit().await?;
+        Ok(view)
+    }
+
+    /// The single policy row, if a caller has written one.
+    ///
+    /// No row means the table default `observe` has never been stored.
+    /// Callers that need a mode anyway treat that as `observe`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn get_inbound_policy(&self) -> Result<Option<InboundPolicy>> {
+        let row = sqlx::query("SELECT accept_mode, updated_at FROM inbound_policy WHERE id = 1")
+            .fetch_optional(self.pool())
+            .await?;
+        Ok(row.map(|row| InboundPolicy {
+            accept_mode: row.get("accept_mode"),
+            updated_at: row.get("updated_at"),
+        }))
+    }
+
+    /// Insert or replace the single policy row and return that transaction's
+    /// view (the mode just written, plus the allowlist already stored).
+    ///
+    /// `accept_mode` must be `off`, `observe`, or `auto`. `updated_at` is a
+    /// [`format_inbound_timestamp`]. This does not compute `policy_version`.
+    ///
+    /// # Errors
+    /// Storage, a mode outside the check, or a timestamp that is not
+    /// [`format_inbound_timestamp`].
+    pub async fn set_inbound_policy(
+        &self,
+        accept_mode: &str,
+        updated_at: &str,
+    ) -> Result<InboundAdmissionView> {
+        if !matches!(accept_mode, "off" | "observe" | "auto") {
+            return Err(StoreError::Conflict(
+                "inbound accept_mode must be off, observe, or auto".to_owned(),
+            ));
+        }
+        require_inbound_timestamp("updated_at", updated_at)?;
+        let mut tx = self.pool().begin().await?;
+        sqlx::query(
+            "INSERT INTO inbound_policy (id, accept_mode, updated_at) VALUES (1, ?, ?) \
+             ON CONFLICT(id) DO UPDATE SET \
+                 accept_mode = excluded.accept_mode, \
+                 updated_at = excluded.updated_at",
+        )
+        .bind(accept_mode)
+        .bind(updated_at)
+        .execute(&mut *tx)
+        .await?;
+        let view = admission_view(&mut tx).await?;
+        tx.commit().await?;
+        Ok(view)
+    }
+
+    /// One page of inbound rows, newest `at` first, then `id`.
+    ///
+    /// `text_preview` is `substr(text, 1, 50)` (SQLite characters, not
+    /// bytes). The full `text` and `meta` columns are not selected. `limit`
+    /// is 1..=101 so a caller can ask for one extra row and learn whether
+    /// another page exists. `before` is exclusive: rows strictly older than
+    /// that `(at, id)`.
+    ///
+    /// # Errors
+    /// Storage, or a `limit` outside 1..=101.
+    pub async fn list_inbound_event_summaries(
+        &self,
+        limit: i64,
+        before: Option<(&str, &str)>,
+    ) -> Result<Vec<InboundEventSummary>> {
+        if !(1..=101).contains(&limit) {
+            return Err(StoreError::Conflict(
+                "inbound event page limit must be 1..=101".to_owned(),
+            ));
+        }
+        let (before_at, before_id) = before.unzip();
+        let rows = sqlx::query(
+            "SELECT id, source, category, recipient_identity, thread_key, actor, human, \
+                    addressed, at, received_at, \
+                    CASE WHEN text IS NULL THEN NULL ELSE substr(text, 1, 50) END AS text_preview, \
+                    text_scrubbed_at, disposition, disposition_reason, policy_version, run_state \
+             FROM inbound_events \
+             WHERE (?1 IS NULL AND ?2 IS NULL) \
+                OR at < ?1 \
+                OR (at = ?1 AND id < ?2) \
+             ORDER BY at DESC, id DESC \
+             LIMIT ?3",
+        )
+        .bind(before_at)
+        .bind(before_id)
+        .bind(limit)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(summary_from_row).collect())
+    }
 }
 
 fn is_inbound_run_event_conflict(err: &dyn sqlx::error::DatabaseError) -> bool {
@@ -604,6 +755,114 @@ fn is_inbound_run_event_conflict(err: &dyn sqlx::error::DatabaseError) -> bool {
         return false;
     }
     err.message().contains("inbound_runs.event_id")
+}
+
+/// One allowlist row as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAllowEntry {
+    pub source: String,
+    pub actor: String,
+    pub added_at: String,
+    pub note: Option<String>,
+}
+
+/// A row the allowlist replace writes. `added_at` is supplied once for the batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAllowWrite {
+    pub source: String,
+    pub actor: String,
+    pub note: Option<String>,
+}
+
+/// The single `inbound_policy` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundPolicy {
+    pub accept_mode: String,
+    pub updated_at: String,
+}
+
+/// Allowlist plus the effective accept mode, from one transaction.
+///
+/// `accept_mode` is `observe` when no policy row has been written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundAdmissionView {
+    pub entries: Vec<InboundAllowEntry>,
+    pub accept_mode: String,
+    pub updated_at: Option<String>,
+}
+
+async fn admission_view(tx: &mut sqlx::SqliteConnection) -> Result<InboundAdmissionView> {
+    let policy = sqlx::query("SELECT accept_mode, updated_at FROM inbound_policy WHERE id = 1")
+        .fetch_optional(&mut *tx)
+        .await?;
+    let rows = sqlx::query(
+        "SELECT source, actor, added_at, note FROM inbound_allowlist ORDER BY source, actor",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let (accept_mode, updated_at) = match policy {
+        Some(row) => (
+            row.get::<String, _>("accept_mode"),
+            Some(row.get::<String, _>("updated_at")),
+        ),
+        None => ("observe".to_owned(), None),
+    };
+    Ok(InboundAdmissionView {
+        entries: rows
+            .into_iter()
+            .map(|row| InboundAllowEntry {
+                source: row.get("source"),
+                actor: row.get("actor"),
+                added_at: row.get("added_at"),
+                note: row.get("note"),
+            })
+            .collect(),
+        accept_mode,
+        updated_at,
+    })
+}
+
+/// A list-page row. `text_preview` is at most 50 characters. There is no
+/// full text and no `meta`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboundEventSummary {
+    pub id: String,
+    pub source: String,
+    pub category: String,
+    pub recipient_identity: Option<String>,
+    pub thread_key: Option<String>,
+    pub actor: Option<String>,
+    pub human: bool,
+    pub addressed: String,
+    pub at: String,
+    pub received_at: String,
+    pub text_preview: Option<String>,
+    pub text_scrubbed_at: Option<String>,
+    pub disposition: String,
+    pub disposition_reason: Option<String>,
+    pub policy_version: Option<String>,
+    pub run_state: Option<String>,
+}
+
+fn summary_from_row(row: SqliteRow) -> InboundEventSummary {
+    InboundEventSummary {
+        id: row.get("id"),
+        source: row.get("source"),
+        category: row.get("category"),
+        recipient_identity: row.get("recipient_identity"),
+        thread_key: row.get("thread_key"),
+        actor: row.get("actor"),
+        human: row.get::<i64, _>("human") != 0,
+        addressed: row.get("addressed"),
+        at: row.get("at"),
+        received_at: row.get("received_at"),
+        text_preview: row.get("text_preview"),
+        text_scrubbed_at: row.get("text_scrubbed_at"),
+        disposition: row.get("disposition"),
+        disposition_reason: row.get("disposition_reason"),
+        policy_version: row.get("policy_version"),
+        run_state: row.get("run_state"),
+    }
 }
 
 fn is_inflight_conflict(err: &dyn sqlx::error::DatabaseError) -> bool {
@@ -1649,5 +1908,108 @@ mod tests {
             started_at: None,
             ended_at: None,
         }
+    }
+
+    #[tokio::test]
+    async fn allowlist_policy_and_event_page_keep_the_body_out_of_the_summary() {
+        let store = Store::open_memory().await.unwrap();
+        assert!(store.get_inbound_policy().await.unwrap().is_none());
+        let written = store
+            .set_inbound_policy("auto", "2026-11-11T01:00:00Z")
+            .await
+            .unwrap();
+        assert_eq!(written.accept_mode, "auto");
+        assert_eq!(written.updated_at.as_deref(), Some("2026-11-11T01:00:00Z"));
+        assert!(written.entries.is_empty());
+        let policy = store.get_inbound_policy().await.unwrap().unwrap();
+        assert_eq!(policy.accept_mode, written.accept_mode);
+        assert_eq!(policy.updated_at, "2026-11-11T01:00:00Z");
+        // Dropping the accept_mode guard in `set_inbound_policy` turns this
+        // red: SQLite's CHECK then fails as `StoreError::Sqlx`, not Conflict,
+        // and the stored mode stays `auto`.
+        let rejected = store
+            .set_inbound_policy("sometimes", "2026-11-11T01:00:00Z")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(rejected, StoreError::Conflict(ref detail) if detail.contains("accept_mode")),
+            "{rejected:?}"
+        );
+        assert_eq!(
+            store
+                .get_inbound_policy()
+                .await
+                .unwrap()
+                .unwrap()
+                .accept_mode,
+            "auto"
+        );
+
+        let replaced = store
+            .replace_inbound_allowlist(
+                &[
+                    InboundAllowWrite {
+                        source: "wechat".into(),
+                        actor: "uid-b".into(),
+                        note: None,
+                    },
+                    InboundAllowWrite {
+                        source: "hyphae".into(),
+                        actor: "npub1".into(),
+                        note: Some("desk".into()),
+                    },
+                ],
+                "2026-11-11T01:00:01Z",
+            )
+            .await
+            .unwrap();
+        assert_eq!(replaced.accept_mode, "auto");
+        assert_eq!(replaced.entries[0].source, "hyphae");
+        assert_eq!(replaced.entries[1].actor, "uid-b");
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert_eq!(listed, replaced.entries);
+        store
+            .replace_inbound_allowlist(&[], "2026-11-11T01:00:02Z")
+            .await
+            .unwrap();
+        assert!(store.list_inbound_allowlist().await.unwrap().is_empty());
+
+        let empty = store.read_inbound_admission().await.unwrap();
+        assert!(empty.entries.is_empty());
+        assert_eq!(empty.accept_mode, "auto");
+        assert_eq!(empty.updated_at.as_deref(), Some("2026-11-11T01:00:00Z"));
+
+        let mut event = sample("hyphae:long", "npub1", "ignore", None);
+        event.text = Some(format!("{}SECRET-TAIL", "你".repeat(50)));
+        event.meta = Some("META-SECRET".into());
+        assert_eq!(
+            store.insert_inbound_event(&event).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        // Dropping the limit guard turns the `0` case red: SQLite `LIMIT 0`
+        // is an empty page, `Ok`, not `Conflict`. `102` is past the 1..=101
+        // window the route uses for one extra row.
+        for limit in [0, 102, -1] {
+            let rejected = store
+                .list_inbound_event_summaries(limit, None)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(rejected, StoreError::Conflict(ref detail) if detail.contains("limit")),
+                "{limit} {rejected:?}"
+            );
+        }
+        let page = store.list_inbound_event_summaries(2, None).await.unwrap();
+        assert_eq!(page.len(), 1);
+        let preview = page[0].text_preview.as_deref().unwrap();
+        assert_eq!(preview.chars().count(), 50);
+        assert!(!preview.contains("SECRET-TAIL"));
+        let stored = store
+            .get_inbound_event("hyphae:long")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.text.unwrap().contains("SECRET-TAIL"));
+        assert_eq!(stored.meta.as_deref(), Some("META-SECRET"));
     }
 }

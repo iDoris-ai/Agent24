@@ -135,7 +135,8 @@ pub use decision_log::{
     NewDecisionOutcome,
 };
 pub use inbound::{
-    InboundEvent, InboundInsert, InboundReconcile, InboundRunLink, NewInboundEvent,
+    InboundAdmissionView, InboundAllowEntry, InboundAllowWrite, InboundEvent, InboundEventSummary,
+    InboundInsert, InboundPolicy, InboundReconcile, InboundRunLink, NewInboundEvent,
     format_inbound_timestamp,
 };
 pub use legacy_recovery::{
