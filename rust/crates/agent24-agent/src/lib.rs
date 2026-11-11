@@ -6765,6 +6765,87 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn an_empty_inbound_origin_is_refused() {
+        // Mutation: drop the empty channel / event_id guard and both calls
+        // link a run. The event rows exist, so the foreign key does not refuse them.
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        assert_eq!(
+            store
+                .insert_inbound_event(&inbound_event("hyphae:empty-channel", "hello"))
+                .await
+                .unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        let mut blank = inbound_event("", "hello");
+        blank.actor = Some("npub-blank".to_owned());
+        assert_eq!(
+            store.insert_inbound_event(&blank).await.unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+
+        let err = manager
+            .start_run_inbound(
+                inbound_create("sess_empty_channel"),
+                InboundOrigin {
+                    event_id: "hyphae:empty-channel".to_owned(),
+                    channel: String::new(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::Store(StoreError::Conflict(ref message))
+                    if message == "inbound origin is empty"
+            ),
+            "{err:?}"
+        );
+
+        let err = manager
+            .start_run_inbound(
+                inbound_create("sess_empty_event"),
+                InboundOrigin {
+                    event_id: String::new(),
+                    channel: "hyphae".to_owned(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AgentError::Store(StoreError::Conflict(ref message))
+                    if message == "inbound origin is empty"
+            ),
+            "{err:?}"
+        );
+
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(runs, 0);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
+    }
+
+    fn inbound_create(session_id: &str) -> RunCreate {
+        RunCreate {
+            idoris_headroom_confirmed: false,
+            session_id: Some(session_id.to_owned()),
+            workspace_id: None,
+            prompt: "hello".to_owned(),
+            model_override: None,
+            mode: agent24_protocol::RunMode::Normal,
+            knowledge_binding_id: None,
+        }
+    }
+
+    #[tokio::test]
     async fn inbound_remember_is_not_a_user_assertion() {
         let (manager, store, kv) =
             manager_with_memory(Arc::new(FixedProvider), Arc::new(UnusedSummarizer)).await;
