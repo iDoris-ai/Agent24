@@ -2,7 +2,7 @@
 
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
-import { registerIpcHandlers } from './ipc/index'
+import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
@@ -742,6 +742,9 @@ function refreshTray(): void {
 const shutdown = createCreativeShutdown({
   prepare: () => {
     isQuitting = true
+    // before-quit below already started this (SIGTERM is synchronous there).
+    // stop() awaits the same promise, capped by OMLX_QUIT_STOP_BUDGET_MS.
+    void ensureOwnedOmlxQuit()
     openDesignComponent?.abort('Agent24 is quitting')
     void presencePoller?.stop()
     try {
@@ -756,7 +759,12 @@ const shutdown = createCreativeShutdown({
       console.error('[main] failed to tear down the Creative view before quit', error)
     }
   },
-  stop: async () => { await creativeServeWeb?.shutdown() },
+  stop: async () => {
+    await Promise.all([
+      creativeServeWeb?.shutdown(),
+      ensureOwnedOmlxQuit(),
+    ])
+  },
   cleanup: () => {
     if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
     stopOpenDesignReady?.()
@@ -768,6 +776,9 @@ const shutdown = createCreativeShutdown({
   },
   quit: () => app.quit(),
 })
+// SIGTERM for an oMLX this process spawned, before shutdown's microtask.
+// ensureOwnedOmlxQuit sends the signal before it returns; stop() waits.
+app.on('before-quit', () => { void ensureOwnedOmlxQuit() })
 app.on('before-quit', shutdown.beforeQuit)
 // KB-C2-03: app quit is binding-level destruction for the KnowledgeView (U4.8);
 // from here on it refuses to open again (ADR §4: stop new calls, then destroy).

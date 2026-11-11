@@ -380,6 +380,8 @@ export interface OmlxStartResult {
 
 export interface OmlxStopResult {
   ok: boolean
+  /** False when this app had not spawned oMLX, so nothing was signalled. */
+  stopped: boolean
 }
 
 export interface OmlxWarmupResult {

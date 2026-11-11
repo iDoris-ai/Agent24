@@ -200,7 +200,7 @@ describe('SettingsPage', () => {
       apiKey: 'test',
       models: ['Qwen3-8B'],
     })
-    mockOmlxStop.mockResolvedValue(undefined)
+    mockOmlxStop.mockResolvedValue({ ok: true, stopped: true })
 
     await renderPage()
     await openTab('Models')
@@ -213,6 +213,27 @@ describe('SettingsPage', () => {
     await waitFor(() => {
       expect(screen.getByText('Disconnected')).toBeInTheDocument()
     })
+  })
+
+  it('stays connected when stop reports the oMLX was not started here', async () => {
+    mockOmlxDetect.mockResolvedValue({
+      url: 'http://127.0.0.1:8088',
+      apiKey: 'test',
+      models: ['Qwen3-8B'],
+    })
+    mockOmlxStop.mockResolvedValue({ ok: true, stopped: false })
+
+    await renderPage()
+    await openTab('Models')
+    await waitFor(() => screen.getByText('Connected'))
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Stop/i }))
+    })
+    expect(mockOmlxStop).toHaveBeenCalled()
+    expect(screen.getByText('Connected')).toBeInTheDocument()
+    expect(screen.getByText(/1 model/)).toBeInTheDocument()
+    expect(screen.getByText('This oMLX was not started by this app. Stop it in the terminal that started it.')).toBeInTheDocument()
   })
 
   it('test connection shows result', async () => {

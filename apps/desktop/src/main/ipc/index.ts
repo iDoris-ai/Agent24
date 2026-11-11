@@ -24,6 +24,7 @@ import {
 } from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
+import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
 import { importFile } from '../documents-import'
@@ -51,30 +52,46 @@ const BACKEND_HOST = '127.0.0.1'
 // oMLX server management. Only the child this app spawned; never a server the
 // user started themselves (FU-114).
 let omlxProcess: ChildProcess | null = null
+/** In-flight stop. start and stop both await it so they cannot overlap. */
+let omlxStopping: Promise<void> | null = null
+/** Quit latch so before-quit and the shutdown wait share one bounded stop. */
+let ownedOmlxQuit: Promise<boolean> | null = null
 
 /** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
  *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
  *  `detached` plus a PGID-reuse check this call site does not have. */
 const OMLX_STOP_GRACE_MS = 5_000
+/** After SIGKILL, give up waiting for `exit` so stop cannot hang forever. */
+const OMLX_KILL_FALLBACK_MS = 2_000
+/** before-quit waits at most grace + SIGKILL fallback + a little slack. */
+export const OMLX_QUIT_STOP_BUDGET_MS = OMLX_STOP_GRACE_MS + OMLX_KILL_FALLBACK_MS + 1_000
 let omlxStopGraceMs = OMLX_STOP_GRACE_MS
+let omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
 
 export function setOmlxStopGraceMsForTests(ms: number): void {
   omlxStopGraceMs = ms
 }
 
+export function setOmlxKillFallbackMsForTests(ms: number): void {
+  omlxKillFallbackMs = ms
+}
+
 /** Drop the owned handle without signalling it. */
 export function resetOmlxProcessForTests(): void {
   omlxProcess = null
+  omlxStopping = null
+  ownedOmlxQuit = null
   omlxStopGraceMs = OMLX_STOP_GRACE_MS
+  omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
 }
 
 function omlxExited(child: ChildProcess): boolean {
   return child.exitCode != null || child.signalCode != null
 }
 
-/** SIGTERM, then SIGKILL after the grace. Resolves on `exit` (or ESRCH when
- *  the pid is already gone). The caller's slot must already have released
- *  `child`, so a start during this wait records a different process. */
+/** SIGTERM, then SIGKILL after the grace. Resolves on `exit`, when `kill`
+ *  reports the pid is already gone, or when `exit` never follows SIGKILL.
+ *  The caller's slot must already have released `child`. */
 function terminateOwnedOmlx(child: ChildProcess): Promise<void> {
   if (omlxExited(child)) return Promise.resolve()
   return new Promise((resolve) => {
@@ -89,21 +106,30 @@ function terminateOwnedOmlx(child: ChildProcess): Promise<void> {
       resolve()
     }
     const onExit = (): void => finish()
-    // Spawn failure emits `error` and may never emit `exit`. A kill failure
-    // while the pid is still live must not finish early — the grace timer
-    // still has to escalate.
+    // Spawn failure emits `error` and may never emit `exit`.
     const onError = (): void => {
       if (child.pid == null || omlxExited(child)) finish()
     }
     const signal = (name: NodeJS.Signals): void => {
+      // ChildProcess.kill returns false on ESRCH (pid already gone). It does
+      // not throw for that. A throw here is a bad signal, not a missing pid;
+      // leave the grace timer to escalate.
+      let delivered = false
       try {
-        child.kill(name)
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException).code
-        if (code === 'ESRCH') finish()
+        delivered = child.kill(name)
+      } catch {
+        return
       }
+      if (!delivered) finish()
     }
-    timer = setTimeout(() => signal('SIGKILL'), omlxStopGraceMs)
+    const escalate = (): void => {
+      if (settled) return
+      signal('SIGKILL')
+      if (settled) return
+      timer = setTimeout(finish, omlxKillFallbackMs)
+      timer.unref?.()
+    }
+    timer = setTimeout(escalate, omlxStopGraceMs)
     timer.unref?.()
     child.on('exit', onExit)
     child.on('error', onError)
@@ -113,6 +139,39 @@ function terminateOwnedOmlx(child: ChildProcess): Promise<void> {
     }
     signal('SIGTERM')
   })
+}
+
+/** Stop the child this app spawned. False when the slot was empty or a stop
+ *  was already in flight (that stop owns the child). SIGTERM is sent before
+ *  the first await when this call owns the child. */
+export async function stopOwnedOmlx(): Promise<boolean> {
+  if (omlxStopping) {
+    await omlxStopping
+    return false
+  }
+  const child = omlxProcess
+  if (!child) return false
+  omlxProcess = null
+  const stopping = terminateOwnedOmlx(child).finally(() => {
+    if (omlxStopping === stopping) omlxStopping = null
+  })
+  omlxStopping = stopping
+  await stopping
+  return true
+}
+
+/** before-quit entry. The first call sends SIGTERM before it returns, then
+ *  waits at most {@link OMLX_QUIT_STOP_BUDGET_MS} (same shape as
+ *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
+export function ensureOwnedOmlxQuit(): Promise<boolean> {
+  if (ownedOmlxQuit) return ownedOmlxQuit
+  const stopping = stopOwnedOmlx()
+  const bounded = stopWithin({ stop: () => stopping }, OMLX_QUIT_STOP_BUDGET_MS)
+  ownedOmlxQuit = bounded
+  void bounded.finally(() => {
+    if (ownedOmlxQuit === bounded) ownedOmlxQuit = null
+  })
+  return bounded
 }
 
 /** oMLX API key the user configured for THIS app (env `OMLX_API_KEY`, the same
@@ -612,7 +671,11 @@ export function registerIpcHandlers(options: {
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
-  app.on('before-quit', () => { quitting = true })
+  app.on('before-quit', () => {
+    quitting = true
+    // SIGTERM goes out before this listener returns when we own the child.
+    void ensureOwnedOmlxQuit()
+  })
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   // oMLX: auto-detect running server
@@ -644,7 +707,8 @@ export function registerIpcHandlers(options: {
   })
 
   // oMLX: start server via `omlx serve`
-  handle(IpcChannels.OmlxStart, (_event, port: unknown, apiKey: unknown): OmlxStartResult => {
+  handle(IpcChannels.OmlxStart, async (_event, port: unknown, apiKey: unknown): Promise<OmlxStartResult> => {
+    if (omlxStopping) await omlxStopping
     const p = port === undefined ? 8000 : parsePort(port)
     if (p === null) return { ok: false, url: '', error: 'invalid port (integer 1-65535)' }
     if (omlxProcess) return { ok: true, url: `http://127.0.0.1:${p}` }
@@ -689,13 +753,11 @@ export function registerIpcHandlers(options: {
   })
 
   // oMLX: stop the server this app spawned. An empty slot means we did not
-  // start one — do not signal anything else (FU-114).
+  // start one — do not signal anything else (FU-114). `stopped` is false then
+  // so the renderer does not pretend the external server disconnected.
   handle(IpcChannels.OmlxStop, async (): Promise<OmlxStopResult> => {
-    const child = omlxProcess
-    if (!child) return { ok: true }
-    if (omlxProcess === child) omlxProcess = null
-    await terminateOwnedOmlx(child)
-    return { ok: true }
+    const stopped = await stopOwnedOmlx()
+    return { ok: true, stopped }
   })
   // llm:status — current active LLM provider + model
   handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
