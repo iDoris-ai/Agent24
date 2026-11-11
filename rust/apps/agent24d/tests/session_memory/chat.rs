@@ -3,6 +3,12 @@
 //! parallel implementation) — these tests exercise that surface directly,
 //! the same way `recall.rs`/`retain.rs` exercise the run path: a real
 //! router, a mock provider, and the actual HTTP handler (`crate::routes::post_chat`).
+//!
+//! These ids are not inserted into `sessions`. A desktop `/chat` id is
+//! client-generated and usually has no row; a missing row is the local
+//! owner and must still be written as `UserSaid`. A row whose channel is
+//! not `desktop`/`cli`/`tui` (the old fixture used `test`) is a non-local
+//! channel and skips the qualified assertion.
 
 use super::*;
 use agent24_memory::{
@@ -73,7 +79,6 @@ async fn explicit_remember_over_chat_stores_a_qualified_assertion() {
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider).await;
-    ensure_session(&state, "chat-session-a").await;
 
     let (status, body) = post_chat_with(&state, Some("chat-session-a"), "记住我对花生过敏").await;
 
@@ -101,8 +106,6 @@ async fn a_remember_after_client_assistant_history_is_stored_as_unknown() {
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider).await;
-    ensure_session(&state, "chat-session-history").await;
-    ensure_session(&state, "chat-session-fresh").await;
 
     // Control first (a later recall of the unknown fact would itself make
     // the control unknown): a first-turn remember without assistant history.
@@ -147,7 +150,6 @@ async fn a_remember_after_any_non_user_client_history_is_stored_as_unknown() {
         let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
         let provider = Arc::new(Provider::default());
         let state = app(kv.clone(), dir.path(), provider).await;
-        ensure_session(&state, "chat-session-role").await;
         let (status, _) = post_chat_messages(
             &state,
             Some("chat-session-role"),
@@ -186,7 +188,6 @@ async fn a_chat_turn_after_a_restricted_reply_remembers_as_restricted() {
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider).await;
-    ensure_session(&state, "chat-session-restricted").await;
     let owner = personal_owner(&kv).await;
     let restricted = agent24_store::AssertionSourceRef::from_sources([(
         "seed".to_owned(),
@@ -258,7 +259,6 @@ async fn a_chat_turn_whose_session_floor_cannot_be_written_fails_before_the_mode
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider.clone()).await;
-    ensure_session(&state, "chat-session-nofloor").await;
     sqlx::raw_sql(
         "CREATE TRIGGER no_floor BEFORE INSERT ON session_source_floor \
          BEGIN SELECT RAISE(ABORT, 'no'); END;",
@@ -286,8 +286,6 @@ async fn a_later_chat_in_a_different_session_recalls_the_same_owners_fact() {
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider.clone()).await;
-    ensure_session(&state, "chat-session-s1").await;
-    ensure_session(&state, "chat-session-s2").await;
     let mut events = state.events.subscribe();
 
     post_chat_with(&state, Some("chat-session-s1"), "记住我对花生过敏").await;
@@ -323,7 +321,6 @@ async fn paused_memory_skips_the_store_and_tells_the_model_so_over_chat() {
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider.clone()).await;
-    ensure_session(&state, "chat-session-paused").await;
     let owner = personal_owner(&kv).await;
     kv.set_memory_enabled(&owner, false).await.unwrap();
     let mut events = state.events.subscribe();
@@ -396,7 +393,6 @@ async fn a_retain_failure_still_returns_200_with_content() {
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider).await;
     let session_id = "chat-session-retain-failure";
-    ensure_session(&state, session_id).await;
     let owner = personal_owner(&kv).await;
     let object = "我对花生过敏";
     // Same technique as retain.rs's `audit_id_conflict_...` test: pre-occupy
@@ -476,7 +472,6 @@ async fn pause_toggled_off_during_the_model_call_reports_paused_not_saved_with_z
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider.clone()).await;
-    ensure_session(&state, "chat-session-race-off").await;
     let owner = personal_owner(&kv).await;
     // Active at prelude time: `chat_memory_prelude` must see Active and must
     // NOT inject the paused notice.
@@ -522,7 +517,6 @@ async fn pause_toggled_on_during_the_model_call_reports_saved_with_a_real_row() 
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let provider = Arc::new(Provider::default());
     let state = app(kv.clone(), dir.path(), provider.clone()).await;
-    ensure_session(&state, "chat-session-race-on").await;
     let owner = personal_owner(&kv).await;
     kv.set_memory_enabled(&owner, false).await.unwrap();
     *provider.pause_toggle.lock().unwrap() = Some((kv.clone(), owner.clone(), true));
@@ -590,7 +584,6 @@ async fn ordinary_chat_turn_on_a_full_partition_is_not_saved_with_a_typed_code()
     let dir = tempfile::tempdir().unwrap();
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
-    ensure_session(&state, "chat-full-ordinary").await;
     set_rows(dir.path(), 0).await;
     let mut events = state.events.subscribe();
 
@@ -617,7 +610,6 @@ async fn explicit_remember_on_a_full_partition_is_failed_with_a_typed_code() {
     let dir = tempfile::tempdir().unwrap();
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
-    ensure_session(&state, "chat-full-explicit").await;
     set_rows(dir.path(), 0).await;
 
     let (status, body) = post_chat_with(&state, Some("chat-full-explicit"), "记住我喜欢茶").await;
@@ -633,7 +625,6 @@ async fn explicit_remember_whose_turn_fits_but_assertion_does_not_is_partial_ove
     let dir = tempfile::tempdir().unwrap();
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
-    ensure_session(&state, "chat-full-partial").await;
     // The turn's two rows fit; the assertion's audit row is the third.
     set_rows(dir.path(), 2).await;
 
@@ -659,7 +650,6 @@ async fn chat_with_room_never_carries_a_memory_error_code() {
     let dir = tempfile::tempdir().unwrap();
     let kv = KvStore::open(&dir.path().join("memory.db")).await.unwrap();
     let state = app(kv.clone(), dir.path(), Arc::new(Provider::default())).await;
-    ensure_session(&state, "chat-room").await;
     let (_, body) = post_chat_with(&state, Some("chat-room"), "记住我喜欢茶").await;
     assert_eq!(body["memory_receipt"], json!("saved"));
     assert!(body.get("memory_error_code").is_none(), "{body}");

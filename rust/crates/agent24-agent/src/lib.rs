@@ -7210,6 +7210,22 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn chat_remember_without_a_session_row_stays_user_said() {
+        let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
+        assert!(store.get_session("s_absent").await.unwrap().is_none());
+        let outcome = manager
+            .chat_remember_turn("run_absent", "s_absent", PIN_PROMPT, "ok", chat_source())
+            .await;
+        assert_eq!(outcome, MemoryWriteOutcome::Saved);
+        assert_eq!(assertion_count(&kv).await, 1);
+        assert_eq!(
+            user_event_origin(&kv, PIN_PROMPT).await,
+            vec![("chat".to_owned(), "user_said".to_owned())]
+        );
+        assert!(skipped_reasons(&log).is_empty());
+    }
+
+    #[tokio::test]
     async fn chat_remember_on_a_non_local_channel_is_not_user_said() {
         let (manager, store, kv, log) = manager_with_memory_log(Arc::new(FixedProvider)).await;
         for (id, channel) in [("s_hy", "hyphae"), ("s_sch", "schedule")] {
