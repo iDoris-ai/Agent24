@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord, type ChatHistorySummary } from '../../../shared/chat-history'
+import type { RunEvent } from '../../../shared/ipc-types'
 import { Sidebar } from '../../capabilities/Sidebar'
 import { CapabilitiesContext, NavPrefsContext } from '../../capabilities/types'
 import { CAPABILITIES } from '../../capabilities/registry'
@@ -24,6 +25,7 @@ let store: ReturnType<typeof createChatHistoryStore>
 let runs: Record<string, string>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 let bridge: Record<string, ReturnType<typeof vi.fn>>
+let emit: (event: RunEvent) => void
 
 /** A conversation the user started, saved by the page. */
 function userRecord(id: string, hour: number): ChatHistoryRecord {
@@ -62,8 +64,13 @@ beforeEach(() => {
     organize: wrap((id: string, p: unknown) => store.organize(id, p)), markSeen: wrap((id: string) => store.markSeen(id)),
   }
   const chatGroups = { get: wrap(() => store.groups()), setCollapsed: wrap((t: string, c: boolean) => store.setCollapsed(t, c)) }
+  const listeners = new Set<(e: RunEvent) => void>()
+  emit = event => { for (const l of listeners) l(event) }
   Object.defineProperty(window, 'agent24', {
-    value: { chatHistory: bridge, chatGroups, backendProxy: proxy, onRunEvent: () => () => {} },
+    value: {
+      chatHistory: bridge, chatGroups, backendProxy: proxy,
+      onRunEvent: (cb: (e: RunEvent) => void) => { listeners.add(cb); return () => listeners.delete(cb) },
+    },
     writable: true, configurable: true,
   })
   resetHistoryStore()
@@ -205,6 +212,12 @@ describe('the sidebar\'s "Needs you" (M6 C2, T-1)', () => {
   it('counts the conversations not archived with something waiting on the user or a task waiting on an approval; not what is unseen', async () => {
     const waiting = scheduleWith('run_wait')
     runs.run_wait = 'awaiting_approval'
+    // QA N6 under the new count: an approval of a run no conversation has a
+    // card for is put in the assistant's own conversation by main (M4 A6,
+    // main.ts approval.required / catch-up), and counts from there.
+    const cli = store.create({ title: '助理发起', title_source: 'assistant', initiator: 'assistant' }).id
+    store.appendRun(cli, 'run_cli', 'task')
+    runs.run_cli = 'awaiting_approval'
     scheduleWith('run_done')
     runs.run_done = 'completed'
     store.save(userRecord('chat_confirm', 2))
@@ -214,12 +227,15 @@ describe('the sidebar\'s "Needs you" (M6 C2, T-1)', () => {
     store.organize('chat_archived', { archived: true })
     await refreshHistory()
     renderSidebar()
-    await waitFor(() => expect(assistant()).toHaveTextContent(/^助理2$/))
-    // Decided: one fewer.
+    await waitFor(() => expect(assistant()).toHaveTextContent(/^助理3$/))
+    // Decided, confirmed: none left. Seeing what is unseen changes nothing.
     runs.run_wait = 'running'
+    runs.run_cli = 'completed'
     store.markSeen(waiting)
     store.clearPending('chat_confirm', 'p1')
     await act(() => refreshHistory())
+    act(() => emit({ type: 'approval.resolved', run_id: 'run_wait' }))
+    act(() => emit({ type: 'run.completed', run_id: 'run_cli' }))
     await waitFor(() => expect(assistant()).toHaveTextContent(/^助理$/))
   })
 
