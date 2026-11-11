@@ -7,7 +7,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { EventEmitter } from 'node:events'
 import type { AddressInfo } from 'node:net'
+import type { ChildProcess } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
@@ -21,6 +24,8 @@ const promptRestorePassword = vi.fn()
 const promptUnlockPassword = vi.fn()
 const promptHomeImportPassword = vi.fn()
 const execFileMock = vi.fn()
+/** When set, the execFile mock returns this child instead of a dummy. */
+const omlxExecFile: { current: ((...args: unknown[]) => unknown) | null } = { current: null }
 const appListeners = new Map<string, Set<() => void>>()
 const appFocus = vi.fn()
 function listenApp(event: string, fn: () => void): void {
@@ -108,6 +113,9 @@ vi.mock('node:child_process', async (orig) => ({
   ...(await orig<typeof import('node:child_process')>()),
   execFile: (...a: unknown[]) => {
     execFileMock(...a)
+    // Only the omlx spawn is replaced. A `pkill` call is recorded and not executed,
+    // so the suite cannot signal a server the user started themselves.
+    if (a[0] === 'omlx' && omlxExecFile.current) return omlxExecFile.current(...a)
     return { on: vi.fn(), kill: vi.fn() }
   },
 }))
@@ -121,7 +129,7 @@ vi.mock('../backend-manager', () => ({
 
 import { IpcChannels } from '../../shared/ipc-types'
 import { createIpcGuard } from './guard'
-import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers, resetLastCommExportForTests } from './index'
+import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers, resetLastCommExportForTests, resetOmlxProcessForTests, setOmlxStopGraceMsForTests } from './index'
 
 const APP_URL = 'file:///app/renderer/index.html'
 const mainFrame = { url: APP_URL }
@@ -284,6 +292,8 @@ beforeEach(() => {
   for (const r of hungExports.splice(0)) r.end(JSON.stringify({ ok: true, data: {} }))
   resetLastCommExportForTests()
   execFileMock.mockReset()
+  omlxExecFile.current = null
+  resetOmlxProcessForTests()
 })
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- tests poke at several result shapes
@@ -1832,6 +1842,184 @@ describe('A4 oMLX IPC hardening', () => {
     } catch { /* grep exit 1 = no match */ }
     // This test file builds the needle by concatenation, so it never matches itself.
     expect(out).toBe('')
+  })
+})
+
+describe('FU-114 OmlxStop only kills the process this app started', () => {
+  function alive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Fields ChildProcess marks readonly; the fakes assign them. */
+  type MutableChild = EventEmitter & {
+    pid: number
+    exitCode: number | null
+    signalCode: NodeJS.Signals | null
+    kill: ChildProcess['kill']
+    signals: Array<NodeJS.Signals | number | undefined>
+  }
+
+  function asChild(child: MutableChild): ChildProcess {
+    return child as unknown as ChildProcess
+  }
+
+  /** Exits on the first signal, so stop resolves without waiting out the grace. */
+  function dyingChild(): ChildProcess {
+    const child: MutableChild = Object.assign(new EventEmitter(), {
+      pid: 42,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      signals: [] as Array<NodeJS.Signals | number | undefined>,
+      kill: (() => true) as ChildProcess['kill'],
+    })
+    child.kill = (() => {
+      setImmediate(() => child.emit('exit', null, 'SIGTERM'))
+      return true
+    }) as ChildProcess['kill']
+    return asChild(child)
+  }
+
+  /** Records signals and stays up until the test emits `exit`. */
+  function heldChild(pid: number): MutableChild {
+    const child: MutableChild = Object.assign(new EventEmitter(), {
+      pid,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      signals: [] as Array<NodeJS.Signals | number | undefined>,
+      kill: (() => true) as ChildProcess['kill'],
+    })
+    child.kill = ((signal?: NodeJS.Signals | number) => {
+      child.signals.push(signal)
+      return true
+    }) as ChildProcess['kill']
+    return child
+  }
+
+  function spawnNode(script: string, extraArgs: string[] = []): ChildProcess {
+    // stdout stays paused so `untilReady` still sees the buffered "ready" line.
+    return spawn(process.execPath, ['-e', script, ...extraArgs], { stdio: ['ignore', 'pipe', 'ignore'] })
+  }
+
+  async function untilReady(child: ChildProcess): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('child did not become ready')), 2_000)
+      const onData = (buf: Buffer): void => {
+        if (!buf.toString().includes('ready')) return
+        clearTimeout(timer)
+        child.stdout?.off('data', onData)
+        resolve()
+      }
+      child.stdout?.on('data', onData)
+      child.once('exit', () => {
+        clearTimeout(timer)
+        reject(new Error('child exited before ready'))
+      })
+    })
+  }
+
+  function killQuiet(pid: number | undefined): void {
+    if (pid == null) return
+    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+  }
+
+  it('OmlxStop never invokes pkill', async () => {
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true })
+    omlxExecFile.current = () => dyingChild()
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true })
+    expect(execFileMock.mock.calls.map((c) => c[0])).not.toContain('pkill')
+  })
+
+  it('leaves an externally started omlx serve running', async () => {
+    // argv contains "omlx serve", which `pkill -f 'omlx serve'` would match.
+    const external = spawnNode(
+      'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)',
+      ['omlx', 'serve'],
+    )
+    try {
+      await untilReady(external)
+      expect(external.pid).toEqual(expect.any(Number))
+      expect(alive(external.pid!)).toBe(true)
+      expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true })
+      expect(alive(external.pid!)).toBe(true)
+      expect(execFileMock.mock.calls.map((c) => c[0])).not.toContain('pkill')
+    } finally {
+      killQuiet(external.pid)
+    }
+  })
+
+  it('stops the process this app spawned', async () => {
+    const owned: { current: ChildProcess | null } = { current: null }
+    omlxExecFile.current = () => {
+      owned.current = spawnNode('process.stdout.write("ready\\n"); setInterval(() => {}, 1000)')
+      return owned.current
+    }
+    try {
+      await call(IpcChannels.OmlxStart, 8123, 'k')
+      const child = owned.current
+      if (!child?.pid) throw new Error('owned child missing')
+      await untilReady(child)
+      const started = Date.now()
+      expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true })
+      expect(alive(child.pid)).toBe(false)
+      // Died on SIGTERM, inside the grace window.
+      expect(Date.now() - started).toBeLessThan(5_000)
+    } finally {
+      killQuiet(owned.current?.pid)
+    }
+  })
+
+  it('escalates to SIGKILL when SIGTERM is ignored', async () => {
+    const graceMs = 400
+    setOmlxStopGraceMsForTests(graceMs)
+    const owned: { current: ChildProcess | null } = { current: null }
+    omlxExecFile.current = () => {
+      owned.current = spawnNode('process.on("SIGTERM", () => {}); process.stdout.write("ready\\n"); setInterval(() => {}, 1000)')
+      return owned.current
+    }
+    try {
+      await call(IpcChannels.OmlxStart, 8123, 'k')
+      const child = owned.current
+      if (!child?.pid) throw new Error('owned child missing')
+      await untilReady(child)
+      const started = Date.now()
+      expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true })
+      const elapsed = Date.now() - started
+      expect(alive(child.pid)).toBe(false)
+      expect(elapsed).toBeGreaterThanOrEqual(graceMs - 50)
+    } finally {
+      killQuiet(owned.current?.pid)
+    }
+  })
+
+  it('does not clear a process started while stop is in flight', async () => {
+    setOmlxStopGraceMsForTests(30)
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7_000 + children.length)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    const stopping = call(IpcChannels.OmlxStop)
+    await vi.waitFor(() => expect(children[0]?.signals).toContain('SIGKILL'))
+    await call(IpcChannels.OmlxStart, 8124, 'k')
+    expect(children).toHaveLength(2)
+    children[0]!.emit('exit', null, 'SIGKILL')
+    expect(await stopping).toEqual({ ok: true })
+    // The old exit must not drop the child started during the stop.
+    await call(IpcChannels.OmlxStart, 8125, 'k')
+    expect(children).toHaveLength(2)
+    expect(children[1]!.signals).toEqual([])
+    const stoppingNext = call(IpcChannels.OmlxStop)
+    await vi.waitFor(() => expect(children[1]!.signals).toContain('SIGKILL'))
+    children[1]!.emit('exit', null, 'SIGKILL')
+    await stoppingNext
   })
 })
 

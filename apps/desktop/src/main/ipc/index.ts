@@ -48,8 +48,72 @@ import type {
 
 const BACKEND_HOST = '127.0.0.1'
 
-// oMLX server management
+// oMLX server management. Only the child this app spawned; never a server the
+// user started themselves (FU-114).
 let omlxProcess: ChildProcess | null = null
+
+/** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
+ *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
+ *  `detached` plus a PGID-reuse check this call site does not have. */
+const OMLX_STOP_GRACE_MS = 5_000
+let omlxStopGraceMs = OMLX_STOP_GRACE_MS
+
+export function setOmlxStopGraceMsForTests(ms: number): void {
+  omlxStopGraceMs = ms
+}
+
+/** Drop the owned handle without signalling it. */
+export function resetOmlxProcessForTests(): void {
+  omlxProcess = null
+  omlxStopGraceMs = OMLX_STOP_GRACE_MS
+}
+
+function omlxExited(child: ChildProcess): boolean {
+  return child.exitCode != null || child.signalCode != null
+}
+
+/** SIGTERM, then SIGKILL after the grace. Resolves on `exit` (or ESRCH when
+ *  the pid is already gone). The caller's slot must already have released
+ *  `child`, so a start during this wait records a different process. */
+function terminateOwnedOmlx(child: ChildProcess): Promise<void> {
+  if (omlxExited(child)) return Promise.resolve()
+  return new Promise((resolve) => {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      child.removeListener('exit', onExit)
+      child.removeListener('error', onError)
+      resolve()
+    }
+    const onExit = (): void => finish()
+    // Spawn failure emits `error` and may never emit `exit`. A kill failure
+    // while the pid is still live must not finish early — the grace timer
+    // still has to escalate.
+    const onError = (): void => {
+      if (child.pid == null || omlxExited(child)) finish()
+    }
+    const signal = (name: NodeJS.Signals): void => {
+      try {
+        child.kill(name)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (code === 'ESRCH') finish()
+      }
+    }
+    timer = setTimeout(() => signal('SIGKILL'), omlxStopGraceMs)
+    timer.unref?.()
+    child.on('exit', onExit)
+    child.on('error', onError)
+    if (omlxExited(child)) {
+      finish()
+      return
+    }
+    signal('SIGTERM')
+  })
+}
 
 /** oMLX API key the user configured for THIS app (env `OMLX_API_KEY`, the same
  *  variable oMLX itself reads). Empty = none: probes that need a key are
@@ -590,8 +654,12 @@ export function registerIpcHandlers(options: {
     // -> auth.api_key), so no `--api-key` flag is needed.
     const env: NodeJS.ProcessEnv = { ...process.env }
     if (typeof apiKey === 'string' && apiKey) env['OMLX_API_KEY'] = apiKey
-    omlxProcess = execFile('omlx', ['serve', '--port', String(p)], { env })
-    omlxProcess.on('exit', () => { omlxProcess = null })
+    const child = execFile('omlx', ['serve', '--port', String(p)], { env })
+    omlxProcess = child
+    // Identity check: this child's exit must not clear a newer start (FU-114).
+    child.on('exit', () => {
+      if (omlxProcess === child) omlxProcess = null
+    })
     return { ok: true, url: `http://127.0.0.1:${p}` }
   })
 
@@ -620,13 +688,13 @@ export function registerIpcHandlers(options: {
     })
   })
 
-  // oMLX: stop server — kills both app-spawned and externally-started processes
-  handle(IpcChannels.OmlxStop, (): OmlxStopResult => {
-    if (omlxProcess) { omlxProcess.kill('SIGTERM'); omlxProcess = null }
-    // pkill is macOS/Linux only; on Windows this is a no-op (omlx is not supported there yet)
-    if (process.platform !== 'win32') {
-      execFile('pkill', ['-f', 'omlx serve'], () => { /* ignore exit code */ })
-    }
+  // oMLX: stop the server this app spawned. An empty slot means we did not
+  // start one — do not signal anything else (FU-114).
+  handle(IpcChannels.OmlxStop, async (): Promise<OmlxStopResult> => {
+    const child = omlxProcess
+    if (!child) return { ok: true }
+    if (omlxProcess === child) omlxProcess = null
+    await terminateOwnedOmlx(child)
     return { ok: true }
   })
   // llm:status — current active LLM provider + model
