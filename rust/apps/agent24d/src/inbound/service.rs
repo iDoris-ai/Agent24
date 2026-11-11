@@ -190,6 +190,17 @@ impl InboundService {
                 event.disposition
             )));
         }
+        // The session channel is the source name. It has to be one of
+        // `RunManager::INBOUND_SOURCE_CHANNELS` (the same set as the route
+        // allowlist). A name outside that set would be stored as the account
+        // owner (#1813 R2 M1). A fresh id every call: reusing the linked
+        // session fails the session insert before `AlreadyLinked`.
+        let channel = event.source;
+        if !agent24_agent::RunManager::INBOUND_SOURCE_CHANNELS.contains(&channel.as_str()) {
+            return Err(IngestError::Invalid(format!(
+                "inbound source {channel} is not a session channel"
+            )));
+        }
         let create = RunCreate {
             idoris_headroom_confirmed: false,
             session_id: Some(format!("sess_{}", ulid())),
@@ -201,7 +212,7 @@ impl InboundService {
         };
         let origin = InboundOrigin {
             event_id: event.id,
-            channel: event.source,
+            channel,
         };
         match self.runs.start_run_inbound(create, origin).await {
             Ok(InboundRunStart::Started(run)) => Ok(IngestOutcome::Started { run_id: run.id }),
@@ -872,6 +883,148 @@ mod tests {
         .unwrap();
         assert_eq!(parked_runs, 1);
         assert_eq!(run_count(&store).await, 2);
+    }
+
+    #[tokio::test]
+    async fn an_inbound_run_opens_its_own_session_and_redelivery_is_already_linked() {
+        // Mutation: reuse `sess_existing` (or the first session id) on the
+        // second dispatch. The session insert fails before the event unique
+        // index, so the second call is an error instead of AlreadyLinked.
+        let (svc, store) = open_service(Arc::new(Hanging)).await;
+        let now = stamp(0);
+        sqlx::query(
+            "INSERT INTO sessions (id, title, channel, created_at, updated_at) \
+             VALUES ('sess_existing', 'owner', 'desktop', ?, ?)",
+        )
+        .bind(&now)
+        .bind(&now)
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        allow(&store, "hyphae", "npub1").await;
+        watermark(&store, "hyphae", &stamp(120)).await;
+        let started = svc
+            .ingest(message("hyphae:fresh", "npub1", &stamp(30), "hello"))
+            .await
+            .unwrap();
+        let IngestOutcome::Started { run_id } = started else {
+            panic!("{started:?}");
+        };
+        let session_id = store
+            .get_run(&run_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .session_id
+            .unwrap();
+        assert_ne!(session_id, "sess_existing");
+        assert_eq!(
+            store
+                .get_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .channel,
+            "hyphae"
+        );
+        let again = svc.dispatch("hyphae:fresh").await.unwrap();
+        assert_eq!(
+            again,
+            IngestOutcome::AlreadyLinked {
+                run_id: run_id.clone()
+            }
+        );
+        assert_eq!(run_count(&store).await, 1);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(sessions, 2);
+        assert_eq!(
+            store
+                .get_run(&run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(session_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn each_external_source_starts_a_run_on_that_channel() {
+        // Mutation: hard-code channel "desktop" and every session channel
+        // fails the set check below.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        for source in agent24_agent::RunManager::INBOUND_SOURCE_CHANNELS {
+            allow(&store, source, "npub1").await;
+            watermark(&store, source, &stamp(120)).await;
+            let mut msg = message(&format!("{source}:one"), "npub1", &stamp(30), "hi");
+            msg.source = (*source).to_owned();
+            let started = svc.ingest(msg).await.unwrap();
+            let IngestOutcome::Started { run_id } = started else {
+                panic!("{source}: {started:?}");
+            };
+            let session_id = store
+                .get_run(&run_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .session_id
+                .unwrap();
+            let channel = store
+                .get_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .channel;
+            assert_eq!(channel, *source);
+            assert!(
+                agent24_agent::RunManager::INBOUND_SOURCE_CHANNELS.contains(&channel.as_str()),
+                "{channel}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_outside_the_channel_set_does_not_start() {
+        // Mutation: drop the channel-set check and this row starts a run
+        // whose session channel is `desktop`.
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        let parked = NewInboundEvent {
+            id: "desktop:1".to_owned(),
+            source: "desktop".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub1".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: stamp(30),
+            received_at: stamp(0),
+            text: Some("hi".to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some("starting".to_owned()),
+        };
+        assert_eq!(
+            store.insert_inbound_event(&parked).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let err = svc.dispatch("desktop:1").await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("not a session channel")),
+            "{err:?}"
+        );
+        assert_eq!(run_count(&store).await, 0);
+        let sessions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sessions")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(sessions, 0);
     }
 
     #[tokio::test]
