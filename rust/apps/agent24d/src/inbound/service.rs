@@ -194,7 +194,31 @@ impl InboundService {
     ///
     /// A second call commits nothing: `inbound_runs.event_id` is unique inside
     /// the same transaction as the run.
+    ///
+    /// Any error releases the sender's in-flight slot: the row moves to
+    /// `start_failed`, which the store only allows from `starting` with no
+    /// `inbound_runs` link, so a row that did get a run is never touched. A
+    /// caller that may drop this future mid-way (a request handler) should
+    /// spawn it; a dropped call leaves the row `starting` until startup
+    /// reconcile.
     pub(crate) async fn dispatch(&self, event_id: &str) -> Result<IngestOutcome, IngestError> {
+        let result = self.dispatch_inner(event_id).await;
+        if result.is_err()
+            && let Err(mark_err) = self
+                .store
+                .mark_inbound_run_state(event_id, "start_failed")
+                .await
+        {
+            tracing::warn!(
+                event_id,
+                error = %mark_err,
+                "inbound start_failed was not recorded"
+            );
+        }
+        result
+    }
+
+    async fn dispatch_inner(&self, event_id: &str) -> Result<IngestOutcome, IngestError> {
         let event = self
             .store
             .get_inbound_event(event_id)
@@ -219,7 +243,7 @@ impl InboundService {
         }
         // `None` is a missing body. `unwrap_or_default` used to start a run
         // whose prompt was empty.
-        let Some(prompt) = event.text else {
+        let Some(prompt) = event.text.filter(|text| !text.is_empty()) else {
             return Err(IngestError::Invalid(format!(
                 "event {event_id} has no text"
             )));
@@ -245,24 +269,10 @@ impl InboundService {
             Ok(InboundRunStart::NotStarting) => Err(IngestError::Invalid(format!(
                 "event {event_id} is not starting"
             ))),
-            Err(err) => {
-                // The event is already `starting` and holds the in-flight
-                // index. The link commits in the same transaction as the run,
-                // so a start error has no `inbound_runs` row. `start_failed`
-                // refuses to move a row that does have one.
-                if let Err(mark_err) = self
-                    .store
-                    .mark_inbound_run_state(event_id, "start_failed")
-                    .await
-                {
-                    tracing::warn!(
-                        event_id,
-                        error = %mark_err,
-                        "inbound start_failed was not recorded"
-                    );
-                }
-                Err(IngestError::Start(err.to_string()))
-            }
+            // The link commits in the same transaction as the run, so a start
+            // error has no `inbound_runs` row; `dispatch` marks it
+            // `start_failed`.
+            Err(err) => Err(IngestError::Start(err.to_string())),
         }
     }
 
@@ -1264,7 +1274,25 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(run_count(&store).await, 0);
-        assert_eq!(state_of(&store, "hyphae:blank").await, "starting");
+        // The refusal releases the slot instead of leaving the row `starting`.
+        assert_eq!(state_of(&store, "hyphae:blank").await, "start_failed");
+
+        // `Some("")` is refused the same way as a missing body.
+        let mut empty = row.clone();
+        empty.id = "hyphae:blank-empty".to_owned();
+        empty.actor = Some("npub-blank-empty".to_owned());
+        empty.text = Some(String::new());
+        assert_eq!(
+            store.insert_inbound_event(&empty).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let err = svc.dispatch("hyphae:blank-empty").await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("no text")),
+            "{err:?}"
+        );
+        assert_eq!(run_count(&store).await, 0);
+        assert_eq!(state_of(&store, "hyphae:blank-empty").await, "start_failed");
     }
 
     #[tokio::test]
