@@ -86,7 +86,7 @@ ADR-041a 已有实现：搜 `inbound_events`、`Admit`、`inbound` 等，除无�
 
 ```sql
 CREATE TABLE inbound_events (
-    id                 TEXT PRIMARY KEY NOT NULL,  -- '<source>:<native_id>[:<edit_version>]'
+    id                 TEXT PRIMARY KEY NOT NULL,  -- '<source>:<native_id>'，不带编辑版本（见 §3.4）
     source             TEXT NOT NULL,              -- 'hyphae' | 'wechat' | 'remote'(预留) | 'scheduler' | 'self'
     category           TEXT NOT NULL,              -- 'direct'|'group'|'group_mention'|'stranger'|'dev_bridge'|'protocol'|'internal'
     recipient_identity TEXT,                       -- 本机接收身份（nickname/npub）
@@ -100,9 +100,9 @@ CREATE TABLE inbound_events (
     meta               TEXT,                       -- 到期置 NULL
     text_scrubbed_at   TEXT,
     disposition        TEXT NOT NULL,              -- 'explicit'|'ignore'|'filtered'|'internal'
-    disposition_reason TEXT,                       -- 'not_allowlisted'|'not_addressed'|'no_rule'|'mode_off'|'stale'|'rate_limited'|'protocol'|'bot' ...
+    disposition_reason TEXT,                       -- 'not_allowlisted'|'not_addressed'|'no_rule'|'stale'|'rate_limited'|'protocol'|'bot' ...
     policy_version     TEXT,
-    run_state          TEXT                        -- NULL|'starting'|'started'|'interrupted'|'start_failed'
+    run_state          TEXT                        -- NULL|'starting'|'started'|'done'|'interrupted'|'start_failed'
 );
 CREATE TABLE inbound_runs (                        -- 与 run 同事务写入
     run_id   TEXT PRIMARY KEY NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
@@ -113,6 +113,8 @@ CREATE INDEX idx_inbound_events_actor  ON inbound_events(source, actor, at);
 CREATE INDEX idx_inbound_events_thread ON inbound_events(source, thread_key, at);
 CREATE INDEX idx_inbound_events_scrub  ON inbound_events(received_at) WHERE text_scrubbed_at IS NULL;
 CREATE INDEX idx_inbound_events_recover ON inbound_events(run_state) WHERE run_state = 'starting';
+CREATE UNIQUE INDEX idx_inbound_events_inflight ON inbound_events(source, actor)
+    WHERE disposition = 'explicit' AND run_state IN ('starting','started');  -- M6：每发送者最多一个在途
 CREATE TABLE inbound_allowlist (source TEXT NOT NULL, actor TEXT NOT NULL, added_at TEXT NOT NULL, note TEXT, PRIMARY KEY (source, actor));
 CREATE TABLE inbound_policy (                      -- 单行
     id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -145,7 +147,7 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 | 2 | 事件时间早于该来源激活水位，或距今超过 `max_age_secs` | `ignore(stale)`（H5） |
 | 3 | `human = false` | `ignore(bot)`（本轮不做 `inferred`） |
 | 4 | 名单外（含陌生人） | `ignore(not_allowlisted)`，不回复不通知 |
-| 5 | 名单内，但该 `source+actor` 已有一个在跑的入站 run，或超速率上限 | `ignore(rate_limited)`（M6） |
+| 5 | 名单内，但该 `source+actor` 已有一个在途的 explicit，或超速率上限 | `ignore(rate_limited)`（M6；在途由库强制，见 §3.4） |
 | 6 | 名单内且 `addressed ∈ {direct, mention}` | `explicit`（任何接受模式都接单，ADR-041 D4） |
 | 7 | 名单内但未 @ | `ignore(no_rule)`（`inferred` 本里程碑统一为这条，ADR-041 D3：无主动技能时记 `ignore(no_rule)`） |
 
@@ -156,8 +158,12 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 ### 3.4 其它约束
 
 - **激活水位（H5）**：每来源启用时记 `activated_at`，只处理其后到达的消息；另有最大时延（默认 10 分钟，待 2c 定值），超出记 `ignore(stale)`。先例：ADR-044 D5 的 F4b「解冻后只分派启动之后到达的消息」。防的是 daemon 离线几天后一次拉到积压消息全起 run。
-- **速率（M6）**：每 `source+actor` 同时最多 1 个入站 run 在跑；滑动窗口速率上限（默认每分钟 3 条，待定），超出记 `ignore(rate_limited)`。
+- **速率（M6，F2）**：每 `source+actor` 同时最多 1 个在途 explicit，**由库强制而不是先查后插**：`inbound_events` 上建部分唯一索引 `CREATE UNIQUE INDEX idx_inbound_events_inflight ON inbound_events(source, actor) WHERE disposition='explicit' AND run_state IN ('starting','started')`；run 终结时由 `agent24d` 把对应行的 `run_state` 置为 `'done'`（run 状态变更处挂钩，含取消、失败；崩溃后对账同样会把无主的 `started` 收敛为 `done`/`interrupted`）。INSERT 撞上该索引时，服务捕获冲突，改写一行 `ignore(rate_limited)`（用新的行 id 后缀或同事务二次插入，2a 定细节），不起 run。放弃的另一种做法是对 `(source,actor)` 在 `ingest` 里串行，它不能防多进程且要持锁；滑动窗口速率上限（默认每分钟 3 条，待定），超出记 `ignore(rate_limited)`。
 - **日程与自唤醒（H7）**：按 ADR-041 D1 写一行 `source=scheduler|self`、`disposition='internal'`，**不改它们的起 run 路径**，不走准入。
+
+- **接受模式本轮只存不判（F5）**：`inbound_policy.accept_mode` 本轮只存储、可读写，**不参与任何判定**，所以 §3.3 没有 `mode_off` 这类原因码。它进策略版本哈希，为以后的 `observe`/`auto`（含 `inferred` 研判）留位置；`explicit` 在任何模式下都接单（ADR-041 D4），本轮与之等价。
+- **编辑消息（F3）**：去重键不带 `[:<edit_version>]`。仓库内查了 wechat-bridge 的 iLink 类型（`ilink/types.ts`，无编辑字段）、`COMM-HYPHAE.md`、`ADR-044`、`agent24-comm/src`，都没有「编辑已发消息」的概念；Nostr 私信（NIP-44）本身也是不可变事件。**未核实** Hyphae 上游是否将来会有编辑。若以后出现：编辑算**新事件**，id 带版本，重新过名单和速率（与新消息同等对待，不继承原事件的准入结果），届时单独一片处理。
+- **开发态名单怎么种（F1）**：`inbound_allowlist` 的写接口是 host_only（legacy 模式 403，2f），而 `POST /api/v1/inbound/events` 只在开发态挂载，两者叠加会让开发态没有办法放行任何微信 uid。办法：`A24_DEV_TOOL=1` 时，daemon 启动读取种子（环境变量 `A24_INBOUND_DEV_ALLOWLIST=wechat:<uid>,...`，或同目录配置文件），在 `ingest` 之前写进 `inbound_allowlist`（幂等 upsert，`note='dev-seed'`）；**capabilities 模式下完全不读、不生效**，所以产品构建里名单只能由 ProductHost 经 2f 写入。种子逻辑放 2g。
 
 ## 4. 分片计划
 
@@ -167,12 +173,12 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 |---|---|---|---|---|---|---|---|
 | X11-2a | 迁移 `0034` + store 层：上述各表；`insert_event`（`ON CONFLICT(id) DO NOTHING`，返回是否插入）；`mark_started`；对账查询；`scrub_expired_inbound_text`（仅入站表部分）；日程/自唤醒的记录行写入 | `agent24-store/migrations/0034_*.sql`、`agent24-store/src/inbound.rs`（新）、`lib.rs`；日程/自唤醒写入点（`agent24-scheduler` 或 `agent24d/src/scheduler_deliver.rs`） | M | 无 | ① 同 id 插两次，第二次返回未插入，行数 1，且**第二次不覆盖第一次的 disposition**（变异：改成 `INSERT OR REPLACE` 变红）。② 清理：早于 cutoff 的行 text/meta 为空、actor/at/category/disposition 原样；晚于 cutoff 的行不变（正对照）；再跑返回 0。③ 0033 库升级后旧表数据不变。④ 日程触发一次后 `inbound_events` 多一行 `internal`，且 run 仍照常起（旧行为不退化） | 迁移编号冲突；见 §7-2 的 CORE-5 5g 约束 | Grok |
 | X11-2b | 准入纯函数 `admit(...)` + 策略版本哈希，覆盖 §3.3 全部 7 行与水位 / 速率入参 | `agent24d/src/inbound/admit.rs`（新） | S | 2a（类型） | 表驱动：每行至少一条命中用例 + 一条不命中的正对照；优先级用例（协议消息即使名单内也是 `ignore(protocol)`）；变异：反转「名单内」判断，至少 3 条变红；同输入同哈希、名单顺序无关 | 与 ADR-041 D3 不一致 | Grok |
-| X11-2c | `RunManager.start_run_inbound` 与 `InboundService.ingest`：INSERT 一次写结果 → 起 run → 同事务 `inbound_runs` → 打 Unknown 标签；启动对账 | `agent24-agent/src/lib.rs`（新内部入口、`execute` 按 origin 打标签）、`agent24-store/src/source_policy.rs`（新增构造 `SourceRef::inbound_external` 或等价）、`agent24d/src/inbound/service.rs`（新）、`serve_steps.rs` | L | 2a、2b | ① explicit：恰好 1 个 run，`inbound_runs` 有行。② 该 run 的 `run_source_tags` 为 **Unknown**（变异：把 execute 改回 `user_input`，测试变红）。③ `/api/v1/peer/runs` 对该 run 隐藏内容（peer 视图见 `peer_runs.rs`）。④ 该 run 的外发被限制（沿用现有 source policy 外发门，用一个会外发的工具调用验证被拦）。⑤ **对同一行直接调用两次派发**（绕开插入去重，直接调 `dispatch(event_id)`）：run 恰好 1 个（变异：去掉 `inbound_runs.event_id UNIQUE` 或事务，测试变红）。⑥ 在「run 已落库、`run_state` 仍 `starting`」时重启：对账补成 `started`，不起第二个 run。⑦ 在「`starting`、无 `inbound_runs`」时重启：`interrupted`，不起 run。⑧ 名单外：0 个 run。⑨ 旧消息（早于水位）：0 个 run（H5）；同 actor 并发两条：只 1 个 run（M6） | `execute` 改动面是内核热路径，需确认不影响普通 run；`persist_new_run`（`lib.rs:679`）是否能与关联表同事务写入**未核实**（§8） | Grok，Opus 验收 |
+| X11-2c | `RunManager.start_run_inbound` 与 `InboundService.ingest`：INSERT 一次写结果 → 起 run → 同事务 `inbound_runs` → 打 Unknown 标签；启动对账 | `agent24-agent/src/lib.rs`（新内部入口、`execute` 按 origin 打标签）、`agent24-store/src/source_policy.rs`（新增构造 `SourceRef::inbound_external` 或等价）、`agent24d/src/inbound/service.rs`（新）、`serve_steps.rs` | L | 2a、2b | ① explicit：恰好 1 个 run，`inbound_runs` 有行。② 该 run 的 `run_source_tags` 为 **Unknown**（变异：把 execute 改回 `user_input`，测试变红）。③ `/api/v1/peer/runs` 对该 run 隐藏内容（peer 视图见 `peer_runs.rs`）。④ 该 run 的外发被限制（沿用现有 source policy 外发门，用一个会外发的工具调用验证被拦）。⑤ **对同一行直接调用两次派发**（绕开插入去重，直接调 `dispatch(event_id)`）：run 恰好 1 个（变异：去掉 `inbound_runs.event_id UNIQUE` 或事务，测试变红）。⑥ 在「run 已落库、`run_state` 仍 `starting`」时重启：对账补成 `started`，不起第二个 run。⑦ 在「`starting`、无 `inbound_runs`」时重启：`interrupted`，不起 run。⑧ 名单外：0 个 run。⑨ 旧消息（早于水位）：0 个 run（H5）；**用真并发**（两个 future 同时 `await` 同一 actor 的两条不同消息，如 `tokio::join!`）：恰好 1 个 run、另一条为 `ignore(rate_limited)`；变异对照：删掉部分唯一索引，测试变红。run 终结后同一 actor 的下一条可以起 run（正对照） | `execute` 改动面是内核热路径，需确认不影响普通 run；`persist_new_run`（`lib.rs:679`）是否能与关联表同事务写入**未核实**（§8） | Grok，Opus 验收 |
 | X11-2d | 180 天清理后台任务 + 接线（范围按 §7-3） | `agent24d/src/inbound/maintenance.rs`（新）、`serve_steps.rs`；若扩范围，`agent24-store` 的 runs/消息清理 | S（仅入站表）/ M（含 runs 与记忆） | 2a | 可注入时钟：179 天与 181 天两行，只有 181 天的正文被清（正对照 179 天不变）；若含 runs：对应 `runs.input` 与消息快照也被清，且非入站 run 不受影响；停止信号下任务退出；启动即扫一次 | 清 run 数据会影响审计与恢复，开片前读恢复路径 | Sonnet |
 | X11-2e | Hyphae 入站适配：私信经 `history inbox --as`（拉取）；群消息经 `groupchat history`（有游标参数，`groupchat.rs:25-28`）；先滤自己发的；分类并写 `category/addressed/human`；调用 `ingest`；Hyphae 来源激活水位 | `agent24d/src/inbound/hyphae_source.rs`（新）、`agent24d/src/comm_routes.rs`（只读复用，不改 comm 依赖） | L | 2c | ① 用 `agent24-comm/tests/fixtures/comm_inbound_six.json` 的六类样本：plain → 按 human 规则；kind-30078 的 f4/1 信封、receipt（ack）、query、response、canary 全部 `ignore(protocol)` 且 0 个 run（变异：把协议判断删掉，至少 3 条变红）。② 好友协议消息 zero-run。③ 群消息：@ 本机身份 → `group_mention`，未 @ → `group`；私信 → `direct`；陌生人 → `stranger`。④ 自己发的消息不入表。⑤ 重启不重放（游标持久）；daemon 离线期间积压的旧消息 → `stale`，0 个 run | Hyphae 入站 JSON 字段未核实；游标语义未核实；keystore 未解锁时的行为 | Grok，Opus 验收 |
 | X11-2f | 名单、接受模式、事件列表 API。写接口（`PUT /api/v1/inbound/allowlist`、`PUT /api/v1/inbound/policy`）加入 `host_only_route`（`capabilities/middleware.rs:49`），只许 ProductHost；读接口 `GET .../allowlist`、`GET .../policy`、`GET .../events`（只回元数据 + 前 50 字，不进 WS `/events`）。CORE-2 `Operation` **拆成读、写两个** | `agent24d/src/inbound/routes.rs`（新）、`capabilities/middleware.rs`、`capabilities/operations.rs`、OpenAPI 与 `packages/api-client` 生成物 | M | 2a | 在 capabilities 模式下：FirstPartyShell 令牌（无提升头）写名单 → 拒；legacy 单令牌写名单 → 拒（`host_only_route` 的 legacy 分支，`middleware.rs:75`）；ProductHost → 通过；读接口 FirstPartyShell 可读。列表不含全文；WS `/events` 抓包无入站内容。contract-tests 覆盖 | 生成物体量大 | Grok |
-| X11-2g | wechat-bridge 改只传输。daemon 侧 `POST /api/v1/inbound/events`：**`source` 由路由固定为 `wechat`，请求体里写别的来源一律 400**；只在 legacy / 开发态挂载，产品（capabilities）模式不挂。桥：id 用 `wechat:<message_id>`，只处理 `message_state=FINISH` 且 `message_type=USER` 的消息（过滤未完成与自己发的）；**删桥内名单与 y/n 审批**；回一句「已记录」，不回发结果 | `packages/wechat-bridge/src/{bridge,agent24,config,main}.ts` 及测试；`agent24d/src/inbound/routes.rs` | M | 2c、2f | ① 桥源码无 `/api/v1/runs` 的 POST。② 名单外微信用户：daemon 记 `ignore`，0 个 run。③ 同一 `message_id` 重投：1 个 run。④ `message_state=GENERATING` 与 `BOT` 消息：不入表。⑤ 请求体带 `source:"hyphae"`：400（变异：去掉固定来源，变红）。⑥ capabilities 模式下该路由 404。⑦ 仍需 `A24_DEV_TOOL=1`。⑧ **行为变化**：微信里不再能回 y/n 批准，审批只在桌面做；桥回复只有「已记录」，用例钉住 | 桥现有测试大改；行为变化需在 README 和 PR 里写明 | Sonnet + Opus 验收 |
-| X11-2h | 防绕过测试与文档收口 | `agent24d/tests/inbound_*.rs`；`docs/adr/ADR-044-communication.md`（回写 T2/T3 与 X11 状态）；`COMM-HYPHAE.md`；ADR-041 D10 修订（若 §7-4 采纳推荐） | S | 2a–2g | ① 静态断言：`packages/*` 与 `agent24-comm` 源码里没有对 `/api/v1/runs` 的 POST；`/runs` 的调用方白名单仅为桌面、ACP（`acp.rs`）、MCP（`agent24-mcp`）、CLI、`wechat-bridge` 已移除（变异：在 comm 里加一处 POST，变红）。② `agent24d/src` 内 `start_run*` 的外部调用点只有 `runs.rs`、`inbound/service.rs`、调度投递。③ 桌面聊天 / ACP / MCP 起 run 后 `inbound_events` 行数不变（正对照）。④ 文档里的待办状态与代码一致 | 源码扫描类测试易误报，需白名单与说明 | Sonnet |
+| X11-2g | wechat-bridge 改只传输，并实现开发态名单种子（§3.4）。daemon 侧 `POST /api/v1/inbound/events`：**`source` 由路由固定为 `wechat`，请求体里写别的来源一律 400**；只在 legacy / 开发态挂载，产品（capabilities）模式不挂。桥：id 用 `wechat:<message_id>`，只处理 `message_state=FINISH` 且 `message_type=USER` 的消息（过滤未完成与自己发的）；**删桥内名单与 y/n 审批**；回一句「已记录」，不回发结果 | `packages/wechat-bridge/src/{bridge,agent24,config,main}.ts` 及测试；`agent24d/src/inbound/routes.rs` | M | 2c、2f | ① 桥源码无 `/api/v1/runs` 的 POST。② 名单外微信用户：daemon 记 `ignore`，0 个 run。③ 同一 `message_id` 重投：1 个 run。④ `message_state=GENERATING` 与 `BOT` 消息：不入表。⑤ 请求体带 `source:"hyphae"`：400（变异：去掉固定来源，变红）。⑥ capabilities 模式下该路由 404。⑦ 仍需 `A24_DEV_TOOL=1`。⑧ **正向格**：`A24_DEV_TOOL=1` 且种子名单含该微信 uid → 该用户 FINISH 的 USER 消息恰好 1 个 run，`run_source_tags` 为 Unknown；同条件去掉种子 → 0 个 run；capabilities 模式下种子环境变量不生效（变异：让种子在 capabilities 下也生效，变红）。⑨ **行为变化**：微信里不再能回 y/n 批准，审批只在桌面做；桥回复只有「已记录」，用例钉住 | 桥现有测试大改；行为变化需在 README 和 PR 里写明 | Sonnet + Opus 验收 |
+| X11-2h | 防绕过测试与文档收口 | `agent24d/tests/inbound_*.rs`；`docs/adr/ADR-044-communication.md`（回写 T2/T3 与 X11 状态）；`COMM-HYPHAE.md`；ADR-041 D10 修订（若 §7-4 采纳推荐），**并在 ADR-041 §4「后果」把「所有新表都在 CORE-5 5f–5g 接线之后才进 main」改写为：入站表（`inbound_events` 等）经 jason 2026-11-11 豁免，因为是只新增、不改旧表的独立表，其余新表（工单等，041b）仍按原约束** | S | 2a–2g | ① 静态断言：`packages/*` 与 `agent24-comm` 源码里没有对 `/api/v1/runs` 的 POST；`/runs` 的调用方白名单仅为桌面、ACP（`acp.rs`）、MCP（`agent24-mcp`）、CLI、`wechat-bridge` 已移除（变异：在 comm 里加一处 POST，变红）。② `agent24d/src` 内 `start_run*` 的外部调用点只有 `runs.rs`、`inbound/service.rs`、调度投递。③ 桌面聊天 / ACP / MCP 起 run 后 `inbound_events` 行数不变（正对照）。④ 文档里的待办状态与代码一致，ADR-041 §4 已写入豁免与 D10 修订 | 源码扫描类测试易误报，需白名单与说明 | Sonnet |
 
 推荐顺序：2a → 2b → 2c → 2d →（2e、2f 并行）→ 2g → 2h。2a–2d 合入后 daemon 已有可测试的完整「记录 → 准入 → 起 run」闭环，只是还没有真实来源。
 
