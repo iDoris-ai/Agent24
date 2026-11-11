@@ -4,9 +4,10 @@ use crate::install::{InstallError, SignatureVerifier, VerifyMode};
 use agent24_models::router::ModelRouter;
 
 fn router_gateway(
-    host: &IdorisHost,
+    router: &ModelRouter,
 ) -> Result<std::sync::Arc<agent24_models::IdorisGateway>, agent24_models::ModelError> {
-    host.router
+    use crate::managed_idoris::IdorisSlotExt;
+    router
         .as_any()
         .downcast_ref::<ModelRouter>()
         .unwrap()
@@ -130,6 +131,7 @@ struct Fixture {
     record: Installation,
     runtime: Arc<FixtureRuntime>,
     keychain: Arc<MemoryKeychain>,
+    router: Arc<ModelRouter>,
 }
 fn mode(path: &Path, permissions: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(permissions)).unwrap();
@@ -232,7 +234,7 @@ impl Fixture {
         let host = IdorisHost::open(
             root,
             managed,
-            router,
+            router.clone(),
             runtime.clone(),
             Arc::new(KeychainSource(keychain.clone())),
         )
@@ -243,6 +245,7 @@ impl Fixture {
             record,
             runtime,
             keychain,
+            router,
         }
     }
     async fn install(&self) {
@@ -357,7 +360,7 @@ async fn state_machine_idempotency_busy_and_stop() {
         f.host.submit(Action::Stop, None).await.unwrap().result,
         Some(Outcome::Succeeded)
     );
-    assert!(router_gateway(&f.host).is_err());
+    assert!(router_gateway(&f.router).is_err());
     let attempts = fs::read_to_string(f.host.root.join("data/state/attempts.jsonl")).unwrap();
     assert_eq!(attempts.lines().count(), 1);
     f.assert_clean();
@@ -542,7 +545,7 @@ async fn terminal_child_failure_closes_gateway_and_updates_status() {
     })
     .await
     .unwrap();
-    assert!(router_gateway(&f.host).is_err());
+    assert!(router_gateway(&f.router).is_err());
     f.assert_clean();
 }
 
@@ -552,10 +555,10 @@ async fn stop_blocks_new_gateway_requests_and_drains_retained_snapshot() {
     f.install().await;
     let op = f.host.submit(Action::Start, None).await.unwrap();
     assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
-    let old_request = router_gateway(&f.host).unwrap();
+    let old_request = router_gateway(&f.router).unwrap();
     let stop = f.host.submit(Action::Stop, None).await.unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
-        while router_gateway(&f.host).is_ok() {
+        while router_gateway(&f.router).is_ok() {
             tokio::task::yield_now().await;
         }
     })
@@ -914,7 +917,7 @@ async fn keychain_lock_after_readiness_retains_the_stable_error_code() {
         f.complete(&start).await.error_code,
         Some(Code::KeychainLocked)
     );
-    assert!(router_gateway(&f.host).is_err());
+    assert!(router_gateway(&f.router).is_err());
     f.assert_clean();
     f.assert_no_secrets();
 }
@@ -1164,7 +1167,7 @@ async fn stopped_generation_cannot_publish_a_gateway_after_prepare() {
     tokio::time::timeout(Duration::from_secs(60), sender.closed())
         .await
         .unwrap();
-    let blocked = router_gateway(&f.host).is_err();
+    let blocked = router_gateway(&f.router).is_err();
     supervisor.stop().await.unwrap();
     f.host.shutdown().await.unwrap();
     assert!(blocked, "monitor published its prepared gateway after stop");
@@ -1249,7 +1252,7 @@ async fn stop_preserves_an_unverified_live_leftover_without_signalling() {
     assert_eq!(completed.error_code, Some(Code::InstanceConflict));
     assert!(path.exists());
     assert_eq!(owner.host.status().await.state, State::Running);
-    assert!(router_gateway(&owner.host).is_ok());
+    assert!(router_gateway(&owner.router).is_ok());
     owner.host.shutdown().await.unwrap();
 }
 

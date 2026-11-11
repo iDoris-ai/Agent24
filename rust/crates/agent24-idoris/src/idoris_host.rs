@@ -932,7 +932,9 @@ impl IdorisHost {
             return Err(Code::Cancelled);
         }
         self.managed.persist_config(&config)?;
-        self.router.replace_idoris(gateway);
+        self.router
+            .replace_idoris(gateway)
+            .map_err(|_| Code::StartFailed)?;
         Ok(())
     }
     async fn execute(
@@ -1184,7 +1186,9 @@ impl IdorisHost {
                     }
                     let result = prepared.and_then(|(config, gateway)| {
                         host.managed.persist_config(&config)?;
-                        host.router.replace_idoris(gateway);
+                        host.router
+                            .replace_idoris(gateway)
+                            .map_err(|_| Code::StartFailed)?;
                         Ok(())
                     });
                     if result.is_ok() {

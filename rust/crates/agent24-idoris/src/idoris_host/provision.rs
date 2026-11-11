@@ -909,7 +909,9 @@ impl IdorisHost {
             write_json(&self.root.join("pending-connect.json"), &pending)?;
             i.operations.get_mut(id).ok_or(Code::NotFound)?.verification =
                 pending.candidate.verification.clone();
-            self.router.replace_idoris(gateway);
+            self.router
+                .replace_idoris(gateway)
+                .map_err(|_| Code::StartFailed)?;
             i.installation = Some(pending.candidate.clone());
             i.supervisor = new_supervisor.take();
             i.supervisor_release = Some(pending.candidate.release_dir.clone());

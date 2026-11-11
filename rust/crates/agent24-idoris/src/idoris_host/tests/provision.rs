@@ -476,7 +476,7 @@ async fn connect_rejects_oversized_or_unsafe_verification_model_id_without_commi
         assert!(x.f.host.status().await.verification.is_none());
         assert!(!x.f.host.root.join("connection.json").exists());
         assert!(!x.f.host.root.join("pending-connect.json").exists());
-        assert!(router_gateway(&x.f.host).is_err());
+        assert!(router_gateway(&x.f.router).is_err());
         assert_eq!(x.keys()[0]["status"], "revoked");
         assert!(x.data.entries.lock().unwrap().is_empty());
         let persisted: serde_json::Value =
@@ -554,7 +554,7 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
         serde_json::to_value(&done).unwrap()["verification"],
         *receipt
     );
-    assert!(router_gateway(&x.f.host).is_ok());
+    assert!(router_gateway(&x.f.router).is_ok());
     assert_eq!(x.keys().len(), 1);
     assert_eq!(x.keys()[0]["allowed_roles"], json!(["daily"]));
     assert!(x.upstream.entries.lock().unwrap().is_empty());
@@ -1065,7 +1065,7 @@ async fn stale_generation_monitor_cannot_withdraw_replacement_gateway() {
             .await
             .unwrap();
     assert_eq!(x.f.complete(&second).await.result, Some(Outcome::Succeeded));
-    assert!(router_gateway(&x.f.host).is_ok());
+    assert!(router_gateway(&x.f.router).is_ok());
     let mut available = Vec::new();
     for ready in [false, true] {
         let (sender, signal) = watch::channel(!ready);
@@ -1088,7 +1088,7 @@ async fn stale_generation_monitor_cannot_withdraw_replacement_gateway() {
         })
         .await
         .unwrap();
-        available.push(router_gateway(&x.f.host).is_ok());
+        available.push(router_gateway(&x.f.router).is_ok());
     }
     let state = x.f.host.status().await.state;
     x.f.host.shutdown().await.unwrap();
