@@ -124,7 +124,8 @@ fn start_run_inbound_is_only_called_from_the_inbound_service() {
         .collect();
     let then: Vec<_> = calls
         .iter()
-        .filter(|(_, name)| name == "start_run_then")
+        // `start_run_then_with` is `start_run_then` plus the skill provider lookup.
+        .filter(|(_, name)| name == "start_run_then" || name == "start_run_then_with")
         .map(|(file, _)| file.as_str())
         .collect();
     let scheduled: Vec<_> = calls
@@ -552,9 +553,10 @@ fn is_ident(byte: u8) -> bool {
 }
 
 fn start_run_calls(src: &str) -> Vec<String> {
-    const NAMES: [&str; 4] = [
+    const NAMES: [&str; 5] = [
         "start_run_with_schedule",
         "start_run_inbound",
+        "start_run_then_with",
         "start_run_then",
         "start_run",
     ];
