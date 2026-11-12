@@ -1,25 +1,22 @@
+import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { Bridge, parseDecision, type SessionStore } from './bridge.js'
-import type { Agent24Client, PendingApproval, RunResult } from './agent24.js'
+import { Bridge, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp } from './bridge.js'
+import type { Agent24Client, InboundEvent, InboundRecord } from './agent24.js'
 import type { Sender } from './ilink/sender.js'
-import { parseAllowedUids } from './config.js'
 import { splitText } from './ilink/sender.js'
 import { messageText, MessageItemType, MessageType, MessageState, type WeixinMessage } from './ilink/types.js'
 
-describe('parseDecision', () => {
-  it('maps affirmatives to approve', () => {
-    for (const t of ['y', 'YES', ' 批准 ', '同意', 'ok', '通过']) {
-      expect(parseDecision(t)).toBe('approve')
+describe('production sources do not post a run', () => {
+  it('has no /api/v1/runs under src, outside tests', () => {
+    const root = fileURLToPath(new URL('.', import.meta.url))
+    const files = productionSources(root)
+    expect(files.length).toBeGreaterThan(0)
+    const forbidden = '/api/v1/' + 'runs'
+    for (const file of files) {
+      expect(readFileSync(file, 'utf8'), file).not.toContain(forbidden)
     }
-  })
-  it('maps negatives to deny', () => {
-    for (const t of ['n', 'No', '拒绝', '不', '取消']) {
-      expect(parseDecision(t)).toBe('deny')
-    }
-  })
-  it('returns null for anything else (treated as a new message)', () => {
-    expect(parseDecision('帮我查一下天气')).toBeNull()
-    expect(parseDecision('yesterday')).toBeNull()
   })
 })
 
@@ -61,187 +58,152 @@ describe('messageText', () => {
   })
 })
 
-describe('parseAllowedUids', () => {
-  it('splits on commas and whitespace, dropping blanks', () => {
-    expect([...parseAllowedUids('a, b ,,c\n d')]).toEqual(['a', 'b', 'c', 'd'])
-  })
-  it('is empty for undefined / blank (fail-closed)', () => {
-    expect(parseAllowedUids(undefined).size).toBe(0)
-    expect(parseAllowedUids('   ').size).toBe(0)
+describe('canonicalStamp', () => {
+  it('drops fractional seconds', () => {
+    expect(canonicalStamp(Date.parse('2026-11-12T03:04:05.678Z'))).toBe('2026-11-12T03:04:05Z')
   })
 })
 
-describe('Bridge authorization + serialization', () => {
-  function textMsg(from: string, text: string): WeixinMessage {
+describe('Bridge transport', () => {
+  function textMsg(
+    from: string,
+    text: string,
+    patch: Partial<WeixinMessage> = {},
+  ): WeixinMessage {
     return {
-      message_id: 1,
+      message_id: 42,
       from_user_id: from,
       to_user_id: 'bot',
       client_id: 'c',
-      create_time_ms: 0,
+      create_time_ms: Date.parse('2026-11-12T03:04:05.678Z'),
       message_type: MessageType.USER,
       message_state: MessageState.FINISH,
       context_token: 'ctx',
       item_list: [{ type: MessageItemType.TEXT, text_item: { text } }],
+      ...patch,
     }
   }
 
-  interface Behavior {
-    runToCompletion?: () => Promise<RunResult>
-    awaitRun?: () => Promise<RunResult>
-    pendingApprovals?: () => Promise<PendingApproval[]>
-    decide?: (id: string, decision: string) => Promise<boolean>
-  }
   interface Fakes {
     bridge: Bridge
-    calls: {
-      createSession: number
-      runToCompletion: number
-      decide: { id: string; decision: string }[]
-      sends: string[]
-    }
+    recorded: InboundEvent[]
+    sends: string[]
   }
 
-  function makeBridge(allowed: string[], behavior: Behavior = {}): Fakes {
-    const calls = {
-      createSession: 0,
-      runToCompletion: 0,
-      decide: [] as { id: string; decision: string }[],
-      sends: [] as string[],
-    }
+  function imageMsg(from: string): WeixinMessage {
+    return textMsg(from, '', { item_list: [{ type: MessageItemType.IMAGE }] })
+  }
+
+  function makeBridge(fail?: Error, outcome: InboundRecord['outcome'] = 'started', reason?: string): Fakes {
+    const recorded: InboundEvent[] = []
+    const sends: string[] = []
     const agent = {
-      async createSession(): Promise<string> {
-        calls.createSession++
-        return `session-${calls.createSession}`
-      },
-      async runToCompletion(): Promise<RunResult> {
-        calls.runToCompletion++
-        return behavior.runToCompletion
-          ? behavior.runToCompletion()
-          : { status: 'completed', text: 'ok', runId: 'r1' }
-      },
-      async awaitRun(): Promise<RunResult> {
-        return behavior.awaitRun ? behavior.awaitRun() : { status: 'completed', text: 'done', runId: 'r1' }
-      },
-      async pendingApprovals(): Promise<PendingApproval[]> {
-        return behavior.pendingApprovals ? behavior.pendingApprovals() : []
-      },
-      async decide(id: string, decision: string): Promise<boolean> {
-        calls.decide.push({ id, decision })
-        return behavior.decide ? behavior.decide(id, decision) : true
+      async recordInbound(event: InboundEvent): Promise<InboundRecord> {
+        if (fail) throw fail
+        recorded.push(event)
+        return { id: event.id, outcome, ...(reason ? { reason } : {}) }
       },
     } as unknown as Agent24Client
     const sender = {
       async send(_user: string, _ctx: string, text: string): Promise<void> {
-        calls.sends.push(text)
+        sends.push(text)
       },
     } as unknown as Sender
-    const store: SessionStore = { load: () => new Map(), save: () => {} }
-    const bridge = new Bridge(agent, sender, store, new Set(allowed))
-    return { bridge, calls }
+    return { bridge: new Bridge(agent, sender), recorded, sends }
   }
 
-  it('drops messages from unauthorized users without running or replying', async () => {
-    const { bridge, calls } = makeBridge(['alice'])
-    await bridge.handle(textMsg('mallory', 'rm -rf ~'))
-    expect(calls.runToCompletion).toBe(0)
-    expect(calls.createSession).toBe(0)
-    expect(calls.sends).toEqual([]) // stranger is never answered
-  })
-
-  it('runs for an authorized user', async () => {
-    const { bridge, calls } = makeBridge(['alice'])
+  it('records a finished user message and replies only 已记录', async () => {
+    const { bridge, recorded, sends } = makeBridge()
     await bridge.handle(textMsg('alice', '查一下天气'))
-    expect(calls.runToCompletion).toBe(1)
-    expect(calls.createSession).toBe(1)
-    expect(calls.sends).toContain('ok')
-  })
-
-  it('serializes concurrent messages from one user (single session, no TOCTOU)', async () => {
-    let release!: () => void
-    const gate = new Promise<void>((r) => (release = r))
-    let firstRunStarted = false
-    const { bridge, calls } = makeBridge(['alice'], {
-      runToCompletion: async () => {
-        // Hold the first run open so the second message would race sessionFor if
-        // handling weren't serialized.
-        if (!firstRunStarted) {
-          firstRunStarted = true
-          await gate
-        }
-        return { status: 'completed', text: 'ok', runId: 'r' }
+    expect(recorded).toEqual([
+      {
+        id: 'wechat:42',
+        actor: 'alice',
+        at: '2026-11-12T03:04:05Z',
+        text: '查一下天气',
       },
-    })
-    const p1 = bridge.handle(textMsg('alice', 'one'))
-    const p2 = bridge.handle(textMsg('alice', 'two'))
-    release()
-    await Promise.all([p1, p2])
-    expect(calls.runToCompletion).toBe(2)
-    expect(calls.createSession).toBe(1) // reused, created exactly once
+    ])
+    expect(sends).toEqual([RECORDED_REPLY])
   })
 
-  it('replies with an error instead of going silent when a daemon call throws', async () => {
-    const { bridge, calls } = makeBridge(['alice'], {
-      runToCompletion: async () => {
-        throw new Error('daemon down')
-      },
-    })
-    await bridge.handle(textMsg('alice', '做点事'))
-    // The user is never left without a reply; the error surfaces.
-    expect(calls.sends.some((s) => s.includes('处理出错') && s.includes('daemon down'))).toBe(true)
-  })
-
-  it('queues parked approvals and resolves them FIFO', async () => {
-    const approval: PendingApproval = {
-      id: 'ap1',
-      run_id: 'r1',
-      summary: '删除 ~/notes.txt',
-      available_decisions: ['approve', 'deny'],
-    }
-    const { bridge, calls } = makeBridge(['alice'], {
-      runToCompletion: async () => ({ status: 'awaiting_approval', runId: 'r1' }),
-      pendingApprovals: async () => [approval],
-      awaitRun: async () => ({ status: 'completed', text: '已删除', runId: 'r1' }),
-    })
-
-    // First message parks on approval — the summary is surfaced to the user.
-    await bridge.handle(textMsg('alice', '删掉笔记'))
-    expect(calls.sends.some((s) => s.includes('需要你批准') && s.includes('删除 ~/notes.txt'))).toBe(true)
-
-    // A non-decision reply nudges (with count + summary), without deciding.
-    await bridge.handle(textMsg('alice', '在吗'))
-    expect(calls.sends.some((s) => s.includes('1 条待批准') && s.includes('删除 ~/notes.txt'))).toBe(true)
-    expect(calls.decide).toHaveLength(0)
-
-    // "y" resolves the oldest approval and delivers the resumed run's outcome.
+  it('records y as ordinary text and does not approve anything', async () => {
+    const { bridge, recorded, sends } = makeBridge()
     await bridge.handle(textMsg('alice', 'y'))
-    expect(calls.decide).toEqual([{ id: 'ap1', decision: 'approve' }])
-    expect(calls.sends.some((s) => s.includes('已批准'))).toBe(true)
-    expect(calls.sends.some((s) => s.includes('已删除'))).toBe(true)
+    expect(recorded.map((event) => event.text)).toEqual(['y'])
+    expect(sends).toEqual([RECORDED_REPLY])
   })
 
-  it('emits a single, FIFO-correct prompt when a resumed run immediately re-parks', async () => {
-    let approvalCall = 0
-    const { bridge, calls } = makeBridge(['alice'], {
-      runToCompletion: async () => ({ status: 'awaiting_approval', runId: 'rA' }),
-      awaitRun: async () => ({ status: 'awaiting_approval', runId: 'rA' }), // resume → re-parks
-      pendingApprovals: async () => {
-        approvalCall++
-        const a =
-          approvalCall === 1
-            ? { id: 'apA', run_id: 'rA', summary: 'A步' }
-            : { id: 'apB', run_id: 'rA', summary: 'B步' }
-        return [{ ...a, available_decisions: ['approve', 'deny'] }]
-      },
-    })
+  it('records a stranger and does not reply when the daemon ignores them', async () => {
+    const { bridge, recorded, sends } = makeBridge(undefined, 'ignored', 'not_allowlisted')
+    await bridge.handle(textMsg('mallory', 'rm -rf ~'))
+    expect(recorded.map((event) => event.actor)).toEqual(['mallory'])
+    expect(sends).toEqual([])
+  })
 
-    await bridge.handle(textMsg('alice', '开始')) // parks on A
-    await bridge.handle(textMsg('alice', 'y')) // resolves A, resumed run re-parks on B
+  it.each(['stale', 'rate_limited', 'no_rule', 'bot'])(
+    'does not reply when the daemon ignores for %s',
+    async (reason) => {
+      const { bridge, recorded, sends } = makeBridge(undefined, 'ignored', reason)
+      await bridge.handle(textMsg('alice', '再来一条'))
+      expect(recorded).toHaveLength(1)
+      expect(sends).toEqual([])
+    },
+  )
 
-    expect(calls.decide).toEqual([{ id: 'apA', decision: 'approve' }])
-    // Exactly one prompt about B — no duplicate deliver()-CTA + surface-next pair.
-    const bPrompts = calls.sends.filter((s) => s.includes('B步'))
-    expect(bPrompts).toHaveLength(1)
-    expect(bPrompts[0]).toContain('还有 1 条待批准') // the FIFO prompt, not deliver()'s own CTA
+  it('does not reply to a duplicate, which may replay an off-list message', async () => {
+    const { bridge, recorded, sends } = makeBridge(undefined, 'duplicate')
+    await bridge.handle(textMsg('mallory', '查一下天气'))
+    expect(recorded).toHaveLength(1)
+    expect(sends).toEqual([])
+  })
+
+  it('does not reply when the daemon says the event is already linked', async () => {
+    const { bridge, recorded, sends } = makeBridge(undefined, 'already_linked')
+    await bridge.handle(textMsg('alice', '查一下天气'))
+    expect(recorded).toHaveLength(1)
+    expect(sends).toEqual([])
+  })
+
+  it('does not post or reply to a picture or blank text', async () => {
+    const { bridge, recorded, sends } = makeBridge()
+    await bridge.handle(imageMsg('alice'))
+    await bridge.handle(textMsg('alice', '   '))
+    await bridge.handle(textMsg('alice', '', { item_list: [] }))
+    expect(recorded).toEqual([])
+    expect(sends).toEqual([])
+  })
+
+  it('does not record GENERATING or BOT messages', async () => {
+    const { bridge, recorded, sends } = makeBridge()
+    await bridge.handle(textMsg('alice', 'partial', { message_state: MessageState.GENERATING }))
+    await bridge.handle(textMsg('alice', 'bot said', { message_type: MessageType.BOT }))
+    await bridge.handle(
+      textMsg('alice', 'both', {
+        message_state: MessageState.GENERATING,
+        message_type: MessageType.BOT,
+      }),
+    )
+    expect(recorded).toEqual([])
+    expect(sends).toEqual([])
+  })
+
+  it('replies with a fixed failure line and does not echo the error', async () => {
+    const { bridge, sends } = makeBridge(new Error('daemon down'))
+    await bridge.handle(textMsg('alice', '做点事'))
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+    expect(sends.join('')).not.toContain('daemon down')
   })
 })
+
+function productionSources(dir: string, out: string[] = []): string[] {
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name)
+    if (statSync(path).isDirectory()) {
+      if (name === 'testing') continue
+      productionSources(path, out)
+    } else if (name.endsWith('.ts') && !name.endsWith('.test.ts')) {
+      out.push(path)
+    }
+  }
+  return out
+}

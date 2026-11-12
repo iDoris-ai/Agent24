@@ -1,11 +1,13 @@
 // F3 WeChat bridge entry point.
 //
-//   agent24 daemon start            # the daemon this bridge drives
+//   agent24 daemon start            # legacy daemon, A24_DEV_TOOL=1, and
+//                                   # A24_INBOUND_DEV_ALLOWLIST=wechat:<uid>,...
 //   A24_DEV_TOOL=1 pnpm --filter @agent24/wechat-bridge bridge
 //
-// First run prints a QR: scan it in WeChat to add the bot. After that, messages
-// you send the bot become agent24d runs, and replies (and approval requests)
-// come back in the chat.
+// First run prints a QR: scan it in WeChat to add the bot. A finished user
+// message with text is posted to the daemon. `started` and `duplicate` are
+// answered with 「已记录」. An ignored sender is not answered.
+// Approvals stay on the desktop.
 
 import { login } from './ilink/auth.js'
 import { ILinkClient } from './ilink/client.js'
@@ -13,8 +15,7 @@ import { Monitor } from './ilink/monitor.js'
 import { Sender } from './ilink/sender.js'
 import { Agent24Client } from './agent24.js'
 import { Bridge } from './bridge.js'
-import { FileSessionStore } from './session-store.js'
-import { CONFIG, discoverDaemon } from './config.js'
+import { discoverDaemon } from './config.js'
 
 async function main(): Promise<void> {
   if (process.env.A24_DEV_TOOL !== '1') {
@@ -39,19 +40,10 @@ async function main(): Promise<void> {
   }
   console.log(`[wechat] 已连接 agent24d: ${daemon.base}`)
 
-  if (CONFIG.ALLOWED_UIDS.size === 0) {
-    console.warn(
-      '[wechat] ⚠️  未配置 A24_WECHAT_ALLOWED_UIDS：将拒绝所有消息（fail-closed）。' +
-        '给 bot 发一条消息，日志会打印你的 from_user_id，再把它设进环境变量以授权。',
-    )
-  } else {
-    console.log(`[wechat] 已授权 ${CONFIG.ALLOWED_UIDS.size} 个用户`)
-  }
-
   const { bot_token, baseurl } = await login()
   const client = new ILinkClient(bot_token, baseurl)
   const sender = new Sender(client)
-  const bridge = new Bridge(new Agent24Client(daemon), sender, new FileSessionStore(CONFIG.SESSION_FILE), CONFIG.ALLOWED_UIDS)
+  const bridge = new Bridge(new Agent24Client(daemon), sender)
 
   const monitor = new Monitor(client, (msg) => {
     void bridge.handle(msg).catch((err) =>
@@ -68,7 +60,7 @@ async function main(): Promise<void> {
   process.on('SIGTERM', shutdown)
 
   monitor.start()
-  console.log('[wechat] ✅ 桥已启动，在微信里给 agent24 发消息即可。')
+  console.log('[wechat] ✅ 桥已启动。发来的消息只会被记录，审批在桌面端处理。')
 }
 
 void main().catch((err) => {
