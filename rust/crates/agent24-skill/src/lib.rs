@@ -437,7 +437,7 @@ fn fill_import_defaults(value: &mut serde_yaml::Value) -> Result<(), SkillError>
     insert_missing(
         map,
         "version",
-        serde_yaml::Value::String("0.0.0".to_string()),
+        serde_yaml::Value::String("0.1.0".to_string()),
     );
     insert_missing(map, "requires", serde_yaml::Value::Sequence(Vec::new()));
     insert_missing(map, "mode", serde_yaml::Value::String("manual".to_string()));

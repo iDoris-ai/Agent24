@@ -529,7 +529,7 @@ fn imported_community_file_fills_defaults_and_user_parse_rejects_it() {
     let markdown = "---\nname: weekly-report\ndescription: 周报\n---\nhello\n";
     assert_eq!(code_of(markdown), "skill_manifest_invalid");
     let manifest = parse_imported(markdown).unwrap();
-    assert_eq!(manifest.version, "0.0.0");
+    assert_eq!(manifest.version, "0.1.0");
     assert!(manifest.requires.is_empty());
     assert_eq!(manifest.mode, SkillMode::Manual);
     assert_eq!(manifest.evals, "");
