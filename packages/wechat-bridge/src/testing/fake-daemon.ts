@@ -14,8 +14,12 @@ export interface RecordedInbound {
 
 export class FakeDaemon {
   private readonly server: http.Server
-  /** Bodies received on the inbound events route, in order. */
+  /** Bodies the route accepted, in order. A failed status is not one of these. */
   readonly events: RecordedInbound[] = []
+  /** Every inbound POST, including ones answered with `failures`. */
+  readonly attempts: RecordedInbound[] = []
+  /** Status codes consumed before a normal 200. `401` and `500` are typical. */
+  readonly failures: number[] = []
   /** These actors are answered `ignored` / `not_allowlisted`. Everyone else is `started`. */
   readonly ignoredActors = new Set<string>()
   port = 0
@@ -46,6 +50,12 @@ export class FakeDaemon {
     const body = (await readJson(req)) as RecordedInbound
 
     if (method === 'POST' && path === '/api/v1/inbound/events') {
+      this.attempts.push(body)
+      const failed = this.failures.shift()
+      if (failed !== undefined) {
+        send(res, { error: { code: 'failed', message: 'nope' } }, failed)
+        return
+      }
       this.events.push(body)
       if (this.ignoredActors.has(body.actor)) {
         send(res, { id: body.id, outcome: 'ignored', reason: 'not_allowlisted' })

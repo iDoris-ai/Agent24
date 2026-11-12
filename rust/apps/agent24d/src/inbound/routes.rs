@@ -7,9 +7,9 @@
 //!
 //! The POST is registered on the kernel router so the route scan and the
 //! operation catalog stay in step. `A24_DEV_TOOL=1` opens it in both auth
-//! modes. Legacy keeps the shared bearer. Capabilities mode accepts only the
-//! dev-bridge component token; anything else is 403, and the route stays 404
-//! when the dev gate is off.
+//! modes. Capabilities mode accepts only the dev-bridge component token;
+//! anything else is 403. Legacy mode keeps the shared bearer for other
+//! routes and rejects it here. The route stays 404 when the dev gate is off.
 //!
 //! Nothing here publishes on the WebSocket `/api/v1/events` hub. The list
 //! returns metadata plus the first 50 characters of `text`. Full text and
@@ -166,8 +166,9 @@ pub(crate) async fn get_events(State(state): State<AppState>, RawQuery(raw): Raw
 /// other than `wechat` is 400. The handler does not copy that field through.
 ///
 /// The route is mounted only when `dev_wechat_events` is set (`A24_DEV_TOOL=1`).
-/// Legacy mode keeps the shared bearer. Capabilities mode accepts only a
-/// `ComponentRuntime` token for `wechat-bridge` that holds `InboundIngest`.
+/// Capabilities mode accepts only a `ComponentRuntime` token for
+/// `wechat-bridge` that holds `InboundIngest`. Legacy mode rejects the shared
+/// bearer here; that mode itself stays for the other routes.
 ///
 /// The JSON body is buffered before this function runs. Capabilities mode
 /// then checks the bearer against the live store again (not revoked, not
@@ -205,10 +206,16 @@ pub(crate) async fn post_wechat_event(
             return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
         }
         Some(authorization)
-    } else if state.auth_mode != AuthMode::LegacySingleToken {
-        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    } else if state.auth_mode == AuthMode::LegacySingleToken {
+        // The shared bearer still opens the other legacy routes. It does not
+        // ingest. Returning `None` here would record the event.
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        );
     } else {
-        None
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
     };
     if let Err(message) = reject_query(raw.as_deref()) {
         return invalid(message);
@@ -1781,6 +1788,46 @@ mod tests {
         app
     }
 
+    /// Capabilities mode plus one real dev-bridge bearer. The store is unchanged.
+    async fn issue_test_bridge(app: &mut AppState) -> String {
+        use crate::capabilities::{
+            Operation, Resource,
+            bridge::{self, BRIDGE_TTL_SECONDS},
+            first_party::{FirstPartyAuthority, test_peer},
+            unix_now,
+        };
+
+        let db = app.store.clone();
+        let cap = crate::capabilities::CapabilityStore::new("daemon-test");
+        let shell = FirstPartyAuthority::new(cap.clone())
+            .issue(&test_peer("daemon-test"))
+            .unwrap();
+        let auth = cap
+            .validate_bearer(
+                &shell.secret,
+                Operation::CapabilityMint,
+                &Resource::global(),
+                unix_now(),
+            )
+            .unwrap();
+        let bridge = bridge::issue_wechat_bridge(&cap, &auth, unix_now(), |event| {
+            let db = db.clone();
+            async move {
+                let ts = bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        .unwrap();
+        let (bearer, _, claims) = bridge.into_bearer_parts();
+        assert_eq!(claims.expires_at - claims.created_at, BRIDGE_TTL_SECONDS);
+        app.enable_capability_auth(cap);
+        bearer
+    }
+
     fn wechat_body(id: &str, actor: &str, at: &str, text: &str) -> String {
         json!({
             "id": id,
@@ -1926,6 +1973,44 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
         assert_eq!(error_code(&json), "not_found");
+    }
+
+    /// The shared bearer still reads models. It cannot post an inbound event.
+    /// Returning `None` from the legacy arm of `post_wechat_event` turns the
+    /// status assertion red and stores the row.
+    #[tokio::test]
+    async fn legacy_shared_bearer_cannot_post_wechat_events() {
+        let app_state = dev_legacy(false).await;
+        let at = format_inbound_timestamp(Utc::now());
+        seed_dev_allowlist(
+            &app_state.store,
+            AuthMode::LegacySingleToken,
+            true,
+            "wechat:alice",
+        )
+        .await
+        .unwrap();
+        let app = crate::server::build_router(app_state.clone());
+        let (models, _) = call(&app, "GET", "/api/v1/models", "testtoken", None).await;
+        assert_eq!(models, StatusCode::OK);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:legacy", "alice", &at, "nope")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        assert_eq!(error_code(&json), "unauthorized");
+        assert!(
+            app_state
+                .store
+                .get_inbound_event("wechat:legacy")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Bridge token: one run, Unknown tag. Each handler check refuses a token
@@ -2139,7 +2224,8 @@ mod tests {
     /// `deny_unknown_fields` still rejects `human`.
     #[tokio::test]
     async fn wechat_post_rejects_another_source_and_unknown_fields() {
-        let app_state = dev_legacy(false).await;
+        let mut app_state = dev_legacy(false).await;
+        let bearer = issue_test_bridge(&mut app_state).await;
         let app = crate::server::build_router(app_state.clone());
         let at = format_inbound_timestamp(Utc::now());
         let hyphae = json!({
@@ -2154,7 +2240,7 @@ mod tests {
             &app,
             "POST",
             "/api/v1/inbound/events",
-            "testtoken",
+            &bearer,
             Some(&hyphae),
         )
         .await;
@@ -2182,7 +2268,7 @@ mod tests {
             &app,
             "POST",
             "/api/v1/inbound/events",
-            "testtoken",
+            &bearer,
             Some(&extra),
         )
         .await;
@@ -2193,7 +2279,7 @@ mod tests {
                 &app,
                 "POST",
                 "/api/v1/inbound/events",
-                "testtoken",
+                &bearer,
                 Some(&wechat_body(id, "alice", &at, "x")),
             )
             .await;
@@ -2207,7 +2293,7 @@ mod tests {
             &app,
             "POST",
             "/api/v1/inbound/events",
-            "testtoken",
+            &bearer,
             Some(&wechat_body("wechat:1", " alice", &at, "x")),
         )
         .await;
@@ -2217,10 +2303,11 @@ mod tests {
     /// Off the list: one ignore row, no run. The body does not echo the text.
     #[tokio::test]
     async fn an_unlisted_wechat_user_is_ignored_and_starts_no_run() {
-        let app_state = dev_legacy(false).await;
+        let mut app_state = dev_legacy(false).await;
         seed_dev_allowlist(&app_state.store, AuthMode::LegacySingleToken, true, "")
             .await
             .unwrap();
+        let bearer = issue_test_bridge(&mut app_state).await;
         let at = format_inbound_timestamp(Utc::now());
         let secret = "SECRET-unlisted-body";
         let app = crate::server::build_router(app_state.clone());
@@ -2228,7 +2315,7 @@ mod tests {
             &app,
             "POST",
             "/api/v1/inbound/events",
-            "testtoken",
+            &bearer,
             Some(&wechat_body("wechat:7", "mallory", &at, secret)),
         )
         .await;
@@ -2253,7 +2340,7 @@ mod tests {
     /// `dev_seed_on_the_same_store_drops_uids_that_left_the_list`.
     #[tokio::test]
     async fn a_seeded_wechat_user_starts_one_unknown_run_and_a_replay_does_not() {
-        let app_state = dev_legacy(true).await;
+        let mut app_state = dev_legacy(true).await;
         let seeded = seed_dev_allowlist(
             &app_state.store,
             AuthMode::LegacySingleToken,
@@ -2279,6 +2366,7 @@ mod tests {
                 .is_some()
         );
 
+        let bearer = issue_test_bridge(&mut app_state).await;
         let at = format_inbound_timestamp(Utc::now());
         let secret = "SECRET-seeded-body";
         let body = json!({
@@ -2290,28 +2378,16 @@ mod tests {
         })
         .to_string();
         let app = crate::server::build_router(app_state.clone());
-        let (status, json) = call(
-            &app,
-            "POST",
-            "/api/v1/inbound/events",
-            "testtoken",
-            Some(&body),
-        )
-        .await;
+        let (status, json) =
+            call(&app, "POST", "/api/v1/inbound/events", &bearer, Some(&body)).await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["outcome"], "started", "{json}");
         assert!(!json.to_string().contains(secret), "{json}");
         let run_id = json["run_id"].as_str().unwrap().to_owned();
         assert_eq!(run_count(&app_state.store).await, 1);
 
-        let (status, replay) = call(
-            &app,
-            "POST",
-            "/api/v1/inbound/events",
-            "testtoken",
-            Some(&body),
-        )
-        .await;
+        let (status, replay) =
+            call(&app, "POST", "/api/v1/inbound/events", &bearer, Some(&body)).await;
         assert_eq!(status, StatusCode::OK, "{replay}");
         assert_eq!(replay["outcome"], "duplicate");
         assert_eq!(run_count(&app_state.store).await, 1);
@@ -2331,15 +2407,28 @@ mod tests {
     /// allowlisted: alice's first POST and bob's POST become `started`.
     #[tokio::test]
     async fn dev_seed_on_the_same_store_drops_uids_that_left_the_list() {
-        let app_state = dev_legacy(true).await;
-        let store = &app_state.store;
-        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "wechat:alice")
+        let mut app_state = dev_legacy(true).await;
+        seed_dev_allowlist(
+            &app_state.store,
+            AuthMode::LegacySingleToken,
+            true,
+            "wechat:alice",
+        )
+        .await
+        .unwrap();
+        seed_dev_allowlist(&app_state.store, AuthMode::LegacySingleToken, true, "")
             .await
             .unwrap();
-        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "")
-            .await
-            .unwrap();
-        assert!(store.list_inbound_allowlist().await.unwrap().is_empty());
+        assert!(
+            app_state
+                .store
+                .list_inbound_allowlist()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let bearer = issue_test_bridge(&mut app_state).await;
+        let store = app_state.store.clone();
 
         let at = format_inbound_timestamp(Utc::now());
         let app = crate::server::build_router(app_state.clone());
@@ -2347,24 +2436,24 @@ mod tests {
             &app,
             "POST",
             "/api/v1/inbound/events",
-            "testtoken",
+            &bearer,
             Some(&wechat_body("wechat:21", "alice", &at, "hello")),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["outcome"], "ignored", "{json}");
         assert_eq!(json["reason"], "not_allowlisted");
-        assert_eq!(run_count(store).await, 0);
+        assert_eq!(run_count(&store).await, 0);
 
         seed_dev_allowlist(
-            store,
+            &store,
             AuthMode::LegacySingleToken,
             true,
             "wechat:alice, wechat:bob",
         )
         .await
         .unwrap();
-        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "wechat:alice")
+        seed_dev_allowlist(&store, AuthMode::LegacySingleToken, true, "wechat:alice")
             .await
             .unwrap();
         let at = format_inbound_timestamp(Utc::now());
@@ -2372,14 +2461,14 @@ mod tests {
             &app,
             "POST",
             "/api/v1/inbound/events",
-            "testtoken",
+            &bearer,
             Some(&wechat_body("wechat:22", "bob", &at, "hello")),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{json}");
         assert_eq!(json["outcome"], "ignored", "{json}");
         assert_eq!(json["reason"], "not_allowlisted");
-        assert_eq!(run_count(store).await, 0);
+        assert_eq!(run_count(&store).await, 0);
         let listed = store.list_inbound_allowlist().await.unwrap();
         assert!(
             listed
@@ -2395,7 +2484,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "")
+        seed_dev_allowlist(&store, AuthMode::LegacySingleToken, true, "")
             .await
             .unwrap();
         let listed = store.list_inbound_allowlist().await.unwrap();
@@ -2409,7 +2498,7 @@ mod tests {
     /// Mapping that `Invalid` onto a 500, or storing the row first, turns this red.
     #[tokio::test]
     async fn an_allowlisted_wechat_message_with_no_text_is_400_and_not_stored() {
-        let app_state = dev_legacy(false).await;
+        let mut app_state = dev_legacy(false).await;
         seed_dev_allowlist(
             &app_state.store,
             AuthMode::LegacySingleToken,
@@ -2418,6 +2507,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let bearer = issue_test_bridge(&mut app_state).await;
         let at = format_inbound_timestamp(Utc::now());
         let app = crate::server::build_router(app_state.clone());
         let bodies = [
@@ -2425,14 +2515,8 @@ mod tests {
             json!({"id": "wechat:12", "actor": "alice", "at": at, "text": ""}).to_string(),
         ];
         for body in &bodies {
-            let (status, json) = call(
-                &app,
-                "POST",
-                "/api/v1/inbound/events",
-                "testtoken",
-                Some(body),
-            )
-            .await;
+            let (status, json) =
+                call(&app, "POST", "/api/v1/inbound/events", &bearer, Some(body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
             assert_eq!(error_code(&json), "invalid_request", "{json}");
             let message = json["error"]["message"].as_str().unwrap();

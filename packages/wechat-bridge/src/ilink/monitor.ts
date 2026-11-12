@@ -4,8 +4,9 @@
 import type { ILinkClient } from './client.js'
 import { MessageState, MessageType, type GetUpdatesResp, type WeixinMessage } from './types.js'
 import { BASE_INFO, CONFIG } from '../config.js'
+import type { CursorStep } from '../bridge.js'
 
-type MessageHandler = (msg: WeixinMessage) => void
+type MessageHandler = (msg: WeixinMessage) => Promise<CursorStep>
 
 export class Monitor {
   private cursor = ''
@@ -16,16 +17,17 @@ export class Monitor {
     private readonly onMessage: MessageHandler,
   ) {}
 
-  start(): void {
+  /** Runs until `stop`, or until a handler returns `stop` (`auth`). */
+  start(): Promise<'auth' | 'stopped'> {
     this.running = true
-    void this.loop()
+    return this.loop()
   }
 
   stop(): void {
     this.running = false
   }
 
-  private async loop(): Promise<void> {
+  private async loop(): Promise<'auth' | 'stopped'> {
     console.log('[wechat] 开始长轮询接收消息...')
     while (this.running) {
       try {
@@ -34,14 +36,28 @@ export class Monitor {
           { get_updates_buf: this.cursor, base_info: BASE_INFO },
           CONFIG.POLL_TIMEOUT_MS + 5_000,
         )
-        if (res.get_updates_buf) this.cursor = res.get_updates_buf
+        // The cursor moves only after every finished message in this batch is
+        // settled. A failed POST keeps `get_updates_buf` so the next poll
+        // redelivers; the daemon dedupes `wechat:<message_id>`.
+        const next = res.get_updates_buf
+        let hold = false
         for (const msg of res.msgs ?? []) {
           if (msg.message_type === MessageType.BOT) continue // skip our own echoes
           // Only act on finished messages — ignore NEW/GENERATING updates so a
           // still-composing/streaming message can't trigger a run prematurely.
           if (msg.message_state !== MessageState.FINISH) continue
-          this.onMessage(msg)
+          const step = await this.onMessage(msg)
+          if (step === 'stop') {
+            this.running = false
+            return 'auth'
+          }
+          if (step !== 'advance') hold = true
         }
+        if (hold) {
+          await sleep(CONFIG.RECONNECT_DELAY_MS)
+          continue
+        }
+        if (next) this.cursor = next
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err)
         if (err instanceof Error && (err.name === 'TimeoutError' || m.includes('timeout'))) {
@@ -51,6 +67,7 @@ export class Monitor {
         await sleep(CONFIG.RECONNECT_DELAY_MS)
       }
     }
+    return 'stopped'
   }
 }
 

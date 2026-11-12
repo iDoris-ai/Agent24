@@ -3,6 +3,7 @@ import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
 import { Bridge, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp } from './bridge.js'
+import { InboundHttpError } from './agent24.js'
 import type { Agent24Client, InboundEvent, InboundRecord } from './agent24.js'
 import type { Sender } from './ilink/sender.js'
 import { splitText } from './ilink/sender.js'
@@ -16,6 +17,15 @@ describe('production sources do not post a run', () => {
     const forbidden = '/api/v1/' + 'runs'
     for (const file of files) {
       expect(readFileSync(file, 'utf8'), file).not.toContain(forbidden)
+    }
+  })
+
+  it('does not read a legacy bearer', () => {
+    const root = fileURLToPath(new URL('.', import.meta.url))
+    const banned = ['A24_TOKEN', 'requireDaemonBearer', 'daemonBearer']
+    for (const file of productionSources(root)) {
+      const text = readFileSync(file, 'utf8')
+      for (const word of banned) expect(text, `${file} ${word}`).not.toContain(word)
     }
   })
 })
@@ -114,7 +124,7 @@ describe('Bridge transport', () => {
 
   it('records a finished user message and replies only 已记录', async () => {
     const { bridge, recorded, sends } = makeBridge()
-    await bridge.handle(textMsg('alice', '查一下天气'))
+    await expect(bridge.handle(textMsg('alice', '查一下天气'))).resolves.toBe('advance')
     expect(recorded).toEqual([
       {
         id: 'wechat:42',
@@ -166,7 +176,7 @@ describe('Bridge transport', () => {
 
   it('does not post or reply to a picture or blank text', async () => {
     const { bridge, recorded, sends } = makeBridge()
-    await bridge.handle(imageMsg('alice'))
+    await expect(bridge.handle(imageMsg('alice'))).resolves.toBe('advance')
     await bridge.handle(textMsg('alice', '   '))
     await bridge.handle(textMsg('alice', '', { item_list: [] }))
     expect(recorded).toEqual([])
@@ -189,9 +199,15 @@ describe('Bridge transport', () => {
 
   it('replies with a fixed failure line and does not echo the error', async () => {
     const { bridge, sends } = makeBridge(new Error('daemon down'))
-    await bridge.handle(textMsg('alice', '做点事'))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('hold')
     expect(sends).toEqual([RECORD_FAILED_REPLY])
     expect(sends.join('')).not.toContain('daemon down')
+  })
+
+  it('stops on 401 without the failure reply', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(401))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('stop')
+    expect(sends).toEqual([])
   })
 })
 

@@ -2441,10 +2441,12 @@ paths:
         Development transport for the wechat bridge. Mounted when the daemon
         was started with `A24_DEV_TOOL=1`, in legacy mode and in capabilities
         mode. Without that flag the answer is 404 (`No v1 route`). Legacy
-        mode keeps the shared bearer. Capabilities mode accepts only a
-        component-runtime token whose component id is `wechat-bridge` and
-        whose only operation is `inbound.ingest`. ProductHost, a first-party
-        shell, a creative token, and the legacy bearer are forbidden there.
+        mode rejects this POST: the shared bearer is not accepted, while that
+        auth mode itself stays for the other routes. Capabilities mode accepts
+        only a component-runtime token whose component id is `wechat-bridge`
+        and whose only operation is `inbound.ingest`. ProductHost, a
+        first-party shell, a creative token, and the legacy bearer are
+        forbidden there.
         The legacy allowlist seed is not applied in capabilities mode.
         `source` is fixed to `wechat`: a body `source` other than `wechat` is
         400, and the stored row is always `wechat` / `dev_bridge` / `direct` /

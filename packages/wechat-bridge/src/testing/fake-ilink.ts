@@ -18,7 +18,6 @@ export interface OutboundRecord {
   text: string
 }
 
-type UpdatesResolver = (msgs: WeixinMessage[]) => void
 type OutboundWaiter = {
   match: (text: string, toUserId: string) => boolean
   resolve: (rec: OutboundRecord) => void
@@ -26,15 +25,27 @@ type OutboundWaiter = {
   timer: ReturnType<typeof setTimeout>
 }
 
+interface StoredUpdate {
+  seq: number
+  msg: WeixinMessage
+}
+
+interface PendingPoll {
+  after: number
+  res: http.ServerResponse
+}
+
 export class FakeILink {
   private readonly server: http.Server
-  private readonly inbound: WeixinMessage[] = []
-  private readonly updatesWaiters: UpdatesResolver[] = []
+  private readonly history: StoredUpdate[] = []
+  private readonly pending: PendingPoll[] = []
   private readonly outboundWaiters: OutboundWaiter[] = []
-  private cursor = 0
+  private nextSeq = 1
   private nextMessageId = 1
   /** Every outbound message the bot sent, in order (ack + real replies). */
   readonly outbound: OutboundRecord[] = []
+  /** `get_updates_buf` sent on each getupdates, in order. */
+  readonly polls: string[] = []
   port = 0
 
   constructor() {
@@ -55,7 +66,11 @@ export class FakeILink {
     // Flush any parked long-poll so in-flight fetches complete and the Monitor
     // loop can observe `running=false` and exit, instead of hanging to the 45s
     // client timeout.
-    while (this.updatesWaiters.length) this.updatesWaiters.shift()!([])
+    const buf = this.latestBuf()
+    while (this.pending.length) {
+      const waiter = this.pending.shift()!
+      this.respondUpdates(waiter.res, [], buf)
+    }
     for (const w of this.outboundWaiters.splice(0)) {
       clearTimeout(w.timer)
       w.reject(new Error('FakeILink closed before outbound arrived'))
@@ -78,9 +93,9 @@ export class FakeILink {
       context_token: `ctx-${fromUserId}`,
       item_list: [{ type: MessageItemType.TEXT, text_item: { text } }],
     }
-    const waiter = this.updatesWaiters.shift()
-    if (waiter) waiter([msg])
-    else this.inbound.push(msg)
+    const seq = this.nextSeq++
+    this.history.push({ seq, msg })
+    this.wake()
   }
 
   /** Resolve when the bot sends an outbound message whose text matches. */
@@ -104,11 +119,13 @@ export class FakeILink {
     const body = await readJson(req)
     const url = req.url ?? ''
     if (url.startsWith('/ilink/bot/getupdates')) {
-      if (this.inbound.length) {
-        this.respondUpdates(res, this.inbound.splice(0))
-      } else {
-        this.updatesWaiters.push((msgs) => this.respondUpdates(res, msgs))
-      }
+      const raw = (body as { get_updates_buf?: unknown }).get_updates_buf
+      const cursor = typeof raw === 'string' ? raw : ''
+      this.polls.push(cursor)
+      const after = Number(cursor) || 0
+      const msgs = this.since(after)
+      if (msgs.length) this.respondUpdates(res, msgs, this.latestBuf())
+      else this.pending.push({ after, res })
       return
     }
     if (url.startsWith('/ilink/bot/sendmessage')) {
@@ -119,8 +136,29 @@ export class FakeILink {
     send(res, { ret: 0 })
   }
 
-  private respondUpdates(res: http.ServerResponse, msgs: WeixinMessage[]): void {
-    send(res, { ret: 0, msgs, get_updates_buf: String(++this.cursor) })
+  private since(after: number): WeixinMessage[] {
+    return this.history.filter((item) => item.seq > after).map((item) => item.msg)
+  }
+
+  private latestBuf(): string {
+    const last = this.history[this.history.length - 1]
+    return last ? String(last.seq) : ''
+  }
+
+  /** Deliver queued messages to polls that are still behind the history. */
+  private wake(): void {
+    const buf = this.latestBuf()
+    const stay: PendingPoll[] = []
+    for (const waiter of this.pending) {
+      const msgs = this.since(waiter.after)
+      if (msgs.length) this.respondUpdates(waiter.res, msgs, buf)
+      else stay.push(waiter)
+    }
+    this.pending.splice(0, this.pending.length, ...stay)
+  }
+
+  private respondUpdates(res: http.ServerResponse, msgs: WeixinMessage[], buf: string): void {
+    send(res, { ret: 0, msgs, get_updates_buf: buf })
   }
 
   private recordOutbound(body: SendMessageBody): void {

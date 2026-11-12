@@ -23,6 +23,7 @@ use zeroize::{Zeroize, Zeroizing};
 compile_error!("test-support must not be enabled in release builds");
 
 mod acp;
+mod bridge_token;
 mod comm_groups;
 mod documents;
 mod enroll;
@@ -207,6 +208,18 @@ enum Command {
         #[command(subcommand)]
         action: query::ToolsAction,
     },
+    /// 开发工具。`A24_DEV_TOOL=1` 才可用。
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+}
+
+/// `agent24 dev …`
+#[derive(Subcommand)]
+enum DevAction {
+    /// 经桌面确认签发 8 小时微信桥令牌，写入状态目录 dev/wechat-bridge.token
+    BridgeToken,
 }
 
 /// `agent24 hw …` (HW-1).
@@ -1097,6 +1110,73 @@ async fn cmd_acp() -> Result<(), String> {
     let result = acp::serve(&ep).await;
     finish(ep).await;
     result
+}
+
+async fn cmd_dev(action: DevAction) -> Result<(), String> {
+    match action {
+        DevAction::BridgeToken => cmd_bridge_token().await,
+    }
+}
+
+/// Enrol, ask the desktop to confirm, and write the dev-bridge file.
+///
+/// Stdout is the path and `expires_at` only. The bearer stays in the file.
+async fn cmd_bridge_token() -> Result<(), String> {
+    if !bridge_token::dev_tool_enabled() {
+        return Err(bridge_token::DEV_TOOL_REQUIRED.to_owned());
+    }
+    let Some(ep) = attach_only_with_enrollment(true).await? else {
+        return Err(
+            "找不到运行中的 agent24d。先以 capabilities 模式启动它（A24_DEV_TOOL=1），再运行 agent24 dev bridge-token。"
+                .to_owned(),
+        );
+    };
+    let reply = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        "/api/v1/capabilities/bridge",
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await
+    .map_err(|err| {
+        let (code, message) = err.parts();
+        format!("{code}: {message}")
+    });
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err);
+        }
+    };
+    if !reply.status.is_success() {
+        let status = reply.status;
+        let body = reply.json_value().await;
+        finish(ep).await;
+        let code = body["error"]["code"].as_str().unwrap_or("request_failed");
+        let message = body["error"]["message"]
+            .as_str()
+            .unwrap_or("bridge token request failed");
+        return Err(format!("{code}: {message} (HTTP {status})"));
+    }
+    let body = reply.json_value().await;
+    finish(ep).await;
+    let token = Zeroizing::new(
+        body["token"]
+            .as_str()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| "签发响应没有令牌".to_owned())?
+            .to_owned(),
+    );
+    let expires_at = body["expires_at"]
+        .as_u64()
+        .ok_or_else(|| "签发响应没有 expires_at".to_owned())?;
+    let root = agent24_protocol::data_dir::data_dir().map_err(|err| err.to_string())?;
+    let path = bridge_token::write_bridge_token_at(&root, token.as_str(), expires_at)?;
+    print!("{}", bridge_token::stdout_lines(&path, expires_at));
+    Ok(())
 }
 
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -3262,6 +3342,7 @@ async fn main() -> std::process::ExitCode {
         Command::Consent { action } => query::consent(action).await,
         Command::Approval { action } => query::approval(action).await,
         Command::Tools { action } => query::tools(action).await,
+        Command::Dev { action } => cmd_dev(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

@@ -18,6 +18,17 @@ export interface InboundEvent {
   text?: string
 }
 
+/** HTTP failure from the inbound route. The body is not part of the message. */
+export class InboundHttpError extends Error {
+  readonly status: number
+
+  constructor(status: number) {
+    super(`record inbound failed: HTTP ${status}`)
+    this.name = 'InboundHttpError'
+    this.status = status
+  }
+}
+
 export class Agent24Client {
   constructor(private readonly ep: DaemonEndpoint) {}
 
@@ -35,7 +46,7 @@ export class Agent24Client {
       headers: this.headers(),
       body: JSON.stringify(event),
     })
-    if (!res.ok) throw new Error(`record inbound failed: HTTP ${res.status}`)
+    if (!res.ok) throw new InboundHttpError(res.status)
     return (await res.json()) as InboundRecord
   }
 }
