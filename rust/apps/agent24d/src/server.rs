@@ -5253,6 +5253,11 @@ pub(crate) mod tests {
             if policy.method == "POST" && policy.template == "/api/v1/inbound/events" {
                 continue;
             }
+            // The bridge mint route is dark unless A24_DEV_TOOL=1. A live
+            // token then gets 404, same as the wechat POST above.
+            if policy.method == "POST" && policy.template == "/api/v1/capabilities/bridge" {
+                continue;
+            }
             let path = concrete_path(policy.template);
             let response = router
                 .clone()
