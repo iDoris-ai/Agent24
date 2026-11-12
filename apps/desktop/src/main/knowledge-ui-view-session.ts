@@ -28,6 +28,8 @@ export interface UiViewSessionDeps {
   sleep: (ms: number) => Promise<void>
   /** U4.5 "恢复即重载": injection was paused and is not any more. */
   onResume?: () => void
+  /** An exchange went through with this many unknown ops dropped (> 0). A count only; nothing else of the answer. */
+  onOpsDropped?: (count: number) => void
 }
 
 export type UiSessionOutcome =
@@ -188,6 +190,7 @@ export class UiViewSession {
       if (this.destroyed) return { kind: 'destroyed' }
       if (exchanged.kind === 'ok') {
         this.session = { ...exchanged.value, exchangedAt: this.deps.now(), generation }
+        if (exchanged.value.droppedOps > 0) this.deps.onOpsDropped?.(exchanged.value.droppedOps)
         this.setPaused(false)
         return { kind: 'ready' }
       }

@@ -172,7 +172,7 @@ class FakeWindow extends FakeEmitter {
 const ALL_CLEARED = ['connections', 'storage', 'cache', 'auth']
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean; ui: (c: KnowledgeViewUiContext) => KnowledgeViewUi; pending: KnowledgePending }> = {}) {
+function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean; ui: (c: KnowledgeViewUiContext) => KnowledgeViewUi; pending: KnowledgePending; log: (message: string) => void }> = {}) {
   const views: FakeView[] = []
   const sessions: FakeSession[] = []
   const states: unknown[] = []
@@ -203,7 +203,7 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
       return timers.length
     },
     clearTimer: (handle: unknown) => { cleared.push(handle as number) },
-    log: () => {},
+    log: over.log ?? (() => {}),
     partitionName: () => `${KNOWLEDGE_VIEW_PARTITION_PREFIX}p${++seq}`,
     proxyPort: () => Promise.resolve(9),
     ...(over.ui ? { ui: over.ui } : {}),
@@ -1221,6 +1221,20 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
     } finally {
       nextLoad = () => Promise.resolve()
     }
+  })
+
+  it('logs a dropped-ops count and keeps the view and its session (#1670 c2)', async () => {
+    const ui = fakeUi()
+    const lines: string[] = []
+    const t = setup({ ui: ui.factory, log: (m) => { lines.push(m) } })
+    let reloads = 0
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.reload = () => { reloads++ }
+    ui.made[0].context.onEvent({ kind: 'ops_dropped', count: 2 })
+    expect(lines).toEqual(["[knowledge-view] UI exchange dropped 2 op(s) outside the host's closed set"])
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    expect(reloads).toBe(0)
+    expect(ui.made).toHaveLength(1)
   })
 
   it('a resume before loadURL alone never reloads the page that follows (U4.5)', async () => {
