@@ -1176,7 +1176,7 @@ export interface paths {
         put?: never;
         /**
          * Record one development WeChat message
-         * @description Development transport for the wechat bridge. Mounted only in legacy mode when the daemon was started with `A24_DEV_TOOL=1`. Capabilities mode, and legacy mode without that flag, answer 404 (`No v1 route`). `source` is fixed to `wechat`: a body `source` other than `wechat` is 400, and the stored row is always `wechat` / `dev_bridge` / `direct` / `human=true`. The route does not copy `category`, `human`, or `addressed` from the body. Admission (allowlist, watermark, rate) still decides whether a run starts. A duplicate `id` does not start a second run. The response does not echo `text`. A storage failure is a generic `storage error`. A start failure is a generic `internal error`. Neither body includes the store text or the prompt. An allowlisted message with no text is 400 and is not stored.
+         * @description Development transport for the wechat bridge. Mounted only in legacy mode when the daemon was started with `A24_DEV_TOOL=1`. Capabilities mode, and legacy mode without that flag, answer 404 (`No v1 route`). `source` is fixed to `wechat`: a body `source` other than `wechat` is 400, and the stored row is always `wechat` / `dev_bridge` / `direct` / `human=true`. The route does not copy `category`, `human`, or `addressed` from the body. Admission (allowlist, watermark, rate) still decides whether a run starts. A duplicate `id` does not start a second run. The response does not echo `text`. A storage failure is a generic `storage error`. A start failure is a generic `internal error`. Neither body includes the store text or the prompt. An allowlisted message with no text is 400 and is not stored. An unknown query parameter is 400. A body over the daemon limit is 413 `payload_too_large`.
          */
         post: operations["postWechatInboundEvent"];
         delete?: never;
@@ -6841,7 +6841,7 @@ export interface operations {
                     "application/json": components["schemas"]["WechatInboundEventResult"];
                 };
             };
-            /** @description Malformed body, unknown field, a source other than wechat, or an allowlisted message with no text */
+            /** @description Malformed body, unknown field, unknown query parameter, a source other than wechat, or an allowlisted message with no text */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -6861,6 +6861,15 @@ export interface operations {
             };
             /** @description Not mounted (capabilities mode, or legacy without A24_DEV_TOOL=1) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+            413: {
                 headers: {
                     [name: string]: unknown;
                 };

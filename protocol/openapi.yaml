@@ -2391,7 +2391,9 @@ paths:
         second run. The response does not echo `text`. A storage failure is a
         generic `storage error`. A start failure is a generic `internal error`.
         Neither body includes the store text or the prompt. An allowlisted
-        message with no text is 400 and is not stored.
+        message with no text is 400 and is not stored. An unknown query
+        parameter is 400. A body over the daemon limit is 413
+        `payload_too_large`.
       requestBody:
         required: true
         content:
@@ -2407,8 +2409,8 @@ paths:
                 $ref: "#/components/schemas/WechatInboundEventResult"
         "400":
           description: >-
-            Malformed body, unknown field, a source other than wechat, or an
-            allowlisted message with no text
+            Malformed body, unknown field, unknown query parameter, a source
+            other than wechat, or an allowlisted message with no text
           content:
             application/json:
               schema:
@@ -2421,6 +2423,12 @@ paths:
                 $ref: "#/components/schemas/Error"
         "404":
           description: Not mounted (capabilities mode, or legacy without A24_DEV_TOOL=1)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "payload_too_large: the request exceeded the daemon-wide body limit"
           content:
             application/json:
               schema:

@@ -148,11 +148,17 @@ export function selectedAuthMode(kind: BackendKind, platform: NodeJS.Platform = 
 /** Drop the development inbound switch before this app starts agent24d.
  * Windows stays on the legacy token (`selectedAuthMode`), and a legacy daemon
  * started with these variables mounts the wechat route and seeds the allowlist.
- * A product launch must not inherit them from the launching shell. */
+ * A product launch must not inherit them from the launching shell.
+ * Windows environment names are case-insensitive, so the comparison is on
+ * `key.toUpperCase()`. */
 export function daemonChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...source }
-  delete env['A24_DEV_TOOL']
-  delete env['A24_INBOUND_DEV_ALLOWLIST']
+  for (const key of Object.keys(env)) {
+    const upper = key.toUpperCase()
+    if (upper === 'A24_DEV_TOOL' || upper === 'A24_INBOUND_DEV_ALLOWLIST') {
+      delete env[key]
+    }
+  }
   return env
 }
 

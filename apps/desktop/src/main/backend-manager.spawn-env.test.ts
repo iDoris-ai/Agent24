@@ -47,6 +47,21 @@ describe('daemonChildEnv', () => {
     expect(env['PATH']).toBe('/usr/bin')
     expect(env['HOME']).toBe('/Users/jason')
   })
+
+  it('drops lowercase and mixed-case spellings', () => {
+    const env = daemonChildEnv({
+      PATH: '/usr/bin',
+      a24_dev_tool: '1',
+      A24_Dev_Tool: '1',
+      a24_inbound_dev_allowlist: 'wechat:alice',
+      A24_Inbound_Dev_Allowlist: 'wechat:bob',
+    })
+    expect(env).not.toHaveProperty('a24_dev_tool')
+    expect(env).not.toHaveProperty('A24_Dev_Tool')
+    expect(env).not.toHaveProperty('a24_inbound_dev_allowlist')
+    expect(env).not.toHaveProperty('A24_Inbound_Dev_Allowlist')
+    expect(env['PATH']).toBe('/usr/bin')
+  })
 })
 
 describe('desktop daemon spawn env', () => {
