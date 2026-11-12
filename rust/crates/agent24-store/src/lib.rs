@@ -202,16 +202,18 @@ pub enum StoreError {
     /// A write contradicts a stored row. The string names the case.
     ///
     /// Skill writes use this when the failure is not one of the typed skill
-    /// codes: an empty field, a `revision_id` already stored for other bytes,
-    /// bytes that do not match the row for that content digest, a revision
-    /// whose skill or kind is not the one requested, a rollback source that
-    /// belongs to another skill, an accepted id that is not a failed case id
-    /// on this binding, or JSON that is not the required array. The `skill`
-    /// module lists them next to the typed codes.
+    /// codes: an empty field, a `content_digest` that is not the SHA-256 of
+    /// the bytes, a `revision_id` / `result_id` / `activation_id` already
+    /// stored, bytes that do not match the row for that content digest, a
+    /// revision whose skill or kind is not the one requested, a rollback
+    /// source that belongs to another skill, an accepted id that is not a
+    /// failed case id on this binding, or JSON that is not the required array.
+    /// The `skill` module lists them next to the typed codes.
     ///
     /// A SQLite busy timeout is [`StoreError::Sqlx`], not this variant. SL-4
-    /// maps that timeout to a retryable error. A stale skill generation is
-    /// [`StoreError::SkillPointerConflict`], which is not a lock timeout.
+    /// treats only `SQLITE_BUSY` as retryable. Other `Sqlx` errors are not.
+    /// A stale skill generation is [`StoreError::SkillPointerConflict`], which
+    /// is not a lock timeout.
     #[error("conflict: {0}")]
     Conflict(String),
     /// Same skill, origin, semver, and kind already stores a different digest.
@@ -224,13 +226,21 @@ pub enum StoreError {
     #[error("skill_pointer_conflict")]
     SkillPointerConflict,
     /// One activation would replace both the body revision and the evals
-    /// revision. Rollback is the move that restores a whole historical pair.
+    /// revision of the same origin. A source switch (the requested pair shares
+    /// one origin, and it is not the pointer's origin) is allowed, as is
+    /// rollback. Nothing was written.
     #[error("skill_activation_mixed")]
     SkillActivationMixed,
     /// Body revision and evals revision do not share an origin. The pointer
     /// primary key stays `skill_id`. Nothing was written.
     #[error("skill_origin_mismatch")]
     SkillOriginMismatch,
+    /// The activation binding has no eval cases. The pointer is unchanged.
+    #[error("skill_eval_empty")]
+    SkillEvalEmpty,
+    /// A failed case in this binding was not accepted. The pointer is unchanged.
+    #[error("skill_eval_failed")]
+    SkillEvalFailed,
     /// ME4-1.2.1 / design §6.2, §6.4: a module's `_a24/scheduler/upsert` for
     /// a brand-new key when it already owns 256 rows. Counted inside the
     /// `BEGIN IMMEDIATE` transaction that would have inserted the row, so

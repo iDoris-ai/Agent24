@@ -10,13 +10,20 @@
 //! generation 0. A stale generation is [`StoreError::SkillPointerConflict`]
 //! and is reported before [`StoreError::SkillActivationMixed`]. Activation and
 //! rollback share one move. The body revision and the evals revision must have
-//! the same origin ([`StoreError::SkillOriginMismatch`]). The pointer primary
-//! key stays `skill_id`.
+//! the same origin ([`StoreError::SkillOriginMismatch`]). When that shared
+//! origin differs from the current pointer, both sides may change in one
+//! activation (a source switch, treated like the first pair). The pointer
+//! primary key stays `skill_id`. History rows carry `origin_from` / `origin_to`
+//! for the confirmation summary.
+//!
+//! `content_digest` is the lowercase hex SHA-256 of `content`. The store
+//! recomputes it and rejects a mismatch with [`StoreError::Conflict`].
 //!
 //! # `StoreError::Conflict` from this module
 //!
 //! - a required text field is empty
-//! - `revision_id` is already stored for a different revision
+//! - `content_digest` is not the SHA-256 of `content`
+//! - `revision_id`, `result_id`, or `activation_id` is already stored
 //! - the digest row exists but the bytes differ
 //! - the revision's skill or kind is not the one requested
 //! - the rollback source belongs to another skill
@@ -25,16 +32,21 @@
 //! - a stored origin, kind, or result code is outside its closed set
 //! - the generation would overflow
 //!
-//! A SQLite busy timeout surfaces as [`StoreError::Sqlx`] (the connection's
-//! busy timeout elapsed, `SQLITE_BUSY`). That is not [`StoreError::Conflict`]
-//! and not [`StoreError::SkillPointerConflict`]. SL-4 maps that timeout to a
-//! retryable error.
+//! Those duplicate ids are checked before insert, so a repeat comes back as
+//! [`StoreError::Conflict`] and not as a SQLite unique-constraint
+//! [`StoreError::Sqlx`].
+//!
+//! SL-4 treats only `SQLITE_BUSY` as retryable. A busy timeout surfaces as
+//! [`StoreError::Sqlx`]. Any other [`StoreError::Sqlx`], [`StoreError::Conflict`],
+//! and the typed skill codes are not retryable.
 //!
 //! This module does not parse a manifest, score an eval, or read the filesystem.
 
 use std::collections::HashSet;
 
 use serde_json::Value;
+use sha2::Digest;
+use sha2::Sha256;
 use sqlx::Row;
 use sqlx::Sqlite;
 use sqlx::Transaction;
@@ -199,13 +211,17 @@ pub enum SkillActivationOutcome {
 
 /// One history row joined to its eval binding and the body revision's origin.
 ///
-/// Rows are ordered by `seq`, not by `created_at`.
+/// Rows are ordered by `seq`, not by `created_at`. `origin_from` is the
+/// previous row's origin (`None` on the first row). `origin_to` is this row.
+/// The confirmation summary reads that pair as the source switch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillActivationRecord {
     pub seq: i64,
     pub activation_id: String,
     pub skill_id: String,
     pub origin: SkillOrigin,
+    pub origin_from: Option<SkillOrigin>,
+    pub origin_to: SkillOrigin,
     pub body_revision_id: String,
     pub evals_revision_id: String,
     pub result_id: String,
@@ -270,9 +286,14 @@ fn json_array(field: &str, value: &str) -> Result<Vec<Value>> {
         .ok_or_else(|| StoreError::Conflict(format!("skill {field} is not a json array")))
 }
 
-/// Every accepted id must be a failed case id in this binding.
+/// Cases must be non-empty. Every accepted id must be a failed case, and
+/// every failed case must be accepted. Empty is [`StoreError::SkillEvalEmpty`].
+/// A failed id left out is [`StoreError::SkillEvalFailed`].
 fn require_accepted(cases_json: &str, accepted_json: &str) -> Result<()> {
     let cases = json_array("cases_json", cases_json)?;
+    if cases.is_empty() {
+        return Err(StoreError::SkillEvalEmpty);
+    }
     let mut failed = HashSet::new();
     let mut seen = HashSet::new();
     for case in &cases {
@@ -299,6 +320,7 @@ fn require_accepted(cases_json: &str, accepted_json: &str) -> Result<()> {
             failed.insert(id.to_owned());
         }
     }
+    let mut accepted = HashSet::new();
     for item in json_array("accepted_json", accepted_json)? {
         let Some(id) = item.as_str() else {
             return Err(StoreError::Conflict(
@@ -310,8 +332,21 @@ fn require_accepted(cases_json: &str, accepted_json: &str) -> Result<()> {
                 "skill accepted id is not a failed case".to_owned(),
             ));
         }
+        accepted.insert(id.to_owned());
+    }
+    if failed.iter().any(|id| !accepted.contains(id)) {
+        return Err(StoreError::SkillEvalFailed);
     }
     Ok(())
+}
+
+/// Lowercase hex SHA-256 of the revision bytes. Callers pass this as
+/// `content_digest`; the store recomputes it and rejects a mismatch.
+fn content_digest_of(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn same_pair(pointer: &SkillPointer, body_revision_id: &str, evals_revision_id: &str) -> bool {
@@ -400,7 +435,16 @@ impl Store {
         .bind(skill_id)
         .fetch_all(self.pool())
         .await?;
-        rows.iter().map(activation_from_row).collect()
+        let mut history = Vec::with_capacity(rows.len());
+        let mut previous_origin = None;
+        for row in &rows {
+            let mut record = activation_from_row(row)?;
+            record.origin_from = previous_origin;
+            record.origin_to = record.origin;
+            previous_origin = Some(record.origin);
+            history.push(record);
+        }
+        Ok(history)
     }
 
     /// Point the skill at one pair.
@@ -411,7 +455,8 @@ impl Store {
     ///
     /// # Errors
     /// [`StoreError::SkillPointerConflict`], [`StoreError::SkillActivationMixed`],
-    /// [`StoreError::SkillOriginMismatch`], missing revisions, or storage.
+    /// [`StoreError::SkillOriginMismatch`], [`StoreError::SkillEvalEmpty`],
+    /// [`StoreError::SkillEvalFailed`], missing revisions, or storage.
     pub async fn activate_skill(&self, req: &NewSkillActivation) -> Result<SkillActivationOutcome> {
         require_text("activation_id", &req.activation_id)?;
         require_text("skill_id", &req.skill_id)?;
@@ -472,6 +517,13 @@ async fn insert_revision_tx(
     tx: &mut Transaction<'_, Sqlite>,
     rev: &NewSkillRevision,
 ) -> Result<SkillRevisionInsert> {
+    let computed = content_digest_of(&rev.content);
+    if computed != rev.content_digest {
+        return Err(StoreError::Conflict(
+            "skill content_digest does not match content".to_owned(),
+        ));
+    }
+
     let by_semver = sqlx::query(
         "SELECT revision_id, content_digest, content FROM skill_revision \
          WHERE skill_id = ? AND origin = ? AND semver = ? AND kind = ?",
@@ -580,7 +632,6 @@ fn decide_generation(
     expected_generation: i64,
     body_revision_id: &str,
     evals_revision_id: &str,
-    allow_both_sides: bool,
 ) -> Result<Option<i64>> {
     if let Some(pointer) = pointer
         && same_pair(pointer, body_revision_id, evals_revision_id)
@@ -590,13 +641,6 @@ fn decide_generation(
     let current = pointer.map(|row| row.generation).unwrap_or(0);
     if current != expected_generation {
         return Err(StoreError::SkillPointerConflict);
-    }
-    if let Some(pointer) = pointer {
-        let body_changed = pointer.body_revision_id != body_revision_id;
-        let evals_changed = pointer.evals_revision_id != evals_revision_id;
-        if body_changed && evals_changed && !allow_both_sides {
-            return Err(StoreError::SkillActivationMixed);
-        }
     }
     Ok(Some(expected_generation))
 }
@@ -608,7 +652,7 @@ async fn require_stored_revision(
     kind: SkillRevisionKind,
 ) -> Result<StoredRevision> {
     let row = sqlx::query(
-        "SELECT skill_id, origin, kind, content_digest, content FROM skill_revision \
+        "SELECT skill_id, origin, kind, content_digest FROM skill_revision \
          WHERE revision_id = ?",
     )
     .bind(revision_id)
@@ -619,7 +663,6 @@ async fn require_stored_revision(
             "skill revision {revision_id}"
         )));
     };
-    let _content: Vec<u8> = row.get("content");
     let stored_skill: String = row.get("skill_id");
     let stored_kind = SkillRevisionKind::parse(&row.get::<String, _>("kind"))?;
     if stored_skill != skill_id || stored_kind != kind {
@@ -686,6 +729,17 @@ async fn insert_eval_result(
     require_text("segment_digest", &binding.segment_digest)?;
     require_text("renderer_version", &binding.renderer_version)?;
     require_accepted(&binding.cases_json, &binding.accepted_json)?;
+    if id_stored(
+        tx,
+        "SELECT 1 AS present FROM skill_eval_result WHERE result_id = ?",
+        &binding.result_id,
+    )
+    .await?
+    {
+        return Err(StoreError::Conflict(
+            "skill result_id already stored".to_owned(),
+        ));
+    }
     sqlx::query(
         "INSERT INTO skill_eval_result ( \
             result_id, body_revision_id, evals_revision_id, segment_digest, \
@@ -710,6 +764,17 @@ async fn insert_activation_row(
     row: &PointerMove<'_>,
     result_id: &str,
 ) -> Result<()> {
+    if id_stored(
+        tx,
+        "SELECT 1 AS present FROM skill_activation WHERE activation_id = ?",
+        row.activation_id,
+    )
+    .await?
+    {
+        return Err(StoreError::Conflict(
+            "skill activation_id already stored".to_owned(),
+        ));
+    }
     sqlx::query(
         "INSERT INTO skill_activation ( \
             activation_id, skill_id, body_revision_id, evals_revision_id, \
@@ -728,10 +793,17 @@ async fn insert_activation_row(
     Ok(())
 }
 
+async fn id_stored(tx: &mut Transaction<'_, Sqlite>, sql: &'static str, id: &str) -> Result<bool> {
+    let row = sqlx::query(sql).bind(id).fetch_optional(&mut **tx).await?;
+    Ok(row.is_some())
+}
+
 async fn audit_move(
     tx: &mut Transaction<'_, Sqlite>,
     row: &PointerMove<'_>,
     content_digest: &str,
+    origin_from: Option<SkillOrigin>,
+    origin_to: SkillOrigin,
 ) -> Result<()> {
     let detail = serde_json::json!({
         "skill_id": row.skill_id,
@@ -739,6 +811,8 @@ async fn audit_move(
         "evals_revision_id": row.evals_revision_id,
         "content_digest": content_digest,
         "result_code": row.result_code,
+        "origin_from": origin_from.map(SkillOrigin::as_str),
+        "origin_to": origin_to.as_str(),
     });
     Store::append_audit_tx(tx, row.created_at, row.actor, row.audit_action, &detail).await?;
     Ok(())
@@ -754,7 +828,6 @@ async fn move_pointer(
         move_req.expected_generation,
         move_req.body_revision_id,
         move_req.evals_revision_id,
-        move_req.allow_both_sides,
     )?;
     let Some(expected) = expected else {
         let generation = pointer
@@ -780,6 +853,16 @@ async fn move_pointer(
     if body.origin != evals.origin {
         return Err(StoreError::SkillOriginMismatch);
     }
+    if let Some(pointer) = pointer.as_ref() {
+        let body_changed = pointer.body_revision_id != move_req.body_revision_id;
+        let evals_changed = pointer.evals_revision_id != move_req.evals_revision_id;
+        // Same-origin moves still change one side at a time. A different
+        // shared origin is a source switch and is allowed, like the first pair.
+        let source_switch = pointer.origin != body.origin;
+        if body_changed && evals_changed && !move_req.allow_both_sides && !source_switch {
+            return Err(StoreError::SkillActivationMixed);
+        }
+    }
     let result_id = match move_req.binding {
         Some(binding) => {
             insert_eval_result(
@@ -804,7 +887,14 @@ async fn move_pointer(
         pointer.is_some(),
     )
     .await?;
-    audit_move(tx, move_req, &body.content_digest).await?;
+    audit_move(
+        tx,
+        move_req,
+        &body.content_digest,
+        pointer.as_ref().map(|row| row.origin),
+        body.origin,
+    )
+    .await?;
     Ok(SkillActivationOutcome::Activated {
         generation,
         activation_id: move_req.activation_id.to_owned(),
@@ -900,11 +990,14 @@ fn activation_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SkillActivationR
             "skill result_code {result_code}"
         )));
     }
+    let origin = SkillOrigin::parse(&row.get::<String, _>("origin"))?;
     Ok(SkillActivationRecord {
         seq: row.get("seq"),
         activation_id: row.get("activation_id"),
         skill_id: row.get("skill_id"),
-        origin: SkillOrigin::parse(&row.get::<String, _>("origin"))?,
+        origin,
+        origin_from: None,
+        origin_to: origin,
         body_revision_id: row.get("body_revision_id"),
         evals_revision_id: row.get("evals_revision_id"),
         result_id: row.get("result_id"),
@@ -935,7 +1028,7 @@ mod tests {
         origin: SkillOrigin,
         semver: &str,
         kind: SkillRevisionKind,
-        digest: &str,
+        _digest: &str,
         content: &[u8],
     ) -> NewSkillRevision {
         NewSkillRevision {
@@ -944,7 +1037,7 @@ mod tests {
             origin,
             semver: semver.to_owned(),
             kind,
-            content_digest: digest.to_owned(),
+            content_digest: content_digest_of(content),
             content: content.to_vec(),
             created_at: "2026-11-12T00:00:00Z".to_owned(),
         }
@@ -1045,6 +1138,7 @@ mod tests {
         let mut flipped = first.clone();
         flipped.revision_id = "rev-body-flipped".to_owned();
         flipped.content = b"hello skill!".to_vec();
+        flipped.content_digest = content_digest_of(&flipped.content);
         let err = store.insert_skill_revision(&flipped).await.unwrap_err();
         assert!(matches!(err, StoreError::SkillRevisionConflict), "{err:?}");
         assert_eq!(
@@ -1101,7 +1195,7 @@ mod tests {
         collided.content = b"other bytes".to_vec();
         let err = store.insert_skill_revision(&collided).await.unwrap_err();
         assert!(
-            matches!(err, StoreError::Conflict(ref message) if message.contains("stored digest")),
+            matches!(err, StoreError::Conflict(ref message) if message.contains("content_digest")),
             "{err:?}"
         );
         assert_eq!(revision_count(&store).await, 1);
@@ -1122,8 +1216,8 @@ mod tests {
         put(&store, &first).await;
         let mut second = first.clone();
         second.revision_id = "rev-body-2".to_owned();
-        second.content_digest = "digest-b".to_owned();
         second.content = b"second body".to_vec();
+        second.content_digest = content_digest_of(&second.content);
         let err = store.insert_skill_revision(&second).await.unwrap_err();
         assert_eq!(err.to_string(), "skill_revision_conflict");
         let stored = store
@@ -1132,7 +1226,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(stored.content, b"first body");
-        assert_eq!(stored.content_digest, "digest-a");
+        assert_eq!(stored.content_digest, content_digest_of(b"first body"));
         assert!(
             store
                 .get_skill_revision("rev-body-2")
@@ -1301,7 +1395,10 @@ mod tests {
         let details = audit_details(&store, AUDIT_ACTIVATE).await;
         assert_eq!(details.len(), 1);
         assert!(!details[0].contains("SECRET-BODY-BYTES"));
-        assert!(details[0].contains("\"content_digest\":\"b1\""));
+        assert!(details[0].contains(&format!(
+            "\"content_digest\":\"{}\"",
+            content_digest_of(b"SECRET-BODY-BYTES")
+        )));
         assert!(details[0].contains("\"result_code\":\"activated\""));
 
         let repeat = store
@@ -2247,5 +2344,491 @@ mod tests {
             1
         );
         assert_eq!(audit_details(&store, AUDIT_ACTIVATE).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn digest_lookup_includes_kind() {
+        let store = Store::open_memory().await.unwrap();
+        let bytes = b"shared text";
+        put(
+            &store,
+            &revision(
+                "rev-body",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "ignored",
+                bytes,
+            ),
+        )
+        .await;
+        let evals = revision(
+            "rev-evals",
+            "notes",
+            SkillOrigin::User,
+            "1.0.0",
+            SkillRevisionKind::Evals,
+            "ignored",
+            bytes,
+        );
+        let inserted = store.insert_skill_revision(&evals).await.unwrap();
+        assert_eq!(
+            inserted,
+            SkillRevisionInsert::Inserted {
+                revision_id: "rev-evals".to_owned()
+            }
+        );
+        assert_eq!(revision_count(&store).await, 2);
+        assert_eq!(
+            store
+                .get_skill_revision("rev-body")
+                .await
+                .unwrap()
+                .unwrap()
+                .kind,
+            SkillRevisionKind::Body
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_digest_bytes_must_match_the_row() {
+        let store = Store::open_memory().await.unwrap();
+        let fresh = b"fresh bytes";
+        let digest = content_digest_of(fresh);
+        sqlx::query(
+            "INSERT INTO skill_revision ( \
+                revision_id, skill_id, origin, semver, kind, content_digest, content, created_at \
+             ) VALUES ('rev-forged', 'notes', 'user', '9.0.0', 'body', ?, 'stale', \
+                       '2026-11-12T00:00:00Z')",
+        )
+        .bind(&digest)
+        .execute(test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let err = store
+            .insert_skill_revision(&revision(
+                "rev-fresh",
+                "notes",
+                SkillOrigin::User,
+                "9.1.0",
+                SkillRevisionKind::Body,
+                &digest,
+                fresh,
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message.contains("stored digest")),
+            "{err:?}"
+        );
+        assert_eq!(revision_count(&store).await, 1);
+    }
+
+    #[tokio::test]
+    async fn source_switch_allows_both_sides_and_same_source_stays_mixed() {
+        let store = Store::open_memory().await.unwrap();
+        put(
+            &store,
+            &revision(
+                "imp-body",
+                "notes",
+                SkillOrigin::Imported,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "ib",
+                b"imported body",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "imp-evals",
+                "notes",
+                SkillOrigin::Imported,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "ie",
+                b"imported evals",
+            ),
+        )
+        .await;
+        store
+            .activate_skill(&activation(
+                "act-imp",
+                "notes",
+                0,
+                "imp-body",
+                "imp-evals",
+                "result-imp",
+                "2026-11-12T00:00:01Z",
+            ))
+            .await
+            .unwrap();
+        put(
+            &store,
+            &revision(
+                "user-body",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "ub",
+                b"user body",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "user-evals",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "ue",
+                b"user evals",
+            ),
+        )
+        .await;
+        let switched = store
+            .activate_skill(&activation(
+                "act-user",
+                "notes",
+                1,
+                "user-body",
+                "user-evals",
+                "result-user",
+                "2026-11-12T00:00:02Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            switched,
+            SkillActivationOutcome::Activated {
+                generation: 2,
+                activation_id: "act-user".to_owned()
+            }
+        );
+        let pointer = store.get_skill_pointer("notes").await.unwrap().unwrap();
+        assert_eq!(pointer.origin, SkillOrigin::User);
+        assert_eq!(pointer.body_revision_id, "user-body");
+        assert_eq!(pointer.evals_revision_id, "user-evals");
+        let history = store.list_skill_activations("notes").await.unwrap();
+        assert_eq!(history[0].origin_from, None);
+        assert_eq!(history[0].origin_to, SkillOrigin::Imported);
+        assert_eq!(history[1].origin_from, Some(SkillOrigin::Imported));
+        assert_eq!(history[1].origin_to, SkillOrigin::User);
+        let details = audit_details(&store, AUDIT_ACTIVATE).await;
+        assert!(details[0].contains("\"origin_from\":null"));
+        assert!(details[0].contains("\"origin_to\":\"imported\""));
+        assert!(details[1].contains("\"origin_from\":\"imported\""));
+        assert!(details[1].contains("\"origin_to\":\"user\""));
+
+        put(
+            &store,
+            &revision(
+                "tasks-user-body",
+                "tasks",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "tb",
+                b"tasks user body",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "tasks-user-evals",
+                "tasks",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "te",
+                b"tasks user evals",
+            ),
+        )
+        .await;
+        store
+            .activate_skill(&activation(
+                "act-tasks-user",
+                "tasks",
+                0,
+                "tasks-user-body",
+                "tasks-user-evals",
+                "result-tasks-user",
+                "2026-11-12T00:00:03Z",
+            ))
+            .await
+            .unwrap();
+        put(
+            &store,
+            &revision(
+                "tasks-imp-body",
+                "tasks",
+                SkillOrigin::Imported,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "tib",
+                b"tasks imported body",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "tasks-imp-evals",
+                "tasks",
+                SkillOrigin::Imported,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "tie",
+                b"tasks imported evals",
+            ),
+        )
+        .await;
+        store
+            .activate_skill(&activation(
+                "act-tasks-imp",
+                "tasks",
+                1,
+                "tasks-imp-body",
+                "tasks-imp-evals",
+                "result-tasks-imp",
+                "2026-11-12T00:00:04Z",
+            ))
+            .await
+            .unwrap();
+        let reverse = store.list_skill_activations("tasks").await.unwrap();
+        assert_eq!(reverse[1].origin_from, Some(SkillOrigin::User));
+        assert_eq!(reverse[1].origin_to, SkillOrigin::Imported);
+        assert_eq!(
+            store
+                .get_skill_pointer("tasks")
+                .await
+                .unwrap()
+                .unwrap()
+                .origin,
+            SkillOrigin::Imported
+        );
+
+        put(
+            &store,
+            &revision(
+                "user-body-2",
+                "notes",
+                SkillOrigin::User,
+                "1.1.0",
+                SkillRevisionKind::Body,
+                "ub2",
+                b"user body two",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "user-evals-2",
+                "notes",
+                SkillOrigin::User,
+                "1.1.0",
+                SkillRevisionKind::Evals,
+                "ue2",
+                b"user evals two",
+            ),
+        )
+        .await;
+        let mixed = store
+            .activate_skill(&activation(
+                "act-mixed",
+                "notes",
+                2,
+                "user-body-2",
+                "user-evals-2",
+                "result-mixed",
+                "2026-11-12T00:00:05Z",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(mixed.to_string(), "skill_activation_mixed");
+        let pointer = store.get_skill_pointer("notes").await.unwrap().unwrap();
+        assert_eq!(pointer.body_revision_id, "user-body");
+        assert_eq!(pointer.evals_revision_id, "user-evals");
+        assert_eq!(pointer.generation, 2);
+        assert_eq!(
+            store.list_skill_activations("notes").await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn eval_failures_must_all_be_accepted_and_empty_cases_are_refused() {
+        let store = Store::open_memory().await.unwrap();
+        put(
+            &store,
+            &revision(
+                "body-1",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "b1",
+                b"body",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "evals-1",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "e1",
+                b"evals",
+            ),
+        )
+        .await;
+        let mut req = activation(
+            "act-empty",
+            "notes",
+            0,
+            "body-1",
+            "evals-1",
+            "result-empty",
+            "2026-11-12T00:00:01Z",
+        );
+        req.binding.cases_json = "[]".to_owned();
+        let empty = store.activate_skill(&req).await.unwrap_err();
+        assert_eq!(empty.to_string(), "skill_eval_empty");
+        assert!(store.get_skill_pointer("notes").await.unwrap().is_none());
+
+        req.activation_id = "act-partial".to_owned();
+        req.binding.result_id = "result-partial".to_owned();
+        req.binding.cases_json =
+            r#"[{"id":"a","passed":false},{"id":"b","passed":false}]"#.to_owned();
+        req.binding.accepted_json = r#"["a"]"#.to_owned();
+        let partial = store.activate_skill(&req).await.unwrap_err();
+        assert_eq!(partial.to_string(), "skill_eval_failed");
+        assert!(store.get_skill_pointer("notes").await.unwrap().is_none());
+        assert!(
+            store
+                .list_skill_activations("notes")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        req.activation_id = "act-ok".to_owned();
+        req.binding.result_id = "result-ok".to_owned();
+        req.binding.accepted_json = r#"["b","a"]"#.to_owned();
+        let ok = store.activate_skill(&req).await.unwrap();
+        assert_eq!(
+            ok,
+            SkillActivationOutcome::Activated {
+                generation: 1,
+                activation_id: "act-ok".to_owned()
+            }
+        );
+        assert_eq!(
+            store
+                .get_skill_pointer("notes")
+                .await
+                .unwrap()
+                .unwrap()
+                .generation,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_result_id_and_activation_id_are_conflicts() {
+        let store = Store::open_memory().await.unwrap();
+        for (id, semver, kind, bytes) in [
+            ("body-1", "1.0.0", SkillRevisionKind::Body, &b"one"[..]),
+            ("body-2", "1.1.0", SkillRevisionKind::Body, &b"two"[..]),
+            ("evals-1", "1.0.0", SkillRevisionKind::Evals, &b"ev"[..]),
+        ] {
+            put(
+                &store,
+                &revision(id, "notes", SkillOrigin::User, semver, kind, "label", bytes),
+            )
+            .await;
+        }
+        store
+            .activate_skill(&activation(
+                "act-1",
+                "notes",
+                0,
+                "body-1",
+                "evals-1",
+                "result-1",
+                "2026-11-12T00:00:01Z",
+            ))
+            .await
+            .unwrap();
+        let reused_result = store
+            .activate_skill(&activation(
+                "act-2",
+                "notes",
+                1,
+                "body-2",
+                "evals-1",
+                "result-1",
+                "2026-11-12T00:00:02Z",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(reused_result, StoreError::Conflict(ref message) if message.contains("result_id")),
+            "{reused_result:?}"
+        );
+        assert!(!matches!(reused_result, StoreError::Sqlx(_)));
+        let reused_activation = store
+            .activate_skill(&activation(
+                "act-1",
+                "notes",
+                1,
+                "body-2",
+                "evals-1",
+                "result-2",
+                "2026-11-12T00:00:03Z",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(reused_activation, StoreError::Conflict(ref message) if message.contains("activation_id")),
+            "{reused_activation:?}"
+        );
+        let pointer = store.get_skill_pointer("notes").await.unwrap().unwrap();
+        assert_eq!(pointer.body_revision_id, "body-1");
+        assert_eq!(pointer.generation, 1);
+        assert_eq!(
+            store.list_skill_activations("notes").await.unwrap().len(),
+            1
+        );
+        let moved = store
+            .activate_skill(&activation(
+                "act-2",
+                "notes",
+                1,
+                "body-2",
+                "evals-1",
+                "result-2",
+                "2026-11-12T00:00:04Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            moved,
+            SkillActivationOutcome::Activated {
+                generation: 2,
+                activation_id: "act-2".to_owned()
+            }
+        );
     }
 }
