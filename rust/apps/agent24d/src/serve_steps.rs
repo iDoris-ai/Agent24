@@ -824,6 +824,19 @@ pub(super) async fn recover_durable_runs(
             workspace_orphans.released_leases
         );
     }
+    // After both orphan sweeps, so a cancelled inbound run is already terminal
+    // and its row can leave the in-flight index (`started` → `done`).
+    let inbound = crate::inbound::reconcile_inbound_runs(&state.store)
+        .await
+        .map_err(std::io::Error::other)?;
+    if inbound.started > 0 || inbound.done > 0 || inbound.interrupted > 0 {
+        tracing::warn!(
+            started = inbound.started,
+            done = inbound.done,
+            interrupted = inbound.interrupted,
+            "reconciled inbound runs from a previous process"
+        );
+    }
 
     // M7: approvals can outlive the task that originally armed their in-memory
     // timeout. Keep durable expiry/recovery active for the daemon lifetime; a
@@ -1817,4 +1830,181 @@ pub(super) async fn advertise_readiness(
         enroll,
         daemon_pid,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+
+    use agent24_store::NewInboundEvent;
+    use agent24_tools::HttpFetchTool;
+
+    use super::*;
+
+    fn event(id: &str, actor: &str, run_state: &str) -> NewInboundEvent {
+        NewInboundEvent {
+            id: id.to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some(actor.to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: "2026-11-11T00:00:00Z".to_owned(),
+            received_at: "2026-11-11T00:00:01Z".to_owned(),
+            text: Some("t".to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some(run_state.to_owned()),
+        }
+    }
+
+    async fn insert_run(store: &Store, id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at) \
+             VALUES (?, ?, \
+             '{\"prompt\":\"x\",\"workspace_id\":null,\"knowledge_binding_id\":null}', \
+             '{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"cost_usd\":0.0}', \
+             ?)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(agent24_core::util::now_iso8601())
+        .execute(agent24_store::test_hooks::pool(store))
+        .await
+        .unwrap();
+    }
+
+    async fn run_state(store: &Store, id: &str) -> String {
+        store
+            .get_inbound_event(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_state
+            .unwrap()
+    }
+
+    /// Restart through `recover_durable_runs`, which is the production call
+    /// after the orphan sweeps. Mutation: drop `reconcile_inbound_runs` from
+    /// that function and every row below stays at its seeded `run_state`.
+    /// Moving that call to before the orphan sweeps leaves `hyphae:running`
+    /// at `started`: the run is still `running` then, so reconcile does not
+    /// mark it `done`.
+    #[tokio::test]
+    async fn startup_reconcile_converges_the_four_restart_shapes() {
+        let store = Store::open_memory().await.unwrap();
+        for (id, actor, state) in [
+            ("hyphae:live", "a-live", "starting"),
+            ("hyphae:none", "a-none", "starting"),
+            ("hyphae:ended", "a-ended", "started"),
+            ("hyphae:gone", "a-gone", "started"),
+            ("hyphae:running", "a-running", "started"),
+        ] {
+            assert_eq!(
+                store
+                    .insert_inbound_event(&event(id, actor, state))
+                    .await
+                    .unwrap(),
+                agent24_store::InboundInsert::Inserted
+            );
+        }
+        insert_run(&store, "run_live", "awaiting_approval").await;
+        insert_run(&store, "run_ended", "completed").await;
+        insert_run(&store, "run_gone", "completed").await;
+        insert_run(&store, "run_running", "running").await;
+        store
+            .insert_inbound_run("run_live", "hyphae:live")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_ended", "hyphae:ended")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_gone", "hyphae:gone")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_running", "hyphae:running")
+            .await
+            .unwrap();
+        let now = agent24_core::util::now_iso8601();
+        sqlx::query(
+            "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, created_at) \
+             VALUES ('run_live', 0, 'assistant', NULL, ?, ?)",
+        )
+        .bind(r#"[{"id":"call_1","name":"http_fetch","arguments":"{}"}]"#)
+        .bind(&now)
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO approvals (id, run_id, tool_call_id, kind, summary, payload, \
+             available_decisions, status, expires_at, created_at) \
+             VALUES ('apr_live', 'run_live', 'call_1', 'exec', 'fetch', '{}', \
+             '[\"approve\",\"deny\"]', 'pending', '2099-01-01T00:00:00Z', ?)",
+        )
+        .bind(&now)
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM runs WHERE id = 'run_gone'")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+
+        let tools = agent24_tools::ToolRegistry::new().with(Arc::new(HttpFetchTool::new(false)));
+        let state = AppState::new(AppDeps {
+            token: "testtoken".to_owned(),
+            router: Arc::new(ModelRouter::with_defaults(vec![])),
+            tools,
+            store: store.clone(),
+            shutdown: Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            workspace_service: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
+                Vec::new(),
+            )),
+            packages_root: Arc::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()),
+        });
+        let cancel = CancellationToken::new();
+        let runtime = crate::module_tool_runtime::AgentModuleToolRuntime::new(
+            std::collections::HashSet::new(),
+        );
+        let registry = agent24_domain::tool::ModuleToolRegistry::new();
+        recover_durable_runs(&state, true, &cancel, &runtime, &registry)
+            .await
+            .unwrap()
+            .expect("os config");
+        cancel.cancel();
+
+        assert_eq!(run_state(&store, "hyphae:live").await, "started");
+        assert_eq!(
+            store.get_run("run_live").await.unwrap().unwrap().status,
+            agent24_protocol::RunStatus::AwaitingApproval
+        );
+        assert_eq!(run_state(&store, "hyphae:none").await, "interrupted");
+        assert_eq!(run_state(&store, "hyphae:ended").await, "done");
+        assert_eq!(run_state(&store, "hyphae:gone").await, "done");
+        assert_eq!(run_state(&store, "hyphae:running").await, "done");
+        assert_eq!(
+            store.get_run("run_running").await.unwrap().unwrap().status,
+            agent24_protocol::RunStatus::Cancelled
+        );
+        assert!(
+            store
+                .inbound_run_id_for_event("hyphae:gone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

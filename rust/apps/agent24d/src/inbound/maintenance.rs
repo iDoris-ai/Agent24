@@ -84,8 +84,9 @@ impl PassReport {
     }
 }
 
-/// One pass at `now`. Fails before the store transaction if the memory purge
-/// fails, so nothing is stamped whose memory copy still exists.
+/// One pass at `now`. A purge that fails is skipped: that session is not
+/// stamped, and the rest of the pass continues. A failure while listing or
+/// re-checking sessions still stops the pass before the store transaction.
 ///
 /// `memory_matters` is false only for an ephemeral daemon, which has no
 /// `memory.db` to leave text in; a persistent daemon whose memory partition
@@ -140,10 +141,20 @@ where
             {
                 continue;
             }
-            let purge = target
-                .purge(&session.id, &session.memory_not_after)
-                .await
-                .map_err(|e| format!("purging memory of session {}: {e}", session.id))?;
+            // One session's purge error used to `?` and drop the rest of the
+            // round (#1812 L2). Skip it, leave it out of `handled` so its
+            // event stays unstamped, and keep going.
+            let purge = match target.purge(&session.id, &session.memory_not_after).await {
+                Ok(purge) => purge,
+                Err(err) => {
+                    tracing::warn!(
+                        session_id = %session.id,
+                        error = %err,
+                        "purging inbound session memory failed; leaving it for the next pass"
+                    );
+                    continue;
+                }
+            };
             // A session the user carried on in keeps its memory (the runs'
             // copies still go and the event is stamped, as for a shared
             // session), so it counts as handled all the same.
@@ -867,6 +878,47 @@ mod tests {
             .await
             .expect("task ends")
             .unwrap();
+    }
+
+    /// Purge fails for one session and succeeds for the other.
+    struct SelectivePurge {
+        fail: &'static str,
+    }
+
+    impl SessionPurger for SelectivePurge {
+        fn purge<'a>(
+            &'a self,
+            session: &'a str,
+            _not_after: &'a str,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<SessionPurge, String>> + Send + 'a>,
+        > {
+            let fail = self.fail;
+            Box::pin(async move {
+                if session == fail {
+                    Err(format!("purge failed for {session}"))
+                } else {
+                    Ok(SessionPurge::default())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_purge_failure_skips_that_session_and_stamps_the_rest() {
+        // Mutation: `?` on the purge error returns before the store
+        // transaction, so neither event is stamped and this is an Err.
+        let fx = Fixture::new().await;
+        fx.seed("bad", "s-bad", "completed", Some(181)).await;
+        fx.seed("good", "s-good", "completed", Some(181)).await;
+        let target: MemoryTarget = Arc::new(SelectivePurge { fail: "s-bad" });
+        let report = run_pass(&fx.store, Some(&target), true, now())
+            .await
+            .unwrap();
+        assert!(!fx.event_text("bad").await.2, "{report:?}");
+        assert!(fx.event_text("good").await.2, "{report:?}");
+        assert_eq!(report.store.events, 1, "{report:?}");
+        assert_eq!(report.store.deferred, 1, "{report:?}");
     }
 
     async fn wait_until(cond: impl Fn() -> bool) {

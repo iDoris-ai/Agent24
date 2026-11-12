@@ -458,6 +458,16 @@ fn clip_preview(text: &str) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    #[test]
+    fn allowlist_sources_match_the_agent_inbound_channels() {
+        // Mutation: add a name to either set and the two lists diverge.
+        let mut routes = ALLOWLIST_SOURCES.to_vec();
+        let mut agent = agent24_agent::RunManager::INBOUND_SOURCE_CHANNELS.to_vec();
+        routes.sort_unstable();
+        agent.sort_unstable();
+        assert_eq!(routes, agent);
+    }
+
     use axum::body::Body;
     use axum::http::{Request, StatusCode, header};
     use http_body_util::BodyExt;

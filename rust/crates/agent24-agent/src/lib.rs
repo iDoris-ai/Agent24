@@ -627,6 +627,8 @@ pub struct InboundOrigin {
 pub enum InboundRunStart {
     Started(Run),
     AlreadyLinked,
+    /// The event is not `starting` and has no link. Nothing was committed.
+    NotStarting,
 }
 
 #[allow(
@@ -636,11 +638,13 @@ pub enum InboundRunStart {
 enum RunStart {
     Ready(Run),
     InboundAlreadyLinked,
+    InboundNotStarting,
 }
 
 enum PersistOutcome {
     Stored,
     InboundAlreadyLinked,
+    InboundNotStarting,
 }
 
 enum ParkedCallStop {
@@ -1204,8 +1208,9 @@ impl RunManager {
     /// (`rust/apps/agent24d/src/inbound/routes.rs`): `hyphae`, `wechat`,
     /// `remote`. `scheduler` and `self` are not on that list. A channel
     /// outside this set is the person at this machine unless `inbound_runs`
-    /// links one of the session's runs.
-    const INBOUND_SOURCE_CHANNELS: &[&str] = &["hyphae", "wechat", "remote"];
+    /// links one of the session's runs. Inbound start uses the source name
+    /// as the session channel and refuses a name that is not in this set.
+    pub const INBOUND_SOURCE_CHANNELS: &[&str] = &["hyphae", "wechat", "remote"];
 
     fn inbound_source_channel(channel: &str) -> bool {
         Self::INBOUND_SOURCE_CHANNELS.contains(&channel)
@@ -1500,6 +1505,7 @@ impl RunManager {
         {
             RunStart::Ready(run) => Ok(InboundRunStart::Started(run)),
             RunStart::InboundAlreadyLinked => Ok(InboundRunStart::AlreadyLinked),
+            RunStart::InboundNotStarting => Ok(InboundRunStart::NotStarting),
         }
     }
 
@@ -1508,6 +1514,9 @@ impl RunManager {
             RunStart::Ready(run) => Ok(run),
             RunStart::InboundAlreadyLinked => Err(AgentError::Store(StoreError::Conflict(
                 "ordinary start linked an inbound event".to_owned(),
+            ))),
+            RunStart::InboundNotStarting => Err(AgentError::Store(StoreError::Conflict(
+                "ordinary start saw an inbound event that is not starting".to_owned(),
             ))),
         }
     }
@@ -1567,9 +1576,16 @@ impl RunManager {
                 return Err(err);
             }
         };
-        if matches!(persisted, PersistOutcome::InboundAlreadyLinked) {
-            self.cancels.lock().await.remove(&run.id);
-            return Ok(RunStart::InboundAlreadyLinked);
+        match persisted {
+            PersistOutcome::Stored => {}
+            PersistOutcome::InboundAlreadyLinked => {
+                self.cancels.lock().await.remove(&run.id);
+                return Ok(RunStart::InboundAlreadyLinked);
+            }
+            PersistOutcome::InboundNotStarting => {
+                self.cancels.lock().await.remove(&run.id);
+                return Ok(RunStart::InboundNotStarting);
+            }
         }
         if let Some(origin) = &inbound {
             // Before spawn, so execute cannot finish (and try to mark done)
@@ -1661,6 +1677,7 @@ impl RunManager {
             agent24_store::InboundRunLink::AlreadyLinked => {
                 Ok(PersistOutcome::InboundAlreadyLinked)
             }
+            agent24_store::InboundRunLink::NotStarting => Ok(PersistOutcome::InboundNotStarting),
         }
     }
 
@@ -2038,6 +2055,7 @@ impl RunManager {
                 tracing::error!(
                     "run {run_id}: resume source refusal could not enter running: {err}"
                 );
+                self.release_inbound_after_abandoned_start(&run_id).await;
                 return;
             }
             self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
@@ -2061,6 +2079,7 @@ impl RunManager {
             .await
         {
             tracing::error!("run {run_id}: resume transition failed: {err}");
+            self.release_inbound_after_abandoned_start(&run_id).await;
             return;
         }
         self.sink.emit(EventBody::RunStarted(RunStartedPayload {
@@ -2308,6 +2327,7 @@ impl RunManager {
             Ok(run) => run,
             Err(err) => {
                 tracing::error!("run {run_id}: failed to start: {err}");
+                self.release_inbound_after_abandoned_start(&run_id).await;
                 return;
             }
         };
@@ -3554,9 +3574,18 @@ impl RunManager {
 
     /// Drop a linked inbound row out of the in-flight index.
     ///
-    /// Called after the terminal event is emitted. An await between the status
-    /// write and that emit lets a waiter observe the terminal run first.
-    /// No link is a no-op. A failure leaves the row for startup reconcile.
+    /// Call only after the run is terminal and that event has been emitted
+    /// (#1810 N4). `mark_inbound_done_for_run` also accepts `starting` →
+    /// `done`, because a completion can land before `mark_inbound_started`;
+    /// that edge is not for a run that is still live.
+    /// [`Self::release_inbound_after_abandoned_start`] is the one caller that
+    /// notes when the terminal transition itself did not apply: the Running
+    /// transition had already failed, and leaving the row at `started` would
+    /// keep the sender's in-flight slot.
+    ///
+    /// An await between the status write and the emit lets a waiter observe
+    /// the terminal run first. No link is a no-op. A failure leaves the row
+    /// for startup reconcile.
     async fn note_inbound_terminal(&self, run_id: &str) {
         if let Err(err) = self.store.mark_inbound_done_for_run(run_id).await {
             tracing::warn!(
@@ -3565,6 +3594,21 @@ impl RunManager {
                 "inbound run_state was not marked done"
             );
         }
+    }
+
+    /// The Running transition failed, so this start or resume never became
+    /// live. Cancel when that edge is legal: the cancelled event is what
+    /// #1810 N4 requires before the in-flight slot is released, and
+    /// [`Self::finish_cancelled`] notes only when the transition lands. A
+    /// run that is already terminal, or a status write that does not apply,
+    /// still has to leave `started` (#1813 L1).
+    ///
+    /// This runs for every run, inbound or not. An ordinary run whose move
+    /// to Running fails is cancelled here. It used to stay non-terminal until
+    /// the next restart swept it. The end state is the same; this lands it now.
+    async fn release_inbound_after_abandoned_start(&self, run_id: &str) {
+        self.finish_cancelled(run_id).await;
+        self.note_inbound_terminal(run_id).await;
     }
 
     /// Land the completed terminal state + event with the given output text.
@@ -6852,6 +6896,212 @@ pub(crate) mod tests {
         assert_eq!(sessions, 0);
     }
 
+    async fn seed_started_inbound(store: &Store, run_id: &str, status: &str) {
+        let event_id = format!("hyphae:{run_id}");
+        let mut event = inbound_event(&event_id, "hello");
+        event.run_state = Some("started".to_owned());
+        event.actor = Some(format!("actor-{run_id}"));
+        assert_eq!(
+            store.insert_inbound_event(&event).await.unwrap(),
+            agent24_store::InboundInsert::Inserted
+        );
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at) \
+             VALUES (?, ?, \
+             '{\"prompt\":\"hello\",\"workspace_id\":null,\"knowledge_binding_id\":null}', \
+             '{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"cost_usd\":0.0}', \
+             ?)",
+        )
+        .bind(run_id)
+        .bind(status)
+        .bind(now_iso8601())
+        .execute(agent24_store::test_hooks::pool(store))
+        .await
+        .unwrap();
+        store.insert_inbound_run(run_id, &event_id).await.unwrap();
+    }
+
+    async fn freeze_run_status(store: &Store) {
+        sqlx::raw_sql(
+            "CREATE TRIGGER freeze_run_status BEFORE UPDATE OF status ON runs \
+             BEGIN SELECT RAISE(ABORT, 'frozen'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(store))
+        .await
+        .unwrap();
+    }
+
+    async fn inbound_run_state(store: &Store, event_id: &str) -> String {
+        store
+            .get_inbound_event(event_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_state
+            .unwrap()
+    }
+
+    fn parked_thread(run_id: &str) -> Vec<RunMessage> {
+        vec![RunMessage {
+            run_id: run_id.to_owned(),
+            seq: 0,
+            role: "assistant".to_owned(),
+            content: None,
+            tool_calls: serde_json::json!([{
+                "id": "call_1",
+                "name": "http_fetch",
+                "arguments": "{}"
+            }]),
+            tool_call_id: None,
+            created_at: now_iso8601(),
+        }]
+    }
+
+    async fn park_approval(store: &Store, run_id: &str) -> Approval {
+        let now = now_iso8601();
+        sqlx::query(
+            "INSERT INTO approvals (id, run_id, tool_call_id, kind, summary, payload, \
+             available_decisions, status, expires_at, created_at) \
+             VALUES (?, ?, 'call_1', 'exec', 'fetch', '{}', '[\"approve\",\"deny\"]', \
+             'pending', '2099-01-01T00:00:00Z', ?)",
+        )
+        .bind(format!("apr_{run_id}"))
+        .bind(run_id)
+        .bind(&now)
+        .execute(agent24_store::test_hooks::pool(store))
+        .await
+        .unwrap();
+        store
+            .get_approval(&format!("apr_{run_id}"))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_failed_start_releases_the_inbound_slot() {
+        // Mutation: drop `note_inbound_terminal` from
+        // `release_inbound_after_abandoned_start`. The status write is
+        // frozen, so `finish_cancelled` does not note, and this stays
+        // `started`.
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_started_inbound(&store, "run_stuck", "queued").await;
+        freeze_run_status(&store).await;
+        manager
+            .execute("run_stuck".to_owned(), CancellationToken::new(), false)
+            .await;
+        assert_eq!(inbound_run_state(&store, "hyphae:run_stuck").await, "done");
+        assert_eq!(
+            store.get_run("run_stuck").await.unwrap().unwrap().status,
+            RunStatus::Queued
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blocked_running_transition_cancels_and_releases_the_slot() {
+        // The trigger refuses only `NEW.status = 'running'`, so
+        // `finish_cancelled` can still write `cancelled`. Mutation: drop
+        // `finish_cancelled` from `release_inbound_after_abandoned_start`
+        // and this run stays `queued` with no `run.cancelled`.
+        let (manager, sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_started_inbound(&store, "run_abandon", "queued").await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER block_running BEFORE UPDATE OF status ON runs \
+             WHEN NEW.status = 'running' \
+             BEGIN SELECT RAISE(ABORT, 'no-running'); END;",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        manager
+            .execute("run_abandon".to_owned(), CancellationToken::new(), false)
+            .await;
+        assert_eq!(
+            store.get_run("run_abandon").await.unwrap().unwrap().status,
+            RunStatus::Cancelled
+        );
+        let events = sink.0.lock().unwrap().clone();
+        assert!(
+            events.iter().any(|event| event == "run.cancelled"),
+            "{events:?}"
+        );
+        assert_eq!(
+            inbound_run_state(&store, "hyphae:run_abandon").await,
+            "done"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_that_cannot_enter_running_releases_the_inbound_slot() {
+        // The origins check passes (no stored messages). The Running
+        // transition is frozen, so this is the "resume transition failed"
+        // return. Mutation: drop the release call there and the row stays
+        // `started`.
+        let (manager, _sink, store) = manager_with_tools(
+            Arc::new(FixedProvider),
+            ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(false))),
+        )
+        .await;
+        seed_started_inbound(&store, "run_resume", "awaiting_approval").await;
+        let approval = park_approval(&store, "run_resume").await;
+        let run = store.get_run("run_resume").await.unwrap().unwrap();
+        freeze_run_status(&store).await;
+        manager
+            .drive_resume(
+                run,
+                parked_thread("run_resume"),
+                approval,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(inbound_run_state(&store, "hyphae:run_resume").await, "done");
+        assert_eq!(
+            store.get_run("run_resume").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resume_whose_source_refusal_cannot_enter_running_releases_the_slot() {
+        // A stored message with no origin makes the source check refuse.
+        // The Running transition is frozen, so this is the other early
+        // return. Mutation: drop the release call there and the row stays
+        // `started`.
+        let (manager, _sink, store) = manager_with_tools(
+            Arc::new(FixedProvider),
+            ToolRegistry::new().with(Arc::new(agent24_tools::HttpFetchTool::new(false))),
+        )
+        .await;
+        seed_started_inbound(&store, "run_unproven", "awaiting_approval").await;
+        sqlx::query(
+            "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, created_at) \
+             VALUES ('run_unproven', 0, 'user', 'hi', '[]', ?)",
+        )
+        .bind(now_iso8601())
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        let approval = park_approval(&store, "run_unproven").await;
+        let run = store.get_run("run_unproven").await.unwrap().unwrap();
+        freeze_run_status(&store).await;
+        manager
+            .drive_resume(
+                run,
+                parked_thread("run_unproven"),
+                approval,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            inbound_run_state(&store, "hyphae:run_unproven").await,
+            "done"
+        );
+        assert_eq!(
+            store.get_run("run_unproven").await.unwrap().unwrap().status,
+            RunStatus::AwaitingApproval
+        );
+    }
+
     fn inbound_create(session_id: &str) -> RunCreate {
         RunCreate {
             idoris_headroom_confirmed: false,
@@ -6862,6 +7112,35 @@ pub(crate) mod tests {
             mode: agent24_protocol::RunMode::Normal,
             knowledge_binding_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn redelivery_with_a_new_session_id_is_already_linked() {
+        // Mutation: pass `sess_new_1` again. The session insert fails before
+        // the event unique index, so this is an error, not AlreadyLinked.
+        let (manager, _sink, store) = manager_with(Arc::new(FixedProvider)).await;
+        seed_session(&store, "sess_owner").await;
+        let first = start_inbound(&manager, &store, "hyphae:again", "sess_new_1", "hello").await;
+        let second = manager
+            .start_run_inbound(
+                inbound_create("sess_new_2"),
+                InboundOrigin {
+                    event_id: "hyphae:again".to_owned(),
+                    channel: "hyphae".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(second, InboundRunStart::AlreadyLinked));
+        assert!(store.get_session("sess_new_2").await.unwrap().is_none());
+        let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        assert_eq!(runs, 1);
+        let run = store.get_run(&first.id).await.unwrap().unwrap();
+        assert_eq!(run.session_id.as_deref(), Some("sess_new_1"));
+        assert_ne!(run.session_id.as_deref(), Some("sess_owner"));
     }
 
     #[tokio::test]

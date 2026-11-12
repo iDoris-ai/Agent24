@@ -188,7 +188,12 @@ pub(crate) struct AdmitInput {
 pub(crate) enum Disposition {
     Explicit,
     Ignore,
+    #[allow(
+        dead_code,
+        reason = "wire value stored by later slices; admit does not mint it"
+    )]
     Filtered,
+    #[allow(dead_code, reason = "scheduler and self write this row without admit")]
     Internal,
 }
 
