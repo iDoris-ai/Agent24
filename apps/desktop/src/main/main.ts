@@ -4,6 +4,7 @@ import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, n
 import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
+import { keptOmlxPath, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx } from './omlx-kept'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
@@ -594,6 +595,7 @@ app.whenReady().then(async () => {
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
     keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() }),
+    rememberKeptOmlx: (k) => { const dir = tryDataDir(); if (dir !== null) rememberKeptOmlx(keptOmlxPath(dir), k, realOmlxProcessProbe()) },
   })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
@@ -786,6 +788,8 @@ function residentStop(): Promise<StopOutcome> {
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
+    // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS.
+    afterUninstall: async () => { const dir = tryDataDir(); if (dir !== null) await stopKeptOmlx(keptOmlxPath(dir), realOmlxProcessProbe(), { graceMs: 5_000, killMs: 2_000 }) },
   })))
 }
 

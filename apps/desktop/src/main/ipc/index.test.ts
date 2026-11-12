@@ -28,6 +28,8 @@ const execFileMock = vi.fn()
 const omlxExecFile: { current: ((...args: unknown[]) => unknown) | null } = { current: null }
 /** What registerIpcHandlers' keepOwnedOmlxOnQuit answers (the resident service installed). */
 const keepOmlx = { current: false }
+/** What registerIpcHandlers' rememberKeptOmlx was told (ruling 乙). */
+const keptOmlx: Array<{ pid: number; port: number }> = []
 const appListeners = new Map<string, Set<() => void>>()
 const appFocus = vi.fn()
 function listenApp(event: string, fn: () => void): void {
@@ -278,6 +280,7 @@ beforeAll(async () => {
     promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
     exportTimeoutMs,
     keepOwnedOmlxOnQuit: () => keepOmlx.current,
+    rememberKeptOmlx: (k: { pid: number; port: number }) => { keptOmlx.push(k) },
     documentsModule: () => docStatus,
     documentsModuleActions: { uninstall: () => docUninstall(), install: () => docInstall() },
     guard: createIpcGuard({
@@ -325,6 +328,7 @@ beforeEach(() => {
   execFileMock.mockReset()
   omlxExecFile.current = null
   keepOmlx.current = false
+  keptOmlx.length = 0
   resetOmlxProcessForTests()
 })
 
@@ -2215,6 +2219,8 @@ describe('FU-114 OmlxStop only kills the process this app started', () => {
     expect(await ensureOwnedOmlxQuit()).toBe(false)
     expect(await ensureOwnedOmlxQuit()).toBe(false)
     expect(children[0]!.signals).toEqual([])
+    // Recorded once, with the port it was started on (ruling 乙).
+    expect(keptOmlx).toEqual([{ pid: 7105, port: 8123 }])
     const stopping = call(IpcChannels.OmlxStop)
     await vi.waitFor(() => expect(children[0]!.signals).toContain('SIGTERM'))
     children[0]!.emit('exit', null, 'SIGTERM')
@@ -2237,6 +2243,25 @@ describe('FU-114 OmlxStop only kills the process this app started', () => {
     const quit = ensureOwnedOmlxQuit()
     children[0]!.emit('exit', null, 'SIGTERM')
     expect(await quit).toBe(true)
+    // Stopped, so nothing is left to record.
+    expect(keptOmlx).toEqual([])
+  })
+
+  it('records nothing on a quit that keeps when this app started no oMLX, or it already exited', async () => {
+    keepOmlx.current = true
+    emitApp('before-quit')
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(keptOmlx).toEqual([])
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7108)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    children[0]!.emit('exit', 0, null)
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(keptOmlx).toEqual([])
   })
 
   it('a stop the quit already started is waited for, whatever is read after it', async () => {

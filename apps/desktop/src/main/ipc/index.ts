@@ -60,6 +60,12 @@ let omlxStopping: Promise<void> | null = null
 let ownedOmlxQuit: Promise<boolean> | null = null
 /** Whether quitting leaves the oMLX this app started running; set by registerIpcHandlers. */
 let keepOwnedOmlxOnQuit: () => boolean = () => false
+/** Port of the child `OmlxStart` actually spawned; null once that child has exited. */
+let omlxPort: number | null = null
+/** Records the pid and port of an oMLX a quit leaves running. Set by registerIpcHandlers. */
+let rememberKept: (k: { pid: number; port: number }) => void = () => {}
+/** The child already handed to `rememberKept`, so a later keep-quit does not record it again. */
+let keptRemembered: ChildProcess | null = null
 
 /** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
  *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
@@ -85,6 +91,8 @@ export function resetOmlxProcessForTests(): void {
   omlxProcess = null
   omlxStopping = null
   ownedOmlxQuit = null
+  omlxPort = null
+  keptRemembered = null
   omlxStopGraceMs = OMLX_STOP_GRACE_MS
   omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
 }
@@ -167,10 +175,26 @@ export async function stopOwnedOmlx(): Promise<boolean> {
 /** before-quit entry. The first call sends SIGTERM before it returns, then
  *  waits at most {@link OMLX_QUIT_STOP_BUDGET_MS} (same shape as
  *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
+/** A quit that leaves the child running: record it once (pid and the port it
+ *  was started on), so the service's stop can stop it later (omlx-kept.ts). */
+function keepOwnedOmlx(): Promise<boolean> {
+  const child = omlxProcess
+  const port = omlxPort
+  if (child && child.pid != null && port !== null && keptRemembered !== child) {
+    keptRemembered = child
+    try {
+      rememberKept({ pid: child.pid, port })
+    } catch (e) {
+      console.warn('[omlx] failed to record the oMLX a quit left running', e)
+    }
+  }
+  return Promise.resolve(false)
+}
+
 export function ensureOwnedOmlxQuit(): Promise<boolean> {
   if (ownedOmlxQuit) return ownedOmlxQuit
   // The resident service daemon uses it after the app is gone (M5 B4).
-  if (keepOwnedOmlxOnQuit()) return Promise.resolve(false)
+  if (keepOwnedOmlxOnQuit()) return keepOwnedOmlx()
   const stopping = stopOwnedOmlx()
   const bounded = stopWithin({ stop: () => stopping }, OMLX_QUIT_STOP_BUDGET_MS)
   ownedOmlxQuit = bounded
@@ -670,6 +694,10 @@ export function registerIpcHandlers(options: {
   /** Whether quitting leaves the oMLX this app started running (the resident
    * service daemon uses it); default: never. */
   keepOwnedOmlxOnQuit?: () => boolean
+  /** Records the pid and port of the oMLX a quit leaves running, so a later
+   * service stop can stop that process when its identity still matches.
+   * Default: do nothing. */
+  rememberKeptOmlx?: (k: { pid: number; port: number }) => void
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
@@ -681,6 +709,7 @@ export function registerIpcHandlers(options: {
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
   keepOwnedOmlxOnQuit = options.keepOwnedOmlxOnQuit ?? (() => false)
+  rememberKept = options.rememberKeptOmlx ?? (() => {})
   app.on('before-quit', () => {
     quitting = true
     // SIGTERM goes out before this listener returns when we own the child.
@@ -730,9 +759,13 @@ export function registerIpcHandlers(options: {
     if (typeof apiKey === 'string' && apiKey) env['OMLX_API_KEY'] = apiKey
     const child = execFile('omlx', ['serve', '--port', String(p)], { env })
     omlxProcess = child
+    omlxPort = p
     // Identity check: this child's exit must not clear a newer start (FU-114).
     child.on('exit', () => {
-      if (omlxProcess === child) omlxProcess = null
+      if (omlxProcess === child) {
+        omlxProcess = null
+        omlxPort = null
+      }
     })
     return { ok: true, url: `http://127.0.0.1:${p}` }
   })

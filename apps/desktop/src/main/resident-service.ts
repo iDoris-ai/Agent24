@@ -512,6 +512,9 @@ export interface StopDeps {
   exited: () => Promise<boolean>
   /** `agent24 service uninstall`. */
   uninstall: () => Promise<void>
+  /** Run inside the hold once the uninstall succeeded, before record; a
+   * failure is ignored (the oMLX a quit left running, omlx-kept.ts). */
+  afterUninstall?: () => Promise<void>
   /** Runs `work` with this app spawning nothing (`whileServiceRestarts`). */
   hold: <T>(work: () => Promise<T>) => Promise<T>
   /** Keeps the answer as declined, so the first-launch box is not shown again. */
@@ -519,8 +522,9 @@ export interface StopDeps {
 }
 
 /** Inside one hold: shutdown (when there is a daemon to ask), wait for it to
- * exit, uninstall, then record. A refused or failed shutdown stops there with
- * nothing changed; a failed record is ignored (the plist is gone already). */
+ * exit, uninstall, then `afterUninstall` (a failure there is ignored), then
+ * record. A refused or failed shutdown stops there with nothing changed; a
+ * failed record is ignored (the plist is gone already). */
 export function stopService(deps: StopDeps): Promise<StopOutcome> {
   return deps.hold(async (): Promise<StopOutcome> => {
     if (!deps.shutdown && deps.unreachable()) return { ok: false, stage: 'shutdown', code: 'not_connected' }
@@ -531,6 +535,9 @@ export function stopService(deps: StopDeps): Promise<StopOutcome> {
       await deps.exited()
     }
     try { await deps.uninstall() } catch (err) { return { ok: false, stage: 'uninstall', code: installErrorCode(err) } }
+    if (deps.afterUninstall) {
+      try { await deps.afterUninstall() } catch { /* ignored */ }
+    }
     try { deps.record() } catch { /* the plist is gone already */ }
     return { ok: true }
   })
@@ -556,7 +563,7 @@ const realStopSystem = (): StopSystem => ({
 /** The real steps for the enrolled service daemon `pid` (null when not
  * enrolled), with the bundled CLI. */
 export function serviceStopDeps(
-  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void },
+  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void; afterUninstall?: () => Promise<void> },
   sys: StopSystem = realStopSystem(),
 ): StopDeps {
   const pid = o.pid
@@ -570,6 +577,7 @@ export function serviceStopDeps(
     uninstall: () => sys.run(o.cli, ['service', 'uninstall'], process.env),
     hold: o.hold,
     record: o.record,
+    ...(o.afterUninstall ? { afterUninstall: o.afterUninstall } : {}),
   }
 }
 

@@ -31,9 +31,26 @@ describe('whether quitting stops the oMLX this app started', () => {
     const ensure = ipc.slice(ipc.indexOf('export function ensureOwnedOmlxQuit'))
     const body = ensure.slice(0, ensure.indexOf('\n}\n'))
     expect(body.indexOf('if (ownedOmlxQuit) return ownedOmlxQuit')).toBeGreaterThan(0)
-    expect(body.indexOf('if (keepOwnedOmlxOnQuit()) return Promise.resolve(false)')).toBeGreaterThan(body.indexOf('if (ownedOmlxQuit) return ownedOmlxQuit'))
+    expect(body.indexOf('if (keepOwnedOmlxOnQuit()) return keepOwnedOmlx()')).toBeGreaterThan(body.indexOf('if (ownedOmlxQuit) return ownedOmlxQuit'))
+    // Asked once per call.
+    expect(body.match(/keepOwnedOmlxOnQuit\(\)/g)).toHaveLength(1)
     expect(body.indexOf('if (keepOwnedOmlxOnQuit())')).toBeLessThan(body.indexOf('stopOwnedOmlx()'))
     // Elsewhere only the user's own stop (OmlxStop) stops it.
     expect(ipc.match(/(?<!function )stopOwnedOmlx\(\)/g)).toHaveLength(2)
+  })
+
+  // Ruling 2026-11-13-pr1-omlx-orphan-ownership (乙): a kept oMLX is recorded
+  // in the data directory, and only the service's stop, after the uninstall,
+  // stops what is on record (resident-service.ts stopService afterUninstall;
+  // 「完全退出」 and the Settings switch off both go through residentStop).
+  it('main.ts records a kept oMLX and stops it only from the service stop', () => {
+    const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
+    expect(main.match(/rememberKeptOmlx: /g)).toHaveLength(1)
+    expect(main.match(/stopKeptOmlx\(/g)).toHaveLength(1)
+    const stop = main.slice(main.indexOf('function residentStop(): Promise<StopOutcome>'))
+    const body = stop.slice(0, stop.indexOf('\n}\n'))
+    expect(body).toContain('afterUninstall:')
+    expect(body).toContain('stopKeptOmlx(')
+    expect(main.match(/residentStop\b/g)!.length).toBeGreaterThanOrEqual(3)
   })
 })
