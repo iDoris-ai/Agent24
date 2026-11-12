@@ -57,69 +57,9 @@ use std::sync::Arc;
 
 use agent24_domain::{Capability, DomainModule, EventBroadcast, EventSink, Grants, KernelCtx};
 use agent24_protocol::EventBody;
+
+use crate::capabilities::requires::{self, Consent, GrantForm, RequiresSpec};
 use axum::Router;
-
-/// What the kernel is willing to lend a domain OS today. A module may REQUEST
-/// more in its manifest; [`Grants::granting`] intersects, so asking gains
-/// nothing. The list grows as `KernelCtx` gains handles — `Models` and
-/// `Scheduler` are deliberately absent because there is nothing to hand out
-/// yet, and granting a capability with no handle would be a lie.
-///
-/// `Memory` joined the list in F1, when `KernelCtx::memory` gained a handle to
-/// give: a module that asks for it gets a view of the shared memory base scoped
-/// to ITS OWN partition (see [`crate::os_memory`]). Before that handle existed,
-/// two domain OSes under one user shared that base.
-///
-/// `Approval` joined in T7b/ME-3e, when `KernelCtx::approval` gained a handle
-/// (`ApprovalRequester`, backed by [`PolicyApprovalBackend`] below).
-const KERNEL_GRANTS: &[Capability] =
-    &[Capability::Events, Capability::Memory, Capability::Approval];
-
-/// What an out-of-process module may be granted. A SEPARATE list from
-/// [`KERNEL_GRANTS`] on purpose — see `docs/design/T7a-ME3e-grants-and-events.md`
-/// §1 for why this list exists at all. It used to be strictly narrower than
-/// [`KERNEL_GRANTS`]; ME4-1.4.1 (`docs/design/ME4-S1-scheduler-callback.md`
-/// §6.5) broke that: `Scheduler` is now WIDER here, because out-of-process
-/// modules have a real handle (`CallbackDeps.scheduler`) that no in-process
-/// module does. Each list only ever promises what its own side can actually
-/// back with a handle — the two are independent for that reason, not because
-/// one is meant to contain the other.
-/// `Approval` joined in T7b/ME-3e, alongside the wire handlers in
-/// `crate::approval_callback` that give it a real handler.
-///
-/// `Memory` joined in T8.5c-W-mount. Out-of-process access to the shared
-/// memory base goes through the OOP wire surface (`_a24/memory/private/*`,
-/// T8.5c-W-wire), gated by [`crate::os_memory::MemoryEntitlement`] rather
-/// than by this list alone — a module may be in this grant set and still
-/// receive `MemoryEntitlement::NONE` (its partition could not be recorded,
-/// or the daemon has no connection-admission budget to offer — see
-/// `MemoryLease::admission()`). This list only says the kernel is WILLING to
-/// consider lending memory to an out-of-process module; whether it actually
-/// can is decided per mount.
-///
-/// `Scheduler` joined in ME4-1.4.1 (`docs/design/ME4-S1-scheduler-callback.md`
-/// §6.5): out-of-process modules now have a real handle
-/// (`CallbackDeps.scheduler`) and a real handler surface
-/// (`_a24/scheduler/{upsert,delete,list}`, `crate::scheduler_callback`).
-/// Deliberately **not** added to [`KERNEL_GRANTS`] — there is still no
-/// in-process scheduler handle to hand out, and this list's own doc comment
-/// above says why that matters (`a_capability_the_kernel_cannot_serve_is_not_granted`
-/// keeps that promise honest for in-process modules).
-///
-/// `Models` joined in ME4-4.2.2b2 (`docs/design/ME4-S2-model-callback.md`
-/// §2.4): out-of-process modules may now hold a real handle
-/// (`CallbackDeps.models: Option<ModelCallbackDeps>` — `Option` because a
-/// daemon that built no router still runs) and a real handler surface
-/// (`_a24/model/complete`, `crate::model_callback`). Same reasoning as
-/// `Scheduler` for why it is not in [`KERNEL_GRANTS`]: `KernelCtx` has no
-/// model handle to lend an in-process module.
-const KERNEL_OOP_GRANTS: &[Capability] = &[
-    Capability::Events,
-    Capability::Approval,
-    Capability::Memory,
-    Capability::Scheduler,
-    Capability::Models,
-];
 
 /// The daemon-level dependencies the OOP callback handlers need, threaded
 /// through [`mount_all`] **by value** and lent to each [`mount_package`] as
@@ -397,7 +337,8 @@ pub struct MountReport {
     pub enabled_at_start: Option<bool>,
     pub outcome: MountOutcome,
     /// Capabilities a LIVE module holds: the intersection of what its manifest
-    /// asked for and [`KERNEL_GRANTS`].
+    /// asked for and the form's ceiling (`capabilities::requires::KERNEL_GRANTS`
+    /// in process, `KERNEL_OOP_GRANTS` out of process).
     ///
     /// Empty for every outcome other than [`MountOutcome::Mounted`], because no
     /// `KernelCtx` was handed over — for a disabled entry the manifest was never
@@ -1713,7 +1654,12 @@ pub async fn mount_all_with_refusals(
             );
             continue;
         }
-        let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
+        let granted = requires::resolve(
+            &RequiresSpec::from_manifest(manifest),
+            GrantForm::InProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        )
+        .granted;
         let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
 
         // The module's directory is DERIVED from its validated name, never from
@@ -2171,7 +2117,12 @@ async fn mount_package(
     // T7a/ME-3e: computed once, before `supervise` — `Offer` and the
     // `MethodsFor` closure both need it, and it must be the SAME `Grants` that
     // ends up in `MountReport.granted` below (judgement 10's consistency).
-    let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_OOP_GRANTS);
+    let granted = requires::resolve(
+        &RequiresSpec::from_manifest(manifest),
+        GrantForm::OutOfProcess.host_cap(),
+        Consent::FirstPartyEnabled,
+    )
+    .granted;
     let broadcast: Arc<dyn EventBroadcast> = Arc::new(HubBroadcast(events.clone()));
     let event_sink = granted
         .has(Capability::Events)
@@ -2446,6 +2397,7 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::capabilities::requires::KERNEL_OOP_GRANTS;
     use agent24_attach::attached::RESERVED_KERNEL_SEGMENTS;
     use agent24_domain::{DomainOsManifest, ModelAccess, Result as DomainResult};
     use axum::body::Body;

@@ -1135,6 +1135,40 @@ fn covered(id: &str, registered: &std::collections::BTreeSet<String>) -> bool {
     registered.contains(id) || mcp_exempt(id)
 }
 
+/// `requires` names kernel capabilities and canonical operations, never a
+/// REGISTRY capability id (C9-A). A kernel name that is also a registry id,
+/// or an operation that is only a slash alias, turns this red.
+fn assert_requires_tokens(
+    requires: &Value,
+    registered: &std::collections::BTreeSet<String>,
+    where_: &str,
+) {
+    let kernel = requires["kernel"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{where_} requires.kernel is missing"));
+    for name in kernel {
+        let name = name.as_str().unwrap();
+        assert!(
+            agent24_domain::Capability::parse(name).is_ok(),
+            "{where_} requires.kernel {name} is not a kernel capability"
+        );
+        assert!(
+            !registered.contains(name),
+            "{where_} requires.kernel {name} is a REGISTRY capability id"
+        );
+    }
+    let operations = requires["operations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{where_} requires.operations is missing"));
+    for op in operations {
+        let op = op.as_str().unwrap();
+        assert!(
+            crate::capabilities::Operation::canonical(op).is_some(),
+            "{where_} requires.operations {op} is not a canonical Operation name"
+        );
+    }
+}
+
 fn provide_ids(body: &Value) -> Vec<String> {
     body["components"]
         .as_array()
@@ -1163,6 +1197,13 @@ async fn registry_lists_every_capability_id_the_components_emit() {
         "ADR-040 should say the C7 registry exists"
     );
     let registered = registered_ids(&markdown);
+    for cap in agent24_domain::ALL_CAPABILITIES {
+        assert!(
+            !registered.contains(cap.as_str()),
+            "kernel capability {} collides with a REGISTRY capability id",
+            cap.as_str()
+        );
+    }
     for id in [
         "model-gateway",
         "nostr-dm",
@@ -1205,6 +1246,9 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     for path in &locks {
         let text = std::fs::read_to_string(path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(requires) = value.get("requires") {
+            assert_requires_tokens(requires, &registered, &path.display().to_string());
+        }
         let Some(provides) = value.get("provides").and_then(|p| p.as_array()) else {
             continue;
         };
@@ -1238,24 +1282,78 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     }
     let mut manifests = Vec::new();
     walk_manifests(&root, &mut manifests);
+    assert!(
+        manifests
+            .iter()
+            .any(|p| p.ends_with("agent24-documents/domain-os.yml")),
+        "documents domain-os.yml must be part of the requires drift check"
+    );
     for path in manifests {
         let text = std::fs::read_to_string(&path).unwrap();
-        if !text
+        let has_provides = text
             .lines()
-            .any(|line| line.trim().starts_with("provides:"))
-        {
-            continue;
-        }
+            .any(|line| line.trim().starts_with("provides:"));
         let manifest = agent24_domain::DomainOsManifest::from_yaml(&text)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for provide in manifest.provides() {
+        if has_provides {
+            for provide in manifest.provides() {
+                assert!(
+                    registered.contains(provide.id()),
+                    "{} provides {}, which REGISTRY.md does not list",
+                    path.display(),
+                    provide.id()
+                );
+            }
+        }
+        for cap in manifest.kernel_capabilities() {
             assert!(
-                registered.contains(provide.id()),
-                "{} provides {}, which REGISTRY.md does not list",
+                agent24_domain::Capability::parse(cap.as_str()).is_ok(),
+                "{} kernel capability {} is not a kernel capability",
                 path.display(),
-                provide.id()
+                cap.as_str()
+            );
+            assert!(
+                !registered.contains(cap.as_str()),
+                "{} kernel capability {} is a REGISTRY capability id",
+                path.display(),
+                cap.as_str()
             );
         }
+    }
+
+    let mut catalogs = Vec::new();
+    fn walk_catalogs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk_catalogs(&path, out);
+            } else if name == "component.json" {
+                out.push(path);
+            }
+        }
+    }
+    walk_catalogs(&root.join("rust"), &mut catalogs);
+    assert!(
+        catalogs
+            .iter()
+            .any(|p| p.ends_with("agent24-documents/component.json")),
+        "documents component.json must be part of the requires drift check"
+    );
+    for path in catalogs {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let Some(requires) = value.get("requires") else {
+            continue;
+        };
+        assert_requires_tokens(requires, &registered, &path.display().to_string());
     }
 
     let app = build_router(server_tests::state().await);
@@ -3203,6 +3301,18 @@ fn documents_d9_catalog_parses_the_module_tools() {
     assert!(catalog.assurance.is_empty());
     assert_eq!(catalog.requires.kernel, ["events", "models"]);
     assert!(catalog.requires.operations.is_empty());
+    let mut with_op: Value =
+        serde_json::from_str(include_str!("../../../agent24-documents/component.json")).unwrap();
+    with_op["requires"]["operations"] = json!(["models.read"]);
+    assert!(
+        documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_ok(),
+        "a canonical Operation name is a valid requires.operations entry"
+    );
+    with_op["requires"]["operations"] = json!(["models/read"]);
+    assert!(
+        documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
+        "a slash alias is not a canonical operation name"
+    );
     // domain-os.yml is parsed, not searched: a comment or another key that
     // happens to contain the text cannot satisfy it.
     let manifest: serde_yaml::Value =
@@ -3317,10 +3427,10 @@ fn documents_d9_missing_or_broken_catalog_is_an_error() {
             v["requires"]["kernel"] = json!(["events", "events"]);
         }),
         ("operations", |v| {
-            v["requires"]["operations"] = json!(["Bad"])
+            v["requires"]["operations"] = json!(["list"])
         }),
         ("operations-unique", |v| {
-            v["requires"]["operations"] = json!(["list", "list"]);
+            v["requires"]["operations"] = json!(["models.read", "models.read"]);
         }),
         // Well formed, but not `<this component's id>.<operation>`.
         ("tool-component", |v| {

@@ -19,16 +19,6 @@ use serde_json::{Value, json};
 use super::Provide;
 use crate::component_manifest::CapProvide;
 
-/// Kernel grants a domain OS may ask for (ADR-038 D2, `requires.kernel`).
-const KERNEL: &[&str] = &[
-    "approval",
-    "events",
-    "memory",
-    "models",
-    "policy",
-    "scheduler",
-];
-
 #[derive(Debug, thiserror::Error)]
 pub(super) enum CatalogError {
     #[error("documents component catalog is missing")]
@@ -221,14 +211,17 @@ impl DocumentsCatalog {
         let mut kernel = BTreeSet::new();
         for name in &self.requires.kernel {
             require(
-                KERNEL.contains(&name.as_str()) && kernel.insert(name.as_str()),
+                crate::capabilities::requires::kernel_token_ok(name)
+                    && kernel.insert(name.as_str()),
                 "requires.kernel",
             )?;
         }
         let mut ops = BTreeSet::new();
         for op in &self.requires.operations {
+            // Canonical CORE-2 names (`models.read`). Slash aliases and bare
+            // tool verbs are not operations here.
             require(
-                operation_ok(op) && ops.insert(op.as_str()),
+                crate::capabilities::requires::operation_token_ok(op) && ops.insert(op.as_str()),
                 "requires.operations",
             )?;
         }

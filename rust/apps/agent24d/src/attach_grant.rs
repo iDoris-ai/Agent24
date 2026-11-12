@@ -13,22 +13,11 @@
 
 use std::sync::Arc;
 
-use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink, Grants};
+use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink};
 
 use agent24_attach::attach_registry::{AttachGrant, AttachGrantBuilder};
 
-/// A3 P2 (design §1 "本期只用 `events`、`models`"): the only two capabilities
-/// an attached module may be granted. Deliberately narrower than
-/// `domain::KERNEL_OOP_GRANTS` — `memory`/`scheduler`/`approval` have no
-/// attach-side story yet (no partition-allocation pass runs for an attached
-/// module, and `host_commands` — A3's own reverse channel — is not one of
-/// `agent24_domain::Capability`'s variants), so granting them here would be
-/// scope no judgement or design section asks for. A manifest MAY still
-/// declare them (`kernel_capabilities` is an open list at the manifest
-/// layer); `Grants::granting`'s intersection with this list is what refuses
-/// them, the same "asking gains nothing" rule every other grant list in this
-/// daemon already documents.
-const ATTACH_OOP_GRANTS: &[Capability] = &[Capability::Events, Capability::Models];
+use crate::capabilities::requires::{self, Consent, GrantForm, RequiresSpec};
 
 /// Daemon handles one admission needs. Dropping the registry's `AttachDeps`
 /// drops this value, and with it the `ModelCallbackDeps` it owns — the same
@@ -46,7 +35,12 @@ pub(crate) struct DaemonAttachGrantBuilder {
 
 impl AttachGrantBuilder for DaemonAttachGrantBuilder {
     fn build(&self, name: &str, manifest: &DomainOsManifest) -> AttachGrant {
-        let granted = Grants::granting(manifest.kernel_capabilities(), ATTACH_OOP_GRANTS);
+        let granted = requires::resolve(
+            &RequiresSpec::from_manifest(manifest),
+            GrantForm::Attach.host_cap(),
+            Consent::FirstPartyEnabled,
+        )
+        .granted;
         let broadcast: Arc<dyn EventBroadcast> =
             Arc::new(crate::domain::HubBroadcast(self.events.clone()));
         let event_sink = granted

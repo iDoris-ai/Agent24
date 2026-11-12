@@ -156,6 +156,14 @@ impl Operation {
         super::route_policy::assurance_level(self)
     }
 
+    /// `action` is a canonical [`Self::action`] name. [`Self::from_action`]'s
+    /// slash aliases (`models/read`, `session/new`, …) are not canonical:
+    /// `requires.operations` accepts only the dotted form.
+    pub fn canonical(action: &str) -> Option<Self> {
+        let parsed = Self::from_action(action)?;
+        (parsed.action() == action).then_some(parsed)
+    }
+
     pub fn from_action(action: &str) -> Option<Self> {
         Some(match action {
             "models.admin" => Self::ModelsAdmin,
