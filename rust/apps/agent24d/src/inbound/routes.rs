@@ -185,7 +185,12 @@ pub(crate) async fn post_wechat_event(
                 "Missing or invalid bearer token",
             );
         };
-        if crate::capabilities::bridge::component_may_ingest(&authorization).is_err() {
+        if let Err(deny) = crate::capabilities::bridge::component_may_ingest(&authorization) {
+            if let Some(event) = crate::capabilities::bridge::deny_audit(&authorization, deny)
+                && let Ok(ts) = crate::capabilities::bridge::audit_now()
+            {
+                let _ = state.store.append_capability_token_audit(&ts, &event).await;
+            }
             return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
         }
     } else if state.auth_mode != AuthMode::LegacySingleToken {
@@ -1889,7 +1894,18 @@ mod tests {
                 unix_now(),
             )
             .unwrap();
-        let bridge = bridge::issue_wechat_bridge(&cap, &auth, unix_now()).unwrap();
+        let bridge = bridge::issue_wechat_bridge(&cap, &auth, unix_now(), |event| {
+            let db = db.clone();
+            async move {
+                let ts = bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        .unwrap();
         let (bridge_bearer, _, claims) = bridge.into_bearer_parts();
         assert_eq!(
             claims.expires_at - claims.created_at,
@@ -2035,6 +2051,24 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
         assert_eq!(run_count(&db).await, 1);
+
+        let actions: Vec<_> = db
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.action)
+            .collect();
+        assert!(
+            actions
+                .iter()
+                .any(|action| action == "capability.token.issued")
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|action| action == "capability.token.denied")
+        );
     }
 
     /// A body `source` other than `wechat` returns in `checked_wechat_event`

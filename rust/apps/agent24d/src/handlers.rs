@@ -206,12 +206,29 @@ pub(super) async fn mint_bridge_capability(
             "Shell authority required",
         );
     };
+    let db = state.store.clone();
     let minted = match crate::capabilities::bridge::issue_wechat_bridge(
         &store,
         &authorization,
         crate::capabilities::unix_now(),
-    ) {
+        |event| async move {
+            let ts = crate::capabilities::bridge::audit_now()?;
+            db.append_capability_token_audit(&ts, &event)
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+        },
+    )
+    .await
+    {
         Ok(minted) => minted,
+        Err(crate::capabilities::bridge::BridgeIssueError::AuditFailed) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_unavailable",
+                "Capability audit could not be written",
+            );
+        }
         Err(crate::capabilities::bridge::BridgeIssueError::Rejected) => {
             return error_response(
                 StatusCode::FORBIDDEN,
@@ -256,12 +273,39 @@ pub(super) async fn revoke_capability(
             "Invalid capability id",
         );
     }
+    // A dev-bridge token is revoked in memory before the audit row. If the
+    // row cannot be written the bearer stays unusable and the caller retries.
+    // Other audiences keep the previous idempotent revoke, with no audit.
     if store
         .claims_by_id(&capability_id)
         .is_some_and(|claims| claims.audience == crate::capabilities::Audience::ComponentRuntime)
     {
-        if crate::capabilities::bridge::revoke_wechat_bridge(store, &capability_id).is_err() {
-            let _ = store.revoke_by_id(&capability_id);
+        let db = state.store.clone();
+        match crate::capabilities::bridge::revoke_wechat_bridge(store, &capability_id, |event| {
+            let db = db.clone();
+            async move {
+                let ts = crate::capabilities::bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(crate::capabilities::bridge::BridgeRevokeError::AuditFailed) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "audit_unavailable",
+                    "Capability audit could not be written",
+                );
+            }
+            // A component token outside the dev-bridge profile cannot carry
+            // the closed audit row. It is still revoked in memory.
+            Err(crate::capabilities::bridge::BridgeRevokeError::NotComponent) => {
+                let _ = store.revoke_by_id(&capability_id);
+            }
         }
     } else {
         let _ = store.revoke_by_id(&capability_id);

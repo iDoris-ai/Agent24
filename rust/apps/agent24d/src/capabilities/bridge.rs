@@ -1,30 +1,37 @@
 //! Dev-bridge `ComponentRuntime` tier. One hardcoded profile: `wechat-bridge`
 //! may call `inbound.ingest` for eight hours. The daemon does not mint a
 //! component token when a component is enabled.
-//!
-//! Issuance and revocation audit land in the following commit. This commit
-//! only admits the token.
 
 use std::collections::BTreeSet;
+use std::future::Future;
+
+use agent24_store::{
+    AuditRef, AuditTimestamp, COMPONENT_RUNTIME_TTL_SECONDS, CapabilityDenyReason,
+    CapabilityRevokeReason, CapabilityTokenAuditEvent, DEV_BRIDGE_COMPONENT_ID,
+    DEV_BRIDGE_OPERATION,
+};
 
 use super::operations::Operation;
 use super::store::CapabilityStore;
 use super::token::random_capability_id;
-use super::types::{Audience, Authorization, CapabilityClaims, UnixSeconds};
+use super::types::{Audience, Authorization, CapabilityClaims, CapabilityError, UnixSeconds};
 
-pub const BRIDGE_TTL_SECONDS: u64 = 8 * 60 * 60;
-const DEV_BRIDGE_COMPONENT_ID: &str = "wechat-bridge";
+pub use agent24_store::COMPONENT_RUNTIME_TTL_SECONDS as BRIDGE_TTL_SECONDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BridgeIssueError {
     /// Caller is not a live first-party shell for this daemon.
     Rejected,
+    /// The decision row was not written, so no token was inserted.
+    AuditFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BridgeRevokeError {
     /// Not a dev-bridge component token.
     NotComponent,
+    /// The row was not written. The token is already revoked.
+    AuditFailed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -32,6 +39,16 @@ pub enum IngestDeny {
     Audience,
     Component,
     Operation,
+}
+
+impl IngestDeny {
+    fn reason(self) -> CapabilityDenyReason {
+        match self {
+            Self::Audience => CapabilityDenyReason::Audience,
+            Self::Component => CapabilityDenyReason::Component,
+            Self::Operation => CapabilityDenyReason::Operation,
+        }
+    }
 }
 
 /// Handler gate for `POST /api/v1/inbound/events`. Each arm is independent:
@@ -53,22 +70,53 @@ pub fn component_may_ingest(auth: &Authorization) -> Result<(), IngestDeny> {
     Ok(())
 }
 
-/// Mint the only component-runtime tier. Eight hours, this daemon generation,
-/// no renewal path.
-pub fn issue_wechat_bridge(
+pub fn deny_audit(auth: &Authorization, deny: IngestDeny) -> Option<CapabilityTokenAuditEvent> {
+    let operation = AuditRef::new(DEV_BRIDGE_OPERATION).ok()?;
+    let component_id = auth
+        .claims
+        .component_id
+        .as_deref()
+        .and_then(|id| AuditRef::new(id).ok());
+    let capability_id = AuditRef::new(&auth.claims.capability_id).ok();
+    Some(CapabilityTokenAuditEvent::Denied {
+        reason: deny.reason(),
+        component_id,
+        capability_id,
+        operation,
+    })
+}
+
+/// Audit first. A write failure leaves the store without this token.
+pub async fn issue_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     authorization: &Authorization,
     now: UnixSeconds,
-) -> Result<super::MintedCapability, BridgeIssueError> {
+    audit: F,
+) -> Result<super::MintedCapability, BridgeIssueError>
+where
+    F: FnOnce(CapabilityTokenAuditEvent) -> Fut,
+    Fut: Future<Output = Result<(), ()>>,
+{
     if authorization.claims.audience != Audience::FirstPartyShell
         || authorization.claims.daemon_generation != store.daemon_generation()
     {
         return Err(BridgeIssueError::Rejected);
     }
+    let capability_id = random_capability_id();
+    let event = CapabilityTokenAuditEvent::Issued {
+        component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID)
+            .map_err(|_| BridgeIssueError::Rejected)?,
+        capability_id: AuditRef::new(&capability_id).map_err(|_| BridgeIssueError::Rejected)?,
+        operation: AuditRef::new(DEV_BRIDGE_OPERATION).map_err(|_| BridgeIssueError::Rejected)?,
+        ttl_seconds: COMPONENT_RUNTIME_TTL_SECONDS,
+    };
+    if audit(event).await.is_err() {
+        return Err(BridgeIssueError::AuditFailed);
+    }
     store
         .insert(CapabilityClaims {
             first_party: None,
-            capability_id: random_capability_id(),
+            capability_id,
             audience: Audience::ComponentRuntime,
             component_id: Some(DEV_BRIDGE_COMPONENT_ID.to_owned()),
             workspace_id: None,
@@ -84,12 +132,17 @@ pub fn issue_wechat_bridge(
         .map_err(|_| BridgeIssueError::Rejected)
 }
 
-/// Revoke one dev-bridge token. A component token outside that profile is
-/// [`BridgeRevokeError::NotComponent`]; the caller still drops it in memory.
-pub fn revoke_wechat_bridge(
+/// Mark the token revoked before the audit write. A write failure must not
+/// put the old bearer back into service; the caller retries the row.
+pub async fn revoke_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     capability_id: &str,
-) -> Result<(), BridgeRevokeError> {
+    audit: F,
+) -> Result<(), BridgeRevokeError>
+where
+    F: FnOnce(CapabilityTokenAuditEvent) -> Fut,
+    Fut: Future<Output = Result<(), ()>>,
+{
     let Some(claims) = store.claims_by_id(capability_id) else {
         return Err(BridgeRevokeError::NotComponent);
     };
@@ -99,7 +152,21 @@ pub fn revoke_wechat_bridge(
         return Err(BridgeRevokeError::NotComponent);
     }
     store.revoke_by_id(capability_id);
+    let event = CapabilityTokenAuditEvent::Revoked {
+        component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID)
+            .map_err(|_| BridgeRevokeError::AuditFailed)?,
+        capability_id: AuditRef::new(capability_id).map_err(|_| BridgeRevokeError::AuditFailed)?,
+        reason: CapabilityRevokeReason::Explicit,
+    };
+    if audit(event).await.is_err() {
+        return Err(BridgeRevokeError::AuditFailed);
+    }
     Ok(())
+}
+
+pub fn audit_now() -> Result<AuditTimestamp, ()> {
+    let stamp = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    AuditTimestamp::new(stamp).map_err(|_| ())
 }
 
 #[cfg(test)]
@@ -126,16 +193,32 @@ mod tests {
         (store, auth)
     }
 
-    #[test]
-    fn shell_issues_an_eight_hour_bridge_token_and_a_host_cannot() {
+    #[tokio::test]
+    async fn audit_failure_does_not_issue_and_revoke_failure_kills_the_token() {
         let (store, auth) = shell_store();
+        let failed = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Err(()) }).await;
+        assert!(matches!(failed, Err(BridgeIssueError::AuditFailed)));
+        assert!(store.claims_by_id("unused").is_none());
+        assert!(
+            store
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .all(|record| record.claims.audience != Audience::ComponentRuntime)
+        );
         let mut host_auth = auth.clone();
         host_auth.claims.audience = Audience::ProductHost;
         assert!(matches!(
-            issue_wechat_bridge(&store, &host_auth, unix_now()),
+            issue_wechat_bridge(&store, &host_auth, unix_now(), |_| async { Ok(()) }).await,
             Err(BridgeIssueError::Rejected)
         ));
-        let minted = issue_wechat_bridge(&store, &auth, unix_now()).unwrap();
+
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
         let (bearer, id, claims) = minted.into_bearer_parts();
         assert_eq!(claims.expires_at - claims.created_at, BRIDGE_TTL_SECONDS);
         assert!(
@@ -159,22 +242,24 @@ mod tests {
                 )
                 .is_err()
         );
-        assert!(revoke_wechat_bridge(&store, &id).is_ok());
-        assert!(
-            store
-                .validate_bearer(
-                    &bearer,
-                    Operation::InboundIngest,
-                    &Resource::global(),
-                    unix_now()
-                )
-                .is_err()
-        );
+
+        let revoke_failed = revoke_wechat_bridge(&store, &id, |_| async { Err(()) }).await;
+        assert_eq!(revoke_failed, Err(BridgeRevokeError::AuditFailed));
+        assert!(matches!(
+            store.validate_bearer(
+                &bearer,
+                Operation::InboundIngest,
+                &Resource::global(),
+                unix_now()
+            ),
+            Err(CapabilityError::Revoked)
+        ));
     }
 
     #[test]
     fn each_ingest_check_fails_on_its_own() {
-        let (_store, auth) = shell_store();
+        let (store, auth) = shell_store();
+        let now = unix_now();
         let mut claims = auth.claims.clone();
         claims.audience = Audience::ComponentRuntime;
         claims.component_id = Some("other-bridge".into());
@@ -200,5 +285,6 @@ mod tests {
             component_may_ingest(&Authorization { claims, epoch: 0 }),
             Err(IngestDeny::Operation)
         );
+        let _ = (store, now);
     }
 }

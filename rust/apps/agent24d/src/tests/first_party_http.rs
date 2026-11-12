@@ -80,7 +80,7 @@ async fn grant(
         .secret
 }
 #[tokio::test]
-async fn bridge_mint_uses_the_host_summary() {
+async fn bridge_mint_uses_the_host_summary_and_writes_the_audit_before_the_token() {
     let (state, token) = setup().await;
     state
         .first_party
@@ -118,6 +118,19 @@ async fn bridge_mint_uses_the_host_summary() {
     assert_eq!(body["component_id"], "wechat-bridge");
     assert_eq!(body["ttl_seconds"], 28_800);
     assert_eq!(body["allowed_operations"][0], "inbound.ingest");
+    let actions: Vec<_> = state
+        .store
+        .list_audit()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.action)
+        .collect();
+    assert!(
+        actions
+            .iter()
+            .any(|action| action == "capability.token.issued")
+    );
     assert!(!body.to_string().contains("客户端"));
 }
 
