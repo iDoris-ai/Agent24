@@ -31,7 +31,7 @@
 | 总体架构与分层 | [分层总览](../ARCHITECTURE-LAYERS.md)；[M1 技术判断与边界](../agent/architecture.md)；[内核边界图](kernel-boundary.html) | ADR-026（Rust Core）、ADR-037（产品形态，已接受：决策 1–5）；均在 [决策日志](../decision.md) 与 [ADR-026](../ADR-026-rust-core-polyglot.md) | [协议规范 SPEC-002](../specs/SPEC-002-protocol.md)、[工程规范 SPEC-001](../specs/SPEC-001-engineering.md)；[产品形态事实清单](../tracking/2026-10-26/SOURCE-ADR-037-facts.md) |
 | 审批、权限、审计 | [分层总览 §4 安全与权限边界](../ARCHITECTURE-LAYERS.md) | [ADR-K1-01](../adr/ADR-K1-01-module-tool-contract.md)、[K1-02](../adr/ADR-K1-02-session-dataflow-security-modes.md)、[K1-03](../adr/ADR-K1-03-enable-authorization-trust-revocation.md)、[K1-04](../adr/ADR-K1-04-audit-and-shared-authorization.md)；日志 ADR-016（模块安全）、ADR-017（隐私） | [审批法律](../laws/APPROVAL.md)；[K1-06a 授权路径](../design/K1-06a-grant-path.md)、[资源范围](../design/K1-06a-resource-scope.md)、[出口矩阵](../design/K1-06b-egress-matrix.md)；[T8 启用准入](../design/T8-ME3g-enable-admission-gate.md)；[内核计划 PLAN-KERNEL-K1](../agent/PLAN-KERNEL-K1.md) |
 | 持续运行：入站、动作、作业 | [Super Agent 演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md) | [ADR-041](../adr/ADR-041-inbound-events-admission-and-work-items.md)、[ADR-042](../adr/ADR-042-durable-actions-and-reconciliation.md)、[ADR-043](../adr/ADR-043-background-jobs-concurrency-and-supervision.md)（041a 已接受、041b 提议；042、043 部分接受） | [关停可观测 SHUT](../design/SHUT-shutdown-observability.md)；[定时回调 ME4-S1](../design/ME4-S1-scheduler-callback.md)；[run 失败类型 FU-57](../design/FU-57-run-failure-kinds.md) |
-| 迁移与启动保护 | [分层总览 §7 尚未完成](../ARCHITECTURE-LAYERS.md) | 日志 ADR-035（token 交付） | [CORE-5 迁移保护](../agent/CORE-5-MIGRATION-GUARD-DESIGN.md)；[CORE-2 接入注册](../agent/CORE-2-ENROLL-DESIGN.md)；[iDoris launcher](../agent/IDORIS-LAUNCHER-DESIGN.md) |
+| 迁移与启动保护 | [分层总览 §7 尚未完成](../ARCHITECTURE-LAYERS.md) | 日志 ADR-035（token 交付，部分取代）；[ADR-046](../adr/ADR-046-idoris-managed-host.md)（iDoris 托管） | [CORE-5 迁移保护](../agent/CORE-5-MIGRATION-GUARD-DESIGN.md)；[CORE-2 接入注册](../agent/CORE-2-ENROLL-DESIGN.md)；[iDoris launcher](../agent/IDORIS-LAUNCHER-DESIGN.md) |
 
 ### 扩展面：领域 OS、组件、技能（L5½ 与 L6）
 
@@ -41,7 +41,7 @@
 | 领域 OS 与进程外模块 | [分层总览 §2 L5½](../ARCHITECTURE-LAYERS.md) | 日志 ADR-029（边界与挂载缝）、ADR-031（进程外协议）、ADR-032（AgentEar、iDoris 接入） | [附着式模块 A3](../design/A3-ATTACHED-MODULE.md)；[进程外 WIRE](../specs/WIRE-OOP-MODULE.md)；[ME-3 规格](../specs/SPEC-ME3-OUT-OF-PROCESS.md)；[OS 能力计划 PLAN-ME4](../agent/PLAN-ME4-OS-CAPABILITIES.md)；[OS SDK ME4-S3](../design/ME4-S3-os-sdk.md) |
 | 技能 | [Super Agent 演进终稿](../research/deepseek-superagent/SUPERAGENT-EVOLUTION-2026-11-01.md) | [ADR-040](../adr/ADR-040-skill-contract-v1.md)（已接受，设计约束） | [技能分发规格](../specs/SPEC-SKILL-DISTRIBUTION.md) |
 | Documenting | [Documenting README](../documenting/README.md)、[基线](../documenting/BASELINE.md) | [ADR-DOC-01](../documenting/adr/ADR-DOC-01-placement-and-integration.md)、[DOC-02](../documenting/adr/ADR-DOC-02-operation-contract.md)、[DOC-03](../documenting/adr/ADR-DOC-03-docx-engine-and-conversion.md) | [DOC-1-06b 模块工具](../design/DOC-1-06b-module-tools.md) |
-| 知识库 | [定位与差异](../knowledge/POSITIONING-AND-DIFFS.md) | [ADR-KB-01](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) | [操作契约](../knowledge/CONTRACT-OPS-v2.md)、[只读契约](../knowledge/CONTRACT-READONLY-v1.md)、[状态契约](../knowledge/CONTRACT-STATE-v1.md)、[UI 桥契约](../knowledge/CONTRACT-UI-BRIDGE-v1.md)；[计划](../knowledge/PLAN-KNOWLEDGE-TASKS.md) |
+| 知识库 | [定位与差异](../knowledge/POSITIONING-AND-DIFFS.md) | [ADR-KB-01](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md)、[ADR-KB-02](../knowledge/ADR-KB-02-HOST-AUTHORITY.md)（宿主凭据与授权） | [操作契约](../knowledge/CONTRACT-OPS-v2.md)、[只读契约](../knowledge/CONTRACT-READONLY-v1.md)、[状态契约](../knowledge/CONTRACT-STATE-v1.md)、[UI 桥契约](../knowledge/CONTRACT-UI-BRIDGE-v1.md)；[计划](../knowledge/PLAN-KNOWLEDGE-TASKS.md) |
 | Open Design 创作区 | [Open Design 工作区 README](../open-design-workspace/README.md)、[P0 冻结索引](../open-design-workspace/design/README.md) | [ADR-OD-001 至 006](../open-design-workspace/design/README.md)（文件名 ADR-001 至 ADR-006，与日志同号，见 ADR 索引） | [兼容矩阵](../open-design-workspace/design/COMPATIBILITY-MATRIX.md)、[风险登记](../open-design-workspace/design/RISK-REGISTER.md)；[落地策略](../design/OPEN-DESIGN-INTEGRATION-LANDING-STRATEGY.md)；[iDoris 版改造计划](../design/OPEN-DESIGN-IDORIS-EDITION.md) |
 
 ### 记忆
@@ -62,7 +62,7 @@
 
 | 主题 | 架构说明 | ADR | 设计与规格 |
 |---|---|---|---|
-| 运行时、网关、硬件分档 | [分层总览](../ARCHITECTURE-LAYERS.md) | 日志 ADR-019（LLM Gateway）、ADR-022（运行时，已收窄）、ADR-032、ADR-036 | [HW-TIERS](../design/HW-TIERS-capability-hardware-matrix.md)；[AgentEar 与 iDoris 接入](../design/INTEGRATION-AGENTEAR-IDORIS.md)；[ME4-S2 模型回调](../design/ME4-S2-model-callback.md) |
+| 运行时、网关、硬件分档 | [分层总览](../ARCHITECTURE-LAYERS.md) | 日志 ADR-019（LLM Gateway）、ADR-022（运行时，已收窄）、ADR-032、ADR-036；[ADR-046](../adr/ADR-046-idoris-managed-host.md)（daemon 托管 iDoris） | [HW-TIERS](../design/HW-TIERS-capability-hardware-matrix.md)；[AgentEar 与 iDoris 接入](../design/INTEGRATION-AGENTEAR-IDORIS.md)；[ME4-S2 模型回调](../design/ME4-S2-model-callback.md) |
 | 决策模型 | | 日志 ADR-033、ADR-034 | [PLAN-DECIDE](../agent/PLAN-DECIDE.md)；[DECISION-MODELS](../research/DECISION-MODELS.md) |
 
 ## 评估与研究：三步评审记录
