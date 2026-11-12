@@ -4829,7 +4829,15 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "413":
-          description: Body or one eval file is over 32 KiB
+          description: |
+            The request body is over 1 MiB, or the skill body or one eval
+            file is over 32 KiB.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Skill store failed
           content:
             application/json:
               schema:
@@ -4858,6 +4866,18 @@ paths:
                 $ref: "#/components/schemas/Error"
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: The request body is over 1 MiB
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal failure while reading the request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
   /skills/{id}:
     get:
       operationId: getSkill

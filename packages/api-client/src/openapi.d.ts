@@ -9398,8 +9398,20 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Body or one eval file is over 32 KiB */
+            /**
+             * @description The request body is over 1 MiB, or the skill body or one eval
+             *     file is over 32 KiB.
+             */
             413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Skill store failed */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -9437,6 +9449,24 @@ export interface operations {
                 };
             };
             401: components["responses"]["Unauthorized"];
+            /** @description The request body is over 1 MiB */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Internal failure while reading the request */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
     getSkill: {
