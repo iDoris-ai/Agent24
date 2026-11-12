@@ -190,6 +190,8 @@ render_skill_segment(body, origin, content_digest) -> String
 - 代次不符先于「两侧都换」：预期代次已过期，即使正文和评测相对指针都变了，也是 `skill_pointer_conflict`，不是 `skill_activation_mixed`。
 - 正文修订与评测修订的 `origin` 必须相同。激活和回滚都要求。不同则 `skill_origin_mismatch`，指针不动。这和 `skill_activation_mixed` 不是同一条件。指针主键仍是 `skill_id`，不按来源拆行。来源切换不拆指针行：历史行带 `origin_from`（上一行来源，第一行为空）和 `origin_to`（这一行来源）。
 - 每次重跑都针对**即将钉上的那一对**，不是针对旧的那一对。
+- 经另一来源绕一圈换两侧是允许的：例如 `imported` → `user` → `imported`，每一跳都是「来源切换」，两侧同时换。确认摘要显示 from/to，历史行记 `origin_from` / `origin_to`，不因为「回到了原来的来源」而当作无变化。
+- 读指针时遇到两侧来源不一致的坏行（库里的数据已经坏了），映射 `500 internal`，不是 400；调用方改请求解决不了。只有写路径上请求里的正文与评测来源不同，才是 `400 skill_origin_mismatch`。
 
 激活请求体只有：`expected_generation`、正文 `revision_id`、评测 `revision_id`、接受的失败 id 列表。正文不在请求体里。服务端按修订 id 读库。
 
@@ -273,6 +275,10 @@ v1 不读组件锁的 `requires`，不实现 C9，不把技能依赖映射成 `O
 
 这条路由是 `skills.activate`，`Elevated`。把它加进 `resolve_target` 的 `supported` 列表（`first_party.rs:500-518`）。不在列表里时，第一方提升会得到 `NotElevatedOperation`，CLI 无法经桌面确认。daemon 自己的 `target_summary` 从库里的修订生成同一份四项摘要；修订读不到则不要发出确认（现有写法是 `NotElevatedOperation`，`first_party.rs:574-576`）。
 
+提升前先做预检：第一方令牌对激活路由发起提升时，daemon 先跑与处理器相同的检查和评测重跑，业务失败（`invalid_request`、`skill_pointer_conflict`、`skill_activation_mixed`、`skill_origin_mismatch`、`skill_revision_*`、`skill_eval_empty`、`skill_eval_failed` 带用例摘要）直接返回，不要求提升；指针已经在目标那一对上则直接 `200 unchanged`，它不移动指针，不需要提升。只有指针真会移动时才生成摘要、要求桌面确认。处理器在提交时仍会重新校验全部检查，store 事务里再做 CAS。摘要里有接受失败用例时追加「接受 N 条失败用例」。审计 actor 记调用方的 audience 与令牌 id，不记密钥。
+
+桌面摘要的数据来源（v1 已接受的做法）：主进程用宿主凭据读 daemon 详情，从 daemon 算出的元数据（semver、`content_digest`、来源）生成四项摘要，不读修订原文字节。渲染进程没有任何写修订的通路，所以这些元数据与库里的字节一致；不为此新增读原文的路由。
+
 CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面出示 daemon 生成的摘要，人点头之后才带提升头调用。CLI 不自批。
 
 路由（ADR-045：新前缀 `skills` 要先写进 ADR-045 §4.4，否则 N10 门禁失败。不要放在 `/api/v1/capabilities/`）：
@@ -304,7 +310,7 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 |---|---|---|
 | `skill_manifest_invalid` | SL-1 解析失败（缺必填字段、字段类型错、能力 id 字符集不合法） | 400 |
 | `skill_id_reserved` | skill id 是保留名 `scans` | 400 |
-| `invalid_request` | 请求不是这条路由接受的 JSON（重扫带了路径，或正文无法解析） | 400 |
+| `invalid_request` | 请求不是这条路由接受的 JSON（重扫带了路径，或正文无法解析）；激活请求体多出字段、两种形态混用、代次为负、请求体超过 1 MiB（激活请求里没有技能正文，不用 `skill_body_too_large`）。例外：已带提升头（`X-Agent24-Elevation`）的请求在中间件的通用提升路径上读请求体，超限按所有提升路由共用的 `413 payload_too_large` 回答，本路由不单独改 | 400 |
 | `not_found` | `GET /api/v1/skills/{id}` 没有这个技能的修订 | 404 |
 | `internal` | 存储失败，或内部不变量失败。调用方改请求体解决不了 | 500 |
 | `skill_proactive_unsupported` | frontmatter 声明主动技能（D6，v1 不做） | 400 |
@@ -320,8 +326,11 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 | `skill_eval_invalid` 补充 | 单条用例的 `expect` 为空（`exact` 与 `contains` 都拒）、同一评测文件内重复用例、JSON 重复键 | 400 |
 | `skill_eval_failed` | 激活时有失败用例未被全部接受（服务端重跑，或 store 写入绑定时兜底）；响应带用例摘要，指针不动 | 409 |
 | `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同，并且与指针同来源（首次激活、回滚、来源切换除外：来源切换是正文与评测同来源且与当前指针来源不同，视同第一对，两侧同时换；正对照「同来源两侧都变 → mixed」）。代次已过期时不走这个码，走 `skill_pointer_conflict` | 400 |
-| `skill_origin_mismatch` | 激活或回滚时，正文修订与评测修订的 `origin` 不同。指针不动。与 `skill_activation_mixed` 无关：两侧可以只换一个，来源仍然必须相同。指针主键仍是 `skill_id` | 400 |
+| `skill_origin_mismatch` | 激活或回滚时，正文修订与评测修订的 `origin` 不同。指针不动。与 `skill_activation_mixed` 无关：两侧可以只换一个，来源仍然必须相同。指针主键仍是 `skill_id`。读指针遇到两侧来源不一致的坏行不是这个码，是 `internal` 500 | 400 |
 | `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符。没有指针行时当前代次是 0 | 409 |
+| `skill_revision_not_found` | 激活请求里的正文或评测修订 id 在库里不存在 | 404 |
+| `skill_revision_mismatch` | 修订属于另一个技能，或种类不对（例如评测槽里放了正文修订） | 400 |
+| `skill_activation_not_found` | 回滚引用的历史激活 id 不存在。代次不符时先报 `skill_pointer_conflict`，再查历史行 | 404 |
 
 回滚恢复一整对历史上已批准的组合，以及来源切换（候选正文与评测同来源、且与当前指针来源不同），允许在已有指针时两侧同时变化。同来源的新修订一次只能换一侧。确认摘要按实际变化显示「换回正文」「换回评测」或「两侧均换回」；来源切换时标明 from/to。
 

@@ -23,6 +23,7 @@ import {
   promptHomeImportPassword as openHomeImportPasswordWindow,
 } from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
+import { handleSkillActivate } from '../skill-activate'
 import { readOmlxSettingsKey } from '../omlx-settings-key'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
@@ -1213,6 +1214,25 @@ export function registerIpcHandlers(options: {
       return proxyToBackend({ method: 'PUT', path: '/api/v1/comm/relay', body: { relays: list } })
     }),
   )
+
+  // Skill activation and rollback (plan §4.9). The route is not on the generic
+  // proxy. Main reads the daemon's own record of the revisions, builds the
+  // four-item summary itself, asks natively, then posts once. No dialog and no
+  // request when the record cannot be read.
+  for (const [channel, form] of [
+    [IpcChannels.SkillsActivate, 'activate'],
+    [IpcChannels.SkillsRollback, 'rollback'],
+  ] as const) {
+    handle(channel, (event, raw: unknown): Promise<BackendProxyResponse> =>
+      exclusive(() =>
+        handleSkillActivate(
+          { call: (req) => proxyToBackend(req), confirm: (message, detail) => confirmNative(event, message, detail) },
+          form,
+          raw,
+        ),
+      ),
+    )
+  }
 
   // Unlock: the keystore password is typed into main's own window and goes
   // straight to the daemon, so the page (which could be compromised) never sees
