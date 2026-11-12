@@ -93,7 +93,7 @@ v1 不做分发来源、不做内置技能、不做默认提供者表、不做�
 
 一条修订是不可变的一行。身份是独立的 `revision_id`。`version`（semver）只是清单上的元数据，不参与「是不是同一条修订」。
 
-修订行至少含：`revision_id`、`skill_id`、`semver`、`kind`（`body` 或 `evals`）、`origin`（`user` 或 `imported`）、`content_digest`（内容摘要）、正文或评测原文、`created_at`。来源和内容摘要都是这行的字段，也写进注入给模型的技能段开头（§4.4 的渲染结果），供冲突判定、确认摘要和评测使用。
+修订行至少含：`revision_id`、`skill_id`、`semver`、`kind`（`body` 或 `evals`）、`origin`（`user` 或 `imported`）、`content_digest`（该行 `content` 字节的小写十六进制 SHA-256；store 重算，与传入不一致则 Conflict）、正文或评测原文、`created_at`。来源和内容摘要都是这行的字段，也写进注入给模型的技能段开头（§4.4 的渲染结果），供冲突判定、确认摘要和评测使用。
 
 判定：
 
@@ -159,12 +159,14 @@ render_skill_segment(body, origin, content_digest) -> String
 - 渲染器版本
 - 每条用例的摘要：稳定 id = `(评测名, judge, input, expect)` 的哈希（评测修订不可变，行号不进 id；同一文件内重复用例在解析时拒绝）、`line`（只作展示）、`judge`、是否通过、`expect` 的摘要
 
-有失败时，请求里的「逐条接受」必须是这些失败 id 的子集，并且和**这一次**绑定对得上。接受记录写在这条绑定上，不改评测原文，不把失败改写成通过。绑定对不上则拒绝，指针不动。
+有失败时，请求里的「逐条接受」必须正好是这些失败 id（不能多，也不能少），并且和**这一次**绑定对得上。接受记录写在这条绑定上，不改评测原文，不把失败改写成通过。绑定对不上则拒绝，指针不动。store 写入绑定前再兜底：零条用例 → `skill_eval_empty`；有失败用例没被全部接受 → `skill_eval_failed`。两种都回滚本次事务，指针不动。服务端重跑仍由 SL-4 做。
 
 一次激活相对当前指针只更换正文或评测其中之一：
 
-- 还没有指针：这一次同时钉上正文修订和评测修订，建立第一对组合。
-- 已经有指针：请求里的两个修订 id 相对指针恰好一个不同。两个都不同则 `skill_activation_mixed`，要分两次激活。两个都相同、且指针已经停在这对上：幂等成功（§4.5 末）。
+- 还没有指针：这一次同时钉上正文修订和评测修订，建立第一对组合。没有指针行时当前代次是 0，`expected_generation` 不是 0 则 `skill_pointer_conflict`。
+- 已经有指针：请求里的两个修订 id 相对指针恰好一个不同。两个都不同则 `skill_activation_mixed`，要分两次激活。例外：正文与评测同来源，且该来源与当前指针来源不同，视同第一对，允许两侧同时换，不报 `skill_activation_mixed`。同来源下两侧都变仍是 `skill_activation_mixed`。两个都相同、且指针已经停在这对上：幂等成功（§4.5 末）。
+- 代次不符先于「两侧都换」：预期代次已过期，即使正文和评测相对指针都变了，也是 `skill_pointer_conflict`，不是 `skill_activation_mixed`。
+- 正文修订与评测修订的 `origin` 必须相同。激活和回滚都要求。不同则 `skill_origin_mismatch`，指针不动。这和 `skill_activation_mixed` 不是同一条件。指针主键仍是 `skill_id`，不按来源拆行。来源切换不拆指针行：历史行带 `origin_from`（上一行来源，第一行为空）和 `origin_to`（这一行来源）。
 - 每次重跑都针对**即将钉上的那一对**，不是针对旧的那一对。
 
 激活请求体只有：`expected_generation`、正文 `revision_id`、评测 `revision_id`、接受的失败 id 列表。正文不在请求体里。服务端按修订 id 读库。
@@ -172,9 +174,9 @@ render_skill_segment(body, origin, content_digest) -> String
 并发，整段在一个事务里：
 
 1. 读指针和代次。
-2. 代次不等于 `expected_generation`，且目标组合也不是指针上已有的那一对：回滚，`409 skill_pointer_conflict`，不写历史、不写审计。
-3. 代次匹配：校验修订存在、这一次只换一侧（或是第一对）、重跑评测、接受列表与失败项一致。
-4. CAS 更新指针（代次加一），插入激活历史，写审计。审计只记 `skill_id`、两个修订 id、内容摘要、结果码，不记正文（ADR-K1-04）。
+2. 代次不等于 `expected_generation`，且目标组合也不是指针上已有的那一对：回滚，`409 skill_pointer_conflict`，不写历史、不写审计。没有指针行时按代次 0 比较。这一步先于「两侧都换」。
+3. 代次匹配：校验修订存在、属于该技能且种类正确、两侧 `origin` 相同、这一次只换一侧（或是第一对、或是回滚、或是来源切换）、重跑评测、接受列表正好是这一次的失败用例 id。零条用例拒绝。
+4. CAS 更新指针（代次加一），插入激活历史，写审计。审计只记 `skill_id`、两个修订 id、内容摘要、结果码、来源切换（`origin_from` / `origin_to`），不记正文（ADR-K1-04）。
 5. 提交。
 
 重复提交：指针已经指向请求中的那一对修订时，返回成功，不新增历史，不增加代次。这覆盖桌面双击和 CLI 重试。目标不同而代次已旧，仍是 `409`。
@@ -243,7 +245,7 @@ v1 不读组件锁的 `requires`，不实现 C9，不把技能依赖映射成 `O
 
 ### 4.9 激活确认、API、CLI 令牌
 
-桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化（回滚时按实际变化显示哪一侧换回）。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
+桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化（回滚时按实际变化显示哪一侧换回）。生成这四项所用的数据还包含来源（`user` 或 `imported`）：store 返回的指针和激活历史带上这个来源，指针主键仍是 `skill_id`。候选修订的来源与当前指针来源不同时，摘要标明来源切换（from 为指针来源，to 为候选来源）。激活历史每一行的 `origin_from` / `origin_to` 是同一次切换的记录。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
 
 `POST /api/v1/skills/{id}/activate` 不进 `ALLOWED_PROXY_ROUTES`（`backend-proxy.ts:56`）。在该文件「有意不代理」的注释里写上这一条。
 
@@ -286,11 +288,12 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 | `skill_eval_invalid` | 评测文件解析失败 | 400 |
 | `skill_eval_empty` | 评测零条用例时请求激活（空评测可以导入，不能激活） | 409 |
 | `skill_eval_invalid` 补充 | 单条用例的 `expect` 为空（`exact` 与 `contains` 都拒）、同一评测文件内重复用例、JSON 重复键 | 400 |
-| `skill_eval_failed` | 激活时服务端重跑有失败用例且未带匹配的接受 id；响应带用例摘要，指针不动 | 409 |
-| `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同（首次激活与回滚除外：首次激活没有指针，按 §4.5 同时钉上两侧建立第一对；正对照测试「首次激活两侧都新 → 成功」） | 400 |
-| `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符 | 409 |
+| `skill_eval_failed` | 激活时有失败用例未被全部接受（服务端重跑，或 store 写入绑定时兜底）；响应带用例摘要，指针不动 | 409 |
+| `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同，并且与指针同来源（首次激活、回滚、来源切换除外：来源切换是正文与评测同来源且与当前指针来源不同，视同第一对，两侧同时换；正对照「同来源两侧都变 → mixed」）。代次已过期时不走这个码，走 `skill_pointer_conflict` | 400 |
+| `skill_origin_mismatch` | 激活或回滚时，正文修订与评测修订的 `origin` 不同。指针不动。与 `skill_activation_mixed` 无关：两侧可以只换一个，来源仍然必须相同。指针主键仍是 `skill_id` | 400 |
+| `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符。没有指针行时当前代次是 0 | 409 |
 
-回滚恢复一整对历史上已批准的组合，是唯一允许（在已有指针时）两侧同时变化的操作；确认摘要按实际变化显示「换回正文」「换回评测」或「两侧均换回」。
+回滚恢复一整对历史上已批准的组合，以及来源切换（候选正文与评测同来源、且与当前指针来源不同），允许在已有指针时两侧同时变化。同来源的新修订一次只能换一侧。确认摘要按实际变化显示「换回正文」「换回评测」或「两侧均换回」；来源切换时标明 from/to。
 
 激活的测试三条：渲染进程经普通代理调用被拒；legacy 共享令牌调用被拒；同一目标重复提交幂等（指针与代次都不动，历史不增加）。再加：不在 `supported` 列表里时 CLI 提升失败。变异是从 `supported` 去掉这一条，或把路由加回 `ALLOWED_PROXY_ROUTES`。
 
@@ -310,10 +313,11 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 
 技能表一张迁移（SL-2）：
 
-- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」；插入函数在摘要不同时返回冲突，摘要相同时返回旧 id。
-- `skill_pointer`：每个 `skill_id` 一行，`body_revision_id`、`evals_revision_id`、`generation`。没有这行就是未激活。
-- `skill_activation`：历史组合，含 §4.5 的结果绑定。回滚按这张表的 id 引用。
-- `run_skill_pin`：`(run_id, skill_id, body_revision_id, content_digest, providers_json)`。providers 只是记录。旧 run 没有这行，读取时当「这次没使用技能」。
+- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」：摘要不同返回 `skill_revision_conflict`，不覆盖。另有唯一索引 `(skill_id, origin, kind, content_digest)`（§4.3）：只升 semver、摘要和字节都相同则返回已有 `revision_id`。
+- `skill_pointer`：每个 `skill_id` 一行（主键就是 `skill_id`），`body_revision_id`、`evals_revision_id`、`generation`。没有这行就是未激活，当前代次按 0。读出的视图带上两侧修订共同的 `origin`。
+- `skill_activation`：历史组合，含 §4.5 的结果绑定。回滚按这张表的 `activation_id` 引用。自增 `seq` 是顺序，不按 `created_at` 排。
+- `skill_eval_result`：绑定上的 `accepted_json` 是 JSON 数组，元素必须是这一次 `cases_json` 里失败用例的 id。
+- `run_skill_pin`：`(run_id, skill_id, body_revision_id, content_digest, providers_json)`。`providers_json` 是 JSON 对象，只作记录。旧 run 没有这行，读取时当「这次没使用技能」。
 
 消息来源的 `CHECK` 放另一张迁移，跟注入那片走（SL-5），不塞进技能表这张。来源种类沿用 `0027`–`0029` 的改表方式。`SourceKind` 存在标签 JSON 里，加变体不必改 `0016` 的表形状；旧 daemon 读到未知种类会走失败关闭，这是预期，不在 v1 里做兼容读取。
 
