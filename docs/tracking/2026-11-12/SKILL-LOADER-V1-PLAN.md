@@ -1,286 +1,366 @@
-# ADR-040 技能加载器 v1 实施方案
+# ADR-040 技能加载器 v1 实施方案（第 2 版）
 
 - 日期：2026-11-12
-- 状态：方案草案，待 jason 拍板 §5 与 §8。只写文档，没有改代码。
-- 依据：[ADR-040](../../adr/ADR-040-skill-contract-v1.md)（已接受，零代码）；上位 [ADR-039](../../adr/ADR-039-concept-model.md) §2.3、§3 规则 3、§6；[ADR-038](../../adr/ADR-038-component-contract-v1.md) D8、D9；[SPEC-SKILL-DISTRIBUTION](../../specs/SPEC-SKILL-DISTRIBUTION.md)；[REGISTRY.md](../../capabilities/REGISTRY.md)；[ADR-K1-03](../../adr/ADR-K1-03-enable-authorization-trust-revocation.md)；[ADR-041](../../adr/ADR-041-inbound-events-admission-and-work-items.md)；issue #1037。
-- 本工作树没有 `docs/tracking/2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md`。C9 的含义以 ADR-038 D7 为准：组件 `requires` 接入授权，尚未接线。
-- 与 SPEC、#1037 冲突时，以已接受的 ADR-040 为准。冲突写在 §3、§8，不改 SPEC 原文。
+- 状态：已拍板（§8）。本版整篇替换同文件第 1 版（`4897a4f5e`）。只写文档，没有改代码。
+- 依据：[ADR-040](../../adr/ADR-040-skill-contract-v1.md)（已接受，零代码）；上位 [ADR-039](../../adr/ADR-039-concept-model.md) §2.3、§3 规则 3、§6；[ADR-038](../../adr/ADR-038-component-contract-v1.md) D8、D9；[SPEC-SKILL-DISTRIBUTION](../../specs/SPEC-SKILL-DISTRIBUTION.md)；[REGISTRY.md](../../capabilities/REGISTRY.md)；[ADR-K1-03](../../adr/ADR-K1-03-enable-authorization-trust-revocation.md)；[ADR-K1-02](../../adr/ADR-K1-02-session-dataflow-security-modes.md)；[ADR-041](../../adr/ADR-041-inbound-events-admission-and-work-items.md)；[ADR-045](../../adr/ADR-045-route-naming.md)；issue #1037。
+- 施工基线是 **C9 合入之后的 `main`**。本工作树还没有 C9 的方案文件，也没有 C9 的代码。C9 的目标语义仍以 ADR-038 D7 为准（`:288-295`）：组件 `requires` 接入授权。技能加载器不实现这套授权。
+- 与 SPEC、#1037 冲突时，以已接受的 ADR-040 为准。冲突的准确说法写在 §3。不改 SPEC 原文。
 
 ## 1. 一页结论
 
-技能今天仍然不能加载。ADR-040 把技能定义成一份带版本的 `SKILL.md`：声明依赖哪些已登记能力，本身不持有权限；安装、激活、执行分开；激活前要过评测和人的审批；改动可回滚。仓库里只有这份契约、一份未实现的分发规格，以及 Documents 清单上强制为空的 `skills` 占位。
+技能今天仍然不能加载。ADR-040 把技能定义成一份带版本的 `SKILL.md`：声明依赖哪些已登记能力，本身不持有权限；安装、激活、执行分开；激活前要过评测和人的审批；改动可回滚。
 
-v1 做的是这条手动路径：校验清单、把不可变版本放进数据库、用 `exact` / `contains` 检查拼出来的提示文本、人在桌面确认后把「当前」指针指到该版本、用户点名要跑哪个技能时把正文注入这一次 run 的 system 消息。注入不增加工具，也不代替审批。
+v1 只做两条来源：**用户写在数据目录里的技能**，以及 **导入的外部正文**。路径是：校验清单、把不可变修订放进数据库、用同一个纯函数渲染技能段、用 `exact` / `contains` 做文本一致性检查、人在桌面点一次确认后把「当前」指针拨到该修订、用户在这个会话里点名的技能把正文注入这一次 run。导入的正文按外部文字处理：注入时写入来源标签，分类是 `Unknown`、处理方式是 `LocalOnly`，激活不把它升成可信文字。用户自己写的技能标 `Ordinary`。注入不增加工具，也不代替工具审批。
 
-v1 不做主动技能、不做模型打分、不做从会话自动起草、不执行技能目录里的脚本、不把技能字段写进组件锁。技能加载器不依赖 C9 才能上线。C9 管的是组件向本体要权限；技能的 `requires` 只是能力 id，解析完仍然要走现有的工具审批和 K1-03。
-
-能力中心现在是导航目录，不是「能力 / 技能」两栏。v1 在同一页加两栏：能力栏只读现有组件清单，技能栏只读新的技能 API。旧的固定到侧边栏的交互留在原地。
+v1 不做分发来源、不做内置技能、不做默认提供者表、不做版本差异界面、不做主动技能、不做模型打分、不做从会话自动起草、不执行技能目录里的脚本。同一能力有多个提供者时直接拒绝并提示。
 
 ## 2. v1 范围
 
-下面「要做」是 ADR-040 已写明、且没有被同一份 ADR 推到 v2 或写明不做的部分。「不做」是 ADR 原文已经排除的。
-
 ### 要做
 
-- **D1 清单。** `SKILL.md` 加 frontmatter。`name`、`version`、`description`、`requires`、`evals` 必填，缺任一项拒绝加载，报 `skill_manifest_invalid`。`requires` 只能是 `REGISTRY.md` 已登记的能力 id，或 `mcp-<server>`。不新增 `capabilities` 字段。外部导入缺字段时，向导补 `requires: []`、`mode: manual`、`version: 0.1.0`、空评测，记 `base.source = imported`，导入后是未激活候选，不能直接运行。原文：`docs/adr/ADR-040-skill-contract-v1.md:22-41`。
-- **D2 运行前解析依赖。** 本体按 `requires` 找提供者；同一能力多个提供者且用户没选默认时拒绝并提示。一次 run 固定 `(skill_id, version, {能力 id → 组件 id@版本})`。技能里的任何字段都不能放行工具。原文：`:43-48`。
-- **D3 三阶段。** 安装后状态 `installed`，不可运行。激活要先评测通过（或用户逐条接受失败），再经提升级审批，然后「当前」指针指向该版本。执行只能跑「当前」版本。零依赖技能同样走三阶段。原文：`:50-55`。
-- **D4 不可变版本与回滚。** 版本记录含来源、内容哈希、基线、时间、`origin`。用户改过的不覆盖；来源升级时展示两份差异，用户选「保留我的」或「用新默认」，不自动合并。回滚是把指针指回历史版本，本身要审批，只影响之后的执行。原文：`:57-62`。
-- **D5 的 v1 子集。** 评测文件是 jsonl，每条 `{ input, expect, judge }`，`judge` 只实现 `exact` 和 `contains`。激活前全部通过，或用户看着失败项逐条接受并记审计。评测用例的改动与正文分开审批。原文：`:64-68`。`local_model` 与自动生成草案明确不在 v1（`:66-69`）。
-- **D7 技能栏要显示的字段。** 名称、版本、来源、依赖的能力（缺的标红）、模式与接受模式、评测通过率、「有新版本」。用户看不到 `base_hash`、`origin`。原文：`:77-79`。v1 没有主动技能，接受模式列固定显示「手动」。
+- **D1 清单，来源只有 `user` 和 `imported`。** `name`、`version`、`description`、`requires`、`evals` 必填，缺任一项拒绝，报 `skill_manifest_invalid`。`requires` 只能是 `REGISTRY.md` 已登记的能力 id，或 `mcp-<server>`。不新增 `capabilities` 字段。原文：`docs/adr/ADR-040-skill-contract-v1.md:22-41`。
+- **D2 运行前解析依赖。** 同一能力零个提供者：拒绝并提示登记表里的中文名和首个提供者。多于一个：拒绝并提示，不自动挑，也不提供默认选择（§4.6）。一次 run 在准入时钉死不可变修订。技能里的任何字段都不能放行工具。原文：`:43-48`。
+- **D3 三阶段。** 安装后是 `installed`，不可运行。激活由服务端重跑评测（或用户按服务端给出的失败项逐条接受），再经桌面确认，然后指针指向这一对修订。执行只跑指针指向的修订。零依赖技能同样走三阶段。原文：`:50-55`。
+- **D4 的 v1 子集。** 修订不可变，身份是 `revision_id`。回滚把指针拨回一条历史激活组合，本身要桌面确认，只影响之后的执行。原文：`:57-62`。v1 没有内置和分发，因此不做「旧默认 → 新默认」两份差异。
+- **D5 的 v1 子集。** 评测文件是 jsonl，每条 `{ input, expect, judge }`，`judge` 只实现 `exact` 和 `contains`。界面把这件事标成「文本一致性检查」。评测用例的改动与正文分开审批。原文：`:64-68`。`local_model` 与自动生成草案不在 v1（`:66-69`）。
+- **D7 技能栏要显示的字段。** 名称、版本、来源、依赖的能力（缺的标红）、模式（固定「手动」）、文本一致性结果、「评测集相对当前指针是否变化」。确认摘要另含内容哈希前 8 位。用户看不到 `base_hash`。原文：`:77-79`。
 
-### 不做（ADR 已写明）
+### 本版从第 1 版砍掉的
 
-- **D6 主动技能。** ADR 状态行：「D6 主动技能 v1 不做」（`:4`）。`mode: proactive`、`off | observe | auto`、入站 `inferred` 触发，都不实现。
-- **D5 `local_model`。** 「v1 只实现 `exact / contains`；`local_model` … v2」（`:66`）。
-- **D5 自动生成草案。** 「v1 不做自动生成，只做人写 + 导入」（`:69`）。因此不接 ADR-043 D4 审查器提案，也不做 #1037 的 S3「从会话蒸馏」。
-- **C7 之前只接受空 `requires` 的限制已经解除。** ADR 写明登记表已建（`:4`、`:38`）。v1 按登记表校验，不再把非空 `requires` 整批拒绝。
+- 分发来源扫描（`distro`）、内置来源扫描（`bundled`）、`proposed`。
+- 版本差异与「保留我的 / 用新默认」（第 1 版 SL-13）。
+- 内置技能版本递增 CI（第 1 版 SL-14）。仓库里还没有要守的 `skills/`。
+- 默认提供者表、`PUT` 选择提供者、能力中心的能力栏（第 1 版 SL-12）。同一能力多个提供者时拒绝并提示。
+- 把技能路由放在 `/api/v1/capabilities/` 下。那个前缀是能力令牌（`route_policy.rs:80-81`，ADR-045 §4.4）。
+
+### ADR 已经写明不做的
+
+- **D6 主动技能。** 「D6 主动技能 v1 不做」（ADR `:4`）。`mode: proactive`、`off | observe | auto`、入站 `inferred` 触发，都不实现。见到 `mode: proactive` 拒绝安装，错误码 `skill_proactive_unsupported`。
+- **D5 `local_model` 与自动生成草案。** 不接 ADR-043 D4，也不做 #1037 的 S3。
+- **D2 的只读上下文。** ADR `:48` 允许技能在步骤里引用会话、工作区、入站事件、工单作为只读上下文。v1 不做，见 §7。
 
 ## 3. 现状盘点与差距
 
-核对日期 2026-11-12，本工作树 `docs/skill-loader-v1-plan` @ `bb03081e8`。
+核对日期 2026-11-12，本工作树 `docs/skill-loader-v1-plan` @ `4897a4f5e`。行号在 C9 合入后可能移动，开工时按符号再对一次，不按本表的行号硬编码。
 
 | 需要的东西 | 现状 | 证据 |
 |---|---|---|
 | 技能加载器 | 没有。`rust/` 里 `skill` 只出现在 Documents 占位和测试读 ADR 的断言 | `documents_catalog.rs:51`、`:235-236`；`component_routes/tests.rs:1155-1163`、`:3278-3279` |
-| 清单占位 | Documents 的 `skills` 必须是空数组，非空则清单非法 | `component.json:27`；`documents_catalog.rs:235-236`；测试 `:3278-3279` |
+| 清单占位 | Documents 的 `skills` 必须是空数组，非空则清单非法 | `component.json:27`；`documents_catalog.rs:235-236` |
 | 组件锁 | `deny_unknown_fields`，没有 `skills` 字段 | `agent24-components/src/lock.rs:12-41` |
 | 能力 id 登记表 | 已有六条：`model-gateway`、四个 `nostr-*`、`documents`。MCP 不进表 | `docs/capabilities/REGISTRY.md:8-14`、`:34-45` |
-| 多提供者默认 | 未实现。全仓没有 `components.json` 的读写，只有 ADR 句子 | `ADR-038-component-contract-v1.md:324-327`；`docs/tracking/2026-11-04/ARCH-OPTIMIZATION-PLAN.md:303` |
-| 分发规格 | 设计定稿，未实现。三来源、只比版本号、用户改过不覆盖 | `SPEC-SKILL-DISTRIBUTION.md:3`、`:21-34`、`:79-90`、`:107-114` |
 | 数据目录 | `<data_dir>` 默认 macOS/Linux 为 `$HOME/.agent24`，可用 `AGENT24_DATA_DIR` 覆盖 | `agent24-protocol/src/data_dir.rs:1-12` |
-| 指令收件箱 | `propose` 落 pending，`approve` 才进入生效集合。这是指令层，不是技能 | `agent24-memory/src/knowledge.rs:1-15`、`:92-111` |
 | run 怎么组上下文 | 快照是：记忆召回、可选暂停通知、会话历史、用户这句话。没有技能正文 | `agent24-agent/src/lib.rs:2439-2506` |
-| run 怎么给工具 | 每轮 `tool_specs_for`：计划模式给只读子集，否则给已注册且在白名单里的工具 | `lib.rs:2923-2957`、`:3406-3411`；`agent24-tools/src/lib.rs:1756-1857` |
-| 工具从哪来 | 内建四个，加 `register_module_tool`。没有「按技能增减工具」的入口 | `agent24-tools/src/lib.rs:1812-1857` |
-| 消息来源 | 闭集：`HostRecall`、`UserPrompt`、`SessionHistory`、`Assistant`、`ToolResult`、`HostSystem`。没有技能来源 | `agent24-store/src/message_origin.rs:22-32` |
-| 能力中心界面 | 一页导航目录（助手、文档、模型、语音等），按组固定到侧边栏。不读组件 `provides`，没有技能栏 | `apps/desktop/src/renderer/pages/Capabilities.tsx:42-89`；`capabilities/registry.ts:8-23` |
-| 组件状态 API | `GET /api/v1/components` 已有，Everyday，操作为 `components.read` | `route_policy.rs:67`；`operations.rs:52-54` |
-| 提升级确认 | 桌面 presence 通道已有：`PresenceRead` / `PresenceDecide` | `operations.rs:44-46`；`presence_desktop.rs:6-7` |
-| 存储迁移 | 最新是 `0035_inbound_cursor.sql`。没有技能表 | `rust/crates/agent24-store/migrations/` |
-| C9 | `requires` 只被解析和展示，没有授权路径读取它 | `ADR-038-component-contract-v1.md:288-295` |
-| issue #1037 | 仍 OPEN。正文是 2026-10-16 的盘点：当时 `rust/` 对 `skill` 零命中，并建议做加载器、导入、从会话蒸馏。蒸馏与 ADR-040 D5 冲突 | `gh issue view 1037` |
+| 用户输入怎么打标签 | 普通 run 用 `SourceRef::user_input`（`Ordinary`）。入站 run 用 `SourceRef::inbound_external`（`Unknown` + `LocalOnly`）。写入失败则 run 以 `source_policy_unavailable` 结束，不调用模型 | `source_policy.rs:266-292`；`lib.rs:2527-2549` |
+| 来源种类 | `SourceKind` 已有 `UserInput`、`SelectedMaterial`、`MemoryRecall`、`SessionContext`、`ScheduleOrigin`、`ToolResult`。`SelectedMaterial` 的构造函数固定 `Unknown`，并带 `revision_digest`；生产路径没有调用点 | `source_policy.rs:60-81`、`:299-313` |
+| 消息来源 | 闭集，SQL `CHECK` 只允许 `HostRecall`、`UserPrompt`、`SessionHistory`、`Assistant`、`ToolResult`、`HostSystem`。`HostSystem` 只用于记忆暂停通知。与 K1 标签是两套表 | `message_origin.rs:23-33`；`0029_run_message_origin_host_system.sql:7` |
+| 入站起 run | `start_run_inbound` 的 `origin` 不在 `RunCreate` 里，外部无法伪造。`execute` 据此打 `inbound_external` | `lib.rs:1490-1509`、`:2533-2536` |
+| 定时自唤醒 | `start_run_with_schedule` 把 `schedule_id` 记在 run 上。自唤醒提示按模型产出处理，不能授权个人记忆 | `lib.rs:1463-1471`、`:1237-1256` |
+| 外发门 | 非 `Ordinary` 的来源会挡住外发，并让 peer 视图隐藏内容。已有入站对照测试 | `lib.rs:6653` 附近 `an_ordinary_run_is_user_input_and_an_inbound_run_is_unknown_and_blocked_from_egress` |
+| 桌面代理 | 渲染进程只能走 `ALLOWED_PROXY_ROUTES`。提升级操作不在这张表里，走主进程专用 IPC | `apps/desktop/src/main/backend-proxy.ts:1-55` |
+| 第一方提升 | `resolve_target` 的 `supported` 列表目前只有模块管理的四条和 iDoris 生命周期。不在列表里的提升级路由直接 `NotElevatedOperation` | `first_party.rs:498-520` |
+| CLI 日常令牌 | 注册时把路由表里的操作几乎全部放进令牌，只排除 presence 通道和 `InboundWrite`，再加 `ModuleRoute` | `first_party.rs:374-384` |
+| 能力中心界面 | 一页导航目录。不读组件 `provides`，没有技能栏 | `apps/desktop/src/renderer/pages/Capabilities.tsx:42-89`；`capabilities/registry.ts:8-23` |
+| 存储迁移 | 最新是 `0035_inbound_cursor.sql`。C9 合入后编号会继续涨。本方案不预定下一个号 | `rust/crates/agent24-store/migrations/` |
+| C9 | 本树未合入。组件 `requires.operations` 今天只被解析和校验 | `documents_catalog.rs:228-233`；ADR-038 `:288-295` |
 
-差距就这一句：契约和登记表在，运行时没有技能对象。run 循环只认本体提示、记忆和已注册工具；能力中心只认导航项。
+差距就这一句：契约和登记表在，运行时没有技能对象。run 循环只认本体提示、记忆和已注册工具。
 
-和旧文档的三处冲突（实现时以 ADR-040 为准）：
+和旧文档的冲突（实现时以 ADR-040 为准）：
 
-1. SPEC §3.1 把内置/分发技能**写入** `~/.agent24/skills/`，来源版本更高就覆盖（`SPEC-SKILL-DISTRIBUTION.md:79-86`）。ADR-040 D4 要求用户改过的不覆盖，并让用户在两份差异里选择（ADR `:60-61`）。
+1. **SPEC 已经有「用户改过则不动」和哈希保护。** §3.1 的四行是：不存在则写入；来源版本更高则覆盖；相等或更低则不动；用户改过则不动，并提示有新版本（`SPEC-SKILL-DISTRIBUTION.md:79-86`）。§4 用 `.seeded.json` 里的哈希判断用户改过，版本号决定要不要升，哈希决定能不能升（`:107-117`）。第 1 版把 SPEC 说成「来源版本更高就覆盖、因此和 ADR 的不覆盖相冲突」，这句不准确。仍然有效的差别是：SPEC 在哈希相同且来源版本更高时**会覆盖写入用户目录**；ADR-040 D4 还要求用户在两份差异里选择，并且不自动合并（ADR `:60-61`）。v1 两边都不做：不扫描内置和分发，不把更高版本写入用户目录，也不做差异界面。
 2. SPEC §5 把 Skill 说成「能力」（`:129`）。ADR-039 把技能和能力分成两个概念（`ADR-039-concept-model.md:40-48`）。
 3. #1037 的 S3 要做自动起草。ADR-040 D5 写明 v1 不做（`:69`）。
 
 ## 4. 目标设计
 
-### 4.1 清单格式与存放
+### 4.1 两条来源
 
-目录约定（待拍板，推荐见 §5 Q1）：
+| origin | 输入 | 谁写入修订 | 注入时的分类 |
+|---|---|---|---|
+| `user` | `<data_dir>/skills/<name>/`，`<name>` 等于 frontmatter 的 `name` | 扫描器。本体不替用户改这些文件 | `Ordinary`，`LocalOnly` |
+| `imported` | `POST /api/v1/skills` 的正文，或桌面主进程读完目录后提交的正文 | 导入 API。不写回用户目录 | `Unknown`，`LocalOnly` |
 
+默认 `<data_dir>` 是 `~/.agent24`（`data_dir.rs:8`）。设了 `AGENT24_DATA_DIR` 就只扫数据目录。
+
+导入修订只存在数据库里。不把导入正文种进 `<data_dir>/skills/`，避免下一次扫描把它当成用户自己写的、标成 `Ordinary`。
+
+`mode` 缺省当 `manual`。`origin` 不由请求体里的字段决定：这条 POST 一律是 `imported`；用户目录扫描一律是 `user`。调用方不能自报更可信的来源。
+
+激活、回滚、评测通过，都不改修订的 `origin`，也不改注入时的分类。导入技能激活之后仍然是 `Unknown`。
+
+### 4.2 修订身份
+
+一条修订是不可变的一行。身份是独立的 `revision_id`。`version`（semver）只是清单上的元数据，不参与「是不是同一条修订」。
+
+修订行至少含：`revision_id`、`skill_id`、`semver`、`kind`（`body` 或 `evals`）、`origin`（`user` 或 `imported`）、`content_digest`（内容摘要）、正文或评测原文、`created_at`。来源和内容摘要都是这行的字段，也写进注入给模型的技能段开头（§4.4 的渲染结果），供冲突判定、确认摘要和评测使用。
+
+判定：
+
+- 同一 `skill_id + origin + semver + kind` 已经有一行，且 `content_digest` 不同：拒绝，错误码 `skill_revision_conflict`，提示升 `version`。不覆盖旧行。
+- 同一内容（同一 `content_digest`）再次导入或再次扫到：返回已有的 `revision_id`，不新插一行。
+- 用户目录里文件变了但 semver 没变：走冲突，不自动变成新修订。用户升版本后才插入新行。新行不移动指针。
+
+正文修订和评测修订是两行。指针分别指向它们。
+
+### 4.3 导入边界
+
+`POST /api/v1/skills` 只收正文，不收路径。请求体是 JSON：`markdown`（`SKILL.md` 全文）和可选的 `evals`（`{ name, content }` 列表）。多出来的 JSON 字段拒绝（包括任何叫 `path`、`origin`、`allowed-tools` 的字段）。服务端不打开调用方给出的路径。
+
+frontmatter：
+
+- 必填字段按 D1 校验。导入时缺的 Agent24 字段，服务端补 `requires: []`、`mode: manual`、`version: 0.1.0`。评测可以先是空的。补完仍然是未激活候选。
+- 未知字段丢弃。响应里列出字段名，界面展示「未生效」。
+- `allowed-tools` 永远不读。它就是一个未知字段，展示「未生效」，不注册工具，不放宽白名单。
+
+正文大小上限 **32 KiB**（32768 字节，按 UTF-8 计）。超过则 `skill_body_too_large`，不入库。单条评测文件同样不超过 32 KiB。
+
+用户目录只可能由扫描器读取，规则和下面的目录快照相同。扫描器不写目录。
+
+桌面若让用户选一个目录来导入（仍然算 `imported`），由主进程做目录约束快照，再把读到的字节交给上面的 POST。快照规则：
+
+- 从用户选定的那一个目录往下读。拒绝绝对路径、拒绝任何含 `..` 的路径、拒绝符号链接（任一路径分量是符号链接都不跟随）、拒绝非普通文件。
+- 只接受该目录下的 `SKILL.md`，以及 `evals/` 里一层的 `*.jsonl`。其余条目不读进修订，响应里列为「未生效」。
+- 最多 32 个普通文件，合计不超过 256 KiB。超出则整次导入失败，不插入半份修订。
+- 不执行目录里的脚本、二进制或工具。
+
+空评测可以导入，不能激活（`skill_eval_empty`）。
+
+### 4.4 评测：同一个纯渲染函数
+
+评测和运行注入共用一个纯函数，放在新 crate `agent24-skill` 里，不读盘、不调模型、不注册工具：
+
+```text
+render_skill_segment(body, origin, content_digest) -> String
 ```
-<data_dir>/skills/<name>/SKILL.md
-<data_dir>/skills/<name>/evals/*.jsonl
-```
 
-`<name>` 等于 frontmatter 的 `name`。frontmatter 字段以 ADR-040 D1 的示例为准（`:24-35`），不再加字段。`mode` 缺省当 `manual`。v1 见到 `mode: proactive` 直接拒绝安装，错误码 `skill_proactive_unsupported`，避免装上一个不会跑的主动技能。
+输出就是将要放进 system 的那一段技能文字，开头带上来源和内容摘要。v1 只注入这段静态正文，不把 `input`、会话历史或工具结果拼进这段。
 
-三来源仍按 SPEC §1 的优先级 **用户 > 分发 > 内置**，同名整体取代、不做字段级合并（`:33-34`）。位置：
+`judge`：
 
-| origin | 只读输入位置 | v1 谁来写 |
-|---|---|---|
-| `user` | `<data_dir>/skills/<name>/` | 只由用户或「导入」API 写入这一棵目录 |
-| `distro` | `$AGENT24_DISTRO_DIR/skills/`，否则 `<资源目录>/distro/skills/` | 本体不写 |
-| `bundled` | `<安装目录>/skills/` | 本体不写 |
-| `imported` | 导入 API 落进 `user` 那棵目录，frontmatter 记 `base.source: imported` | 导入 API |
-| `proposed` | 不落盘 | v1 不产生 |
+- `exact`：技能段与 `expect` 全等。
+- `contains`：`expect` 是技能段的非空子串。`expect` 为空则整份评测非法（`skill_eval_invalid`），不能靠空串凑通过。
 
-权威状态在数据库，不在目录。目录是输入。启动时扫描三个来源，校验通过的才成为一条 `installed` 版本。校验失败的来源留在磁盘上，列表里标 `skill_manifest_invalid`，不进入「当前」。
+比较对象是技能段，不是整包提示，也不是 `input`。反例：`expect` 只出现在 `input` 里、技能段里没有，判定失败。变异：把比较对象改成 `input`，或改成「永远等于 expect」，这条反例会变绿，即变异失败。
 
-默认安装时 `<data_dir>` 就是 `~/.agent24`（`data_dir.rs:8`），所以和 SPEC 写的 `~/.agent24/skills/` 在默认路径上是同一个目录。设了 `AGENT24_DATA_DIR` 就只认数据目录，不另写一份到家目录。
+这只证明「注入的就是这份文字」。界面文案用「文本一致性检查」，不用「模型会照着做」或单独的「评测通过率」充当能力证明。可以显示「N/M 条文本一致」。零条时不能激活。
 
-### 4.2 依赖解析，以及它和 C9 的关系
+渲染器版本是这个 crate 里的一个常量。改了渲染函数就必须升这个常量。
 
-技能 `requires` 的元素是**能力 id**（ADR-038 D9，`ADR-038:311-314`；登记表 `REGISTRY.md:3`）。组件锁里的 `requires` 是另一回事：本体权限 `kernel` 与 `operations`（`lock.rs:110-117`，ADR-038 D7 `:292`）。两套字段同名，解析代码必须分开类型，不能复用同一个结构体。
+### 4.5 评测结果状态机，以及激活
 
-一次执行前：
+评测由服务端在激活请求里重跑。请求体不带通过与否，也不带客户端算好的分数。多出来的这类字段直接拒绝。
 
-1. 读该版本的 `requires`。
-2. 对每个能力 id，在 `GET /api/v1/components` 已经在用的清单里找 `provides[].id` 相同、且状态可用的组件。
-3. 零个：拒绝这次执行，错误给用户看，带登记表里的中文名和「首个提供者」。不静默跳过（ADR-039 规则 2，`ADR-039:57`）。
-4. 多于一个且该能力 id 没有默认提供者：拒绝并提示去选。不自动挑（ADR-038 D9 `:324-327`）。
-5. 恰好一个，或已有默认：绑定 `组件 id` 加清单上的 `version`。
-6. 把绑定写进这次 run，执行中不改（ADR-040 D2 `:46`）。
+一次服务端重跑写成一条结果绑定，字段缺一不可：
 
-**技能不持有权限。** 绑定只说明「这次用哪个组件来提供这个能力」。它不是 capability token，不是 K1-03 的逐工具同意，也不是审批通过。步骤里的每次工具调用仍走 `ToolRegistry` 的白名单和审批门（`agent24-tools/src/lib.rs:1756-1803`），以及已经落地的模块同意记录。技能版本、评测通过、激活审批都不能让某次工具调用跳过这些门（ADR-040 `:47`；ADR-K1-03 `:19-32`：安装、导入、签名都不是同意）。
+- 正文 `revision_id`
+- 评测 `revision_id`
+- 渲染段的内容摘要
+- 渲染器版本
+- 每条用例的摘要：稳定 id（评测名 + 行号）、`judge`、是否通过、`expect` 的摘要
 
-**不依赖 C9 才能做。** C9 要接的是组件锁的 `requires` ∩ `Grants` ∩ 用户确认（ADR-038 `:288-295`）。技能加载器不读那组字段，也不替组件申请 `operations`。v1 缺能力只表示「没装」或「没选默认提供者」。等 C9 落地后，可以另加一态「组件已装但本体权限未授」，那一态不属于本方案的任何一片。在 C9 之前，组件工具该被拒的，仍由现有审批和同意记录拒绝。
+有失败时，请求里的「逐条接受」必须是这些失败 id 的子集，并且和**这一次**绑定对得上。接受记录写在这条绑定上，不改评测原文，不把失败改写成通过。绑定对不上则拒绝，指针不动。
 
-v1 要补的是 ADR-038 写了但代码没有的「默认提供者」选择。存放见 §4.8。选择本身不是授权。
+一次激活相对当前指针只更换正文或评测其中之一：
 
-`mcp-<server>` 不在登记表里（`REGISTRY.md:34`）。解析时认 `GET /api/v1/components` 里形态为 MCP、`provides` 含该 id 的那一条。id 不合法或重复、因而没有 `provides` 的 server（`REGISTRY.md:42-45`）对技能来说就是缺能力。
+- 还没有指针：这一次同时钉上正文修订和评测修订，建立第一对组合。
+- 已经有指针：请求里的两个修订 id 相对指针恰好一个不同。两个都不同则 `skill_activation_mixed`，要分两次激活。两个都相同、且指针已经停在这对上：幂等成功（§4.5 末）。
+- 每次重跑都针对**即将钉上的那一对**，不是针对旧的那一对。
 
-### 4.3 安装、激活、执行
+激活请求体只有：`expected_generation`、正文 `revision_id`、评测 `revision_id`、接受的失败 id 列表。正文不在请求体里。服务端按修订 id 读库。
 
-**安装。** 清单和评测文件分开校验。清单通过即插入一条不可变版本，状态 `installed`。空评测允许安装（导入向导会写出空评测，ADR `:40`），但不允许激活。`installed` 的版本不能被 run 选中。
+并发，整段在一个事务里：
 
-**激活。** 顺序固定，不能并成一个请求：
+1. 读指针和代次。
+2. 代次不等于 `expected_generation`，且目标组合也不是指针上已有的那一对：回滚，`409 skill_pointer_conflict`，不写历史、不写审计。
+3. 代次匹配：校验修订存在、这一次只换一侧（或是第一对）、重跑评测、接受列表与失败项一致。
+4. CAS 更新指针（代次加一），插入激活历史，写审计。审计只记 `skill_id`、两个修订 id、内容摘要、结果码，不记正文（ADR-K1-04）。
+5. 提交。
 
-1. 评测跑器对**这一对**（正文版本，评测集版本）给出通过或逐条失败。
-2. 有失败时，请求里必须带用户逐条勾选的失败 id。没勾全就拒绝。
-3. 通过或勾全之后，走提升级（现有桌面 presence，`presence_desktop.rs:6-7`）。用户拒绝则指针不动。
-4. 指针改为该版本，写审计。审计只记 `skill_id`、版本、内容哈希、结果码，不记正文（ADR-K1-04 `:15`、`:45`）。
+重复提交：指针已经指向请求中的那一对修订时，返回成功，不新增历史，不增加代次。这覆盖桌面双击和 CLI 重试。目标不同而代次已旧，仍是 `409`。
 
-**执行。** 只有指针指向的版本能跑。run 请求显式带 `skill_id`；不带则行为与今天完全一样。服务端忽略客户端传来的版本号，只用指针上的版本。解析失败则不起 run。
+回滚是同一种请求，但引用一条历史激活记录的 id。服务端核对那条记录还在，正文和评测原文仍能按修订 id 读到，然后用同一次 CAS 把指针拨回那一对。回滚不重跑评测，不接受客户端新算的结果，不改历史绑定。它一次恢复一整对已经批准过的组合；这和「新修订一次只能换一侧」不共用同一条规则。不撤销已经发生的工具副作用，不恢复已撤销的同意，不恢复已删除的记忆（ADR-040 `:62`）。
 
-回滚走同一条激活路径，目标改成一条历史版本：再评测（评测集用那条历史自己的）、再提升级、再移动指针。不撤销已经发生的工具副作用，不恢复已撤销的同意，不恢复已删除的记忆（ADR-040 `:62`）。
+桌面确认见 §4.9。用户拒绝或关闭确认时，请求不会发出，指针不动。
 
-### 4.4 版本与「默认更新」
+### 4.6 依赖解析
 
-表意（列名实现时可以缩短，语义不能少）：
+技能 `requires` 的元素是能力 id（ADR-038 D9，`ADR-038:311-314`；登记表 `REGISTRY.md:3`）。组件锁里的 `requires` 是本体权限 `kernel` 与 `operations`（`lock.rs:110-117`）。两套字段同名，解析代码必须分开类型。
 
-- `skill_revision`：`(skill_id, version, kind, source, content_hash, base_hash, created_at, origin, body_or_evals)`。`kind` 只有 `body` 和 `evals`。同一 `skill_id + version + kind` 只能有一行。正文改动和评测改动是两行，分开激活（ADR-040 `:68`）。
-- `skill_current`：每个 `skill_id` 一行，指向已激活的 body 修订和 evals 修订。没有这行就是未激活。
-- `run_skill_binding`：`(run_id, skill_id, version, content_hash, providers_json)`。providers 是能力 id 到 `组件 id@版本` 的映射。旧 run 没有这行，读取时当「这次没使用技能」。
+v1 不读组件锁的 `requires`，不实现 C9，不把技能依赖映射成 `Operation` 或模块同意。缺能力只表示没装，或同一能力有多个提供者。组件工具该被拒的，仍由现有审批和同意记录拒绝。
 
-`origin` 闭集：`bundled`、`distro`、`user`、`imported`、`proposed`。v1 不写入 `proposed`。
+执行准入时，对指针上的正文修订：
 
-用户改过的判定用哈希，不用 mtime（SPEC `:88-90` 与 ADR 备选表 `:88` 一致）。内置或分发出现更高版本时：插入一条新的 `installed` 修订，**不**改 `skill_current`。界面同时给出「旧默认 → 新默认」和「你的版本 → 新默认」。用户选「用新默认」就是一次激活；选「保留我的」只把提示标成已读。不自动合并（ADR `:61`）。
+1. 零个可用提供者：不起 run，`skill_capability_missing`，带登记表中文名和首个提供者。
+2. 多于一个：不起 run，`skill_provider_ambiguous`，提示里写上能力 id 和这些组件 id。不自动挑，没有选择接口。
+3. 恰好一个：把 `能力 id → 组件 id@版本` 记到这次 run 的绑定上。
 
-bundled 技能改内容必须升 `version`。CI 门沿用 SPEC §3.2（`:92-97`），单独一条工作流，不塞进解析器那片。仓库里还没有 `skills/` 时，门先对着即将新增的 `skills/<name>/SKILL.md`。
+**这份绑定只是记录，供审计和回放。** v1 不用它过滤工具列表，也不用它拒绝「调用了绑定之外的组件」。工具仍走 `ToolRegistry` 的白名单和审批门（`agent24-tools/src/lib.rs:1756-1803`）。技能版本、评测通过、激活审批都不是授权（ADR-040 `:47`；ADR-K1-03 `:19-32`）。
 
-### 4.5 评测门
+`mcp-<server>` 不在登记表里（`REGISTRY.md:34`）。解析时认组件清单里形态为 MCP、`provides` 含该 id 的条目。没有 `provides` 的 server（`REGISTRY.md:42-45`）就是缺能力。
 
-jsonl 每行一个对象：`input`、`expect`、`judge`。`judge` 不是 `exact` 或 `contains` 则整份评测非法。
+### 4.7 注入、标签、冷恢复
 
-v1 **不调用模型**。跑器把「技能正文 + 这条 input」拼成将要注入的 system 文本，再比较：
+用户在会话里选定一个技能后，这个会话的每一轮 `RunCreate` 都带上同一个 `skill_id`。服务端不另存一份会话级指针。换会话就不带。服务端忽略客户端传来的任何版本号，准入时只读当前指针，然后立刻把修订 id 钉在这次 run 上。
 
-- `exact`：拼好的文本与 `expect` 全等。
-- `contains`：`expect` 是拼好的文本的子串。
+正文始终按钉住的 `revision_id` 读取，不在稍后按「当前指针」再读。指针在 run 开始之后被拨走，这次 run 仍用钉住的那一版。
 
-这只证明「激活后注入的就是这份文字」，不证明模型会照着做。模型打分是 v2 的 `local_model`（ADR `:66`）。评测不注册工具、不发网络、不写工作区。带 `requires` 的技能在 v1 也只评这段文字；缺能力不在评测里假装通过，激活之后的执行仍会按 §4.2 拒绝。
+注入点在 `execute` 组装首包快照处（`lib.rs:2439-2506`），放在暂停通知之后、会话历史之前。技能段用 §4.4 的纯函数从钉住的修订生成。不改每轮重算工具的逻辑（`:2940-2957`）。不提供 `use_skill` 一类工具。
 
-通过率 = 通过条数 / 条数，给技能栏显示。零条时通过率显示为空，激活按钮不可用，除非走导入之后用户补上至少一条（ADR D1 `evals` 必填是加载条件；导入向导允许先落空评测，`:40`，激活仍要 D5 的至少一条，`:55`、`:66-67`）。
+两条记录都要写，缺一不可：
 
-用户逐条接受失败：每一条失败有稳定 id（文件相对路径 + 行号）。接受记录进审计，不改评测文件，不把失败改写成通过。
+1. **消息来源。** 新的 `MessageOrigin` 种类（建议名 `SkillText`），带这次渲染段的 `instance_digest`。不复用 `HostSystem`（那是暂停通知，`message_origin.rs:31-32`）。SQL `CHECK` 要加这个种类，做法沿用 `0029` 的建新表再拷贝。只加消息来源不够：外发门读的是 K1 标签，不读这张表。
+2. **K1 来源标签。** 注入的同一时刻调用 `tag_run_source`，参照 `lib.rs:2527-2549`。新的 `SourceKind::SkillText`（不复用 `SelectedMaterial`：那个构造函数把分类固定成 `Unknown`，且注释写明留给尚未存在的「选中文件」入口，`source_policy.rs:63-66`、`:299-313`）。`source_id` 形如 `skill_text:{skill_id}`。`revision_digest` 必须是钉住修订的内容摘要，不能空。`mode` 一律 `LocalOnly`。`imported` 的分类是 `Unknown`，构造方式对齐 `SourceRef::inbound_external`（`source_policy.rs:279-292`）。`user` 的分类是 `Ordinary`。
 
-### 4.6 如何进入 run_loop
+标签写入失败、或这次 run 钉了技能却读不到标签：run 以 `source_policy_unavailable` 结束，技能段不得送进模型。缺标签时不得当成 `Ordinary`。
 
-**推荐：显式选中的「当前」技能，整段注入 system，不做成工具。** 取舍待拍板（§8）。
+冷恢复沿用已经落库的快照和标签，不重读指针，不重新分类。`execute` 的恢复路径今天也不会重打用户输入标签（`lib.rs:2529-2532`），技能照同一条。
 
-注入点是 `execute` 组装首包快照的地方（`agent24-agent/src/lib.rs:2439-2506`），放在暂停通知之后、会话历史之前，这样 `normalize` 会把它和别的 system 段合成一条（同文件 `:447-466`）。不改 `run_loop` 里每轮重算工具的逻辑（`:2940-2957`）。技能正文不进入 `ToolRegistry`。
+验收时至少这三条：
 
-来源不能复用 `HostSystem`。那个变体今天专指记忆暂停通知（`message_origin.rs:31-32`）。技能正文要新的来源种类，至少带 `skill_id`、`version`、`content_hash`，并且走新的迁移。否则审计和出站裁剪无法把「内核通知」和「用户激活的技能文字」分开。出站时技能文字可以送给模型（它就是提示），但来源标签必须在。
-
-不提供 `use_skill` 一类工具。模型不能自己换技能、不能读未激活版本、不能因为技能正文里写了工具名就多看到一个工具。
+- 导入技能的 run 不能走外发工具，也不能被转发。变异：把该标签改成 `Ordinary`（或删掉 `Unknown`），外发断言变红。
+- 标签写入失败：不起模型调用。变异：忽略 `tag_run_source` 的错误并继续，测试变红。
+- 冷恢复：进程重启后正文仍是钉住修订的字节，导入技能的标签仍是 `Unknown`。指针在重启前已被拨到别的修订，恢复出来的仍是旧的那一版。
 
 没带 `skill_id` 的 run：快照与今天相同。这是回归哨兵。
 
-### 4.7 能力中心最小界面
+### 4.8 谁能带 skill_id
 
-同一页两个栏，不新开产品名词。
+`RunCreate` 增加可选 `skill_id`。省略或 null 等于没选技能。不增加 `skill_version`。旧客户端省略该字段仍能反序列化。
 
-- **能力。** 只读。把 `GET /api/v1/components` 的 `provides` 展平：能力 id、三语名（没有就用 id）、提供者组件 id 与状态、是否为该能力的默认提供者。缺提供者的登记表 id 也列出，并标「未安装」。这一栏不提供安装按钮（安装仍走现有组件流程）。
-- **技能。** 只读列表加三个动作：激活、回滚、在「有新版本」时选择保留或改用新默认。列就是 D7 那一组（ADR `:79`）。缺的依赖标红。不展示 `base_hash`、`origin`、哈希原文。
-- **不动**现有侧边栏固定逻辑（`Capabilities.tsx:62-79`，`registry.ts:8-23`）。那是导航，不是 ADR-039 的能力栏。两栏做完之后，导航目录仍可用。
+不能带 `skill_id` 的两条路径，在插入 run 之前拒绝，错误码 `skill_not_admitted`：
 
-激活、回滚、接受失败项、改用新默认，都走桌面已有的 presence 确认，不在渲染进程里直接改指针。
+- 入站：`RunManager::start_run_inbound`（`lib.rs:1497`）。`RunCreate` 上就算有这个字段，这条路径也不接受。
+- 定时自唤醒：`start_run_with_schedule`（`lib.rs:1465`）。
 
-### 4.8 API 与 CLI
+各有一条反例测试：构造带 `skill_id` 的调用，断言没有 run、没有技能修订被读、没有技能标签。普通 `start_run` 带同一个 `skill_id` 仍可准入（正对照）。
 
-新操作，挂到现有路由表（`route_policy.rs` 的 `POLICIES`）和 `Operation`（`operations.rs:4-61`）：
+### 4.9 激活确认、API、CLI 令牌
+
+桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
+
+`POST /api/v1/skills/{id}/activate` 不进 `ALLOWED_PROXY_ROUTES`（`backend-proxy.ts:56`）。在该文件「有意不代理」的注释里写上这一条。
+
+这条路由是 `skills.activate`，`Elevated`。把它加进 `resolve_target` 的 `supported` 列表（`first_party.rs:500-518`）。不在列表里时，第一方提升会得到 `NotElevatedOperation`，CLI 无法经桌面确认。daemon 自己的 `target_summary` 从库里的修订生成同一份四项摘要；修订读不到则不要发出确认（现有写法是 `NotElevatedOperation`，`first_party.rs:574-576`）。
+
+CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面出示 daemon 生成的摘要，人点头之后才带提升头调用。CLI 不自批。
+
+路由（ADR-045：新前缀 `skills` 要先写进 ADR-045 §4.4，否则 N10 门禁失败。不要放在 `/api/v1/capabilities/`）：
 
 | 方法与路径 | 操作 | 级别 | 作用 |
 |---|---|---|---|
 | `GET /api/v1/skills` | `skills.read` | Everyday | 列表。不含正文 |
-| `GET /api/v1/skills/{id}` | `skills.read` | Everyday | 一个技能的当前指针、已安装版本、依赖是否齐、评测摘要 |
-| `POST /api/v1/skills` | `skills.install` | Everyday | 安装或导入为 `installed`。不移动指针 |
-| `POST /api/v1/skills/{id}/eval` | `skills.read` | Everyday | 只跑评测，不激活 |
-| `POST /api/v1/skills/{id}/activate` | `skills.activate` | Elevated | 激活或回滚。要 presence |
-| `PUT /api/v1/capabilities/{id}/provider` | `skills.provider` | Everyday | 记下该能力 id 的默认提供者。不发权限 |
+| `GET /api/v1/skills/{id}` | `skills.read` | Everyday | 指针、代次、已安装修订、依赖是否只有一个提供者、文本一致性摘要 |
+| `POST /api/v1/skills` | `skills.install` | Everyday | 导入正文，状态 `installed`。不移动指针 |
+| `POST /api/v1/skills/{id}/activate` | `skills.activate` | Elevated | 激活或回滚。服务端重跑评测。要桌面确认 |
 
-`RunCreate` 增加可选 `skill_id`。缺省省略，旧客户端不受影响。服务端不接受 `skill_version`。
+没有单独的「客户端上报评测结果」路由。激活失败且未接受时，响应带服务端刚算出的用例摘要，指针不动；客户端带上接受 id 再提交一次，服务端重跑并核对。
 
-CLI 与桌面共用上述 HTTP，不直开数据库。`agent24 skill list|show|install` 对着 read/install。`activate` 在核实 CLI 能否走完 presence 之前**不做**（§9）。默认提供者的选择放在桌面能力栏，v1 CLI 不提供。
+`{id}` 是这条路径上唯一的参数，符合 ADR-045 N3。`activate` 是路径末尾的动词，符合 N7。
 
-错误码闭集：`skill_manifest_invalid`、`skill_proactive_unsupported`、`skill_capability_unknown`、`skill_capability_missing`、`skill_provider_unselected`、`skill_not_active`、`skill_eval_failed`、`skill_eval_empty`。
+这些操作不进 `creative_route_permitted`（`route_policy.rs:222`）。
 
-### 4.9 存储
+**CLI 日常令牌会自动带上路由表里的新操作。** `FirstPartyAuthority::mint` 把 `policies()` 里的操作放进日常令牌，只滤掉 presence 和 `InboundWrite`（`first_party.rs:374-384`）。因此 `skills.read` 和 `skills.install` 会随注册发给 CLI。这是有意的：CLI 的 list / show / install 就靠这张令牌，不为技能单独开一张过滤表，也不要在 mint 里把 `skills.*` 抠掉。`skills.activate` 同样会出现在令牌上（现有过滤不按级别剔除），但没有提升头时中间件拒绝提升级调用（`middleware.rs:258-265`）。SL-3 加一条测试钉住「日常令牌含 `skills.read` 和 `skills.install`」，避免以后有人把它当成疏漏删掉。
 
-新表都在 `agent24-store` 的**新迁移**里，编号接在 `0035_inbound_cursor.sql` 之后。不改旧迁移。
+**组件不能被授予这些操作。** C9 合入后，组件锁的 `requires.operations` 会有一份「可授予 / 排除」测试。SL-3 把 `skills.read`、`skills.install`、`skills.activate` 写进排除名单：组件清单声明其中任一项则非法。开工时若测试改了名，以这条语义为准。技能加载器自己不读 `requires.operations`。
 
-建议拆成两条迁移，避免一片又改表又改消息来源：
+错误码闭集：`skill_manifest_invalid`、`skill_proactive_unsupported`、`skill_body_too_large`、`skill_revision_conflict`、`skill_capability_unknown`、`skill_capability_missing`、`skill_provider_ambiguous`、`skill_not_active`、`skill_not_admitted`、`skill_eval_invalid`、`skill_eval_empty`、`skill_eval_failed`、`skill_activation_mixed`、`skill_pointer_conflict`。
 
-1. `0036_skill_revisions.sql`：`skill_revision`、`skill_current`、`skill_provider_choice`、`run_skill_binding`。`skill_provider_choice` 就是 D9 那个「每个能力 id 一个默认提供者」。不新建 `components.json`，免得再出现一个与 SQLite 双写的文件。路径名仍可在文档里叫「默认提供者」，用户看不到文件名。
-2. 下一条迁移只加技能消息来源（实现那片再编号）。来源种类是安全相关的既有模式（`0027`–`0029` 已这么做过），和技能表分开审。
+激活的测试三条：渲染进程经普通代理调用被拒；legacy 共享令牌调用被拒；同一目标重复提交幂等（指针与代次都不动，历史不增加）。再加：不在 `supported` 列表里时 CLI 提升失败。变异是从 `supported` 去掉这一条，或把路由加回 `ALLOWED_PROXY_ROUTES`。
 
-`skill_revision` 保存正文和评测原文，因为回滚和「默认更新」的差异要能离线算出来。审计表不保存原文。
+### 4.10 桌面技能栏
 
-这些迁移是数据写入语义，按仓库约定，对应 PR 要等 PR-Daemon APPROVE 再合。
+同一能力中心页加一个技能栏，不新开产品名词，也不做能力栏。
 
-组件锁和 Documents 清单在 v1 **不**加非空 `skills`。现有测试继续要求空数组（`component_routes/tests.rs:3278-3279`）。组件附带技能将来走同一套安装 API，`origin` 用 `bundled`，另记 `component_id`；升级组件不改 `skill_current`（ADR-040 `:41`）。那一条等到真有一个组件带技能目录时再开片，不在本 v1。
+列：名称、semver、来源（用户 / 导入）、依赖的能力（缺的或不止一个提供者的标红）、模式（固定「手动」）、文本一致性（N/M）、评测集是否相对指针有变化。确认前能看到哈希前 8 位。不展示内部字段名 `base_hash`。
 
-## 5. 对 ADR-040 开放问题的推荐
+激活和回滚只走 §4.9 的主进程 IPC。侧边栏固定逻辑不动（`Capabilities.tsx:62-79`，`registry.ts:8-23`）。
 
-四条都是 ADR §6 已有的建议。这里采纳原文建议，并补一句实现含义。**四条都待 jason 拍板。**
+会话里选中的技能记在桌面会话状态中，这个会话的每一轮发 run 都带上 `skill_id`。服务端不记得这件事。
 
-- **Q1 目录放 `<data_dir>/skills/`。推荐：是。** 与 ADR-037 的数据目录是同一个根（`data_dir.rs:1-12`）。默认安装因此也满足 SPEC 写的 `~/.agent24/skills/`。不要在 `AGENT24_DATA_DIR` 之外再写一份。
-- **Q2 社区 `SKILL.md` 读到哪。推荐：v1 只读 frontmatter 和正文，不执行附带脚本，不加载脚本、二进制和未声明的附件。** 多出来的文件当未知内容拒绝导入，不静默忽略后执行。
-- **Q3 能否声明「只在 LocalOnly 下运行」。推荐：v1 不加字段。** 数据能不能出本机，仍由技能用到的工具和 K1-02 决定。技能正文不是出口政策。
-- **Q4 一条 `exact` 够不够。推荐：v1 够。** 激活至少一条 `exact` 或 `contains`。通过率以后再提高门槛。空评测不能激活。
+### 4.11 存储
 
-## 6. 分片计划
+表都在 `agent24-store` 的新迁移里。编号在该片开工时取「当时最新 + 1」。本方案不写死 `0036`。不改旧迁移。
 
-集成分支用 `ab/skill`（本方案不创建分支）。task 分支 `ab/skill-NN-<短名>`，PR 基线是 `ab/skill`，不是 `main`。下表「规模」是该片产品代码的估计行数，不含测试。超过 300 就再拆。没有一片依赖 C9。
+技能表一张迁移（SL-2）：
+
+- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」；插入函数在摘要不同时返回冲突，摘要相同时返回旧 id。
+- `skill_pointer`：每个 `skill_id` 一行，`body_revision_id`、`evals_revision_id`、`generation`。没有这行就是未激活。
+- `skill_activation`：历史组合，含 §4.5 的结果绑定。回滚按这张表的 id 引用。
+- `run_skill_pin`：`(run_id, skill_id, body_revision_id, content_digest, providers_json)`。providers 只是记录。旧 run 没有这行，读取时当「这次没使用技能」。
+
+消息来源的 `CHECK` 放另一张迁移，跟注入那片走（SL-5），不塞进技能表这张。来源种类沿用 `0027`–`0029` 的改表方式。`SourceKind` 存在标签 JSON 里，加变体不必改 `0016` 的表形状；旧 daemon 读到未知种类会走失败关闭，这是预期，不在 v1 里做兼容读取。
+
+`skill_revision` 保存正文和评测原文，回滚才读得到。审计不保存原文。
+
+这两张迁移都是数据写入语义，对应 PR 要等 PR-Daemon APPROVE 再合。
+
+组件锁和 Documents 清单继续要求 `skills` 为空（`documents_catalog.rs:235-236`）。组件附带技能不在 v1。
+
+## 5. 分片计划
+
+集成分支用 `ab/skill`（本方案不创建分支）。task 分支 `ab/skill-NN-<短名>`，PR 基线是 `ab/skill`，不是 `main`。`ab/skill` 从 **C9 已合入的 `main`** 拉出。下表「规模」是该片产品代码的估计行数，不含测试。超过 300 就再拆；SL-5 若超过，是因为注入和 `Unknown` 标签必须同片，中间版本不能把外部正文标成普通用户输入，在 PR 正文说明为什么不拆。
+
+没有一片去实现 C9。SL-2、SL-4、SL-5 合入集成分支前等 PR-Daemon APPROVE。其余片 CI 全绿加本地门禁后可合。
 
 | 片 | 目标 | 涉及文件 | 规模 | 依赖 | 验收（含变异） | 风险 | 建议派给 |
 |---|---|---|---|---|---|---|---|
-| SL-1 | 纯解析：D1 字段、semver、能力 id 字符集、`skill_manifest_invalid`、拒绝 `proactive` | 新 `rust/crates/agent24-skill`（只解析，不读盘、不入库） | ~200 | 无。不依赖 C9 | 缺任一必填字段、未登记 id、`capabilities` 字段、`proactive` 都失败。删掉「缺字段即失败」后，缺 `evals` 的夹具变绿，即变异失败 | 低 | Rust 代理 |
-| SL-2 | 迁移 0036：修订、当前指针、默认提供者、run 绑定。只插入不覆盖；指针单独更新 | `agent24-store/migrations/0036_skill_revisions.sql` 与对应 store API | ~250 | SL-1 的类型。不依赖 C9。**数据写入，等 PR-Daemon APPROVE** | 同一 `(skill_id, version, kind)` 插第二次失败。没有指针时「当前」查询为空。把「冲突则失败」改成覆盖后，第二条测试变红 | 迁移写坏旧库 | Rust 代理 |
-| SL-3 | 扫描三来源，校验后写入 `installed`。更高版本不改指针。用户目录只读，扫描器不写目录 | `agent24-skill` 的扫描；daemon 启动时调用 | ~250 | SL-2。不依赖 C9 | 四种播种：没有、更高、相同或更低、哈希不同。第四种不覆盖。把「哈希不同则不动」改成按 SPEC §3.1 覆盖写入，该测试变红 | 扫到家目录以外的路径 | Rust 代理 |
-| SL-4 | `POST/GET /api/v1/skills`。安装后不可被 run 选中 | `agent24d` 路由、`operations.rs`、`route_policy.rs`；CLI 只读客户端可另片 | ~250 | SL-2、SL-3。不依赖 C9 | 安装响应状态是 `installed`，`GET` 的当前指针仍空。若有人把安装写成顺手激活，测试变红 | 新 Operation 漏登记会让能力模式拒路由或误放行 | Rust 代理 |
-| SL-5 | `exact` / `contains` 跑器，不调模型、不碰工具 | `agent24-skill` 评测模块；`POST .../eval` | ~200 | SL-1。不依赖 C9 | `contains` 命中子串则过，改一个字则不过。把比较对象从「拼好的提示」改成「永远等于 expect」，负例变绿，即变异失败 | 低 | Rust 代理 |
-| SL-6 | 激活与回滚：评测门、逐条接受、presence、审计、移动指针 | `agent24d` 激活路由；审计 action 白名单 | ~280 | SL-2、SL-5、现有 presence。不依赖 C9。**授权与审计，等 PR-Daemon APPROVE** | 未评测、评测失败且未逐条接受、presence 拒绝，指针都不动。删掉 presence 检查后，未确认也激活成功，测试变红。回滚不删除 `run_skill_binding` 旧行 | 把技能激活做成了授权 | Rust 代理 |
-| SL-7 | 执行前解析能力 id；零个拒绝；多个且无默认拒绝；写出 `run_skill_binding`。默认提供者用 SL-2 的表 | daemon 执行前检查；`PUT .../provider` | ~250 | SL-2、现有组件清单。**不读组件 `requires`，不依赖 C9** | 两个提供者且无默认时不起 run。自动挑第一个的变异会使该测试变绿（失败）。`requires: [documents]` 不会写出任何 `Operation` 或同意记录 | 和 C9 的 `requires` 混类型 | Rust 代理 |
-| SL-8 | `RunCreate.skill_id`；快照注入正文；新消息来源。不改工具列表。无 `skill_id` 的快照与现在一致 | `agent24-agent/src/lib.rs` 快照段；`message_origin.rs`；一条新迁移；协议 `RunCreate` | ~250 | SL-6、SL-7。不依赖 C9。**来源标签与数据写入，等 PR-Daemon APPROVE** | 带技能的首包多一条带来源的 system，工具广告与不带技能时相同。把技能正文塞进 `tool_specs_for` 的变异会让「工具列表不变」变红。无 `skill_id` 的快照字节级对比（来源序列）与基线一致 | 注入变成第二套系统提示且无法追溯 | Rust 代理。改 `agent24-agent` 后要跑 `cargo test -j 4 -p agent24d --bin agent24d` |
-| SL-9 | 导入：缺字段按 D1 补齐，`imported`，空评测，状态 `installed`，随后激活被 `skill_eval_empty` 拒绝 | 导入 API（可并入 SL-4，若合并后非测试超过 300 则保持独立） | ~200 | SL-4、SL-5。不依赖 C9 | 一份只有正文的社区 `SKILL.md` 导入成功但不能激活。补一条 `exact` 之后才能走 SL-6。导入路径若直接把指针写上，测试变红 | 外部正文绕过激活 | Rust 代理 |
-| SL-10 | CLI：`skill list`、`show`、`install`。REST 客户端，不开库 | `agent24-cli/src/main.rs` 与小模块 | ~200 | SL-4。不依赖 C9 | 对临时 daemon：list 能看到 install 的结果；没有 activate 子命令。本片不改 daemon 环境变量；若误读新 env，再补 `agent24-cli` 的 env 扫描测试 | 低 | Rust 代理 |
-| SL-11 | 桌面技能栏：D7 列、缺依赖标红、激活/回滚走 presence | `apps/desktop/src/renderer/pages/Capabilities.tsx` 加栏，不改固定逻辑 | ~250 | SL-4、SL-6 的 API。不依赖 C9 | 组件测试或页面测试：缺依赖的行带红标；未激活没有「执行」。本片合入前用桌面手工点激活被拒、点接受后指针变化。只改文案不算完成 | 渲染进程直写指针 | 桌面代理 |
-| SL-12 | 桌面能力栏最小列表：展平 `provides`，未安装的登记 id 可见 | 同上页的另一栏；可与 SL-11 分 PR | ~200 | 现有 `GET /api/v1/components`。不依赖 C9，也不展示「未授权」 | 登记表有而组件清单没有的 id 出现且标未安装。把「未安装」画成已启用的变异，断言变红 | 与导航目录混淆 | 桌面代理 |
-| SL-13 | 「有新版本」两份差异与两个选择。选择「用新默认」走 SL-6，不自动合并 | store 查询加桌面一行 | ~200 | SL-3、SL-6。不依赖 C9 | 用户改过哈希、来源版本更高：指针不变，且响应里有两段差异。自动把指针拨到新默认的变异，测试变红 | 差异里带出正文到审计 | Rust 代理做 API，桌面代理做两颗按钮 |
-| SL-14 | bundled 技能的版本递增 CI | 新的检查脚本，对着 `skills/<name>/` | ~150 | 无产品代码依赖。不依赖 C9 | 夹具：改了正文但 version 未升，检查失败。删掉这条比较后检查变绿，即变异失败 | 低 | Rust 代理 |
+| SL-1 | 纯解析与文本一致性检查。必填字段、semver 仅作元数据、能力 id 字符集、未知 frontmatter 丢弃、`allowed-tools` 不进入结果、32 KiB 上限、拒绝 `proactive`、`render_skill_segment`、`exact` / `contains`、拒绝空 `contains` | 新 `rust/crates/agent24-skill`。不读盘、不入库 | ~250 | 无 | 缺必填字段失败。未知字段出现在「未生效」列表且不出现在结构化结果里。`expect` 只存在于 `input` 时失败。删掉空 `contains` 拒绝后，空 `expect` 夹具变绿，即变异失败 | 低 | Rust 代理 |
+| SL-2 | 技能表迁移与 store API。只插入不覆盖。同摘要幂等，同 semver 异摘要冲突。指针单独更新 | `agent24-store` 新迁移（编号开工时定）与 store API | ~220 | SL-1 的类型。**数据写入，等 PR-Daemon APPROVE** | 冲突插入失败并保留第一行。同摘要第二次返回同一个 `revision_id`。没有指针时当前查询为空。把冲突改成覆盖后，第一条测试变红 | 迁移写坏旧库；编号和 C9 撞车 | Rust 代理 |
+| SL-3 | 导入 API 与用户目录扫描。POST 无路径。目录快照拒绝 `..`、绝对路径、符号链接、非普通文件，并限制 32 文件 / 256 KiB。导入恒为 `imported`，扫描恒为 `user`。不移动指针。改 ADR-045 §4.4 增加前缀 `skills`。新操作写入 C9 排除测试。钉住 CLI 日常令牌含 read/install | `agent24d` 路由、`operations.rs`、`route_policy.rs`、OpenAPI；ADR-045；C9 那份排除测试 | ~280 | SL-2。改了 `protocol/` 时跑 `pnpm lint:openapi` 与 `pnpm gen:api` | 请求体带 `path` 被拒。同内容重复导入不新行。同版本异内容 `skill_revision_conflict`。导入后指针仍空。组件清单写 `skills.activate` 被拒。把 POST 改成接受路径并打开该路径，目录逃逸测试变红 | 新 Operation 漏登记会误放行；导入正文被扫描成 `user` | Rust 代理 |
+| SL-4 | 激活与回滚。服务端重跑、结果绑定、一次只换一侧、事务内 CAS、幂等、桌面主进程 IPC、`supported` 列表、代理表明确排除 | `agent24d` 激活路由；`first_party.rs`；`backend-proxy.ts` 与其测试；审计 action | ~280 | SL-1、SL-2。**授权与审计，等 PR-Daemon APPROVE** | 渲染进程直调被拒；legacy 令牌被拒；重复提交幂等。未接受的失败、两侧同时换新、代次不符，指针都不动。从 `supported` 去掉 activate 后，CLI 提升测试变红。回滚不重跑评测，不删除旧的 pin | 把激活做成授权；代理转发提升级请求 | Rust 代理做 daemon；桌面代理做 IPC |
+| SL-5 | 准入解析、钉修订、注入、`SkillText` 消息来源与 K1 标签。入站和自唤醒拒绝 `skill_id`。多提供者拒绝。绑定只记录 | `agent24-agent` 快照与 `start_run_*`；`message_origin.rs`；`source_policy.rs`；来源 `CHECK` 的新迁移（编号开工时定）；协议 `RunCreate` | ~280 | SL-3、SL-4。**来源标签与数据写入，等 PR-Daemon APPROVE**。改 `agent24-agent` 后跑 `cargo test -j 4 -p agent24d --bin agent24d` | 导入 run 外发被拒（去掉 `Unknown` 则变红）。标签写失败不起模型。冷恢复仍是钉住的字节。`start_run_inbound` 与 `start_run_with_schedule` 带 `skill_id` 的反例不起 run。两个提供者不起 run，且工具列表与不带技能时相同。无 `skill_id` 的快照与基线一致 | 只加了消息来源、标签仍是 `Ordinary`，外发门失效 | Rust 代理 |
+| SL-6 | 桌面技能栏。D7 的 v1 列、缺依赖标红、按钮走主进程 IPC、会话记住选择并每轮重发、文案用「文本一致性检查」 | `Capabilities.tsx` 加栏，不改固定逻辑；会话发 run 的那一处 | ~250 | SL-3、SL-4 的 API | 页面测试：不止一个提供者的行标红；未激活没有执行。代理测试：激活不在 `ALLOWED_PROXY_ROUTES`。合入前桌面手工点按钮，摘要四项来自主进程读到的字节，指针变化；再点一次指针代次不变 | 渲染进程直写指针，或会话只在第一轮带 `skill_id` | 桌面代理 |
+| SL-7（可选） | CLI：`skill list`、`show`、`install`，以及经桌面确认的 `activate`。REST，不开库 | `agent24-cli` | ~200 | SL-3、SL-4 | 对临时 daemon：list 能看到 install；activate 在没有桌面确认时失败，确认后指针变化。本片不新增 daemon 环境变量。若误读新 env，再补 `agent24-cli` 的 env 扫描测试 | CLI 用日常令牌直接激活 | Rust 代理 |
 
-建议顺序：SL-1 → SL-2 → SL-5 → SL-4 → SL-6，然后 SL-3、SL-7、SL-9 可并行，SL-8 在 SL-6 和 SL-7 之后，SL-10 在 SL-4 之后，SL-11/12/13 在对应 API 之后。SL-14 可随时做。
+顺序：SL-1 → SL-2 → SL-3 → SL-4 → SL-5 → SL-6。SL-7 在 SL-4 之后，可与 SL-5、SL-6 并行。首条闭环是 SL-1：解析和文本检查不依赖数据库。
 
-SL-2、SL-6、SL-8 属于数据写入或授权记录，合入集成分支前要等 PR-Daemon APPROVE。其余片 CI 全绿加本地门禁后可合，意见在后续片修。
+## 6. 明确不做
 
-## 7. 明确不做
-
-- 不做 D6：不读入站事件，不实现 `observe` / `auto`，不让 ADR-041 D3 的 `inferred` 启动技能。`mode: proactive` 安装即拒绝。
+- 不做 `distro`、`bundled`、`proposed`。不扫描安装目录和分发目录。不做版本差异界面，不做内置版本 CI，不把更高版本写入用户目录。
+- 不做默认提供者表，不做 `PUT /api/v1/capabilities/{id}/provider`，不做能力中心的能力栏。同一能力多个提供者时拒绝并提示。
+- 提供者绑定不做调用约束：不按绑定增减工具，也不在调用时核对组件 id。
+- 不做 D6：不读入站事件来启动技能，不实现 `observe` / `auto`。`mode: proactive` 安装即拒绝。入站 run 与定时自唤醒不能带 `skill_id`。
+- 不做 ADR-040 D2 的只读上下文（会话、工作区、入站事件、工单）。v1 注入的只有静态技能段。
 - 不做 `local_model`，评测不调用 iDoris 或云端模型。
-- 不做从会话蒸馏、不做审查器提案、不调用 `KnowledgeBase::propose`。指令收件箱保持原语义（`knowledge.rs:12-15`）。
-- 不执行技能目录里的脚本、二进制或工具调用。技能不是工具，也不往 `ToolRegistry` 注册。
-- 不把 `skills` 写进 `ComponentLock`，不放宽 Documents 的空 `skills`（`documents_catalog.rs:235-236`）。
+- 不做从会话蒸馏、不做审查器提案、不调用 `KnowledgeBase::propose`。
+- 不执行技能目录里的脚本、二进制或工具调用。不把 `allowed-tools` 读成权限。
+- 不把 `skills` 写进 `ComponentLock`，不放宽 Documents 的空 `skills`。
 - 不实现 C9，不把技能 `requires` 映射成 `Operation` 或模块同意。
-- 不改无 `skill_id` 的 run、不改计划模式的工具子集、不改记忆召回顺序。
-- 不自动合并用户改过的技能，不按 mtime 升级，不在升级时删除用户目录。
-- 不做技能市场、签名验证、跨社区 Nostr 分发（SPEC §7 仍未决）。
+- 激活不把 `imported` 降级成 `Ordinary`，也不把用户技能升成更可信的种类。
+- 不改无 `skill_id` 的 run，不改计划模式的工具子集，不改记忆召回顺序。
+- 不做技能市场、签名验证、跨社区 Nostr 分发。
 - 不改 `docs/tracking/2026-11-10/MILESTONES-AND-TASKS.md` 和 `followups.md`。
 - 不在本方案里写代码。
 
-## 8. 需要 jason 拍板的取舍
+## 7. 与 C9 的施工关系
 
-推荐已经写进 §4，这里只留决定。加上 §5 的 Q1–Q4，一共这些。
+- 开工基线是 C9 合入后的 `main`。迁移号在 SL-2 和 SL-5 各自开工时再定。本树最新是 `0035_inbound_cursor.sql`，不能据此预定 `0036`。
+- 技能 `requires` 只解析能力 id。C9 接通的是组件锁那一套 `requires` ∩ `Grants` ∩ 用户确认。两套类型保持分开。
+- 新的 `skills.*` 操作写进 C9 的「组件可授予操作」排除测试。CLI 日常令牌因为 `first_party.rs:374-384` 的路由映射会带上这些操作，这是有意的，SL-3 用测试钉住，见 §4.9。
 
-1. **进 run 的方式：注入 system，而不是给模型一个选技能的工具。** 用户或界面指定 `skill_id`，本体只注入「当前」版本的正文。模型不能自己换技能。这和「零依赖技能就是提示模板」（ADR-039 `:48`）一致，也避免一段文本变成新的工具入口。
-2. **v1 评测不跑模型。** `exact` / `contains` 比较的是即将注入的提示文本。真要看模型听话与否，等 v2 的 `local_model`。
-3. **版本表是权威，扫描器不按 SPEC §3.1 把更高版本覆盖写进用户目录。** 用户目录只作为 `user` 来源的输入。这样才做得到「保留我的 / 用新默认」。
-4. **技能 v1 不等 C9。** 依赖解析只回答装了谁、选了谁。权限仍走现有工具门。C9 之后再考虑「已装但未授权」的红标。
-5. **默认提供者放数据库表，不新建 `components.json`。** 选择不是授权。组件锁继续不收 `skills`。
+## 8. 已拍板
 
-## 9. 未核实
+jason 2026-11-12 拍板的三条：
 
-- 本工作树没有 C9 方案文件。若那份方案把「能力 id」和组件 `requires` 收成同一个结构，SL-7 要跟着改类型，避免混用。
-- CLI 令牌能不能走完桌面 presence，从而安全地调用 Elevated 的激活接口：只看到桌面通道（`presence_desktop.rs:6-7`），没有把 CLI 的确认路径读完。所以 SL-10 不含 `activate`。
-- `<安装目录>/skills/` 与 `<资源目录>/distro/skills/` 在打包产物里的实际路径没有对照安装器核对。SL-3 开工前要钉死这两个根，否则 bundled 扫描会扫错目录。
-- `RunCreate` 现在的字段表没有在本方案里逐项抄录。SL-8 加 `skill_id` 时要确认旧客户端省略该字段仍能反序列化，并确认 OpenAPI 与 `pnpm gen:api` 的生成物。
-- 技能正文进 system 之后，出站裁剪和 LocalOnly 是否会把整段 `HostSystem` 以外的 system 当内核文本放行，没有沿 `request_messages_for` 的每一条分支读完。SL-8 必须补一条：技能来源不得被当成比用户提示更可信的内部文案。
-- iDoris-Components 里那五个技能文件（#1037 第 7 节提到的样本）不在本仓库，没有打开看。导入夹具不要假设它们的 frontmatter。
-- 能力中心是否还有第二套「组件卡片」页面会和 SL-12 重复，只查了 `Capabilities.tsx` 和 `capabilities/registry.ts`。开工前在 `apps/desktop/src/renderer` 再搜一次组件列表的展示。
+1. **导入的技能正文按外部文字处理。** 注入时写 `tag_run_source`（`SourceRef`，对齐 `source_policy.rs:279-292` 的 `inbound_external` 与 `lib.rs:2527-2549` 的落标签）。`imported` 为 `Unknown` + `LocalOnly`，用户自写为 `Ordinary`。激活不降级。新增 `SourceKind::SkillText`，带 `revision_digest`。只加 `MessageOrigin` 不够。
+2. **激活是桌面点按钮即确认。** 走桌面主进程专用 IPC：宿主读取候选内容，生成确认摘要（技能名、版本、内容哈希前 8 位、评测集是否变化），一次性提交。禁止 backend-proxy 转发 activate。activate 加入 `first_party.rs:500-518` 的 `supported` 列表。CLI 经桌面确认可以激活。
+3. **v1 只做 `user` 和 `imported`。** 不做分发来源扫描，不做版本差异，不做内置版本 CI，不做默认提供者表和 `PUT` 提供者。同一能力有多个提供者时直接拒绝并提示。
+
+ADR-040 §6 的四条，按评审推荐定为：
+
+- **Q1 已定。** 用户技能放 `<data_dir>/skills/`。与 ADR-037 的数据目录是同一个根。不在 `AGENT24_DATA_DIR` 之外再写一份。导入正文不写入这个目录。
+- **Q2 已定。** v1 只读 frontmatter 和正文，不执行附带脚本，不加载脚本、二进制和未声明的附件。未知 frontmatter 字段丢弃，并在响应和界面展示「未生效」。`allowed-tools` 永不读取。正文上限 32 KiB。目录导入使用 §4.3 的约束快照。
+- **Q3 已定。** v1 不加「只在 LocalOnly 下运行」的清单字段。能不能出本机，由这次 run 的来源标签、用到的工具和 K1-02 决定。导入正文的 `Unknown` + `LocalOnly` 来自 §4.7 的标签，不是清单字段。
+- **Q4 已定。** 激活至少一条 `exact` 或 `contains`，对象是技能段。空评测不能激活。空 `expect` 非法。界面称为文本一致性检查。
+
+本版没有留下产品取舍。§9 只是开工时要再读一遍的事实，不是待选方案。
+
+## 9. 开工时再核对的事实
+
+- C9 的排除测试在本树不存在。合入后按「组件声明 `skills.*` 即非法」对上真实测试名，再改那一份夹具。
+- 迁移的实际编号以开工时 `rust/crates/agent24-store/migrations/` 的最大号为准。
+- `RunCreate` 的字段在 `agent24-protocol/src/types.rs:479`。加 `skill_id` 时确认省略仍能反序列化，并确认 OpenAPI 与 `pnpm gen:api` 无意外 diff。
+- 外发门和 peer 隐藏以「标签分类不是 `Ordinary`」为准（入站测试 `lib.rs:6653` 附近）。SL-5 沿用这条门，不新写一套只认技能的门。冷恢复若发现恢复路径会重打 `user_input`，技能标签必须在那次重打之后仍是 `SkillText` 的原分类，不能被盖成 `Ordinary`。
+- iDoris-Components 里 #1037 提到的五个技能样本不在本仓库。导入夹具用本方案自己的最小 `SKILL.md`，不假设那些文件的 frontmatter。
+- 能力中心是否还有第二套组件列表页面，开工前在 `apps/desktop/src/renderer` 再搜一次。本版不做能力栏，搜到也不在 v1 改它。
