@@ -981,9 +981,10 @@ mod tests {
                                 // the same rule `daemonChildEnv` enforces for the desktop.
                                     | "A24_DEV_TOOL"
                                     | "A24_INBOUND_DEV_ALLOWLIST"
-                                // test-only hold on the user-skill scan, so a
-                                // startup test can observe the ready line first.
-                                // A LaunchAgent must not keep this.
+                                // Debug-only (`debug_assertions`) delay of the
+                                // startup skill scan in the `serve` spawn.
+                                // HTTP rescan does not read it. A LaunchAgent
+                                // must not keep this.
                                     | "AGENT24_SKILL_SCAN_DELAY_MS"
                             )
                         {

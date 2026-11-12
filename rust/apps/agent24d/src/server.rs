@@ -1679,6 +1679,9 @@ pub async fn serve(
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
     tokio::spawn(async move {
+        // Debug builds only, and only this startup scan. HTTP rescan does not wait.
+        #[cfg(debug_assertions)]
+        crate::skill_routes::pause_scan_for_tests().await;
         let user_skills = crate::skill_routes::scan_installed_user_skills(&skill_scan_store).await;
         if !user_skills.errors.is_empty() {
             tracing::warn!(

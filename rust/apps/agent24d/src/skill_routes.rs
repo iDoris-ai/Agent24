@@ -10,8 +10,9 @@
 //! regular file. Reads use `take(remaining + 1)` and the directory quota
 //! counts bytes actually read. `evals/` is opened from the skill directory
 //! handle. Caps: 64 skill directories, 8 directories and depth 2 inside one
-//! skill, 32 regular files, 256 KiB. Validation, the manifest digest, and the
-//! stored eval bytes all come from that one snapshot.
+//! skill, 32 regular files, 256 KiB. Every root dirent shares one read budget
+//! of 72. One skill directory stops at 40 entries. Validation, the manifest
+//! digest, and the stored eval bytes all come from that one snapshot.
 //!
 //! Neither path moves the skill pointer. Activation is SL-4. Provider status
 //! is SL-5 and is omitted here.
@@ -34,12 +35,16 @@ use crate::server::{AppState, error_response};
 
 const MAX_FILES: usize = 32;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024;
-/// Direct children of `<data_dir>/skills`. Plan §4.3.
+/// Direct child directories of `<data_dir>/skills`. Plan §4.3.
 const MAX_SKILL_DIRS: usize = 64;
-/// Dirents read past the file cap before a skill directory stops. A skill
-/// that is exactly at 32 files still finishes. One far past it is not listed
-/// to the end.
+/// Dirents read past a cap before the scan stops. A skill that is exactly at
+/// 32 files still finishes. One far past it is not listed to the end.
 const ENTRY_READ_SLACK: usize = 8;
+/// Every root dirent shares this budget: directories, regular files, symlinks,
+/// missing names, and open errors. Plan §4.3.
+const ROOT_READ_BUDGET: usize = MAX_SKILL_DIRS + ENTRY_READ_SLACK;
+/// Entries inside one skill directory, of any kind, before that directory stops.
+const MAX_SKILL_DIR_ENTRIES: usize = MAX_FILES + ENTRY_READ_SLACK;
 /// Directories opened under one skill, including the skill directory.
 const MAX_WALK_DIRS: usize = 8;
 /// Skill directory is depth 1. `evals/` is depth 2.
@@ -225,18 +230,19 @@ pub async fn post_skill_scan(State(state): State<AppState>, body: Body) -> Respo
 }
 
 /// Startup scan of `<data_dir>/skills`. A missing directory is an empty scan.
-/// One bad skill does not fail the caller.
+/// One bad skill does not fail the caller. HTTP rescan uses this directly and
+/// does not take `AGENT24_SKILL_SCAN_DELAY_MS`.
 pub async fn scan_installed_user_skills(store: &Store) -> ScanReport {
-    // Test seam so a startup scan can be held past the ready line.
-    // `AGENT24_SKILL_SCAN_DELAY_MS` is not a LaunchAgent setting.
-    pause_scan_for_tests().await;
     let Some(dir) = agent24_protocol::state_file::state_dir() else {
         return ScanReport::empty();
     };
     scan_root(store, &dir.join("skills")).await
 }
 
-async fn pause_scan_for_tests() {
+/// Hold only the startup scan in `server`. Debug builds only.
+/// `AGENT24_SKILL_SCAN_DELAY_MS` is not a LaunchAgent setting.
+#[cfg(debug_assertions)]
+pub(crate) async fn pause_scan_for_tests() {
     let Ok(raw) = std::env::var("AGENT24_SKILL_SCAN_DELAY_MS") else {
         return;
     };
@@ -911,13 +917,35 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
         };
         let mut prepared = Vec::new();
         let mut skill_dirs = 0usize;
+        let mut read = 0usize;
         let mut capped = false;
         if let Err(message) = for_each_entry(&root_fd, |name| {
+            if capped {
+                return Ok(Walk::Stop);
+            }
+            // Directories, files, symlinks, missing names, and open errors
+            // share this counter. Counting only directories leaves the rest
+            // unbounded.
+            read += 1;
+            if read > ROOT_READ_BUDGET {
+                capped = true;
+                prepared.push(failed(
+                    ".",
+                    "skill_manifest_invalid",
+                    &format!("entries exceed {ROOT_READ_BUDGET}"),
+                ));
+                return Ok(Walk::Stop);
+            }
             match open_directory(&root_fd, name) {
                 OpenDir::Dir(fd) => {
                     skill_dirs += 1;
                     if skill_dirs > MAX_SKILL_DIRS {
                         capped = true;
+                        prepared.push(failed(
+                            ".",
+                            "skill_manifest_invalid",
+                            "skill directory count exceeds 64",
+                        ));
                         return Ok(Walk::Stop);
                     }
                     prepared.push(prepare_skill(name, fd));
@@ -944,13 +972,6 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
                 "skill_manifest_invalid",
                 &message,
             )];
-        }
-        if capped {
-            prepared.push(failed(
-                ".",
-                "skill_manifest_invalid",
-                "skill directory count exceeds 64",
-            ));
         }
         prepared
     }
@@ -1002,8 +1023,8 @@ fn walk_skill(
     let mut entries = 0usize;
     for_each_entry(dir, |name| {
         entries += 1;
-        if entries > MAX_FILES + ENTRY_READ_SLACK {
-            return Err("skill directory exceeds 32 files".to_owned());
+        if entries > MAX_SKILL_DIR_ENTRIES {
+            return Err(format!("entries exceed {MAX_SKILL_DIR_ENTRIES}"));
         }
         let rel = if rel_dir.is_empty() {
             name.to_owned()
@@ -1867,6 +1888,43 @@ mod tests {
         assert_eq!(report.errors[0].path, ".");
         assert!(report.errors[0].message.contains("64"), "{report:?}");
         assert_eq!(state.store.list_skill_revisions().await.unwrap().len(), 128);
+    }
+
+    #[tokio::test]
+    async fn user_scan_stops_root_symlinks_within_the_read_budget() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        for index in 0..200 {
+            std::os::unix::fs::symlink("missing", skills.join(format!("link-{index:03}"))).unwrap();
+        }
+        let report = scan_root(&state.store, &skills).await;
+        assert!(report.skills.is_empty(), "{report:?}");
+        assert!(
+            report.errors.len() <= ROOT_READ_BUDGET + 1,
+            "errors {} budget {}: {report:?}",
+            report.errors.len(),
+            ROOT_READ_BUDGET
+        );
+        assert_eq!(
+            report.errors.iter().filter(|err| err.path == ".").count(),
+            1,
+            "{report:?}"
+        );
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.path == "." && err.message.contains(&ROOT_READ_BUDGET.to_string())),
+            "{report:?}"
+        );
+        let individuals = report.errors.iter().filter(|err| err.path != ".").count();
+        assert!(
+            individuals > 0 && individuals <= ROOT_READ_BUDGET,
+            "{report:?}"
+        );
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
     }
 
     #[tokio::test]
