@@ -395,6 +395,59 @@ fn real_bridge_token_ingests_one_wechat_message() {
     assert_eq!(sqlite(host.home(), "SELECT COUNT(*) FROM runs;"), "1");
 }
 
+/// The daemon gate is off. The CLI must not ask the desktop and then 404.
+/// Answering `presence_required` before the 404 turns the approval assertion red.
+#[test]
+fn bridge_token_does_not_elevate_when_the_daemon_gate_is_off() {
+    let host = Host::start("allow");
+    let out = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("没有设置 A24_DEV_TOOL=1"), "{stderr}");
+    assert!(!stderr.contains("Waiting for approval"), "{stderr}");
+}
+
+/// The shell revokes the bridge token it just wrote. The bearer is then 401
+/// and the file is gone. Skipping the delete leaves the path in place.
+#[test]
+fn real_shell_revokes_its_bridge_token() {
+    let host = Host::start_with("allow", &[("A24_DEV_TOOL", "1")]);
+    let out = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = host.home().join(".agent24/dev/wechat-bridge.token");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let token = file["token"].as_str().unwrap().to_owned();
+    assert!(!file["capability_id"].as_str().unwrap().is_empty());
+    let revoked = host.cli_env(
+        &["dev", "bridge-token", "--revoke"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&revoked.stderr);
+    assert!(revoked.status.success(), "{stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(!path.exists());
+    let (status, body) = host.request_as(
+        "POST",
+        "/api/v1/inbound/events",
+        &token,
+        &json!({"id": "wechat:1001", "actor": "alice", "at": stamp(0), "text": "hello"}),
+    );
+    assert_eq!(status, 401, "{body}");
+}
+
 impl Host {
     fn home(&self) -> &Path {
         self._home.path()

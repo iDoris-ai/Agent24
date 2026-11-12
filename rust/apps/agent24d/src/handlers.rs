@@ -217,12 +217,15 @@ pub(super) async fn mint_bridge_capability(
         &store,
         &authorization,
         crate::capabilities::unix_now(),
-        |event| async move {
-            let ts = crate::capabilities::bridge::audit_now()?;
-            db.append_capability_token_audit(&ts, &event)
-                .await
-                .map(|_| ())
-                .map_err(|_| ())
+        |event| {
+            let db = db.clone();
+            async move {
+                let ts = crate::capabilities::bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
         },
     )
     .await
@@ -270,20 +273,24 @@ pub(super) async fn mint_bridge_capability(
 
 /// Revoke one capability by id.
 ///
-/// A live dev-bridge token is revoked in memory first. The audit row is
-/// `capability.token.revoked`. If that write fails the response is 503
-/// `audit_unavailable` and the bearer stays unusable; the caller retries the
-/// row. Every other id (unknown, already revoked, or not the dev-bridge
-/// profile) still answers 200 `revoked` and does not try to write that closed
-/// row.
+/// A live dev-bridge token is revoked in memory first. The
+/// `capability.token.revoked` row is written only when `revoke_by_id`
+/// returns true (the record changed from live to revoked). If that write
+/// fails the response is 503 `audit_unavailable` and the bearer stays
+/// unusable. A later call sees the record already revoked, answers 200, and
+/// does not append another row. It does not backfill the missing one.
 ///
-/// 503 is therefore only returned for a bridge id while the audit store is
-/// failing. That tells the caller this id was a dev-bridge token. The
-/// difference is acceptable: the route already requires the elevated shell
-/// that issued the id, the body contains no bearer, and a uniform 200 would
-/// hide the missing row so the host would not retry. Unknown ids stay 200,
-/// including while the audit store is down, so this is not an existence
-/// oracle for arbitrary ids.
+/// 503 is only returned for a bridge id whose revoke transition just
+/// happened and whose audit write failed. That tells the caller this id was
+/// a live dev-bridge token. The body contains no bearer. Unknown ids,
+/// already-revoked ids, and tokens outside the dev-bridge profile answer
+/// 200 `revoked` and do not write that row, including while the audit store
+/// is down, so this is not an existence oracle for arbitrary ids.
+///
+/// The shell that holds `capability.revoke` can revoke the bridge token
+/// after desktop confirmation. Revoking that shell does not revoke the
+/// bridge token. The token still dies at its 8-hour TTL, or when this
+/// daemon process is gone and the generation no longer matches.
 pub(super) async fn revoke_capability(
     State(state): State<AppState>,
     Path(capability_id): Path<String>,
@@ -302,8 +309,9 @@ pub(super) async fn revoke_capability(
             "Invalid capability id",
         );
     }
-    // A dev-bridge token is revoked in memory before the audit row. If the
-    // row cannot be written the bearer stays unusable and the caller retries.
+    // A dev-bridge token is revoked in memory before the audit row, and the
+    // row is written only for that transition. A failed write leaves the
+    // bearer unusable. The next call is 200 and does not write again.
     // Other audiences keep the previous idempotent revoke, with no audit.
     if store
         .claims_by_id(&capability_id)

@@ -194,12 +194,14 @@ pub(crate) async fn post_wechat_event(
             );
         };
         if let Err(deny) = crate::capabilities::bridge::component_may_ingest(&authorization) {
-            if let Some(caps) = state.capabilities.as_ref() {
+            if let Some(reason) = deny.audit_reason()
+                && let Some(caps) = state.capabilities.as_ref()
+            {
                 crate::capabilities::bridge::write_component_denial(
                     caps,
                     &state.store,
                     &authorization,
-                    deny.reason(),
+                    reason,
                 )
                 .await;
             }

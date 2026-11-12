@@ -133,6 +133,83 @@ async fn bridge_mint_uses_the_host_summary_and_writes_the_audit_before_the_token
             .any(|action| action == "capability.token.issued")
     );
     assert!(!body.to_string().contains("客户端"));
+    let issued = state
+        .store
+        .list_audit()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.action == "capability.token.issued")
+        .unwrap();
+    assert_eq!(
+        issued.detail["issued"]["issuer_capability_id"].as_str(),
+        Some(token.token_id.as_str())
+    );
+}
+
+/// The shell that minted the bridge token revokes it. The next use is 401.
+/// A second revoke does not write another `capability.token.revoked` row.
+/// Removing `CapabilityRevoke` from `resolve_target` makes `grant` fail.
+#[tokio::test]
+async fn shell_revokes_the_bridge_token_it_issued() {
+    let (mut state, token) = setup().await;
+    state.dev_wechat_events = true;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .set_provider(Some(Arc::new(Allow)));
+    let secret = grant(&state, &token, "POST", "/api/v1/capabilities/bridge", "").await;
+    let response = build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/bridge",
+            "",
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = body["capability_id"].as_str().unwrap();
+    let bearer = body["token"].as_str().unwrap().to_owned();
+    let path = format!("/api/v1/capabilities/{id}/revoke");
+    let blocked = build_router(state.clone())
+        .oneshot(request(&token.secret, "POST", &path, "", None))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(blocked).await, "presence_required");
+    for _ in 0..2 {
+        let secret = grant(&state, &token, "POST", &path, "").await;
+        let response = build_router(state.clone())
+            .oneshot(request(
+                &token.secret,
+                "POST",
+                &path,
+                "",
+                Some(secret.as_str()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let revoked = state
+        .store
+        .list_audit()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.action == "capability.token.revoked")
+        .count();
+    assert_eq!(revoked, 1);
+    let rejected = build_router(state)
+        .oneshot(request(&bearer, "GET", "/api/v1/models", "", None))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 }
 
 /// The dev gate off is the same 404 as the wechat POST. Nothing is issued

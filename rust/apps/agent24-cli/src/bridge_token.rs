@@ -18,14 +18,26 @@ pub fn stdout_lines(path: &Path, expires_at: u64) -> String {
     format!("{}\nexpires_at: {expires_at}\n", path.display())
 }
 
+pub fn capability_id_ok(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
+}
+
 /// Create `dev/` at 0700 and replace the token file at 0600.
 ///
 /// The bytes land in a temporary file in that directory, then `rename`
 /// publishes them. A failure deletes the temporary file and does not include
-/// the bearer.
-pub fn write_bridge_token_at(root: &Path, token: &str, expires_at: u64) -> Result<PathBuf, String> {
+/// the bearer. An empty bearer writes nothing, including the directory.
+pub fn write_bridge_token_at(
+    root: &Path,
+    token: &str,
+    expires_at: u64,
+    capability_id: &str,
+) -> Result<PathBuf, String> {
     if token.is_empty() {
         return Err("bridge token is empty".to_owned());
+    }
+    if !capability_id_ok(capability_id) {
+        return Err("bridge capability id is empty".to_owned());
     }
     let dev = root.join("dev");
     std::fs::create_dir_all(&dev).map_err(|e| format!("creating {}: {e}", dev.display()))?;
@@ -41,6 +53,7 @@ pub fn write_bridge_token_at(root: &Path, token: &str, expires_at: u64) -> Resul
     let body = serde_json::to_vec(&serde_json::json!({
         "token": token,
         "expires_at": expires_at,
+        "capability_id": capability_id,
     }))
     .map_err(|_| "encoding bridge token file failed".to_owned())?;
     let written = (|| {
@@ -69,6 +82,39 @@ pub fn write_bridge_token_at(root: &Path, token: &str, expires_at: u64) -> Resul
     Ok(dest)
 }
 
+/// The id recorded when the file was written. Missing file or missing id
+/// is an error and does not contact the daemon.
+pub fn read_bridge_capability_id(root: &Path) -> Result<String, String> {
+    let path = bridge_token_path(root);
+    let text = std::fs::read_to_string(&path)
+        .map_err(|err| format!("reading {}: {err}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|_| format!("{} 不是 JSON，无法撤销", path.display()))?;
+    let id = parsed["capability_id"].as_str().unwrap_or("");
+    if !capability_id_ok(id) {
+        return Err(format!("{} 没有 capability_id，无法撤销", path.display()));
+    }
+    Ok(id.to_owned())
+}
+
+pub fn remove_bridge_token_at(root: &Path) -> Result<(), String> {
+    let path = bridge_token_path(root);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("removing {}: {err}", path.display())),
+    }
+}
+
+/// HTTP failure text for a bridge issue or revoke that is not the closed gate.
+pub fn http_failure(status: u16, body: &serde_json::Value) -> String {
+    let code = body["error"]["code"].as_str().unwrap_or("request_failed");
+    let message = body["error"]["message"]
+        .as_str()
+        .unwrap_or("bridge token request failed");
+    format!("{code}: {message} (HTTP {status})")
+}
+
 /// `A24_DEV_TOOL=1`, the same switch the wechat bridge and the daemon use.
 pub fn dev_tool_enabled() -> bool {
     std::env::var("A24_DEV_TOOL").ok().as_deref() == Some("1")
@@ -76,6 +122,9 @@ pub fn dev_tool_enabled() -> bool {
 
 pub const DEV_TOOL_REQUIRED: &str =
     "微信桥令牌只在开发时签发。请设置 A24_DEV_TOOL=1 后再运行 agent24 dev bridge-token。";
+
+/// Daemon answered 404 `not_found` on the issue route. No elevation was asked.
+pub const DAEMON_DEV_TOOL_REQUIRED: &str = "运行中的 agent24d 没有设置 A24_DEV_TOOL=1，开发签发路由不存在。请先带上这个变量启动 daemon，再运行 agent24 dev bridge-token。这次没有请求桌面确认。";
 
 #[cfg(test)]
 mod tests {
@@ -98,7 +147,7 @@ mod tests {
     fn writes_0600_file_under_0700_dev_and_stdout_omits_the_bearer() {
         let root = tempfile::tempdir().unwrap();
         let secret = "bridge-secret-not-for-stdout";
-        let path = write_bridge_token_at(root.path(), secret, 1_700_000_000).unwrap();
+        let path = write_bridge_token_at(root.path(), secret, 1_700_000_000, "abc123").unwrap();
         assert_eq!(path, bridge_token_path(root.path()));
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(mode(&path), 0o600);
@@ -106,14 +155,29 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["token"], secret);
         assert_eq!(parsed["expires_at"], 1_700_000_000);
+        assert_eq!(parsed["capability_id"], "abc123");
+        assert_eq!(read_bridge_capability_id(root.path()).unwrap(), "abc123");
         let printed = stdout_lines(&path, 1_700_000_000);
         assert!(!printed.contains(secret));
         assert!(printed.contains(&path.display().to_string()));
         assert!(printed.contains("expires_at: 1700000000"));
         // A second issue replaces the file and keeps the mode.
-        let again = write_bridge_token_at(root.path(), "next-secret", 1_700_000_100).unwrap();
+        let again =
+            write_bridge_token_at(root.path(), "next-secret", 1_700_000_100, "def456").unwrap();
         assert_eq!(again, path);
         assert_eq!(mode(&again), 0o600);
         assert_eq!(mode(again.parent().unwrap()), 0o700);
+        assert_eq!(read_bridge_capability_id(root.path()).unwrap(), "def456");
+    }
+
+    /// An empty bearer is not written. Deleting the empty check in
+    /// `write_bridge_token_at` turns this red.
+    #[test]
+    fn empty_token_is_not_written() {
+        let root = tempfile::tempdir().unwrap();
+        let err = write_bridge_token_at(root.path(), "", 1, "abc123").unwrap_err();
+        assert!(err.contains("empty"), "{err}");
+        assert!(!bridge_token_path(root.path()).exists());
+        assert!(!root.path().join("dev").exists());
     }
 }

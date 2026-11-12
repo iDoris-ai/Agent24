@@ -231,6 +231,9 @@ impl FirstPartyAuthority {
             "/api/v1/capabilities/bridge" => {
                 return Some("签发 8 小时微信桥开发令牌，只能写入入站事件".to_owned());
             }
+            "/api/v1/capabilities/{capability_id}/revoke" => {
+                return Some("撤销微信桥开发令牌".to_owned());
+            }
             "/api/v1/idoris/operations/{id}/cancel" => {
                 let id = target
                     .path
@@ -527,6 +530,11 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
             && matches!(
                 (method.as_str(), policy.template),
                 ("POST", "/api/v1/capabilities/bridge")
+            ))
+        || (policy.operation == Operation::CapabilityRevoke
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/{capability_id}/revoke")
             ));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -845,6 +853,29 @@ mod tests {
         let target = resolve_target(&request).unwrap();
         let details = authority.target_summary("absent", &target).unwrap();
         assert_eq!(details, "签发 8 小时微信桥开发令牌，只能写入入站事件");
+        assert!(!details.contains("客户端"));
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+    }
+
+    /// Dropping `CapabilityRevoke` from `resolve_target` turns the first
+    /// `unwrap` red. Dropping the summary arm turns the details `unwrap` red.
+    #[test]
+    fn bridge_revoke_summary_is_fixed_and_ignores_client_text() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: "/api/v1/capabilities/aabbccddeeff00112233445566778899/revoke".into(),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "撤销微信桥开发令牌");
         assert!(!details.contains("客户端"));
         let dirty = ElevateRequest {
             body_sha256: body_digest(b"{}"),
