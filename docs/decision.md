@@ -1426,7 +1426,21 @@ D0-2 要求"在 `agent24-decide` 里定义写入/追加/导出/删除的 trait�
 ## ADR-035：iDoris Admin session token 由可信 launcher 通过匿名 inherited FD/HANDLE 一次性交付
 
 **日期**：2026-10-08
-**状态**：✅ 采纳（jason 明确拍板；追踪 issue：Agent24 #765）
+**状态**：⚠️ 部分取代（2026-11-12，S0-8。原文：✅ 采纳（jason 明确拍板；追踪 issue：Agent24 #765））
+
+**部分取代（2026-11-12）**：启动者改成 agent24d 里的 supervisor，桌面不再持有 Admin token。现行交接见 [ADR-046](adr/ADR-046-idoris-managed-host.md) D3（IL-13；S2-2 #1790）。
+
+仍有效：daemon 用 CSPRNG 生成一次性 Admin session token，经匿名 stdin 管道交给它拉起的 iDoris（`serve --admin-token-stdin`）；token 不进 argv、环境变量、普通文件、stdout/stderr 或日志。决策 2（Windows 用显式 allowlist 的 inherited HANDLE，禁止继承全部句柄）没有被本篇取代，仍是那一侧的决定。
+
+被 ADR-046 取代的条款：
+
+- 决策 1 的后半：第二条匿名管道交给 Agent24 Electron main 的专用 inherited FD。
+- 决策 3：Electron main 读 65 字节帧，token 只驻留 main 进程内存。
+- 决策 4：renderer 只获得零参数 `idorisStatus()`，由 main 里的 Admin HTTP client 访问冻结路由。
+- 决策 5 里「写完两条管道后 launcher 丢掉自己的副本」：daemon 在该子进程这一代的内存里保留副本，用于本机 Admin 就绪检查和日志脱敏，子进程结构丢弃时一起丢掉；不交给桌面。
+- 信任边界里「消费 token 的 Agent24 Electron main」：消费者是 daemon 的 supervisor。
+
+下面的正文保留 2026-10-08 的原文，供对照。上文列出的条款以 ADR-046 为准。
 
 ### 背景
 
