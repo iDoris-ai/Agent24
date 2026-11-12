@@ -301,3 +301,137 @@ async fn content_digest_is_unique_per_skill_origin_and_kind() {
     assert_eq!(ids[0].1, "act-later");
     assert_eq!(ids[1].1, "act-earlier");
 }
+
+async fn seed_body_and_evals(store: &Store) {
+    insert_revision(store, "body-1", "user", "1.0.0", "body", "db").await;
+    insert_revision(store, "evals-1", "user", "1.0.0", "evals", "de").await;
+}
+
+async fn insert_eval(store: &Store, result_id: &str) {
+    sqlx::query(
+        "INSERT INTO skill_eval_result ( \
+            result_id, body_revision_id, evals_revision_id, segment_digest, \
+            renderer_version, cases_json, created_at \
+         ) VALUES (?, 'body-1', 'evals-1', 'seg', 'r1', '[]', '2026-11-12T00:00:00Z')",
+    )
+    .bind(result_id)
+    .execute(pool(store))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn equal_body_and_evals_revision_ids_are_rejected() {
+    let store = memory().await;
+    seed_body_and_evals(&store).await;
+    reject(
+        &store,
+        "INSERT INTO skill_pointer ( \
+            skill_id, body_revision_id, evals_revision_id, generation \
+         ) VALUES ('notes', 'body-1', 'body-1', 1)",
+    )
+    .await;
+    reject(
+        &store,
+        "INSERT INTO skill_eval_result ( \
+            result_id, body_revision_id, evals_revision_id, segment_digest, \
+            renderer_version, cases_json, created_at \
+         ) VALUES ('same', 'body-1', 'body-1', 'seg', 'r1', '[]', '2026-11-12T00:00:00Z')",
+    )
+    .await;
+    insert_eval(&store, "res-ok").await;
+    reject(
+        &store,
+        "INSERT INTO skill_activation ( \
+            activation_id, skill_id, body_revision_id, evals_revision_id, \
+            result_id, result_code, created_at \
+         ) VALUES ('act-same', 'notes', 'body-1', 'body-1', 'res-ok', 'activated', '2026-11-12T00:00:00Z')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pointer_generation_below_one_is_rejected() {
+    let store = memory().await;
+    seed_body_and_evals(&store).await;
+    reject(
+        &store,
+        "INSERT INTO skill_pointer ( \
+            skill_id, body_revision_id, evals_revision_id, generation \
+         ) VALUES ('notes', 'body-1', 'evals-1', 0)",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn activation_result_code_outside_the_pair_is_rejected() {
+    let store = memory().await;
+    seed_body_and_evals(&store).await;
+    insert_eval(&store, "res-ok").await;
+    reject(
+        &store,
+        "INSERT INTO skill_activation ( \
+            activation_id, skill_id, body_revision_id, evals_revision_id, \
+            result_id, result_code, created_at \
+         ) VALUES ('act-other', 'notes', 'body-1', 'evals-1', 'res-ok', 'other', '2026-11-12T00:00:00Z')",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn eval_cases_json_must_be_an_array() {
+    let store = memory().await;
+    seed_body_and_evals(&store).await;
+    for (index, cases) in ["'{}'", "'\"x\"'"].iter().enumerate() {
+        let sql = format!(
+            "INSERT INTO skill_eval_result ( \
+                result_id, body_revision_id, evals_revision_id, segment_digest, \
+                renderer_version, cases_json, created_at \
+             ) VALUES ('bad-cases-{index}', 'body-1', 'evals-1', 'seg', 'r1', {cases}, '2026-11-12T00:00:00Z')"
+        );
+        reject(&store, &sql).await;
+    }
+}
+
+#[tokio::test]
+async fn activation_seq_is_not_reused_after_deleting_the_newest_row() {
+    let store = memory().await;
+    seed_body_and_evals(&store).await;
+    insert_eval(&store, "res-ok").await;
+    for activation_id in ["act-1", "act-2"] {
+        sqlx::query(
+            "INSERT INTO skill_activation ( \
+                activation_id, skill_id, body_revision_id, evals_revision_id, \
+                result_id, result_code, created_at \
+             ) VALUES (?, 'notes', 'body-1', 'evals-1', 'res-ok', 'activated', '2026-11-12T00:00:00Z')",
+        )
+        .bind(activation_id)
+        .execute(pool(&store))
+        .await
+        .unwrap();
+    }
+    let newest: i64 = sqlx::query_scalar("SELECT MAX(seq) FROM skill_activation")
+        .fetch_one(pool(&store))
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM skill_activation WHERE seq = ?")
+        .bind(newest)
+        .execute(pool(&store))
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO skill_activation ( \
+            activation_id, skill_id, body_revision_id, evals_revision_id, \
+            result_id, result_code, created_at \
+         ) VALUES ('act-3', 'notes', 'body-1', 'evals-1', 'res-ok', 'rolled_back', '2026-11-12T00:00:00Z')",
+    )
+    .execute(pool(&store))
+    .await
+    .unwrap();
+    let next: i64 =
+        sqlx::query_scalar("SELECT seq FROM skill_activation WHERE activation_id = 'act-3'")
+            .fetch_one(pool(&store))
+            .await
+            .unwrap();
+    assert!(next > newest, "seq {next} reused {newest}");
+}
