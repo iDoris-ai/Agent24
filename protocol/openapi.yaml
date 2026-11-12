@@ -4883,6 +4883,82 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /skills/{id}/activate:
+    post:
+      operationId: activateSkill
+      tags: [skills]
+      summary: Activate a skill pair, or roll back to a recorded one
+      description: |
+        Elevated `skills.activate`. Not proxied by the desktop backend proxy:
+        only the desktop main process (host credentials) and an elevated CLI
+        token reach it. The legacy shared token is refused.
+
+        Send either `body_revision_id` + `evals_revision_id` (+ `accepted`)
+        or `rollback_activation_id`. No pass flag, score, or body text is
+        accepted (`400 invalid_request`). The server reruns the evals from the
+        stored revisions and binds that result. A rollback does not rerun.
+
+        `unchanged: true` means the pointer already named the pair. Nothing
+        was written, and it does not mean this request's evals or accepted
+        list were checked or stored.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: X-Agent24-Elevation
+          in: header
+          required: false
+          description: Elevation grant for a first-party shell token.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SkillActivateRequest"
+      responses:
+        "200":
+          description: Activated, rolled back, or unchanged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillActivation"
+        "400":
+          description: >-
+            `invalid_request`, `skill_activation_mixed`,
+            `skill_origin_mismatch`, or a manifest or eval rejection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not permitted, or `presence_required` without a grant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Unknown revision or activation record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `skill_pointer_conflict`, `skill_eval_empty`, or
+            `skill_eval_failed` (`error.details.cases` and `failed` carry the
+            server-computed run; the pointer did not move)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Storage failure, or a corrupt pointer row
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -7137,9 +7213,29 @@ components:
       properties:
         consistent: { type: integer }
         total: { type: integer }
+    SkillActivationRecord:
+      type: object
+      required:
+        - activation_id
+        - seq
+        - body_revision_id
+        - evals_revision_id
+        - result_code
+        - origin_from
+        - origin_to
+        - created_at
+      properties:
+        activation_id: { type: string }
+        seq: { type: integer }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        result_code: { type: string, enum: [activated, rolled_back] }
+        origin_from: { type: [string, "null"], enum: [imported, user, null] }
+        origin_to: { type: string, enum: [imported, user] }
+        created_at: { type: string }
     SkillDetail:
       type: object
-      required: [skill_id, pointer, generation, revisions, text_consistency]
+      required: [skill_id, pointer, generation, revisions, activations, text_consistency]
       properties:
         skill_id: { type: string }
         pointer:
@@ -7151,10 +7247,54 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/SkillRevisionMeta"
+        activations:
+          type: array
+          description: Activation and rollback history, oldest first. No eval cases or text.
+          items:
+            $ref: "#/components/schemas/SkillActivationRecord"
         text_consistency:
           oneOf:
             - $ref: "#/components/schemas/SkillConsistency"
             - type: "null"
+    SkillActivateRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_generation]
+      description: >-
+        Pair form: both revision ids, plus `accepted` (exactly the failed case
+        ids of the server's own run). Rollback form: `rollback_activation_id`
+        alone.
+      properties:
+        expected_generation: { type: integer, minimum: 0 }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        accepted:
+          type: array
+          items: { type: string }
+        rollback_activation_id: { type: string }
+    SkillActivation:
+      type: object
+      required:
+        - skill_id
+        - result
+        - unchanged
+        - activation_id
+        - generation
+        - pointer
+        - text_consistency
+        - note
+      properties:
+        skill_id: { type: string }
+        result: { type: string, enum: [activated, rolled_back, unchanged] }
+        unchanged: { type: boolean }
+        activation_id: { type: [string, "null"] }
+        generation: { type: integer }
+        pointer: { $ref: "#/components/schemas/SkillPointer" }
+        text_consistency:
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
+        note: { type: [string, "null"] }
     SkillScanError:
       type: object
       required: [path, code, message]

@@ -59,6 +59,16 @@ fn host_only_route(method: &Method, path: &str) -> bool {
             && matches!(path, "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy"))
 }
 
+/// `POST /api/v1/skills/{id}/activate` is `skills.activate`, Elevated. The
+/// legacy shared token cannot be elevated, so it cannot reach it at all.
+fn skill_activate_route(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && path
+            .strip_prefix("/api/v1/skills/")
+            .and_then(|rest| rest.strip_suffix("/activate"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
 fn is_component_report(path: &str) -> bool {
     path.strip_prefix("/api/v1/components/")
@@ -77,7 +87,9 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
     if bearer
         .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
     {
-        if host_only_route(req.method(), req.uri().path()) {
+        if host_only_route(req.method(), req.uri().path())
+            || skill_activate_route(req.method(), req.uri().path())
+        {
             return error_response(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -423,6 +435,40 @@ async fn authorize(
                                 &authorization.claims.capability_id,
                                 template,
                                 &bytes,
+                            );
+                        }
+                    } else if method == Method::POST && template == "/api/v1/skills/{id}/activate" {
+                        // SL-4: the summary is built from stored revisions,
+                        // never from anything the caller sent besides ids.
+                        let path = req.uri().path().to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        if let Some(authority) = &state.first_party
+                            && let Some(skill_id) = path
+                                .strip_prefix("/api/v1/skills/")
+                                .and_then(|rest| rest.strip_suffix("/activate"))
+                            && let Some(summary) = crate::skill_routes::activation_summary(
+                                &state.store,
+                                skill_id,
+                                &bytes,
+                            )
+                            .await
+                        {
+                            authority.remember_skill_activation(
+                                &authorization.claims.capability_id,
+                                &path,
+                                &bytes,
+                                summary,
                             );
                         }
                     } else if method == Method::POST && template == "/api/v1/attached" {

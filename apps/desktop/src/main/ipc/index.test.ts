@@ -201,6 +201,18 @@ beforeAll(async () => {
           res.statusCode = 409
           res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
         } else res.end(JSON.stringify({ ok: true, data: { status: 'imported', nickname: 'r1', npub: 'npub1x', default: false } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/skills/demo') {
+        res.end(JSON.stringify({
+          skill_id: 'demo', generation: 2, text_consistency: null, activations: [],
+          pointer: { origin: 'imported', body_revision_id: 'b1', evals_revision_id: 'e1', generation: 2 },
+          revisions: [
+            { revision_id: 'b1', origin: 'imported', semver: '1.0.0', kind: 'body', content_digest: 'aaaaaaaa11', created_at: 't' },
+            { revision_id: 'e1', origin: 'imported', semver: '1.0.0', kind: 'evals', content_digest: 'bbbbbbbb22', created_at: 't' },
+            { revision_id: 'b2', origin: 'imported', semver: '2.0.0', kind: 'body', content_digest: 'cafef00d99', created_at: 't' },
+          ],
+        }))
+      } else if (req.method === 'POST' && req.url === '/api/v1/skills/demo/activate') {
+        res.end(JSON.stringify({ result: 'activated' }))
       } else if (req.method === 'GET' && req.url === '/api/v1/comm/relay') {
         res.end(JSON.stringify({ ok: true, data: { relays: currentRelays.relays, source: 'config', configured: currentRelays.configured } }))
       } else if (req.method === 'PUT' && req.url === '/api/v1/comm/relay') {
@@ -1410,6 +1422,31 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
     typingHome('wrong-home', 'home-pass-1')
     expect((await call(IpcChannels.CommHomeImport)).ok).toBe(true)
     expect(seen.map((r) => JSON.parse(r.body).password)).toEqual(['wrong-home', 'home-pass-1'])
+  })
+
+  it('skills: the confirmation is built in main from the daemon record, then one POST with the daemon generation', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    const result = await call(IpcChannels.SkillsActivate, {
+      skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1', summary: 'FORGED', expectedGeneration: 99,
+    })
+    expect(result.ok).toBe(true)
+    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { message: string; detail: string }
+    expect(opts.message).toContain('"demo"')
+    expect(opts.detail).toContain('2.0.0')
+    expect(opts.detail).toContain('cafef00d')
+    expect(`${opts.message}${opts.detail}`).not.toContain('FORGED')
+    const posts = seen.filter((r) => r.method === 'POST')
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.url).toBe('/api/v1/skills/demo/activate')
+    expect(JSON.parse(posts[0]!.body)).toEqual({ expected_generation: 2, body_revision_id: 'b2', evals_revision_id: 'e1', accepted: [] })
+  })
+  it('skills: declining sends no POST, and the page cannot reach the route through the proxy', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    expect((await call(IpcChannels.SkillsActivate, { skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1' })).data.error.code).toBe('cancelled')
+    expect(seen.filter((r) => r.method === 'POST')).toHaveLength(0)
+    const proxied = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/skills/demo/activate', body: {} })
+    expect(proxied.ok).toBe(false)
+    expect(seen.filter((r) => r.method === 'POST')).toHaveLength(0)
   })
 
   it('relay: a changed list is confirmed natively, then PUT exactly as validated', async () => {

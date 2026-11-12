@@ -124,6 +124,12 @@ const api = {
   commHomeImport: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommHomeImport),
   /** Elevated: replaces the relay list. Main validates the URLs and confirms natively when the list changes. */
   commRelaySet: (relays: string[]): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommRelaySet, relays),
+  /** Elevated: activates one body/evals pair. The page names the skill, the two revision ids and the failing case ids it accepts; main builds the confirmation from the daemon's record and ignores any summary or generation the page adds. */
+  skillsActivate: (input: { skillId: string; bodyRevisionId: string; evalsRevisionId: string; accepted?: string[] }): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.SkillsActivate, input),
+  /** Elevated: moves the pointer back to one recorded activation. */
+  skillsRollback: (input: { skillId: string; rollbackActivationId: string }): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.SkillsRollback, input),
   /** Elevated: main asks for the keystore password in its own window; the page only says whether to remember it. */
   commUnlock: (remember: boolean): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommUnlock, remember),
 

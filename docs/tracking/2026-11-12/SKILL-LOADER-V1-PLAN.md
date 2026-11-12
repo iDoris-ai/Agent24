@@ -190,6 +190,8 @@ render_skill_segment(body, origin, content_digest) -> String
 - 代次不符先于「两侧都换」：预期代次已过期，即使正文和评测相对指针都变了，也是 `skill_pointer_conflict`，不是 `skill_activation_mixed`。
 - 正文修订与评测修订的 `origin` 必须相同。激活和回滚都要求。不同则 `skill_origin_mismatch`，指针不动。这和 `skill_activation_mixed` 不是同一条件。指针主键仍是 `skill_id`，不按来源拆行。来源切换不拆指针行：历史行带 `origin_from`（上一行来源，第一行为空）和 `origin_to`（这一行来源）。
 - 每次重跑都针对**即将钉上的那一对**，不是针对旧的那一对。
+- 经另一来源绕一圈换两侧是允许的：例如 `imported` → `user` → `imported`，每一跳都是「来源切换」，两侧同时换。确认摘要显示 from/to，历史行记 `origin_from` / `origin_to`，不因为「回到了原来的来源」而当作无变化。
+- 读指针时遇到两侧来源不一致的坏行（库里的数据已经坏了），映射 `500 internal`，不是 400；调用方改请求解决不了。只有写路径上请求里的正文与评测来源不同，才是 `400 skill_origin_mismatch`。
 
 激活请求体只有：`expected_generation`、正文 `revision_id`、评测 `revision_id`、接受的失败 id 列表。正文不在请求体里。服务端按修订 id 读库。
 
@@ -320,7 +322,7 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 | `skill_eval_invalid` 补充 | 单条用例的 `expect` 为空（`exact` 与 `contains` 都拒）、同一评测文件内重复用例、JSON 重复键 | 400 |
 | `skill_eval_failed` | 激活时有失败用例未被全部接受（服务端重跑，或 store 写入绑定时兜底）；响应带用例摘要，指针不动 | 409 |
 | `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同，并且与指针同来源（首次激活、回滚、来源切换除外：来源切换是正文与评测同来源且与当前指针来源不同，视同第一对，两侧同时换；正对照「同来源两侧都变 → mixed」）。代次已过期时不走这个码，走 `skill_pointer_conflict` | 400 |
-| `skill_origin_mismatch` | 激活或回滚时，正文修订与评测修订的 `origin` 不同。指针不动。与 `skill_activation_mixed` 无关：两侧可以只换一个，来源仍然必须相同。指针主键仍是 `skill_id` | 400 |
+| `skill_origin_mismatch` | 激活或回滚时，正文修订与评测修订的 `origin` 不同。指针不动。与 `skill_activation_mixed` 无关：两侧可以只换一个，来源仍然必须相同。指针主键仍是 `skill_id`。读指针遇到两侧来源不一致的坏行不是这个码，是 `internal` 500 | 400 |
 | `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符。没有指针行时当前代次是 0 | 409 |
 
 回滚恢复一整对历史上已批准的组合，以及来源切换（候选正文与评测同来源、且与当前指针来源不同），允许在已有指针时两侧同时变化。同来源的新修订一次只能换一侧。确认摘要按实际变化显示「换回正文」「换回评测」或「两侧均换回」；来源切换时标明 from/to。

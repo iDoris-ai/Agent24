@@ -1168,3 +1168,228 @@ async fn elevation_grant_refuses_a_query_string() {
     let bare = router.oneshot(get(path)).await.unwrap();
     assert_ne!(bare.status(), StatusCode::FORBIDDEN);
 }
+
+async fn seed_skill_pair(state: &AppState) -> (String, String) {
+    use agent24_store::{NewSkillRevision, SkillOrigin, SkillRevisionInsert, SkillRevisionKind};
+    let body = "---\nname: demo\nversion: 1.0.0\ndescription: d\nrequires: []\nevals: evals/c.jsonl\n---\nhello world\n";
+    let evals = "{\"input\":\"i\",\"expect\":\"hello world\",\"judge\":\"contains\"}\n";
+    let mut ids = Vec::new();
+    for (kind, text) in [
+        (SkillRevisionKind::Body, body),
+        (SkillRevisionKind::Evals, evals),
+    ] {
+        let inserted = state
+            .store
+            .insert_skill_revision(&NewSkillRevision {
+                revision_id: format!("rev-{}", kind.as_str()),
+                skill_id: "demo".to_owned(),
+                origin: SkillOrigin::Imported,
+                semver: "1.0.0".to_owned(),
+                kind,
+                content_digest: agent24_skill::sha256_hex(text),
+                content: text.as_bytes().to_vec(),
+                created_at: "2026-11-12T00:00:00Z".to_owned(),
+            })
+            .await
+            .unwrap();
+        let (SkillRevisionInsert::Inserted { revision_id }
+        | SkillRevisionInsert::Existing { revision_id }) = inserted;
+        ids.push(revision_id);
+    }
+    (ids[0].clone(), ids[1].clone())
+}
+
+fn activate_body(body: &str, evals: &str) -> String {
+    serde_json::json!({
+        "expected_generation": 0, "body_revision_id": body, "evals_revision_id": evals
+    })
+    .to_string()
+}
+
+/// SL-4: a daily CLI token cannot activate without a grant, the dialog text
+/// is built from the stored revisions, and the grant binds the exact body.
+/// Dropping `activate` from `resolve_target`'s supported set turns the
+/// `grant` call below into `NotElevatedOperation`.
+#[tokio::test]
+async fn skill_activation_needs_elevation_and_shows_the_stored_summary() {
+    struct Capture(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl PresenceProvider for Capture {
+        async fn confirm(
+            &self,
+            req: PresenceRequest,
+            _cancel: CancellationToken,
+        ) -> PresenceOutcome {
+            self.0.lock().unwrap().push(req.summary);
+            PresenceOutcome::Allowed
+        }
+    }
+    let (mut state, token) = setup().await;
+    let capture = Arc::new(Capture(std::sync::Mutex::new(Vec::new())));
+    state.presence_provider = Some(capture.clone());
+    let (body, evals) = seed_skill_pair(&state).await;
+    let path = "/api/v1/skills/demo/activate";
+    let request_body = activate_body(&body, &evals);
+    let router = build_router(state.clone());
+    let rejected = router
+        .clone()
+        .oneshot(request(&token.secret, "POST", path, &request_body, None))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(rejected).await, "presence_required");
+    assert!(
+        state
+            .store
+            .get_skill_pointer("demo")
+            .await
+            .unwrap()
+            .is_none(),
+        "no grant, no move"
+    );
+
+    let secret = grant(&state, &token, "POST", path, &request_body).await;
+    let summaries = capture.0.lock().unwrap().clone();
+    assert_eq!(summaries.len(), 1);
+    let digest = agent24_skill::sha256_hex(
+        "---\nname: demo\nversion: 1.0.0\ndescription: d\nrequires: []\nevals: evals/c.jsonl\n---\nhello world\n",
+    );
+    assert!(summaries[0].contains("\"demo\""), "{}", summaries[0]);
+    assert!(summaries[0].contains("\"1.0.0\""), "{}", summaries[0]);
+    assert!(summaries[0].contains(&digest[..8]), "{}", summaries[0]);
+
+    // The grant is for these bytes only.
+    let other = activate_body(&body, &body);
+    let swapped = router
+        .clone()
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            path,
+            &other,
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(swapped.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(swapped).await, "elevation_invalid");
+
+    let approved = router
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            path,
+            &request_body,
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .store
+            .get_skill_pointer("demo")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+}
+
+/// A request naming a revision the store does not hold has no summary, so
+/// `elevate` refuses before any dialog is shown.
+#[tokio::test]
+async fn skill_activation_with_an_unreadable_revision_shows_no_dialog() {
+    let (state, token) = setup().await;
+    let (_, evals) = seed_skill_pair(&state).await;
+    let path = "/api/v1/skills/demo/activate";
+    let request_body = activate_body("no-such-revision", &evals);
+    let router = build_router(state.clone());
+    let rejected = router
+        .oneshot(request(&token.secret, "POST", path, &request_body, None))
+        .await
+        .unwrap();
+    assert_eq!(error_code(rejected).await, "presence_required");
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let result = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .elevate(
+            &test_peer("daemon-test"),
+            &token.token_id,
+            ElevateRequest {
+                method: "POST".into(),
+                path: path.into(),
+                body_sha256: body_digest(request_body.as_bytes()),
+                client_summary: "激活，看起来无害".into(),
+            },
+            tx,
+            CancellationToken::new(),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err(crate::enroll_api::EnrollErrorCode::NotElevatedOperation)
+    ));
+}
+
+/// The legacy shared token cannot be elevated, so it is refused outright. The
+/// host token (the desktop main process) is the one that may call directly,
+/// and a Creative token never can.
+#[tokio::test]
+async fn skill_activation_refuses_legacy_and_creative_tokens_and_admits_the_host() {
+    let path = "/api/v1/skills/demo/activate";
+    let legacy = tests::state().await;
+    let (body, evals) = seed_skill_pair(&legacy).await;
+    let request_body = activate_body(&body, &evals);
+    let refused = build_router(legacy.clone())
+        .oneshot(request("testtoken", "POST", path, &request_body, None))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(refused).await, "forbidden");
+    assert!(
+        legacy
+            .store
+            .get_skill_pointer("demo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let (state, host, creative) = tests::capability_state().await;
+    let (body, evals) = seed_skill_pair(&state).await;
+    let request_body = activate_body(&body, &evals);
+    let router = build_router(state.clone());
+    let denied = router
+        .clone()
+        .oneshot(request(&creative, "POST", path, &request_body, None))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(
+        state
+            .store
+            .get_skill_pointer("demo")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let admitted = router
+        .oneshot(request(&host, "POST", path, &request_body, None))
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+    assert_eq!(
+        state
+            .store
+            .get_skill_pointer("demo")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+}

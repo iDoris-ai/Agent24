@@ -115,6 +115,9 @@ struct SkillDetail {
     pointer: Option<PointerView>,
     generation: i64,
     revisions: Vec<RevisionView>,
+    /// Activation and rollback history, oldest first. Ids and results only:
+    /// no eval cases and no text. A rollback names one of these by id.
+    activations: Vec<ActivationView>,
     /// Counts for the pointer's body and evals revisions. `None` when the
     /// skill has no pointer. v1 does not infer a pair. Provider status is
     /// SL-5 and is omitted.
@@ -128,6 +131,18 @@ struct RevisionView {
     semver: String,
     kind: String,
     content_digest: String,
+    created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ActivationView {
+    activation_id: String,
+    seq: i64,
+    body_revision_id: String,
+    evals_revision_id: String,
+    result_code: String,
+    origin_from: Option<String>,
+    origin_to: String,
     created_at: String,
 }
 
@@ -157,6 +172,8 @@ struct StoredSkill {
 
 enum Fail {
     Http(StatusCode, &'static str, String),
+    /// Same envelope plus `error.details`. Only `skill_eval_failed` uses it.
+    Detailed(StatusCode, &'static str, String, serde_json::Value),
 }
 
 pub async fn list_skills(State(state): State<AppState>) -> Response {
@@ -561,6 +578,22 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         .map_err(|_| Fail::internal("read pointer"))?;
     let generation = pointer.as_ref().map(|row| row.generation).unwrap_or(0);
     let text_consistency = text_consistency(store, pointer.as_ref()).await?;
+    let activations = store
+        .list_skill_activations(skill_id)
+        .await
+        .map_err(|_| Fail::internal("read history"))?
+        .into_iter()
+        .map(|row| ActivationView {
+            activation_id: row.activation_id,
+            seq: row.seq,
+            body_revision_id: row.body_revision_id,
+            evals_revision_id: row.evals_revision_id,
+            result_code: row.result_code,
+            origin_from: row.origin_from.map(|origin| origin.as_str().to_owned()),
+            origin_to: row.origin_to.as_str().to_owned(),
+            created_at: row.created_at,
+        })
+        .collect();
     let revisions = mine
         .iter()
         .map(|row| RevisionView {
@@ -577,6 +610,7 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         pointer: pointer.map(pointer_view),
         generation,
         revisions,
+        activations,
         text_consistency,
     })
 }
@@ -676,6 +710,454 @@ fn is_inserted(row: &SkillRevisionInsert) -> bool {
     matches!(row, SkillRevisionInsert::Inserted { .. })
 }
 
+/// `POST /api/v1/skills/{id}/activate` body. Two shapes, never mixed:
+/// a pair (`body_revision_id`, `evals_revision_id`, `accepted`) or a rollback
+/// (`rollback_activation_id`). There is no field for a pass flag, a score or
+/// body text: `deny_unknown_fields` makes those a 400, and the server reruns
+/// the evals itself (plan §4.5).
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivateRequest {
+    expected_generation: i64,
+    body_revision_id: Option<String>,
+    evals_revision_id: Option<String>,
+    #[serde(default)]
+    accepted: Vec<String>,
+    rollback_activation_id: Option<String>,
+}
+
+enum ActivateTarget {
+    Pair {
+        body_revision_id: String,
+        evals_revision_id: String,
+        accepted: Vec<String>,
+    },
+    Rollback {
+        activation_id: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct ActivateResponse {
+    skill_id: String,
+    /// `activated`, `rolled_back` or `unchanged`.
+    result: &'static str,
+    unchanged: bool,
+    activation_id: Option<String>,
+    generation: i64,
+    pointer: PointerView,
+    text_consistency: Option<ConsistencyView>,
+    /// Set on `unchanged`: nothing was written, and this request's eval run
+    /// and accepted list were not checked or stored (#1829 L3).
+    note: Option<&'static str>,
+}
+
+const UNCHANGED_NOTE: &str =
+    "指针已在这一对上，未写入任何记录；本次请求的评测与接受列表没有被校验或落库";
+
+/// The pair a request asks for, with both rows read from the store.
+struct Resolved {
+    pointer: Option<agent24_store::SkillPointer>,
+    body: agent24_store::SkillRevision,
+    evals: agent24_store::SkillRevision,
+    rollback: bool,
+}
+
+fn invalid_request(message: &str) -> Fail {
+    Fail::Http(
+        StatusCode::BAD_REQUEST,
+        "invalid_request",
+        message.to_owned(),
+    )
+}
+
+fn parse_activate(bytes: &[u8]) -> Result<(i64, ActivateTarget), Fail> {
+    let request: ActivateRequest = serde_json::from_slice(bytes).map_err(|_| {
+        invalid_request(
+            "请求体只接受 expected_generation、修订 id、accepted 或 rollback_activation_id",
+        )
+    })?;
+    if request.expected_generation < 0 {
+        return Err(invalid_request("expected_generation 不能为负"));
+    }
+    let target = match (
+        request.body_revision_id,
+        request.evals_revision_id,
+        request.rollback_activation_id,
+    ) {
+        (Some(body), Some(evals), None) if !body.is_empty() && !evals.is_empty() => {
+            ActivateTarget::Pair {
+                body_revision_id: body,
+                evals_revision_id: evals,
+                accepted: request.accepted,
+            }
+        }
+        (None, None, Some(id)) if !id.is_empty() => {
+            if !request.accepted.is_empty() {
+                return Err(invalid_request("回滚不接受 accepted"));
+            }
+            ActivateTarget::Rollback { activation_id: id }
+        }
+        _ => {
+            return Err(invalid_request(
+                "需要一对修订 id，或一个 rollback_activation_id",
+            ));
+        }
+    };
+    Ok((request.expected_generation, target))
+}
+
+async fn load_revision(
+    store: &Store,
+    skill_id: &str,
+    revision_id: &str,
+    kind: SkillRevisionKind,
+) -> Result<agent24_store::SkillRevision, Fail> {
+    let row = store
+        .get_skill_revision(revision_id)
+        .await
+        .map_err(|_| Fail::internal("read revision"))?;
+    let Some(row) = row else {
+        return Err(Fail::Http(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "修订不存在".to_owned(),
+        ));
+    };
+    if row.skill_id != skill_id || row.kind != kind {
+        return Err(invalid_request("修订不属于这个技能，或种类不对"));
+    }
+    Ok(row)
+}
+
+/// Read what the request points at, in the store's own order: the pointer, a
+/// rollback's history row, a stale generation, then the rows, the origin and
+/// the one-side rule. `Err(pointer)` inside the `Ok` is the idempotent case:
+/// the pointer already names the pair.
+async fn resolve_activation(
+    store: &Store,
+    skill_id: &str,
+    expected_generation: i64,
+    target: &ActivateTarget,
+) -> Result<Result<Resolved, agent24_store::SkillPointer>, Fail> {
+    // A bad pointer row (two sides with different origins) is a corrupt
+    // read: 500 internal, not the write-path `skill_origin_mismatch`.
+    let pointer = store
+        .get_skill_pointer(skill_id)
+        .await
+        .map_err(|_| Fail::internal("read pointer"))?;
+    let (body_id, evals_id, rollback) = match target {
+        ActivateTarget::Pair {
+            body_revision_id,
+            evals_revision_id,
+            ..
+        } => (body_revision_id.clone(), evals_revision_id.clone(), false),
+        ActivateTarget::Rollback { activation_id } => {
+            let history = store
+                .list_skill_activations(skill_id)
+                .await
+                .map_err(|_| Fail::internal("read history"))?;
+            let Some(row) = history
+                .iter()
+                .find(|row| row.activation_id == *activation_id)
+            else {
+                return Err(Fail::Http(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "激活记录不存在".to_owned(),
+                ));
+            };
+            (
+                row.body_revision_id.clone(),
+                row.evals_revision_id.clone(),
+                true,
+            )
+        }
+    };
+    if let Some(pointer) = &pointer
+        && pointer.body_revision_id == body_id
+        && pointer.evals_revision_id == evals_id
+    {
+        return Ok(Err(pointer.clone()));
+    }
+    let current = pointer.as_ref().map_or(0, |row| row.generation);
+    if current != expected_generation {
+        return Err(Fail::from_store(
+            agent24_store::StoreError::SkillPointerConflict,
+        ));
+    }
+    let body = load_revision(store, skill_id, &body_id, SkillRevisionKind::Body).await?;
+    let evals = load_revision(store, skill_id, &evals_id, SkillRevisionKind::Evals).await?;
+    if body.origin != evals.origin {
+        return Err(Fail::from_store(
+            agent24_store::StoreError::SkillOriginMismatch,
+        ));
+    }
+    if !rollback
+        && let Some(pointer) = &pointer
+        && pointer.body_revision_id != body_id
+        && pointer.evals_revision_id != evals_id
+        && pointer.origin == body.origin
+    {
+        return Err(Fail::from_store(
+            agent24_store::StoreError::SkillActivationMixed,
+        ));
+    }
+    Ok(Ok(Resolved {
+        pointer,
+        body,
+        evals,
+        rollback,
+    }))
+}
+
+/// The one eval run, from the stored bytes, by the same pure function the
+/// install path uses. Nothing the request carries is read here.
+fn rerun_evals(
+    body: &agent24_store::SkillRevision,
+    evals: &agent24_store::SkillRevision,
+) -> Result<agent24_skill::TextConsistencyReport, Fail> {
+    let markdown =
+        String::from_utf8(body.content.clone()).map_err(|_| Fail::internal("body is not utf-8"))?;
+    let eval_text = String::from_utf8(evals.content.clone())
+        .map_err(|_| Fail::internal("evals is not utf-8"))?;
+    let manifest = parse_for_origin(body.origin, &markdown)
+        .map_err(|_| Fail::internal("stored body no longer parses"))?;
+    if manifest.evals.is_empty() {
+        return Err(Fail::from_store(agent24_store::StoreError::SkillEvalEmpty));
+    }
+    agent24_skill::check_text_consistency(
+        &manifest.evals,
+        &eval_text,
+        &manifest.body,
+        skill_origin(body.origin),
+        &manifest.content_digest(),
+    )
+    .map_err(|err| match err {
+        SkillError::EvalEmpty => Fail::from_store(agent24_store::StoreError::SkillEvalEmpty),
+        other => Fail::from_skill(other),
+    })
+}
+
+fn case_values(report: &agent24_skill::TextConsistencyReport) -> Vec<serde_json::Value> {
+    report
+        .cases
+        .iter()
+        .map(|case| {
+            serde_json::json!({
+                "id": case.id,
+                "line": case.line,
+                "judge": case.judge.as_str(),
+                "passed": case.passed,
+                "expect_digest": case.expect_digest,
+            })
+        })
+        .collect()
+}
+
+/// The accepted ids must be exactly this run's failed ids, each once.
+fn check_accepted(
+    report: &agent24_skill::TextConsistencyReport,
+    accepted: &[String],
+) -> Result<(), Fail> {
+    let failed: BTreeSet<&str> = report.failure_ids().into_iter().collect();
+    let given: BTreeSet<&str> = accepted.iter().map(String::as_str).collect();
+    if given.len() != accepted.len() {
+        return Err(invalid_request("accepted 里有重复 id"));
+    }
+    if given == failed {
+        return Ok(());
+    }
+    Err(Fail::Detailed(
+        StatusCode::CONFLICT,
+        "skill_eval_failed",
+        "接受列表必须正好是这一次评测的失败用例".to_owned(),
+        serde_json::json!({
+            "cases": case_values(report),
+            "failed": failed,
+            "renderer_version": report.renderer_version,
+        }),
+    ))
+}
+
+async fn activate_skill(
+    store: &Store,
+    skill_id: &str,
+    bytes: &[u8],
+) -> Result<ActivateResponse, Fail> {
+    let (expected_generation, target) = parse_activate(bytes)?;
+    let resolved = match resolve_activation(store, skill_id, expected_generation, &target).await? {
+        Ok(resolved) => resolved,
+        Err(pointer) => {
+            return Ok(ActivateResponse {
+                skill_id: skill_id.to_owned(),
+                result: "unchanged",
+                unchanged: true,
+                activation_id: None,
+                generation: pointer.generation,
+                text_consistency: None,
+                note: Some(UNCHANGED_NOTE),
+                pointer: pointer_view(pointer),
+            });
+        }
+    };
+    let activation_id = uuid::Uuid::new_v4().to_string();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let mut consistency = None;
+    let outcome = match &target {
+        ActivateTarget::Pair { accepted, .. } => {
+            let report = rerun_evals(&resolved.body, &resolved.evals)?;
+            check_accepted(&report, accepted)?;
+            let (consistent, total) = report.consistent_counts();
+            consistency = Some(ConsistencyView { consistent, total });
+            let binding = agent24_store::SkillEvalBinding {
+                result_id: uuid::Uuid::new_v4().to_string(),
+                segment_digest: report.segment_digest.clone(),
+                renderer_version: report.renderer_version.to_string(),
+                cases_json: serde_json::Value::Array(case_values(&report)).to_string(),
+                accepted_json: serde_json::json!(accepted).to_string(),
+            };
+            store
+                .activate_skill(&agent24_store::NewSkillActivation {
+                    activation_id: activation_id.clone(),
+                    skill_id: skill_id.to_owned(),
+                    expected_generation,
+                    body_revision_id: resolved.body.revision_id.clone(),
+                    evals_revision_id: resolved.evals.revision_id.clone(),
+                    binding,
+                    created_at,
+                    actor: "host".to_owned(),
+                })
+                .await
+        }
+        ActivateTarget::Rollback {
+            activation_id: source,
+        } => {
+            store
+                .rollback_skill(&agent24_store::SkillRollback {
+                    activation_id: activation_id.clone(),
+                    skill_id: skill_id.to_owned(),
+                    expected_generation,
+                    source_activation_id: source.clone(),
+                    created_at,
+                    actor: "host".to_owned(),
+                })
+                .await
+        }
+    }
+    .map_err(Fail::from_store)?;
+    let pointer = |generation| PointerView {
+        origin: resolved.body.origin.as_str().to_owned(),
+        body_revision_id: resolved.body.revision_id.clone(),
+        evals_revision_id: resolved.evals.revision_id.clone(),
+        generation,
+    };
+    Ok(match outcome {
+        agent24_store::SkillActivationOutcome::Activated {
+            generation,
+            activation_id,
+        } => ActivateResponse {
+            skill_id: skill_id.to_owned(),
+            result: if resolved.rollback {
+                "rolled_back"
+            } else {
+                "activated"
+            },
+            unchanged: false,
+            activation_id: Some(activation_id),
+            generation,
+            pointer: pointer(generation),
+            text_consistency: consistency,
+            note: None,
+        },
+        // A race: another request moved the pointer to this pair first.
+        agent24_store::SkillActivationOutcome::Unchanged { generation } => ActivateResponse {
+            skill_id: skill_id.to_owned(),
+            result: "unchanged",
+            unchanged: true,
+            activation_id: None,
+            generation,
+            pointer: pointer(generation),
+            text_consistency: None,
+            note: Some(UNCHANGED_NOTE),
+        },
+    })
+}
+
+pub async fn post_skill_activate(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    body: Body,
+) -> Response {
+    let bytes = match read_body(body).await {
+        Ok(bytes) => bytes,
+        Err(fail) => return fail_response(&fail),
+    };
+    match activate_skill(&state.store, &id, &bytes).await {
+        Ok(response) => Json(response).into_response(),
+        Err(fail) => fail_response(&fail),
+    }
+}
+
+/// Four-item confirmation summary for the elevation dialog, from stored rows.
+/// Skill name, semver, first 8 hex of the body digest, whether the evals side
+/// differs from the pointer (a rollback names the side that comes back), and
+/// from/to on a source switch. `None` when the request is not one this route
+/// accepts or a row is unreadable: nothing is then shown to approve.
+pub(crate) async fn activation_summary(
+    store: &Store,
+    skill_id: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    let (expected_generation, target) = parse_activate(bytes).ok()?;
+    let resolved = match resolve_activation(store, skill_id, expected_generation, &target)
+        .await
+        .ok()?
+    {
+        Ok(resolved) => resolved,
+        // Already on this pair: the request is a no-op, nothing to approve.
+        Err(_) => return None,
+    };
+    let name = crate::capabilities::first_party::shown(skill_id)?;
+    let semver = crate::capabilities::first_party::shown(&resolved.body.semver)?;
+    let digest: String = resolved.body.content_digest.chars().take(8).collect();
+    let (body_changed, evals_changed) = match &resolved.pointer {
+        Some(pointer) => (
+            pointer.body_revision_id != resolved.body.revision_id,
+            pointer.evals_revision_id != resolved.evals.revision_id,
+        ),
+        None => (true, true),
+    };
+    let evals_text = match (&resolved.pointer, resolved.rollback) {
+        (None, _) => "无当前指针，首次钉上",
+        (Some(_), false) if evals_changed => "有变化",
+        (Some(_), false) => "无变化",
+        (Some(_), true) => match (body_changed, evals_changed) {
+            (true, true) => "两侧均换回",
+            (true, false) => "换回正文",
+            (false, _) => "换回评测",
+        },
+    };
+    let verb = if resolved.rollback {
+        "回滚"
+    } else {
+        "激活"
+    };
+    let mut summary = format!(
+        "{verb}技能 {name}；版本 {semver}；内容摘要 {digest}；评测集相对当前指针：{evals_text}"
+    );
+    if let Some(pointer) = &resolved.pointer
+        && pointer.origin != resolved.body.origin
+    {
+        summary.push_str(&format!(
+            "；来源切换：{} → {}",
+            pointer.origin.as_str(),
+            resolved.body.origin.as_str()
+        ));
+    }
+    Some(summary)
+}
+
 impl Fail {
     fn from_skill(err: SkillError) -> Self {
         let status = match err {
@@ -695,7 +1177,38 @@ impl Fail {
     }
 
     fn from_store(err: agent24_store::StoreError) -> Self {
+        use agent24_store::StoreError as E;
         match err {
+            E::SkillPointerConflict => Self::Http(
+                StatusCode::CONFLICT,
+                "skill_pointer_conflict",
+                "指针代次已变，请重新读取后再提交".to_owned(),
+            ),
+            E::SkillActivationMixed => Self::Http(
+                StatusCode::BAD_REQUEST,
+                "skill_activation_mixed",
+                "一次只能换正文或评测其中一侧".to_owned(),
+            ),
+            E::SkillOriginMismatch => Self::Http(
+                StatusCode::BAD_REQUEST,
+                "skill_origin_mismatch",
+                "正文与评测来源不同".to_owned(),
+            ),
+            E::SkillEvalEmpty => Self::Http(
+                StatusCode::CONFLICT,
+                "skill_eval_empty",
+                "评测没有用例，不能激活".to_owned(),
+            ),
+            E::SkillEvalFailed => Self::Http(
+                StatusCode::CONFLICT,
+                "skill_eval_failed",
+                "有失败用例未被接受".to_owned(),
+            ),
+            E::NotFound(_) => Self::Http(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "修订或激活记录不存在".to_owned(),
+            ),
             agent24_store::StoreError::SkillRevisionConflict => Self::Http(
                 StatusCode::CONFLICT,
                 "skill_revision_conflict",
@@ -714,7 +1227,9 @@ impl Fail {
 
     fn code_message(&self) -> (String, String) {
         match self {
-            Self::Http(_, code, message) => ((*code).to_owned(), message.clone()),
+            Self::Http(_, code, message) | Self::Detailed(_, code, message, _) => {
+                ((*code).to_owned(), message.clone())
+            }
         }
     }
 
@@ -730,6 +1245,13 @@ impl Fail {
 fn fail_response(fail: &Fail) -> Response {
     match fail {
         Fail::Http(status, code, message) => error_response(*status, code, message),
+        Fail::Detailed(status, code, message, details) => (
+            *status,
+            Json(serde_json::json!({
+                "error": { "code": code, "message": message, "details": details }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1121,6 +1643,9 @@ fn failed(path: impl Into<String>, code: &str, message: &str) -> Prepared {
         message: message.to_owned(),
     }
 }
+
+#[cfg(test)]
+mod activate_tests;
 
 #[cfg(test)]
 mod tests {
