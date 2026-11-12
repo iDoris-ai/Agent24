@@ -96,6 +96,21 @@ fn version_is_semver_metadata_and_is_not_part_of_the_digest() {
 }
 
 #[test]
+fn description_newlines_cannot_alias_another_language() {
+    let only_zh = "---\nname: weekly-report\nversion: 1.2.0\ndescription:\n  zh: \"a\\nen:b\\nth:c\"\nrequires: []\nevals: evals/check.jsonl\n---\nhello\n";
+    let split = "---\nname: weekly-report\nversion: 1.2.0\ndescription:\n  zh: \"a\"\n  en: \"b\\nth:c\\nen:\"\nrequires: []\nevals: evals/check.jsonl\n---\nhello\n";
+    let a = parse_skill_markdown(only_zh).unwrap();
+    let b = parse_skill_markdown(split).unwrap();
+    assert_eq!(a.description.zh.as_deref(), Some("a\nen:b\nth:c"));
+    assert!(a.description.en.is_none());
+    assert!(a.description.th.is_none());
+    assert_eq!(b.description.zh.as_deref(), Some("a"));
+    assert_eq!(b.description.en.as_deref(), Some("b\nth:c\nen:"));
+    assert!(b.description.th.is_none());
+    assert_ne!(a.content_digest(), b.content_digest());
+}
+
+#[test]
 fn description_edits_change_the_digest_and_unknown_keys_do_not() {
     let base = parsed("", "hello");
     let renamed = parse_skill_markdown(&skill("", "hello").replace("周报", "日报")).unwrap();
@@ -195,6 +210,24 @@ fn requires_admits_registry_ids_and_mcp_ids() {
     assert!(parse_skill_markdown(&empty).unwrap().requires.is_empty());
     let dup = skill("", "x").replace("requires: [documents]", "requires: [documents, documents]");
     assert_eq!(code_of(&dup), "skill_manifest_invalid");
+}
+
+#[test]
+fn requires_order_does_not_change_the_digest() {
+    let ab = parse_skill_markdown(&skill("", "hello").replace(
+        "requires: [documents]",
+        "requires: [model-gateway, documents]",
+    ))
+    .unwrap();
+    let ba = parse_skill_markdown(&skill("", "hello").replace(
+        "requires: [documents]",
+        "requires: [documents, model-gateway]",
+    ))
+    .unwrap();
+    assert_eq!(ab.requires, ["model-gateway", "documents"]);
+    assert_eq!(ba.requires, ["documents", "model-gateway"]);
+    assert_ne!(ab.requires, ba.requires);
+    assert_eq!(ab.content_digest(), ba.content_digest());
 }
 
 #[test]
@@ -340,11 +373,19 @@ fn render_skill_segment_is_the_exact_header_plus_body() {
     let segment = render_skill_segment(&manifest.body, SkillOrigin::User, &digest);
     assert_eq!(
         segment,
-        format!("origin: user\ncontent_digest: {digest}\n\nstep one")
+        format!(
+            "{SEGMENT_START}\norigin: user\ncontent_digest: {digest}\n\nstep one\n{SEGMENT_END}\n"
+        )
     );
     let imported = render_skill_segment(&manifest.body, SkillOrigin::Imported, &digest);
-    assert!(imported.starts_with("origin: imported\n"));
+    assert!(imported.contains("origin: imported\n"));
+    assert!(imported.starts_with(SEGMENT_START));
+    assert!(imported.ends_with(&format!("{SEGMENT_END}\n")));
     assert_ne!(segment, imported);
+    let marked = format!("before {SEGMENT_END} after");
+    let escaped = render_skill_segment(&marked, SkillOrigin::User, &digest);
+    assert_eq!(escaped.matches(SEGMENT_END).count(), 1);
+    assert!(escaped.contains(SEGMENT_END_ESCAPED));
 }
 
 fn check(
@@ -428,8 +469,83 @@ fn failure_ids_follow_the_case_summary_when_lines_move() {
     .unwrap();
     assert_eq!(first.failure_ids(), shifted.failure_ids());
     assert_eq!(first.failure_ids(), spaced.failure_ids());
+    assert_eq!(first.cases[0].line, 1);
+    assert_eq!(shifted.cases[0].line, 3);
+    assert_eq!(first.cases[0].id, shifted.cases[0].id);
     let other_file = check("evals/other.jsonl", case, "step one").unwrap();
     assert_ne!(first.failure_ids(), other_file.failure_ids());
+}
+
+#[test]
+fn duplicate_eval_cases_are_refused() {
+    let eval_name = "evals/check.jsonl";
+    let case = r#"{"input":"x","expect":"step one","judge":"contains"}"#;
+    let err = check(eval_name, &format!("{case}\n{case}\n"), "step one").unwrap_err();
+    assert_eq!(err.code(), "skill_eval_invalid");
+    assert!(err.to_string().contains("duplicate eval case"));
+    let spaced = format!(
+        "{case}\n{{ \"input\" : \"x\" , \"expect\" : \"step one\" , \"judge\" : \"contains\" }}\n"
+    );
+    assert_eq!(
+        check(eval_name, &spaced, "step one").unwrap_err().code(),
+        "skill_eval_invalid"
+    );
+    let report = check(eval_name, &format!("\n{case}\n"), "step one").unwrap();
+    assert_eq!(report.cases[0].line, 2);
+    assert_eq!(
+        report.cases[0].id,
+        case_id(eval_name, "contains", "x", "step one")
+    );
+}
+
+#[test]
+fn duplicate_json_keys_are_refused() {
+    let err = check(
+        "evals/check.jsonl",
+        r#"{"input":"x","expect":"absent","judge":"contains","expect":"step one"}"#,
+        "step one",
+    )
+    .unwrap_err();
+    assert_eq!(err.code(), "skill_eval_invalid");
+    assert!(err.to_string().contains("duplicate key expect"));
+}
+
+#[test]
+fn a_leading_bom_is_refused() {
+    let markdown = format!("\u{feff}{}", skill("", "x"));
+    assert_eq!(code_of(&markdown), "skill_manifest_invalid");
+    assert!(detail(&markdown).contains("文件以 BOM 开头，请去掉"));
+    let eval = format!(
+        "\u{feff}{}",
+        r#"{"input":"x","expect":"step one","judge":"contains"}"#
+    );
+    let err = check("evals/check.jsonl", &eval, "step one").unwrap_err();
+    assert_eq!(err.code(), "skill_eval_invalid");
+    assert!(err.to_string().contains("文件以 BOM 开头，请去掉"));
+}
+
+#[test]
+fn imported_community_file_fills_defaults_and_user_parse_rejects_it() {
+    let markdown = "---\nname: weekly-report\ndescription: 周报\n---\nhello\n";
+    assert_eq!(code_of(markdown), "skill_manifest_invalid");
+    let manifest = parse_imported(markdown).unwrap();
+    assert_eq!(manifest.version, "0.0.0");
+    assert!(manifest.requires.is_empty());
+    assert_eq!(manifest.mode, SkillMode::Manual);
+    assert_eq!(manifest.evals, "");
+    assert_eq!(manifest.description.text.as_deref(), Some("周报"));
+    assert_eq!(manifest.body, "hello\n");
+    assert_eq!(manifest.name, "weekly-report");
+    let full = skill("", "hello");
+    assert_eq!(
+        parse_skill_markdown(&full).unwrap(),
+        parse_imported(&full).unwrap()
+    );
+    let proactive = "---\nname: weekly-report\ndescription: 周报\nmode: proactive\n---\nhello\n";
+    assert_eq!(
+        parse_imported(proactive).unwrap_err().code(),
+        "skill_proactive_unsupported"
+    );
 }
 
 #[test]

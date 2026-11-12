@@ -8,12 +8,21 @@
 //! the manifest and is not an input of that digest.
 //!
 //! Eval checks and run injection share [`render_skill_segment`].
-//! [`RENDERER_VERSION`] changes with that format.
+//! [`RENDERER_VERSION`] changes with that format. The segment is delimited so
+//! the body cannot be confused with the header. Authorization still depends
+//! on the K1 origin label; the delimiters only prevent that confusion.
 //!
 //! A case id comes from [`case_id`]: the eval name plus the case fields.
-//! The jsonl line number is not part of the id.
+//! [`CaseSummary::line`] is the jsonl line for display and is not part of the id.
+//!
+//! [`Judge::Exact`] compares that whole rendered segment, header included, so
+//! exact is essentially only suitable for tool-generated expects.
+
+use std::collections::HashSet;
+use std::fmt;
 
 use serde::Serialize;
+use serde::de::{self, Deserializer, MapAccess, Visitor};
 use serde_json::Map;
 use sha2::{Digest, Sha256};
 
@@ -21,7 +30,12 @@ use sha2::{Digest, Sha256};
 pub const BODY_MAX_BYTES: usize = 32 * 1024;
 
 /// Bump this when [`render_skill_segment`] changes its text.
-pub const RENDERER_VERSION: u32 = 1;
+pub const RENDERER_VERSION: u32 = 2;
+
+const SEGMENT_START: &str = "<<<agent24-skill>>>";
+const SEGMENT_END: &str = "<<<agent24-skill-end>>>";
+/// Replacement that does not itself contain [`SEGMENT_END`].
+const SEGMENT_END_ESCAPED: &str = "<<<agent24-skill-end\\>>>";
 
 const KNOWN_FRONTMATTER: &[&str] = &[
     "description",
@@ -134,6 +148,8 @@ impl SkillMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Judge {
+    /// Compares the whole rendered segment, including the header and markers.
+    /// Exact is essentially only suitable for tool-generated expects.
     Exact,
     Contains,
 }
@@ -159,17 +175,39 @@ pub struct SkillDescription {
     pub th: Option<String>,
 }
 
+struct DescriptionSlots {
+    kind: &'static str,
+    zh: String,
+    en: String,
+    th: String,
+}
+
 impl SkillDescription {
-    fn canonical(&self) -> String {
+    /// One digest part per language. A present value is `1` plus the text; an
+    /// absent value is `0`. [`digest_parts`] length-prefixes each part, so a
+    /// newline inside one language cannot impersonate the next.
+    fn digest_slots(&self) -> DescriptionSlots {
         if let Some(text) = &self.text {
-            return format!("text:{text}");
+            return DescriptionSlots {
+                kind: "text",
+                zh: presence(Some(text)),
+                en: presence(None),
+                th: presence(None),
+            };
         }
-        format!(
-            "zh:{}\nen:{}\nth:{}",
-            self.zh.as_deref().unwrap_or(""),
-            self.en.as_deref().unwrap_or(""),
-            self.th.as_deref().unwrap_or("")
-        )
+        DescriptionSlots {
+            kind: "langs",
+            zh: presence(self.zh.as_deref()),
+            en: presence(self.en.as_deref()),
+            th: presence(self.th.as_deref()),
+        }
+    }
+}
+
+fn presence(value: Option<&str>) -> String {
+    match value {
+        Some(text) => format!("1{text}"),
+        None => "0".to_string(),
     }
 }
 
@@ -181,6 +219,7 @@ pub struct SkillManifest {
     pub version: String,
     pub description: SkillDescription,
     pub requires: Vec<String>,
+    /// Eval path. An empty string is an empty eval list (`evals: []`), not a path.
     pub evals: String,
     pub mode: SkillMode,
     /// Frontmatter keys that were dropped, sorted. Includes `allowed-tools` when present.
@@ -191,12 +230,18 @@ pub struct SkillManifest {
 
 impl SkillManifest {
     pub fn content_digest(&self) -> String {
-        let description = self.description.canonical();
-        let requires = self.requires.join("\n");
+        let slots = self.description.digest_slots();
+        let mut requires = self.requires.clone();
+        requires.sort_unstable();
+        requires.dedup();
+        let requires = requires.join("\n");
         digest_parts(&[
             "skill",
             self.name.as_str(),
-            description.as_str(),
+            slots.kind,
+            slots.zh.as_str(),
+            slots.en.as_str(),
+            slots.th.as_str(),
             requires.as_str(),
             self.evals.as_str(),
             self.mode.as_str(),
@@ -211,6 +256,8 @@ pub struct CaseSummary {
     pub judge: Judge,
     pub passed: bool,
     pub expect_digest: String,
+    /// 1-based source line. Display only; not an input of [`case_id`].
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +283,7 @@ impl TextConsistencyReport {
 }
 
 struct EvalCase {
+    line: usize,
     input: String,
     expect: String,
     judge: Judge,
@@ -311,12 +359,30 @@ pub fn case_id(eval_name: &str, judge: &str, input: &str, expect: &str) -> Strin
 }
 
 pub fn parse_skill_markdown(markdown: &str) -> Result<SkillManifest, SkillError> {
+    parse_markdown(markdown, false)
+}
+
+/// Import entry for a community single-file `SKILL.md` (SL-3).
+///
+/// Missing `version`, `requires`, `mode`, and `evals` are filled first
+/// (`0.0.0`, `[]`, `manual`, `[]`). The filled frontmatter then uses the same
+/// checks as [`parse_skill_markdown`]. A user-written skill still has to carry
+/// `version`, `requires`, and `evals`; this function is the only filler.
+pub fn parse_imported(markdown: &str) -> Result<SkillManifest, SkillError> {
+    parse_markdown(markdown, true)
+}
+
+fn parse_markdown(markdown: &str, imported: bool) -> Result<SkillManifest, SkillError> {
+    refuse_bom(markdown, false)?;
     if markdown.len() > BODY_MAX_BYTES {
         return Err(SkillError::BodyTooLarge);
     }
     let (yaml, body) = split_frontmatter(markdown)?;
-    let value: serde_yaml::Value =
+    let mut value: serde_yaml::Value =
         serde_yaml::from_str(yaml).map_err(|err| SkillError::manifest(err.to_string()))?;
+    if imported {
+        fill_import_defaults(&mut value)?;
+    }
     let Some(mapping) = value.as_mapping() else {
         return Err(SkillError::manifest("frontmatter is not a map"));
     };
@@ -338,7 +404,7 @@ pub fn parse_skill_markdown(markdown: &str) -> Result<SkillManifest, SkillError>
     }
     let description = parse_description(lookup(&pairs, "description"), &mut ineffective)?;
     let requires = parse_requires(lookup(&pairs, "requires"))?;
-    let evals = required_string(&pairs, "evals")?;
+    let evals = parse_evals(lookup(&pairs, "evals"))?;
     ineffective.sort_unstable();
     Ok(SkillManifest {
         name,
@@ -350,6 +416,40 @@ pub fn parse_skill_markdown(markdown: &str) -> Result<SkillManifest, SkillError>
         ineffective,
         body: body.to_string(),
     })
+}
+
+fn refuse_bom(text: &str, eval: bool) -> Result<(), SkillError> {
+    if text.starts_with('\u{feff}') {
+        let detail = "文件以 BOM 开头，请去掉";
+        return Err(if eval {
+            SkillError::eval(detail)
+        } else {
+            SkillError::manifest(detail)
+        });
+    }
+    Ok(())
+}
+
+fn fill_import_defaults(value: &mut serde_yaml::Value) -> Result<(), SkillError> {
+    let Some(map) = value.as_mapping_mut() else {
+        return Err(SkillError::manifest("frontmatter is not a map"));
+    };
+    insert_missing(
+        map,
+        "version",
+        serde_yaml::Value::String("0.0.0".to_string()),
+    );
+    insert_missing(map, "requires", serde_yaml::Value::Sequence(Vec::new()));
+    insert_missing(map, "mode", serde_yaml::Value::String("manual".to_string()));
+    insert_missing(map, "evals", serde_yaml::Value::Sequence(Vec::new()));
+    Ok(())
+}
+
+fn insert_missing(map: &mut serde_yaml::Mapping, key: &str, value: serde_yaml::Value) {
+    if map.keys().any(|existing| existing.as_str() == Some(key)) {
+        return;
+    }
+    map.insert(serde_yaml::Value::String(key.to_string()), value);
 }
 
 fn split_frontmatter(markdown: &str) -> Result<(&str, &str), SkillError> {
@@ -469,6 +569,22 @@ fn parse_description(
     }
 }
 
+fn parse_evals(value: Option<&serde_yaml::Value>) -> Result<String, SkillError> {
+    let Some(value) = value else {
+        return Err(SkillError::manifest("missing evals"));
+    };
+    if let Some(text) = value.as_str() {
+        if text.is_empty() {
+            return Err(SkillError::manifest("evals is empty"));
+        }
+        return Ok(text.to_string());
+    }
+    if value.as_sequence().is_some_and(Vec::is_empty) {
+        return Ok(String::new());
+    }
+    Err(SkillError::manifest("evals is not a string"))
+}
+
 fn parse_requires(value: Option<&serde_yaml::Value>) -> Result<Vec<String>, SkillError> {
     let Some(value) = value else {
         return Err(SkillError::manifest("missing requires"));
@@ -550,13 +666,25 @@ fn dot_separated_idents(text: &str, reject_numeric_leading_zero: bool) -> bool {
     })
 }
 
-/// Header plus `body`. Eval checks and run injection both call this.
+/// Header plus `body`, wrapped in start and end markers.
+///
+/// Authorization still depends on the K1 origin label. The markers only keep
+/// the body from being confused with the header. A body that contains the end
+/// marker is escaped, so the closing marker appears once, at the end.
+///
+/// [`Judge::Exact`] compares this whole segment, header included, so exact is
+/// essentially only suitable for tool-generated expects.
 pub fn render_skill_segment(body: &str, origin: SkillOrigin, content_digest: &str) -> String {
+    let body = escape_segment_body(body);
     format!(
-        "origin: {}\ncontent_digest: {}\n\n{body}",
+        "{SEGMENT_START}\norigin: {}\ncontent_digest: {}\n\n{body}\n{SEGMENT_END}\n",
         origin.as_str(),
         content_digest
     )
+}
+
+fn escape_segment_body(body: &str) -> String {
+    body.replace(SEGMENT_END, SEGMENT_END_ESCAPED)
 }
 
 pub fn check_text_consistency(
@@ -577,15 +705,24 @@ pub fn check_text_consistency(
         return Err(SkillError::EvalEmpty);
     }
     let segment = render_skill_segment(body, origin, content_digest);
-    let summaries = cases
-        .iter()
-        .map(|case| CaseSummary {
-            id: case_id(eval_name, case.judge.as_str(), &case.input, &case.expect),
+    let mut seen = HashSet::with_capacity(cases.len());
+    let mut summaries = Vec::with_capacity(cases.len());
+    for case in &cases {
+        let id = case_id(eval_name, case.judge.as_str(), &case.input, &case.expect);
+        if !seen.insert(id.clone()) {
+            return Err(SkillError::eval(format!(
+                "duplicate eval case on line {}",
+                case.line
+            )));
+        }
+        summaries.push(CaseSummary {
+            id,
             judge: case.judge,
             passed: case_passes(&segment, case),
             expect_digest: sha256_hex(&case.expect),
-        })
-        .collect();
+            line: case.line,
+        });
+    }
     Ok(TextConsistencyReport {
         renderer_version: RENDERER_VERSION,
         segment_digest: sha256_hex(&segment),
@@ -594,31 +731,29 @@ pub fn check_text_consistency(
 }
 
 fn parse_cases(eval_jsonl: &str) -> Result<Vec<EvalCase>, SkillError> {
+    refuse_bom(eval_jsonl, true)?;
     let mut cases = Vec::new();
-    for line in eval_jsonl.lines() {
+    for (index, line) in eval_jsonl.lines().enumerate() {
+        let line_no = index + 1;
         let line = line.trim_end_matches('\r');
         if line.trim().is_empty() {
             continue;
         }
-        cases.push(parse_case(line)?);
+        cases.push(parse_case(line_no, line)?);
     }
     Ok(cases)
 }
 
-fn parse_case(line: &str) -> Result<EvalCase, SkillError> {
-    let value: serde_json::Value =
-        serde_json::from_str(line).map_err(|_| SkillError::eval("eval line is not json"))?;
-    let Some(obj) = value.as_object() else {
-        return Err(SkillError::eval("eval line is not an object"));
-    };
+fn parse_case(line_no: usize, line: &str) -> Result<EvalCase, SkillError> {
+    let obj = parse_json_object(line)?;
     for key in obj.keys() {
         if key != "input" && key != "expect" && key != "judge" {
             return Err(SkillError::eval(format!("unknown eval field {key}")));
         }
     }
-    let input = json_string(obj, "input")?;
-    let expect = json_string(obj, "expect")?;
-    let judge_text = json_string(obj, "judge")?;
+    let input = json_string(&obj, "input")?;
+    let expect = json_string(&obj, "expect")?;
+    let judge_text = json_string(&obj, "judge")?;
     if expect.is_empty() {
         return Err(SkillError::eval("expect is empty"));
     }
@@ -629,10 +764,60 @@ fn parse_case(line: &str) -> Result<EvalCase, SkillError> {
         _ => return Err(SkillError::eval("judge is not supported")),
     };
     Ok(EvalCase {
+        line: line_no,
         input,
         expect,
         judge,
     })
+}
+
+fn parse_json_object(line: &str) -> Result<Map<String, serde_json::Value>, SkillError> {
+    struct ObjVisitor;
+    impl<'de> Visitor<'de> for ObjVisitor {
+        type Value = Map<String, serde_json::Value>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a json object")
+        }
+
+        fn visit_map<A>(self, mut access: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut map = Map::new();
+            while let Some(key) = access.next_key::<String>()? {
+                if map.contains_key(&key) {
+                    return Err(de::Error::custom(format!("duplicate key {key}")));
+                }
+                let value = access.next_value()?;
+                map.insert(key, value);
+            }
+            Ok(map)
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_str(line);
+    let map =
+        Deserializer::deserialize_any(&mut deserializer, ObjVisitor).map_err(eval_json_error)?;
+    deserializer
+        .end()
+        .map_err(|_| SkillError::eval("eval line is not json"))?;
+    Ok(map)
+}
+
+fn eval_json_error(err: serde_json::Error) -> SkillError {
+    let message = err.to_string();
+    let head = match message.split_once(" at line ") {
+        Some((head, _)) => head,
+        None => message.as_str(),
+    };
+    if let Some(key) = head.strip_prefix("duplicate key ") {
+        return SkillError::eval(format!("duplicate key {key}"));
+    }
+    if message.contains("invalid type") {
+        return SkillError::eval("eval line is not an object");
+    }
+    SkillError::eval("eval line is not json")
 }
 
 fn json_string(obj: &Map<String, serde_json::Value>, key: &str) -> Result<String, SkillError> {
