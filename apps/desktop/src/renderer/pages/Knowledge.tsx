@@ -61,7 +61,14 @@ export default function KnowledgePage(): JSX.Element {
   // closed; under one of them it stays mounted but hidden, so unsaved edits stay.
   const draftsPanel = useDraftsPanel()
 
-  useEffect(() => window.agent24.knowledgeView.onState((next) => setState(next)), [])
+  // M2 B1: the view's latest state, the last theme main was given (by show, a re-report or reload),
+  // and the theme re-report the show effect owns (a no-op outside it).
+  const viewState = useRef<KnowledgeViewState | null>(null)
+  const sentTheme = useRef<KnowledgeViewTheme | null>(null)
+  const reportTheme = useRef<() => void>(() => {})
+  useEffect(() => window.agent24.knowledgeView.onState((next) => { viewState.current = next; setState(next) }), [])
+  // A theme change held back while the view was not ready goes out once it is.
+  useEffect(() => { if (state?.state === 'ready') reportTheme.current() }, [state])
   useEffect(() => window.agent24.knowledgeView.onCitation((next) => setCitation(next)), [])
   useEffect(() => window.agent24.knowledgeView.onConfirm((ask) => {
     setConfirmAsk(ask)
@@ -79,13 +86,31 @@ export default function KnowledgePage(): JSX.Element {
     const observer = new ResizeObserver(syncBounds)
     observer.observe(host)
     window.addEventListener('resize', syncBounds)
-    void window.agent24.knowledgeView.show(rectOf(host), currentTheme(host)).then(
+    sentTheme.current = currentTheme(host)
+    void window.agent24.knowledgeView.show(rectOf(host), sentTheme.current).then(
       (r) => { if (!cancelled) setResult(r) },
       () => { if (!cancelled) setResult({ ok: false, code: 'window_unavailable' }) },
     )
+    // M2 B1: a shell class change re-reports the theme when it differs from the last one sent.
+    // Only while the view is ready: in any other state show() would load or rebuild the view
+    // (a crash's backoff, a failed load), so the change waits for the next 'ready'.
+    const shell = host.closest('.app')
+    reportTheme.current = () => {
+      const theme = currentTheme(host)
+      if (cancelled || theme === sentTheme.current || viewState.current?.state !== 'ready') return
+      sentTheme.current = theme
+      void window.agent24.knowledgeView.show(rectOf(host), theme).then(
+        (r) => { if (!cancelled) setResult(r) },
+        () => { if (!cancelled) setResult({ ok: false, code: 'window_unavailable' }) },
+      )
+    }
+    const themeObserver = new MutationObserver(() => reportTheme.current())
+    if (shell) themeObserver.observe(shell, { attributes: true, attributeFilter: ['class'] })
     return () => {
       cancelled = true
       observer.disconnect()
+      themeObserver.disconnect()
+      reportTheme.current = () => {}
       window.removeEventListener('resize', syncBounds)
       void window.agent24.knowledgeView.hide()
     }
@@ -95,7 +120,8 @@ export default function KnowledgePage(): JSX.Element {
     const host = hostRef.current
     if (!host) return
     setState(null)
-    void window.agent24.knowledgeView.reload(rectOf(host), currentTheme(host)).then(setResult, () => setResult({ ok: false, code: 'window_unavailable' }))
+    sentTheme.current = currentTheme(host)
+    void window.agent24.knowledgeView.reload(rectOf(host), sentTheme.current).then(setResult, () => setResult({ ok: false, code: 'window_unavailable' }))
   }
 
   const acceptConfirm = (id: string): void => {
