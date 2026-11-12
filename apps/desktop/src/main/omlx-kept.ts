@@ -1,13 +1,15 @@
-// PR#1 F1 follow-up (ruling 2026-11-13-pr1-omlx-orphan-ownership, question 1: 乙).
-// A quit that leaves the oMLX this app started running (omlx-quit-policy.ts:
-// the resident service uses it) records which process that is, in the data
-// directory. A later launch does not own it (App.tsx finds it running and
-// starts none), so only the service's stop (「完全退出」, or the Settings
-// switch off), once the LaunchAgent is removed, stops what is on record, and
-// only when every part of the identity still matches: the same pid, started
-// at the same time, with the same command, listening on the same port. Any
-// mismatch stops nothing; the record is cleared either way. Nothing else
-// stops it: Settings' oMLX stop does not (a known limit).
+// PR#1 F1 follow-up (rulings 2026-11-13-pr1-omlx-orphan-ownership, 乙, and
+// 2026-11-13-pr1-omlx-kept-deactivate, A). A quit that leaves the oMLX this
+// app started running (omlx-quit-policy.ts: the resident service uses it)
+// records which process that is, in the data directory. A later launch does
+// not own it (App.tsx finds it running and starts none), so a later quit with
+// the service not installed (after 「完全退出」, after the Settings switch
+// off, or with the plist removed outside the app) stops what is on record,
+// and only when every part of the identity still matches: the same pid,
+// started at the same time, with the same command, listening on the same
+// port. Any mismatch stops nothing; the record is cleared either way. The
+// Settings switch off itself stops nothing (the app may be using it), nor
+// does Settings' oMLX stop (a known limit).
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
@@ -35,6 +37,10 @@ export interface OmlxProcessProbe {
   /** process.kill(pid, signal); false when it threw. */
   signal: (pid: number, signal: NodeJS.Signals) => boolean
 }
+
+/** At most this many records are kept (the newest); in practice there is one:
+ *  a launch that finds oMLX already running on 8088 starts none. */
+export const MAX_KEPT_OMLX = 2
 
 export const KEPT_OMLX_FORMAT = 'agent24.desktop.omlx-kept'
 export const KEPT_OMLX_VERSION = 1
@@ -91,6 +97,7 @@ export function rememberKeptOmlx(file: string, child: { pid: number; port: numbe
     const index = kept.findIndex((row) => row.pid === child.pid)
     if (index >= 0) kept[index] = next
     else kept.push(next)
+    while (kept.length > MAX_KEPT_OMLX) kept.shift()
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.rmSync(temp, { force: true })
     const fd = fs.openSync(temp, 'wx', 0o600)
@@ -108,9 +115,10 @@ export function rememberKeptOmlx(file: string, child: { pid: number; port: numbe
 }
 
 export interface KeptStopResult {
-  /** Records whose identity matched: SIGTERM was sent. */
+  /** Records whose identity matched and SIGTERM went out. */
   stopped: number[]
-  /** Records not signalled: gone, reused pid, other command, other port. */
+  /** Records not signalled: gone, reused pid, other command, other port, or
+   *  the SIGTERM itself failed. */
   dropped: number[]
 }
 
@@ -124,12 +132,18 @@ async function waitUntilGone(probe: OmlxProcessProbe, pid: number, ms: number): 
   }
 }
 
-/** After the LaunchAgent is removed: for each record, when `probe` still
- * reads the same started, the same command and a listener on the same port
- * for that pid, send SIGTERM; when it is still alive after `graceMs`, and its
- * started still matches, SIGKILL; then wait at most `killMs` more. Any other
- * record is dropped without a signal. The file is removed at the end in every
- * case (also when it could not be read). Never throws. */
+/** At a quit with the resident service not installed (its plist gone: after
+ * 「完全退出」, after the Settings switch off, or removed outside the app):
+ * for each record (the newest {@link MAX_KEPT_OMLX}), when `probe` still reads
+ * the same started, the same command and a listener on the same port for that
+ * pid, it is to be stopped; any other record is dropped without a signal. The
+ * file is removed right after these checks, before any signal, so whether it
+ * is cleared does not depend on how long the stop takes (a quit's budget may
+ * cut the wait short; what then survives is not tried again). Then, for all
+ * matched records at once: SIGTERM; when still alive after `graceMs`, and its
+ * started still matches, SIGKILL; then wait at most `killMs` more. The checks
+ * are synchronous (ps, lsof): at most 2 records × 2 s in the worst case.
+ * Never throws. */
 export async function stopKeptOmlx(
   file: string,
   probe: OmlxProcessProbe,
@@ -137,34 +151,52 @@ export async function stopKeptOmlx(
 ): Promise<KeptStopResult> {
   const stopped: number[] = []
   const dropped: number[] = []
-  try {
-    for (const k of readKeptOmlx(file)) {
-      if (probe.started(k.pid) === k.started && probe.command(k.pid) === k.command && probe.listensOn(k.pid, k.port)) {
-        probe.signal(k.pid, 'SIGTERM')
-        stopped.push(k.pid)
-        await waitUntilGone(probe, k.pid, timing.graceMs)
-        if (probe.alive(k.pid) && probe.started(k.pid) === k.started) {
-          probe.signal(k.pid, 'SIGKILL')
-          await waitUntilGone(probe, k.pid, timing.killMs)
-        }
-      } else {
-        dropped.push(k.pid)
-      }
+  const matched: KeptOmlx[] = []
+  const all = readKeptOmlx(file)
+  const looked = all.slice(-MAX_KEPT_OMLX)
+  for (const k of all.slice(0, all.length - looked.length)) dropped.push(k.pid)
+  for (const k of looked) {
+    try {
+      if (probe.started(k.pid) === k.started && probe.command(k.pid) === k.command && probe.listensOn(k.pid, k.port)) matched.push(k)
+      else dropped.push(k.pid)
+    } catch {
+      dropped.push(k.pid)
     }
-  } catch {
-    // a probe failure: keep what was already decided, still clear the file
   }
   try {
     fs.rmSync(file, { force: true })
   } catch {
     // never throws
   }
+  await Promise.all(matched.map(async (k) => {
+    try {
+      if (!probe.signal(k.pid, 'SIGTERM')) {
+        dropped.push(k.pid)
+        return
+      }
+      stopped.push(k.pid)
+      await waitUntilGone(probe, k.pid, timing.graceMs)
+      if (probe.alive(k.pid) && probe.started(k.pid) === k.started) {
+        probe.signal(k.pid, 'SIGKILL')
+        await waitUntilGone(probe, k.pid, timing.killMs)
+      }
+    } catch {
+      // a probe failure: what was decided stays
+    }
+  }))
   return { stopped, dropped }
 }
 
+/** `ps` reads in a fixed zone and locale, so the start time recorded at one
+ *  launch reads the same at a later one (a changed TZ or LC_TIME otherwise
+ *  changes the text). Short timeout: it runs synchronously in before-quit. */
+const PS_ENV: NodeJS.ProcessEnv = { ...process.env, TZ: 'UTC', LC_ALL: 'C' }
+const PS_TIMEOUT_MS = 500
+const LSOF_TIMEOUT_MS = 1_000
+
 function psValue(pid: number, column: 'lstart=' | 'command='): string | null {
   try {
-    const out = execFileSync('/bin/ps', ['-o', column, '-p', String(pid)], { encoding: 'utf8', timeout: 2000 })
+    const out = execFileSync('/bin/ps', ['-o', column, '-p', String(pid)], { encoding: 'utf8', timeout: PS_TIMEOUT_MS, env: PS_ENV })
     const text = out.trim()
     return text === '' ? null : text
   } catch {
@@ -180,7 +212,7 @@ export function realOmlxProcessProbe(): OmlxProcessProbe {
     command: (pid) => psValue(pid, 'command='),
     listensOn: (pid, port) => {
       try {
-        const out = execFileSync('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8', timeout: 2000 })
+        const out = execFileSync('/usr/sbin/lsof', ['-nP', '-a', '-p', String(pid), `-iTCP:${port}`, '-sTCP:LISTEN', '-t'], { encoding: 'utf8', timeout: LSOF_TIMEOUT_MS })
         return out.split('\n').some((line) => line.trim() === String(pid))
       } catch {
         return false

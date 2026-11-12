@@ -30,6 +30,9 @@ const omlxExecFile: { current: ((...args: unknown[]) => unknown) | null } = { cu
 const keepOmlx = { current: false }
 /** What registerIpcHandlers' rememberKeptOmlx was told (ruling 乙). */
 const keptOmlx: Array<{ pid: number; port: number }> = []
+const rememberThrows = { current: false }
+/** What registerIpcHandlers' stopKeptOmlx does and how often it was asked (ruling A). */
+const keptStop: { calls: number; impl: () => Promise<void> } = { calls: 0, impl: () => Promise.resolve() }
 const appListeners = new Map<string, Set<() => void>>()
 const appFocus = vi.fn()
 function listenApp(event: string, fn: () => void): void {
@@ -280,7 +283,11 @@ beforeAll(async () => {
     promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
     exportTimeoutMs,
     keepOwnedOmlxOnQuit: () => keepOmlx.current,
-    rememberKeptOmlx: (k: { pid: number; port: number }) => { keptOmlx.push(k) },
+    rememberKeptOmlx: (k: { pid: number; port: number }) => {
+      if (rememberThrows.current) throw new Error('disk full')
+      keptOmlx.push(k)
+    },
+    stopKeptOmlx: () => { keptStop.calls++; return keptStop.impl() },
     documentsModule: () => docStatus,
     documentsModuleActions: { uninstall: () => docUninstall(), install: () => docInstall() },
     guard: createIpcGuard({
@@ -329,6 +336,9 @@ beforeEach(() => {
   omlxExecFile.current = null
   keepOmlx.current = false
   keptOmlx.length = 0
+  rememberThrows.current = false
+  keptStop.calls = 0
+  keptStop.impl = () => Promise.resolve()
   resetOmlxProcessForTests()
 })
 
@@ -2221,6 +2231,8 @@ describe('FU-114 OmlxStop only kills the process this app started', () => {
     expect(children[0]!.signals).toEqual([])
     // Recorded once, with the port it was started on (ruling 乙).
     expect(keptOmlx).toEqual([{ pid: 7105, port: 8123 }])
+    // A quit that keeps stops nothing kept earlier either (ruling A).
+    expect(keptStop.calls).toBe(0)
     const stopping = call(IpcChannels.OmlxStop)
     await vi.waitFor(() => expect(children[0]!.signals).toContain('SIGTERM'))
     children[0]!.emit('exit', null, 'SIGTERM')
@@ -2245,6 +2257,74 @@ describe('FU-114 OmlxStop only kills the process this app started', () => {
     expect(await quit).toBe(true)
     // Stopped, so nothing is left to record.
     expect(keptOmlx).toEqual([])
+  })
+
+  // Ruling 2026-11-13-pr1-omlx-kept-deactivate (A): a quit with the plist gone
+  // stops what earlier quits left running, once, inside the same budget.
+  it('a quit that stops also stops what earlier quits left running, once for all its entries', async () => {
+    let release = () => {}
+    keptStop.impl = () => new Promise<void>((r) => { release = r })
+    emitApp('before-quit')
+    const quits = [ensureOwnedOmlxQuit(), ensureOwnedOmlxQuit()]
+    expect(keptStop.calls).toBe(1)
+    release()
+    expect(await Promise.all(quits)).toEqual([true, true])
+  })
+
+  it('the quit waits for the stop of what earlier quits left running, but no longer than its budget', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      keptStop.impl = () => new Promise<void>(() => {})
+      let settled: boolean | null = null
+      void ensureOwnedOmlxQuit().then((v) => { settled = v })
+      await vi.advanceTimersByTimeAsync(OMLX_QUIT_STOP_BUDGET_MS - 1)
+      expect(settled).toBeNull()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(settled).toBe(false)
+      expect(keptStop.calls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a quit that stops goes on when stopping what earlier quits left running throws or fails', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    keptStop.impl = () => { throw new Error('ps failed') }
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    resetOmlxProcessForTests()
+    keptStop.impl = () => Promise.reject(new Error('lsof failed'))
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    expect(keptStop.calls).toBe(2)
+  })
+
+  it('a quit that keeps goes on when recording it fails', async () => {
+    keepOmlx.current = true
+    rememberThrows.current = true
+    omlxExecFile.current = () => asChild(heldChild(7109))
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(() => emitApp('before-quit')).not.toThrow()
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+  })
+
+  it('an older child exiting late does not clear the port of the one started after it', async () => {
+    setOmlxStopGraceMsForTests(10)
+    setOmlxKillFallbackMsForTests(10)
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7110 + children.length)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    // It ignores both signals: the stop gives up after the kill fallback.
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+    await call(IpcChannels.OmlxStart, 8124, 'k')
+    expect(children).toHaveLength(2)
+    children[0]!.emit('exit', null, 'SIGKILL')
+    keepOmlx.current = true
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(keptOmlx).toEqual([{ pid: 7111, port: 8124 }])
   })
 
   it('records nothing on a quit that keeps when this app started no oMLX, or it already exited', async () => {

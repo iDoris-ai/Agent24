@@ -596,6 +596,9 @@ app.whenReady().then(async () => {
     },
     keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() }),
     rememberKeptOmlx: (k) => { const dir = tryDataDir(); if (dir !== null) rememberKeptOmlx(keptOmlxPath(dir), k, realOmlxProcessProbe()) },
+    // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS
+    // (FU-114 terminateOwnedOmlx), inside the same OMLX_QUIT_STOP_BUDGET_MS.
+    stopKeptOmlx: async () => { const dir = tryDataDir(); if (dir !== null) await stopKeptOmlx(keptOmlxPath(dir), realOmlxProcessProbe(), { graceMs: 5_000, killMs: 2_000 }) },
   })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
@@ -788,8 +791,6 @@ function residentStop(): Promise<StopOutcome> {
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
-    // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS.
-    afterUninstall: async () => { const dir = tryDataDir(); if (dir !== null) await stopKeptOmlx(keptOmlxPath(dir), realOmlxProcessProbe(), { graceMs: 5_000, killMs: 2_000 }) },
   })))
 }
 

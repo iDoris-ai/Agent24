@@ -39,18 +39,26 @@ describe('whether quitting stops the oMLX this app started', () => {
     expect(ipc.match(/(?<!function )stopOwnedOmlx\(\)/g)).toHaveLength(2)
   })
 
-  // Ruling 2026-11-13-pr1-omlx-orphan-ownership (乙): a kept oMLX is recorded
-  // in the data directory, and only the service's stop, after the uninstall,
-  // stops what is on record (resident-service.ts stopService afterUninstall;
-  // 「完全退出」 and the Settings switch off both go through residentStop).
-  it('main.ts records a kept oMLX and stops it only from the service stop', () => {
+  // Rulings 2026-11-13-pr1-omlx-orphan-ownership (乙) and
+  // 2026-11-13-pr1-omlx-kept-deactivate (A): a kept oMLX is recorded in the
+  // data directory and stopped by a later quit with the plist gone (through
+  // ensureOwnedOmlxQuit, which asks stopKeptOmlx). The service's stop itself
+  // (「完全退出」 before its quit, the Settings switch off) stops nothing.
+  it('main.ts records a kept oMLX and stops it only from a quit, never from the service stop', () => {
     const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
     expect(main.match(/rememberKeptOmlx: /g)).toHaveLength(1)
+    expect(main.match(/stopKeptOmlx: /g)).toHaveLength(1)
     expect(main.match(/stopKeptOmlx\(/g)).toHaveLength(1)
+    // Both are options of the one registerIpcHandlers call.
+    const register = main.slice(main.indexOf('registerIpcHandlers({'))
+    const args = register.slice(0, register.indexOf('\n  })\n'))
+    expect(args).toContain('rememberKeptOmlx: ')
+    expect(args).toContain('stopKeptOmlx: ')
     const stop = main.slice(main.indexOf('function residentStop(): Promise<StopOutcome>'))
     const body = stop.slice(0, stop.indexOf('\n}\n'))
-    expect(body).toContain('afterUninstall:')
-    expect(body).toContain('stopKeptOmlx(')
-    expect(main.match(/residentStop\b/g)!.length).toBeGreaterThanOrEqual(3)
+    expect(body).not.toMatch(/[Kk]ept/)
+    expect(body).not.toContain('afterUninstall')
+    const resident = fs.readFileSync(path.join(__dirname, 'resident-service.ts'), 'utf8')
+    expect(resident).not.toMatch(/[Kk]eptOmlx|afterUninstall/)
   })
 })

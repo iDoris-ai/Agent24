@@ -66,6 +66,8 @@ let omlxPort: number | null = null
 let rememberKept: (k: { pid: number; port: number }) => void = () => {}
 /** The child already handed to `rememberKept`, so a later keep-quit does not record it again. */
 let keptRemembered: ChildProcess | null = null
+/** Stops what earlier quits left running and recorded (omlx-kept.ts). Set by registerIpcHandlers. */
+let stopKept: () => Promise<void> = () => Promise.resolve()
 
 /** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
  *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
@@ -172,9 +174,6 @@ export async function stopOwnedOmlx(): Promise<boolean> {
   return true
 }
 
-/** before-quit entry. The first call sends SIGTERM before it returns, then
- *  waits at most {@link OMLX_QUIT_STOP_BUDGET_MS} (same shape as
- *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
 /** A quit that leaves the child running: record it once (pid and the port it
  *  was started on), so the service's stop can stop it later (omlx-kept.ts). */
 function keepOwnedOmlx(): Promise<boolean> {
@@ -191,12 +190,27 @@ function keepOwnedOmlx(): Promise<boolean> {
   return Promise.resolve(false)
 }
 
+/** A quit that stops: what earlier quits left running goes too, inside the
+ *  same budget. Never throws, never rejects. */
+function stopKeptOnQuit(): Promise<void> {
+  try {
+    return stopKept().catch((e: unknown) => { console.warn('[omlx] failed to stop the oMLX an earlier quit left running', e) })
+  } catch (e) {
+    console.warn('[omlx] failed to stop the oMLX an earlier quit left running', e)
+    return Promise.resolve()
+  }
+}
+
+/** before-quit entry. The first call sends SIGTERM before it returns, then
+ *  waits at most {@link OMLX_QUIT_STOP_BUDGET_MS} (same shape as
+ *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
 export function ensureOwnedOmlxQuit(): Promise<boolean> {
   if (ownedOmlxQuit) return ownedOmlxQuit
   // The resident service daemon uses it after the app is gone (M5 B4).
   if (keepOwnedOmlxOnQuit()) return keepOwnedOmlx()
   const stopping = stopOwnedOmlx()
-  const bounded = stopWithin({ stop: () => stopping }, OMLX_QUIT_STOP_BUDGET_MS)
+  const kept = stopKeptOnQuit()
+  const bounded = stopWithin({ stop: () => Promise.all([stopping, kept]) }, OMLX_QUIT_STOP_BUDGET_MS)
   ownedOmlxQuit = bounded
   void bounded.finally(() => {
     if (ownedOmlxQuit === bounded) ownedOmlxQuit = null
@@ -698,6 +712,10 @@ export function registerIpcHandlers(options: {
    * service stop can stop that process when its identity still matches.
    * Default: do nothing. */
   rememberKeptOmlx?: (k: { pid: number; port: number }) => void
+  /** At a quit that stops (the resident service not installed): stops what
+   * earlier quits left running and recorded, when its identity still matches.
+   * Default: nothing. */
+  stopKeptOmlx?: () => Promise<void>
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
@@ -710,6 +728,7 @@ export function registerIpcHandlers(options: {
   const documentsModuleActions = options.documentsModuleActions ?? null
   keepOwnedOmlxOnQuit = options.keepOwnedOmlxOnQuit ?? (() => false)
   rememberKept = options.rememberKeptOmlx ?? (() => {})
+  stopKept = options.stopKeptOmlx ?? (() => Promise.resolve())
   app.on('before-quit', () => {
     quitting = true
     // SIGTERM goes out before this listener returns when we own the child.

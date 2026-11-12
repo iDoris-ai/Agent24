@@ -13,7 +13,6 @@ function fakeStop(o: {
   uninstall?: () => Promise<void>
   record?: () => void
   unreachable?: boolean
-  afterUninstall?: () => Promise<void>
 } = {}) {
   const calls: string[] = []
   let held = false
@@ -31,9 +30,6 @@ function fakeStop(o: {
       try { return await work() } finally { held = false; calls.push('release') }
     },
     record: () => { calls.push(`record held=${held}`); o.record?.() },
-    ...(o.afterUninstall ? {
-      afterUninstall: async () => { calls.push(`afterUninstall held=${held}`); await o.afterUninstall!() },
-    } : {}),
   }
   return { deps, calls }
 }
@@ -110,34 +106,6 @@ describe('stopService', () => {
     const { deps } = fakeStop({ record: () => { throw new Error('disk full') } })
     expect(await stopService(deps)).toEqual({ ok: true })
   })
-
-  // PR#1 F1 follow-up (ruling 2026-11-13-pr1-omlx-orphan-ownership, 乙): the
-  // oMLX a quit left running is stopped only once the LaunchAgent is removed.
-  it('stops what a quit left running only after the uninstall, inside the hold', async () => {
-    const { deps, calls } = fakeStop({ afterUninstall: async () => {} })
-    expect(await stopService(deps)).toEqual({ ok: true })
-    expect(calls).toEqual(['hold', 'shutdown held=true', 'exited held=true', 'uninstall held=true', 'afterUninstall held=true', 'record held=true', 'release'])
-  })
-
-  it('stops nothing that a quit left running when the uninstall fails (the plist stays)', async () => {
-    const { deps, calls } = fakeStop({ afterUninstall: async () => {}, uninstall: () => Promise.reject(Object.assign(new Error('rm'), { code: 'EACCES' })) })
-    expect(await stopService(deps)).toEqual({ ok: false, stage: 'uninstall', code: 'EACCES' })
-    expect(calls).not.toContain('afterUninstall held=true')
-  })
-
-  it('stops nothing that a quit left running when the shutdown is refused or the daemon is unreachable', async () => {
-    for (const o of [{ shutdown: async () => ({ status: 403, code: 'presence_denied' }) }, { enrolled: false, unreachable: true }]) {
-      const { deps, calls } = fakeStop({ afterUninstall: async () => {}, ...o })
-      expect((await stopService(deps)).ok).toBe(false)
-      expect(calls).not.toContain('afterUninstall held=true')
-    }
-  })
-
-  it('a failure stopping what a quit left running is ignored: the service is stopped all the same', async () => {
-    const { deps, calls } = fakeStop({ afterUninstall: () => Promise.reject(new Error('ps failed')) })
-    expect(await stopService(deps)).toEqual({ ok: true })
-    expect(calls).toContain('record held=true')
-  })
 })
 
 describe('serviceStopDeps (the real steps over a fake system)', () => {
@@ -157,19 +125,6 @@ describe('serviceStopDeps (the real steps over a fake system)', () => {
     const deps = serviceStopDeps({ cli: '/App/backend/agent24', pid, spawned, hold, record }, sys)
     return { deps, runs, hold, record, shutdowns: () => shutdowns }
   }
-
-  it('passes the stop of what a quit left running through as afterUninstall', async () => {
-    let stops = 0
-    const afterUninstall = async () => { stops++ }
-    const deps = serviceStopDeps({ cli: '/App/backend/agent24', pid: null, spawned: () => false, hold: (work) => work(), record: () => {}, afterUninstall }, {
-      run: async () => {}, record: () => null, alive: () => false, shutdown: async () => ({ status: 202 }), exitWaitMs: 0,
-    })
-    await deps.afterUninstall!()
-    expect(stops).toBe(1)
-    expect(serviceStopDeps({ cli: 'x', pid: null, spawned: () => false, hold: (work) => work(), record: () => {} }, {
-      run: async () => {}, record: () => null, alive: () => false, shutdown: async () => ({ status: 202 }), exitWaitMs: 0,
-    }).afterUninstall).toBeUndefined()
-  })
 
   it('not enrolled: no shutdown to send', () => {
     expect(system(null).deps.shutdown).toBeNull()
