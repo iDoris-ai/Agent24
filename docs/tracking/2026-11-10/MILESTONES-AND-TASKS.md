@@ -142,7 +142,7 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 |---|---|---|---|---|
 | ADR-044 | 通讯 ADR | DONE（已接受） | #1593、#1601 | |
 | 尾巴 2 | 旧集成分支 `ab/comm`、`ab/decide` 盘点存档 | READY（jason 2026-11-10 列为开第 2 期前要清的尾巴） | — | 首期记「需先吸收 main 或归档」；现落后 2939 / 2914 提交；只盘点存档，是否吸收未定 |
-| 尾巴 3a：X11 | 外部入口统一走 ADR-041a 准入 | READY（前置 ADR-041a 已接受） | — | 含 Nostr 入站、语音输入、远程 @agent、手机遥控。①（产品隔离）已合入 #1785；②③④ 实施方案见 [INBOUND-ADMISSION-PLAN](INBOUND-ADMISSION-PLAN.md) |
+| 尾巴 3a：X11 | 外部入口统一走 ADR-041a 准入 | DONE | #1785、#1797、#1805、#1806、#1803、#1810、#1813、#1816、#1808、#1812、#1820、#1809、#1811、#1818、#1819 | ① 产品隔离 #1785。②③④ 见 [INBOUND-ADMISSION-PLAN](INBOUND-ADMISSION-PLAN.md) §4.1。2e 迁移 #1820 在审；Hyphae 轮询尚未单独合入 main。手机遥控、041b 工单、自动回发本里程碑不做 |
 | 尾巴 3b：X7 | nostr-bridge 不再是身份来源，并入 comm | READY | — | Q6 = (c)；在此之前产品构建禁止 bridge 用 legacy 全权 token |
 | COMM-FRIENDS | 好友机制 | BACKLOG（jason 定为之后，本轮不做） | — | 好友不等于能指挥 agent |
 
