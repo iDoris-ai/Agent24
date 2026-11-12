@@ -355,6 +355,19 @@ impl Store {
         Ok(count)
     }
 
+    /// Whether any `inbound_allowlist` row has this `source`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_source_allowlisted(&self, source: &str) -> Result<bool> {
+        let hit: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM inbound_allowlist WHERE source = ? LIMIT 1")
+                .bind(source)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(hit.is_some())
+    }
+
     /// Whether `(source, actor)` is on `inbound_allowlist`.
     ///
     /// # Errors
@@ -393,6 +406,110 @@ impl Store {
         .fetch_optional(self.pool())
         .await?;
         Ok(at)
+    }
+
+    /// Insert the source watermark if that source has none yet.
+    ///
+    /// A row that is already there is left as it was (`ON CONFLICT DO
+    /// NOTHING`), so a restart does not move the activation time.
+    /// `activated_at` is [`format_inbound_timestamp`]. `max_age_secs` is
+    /// stored for the row; admission reads the caller's own constant.
+    ///
+    /// # Errors
+    /// Storage, or an `activated_at` that is not [`format_inbound_timestamp`].
+    pub async fn ensure_inbound_watermark(
+        &self,
+        source: &str,
+        activated_at: &str,
+        max_age_secs: i64,
+    ) -> Result<()> {
+        require_inbound_timestamp("activated_at", activated_at)?;
+        sqlx::query(
+            "INSERT INTO inbound_source_watermark (source, activated_at, max_age_secs) \
+             VALUES (?, ?, ?) ON CONFLICT(source) DO NOTHING",
+        )
+        .bind(source)
+        .bind(activated_at)
+        .bind(max_age_secs)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Group-history cursor for `(source, recipient_identity, thread_key)`.
+    ///
+    /// `recipient_identity` is the local npub the cursor belongs to. Two
+    /// identities in one group do not share a row.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_cursor(
+        &self,
+        source: &str,
+        recipient_identity: &str,
+        thread_key: &str,
+    ) -> Result<Option<String>> {
+        let cursor: Option<String> = sqlx::query_scalar(
+            "SELECT cursor FROM inbound_cursor \
+             WHERE source = ? AND recipient_identity = ? AND thread_key = ?",
+        )
+        .bind(source)
+        .bind(recipient_identity)
+        .bind(thread_key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(cursor)
+    }
+
+    /// Insert or replace the group-history cursor for one local identity.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn set_inbound_cursor(
+        &self,
+        source: &str,
+        recipient_identity: &str,
+        thread_key: &str,
+        cursor: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO inbound_cursor (source, recipient_identity, thread_key, cursor) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(source, recipient_identity, thread_key) \
+             DO UPDATE SET cursor = excluded.cursor",
+        )
+        .bind(source)
+        .bind(recipient_identity)
+        .bind(thread_key)
+        .bind(cursor)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Drop the group-history cursor for one local identity.
+    ///
+    /// The source watermark is a different row and is left in place. A
+    /// missing row is success.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn clear_inbound_cursor(
+        &self,
+        source: &str,
+        recipient_identity: &str,
+        thread_key: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM inbound_cursor \
+             WHERE source = ? AND recipient_identity = ? AND thread_key = ?",
+        )
+        .bind(source)
+        .bind(recipient_identity)
+        .bind(thread_key)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     /// Insert `session`, `run`, and `inbound_runs` in one `BEGIN IMMEDIATE`.
@@ -1820,6 +1937,13 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
         // 0034 入站表 + 0035 游标；升级后旧行不变，schema 停在当前最新。
         assert_eq!(store.latest_applied_migration().await.unwrap(), 35);
+        let cursor_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'inbound_cursor'",
+        )
+        .fetch_one(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(cursor_table, 1);
         let input: String = sqlx::query_scalar("SELECT input FROM runs WHERE id = 'old_run'")
             .fetch_one(crate::test_hooks::pool(&store))
             .await
@@ -2607,5 +2731,71 @@ mod tests {
         );
         let listed = store.list_inbound_allowlist().await.unwrap();
         assert!(listed.iter().all(|row| row.actor != "alice"));
+    }
+
+    /// Two local identities in one group keep their own cursors.
+    /// Mutation: drop `recipient_identity` from the primary key and the
+    /// second `set` overwrites the first, so the `logical-a` assert goes red.
+    #[tokio::test]
+    async fn two_identities_in_one_group_keep_separate_cursors() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .set_inbound_cursor("hyphae", "npub-a", "group-1", "logical-a")
+            .await
+            .unwrap();
+        store
+            .set_inbound_cursor("hyphae", "npub-b", "group-1", "logical-b")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-a", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-a")
+        );
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-b", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-b")
+        );
+        store
+            .set_inbound_cursor("hyphae", "npub-a", "group-1", "logical-a2")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-b", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-b"),
+            "advancing one identity must not move the other"
+        );
+        store
+            .clear_inbound_cursor("hyphae", "npub-a", "group-1")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .inbound_cursor("hyphae", "npub-a", "group-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-b", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-b"),
+            "clearing one identity must leave the other cursor"
+        );
+        assert!(!store.inbound_source_allowlisted("hyphae").await.unwrap());
     }
 }

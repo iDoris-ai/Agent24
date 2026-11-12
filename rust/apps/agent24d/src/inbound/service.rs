@@ -15,16 +15,8 @@
 //! 盖不住卡在模型请求上的 run。取消该 run 后，入站行变为 `done`，同一
 //! actor 的下一条才能再起。
 //!
-//! X11-2e / X11-2g call [`InboundService`]. This slice has no HTTP route, so
-//! the ingest types are unused in a non-test build.
-
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "X11-2e and X11-2g call InboundService; this slice wires startup reconcile only"
-    )
-)]
+//! X11-2e calls [`InboundService`] from the Hyphae poller. X11-2g will call
+//! it from the dev bridge. This slice has no HTTP route of its own.
 
 use std::sync::Arc;
 
@@ -88,7 +80,10 @@ pub(crate) enum IngestOutcome {
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "error payloads are for X11-2e and X11-2g callers")]
+#[allow(
+    dead_code,
+    reason = "variant payloads are observed through Debug; that does not count as a read"
+)]
 pub(crate) enum IngestError {
     Invalid(String),
     /// `source` is scheduler or self, or `category` is internal.

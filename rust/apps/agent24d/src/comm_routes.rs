@@ -115,6 +115,10 @@ pub struct CommDaemonSlot(
     /// takes the lock once for both marks. Kept in release builds: the
     /// route-catalog source scan cannot skip `#[cfg(test)]` on a tuple field.
     std::sync::atomic::AtomicUsize,
+    /// CLI the inbound poller uses. Set when a verified binary is ready.
+    /// Cleared when the next build finds Hyphae unconfigured or fails.
+    /// The poller clones this at the start of every round.
+    Mutex<Option<Arc<dyn crate::inbound::HyphaeCli>>>,
 );
 
 /// What the last comm-state build left for `/api/v1/components`.
@@ -226,7 +230,25 @@ impl CommDaemonSlot {
             Mutex::new(BuildNote::default()),
             Mutex::new(Duration::ZERO),
             std::sync::atomic::AtomicUsize::new(0),
+            Mutex::new(None),
         )
+    }
+
+    /// Replace the CLI handle the inbound poller reads each round.
+    pub fn set_hyphae_cli(&self, cli: Option<Arc<dyn crate::inbound::HyphaeCli>>) {
+        *self
+            .5
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = cli;
+    }
+
+    /// The CLI from the last successful comm build, if Hyphae is configured.
+    #[must_use]
+    pub fn hyphae_cli(&self) -> Option<Arc<dyn crate::inbound::HyphaeCli>> {
+        self.5
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Called once by `build_ready_state`, right after the supervisor actor
@@ -530,7 +552,105 @@ async fn build_ready_state(
     {
         tracing::warn!("comm: autostart failed to start the hyphae daemon: {e}");
     }
+    slot.set_hyphae_cli(Some(Arc::new(LiveHyphae {
+        runner: Arc::clone(&runner),
+        password_store: Arc::clone(&password_store),
+        home: home.to_path_buf(),
+    })));
     Ok(CommState::ready(runner, password_store, home.to_path_buf()).with_daemon(daemon))
+}
+
+/// Read-only Hyphae CLI for the inbound poller. Same runner and password
+/// store as the comm routes. Does not change `agent24-comm`.
+struct LiveHyphae {
+    runner: Arc<HyphaeRunner>,
+    password_store: Arc<dyn PasswordStore>,
+    home: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl crate::inbound::HyphaeCli for LiveHyphae {
+    async fn run(
+        &self,
+        args: &[String],
+        with_password: bool,
+    ) -> Result<Value, crate::inbound::HyphaeCliError> {
+        let password = if with_password {
+            Some(self.keystore_password().await?)
+        } else {
+            None
+        };
+        let invocation = agent24_comm::Invocation {
+            args: args.iter().map(std::ffi::OsString::from).collect(),
+            password,
+            timeout: Some(DEFAULT_TIMEOUT),
+        };
+        match self.runner.run(invocation).await {
+            Ok(agent24_comm::Envelope::Ok { data }) => Ok(data),
+            Ok(agent24_comm::Envelope::Failed {
+                exit: agent24_comm::ExitClass::AuthError,
+                ..
+            }) => Err(crate::inbound::HyphaeCliError::Locked),
+            Ok(agent24_comm::Envelope::Failed { error, message, .. }) => Err(
+                crate::inbound::HyphaeCliError::Failed(cli_failure(&error, &message)),
+            ),
+            Err(agent24_comm::RunnerError::Spawn(_)) => {
+                Err(crate::inbound::HyphaeCliError::NotInstalled)
+            }
+            Err(err) => Err(crate::inbound::HyphaeCliError::Failed(one_line(
+                &err.to_string(),
+            ))),
+        }
+    }
+}
+
+impl LiveHyphae {
+    /// Keystore password for `groupchat`. A missing file, salt, or keyring
+    /// entry is [`crate::inbound::HyphaeCliError::Locked`]. The password is
+    /// not logged.
+    async fn keystore_password(
+        &self,
+    ) -> Result<agent24_comm::Password, crate::inbound::HyphaeCliError> {
+        let salt = inbound_keystore_salt(&self.home).await?;
+        let account = agent24_comm::Account::from_salt(&salt);
+        self.password_store
+            .get(&account)
+            .await
+            .map_err(|_| crate::inbound::HyphaeCliError::Locked)
+    }
+}
+
+/// `keystore.json`'s `salt` only. Same read as comm's identity routes, copied
+/// here because that helper is `pub(crate)` inside `agent24-comm`.
+async fn inbound_keystore_salt(home: &Path) -> Result<String, crate::inbound::HyphaeCliError> {
+    let path = home.join(".hyphae").join("keystore.json");
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|_| crate::inbound::HyphaeCliError::Locked)?;
+    let value: Value =
+        serde_json::from_slice(&bytes).map_err(|_| crate::inbound::HyphaeCliError::Locked)?;
+    value
+        .get("salt")
+        .and_then(Value::as_str)
+        .filter(|salt| !salt.is_empty())
+        .map(str::to_owned)
+        .ok_or(crate::inbound::HyphaeCliError::Locked)
+}
+
+fn cli_failure(error: &str, message: &str) -> String {
+    one_line(&format!("{error}: {message}"))
+}
+
+fn one_line(text: &str) -> String {
+    let mut out: String = text
+        .chars()
+        .filter(|ch| *ch != '\n' && *ch != '\r')
+        .take(160)
+        .collect();
+    if text.chars().filter(|ch| *ch != '\n' && *ch != '\r').count() > 160 {
+        out.push('…');
+    }
+    out
 }
 
 /// Which `PasswordStore` backend `A24_COMM_PASSWORD_STORE` selects
@@ -651,6 +771,8 @@ impl CommRuntime {
             Err(failure) => {
                 // No verdict: do not leave the slot blank. A blank slot is
                 // `absent` ("not installed"), and this build did fail.
+                // Drop any CLI from a previous successful build.
+                self.slot.set_hyphae_cli(None);
                 self.slot
                     .note(failure.rejection, failure.rejection.is_none());
                 Err(failure.reason)
@@ -665,6 +787,7 @@ impl CommRuntime {
         };
         let Some(source) = resolve_source_path(&self.state_dir, &self.lock, &self.platform).await?
         else {
+            self.slot.set_hyphae_cli(None);
             return Ok(CommState::unconfigured(
                 "no Hyphae binary is configured; download and set up Hyphae",
             ));

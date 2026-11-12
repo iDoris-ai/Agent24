@@ -1611,6 +1611,16 @@ pub async fn serve(
     let comm_router =
         crate::comm_routes::build(&state_dir, params.stop_grace, &comm_daemon_slot).await;
     state.comm_slot = Some(Arc::clone(&comm_daemon_slot));
+    // X11-2e: the poller reads the CLI and the opt-in again every round.
+    // Default is not to pull. A Hyphae binary configured after startup is
+    // picked up on the next round.
+    let inbound_slot = Arc::clone(&comm_daemon_slot);
+    serve_steps::start_hyphae_inbound(
+        &state,
+        move || inbound_slot.hyphae_cli(),
+        shutdown.child_token(),
+    )
+    .await;
 
     serve_steps::fill_module_surfaces(&mut state, &catalogue);
     let enroll_authority = state.first_party.clone();

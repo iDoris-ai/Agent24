@@ -126,7 +126,9 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 );
 ```
 
-外键方向说明：`inbound_runs.run_id → runs(id) ON DELETE CASCADE`（run 被清则关联行跟着清，事件行保留）；事件表自己不引用 `runs`，所以 run 删除不会破坏入站记录（评审 L：`ON DELETE SET NULL` 的诉求用关联表实现）。读位置若 Hyphae 自带游标则不另建表，否则 2e 加 `inbound_cursor`。
+外键方向说明：`inbound_runs.run_id → runs(id) ON DELETE CASCADE`（run 被清则关联行跟着清，事件行保留）；事件表自己不引用 `runs`，所以 run 删除不会破坏入站记录（评审 L：`ON DELETE SET NULL` 的诉求用关联表实现）。读位置若 Hyphae 自带游标则不另建表，否则 2e 加 `inbound_cursor`。群游标主键是 `(source, recipient_identity, thread_key)`：Hyphae 群消息按本机身份分开存，两个身份同群不能共用一行。
+
+2026-11-12 jason：Hyphae 入站**默认不拉取**。只有 `inbound_allowlist` 里至少有一条 `source=hyphae`，或 `inbound_policy` 行存在且 `accept_mode` 是用户明确设置过的 `observe` / `auto`，才轮询。策略行不存在且名单为空则不拉。用户设为 `accept_mode=off` 时一律不拉，名单里有 hyphae 条目也不拉（关就是关）。这个开关每轮重读，不在进程启动时定死。
 
 策略版本 = `sha256(排序后的名单 + accept_mode + 准入表版本号)`，判定时现算，写进该行。
 

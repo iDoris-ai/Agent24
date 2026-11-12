@@ -1008,6 +1008,17 @@ pub(super) fn start_process_host(
     host
 }
 
+/// X11-2e: poll Hyphae into inbound. The task is detached and ends on
+/// `cancel`. `cli` is read every round (the comm slot), not once here.
+/// Pulling also waits for an opt-in read from the store each round.
+pub(super) async fn start_hyphae_inbound(
+    state: &AppState,
+    cli: impl Fn() -> Option<Arc<dyn crate::inbound::HyphaeCli>> + Send + Sync + 'static,
+    cancel: CancellationToken,
+) {
+    crate::inbound::start_hyphae_inbound(&state.store, Arc::clone(&state.runs), cli, cancel).await;
+}
+
 pub(super) fn spawn_ordered_shutdown(
     shutdown: &Shutdown,
     host: &Result<crate::domain::ProcessHost, String>,
