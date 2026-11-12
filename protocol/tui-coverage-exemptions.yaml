@@ -163,4 +163,7 @@ exemptions:
     fallback: "raw-http，入站事件列表只给 API（正文前 50 字）；TUI-2 增加对应 agent24 子命令"
   - operationId: postWechatInboundEvent
     category: visual
-    fallback: "开发态微信桥专用（A24_DEV_TOOL=1，legacy）；产品 capabilities 模式 404，终端不做，TUI 不提供入口"
+    fallback: "开发态微信桥专用（A24_DEV_TOOL=1）。capabilities 只收 ComponentRuntime 桥令牌。终端不做，TUI 不提供入口"
+  - operationId: mintBridgeCapability
+    category: planned-tui-2
+    fallback: "C9-C 的 agent24 dev bridge-token；本片只有 daemon 路由，签发前要桌面确认"

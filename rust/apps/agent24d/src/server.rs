@@ -860,7 +860,7 @@ impl AppState {
             .remove(name);
     }
 
-    fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
+    pub(crate) fn enable_capability_auth(&mut self, store: crate::capabilities::CapabilityStore) {
         self.token = Arc::new(String::new());
         self.auth_mode = AuthMode::Capabilities;
         self.first_party = Some(Arc::new(
@@ -896,7 +896,8 @@ mod handlers;
 
 use crate::capabilities::middleware::auth;
 use handlers::{
-    health, mint_creative_capability, revoke_capability, shutdown_handler, shutdown_report,
+    health, mint_bridge_capability, mint_creative_capability, revoke_capability, shutdown_handler,
+    shutdown_report,
 };
 
 async fn fallback() -> Response {
@@ -1000,6 +1001,7 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/capabilities/creative",
             post(mint_creative_capability),
         )
+        .route("/api/v1/capabilities/bridge", post(mint_bridge_capability))
         .route(
             "/api/v1/capabilities/{capability_id}/revoke",
             post(revoke_capability),
@@ -5249,6 +5251,11 @@ pub(crate) mod tests {
             // X11-2g: this POST is on the catalog so the route scan matches,
             // and capabilities mode answers 404 instead of the creative 403.
             if policy.method == "POST" && policy.template == "/api/v1/inbound/events" {
+                continue;
+            }
+            // The bridge mint route is dark unless A24_DEV_TOOL=1. A live
+            // token then gets 404, same as the wechat POST above.
+            if policy.method == "POST" && policy.template == "/api/v1/capabilities/bridge" {
                 continue;
             }
             let path = concrete_path(policy.template);

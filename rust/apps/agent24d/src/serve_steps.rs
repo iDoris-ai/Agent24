@@ -754,8 +754,10 @@ pub(super) async fn assemble_app_state(
     if crate::enroll_test_support::enabled() {
         state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
-    // X11-2g. The seed string is empty unless legacy and `A24_DEV_TOOL=1`,
-    // so capabilities mode does not apply `A24_INBOUND_DEV_ALLOWLIST`.
+    // X11-2g / C9-B. `A24_DEV_TOOL=1` opens the route in either mode. The
+    // seed string stays empty in capabilities mode, so
+    // `A24_INBOUND_DEV_ALLOWLIST` is not applied there. `seed_dev_allowlist`
+    // still deletes leftover `dev-seed` wechat rows when that gate is on.
     let dev_tool = std::env::var("A24_DEV_TOOL").ok();
     let allowlist = std::env::var("A24_INBOUND_DEV_ALLOWLIST").ok();
     let (enabled, seed) =
@@ -1861,18 +1863,20 @@ pub(super) async fn advertise_readiness(
     }))
 }
 
-/// Development wechat route switch.
+/// Development wechat route switch, separate from the legacy allowlist seed.
 ///
-/// On only for legacy mode with `A24_DEV_TOOL=1`. The returned seed is that
-/// variable's value in that case, and empty otherwise, including when the
-/// variable is missing. Capabilities mode stays off when both are set.
+/// `A24_DEV_TOOL=1` opens `POST /api/v1/inbound/events` in either auth mode.
+/// The returned seed is imported only for legacy mode. Capabilities mode
+/// leaves it empty, so `A24_INBOUND_DEV_ALLOWLIST` is not applied there.
+/// The caller still runs `seed_dev_allowlist`, which drops leftover
+/// `dev-seed` rows in that mode when the gate is on.
 pub(crate) fn dev_wechat_seed(
     auth_mode: AuthMode,
     dev_tool: Option<&str>,
     allowlist: Option<&str>,
 ) -> (bool, String) {
-    let enabled = auth_mode == AuthMode::LegacySingleToken && dev_tool == Some("1");
-    let seed = if enabled {
+    let enabled = dev_tool == Some("1");
+    let seed = if enabled && auth_mode == AuthMode::LegacySingleToken {
         allowlist.unwrap_or_default().to_owned()
     } else {
         String::new()
@@ -1909,6 +1913,10 @@ mod tests {
         assert_eq!(seed, "");
 
         let (on, seed) = dev_wechat_seed(AuthMode::Capabilities, Some("1"), Some("wechat:alice"));
+        assert!(on);
+        assert_eq!(seed, "");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::Capabilities, None, Some("wechat:alice"));
         assert!(!on);
         assert_eq!(seed, "");
     }

@@ -3,6 +3,7 @@
 //! The public surface is re-exported here so callers continue to use
 //! `crate::capabilities` while the implementation is organized by concern.
 
+pub mod bridge;
 pub mod delegation;
 pub mod first_party;
 pub mod middleware;
@@ -21,8 +22,8 @@ mod watch;
 pub use mint::CreativeMintRequest;
 pub use operations::{Operation, ResourceScope};
 pub use route_policy::{
-    AssuranceLevel, RouteDecision, RoutePolicy, creative_route_permitted, decide, policies,
-    required_operation,
+    AssuranceLevel, RouteDecision, RoutePolicy, component_route_permitted,
+    creative_route_permitted, decide, policies, required_operation,
 };
 pub use store::CapabilityStore;
 pub use token::{CapabilityToken, MintedCapability};

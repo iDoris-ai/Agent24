@@ -15,6 +15,8 @@ pub enum Audience {
     ProductHost,
     FirstPartyShell,
     CreativeRuntime,
+    /// Hardcoded dev-bridge tier. Not a general component audience.
+    ComponentRuntime,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -107,6 +109,9 @@ pub struct CapabilityClaims {
     pub first_party: Option<FirstPartyClaims>,
     pub capability_id: String,
     pub audience: Audience,
+    /// Set only for [`Audience::ComponentRuntime`]. The dev-bridge tier is
+    /// `wechat-bridge`; other audiences leave this empty.
+    pub component_id: Option<String>,
     pub workspace_id: Option<String>,
     pub attachment_id: Option<String>,
     pub principal_id: Option<String>,
@@ -115,6 +120,11 @@ pub struct CapabilityClaims {
     pub sidecar_generation: Option<String>,
     pub created_at: UnixSeconds,
     pub expires_at: UnixSeconds,
+    /// Monotonic expiry for the dev-bridge tier. Either this or `expires_at`
+    /// expiring invalidates the token. `None` keeps the wall-clock check
+    /// only. First-party shells use [`FirstPartyClaims::deadline`] and leave
+    /// this empty.
+    pub deadline: Option<tokio::time::Instant>,
     pub allowed_operations: BTreeSet<super::operations::Operation>,
 }
 
