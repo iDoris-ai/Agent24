@@ -169,6 +169,28 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// SL-4: the summary the daemon built from stored revisions for a rejected
+    /// `POST /api/v1/skills/{id}/activate`. The body hash binds it to this
+    /// exact request; a different body finds nothing to approve.
+    pub fn remember_skill_activation(
+        &self,
+        token_id: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::SkillsActivate,
+                method: "POST".into(),
+                template: "/api/v1/skills/{id}/activate".into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
@@ -206,7 +228,10 @@ impl FirstPartyAuthority {
     fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
         if matches!(
             target.template.as_str(),
-            "/api/v1/attached" | "/api/v1/idoris/install" | "/api/v1/idoris/connect"
+            "/api/v1/attached"
+                | "/api/v1/idoris/install"
+                | "/api/v1/idoris/connect"
+                | "/api/v1/skills/{id}/activate"
         ) {
             return self
                 .request_summaries
@@ -550,6 +575,12 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
             && matches!(
                 (method.as_str(), policy.template),
                 ("POST", "/api/v1/capabilities/{capability_id}/revoke")
+            ))
+        // SL-4: skill activation and rollback, summarised from stored rows.
+        || (policy.operation == Operation::SkillsActivate
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/skills/{id}/activate")
             ));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -698,7 +729,7 @@ const SUMMARY_MAX_UTF16: usize = 500;
 /// `SHOWN_MAX_CHARS` is refused. The length of the *whole* summary is capped
 /// separately (`SUMMARY_MAX_UTF16`, enforced in `elevate`); this function
 /// alone does not stop a long summary from being clipped by the dialog.
-fn shown(value: &str) -> Option<String> {
+pub(crate) fn shown(value: &str) -> Option<String> {
     use unicode_general_category::{GeneralCategory as G, get_general_category};
     let hidden = |c: char| {
         matches!(
@@ -872,6 +903,55 @@ mod tests {
             .clone();
         assert!(allowed.contains(&Operation::SkillsRead), "{allowed:?}");
         assert!(allowed.contains(&Operation::SkillsInstall), "{allowed:?}");
+    }
+
+    /// SL-4. Removing the activate row from `resolve_target`'s supported set
+    /// turns the first assertion into `NotElevatedOperation`, which is how a
+    /// CLI elevation would fail. The summary needs the remembered request.
+    #[test]
+    fn skill_activate_is_elevatable_with_a_remembered_summary_only() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let path = "/api/v1/skills/demo/activate";
+        let body = br#"{"expected_generation":0}"#;
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: path.into(),
+            body_sha256: body_digest(body),
+            client_summary: "CLIENT SECRET".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        assert_eq!(target.operation, Operation::SkillsActivate);
+        assert!(authority.target_summary("id", &target).is_none());
+        authority.remember_skill_activation("id", path, body, "激活技能 \"demo\"".to_owned());
+        assert_eq!(
+            authority.target_summary("id", &target).unwrap(),
+            "激活技能 \"demo\""
+        );
+        // Another body, or another skill's path, finds nothing to approve.
+        let other_body = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let other = resolve_target(&other_body).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        let elsewhere = ElevateRequest {
+            path: "/api/v1/skills/other/activate".into(),
+            body_sha256: body_digest(body),
+            ..other_body
+        };
+        let other = resolve_target(&elsewhere).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        // Reading a skill is Everyday, not elevatable.
+        let read = ElevateRequest {
+            method: "GET".into(),
+            path: "/api/v1/skills/demo".into(),
+            body_sha256: body_digest(b""),
+            client_summary: String::new(),
+        };
+        assert_eq!(
+            resolve_target(&read).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
     }
 
     #[test]

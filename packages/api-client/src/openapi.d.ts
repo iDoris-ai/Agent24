@@ -2389,6 +2389,41 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/skills/{id}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate a skill pair, or roll back to a recorded one
+         * @description Elevated `skills.activate`. Not proxied by the desktop backend proxy:
+         *     only the desktop main process (host credentials) and an elevated CLI
+         *     token reach it. The legacy shared token is refused.
+         *
+         *     Send either `body_revision_id` + `evals_revision_id` (+ `accepted`)
+         *     or `rollback_activation_id`. No pass flag, score, or body text is
+         *     accepted (`400 invalid_request`). The server reruns the evals from the
+         *     stored revisions and binds that result. A rollback does not rerun.
+         *
+         *     A first-party shell token gets these errors, and `unchanged`, without
+         *     elevation: the daemon runs the same checks and the eval rerun first and
+         *     asks for presence only when the pointer would really move.
+         *
+         *     `unchanged: true` means the pointer already named the pair. Nothing
+         *     was written, and it does not mean this request's evals or accepted
+         *     list were checked or stored.
+         */
+        post: operations["activateSkill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3589,12 +3624,46 @@ export interface components {
             consistent: number;
             total: number;
         };
+        SkillActivationRecord: {
+            activation_id: string;
+            seq: number;
+            body_revision_id: string;
+            evals_revision_id: string;
+            /** @enum {string} */
+            result_code: "activated" | "rolled_back";
+            /** @enum {string|null} */
+            origin_from: "imported" | "user" | null;
+            /** @enum {string} */
+            origin_to: "imported" | "user";
+            created_at: string;
+        };
         SkillDetail: {
             skill_id: string;
             pointer: components["schemas"]["SkillPointer"] | null;
             generation: number;
             revisions: components["schemas"]["SkillRevisionMeta"][];
+            /** @description Activation and rollback history, oldest first. No eval cases or text. */
+            activations: components["schemas"]["SkillActivationRecord"][];
             text_consistency: components["schemas"]["SkillConsistency"] | null;
+        };
+        /** @description Pair form: both revision ids, plus `accepted` (exactly the failed case ids of the server's own run). Rollback form: `rollback_activation_id` alone. */
+        SkillActivateRequest: {
+            expected_generation: number;
+            body_revision_id?: string;
+            evals_revision_id?: string;
+            accepted?: string[];
+            rollback_activation_id?: string;
+        };
+        SkillActivation: {
+            skill_id: string;
+            /** @enum {string} */
+            result: "activated" | "rolled_back" | "unchanged";
+            unchanged: boolean;
+            activation_id: string | null;
+            generation: number;
+            pointer: components["schemas"]["SkillPointer"];
+            text_consistency: components["schemas"]["SkillConsistency"] | null;
+            note: string | null;
         };
         SkillScanError: {
             path: string;
@@ -9512,6 +9581,81 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             /** @description No revision is installed for this id */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    activateSkill: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Elevation grant for a first-party shell token. */
+                "X-Agent24-Elevation"?: string;
+            };
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillActivateRequest"];
+            };
+        };
+        responses: {
+            /** @description Activated, rolled back, or unchanged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillActivation"];
+                };
+            };
+            /** @description `invalid_request`, `skill_activation_mixed`, `skill_origin_mismatch`, `skill_revision_mismatch`, or a manifest or eval rejection */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Not permitted, or `presence_required` without a grant */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `skill_revision_not_found` or `skill_activation_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `skill_pointer_conflict`, `skill_eval_empty`, or `skill_eval_failed` (`error.details.cases` and `failed` carry the server-computed run; the pointer did not move) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Storage failure, or a corrupt pointer row */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

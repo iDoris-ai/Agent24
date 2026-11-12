@@ -67,6 +67,11 @@ export const IpcChannels = {
   CommHomeImport: 'comm:home-import',
   CommRelaySet: 'comm:relay-set',
   CommUnlock: 'comm:unlock',
+  // Skill loader SL-4: `POST /api/v1/skills/{id}/activate` is Elevated and not
+  // on the generic proxy. Main reads the daemon's own record of the
+  // revisions, shows its own summary natively, then posts once.
+  SkillsActivate: 'skills:activate',
+  SkillsRollback: 'skills:rollback',
   // A-3: disable/enable or unpair AgentEar (PATCH / DELETE
   // /api/v1/attached/agentear). The module name is fixed in main; the
   // renderer cannot name another one. Same native-confirm rule as above.

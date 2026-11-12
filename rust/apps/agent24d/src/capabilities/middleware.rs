@@ -59,6 +59,16 @@ fn host_only_route(method: &Method, path: &str) -> bool {
             && matches!(path, "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy"))
 }
 
+/// `POST /api/v1/skills/{id}/activate` is `skills.activate`, Elevated. The
+/// legacy shared token cannot be elevated, so it cannot reach it at all.
+fn skill_activate_route(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && path
+            .strip_prefix("/api/v1/skills/")
+            .and_then(|rest| rest.strip_suffix("/activate"))
+            .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
 /// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
 fn is_component_report(path: &str) -> bool {
     path.strip_prefix("/api/v1/components/")
@@ -77,7 +87,9 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
     if bearer
         .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
     {
-        if host_only_route(req.method(), req.uri().path()) {
+        if host_only_route(req.method(), req.uri().path())
+            || skill_activate_route(req.method(), req.uri().path())
+        {
             return error_response(
                 StatusCode::FORBIDDEN,
                 "forbidden",
@@ -451,6 +463,71 @@ async fn authorize(
                                 template,
                                 &bytes,
                             );
+                        }
+                    } else if method == Method::POST && template == "/api/v1/skills/{id}/activate" {
+                        // SL-4: the summary is built from stored revisions,
+                        // never from anything the caller sent besides ids.
+                        let path = req.uri().path().to_owned();
+                        let bearer = bearer.to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            // Same answer as the handler: this request has no
+                            // skill body, so an oversized one is just invalid.
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                "请求体过大",
+                            );
+                        };
+                        // A slow body may outlive the token. Check it again
+                        // before any pointer or eval state is read.
+                        if store
+                            .validate_bearer(
+                                &bearer,
+                                operation,
+                                &crate::capabilities::Resource::global(),
+                                crate::capabilities::unix_now(),
+                            )
+                            .is_err()
+                        {
+                            return error_response(
+                                StatusCode::UNAUTHORIZED,
+                                "unauthorized",
+                                "Missing or invalid bearer token",
+                            );
+                        }
+                        if let Some(authority) = &state.first_party
+                            && let Some(skill_id) = path
+                                .strip_prefix("/api/v1/skills/")
+                                .and_then(|rest| rest.strip_suffix("/activate"))
+                        {
+                            // Business failures and a no-op answer here, before
+                            // any elevation. Only a request that would move the
+                            // pointer gets a summary and a dialog.
+                            match crate::skill_routes::activation_precheck(
+                                &state.store,
+                                skill_id,
+                                &bytes,
+                            )
+                            .await
+                            {
+                                crate::skill_routes::Precheck::Respond(response) => {
+                                    return response;
+                                }
+                                crate::skill_routes::Precheck::Elevate(summary) => {
+                                    authority.remember_skill_activation(
+                                        &authorization.claims.capability_id,
+                                        &path,
+                                        &bytes,
+                                        summary,
+                                    );
+                                }
+                                crate::skill_routes::Precheck::Refuse => {}
+                            }
                         }
                     } else if method == Method::POST && template == "/api/v1/attached" {
                         let bytes = match axum::body::to_bytes(

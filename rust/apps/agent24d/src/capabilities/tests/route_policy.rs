@@ -269,7 +269,7 @@ fn section_3_rows_match_operation_and_level() {
         });
     }
 
-    // Skill loader SL-3. Activate is not a route until SL-4.
+    // Skill loader SL-3.
     for (method, path, operation) in [
         ("GET", "/skills", "SkillsRead"),
         ("GET", "/skills/{id}", "SkillsRead"),
@@ -283,6 +283,14 @@ fn section_3_rows_match_operation_and_level() {
             level: AssuranceLevel::Everyday,
         });
     }
+
+    // SL-4: activation and rollback are Elevated.
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/skills/{id}/activate".into(),
+        operation: "SkillsActivate".into(),
+        level: AssuranceLevel::Elevated,
+    });
 
     let mut catalog = BTreeSet::new();
     for policy in policies() {

@@ -1138,6 +1138,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             post(crate::skill_routes::post_skill_scan),
         )
         .route("/api/v1/skills/{id}", get(crate::skill_routes::get_skill))
+        .route(
+            "/api/v1/skills/{id}/activate",
+            post(crate::skill_routes::post_skill_activate),
+        )
         .route("/api/v1/events", get(crate::events::ws_events))
         // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2): register/rotate,
         // list and revoke attached modules. `attached` is reserved in
