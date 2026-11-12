@@ -470,10 +470,12 @@ async fn store_pair(
         .await
         .map_err(Fail::from_store)?;
     let inserted = is_inserted(&body_row) || is_inserted(&evals_row);
+    // A pointer whose two sides have different origins is a corrupt read:
+    // 500 internal, not the write-path `skill_origin_mismatch`.
     let pointer = store
         .get_skill_pointer(&manifest.name)
         .await
-        .map_err(Fail::from_store)?;
+        .map_err(|_| Fail::internal("read pointer"))?;
     let generation = pointer.as_ref().map(|row| row.generation).unwrap_or(0);
     Ok(StoredSkill {
         response: InstallResponse {

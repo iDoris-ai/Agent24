@@ -228,6 +228,15 @@ impl ExplorerSubagent {
                 temperature: None,
                 progress: None,
             };
+            // Same fail-closed rule as the run loop: a pinned skill without
+            // its label means no model call at all, cloud or local.
+            if let Some(store) = &store
+                && super::skill_inject::label_missing(store, ctx.run_id()).await
+            {
+                return Err(ToolError::Denied(
+                    "denied by policy: skill source label unavailable".to_owned(),
+                ));
+            }
             let mode = match &store {
                 Some(store) => match store.run_policy_snapshot(ctx.run_id()).await {
                     Ok(snapshot) => snapshot.effective_mode,

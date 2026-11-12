@@ -648,3 +648,43 @@ async fn the_audit_actor_is_the_callers_audience_and_token_id() {
         .unwrap();
     assert_eq!(direct.actor, "daemon");
 }
+
+/// SL-5: the install route reads the pointer after it writes the pair. A
+/// pointer whose two sides have different origins is a bad stored row, so
+/// that read is 500 `internal`, not the 400 `skill_origin_mismatch`.
+#[tokio::test]
+async fn installing_over_a_split_origin_pointer_reads_as_500() {
+    let state = fixture().await;
+    let store = state.store.clone();
+    let ib = body(&store, SkillOrigin::Imported, "1.0.0", "hello world").await;
+    let ue = evals(&store, SkillOrigin::User, "1.1.0", &["hello world"]).await;
+    sqlx::query(
+        "INSERT INTO skill_pointer (skill_id, body_revision_id, evals_revision_id, generation) \
+         VALUES (?, ?, ?, 1)",
+    )
+    .bind(SKILL)
+    .bind(&ib)
+    .bind(&ue)
+    .execute(agent24_store::test_hooks::pool(&store))
+    .await
+    .unwrap();
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/skills")
+        .header("authorization", "Bearer testtoken")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"markdown": "---\nname: demo\ndescription: d\n---\nhello again\n"}).to_string(),
+        ))
+        .unwrap();
+    let response = crate::server::build_router_with_modules(state.clone(), Router::new())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let value: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["code"], "internal", "{value}");
+}

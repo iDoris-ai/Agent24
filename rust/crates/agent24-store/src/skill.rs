@@ -82,7 +82,7 @@ impl SkillOrigin {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "user" => Ok(Self::User),
             "imported" => Ok(Self::Imported),
@@ -108,7 +108,7 @@ impl SkillRevisionKind {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "body" => Ok(Self::Body),
             "evals" => Ok(Self::Evals),

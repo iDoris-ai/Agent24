@@ -20,6 +20,7 @@ agent24-memory = { path = "../agent24-memory" }
 async-trait = "0.1"
 agent24-models = { path = "../agent24-models" }
 agent24-protocol = { path = "../agent24-protocol" }
+agent24-skill = { path = "../agent24-skill" }
 agent24-store = { path = "../agent24-store" }
 agent24-tools = { path = "../agent24-tools" }
 agent24-workspace = { path = "../agent24-workspace" }

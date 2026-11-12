@@ -106,6 +106,7 @@ async fn assert_quota_rejection(rows: i64) {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -147,6 +148,7 @@ async fn assert_quota_rejection(rows: i64) {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -230,6 +232,7 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -298,6 +301,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -367,6 +371,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -435,6 +440,7 @@ async fn summarizer_timeout_keeps_durable_originals_without_write_failed_event()
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -597,6 +603,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -614,6 +621,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

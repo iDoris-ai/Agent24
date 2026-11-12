@@ -2105,8 +2105,8 @@ mod tests {
         pool.close().await;
 
         let store = Store::open(&path).await.unwrap();
-        // 0034 入站表 + 0035 游标 + 0036 技能表；升级后旧行不变，schema 停在当前最新。
-        assert_eq!(store.latest_applied_migration().await.unwrap(), 36);
+        // 0034 入站表 + 0035 游标 + 0036 技能表 + 0037 来源种类；升级后旧行不变，schema 停在当前最新。
+        assert_eq!(store.latest_applied_migration().await.unwrap(), 37);
         let cursor_table: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'inbound_cursor'",
         )

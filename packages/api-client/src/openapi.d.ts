@@ -2965,6 +2965,8 @@ export interface components {
             mode?: components["schemas"]["RunMode"];
             /** @description KB-HOST-01: a Knowledge binding the product host activated over its private interface. A selector, not an authority: only the product host may name one, and only one it has active; the run is pinned to that activation. Omit/null for a run without Knowledge. */
             knowledge_binding_id?: string | null;
+            /** @description A skill to run under (SL-5). Only the id: the server reads the skill's current activation pointer when the run is admitted and pins that revision, so there is no version field. A skill with no pointer (installed, never activated) is refused with `skill_not_active`; it never falls back to the latest revision. Imported skill text is labelled `Unknown` + `LocalOnly`. Inbound events and scheduled self-wake runs cannot carry one (`skill_not_admitted`), and neither can a workspace-bound run in v1. Omit/null for a run without a skill. */
+            skill_id?: string | null;
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";
@@ -5947,7 +5949,15 @@ export interface operations {
                     "application/json": components["schemas"]["Run"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            /** @description invalid_request, or skill_not_admitted: skill_id was named on a workspace-bound request or session (a v1 restriction). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description host_authority_required: knowledge_binding_id was named by a caller other than the product host */
             403: {
                 headers: {
@@ -5958,7 +5968,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id. knowledge_session_rebound: the session's runs used another activation of that binding, or it holds Knowledge results from before a daemon restart; start a new session. Also returned for a session not yet pinned once the daemon has reached its limit of pinned sessions; then a new session is refused too, until the daemon restarts. */
+            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id. knowledge_session_rebound: the session's runs used another activation of that binding, or it holds Knowledge results from before a daemon restart; start a new session. Also returned for a session not yet pinned once the daemon has reached its limit of pinned sessions; then a new session is refused too, until the daemon restarts. Skill runs: skill_not_active (no activation pointer), skill_capability_missing (a required capability has no ready provider), skill_provider_ambiguous (more than one), and skill_pointer_conflict (the pointer moved during admission; retry). */
             409: {
                 headers: {
                     [name: string]: unknown;
