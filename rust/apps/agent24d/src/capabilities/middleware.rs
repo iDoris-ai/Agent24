@@ -116,6 +116,14 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
         }
         return admit_inbound_ingest(state, req, next).await;
     }
+    // Same darkness as the wechat POST. A live token sees 404 and nothing is
+    // issued. 409 stays the legacy-mode answer when the gate is on.
+    if method == Method::POST && path == "/api/v1/capabilities/bridge" && !state.dev_wechat_events {
+        if let Some(denied) = capability_token_rejected(&state, &req) {
+            return denied;
+        }
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    }
     let matched = req
         .extensions()
         .get::<MatchedPath>()
@@ -261,6 +269,16 @@ async fn authorize(
             if host_only_route(method, req.uri().path())
                 && authorization.claims.audience != crate::capabilities::Audience::ProductHost
             {
+                if authorization.claims.audience == crate::capabilities::Audience::ComponentRuntime
+                {
+                    crate::capabilities::bridge::write_component_denial(
+                        store,
+                        &state.store,
+                        &authorization,
+                        agent24_store::CapabilityDenyReason::Route,
+                    )
+                    .await;
+                }
                 return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
             }
             // R5: a Creative token that validates still cannot call a route
@@ -277,6 +295,13 @@ async fn authorize(
                     || operation == crate::capabilities::Operation::ModuleRoute
                     || !crate::capabilities::component_route_permitted(method, template))
             {
+                crate::capabilities::bridge::write_component_denial(
+                    store,
+                    &state.store,
+                    &authorization,
+                    agent24_store::CapabilityDenyReason::Route,
+                )
+                .await;
                 return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
             }
             // §10 R1 guards daily first-party tokens. ProductHost is the
@@ -440,10 +465,23 @@ async fn authorize(
             next.run(req).await
         }
         Err(
-            crate::capabilities::CapabilityError::OperationDenied
+            err @ (crate::capabilities::CapabilityError::OperationDenied
             | crate::capabilities::CapabilityError::ResourceDenied
-            | crate::capabilities::CapabilityError::HostRequired,
-        ) => error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed"),
+            | crate::capabilities::CapabilityError::HostRequired),
+        ) => {
+            if matches!(err, crate::capabilities::CapabilityError::OperationDenied)
+                && let Ok(auth) = store.authenticate_bearer(bearer, crate::capabilities::unix_now())
+            {
+                crate::capabilities::bridge::write_component_denial(
+                    store,
+                    &state.store,
+                    &auth,
+                    agent24_store::CapabilityDenyReason::Operation,
+                )
+                .await;
+            }
+            error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed")
+        }
         Err(_) => error_response(
             StatusCode::UNAUTHORIZED,
             "unauthorized",

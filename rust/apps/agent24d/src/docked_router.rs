@@ -374,6 +374,7 @@ mod tests {
                 sidecar_generation: None,
                 created_at: now,
                 expires_at: now + 600,
+                deadline: None,
                 allowed_operations: BTreeSet::from([Operation::HealthRead]),
             })
             .unwrap()

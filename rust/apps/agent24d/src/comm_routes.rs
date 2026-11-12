@@ -2422,6 +2422,7 @@ mod hy1_regression_tests {
                         sidecar_generation: None,
                         created_at: 0,
                         expires_at: 0,
+                        deadline: None,
                         allowed_operations: std::collections::BTreeSet::new(),
                     },
                 });

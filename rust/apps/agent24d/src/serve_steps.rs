@@ -756,7 +756,8 @@ pub(super) async fn assemble_app_state(
     }
     // X11-2g / C9-B. `A24_DEV_TOOL=1` opens the route in either mode. The
     // seed string stays empty in capabilities mode, so
-    // `A24_INBOUND_DEV_ALLOWLIST` is not applied there.
+    // `A24_INBOUND_DEV_ALLOWLIST` is not applied there. `seed_dev_allowlist`
+    // still deletes leftover `dev-seed` wechat rows when that gate is on.
     let dev_tool = std::env::var("A24_DEV_TOOL").ok();
     let allowlist = std::env::var("A24_INBOUND_DEV_ALLOWLIST").ok();
     let (enabled, seed) =
@@ -1867,6 +1868,8 @@ pub(super) async fn advertise_readiness(
 /// `A24_DEV_TOOL=1` opens `POST /api/v1/inbound/events` in either auth mode.
 /// The returned seed is imported only for legacy mode. Capabilities mode
 /// leaves it empty, so `A24_INBOUND_DEV_ALLOWLIST` is not applied there.
+/// The caller still runs `seed_dev_allowlist`, which drops leftover
+/// `dev-seed` rows in that mode when the gate is on.
 pub(crate) fn dev_wechat_seed(
     auth_mode: AuthMode,
     dev_tool: Option<&str>,

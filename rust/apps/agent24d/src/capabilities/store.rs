@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::watch;
 
 use super::token::{CapabilityToken, MintedCapability, digest};
 use super::types::CapabilityClaims;
+
+/// Same capability id and deny reason write at most one audit row per window.
+pub(crate) const DENY_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct Record {
@@ -14,10 +18,13 @@ pub(crate) struct Record {
 
 impl Record {
     pub(crate) fn expired(&self, now: super::types::UnixSeconds) -> bool {
-        self.claims.first_party.as_ref().map_or_else(
-            || now >= self.claims.expires_at,
-            |claims| tokio::time::Instant::now() >= claims.deadline,
-        )
+        if let Some(claims) = self.claims.first_party.as_ref() {
+            return tokio::time::Instant::now() >= claims.deadline;
+        }
+        if let Some(deadline) = self.claims.deadline {
+            return tokio::time::Instant::now() >= deadline;
+        }
+        now >= self.claims.expires_at
     }
 }
 
@@ -30,6 +37,8 @@ pub(crate) struct State {
 pub(crate) struct Shared {
     pub(crate) state: Mutex<State>,
     pub(crate) changed: watch::Sender<u64>,
+    deny_audit_at:
+        Mutex<HashMap<(String, agent24_store::CapabilityDenyReason), tokio::time::Instant>>,
 }
 
 /// In-memory capability authority. It stores only token digests and claims.
@@ -50,8 +59,31 @@ impl CapabilityStore {
                     epoch: 0,
                 }),
                 changed: watch::channel(0).0,
+                deny_audit_at: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    /// `true` when this id and reason should be written. A repeat inside
+    /// [`DENY_AUDIT_INTERVAL`] returns `false`. A poisoned lock records.
+    pub(crate) fn claim_deny_audit(
+        &self,
+        capability_id: &str,
+        reason: agent24_store::CapabilityDenyReason,
+    ) -> bool {
+        let Ok(mut slots) = self.shared.deny_audit_at.lock() else {
+            return true;
+        };
+        let now = tokio::time::Instant::now();
+        let key = (capability_id.to_owned(), reason);
+        let fresh = slots
+            .get(&key)
+            .is_none_or(|at| now.saturating_duration_since(*at) >= DENY_AUDIT_INTERVAL);
+        if fresh {
+            slots.insert(key, now);
+            slots.retain(|_, at| now.saturating_duration_since(*at) < DENY_AUDIT_INTERVAL);
+        }
+        fresh
     }
 
     pub fn daemon_generation(&self) -> &str {

@@ -367,6 +367,7 @@ impl FirstPartyAuthority {
                     sidecar_generation: None,
                     created_at: now,
                     expires_at: now + TOKEN_TTL,
+                    deadline: None,
                     // The presence channel answers this token's own elevation
                     // challenges: a first-party shell must never reach it,
                     // or an enrolled CLI could approve itself (#1447 F1).

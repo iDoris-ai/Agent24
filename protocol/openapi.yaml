@@ -2342,7 +2342,10 @@ paths:
         include client text. The body is empty. The token audience is
         `component_runtime`, component id `wechat-bridge`, operation
         `inbound.ingest`, TTL 8 hours, not renewable. It is bound to the
-        current daemon generation. Legacy mode answers
+        current daemon generation. The route is absent (`not_found`) unless
+        the daemon was started with `A24_DEV_TOOL=1`; a missing bearer is
+        still 401, and a closed gate does not issue or write
+        `capability.token.issued`. Legacy mode with the gate on answers
         `capability_mode_required`. A first-party shell without an elevation
         grant answers `presence_required`. If the audit row cannot be written
         the token is not issued (`audit_unavailable`).
@@ -2355,6 +2358,14 @@ paths:
                 $ref: "#/components/schemas/BridgeCapability"
         "403":
           description: Missing elevation, or the caller is not a first-party shell
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: >-
+            Development gate is off (`A24_DEV_TOOL` is not `1`). No token is
+            issued and no issue audit is written.
           content:
             application/json:
               schema:

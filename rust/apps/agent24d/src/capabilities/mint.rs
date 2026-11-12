@@ -70,6 +70,7 @@ impl CapabilityStore {
             sidecar_generation: None,
             created_at,
             expires_at: created_at.saturating_add(ttl.as_secs()),
+            deadline: None,
             allowed_operations: BTreeSet::new(),
         })
     }
@@ -142,6 +143,7 @@ impl CapabilityStore {
                 sidecar_generation: Some(request.sidecar_generation),
                 created_at: request.created_at,
                 expires_at: request.created_at.saturating_add(request.ttl.as_secs()),
+                deadline: None,
                 allowed_operations,
             },
         )

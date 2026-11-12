@@ -4,18 +4,21 @@
 
 use std::collections::BTreeSet;
 use std::future::Future;
+use std::time::Duration;
 
 use agent24_store::{
     AuditRef, AuditTimestamp, COMPONENT_RUNTIME_TTL_SECONDS, CapabilityDenyReason,
     CapabilityRevokeReason, CapabilityTokenAuditEvent, DEV_BRIDGE_COMPONENT_ID,
-    DEV_BRIDGE_OPERATION,
+    DEV_BRIDGE_OPERATION, Store,
 };
+use tokio::time::Instant;
 
 use super::operations::Operation;
 use super::store::CapabilityStore;
 use super::token::random_capability_id;
 use super::types::{Audience, Authorization, CapabilityClaims, CapabilityError, UnixSeconds};
 
+pub(crate) use super::store::DENY_AUDIT_INTERVAL;
 pub use agent24_store::COMPONENT_RUNTIME_TTL_SECONDS as BRIDGE_TTL_SECONDS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -42,12 +45,23 @@ pub enum IngestDeny {
 }
 
 impl IngestDeny {
-    fn reason(self) -> CapabilityDenyReason {
+    pub(crate) fn reason(self) -> CapabilityDenyReason {
         match self {
             Self::Audience => CapabilityDenyReason::Audience,
             Self::Component => CapabilityDenyReason::Component,
             Self::Operation => CapabilityDenyReason::Operation,
         }
+    }
+}
+
+pub(crate) fn liveness_deny(err: super::types::CapabilityError) -> Option<CapabilityDenyReason> {
+    match err {
+        super::types::CapabilityError::Revoked => Some(CapabilityDenyReason::Revoked),
+        super::types::CapabilityError::Expired => Some(CapabilityDenyReason::Expired),
+        super::types::CapabilityError::StaleGeneration => {
+            Some(CapabilityDenyReason::StaleGeneration)
+        }
+        _ => None,
     }
 }
 
@@ -70,7 +84,10 @@ pub fn component_may_ingest(auth: &Authorization) -> Result<(), IngestDeny> {
     Ok(())
 }
 
-pub fn deny_audit(auth: &Authorization, deny: IngestDeny) -> Option<CapabilityTokenAuditEvent> {
+fn denial_event(
+    auth: &Authorization,
+    reason: CapabilityDenyReason,
+) -> Option<CapabilityTokenAuditEvent> {
     let operation = AuditRef::new(DEV_BRIDGE_OPERATION).ok()?;
     let component_id = auth
         .claims
@@ -79,11 +96,35 @@ pub fn deny_audit(auth: &Authorization, deny: IngestDeny) -> Option<CapabilityTo
         .and_then(|id| AuditRef::new(id).ok());
     let capability_id = AuditRef::new(&auth.claims.capability_id).ok();
     Some(CapabilityTokenAuditEvent::Denied {
-        reason: deny.reason(),
+        reason,
         component_id,
         capability_id,
         operation,
     })
+}
+
+/// Append `capability.token.denied` for a component token. The operation
+/// field stays `inbound.ingest` (the only profile `validate` accepts). The
+/// reason distinguishes route, operation, and liveness. The bearer is not
+/// stored. The same id and reason inside [`DENY_AUDIT_INTERVAL`] is skipped.
+pub async fn write_component_denial(
+    caps: &CapabilityStore,
+    db: &Store,
+    auth: &Authorization,
+    reason: CapabilityDenyReason,
+) {
+    if auth.claims.audience != Audience::ComponentRuntime {
+        return;
+    }
+    let Some(event) = denial_event(auth, reason) else {
+        return;
+    };
+    if !caps.claim_deny_audit(&auth.claims.capability_id, reason) {
+        return;
+    }
+    if let Ok(ts) = audit_now() {
+        let _ = db.append_capability_token_audit(&ts, &event).await;
+    }
 }
 
 /// Audit first. A write failure leaves the store without this token.
@@ -127,6 +168,7 @@ where
             sidecar_generation: None,
             created_at: now,
             expires_at: now.saturating_add(BRIDGE_TTL_SECONDS),
+            deadline: Some(Instant::now() + Duration::from_secs(BRIDGE_TTL_SECONDS)),
             allowed_operations: BTreeSet::from([Operation::InboundIngest]),
         })
         .map_err(|_| BridgeIssueError::Rejected)
@@ -231,6 +273,8 @@ mod tests {
                 )
                 .is_ok()
         );
+        // Wall-clock `expires_at` is not the gate. `bridge_token_ttl_ignores_wall_clock_jumps`
+        // advances the monotonic deadline.
         let stale = claims.expires_at;
         assert!(
             store
@@ -240,7 +284,7 @@ mod tests {
                     &Resource::global(),
                     stale
                 )
-                .is_err()
+                .is_ok()
         );
 
         let revoke_failed = revoke_wechat_bridge(&store, &id, |_| async { Err(()) }).await;
@@ -286,5 +330,53 @@ mod tests {
             Err(IngestDeny::Operation)
         );
         let _ = (store, now);
+    }
+
+    /// A jump of the wall clock past `expires_at` leaves the bridge token
+    /// live. Advancing the runtime clock by the TTL expires it.
+    /// Clearing `deadline` in `issue_wechat_bridge` turns the first `is_ok` red.
+    #[tokio::test(start_paused = true)]
+    async fn bridge_token_ttl_ignores_wall_clock_jumps() {
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (bearer, _, claims) = minted.into_bearer_parts();
+        assert!(claims.deadline.is_some());
+        let jumped = unix_now() + BRIDGE_TTL_SECONDS * 100;
+        assert!(store.require_live_bearer(&bearer, jumped).is_ok());
+        assert!(
+            store
+                .validate_bearer(
+                    &bearer,
+                    Operation::InboundIngest,
+                    &Resource::global(),
+                    jumped
+                )
+                .is_ok()
+        );
+        tokio::time::advance(Duration::from_secs(BRIDGE_TTL_SECONDS)).await;
+        assert!(store.require_live_bearer(&bearer, 0).is_err());
+        assert!(
+            store
+                .validate_bearer(&bearer, Operation::InboundIngest, &Resource::global(), 0)
+                .is_err()
+        );
+    }
+
+    /// Same id and reason is one slot. A different reason, a different id,
+    /// or the interval elapsing opens another. Dropping the retain-and-skip
+    /// in `claim_deny_audit` turns the second assertion red.
+    #[tokio::test(start_paused = true)]
+    async fn deny_audit_for_one_token_and_reason_is_throttled() {
+        use agent24_store::CapabilityDenyReason;
+
+        let store = CapabilityStore::new("g");
+        assert!(store.claim_deny_audit("gate-models", CapabilityDenyReason::Route));
+        assert!(!store.claim_deny_audit("gate-models", CapabilityDenyReason::Route));
+        assert!(store.claim_deny_audit("gate-models", CapabilityDenyReason::Operation));
+        assert!(store.claim_deny_audit("gate-module", CapabilityDenyReason::Route));
+        tokio::time::advance(DENY_AUDIT_INTERVAL).await;
+        assert!(store.claim_deny_audit("gate-models", CapabilityDenyReason::Route));
     }
 }

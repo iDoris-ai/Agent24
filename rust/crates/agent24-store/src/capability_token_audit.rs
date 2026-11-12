@@ -29,13 +29,19 @@ pub enum CapabilityRevokeReason {
 }
 
 /// Why a presented credential was refused. Closed; not a message string.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityDenyReason {
     Audience,
     Component,
     Operation,
     Route,
+    /// Presented after the body was read; the in-memory record is revoked.
+    Revoked,
+    /// Monotonic deadline has passed. Not a wall-clock `expires_at`.
+    Expired,
+    /// `daemon_generation` does not match this process.
+    StaleGeneration,
 }
 
 /// One capability-token decision. `deny_unknown_fields` rejects a smuggled
@@ -180,6 +186,59 @@ mod tests {
         let mut event = issued();
         if let CapabilityTokenAuditEvent::Issued { ttl_seconds, .. } = &mut event {
             *ttl_seconds = 60;
+        }
+        assert!(
+            store
+                .append_capability_token_audit(&ts(), &event)
+                .await
+                .is_err()
+        );
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
+    fn revoked() -> CapabilityTokenAuditEvent {
+        CapabilityTokenAuditEvent::Revoked {
+            component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID).unwrap(),
+            capability_id: AuditRef::new("aabbccddeeff00112233445566778899").unwrap(),
+            reason: CapabilityRevokeReason::Explicit,
+        }
+    }
+
+    fn denied() -> CapabilityTokenAuditEvent {
+        CapabilityTokenAuditEvent::Denied {
+            reason: CapabilityDenyReason::Operation,
+            component_id: Some(AuditRef::new(DEV_BRIDGE_COMPONENT_ID).unwrap()),
+            capability_id: Some(AuditRef::new("aabbccddeeff00112233445566778899").unwrap()),
+            operation: AuditRef::new(DEV_BRIDGE_OPERATION).unwrap(),
+        }
+    }
+
+    /// Revoked rows name `wechat-bridge`. A foreign component is not written.
+    /// Deleting the component check in `validate` turns this red.
+    #[tokio::test]
+    async fn revoke_audit_rejects_a_foreign_component() {
+        let store = Store::open_memory().await.unwrap();
+        let mut event = revoked();
+        if let CapabilityTokenAuditEvent::Revoked { component_id, .. } = &mut event {
+            *component_id = AuditRef::new("other-bridge").unwrap();
+        }
+        assert!(
+            store
+                .append_capability_token_audit(&ts(), &event)
+                .await
+                .is_err()
+        );
+        assert!(store.list_audit().await.unwrap().is_empty());
+    }
+
+    /// Denied rows name `inbound.ingest`. Another operation is not written.
+    /// Deleting the operation check in `validate` turns this red.
+    #[tokio::test]
+    async fn deny_audit_rejects_a_foreign_operation() {
+        let store = Store::open_memory().await.unwrap();
+        let mut event = denied();
+        if let CapabilityTokenAuditEvent::Denied { operation, .. } = &mut event {
+            *operation = AuditRef::new("models.read").unwrap();
         }
         assert!(
             store

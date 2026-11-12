@@ -168,8 +168,15 @@ pub(crate) async fn get_events(State(state): State<AppState>, RawQuery(raw): Raw
 /// The route is mounted only when `dev_wechat_events` is set (`A24_DEV_TOOL=1`).
 /// Legacy mode keeps the shared bearer. Capabilities mode accepts only a
 /// `ComponentRuntime` token for `wechat-bridge` that holds `InboundIngest`.
+///
+/// The JSON body is buffered before this function runs. Capabilities mode
+/// then checks the bearer against the live store again (not revoked, not
+/// past the monotonic deadline, this daemon's generation). Middleware's
+/// check is a snapshot from before that read. A failure is 401 and one
+/// throttled denial row. The bearer is not in the row.
 pub(crate) async fn post_wechat_event(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     authorization: Option<Extension<crate::capabilities::Authorization>>,
     RawQuery(raw): RawQuery,
     body: Result<Json<PostWechatEvent>, JsonRejection>,
@@ -177,7 +184,7 @@ pub(crate) async fn post_wechat_event(
     if !state.dev_wechat_events {
         return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
     }
-    if state.auth_mode == AuthMode::Capabilities {
+    let live = if state.auth_mode == AuthMode::Capabilities {
         let Some(Extension(authorization)) = authorization else {
             return error_response(
                 StatusCode::UNAUTHORIZED,
@@ -186,16 +193,23 @@ pub(crate) async fn post_wechat_event(
             );
         };
         if let Err(deny) = crate::capabilities::bridge::component_may_ingest(&authorization) {
-            if let Some(event) = crate::capabilities::bridge::deny_audit(&authorization, deny)
-                && let Ok(ts) = crate::capabilities::bridge::audit_now()
-            {
-                let _ = state.store.append_capability_token_audit(&ts, &event).await;
+            if let Some(caps) = state.capabilities.as_ref() {
+                crate::capabilities::bridge::write_component_denial(
+                    caps,
+                    &state.store,
+                    &authorization,
+                    deny.reason(),
+                )
+                .await;
             }
             return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
         }
+        Some(authorization)
     } else if state.auth_mode != AuthMode::LegacySingleToken {
         return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
-    }
+    } else {
+        None
+    };
     if let Err(message) = reject_query(raw.as_deref()) {
         return invalid(message);
     }
@@ -207,6 +221,42 @@ pub(crate) async fn post_wechat_event(
         Ok(message) => message,
         Err(message) => return invalid(message),
     };
+    if let Some(authorization) = live.as_ref() {
+        let Some(caps) = state.capabilities.as_ref() else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "host_authority_unavailable",
+                "Capability authority unavailable",
+            );
+        };
+        let Some(bearer) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+        else {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            );
+        };
+        if let Err(err) = caps.authenticate_bearer(bearer, crate::capabilities::unix_now()) {
+            if let Some(reason) = crate::capabilities::bridge::liveness_deny(err) {
+                crate::capabilities::bridge::write_component_denial(
+                    caps,
+                    &state.store,
+                    authorization,
+                    reason,
+                )
+                .await;
+            }
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            );
+        }
+    }
     let service = InboundService::new(state.store.clone(), std::sync::Arc::clone(&state.runs));
     // `InboundService::dispatch` (service.rs) says a request handler that may
     // be dropped mid-way should spawn the call. Dropping `ingest` after the
@@ -235,27 +285,39 @@ pub(crate) async fn post_wechat_event(
     }
 }
 
-/// Development allowlist seed (plan §3.4). Capabilities mode returns before
-/// the list is parsed, so the variable is not applied there.
+/// Development allowlist seed (plan §3.4). Capabilities mode does not import
+/// `raw`. When the dev gate is on it syncs an empty list, which deletes
+/// leftover `wechat` rows whose note is `dev-seed`. A ProductHost row (any
+/// other note) stays. The gate off does neither.
 ///
-/// Each call syncs `wechat` rows whose note is `dev-seed` to the actors in
-/// `raw`. Actors that left the list are deleted. An empty list deletes every
+/// Each legacy call syncs `wechat` rows whose note is `dev-seed` to the actors
+/// in `raw`. Actors that left the list are deleted. An empty list deletes every
 /// such row, and when this route is on that also logs one warning. A row
 /// with any other note is left alone, including its `added_at`. A pair that
 /// is already stored is not rewritten.
 ///
-/// When the seed runs, the wechat watermark is inserted if missing. A later
-/// start does not move it.
+/// When the legacy seed runs, the wechat watermark is inserted if missing. A
+/// later start does not move it. The capabilities cleanup does not touch the
+/// watermark.
 pub(crate) async fn seed_dev_allowlist(
     store: &Store,
     auth_mode: AuthMode,
     dev_tool: bool,
     raw: &str,
 ) -> Result<usize, Box<StoreError>> {
-    if auth_mode != AuthMode::LegacySingleToken || !dev_tool {
+    if !dev_tool {
         return Ok(0);
     }
     let now = format_inbound_timestamp(Utc::now());
+    if auth_mode != AuthMode::LegacySingleToken {
+        if auth_mode == AuthMode::Capabilities {
+            store
+                .sync_wechat_dev_seed_allowlist(&[], &now)
+                .await
+                .map_err(Box::new)?;
+        }
+        return Ok(0);
+    }
     let mut actors = Vec::new();
     for piece in raw.split(',') {
         let piece = piece.trim();
@@ -1933,6 +1995,7 @@ mod tests {
                 sidecar_generation: None,
                 created_at: now,
                 expires_at: now + 600,
+                deadline: None,
                 allowed_operations: allowed,
             })
             .unwrap()
@@ -2438,5 +2501,364 @@ mod tests {
             .unwrap();
         assert_eq!(seeded, 0);
         assert!(other.list_inbound_allowlist().await.unwrap().is_empty());
+    }
+
+    /// Same store, legacy then capabilities. The dev gate on clears
+    /// `note=dev-seed` and does not import the env list. A host note stays
+    /// and still admits. Skipping the empty sync in `seed_dev_allowlist`
+    /// leaves alice allowlisted, so her POST is `started`.
+    #[tokio::test]
+    async fn capabilities_startup_on_the_legacy_store_drops_dev_seed_and_keeps_a_host_row() {
+        use crate::capabilities::{
+            Operation, Resource,
+            bridge::{self, BRIDGE_TTL_SECONDS},
+            first_party::{FirstPartyAuthority, test_peer},
+            unix_now,
+        };
+
+        let mut app = dev_legacy(true).await;
+        let db = app.store.clone();
+        seed_dev_allowlist(&db, AuthMode::LegacySingleToken, true, "wechat:alice")
+            .await
+            .unwrap();
+        let stamp = format_inbound_timestamp(Utc::now());
+        assert!(
+            db.insert_inbound_allowlist_if_absent("wechat", "bob", &stamp, Some("host"))
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            seed_dev_allowlist(&db, AuthMode::Capabilities, false, "wechat:carol")
+                .await
+                .unwrap(),
+            0
+        );
+        let listed = db.list_inbound_allowlist().await.unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|row| row.actor == "alice" && row.note.as_deref() == Some("dev-seed"))
+        );
+        assert!(listed.iter().all(|row| row.actor != "carol"));
+
+        assert_eq!(
+            seed_dev_allowlist(&db, AuthMode::Capabilities, true, "wechat:alice")
+                .await
+                .unwrap(),
+            0
+        );
+        let listed = db.list_inbound_allowlist().await.unwrap();
+        assert!(listed.iter().all(|row| row.actor != "alice"), "{listed:?}");
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].actor, "bob");
+        assert_eq!(listed[0].note.as_deref(), Some("host"));
+        assert_eq!(listed[0].added_at, stamp);
+
+        let cap = crate::capabilities::CapabilityStore::new("daemon-test");
+        let shell = FirstPartyAuthority::new(cap.clone())
+            .issue(&test_peer("daemon-test"))
+            .unwrap();
+        let auth = cap
+            .validate_bearer(
+                &shell.secret,
+                Operation::CapabilityMint,
+                &Resource::global(),
+                unix_now(),
+            )
+            .unwrap();
+        let bridge = bridge::issue_wechat_bridge(&cap, &auth, unix_now(), |event| {
+            let db = db.clone();
+            async move {
+                let ts = bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        .unwrap();
+        let (bearer, _, claims) = bridge.into_bearer_parts();
+        assert_eq!(claims.expires_at - claims.created_at, BRIDGE_TTL_SECONDS);
+        assert!(claims.deadline.is_some());
+        app.enable_capability_auth(cap);
+        let at = format_inbound_timestamp(Utc::now());
+        let router = crate::server::build_router(app);
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &bearer,
+            Some(&wechat_body("wechat:31", "alice", &at, "from-seed")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "ignored", "{json}");
+        assert_eq!(json["reason"], "not_allowlisted");
+        assert_eq!(run_count(&db).await, 0);
+
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &bearer,
+            Some(&wechat_body("wechat:32", "bob", &at, "from-host")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "started", "{json}");
+        assert_eq!(run_count(&db).await, 1);
+    }
+
+    /// The body is read after middleware accepts the bearer. Revoke, expiry,
+    /// or a generation change during that read is 401, one denial row, and
+    /// no extra run. `bob` is allowlisted, so dropping the
+    /// `authenticate_bearer` after `checked_wechat_event` starts his run.
+    #[tokio::test]
+    async fn revoked_or_expired_bridge_token_is_refused_after_the_body() {
+        use std::collections::BTreeSet;
+
+        use crate::capabilities::{Audience, CapabilityClaims, Operation, unix_now};
+
+        let mut app = dev_legacy(true).await;
+        let db = app.store.clone();
+        let at = format_inbound_timestamp(Utc::now());
+        db.insert_inbound_allowlist_if_absent("wechat", "alice", &at, Some("host"))
+            .await
+            .unwrap();
+        db.insert_inbound_allowlist_if_absent("wechat", "bob", &at, Some("host"))
+            .await
+            .unwrap();
+        db.ensure_inbound_source_watermark("wechat", &at, 86_400)
+            .await
+            .unwrap();
+        let cap = crate::capabilities::CapabilityStore::new("daemon-test");
+        let forge = |id: &str| {
+            let now = unix_now();
+            cap.insert(CapabilityClaims {
+                first_party: None,
+                capability_id: id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some("wechat-bridge".into()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "daemon-test".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 86_400,
+                deadline: Some(tokio::time::Instant::now() + StdDuration::from_secs(3_600)),
+                allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+            })
+            .unwrap()
+            .into_bearer_parts()
+        };
+        let (control_bearer, _, _) = forge("bridge-control");
+        app.enable_capability_auth(cap.clone());
+        let router = crate::server::build_router(app);
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &control_bearer,
+            Some(&wechat_body("wechat:40", "alice", &at, "ok")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "started", "{json}");
+        assert_eq!(run_count(&db).await, 1);
+
+        struct LateCase {
+            id: &'static str,
+            reason: &'static str,
+            hook: Box<dyn FnOnce() + Send>,
+        }
+        let cases = [
+            LateCase {
+                id: "bridge-revoked",
+                reason: "revoked",
+                hook: Box::new({
+                    let cap = cap.clone();
+                    move || {
+                        cap.revoke_by_id("bridge-revoked");
+                    }
+                }),
+            },
+            LateCase {
+                id: "bridge-expired",
+                reason: "expired",
+                hook: Box::new({
+                    let cap = cap.clone();
+                    move || {
+                        let mut state = cap.shared.state.lock().unwrap();
+                        let digest = *state.ids.get("bridge-expired").unwrap();
+                        state.records.get_mut(&digest).unwrap().claims.deadline =
+                            Some(tokio::time::Instant::now());
+                    }
+                }),
+            },
+            LateCase {
+                id: "bridge-generation",
+                reason: "stale_generation",
+                hook: Box::new({
+                    let cap = cap.clone();
+                    move || {
+                        let mut state = cap.shared.state.lock().unwrap();
+                        let digest = *state.ids.get("bridge-generation").unwrap();
+                        state
+                            .records
+                            .get_mut(&digest)
+                            .unwrap()
+                            .claims
+                            .daemon_generation = "rotated".into();
+                    }
+                }),
+            },
+        ];
+        for (index, case) in cases.into_iter().enumerate() {
+            let LateCase { id, reason, hook } = case;
+            let (bearer, forged_id, _) = forge(id);
+            assert_eq!(forged_id, id);
+            let event_id = format!("wechat:4{}", index + 1);
+            let payload = wechat_body(&event_id, "bob", &at, "late");
+            let body = axum::body::Body::from_stream(futures::stream::once(async move {
+                hook();
+                Ok::<axum::body::Bytes, std::convert::Infallible>(payload.into())
+            }));
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/inbound/events")
+                        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            let json = json_of(response).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{id} {json}");
+            assert_eq!(error_code(&json), "unauthorized", "{json}");
+            assert!(db.get_inbound_event(&event_id).await.unwrap().is_none());
+            assert_eq!(run_count(&db).await, 1, "{id}");
+            let matched = db
+                .list_audit()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.action == "capability.token.denied")
+                .filter(|entry| {
+                    entry.detail["denied"]["capability_id"].as_str() == Some(id)
+                        && entry.detail["denied"]["reason"].as_str() == Some(reason)
+                        && entry.detail["denied"]["operation"].as_str() == Some("inbound.ingest")
+                })
+                .count();
+            assert_eq!(matched, 1, "{id} {reason}");
+            let blob: String = db
+                .list_audit()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.detail.to_string())
+                .collect();
+            assert!(!blob.contains(&bearer), "{id}");
+        }
+    }
+
+    /// A component token that already holds `ModelsRead` or `ModuleRoute`
+    /// is still 403. The row is `capability.token.denied` with reason `route`
+    /// or `operation`, and the same id plus reason is written once.
+    /// `false &&` in front of the component gate in `authorize` turns the
+    /// models and module assertions red.
+    #[tokio::test]
+    async fn component_route_and_operation_denials_are_403_and_audited_once() {
+        use crate::capabilities::{Audience, CapabilityClaims, Operation, unix_now};
+
+        let (app, _host, _creative) = capability_state().await;
+        let cap = app.capabilities.clone().unwrap();
+        let db = app.store.clone();
+        let now = unix_now();
+        let forge = |id: &str, ops: &[Operation]| {
+            cap.insert(CapabilityClaims {
+                first_party: None,
+                capability_id: id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some("wechat-bridge".into()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "daemon-test".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 600,
+                deadline: Some(tokio::time::Instant::now() + StdDuration::from_secs(600)),
+                allowed_operations: ops.iter().copied().collect(),
+            })
+            .unwrap()
+            .into_bearer_parts()
+            .0
+        };
+        let models = forge(
+            "gate-models",
+            &[Operation::InboundIngest, Operation::ModelsRead],
+        );
+        let module = forge("gate-module", &[Operation::ModuleRoute]);
+        let ingest_only = forge("gate-ingest", &[Operation::InboundIngest]);
+        let modules = axum::Router::new().route(
+            "/api/v1/probe/item",
+            axum::routing::get(|| async { StatusCode::NO_CONTENT }),
+        );
+        let router = crate::server::build_router_with_modules(app, modules);
+
+        let deny_count = |entries: &[agent24_store::AuditEntry], id: &str, reason: &str| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == "capability.token.denied"
+                        && entry.detail["denied"]["capability_id"].as_str() == Some(id)
+                        && entry.detail["denied"]["reason"].as_str() == Some(reason)
+                        && entry.detail["denied"]["operation"].as_str() == Some("inbound.ingest")
+                })
+                .count()
+        };
+
+        for _ in 0..2 {
+            let (status, json) = call(&router, "GET", "/api/v1/models", &models, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+            assert_eq!(error_code(&json), "forbidden", "{json}");
+        }
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(deny_count(&entries, "gate-models", "route"), 1);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.detail.to_string().contains(&models))
+        );
+
+        let (status, json) = call(&router, "GET", "/api/v1/probe/item", &module, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        assert_eq!(error_code(&json), "forbidden", "{json}");
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(deny_count(&entries, "gate-module", "route"), 1);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.detail.to_string().contains(&module))
+        );
+
+        let (status, json) = call(&router, "GET", "/api/v1/models", &ingest_only, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(deny_count(&entries, "gate-ingest", "operation"), 1);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.detail.to_string().contains(&ingest_only))
+        );
     }
 }

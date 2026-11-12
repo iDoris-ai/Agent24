@@ -192,6 +192,12 @@ pub(super) async fn mint_bridge_capability(
     State(state): State<AppState>,
     authorization: Option<Extension<crate::capabilities::Authorization>>,
 ) -> Response {
+    // Dark unless `A24_DEV_TOOL=1`, including legacy mode. 409 remains the
+    // answer when the gate is on and this process has no capability store.
+    // Checked before issue so a closed gate writes no `capability.token.issued`.
+    if !state.dev_wechat_events {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    }
     let Some(store) = state.capabilities.clone() else {
         return error_response(
             StatusCode::CONFLICT,
@@ -255,6 +261,22 @@ pub(super) async fn mint_bridge_capability(
         .into_response()
 }
 
+/// Revoke one capability by id.
+///
+/// A live dev-bridge token is revoked in memory first. The audit row is
+/// `capability.token.revoked`. If that write fails the response is 503
+/// `audit_unavailable` and the bearer stays unusable; the caller retries the
+/// row. Every other id (unknown, already revoked, or not the dev-bridge
+/// profile) still answers 200 `revoked` and does not try to write that closed
+/// row.
+///
+/// 503 is therefore only returned for a bridge id while the audit store is
+/// failing. That tells the caller this id was a dev-bridge token. The
+/// difference is acceptable: the route already requires the elevated shell
+/// that issued the id, the body contains no bearer, and a uniform 200 would
+/// hide the missing row so the host would not retry. Unknown ids stay 200,
+/// including while the audit store is down, so this is not an existence
+/// oracle for arbitrary ids.
 pub(super) async fn revoke_capability(
     State(state): State<AppState>,
     Path(capability_id): Path<String>,
