@@ -26,6 +26,8 @@ const promptHomeImportPassword = vi.fn()
 const execFileMock = vi.fn()
 /** When set, the execFile mock returns this child instead of a dummy. */
 const omlxExecFile: { current: ((...args: unknown[]) => unknown) | null } = { current: null }
+/** What registerIpcHandlers' keepOwnedOmlxOnQuit answers (the resident service installed). */
+const keepOmlx = { current: false }
 const appListeners = new Map<string, Set<() => void>>()
 const appFocus = vi.fn()
 function listenApp(event: string, fn: () => void): void {
@@ -275,6 +277,7 @@ beforeAll(async () => {
     promptUnlockPassword: (...a: unknown[]) => promptUnlockPassword(...a) as never,
     promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
     exportTimeoutMs,
+    keepOwnedOmlxOnQuit: () => keepOmlx.current,
     documentsModule: () => docStatus,
     documentsModuleActions: { uninstall: () => docUninstall(), install: () => docInstall() },
     guard: createIpcGuard({
@@ -321,6 +324,7 @@ beforeEach(() => {
   resetLastCommExportForTests()
   execFileMock.mockReset()
   omlxExecFile.current = null
+  keepOmlx.current = false
   resetOmlxProcessForTests()
 })
 
@@ -2193,6 +2197,65 @@ describe('FU-114 OmlxStop only kills the process this app started', () => {
     children[1]!.emit('exit', null, 'SIGTERM')
     await quit
     expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  // PR#1 F1 (ruling 2026-11-13-pr1-omlx-quit-resident, A): with the resident
+  // service installed the daemon keeps running after the app quits and uses
+  // this oMLX, so quitting leaves it running; the user's own stop still stops it.
+  it('leaves the oMLX this app started running on quit when the resident service is installed', async () => {
+    keepOmlx.current = true
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7105)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    emitApp('before-quit')
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(children[0]!.signals).toEqual([])
+    const stopping = call(IpcChannels.OmlxStop)
+    await vi.waitFor(() => expect(children[0]!.signals).toContain('SIGTERM'))
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await stopping).toEqual({ ok: true, stopped: true })
+  })
+
+  it('reads whether to keep it at the quit, not when the handlers were registered', async () => {
+    keepOmlx.current = true
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7106)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    // 「完全退出」 removed the LaunchAgent before it quits.
+    keepOmlx.current = false
+    emitApp('before-quit')
+    expect(children[0]!.signals[0]).toBe('SIGTERM')
+    const quit = ensureOwnedOmlxQuit()
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await quit).toBe(true)
+  })
+
+  it('a stop the quit already started is waited for, whatever is read after it', async () => {
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7107)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    emitApp('before-quit')
+    expect(children[0]!.signals[0]).toBe('SIGTERM')
+    keepOmlx.current = true
+    let settled = false
+    const quit = ensureOwnedOmlxQuit().then((v) => { settled = true; return v })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(settled).toBe(false)
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await quit).toBe(true)
   })
 })
 

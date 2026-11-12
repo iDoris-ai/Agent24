@@ -3,6 +3,7 @@
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
+import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
@@ -592,6 +593,7 @@ app.whenReady().then(async () => {
       uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
+    keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() }),
   })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,

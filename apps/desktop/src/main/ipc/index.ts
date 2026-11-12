@@ -58,6 +58,8 @@ let omlxProcess: ChildProcess | null = null
 let omlxStopping: Promise<void> | null = null
 /** Quit latch so before-quit and the shutdown wait share one bounded stop. */
 let ownedOmlxQuit: Promise<boolean> | null = null
+/** Whether quitting leaves the oMLX this app started running; set by registerIpcHandlers. */
+let keepOwnedOmlxOnQuit: () => boolean = () => false
 
 /** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
  *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
@@ -167,6 +169,8 @@ export async function stopOwnedOmlx(): Promise<boolean> {
  *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
 export function ensureOwnedOmlxQuit(): Promise<boolean> {
   if (ownedOmlxQuit) return ownedOmlxQuit
+  // The resident service daemon uses it after the app is gone (M5 B4).
+  if (keepOwnedOmlxOnQuit()) return Promise.resolve(false)
   const stopping = stopOwnedOmlx()
   const bounded = stopWithin({ stop: () => stopping }, OMLX_QUIT_STOP_BUDGET_MS)
   ownedOmlxQuit = bounded
@@ -663,6 +667,9 @@ export function registerIpcHandlers(options: {
    * Tests shrink `current`; production leaves it at {@link EXPORT_TIMEOUT_MS}.
    */
   exportTimeoutMs?: { current: number }
+  /** Whether quitting leaves the oMLX this app started running (the resident
+   * service daemon uses it); default: never. */
+  keepOwnedOmlxOnQuit?: () => boolean
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
@@ -673,6 +680,7 @@ export function registerIpcHandlers(options: {
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
+  keepOwnedOmlxOnQuit = options.keepOwnedOmlxOnQuit ?? (() => false)
   app.on('before-quit', () => {
     quitting = true
     // SIGTERM goes out before this listener returns when we own the child.
