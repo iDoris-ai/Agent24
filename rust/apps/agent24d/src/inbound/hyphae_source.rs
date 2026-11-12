@@ -30,17 +30,23 @@
 //! forever, and a future `created_at` pins the cursor in the future. This
 //! poller does not pass `--after-id`. `inbound_cursor` stays in the store
 //! (the table and its read/write API are unused here). 游标表保留，当前按最新页
-//! + 去重；Hyphae 若提供按本地接收序的游标再启用。
+//! + 去重；Hyphae 若提供按本地接收序的游标再启用。已入库的 id 不再 `ingest`。
+//!
+//! 例外是 `run_state=start_failed`：交给 `redispatch_failed`，只在
+//! `received_at` 仍处于 600 秒窗口内、且该发送者没有在途 explicit 时重试。
 //!
 //! `identity list` `data` is an array of `{nickname, npub, ...}`.
 //! `groupchat list` `data` is `{"groups":[{"group_id", ...}]}`.
 //!
 //! Unverified and therefore conservative: a group @ is only the local npub
 //! or `@nickname` in the text (no mention array → not a mention →
-//! `addressed=none`). `@nickname` needs a boundary on both sides: the
-//! neighbor is the end of the text, or a character that is not a Unicode
-//! alphanumeric and not `-`, `_`, or `.`. `bob@me.com`, `@ann-bot`,
-//! `@ann.x`, and `@ann其他` are not mentions. There is no
+//! `addressed=none`). `@nickname` needs a boundary on both sides. A neighbor
+//! that is a Unicode alphanumeric, or `-`, `_`, or `.`, is still part of the
+//! token, except a trailing `.` whose next character is whitespace or the end
+//! of the text (`@ann.`). `bob@me.com`, `@ann-bot`, `@ann.x`, and `@ann其他`
+//! are not mentions. `@ann你好` (CJK glued on) is not a mention either: a
+//! Chinese nickname is ambiguous, so a miss is the deliberate conservative
+//! call. There is no
 //! per-message human/bot flag; `human` is the content rule below, and a
 //! body we cannot classify as protocol is `human=true` (the written §3.3
 //! rule). An empty `event_id` is not ingested. A body whose trimmed text
@@ -86,8 +92,9 @@ use super::service::{INBOUND_MAX_AGE_SECS, InboundMessage, InboundService};
 pub(crate) const HYPHAE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// `history inbox` / `groupchat history` page size. Comm caps both at 200.
 /// One round reads one page. Rows older than that page are left unseen.
-/// That is the safe direction: they do not start a run. X11-2h follows up
-/// on the same cap for DMs and groups (at most 200 per round).
+/// They do not start a run, and a stranger can fill the page so an
+/// allowlisted sender is crowded off this round. That availability gap is
+/// recorded on X11-2h (at most 200 per round, DMs and groups).
 const HISTORY_LIMIT: u32 = 200;
 /// Locked keystore / missing binary: warn at most this often, per category.
 const QUIET_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
@@ -307,14 +314,8 @@ impl HyphaeInbound {
                 .filter(|id| !id.is_empty())
             {
                 let stored_id = format!("hyphae:{event_id}");
-                match self.store.get_inbound_event(&stored_id).await {
-                    Ok(Some(_)) => continue,
-                    Ok(None) => {}
-                    Err(err) => {
-                        return Err(PullError::Store(format!(
-                            "direct lookup {stored_id}: {err}"
-                        )));
-                    }
+                if self.already_seen(&stored_id).await? {
+                    continue;
                 }
             }
             self.count_direct_attempt();
@@ -367,14 +368,16 @@ impl HyphaeInbound {
     /// Latest page only. No `--after-id`: that cursor is
     /// `(created_at, logical_id)`, so a late earlier row never returns and a
     /// future stamp moves the cursor ahead of every later real message.
-    /// Already-stored ids are skipped; anything else is ingested. A retryable
-    /// ingest error stops this group for the round. The next round reads the
-    /// latest page again.
+    /// Already-stored ids are skipped, except `start_failed`, which is
+    /// redispatched. Anything else is ingested. A retryable ingest error
+    /// stops this group for the round. The next round reads the latest page
+    /// again.
     ///
     /// Hyphae with no cursor returns the newest [`HISTORY_LIMIT`] rows,
-    /// oldest first. A backlog past that page is not fetched. Missing those
-    /// older rows is the safe direction (they do not start a run). X11-2h:
-    /// DMs and groups are at most 200 messages per round.
+    /// oldest first. A backlog past that page is not fetched. Those older
+    /// rows do not start a run, and a stranger can fill the page so an
+    /// allowlisted sender is crowded off this round. X11-2h: DMs and groups
+    /// are at most 200 messages per round.
     async fn poll_group(
         &self,
         cli: &dyn HyphaeCli,
@@ -550,12 +553,8 @@ impl HyphaeInbound {
             });
         };
         let stored_id = format!("hyphae:{event_id}");
-        match self.store.get_inbound_event(&stored_id).await {
-            Ok(Some(_)) => return Ok(Handled::Done),
-            Ok(None) => {}
-            Err(err) => {
-                return Err(PullError::Store(format!("group lookup {stored_id}: {err}")));
-            }
+        if self.already_seen(&stored_id).await? {
+            return Ok(Handled::Done);
         }
         let Some(actor) = row
             .get("sender")
@@ -614,6 +613,34 @@ impl HyphaeInbound {
             Err(err) => {
                 self.quiet_warn("allowlist", &format!("allowlist lookup failed: {err}"));
                 false
+            }
+        }
+    }
+
+    /// `true` when `stored_id` is already in the table and this round must
+    /// not `ingest` it. `start_failed` is the exception: retry through
+    /// [`InboundService::redispatch_failed`] (still not a second insert).
+    async fn already_seen(&self, stored_id: &str) -> Result<bool, PullError> {
+        match self.store.get_inbound_event(stored_id).await {
+            Ok(Some(event)) if event.run_state.as_deref() == Some("start_failed") => {
+                self.redispatch_stored(stored_id).await?;
+                Ok(true)
+            }
+            Ok(Some(_)) => Ok(true),
+            Ok(None) => Ok(false),
+            Err(err) => Err(PullError::Store(format!("lookup {stored_id}: {err}"))),
+        }
+    }
+
+    async fn redispatch_stored(&self, stored_id: &str) -> Result<(), PullError> {
+        self.ensure_polling().await?;
+        match self.service.redispatch_failed(stored_id).await {
+            Ok(_) => Ok(()),
+            Err(super::service::IngestError::Store(err)) => Err(PullError::Store(err.to_string())),
+            Err(super::service::IngestError::Start(err)) => Err(PullError::Store(err)),
+            Err(err) => {
+                self.quiet_warn("ingest", &format!("redispatch failed: {err:?}"));
+                Ok(())
             }
         }
     }
@@ -867,6 +894,9 @@ fn is_protocol(text: &str) -> bool {
 /// `@nickname` with a boundary on both sides. A neighbor that is a Unicode
 /// alphanumeric, or `-`, `_`, or `.`, is still part of the token, so
 /// `bob@me.com`, `@ann-bot`, `@ann.x`, and `@ann其他` are not mentions.
+/// A `.` that ends the text, or is followed by whitespace, is a boundary
+/// (`@ann.`). `@ann你好` is not: CJK glued to the nickname is ambiguous,
+/// and missing it is the deliberate conservative call.
 fn mentions(text: &str, npub: &str, nickname: &str) -> bool {
     if !npub.is_empty() && text.contains(npub) {
         return true;
@@ -881,12 +911,20 @@ fn mentions(text: &str, npub: &str, nickname: &str) -> bool {
                 .chars()
                 .next_back()
                 .is_some_and(|ch| !mention_token_char(ch));
-        let right = text[index + needle.len()..]
-            .chars()
-            .next()
-            .is_none_or(|ch| !mention_token_char(ch));
+        let right = mention_right_boundary(&text[index + needle.len()..]);
         left && right
     })
+}
+
+/// Right edge of `@nickname`. `.` then whitespace or the end of the text is
+/// a sentence-final period, not another token character.
+fn mention_right_boundary(rest: &str) -> bool {
+    let mut chars = rest.chars();
+    match chars.next() {
+        None => true,
+        Some('.') => chars.next().is_none_or(char::is_whitespace),
+        Some(ch) => !mention_token_char(ch),
+    }
 }
 
 /// Character that continues a nickname token. Either side of `@nickname`
@@ -1072,7 +1110,10 @@ mod tests {
         })
     }
 
-    async fn open(script: Arc<Script>, now: DateTime<Utc>) -> (HyphaeInbound, Store) {
+    async fn open_managed(
+        script: Arc<Script>,
+        now: DateTime<Utc>,
+    ) -> (HyphaeInbound, Store, Arc<RunManager>) {
         let store = Store::open_memory().await.unwrap();
         let runs = RunManager::new(
             store.clone(),
@@ -1086,13 +1127,18 @@ mod tests {
         );
         let inbound = HyphaeInbound::new(
             store.clone(),
-            runs,
+            Arc::clone(&runs),
             Arc::new({
                 let script = Arc::clone(&script);
                 move || Some(Arc::clone(&script) as Arc<dyn HyphaeCli>)
             }),
             Arc::new(move || now),
         );
+        (inbound, store, runs)
+    }
+
+    async fn open(script: Arc<Script>, now: DateTime<Utc>) -> (HyphaeInbound, Store) {
+        let (inbound, store, _) = open_managed(script, now).await;
         (inbound, store)
     }
 
@@ -1603,11 +1649,18 @@ mod tests {
 
     /// Mutation: treat the right edge as ASCII only (`is_ascii_alphanumeric`
     /// plus `_`). `@ann其他` then counts as a mention and this test goes red.
+    /// Treating every `.` as a token character makes `@ann.` miss.
+    /// Treating CJK as a boundary makes `@ann你好` hit; that miss is
+    /// deliberate (a Chinese nickname is ambiguous).
     #[test]
     fn nickname_ann_rejects_a_longer_token() {
         assert!(!mentions("@ann-bot", SELF_NPUB, "ann"));
         assert!(!mentions("@ann其他", SELF_NPUB, "ann"));
         assert!(!mentions("@ann.x", SELF_NPUB, "ann"));
+        assert!(mentions("@ann.", SELF_NPUB, "ann"));
+        assert!(mentions("@ann. ", SELF_NPUB, "ann"));
+        assert!(mentions("@ann.\nnext", SELF_NPUB, "ann"));
+        assert!(!mentions("@ann你好", SELF_NPUB, "ann"));
         assert!(mentions("@ann 你好", SELF_NPUB, "ann"));
         assert!(mentions("@ann，", SELF_NPUB, "ann"));
         assert!(
@@ -1637,6 +1690,134 @@ mod tests {
             start + interval,
             interval
         ));
+    }
+
+    fn one_direct(id: &str, now_at: DateTime<Utc>) -> Arc<Script> {
+        Arc::new(Script {
+            calls: StdMutex::new(Vec::new()),
+            directs: StdMutex::new(vec![direct(
+                id,
+                PEER,
+                now_at.timestamp(),
+                "please run",
+                true,
+            )]),
+            groups: StdMutex::new(Vec::new()),
+            fail: StdMutex::new(None),
+        })
+    }
+
+    async fn inbound_state(store: &Store, id: &str) -> String {
+        store
+            .get_inbound_event(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_state
+            .unwrap()
+    }
+
+    /// Mutation: drop the `redispatch_stored` call in `already_seen`. The
+    /// second poll skips the stored row, so this stays `start_failed` with
+    /// zero runs. The first failure is `RunManager::fail_next_inbound_start`
+    /// after the inbound insert, not a `BEFORE INSERT` trigger.
+    #[tokio::test]
+    async fn a_failed_start_is_redispatched_on_the_next_poll() {
+        let now_at = wall_now();
+        let (inbound, store, manager) = open_managed(one_direct("evt-retry", now_at), now_at).await;
+        allow(&store, PEER).await;
+        manager.fail_next_inbound_start();
+
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-retry").await,
+            "start_failed"
+        );
+        assert_eq!(runs(&store).await, 0);
+
+        inbound.poll_round().await.unwrap();
+        assert_eq!(runs(&store).await, 1);
+        let state = inbound_state(&store, "hyphae:evt-retry").await;
+        assert!(
+            matches!(state.as_str(), "started" | "done"),
+            "redispatch starts the run, got {state}"
+        );
+    }
+
+    /// The row would start if retried. `received_at` older than 600s does not.
+    #[tokio::test]
+    async fn a_start_failure_older_than_the_window_is_not_retried() {
+        let now_at = wall_now();
+        let (inbound, store, manager) = open_managed(one_direct("evt-old", now_at), now_at).await;
+        allow(&store, PEER).await;
+        manager.fail_next_inbound_start();
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-old").await,
+            "start_failed"
+        );
+
+        let stale = format_inbound_timestamp(Utc::now() - chrono::Duration::seconds(601));
+        sqlx::query("UPDATE inbound_events SET received_at = ? WHERE id = ?")
+            .bind(&stale)
+            .bind("hyphae:evt-old")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-old").await,
+            "start_failed"
+        );
+        assert_eq!(runs(&store).await, 0);
+    }
+
+    /// Same actor already `starting`: the partial unique index blocks the
+    /// `start_failed` → `starting` move, so redispatch does not start a run.
+    #[tokio::test]
+    async fn redispatch_does_not_pass_an_inflight_sender() {
+        let now_at = wall_now();
+        let (inbound, store, manager) = open_managed(one_direct("evt-held", now_at), now_at).await;
+        allow(&store, PEER).await;
+        manager.fail_next_inbound_start();
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-held").await,
+            "start_failed"
+        );
+
+        let stamp = format_inbound_timestamp(Utc::now());
+        let inserted = store
+            .insert_inbound_event(&agent24_store::NewInboundEvent {
+                id: "hyphae:occupy".to_owned(),
+                source: SOURCE.to_owned(),
+                category: "direct".to_owned(),
+                recipient_identity: Some(SELF_NPUB.to_owned()),
+                thread_key: None,
+                actor: Some(PEER.to_owned()),
+                human: true,
+                addressed: "direct".to_owned(),
+                at: stamp.clone(),
+                received_at: stamp,
+                text: Some("occupy".to_owned()),
+                meta: None,
+                disposition: "explicit".to_owned(),
+                disposition_reason: None,
+                policy_version: None,
+                run_state: Some("starting".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(inserted, agent24_store::InboundInsert::Inserted);
+
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-held").await,
+            "start_failed"
+        );
+        assert_eq!(inbound_state(&store, "hyphae:occupy").await, "starting");
+        assert_eq!(runs(&store).await, 0);
     }
 
     /// Mutation: drop the `hyphae.group/` arm. This row becomes a human

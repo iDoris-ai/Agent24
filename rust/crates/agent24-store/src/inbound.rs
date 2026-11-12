@@ -249,6 +249,33 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// Move `start_failed` back to `starting` so a later dispatch can retry.
+    ///
+    /// The `WHERE` requires `disposition='explicit'`, `run_state='start_failed'`,
+    /// and no `inbound_runs` row. A missing id or any other state returns
+    /// `false` and writes nothing. A clash on `idx_inbound_events_inflight`
+    /// (this sender already has a `starting` or `started` explicit row) is
+    /// also `false`: the row stays `start_failed`.
+    ///
+    /// # Errors
+    /// Storage, other than that in-flight index.
+    pub async fn reopen_inbound_start_failed(&self, id: &str) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE inbound_events SET run_state = 'starting' \
+             WHERE id = ? AND run_state = 'start_failed' AND disposition = 'explicit' \
+               AND NOT EXISTS (SELECT 1 FROM inbound_runs WHERE event_id = ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(self.pool())
+        .await;
+        match updated {
+            Ok(done) => Ok(done.rows_affected() > 0),
+            Err(sqlx::Error::Database(err)) if is_inflight_conflict(err.as_ref()) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Link a run to the inbound event that started it.
     ///
     /// `run_id` and `event_id` are both unique. The run row must already exist.
@@ -1855,6 +1882,122 @@ mod tests {
         let after = store.inbound_reconcile().await.unwrap();
         assert!(after.linked.is_empty());
         assert!(after.unlinked.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reopen_start_failed_requires_explicit_unlinked_and_a_free_slot() {
+        let store = Store::open_memory().await.unwrap();
+        let hold = sample("hyphae:hold", "npub1", "explicit", Some("starting"));
+        let failed = sample("hyphae:retry", "npub1", "explicit", Some("start_failed"));
+        assert_eq!(
+            store.insert_inbound_event(&hold).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        assert_eq!(
+            store.insert_inbound_event(&failed).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:retry")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("start_failed")
+        );
+
+        assert!(
+            store
+                .mark_inbound_run_state("hyphae:hold", "started")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_inbound_run_state("hyphae:hold", "done")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .reopen_inbound_start_failed("hyphae:retry")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("starting")
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:retry")
+                .await
+                .unwrap()
+        );
+
+        let linked = sample(
+            "hyphae:linked-fail",
+            "npub9",
+            "explicit",
+            Some("start_failed"),
+        );
+        assert_eq!(
+            store.insert_inbound_event(&linked).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        seed_run(&store, "run_linked_fail").await;
+        store
+            .insert_inbound_run("run_linked_fail", "hyphae:linked-fail")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:linked-fail")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:linked-fail")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("start_failed")
+        );
+
+        let ignored = sample("hyphae:ignored", "npub8", "ignore", Some("start_failed"));
+        assert_eq!(
+            store.insert_inbound_event(&ignored).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:ignored")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:missing")
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

@@ -7,7 +7,10 @@
 //! commit and before `run_state` leaves `starting` is what
 //! [`reconcile_inbound_runs`] closes: a link with a live run becomes
 //! `started`; a link whose run has ended becomes `done`; `starting` with no
-//! link becomes `interrupted` and is not started again.
+//! link becomes `interrupted` and is not started again. `start_failed` is
+//! not that path. [`InboundService::redispatch_failed`] may move it back to
+//! `starting` while `received_at` is still inside [`INBOUND_MAX_AGE_SECS`].
+//! `interrupted` is still not started again.
 //!
 //! 评审 N1：没有 run 级墙钟超时。`MAX_ITERATIONS`
 //! （`agent24-agent/src/lib.rs:62`，循环在同文件约 2751 行）只限制模型
@@ -211,6 +214,45 @@ impl InboundService {
             );
         }
         result
+    }
+
+    /// Retry a start that failed before any run was linked.
+    ///
+    /// The row must still be `explicit` and `start_failed`, and `received_at`
+    /// must be no older than [`INBOUND_MAX_AGE_SECS`]. Older than that is
+    /// expired: the row stays `start_failed` and this does not call
+    /// [`Self::dispatch`]. A sender who already has an in-flight explicit row
+    /// fails the `start_failed` → `starting` transition (the partial unique
+    /// index). That stays `start_failed` and is reported as `rate_limited`,
+    /// so a later round can try again. This does not insert an `ignore` row.
+    pub(crate) async fn redispatch_failed(
+        &self,
+        event_id: &str,
+    ) -> Result<IngestOutcome, IngestError> {
+        let event = self
+            .store
+            .get_inbound_event(event_id)
+            .await?
+            .ok_or_else(|| IngestError::Invalid(format!("unknown inbound event {event_id}")))?;
+        if event.run_state.as_deref() != Some("start_failed")
+            || event.disposition != Disposition::Explicit.as_str()
+        {
+            return Ok(IngestOutcome::Duplicate);
+        }
+        let received = parse_unix("received_at", &event.received_at).unwrap_or(i64::MIN);
+        let age = Utc::now().timestamp().saturating_sub(received);
+        let max_age = i64::try_from(INBOUND_MAX_AGE_SECS).unwrap_or(i64::MAX);
+        if age > max_age {
+            return Ok(IngestOutcome::Ignored {
+                reason: "stale".to_owned(),
+            });
+        }
+        if !self.store.reopen_inbound_start_failed(event_id).await? {
+            return Ok(IngestOutcome::Ignored {
+                reason: "rate_limited".to_owned(),
+            });
+        }
+        self.dispatch(event_id).await
     }
 
     async fn dispatch_inner(&self, event_id: &str) -> Result<IngestOutcome, IngestError> {
