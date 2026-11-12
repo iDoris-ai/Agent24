@@ -4898,6 +4898,10 @@ paths:
         accepted (`400 invalid_request`). The server reruns the evals from the
         stored revisions and binds that result. A rollback does not rerun.
 
+        A first-party shell token gets these errors, and `unchanged`, without
+        elevation: the daemon runs the same checks and the eval rerun first and
+        asks for presence only when the pointer would really move.
+
         `unchanged: true` means the pointer already named the pair. Nothing
         was written, and it does not mean this request's evals or accepted
         list were checked or stored.
@@ -4924,7 +4928,8 @@ paths:
         "400":
           description: >-
             `invalid_request`, `skill_activation_mixed`,
-            `skill_origin_mismatch`, or a manifest or eval rejection
+            `skill_origin_mismatch`, `skill_revision_mismatch`, or a manifest
+            or eval rejection
           content:
             application/json:
               schema:
@@ -4938,7 +4943,8 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "404":
-          description: Unknown revision or activation record
+          description: >-
+            `skill_revision_not_found` or `skill_activation_not_found`
           content:
             application/json:
               schema:

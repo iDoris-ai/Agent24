@@ -2386,6 +2386,10 @@ export interface paths {
          *     accepted (`400 invalid_request`). The server reruns the evals from the
          *     stored revisions and binds that result. A rollback does not rerun.
          *
+         *     A first-party shell token gets these errors, and `unchanged`, without
+         *     elevation: the daemon runs the same checks and the eval rerun first and
+         *     asks for presence only when the pointer would really move.
+         *
          *     `unchanged: true` means the pointer already named the pair. Nothing
          *     was written, and it does not mean this request's evals or accepted
          *     list were checked or stored.
@@ -9472,7 +9476,7 @@ export interface operations {
                     "application/json": components["schemas"]["SkillActivation"];
                 };
             };
-            /** @description `invalid_request`, `skill_activation_mixed`, `skill_origin_mismatch`, or a manifest or eval rejection */
+            /** @description `invalid_request`, `skill_activation_mixed`, `skill_origin_mismatch`, `skill_revision_mismatch`, or a manifest or eval rejection */
             400: {
                 headers: {
                     [name: string]: unknown;
@@ -9491,7 +9495,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description Unknown revision or activation record */
+            /** @description `skill_revision_not_found` or `skill_activation_not_found` */
             404: {
                 headers: {
                     [name: string]: unknown;

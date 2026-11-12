@@ -2,8 +2,11 @@
 //! written straight into the store so each test controls the exact pair.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use axum::Router;
 use axum::body::Body;
+use axum::http::Request;
 use serde_json::{Value, json};
+use tower::ServiceExt;
 
 use super::*;
 
@@ -69,6 +72,7 @@ async fn post(state: &AppState, id: &str, request: Value) -> (StatusCode, Value)
     let response = post_skill_activate(
         State(state.clone()),
         AxumPath(id.to_owned()),
+        None,
         Body::from(request.to_string()),
     )
     .await;
@@ -382,7 +386,12 @@ async fn rollback_restores_a_whole_pair_without_rerunning_or_deleting_pins() {
     let missing = json!({"expected_generation": 3, "rollback_activation_id": "nope"});
     let (status, value) = post(&state, SKILL, missing).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
-    assert_eq!(value["error"]["code"], "not_found");
+    assert_eq!(value["error"]["code"], "skill_activation_not_found");
+    // A stale generation is reported before a missing history row.
+    let stale = json!({"expected_generation": 9, "rollback_activation_id": "nope"});
+    let (status, value) = post(&state, SKILL, stale).await;
+    assert_eq!(status, StatusCode::CONFLICT, "{value}");
+    assert_eq!(value["error"]["code"], "skill_pointer_conflict");
     let with_accepted = json!({
         "expected_generation": 3, "rollback_activation_id": first_activation, "accepted": ["x"]
     });
@@ -409,12 +418,20 @@ async fn request_shapes_and_unknown_revisions_are_refused() {
     }
     let (status, value) = post(&state, SKILL, pair(0, "missing", &e1)).await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{value}");
+    assert_eq!(value["error"]["code"], "skill_revision_not_found");
     // A body id in the evals slot is the wrong kind.
     let (status, value) = post(&state, SKILL, pair(0, &b1, &b1)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"]["code"], "skill_revision_mismatch");
     // Another skill's revision is not this skill's.
     let (status, value) = post(&state, "other", pair(0, &b1, &e1)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"]["code"], "skill_revision_mismatch");
+    // There is no skill body in this request: a huge one is just a bad request.
+    let huge = json!({"expected_generation": 0, "accepted": ["x".repeat(2 * 1024 * 1024)]});
+    let (status, value) = post(&state, SKILL, huge).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+    assert_eq!(value["error"]["code"], "invalid_request");
     assert!(pointer(&store).await.is_none());
 }
 
@@ -450,7 +467,7 @@ async fn the_summary_comes_from_stored_rows_in_four_items() {
     let b1 = body(&store, SkillOrigin::Imported, "1.0.0", "hello world").await;
     let e1 = evals(&store, SkillOrigin::Imported, "1.0.0", &["hello world"]).await;
     let b2 = body(&store, SkillOrigin::Imported, "2.0.0", "hello world two").await;
-    let ue = evals(&store, SkillOrigin::User, "9.0.0", &["hello world"]).await;
+    let ue = evals(&store, SkillOrigin::User, "9.0.0", &["user text"]).await;
     let ub = body(&store, SkillOrigin::User, "9.0.0", "user text").await;
     let request = pair(0, &b1, &e1).to_string();
     let first = activation_summary(&store, SKILL, request.as_bytes())
@@ -554,4 +571,80 @@ async fn the_detail_lists_activations_without_cases_or_text() {
     assert_eq!(rows[0]["origin_to"], "imported");
     assert!(rows[0].get("cases_json").is_none());
     assert!(!detail.to_string().contains("hello world"));
+}
+
+/// Accepting failures is disclosed in the daemon's own summary.
+/// Mutation: drop the `接受 N 条失败用例` suffix in `summary_of` and this is red.
+#[tokio::test]
+async fn the_summary_discloses_accepted_failures() {
+    let state = fixture().await;
+    let store = state.store.clone();
+    let b1 = body(&store, SkillOrigin::Imported, "1.0.0", "hello world").await;
+    let e1 = evals(
+        &store,
+        SkillOrigin::Imported,
+        "1.0.0",
+        &["hello world", "absent"],
+    )
+    .await;
+    let (_, probe) = post(&state, SKILL, pair(0, &b1, &e1)).await;
+    let failed = probe["error"]["details"]["failed"].clone();
+    let mut request = pair(0, &b1, &e1);
+    request["accepted"] = failed;
+    let summary = activation_summary(&store, SKILL, request.to_string().as_bytes())
+        .await
+        .unwrap();
+    assert!(summary.ends_with("；接受 1 条失败用例"), "{summary}");
+    // Without accepted failures the suffix is absent. Unaccepted failures
+    // have no summary at all: the pre-check answers 409 instead.
+    let clean = body(&store, SkillOrigin::Imported, "2.0.0", "hello world").await;
+    let ok_evals = evals(&store, SkillOrigin::Imported, "2.0.0", &["hello world"]).await;
+    let summary = activation_summary(
+        &store,
+        SKILL,
+        pair(0, &clean, &ok_evals).to_string().as_bytes(),
+    )
+    .await
+    .unwrap();
+    assert!(!summary.contains("接受"), "{summary}");
+    assert!(
+        activation_summary(&store, SKILL, pair(0, &b1, &e1).to_string().as_bytes())
+            .await
+            .is_none()
+    );
+}
+
+/// The audit actor names the caller's audience and token id, not a constant.
+#[tokio::test]
+async fn the_audit_actor_is_the_callers_audience_and_token_id() {
+    let state = fixture().await;
+    let store = state.store.clone();
+    let b1 = body(&store, SkillOrigin::Imported, "1.0.0", "hello world").await;
+    let e1 = evals(&store, SkillOrigin::Imported, "1.0.0", &["hello world"]).await;
+    let (_, _) = post(&state, SKILL, pair(0, &b1, &e1)).await;
+    let (cap_state, host, _) = crate::server::tests::capability_state().await;
+    let store = cap_state.store.clone();
+    let b = body(&store, SkillOrigin::Imported, "1.0.0", "hello world").await;
+    let e = evals(&store, SkillOrigin::Imported, "1.0.0", &["hello world"]).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/v1/skills/demo/activate")
+        .header("authorization", format!("Bearer {host}"))
+        .body(Body::from(pair(0, &b, &e).to_string()))
+        .unwrap();
+    let response = crate::server::build_router_with_modules(cap_state.clone(), Router::new())
+        .oneshot(request)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let audit = store.list_audit().await.unwrap();
+    let entry = audit.iter().find(|e| e.action == "skill.activate").unwrap();
+    assert!(entry.actor.starts_with("product_host:"), "{}", entry.actor);
+    assert!(!entry.actor.contains(&host), "never the bearer secret");
+    let unauth = state.store.list_audit().await.unwrap();
+    let direct = unauth
+        .iter()
+        .find(|e| e.action == "skill.activate")
+        .unwrap();
+    assert_eq!(direct.actor, "daemon");
 }

@@ -820,12 +820,16 @@ async fn load_revision(
     let Some(row) = row else {
         return Err(Fail::Http(
             StatusCode::NOT_FOUND,
-            "not_found",
+            "skill_revision_not_found",
             "修订不存在".to_owned(),
         ));
     };
     if row.skill_id != skill_id || row.kind != kind {
-        return Err(invalid_request("修订不属于这个技能，或种类不对"));
+        return Err(Fail::Http(
+            StatusCode::BAD_REQUEST,
+            "skill_revision_mismatch",
+            "修订不属于这个技能，或种类不对".to_owned(),
+        ));
     }
     Ok(row)
 }
@@ -861,9 +865,15 @@ async fn resolve_activation(
                 .iter()
                 .find(|row| row.activation_id == *activation_id)
             else {
+                // A stale generation is reported before a missing history row.
+                if pointer.as_ref().map_or(0, |row| row.generation) != expected_generation {
+                    return Err(Fail::from_store(
+                        agent24_store::StoreError::SkillPointerConflict,
+                    ));
+                }
                 return Err(Fail::Http(
                     StatusCode::NOT_FOUND,
-                    "not_found",
+                    "skill_activation_not_found",
                     "激活记录不存在".to_owned(),
                 ));
             };
@@ -980,41 +990,103 @@ fn check_accepted(
     ))
 }
 
+/// What a request would do, decided before anything is written or asked.
+enum Plan {
+    /// The pointer already names the pair. Moves nothing.
+    Unchanged(agent24_store::SkillPointer),
+    Move(Box<PreparedMove>),
+}
+
+struct PreparedMove {
+    resolved: Resolved,
+    expected_generation: i64,
+    target: ActivateTarget,
+    /// The server's own eval run. `None` for a rollback, which never reruns.
+    report: Option<agent24_skill::TextConsistencyReport>,
+}
+
+/// Parse, resolve and rerun: every business check except the commit-time CAS,
+/// which the store repeats inside its own transaction.
+async fn prepare_activation(store: &Store, skill_id: &str, bytes: &[u8]) -> Result<Plan, Fail> {
+    let (expected_generation, target) = parse_activate(bytes)?;
+    let resolved = match resolve_activation(store, skill_id, expected_generation, &target).await? {
+        Ok(resolved) => resolved,
+        Err(pointer) => return Ok(Plan::Unchanged(pointer)),
+    };
+    let report = match &target {
+        ActivateTarget::Pair { accepted, .. } => {
+            let report = rerun_evals(&resolved.body, &resolved.evals)?;
+            check_accepted(&report, accepted)?;
+            Some(report)
+        }
+        ActivateTarget::Rollback { .. } => None,
+    };
+    Ok(Plan::Move(Box::new(PreparedMove {
+        resolved,
+        expected_generation,
+        target,
+        report,
+    })))
+}
+
+fn unchanged_response(skill_id: &str, pointer: agent24_store::SkillPointer) -> ActivateResponse {
+    ActivateResponse {
+        skill_id: skill_id.to_owned(),
+        result: "unchanged",
+        unchanged: true,
+        activation_id: None,
+        generation: pointer.generation,
+        text_consistency: None,
+        note: Some(UNCHANGED_NOTE),
+        pointer: pointer_view(pointer),
+    }
+}
+
+/// Audit actor: audience and token id of the caller, never a secret.
+fn actor_of(auth: Option<&crate::capabilities::Authorization>) -> String {
+    use crate::capabilities::Audience;
+    let Some(auth) = auth else {
+        return "daemon".to_owned();
+    };
+    let audience = match auth.claims.audience {
+        Audience::ProductHost => "product_host",
+        Audience::FirstPartyShell => "first_party_shell",
+        Audience::CreativeRuntime => "creative_runtime",
+        Audience::ComponentRuntime => "component_runtime",
+    };
+    format!("{audience}:{}", auth.claims.capability_id)
+}
+
 async fn activate_skill(
     store: &Store,
     skill_id: &str,
     bytes: &[u8],
+    actor: &str,
 ) -> Result<ActivateResponse, Fail> {
-    let (expected_generation, target) = parse_activate(bytes)?;
-    let resolved = match resolve_activation(store, skill_id, expected_generation, &target).await? {
-        Ok(resolved) => resolved,
-        Err(pointer) => {
-            return Ok(ActivateResponse {
-                skill_id: skill_id.to_owned(),
-                result: "unchanged",
-                unchanged: true,
-                activation_id: None,
-                generation: pointer.generation,
-                text_consistency: None,
-                note: Some(UNCHANGED_NOTE),
-                pointer: pointer_view(pointer),
-            });
-        }
+    // Everything is checked again here, at commit time, whatever a
+    // pre-check said earlier; the store adds its own CAS in the transaction.
+    let prepared = match prepare_activation(store, skill_id, bytes).await? {
+        Plan::Unchanged(pointer) => return Ok(unchanged_response(skill_id, pointer)),
+        Plan::Move(prepared) => *prepared,
     };
+    let PreparedMove {
+        resolved,
+        expected_generation,
+        target,
+        report,
+    } = prepared;
     let activation_id = uuid::Uuid::new_v4().to_string();
     let created_at = chrono::Utc::now().to_rfc3339();
     let mut consistency = None;
-    let outcome = match &target {
-        ActivateTarget::Pair { accepted, .. } => {
-            let report = rerun_evals(&resolved.body, &resolved.evals)?;
-            check_accepted(&report, accepted)?;
+    let outcome = match (&target, &report) {
+        (ActivateTarget::Pair { accepted, .. }, Some(report)) => {
             let (consistent, total) = report.consistent_counts();
             consistency = Some(ConsistencyView { consistent, total });
             let binding = agent24_store::SkillEvalBinding {
                 result_id: uuid::Uuid::new_v4().to_string(),
                 segment_digest: report.segment_digest.clone(),
                 renderer_version: report.renderer_version.to_string(),
-                cases_json: serde_json::Value::Array(case_values(&report)).to_string(),
+                cases_json: serde_json::Value::Array(case_values(report)).to_string(),
                 accepted_json: serde_json::json!(accepted).to_string(),
             };
             store
@@ -1026,13 +1098,16 @@ async fn activate_skill(
                     evals_revision_id: resolved.evals.revision_id.clone(),
                     binding,
                     created_at,
-                    actor: "host".to_owned(),
+                    actor: actor.to_owned(),
                 })
                 .await
         }
-        ActivateTarget::Rollback {
-            activation_id: source,
-        } => {
+        (
+            ActivateTarget::Rollback {
+                activation_id: source,
+            },
+            _,
+        ) => {
             store
                 .rollback_skill(&agent24_store::SkillRollback {
                     activation_id: activation_id.clone(),
@@ -1040,9 +1115,12 @@ async fn activate_skill(
                     expected_generation,
                     source_activation_id: source.clone(),
                     created_at,
-                    actor: "host".to_owned(),
+                    actor: actor.to_owned(),
                 })
                 .await
+        }
+        (ActivateTarget::Pair { .. }, None) => {
+            return Err(Fail::internal("pair without an eval run"));
         }
     }
     .map_err(Fail::from_store)?;
@@ -1084,40 +1162,76 @@ async fn activate_skill(
     })
 }
 
+/// A body over the cap is an unusable request here, not a skill body.
+async fn read_activate_body(body: Body) -> Result<Vec<u8>, Fail> {
+    match axum::body::to_bytes(body, REQUEST_MAX_BYTES).await {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(_) => Err(invalid_request("请求体过大")),
+    }
+}
+
 pub async fn post_skill_activate(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    auth: Option<axum::Extension<crate::capabilities::Authorization>>,
     body: Body,
 ) -> Response {
-    let bytes = match read_body(body).await {
+    let bytes = match read_activate_body(body).await {
         Ok(bytes) => bytes,
         Err(fail) => return fail_response(&fail),
     };
-    match activate_skill(&state.store, &id, &bytes).await {
+    let actor = actor_of(auth.as_ref().map(|ext| &ext.0));
+    match activate_skill(&state.store, &id, &bytes, &actor).await {
         Ok(response) => Json(response).into_response(),
         Err(fail) => fail_response(&fail),
     }
 }
 
-/// Four-item confirmation summary for the elevation dialog, from stored rows.
-/// Skill name, semver, first 8 hex of the body digest, whether the evals side
-/// differs from the pointer (a rollback names the side that comes back), and
-/// from/to on a source switch. `None` when the request is not one this route
-/// accepts or a row is unreadable: nothing is then shown to approve.
+/// What the middleware does with an Elevated activate that has no grant yet.
+pub(crate) enum Precheck {
+    /// Answer now, without elevation: a business error from the table, or
+    /// `unchanged` because the pointer would not move.
+    Respond(Response),
+    /// The pointer would move: ask for presence with this summary.
+    Elevate(String),
+    /// The request would move the pointer but no safe summary can be built.
+    Refuse,
+}
+
+/// Run the same checks as the handler, plus the eval rerun, before any
+/// confirmation is asked. The handler repeats all of them at commit.
+pub(crate) async fn activation_precheck(store: &Store, skill_id: &str, bytes: &[u8]) -> Precheck {
+    match prepare_activation(store, skill_id, bytes).await {
+        Err(fail) => Precheck::Respond(fail_response(&fail)),
+        Ok(Plan::Unchanged(pointer)) => {
+            Precheck::Respond(Json(unchanged_response(skill_id, pointer)).into_response())
+        }
+        Ok(Plan::Move(prepared)) => match summary_of(skill_id, &prepared) {
+            Some(summary) => Precheck::Elevate(summary),
+            None => Precheck::Refuse,
+        },
+    }
+}
+
+/// The summary only, for tests. `None` unless the pointer would move.
+#[cfg(test)]
 pub(crate) async fn activation_summary(
     store: &Store,
     skill_id: &str,
     bytes: &[u8],
 ) -> Option<String> {
-    let (expected_generation, target) = parse_activate(bytes).ok()?;
-    let resolved = match resolve_activation(store, skill_id, expected_generation, &target)
-        .await
-        .ok()?
-    {
-        Ok(resolved) => resolved,
-        // Already on this pair: the request is a no-op, nothing to approve.
-        Err(_) => return None,
-    };
+    match activation_precheck(store, skill_id, bytes).await {
+        Precheck::Elevate(summary) => Some(summary),
+        _ => None,
+    }
+}
+
+/// Confirmation summary from stored rows: skill name, semver, first 8 hex of
+/// the body digest, whether the evals side differs from the pointer (a
+/// rollback names the side that comes back), from/to on a source switch, and
+/// how many failing cases the request accepts.
+fn summary_of(skill_id: &str, prepared: &PreparedMove) -> Option<String> {
+    let resolved = &prepared.resolved;
     let name = crate::capabilities::first_party::shown(skill_id)?;
     let semver = crate::capabilities::first_party::shown(&resolved.body.semver)?;
     let digest: String = resolved.body.content_digest.chars().take(8).collect();
@@ -1154,6 +1268,11 @@ pub(crate) async fn activation_summary(
             pointer.origin.as_str(),
             resolved.body.origin.as_str()
         ));
+    }
+    if let ActivateTarget::Pair { accepted, .. } = &prepared.target
+        && !accepted.is_empty()
+    {
+        summary.push_str(&format!("；接受 {} 条失败用例", accepted.len()));
     }
     Some(summary)
 }
@@ -1204,10 +1323,15 @@ impl Fail {
                 "skill_eval_failed",
                 "有失败用例未被接受".to_owned(),
             ),
+            E::NotFound(what) if what.starts_with("skill activation") => Self::Http(
+                StatusCode::NOT_FOUND,
+                "skill_activation_not_found",
+                "激活记录不存在".to_owned(),
+            ),
             E::NotFound(_) => Self::Http(
                 StatusCode::NOT_FOUND,
-                "not_found",
-                "修订或激活记录不存在".to_owned(),
+                "skill_revision_not_found",
+                "修订不存在".to_owned(),
             ),
             agent24_store::StoreError::SkillRevisionConflict => Self::Http(
                 StatusCode::CONFLICT,

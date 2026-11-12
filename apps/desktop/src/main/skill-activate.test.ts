@@ -99,21 +99,22 @@ describe('skills:activate main-process IPC', () => {
     expect(posts(h.calls)).toHaveLength(0)
   })
 
-  it('shows no dialog and sends nothing when a revision is not in the daemon record', async () => {
-    for (const input of [
-      { skillId: 'demo', bodyRevisionId: 'nope', evalsRevisionId: 'e1' },
-      { skillId: 'demo', bodyRevisionId: 'e1', evalsRevisionId: 'e1' }, // an evals id in the body slot
-      { skillId: 'demo', bodyRevisionId: 'b1', evalsRevisionId: 'ue' }, // origins differ
-    ]) {
+  it('answers 404 or 400, with no dialog and no request, when a revision is not usable in the daemon record', async () => {
+    for (const [input, status, code] of [
+      [{ skillId: 'demo', bodyRevisionId: 'nope', evalsRevisionId: 'e1' }, 404, 'skill_revision_not_found'],
+      [{ skillId: 'demo', bodyRevisionId: 'e1', evalsRevisionId: 'e1' }, 400, 'skill_revision_mismatch'], // an evals id in the body slot
+      [{ skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'ue' }, 400, 'skill_origin_mismatch'], // origins differ
+    ] as const) {
       const h = harness()
       const res = await handleSkillActivate(h.deps, 'activate', input)
       expect(res.ok, JSON.stringify(input)).toBe(false)
+      expect([res.status, (res.data as { error: { code: string } }).error.code]).toEqual([status, code])
       expect(h.confirm).not.toHaveBeenCalled()
       expect(posts(h.calls)).toHaveLength(0)
     }
-    const unreadable = harness({ record: { ok: false, status: 502, data: null } })
+    const unreadable = harness({ record: { ok: false, status: 500, data: null } })
     const res = await handleSkillActivate(unreadable.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1' })
-    expect((res.data as { error: { code: string } }).error.code).toBe('skill_unavailable')
+    expect([res.status, (res.data as { error: { code: string } }).error.code]).toEqual([502, 'skill_unavailable'])
     expect(unreadable.confirm).not.toHaveBeenCalled()
     const malformed = harness({ record: { ok: true, status: 200, data: { skill_id: 'demo' } } })
     await handleSkillActivate(malformed.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1' })
@@ -159,5 +160,36 @@ describe('skills:activate main-process IPC', () => {
     await handleSkillActivate(h.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1', accepted: ['c1', 'c2'] })
     expect(h.confirm.mock.calls[0][1]).toContain('accept: 2')
     expect(posts(h.calls)[0].body).toMatchObject({ accepted: ['c1', 'c2'] })
+  })
+
+  it('passes transport and credential failures through instead of folding them into 502', async () => {
+    const input = { skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1' }
+    for (const record of [
+      { ok: false, status: 502, data: { error: { code: 'backend_not_ready', message: 'x' } } },
+      { ok: false, status: 504, data: { error: { code: 'timeout', message: 'x' } } },
+      { ok: false, status: 401, data: { error: { code: 'unauthorized', message: 'x' } } },
+      { ok: false, status: 403, data: { error: { code: 'forbidden', message: 'x' } } },
+    ] as BackendProxyResponse[]) {
+      const h = harness({ record })
+      const res = await handleSkillActivate(h.deps, 'activate', input)
+      expect(res).toEqual(record)
+      expect(h.confirm).not.toHaveBeenCalled()
+      expect(posts(h.calls)).toHaveLength(0)
+    }
+    const missing = harness({ record: { ok: false, status: 404, data: null } })
+    expect((await handleSkillActivate(missing.deps, 'activate', input)).status).toBe(404)
+  })
+
+  it('shows no dialog when the pair is already active, and posts so the daemon answers unchanged', async () => {
+    const h = harness()
+    const res = await handleSkillActivate(h.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'b1', evalsRevisionId: 'e1' })
+    expect(res.ok).toBe(true)
+    expect(h.confirm).not.toHaveBeenCalled()
+    expect(posts(h.calls)[0].body).toEqual({ expected_generation: 4, body_revision_id: 'b1', evals_revision_id: 'e1', accepted: [] })
+    // A rollback to the current pair is the same no-op.
+    const rb = harness()
+    await handleSkillActivate(rb.deps, 'rollback', { skillId: 'demo', rollbackActivationId: 'act-1' })
+    expect(rb.confirm).not.toHaveBeenCalled()
+    expect(posts(rb.calls)[0].body).toEqual({ expected_generation: 4, rollback_activation_id: 'act-1' })
   })
 })

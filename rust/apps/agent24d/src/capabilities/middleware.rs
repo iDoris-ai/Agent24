@@ -441,35 +441,66 @@ async fn authorize(
                         // SL-4: the summary is built from stored revisions,
                         // never from anything the caller sent besides ids.
                         let path = req.uri().path().to_owned();
+                        let bearer = bearer.to_owned();
                         let Ok(bytes) = axum::body::to_bytes(
                             req.into_body(),
                             agent24_domain::http::MAX_BODY_BYTES,
                         )
                         .await
                         else {
+                            // Same answer as the handler: this request has no
+                            // skill body, so an oversized one is just invalid.
                             return error_response(
-                                StatusCode::PAYLOAD_TOO_LARGE,
-                                "payload_too_large",
-                                "Request body exceeds limit",
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                "请求体过大",
                             );
                         };
+                        // A slow body may outlive the token. Check it again
+                        // before any pointer or eval state is read.
+                        if store
+                            .validate_bearer(
+                                &bearer,
+                                operation,
+                                &crate::capabilities::Resource::global(),
+                                crate::capabilities::unix_now(),
+                            )
+                            .is_err()
+                        {
+                            return error_response(
+                                StatusCode::UNAUTHORIZED,
+                                "unauthorized",
+                                "Missing or invalid bearer token",
+                            );
+                        }
                         if let Some(authority) = &state.first_party
                             && let Some(skill_id) = path
                                 .strip_prefix("/api/v1/skills/")
                                 .and_then(|rest| rest.strip_suffix("/activate"))
-                            && let Some(summary) = crate::skill_routes::activation_summary(
+                        {
+                            // Business failures and a no-op answer here, before
+                            // any elevation. Only a request that would move the
+                            // pointer gets a summary and a dialog.
+                            match crate::skill_routes::activation_precheck(
                                 &state.store,
                                 skill_id,
                                 &bytes,
                             )
                             .await
-                        {
-                            authority.remember_skill_activation(
-                                &authorization.claims.capability_id,
-                                &path,
-                                &bytes,
-                                summary,
-                            );
+                            {
+                                crate::skill_routes::Precheck::Respond(response) => {
+                                    return response;
+                                }
+                                crate::skill_routes::Precheck::Elevate(summary) => {
+                                    authority.remember_skill_activation(
+                                        &authorization.claims.capability_id,
+                                        &path,
+                                        &bytes,
+                                        summary,
+                                    );
+                                }
+                                crate::skill_routes::Precheck::Refuse => {}
+                            }
                         }
                     } else if method == Method::POST && template == "/api/v1/attached" {
                         let bytes = match axum::body::to_bytes(

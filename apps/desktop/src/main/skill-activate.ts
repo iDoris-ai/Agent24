@@ -102,32 +102,41 @@ const plain = (text: string, max = 64): string => {
 
 export interface Confirmation { message: string; detail: string }
 
+/** Why no confirmation could be built from the daemon's record. */
+export type ConfirmationFailure = 'revision_not_found' | 'activation_not_found' | 'revision_mismatch' | 'origin_mismatch'
+/** The request names the pair the pointer already holds: nothing would move. */
+export type Noop = { noop: true }
+
 /**
  * Four items from the daemon's record: skill name, semver, the first 8 hex of
  * the body digest, and whether the evals side differs from the current
  * pointer (a rollback says which side comes back). A source switch adds
- * from/to. `null` when a revision or the history row is not in the record:
- * nothing is shown and nothing is sent.
+ * from/to. A failure names what the record lacks: nothing is shown and
+ * nothing is sent. A pair the pointer already holds is `noop`: no dialog.
  */
-export function buildConfirmation(input: SkillActivateInput, detail: Detail): Confirmation | null {
-  const find = (id: string, kind: string): Revision | undefined =>
-    detail.revisions.find((r) => r.revision_id === id && r.kind === kind)
+export function buildConfirmation(
+  input: SkillActivateInput,
+  detail: Detail,
+): Confirmation | Noop | { failure: ConfirmationFailure } {
   const rollback = 'rollbackActivationId' in input
   let bodyId: string
   let evalsId: string
   if (rollback) {
     const row = detail.activations.find((a) => a.activation_id === input.rollbackActivationId)
-    if (!row) return null
+    if (!row) return { failure: 'activation_not_found' }
     bodyId = row.body_revision_id
     evalsId = row.evals_revision_id
   } else {
     bodyId = input.bodyRevisionId
     evalsId = input.evalsRevisionId
   }
-  const body = find(bodyId, 'body')
-  const evals = find(evalsId, 'evals')
-  if (!body || !evals || body.origin !== evals.origin) return null
   const pointer = detail.pointer
+  if (pointer && pointer.body_revision_id === bodyId && pointer.evals_revision_id === evalsId) return { noop: true }
+  const body = detail.revisions.find((r) => r.revision_id === bodyId)
+  const evals = detail.revisions.find((r) => r.revision_id === evalsId)
+  if (!body || !evals) return { failure: 'revision_not_found' }
+  if (body.kind !== 'body' || evals.kind !== 'evals') return { failure: 'revision_mismatch' }
+  if (body.origin !== evals.origin) return { failure: 'origin_mismatch' }
   const bodyChanged = !pointer || pointer.body_revision_id !== body.revision_id
   const evalsChanged = !pointer || pointer.evals_revision_id !== evals.revision_id
   let state: string
@@ -154,6 +163,22 @@ export function buildConfirmation(input: SkillActivateInput, detail: Detail): Co
 /** `skills:activate` takes a pair, `skills:rollback` takes a history id. */
 export type SkillActivateForm = 'activate' | 'rollback'
 
+/** Transport and credential failures keep their own shape (agentearFailure pattern). */
+const PASSTHROUGH_CODES = new Set(['backend_not_ready', 'timeout', 'proxy_failed'])
+function readFailure(res: BackendProxyResponse): BackendProxyResponse {
+  const code = (res.data as { error?: { code?: unknown } } | null)?.error?.code
+  if ((typeof code === 'string' && PASSTHROUGH_CODES.has(code)) || res.status === 401 || res.status === 403) return res
+  if (res.status === 404) return fail(404, 'not_found', mt('err.skillUnavailable'))
+  return fail(502, 'skill_unavailable', mt('err.skillUnavailable'))
+}
+
+const FAILURE_STATUS: Record<ConfirmationFailure, [number, string]> = {
+  revision_not_found: [404, 'skill_revision_not_found'],
+  activation_not_found: [404, 'skill_activation_not_found'],
+  revision_mismatch: [400, 'skill_revision_mismatch'],
+  origin_mismatch: [400, 'skill_origin_mismatch'],
+}
+
 export async function handleSkillActivate(
   deps: SkillActivateDeps,
   form: SkillActivateForm,
@@ -164,13 +189,18 @@ export async function handleSkillActivate(
     return fail(400, 'invalid_request', 'invalid skill activation request')
   }
   const record = await deps.call({ method: 'GET', path: `/api/v1/skills/${input.skillId}` })
-  const detail = record.ok ? parseDetail(record.data, input.skillId) : null
-  const confirmation = detail ? buildConfirmation(input, detail) : null
-  if (!detail || !confirmation) {
-    // 404 stays 404; every other failure is one error shape.
-    return fail(record.status === 404 ? 404 : 502, 'skill_unavailable', mt('err.skillUnavailable'))
+  if (!record.ok) return readFailure(record)
+  const detail = parseDetail(record.data, input.skillId)
+  // A record that is not the promised shape: nothing is shown, nothing sent.
+  if (!detail) return fail(502, 'skill_unavailable', mt('err.skillUnavailable'))
+  const confirmation = buildConfirmation(input, detail)
+  if ('failure' in confirmation) {
+    const [status, code] = FAILURE_STATUS[confirmation.failure]
+    return fail(status, code, mt('err.skillUnavailable'))
   }
-  if (!(await deps.confirm(confirmation.message, confirmation.detail))) {
+  // Nothing would move, so there is nothing to confirm: the daemon answers
+  // `unchanged` and writes nothing.
+  if (!('noop' in confirmation) && !(await deps.confirm(confirmation.message, confirmation.detail))) {
     return fail(499, 'cancelled', mt('err.cancelled'))
   }
   // The generation is the daemon's own, read above: a page cannot supply one.

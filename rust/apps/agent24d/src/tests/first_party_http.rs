@@ -1297,42 +1297,184 @@ async fn skill_activation_needs_elevation_and_shows_the_stored_summary() {
     );
 }
 
-/// A request naming a revision the store does not hold has no summary, so
-/// `elevate` refuses before any dialog is shown.
-#[tokio::test]
-async fn skill_activation_with_an_unreadable_revision_shows_no_dialog() {
-    let (state, token) = setup().await;
-    let (_, evals) = seed_skill_pair(&state).await;
-    let path = "/api/v1/skills/demo/activate";
-    let request_body = activate_body("no-such-revision", &evals);
-    let router = build_router(state.clone());
-    let rejected = router
-        .oneshot(request(&token.secret, "POST", path, &request_body, None))
+async fn seed_rev(
+    state: &AppState,
+    origin: agent24_store::SkillOrigin,
+    kind: agent24_store::SkillRevisionKind,
+    semver: &str,
+    text: &str,
+) -> String {
+    use agent24_store::{NewSkillRevision, SkillRevisionInsert};
+    let inserted = state
+        .store
+        .insert_skill_revision(&NewSkillRevision {
+            revision_id: uuid::Uuid::new_v4().to_string(),
+            skill_id: "demo".to_owned(),
+            origin,
+            semver: semver.to_owned(),
+            kind,
+            content_digest: agent24_skill::sha256_hex(text),
+            content: text.as_bytes().to_vec(),
+            created_at: "2026-11-12T00:00:00Z".to_owned(),
+        })
         .await
         .unwrap();
-    assert_eq!(error_code(rejected).await, "presence_required");
-    let (tx, _rx) = tokio::sync::oneshot::channel();
-    let result = state
-        .first_party
-        .as_ref()
-        .unwrap()
-        .elevate(
-            &test_peer("daemon-test"),
-            &token.token_id,
-            ElevateRequest {
-                method: "POST".into(),
-                path: path.into(),
-                body_sha256: body_digest(request_body.as_bytes()),
-                client_summary: "激活，看起来无害".into(),
-            },
-            tx,
-            CancellationToken::new(),
+    let (SkillRevisionInsert::Inserted { revision_id }
+    | SkillRevisionInsert::Existing { revision_id }) = inserted;
+    revision_id
+}
+
+/// Round 2: a first-party shell gets the plan's business errors straight
+/// away, with no elevation, and only a request that would really move the
+/// pointer is told `presence_required`. Mutation: make the middleware answer
+/// `None` for failures again (`.ok()?`) and the first assertions go red.
+#[tokio::test]
+async fn skill_activation_business_failures_answer_before_elevation() {
+    use agent24_store::{SkillOrigin as O, SkillRevisionKind as K};
+    let (state, token) = setup().await;
+    let md = |v: &str, t: &str| {
+        format!(
+            "---\nname: demo\nversion: {v}\ndescription: d\nrequires: []\nevals: evals/c.jsonl\n---\n{t}\n"
         )
-        .await;
-    assert!(matches!(
-        result,
-        Err(crate::enroll_api::EnrollErrorCode::NotElevatedOperation)
-    ));
+    };
+    let ev = |e: &str| format!("{{\"input\":\"i\",\"expect\":\"{e}\",\"judge\":\"contains\"}}\n");
+    let b1 = seed_rev(
+        &state,
+        O::Imported,
+        K::Body,
+        "1.0.0",
+        &md("1.0.0", "hello world"),
+    )
+    .await;
+    let e1 = seed_rev(&state, O::Imported, K::Evals, "1.0.0", &ev("hello world")).await;
+    let b2 = seed_rev(
+        &state,
+        O::Imported,
+        K::Body,
+        "2.0.0",
+        &md("2.0.0", "hello world two"),
+    )
+    .await;
+    let e2 = seed_rev(
+        &state,
+        O::Imported,
+        K::Evals,
+        "2.0.0",
+        &ev("hello world two"),
+    )
+    .await;
+    let bad = seed_rev(&state, O::Imported, K::Evals, "1.5.0", &ev("absent")).await;
+    let ue = seed_rev(&state, O::User, K::Evals, "1.0.0", &ev("hello world")).await;
+    let path = "/api/v1/skills/demo/activate";
+    let router = build_router(state.clone());
+    let send = |body: serde_json::Value| {
+        let router = router.clone();
+        let secret = token.secret.clone();
+        async move {
+            let response = router
+                .oneshot(request(&secret, "POST", path, &body.to_string(), None))
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            )
+        }
+    };
+    let pair = |generation: i64, b: &str, e: &str| serde_json::json!({"expected_generation": generation, "body_revision_id": b, "evals_revision_id": e});
+
+    // Nothing is pinned yet.
+    let (status, v) = send(pair(0, "no-such", &e1)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("skill_revision_not_found")),
+        "{v}"
+    );
+    let (status, v) = send(pair(0, &b1, &bad)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("skill_eval_failed")),
+        "{v}"
+    );
+    assert_eq!(
+        v["error"]["details"]["cases"].as_array().unwrap().len(),
+        1,
+        "case summary"
+    );
+    let (status, v) = send(serde_json::json!({"expected_generation": 0})).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("invalid_request")),
+        "{v}"
+    );
+    // First activation of a clean pair moves the pointer, so it needs presence.
+    let (status, v) = send(pair(0, &b1, &e1)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("presence_required")),
+        "{v}"
+    );
+    // Pin it as the host would, then retry through the shell.
+    let secret = grant(&state, &token, "POST", path, &pair(0, &b1, &e1).to_string()).await;
+    let approved = router
+        .clone()
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            path,
+            &pair(0, &b1, &e1).to_string(),
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(approved.status(), StatusCode::OK);
+
+    let (status, v) = send(pair(0, &b2, &e1)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::CONFLICT, Some("skill_pointer_conflict")),
+        "{v}"
+    );
+    let (status, v) = send(pair(1, &b2, &e2)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("skill_activation_mixed")),
+        "{v}"
+    );
+    let (status, v) = send(pair(1, &b1, &ue)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("skill_origin_mismatch")),
+        "{v}"
+    );
+    // The idempotent retry succeeds with no elevation, even on a stale generation.
+    for generation in [1, 0] {
+        let (status, v) = send(pair(generation, &b1, &e1)).await;
+        assert_eq!(status, StatusCode::OK, "{v}");
+        assert_eq!(v["unchanged"], true);
+        assert_eq!(v["generation"], 1);
+    }
+    let history = state.store.list_skill_activations("demo").await.unwrap();
+    assert_eq!(history.len(), 1, "no history from the retries");
+    assert_eq!(
+        state
+            .store
+            .get_skill_pointer("demo")
+            .await
+            .unwrap()
+            .unwrap()
+            .generation,
+        1
+    );
+    // A request that would really move the pointer is the one that asks.
+    let (status, v) = send(pair(1, &b2, &e1)).await;
+    assert_eq!(
+        (status, v["error"]["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("presence_required")),
+        "{v}"
+    );
 }
 
 /// The legacy shared token cannot be elevated, so it is refused outright. The
@@ -1392,4 +1534,80 @@ async fn skill_activation_refuses_legacy_and_creative_tokens_and_admits_the_host
             .generation,
         1
     );
+}
+
+/// Round 3. The token is checked again after the body is read: a slow upload
+/// must not get pointer or eval state once the token has been revoked.
+/// Mutation: remove the `validate_bearer` re-check in the activate pre-check
+/// branch and this goes red (the answer becomes a business response).
+#[tokio::test]
+async fn skill_activation_precheck_rechecks_the_token_after_a_slow_body() {
+    let (state, token) = setup().await;
+    let (body, evals) = seed_skill_pair(&state).await;
+    let path = "/api/v1/skills/demo/activate";
+    let full = activate_body(&body, &evals).into_bytes();
+    let (first, rest) = full.split_at(10);
+    let (tx, rx) = tokio::sync::mpsc::channel::<axum::body::Bytes>(4);
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv()
+            .await
+            .map(|chunk| (Ok::<_, std::io::Error>(chunk), rx))
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(
+            header::AUTHORIZATION,
+            format!("Bearer {}", token.secret.as_str()),
+        )
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .unwrap();
+    let router = build_router(state.clone());
+    let pending = tokio::spawn(async move { router.oneshot(req).await.unwrap() });
+    tx.send(axum::body::Bytes::copy_from_slice(first))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .revoke(&test_peer("daemon-test"), &token.token_id);
+    tx.send(axum::body::Bytes::copy_from_slice(rest))
+        .await
+        .unwrap();
+    drop(tx);
+    let response = pending.await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["code"], "unauthorized");
+    assert!(
+        value["error"].get("details").is_none(),
+        "no state in the answer: {value}"
+    );
+    assert!(!value.to_string().contains(&body));
+}
+
+/// Round 3. An over-limit body is `400 invalid_request` on both paths: the
+/// first-party pre-check in the middleware and the handler itself (host).
+#[tokio::test]
+async fn skill_activation_oversized_body_is_invalid_request_on_both_paths() {
+    let path = "/api/v1/skills/demo/activate";
+    let huge = "x".repeat(2 * 1024 * 1024);
+    let (state, token) = setup().await;
+    let via_middleware = build_router(state.clone())
+        .oneshot(request(&token.secret, "POST", path, &huge, None))
+        .await
+        .unwrap();
+    assert_eq!(via_middleware.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(via_middleware).await, "invalid_request");
+    let (state, host, _) = tests::capability_state().await;
+    let via_handler = build_router(state)
+        .oneshot(request(&host, "POST", path, &huge, None))
+        .await
+        .unwrap();
+    assert_eq!(via_handler.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(error_code(via_handler).await, "invalid_request");
 }
