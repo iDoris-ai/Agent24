@@ -194,7 +194,7 @@ impl CapabilityStore {
     }
 }
 
-fn process_live(record: &Record) -> bool {
+pub(crate) fn process_live(record: &Record) -> bool {
     record
         .claims
         .first_party

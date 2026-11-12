@@ -159,8 +159,8 @@ async fn write_component_denial_with<F, Fut>(
 
 /// Audit first. A write failure leaves the store without this token.
 /// After that write, the caller is checked again and the new token is
-/// inserted under the same store lock. A caller revoked, expired, or
-/// rotated during the audit is not issued.
+/// inserted under the same store lock. A caller revoked, expired, rotated,
+/// or whose shell process has exited during the audit is not issued.
 pub async fn issue_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     authorization: &Authorization,
@@ -210,8 +210,8 @@ where
     )
 }
 
-/// Caller liveness and the insert share one lock, so a revoke that lands
-/// during the audit cannot slip a token in afterwards.
+/// Caller liveness and the insert share one lock, so a revoke or a dead
+/// shell that lands during the audit cannot slip a token in afterwards.
 fn insert_for_live_caller(
     store: &CapabilityStore,
     authorization: &Authorization,
@@ -229,7 +229,8 @@ fn insert_for_live_caller(
         .copied()
         .and_then(|digest| state.records.get(&digest))
         .is_some_and(|record| {
-            !record.revoked
+            super::validate::process_live(record)
+                && !record.revoked
                 && record.claims.audience == Audience::FirstPartyShell
                 && record.claims.daemon_generation == store.daemon_generation()
                 && !record.expired(now)
@@ -447,6 +448,49 @@ mod tests {
             let caller_id = caller_id.clone();
             async move {
                 during.revoke_by_id(&caller_id);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(matches!(failed, Err(BridgeIssueError::CallerInvalid)));
+        assert!(
+            store
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .all(|record| record.claims.audience != Audience::ComponentRuntime)
+        );
+    }
+
+    /// A shell whose process is already dead is not issued. Bumping the
+    /// recorded start time is the same stand-in `process_live` uses.
+    /// Dropping `process_live` in `insert_for_live_caller` turns this
+    /// `CallerInvalid` into `Ok`.
+    #[tokio::test]
+    async fn dead_shell_during_audit_is_not_issued() {
+        let (store, auth) = shell_store();
+        let caller_id = auth.claims.capability_id.clone();
+        let during = store.clone();
+        let failed = issue_wechat_bridge(&store, &auth, unix_now(), move |_| {
+            let during = during.clone();
+            let caller_id = caller_id.clone();
+            async move {
+                let mut state = during.shared.state.lock().unwrap();
+                let digest = *state.ids.get(&caller_id).unwrap();
+                state
+                    .records
+                    .get_mut(&digest)
+                    .unwrap()
+                    .claims
+                    .first_party
+                    .as_mut()
+                    .unwrap()
+                    .peer
+                    .start
+                    .sec += 1;
                 Ok(())
             }
         })

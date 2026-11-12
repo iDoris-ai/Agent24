@@ -2961,4 +2961,108 @@ mod tests {
                 .any(|entry| entry.detail.to_string().contains(&ingest_only))
         );
     }
+
+    fn forge_bridge(cap: &crate::capabilities::CapabilityStore, id: &str) -> String {
+        use std::collections::BTreeSet;
+
+        use crate::capabilities::{Audience, CapabilityClaims, Operation, unix_now};
+
+        let now = unix_now();
+        cap.insert(CapabilityClaims {
+            first_party: None,
+            capability_id: id.to_owned(),
+            audience: Audience::ComponentRuntime,
+            component_id: Some("wechat-bridge".into()),
+            workspace_id: None,
+            attachment_id: None,
+            principal_id: None,
+            daemon_generation: "daemon-test".into(),
+            host_generation: None,
+            sidecar_generation: None,
+            created_at: now,
+            expires_at: now + 600,
+            deadline: Some(tokio::time::Instant::now() + StdDuration::from_secs(600)),
+            allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+        })
+        .unwrap()
+        .into_bearer_parts()
+        .0
+    }
+
+    fn denied_rows(entries: &[agent24_store::AuditEntry], id: &str, reason: &str) -> usize {
+        entries
+            .iter()
+            .filter(|entry| {
+                entry.action == "capability.token.denied"
+                    && entry.detail["denied"]["capability_id"].as_str() == Some(id)
+                    && entry.detail["denied"]["reason"].as_str() == Some(reason)
+                    && entry.detail["denied"]["operation"].as_str() == Some("inbound.ingest")
+            })
+            .count()
+    }
+
+    /// A revoked bridge token on a mapped route (`GET /api/v1/models`) is 401
+    /// and one denial. A second hit stays one row. An unknown bearer is 401
+    /// and writes nothing. Dropping `finish_rejection` in `authorize`'s
+    /// `validate_bearer` error arm turns the row assertion red.
+    #[tokio::test]
+    async fn revoked_bridge_token_on_models_is_401_and_audited() {
+        let (app, _host, _creative) = capability_state().await;
+        let cap = app.capabilities.clone().unwrap();
+        let db = app.store.clone();
+        let bearer = forge_bridge(&cap, "models-revoked");
+        cap.revoke_by_id("models-revoked");
+        let router = crate::server::build_router(app);
+
+        for _ in 0..2 {
+            let (status, json) = call(&router, "GET", "/api/v1/models", &bearer, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+            assert_eq!(error_code(&json), "unauthorized", "{json}");
+        }
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(denied_rows(&entries, "models-revoked", "revoked"), 1);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.detail.to_string().contains(&bearer))
+        );
+
+        let before = db.list_audit().await.unwrap().len();
+        let (status, json) =
+            call(&router, "GET", "/api/v1/models", "not-a-known-bearer", None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        assert_eq!(db.list_audit().await.unwrap().len(), before);
+    }
+
+    /// A bridge token whose daemon generation no longer matches is 401 and
+    /// one `stale_generation` row on the same mapped route. Hard-coding only
+    /// `Revoked` in that arm turns this red.
+    #[tokio::test]
+    async fn stale_generation_bridge_token_on_models_is_401_and_audited() {
+        let (app, _host, _creative) = capability_state().await;
+        let cap = app.capabilities.clone().unwrap();
+        let db = app.store.clone();
+        let bearer = forge_bridge(&cap, "models-stale");
+        {
+            let mut state = cap.shared.state.lock().unwrap();
+            let digest = *state.ids.get("models-stale").unwrap();
+            state
+                .records
+                .get_mut(&digest)
+                .unwrap()
+                .claims
+                .daemon_generation = "rotated".into();
+        }
+        let router = crate::server::build_router(app);
+        let (status, json) = call(&router, "GET", "/api/v1/models", &bearer, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        assert_eq!(error_code(&json), "unauthorized", "{json}");
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(denied_rows(&entries, "models-stale", "stale_generation"), 1);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.detail.to_string().contains(&bearer))
+        );
+    }
 }

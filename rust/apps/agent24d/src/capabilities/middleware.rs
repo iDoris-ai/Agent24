@@ -192,11 +192,20 @@ async fn admit_inbound_ingest(state: AppState, mut req: Request<Body>, next: Nex
             req.extensions_mut().insert(authorization);
             next.run(req).await
         }
-        Err(_) => error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        ),
+        Err(err) => {
+            finish_rejection(
+                &state,
+                TokenRejection {
+                    response: error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "unauthorized",
+                        "Missing or invalid bearer token",
+                    ),
+                    denial: component_liveness_denial(store, bearer, err),
+                },
+            )
+            .await
+        }
     }
 }
 
@@ -242,22 +251,32 @@ fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<To
     };
     match store.authenticate_bearer(bearer, crate::capabilities::unix_now()) {
         Ok(_) => None,
-        Err(err) => {
-            let denial = crate::capabilities::bridge::liveness_deny(err).and_then(|reason| {
-                store
-                    .known_component_bearer(bearer)
-                    .map(|auth| (auth, reason))
-            });
-            Some(TokenRejection {
-                response: error_response(
-                    StatusCode::UNAUTHORIZED,
-                    "unauthorized",
-                    "Missing or invalid bearer token",
-                ),
-                denial,
-            })
-        }
+        Err(err) => Some(TokenRejection {
+            response: error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            ),
+            denial: component_liveness_denial(store, bearer, err),
+        }),
     }
+}
+
+/// Revoked, expired, or stale component-runtime rows are audited. An unknown
+/// bearer is not: `known_component_bearer` returns `None`.
+fn component_liveness_denial(
+    store: &crate::capabilities::CapabilityStore,
+    bearer: &str,
+    err: crate::capabilities::CapabilityError,
+) -> Option<(
+    crate::capabilities::Authorization,
+    agent24_store::CapabilityDenyReason,
+)> {
+    crate::capabilities::bridge::liveness_deny(err).and_then(|reason| {
+        store
+            .known_component_bearer(bearer)
+            .map(|auth| (auth, reason))
+    })
 }
 
 async fn finish_rejection(state: &AppState, rejection: TokenRejection) -> Response {
@@ -525,11 +544,20 @@ async fn authorize(
             }
             error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed")
         }
-        Err(_) => error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        ),
+        Err(err) => {
+            finish_rejection(
+                state,
+                TokenRejection {
+                    response: error_response(
+                        StatusCode::UNAUTHORIZED,
+                        "unauthorized",
+                        "Missing or invalid bearer token",
+                    ),
+                    denial: component_liveness_denial(store, bearer, err),
+                },
+            )
+            .await
+        }
     }
 }
 
