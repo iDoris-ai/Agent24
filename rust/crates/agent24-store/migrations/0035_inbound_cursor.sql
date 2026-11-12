@@ -10,5 +10,8 @@ CREATE TABLE inbound_cursor (
     recipient_identity TEXT NOT NULL,
     thread_key         TEXT NOT NULL,
     cursor             TEXT NOT NULL,
-    PRIMARY KEY (source, recipient_identity, thread_key)
+    PRIMARY KEY (source, recipient_identity, thread_key),
+    -- An empty string is a different key from NULL and would make
+    -- `--after-id ''` the cursor; refuse it at the table.
+    CHECK (recipient_identity <> '' AND thread_key <> '' AND cursor <> '')
 );
