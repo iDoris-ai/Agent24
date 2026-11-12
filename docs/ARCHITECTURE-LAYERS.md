@@ -62,8 +62,9 @@
 │   └ os-cwd：post-fork fchdir，把子进程 cwd 钉在 workspace 内             │
 │ 平台原语：os-proc（进程身份，CORE-2）· os-sqlite（SQLite 在线备份）     │
 └──────────────┬───────────────────────────────────────────────────────┘
-┌──────────────▼──────── L1 纯领域核心：agent24-core ────────────────────┐
-│ 零框架依赖的状态机（ADR-026）                                           │
+┌──────────────▼──────── L1 纯领域核心：agent24-core · agent24-skill ───┐
+│ core：零框架依赖的状态机（ADR-026）                                     │
+│ skill：清单解析、render_skill_segment、文本一致性（ADR-040，不读盘）    │
 └──────────────┬───────────────────────────────────────────────────────┘
 ┌──────────────▼──────── L0 契约层 ──────────────────────────────────────┐
 │ agent24-protocol（v1 wire 类型）· agent24-domain（DomainModule /        │
@@ -89,6 +90,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | protocol | L0 | （无） | knowledge |
 | sidecar-host-protocol | L0 | （无） | — |
 | core | L1 | protocol | — |
+| skill | L1 | （无） | — |
 | os-cwd | L2 | （无） | — |
 | store | L2 | core, protocol | decide |
 | workspace | L2 | core, os-cwd, protocol, store | — |
@@ -119,12 +121,13 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | sidecar-host | L6 | sidecar-host-protocol | — |
 | cli | L7 | documents-client, hw, mcp, os-packages, os-proc, protocol, store | — |
 
-共 33 个 crate（`cargo metadata` 的 workspace member 数）。
+共 34 个 crate（`cargo metadata` 的 workspace member 数）。
 <!-- END GENERATED: layer-deps -->
 
 读表时的几点说明（手写，依赖表变了要回来核对）：
 
 - 依赖方向一律向下，正常依赖里没有环，也没有下层依赖上层（R1 §3.2 用 DFS 核过）。dev 依赖里有两条反向，只影响测试：`protocol` → `knowledge`、`store` → `decide`。
+- `skill` 在 L1，正常依赖为空。清单解析、`render_skill_segment`、文本一致性检查放在这里；以后 `agent` 与 `agent24d` 向下引用。
 - `idoris` 依赖 `components`，不是反过来：`ComponentLock` 和通用下载器在 `components`，iDoris 的 `IdorisLock` 是它之上的视图（ADR-038 C1，#1539；原先 11-01 版写成「`components` 借用 `idoris`」，已不成立，`fetch_verified` 在全仓已不存在）。
 - `agent24d` 是内核运行时的组合根，没有 crate 反向依赖它。`comm` 编译进 `agent24d`，且不依赖其它内部 crate。
 - `worker` 依赖 `protocol`，但没有任何 crate 依赖它。`decide` 只被 `agent24d` 的 `GET /api/v1/decide/profile` 消费。
