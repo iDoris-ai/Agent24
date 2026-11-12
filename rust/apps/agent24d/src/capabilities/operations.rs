@@ -59,6 +59,11 @@ pub enum Operation {
     // check never fires.
     InboundRead,
     InboundWrite,
+    // Skill loader SL-3. Read and install are Everyday routes. Activate is
+    // Elevated and has no route until SL-4, so its assurance level stays None.
+    SkillsRead,
+    SkillsInstall,
+    SkillsActivate,
     /// C9-B dev-bridge ingest. Everyday, and not on a shell or creative token.
     /// Route admission is [`super::component_route_permitted`], not this variant.
     InboundIngest,
@@ -151,8 +156,19 @@ impl Operation {
             Self::ComponentsReport => "components.report",
             Self::InboundRead => "inbound.read",
             Self::InboundWrite => "inbound.write",
+            Self::SkillsRead => "skills.read",
+            Self::SkillsInstall => "skills.install",
+            Self::SkillsActivate => "skills.activate",
             Self::InboundIngest => "inbound.ingest",
         }
+    }
+
+    /// Component locks may not grant skill operations (skill-loader §4.9).
+    pub fn component_may_require(self) -> bool {
+        !matches!(
+            self,
+            Self::SkillsRead | Self::SkillsInstall | Self::SkillsActivate
+        )
     }
 
     /// Catalog level for this operation. `None` when no route assigns one.
@@ -212,6 +228,9 @@ impl Operation {
             "components.report" => Self::ComponentsReport,
             "inbound.read" => Self::InboundRead,
             "inbound.write" => Self::InboundWrite,
+            "skills.read" => Self::SkillsRead,
+            "skills.install" => Self::SkillsInstall,
+            "skills.activate" => Self::SkillsActivate,
             "inbound.ingest" => Self::InboundIngest,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,

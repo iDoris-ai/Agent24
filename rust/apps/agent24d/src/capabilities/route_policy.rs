@@ -186,6 +186,12 @@ const POLICIES: &[RoutePolicy] = &[
     // [`component_route_permitted`], not "every row with this operation".
     // Without `A24_DEV_TOOL=1` the middleware answers 404.
     row("POST", "/api/v1/inbound/events", Operation::InboundIngest, AssuranceLevel::Everyday),
+    // Skill loader SL-3. Activate is SL-4 and is not registered here.
+    // These rows stay out of creative_route_permitted.
+    row("GET", "/api/v1/skills", Operation::SkillsRead, AssuranceLevel::Everyday),
+    row("GET", "/api/v1/skills/{id}", Operation::SkillsRead, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills", Operation::SkillsInstall, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills/scans", Operation::SkillsInstall, AssuranceLevel::Everyday),
 ];
 
 pub fn policies() -> &'static [RoutePolicy] {
