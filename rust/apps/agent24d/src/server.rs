@@ -67,6 +67,10 @@ pub struct AppState {
     /// [`AppState::new`]; production capability mode replaces it before the
     /// router is built.
     pub auth_mode: AuthMode,
+    /// X11-2g: legacy daemon started with `A24_DEV_TOOL=1`. The wechat POST
+    /// answers 404 unless this is set. Capabilities mode leaves it false and
+    /// the auth middleware answers 404 before the handler.
+    pub dev_wechat_events: bool,
     pub capabilities: Option<crate::capabilities::CapabilityStore>,
     pub first_party: Option<Arc<crate::capabilities::first_party::FirstPartyAuthority>>,
     pub presence_provider: Option<Arc<dyn crate::capabilities::presence::PresenceProvider>>,
@@ -762,6 +766,7 @@ impl AppState {
             risk_overrides,
             token: Arc::new(token),
             auth_mode: AuthMode::LegacySingleToken,
+            dev_wechat_events: false,
             capabilities: None,
             first_party: None,
             presence_provider: None,
@@ -1112,7 +1117,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/inbound/policy",
             get(crate::inbound::get_policy).put(crate::inbound::put_policy),
         )
-        .route("/api/v1/inbound/events", get(crate::inbound::get_events))
+        .route(
+            "/api/v1/inbound/events",
+            get(crate::inbound::get_events).post(crate::inbound::post_wechat_event),
+        )
         .route("/api/v1/events", get(crate::events::ws_events))
         // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2): register/rotate,
         // list and revoke attached modules. `attached` is reserved in
@@ -3261,12 +3269,23 @@ pub(crate) mod tests {
         state_with_guardian(None).await
     }
 
+    pub(crate) async fn state_with_router(router: Arc<ModelRouter>) -> AppState {
+        state_with_guardian_and_router(None, router).await
+    }
+
     async fn state_with_guardian(
         guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
     ) -> AppState {
+        state_with_guardian_and_router(guardian, Arc::new(ModelRouter::with_defaults(vec![]))).await
+    }
+
+    async fn state_with_guardian_and_router(
+        guardian: Option<StdArc<agent24_policy::guardian::Guardian>>,
+        router: Arc<ModelRouter>,
+    ) -> AppState {
         AppState::new(AppDeps {
             token: "testtoken".to_owned(),
-            router: Arc::new(ModelRouter::with_defaults(vec![])),
+            router,
             tools: agent24_tools::ToolRegistry::new(),
             store: Store::open_memory().await.unwrap(),
             shutdown: Shutdown::new(CancellationToken::new()),
@@ -5211,6 +5230,11 @@ pub(crate) mod tests {
             // Docked-only routes are not on the business router; the docked
             // router's own tests cover Creative there.
             if policy.operation == crate::capabilities::Operation::DiagnosticRead {
+                continue;
+            }
+            // X11-2g: this POST is on the catalog so the route scan matches,
+            // and capabilities mode answers 404 instead of the creative 403.
+            if policy.method == "POST" && policy.template == "/api/v1/inbound/events" {
                 continue;
             }
             let path = concrete_path(policy.template);

@@ -1174,7 +1174,11 @@ export interface paths {
          */
         get: operations["listInboundEvents"];
         put?: never;
-        post?: never;
+        /**
+         * Record one development WeChat message
+         * @description Development transport for the wechat bridge. Mounted only in legacy mode when the daemon was started with `A24_DEV_TOOL=1`. Capabilities mode, and legacy mode without that flag, answer 404 (`No v1 route`). `source` is fixed to `wechat`: a body `source` other than `wechat` is 400, and the stored row is always `wechat` / `dev_bridge` / `direct` / `human=true`. The route does not copy `category`, `human`, or `addressed` from the body. Admission (allowlist, watermark, rate) still decides whether a run starts. A duplicate `id` does not start a second run. The response does not echo `text`. A storage failure is a generic `storage error`. A start failure is a generic `internal error`. Neither body includes the store text or the prompt. An allowlisted message with no text is 400 and is not stored.
+         */
+        post: operations["postWechatInboundEvent"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3319,6 +3323,30 @@ export interface components {
                 before_at: string;
                 before_id: string;
             } | null;
+        };
+        WechatInboundEventWrite: {
+            /** @description `wechat:` plus the iLink decimal `message_id`. */
+            id: string;
+            /**
+             * @description Optional. Omitted or `wechat` is accepted. Any other value is 400. The route stores `wechat` either way.
+             * @enum {string}
+             */
+            source?: "wechat";
+            /** @description WeChat `from_user_id`, NFC, no control or format characters. */
+            actor: string;
+            /** @description Message time, `YYYY-MM-DDTHH:MM:SSZ`, no fractional seconds. */
+            at: string;
+            /** @description Message text. Empty or omitted is no body. An allowlisted message with no body is 400 and is not stored. */
+            text?: string;
+        };
+        WechatInboundEventResult: {
+            id: string;
+            /** @enum {string} */
+            outcome: "duplicate" | "ignored" | "started" | "already_linked";
+            /** @description Present when `outcome` is `ignored`. */
+            reason?: string;
+            /** @description Present for `started`, and for `already_linked` when the link row is still there. Omitted when that row is gone. */
+            run_id?: string;
         };
         ErrorBody: {
             /**
@@ -6782,6 +6810,66 @@ export interface operations {
             };
             /** @description Invalid query */
             400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    postWechatInboundEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WechatInboundEventWrite"];
+            };
+        };
+        responses: {
+            /** @description Recorded. `outcome` says whether a run started. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WechatInboundEventResult"];
+                };
+            };
+            /** @description Malformed body, unknown field, a source other than wechat, or an allowlisted message with no text */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not mounted (capabilities mode, or legacy without A24_DEV_TOOL=1) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Storage failure (`storage error`) or start failure (`internal error`). The body does not include the store text or the prompt. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

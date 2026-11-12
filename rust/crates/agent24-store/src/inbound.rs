@@ -705,6 +705,70 @@ impl Store {
         Ok(view)
     }
 
+    /// Insert one allowlist row. A `(source, actor)` that is already stored
+    /// is left as it was, including `added_at` and `note`.
+    ///
+    /// Returns whether this call inserted the row.
+    ///
+    /// # Errors
+    /// Storage, or an `added_at` that is not [`format_inbound_timestamp`].
+    pub async fn insert_inbound_allowlist_if_absent(
+        &self,
+        source: &str,
+        actor: &str,
+        added_at: &str,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        require_inbound_timestamp("added_at", added_at)?;
+        let inserted = sqlx::query(
+            "INSERT INTO inbound_allowlist (source, actor, added_at, note) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(source, actor) DO NOTHING",
+        )
+        .bind(source)
+        .bind(actor)
+        .bind(added_at)
+        .bind(note)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(inserted > 0)
+    }
+
+    /// Insert the source watermark when that source has none.
+    ///
+    /// A second call does not move `activated_at`. Admission compares events
+    /// to this stamp (H5).
+    ///
+    /// # Errors
+    /// Storage, a non-positive `max_age_secs`, or an `activated_at` that is
+    /// not [`format_inbound_timestamp`].
+    pub async fn ensure_inbound_source_watermark(
+        &self,
+        source: &str,
+        activated_at: &str,
+        max_age_secs: i64,
+    ) -> Result<bool> {
+        require_inbound_timestamp("activated_at", activated_at)?;
+        if max_age_secs <= 0 {
+            return Err(StoreError::Conflict(
+                "inbound watermark max_age_secs must be positive".to_owned(),
+            ));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO inbound_source_watermark (source, activated_at, max_age_secs) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(source) DO NOTHING",
+        )
+        .bind(source)
+        .bind(activated_at)
+        .bind(max_age_secs)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(inserted > 0)
+    }
+
     /// The single policy row, if a caller has written one.
     ///
     /// No row means the table default `observe` has never been stored.

@@ -63,6 +63,19 @@ describe('inbound allowlist, policy, and event list (X11-2f)', () => {
     expect((bad.body as { error: { code: string } }).error.code).toBe('invalid_request')
   })
 
+  it('does not mount the development wechat ingest route', async (ctx) => {
+    if (!IS_RUST) return ctx.skip()
+    const res = await post('/api/v1/inbound/events', {
+      id: 'wechat:1',
+      source: 'hyphae',
+      actor: 'alice',
+      at: '2026-11-12T00:00:00Z',
+      text: 'nope',
+    })
+    expect(res.status, JSON.stringify(res.body)).toBe(404)
+    expect((res.body as { error: { code: string } }).error.code).toBe('not_found')
+  })
+
   it('reads do not publish inbound content on the events websocket', async (ctx) => {
     if (!IS_RUST) return ctx.skip()
     const frames: string[] = []

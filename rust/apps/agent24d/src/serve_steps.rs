@@ -754,6 +754,20 @@ pub(super) async fn assemble_app_state(
     if crate::enroll_test_support::enabled() {
         state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
+    // X11-2g. Capabilities mode does not read `A24_INBOUND_DEV_ALLOWLIST`.
+    let dev_tool = std::env::var("A24_DEV_TOOL").ok().as_deref() == Some("1");
+    state.dev_wechat_events = state.auth_mode == AuthMode::LegacySingleToken && dev_tool;
+    let seed = if state.dev_wechat_events {
+        std::env::var("A24_INBOUND_DEV_ALLOWLIST").unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let seeded = crate::inbound::seed_dev_allowlist(&state.store, state.auth_mode, dev_tool, &seed)
+        .await
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+    if seeded > 0 {
+        tracing::info!(seeded, "seeded the development wechat inbound allowlist");
+    }
     Ok((report, state))
 }
 

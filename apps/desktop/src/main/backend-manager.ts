@@ -145,6 +145,17 @@ export function selectedAuthMode(kind: BackendKind, platform: NodeJS.Platform = 
   return kind === 'rust' && platform !== 'win32' ? 'capabilities' : 'legacy'
 }
 
+/** Drop the development inbound switch before this app starts agent24d.
+ * Windows stays on the legacy token (`selectedAuthMode`), and a legacy daemon
+ * started with these variables mounts the wechat route and seeds the allowlist.
+ * A product launch must not inherit them from the launching shell. */
+export function daemonChildEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...source }
+  delete env['A24_DEV_TOOL']
+  delete env['A24_INBOUND_DEV_ALLOWLIST']
+  return env
+}
+
 /** Dev-only, explicit opt-in (`AGENT24_BACKEND=node`): the contract-test
  * reference daemon at packages/node-daemon/dist/server.js. REV-01: desktop no
  * longer depends on or builds @agent24/node-daemon, so this resolves the
@@ -402,19 +413,19 @@ function defaultSpawnProcess(kind: BackendKind, authMode: DaemonAuthMode, packag
       // daemon treats EOF there as its host going away and shuts down.
       return spawn(bin, ['serve', '--port', '0', '--auth-mode', 'capabilities', '--host-bootstrap-stdio'], {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env },
+        env: daemonChildEnv(),
       })
     }
     return spawn(bin, ['serve', '--port', '0'], {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env },
+      env: daemonChildEnv(),
     })
   }
   const entry = resolveNodeEntry()
   return fork(entry, [], {
     // piped (not inherited) so the ready line can be scanned
     silent: true,
-    env: { ...process.env, NODE_ENV: process.env['NODE_ENV'] ?? 'production' },
+    env: { ...daemonChildEnv(), NODE_ENV: process.env['NODE_ENV'] ?? 'production' },
   })
 }
 

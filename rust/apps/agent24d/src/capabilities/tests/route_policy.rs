@@ -248,6 +248,12 @@ fn section_3_rows_match_operation_and_level() {
             "InboundRead",
             AssuranceLevel::Everyday,
         ),
+        (
+            "POST",
+            "/inbound/events",
+            "InboundWrite",
+            AssuranceLevel::Elevated,
+        ),
     ] {
         fixed.push(DesignRow {
             method: method.into(),
@@ -439,6 +445,10 @@ fn method_splits_shutdown_and_memory_settings() {
     assert_eq!(
         required_operation(&Method::GET, "/api/v1/inbound/events"),
         Some(Operation::InboundRead)
+    );
+    assert_eq!(
+        required_operation(&Method::POST, "/api/v1/inbound/events"),
+        Some(Operation::InboundWrite)
     );
     assert_eq!(
         required_operation(&Method::PUT, "/api/v1/inbound/allowlist"),

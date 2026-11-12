@@ -102,6 +102,15 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
 async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Response {
     let method = req.method().clone();
     let path = req.uri().path().to_owned();
+    // X11-2g: the wechat POST is not a product route. GET on the same path
+    // would make `decide` answer 405. A live token gets 404; a missing token
+    // still gets 401, so this does not enumerate the route.
+    if method == Method::POST && path == "/api/v1/inbound/events" {
+        if let Some(denied) = capability_token_rejected(&state, &req) {
+            return denied;
+        }
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    }
     let matched = req
         .extensions()
         .get::<MatchedPath>()
