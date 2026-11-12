@@ -384,7 +384,7 @@ hyphae daemon --identity <default> --password-stdin --notify=false --auto-reply=
 
 - **默认不拉取。** 某一轮要同时满足：comm 槽当前有 CLI，并且（`inbound_allowlist` 里有 `source=hyphae` 的行，或 `inbound_policy.accept_mode` 被明确写成 `observe` / `auto`）。没有策略行、名单也为空时不拉。
 - **`accept_mode=off` 一律停**，名单里即使有 hyphae 也不拉。off 就是停。每一轮重新读策略和 CLI，不在进程启动时冻住。
-- **群游标按身份分开**：`inbound_cursor` 的键是来源、本机 npub、群 id。私信一页最多 200 条（`history inbox` 与 `groupchat history` 的 `--limit`，comm 两侧上限都是 200）；超出的部分这一轮看不到，旧到超过最大时延的记 `stale`。
+- **群聊与私信每轮各取最新一页。** `history inbox` 与 `groupchat history` 的 `--limit` 都是 200（comm 两侧上限都是 200）。群聊每轮取最新一页、已入库跳过，不再用游标翻页。`inbound_cursor` 表保留，暂不使用。这一页之前的消息本轮漏看。旧到超过最大时延的记 `stale`。
 - **只轮询 active 群。** `groupchat list` 里 `state` 不是 `active` 的（已离开、尚未激活、缺 state）不拉历史。
 
 ## 8. 任务表

@@ -2,10 +2,12 @@
 //!
 //! Scan method (shared by both checks):
 //! - Root is this package's manifest, three levels up (the repo).
-//! - Only `.ts` and `.rs`. Skip directories named `node_modules`, `target`,
-//!   `dist`, or `.git` (by name, before following a symlink).
-//! - Skip tests: `*.test.ts`, `*.spec.ts`, `*_test.rs`, `*_tests.rs`, and any
-//!   path component `tests` or `__tests__`.
+//! - `.ts` and `.rs` everywhere this scan walks. Under `packages/` also
+//!   `.js`, `.mjs`, `.cjs`, `.tsx`, `.mts`, and `.jsx`. Skip directories
+//!   named `node_modules`, `target`, `dist`, or `.git` (by name, before
+//!   following a symlink).
+//! - Skip tests: a stem ending in `.test` or `.spec`, `*_test.rs`,
+//!   `*_tests.rs`, and any path component `tests` or `__tests__`.
 //! - Strip `//` and `/* */` with a string-aware scan, so a comment that names
 //!   the route does not count and a string literal does. Rust raw strings and
 //!   char literals stay strings; a `'lifetime` is not a string. `.ts` treats
@@ -14,12 +16,22 @@
 //!   or a `use` through `;`, including stacked attributes). An inline test
 //!   module is not production.
 //!
-//! A create POST is the exact path `/api/v1/runs` whose next byte does not
-//! continue the path (`/`, `{`, `$`, or an identifier byte), and whose nearest
-//! method token in the previous 400 bytes is a POST (`.post(`, `POST`, or
-//! `Method::POST`) rather than GET / PUT / PATCH / DELETE. The 400-byte window
-//! is why a comment that was already stripped cannot trip the check, and why
-//! an earlier POST on a different route does not paint a later GET.
+//! A create path is the exact path `/api/v1/runs` whose next byte does not
+//! continue the path (`/`, `{`, `$`, or an identifier byte). A following `?`
+//! is still that path (a query string, not a subpath).
+//!
+//! Two scans:
+//! - `packages/` and `agent24-comm` are strict. The exact path is enough;
+//!   no method word is required. The same file is also a hit when it has a
+//!   string that is exactly `/api/v1/` (`'`, `"`, or `` ` ``) and a `+`
+//!   whose other operand is a string `runs` (or `runs?…`). A template
+//!   splice `` `/api/v1/${'runs'}` `` (either quote) is the same hit.
+//! - The whitelist below still requires a method. The method window is 400
+//!   bytes before the path and 400 bytes after it. The nearest method token
+//!   in that window must be a POST (`.post(`, `post`, or `Method::POST`),
+//!   compared case-insensitively, rather than GET / PUT / PATCH / DELETE.
+//!   Nearest is why an earlier POST does not paint a later GET, and why
+//!   `{ method: 'post' }` after the path still counts.
 //!
 //! Create-caller whitelist (the route registered in `agent24d` is the callee
 //! and that whole tree is not scanned):
@@ -34,9 +46,10 @@
 //! allowlist forbids an HTTP client (`comm_dependency_allowlist.rs`).
 //!
 //! `start_run*` is scanned only under `agent24d/src`, after the same comment
-//! and `#[cfg(test)]` strip. Longer names are distinct because the match
-//! requires `(` immediately after optional whitespace, so `start_run_then`
-//! is not also `start_run`.
+//! and `#[cfg(test)]` strip. The scan only recognizes a call: the name must
+//! be followed by optional whitespace and then `(`. A bare name, or the same
+//! characters inside a string, is not a call. Longer names stay distinct
+//! because of that parenthesis, so `start_run_then` is not also `start_run`.
 
 const CREATE_PATH: &str = "/api/v1/runs";
 const METHOD_WINDOW: usize = 400;
@@ -44,13 +57,21 @@ const METHOD_WINDOW: usize = 400;
 #[test]
 fn packages_and_comm_do_not_post_runs_and_create_callers_stay_on_the_whitelist() {
     let root = repo_root();
-    let forbidden = create_posts_under(&root, &["packages", "rust/crates/agent24-comm"]);
+    let forbidden = create_posts_under(
+        &root,
+        &["packages", "rust/crates/agent24-comm"],
+        RunsScan::Strict,
+    );
     assert!(
         forbidden.is_empty(),
         "packages or agent24-comm POST {CREATE_PATH}: {forbidden:?}"
     );
 
-    let mut hits = create_posts_under(&root, &["apps", "packages", "rust/apps", "rust/crates"]);
+    let mut hits = create_posts_under(
+        &root,
+        &["apps", "packages", "rust/apps", "rust/crates"],
+        RunsScan::Method,
+    );
     hits.retain(|path| !path.starts_with("rust/apps/agent24d/"));
     let stray: Vec<_> = hits
         .iter()
@@ -170,13 +191,112 @@ fn scan_ignores_comments_tests_and_non_create_paths() {
     assert_eq!(create_post_count(&stripped), 0);
 }
 
+/// Shapes the old “POST in the 400 bytes before the path” window missed.
+/// Each one must be a strict-zone hit. The two method-window asserts are the
+/// whitelist half: POST after the path, and a lowercase `post`.
+#[test]
+fn strict_zone_flags_shapes_the_method_prefix_window_missed() {
+    let old_wechat_run = r#"
+        async runToCompletion(prompt: string, sessionId?: string): Promise<RunResult> {
+            const create = await fetch(`${this.ep.base}/api/v1/runs`, {
+                method: 'POST',
+                headers: this.headers(),
+                body: JSON.stringify(sessionId ? { prompt, session_id: sessionId } : { prompt }),
+            })
+            if (!create.ok) {
+                return { status: 'failed', error: `run create failed: HTTP ${create.status}`, runId: '' }
+            }
+            const run = (await create.json()) as { id: string }
+            return this.awaitRun(run.id)
+        }
+    "#;
+    let strict_cases = [
+        "const RUNS = '/api/v1/runs'",
+        "fetch('/api/v1/runs?x=1')",
+        "const path = '/api/v1/' + 'runs'",
+        "const path = \"/api/v1/\" + \"runs\"",
+        "const path = `/api/v1/` + `runs`",
+        "const API = '/api/v1/'\nconst path = API + 'runs'",
+        "fetch(`/api/v1/${'runs'}`)",
+        "fetch(`/api/v1/${\"runs\"}`)",
+        "await fetch(`${this.ep.base}/api/v1/runs`, { method: 'POST' })",
+        "fetch('/api/v1/runs', { method: 'post' })",
+        old_wechat_run,
+    ];
+    for src in strict_cases {
+        assert!(strict_hit(src), "strict scan missed a create shape:\n{src}");
+    }
+    assert!(
+        !strict_hit("fetch('/api/v1/runs/{id}/cancel')"),
+        "a subpath is not the create path"
+    );
+    assert!(
+        !strict_hit("fetch('/api/v1/runs/' + id)"),
+        "a slash after the path is a subpath"
+    );
+    assert!(
+        !strict_hit("// POST /api/v1/runs\nconst x = 1"),
+        "a comment is not a call"
+    );
+
+    assert_eq!(
+        create_post_count("await fetch(`${this.ep.base}/api/v1/runs`, { method: 'POST' })"),
+        1,
+        "POST after the path must count on the whitelist"
+    );
+    assert_eq!(
+        create_post_count("fetch('/api/v1/runs', { method: 'post' })"),
+        1,
+        "lowercase post must count on the whitelist"
+    );
+    assert_eq!(
+        create_post_count("r('GET', '/api/v1/runs')"),
+        0,
+        "a nearer GET is not a create POST"
+    );
+    assert_eq!(
+        create_post_count("r('get', '/api/v1/runs');\nr('POST', '/other')"),
+        0,
+        "lowercase get stays a GET"
+    );
+
+    for ext in ["js", "mjs", "cjs", "tsx", "mts", "jsx"] {
+        let rel = format!("packages/wechat-bridge/src/bypass.{ext}");
+        let path = repo_root().join(&rel);
+        assert!(
+            is_scanned_source(&path),
+            "{ext} under packages must be scanned"
+        );
+        assert!(
+            package_file_is_a_violation(&rel, "const RUNS = '/api/v1/runs'"),
+            "{ext} carrying the create path must be a hit"
+        );
+    }
+    assert!(
+        !is_scanned_source(&repo_root().join("apps/desktop/src/bypass.js")),
+        "js outside packages stays out of this scan"
+    );
+    assert!(
+        !is_scanned_source(&repo_root().join("packages/wechat-bridge/src/bypass.test.js")),
+        "package tests stay out of this scan"
+    );
+}
+
 fn create_caller_allowed(path: &str) -> bool {
     path.starts_with("apps/desktop/")
         || path.starts_with("rust/apps/agent24-cli/")
         || path.starts_with("rust/crates/agent24-mcp/")
 }
 
-fn create_posts_under(root: &std::path::Path, rels: &[&str]) -> Vec<String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RunsScan {
+    /// Exact path, or a `/api/v1/` literal spliced with `runs`. No method word.
+    Strict,
+    /// Nearest method in the window on both sides of the path is POST.
+    Method,
+}
+
+fn create_posts_under(root: &std::path::Path, rels: &[&str], mode: RunsScan) -> Vec<String> {
     let mut hits = Vec::new();
     for rel in rels {
         let dir = root.join(rel);
@@ -184,13 +304,17 @@ fn create_posts_under(root: &std::path::Path, rels: &[&str]) -> Vec<String> {
         walk(&dir, &mut files);
         for path in files {
             let lang = match path.extension().and_then(|ext| ext.to_str()) {
-                Some("ts") => Lang::TypeScript,
                 Some("rs") => Lang::Rust,
+                Some("ts" | "tsx" | "mts" | "js" | "mjs" | "cjs" | "jsx") => Lang::TypeScript,
                 _ => continue,
             };
             let text = std::fs::read_to_string(&path).unwrap_or_default();
             let stripped = strip_cfg_test(&strip_comments(&text, lang));
-            if create_post_count(&stripped) == 0 {
+            let hits_here = match mode {
+                RunsScan::Strict => strict_violation_count(&stripped, lang),
+                RunsScan::Method => create_post_count(&stripped),
+            };
+            if hits_here == 0 {
                 continue;
             }
             let rel_path = path
@@ -205,14 +329,41 @@ fn create_posts_under(root: &std::path::Path, rels: &[&str]) -> Vec<String> {
     hits
 }
 
+fn strict_hit(src: &str) -> bool {
+    strict_violation_count(&strip_comments(src, Lang::TypeScript), Lang::TypeScript) > 0
+}
+
+fn package_file_is_a_violation(rel: &str, src: &str) -> bool {
+    let path = repo_root().join(rel);
+    is_scanned_source(&path) && strict_hit(src)
+}
+
+fn strict_violation_count(src: &str, lang: Lang) -> usize {
+    let mut count = exact_path_count(src, RunsScan::Strict);
+    if has_api_v1_prefix_literal(src, lang) && has_runs_concat_operand(src, lang) {
+        count += 1;
+    }
+    if has_template_runs_splice(src) {
+        count += 1;
+    }
+    count
+}
+
 fn create_post_count(src: &str) -> usize {
+    exact_path_count(src, RunsScan::Method)
+}
+
+fn exact_path_count(src: &str, mode: RunsScan) -> usize {
     let bytes = src.as_bytes();
     let mut count = 0;
     let mut i = 0;
     while i + CREATE_PATH.len() <= bytes.len() {
         if bytes[i..].starts_with(CREATE_PATH.as_bytes()) && !continues_path(bytes, i) {
-            let from = i.saturating_sub(METHOD_WINDOW);
-            if nearest_is_post(&src[from..i]) {
+            let hit = match mode {
+                RunsScan::Strict => true,
+                RunsScan::Method => nearest_is_post(src, i),
+            };
+            if hit {
                 count += 1;
             }
             i += CREATE_PATH.len();
@@ -232,43 +383,161 @@ fn continues_path(bytes: &[u8], path_at: usize) -> bool {
     byte == b'/' || byte == b'{' || byte == b'$' || byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-fn nearest_is_post(before: &str) -> bool {
-    let bytes = before.as_bytes();
-    let mut last_post: Option<bool> = None;
-    let mut i = 0;
-    while i < bytes.len() {
-        if let Some(post) = method_at(bytes, i) {
-            last_post = Some(post);
+fn nearest_is_post(src: &str, path_at: usize) -> bool {
+    let bytes = src.as_bytes();
+    let path_end = path_at + CREATE_PATH.len();
+    let start = path_at.saturating_sub(METHOD_WINDOW);
+    let end = (path_end + METHOD_WINDOW).min(bytes.len());
+    let mut best: Option<(usize, bool)> = None;
+    let mut i = start;
+    while i < end {
+        if i >= path_at && i < path_end {
+            i = path_end;
+            continue;
+        }
+        if let Some((len, post)) = method_at(bytes, i) {
+            let match_end = i + len;
+            if i < path_end && match_end > path_at {
+                i += 1;
+                continue;
+            }
+            let dist = if match_end <= path_at {
+                path_at - match_end
+            } else {
+                i.saturating_sub(path_end)
+            };
+            if best.is_none_or(|(prev, _)| dist < prev) {
+                best = Some((dist, post));
+            }
+            i += len;
+            continue;
         }
         i += 1;
     }
-    last_post == Some(true)
+    best.is_some_and(|(_, post)| post)
 }
 
-fn method_at(bytes: &[u8], i: usize) -> Option<bool> {
+fn method_at(bytes: &[u8], i: usize) -> Option<(usize, bool)> {
     let rest = &bytes[i..];
-    if rest.starts_with(b".post(") {
-        return Some(true);
-    }
-    if rest.starts_with(b".get(")
-        || rest.starts_with(b".put(")
-        || rest.starts_with(b".patch(")
-        || rest.starts_with(b".delete(")
-    {
-        return Some(false);
+    for (dotted, post) in [
+        (".post(", true),
+        (".get(", false),
+        (".put(", false),
+        (".patch(", false),
+        (".delete(", false),
+    ] {
+        if rest.len() >= dotted.len()
+            && rest[..dotted.len()].eq_ignore_ascii_case(dotted.as_bytes())
+        {
+            return Some((dotted.len(), post));
+        }
     }
     for (word, post) in [
-        ("POST", true),
-        ("GET", false),
-        ("PUT", false),
-        ("PATCH", false),
-        ("DELETE", false),
+        ("post", true),
+        ("get", false),
+        ("put", false),
+        ("patch", false),
+        ("delete", false),
     ] {
-        if rest.starts_with(word.as_bytes()) && word_boundary(bytes, i, word.len()) {
-            return Some(post);
+        if rest.len() >= word.len()
+            && rest[..word.len()].eq_ignore_ascii_case(word.as_bytes())
+            && word_boundary(bytes, i, word.len())
+        {
+            return Some((word.len(), post));
         }
     }
     None
+}
+
+fn has_api_v1_prefix_literal(src: &str, lang: Lang) -> bool {
+    let mut i = 0;
+    while i < src.len() {
+        if let Some(len) = string_at(src, i, lang) {
+            if literal_content(src, i, len) == Some("/api/v1/") {
+                return true;
+            }
+            i += len;
+            continue;
+        }
+        i += src[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn has_runs_concat_operand(src: &str, lang: Lang) -> bool {
+    let bytes = src.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(len) = string_at(src, i, lang) {
+            i += len;
+            continue;
+        }
+        let prev_ok = i == 0 || !matches!(bytes[i - 1], b'+' | b'=');
+        if bytes[i] == b'+' && prev_ok && runs_literal_after(&src[i + 1..], lang) {
+            return true;
+        }
+        i += src[i..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
+fn runs_literal_after(src: &str, lang: Lang) -> bool {
+    let rest = src.trim_start();
+    let Some(len) = string_at(rest, 0, lang) else {
+        return false;
+    };
+    match literal_content(rest, 0, len) {
+        Some("runs") => true,
+        Some(text) => text.starts_with("runs?"),
+        None => false,
+    }
+}
+
+fn has_template_runs_splice(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let needle = b"/api/v1/${";
+    let mut i = 0;
+    while i + needle.len() <= bytes.len() {
+        if bytes[i..].starts_with(needle) {
+            let mut rest = src[i + needle.len()..].trim_start();
+            rest = strip_one_quote(rest);
+            if let Some(after_runs) = rest.strip_prefix("runs") {
+                let after_quote = strip_one_quote(after_runs);
+                if after_quote.trim_start().starts_with('}') {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+fn strip_one_quote(src: &str) -> &str {
+    src.strip_prefix('\'')
+        .or_else(|| src.strip_prefix('"'))
+        .or_else(|| src.strip_prefix('`'))
+        .unwrap_or(src)
+}
+
+fn string_at(src: &str, i: usize, lang: Lang) -> Option<usize> {
+    match lang {
+        Lang::Rust => rust_string_len(&src[i..]),
+        Lang::TypeScript => ts_string_len(&src[i..]),
+    }
+}
+
+fn literal_content(src: &str, i: usize, len: usize) -> Option<&str> {
+    let raw = &src[i..i + len];
+    let bytes = raw.as_bytes();
+    let quote = *bytes.first()?;
+    if quote != b'\'' && quote != b'"' && quote != b'`' {
+        return None;
+    }
+    if bytes.last() != Some(&quote) || raw.len() < 2 {
+        return None;
+    }
+    Some(&raw[1..raw.len() - 1])
 }
 
 fn word_boundary(bytes: &[u8], at: usize, len: usize) -> bool {
@@ -606,12 +875,21 @@ fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 
 fn is_scanned_source(path: &std::path::Path) -> bool {
     let ext = path.extension().and_then(|ext| ext.to_str());
-    if ext != Some("ts") && ext != Some("rs") {
+    let under_packages = path
+        .components()
+        .any(|component| component.as_os_str() == "packages");
+    let ext_ok = match ext {
+        Some("ts" | "rs") => true,
+        Some("js" | "mjs" | "cjs" | "tsx" | "mts" | "jsx") => under_packages,
+        _ => false,
+    };
+    if !ext_ok {
         return false;
     }
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    if name.ends_with(".test.ts")
-        || name.ends_with(".spec.ts")
+    let stem = path.file_stem().and_then(|n| n.to_str()).unwrap_or("");
+    if stem.ends_with(".test")
+        || stem.ends_with(".spec")
         || name.ends_with("_test.rs")
         || name.ends_with("_tests.rs")
     {

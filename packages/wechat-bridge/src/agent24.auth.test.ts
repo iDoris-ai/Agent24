@@ -39,7 +39,16 @@ describe('Agent24Client without a bearer sends nothing', () => {
         vi.fn(async () => new Response(JSON.stringify({ error: { message: 'SECRET' } }), { status })),
       )
       const c = new Agent24Client({ base: 'http://127.0.0.1:1', token: 'b' })
-      await expect(c.recordInbound(event)).rejects.toThrow(new RegExp(`HTTP ${status}`))
+      let thrown: unknown
+      try {
+        await c.recordInbound(event)
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      const message = thrown instanceof Error ? thrown.message : String(thrown)
+      expect(message).toMatch(new RegExp(`HTTP ${status}`))
+      expect(message).not.toContain('SECRET')
     })
   }
 })

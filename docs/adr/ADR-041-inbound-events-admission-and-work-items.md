@@ -31,7 +31,7 @@ Agent24 今天有**五条**入站路径，各走各的：
 
 - 新增本体内部资源**入站事件**（`inbound_events` 表）：`id`（`<source>:<native_id>[:<edit_version>]`）、`source`（组件 id 或 `scheduler` / `self`）、`thread_key`（来源定义的讨论串键，可空；Hyphae 群聊用 `group_id`）、`actor`（来源原生身份，可空）、`human: bool`、`addressed: none | mention | direct`、`at`、`text`（上限默认 4 000 字）、`meta`（来源自有 JSON，不可信）、`disposition`。
 - 同 `id` 再次写入返回 `duplicate`，不建第二条记录，不触发第二次处理。编辑过的消息要当新事件时，来源在 id 里带版本（原型 008 §3）。
-- 五条现有路径改为适配器：scheduler 投递与 self_wake 写入 `source = scheduler | self`；Hyphae 收件箱由 daemon 主动拉取写入；nostr-bridge 与 wechat-bridge 改为只做传输，名单与去重搬进 daemon（迁入前桥的内存去重不算满足本条）。
+- 五条现有路径改为适配器：scheduler 投递与 self_wake 写入 `source = scheduler | self`；Hyphae 收件箱由 daemon 主动拉取写入；wechat-bridge 改为只做传输，名单与去重搬进 daemon（迁入前桥的内存去重不算满足本条）。nostr-bridge 已删除（#1785），不再是一条入站路径。
 - 入站事件不是出站事件流（`protocol/events.schema.json` 的 `run.* / tool.* / schedule.* / approval.*`）。分表、分名；入站内容不进 WS `/events` 广播。
 
 ### D2 来源的职责：身份、读位置、范围、讨论串
@@ -130,7 +130,7 @@ Agent24 今天有**五条**入站路径，各走各的：
 - Q1 AgentEar 转写算 `addressed: direct` 还是单独一类；来源标签是否 `Unknown`。建议 `direct`、actor = 本机用户、标签交 K1-02 定。
 - Q2 入站事件与工单保留期。建议与审计一致 180 天，受记忆 P1 purge 覆盖。
 - Q3 已结束工单何时允许重开：原型允许用户在原讨论串的消息直接恢复。建议 v1 允许，但先重验授权依据。
-- Q4 nostr-bridge / wechat-bridge 的名单搬进 daemon 时的行为差异；桥的内存去重在迁入前是否先落本地文件。
+- Q4 **已由 X11-2f / 2g 落地**（#1809、#1811、#1818、#1819）。名单在 daemon 的 `inbound_allowlist`，去重在 `inbound_events` 的 id。wechat-bridge 不再自持名单，也不再 `POST /api/v1/runs`。nostr-bridge 已删除（#1785），没有「先把去重落在桥本地文件」这一步。
 - Q5 工单是否暴露给组件（领域 OS 想知道「这是哪件事」）。建议 v1 不暴露，只在 K1-01 可信上下文里带 `work_item_id` 作关联。
 
 ## 7. 评审记录

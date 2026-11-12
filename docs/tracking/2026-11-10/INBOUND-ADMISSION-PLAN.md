@@ -1,7 +1,7 @@
 # 入站准入里程碑实施方案（X11 ②③④）
 
 - 日期：2026-11-10（基线：`origin/main` @ `2fa86db3b`；第 2 版吸收 Opus 独立评审）
-- 状态：已实施。2a–2d、2f、2g 已合入 main；2e 迁移 #1820 在审，Hyphae 轮询尚未单独合入 main；2h 为本收口。对照见 §4.1。
+- 状态：已实施。2a–2d、2f、2g 已合入 main；2e 迁移 #1820 已合（bb03081e）；2e 第 2 部分（Hyphae 轮询）走 #1821，尚未合入 main；2h 为本收口。对照见 §4.1。
 - 依据：[ADR-041](../../adr/ADR-041-inbound-events-admission-and-work-items.md) 的 041a（D1–D4、D10，已接受）；[ADR-044](../../adr/ADR-044-communication.md) D5（X11 结论）；[MILESTONES-AND-TASKS §2.4](MILESTONES-AND-TASKS.md)「尾巴 3a：X11」。
 - 不实现 ADR-041b（工单，D5–D9）。
 - §7 四条取舍 jason 2026-11-11 已拍板，均按推荐。
@@ -202,7 +202,7 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 | X11-2b | 已合入 main | #1803 |
 | X11-2c | 已合入 main | #1810、#1813、#1816 |
 | X11-2d | 已合入 main | #1808、#1812 |
-| X11-2e | 迁移 #1820 在审；Hyphae 轮询（第 2 部分）在 X11-2e 分支，尚未单独合入 main | #1820 |
+| X11-2e | 迁移 #1820 已合（bb03081e）；第 2 部分 Hyphae 轮询走 #1821，尚未合入 main。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用 | #1820、#1821 |
 | X11-2f | 已合入 main | #1809、#1811 |
 | X11-2g | 已合入 main | #1818、#1819 |
 | X11-2h | 本收口，尚未开 PR | — |
@@ -214,8 +214,8 @@ X11 ① 产品隔离是 #1785。方案文档是 #1797。
 - **拆分**：2a、2c、2d、2e、2f、2g 都不是一片一个 PR。2e 拆成迁移与 Hyphae 轮询两段，轮询还没自己的已合并 PR。
 - **默认不拉取**（jason 2026-11-12）：有 CLI，且名单里有 hyphae 或 `accept_mode` 明确为 `observe` / `auto`，才拉。`accept_mode=off` 一律停。这和 §3.4「接受模式本轮只存不判」不完全一样：模式仍不进 `admit()`，但已经是拉不拉的开关。
 - **名单外不回复，含 duplicate**：微信桥只在 daemon 报告这次真的起了 run 时回「已记录」。`ignored`、`duplicate`、`already_linked` 都不回。原 2g 验收写的是桥回复只有「已记录」，没有把 duplicate 排除在外。
-- **私信每轮最多 200 条**；群游标按（来源、本机 npub、群 id）分开；只轮询 `state=active` 的群。见 `COMM-HYPHAE.md` §7.1。
-- **`INBOUND_RATE_LIMIT` / `INBOUND_MAX_AGE` 仍是占位**（每分钟 3 条、10 分钟），正式上线前确认。见 followups。
+- **群聊与私信每轮各最多取最新 200 条**，更早的漏看（安全方向，见 followups）。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用。只轮询 `state=active` 的群。见 `COMM-HYPHAE.md` §7.1。
+- **`INBOUND_RATE_LIMIT` / `INBOUND_MAX_AGE_SECS` 仍是占位**（每分钟 3 条、10 分钟），正式上线前确认。见 followups。代码里的名字是 `INBOUND_MAX_AGE_SECS`（`inbound/service.rs`）。
 
 推荐顺序：2a → 2b → 2c → 2d →（2e、2f 并行）→ 2g → 2h。2a–2d 合入后 daemon 已有可测试的完整「记录 → 准入 → 起 run」闭环，只是还没有真实来源。
 

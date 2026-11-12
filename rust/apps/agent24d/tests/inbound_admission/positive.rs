@@ -60,7 +60,14 @@ async fn desktop_chat_plain_runs_and_scheduler_do_not_add_non_internal_inbound_r
             .unwrap(),
     )
     .await;
-    let _ = chat;
+    let chat_status = chat.status();
+    assert!(
+        matches!(
+            chat_status,
+            StatusCode::SERVICE_UNAVAILABLE | StatusCode::INTERNAL_SERVER_ERROR
+        ),
+        "chat with no provider returned {chat_status}"
+    );
     assert_eq!(
         count(&state, false).await,
         1,
