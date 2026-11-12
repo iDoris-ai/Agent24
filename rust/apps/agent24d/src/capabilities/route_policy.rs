@@ -181,6 +181,9 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/inbound/policy", Operation::InboundRead, AssuranceLevel::Everyday),
     row("PUT", "/api/v1/inbound/policy", Operation::InboundWrite, AssuranceLevel::Elevated),
     row("GET", "/api/v1/inbound/events", Operation::InboundRead, AssuranceLevel::Everyday),
+    // X11-2g. Registered so the kernel scan matches this catalog. Capabilities
+    // mode answers 404 before the operation is consulted (middleware).
+    row("POST", "/api/v1/inbound/events", Operation::InboundWrite, AssuranceLevel::Elevated),
 ];
 
 pub fn policies() -> &'static [RoutePolicy] {

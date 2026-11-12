@@ -3,16 +3,19 @@
 //!
 //! `admit` is the pure policy hash and the §3.3 table. `routes` serves HTTP.
 //! `service` ingests, starts runs, and reconciles at startup. `policy_version`
-//! is already called from `routes`. Items that only the table uses carry
-//! `cfg_attr(not(test), expect(dead_code))`: the bin does not call them yet,
-//! and the admit tests do, so a module-level expect is unfulfilled there.
+//! is already called from `routes`. The development wechat POST calls
+//! `InboundService::ingest`, which calls `admit`, so the table types are live
+//! in the bin.
 
 mod admit;
 mod maintenance;
 mod routes;
 mod service;
 
-pub(crate) use routes::{get_allowlist, get_events, get_policy, put_allowlist, put_policy};
+pub(crate) use routes::{
+    get_allowlist, get_events, get_policy, post_wechat_event, put_allowlist, put_policy,
+    seed_dev_allowlist,
+};
 #[allow(
     unused_imports,
     reason = "X11-2e and X11-2g call InboundService; this slice wires startup reconcile only"

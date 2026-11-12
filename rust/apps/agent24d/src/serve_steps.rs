@@ -754,6 +754,24 @@ pub(super) async fn assemble_app_state(
     if crate::enroll_test_support::enabled() {
         state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
+    // X11-2g. The seed string is empty unless legacy and `A24_DEV_TOOL=1`,
+    // so capabilities mode does not apply `A24_INBOUND_DEV_ALLOWLIST`.
+    let dev_tool = std::env::var("A24_DEV_TOOL").ok();
+    let allowlist = std::env::var("A24_INBOUND_DEV_ALLOWLIST").ok();
+    let (enabled, seed) =
+        dev_wechat_seed(state.auth_mode, dev_tool.as_deref(), allowlist.as_deref());
+    state.dev_wechat_events = enabled;
+    let seeded = crate::inbound::seed_dev_allowlist(
+        &state.store,
+        state.auth_mode,
+        dev_tool.as_deref() == Some("1"),
+        &seed,
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    if seeded > 0 {
+        tracing::info!(seeded, "seeded the development wechat inbound allowlist");
+    }
     Ok((report, state))
 }
 
@@ -1832,6 +1850,25 @@ pub(super) async fn advertise_readiness(
     }))
 }
 
+/// Development wechat route switch.
+///
+/// On only for legacy mode with `A24_DEV_TOOL=1`. The returned seed is that
+/// variable's value in that case, and empty otherwise, including when the
+/// variable is missing. Capabilities mode stays off when both are set.
+pub(crate) fn dev_wechat_seed(
+    auth_mode: AuthMode,
+    dev_tool: Option<&str>,
+    allowlist: Option<&str>,
+) -> (bool, String) {
+    let enabled = auth_mode == AuthMode::LegacySingleToken && dev_tool == Some("1");
+    let seed = if enabled {
+        allowlist.unwrap_or_default().to_owned()
+    } else {
+        String::new()
+    };
+    (enabled, seed)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1841,7 +1878,29 @@ mod tests {
     use agent24_store::NewInboundEvent;
     use agent24_tools::HttpFetchTool;
 
+    use agent24_protocol::state_file::AuthMode;
+
     use super::*;
+
+    #[test]
+    fn dev_wechat_seed_follows_auth_mode_and_the_dev_tool_flag() {
+        let (on, seed) =
+            dev_wechat_seed(AuthMode::LegacySingleToken, Some("1"), Some("wechat:alice"));
+        assert!(on);
+        assert_eq!(seed, "wechat:alice");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::LegacySingleToken, Some("1"), None);
+        assert!(on);
+        assert_eq!(seed, "");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::LegacySingleToken, None, Some("wechat:alice"));
+        assert!(!on);
+        assert_eq!(seed, "");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::Capabilities, Some("1"), Some("wechat:alice"));
+        assert!(!on);
+        assert_eq!(seed, "");
+    }
 
     fn event(id: &str, actor: &str, run_state: &str) -> NewInboundEvent {
         NewInboundEvent {

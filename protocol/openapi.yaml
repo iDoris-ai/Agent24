@@ -80,9 +80,12 @@ tags:
   - name: inbound
     description: >-
       X11-2f: who may start a run from an external message, the stored accept
-      mode, and the inbound event list. Writes are ProductHost only. The list
-      returns metadata and the first 50 characters of the body. It is not
-      pushed on the WebSocket events stream.
+      mode, and the inbound event list. Allowlist and policy writes are
+      ProductHost only. The list returns metadata and the first 50 characters
+      of the body. It is not pushed on the WebSocket events stream.
+      X11-2g adds `POST /inbound/events` for the development wechat bridge.
+      That POST is mounted only in legacy mode when `A24_DEV_TOOL=1`.
+      Capabilities mode answers 404.
   - name: sin90
     description: The Sin90 Personal-OS module (own store; degrades independently).
   - name: documents
@@ -2367,6 +2370,73 @@ paths:
                 $ref: "#/components/schemas/InboundEventPage"
         "400":
           description: Invalid query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      operationId: postWechatInboundEvent
+      x-milestone: X11-2g
+      tags: [inbound]
+      summary: Record one development WeChat message
+      description: >-
+        Development transport for the wechat bridge. Mounted only in legacy
+        mode when the daemon was started with `A24_DEV_TOOL=1`. Capabilities
+        mode, and legacy mode without that flag, answer 404 (`No v1 route`).
+        `source` is fixed to `wechat`: a body `source` other than `wechat` is
+        400, and the stored row is always `wechat` / `dev_bridge` / `direct` /
+        `human=true`. The route does not copy `category`, `human`, or
+        `addressed` from the body. Admission (allowlist, watermark, rate)
+        still decides whether a run starts. A duplicate `id` does not start a
+        second run. The response does not echo `text`. A storage failure is a
+        generic `storage error`. A start failure is a generic `internal error`.
+        Neither body includes the store text or the prompt. An allowlisted
+        message with no text is 400 and is not stored. An unknown query
+        parameter is 400. A body over the daemon limit is 413
+        `payload_too_large`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WechatInboundEventWrite"
+      responses:
+        "200":
+          description: Recorded. `outcome` says whether a run started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WechatInboundEventResult"
+        "400":
+          description: >-
+            Malformed body, unknown field, unknown query parameter, a source
+            other than wechat, or an allowlisted message with no text
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Not mounted (capabilities mode, or legacy without A24_DEV_TOOL=1)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "payload_too_large: the request exceeded the daemon-wide body limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: >-
+            Storage failure (`storage error`) or start failure (`internal error`).
+            The body does not include the store text or the prompt.
           content:
             application/json:
               schema:
@@ -6663,6 +6733,53 @@ components:
             before_id:
               type: string
           description: Present when another older page exists. Send both values back as query parameters.
+    WechatInboundEventWrite:
+      type: object
+      additionalProperties: false
+      required: [id, actor, at]
+      properties:
+        id:
+          type: string
+          pattern: "^wechat:[0-9]{1,32}$"
+          description: "`wechat:` plus the iLink decimal `message_id`."
+        source:
+          type: string
+          enum: [wechat]
+          description: >-
+            Optional. Omitted or `wechat` is accepted. Any other value is 400.
+            The route stores `wechat` either way.
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: WeChat `from_user_id`, NFC, no control or format characters.
+        at:
+          type: string
+          pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          description: Message time, `YYYY-MM-DDTHH:MM:SSZ`, no fractional seconds.
+        text:
+          type: string
+          description: >-
+            Message text. Empty or omitted is no body. An allowlisted message
+            with no body is 400 and is not stored.
+    WechatInboundEventResult:
+      type: object
+      additionalProperties: false
+      required: [id, outcome]
+      properties:
+        id:
+          type: string
+        outcome:
+          type: string
+          enum: [duplicate, ignored, started, already_linked]
+        reason:
+          type: string
+          description: Present when `outcome` is `ignored`.
+        run_id:
+          type: string
+          description: >-
+            Present for `started`, and for `already_linked` when the link row
+            is still there. Omitted when that row is gone.
 
     ErrorBody:
       type: object

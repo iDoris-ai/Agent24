@@ -705,6 +705,124 @@ impl Store {
         Ok(view)
     }
 
+    /// Insert one allowlist row. A `(source, actor)` that is already stored
+    /// is left as it was, including `added_at` and `note`.
+    ///
+    /// Returns whether this call inserted the row.
+    ///
+    /// # Errors
+    /// Storage, or an `added_at` that is not [`format_inbound_timestamp`].
+    pub async fn insert_inbound_allowlist_if_absent(
+        &self,
+        source: &str,
+        actor: &str,
+        added_at: &str,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        require_inbound_timestamp("added_at", added_at)?;
+        let inserted = sqlx::query(
+            "INSERT INTO inbound_allowlist (source, actor, added_at, note) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(source, actor) DO NOTHING",
+        )
+        .bind(source)
+        .bind(actor)
+        .bind(added_at)
+        .bind(note)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(inserted > 0)
+    }
+
+    /// Sync the development wechat seed in one transaction.
+    ///
+    /// Deletes `wechat` rows whose note is `dev-seed` and whose actor is not
+    /// in `actors`. An empty slice deletes every such row. Rows with any
+    /// other note, and rows for any other source, stay, including `added_at`.
+    /// Each actor that is not already stored is inserted with note
+    /// `dev-seed`. A pair that is already stored keeps the note and
+    /// `added_at` it had.
+    ///
+    /// Returns how many rows this call inserted.
+    ///
+    /// # Errors
+    /// Storage, or an `added_at` that is not [`format_inbound_timestamp`].
+    pub async fn sync_wechat_dev_seed_allowlist(
+        &self,
+        actors: &[String],
+        added_at: &str,
+    ) -> Result<usize> {
+        require_inbound_timestamp("added_at", added_at)?;
+        let mut tx = self.pool().begin().await?;
+        let mut sql = String::from(
+            "DELETE FROM inbound_allowlist WHERE source = 'wechat' AND note = 'dev-seed'",
+        );
+        if !actors.is_empty() {
+            let placeholders = actors.iter().map(|_| "?").collect::<Vec<_>>().join(", ");
+            sql.push_str(" AND actor NOT IN (");
+            sql.push_str(&placeholders);
+            sql.push(')');
+        }
+        let mut delete = sqlx::query(&sql);
+        for actor in actors {
+            delete = delete.bind(actor);
+        }
+        delete.execute(&mut *tx).await?;
+        let mut inserted = 0usize;
+        for actor in actors {
+            let rows = sqlx::query(
+                "INSERT INTO inbound_allowlist (source, actor, added_at, note) \
+                 VALUES ('wechat', ?, ?, 'dev-seed') \
+                 ON CONFLICT(source, actor) DO NOTHING",
+            )
+            .bind(actor)
+            .bind(added_at)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if rows > 0 {
+                inserted += 1;
+            }
+        }
+        tx.commit().await?;
+        Ok(inserted)
+    }
+
+    /// Insert the source watermark when that source has none.
+    ///
+    /// A second call does not move `activated_at`. Admission compares events
+    /// to this stamp (H5).
+    ///
+    /// # Errors
+    /// Storage, a non-positive `max_age_secs`, or an `activated_at` that is
+    /// not [`format_inbound_timestamp`].
+    pub async fn ensure_inbound_source_watermark(
+        &self,
+        source: &str,
+        activated_at: &str,
+        max_age_secs: i64,
+    ) -> Result<bool> {
+        require_inbound_timestamp("activated_at", activated_at)?;
+        if max_age_secs <= 0 {
+            return Err(StoreError::Conflict(
+                "inbound watermark max_age_secs must be positive".to_owned(),
+            ));
+        }
+        let inserted = sqlx::query(
+            "INSERT INTO inbound_source_watermark (source, activated_at, max_age_secs) \
+             VALUES (?, ?, ?) \
+             ON CONFLICT(source) DO NOTHING",
+        )
+        .bind(source)
+        .bind(activated_at)
+        .bind(max_age_secs)
+        .execute(self.pool())
+        .await?
+        .rows_affected();
+        Ok(inserted > 0)
+    }
+
     /// The single policy row, if a caller has written one.
     ///
     /// No row means the table default `observe` has never been stored.
@@ -2394,5 +2512,99 @@ mod tests {
             .unwrap();
         assert!(stored.text.is_none());
         assert!(stored.meta.is_none());
+    }
+
+    /// Same store: actors that leave the dev seed are deleted. A host note
+    /// and a non-wechat `dev-seed` row stay. Dropping the `DELETE` in
+    /// `sync_wechat_dev_seed_allowlist` leaves bob and turns this red.
+    #[tokio::test]
+    async fn sync_inbound_wechat_dev_seed_drops_rows_missing_from_the_list() {
+        let store = Store::open_memory().await.unwrap();
+        let first = "2026-11-11T01:00:00Z";
+        let later = "2026-11-11T02:00:00Z";
+        assert!(
+            store
+                .insert_inbound_allowlist_if_absent("wechat", "alice", first, Some("dev-seed"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_inbound_allowlist_if_absent("wechat", "bob", first, Some("dev-seed"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_inbound_allowlist_if_absent("wechat", "carol", first, Some("host"))
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .insert_inbound_allowlist_if_absent("hyphae", "npub1", first, Some("dev-seed"))
+                .await
+                .unwrap()
+        );
+
+        let inserted = store
+            .sync_wechat_dev_seed_allowlist(&["alice".into(), "carol".into()], later)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 0);
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert!(listed.iter().all(|row| row.actor != "bob"), "{listed:?}");
+        let alice = listed.iter().find(|row| row.actor == "alice").unwrap();
+        assert_eq!(alice.added_at, first);
+        assert_eq!(alice.note.as_deref(), Some("dev-seed"));
+        let carol = listed.iter().find(|row| row.actor == "carol").unwrap();
+        assert_eq!(carol.note.as_deref(), Some("host"));
+        assert_eq!(carol.added_at, first);
+        assert!(listed.iter().any(|row| {
+            row.source == "hyphae"
+                && row.actor == "npub1"
+                && row.note.as_deref() == Some("dev-seed")
+        }));
+
+        let inserted = store
+            .sync_wechat_dev_seed_allowlist(&["dave".into()], later)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 1);
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert!(listed.iter().any(|row| {
+            row.actor == "dave" && row.note.as_deref() == Some("dev-seed") && row.added_at == later
+        }));
+        assert!(listed.iter().all(|row| row.actor != "alice"));
+        assert!(listed.iter().any(|row| row.actor == "carol"));
+
+        let inserted = store
+            .sync_wechat_dev_seed_allowlist(&[], later)
+            .await
+            .unwrap();
+        assert_eq!(inserted, 0);
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert!(
+            listed
+                .iter()
+                .all(|row| row.note.as_deref() != Some("dev-seed") || row.source != "wechat")
+        );
+        assert!(
+            listed
+                .iter()
+                .any(|row| row.actor == "carol" && row.note.as_deref() == Some("host"))
+        );
+        assert!(listed.iter().any(|row| row.source == "hyphae"));
+
+        let rejected = store
+            .sync_wechat_dev_seed_allowlist(&["alice".into()], "not-a-stamp")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(rejected, StoreError::Conflict(ref detail) if detail.contains("added_at")),
+            "{rejected:?}"
+        );
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert!(listed.iter().all(|row| row.actor != "alice"));
     }
 }

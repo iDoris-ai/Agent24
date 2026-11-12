@@ -1,8 +1,15 @@
 //! Allowlist, accept mode, and the inbound event list (X11-2f).
+//! `POST /api/v1/inbound/events` is the development wechat bridge (X11-2g).
 //!
 //! Writes (`PUT` allowlist and policy) are ProductHost-only. The gate is
 //! [`crate::capabilities::middleware`]'s `host_only_route`, not a check in
 //! these handlers. Reads are everyday: a first-party shell may call them.
+//!
+//! The POST is registered on the kernel router so the route scan and the
+//! operation catalog stay in step. It answers only in legacy mode when
+//! `AppState::dev_wechat_events` is set (`A24_DEV_TOOL=1` at startup).
+//! Capabilities mode answers 404 from the auth middleware before this
+//! handler runs, and the handler repeats that 404.
 //!
 //! Nothing here publishes on the WebSocket `/api/v1/events` hub. The list
 //! returns metadata plus the first 50 characters of `text`. Full text and
@@ -17,8 +24,10 @@
 //! concurrency. A `(source, actor)` that is already stored keeps its
 //! `added_at`; a new pair is stamped now.
 
+use agent24_protocol::state_file::AuthMode;
 use agent24_store::{
-    InboundAdmissionView, InboundAllowWrite, InboundEventSummary, format_inbound_timestamp,
+    InboundAdmissionView, InboundAllowWrite, InboundEventSummary, Store, StoreError,
+    format_inbound_timestamp,
 };
 use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
 use axum::extract::{RawQuery, State};
@@ -31,6 +40,7 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
 use super::admit::{AcceptMode, AllowlistEntry, Source};
+use super::service::{InboundMessage, InboundService, IngestError, IngestOutcome};
 use crate::server::{AppState, error_response};
 
 /// Sources that go through admission. `scheduler` and `self` do not
@@ -152,6 +162,114 @@ pub(crate) async fn get_events(State(state): State<AppState>, RawQuery(raw): Raw
     Json(json!({ "events": events, "next": next })).into_response()
 }
 
+/// Development wechat ingest. `source` is always `wechat`. A body `source`
+/// other than `wechat` is 400. The handler does not copy that field through.
+///
+/// Legacy mode and `dev_wechat_events` are both required. Anything else is
+/// 404, the same answer capabilities mode gives in the auth middleware.
+pub(crate) async fn post_wechat_event(
+    State(state): State<AppState>,
+    RawQuery(raw): RawQuery,
+    body: Result<Json<PostWechatEvent>, JsonRejection>,
+) -> Response {
+    if state.auth_mode != AuthMode::LegacySingleToken || !state.dev_wechat_events {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    }
+    if let Err(message) = reject_query(raw.as_deref()) {
+        return invalid(message);
+    }
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => return rejected_json(rejection),
+    };
+    let message = match checked_wechat_event(&body) {
+        Ok(message) => message,
+        Err(message) => return invalid(message),
+    };
+    let service = InboundService::new(state.store.clone(), std::sync::Arc::clone(&state.runs));
+    // `InboundService::dispatch` (service.rs) says a request handler that may
+    // be dropped mid-way should spawn the call. Dropping `ingest` after the
+    // insert and before the run commits leaves the row `starting`, and that
+    // sender stays rate-limited until restart. `tokio::spawn` detaches when
+    // the `JoinHandle` is dropped, so a client disconnect does not cancel the
+    // task. Awaiting the handle is how a client that stays connected receives
+    // the outcome.
+    //
+    // No disconnect test: `oneshot` waits until this handler returns, so it
+    // cannot abort the socket after the insert commits and before `dispatch`
+    // returns. Opening that window needs a live connection dropped on a
+    // timer, and the pass/fail would be a race.
+    let joined = tokio::spawn(async move { service.ingest(message).await }).await;
+    match joined {
+        Ok(Ok(outcome)) => Json(outcome_json(&body.id, outcome)).into_response(),
+        Ok(Err(err)) => ingest_error_response(err),
+        Err(join_err) => {
+            tracing::error!(error = %join_err, "wechat inbound ingest task panicked");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal error",
+            )
+        }
+    }
+}
+
+/// Development allowlist seed (plan §3.4). Capabilities mode returns before
+/// the list is parsed, so the variable is not applied there.
+///
+/// Each call syncs `wechat` rows whose note is `dev-seed` to the actors in
+/// `raw`. Actors that left the list are deleted. An empty list deletes every
+/// such row, and when this route is on that also logs one warning. A row
+/// with any other note is left alone, including its `added_at`. A pair that
+/// is already stored is not rewritten.
+///
+/// When the seed runs, the wechat watermark is inserted if missing. A later
+/// start does not move it.
+pub(crate) async fn seed_dev_allowlist(
+    store: &Store,
+    auth_mode: AuthMode,
+    dev_tool: bool,
+    raw: &str,
+) -> Result<usize, Box<StoreError>> {
+    if auth_mode != AuthMode::LegacySingleToken || !dev_tool {
+        return Ok(0);
+    }
+    let now = format_inbound_timestamp(Utc::now());
+    let mut actors = Vec::new();
+    for piece in raw.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let Some(actor) = piece.strip_prefix("wechat:") else {
+            tracing::warn!("skipping inbound dev seed entry that is not wechat:<uid>");
+            continue;
+        };
+        let actor: String = actor.nfc().collect();
+        if !valid_actor(&actor) {
+            tracing::warn!("skipping inbound dev seed actor that failed validation");
+            continue;
+        }
+        if actors.iter().any(|have: &String| have == &actor) {
+            continue;
+        }
+        actors.push(actor);
+    }
+    if actors.is_empty() {
+        tracing::warn!("开发态微信入站已开但名单为空");
+    }
+    let inserted = store
+        .sync_wechat_dev_seed_allowlist(&actors, &now)
+        .await
+        .map_err(Box::new)?;
+    let max_age = i64::try_from(super::service::INBOUND_MAX_AGE_SECS).unwrap_or(600);
+    store
+        .ensure_inbound_source_watermark("wechat", &now, max_age)
+        .await
+        .map_err(Box::new)?;
+    Ok(inserted)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PutAllowlist {
@@ -171,6 +289,103 @@ pub(crate) struct AllowEntryIn {
 #[serde(deny_unknown_fields)]
 pub(crate) struct PutPolicy {
     accept_mode: String,
+}
+
+/// Body of `POST /api/v1/inbound/events`. `source` is optional only so a
+/// caller who sends one can be rejected. The route always ingests `wechat`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PostWechatEvent {
+    id: String,
+    #[serde(default)]
+    source: Option<String>,
+    actor: String,
+    at: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+fn checked_wechat_event(body: &PostWechatEvent) -> Result<InboundMessage, &'static str> {
+    if let Some(source) = body.source.as_deref()
+        && source != "wechat"
+    {
+        return Err("source is fixed to wechat");
+    }
+    if !valid_wechat_event_id(&body.id) {
+        return Err("id must look like wechat:<message_id>");
+    }
+    let actor: String = body.actor.nfc().collect();
+    if !valid_actor(&actor) {
+        return Err("actor must be 1 to 256 characters without control or format characters");
+    }
+    if !canonical_stamp(&body.at) {
+        return Err("at must be YYYY-MM-DDTHH:MM:SSZ");
+    }
+    let text = match body.text.as_deref() {
+        None | Some("") => None,
+        Some(text) => Some(text.to_owned()),
+    };
+    Ok(InboundMessage {
+        id: body.id.clone(),
+        // Fixed here. Copying `body.source` would let a caller pick hyphae.
+        source: "wechat".to_owned(),
+        category: "dev_bridge".to_owned(),
+        recipient_identity: None,
+        thread_key: None,
+        actor: Some(actor),
+        human: true,
+        addressed: "direct".to_owned(),
+        at: body.at.clone(),
+        text,
+        meta: None,
+    })
+}
+
+/// `wechat:` plus a decimal message id. One colon, no empty suffix.
+fn valid_wechat_event_id(id: &str) -> bool {
+    let Some(native) = id.strip_prefix("wechat:") else {
+        return false;
+    };
+    !native.is_empty() && native.len() <= 32 && native.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn outcome_json(id: &str, outcome: IngestOutcome) -> Value {
+    match outcome {
+        IngestOutcome::Duplicate => json!({"id": id, "outcome": "duplicate"}),
+        IngestOutcome::Ignored { reason } => {
+            json!({"id": id, "outcome": "ignored", "reason": reason})
+        }
+        IngestOutcome::Started { run_id } => {
+            json!({"id": id, "outcome": "started", "run_id": run_id})
+        }
+        IngestOutcome::AlreadyLinked { run_id } => {
+            let mut body = json!({"id": id, "outcome": "already_linked"});
+            // `None` and "" are not a run id. Omit the field; do not send null.
+            if let Some(run_id) = run_id.filter(|run_id| !run_id.is_empty()) {
+                body["run_id"] = json!(run_id);
+            }
+            body
+        }
+    }
+}
+
+/// Store and start failures are logged. The body never includes the store
+/// text or the prompt (E4). A start failure is `internal error`. A store
+/// failure stays the generic `storage error` the other daemon routes use.
+fn ingest_error_response(err: IngestError) -> Response {
+    match err {
+        IngestError::Invalid(message) => invalid(&message),
+        IngestError::NotInbound => invalid("not an inbound event"),
+        IngestError::Store(err) => store_failed("ingest wechat event", &err),
+        IngestError::Start(detail) => {
+            tracing::error!(error = %detail, "wechat inbound start failed");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "internal error",
+            )
+        }
+    }
 }
 
 struct EventQuery {
@@ -475,8 +690,18 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration as StdDuration;
+
+    use agent24_models::router::{ModelRouter, Tier};
+    use agent24_models::{CompletionRequest, CompletionResponse, ModelError, ModelProvider, Msg};
+    use agent24_protocol::state_file::AuthMode;
+    use agent24_store::{SourceClassification, SourceKind, format_inbound_timestamp};
+    use async_trait::async_trait;
+    use chrono::Utc;
+
     use crate::enroll_api::EnrollAuthority;
-    use crate::server::tests::{capability_state, state};
+    use crate::server::tests::{capability_state, state, state_with_router};
 
     async fn json_of(res: axum::response::Response) -> Value {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
@@ -1426,5 +1651,563 @@ mod tests {
             .await
             .unwrap()
             .status()
+    }
+
+    struct Fixed;
+
+    #[async_trait]
+    impl ModelProvider for Fixed {
+        fn name(&self) -> &str {
+            "fixed"
+        }
+        async fn complete(
+            &self,
+            _req: &CompletionRequest,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<CompletionResponse, ModelError> {
+            Ok(CompletionResponse {
+                message: Msg::assistant(Some("pong".to_owned()), vec![]),
+                usage: agent24_protocol::Usage {
+                    prompt_tokens: 1,
+                    completion_tokens: 1,
+                    total_tokens: 2,
+                    cost_usd: 0.0,
+                },
+                model_id: None,
+            })
+        }
+        async fn models(
+            &self,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn dev_legacy(start_runs: bool) -> AppState {
+        let mut app = if start_runs {
+            let router = Arc::new(ModelRouter::with_defaults(vec![(
+                Arc::new(Fixed) as Arc<dyn ModelProvider>,
+                Tier::Local,
+            )]));
+            state_with_router(router).await
+        } else {
+            state().await
+        };
+        app.dev_wechat_events = true;
+        app
+    }
+
+    fn wechat_body(id: &str, actor: &str, at: &str, text: &str) -> String {
+        json!({
+            "id": id,
+            "actor": actor,
+            "at": at,
+            "text": text,
+        })
+        .to_string()
+    }
+
+    async fn run_count(store: &agent24_store::Store) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM runs")
+            .fetch_one(agent24_store::test_hooks::pool(store))
+            .await
+            .unwrap()
+    }
+
+    async fn wait_terminal(store: &agent24_store::Store, id: &str) {
+        for _ in 0..100 {
+            let run = store.get_run(id).await.unwrap().unwrap();
+            if agent24_core::run_is_terminal(run.status) {
+                return;
+            }
+            tokio::time::sleep(StdDuration::from_millis(20)).await;
+        }
+        panic!("run {id} never finished");
+    }
+
+    /// A missing link is not a run id. Sending `run_id: null` or `""` turns this red.
+    #[test]
+    fn already_linked_omits_run_id_when_the_link_row_is_gone() {
+        let missing = outcome_json("wechat:1", IngestOutcome::AlreadyLinked { run_id: None });
+        assert_eq!(
+            missing,
+            json!({"id": "wechat:1", "outcome": "already_linked"})
+        );
+        assert!(missing.get("run_id").is_none());
+
+        let blank = outcome_json(
+            "wechat:1",
+            IngestOutcome::AlreadyLinked {
+                run_id: Some(String::new()),
+            },
+        );
+        assert!(blank.get("run_id").is_none(), "{blank}");
+
+        let linked = outcome_json(
+            "wechat:1",
+            IngestOutcome::AlreadyLinked {
+                run_id: Some("run_kept".into()),
+            },
+        );
+        assert_eq!(linked["run_id"], "run_kept");
+    }
+
+    /// A start failure must not copy the prompt or the store text into the body.
+    /// Calling it `storage error` turns this red.
+    #[tokio::test]
+    async fn wechat_start_failure_does_not_return_the_prompt() {
+        let secret = "SECRET-wechat-prompt";
+        let response = ingest_error_response(IngestError::Start(secret.to_owned()));
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = json_of(response).await;
+        let rendered = json.to_string();
+        assert_eq!(json["error"]["message"], "internal error", "{rendered}");
+        assert!(!rendered.contains("storage error"), "{rendered}");
+        assert!(!rendered.contains(secret), "{rendered}");
+    }
+
+    /// Capabilities mode is 404 for a live host token, a creative token, and
+    /// after the bearer check. No row is written. Dropping the middleware
+    /// short-circuit and the handler's auth-mode check turns the host call
+    /// into a 200.
+    #[tokio::test]
+    async fn capabilities_mode_does_not_mount_wechat_ingest() {
+        let (mut app_state, host, creative) = capability_state().await;
+        app_state.dev_wechat_events = true;
+        let seeded = seed_dev_allowlist(
+            &app_state.store,
+            AuthMode::Capabilities,
+            true,
+            "wechat:alice",
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, 0);
+        assert!(
+            app_state
+                .store
+                .list_inbound_allowlist()
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app_state
+                .store
+                .inbound_watermark_activated_at("wechat")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let at = format_inbound_timestamp(Utc::now());
+        let body = wechat_body("wechat:1", "alice", &at, "hello");
+        let app = crate::server::build_router(app_state);
+        for bearer in [host.as_str(), creative.as_str()] {
+            let (status, json) =
+                call(&app, "POST", "/api/v1/inbound/events", bearer, Some(&body)).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{bearer} {json}");
+            assert_eq!(error_code(&json), "not_found", "{json}");
+        }
+        let missing = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/inbound/events")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// The route stays dark unless startup saw `A24_DEV_TOOL=1`.
+    #[tokio::test]
+    async fn wechat_ingest_requires_the_dev_tool_flag() {
+        let app_state = state().await;
+        assert!(!app_state.dev_wechat_events);
+        let app = crate::server::build_router(app_state);
+        let at = format_inbound_timestamp(Utc::now());
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:1", "alice", &at, "hello")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
+        assert_eq!(error_code(&json), "not_found");
+    }
+
+    /// A body `source` other than `wechat` returns in `checked_wechat_event`
+    /// before ingest. Dropping that return turns the hyphae body into a 200.
+    /// `deny_unknown_fields` still rejects `human`.
+    #[tokio::test]
+    async fn wechat_post_rejects_another_source_and_unknown_fields() {
+        let app_state = dev_legacy(false).await;
+        let app = crate::server::build_router(app_state.clone());
+        let at = format_inbound_timestamp(Utc::now());
+        let hyphae = json!({
+            "id": "wechat:1",
+            "source": "hyphae",
+            "actor": "alice",
+            "at": at,
+            "text": "nope",
+        })
+        .to_string();
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&hyphae),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(json["error"]["message"], "source is fixed to wechat");
+        assert_eq!(
+            app_state
+                .store
+                .list_inbound_event_summaries(10, None)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let extra = json!({
+            "id": "wechat:1",
+            "actor": "alice",
+            "at": at,
+            "text": "nope",
+            "human": false,
+        })
+        .to_string();
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&extra),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+
+        for id in ["hyphae:1", "wechat:", "wechat:abc", "wechat:1:2"] {
+            let (status, json) = call(
+                &app,
+                "POST",
+                "/api/v1/inbound/events",
+                "testtoken",
+                Some(&wechat_body(id, "alice", &at, "x")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{id} {json}");
+            assert_eq!(
+                json["error"]["message"],
+                "id must look like wechat:<message_id>"
+            );
+        }
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:1", " alice", &at, "x")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    }
+
+    /// Off the list: one ignore row, no run. The body does not echo the text.
+    #[tokio::test]
+    async fn an_unlisted_wechat_user_is_ignored_and_starts_no_run() {
+        let app_state = dev_legacy(false).await;
+        seed_dev_allowlist(&app_state.store, AuthMode::LegacySingleToken, true, "")
+            .await
+            .unwrap();
+        let at = format_inbound_timestamp(Utc::now());
+        let secret = "SECRET-unlisted-body";
+        let app = crate::server::build_router(app_state.clone());
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:7", "mallory", &at, secret)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "ignored");
+        assert_eq!(json["reason"], "not_allowlisted");
+        assert!(!json.to_string().contains(secret), "{json}");
+        assert_eq!(run_count(&app_state.store).await, 0);
+        let row = app_state
+            .store
+            .get_inbound_event("wechat:7")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.disposition, "ignore");
+        assert_eq!(row.source, "wechat");
+        assert_eq!(row.disposition_reason.as_deref(), Some("not_allowlisted"));
+    }
+
+    /// Seeded uid: one run, Unknown tag. The same id again does not start
+    /// another. Shrinking the seed on this same store is
+    /// `dev_seed_on_the_same_store_drops_uids_that_left_the_list`.
+    #[tokio::test]
+    async fn a_seeded_wechat_user_starts_one_unknown_run_and_a_replay_does_not() {
+        let app_state = dev_legacy(true).await;
+        let seeded = seed_dev_allowlist(
+            &app_state.store,
+            AuthMode::LegacySingleToken,
+            true,
+            "wechat:alice, wechat:bob",
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, 2);
+        let listed = app_state.store.list_inbound_allowlist().await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert!(
+            listed
+                .iter()
+                .all(|row| row.note.as_deref() == Some("dev-seed"))
+        );
+        assert!(
+            app_state
+                .store
+                .inbound_watermark_activated_at("wechat")
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        let at = format_inbound_timestamp(Utc::now());
+        let secret = "SECRET-seeded-body";
+        let body = json!({
+            "id": "wechat:9",
+            "source": "wechat",
+            "actor": "alice",
+            "at": at,
+            "text": secret,
+        })
+        .to_string();
+        let app = crate::server::build_router(app_state.clone());
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "started", "{json}");
+        assert!(!json.to_string().contains(secret), "{json}");
+        let run_id = json["run_id"].as_str().unwrap().to_owned();
+        assert_eq!(run_count(&app_state.store).await, 1);
+
+        let (status, replay) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&body),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(replay["outcome"], "duplicate");
+        assert_eq!(run_count(&app_state.store).await, 1);
+
+        wait_terminal(&app_state.store, &run_id).await;
+        let tags = app_state.store.list_run_source_tags(&run_id).await.unwrap();
+        let user = tags
+            .iter()
+            .find(|tag| tag.source.kind == SourceKind::UserInput)
+            .unwrap();
+        assert_eq!(user.source.classification, SourceClassification::Unknown);
+    }
+
+    /// Same store. An empty seed removes alice. Shrinking `alice,bob` to
+    /// `alice` removes bob. A row whose note is not `dev-seed` stays.
+    /// Dropping the `DELETE` in `sync_wechat_dev_seed_allowlist` leaves them
+    /// allowlisted: alice's first POST and bob's POST become `started`.
+    #[tokio::test]
+    async fn dev_seed_on_the_same_store_drops_uids_that_left_the_list() {
+        let app_state = dev_legacy(true).await;
+        let store = &app_state.store;
+        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "wechat:alice")
+            .await
+            .unwrap();
+        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "")
+            .await
+            .unwrap();
+        assert!(store.list_inbound_allowlist().await.unwrap().is_empty());
+
+        let at = format_inbound_timestamp(Utc::now());
+        let app = crate::server::build_router(app_state.clone());
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:21", "alice", &at, "hello")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "ignored", "{json}");
+        assert_eq!(json["reason"], "not_allowlisted");
+        assert_eq!(run_count(store).await, 0);
+
+        seed_dev_allowlist(
+            store,
+            AuthMode::LegacySingleToken,
+            true,
+            "wechat:alice, wechat:bob",
+        )
+        .await
+        .unwrap();
+        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "wechat:alice")
+            .await
+            .unwrap();
+        let at = format_inbound_timestamp(Utc::now());
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:22", "bob", &at, "hello")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "ignored", "{json}");
+        assert_eq!(json["reason"], "not_allowlisted");
+        assert_eq!(run_count(store).await, 0);
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert!(
+            listed
+                .iter()
+                .any(|row| row.actor == "alice" && row.note.as_deref() == Some("dev-seed"))
+        );
+        assert!(listed.iter().all(|row| row.actor != "bob"));
+
+        let stamp = format_inbound_timestamp(Utc::now());
+        assert!(
+            store
+                .insert_inbound_allowlist_if_absent("wechat", "carol", &stamp, Some("host"))
+                .await
+                .unwrap()
+        );
+        seed_dev_allowlist(store, AuthMode::LegacySingleToken, true, "")
+            .await
+            .unwrap();
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        assert_eq!(listed.len(), 1, "{listed:?}");
+        assert_eq!(listed[0].actor, "carol");
+        assert_eq!(listed[0].note.as_deref(), Some("host"));
+        assert_eq!(listed[0].added_at, stamp);
+    }
+
+    /// An allowlisted message with no body is refused before the insert.
+    /// Mapping that `Invalid` onto a 500, or storing the row first, turns this red.
+    #[tokio::test]
+    async fn an_allowlisted_wechat_message_with_no_text_is_400_and_not_stored() {
+        let app_state = dev_legacy(false).await;
+        seed_dev_allowlist(
+            &app_state.store,
+            AuthMode::LegacySingleToken,
+            true,
+            "wechat:alice",
+        )
+        .await
+        .unwrap();
+        let at = format_inbound_timestamp(Utc::now());
+        let app = crate::server::build_router(app_state.clone());
+        let bodies = [
+            json!({"id": "wechat:11", "actor": "alice", "at": at}).to_string(),
+            json!({"id": "wechat:12", "actor": "alice", "at": at, "text": ""}).to_string(),
+        ];
+        for body in &bodies {
+            let (status, json) = call(
+                &app,
+                "POST",
+                "/api/v1/inbound/events",
+                "testtoken",
+                Some(body),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+            assert_eq!(error_code(&json), "invalid_request", "{json}");
+            let message = json["error"]["message"].as_str().unwrap();
+            assert!(message.contains("no text"), "{json}");
+            assert!(!json.to_string().contains("storage error"), "{json}");
+            assert!(!json.to_string().contains("internal error"), "{json}");
+        }
+        assert_eq!(run_count(&app_state.store).await, 0);
+        assert!(
+            app_state
+                .store
+                .list_inbound_event_summaries(10, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// An existing host note is not replaced. A capabilities call with the
+    /// same variable writes nothing. Deleting the auth-mode guard in
+    /// `seed_dev_allowlist` turns the capabilities assertion red.
+    #[tokio::test]
+    async fn dev_seed_is_idempotent_and_does_not_run_in_capabilities_mode() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let stamp = format_inbound_timestamp(Utc::now());
+        assert!(
+            store
+                .insert_inbound_allowlist_if_absent("wechat", "kept", &stamp, Some("host"))
+                .await
+                .unwrap()
+        );
+        let seeded = seed_dev_allowlist(
+            &store,
+            AuthMode::LegacySingleToken,
+            true,
+            "wechat:kept, not-wechat, wechat:new",
+        )
+        .await
+        .unwrap();
+        assert_eq!(seeded, 1);
+        let listed = store.list_inbound_allowlist().await.unwrap();
+        let kept = listed.iter().find(|row| row.actor == "kept").unwrap();
+        assert_eq!(kept.note.as_deref(), Some("host"));
+        assert_eq!(kept.added_at, stamp);
+        assert!(
+            listed
+                .iter()
+                .any(|row| row.actor == "new" && row.note.as_deref() == Some("dev-seed"))
+        );
+
+        let other = agent24_store::Store::open_memory().await.unwrap();
+        let seeded = seed_dev_allowlist(&other, AuthMode::Capabilities, true, "wechat:alice")
+            .await
+            .unwrap();
+        assert_eq!(seeded, 0);
+        assert!(other.list_inbound_allowlist().await.unwrap().is_empty());
+        assert!(
+            other
+                .inbound_watermark_activated_at("wechat")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let seeded = seed_dev_allowlist(&other, AuthMode::LegacySingleToken, false, "wechat:alice")
+            .await
+            .unwrap();
+        assert_eq!(seeded, 0);
+        assert!(other.list_inbound_allowlist().await.unwrap().is_empty());
     }
 }
