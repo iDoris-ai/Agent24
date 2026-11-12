@@ -702,30 +702,81 @@ pub fn render_skill_segment(body: &str, origin: SkillOrigin, content_digest: &st
     )
 }
 
-/// The end marker, the start marker, and any body line that begins (after
-/// optional blanks) with `origin:` or `content_digest:` are escaped, so the
-/// header lines and both markers appear once each and only where the renderer
-/// wrote them. A reader must take origin from the stored revision, never from
-/// text inside the segment.
+/// Make the body unable to pose as the header or as a marker.
+///
+/// The text is cut at every line separator a reader may honour (`\r\n`,
+/// `\r`, `\n`, VT, FF, NEL, U+2028, U+2029); the separators are kept as they
+/// are. For each line, matching ignores case and every invisible character
+/// ([`is_invisible`]), anywhere in the line:
+///
+/// - a start or end marker is replaced by its escaped form, and the line's
+///   invisible characters are dropped;
+/// - a line that begins with `origin` or `content_digest`, then optional
+///   blanks, then `:` gets a leading backslash, and its invisible characters
+///   are dropped.
+///
+/// A reader must still take origin from the stored revision, never from text
+/// inside the segment.
 fn escape_segment_body(body: &str) -> String {
-    let body = body
+    let mut out = String::with_capacity(body.len());
+    let mut line = String::new();
+    let mut chars = body.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if is_line_separator(ch) {
+            out.push_str(&escape_line(&line));
+            line.clear();
+            out.push(ch);
+            if ch == '\r' && chars.peek() == Some(&'\n') {
+                out.push('\n');
+                chars.next();
+            }
+        } else {
+            line.push(ch);
+        }
+    }
+    out.push_str(&escape_line(&line));
+    out
+}
+
+fn is_line_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '\n' | '\r' | '\u{000B}' | '\u{000C}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
+}
+
+fn escape_line(line: &str) -> String {
+    // The exact-case markers are replaced first, in place.
+    let line = line
         .replace(SEGMENT_END, SEGMENT_END_ESCAPED)
         .replace(SEGMENT_START, SEGMENT_START_ESCAPED);
-    let mut out = String::with_capacity(body.len());
-    for (index, line) in body.split('\n').enumerate() {
-        if index > 0 {
-            out.push('\n');
-        }
-        // Leading zero-width characters and BOMs are dropped, so they cannot
-        // hide a header lookalike from the check below.
-        let line = strip_leading_invisible(line);
-        let head = line.trim_start();
-        if head.starts_with("origin:") || head.starts_with("content_digest:") {
-            out.push('\\');
-        }
-        out.push_str(&line);
+    let bare: String = line.chars().filter(|ch| !is_invisible(*ch)).collect();
+    let lower = bare.to_ascii_lowercase();
+    let has_marker = lower.contains(SEGMENT_END) || lower.contains(SEGMENT_START);
+    let head = lower.trim_start();
+    let header = ["origin", "content_digest"].iter().any(|key| {
+        head.strip_prefix(key)
+            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+    });
+    if !has_marker && !header {
+        return line;
     }
-    out
+    let mut escaped = bare;
+    if has_marker {
+        // ASCII lowercasing keeps byte offsets, so `lower` indexes `escaped`.
+        for (marker, replacement) in [
+            (SEGMENT_END, SEGMENT_END_ESCAPED),
+            (SEGMENT_START, SEGMENT_START_ESCAPED),
+        ] {
+            while let Some(at) = escaped.to_ascii_lowercase().find(marker) {
+                escaped.replace_range(at..at + marker.len(), replacement);
+            }
+        }
+    }
+    if header {
+        escaped.insert(0, '\\');
+    }
+    escaped
 }
 
 /// Default-ignorable and format (Cf) code points that render as nothing:
@@ -754,21 +805,6 @@ fn is_invisible(ch: char) -> bool {
             | '\u{1D173}'..='\u{1D17A}'
             | '\u{E0000}'..='\u{E0FFF}'
     )
-}
-
-fn strip_leading_invisible(line: &str) -> String {
-    let mut kept = String::with_capacity(line.len());
-    let mut leading = true;
-    for ch in line.chars() {
-        if leading && is_invisible(ch) {
-            continue;
-        }
-        if !ch.is_whitespace() {
-            leading = false;
-        }
-        kept.push(ch);
-    }
-    kept
 }
 
 pub fn check_text_consistency(

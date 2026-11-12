@@ -241,6 +241,13 @@ pub async fn create_run(
             "prompt is required",
         );
     }
+    if create.skill_id.as_deref().is_some_and(str::is_empty) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "skill_id must not be empty",
+        );
+    }
     // Checked before the run exists, pinned once it is stored and before it
     // executes, so its first Knowledge tool call already finds the pin.
     let binding = match create.knowledge_binding_id.as_deref() {
@@ -418,6 +425,11 @@ mod skill_run_tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["error"]["code"], "skill_not_admitted");
+
+        // An empty id is a malformed request, not a missing skill.
+        let (status, value) = post_run(&state, json!({"prompt": "hi", "skill_id": ""})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["code"], "invalid_request");
 
         // A required capability nobody provides: the test daemon mounts none.
         activate(&state, "nostr-dm").await;

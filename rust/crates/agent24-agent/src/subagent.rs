@@ -229,7 +229,10 @@ impl ExplorerSubagent {
                 progress: None,
             };
             // Same fail-closed rule as the run loop: a pinned skill without
-            // its label means no model call at all, cloud or local.
+            // its label means no model call at all, cloud or local. Without a
+            // store (`new`, tests only: the daemon builds this with
+            // `new_with_store`) no run can carry a pin, and the model call
+            // below is forced LocalOnly, so there is nothing to look up.
             if let Some(store) = &store
                 && super::skill_inject::label_missing(store, ctx.run_id()).await
             {

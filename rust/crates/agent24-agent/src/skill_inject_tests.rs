@@ -876,6 +876,7 @@ async fn cold_restart(delete_label: bool) {
         let broker = ApprovalBroker::new(store.clone(), Arc::clone(&emit), Duration::from_secs(30));
         let tools = ToolRegistry::builtin(dir.path().to_path_buf())
             .with_gate(Arc::new(BrokerGate::new(Arc::clone(&broker))));
+        let after_sink = Arc::new(RecordingSink(StdMutex::new(vec![])));
         let after = RunManager::new(
             store.clone(),
             Arc::new(ModelRouter::with_defaults(vec![(
@@ -883,7 +884,7 @@ async fn cold_restart(delete_label: bool) {
                 Tier::Local,
             )])),
             Arc::new(tools),
-            Arc::new(RecordingSink(StdMutex::new(vec![]))),
+            after_sink.clone(),
             CancellationToken::new(),
         );
         assert_eq!(after.restore_pending_approvals().await.unwrap(), (1, 0));
@@ -908,6 +909,13 @@ async fn cold_restart(delete_label: bool) {
             assert_eq!(done.error.unwrap().code, "source_policy_unavailable");
             assert!(provider.seen.lock().unwrap().is_empty(), "no model call");
             assert!(!marker.exists(), "{origin:?}: the child never spawns");
+            // The resume-time check refuses before the run restarts: no
+            // run.started event, and nothing for a later layer to deny.
+            let events = after_sink.0.lock().unwrap().clone();
+            assert!(
+                !events.iter().any(|e| e == "run.started"),
+                "{origin:?}: the run restarted before the check: {events:?}"
+            );
             continue;
         }
 
@@ -1113,5 +1121,78 @@ async fn a_tampered_skill_label_is_treated_as_missing() {
             .unwrap();
         assert!(skill_inject::label_missing(&store, &run.id).await, "{what}");
         assert!(!process_egress_allowed_in(&manager, &run).await, "{what}");
+    }
+}
+
+/// The pin agrees with its revision row, but the stored bytes no longer parse
+/// to that digest (the row was altered): the render check refuses, and the
+/// model is not called.
+#[tokio::test]
+async fn pinned_bytes_that_do_not_match_the_pinned_digest_are_refused() {
+    let provider = recording();
+    let (manager, _sink, store) = manager_with(provider.clone()).await;
+    activate(&store, "weekly-report", StoredOrigin::User, &[], SKILL_BODY).await;
+    let other = skill_md("weekly-report", &[], "A DIFFERENT BODY");
+    sqlx::query(
+        "UPDATE skill_revision SET content = ? WHERE revision_id = 'rev_weekly-report_1.0.0_b'",
+    )
+    .bind(other.as_bytes())
+    .execute(agent24_store::test_hooks::pool(&store))
+    .await
+    .unwrap();
+    let digest: String = sqlx::query_scalar(
+        "SELECT content_digest FROM skill_revision WHERE revision_id = 'rev_weekly-report_1.0.0_b'",
+    )
+    .fetch_one(agent24_store::test_hooks::pool(&store))
+    .await
+    .unwrap();
+    let mut run = create_queued_run("run_bytes");
+    run.input.prompt = "hi".to_owned();
+    store.insert_run(&run).await.unwrap();
+    sqlx::query(
+        "INSERT INTO run_skill_pin (run_id, skill_id, body_revision_id, content_digest, providers_json) \
+         VALUES ('run_bytes', 'weekly-report', 'rev_weekly-report_1.0.0_b', ?, '{}')",
+    )
+    .bind(&digest)
+    .execute(agent24_store::test_hooks::pool(&store))
+    .await
+    .unwrap();
+    // The store accepts the pin: it agrees with the revision row.
+    assert!(
+        store
+            .get_run_skill_pin("run_bytes")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    manager
+        .execute("run_bytes".to_owned(), CancellationToken::new(), false)
+        .await;
+    let run = store.get_run("run_bytes").await.unwrap().unwrap();
+    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.error.unwrap().code, "skill_pin_invalid");
+    assert!(provider.seen.lock().unwrap().is_empty());
+}
+
+fn create_queued_run(id: &str) -> Run {
+    Run {
+        id: id.to_owned(),
+        session_id: None,
+        workspace_id: None,
+        status: RunStatus::Queued,
+        input: RunInput {
+            prompt: "hi".to_owned(),
+            workspace_id: None,
+            model_override: None,
+            mode: RunMode::Normal,
+            knowledge_binding_id: None,
+        },
+        output: None,
+        error: None,
+        usage: zero_usage(),
+        schedule_id: None,
+        created_at: now_iso8601(),
+        started_at: None,
+        ended_at: None,
     }
 }
