@@ -218,8 +218,9 @@ where
             allowed_operations: BTreeSet::from([Operation::InboundIngest]),
         },
     ) {
-        Err(BridgeIssueError::CallerInvalid) => {
+        Err(err @ (BridgeIssueError::CallerInvalid | BridgeIssueError::Rejected)) => {
             // The issued row names an id that was not inserted. Close it.
+            // `Rejected` here is only `insert_locked` failing after that row.
             let aborted = CapabilityTokenAuditEvent::IssueAborted {
                 component_id,
                 capability_id: capability_ref,
@@ -229,7 +230,7 @@ where
             if audit(aborted).await.is_err() {
                 return Err(BridgeIssueError::AuditFailed);
             }
-            Err(BridgeIssueError::CallerInvalid)
+            Err(err)
         }
         other => other,
     }
@@ -268,8 +269,17 @@ fn insert_for_live_caller(
         .map_err(|_| BridgeIssueError::Rejected)
 }
 
+/// Dev-bridge profile: component runtime whose component id is
+/// `wechat-bridge`. Other audiences, including another component, are not.
+pub(crate) fn is_dev_bridge(claims: &CapabilityClaims) -> bool {
+    claims.audience == Audience::ComponentRuntime
+        && claims.component_id.as_deref() == Some(DEV_BRIDGE_COMPONENT_ID)
+}
+
 /// Mark the token revoked before the audit write. A write failure must not
-/// put the old bearer back into service; the caller retries the row.
+/// put the old bearer back into service. The in-memory record is marked
+/// audit-pending, and the next revoke of the same id writes that one
+/// `Revoked` row. A revoke whose audit already succeeded writes nothing.
 pub async fn revoke_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     capability_id: &str,
@@ -282,14 +292,13 @@ where
     let Some(claims) = store.claims_by_id(capability_id) else {
         return Err(BridgeRevokeError::NotComponent);
     };
-    if claims.audience != Audience::ComponentRuntime
-        || claims.component_id.as_deref() != Some(DEV_BRIDGE_COMPONENT_ID)
-    {
+    if !is_dev_bridge(&claims) {
         return Err(BridgeRevokeError::NotComponent);
     }
-    // Already revoked, missing, or a poisoned lock: no second Revoked row.
-    // A retry after `AuditFailed` therefore does not backfill the row.
-    if !store.revoke_by_id(capability_id) {
+    let transitioned = store.revoke_by_id(capability_id);
+    let pending = store.revoke_audit_pending(capability_id);
+    // Already revoked and the row was written: do not append another.
+    if !transitioned && !pending {
         return Ok(());
     }
     let event = CapabilityTokenAuditEvent::Revoked {
@@ -299,8 +308,10 @@ where
         reason: CapabilityRevokeReason::Explicit,
     };
     if audit(event).await.is_err() {
+        store.set_revoke_audit_pending(capability_id, true);
         return Err(BridgeRevokeError::AuditFailed);
     }
+    store.set_revoke_audit_pending(capability_id, false);
     Ok(())
 }
 
@@ -741,6 +752,38 @@ mod tests {
                 .claim_deny_audit("gate-models", CapabilityDenyReason::Route)
                 .is_none()
         );
+    }
+
+    /// A failed revoke audit stays pending. The next call writes one row.
+    /// A third call does not write again. Clearing the pending flag on the
+    /// failure path turns the second count into 0.
+    #[tokio::test]
+    async fn failed_revoke_audit_is_written_on_the_next_call_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        let writes = AtomicUsize::new(0);
+        let first = revoke_wechat_bridge(&store, &id, |_| async { Err(()) }).await;
+        assert_eq!(first, Err(BridgeRevokeError::AuditFailed));
+        assert!(store.revoke_audit_pending(&id));
+        let second = revoke_wechat_bridge(&store, &id, |_| {
+            writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(second, Ok(()));
+        assert!(!store.revoke_audit_pending(&id));
+        let third = revoke_wechat_bridge(&store, &id, |_| {
+            writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(third, Ok(()));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
     }
 
     /// The second revoke does not append another `Revoked` row. Ignoring

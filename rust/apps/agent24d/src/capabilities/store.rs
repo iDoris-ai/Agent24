@@ -20,6 +20,10 @@ pub(crate) const DENY_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) struct Record {
     pub(crate) claims: CapabilityClaims,
     pub(crate) revoked: bool,
+    /// The in-memory revoke already happened and the `Revoked` audit row
+    /// did not. A later revoke of this id writes that one row, then clears
+    /// the flag. A successful audit leaves this false.
+    pub(crate) revoke_audit_pending: bool,
 }
 
 impl Record {
@@ -166,6 +170,7 @@ impl CapabilityStore {
             Record {
                 claims: claims.clone(),
                 revoked: false,
+                revoke_audit_pending: false,
             },
         );
         Ok(MintedCapability { token, claims })

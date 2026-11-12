@@ -15,6 +15,7 @@ describe('wechat data dir', () => {
     expect(CONFIG.DAEMON_STATE_FILE).toBe('/a/link/../x/daemon.json')
     expect(CONFIG.TOKEN_FILE).toBe('/a/link/../x/wechat-token.json')
     expect(CONFIG.BRIDGE_TOKEN_FILE).toBe('/a/link/../x/dev/wechat-bridge.token')
+    expect(CONFIG.BRIDGE_CURSOR_FILE).toBe('/a/link/../x/dev/wechat-bridge.cursor')
     delete process.env.AGENT24_DATA_DIR
     process.env.HOME = '/a/link/..'
     expect(CONFIG.DAEMON_STATE_FILE).toBe('/a/link/../.agent24/daemon.json')

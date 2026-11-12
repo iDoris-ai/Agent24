@@ -45,6 +45,29 @@ impl CapabilityStore {
         true
     }
 
+    pub(crate) fn revoke_audit_pending(&self, capability_id: &str) -> bool {
+        let Ok(state) = self.shared.state.lock() else {
+            return false;
+        };
+        state
+            .ids
+            .get(capability_id)
+            .and_then(|digest| state.records.get(digest))
+            .is_some_and(|record| record.revoke_audit_pending)
+    }
+
+    pub(crate) fn set_revoke_audit_pending(&self, capability_id: &str, pending: bool) {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return;
+        };
+        let Some(digest) = state.ids.get(capability_id).copied() else {
+            return;
+        };
+        if let Some(record) = state.records.get_mut(&digest) {
+            record.revoke_audit_pending = pending;
+        }
+    }
+
     pub fn revoke_by_generation(&self, generation: &str) -> usize {
         self.revoke_where(|claims| {
             claims.daemon_generation == generation

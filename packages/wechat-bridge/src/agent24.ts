@@ -18,14 +18,19 @@ export interface InboundEvent {
   text?: string
 }
 
+/** How long one inbound POST may take before it is treated as a hold. */
+export const INBOUND_TIMEOUT_MS = 15_000
+
 /** HTTP failure from the inbound route. The body is not part of the message. */
 export class InboundHttpError extends Error {
   readonly status: number
+  readonly code: string
 
-  constructor(status: number) {
+  constructor(status: number, code = '') {
     super(`record inbound failed: HTTP ${status}`)
     this.name = 'InboundHttpError'
     this.status = status
+    this.code = code
   }
 }
 
@@ -45,8 +50,18 @@ export class Agent24Client {
       method: 'POST',
       headers: this.headers(),
       body: JSON.stringify(event),
+      signal: AbortSignal.timeout(INBOUND_TIMEOUT_MS),
     })
-    if (!res.ok) throw new InboundHttpError(res.status)
+    if (!res.ok) {
+      let code = ''
+      try {
+        const body = (await res.json()) as { error?: { code?: unknown } }
+        if (typeof body?.error?.code === 'string') code = body.error.code
+      } catch {
+        // The status is enough when the body is not JSON.
+      }
+      throw new InboundHttpError(res.status, code)
+    }
     return (await res.json()) as InboundRecord
   }
 }

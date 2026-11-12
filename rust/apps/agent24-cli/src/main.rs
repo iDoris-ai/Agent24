@@ -1170,24 +1170,67 @@ async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
         return Err(bridge_http_error(status, &body));
     }
     let body = reply.json_value().await;
-    finish(ep).await;
-    let token = Zeroizing::new(
-        body["token"]
-            .as_str()
-            .filter(|token| !token.is_empty())
-            .ok_or_else(|| "签发响应没有令牌".to_owned())?
-            .to_owned(),
-    );
-    let expires_at = body["expires_at"]
-        .as_u64()
-        .ok_or_else(|| "签发响应没有 expires_at".to_owned())?;
+    let Some(token_text) = body["token"].as_str().filter(|token| !token.is_empty()) else {
+        finish(ep).await;
+        return Err("签发响应没有令牌".to_owned());
+    };
+    let token = Zeroizing::new(token_text.to_owned());
+    let expires_at = body["expires_at"].as_u64();
     let capability_id = body["capability_id"]
         .as_str()
         .filter(|id| bridge_token::capability_id_ok(id))
-        .ok_or_else(|| "签发响应没有 capability_id".to_owned())?;
-    let root = agent24_protocol::data_dir::data_dir().map_err(|err| err.to_string())?;
-    let path =
-        bridge_token::write_bridge_token_at(&root, token.as_str(), expires_at, capability_id)?;
+        .map(str::to_owned);
+    let (Some(expires_at), Some(capability_id)) = (expires_at, capability_id) else {
+        finish(ep).await;
+        return Err("签发响应没有 expires_at 或 capability_id".to_owned());
+    };
+    let root = match agent24_protocol::data_dir::data_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err.to_string());
+        }
+    };
+    let path = match bridge_token::write_bridge_token_at(
+        &root,
+        token.as_str(),
+        expires_at,
+        capability_id.as_str(),
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            let note = match send_elevating(
+                &ep,
+                reqwest::Method::POST,
+                &format!("/api/v1/capabilities/{capability_id}/revoke"),
+                None,
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+            {
+                Ok(reply) if reply.status.is_success() => {
+                    let _ = reply.json_value().await;
+                    "已撤销刚签发的令牌。".to_owned()
+                }
+                Ok(reply) => {
+                    let status = reply.status;
+                    let body = reply.json_value().await;
+                    format!(
+                        "撤销刚签发的令牌没有成功（{}）。",
+                        bridge_token::http_failure(status.as_u16(), &body)
+                    )
+                }
+                Err(err) => {
+                    let (code, message) = err.parts();
+                    format!("撤销刚签发的令牌没有成功（{code}: {message}）。")
+                }
+            };
+            finish(ep).await;
+            return Err(format!("{err}。{note}"));
+        }
+    };
+    finish(ep).await;
     print!("{}", bridge_token::stdout_lines(&path, expires_at));
     Ok(())
 }
@@ -1233,7 +1276,8 @@ async fn cmd_bridge_token_revoke() -> Result<(), String> {
     }
     finish(ep).await;
     let path = bridge_token::bridge_token_path(&root);
-    bridge_token::remove_bridge_token_at(&root)?;
+    // Only a 2xx reply reaches here. A different id in the file is kept.
+    bridge_token::remove_bridge_token_if_id(&root, &capability_id)?;
     print!("{}\nrevoked\n", path.display());
     Ok(())
 }

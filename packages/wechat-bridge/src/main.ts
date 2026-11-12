@@ -14,7 +14,7 @@ import { Monitor } from './ilink/monitor.js'
 import { Sender } from './ilink/sender.js'
 import { Agent24Client } from './agent24.js'
 import { Bridge } from './bridge.js'
-import { discoverDaemon, type DaemonEndpoint } from './config.js'
+import { discoverDaemon, loadBridgeCursor, type DaemonEndpoint } from './config.js'
 
 async function main(): Promise<void> {
   if (process.env.A24_DEV_TOOL !== '1') {
@@ -34,7 +34,7 @@ async function main(): Promise<void> {
   const sender = new Sender(client)
   const bridge = new Bridge(new Agent24Client(daemon), sender)
 
-  const monitor = new Monitor(client, (msg) => bridge.handle(msg))
+  const monitor = new Monitor(client, (msg) => bridge.handle(msg), loadBridgeCursor())
 
   const shutdown = () => {
     console.log('\n[wechat] 停止中...')
@@ -48,6 +48,10 @@ async function main(): Promise<void> {
   const reason = await monitor.start()
   if (reason === 'auth') {
     console.error('[wechat] 令牌失效，请重新运行 `agent24 dev bridge-token`')
+    process.exit(1)
+  }
+  if (reason === 'capabilities') {
+    console.error('[wechat] 需要 capabilities 模式')
     process.exit(1)
   }
 }

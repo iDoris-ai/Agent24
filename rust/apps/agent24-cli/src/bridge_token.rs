@@ -22,11 +22,48 @@ pub fn capability_id_ok(id: &str) -> bool {
     !id.is_empty() && id.len() <= 256 && id.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
+/// `dev/` must be a real directory, not a symlink. It is opened
+/// `O_NOFOLLOW` and set to 0700 through that handle.
+fn ensure_private_dev(dev: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(dev) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(format!("{} 是符号链接，拒绝写入", dev.display()));
+        }
+        Ok(meta) if !meta.is_dir() => {
+            return Err(format!("{} 不是目录，拒绝写入", dev.display()));
+        }
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(dev).map_err(|e| format!("creating {}: {e}", dev.display()))?;
+        }
+        Err(err) => return Err(format!("reading {}: {err}", dev.display())),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let flags = rustix::fs::OFlags::RDONLY
+            | rustix::fs::OFlags::DIRECTORY
+            | rustix::fs::OFlags::NOFOLLOW
+            | rustix::fs::OFlags::CLOEXEC;
+        let handle = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(flags.bits().cast_signed())
+            .open(dev)
+            .map_err(|e| format!("{} 无法以 O_NOFOLLOW 打开: {e}", dev.display()))?;
+        handle
+            .set_permissions(std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("securing {}: {e}", dev.display()))?;
+    }
+    Ok(())
+}
+
 /// Create `dev/` at 0700 and replace the token file at 0600.
 ///
-/// The bytes land in a temporary file in that directory, then `rename`
-/// publishes them. A failure deletes the temporary file and does not include
-/// the bearer. An empty bearer writes nothing, including the directory.
+/// The bytes land in a temporary file in that directory, opened
+/// `O_NOFOLLOW`, then `rename` publishes them. A symlink `dev/` is refused
+/// and nothing is written through it. A failure deletes the temporary file
+/// and does not include the bearer. An empty bearer writes nothing,
+/// including the directory.
 pub fn write_bridge_token_at(
     root: &Path,
     token: &str,
@@ -40,13 +77,7 @@ pub fn write_bridge_token_at(
         return Err("bridge capability id is empty".to_owned());
     }
     let dev = root.join("dev");
-    std::fs::create_dir_all(&dev).map_err(|e| format!("creating {}: {e}", dev.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dev, std::fs::Permissions::from_mode(0o700))
-            .map_err(|e| format!("securing {}: {e}", dev.display()))?;
-    }
+    ensure_private_dev(&dev)?;
     let dest = bridge_token_path(root);
     let tmp = dev.join(format!(".wechat-bridge.token.{}.tmp", std::process::id()));
     let _ = std::fs::remove_file(&tmp);
@@ -62,7 +93,9 @@ pub fn write_bridge_token_at(
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
+            let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
             options.mode(0o600);
+            options.custom_flags(flags.bits().cast_signed());
         }
         let mut file = options.open(&tmp)?;
         file.write_all(&body)?;
@@ -82,19 +115,45 @@ pub fn write_bridge_token_at(
     Ok(dest)
 }
 
-/// The id recorded when the file was written. Missing file or missing id
-/// is an error and does not contact the daemon.
-pub fn read_bridge_capability_id(root: &Path) -> Result<String, String> {
-    let path = bridge_token_path(root);
-    let text = std::fs::read_to_string(&path)
+/// Read the token file without following a symlink.
+fn read_token_text(path: &Path) -> Result<Option<String>, String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let flags = rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+        options.custom_flags(flags.bits().cast_signed());
+    }
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("reading {}: {err}", path.display())),
+    };
+    use std::io::Read;
+    let mut text = String::new();
+    file.read_to_string(&mut text)
         .map_err(|err| format!("reading {}: {err}", path.display()))?;
-    let parsed: serde_json::Value = serde_json::from_str(&text)
+    Ok(Some(text))
+}
+
+fn capability_id_in(path: &Path, text: &str) -> Result<String, String> {
+    let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|_| format!("{} 不是 JSON，无法撤销", path.display()))?;
     let id = parsed["capability_id"].as_str().unwrap_or("");
     if !capability_id_ok(id) {
         return Err(format!("{} 没有 capability_id，无法撤销", path.display()));
     }
     Ok(id.to_owned())
+}
+
+/// The id recorded when the file was written. Missing file or missing id
+/// is an error and does not contact the daemon. A symlink is not followed.
+pub fn read_bridge_capability_id(root: &Path) -> Result<String, String> {
+    let path = bridge_token_path(root);
+    let text =
+        read_token_text(&path)?.ok_or_else(|| format!("reading {}: not found", path.display()))?;
+    capability_id_in(&path, &text)
 }
 
 pub fn remove_bridge_token_at(root: &Path) -> Result<(), String> {
@@ -104,6 +163,25 @@ pub fn remove_bridge_token_at(root: &Path) -> Result<(), String> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("removing {}: {err}", path.display())),
     }
+}
+
+/// Delete the token file only when it still names `capability_id`.
+///
+/// The file is read again immediately before the delete. A different id is
+/// left in place. A missing file is already gone.
+pub fn remove_bridge_token_if_id(root: &Path, capability_id: &str) -> Result<(), String> {
+    let path = bridge_token_path(root);
+    let Some(text) = read_token_text(&path)? else {
+        return Ok(());
+    };
+    let current = capability_id_in(&path, &text)?;
+    if current != capability_id {
+        return Err(format!(
+            "{} 的 capability_id 是 {current}，与本次撤销的 {capability_id} 不一致，文件保留。",
+            path.display()
+        ));
+    }
+    remove_bridge_token_at(root)
 }
 
 /// HTTP failure text for a bridge issue or revoke that is not the closed gate.
@@ -179,5 +257,34 @@ mod tests {
         assert!(err.contains("empty"), "{err}");
         assert!(!bridge_token_path(root.path()).exists());
         assert!(!root.path().join("dev").exists());
+    }
+
+    /// `dev` as a symlink is not a place to write. Following it would drop
+    /// the bearer in the link target. Dropping the symlink check turns this red.
+    #[test]
+    #[cfg(unix)]
+    fn refuses_to_write_when_dev_is_a_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), root.path().join("dev")).unwrap();
+        let err = write_bridge_token_at(root.path(), "secret", 1, "abc123").unwrap_err();
+        assert!(err.contains("符号链接"), "{err}");
+        assert!(elsewhere.path().read_dir().unwrap().next().is_none());
+        assert!(!bridge_token_path(root.path()).exists());
+    }
+
+    /// The file is reread before delete. A replaced id is kept.
+    /// Skipping the compare deletes the new file and turns this red.
+    #[test]
+    fn revoke_delete_keeps_a_file_whose_id_changed() {
+        let root = tempfile::tempdir().unwrap();
+        write_bridge_token_at(root.path(), "secret", 1, "abc123").unwrap();
+        write_bridge_token_at(root.path(), "next", 2, "def456").unwrap();
+        let err = remove_bridge_token_if_id(root.path(), "abc123").unwrap_err();
+        assert!(err.contains("不一致"), "{err}");
+        assert!(bridge_token_path(root.path()).exists());
+        assert_eq!(read_bridge_capability_id(root.path()).unwrap(), "def456");
+        remove_bridge_token_if_id(root.path(), "def456").unwrap();
+        assert!(!bridge_token_path(root.path()).exists());
     }
 }

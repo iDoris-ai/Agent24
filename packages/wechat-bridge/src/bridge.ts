@@ -20,12 +20,30 @@ function shouldAck(outcome: InboundRecord['outcome']): boolean {
   return outcome === 'started'
 }
 
-/** `advance` — the server accepted the event, or the message was not posted.
- * `hold` — the POST failed; the iLink cursor must stay put.
- * `stop` — the bridge token was rejected. */
-export type CursorStep = 'advance' | 'hold' | 'stop'
+/** `advance` — the server accepted the event, the message was not posted,
+ * or the failure is permanent (400/403/413/422 and other 4xx except 401/429).
+ * `hold` — network error, timeout, 5xx, or 429. The cursor stays put.
+ * `stop` — the bridge token was rejected (401).
+ * `capabilities` — legacy mode answered 409 `capability_mode_required`. */
+export type CursorStep = 'advance' | 'hold' | 'stop' | 'capabilities'
+
+const PERMANENT_STATUS = new Set([400, 403, 413, 422])
+
+/** Classify a failed `recordInbound`. Network errors and timeouts hold. */
+export function classifyInboundFailure(err: unknown): CursorStep {
+  if (err instanceof InboundHttpError) {
+    if (err.status === 401) return 'stop'
+    if (err.status === 409 && err.code === 'capability_mode_required') return 'capabilities'
+    if (err.status === 429 || err.status >= 500) return 'hold'
+    if (PERMANENT_STATUS.has(err.status) || (err.status >= 400 && err.status < 500)) return 'advance'
+  }
+  return 'hold'
+}
 
 export class Bridge {
+  /** `记录失败` is sent at most once per WeChat message id. */
+  private readonly failureReplied = new Set<string>()
+
   constructor(
     private readonly agent: Agent24Client,
     private readonly sender: Sender,
@@ -52,11 +70,19 @@ export class Bridge {
       if (shouldAck(recorded.outcome)) await this.reply(user, ctx, RECORDED_REPLY)
       return 'advance'
     } catch (err) {
-      if (err instanceof InboundHttpError && err.status === 401) return 'stop'
+      const step = classifyInboundFailure(err)
+      if (step === 'stop' || step === 'capabilities') return step
       console.error('[wechat] 记录消息出错:', err instanceof Error ? err.message : err)
-      await this.reply(user, ctx, RECORD_FAILED_REPLY)
-      return 'hold'
+      await this.failReplyOnce(msg, user, ctx)
+      return step
     }
+  }
+
+  private async failReplyOnce(msg: WeixinMessage, user: string, ctx: string): Promise<void> {
+    const key = String(msg.message_id)
+    if (this.failureReplied.has(key)) return
+    this.failureReplied.add(key)
+    await this.reply(user, ctx, RECORD_FAILED_REPLY)
   }
 
   private async reply(user: string, ctx: string, text: string): Promise<void> {

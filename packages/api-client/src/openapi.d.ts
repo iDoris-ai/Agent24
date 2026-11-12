@@ -1219,7 +1219,7 @@ export interface paths {
         put?: never;
         /**
          * Record one development WeChat message
-         * @description Development transport for the wechat bridge. Mounted when the daemon was started with `A24_DEV_TOOL=1`, in legacy mode and in capabilities mode. Without that flag the answer is 404 (`No v1 route`). Legacy mode rejects this POST: the shared bearer is not accepted, while that auth mode itself stays for the other routes. Capabilities mode accepts only a component-runtime token whose component id is `wechat-bridge` and whose only operation is `inbound.ingest`. ProductHost, a first-party shell, a creative token, and the legacy bearer are forbidden there. The legacy allowlist seed is not applied in capabilities mode. `source` is fixed to `wechat`: a body `source` other than `wechat` is 400, and the stored row is always `wechat` / `dev_bridge` / `direct` / `human=true`. The route does not copy `category`, `human`, or `addressed` from the body. Admission (allowlist, watermark, rate) still decides whether a run starts. A duplicate `id` does not start a second run. The response does not echo `text`. A storage failure is a generic `storage error`. A start failure is a generic `internal error`. Neither body includes the store text or the prompt. An allowlisted message with no text is 400 and is not stored. An unknown query parameter is 400. A body over the daemon limit is 413 `payload_too_large`.
+         * @description Development transport for the wechat bridge. Mounted when the daemon was started with `A24_DEV_TOOL=1`, in legacy mode and in capabilities mode. Without that flag the answer is 404 (`No v1 route`). Legacy mode rejects this POST with 409 `capability_mode_required`: the shared bearer is not accepted, while that auth mode itself stays for the other routes. Capabilities mode accepts only a component-runtime token whose component id is `wechat-bridge` and whose only operation is `inbound.ingest`. ProductHost, a first-party shell, a creative token, and the legacy bearer are forbidden there. The legacy allowlist seed is not applied in capabilities mode. `source` is fixed to `wechat`: a body `source` other than `wechat` is 400, and the stored row is always `wechat` / `dev_bridge` / `direct` / `human=true`. The route does not copy `category`, `human`, or `addressed` from the body. Admission (allowlist, watermark, rate) still decides whether a run starts. A duplicate `id` does not start a second run. The response does not echo `text`. A storage failure is a generic `storage error`. A start failure is a generic `internal error`. Neither body includes the store text or the prompt. An allowlisted message with no text is 400 and is not stored. An unknown query parameter is 400. A body over the daemon limit is 413 `payload_too_large`.
          */
         post: operations["postWechatInboundEvent"];
         delete?: never;
@@ -7084,6 +7084,15 @@ export interface operations {
             };
             /** @description Not mounted (`A24_DEV_TOOL` is not `1`) */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Legacy mode with the dev gate on (`capability_mode_required`). The shared bearer is valid for other routes and is not accepted for this POST. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

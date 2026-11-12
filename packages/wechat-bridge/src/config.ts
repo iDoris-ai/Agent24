@@ -38,6 +38,10 @@ export const CONFIG = {
   get BRIDGE_TOKEN_FILE(): string {
     return joinLiteral(dataDir(), 'dev', 'wechat-bridge.token')
   },
+  /** Last committed iLink `get_updates_buf`, beside the token file. */
+  get BRIDGE_CURSOR_FILE(): string {
+    return joinLiteral(dataDir(), 'dev', 'wechat-bridge.cursor')
+  },
 }
 
 export const BRIDGE_TOKEN_HINT = '请运行 `agent24 dev bridge-token`'
@@ -55,25 +59,52 @@ export interface BridgeCredential {
   expiresAt: number
 }
 
-/** Read `dev/wechat-bridge.token`. Missing, not mode 0600, or expired: refuse.
- * This does not open `daemon.json`. */
-export function loadBridgeCredential(nowMs = Date.now()): BridgeCredential {
-  const path = CONFIG.BRIDGE_TOKEN_FILE
+const OPEN_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+
+function assertPrivateDir(dir: string): void {
   let st: fs.Stats
   try {
-    st = fs.lstatSync(path)
+    st = fs.lstatSync(dir)
+  } catch {
+    throw new Error(`无法读取微信桥目录 ${dir}。${BRIDGE_TOKEN_HINT}`)
+  }
+  if (st.isSymbolicLink() || !st.isDirectory() || (st.mode & 0o777) !== 0o700) {
+    throw new Error(`微信桥目录必须是模式 0700 的真实目录（${dir}）。${BRIDGE_TOKEN_HINT}`)
+  }
+}
+
+/** Open `path` without following a symlink, then check the fd. */
+function readPrivateFile(path: string, mode: number): string {
+  let fd: number
+  try {
+    fd = fs.openSync(path, OPEN_NOFOLLOW)
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code
     if (code === 'ENOENT') throw new Error(`没有微信桥令牌文件 ${path}。${BRIDGE_TOKEN_HINT}`)
+    if (code === 'ELOOP') throw new Error(`微信桥令牌文件不能是符号链接（${path}）。${BRIDGE_TOKEN_HINT}`)
     throw new Error(`无法读取微信桥令牌文件 ${path}。${BRIDGE_TOKEN_HINT}`)
   }
-  if (!st.isFile() || (st.mode & 0o777) !== 0o600) {
-    throw new Error(`微信桥令牌文件权限必须是 0600（${path}）。${BRIDGE_TOKEN_HINT}`)
+  try {
+    const st = fs.fstatSync(fd)
+    if (!st.isFile() || (st.mode & 0o777) !== mode) {
+      throw new Error(`微信桥令牌文件权限必须是 0${mode.toString(8)}（${path}）。${BRIDGE_TOKEN_HINT}`)
+    }
+    return fs.readFileSync(fd, 'utf8')
+  } finally {
+    fs.closeSync(fd)
   }
+}
+
+/** Read `dev/wechat-bridge.token`. Missing, not mode 0600, a symlink, or expired: refuse.
+ * The parent directory must be a real 0700 directory. This does not open `daemon.json`. */
+export function loadBridgeCredential(nowMs = Date.now()): BridgeCredential {
+  const path = CONFIG.BRIDGE_TOKEN_FILE
+  assertPrivateDir(path.slice(0, path.lastIndexOf('/')))
   let parsed: { token?: unknown; expires_at?: unknown }
   try {
-    parsed = JSON.parse(fs.readFileSync(path, 'utf8')) as { token?: unknown; expires_at?: unknown }
-  } catch {
+    parsed = JSON.parse(readPrivateFile(path, 0o600)) as { token?: unknown; expires_at?: unknown }
+  } catch (err) {
+    if (err instanceof Error && err.message.includes('微信桥')) throw err
     throw new Error(`微信桥令牌文件无法解析（${path}）。${BRIDGE_TOKEN_HINT}`)
   }
   if (typeof parsed.token !== 'string' || parsed.token.length === 0) {
@@ -88,6 +119,55 @@ export function loadBridgeCredential(nowMs = Date.now()): BridgeCredential {
   return { token: parsed.token, expiresAt: parsed.expires_at }
 }
 
+/** Last committed cursor. Missing, unreadable, or a symlink: start from empty. */
+export function loadBridgeCursor(): string {
+  const path = CONFIG.BRIDGE_CURSOR_FILE
+  let fd: number
+  try {
+    fd = fs.openSync(path, OPEN_NOFOLLOW)
+  } catch {
+    return ''
+  }
+  try {
+    const st = fs.fstatSync(fd)
+    if (!st.isFile() || (st.mode & 0o777) !== 0o600) return ''
+    return fs.readFileSync(fd, 'utf8')
+  } catch {
+    return ''
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+/** Atomically publish the cursor next to the token (0600, temp file + rename). */
+export function saveBridgeCursor(cursor: string): void {
+  const path = CONFIG.BRIDGE_CURSOR_FILE
+  const dir = path.slice(0, path.lastIndexOf('/'))
+  assertPrivateDir(dir)
+  const tmp = `${path}.${process.pid}.tmp`
+  let fd: number
+  try {
+    fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600)
+  } catch (err) {
+    throw new Error(`无法写入微信桥游标 ${path}: ${err instanceof Error ? err.message : err}`)
+  }
+  try {
+    fs.writeFileSync(fd, cursor, 'utf8')
+    fs.fchmodSync(fd, 0o600)
+    fs.fsyncSync(fd)
+  } finally {
+    fs.closeSync(fd)
+  }
+  try {
+    fs.renameSync(tmp, path)
+  } catch (err) {
+    fs.rmSync(tmp, { force: true })
+    throw err
+  }
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]'])
+
 function daemonBase(): string {
   const envBase = process.env.A24_BASE_URL
   if (envBase) {
@@ -97,7 +177,13 @@ function daemonBase(): string {
     } catch {
       throw new DaemonStateError('A24_BASE_URL is not a valid URL')
     }
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') throw new DaemonStateError('A24_BASE_URL must be http(s)')
+    if (url.protocol !== 'http:') throw new DaemonStateError('A24_BASE_URL must be http')
+    if (url.username !== '' || url.password !== '') {
+      throw new DaemonStateError('A24_BASE_URL 只允许 127.0.0.1、::1 或 localhost')
+    }
+    if (!LOOPBACK_HOSTS.has(url.hostname)) {
+      throw new DaemonStateError('A24_BASE_URL 只允许 127.0.0.1、::1 或 localhost')
+    }
     return envBase.replace(/\/+$/, '')
   }
   const found = readDaemonState(CONFIG.DAEMON_STATE_FILE)

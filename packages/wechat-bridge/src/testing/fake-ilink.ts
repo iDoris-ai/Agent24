@@ -42,6 +42,13 @@ export class FakeILink {
   private readonly outboundWaiters: OutboundWaiter[] = []
   private nextSeq = 1
   private nextMessageId = 1
+  /**
+   * Seq captured on the first empty-cursor poll. Older history is not
+   * replayed. Later polls that still send `''` use this same floor, so a
+   * hold can redeliver. A committed numeric cursor is the only way to skip
+   * messages that arrived after that floor.
+   */
+  private emptyFloor: number | null = null
   /** Every outbound message the bot sent, in order (ack + real replies). */
   readonly outbound: OutboundRecord[] = []
   /** `get_updates_buf` sent on each getupdates, in order. */
@@ -80,8 +87,39 @@ export class FakeILink {
     )
   }
 
+  /** Complete parked long-polls so a stopped Monitor can leave the loop. */
+  releasePolls(): void {
+    const buf = this.latestBuf()
+    while (this.pending.length) {
+      const waiter = this.pending.shift()!
+      this.respondUpdates(waiter.res, [], buf)
+    }
+  }
+
+  /** Wait until `n` getupdates requests have been seen. */
+  async waitUntilPolled(n: number, timeoutMs = 2000): Promise<void> {
+    const start = Date.now()
+    while (this.polls.length < n) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(`timed out waiting for ${n} polls, saw ${this.polls.length}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10))
+    }
+  }
+
   /** Simulate a WeChat user sending a text message to the bot. */
   pushUserText(fromUserId: string, text: string): void {
+    this.enqueue(fromUserId, text)
+    this.wake()
+  }
+
+  /** Queue several messages and wake once, so one poll sees the whole batch. */
+  pushBatch(items: Array<{ from: string; text: string }>): void {
+    for (const item of items) this.enqueue(item.from, item.text)
+    this.wake()
+  }
+
+  private enqueue(fromUserId: string, text: string): void {
     const msg: WeixinMessage = {
       message_id: this.nextMessageId++,
       from_user_id: fromUserId,
@@ -95,7 +133,6 @@ export class FakeILink {
     }
     const seq = this.nextSeq++
     this.history.push({ seq, msg })
-    this.wake()
   }
 
   /** Resolve when the bot sends an outbound message whose text matches. */
@@ -122,7 +159,11 @@ export class FakeILink {
       const raw = (body as { get_updates_buf?: unknown }).get_updates_buf
       const cursor = typeof raw === 'string' ? raw : ''
       this.polls.push(cursor)
-      const after = Number(cursor) || 0
+      // Empty does not replay from seq 0. The floor freezes on the first
+      // empty poll. A restart that does not load the persisted cursor sends
+      // `''` again and is handed that same floor — the resume test stays
+      // red unless it passes the committed buf.
+      const after = cursor === '' ? (this.emptyFloor ??= this.latestSeq()) : Number(cursor) || 0
       const msgs = this.since(after)
       if (msgs.length) this.respondUpdates(res, msgs, this.latestBuf())
       else this.pending.push({ after, res })
@@ -140,9 +181,14 @@ export class FakeILink {
     return this.history.filter((item) => item.seq > after).map((item) => item.msg)
   }
 
-  private latestBuf(): string {
+  private latestSeq(): number {
     const last = this.history[this.history.length - 1]
-    return last ? String(last.seq) : ''
+    return last ? last.seq : 0
+  }
+
+  private latestBuf(): string {
+    const seq = this.latestSeq()
+    return seq ? String(seq) : ''
   }
 
   /** Deliver queued messages to polls that are still behind the history. */

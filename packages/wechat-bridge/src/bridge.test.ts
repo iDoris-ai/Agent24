@@ -209,6 +209,37 @@ describe('Bridge transport', () => {
     await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('stop')
     expect(sends).toEqual([])
   })
+
+  it('advances on 400 after one failure reply', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(400))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('advance')
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+  })
+
+  it('holds on 500, 429, and a timeout', async () => {
+    for (const fail of [new InboundHttpError(500), new InboundHttpError(429)]) {
+      const { bridge } = makeBridge(fail)
+      await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('hold')
+    }
+    const timeout = new Error('The operation was aborted due to timeout')
+    timeout.name = 'TimeoutError'
+    const { bridge } = makeBridge(timeout)
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('hold')
+  })
+
+  it('sends 记录失败 once for the same message id', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(500))
+    const msg = textMsg('alice', '做点事')
+    await expect(bridge.handle(msg)).resolves.toBe('hold')
+    await expect(bridge.handle(msg)).resolves.toBe('hold')
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+  })
+
+  it('stops on legacy capability mode without the failure reply', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(409, 'capability_mode_required'))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('capabilities')
+    expect(sends).toEqual([])
+  })
 })
 
 function productionSources(dir: string, out: string[] = []): string[] {

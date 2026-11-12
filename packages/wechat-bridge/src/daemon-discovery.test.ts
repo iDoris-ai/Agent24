@@ -108,5 +108,35 @@ describe('discoverDaemon (token file, then the shared daemon.json parser)', () =
     expect(() => discoverDaemon()).toThrow(/valid URL/)
     process.env.A24_BASE_URL = 'ftp://127.0.0.1:9'
     expect(() => discoverDaemon()).toThrow(/http/)
+    process.env.A24_BASE_URL = 'https://127.0.0.1:9'
+    expect(() => discoverDaemon()).toThrow(/http/)
+    process.env.A24_BASE_URL = 'http://example.com:9'
+    expect(() => discoverDaemon()).toThrow(/127\.0\.0\.1/)
+    process.env.A24_BASE_URL = 'http://127.0.0.2:9'
+    expect(() => discoverDaemon()).toThrow(/127\.0\.0\.1/)
+    process.env.A24_BASE_URL = 'http://[::1]:9/'
+    expect(discoverDaemon()).toEqual({ base: 'http://[::1]:9', token: BRIDGE })
+    process.env.A24_BASE_URL = 'http://localhost:9'
+    expect(discoverDaemon()).toEqual({ base: 'http://localhost:9', token: BRIDGE })
+  })
+
+  it('refuses a token file that is a symlink', () => {
+    const file = writeToken(dir, BRIDGE, FUTURE)
+    const real = `${file}.real`
+    fs.renameSync(file, real)
+    fs.chmodSync(real, 0o600)
+    fs.symlinkSync(real, file)
+    expect(() => discoverDaemon()).toThrow(/符号链接/)
+  })
+
+  it('refuses when dev is a symlink', () => {
+    const real = path.join(dir, 'real-dev')
+    fs.mkdirSync(real)
+    fs.chmodSync(real, 0o700)
+    const file = path.join(real, 'wechat-bridge.token')
+    fs.writeFileSync(file, JSON.stringify({ token: BRIDGE, expires_at: FUTURE }))
+    fs.chmodSync(file, 0o600)
+    fs.symlinkSync(real, path.join(dir, 'dev'))
+    expect(() => discoverDaemon()).toThrow(/真实目录/)
   })
 })

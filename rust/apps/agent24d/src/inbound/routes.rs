@@ -167,8 +167,9 @@ pub(crate) async fn get_events(State(state): State<AppState>, RawQuery(raw): Raw
 ///
 /// The route is mounted only when `dev_wechat_events` is set (`A24_DEV_TOOL=1`).
 /// Capabilities mode accepts only a `ComponentRuntime` token for
-/// `wechat-bridge` that holds `InboundIngest`. Legacy mode rejects the shared
-/// bearer here; that mode itself stays for the other routes.
+/// `wechat-bridge` that holds `InboundIngest`. Legacy mode answers 409
+/// `capability_mode_required` for the shared bearer here; that mode itself
+/// stays for the other routes.
 ///
 /// The JSON body is buffered before this function runs. Capabilities mode
 /// then checks the bearer against the live store again (not revoked, not
@@ -210,11 +211,12 @@ pub(crate) async fn post_wechat_event(
         Some(authorization)
     } else if state.auth_mode == AuthMode::LegacySingleToken {
         // The shared bearer still opens the other legacy routes. It does not
-        // ingest. Returning `None` here would record the event.
+        // ingest. 409, not 401: the bearer is valid, the mode is wrong.
+        // Returning `None` here would record the event.
         return error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Bridge capabilities require capability auth mode",
         );
     } else {
         return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
@@ -1978,8 +1980,9 @@ mod tests {
     }
 
     /// The shared bearer still reads models. It cannot post an inbound event.
-    /// Returning `None` from the legacy arm of `post_wechat_event` turns the
-    /// status assertion red and stores the row.
+    /// The answer is 409 `capability_mode_required`, not 401. Returning
+    /// `None` from the legacy arm of `post_wechat_event` turns the status
+    /// assertion red and stores the row. Answering 401 turns the code red.
     #[tokio::test]
     async fn legacy_shared_bearer_cannot_post_wechat_events() {
         let app_state = dev_legacy(false).await;
@@ -2003,8 +2006,8 @@ mod tests {
             Some(&wechat_body("wechat:legacy", "alice", &at, "nope")),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
-        assert_eq!(error_code(&json), "unauthorized");
+        assert_eq!(status, StatusCode::CONFLICT, "{json}");
+        assert_eq!(error_code(&json), "capability_mode_required");
         assert!(
             app_state
                 .store
