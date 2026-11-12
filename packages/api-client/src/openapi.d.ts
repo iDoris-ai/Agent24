@@ -2272,6 +2272,80 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List installed skills without bodies
+         * @description Everyday `skills.read`. One row per installed skill and origin.
+         *     Bodies are not included. An empty pointer means the skill is not active
+         *     and the generation is 0.
+         */
+        get: operations["listSkills"];
+        put?: never;
+        /**
+         * Import a skill from a request body
+         * @description Everyday `skills.install`. The JSON body is `markdown` plus optional
+         *     `evals` (`name` and `content`). A path, an origin, or any other field
+         *     is rejected. The server does not open a caller path. Origin is always
+         *     `imported`. The pointer does not move.
+         */
+        post: operations["postSkill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/skills/scans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rescan the user skill directory
+         * @description Everyday `skills.install`. The body is empty or `{}`. No path is
+         *     accepted. The scan reads `<data_dir>/skills` and stores `origin=user`.
+         *     One bad skill is reported in `errors` and does not fail the others.
+         */
+        post: operations["postSkillScan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/skills/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one installed skill
+         * @description Everyday `skills.read`. Returns the pointer, generation (0 when there
+         *     is no pointer), installed revision metadata, and a text-consistency
+         *     summary. Bodies are not included. Provider resolution is SL-5 and is
+         *     not in this response.
+         */
+        get: operations["getSkill"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -3373,6 +3447,81 @@ export interface components {
         };
         Error: {
             error: components["schemas"]["ErrorBody"];
+        };
+        SkillImportEval: {
+            /** @description Relative eval path declared in the manifest. Not a filesystem path the server opens. */
+            name: string;
+            /** @description UTF-8 eval document, at most 32 KiB. */
+            content: string;
+        };
+        SkillImportRequest: {
+            /** @description Full SKILL.md text, at most 32 KiB UTF-8. */
+            markdown: string;
+            evals?: components["schemas"]["SkillImportEval"][];
+        };
+        SkillInstall: {
+            skill_id: string;
+            /** @enum {string} */
+            origin: "imported" | "user";
+            semver: string;
+            body_revision_id: string;
+            evals_revision_id: string;
+            content_digest: string;
+            /** @description Field and file names that did not take effect on this parse. */
+            ineffective: string[];
+            inserted: boolean;
+            pointer: components["schemas"]["SkillPointer"] | null;
+            generation: number;
+        };
+        SkillPointer: {
+            /** @enum {string} */
+            origin: "imported" | "user";
+            body_revision_id: string;
+            evals_revision_id: string;
+            generation: number;
+        };
+        SkillListItem: {
+            skill_id: string;
+            /** @enum {string} */
+            origin: "imported" | "user";
+            semver: string;
+            generation: number;
+            active: boolean;
+        };
+        SkillList: {
+            skills: components["schemas"]["SkillListItem"][];
+        };
+        SkillRevisionMeta: {
+            revision_id: string;
+            /** @enum {string} */
+            origin: "imported" | "user";
+            semver: string;
+            /** @enum {string} */
+            kind: "body" | "evals";
+            content_digest: string;
+            created_at: string;
+        };
+        SkillConsistency: {
+            consistent: number;
+            total: number;
+        };
+        SkillDetail: {
+            skill_id: string;
+            pointer: components["schemas"]["SkillPointer"] | null;
+            generation: number;
+            revisions: components["schemas"]["SkillRevisionMeta"][];
+            text_consistency: components["schemas"]["SkillConsistency"] | null;
+        };
+        SkillScanError: {
+            path: string;
+            code: string;
+            message: string;
+        };
+        SkillScan: {
+            /** @enum {string} */
+            origin: "user";
+            skills: components["schemas"]["SkillInstall"][];
+            errors: components["schemas"]["SkillScanError"][];
         };
         /** @description `doc_` + ULID, generated by the OS (ADR-DOC-02 §3). The first ULID character is 0–7: larger values overflow 128 bits. */
         DocumentIdString: string;
@@ -8992,6 +9141,141 @@ export interface operations {
             502: components["responses"]["IdorisFailure"];
             503: components["responses"]["IdorisFailure"];
             504: components["responses"]["IdorisFailure"];
+        };
+    };
+    listSkills: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed skills */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    postSkill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Installed or adopted revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillInstall"];
+                };
+            };
+            /** @description Manifest, eval, or request rejection */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Same semver and a different content digest */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Body or one eval file is over 32 KiB */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    postSkillScan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Scan result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillScan"];
+                };
+            };
+            /** @description The body carried a path or another field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    getSkill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Skill detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillDetail"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description No revision is installed for this id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
 }

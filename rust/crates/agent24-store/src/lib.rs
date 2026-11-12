@@ -174,7 +174,7 @@ pub use run_workspace_terminal::RunTerminalTransition;
 pub use skill::{
     NewSkillActivation, NewSkillRevision, SkillActivationOutcome, SkillActivationRecord,
     SkillEvalBinding, SkillOrigin, SkillPointer, SkillRevision, SkillRevisionInsert,
-    SkillRevisionKind, SkillRollback,
+    SkillRevisionKind, SkillRevisionMeta, SkillRollback,
 };
 pub use source_policy::{
     ASSERTION_SOURCE_REF_SCHEMA_VERSION, AssertionSourceRef, PolicySnapshot,

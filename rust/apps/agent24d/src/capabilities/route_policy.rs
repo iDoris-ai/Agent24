@@ -184,6 +184,12 @@ const POLICIES: &[RoutePolicy] = &[
     // X11-2g. Registered so the kernel scan matches this catalog. Capabilities
     // mode answers 404 before the operation is consulted (middleware).
     row("POST", "/api/v1/inbound/events", Operation::InboundWrite, AssuranceLevel::Elevated),
+    // Skill loader SL-3. Activate is SL-4 and is not registered here.
+    // These rows stay out of creative_route_permitted.
+    row("GET", "/api/v1/skills", Operation::SkillsRead, AssuranceLevel::Everyday),
+    row("GET", "/api/v1/skills/{id}", Operation::SkillsRead, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills", Operation::SkillsInstall, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills/scans", Operation::SkillsInstall, AssuranceLevel::Everyday),
 ];
 
 pub fn policies() -> &'static [RoutePolicy] {

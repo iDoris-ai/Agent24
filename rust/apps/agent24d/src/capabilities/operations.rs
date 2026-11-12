@@ -59,6 +59,11 @@ pub enum Operation {
     // check never fires.
     InboundRead,
     InboundWrite,
+    // Skill loader SL-3. Read and install are Everyday routes. Activate is
+    // Elevated and has no route until SL-4, so its assurance level stays None.
+    SkillsRead,
+    SkillsInstall,
+    SkillsActivate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,7 +153,18 @@ impl Operation {
             Self::ComponentsReport => "components.report",
             Self::InboundRead => "inbound.read",
             Self::InboundWrite => "inbound.write",
+            Self::SkillsRead => "skills.read",
+            Self::SkillsInstall => "skills.install",
+            Self::SkillsActivate => "skills.activate",
         }
+    }
+
+    /// Component locks may not grant skill operations (skill-loader §4.9).
+    pub fn component_may_require(self) -> bool {
+        !matches!(
+            self,
+            Self::SkillsRead | Self::SkillsInstall | Self::SkillsActivate
+        )
     }
 
     /// Catalog level for this operation. `None` when no route assigns one.
@@ -208,6 +224,9 @@ impl Operation {
             "components.report" => Self::ComponentsReport,
             "inbound.read" => Self::InboundRead,
             "inbound.write" => Self::InboundWrite,
+            "skills.read" => Self::SkillsRead,
+            "skills.install" => Self::SkillsInstall,
+            "skills.activate" => Self::SkillsActivate,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,

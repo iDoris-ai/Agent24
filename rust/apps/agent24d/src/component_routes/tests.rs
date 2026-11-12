@@ -3313,6 +3313,13 @@ fn documents_d9_catalog_parses_the_module_tools() {
         documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
         "a slash alias is not a canonical operation name"
     );
+    for op in ["skills.read", "skills.install", "skills.activate"] {
+        with_op["requires"]["operations"] = json!([op]);
+        assert!(
+            documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
+            "a component lock cannot grant {op}"
+        );
+    }
     // domain-os.yml is parsed, not searched: a comment or another key that
     // happens to contain the text cannot satisfy it.
     let manifest: serde_yaml::Value =

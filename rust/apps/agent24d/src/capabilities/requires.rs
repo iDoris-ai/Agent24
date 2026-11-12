@@ -228,6 +228,7 @@ impl RequiresSpec {
         for name in operations {
             let name = name.as_ref();
             match Operation::canonical(name) {
+                Some(op) if !op.component_may_require() => invalid.push(name.to_owned()),
                 Some(op) if seen_ops.insert(op) => ops.push(op),
                 Some(_) => {}
                 None => invalid.push(name.to_owned()),
@@ -258,9 +259,10 @@ pub(crate) fn kernel_token_ok(name: &str) -> bool {
     Capability::parse(name).is_ok() && !is_registry_capability_id(name)
 }
 
-/// `requires.operations` token: canonical dotted [`Operation`] name.
+/// `requires.operations` token: a canonical dotted [`Operation`] name that a
+/// component lock is allowed to grant. Skill operations are excluded.
 pub(crate) fn operation_token_ok(name: &str) -> bool {
-    Operation::canonical(name).is_some()
+    Operation::canonical(name).is_some_and(Operation::component_may_require)
 }
 
 fn is_registry_capability_id(name: &str) -> bool {

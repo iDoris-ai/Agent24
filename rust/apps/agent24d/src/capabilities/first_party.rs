@@ -819,6 +819,24 @@ mod tests {
                 .is_err()
         );
     }
+
+    /// `mint` copies route-table operations except presence and `InboundWrite`.
+    /// Skill list / show / install use this daily token (skill-loader §4.9).
+    /// Filtering `skills.*` out of `issue` turns the assertions red.
+    #[test]
+    fn shell_token_keeps_skill_read_and_install() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let parsed = CapabilityToken::parse_bearer(&token.secret).unwrap();
+        let allowed = store.shared.state.lock().unwrap().records[&digest(&parsed)]
+            .claims
+            .allowed_operations
+            .clone();
+        assert!(allowed.contains(&Operation::SkillsRead), "{allowed:?}");
+        assert!(allowed.contains(&Operation::SkillsInstall), "{allowed:?}");
+    }
     #[tokio::test(start_paused = true)]
     async fn daily_token_ttl_ignores_wall_clock_jumps() {
         let store = CapabilityStore::new("g");

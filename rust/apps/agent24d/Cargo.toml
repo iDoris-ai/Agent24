@@ -38,6 +38,7 @@ agent24-memory = { path = "../../crates/agent24-memory" }
 agent24-models = { path = "../../crates/agent24-models" }
 agent24-policy = { path = "../../crates/agent24-policy" }
 agent24-scheduler = { path = "../../crates/agent24-scheduler" }
+agent24-skill = { path = "../../crates/agent24-skill" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 async-trait = "0.1"
 # T8.5c-P: cursor tokens are `base64(v2:<seq>:<fingerprint>)` (design §7.1).

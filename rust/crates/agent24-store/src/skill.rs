@@ -56,7 +56,7 @@ pub enum SkillOrigin {
 }
 
 impl SkillOrigin {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::User => "user",
             Self::Imported => "imported",
@@ -82,7 +82,7 @@ pub enum SkillRevisionKind {
 }
 
 impl SkillRevisionKind {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Self::Body => "body",
             Self::Evals => "evals",
@@ -96,6 +96,18 @@ impl SkillRevisionKind {
             other => Err(StoreError::Conflict(format!("skill kind {other}"))),
         }
     }
+}
+
+/// Revision identity without the blob. List responses use this.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRevisionMeta {
+    pub revision_id: String,
+    pub skill_id: String,
+    pub origin: SkillOrigin,
+    pub semver: String,
+    pub kind: SkillRevisionKind,
+    pub content_digest: String,
+    pub created_at: String,
 }
 
 /// One immutable revision. `content` is the raw bytes the caller stored.
@@ -339,6 +351,56 @@ impl Store {
         Ok(inserted)
     }
 
+    /// Insert a body row and an evals row in one transaction.
+    ///
+    /// The same `(skill_id, origin, kind, content_digest)` returns the stored
+    /// id even when the new bytes differ (a semver-only edit, or a dropped
+    /// frontmatter key). A different digest at the same semver is
+    /// [`StoreError::SkillRevisionConflict`] and rolls back both inserts.
+    ///
+    /// # Errors
+    /// Conflict, a kind mismatch, or storage.
+    pub async fn install_skill_pair(
+        &self,
+        body: &NewSkillRevision,
+        evals: &NewSkillRevision,
+    ) -> Result<(SkillRevisionInsert, SkillRevisionInsert)> {
+        require_revision_input(body)?;
+        require_revision_input(evals)?;
+        if body.kind != SkillRevisionKind::Body || evals.kind != SkillRevisionKind::Evals {
+            return Err(StoreError::Conflict(
+                "skill pair kinds are body then evals".to_owned(),
+            ));
+        }
+        if body.skill_id != evals.skill_id
+            || body.origin != evals.origin
+            || body.semver != evals.semver
+        {
+            return Err(StoreError::Conflict(
+                "skill pair does not share skill, origin, and semver".to_owned(),
+            ));
+        }
+        let mut tx = self.pool().begin_with("BEGIN IMMEDIATE").await?;
+        let body_row = adopt_or_insert(&mut tx, body).await?;
+        let evals_row = adopt_or_insert(&mut tx, evals).await?;
+        tx.commit().await?;
+        Ok((body_row, evals_row))
+    }
+
+    /// Every revision, without blobs, oldest `created_at` first.
+    ///
+    /// # Errors
+    /// Storage, or a row outside the closed sets.
+    pub async fn list_skill_revisions(&self) -> Result<Vec<SkillRevisionMeta>> {
+        let rows = sqlx::query(
+            "SELECT revision_id, skill_id, origin, semver, kind, content_digest, created_at \
+             FROM skill_revision ORDER BY skill_id, created_at, revision_id",
+        )
+        .fetch_all(self.pool())
+        .await?;
+        rows.iter().map(meta_from_row).collect()
+    }
+
     /// The current pointer, or `None` when the skill has never been activated.
     ///
     /// The view includes the shared `origin` of the two revisions.
@@ -536,6 +598,55 @@ async fn insert_revision_tx(
     .await?;
     Ok(SkillRevisionInsert::Inserted {
         revision_id: rev.revision_id.clone(),
+    })
+}
+
+/// Same digest adopts the stored id and leaves its bytes alone. Same semver
+/// with a different digest conflicts. A fresh pair is inserted.
+async fn adopt_or_insert(
+    tx: &mut Transaction<'_, Sqlite>,
+    rev: &NewSkillRevision,
+) -> Result<SkillRevisionInsert> {
+    let by_digest = sqlx::query(
+        "SELECT revision_id FROM skill_revision \
+         WHERE skill_id = ? AND origin = ? AND kind = ? AND content_digest = ?",
+    )
+    .bind(&rev.skill_id)
+    .bind(rev.origin.as_str())
+    .bind(rev.kind.as_str())
+    .bind(&rev.content_digest)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = by_digest {
+        return Ok(SkillRevisionInsert::Existing {
+            revision_id: row.get("revision_id"),
+        });
+    }
+    let by_semver = sqlx::query(
+        "SELECT revision_id, content_digest, content FROM skill_revision \
+         WHERE skill_id = ? AND origin = ? AND semver = ? AND kind = ?",
+    )
+    .bind(&rev.skill_id)
+    .bind(rev.origin.as_str())
+    .bind(&rev.semver)
+    .bind(rev.kind.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = by_semver {
+        return same_bytes_or_conflict(&row, rev);
+    }
+    insert_revision_tx(tx, rev).await
+}
+
+fn meta_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SkillRevisionMeta> {
+    Ok(SkillRevisionMeta {
+        revision_id: row.get("revision_id"),
+        skill_id: row.get("skill_id"),
+        origin: SkillOrigin::parse(&row.get::<String, _>("origin"))?,
+        semver: row.get("semver"),
+        kind: SkillRevisionKind::parse(&row.get::<String, _>("kind"))?,
+        content_digest: row.get("content_digest"),
+        created_at: row.get("created_at"),
     })
 }
 
@@ -2247,5 +2358,92 @@ mod tests {
             1
         );
         assert_eq!(audit_details(&store, AUDIT_ACTIVATE).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn install_pair_adopts_same_digest_and_rolls_back_a_conflict() {
+        let store = Store::open_memory().await.unwrap();
+        let body = revision(
+            "body-1",
+            "notes",
+            SkillOrigin::Imported,
+            "0.1.0",
+            SkillRevisionKind::Body,
+            "digest-body",
+            b"body-v1",
+        );
+        let evals = revision(
+            "evals-1",
+            "notes",
+            SkillOrigin::Imported,
+            "0.1.0",
+            SkillRevisionKind::Evals,
+            "digest-evals",
+            b"evals-v1",
+        );
+        let inserted = store.install_skill_pair(&body, &evals).await.unwrap();
+        assert!(matches!(inserted.0, SkillRevisionInsert::Inserted { .. }));
+        let mut bumped = body.clone();
+        bumped.revision_id = "body-2".to_owned();
+        bumped.semver = "0.2.0".to_owned();
+        bumped.content = b"body-v1-with-a-different-version-line".to_vec();
+        let mut evals_bumped = evals.clone();
+        evals_bumped.revision_id = "evals-2".to_owned();
+        evals_bumped.semver = "0.2.0".to_owned();
+        let again = store
+            .install_skill_pair(&bumped, &evals_bumped)
+            .await
+            .unwrap();
+        assert_eq!(
+            again.0,
+            SkillRevisionInsert::Existing {
+                revision_id: "body-1".to_owned()
+            }
+        );
+        assert_eq!(revision_count(&store).await, 2);
+        assert_eq!(
+            store
+                .get_skill_revision("body-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"body-v1"
+        );
+
+        put(
+            &store,
+            &revision(
+                "taken",
+                "other",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "other-digest",
+                b"other",
+            ),
+        )
+        .await;
+        let mut fresh = body.clone();
+        fresh.revision_id = "body-new".to_owned();
+        fresh.skill_id = "fresh".to_owned();
+        fresh.semver = "1.0.0".to_owned();
+        fresh.content_digest = "fresh-body".to_owned();
+        fresh.content = b"fresh body".to_vec();
+        let mut clash = evals.clone();
+        clash.revision_id = "taken".to_owned();
+        clash.skill_id = "fresh".to_owned();
+        clash.semver = "1.0.0".to_owned();
+        clash.content_digest = "fresh-evals".to_owned();
+        clash.content = b"fresh evals".to_vec();
+        let err = store.install_skill_pair(&fresh, &clash).await.unwrap_err();
+        assert!(matches!(err, StoreError::Conflict(_)), "{err:?}");
+        assert!(
+            store
+                .get_skill_revision("body-new")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -1125,6 +1125,17 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/inbound/events",
             get(crate::inbound::get_events).post(crate::inbound::post_wechat_event),
         )
+        // Skill loader SL-3. `{id}` is the only path parameter. The scan
+        // route is a noun collection (ADR-045 N5). Activate is SL-4.
+        .route(
+            "/api/v1/skills",
+            get(crate::skill_routes::list_skills).post(crate::skill_routes::post_skill),
+        )
+        .route(
+            "/api/v1/skills/scans",
+            post(crate::skill_routes::post_skill_scan),
+        )
+        .route("/api/v1/skills/{id}", get(crate::skill_routes::get_skill))
         .route("/api/v1/events", get(crate::events::ws_events))
         // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2): register/rotate,
         // list and revoke attached modules. `attached` is reserved in
@@ -1541,6 +1552,13 @@ pub async fn serve(
         ephemeral,
     )
     .await?;
+    let user_skills = crate::skill_routes::scan_installed_user_skills(&state.store).await;
+    if !user_skills.errors.is_empty() {
+        tracing::warn!(
+            skipped = user_skills.errors.len(),
+            "user skill directory scan skipped entries"
+        );
+    }
     let os_config = serve_steps::recover_durable_runs(
         &state,
         ephemeral,

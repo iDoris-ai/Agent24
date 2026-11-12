@@ -52,6 +52,7 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   PUT    /api/v1/comm/relay                -> IpcChannels.CommRelaySet
  *   POST   /api/v1/comm/unlock               -> IpcChannels.CommUnlock
  *   POST   /api/v1/components/{id}/report    -> main only (open-design-report.ts)
+ *   POST   /api/v1/skills/{id}/activate      -> SL-4 主进程 IPC（技能加载器 §4.9）。渲染进程不调用。
  */
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // ADR-038 C3b: read-only component list. The host report POST stays in main.
