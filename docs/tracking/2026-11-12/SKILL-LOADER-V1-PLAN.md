@@ -163,8 +163,10 @@ render_skill_segment(body, origin, content_digest) -> String
 
 一次激活相对当前指针只更换正文或评测其中之一：
 
-- 还没有指针：这一次同时钉上正文修订和评测修订，建立第一对组合。
+- 还没有指针：这一次同时钉上正文修订和评测修订，建立第一对组合。没有指针行时当前代次是 0，`expected_generation` 不是 0 则 `skill_pointer_conflict`。
 - 已经有指针：请求里的两个修订 id 相对指针恰好一个不同。两个都不同则 `skill_activation_mixed`，要分两次激活。两个都相同、且指针已经停在这对上：幂等成功（§4.5 末）。
+- 代次不符先于「两侧都换」：预期代次已过期，即使正文和评测相对指针都变了，也是 `skill_pointer_conflict`，不是 `skill_activation_mixed`。
+- 正文修订与评测修订的 `origin` 必须相同。激活和回滚都要求。不同则 `skill_origin_mismatch`，指针不动。这和 `skill_activation_mixed` 不是同一条件。指针主键仍是 `skill_id`，不按来源拆行。
 - 每次重跑都针对**即将钉上的那一对**，不是针对旧的那一对。
 
 激活请求体只有：`expected_generation`、正文 `revision_id`、评测 `revision_id`、接受的失败 id 列表。正文不在请求体里。服务端按修订 id 读库。
@@ -172,8 +174,8 @@ render_skill_segment(body, origin, content_digest) -> String
 并发，整段在一个事务里：
 
 1. 读指针和代次。
-2. 代次不等于 `expected_generation`，且目标组合也不是指针上已有的那一对：回滚，`409 skill_pointer_conflict`，不写历史、不写审计。
-3. 代次匹配：校验修订存在、这一次只换一侧（或是第一对）、重跑评测、接受列表与失败项一致。
+2. 代次不等于 `expected_generation`，且目标组合也不是指针上已有的那一对：回滚，`409 skill_pointer_conflict`，不写历史、不写审计。没有指针行时按代次 0 比较。这一步先于「两侧都换」。
+3. 代次匹配：校验修订存在、属于该技能且种类正确、两侧 `origin` 相同、这一次只换一侧（或是第一对、或是回滚）、重跑评测、接受列表里的 id 都是这一次失败用例的 id。
 4. CAS 更新指针（代次加一），插入激活历史，写审计。审计只记 `skill_id`、两个修订 id、内容摘要、结果码，不记正文（ADR-K1-04）。
 5. 提交。
 
@@ -243,7 +245,7 @@ v1 不读组件锁的 `requires`，不实现 C9，不把技能依赖映射成 `O
 
 ### 4.9 激活确认、API、CLI 令牌
 
-桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化（回滚时按实际变化显示哪一侧换回）。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
+桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化（回滚时按实际变化显示哪一侧换回）。生成这四项所用的数据还包含来源（`user` 或 `imported`）：store 返回的指针和激活历史带上这个来源，指针主键仍是 `skill_id`。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
 
 `POST /api/v1/skills/{id}/activate` 不进 `ALLOWED_PROXY_ROUTES`（`backend-proxy.ts:56`）。在该文件「有意不代理」的注释里写上这一条。
 
@@ -287,8 +289,9 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 | `skill_eval_empty` | 评测零条用例时请求激活（空评测可以导入，不能激活） | 409 |
 | `skill_eval_invalid` 补充 | 单条用例的 `expect` 为空（`exact` 与 `contains` 都拒）、同一评测文件内重复用例、JSON 重复键 | 400 |
 | `skill_eval_failed` | 激活时服务端重跑有失败用例且未带匹配的接受 id；响应带用例摘要，指针不动 | 409 |
-| `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同（首次激活与回滚除外：首次激活没有指针，按 §4.5 同时钉上两侧建立第一对；正对照测试「首次激活两侧都新 → 成功」） | 400 |
-| `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符 | 409 |
+| `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同（首次激活与回滚除外：首次激活没有指针，按 §4.5 同时钉上两侧建立第一对；正对照测试「首次激活两侧都新 → 成功」）。代次已过期时不走这个码，走 `skill_pointer_conflict` | 400 |
+| `skill_origin_mismatch` | 激活或回滚时，正文修订与评测修订的 `origin` 不同。指针不动。与 `skill_activation_mixed` 无关：两侧可以只换一个，来源仍然必须相同。指针主键仍是 `skill_id` | 400 |
+| `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符。没有指针行时当前代次是 0 | 409 |
 
 回滚恢复一整对历史上已批准的组合，是唯一允许（在已有指针时）两侧同时变化的操作；确认摘要按实际变化显示「换回正文」「换回评测」或「两侧均换回」。
 
@@ -310,10 +313,11 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 
 技能表一张迁移（SL-2）：
 
-- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」；插入函数在摘要不同时返回冲突，摘要相同时返回旧 id。
-- `skill_pointer`：每个 `skill_id` 一行，`body_revision_id`、`evals_revision_id`、`generation`。没有这行就是未激活。
-- `skill_activation`：历史组合，含 §4.5 的结果绑定。回滚按这张表的 id 引用。
-- `run_skill_pin`：`(run_id, skill_id, body_revision_id, content_digest, providers_json)`。providers 只是记录。旧 run 没有这行，读取时当「这次没使用技能」。
+- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」：摘要不同返回 `skill_revision_conflict`，不覆盖。另有唯一索引 `(skill_id, origin, kind, content_digest)`（§4.3）：只升 semver、摘要和字节都相同则返回已有 `revision_id`。
+- `skill_pointer`：每个 `skill_id` 一行（主键就是 `skill_id`），`body_revision_id`、`evals_revision_id`、`generation`。没有这行就是未激活，当前代次按 0。读出的视图带上两侧修订共同的 `origin`。
+- `skill_activation`：历史组合，含 §4.5 的结果绑定。回滚按这张表的 `activation_id` 引用。自增 `seq` 是顺序，不按 `created_at` 排。
+- `skill_eval_result`：绑定上的 `accepted_json` 是 JSON 数组，元素必须是这一次 `cases_json` 里失败用例的 id。
+- `run_skill_pin`：`(run_id, skill_id, body_revision_id, content_digest, providers_json)`。`providers_json` 是 JSON 对象，只作记录。旧 run 没有这行，读取时当「这次没使用技能」。
 
 消息来源的 `CHECK` 放另一张迁移，跟注入那片走（SL-5），不塞进技能表这张。来源种类沿用 `0027`–`0029` 的改表方式。`SourceKind` 存在标签 JSON 里，加变体不必改 `0016` 的表形状；旧 daemon 读到未知种类会走失败关闭，这是预期，不在 v1 里做兼容读取。
 

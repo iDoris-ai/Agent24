@@ -82,6 +82,7 @@ mod run_workspace_admission;
 mod run_workspace_authority;
 mod run_workspace_orphan;
 mod run_workspace_terminal;
+mod skill;
 pub mod source_policy;
 #[doc(hidden)]
 pub mod sqlite_phase;
@@ -170,6 +171,11 @@ pub use run_workspace_admission::{RunAdmission, RunAdmissionDenial};
 pub use run_workspace_authority::RunWorkspaceAuthoritySnapshot;
 pub use run_workspace_orphan::WorkspaceOrphanSweep;
 pub use run_workspace_terminal::RunTerminalTransition;
+pub use skill::{
+    NewSkillActivation, NewSkillRevision, SkillActivationOutcome, SkillActivationRecord,
+    SkillEvalBinding, SkillOrigin, SkillPointer, SkillRevision, SkillRevisionInsert,
+    SkillRevisionKind, SkillRollback,
+};
 pub use source_policy::{
     ASSERTION_SOURCE_REF_SCHEMA_VERSION, AssertionSourceRef, PolicySnapshot,
     SOURCE_TAG_SCHEMA_VERSION, SourceClassification, SourceKind, SourceMode, SourceRef,
@@ -193,8 +199,38 @@ pub enum StoreError {
     Transition(#[from] agent24_core::TransitionError),
     #[error("not found: {0}")]
     NotFound(String),
+    /// A write contradicts a stored row. The string names the case.
+    ///
+    /// Skill writes use this when the failure is not one of the typed skill
+    /// codes: an empty field, a `revision_id` already stored for other bytes,
+    /// bytes that do not match the row for that content digest, a revision
+    /// whose skill or kind is not the one requested, a rollback source that
+    /// belongs to another skill, an accepted id that is not a failed case id
+    /// on this binding, or JSON that is not the required array. The `skill`
+    /// module lists them next to the typed codes.
+    ///
+    /// A SQLite busy timeout is [`StoreError::Sqlx`], not this variant. SL-4
+    /// maps that timeout to a retryable error. A stale skill generation is
+    /// [`StoreError::SkillPointerConflict`], which is not a lock timeout.
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Same skill, origin, semver, and kind already stores a different digest.
+    /// The stored row is left as it was. Plan §4.3.
+    #[error("skill_revision_conflict")]
+    SkillRevisionConflict,
+    /// Expected pointer generation does not match, and the requested pair is
+    /// not the pair already stored. Checked before a mixed move. Nothing was
+    /// written. No pointer row means generation 0.
+    #[error("skill_pointer_conflict")]
+    SkillPointerConflict,
+    /// One activation would replace both the body revision and the evals
+    /// revision. Rollback is the move that restores a whole historical pair.
+    #[error("skill_activation_mixed")]
+    SkillActivationMixed,
+    /// Body revision and evals revision do not share an origin. The pointer
+    /// primary key stays `skill_id`. Nothing was written.
+    #[error("skill_origin_mismatch")]
+    SkillOriginMismatch,
     /// ME4-1.2.1 / design §6.2, §6.4: a module's `_a24/scheduler/upsert` for
     /// a brand-new key when it already owns 256 rows. Counted inside the
     /// `BEGIN IMMEDIATE` transaction that would have inserted the row, so
