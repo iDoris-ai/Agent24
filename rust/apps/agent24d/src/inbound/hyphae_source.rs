@@ -32,8 +32,10 @@
 //! (the table and its read/write API are unused here). 游标表保留，当前按最新页
 //! + 去重；Hyphae 若提供按本地接收序的游标再启用。已入库的 id 不再 `ingest`。
 //!
-//! 例外是 `run_state=start_failed`：交给 `redispatch_failed`，只在
-//! `received_at` 仍处于 600 秒窗口内、且该发送者没有在途 explicit 时重试。
+//! 例外是 `run_state=start_failed`：交给 `redispatch_failed`。重派前按当前
+//! 名单、速率、水位、时延再准入；不再允许则留在 `start_failed`。600 秒窗口按
+//! `received_at`（注入时钟），不是事件时间 `at`。重派的启动失败只记限频
+//! warn，不挡住同页后面的消息。写入失败仍停当前私信或群。
 //!
 //! `identity list` `data` is an array of `{nickname, npub, ...}`.
 //! `groupchat list` `data` is `{"groups":[{"group_id", ...}]}`.
@@ -183,7 +185,7 @@ impl HyphaeInbound {
         cli: HyphaeCliSource,
         now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
     ) -> Self {
-        let service = InboundService::new(store.clone(), runs);
+        let service = InboundService::with_clock(store.clone(), runs, Arc::clone(&now));
         Self {
             store,
             service,
@@ -620,6 +622,8 @@ impl HyphaeInbound {
     /// `true` when `stored_id` is already in the table and this round must
     /// not `ingest` it. `start_failed` is the exception: retry through
     /// [`InboundService::redispatch_failed`] (still not a second insert).
+    /// A start error on that retry is warned and the rest of the page still
+    /// runs. A store error stops this inbox or group.
     async fn already_seen(&self, stored_id: &str) -> Result<bool, PullError> {
         match self.store.get_inbound_event(stored_id).await {
             Ok(Some(event)) if event.run_state.as_deref() == Some("start_failed") => {
@@ -637,7 +641,12 @@ impl HyphaeInbound {
         match self.service.redispatch_failed(stored_id).await {
             Ok(_) => Ok(()),
             Err(super::service::IngestError::Store(err)) => Err(PullError::Store(err.to_string())),
-            Err(super::service::IngestError::Start(err)) => Err(PullError::Store(err)),
+            // The row stays `start_failed`. The next round can try it again.
+            // Stopping here used to hold every later message on this page.
+            Err(super::service::IngestError::Start(err)) => {
+                self.quiet_warn("redispatch", &format!("redispatch start failed: {err}"));
+                Ok(())
+            }
             Err(err) => {
                 self.quiet_warn("ingest", &format!("redispatch failed: {err:?}"));
                 Ok(())
@@ -1114,6 +1123,13 @@ mod tests {
         script: Arc<Script>,
         now: DateTime<Utc>,
     ) -> (HyphaeInbound, Store, Arc<RunManager>) {
+        open_managed_clock(script, Arc::new(move || now)).await
+    }
+
+    async fn open_managed_clock(
+        script: Arc<Script>,
+        now: Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>,
+    ) -> (HyphaeInbound, Store, Arc<RunManager>) {
         let store = Store::open_memory().await.unwrap();
         let runs = RunManager::new(
             store.clone(),
@@ -1132,9 +1148,27 @@ mod tests {
                 let script = Arc::clone(&script);
                 move || Some(Arc::clone(&script) as Arc<dyn HyphaeCli>)
             }),
-            Arc::new(move || now),
+            now,
         );
         (inbound, store, runs)
+    }
+
+    /// Poller clock. `redispatch_failed` reads this, not `Utc::now`.
+    struct SharedClock(StdMutex<DateTime<Utc>>);
+
+    impl SharedClock {
+        fn at(now: DateTime<Utc>) -> Arc<Self> {
+            Arc::new(Self(StdMutex::new(now)))
+        }
+
+        fn set(&self, now: DateTime<Utc>) {
+            *self.0.lock().unwrap() = now;
+        }
+
+        fn callback(self: &Arc<Self>) -> Arc<dyn Fn() -> DateTime<Utc> + Send + Sync> {
+            let clock = Arc::clone(self);
+            Arc::new(move || *clock.0.lock().unwrap())
+        }
     }
 
     async fn open(script: Arc<Script>, now: DateTime<Utc>) -> (HyphaeInbound, Store) {
@@ -1744,11 +1778,16 @@ mod tests {
         );
     }
 
-    /// The row would start if retried. `received_at` older than 600s does not.
+    /// The row would start if retried. The injected clock 601s past
+    /// `received_at` does not. The event time `at` is unchanged.
+    /// Mutation: read `Utc::now()` in `redispatch_failed` instead of the
+    /// injected clock. The age stays inside the window and this starts a run.
     #[tokio::test]
     async fn a_start_failure_older_than_the_window_is_not_retried() {
         let now_at = wall_now();
-        let (inbound, store, manager) = open_managed(one_direct("evt-old", now_at), now_at).await;
+        let clock = SharedClock::at(now_at);
+        let (inbound, store, manager) =
+            open_managed_clock(one_direct("evt-old", now_at), clock.callback()).await;
         allow(&store, PEER).await;
         manager.fail_next_inbound_start();
         inbound.poll_round().await.unwrap();
@@ -1757,13 +1796,16 @@ mod tests {
             "start_failed"
         );
 
-        let stale = format_inbound_timestamp(Utc::now() - chrono::Duration::seconds(601));
-        sqlx::query("UPDATE inbound_events SET received_at = ? WHERE id = ?")
-            .bind(&stale)
-            .bind("hyphae:evt-old")
-            .execute(agent24_store::test_hooks::pool(&store))
+        let received = store
+            .get_inbound_event("hyphae:evt-old")
             .await
-            .unwrap();
+            .unwrap()
+            .unwrap()
+            .received_at;
+        let received_at = chrono::DateTime::parse_from_rfc3339(&received)
+            .unwrap()
+            .with_timezone(&Utc);
+        clock.set(received_at + chrono::Duration::seconds(601));
 
         inbound.poll_round().await.unwrap();
         assert_eq!(
@@ -1771,6 +1813,152 @@ mod tests {
             "start_failed"
         );
         assert_eq!(runs(&store).await, 0);
+    }
+
+    /// Mutation: skip the re-admit in `redispatch_failed` (reopen straight
+    /// away). This starts a run after the actor has left the allowlist.
+    /// Positive control: [`redispatch_starts_when_the_actor_stays_allowlisted`].
+    #[tokio::test]
+    async fn redispatch_refuses_an_actor_removed_from_the_allowlist() {
+        let (state, disposition, run_count) = retry_after_failed_start(true).await;
+        assert_eq!(state, "start_failed");
+        assert_eq!(disposition, "explicit");
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn redispatch_starts_when_the_actor_stays_allowlisted() {
+        let (state, disposition, run_count) = retry_after_failed_start(false).await;
+        assert!(
+            matches!(state.as_str(), "started" | "done"),
+            "retry starts the run, got {state}"
+        );
+        assert_eq!(disposition, "explicit");
+        assert_eq!(run_count, 1);
+    }
+
+    /// Two other rows already fill 2 of the 3-per-minute cap. Counting this
+    /// `start_failed` row again would make 3 and refuse the retry.
+    /// Mutation: pass `None` as the window exclude id. This stays at 0 runs.
+    #[tokio::test]
+    async fn redispatch_does_not_count_its_own_row_in_the_rate_window() {
+        let now_at = wall_now();
+        let (inbound, store, manager) = open_managed(one_direct("evt-rate", now_at), now_at).await;
+        observe(&store, "observe").await;
+        allow(&store, PEER).await;
+        manager.fail_next_inbound_start();
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-rate").await,
+            "start_failed"
+        );
+
+        let stamp = format_inbound_timestamp(Utc::now());
+        for id in ["hyphae:pad-1", "hyphae:pad-2"] {
+            let inserted = store
+                .insert_inbound_event(&agent24_store::NewInboundEvent {
+                    id: id.to_owned(),
+                    source: SOURCE.to_owned(),
+                    category: "direct".to_owned(),
+                    recipient_identity: Some(SELF_NPUB.to_owned()),
+                    thread_key: None,
+                    actor: Some(PEER.to_owned()),
+                    human: true,
+                    addressed: "direct".to_owned(),
+                    at: stamp.clone(),
+                    received_at: stamp.clone(),
+                    text: Some("pad".to_owned()),
+                    meta: None,
+                    disposition: "ignore".to_owned(),
+                    disposition_reason: Some("no_rule".to_owned()),
+                    policy_version: None,
+                    run_state: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(inserted, agent24_store::InboundInsert::Inserted);
+        }
+
+        inbound.poll_round().await.unwrap();
+        let state = inbound_state(&store, "hyphae:evt-rate").await;
+        assert!(
+            matches!(state.as_str(), "started" | "done"),
+            "the failed row is not a fourth message, got {state}"
+        );
+        assert_eq!(runs(&store).await, 1);
+    }
+
+    /// Page `[start_failed A, new B]`. A's retry fails again. B is still
+    /// stored this round. Mutation: map `IngestError::Start` back to
+    /// `PullError::Store` in `redispatch_stored`. B is absent.
+    #[tokio::test]
+    async fn a_failed_redispatch_does_not_block_the_rest_of_the_page() {
+        let now_at = wall_now();
+        let now = now_at.timestamp();
+        let script = Arc::new(Script {
+            calls: StdMutex::new(Vec::new()),
+            directs: StdMutex::new(vec![direct("evt-a", PEER, now, "please run a", true)]),
+            groups: StdMutex::new(Vec::new()),
+            fail: StdMutex::new(None),
+        });
+        let (inbound, store, manager) = open_managed(Arc::clone(&script), now_at).await;
+        observe(&store, "observe").await;
+        allow(&store, PEER).await;
+        manager.fail_next_inbound_start();
+        inbound.poll_round().await.unwrap();
+        assert_eq!(inbound_state(&store, "hyphae:evt-a").await, "start_failed");
+
+        script
+            .directs
+            .lock()
+            .unwrap()
+            .push(direct("evt-b", PEER, now + 1, "please run b", true));
+        manager.fail_next_inbound_start();
+        inbound.poll_round().await.unwrap();
+
+        assert_eq!(inbound_state(&store, "hyphae:evt-a").await, "start_failed");
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-b")
+                .await
+                .unwrap()
+                .is_some(),
+            "B is stored in the same round as the failed redispatch"
+        );
+        assert_eq!(runs(&store).await, 1);
+    }
+
+    /// `remove` drops the actor between the failed start and the retry.
+    /// `observe` keeps the round running after the allowlist row is gone.
+    async fn retry_after_failed_start(remove: bool) -> (String, String, i64) {
+        let now_at = wall_now();
+        let (inbound, store, manager) = open_managed(one_direct("evt-list", now_at), now_at).await;
+        observe(&store, "observe").await;
+        allow(&store, PEER).await;
+        manager.fail_next_inbound_start();
+        inbound.poll_round().await.unwrap();
+        assert_eq!(
+            inbound_state(&store, "hyphae:evt-list").await,
+            "start_failed"
+        );
+        assert_eq!(runs(&store).await, 0);
+
+        if remove {
+            sqlx::query("DELETE FROM inbound_allowlist WHERE source = ? AND actor = ?")
+                .bind(SOURCE)
+                .bind(PEER)
+                .execute(agent24_store::test_hooks::pool(&store))
+                .await
+                .unwrap();
+        }
+
+        inbound.poll_round().await.unwrap();
+        let row = store
+            .get_inbound_event("hyphae:evt-list")
+            .await
+            .unwrap()
+            .unwrap();
+        (row.run_state.unwrap(), row.disposition, runs(&store).await)
     }
 
     /// Same actor already `starting`: the partial unique index blocks the

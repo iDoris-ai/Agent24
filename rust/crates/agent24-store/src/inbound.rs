@@ -368,15 +368,38 @@ impl Store {
         actor: &str,
         since: &str,
     ) -> Result<i64> {
+        self.count_inbound_window_except(source, actor, since, None)
+            .await
+    }
+
+    /// As [`Self::count_inbound_window`], skipping `except_id` when it is set.
+    ///
+    /// A retry already has its row stored. Passing that id keeps the window
+    /// the same shape as the first admission, which did not count the row
+    /// under consideration. `None` counts every matching row.
+    ///
+    /// # Errors
+    /// Storage, or a `since` that is not [`format_inbound_timestamp`].
+    pub async fn count_inbound_window_except(
+        &self,
+        source: &str,
+        actor: &str,
+        since: &str,
+        except_id: Option<&str>,
+    ) -> Result<i64> {
         require_inbound_timestamp("since", since)?;
+        let except_id = except_id.map(str::to_owned);
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM inbound_events \
              WHERE source = ? AND actor = ? AND received_at >= ? \
-               AND category <> 'protocol' AND disposition <> 'filtered'",
+               AND category <> 'protocol' AND disposition <> 'filtered' \
+               AND (? IS NULL OR id <> ?)",
         )
         .bind(source)
         .bind(actor)
         .bind(since)
+        .bind(except_id.clone())
+        .bind(except_id)
         .fetch_one(self.pool())
         .await?;
         Ok(count)
@@ -2155,6 +2178,27 @@ mod tests {
         assert_eq!(
             store
                 .count_inbound_window("hyphae", "npub1", "2026-11-11T00:00:00Z")
+                .await
+                .unwrap(),
+            3
+        );
+        // The row being retried is already stored. Mutation: drop the
+        // `id <> ?` arm and this stays 3.
+        assert_eq!(
+            store
+                .count_inbound_window_except(
+                    "hyphae",
+                    "npub1",
+                    "2026-11-11T00:00:00Z",
+                    Some("hyphae:in-explicit"),
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .count_inbound_window_except("hyphae", "npub1", "2026-11-11T00:00:00Z", None)
                 .await
                 .unwrap(),
             3

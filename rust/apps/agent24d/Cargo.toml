@@ -116,6 +116,10 @@ agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
 tempfile = "3"
 
 [dev-dependencies]
+# `RunManager::fail_next_inbound_start` is cfg'd out unless this feature is
+# on. Unit tests in this binary call it; `cargo build --release` does not
+# enable it.
+agent24-agent = { path = "../../crates/agent24-agent", features = ["test-support"] }
 # The hash-pause hook is cfg'd out unless this feature is on. Unit tests in
 # this binary call it; `cargo build --release` does not enable it.
 agent24-components = { path = "../../crates/agent24-components", features = ["test-support"] }
