@@ -123,7 +123,7 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 | C3a / C3b | `/api/v1/components` 统一状态面；OD 状态由桌面上报 | DONE | #1545、#1549 | |
 | C4–C7 | AgentEar、Knowledge、Documents、领域 OS / MCP 清单 | DONE | #1572、#1571、#1570、#1575 | |
 | C8 | Open Design 改由 `SidecarManager` 托管 | DONE | #1580、#1584 | Q1 = (b) |
-| C9 | `requires` 接入授权 | BACKLOG（未排期，不在第 0–2 期） | — | jason 2026-11-10 |
+| C9 | `requires` 接入授权 | BACKLOG（未排期，不在第 0–2 期） | — | jason 2026-11-10；2026-11-12 起排为主线，实施方案见 [C9-REQUIRES-AUTHZ-PLAN](../2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md) |
 | — | Hyphae 锁只有 darwin-arm64、linux-x64 两个平台 | BACKLOG | — | `rust/crates/agent24-comm/hyphae.lock.json`，本期核对仍是这两个 |
 
 ### 2.3 内核（CORE-2 / CORE-5）
