@@ -31,6 +31,7 @@ LAYER = {
     "domain": "L0",
     "sidecar-host-protocol": "L0",
     "core": "L1",
+    "skill": "L1",
     "store": "L2",
     "workspace": "L2",
     "os-cwd": "L2",
