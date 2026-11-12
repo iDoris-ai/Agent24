@@ -18,11 +18,17 @@ pub(crate) struct Record {
 
 impl Record {
     pub(crate) fn expired(&self, now: super::types::UnixSeconds) -> bool {
+        // Shell tokens stay on their own monotonic deadline. A wall-clock
+        // jump must not expire them (`daily_token_ttl_ignores_wall_clock_jumps`).
         if let Some(claims) = self.claims.first_party.as_ref() {
             return tokio::time::Instant::now() >= claims.deadline;
         }
+        // Bridge tokens die when either clock says so. `Instant` does not
+        // move while macOS is asleep, so `expires_at` covers that gap. A
+        // backward jump leaves `expires_at` in the future and the monotonic
+        // deadline still fires.
         if let Some(deadline) = self.claims.deadline {
-            return tokio::time::Instant::now() >= deadline;
+            return tokio::time::Instant::now() >= deadline || now >= self.claims.expires_at;
         }
         now >= self.claims.expires_at
     }
@@ -37,7 +43,7 @@ pub(crate) struct State {
 pub(crate) struct Shared {
     pub(crate) state: Mutex<State>,
     pub(crate) changed: watch::Sender<u64>,
-    deny_audit_at:
+    pub(crate) deny_audit_at:
         Mutex<HashMap<(String, agent24_store::CapabilityDenyReason), tokio::time::Instant>>,
 }
 
@@ -64,15 +70,16 @@ impl CapabilityStore {
         }
     }
 
-    /// `true` when this id and reason should be written. A repeat inside
-    /// [`DENY_AUDIT_INTERVAL`] returns `false`. A poisoned lock records.
+    /// The timestamp just stored when this id and reason should be written.
+    /// A repeat inside [`DENY_AUDIT_INTERVAL`] returns `None`. A poisoned
+    /// lock records and returns `Some(now)`.
     pub(crate) fn claim_deny_audit(
         &self,
         capability_id: &str,
         reason: agent24_store::CapabilityDenyReason,
-    ) -> bool {
+    ) -> Option<tokio::time::Instant> {
         let Ok(mut slots) = self.shared.deny_audit_at.lock() else {
-            return true;
+            return Some(tokio::time::Instant::now());
         };
         let now = tokio::time::Instant::now();
         let key = (capability_id.to_owned(), reason);
@@ -82,8 +89,27 @@ impl CapabilityStore {
         if fresh {
             slots.insert(key, now);
             slots.retain(|_, at| now.saturating_duration_since(*at) < DENY_AUDIT_INTERVAL);
+            Some(now)
+        } else {
+            None
         }
-        fresh
+    }
+
+    /// Drop a slot only when it is still the timestamp this caller stored.
+    /// A newer claim from a write that succeeded stays in place.
+    pub(crate) fn release_deny_audit(
+        &self,
+        capability_id: &str,
+        reason: agent24_store::CapabilityDenyReason,
+        claimed_at: tokio::time::Instant,
+    ) {
+        let Ok(mut slots) = self.shared.deny_audit_at.lock() else {
+            return;
+        };
+        let key = (capability_id.to_owned(), reason);
+        if slots.get(&key).is_some_and(|at| *at == claimed_at) {
+            slots.remove(&key);
+        }
     }
 
     pub fn daemon_generation(&self) -> &str {

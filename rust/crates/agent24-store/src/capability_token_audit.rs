@@ -38,7 +38,7 @@ pub enum CapabilityDenyReason {
     Route,
     /// Presented after the body was read; the in-memory record is revoked.
     Revoked,
-    /// Monotonic deadline has passed. Not a wall-clock `expires_at`.
+    /// Monotonic deadline or, for a bridge token, wall-clock `expires_at`.
     Expired,
     /// `daemon_generation` does not match this process.
     StaleGeneration,

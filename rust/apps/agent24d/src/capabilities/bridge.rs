@@ -27,6 +27,8 @@ pub enum BridgeIssueError {
     Rejected,
     /// The decision row was not written, so no token was inserted.
     AuditFailed,
+    /// The caller was revoked, expired, or rotated before the insert.
+    CallerInvalid,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,21 +115,52 @@ pub async fn write_component_denial(
     auth: &Authorization,
     reason: CapabilityDenyReason,
 ) {
+    let db = db.clone();
+    write_component_denial_with(caps, auth, reason, move |event| {
+        let db = db.clone();
+        async move {
+            let ts = audit_now()?;
+            db.append_capability_token_audit(&ts, &event)
+                .await
+                .map(|_| ())
+                .map_err(|_| ())
+        }
+    })
+    .await;
+}
+
+async fn write_component_denial_with<F, Fut>(
+    caps: &CapabilityStore,
+    auth: &Authorization,
+    reason: CapabilityDenyReason,
+    write: F,
+) where
+    F: FnOnce(CapabilityTokenAuditEvent) -> Fut,
+    Fut: Future<Output = Result<(), ()>>,
+{
     if auth.claims.audience != Audience::ComponentRuntime {
         return;
     }
     let Some(event) = denial_event(auth, reason) else {
         return;
     };
-    if !caps.claim_deny_audit(&auth.claims.capability_id, reason) {
+    let Some(claimed_at) = caps.claim_deny_audit(&auth.claims.capability_id, reason) else {
         return;
-    }
-    if let Ok(ts) = audit_now() {
-        let _ = db.append_capability_token_audit(&ts, &event).await;
+    };
+    if write(event).await.is_err() {
+        caps.release_deny_audit(&auth.claims.capability_id, reason, claimed_at);
+        tracing::warn!(
+            capability_id = %auth.claims.capability_id,
+            ?reason,
+            "capability denial audit was not written; throttle slot released"
+        );
     }
 }
 
 /// Audit first. A write failure leaves the store without this token.
+/// After that write, the caller is checked again and the new token is
+/// inserted under the same store lock. A caller revoked, expired, or
+/// rotated during the audit is not issued.
 pub async fn issue_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     authorization: &Authorization,
@@ -154,8 +187,11 @@ where
     if audit(event).await.is_err() {
         return Err(BridgeIssueError::AuditFailed);
     }
-    store
-        .insert(CapabilityClaims {
+    insert_for_live_caller(
+        store,
+        authorization,
+        now,
+        CapabilityClaims {
             first_party: None,
             capability_id,
             audience: Audience::ComponentRuntime,
@@ -170,7 +206,39 @@ where
             expires_at: now.saturating_add(BRIDGE_TTL_SECONDS),
             deadline: Some(Instant::now() + Duration::from_secs(BRIDGE_TTL_SECONDS)),
             allowed_operations: BTreeSet::from([Operation::InboundIngest]),
-        })
+        },
+    )
+}
+
+/// Caller liveness and the insert share one lock, so a revoke that lands
+/// during the audit cannot slip a token in afterwards.
+fn insert_for_live_caller(
+    store: &CapabilityStore,
+    authorization: &Authorization,
+    now: UnixSeconds,
+    claims: CapabilityClaims,
+) -> Result<super::MintedCapability, BridgeIssueError> {
+    let mut state = store
+        .shared
+        .state
+        .lock()
+        .map_err(|_| BridgeIssueError::CallerInvalid)?;
+    let live = state
+        .ids
+        .get(&authorization.claims.capability_id)
+        .copied()
+        .and_then(|digest| state.records.get(&digest))
+        .is_some_and(|record| {
+            !record.revoked
+                && record.claims.audience == Audience::FirstPartyShell
+                && record.claims.daemon_generation == store.daemon_generation()
+                && !record.expired(now)
+        });
+    if !live {
+        return Err(BridgeIssueError::CallerInvalid);
+    }
+    store
+        .insert_locked(&mut state, claims)
         .map_err(|_| BridgeIssueError::Rejected)
 }
 
@@ -273,16 +341,16 @@ mod tests {
                 )
                 .is_ok()
         );
-        // Wall-clock `expires_at` is not the gate. `bridge_token_ttl_ignores_wall_clock_jumps`
-        // advances the monotonic deadline.
-        let stale = claims.expires_at;
+        // Still inside `expires_at`. A jump past it is
+        // `bridge_token_ttl_ignores_wall_clock_jumps`.
+        let inside = claims.expires_at - 1;
         assert!(
             store
                 .validate_bearer(
                     &bearer,
                     Operation::InboundIngest,
                     &Resource::global(),
-                    stale
+                    inside
                 )
                 .is_ok()
         );
@@ -332,9 +400,10 @@ mod tests {
         let _ = (store, now);
     }
 
-    /// A jump of the wall clock past `expires_at` leaves the bridge token
-    /// live. Advancing the runtime clock by the TTL expires it.
-    /// Clearing `deadline` in `issue_wechat_bridge` turns the first `is_ok` red.
+    /// A wall-clock jump past `expires_at` expires the bridge token. A
+    /// backward jump does not: the monotonic deadline still fires on time.
+    /// Dropping the `expires_at` arm in `Record::expired` turns the forward
+    /// jump red. Shell tokens do not use this arm.
     #[tokio::test(start_paused = true)]
     async fn bridge_token_ttl_ignores_wall_clock_jumps() {
         let (store, auth) = shell_store();
@@ -344,7 +413,7 @@ mod tests {
         let (bearer, _, claims) = minted.into_bearer_parts();
         assert!(claims.deadline.is_some());
         let jumped = unix_now() + BRIDGE_TTL_SECONDS * 100;
-        assert!(store.require_live_bearer(&bearer, jumped).is_ok());
+        assert!(store.require_live_bearer(&bearer, jumped).is_err());
         assert!(
             store
                 .validate_bearer(
@@ -353,8 +422,9 @@ mod tests {
                     &Resource::global(),
                     jumped
                 )
-                .is_ok()
+                .is_err()
         );
+        assert!(store.require_live_bearer(&bearer, 0).is_ok());
         tokio::time::advance(Duration::from_secs(BRIDGE_TTL_SECONDS)).await;
         assert!(store.require_live_bearer(&bearer, 0).is_err());
         assert!(
@@ -362,6 +432,104 @@ mod tests {
                 .validate_bearer(&bearer, Operation::InboundIngest, &Resource::global(), 0)
                 .is_err()
         );
+    }
+
+    /// Revoking the caller while the audit future is in flight does not
+    /// insert a bridge token. Skipping the live check in
+    /// `insert_for_live_caller` turns this `CallerInvalid` into `Ok`.
+    #[tokio::test]
+    async fn revoked_caller_during_audit_is_not_issued() {
+        let (store, auth) = shell_store();
+        let caller_id = auth.claims.capability_id.clone();
+        let during = store.clone();
+        let failed = issue_wechat_bridge(&store, &auth, unix_now(), move |_| {
+            let during = during.clone();
+            let caller_id = caller_id.clone();
+            async move {
+                during.revoke_by_id(&caller_id);
+                Ok(())
+            }
+        })
+        .await;
+        assert!(matches!(failed, Err(BridgeIssueError::CallerInvalid)));
+        assert!(
+            store
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .all(|record| record.claims.audience != Audience::ComponentRuntime)
+        );
+    }
+
+    fn component_auth(id: &str) -> Authorization {
+        let now = unix_now();
+        Authorization {
+            claims: CapabilityClaims {
+                first_party: None,
+                capability_id: id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some(DEV_BRIDGE_COMPONENT_ID.to_owned()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "g".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + BRIDGE_TTL_SECONDS,
+                deadline: Some(Instant::now() + Duration::from_secs(BRIDGE_TTL_SECONDS)),
+                allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+            },
+            epoch: 0,
+        }
+    }
+
+    /// A failed denial write releases its own throttle slot, so the next
+    /// refusal of the same id and reason is written. Dropping
+    /// `release_deny_audit` leaves the second `list_audit` empty.
+    /// Releasing without comparing timestamps clears a newer claim.
+    #[tokio::test]
+    async fn deny_audit_write_failure_releases_the_slot() {
+        use agent24_store::{CapabilityDenyReason, Store};
+
+        let store = CapabilityStore::new("g");
+        let db = Store::open_memory().await.unwrap();
+        let auth = component_auth("slot-a");
+        write_component_denial_with(&store, &auth, CapabilityDenyReason::Revoked, |_| async {
+            Err(())
+        })
+        .await;
+        assert!(db.list_audit().await.unwrap().is_empty());
+
+        let claimed = store
+            .claim_deny_audit("other-slot", CapabilityDenyReason::Revoked)
+            .unwrap();
+        {
+            let mut slots = store.shared.deny_audit_at.lock().unwrap();
+            slots.insert(
+                ("other-slot".to_owned(), CapabilityDenyReason::Revoked),
+                claimed + Duration::from_millis(5),
+            );
+        }
+        store.release_deny_audit("other-slot", CapabilityDenyReason::Revoked, claimed);
+        assert!(
+            store
+                .claim_deny_audit("other-slot", CapabilityDenyReason::Revoked)
+                .is_none()
+        );
+
+        write_component_denial(&store, &db, &auth, CapabilityDenyReason::Revoked).await;
+        let denied = db
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "capability.token.denied")
+            .count();
+        assert_eq!(denied, 1);
     }
 
     /// Same id and reason is one slot. A different reason, a different id,
@@ -372,11 +540,31 @@ mod tests {
         use agent24_store::CapabilityDenyReason;
 
         let store = CapabilityStore::new("g");
-        assert!(store.claim_deny_audit("gate-models", CapabilityDenyReason::Route));
-        assert!(!store.claim_deny_audit("gate-models", CapabilityDenyReason::Route));
-        assert!(store.claim_deny_audit("gate-models", CapabilityDenyReason::Operation));
-        assert!(store.claim_deny_audit("gate-module", CapabilityDenyReason::Route));
+        assert!(
+            store
+                .claim_deny_audit("gate-models", CapabilityDenyReason::Route)
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_deny_audit("gate-models", CapabilityDenyReason::Route)
+                .is_none()
+        );
+        assert!(
+            store
+                .claim_deny_audit("gate-models", CapabilityDenyReason::Operation)
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_deny_audit("gate-module", CapabilityDenyReason::Route)
+                .is_some()
+        );
         tokio::time::advance(DENY_AUDIT_INTERVAL).await;
-        assert!(store.claim_deny_audit("gate-models", CapabilityDenyReason::Route));
+        assert!(
+            store
+                .claim_deny_audit("gate-models", CapabilityDenyReason::Route)
+                .is_some()
+        );
     }
 }

@@ -242,6 +242,13 @@ pub(super) async fn mint_bridge_capability(
                 "Shell authority required",
             );
         }
+        Err(crate::capabilities::bridge::BridgeIssueError::CallerInvalid) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            );
+        }
     };
     let (token, capability_id, claims) = minted.into_bearer_parts();
     (

@@ -107,7 +107,7 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
     // still gets 401, so this does not enumerate the route.
     if method == Method::POST && path == "/api/v1/inbound/events" {
         if let Some(denied) = capability_token_rejected(&state, &req) {
-            return denied;
+            return finish_rejection(&state, denied).await;
         }
         // The dev gate opens the route in both auth modes. The handler, not
         // the catalog operation, accepts only a wechat-bridge component token.
@@ -120,7 +120,7 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
     // issued. 409 stays the legacy-mode answer when the gate is on.
     if method == Method::POST && path == "/api/v1/capabilities/bridge" && !state.dev_wechat_events {
         if let Some(denied) = capability_token_rejected(&state, &req) {
-            return denied;
+            return finish_rejection(&state, denied).await;
         }
         return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
     }
@@ -132,13 +132,13 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
     {
         crate::capabilities::RouteDecision::UnknownPath => {
             if let Some(denied) = capability_token_rejected(&state, &req) {
-                return denied;
+                return finish_rejection(&state, denied).await;
             }
             error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route")
         }
         crate::capabilities::RouteDecision::MethodNotAllowed => {
             if let Some(denied) = capability_token_rejected(&state, &req) {
-                return denied;
+                return finish_rejection(&state, denied).await;
             }
             next.run(req).await
         }
@@ -200,15 +200,30 @@ async fn admit_inbound_ingest(state: AppState, mut req: Request<Body>, next: Nex
     }
 }
 
+struct TokenRejection {
+    response: Response,
+    /// Known component-runtime token that failed liveness. Written after the
+    /// borrow of the request ends, so the middleware future stays `Send`.
+    denial: Option<(
+        crate::capabilities::Authorization,
+        agent24_store::CapabilityDenyReason,
+    )>,
+}
+
 /// Missing, unparseable, unknown, revoked, expired, or stale bearers are 401.
 /// A live token returns `None` so the caller can answer 404 or 405.
-fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<Response> {
+/// A known component-runtime token that fails liveness also carries a denial
+/// to audit. An unknown bearer does not.
+fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<TokenRejection> {
     let Some(store) = state.capabilities.as_ref() else {
-        return Some(error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "host_authority_unavailable",
-            "Capability authority unavailable",
-        ));
+        return Some(TokenRejection {
+            response: error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "host_authority_unavailable",
+                "Capability authority unavailable",
+            ),
+            denial: None,
+        });
     };
     let Some(bearer) = req
         .headers()
@@ -216,20 +231,48 @@ fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<Re
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
     else {
-        return Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        ));
+        return Some(TokenRejection {
+            response: error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            ),
+            denial: None,
+        });
     };
-    match store.require_live_bearer(bearer, crate::capabilities::unix_now()) {
-        Ok(()) => None,
-        Err(_) => Some(error_response(
-            StatusCode::UNAUTHORIZED,
-            "unauthorized",
-            "Missing or invalid bearer token",
-        )),
+    match store.authenticate_bearer(bearer, crate::capabilities::unix_now()) {
+        Ok(_) => None,
+        Err(err) => {
+            let denial = crate::capabilities::bridge::liveness_deny(err).and_then(|reason| {
+                store
+                    .known_component_bearer(bearer)
+                    .map(|auth| (auth, reason))
+            });
+            Some(TokenRejection {
+                response: error_response(
+                    StatusCode::UNAUTHORIZED,
+                    "unauthorized",
+                    "Missing or invalid bearer token",
+                ),
+                denial,
+            })
+        }
     }
+}
+
+async fn finish_rejection(state: &AppState, rejection: TokenRejection) -> Response {
+    if let Some((authorization, reason)) = rejection.denial
+        && let Some(store) = state.capabilities.as_ref()
+    {
+        crate::capabilities::bridge::write_component_denial(
+            store,
+            &state.store,
+            &authorization,
+            reason,
+        )
+        .await;
+    }
+    rejection.response
 }
 
 async fn authorize(

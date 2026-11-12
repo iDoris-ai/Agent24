@@ -2769,6 +2769,106 @@ mod tests {
         }
     }
 
+    /// A component token that is already revoked or expired when middleware
+    /// runs is 401 and one denial row. An unknown bearer is 401 and writes
+    /// nothing. Dropping `write_component_denial` in `finish_rejection`
+    /// turns the row assertions red.
+    #[tokio::test]
+    async fn revoked_or_expired_component_token_is_401_and_audited() {
+        use std::collections::BTreeSet;
+
+        use crate::capabilities::{Audience, CapabilityClaims, Operation, unix_now};
+
+        let mut app = dev_legacy(false).await;
+        let db = app.store.clone();
+        let cap = crate::capabilities::CapabilityStore::new("daemon-test");
+        let forge = |id: &str| {
+            let now = unix_now();
+            cap.insert(CapabilityClaims {
+                first_party: None,
+                capability_id: id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some("wechat-bridge".into()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "daemon-test".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 86_400,
+                deadline: Some(tokio::time::Instant::now() + StdDuration::from_secs(3_600)),
+                allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+            })
+            .unwrap()
+            .into_bearer_parts()
+        };
+        let (revoked_bearer, _, _) = forge("bridge-already-revoked");
+        let (expired_bearer, _, _) = forge("bridge-already-expired");
+        cap.revoke_by_id("bridge-already-revoked");
+        {
+            let mut state = cap.shared.state.lock().unwrap();
+            let digest = *state.ids.get("bridge-already-expired").unwrap();
+            state.records.get_mut(&digest).unwrap().claims.deadline =
+                Some(tokio::time::Instant::now());
+        }
+        app.enable_capability_auth(cap);
+        let router = crate::server::build_router(app);
+        let at = format_inbound_timestamp(Utc::now());
+
+        let denied = |entries: &[agent24_store::AuditEntry], id: &str, reason: &str| {
+            entries
+                .iter()
+                .filter(|entry| {
+                    entry.action == "capability.token.denied"
+                        && entry.detail["denied"]["capability_id"].as_str() == Some(id)
+                        && entry.detail["denied"]["reason"].as_str() == Some(reason)
+                })
+                .count()
+        };
+
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &revoked_bearer,
+            Some(&wechat_body("wechat:50", "alice", &at, "late")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(denied(&entries, "bridge-already-revoked", "revoked"), 1);
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| { entry.detail.to_string().contains(&revoked_bearer) })
+        );
+
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &expired_bearer,
+            Some(&wechat_body("wechat:51", "alice", &at, "late")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        let entries = db.list_audit().await.unwrap();
+        assert_eq!(denied(&entries, "bridge-already-expired", "expired"), 1);
+
+        let before = db.list_audit().await.unwrap().len();
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            "not-a-known-bearer",
+            Some(&wechat_body("wechat:52", "alice", &at, "late")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+        assert_eq!(db.list_audit().await.unwrap().len(), before);
+    }
+
     /// A component token that already holds `ModelsRead` or `ModuleRoute`
     /// is still 403. The row is `capability.token.denied` with reason `route`
     /// or `operation`, and the same id plus reason is written once.

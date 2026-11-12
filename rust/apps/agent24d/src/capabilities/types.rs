@@ -120,9 +120,10 @@ pub struct CapabilityClaims {
     pub sidecar_generation: Option<String>,
     pub created_at: UnixSeconds,
     pub expires_at: UnixSeconds,
-    /// Monotonic expiry for the dev-bridge tier. `None` keeps the wall-clock
-    /// `expires_at` check. First-party shells use [`FirstPartyClaims::deadline`]
-    /// and leave this empty.
+    /// Monotonic expiry for the dev-bridge tier. Either this or `expires_at`
+    /// expiring invalidates the token. `None` keeps the wall-clock check
+    /// only. First-party shells use [`FirstPartyClaims::deadline`] and leave
+    /// this empty.
     pub deadline: Option<tokio::time::Instant>,
     pub allowed_operations: BTreeSet<super::operations::Operation>,
 }

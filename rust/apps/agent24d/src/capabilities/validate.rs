@@ -96,6 +96,23 @@ impl CapabilityStore {
         })
     }
 
+    /// Claims when this bearer is a `ComponentRuntime` row already in the store.
+    /// Revoked, expired, and stale rows are included. An unknown bearer is
+    /// `None`, so a rejection audit cannot be filled by guessing tokens.
+    pub(crate) fn known_component_bearer(&self, bearer: &str) -> Option<Authorization> {
+        let token = CapabilityToken::parse_bearer(bearer).ok()?;
+        let digest = digest(&token);
+        let state = self.shared.state.lock().ok()?;
+        let record = state.records.get(&digest)?;
+        if record.claims.audience != super::Audience::ComponentRuntime {
+            return None;
+        }
+        Some(Authorization {
+            claims: record.claims.clone(),
+            epoch: state.epoch,
+        })
+    }
+
     /// 404 and 405 must not reveal the route table to a missing, unknown, or
     /// revoked token. This is [`Self::authenticate_bearer`] without the claims.
     pub fn require_live_bearer(
