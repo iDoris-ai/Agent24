@@ -1818,7 +1818,8 @@ mod tests {
         pool.close().await;
 
         let store = Store::open(&path).await.unwrap();
-        assert_eq!(store.latest_applied_migration().await.unwrap(), 34);
+        // 0034 入站表 + 0035 游标；升级后旧行不变，schema 停在当前最新。
+        assert_eq!(store.latest_applied_migration().await.unwrap(), 35);
         let input: String = sqlx::query_scalar("SELECT input FROM runs WHERE id = 'old_run'")
             .fetch_one(crate::test_hooks::pool(&store))
             .await
