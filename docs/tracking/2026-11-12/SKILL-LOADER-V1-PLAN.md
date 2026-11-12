@@ -109,7 +109,7 @@ v1 不做分发来源、不做内置技能、不做默认提供者表、不做�
 
 frontmatter：
 
-- 必填字段按 D1 校验。导入时缺的 Agent24 字段，服务端补 `requires: []`、`mode: manual`、`version: 0.1.0`。评测可以先是空的。补完仍然是未激活候选。
+- 必填字段按 D1 校验。导入时缺的 Agent24 字段，服务端补 `requires: []`、`mode: manual`、`version: 0.1.0`、`evals: []`（SL-1 提供带导入缺省值的解析入口，SL-3 调用它；用户自写技能仍走必填校验）。评测可以先是空的。去重键为 `(skill_id, origin, kind, content_digest)`：只升 semver 不改内容时返回已有修订；本次导入的「未生效」字段列表一律取这次解析结果，不从库里旧行拼。补完仍然是未激活候选。
 - 未知字段丢弃。响应里列出字段名，界面展示「未生效」。
 - `allowed-tools` 永远不读。它就是一个未知字段，展示「未生效」，不注册工具，不放宽白名单。
 
@@ -157,7 +157,7 @@ render_skill_segment(body, origin, content_digest) -> String
 - 评测 `revision_id`
 - 渲染段的内容摘要
 - 渲染器版本
-- 每条用例的摘要：稳定 id（评测名 + 行号）、`judge`、是否通过、`expect` 的摘要
+- 每条用例的摘要：稳定 id = `(评测名, judge, input, expect)` 的哈希（评测修订不可变，行号不进 id；同一文件内重复用例在解析时拒绝）、`line`（只作展示）、`judge`、是否通过、`expect` 的摘要
 
 有失败时，请求里的「逐条接受」必须是这些失败 id 的子集，并且和**这一次**绑定对得上。接受记录写在这条绑定上，不改评测原文，不把失败改写成通过。绑定对不上则拒绝，指针不动。
 
@@ -284,7 +284,8 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 | `skill_not_active` | 普通 `start_run` 带的 `skill_id` 不存在或没有指针（§4.8） | 409 |
 | `skill_not_admitted` | 入站或定时自唤醒路径带 `skill_id`（§4.8） | 400 |
 | `skill_eval_invalid` | 评测文件解析失败 | 400 |
-| `skill_eval_empty` | `contains` 期望为空 | 400 |
+| `skill_eval_empty` | 评测零条用例时请求激活（空评测可以导入，不能激活） | 409 |
+| `skill_eval_invalid` 补充 | 单条用例的 `expect` 为空（`exact` 与 `contains` 都拒）、同一评测文件内重复用例、JSON 重复键 | 400 |
 | `skill_eval_failed` | 激活时服务端重跑有失败用例且未带匹配的接受 id；响应带用例摘要，指针不动 | 409 |
 | `skill_activation_mixed` | 已有指针，且请求里正文修订与评测修订相对当前指针**都**不同（首次激活与回滚除外：首次激活没有指针，按 §4.5 同时钉上两侧建立第一对；正对照测试「首次激活两侧都新 → 成功」） | 400 |
 | `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符 | 409 |
