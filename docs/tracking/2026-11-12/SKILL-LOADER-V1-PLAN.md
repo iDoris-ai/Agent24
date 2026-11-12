@@ -235,9 +235,15 @@ v1 不读组件锁的 `requires`，不实现 C9，不把技能依赖映射成 `O
 
 各有一条反例测试：构造带 `skill_id` 的调用，断言没有 run、没有技能修订被读、没有技能标签。普通 `start_run` 带同一个 `skill_id` 仍可准入（正对照）。
 
+普通 `start_run` 带 `skill_id` 时，在插入 run 之前只读 `skill_pointer`：
+
+- `skill_id` 不存在，或存在但没有指针行（只装未激活，导入后的默认状态）：一律拒绝，错误码 `skill_not_active`；不读任何修订、不打来源标签、不插入 run。**不得回落去读最新修订**——那会让导入的 `Unknown` 文本绕过「激活 = 用户确认」。
+- 有指针：钉住指针指向的不可变修订，再走 §4.6 的依赖解析。
+- 反例测试（SL-5 验收）：装了、没激活、带 id → 无 run、无标签、无修订读取；变异：改成「无指针时读最新修订」→ 测试变红。
+
 ### 4.9 激活确认、API、CLI 令牌
 
-桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
+桌面技能栏上点「激活」或「回滚」就是用户的确认。渲染进程不调用激活路由。主进程专用 IPC 做这几步：用自己的宿主凭据读取候选修订的字节，自己生成确认摘要，然后一次性提交 §4.5 的请求。摘要固定四项：技能名、semver、内容摘要的前 8 位十六进制、评测修订相对当前指针是否变化（回滚时显示「两侧均换回」）。摘要以主进程读到的字节为准，不采用渲染进程传来的摘要。
 
 `POST /api/v1/skills/{id}/activate` 不进 `ALLOWED_PROXY_ROUTES`（`backend-proxy.ts:56`）。在该文件「有意不代理」的注释里写上这一条。
 
@@ -264,7 +270,26 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 
 **组件不能被授予这些操作。** C9 合入后，组件锁的 `requires.operations` 会有一份「可授予 / 排除」测试。SL-3 把 `skills.read`、`skills.install`、`skills.activate` 写进排除名单：组件清单声明其中任一项则非法。开工时若测试改了名，以这条语义为准。技能加载器自己不读 `requires.operations`。
 
-错误码闭集：`skill_manifest_invalid`、`skill_proactive_unsupported`、`skill_body_too_large`、`skill_revision_conflict`、`skill_capability_unknown`、`skill_capability_missing`、`skill_provider_ambiguous`、`skill_not_active`、`skill_not_admitted`、`skill_eval_invalid`、`skill_eval_empty`、`skill_eval_failed`、`skill_activation_mixed`、`skill_pointer_conflict`。
+错误码闭集（每个码都有唯一触发条件；测试按此表写）：
+
+| 码 | 何时抛 | HTTP |
+|---|---|---|
+| `skill_manifest_invalid` | SL-1 解析失败（缺必填字段、字段类型错、能力 id 字符集不合法） | 400 |
+| `skill_proactive_unsupported` | frontmatter 声明主动技能（D6，v1 不做） | 400 |
+| `skill_body_too_large` | 正文超过 32 KiB | 413 |
+| `skill_revision_conflict` | 同来源同 semver 但内容摘要不同（提示升版本） | 409 |
+| `skill_capability_unknown` | 依赖的能力 id 不在 `docs/capabilities/REGISTRY.md` 登记表里（安装时就拒） | 400 |
+| `skill_capability_missing` | 登记过的能力当前零个可用提供者（准入时拒，§4.6 第 1 条） | 409 |
+| `skill_provider_ambiguous` | 同一能力有多个提供者（准入时拒，§4.6） | 409 |
+| `skill_not_active` | 普通 `start_run` 带的 `skill_id` 不存在或没有指针（§4.8） | 409 |
+| `skill_not_admitted` | 入站或定时自唤醒路径带 `skill_id`（§4.8） | 400 |
+| `skill_eval_invalid` | 评测文件解析失败 | 400 |
+| `skill_eval_empty` | `contains` 期望为空 | 400 |
+| `skill_eval_failed` | 激活时服务端重跑有失败用例且未带匹配的接受 id；响应带用例摘要，指针不动 | 409 |
+| `skill_activation_mixed` | 一次激活同时换正文和评测两侧（回滚除外，见下） | 400 |
+| `skill_pointer_conflict` | CAS 失败：预期指针代次与当前不符 | 409 |
+
+回滚恢复一整对历史上已批准的组合，是唯一允许两侧同时变化的操作；确认摘要在回滚时显示「正文与评测两侧均换回」。
 
 激活的测试三条：渲染进程经普通代理调用被拒；legacy 共享令牌调用被拒；同一目标重复提交幂等（指针与代次都不动，历史不增加）。再加：不在 `supported` 列表里时 CLI 提升失败。变异是从 `supported` 去掉这一条，或把路由加回 `ALLOWED_PROXY_ROUTES`。
 
@@ -357,6 +382,8 @@ ADR-040 §6 的四条，按评审推荐定为：
 本版没有留下产品取舍。§9 只是开工时要再读一遍的事实，不是待选方案。
 
 ## 9. 开工时再核对的事实
+
+各片验收按符号名定位代码（函数名、测试名），文中行号只作参考，C9 合入后会漂移。
 
 - C9 的排除测试在本树不存在。合入后按「组件声明 `skills.*` 即非法」对上真实测试名，再改那一份夹具。
 - 迁移的实际编号以开工时 `rust/crates/agent24-store/migrations/` 的最大号为准。
