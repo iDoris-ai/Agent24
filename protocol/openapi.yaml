@@ -6965,6 +6965,7 @@ components:
         - inserted
         - pointer
         - generation
+        - text_consistency
       properties:
         skill_id: { type: string }
         origin: { type: string, enum: [imported, user] }
@@ -6982,6 +6983,13 @@ components:
             - $ref: "#/components/schemas/SkillPointer"
             - type: "null"
         generation: { type: integer }
+        text_consistency:
+          description: >-
+            Counts for the body and evals this install wrote or reused.
+            Null when that pair cannot be checked.
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
     SkillPointer:
       type: object
       required: [origin, body_revision_id, evals_revision_id, generation]

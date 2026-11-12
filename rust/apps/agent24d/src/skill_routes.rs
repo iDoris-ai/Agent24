@@ -36,6 +36,10 @@ const MAX_FILES: usize = 32;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024;
 /// Direct children of `<data_dir>/skills`. Plan §4.3.
 const MAX_SKILL_DIRS: usize = 64;
+/// Dirents read past the file cap before a skill directory stops. A skill
+/// that is exactly at 32 files still finishes. One far past it is not listed
+/// to the end.
+const ENTRY_READ_SLACK: usize = 8;
 /// Directories opened under one skill, including the skill directory.
 const MAX_WALK_DIRS: usize = 8;
 /// Skill directory is depth 1. `evals/` is depth 2.
@@ -73,6 +77,9 @@ pub(crate) struct InstallResponse {
     inserted: bool,
     pointer: Option<PointerView>,
     generation: i64,
+    /// Counts for the body and evals this call wrote or reused. Both sides
+    /// are the bytes in hand, not a later pairing of unrelated rows.
+    text_consistency: Option<ConsistencyView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -103,9 +110,9 @@ struct SkillDetail {
     pointer: Option<PointerView>,
     generation: i64,
     revisions: Vec<RevisionView>,
-    /// Text-consistency counts for the newest body row and the newest evals
-    /// row of that same origin. v1 has no install-pair table, so this is not
-    /// matched by semver. Provider status is SL-5 and is omitted.
+    /// Counts for the pointer's body and evals revisions. `None` when the
+    /// skill has no pointer. v1 does not infer a pair. Provider status is
+    /// SL-5 and is omitted.
     text_consistency: Option<ConsistencyView>,
 }
 
@@ -220,10 +227,25 @@ pub async fn post_skill_scan(State(state): State<AppState>, body: Body) -> Respo
 /// Startup scan of `<data_dir>/skills`. A missing directory is an empty scan.
 /// One bad skill does not fail the caller.
 pub async fn scan_installed_user_skills(store: &Store) -> ScanReport {
+    // Test seam so a startup scan can be held past the ready line.
+    // `AGENT24_SKILL_SCAN_DELAY_MS` is not a LaunchAgent setting.
+    pause_scan_for_tests().await;
     let Some(dir) = agent24_protocol::state_file::state_dir() else {
         return ScanReport::empty();
     };
     scan_root(store, &dir.join("skills")).await
+}
+
+async fn pause_scan_for_tests() {
+    let Ok(raw) = std::env::var("AGENT24_SKILL_SCAN_DELAY_MS") else {
+        return;
+    };
+    let Ok(ms) = raw.parse::<u64>() else {
+        return;
+    };
+    if (1..=5_000).contains(&ms) {
+        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+    }
 }
 
 /// Scan `skills_root` as `origin=user`. Does not create or modify the directory.
@@ -397,13 +419,9 @@ async fn store_pair(
     ineffective: Vec<String>,
 ) -> Result<StoredSkill, Fail> {
     let created_at = chrono::Utc::now().to_rfc3339();
-    // Body rows store the manifest digest, recomputed from this parse. The
-    // store does not depend on the skill crate, so the check stays here.
+    // Body rows store this parse's manifest digest. The store does not
+    // recompute it; calling `content_digest` twice cannot check anything.
     let content_digest = manifest.content_digest();
-    let recomputed = manifest.content_digest();
-    if content_digest != recomputed {
-        return Err(Fail::internal("recompute body digest"));
-    }
     let body = NewSkillRevision {
         revision_id: uuid::Uuid::new_v4().to_string(),
         skill_id: manifest.name.clone(),
@@ -446,6 +464,7 @@ async fn store_pair(
             inserted,
             pointer: pointer.map(pointer_view),
             generation,
+            text_consistency: consistency_view(origin, manifest, eval_text),
         },
     })
 }
@@ -463,6 +482,8 @@ async fn skill_list(store: &Store) -> Result<SkillListResponse, Fail> {
             continue;
         }
         let key = (row.skill_id.clone(), row.origin.as_str().to_owned());
+        // Stored semver of the newest body row. A version-only reuse does not
+        // write the semver parsed on that later install.
         let replace = newest
             .get(&key)
             .is_none_or(|(_, created)| row.created_at.as_str() >= created.as_str());
@@ -533,7 +554,7 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         .await
         .map_err(|_| Fail::internal("read pointer"))?;
     let generation = pointer.as_ref().map(|row| row.generation).unwrap_or(0);
-    let text_consistency = text_consistency(store, &mine).await?;
+    let text_consistency = text_consistency(store, pointer.as_ref()).await?;
     let revisions = mine
         .iter()
         .map(|row| RevisionView {
@@ -554,32 +575,50 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
     })
 }
 
+fn consistency_view(
+    origin: SkillOrigin,
+    manifest: &SkillManifest,
+    eval_text: &str,
+) -> Option<ConsistencyView> {
+    if manifest.evals.is_empty() || eval_text.is_empty() {
+        return Some(ConsistencyView {
+            consistent: 0,
+            total: 0,
+        });
+    }
+    match agent24_skill::check_text_consistency(
+        &manifest.evals,
+        eval_text,
+        &manifest.body,
+        skill_origin(origin),
+        &manifest.content_digest(),
+    ) {
+        Ok(report) => {
+            let (consistent, total) = report.consistent_counts();
+            Some(ConsistencyView { consistent, total })
+        }
+        Err(SkillError::EvalEmpty) => Some(ConsistencyView {
+            consistent: 0,
+            total: 0,
+        }),
+        Err(_) => None,
+    }
+}
+
+/// The activated pair only. No pointer means no consistency count.
 async fn text_consistency(
     store: &Store,
-    rows: &[agent24_store::SkillRevisionMeta],
+    pointer: Option<&agent24_store::SkillPointer>,
 ) -> Result<Option<ConsistencyView>, Fail> {
-    let body = rows
-        .iter()
-        .rev()
-        .find(|row| row.kind == SkillRevisionKind::Body);
-    let Some(body) = body else {
-        return Ok(None);
-    };
-    // v1 has no pair table. The newest body and the newest evals row of the
-    // same origin are the pair the latest install wrote or reused.
-    let evals = rows
-        .iter()
-        .rev()
-        .find(|row| row.kind == SkillRevisionKind::Evals && row.origin == body.origin);
-    let Some(evals) = evals else {
+    let Some(pointer) = pointer else {
         return Ok(None);
     };
     let body_row = store
-        .get_skill_revision(&body.revision_id)
+        .get_skill_revision(&pointer.body_revision_id)
         .await
         .map_err(|_| Fail::internal("read body"))?;
     let eval_row = store
-        .get_skill_revision(&evals.revision_id)
+        .get_skill_revision(&pointer.evals_revision_id)
         .await
         .map_err(|_| Fail::internal("read evals"))?;
     let (Some(body_row), Some(eval_row)) = (body_row, eval_row) else {
@@ -591,32 +630,10 @@ async fn text_consistency(
     let Ok(eval_text) = String::from_utf8(eval_row.content) else {
         return Ok(None);
     };
-    let Ok(manifest) = parse_for_origin(body.origin, &markdown) else {
+    let Ok(manifest) = parse_for_origin(body_row.origin, &markdown) else {
         return Ok(None);
     };
-    if manifest.evals.is_empty() || eval_text.is_empty() {
-        return Ok(Some(ConsistencyView {
-            consistent: 0,
-            total: 0,
-        }));
-    }
-    match agent24_skill::check_text_consistency(
-        &manifest.evals,
-        &eval_text,
-        &manifest.body,
-        skill_origin(body.origin),
-        &manifest.content_digest(),
-    ) {
-        Ok(report) => {
-            let (consistent, total) = report.consistent_counts();
-            Ok(Some(ConsistencyView { consistent, total }))
-        }
-        Err(SkillError::EvalEmpty) => Ok(Some(ConsistencyView {
-            consistent: 0,
-            total: 0,
-        })),
-        Err(_) => Ok(None),
-    }
+    Ok(consistency_view(body_row.origin, &manifest, &eval_text))
 }
 
 fn parse_for_origin(origin: SkillOrigin, markdown: &str) -> Result<SkillManifest, SkillError> {
@@ -821,25 +838,38 @@ fn io_message(err: rustix::io::Errno) -> String {
 }
 
 #[cfg(unix)]
-fn entry_names(dir: &OwnedFd) -> Result<Vec<String>, String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Walk {
+    Next,
+    Stop,
+}
+
+/// Read `readdir` one entry at a time. `visit` returning [`Walk::Stop`] ends
+/// the listing. Names are not collected and then sorted.
+#[cfg(unix)]
+fn for_each_entry(
+    dir: &OwnedFd,
+    mut visit: impl FnMut(&str) -> Result<Walk, String>,
+) -> Result<(), String> {
     let listed = rustix::fs::Dir::read_from(dir).map_err(io_message)?;
-    let mut names = Vec::new();
     for entry in listed {
         let entry = entry.map_err(io_message)?;
         let name = entry
             .file_name()
             .to_str()
-            .map_err(|_| "skill directory entry is not utf-8".to_owned())?;
+            .map_err(|_| "skill directory entry is not utf-8".to_owned())?
+            .to_owned();
         if name.is_empty() || name == "." || name == ".." {
             continue;
         }
         if name.contains('/') || name.contains('\\') {
             return Err(format!("skill directory entry escapes: {name}"));
         }
-        names.push(name.to_owned());
+        if visit(&name)? == Walk::Stop {
+            break;
+        }
     }
-    names.sort();
-    Ok(names)
+    Ok(())
 }
 
 fn prepare_root(root: &Path) -> Vec<Prepared> {
@@ -879,39 +909,26 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
                 )];
             }
         };
-        let names = match entry_names(&root_fd) {
-            Ok(names) => names,
-            Err(message) => {
-                return vec![failed(
-                    root.display().to_string(),
-                    "skill_manifest_invalid",
-                    &message,
-                )];
-            }
-        };
         let mut prepared = Vec::new();
         let mut skill_dirs = 0usize;
-        for name in names {
-            match open_directory(&root_fd, name.as_str()) {
+        let mut capped = false;
+        if let Err(message) = for_each_entry(&root_fd, |name| {
+            match open_directory(&root_fd, name) {
                 OpenDir::Dir(fd) => {
                     skill_dirs += 1;
                     if skill_dirs > MAX_SKILL_DIRS {
-                        prepared.push(failed(
-                            name,
-                            "skill_manifest_invalid",
-                            "skill directory count exceeds 64",
-                        ));
-                        continue;
+                        capped = true;
+                        return Ok(Walk::Stop);
                     }
-                    prepared.push(prepare_skill(&name, fd));
+                    prepared.push(prepare_skill(name, fd));
                 }
                 OpenDir::NotDirectory => {}
                 OpenDir::Symlink => {
-                    prepared.push(failed(&name, "skill_manifest_invalid", "symlink rejected"));
+                    prepared.push(failed(name, "skill_manifest_invalid", "symlink rejected"));
                 }
                 OpenDir::Missing => {
                     prepared.push(failed(
-                        &name,
+                        name,
                         "skill_manifest_invalid",
                         "skill directory is missing",
                     ));
@@ -920,6 +937,20 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
                     prepared.push(failed(name, "skill_manifest_invalid", &message));
                 }
             }
+            Ok(Walk::Next)
+        }) {
+            return vec![failed(
+                root.display().to_string(),
+                "skill_manifest_invalid",
+                &message,
+            )];
+        }
+        if capped {
+            prepared.push(failed(
+                ".",
+                "skill_manifest_invalid",
+                "skill directory count exceeds 64",
+            ));
         }
         prepared
     }
@@ -968,23 +999,28 @@ fn walk_skill(
     if quota.dirs > MAX_WALK_DIRS {
         return Err("skill directory exceeds 8 directories".to_owned());
     }
-    for name in entry_names(dir)? {
+    let mut entries = 0usize;
+    for_each_entry(dir, |name| {
+        entries += 1;
+        if entries > MAX_FILES + ENTRY_READ_SLACK {
+            return Err("skill directory exceeds 32 files".to_owned());
+        }
         let rel = if rel_dir.is_empty() {
-            name.clone()
+            name.to_owned()
         } else {
             format!("{rel_dir}/{name}")
         };
-        match open_directory(dir, name.as_str()) {
+        match open_directory(dir, name) {
             OpenDir::Dir(child) => {
                 walk_skill(&child, &rel, depth + 1, quota, ingested, skipped)?;
             }
             OpenDir::Symlink => return Err(format!("symlink rejected: {rel}")),
-            OpenDir::NotDirectory => read_regular(dir, &name, &rel, quota, ingested, skipped)?,
+            OpenDir::NotDirectory => read_regular(dir, name, &rel, quota, ingested, skipped)?,
             OpenDir::Missing => return Err(format!("skill directory entry is missing: {rel}")),
             OpenDir::Error(message) => return Err(message),
         }
-    }
-    Ok(())
+        Ok(Walk::Next)
+    })
 }
 
 #[cfg(unix)]
@@ -1194,6 +1230,8 @@ mod tests {
         assert!(first["pointer"].is_null());
         assert_eq!(first["generation"], 0);
         assert_eq!(first["semver"], "0.1.0");
+        assert_eq!(first["text_consistency"]["consistent"], 0);
+        assert_eq!(first["text_consistency"]["total"], 0);
         assert!(first["ineffective"].as_array().unwrap().is_empty());
         let (status, second) = call(
             &state,
@@ -1223,8 +1261,7 @@ mod tests {
         assert!(!detail.to_string().contains("hello"));
         assert_eq!(detail["generation"], 0);
         assert!(detail["pointer"].is_null());
-        assert_eq!(detail["text_consistency"]["consistent"], 0);
-        assert_eq!(detail["text_consistency"]["total"], 0);
+        assert!(detail["text_consistency"].is_null(), "{detail}");
         assert!(detail.get("providers").is_none());
     }
 
@@ -1489,6 +1526,9 @@ mod tests {
         assert_eq!(report.skills[0].origin, "user");
         assert_eq!(report.skills[0].skill_id, "weekly-report");
         assert!(report.skills[0].pointer.is_none());
+        let counts = report.skills[0].text_consistency.as_ref().unwrap();
+        assert_eq!(counts.consistent, 1);
+        assert_eq!(counts.total, 1);
         assert!(
             report.skills[0]
                 .ineffective
@@ -1505,8 +1545,7 @@ mod tests {
         assert!(stored.contains("hello"), "{stored}");
         let (status, detail) = call(&state, "GET", "/api/v1/skills/weekly-report", None).await;
         assert_eq!(status, StatusCode::OK, "{detail}");
-        assert_eq!(detail["text_consistency"]["consistent"], 1);
-        assert_eq!(detail["text_consistency"]["total"], 1);
+        assert!(detail["text_consistency"].is_null(), "{detail}");
         assert!(!detail.to_string().contains("NOTEONLY"));
     }
 
@@ -1668,6 +1707,15 @@ mod tests {
         assert_eq!(second["semver"], "2.0.0");
         assert_eq!(second["inserted"], false);
         assert_eq!(second["body_revision_id"], first["body_revision_id"]);
+        let (status, list) = call(&state, "GET", "/api/v1/skills", None).await;
+        assert_eq!(status, StatusCode::OK, "{list}");
+        let listed = list["skills"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["skill_id"] == "weekly-report")
+            .unwrap();
+        assert_eq!(listed["semver"], "1.0.0", "{listed}");
         let stored = stored_text(&state.store).await;
         assert!(stored.contains("version: 1.0.0"), "{stored}");
         assert!(!stored.contains("version: 2.0.0"), "{stored}");
@@ -1697,11 +1745,12 @@ mod tests {
             upgraded["evals_revision_id"],
             installed["evals_revision_id"]
         );
+        assert_eq!(upgraded["text_consistency"]["total"], 1);
+        assert_eq!(upgraded["text_consistency"]["consistent"], 0);
         let (status, detail) = call(&state, "GET", "/api/v1/skills/weekly-notes", None).await;
         assert_eq!(status, StatusCode::OK, "{detail}");
-        assert!(!detail["text_consistency"].is_null(), "{detail}");
-        assert_eq!(detail["text_consistency"]["total"], 1);
-        assert_eq!(detail["text_consistency"]["consistent"], 0);
+        assert!(detail["pointer"].is_null(), "{detail}");
+        assert!(detail["text_consistency"].is_null(), "{detail}");
 
         let again = "---\nname: weekly-notes\nversion: 2.0.0\ndescription: 周报\nevals: evals/check.jsonl\n---\nhello\n";
         let (status, conflict) = call(
@@ -1713,6 +1762,111 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
         assert_eq!(conflict["error"]["code"], "skill_revision_conflict");
+    }
+
+    #[tokio::test]
+    async fn interleaved_installs_do_not_invent_a_pair_on_the_detail() {
+        let state = crate::server::tests::state().await;
+        let case = |expect: &str| {
+            format!("{{\"input\":\"x\",\"expect\":\"{expect}\",\"judge\":\"contains\"}}\n")
+        };
+        let install = |version: &str, body: &str, evals: &str| {
+            let markdown = format!(
+                "---\nname: weekly-report\nversion: {version}\ndescription: 周报\nevals: evals/check.jsonl\n---\n{body}"
+            );
+            json!({
+                "markdown": markdown,
+                "evals": [{ "name": "evals/check.jsonl", "content": evals }],
+            })
+            .to_string()
+        };
+        let first_body = install("1.0.0", "alpha-token\n", &case("alpha-token"));
+        let (status, first) = call(&state, "POST", "/api/v1/skills", Some(&first_body)).await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        assert_eq!(first["text_consistency"]["consistent"], 1);
+        assert_eq!(first["text_consistency"]["total"], 1);
+        let second_evals = format!("{}{}", case("beta-token"), case("only-in-e2"));
+        let second_body = install("2.0.0", "beta-token\n", &second_evals);
+        let (status, second) = call(&state, "POST", "/api/v1/skills", Some(&second_body)).await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["text_consistency"]["consistent"], 1);
+        assert_eq!(second["text_consistency"]["total"], 2);
+        let third_body = install("3.0.0", "alpha-token\n", &case("beta-token"));
+        let (status, third) = call(&state, "POST", "/api/v1/skills", Some(&third_body)).await;
+        assert_eq!(status, StatusCode::OK, "{third}");
+        assert_eq!(third["body_revision_id"], first["body_revision_id"]);
+        assert_ne!(third["evals_revision_id"], first["evals_revision_id"]);
+        assert_ne!(third["evals_revision_id"], second["evals_revision_id"]);
+        // (A, E3) is inconsistent. (B, E3) would have been consistent.
+        assert_eq!(third["text_consistency"]["consistent"], 0, "{third}");
+        assert_eq!(third["text_consistency"]["total"], 1, "{third}");
+        let (status, detail) = call(&state, "GET", "/api/v1/skills/weekly-report", None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert!(detail["pointer"].is_null(), "{detail}");
+        assert!(detail["text_consistency"].is_null(), "{detail}");
+
+        let outcome = state
+            .store
+            .activate_skill(&agent24_store::NewSkillActivation {
+                activation_id: "act-pair".to_owned(),
+                skill_id: "weekly-report".to_owned(),
+                expected_generation: 0,
+                body_revision_id: third["body_revision_id"].as_str().unwrap().to_owned(),
+                evals_revision_id: third["evals_revision_id"].as_str().unwrap().to_owned(),
+                binding: agent24_store::SkillEvalBinding {
+                    result_id: "result-pair".to_owned(),
+                    segment_digest: "segment".to_owned(),
+                    renderer_version: "skill-render-1".to_owned(),
+                    cases_json: r#"[{"id":"c1","passed":true}]"#.to_owned(),
+                    accepted_json: "[]".to_owned(),
+                },
+                created_at: "2026-11-12T00:00:03Z".to_owned(),
+                actor: "host".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            agent24_store::SkillActivationOutcome::Activated { .. }
+        ));
+        let (status, pointed) = call(&state, "GET", "/api/v1/skills/weekly-report", None).await;
+        assert_eq!(status, StatusCode::OK, "{pointed}");
+        assert_eq!(
+            pointed["pointer"]["body_revision_id"],
+            third["body_revision_id"]
+        );
+        assert_eq!(
+            pointed["pointer"]["evals_revision_id"],
+            third["evals_revision_id"]
+        );
+        assert_eq!(pointed["text_consistency"]["consistent"], 0, "{pointed}");
+        assert_eq!(pointed["text_consistency"]["total"], 1, "{pointed}");
+    }
+
+    #[tokio::test]
+    async fn user_scan_stops_at_64_skill_directories_with_one_summary_error() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        for index in 0..70 {
+            let name = format!("skill-{index:02}");
+            let dir = skills.join(&name);
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!(
+                    "---\nname: {name}\nversion: 1.0.0\ndescription: 周报\nrequires: []\nevals: []\n---\nhello\n"
+                ),
+            )
+            .unwrap();
+        }
+        let report = scan_root(&state.store, &skills).await;
+        assert_eq!(report.skills.len(), 64, "{report:?}");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert_eq!(report.errors[0].path, ".");
+        assert!(report.errors[0].message.contains("64"), "{report:?}");
+        assert_eq!(state.store.list_skill_revisions().await.unwrap().len(), 128);
     }
 
     #[tokio::test]

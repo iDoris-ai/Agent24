@@ -3569,6 +3569,100 @@ mod tests {
         );
     }
 
+    /// v1 known limitation. A version-only reuse does not store the new semver,
+    /// so the same semver with a different digest inserts another row. Pointers
+    /// and pins use revision ids. The semver label can name two bodies.
+    #[tokio::test]
+    async fn known_limitation_version_reuse_lets_the_same_semver_insert_another_body() {
+        let store = Store::open_memory().await.unwrap();
+        let evals = content_digest_of(b"evals");
+        store
+            .install_skill_pair(
+                &pair_row(
+                    "b1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A",
+                ),
+                &pair_row(
+                    "e1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        let reused = store
+            .install_skill_pair(
+                &pair_row(
+                    "b2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A",
+                ),
+                &pair_row(
+                    "e2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reused.0,
+            SkillRevisionInsert::Existing {
+                revision_id: "b1".to_owned()
+            }
+        );
+        let inserted = store
+            .install_skill_pair(
+                &pair_row(
+                    "b3",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-b",
+                    b"B",
+                ),
+                &pair_row(
+                    "e3",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inserted.0,
+            SkillRevisionInsert::Inserted {
+                revision_id: "b3".to_owned()
+            }
+        );
+        assert_eq!(revision_count(&store).await, 3);
+        assert_eq!(
+            store
+                .get_skill_revision("b3")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"B"
+        );
+    }
+
     #[tokio::test]
     async fn dedupe_hit_rejects_a_revision_id_owned_by_another_row() {
         let store = Store::open_memory().await.unwrap();

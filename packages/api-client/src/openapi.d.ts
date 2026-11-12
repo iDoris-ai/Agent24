@@ -3472,6 +3472,8 @@ export interface components {
             inserted: boolean;
             pointer: components["schemas"]["SkillPointer"] | null;
             generation: number;
+            /** @description Counts for the body and evals this install wrote or reused. Null when that pair cannot be checked. */
+            text_consistency: components["schemas"]["SkillConsistency"] | null;
         };
         SkillPointer: {
             /** @enum {string} */

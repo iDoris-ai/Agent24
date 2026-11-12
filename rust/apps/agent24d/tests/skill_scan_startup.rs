@@ -44,12 +44,28 @@ fn serve_scans_the_user_directory_after_it_is_ready() {
     )
     .unwrap();
 
-    let (port, token, run) = serve(home.path(), data.path());
+    // The scan sleeps after the ready line, so the listener answers 404
+    // before the skill row exists.
+    let (port, token, run) = serve_with(
+        home.path(),
+        data.path(),
+        &[("AGENT24_SKILL_SCAN_DELAY_MS", "1500")],
+    );
     let by = Instant::now() + Duration::from_secs(15);
-    let mut last;
+    let mut saw_absent = false;
+    let mut last = String::new();
     loop {
+        assert!(
+            Instant::now() < by,
+            "serve did not answer before the scan, or the skill never appeared: {last}"
+        );
         match get_skill(port, &token) {
+            Ok((404, _)) => saw_absent = true,
             Ok((200, body)) => {
+                assert!(
+                    saw_absent,
+                    "skill was stored before the server answered; scan was not shown to wait: {body}"
+                );
                 let detail: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
                 assert_eq!(detail["skill_id"], "weekly-report", "{detail}");
                 assert!(
@@ -63,11 +79,7 @@ fn serve_scans_the_user_directory_after_it_is_ready() {
             Ok((status, body)) => last = format!("{status} {body}"),
             Err(err) => last = err,
         }
-        assert!(
-            Instant::now() < by,
-            "user skill was not visible after serve became ready: {last}"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(20));
     }
     drop(run);
 }
@@ -126,10 +138,17 @@ fn rescan_route_rejects_a_path() {
 }
 
 fn serve(home: &Path, data: &Path) -> (u16, String, Running) {
+    serve_with(home, data, &[])
+}
+
+fn serve_with(home: &Path, data: &Path, extra: &[(&str, &str)]) -> (u16, String, Running) {
     let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("AGENT24_DATA_DIR", data);
+    for (key, value) in extra {
+        cmd.env(key, value);
+    }
     let mut child = cmd
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
