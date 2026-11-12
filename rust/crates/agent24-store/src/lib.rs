@@ -65,6 +65,7 @@ mod allocation_retention_plan;
 mod allocation_retention_writer;
 mod allocation_types;
 mod audit;
+mod capability_token_audit;
 mod conn_phase;
 mod decision_log;
 mod inbound;
@@ -132,6 +133,10 @@ pub use allocation_types::{
     AllocationFailureReason, AllocationId, AllocationPhase, AllocationValueError,
 };
 pub use audit::AuditEntry;
+pub use capability_token_audit::{
+    COMPONENT_RUNTIME_TTL_SECONDS, CapabilityDenyReason, CapabilityRevokeReason,
+    CapabilityTokenAuditEvent, DEV_BRIDGE_COMPONENT_ID, DEV_BRIDGE_OPERATION,
+};
 pub use decision_log::{
     DecisionLogExportRow, DecisionLogRow, DecisionOutcomeRow, NewDecisionLogEntry,
     NewDecisionOutcome,

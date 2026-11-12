@@ -251,7 +251,13 @@ fn section_3_rows_match_operation_and_level() {
         (
             "POST",
             "/inbound/events",
-            "InboundWrite",
+            "InboundIngest",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/capabilities/bridge",
+            "CapabilityMint",
             AssuranceLevel::Elevated,
         ),
     ] {
@@ -403,6 +409,43 @@ fn creative_allowlist_is_unchanged_and_new_routes_stay_closed() {
     assert!(Operation::from_action("not.an.operation").is_none());
 }
 
+/// A second route that reuses `InboundIngest` is not on the explicit list.
+/// Changing `component_route_permitted` to `true`, or to "the catalog
+/// operation is InboundIngest", turns the extra-row assertion red.
+#[test]
+fn an_extra_inbound_ingest_route_is_not_admitted() {
+    let extra = RoutePolicy {
+        method: "POST",
+        template: "/api/v1/inbound/events/replay",
+        operation: Operation::InboundIngest,
+        level: AssuranceLevel::Everyday,
+    };
+    assert_eq!(extra.operation, Operation::InboundIngest);
+    assert!(!component_route_permitted(&Method::POST, extra.template));
+    assert!(component_route_permitted(
+        &Method::POST,
+        "/api/v1/inbound/events"
+    ));
+    for policy in policies() {
+        let open = policy.method == "POST" && policy.template == "/api/v1/inbound/events";
+        assert_eq!(
+            component_route_permitted(&method(policy.method), policy.template),
+            open,
+            "{} {}",
+            policy.method,
+            policy.template
+        );
+    }
+    assert!(!component_route_permitted(
+        &Method::POST,
+        "/api/v1/documents/x"
+    ));
+    assert!(!component_route_permitted(
+        &Method::GET,
+        "/api/v1/inbound/events"
+    ));
+}
+
 #[test]
 fn method_splits_shutdown_and_memory_settings() {
     assert_eq!(
@@ -463,7 +506,11 @@ fn method_splits_shutdown_and_memory_settings() {
     );
     assert_eq!(
         required_operation(&Method::POST, "/api/v1/inbound/events"),
-        Some(Operation::InboundWrite)
+        Some(Operation::InboundIngest)
+    );
+    assert_eq!(
+        Operation::InboundIngest.assurance_level(),
+        Some(AssuranceLevel::Everyday)
     );
     assert_eq!(
         required_operation(&Method::PUT, "/api/v1/inbound/allowlist"),

@@ -64,6 +64,9 @@ pub enum Operation {
     SkillsRead,
     SkillsInstall,
     SkillsActivate,
+    /// C9-B dev-bridge ingest. Everyday, and not on a shell or creative token.
+    /// Route admission is [`super::component_route_permitted`], not this variant.
+    InboundIngest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,6 +159,7 @@ impl Operation {
             Self::SkillsRead => "skills.read",
             Self::SkillsInstall => "skills.install",
             Self::SkillsActivate => "skills.activate",
+            Self::InboundIngest => "inbound.ingest",
         }
     }
 
@@ -227,6 +231,7 @@ impl Operation {
             "skills.read" => Self::SkillsRead,
             "skills.install" => Self::SkillsInstall,
             "skills.activate" => Self::SkillsActivate,
+            "inbound.ingest" => Self::InboundIngest,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,

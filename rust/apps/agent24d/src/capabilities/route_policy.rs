@@ -78,6 +78,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/models", Operation::ModelsRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/decide/profile", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/capabilities/creative", Operation::CapabilityMint, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/capabilities/bridge", Operation::CapabilityMint, AssuranceLevel::Elevated),
     row("POST", "/api/v1/capabilities/{capability_id}/revoke", Operation::CapabilityRevoke, AssuranceLevel::Elevated),
     row("GET", "/api/v1/usage", Operation::UsageRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/timings", Operation::UsageRead, AssuranceLevel::Everyday),
@@ -181,9 +182,10 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/inbound/policy", Operation::InboundRead, AssuranceLevel::Everyday),
     row("PUT", "/api/v1/inbound/policy", Operation::InboundWrite, AssuranceLevel::Elevated),
     row("GET", "/api/v1/inbound/events", Operation::InboundRead, AssuranceLevel::Everyday),
-    // X11-2g. Registered so the kernel scan matches this catalog. Capabilities
-    // mode answers 404 before the operation is consulted (middleware).
-    row("POST", "/api/v1/inbound/events", Operation::InboundWrite, AssuranceLevel::Elevated),
+    // C9-B. Everyday `inbound.ingest`. The component token's route list is
+    // [`component_route_permitted`], not "every row with this operation".
+    // Without `A24_DEV_TOOL=1` the middleware answers 404.
+    row("POST", "/api/v1/inbound/events", Operation::InboundIngest, AssuranceLevel::Everyday),
     // Skill loader SL-3. Activate is SL-4 and is not registered here.
     // These rows stay out of creative_route_permitted.
     row("GET", "/api/v1/skills", Operation::SkillsRead, AssuranceLevel::Everyday),
@@ -227,6 +229,13 @@ pub fn required_operation(method: &Method, matched_route_template: &str) -> Opti
 /// stops here after the bearer check.
 pub fn creative_route_permitted(method: &Method, template: &str) -> bool {
     method == Method::GET && template == "/api/v1/models"
+}
+
+/// Component-runtime tokens may call only this list. A new route mapped to
+/// [`Operation::InboundIngest`] is not admitted: this function does not read
+/// the catalog. `ModuleRoute` and host-only routes are not on the list.
+pub fn component_route_permitted(method: &Method, template: &str) -> bool {
+    method == Method::POST && template == "/api/v1/inbound/events"
 }
 
 pub fn decide(
