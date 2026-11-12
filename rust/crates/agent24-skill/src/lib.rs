@@ -303,6 +303,9 @@ pub enum SkillError {
     EvalInvalid { detail: String },
     #[error("skill_eval_empty")]
     EvalEmpty,
+    /// `scans` is the collection noun of `POST /api/v1/skills/scans`.
+    #[error("skill_id_reserved")]
+    IdReserved,
 }
 
 impl SkillError {
@@ -314,6 +317,7 @@ impl SkillError {
             Self::CapabilityUnknown { .. } => "skill_capability_unknown",
             Self::EvalInvalid { .. } => "skill_eval_invalid",
             Self::EvalEmpty => "skill_eval_empty",
+            Self::IdReserved => "skill_id_reserved",
         }
     }
 
@@ -397,6 +401,9 @@ fn parse_markdown(markdown: &str, imported: bool) -> Result<SkillManifest, Skill
     let name = required_string(&pairs, "name")?;
     if !is_capability_id_shape(&name) {
         return Err(SkillError::manifest("name is not a skill id"));
+    }
+    if name == "scans" {
+        return Err(SkillError::IdReserved);
     }
     let version = required_string(&pairs, "version")?;
     if !is_semver(&version) {

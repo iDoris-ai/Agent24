@@ -1552,13 +1552,6 @@ pub async fn serve(
         ephemeral,
     )
     .await?;
-    let user_skills = crate::skill_routes::scan_installed_user_skills(&state.store).await;
-    if !user_skills.errors.is_empty() {
-        tracing::warn!(
-            skipped = user_skills.errors.len(),
-            "user skill directory scan skipped entries"
-        );
-    }
     let os_config = serve_steps::recover_durable_runs(
         &state,
         ephemeral,
@@ -1646,6 +1639,9 @@ pub async fn serve(
 
     serve_steps::fill_module_surfaces(&mut state, &catalogue);
     let enroll_authority = state.first_party.clone();
+    // The user-directory scan runs after the listener is accepting. It must
+    // not sit on the path that publishes the ready line.
+    let skill_scan_store = state.store.clone();
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     let still = serve_steps::advertise_readiness(
@@ -1682,6 +1678,15 @@ pub async fn serve(
     let router = guard_host_origin(router, local.port());
     let server = axum::serve(listener, router)
         .with_graceful_shutdown(async move { graceful_cancel.cancelled().await });
+    tokio::spawn(async move {
+        let user_skills = crate::skill_routes::scan_installed_user_skills(&skill_scan_store).await;
+        if !user_skills.errors.is_empty() {
+            tracing::warn!(
+                skipped = user_skills.errors.len(),
+                "user skill directory scan skipped entries"
+            );
+        }
+    });
 
     // Force-exit backstop: once cancelled, in-flight requests get
     // the HTTP window (1.5s) to finish, then the process exits regardless.

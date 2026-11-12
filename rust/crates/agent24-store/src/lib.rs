@@ -217,7 +217,7 @@ pub enum StoreError {
     #[error("conflict: {0}")]
     Conflict(String),
     /// Same skill, origin, semver, and kind already stores a different digest.
-    /// The stored row is left as it was. Plan §4.3.
+    /// The stored row is left as it was. Plan §4.2 / §4.11.
     #[error("skill_revision_conflict")]
     SkillRevisionConflict,
     /// Expected pointer generation does not match, and the requested pair is

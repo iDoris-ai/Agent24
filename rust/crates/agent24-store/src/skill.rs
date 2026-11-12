@@ -1,10 +1,11 @@
 //! Skill revisions, the current pointer, activation history, and eval bindings.
 //!
 //! SL-2 (skill-loader plan §4.2, §4.3, §4.5, §4.11). Revisions are insert-only.
-//! The dedup key is `(skill_id, origin, kind, content_digest)`: the same bytes
-//! return the stored id, including when only semver changed. The same semver
-//! with a different digest is [`StoreError::SkillRevisionConflict`] and does
-//! not replace the row.
+//! [`Store::insert_skill_revision`] checks a byte SHA-256, then dedupes on
+//! `(skill_id, origin, kind, content_digest)`. [`Store::install_skill_pair`]
+//! looks up `(skill_id, origin, semver, kind)` first. The same semver with a
+//! different digest is [`StoreError::SkillRevisionConflict`] and does not
+//! replace the row.
 //!
 //! The pointer moves by compare-and-swap on `generation`. No pointer row is
 //! generation 0. A stale generation is [`StoreError::SkillPointerConflict`]
@@ -16,8 +17,12 @@
 //! primary key stays `skill_id`. History rows carry `origin_from` / `origin_to`
 //! for the confirmation summary.
 //!
-//! `content_digest` is the lowercase hex SHA-256 of `content`. The store
-//! recomputes it and rejects a mismatch with [`StoreError::Conflict`].
+//! [`Store::insert_skill_revision`] treats `content_digest` as the lowercase
+//! hex SHA-256 of `content` and rejects a mismatch with [`StoreError::Conflict`].
+//! That single-row entry is what the store tests call. Install and scan use
+//! [`Store::install_skill_pair`]: a body row's digest is the manifest digest
+//! (not recomputed here), and an evals row's digest is the SHA-256 of its
+//! bytes, which the pair path recomputes.
 //!
 //! # `StoreError::Conflict` from this module
 //!
@@ -395,13 +400,18 @@ impl Store {
 
     /// Insert a body row and an evals row in one transaction.
     ///
-    /// The same `(skill_id, origin, kind, content_digest)` returns the stored
-    /// id even when the new bytes differ. A skill body's digest is the
-    /// manifest digest, so unknown frontmatter does not mint a new row.
-    /// A different digest at the same semver is
+    /// Lookup is `(skill_id, origin, semver, kind)` first. The same digest
+    /// returns the stored id, even when a body row's bytes differ (the body
+    /// digest is the manifest digest, so a version-only edit reuses the row).
+    /// A different digest at that semver is
     /// [`StoreError::SkillRevisionConflict`] and rolls back both inserts.
-    /// This path does not require the digest to be the SHA-256 of the bytes.
-    /// [`Store::insert_skill_revision`] still does.
+    /// Only a semver miss falls through to
+    /// `(skill_id, origin, kind, content_digest)`.
+    ///
+    /// An evals row's digest is the SHA-256 of its bytes. This path recomputes
+    /// it and rejects a mismatch with [`StoreError::Conflict`]. A body row is
+    /// not checked here; the route asserts the manifest digest.
+    /// [`Store::insert_skill_revision`] still requires a byte digest for both.
     ///
     /// # Errors
     /// Conflict, a kind mismatch, or storage.
@@ -611,7 +621,14 @@ async fn insert_revision_tx(
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = by_semver {
-        return same_bytes_or_conflict(&row, rev);
+        let stored_id: String = row.get("revision_id");
+        let decision = same_bytes_or_conflict(&row, rev)?;
+        if matches!(decision, SkillRevisionInsert::Existing { .. }) {
+            // Before accepting the dedupe hit: the caller's id must not already
+            // name some other revision.
+            ensure_revision_id_free_or_same(tx, &rev.revision_id, Some(&stored_id)).await?;
+        }
+        return Ok(decision);
     }
 
     let by_digest = sqlx::query(
@@ -628,8 +645,10 @@ async fn insert_revision_tx(
         let digest: String = row.get("content_digest");
         let content: Vec<u8> = row.get("content");
         if digest == rev.content_digest && content == rev.content {
+            let stored_id: String = row.get("revision_id");
+            ensure_revision_id_free_or_same(tx, &rev.revision_id, Some(&stored_id)).await?;
             return Ok(SkillRevisionInsert::Existing {
-                revision_id: row.get("revision_id"),
+                revision_id: stored_id,
             });
         }
         return Err(StoreError::Conflict(
@@ -637,15 +656,7 @@ async fn insert_revision_tx(
         ));
     }
 
-    let taken = sqlx::query("SELECT 1 AS present FROM skill_revision WHERE revision_id = ?")
-        .bind(&rev.revision_id)
-        .fetch_optional(&mut **tx)
-        .await?;
-    if taken.is_some() {
-        return Err(StoreError::Conflict(
-            "skill revision_id already stored".to_owned(),
-        ));
-    }
+    ensure_revision_id_free_or_same(tx, &rev.revision_id, None).await?;
 
     sqlx::query(
         "INSERT INTO skill_revision ( \
@@ -667,13 +678,39 @@ async fn insert_revision_tx(
     })
 }
 
-/// Same caller digest adopts the stored id and leaves its bytes alone.
-/// Same semver with a different digest conflicts. A fresh pair is inserted
-/// with the caller's digest, which for a skill body is the manifest digest.
+/// Semver first, then digest. An evals digest is the byte SHA-256 and is
+/// recomputed here. A body digest is the caller's manifest digest.
 async fn adopt_or_insert(
     tx: &mut Transaction<'_, Sqlite>,
     rev: &NewSkillRevision,
 ) -> Result<SkillRevisionInsert> {
+    if rev.kind == SkillRevisionKind::Evals {
+        let computed = content_digest_of(&rev.content);
+        if computed != rev.content_digest {
+            return Err(StoreError::Conflict(
+                "skill content_digest does not match content".to_owned(),
+            ));
+        }
+    }
+    let by_semver = sqlx::query(
+        "SELECT revision_id, content_digest FROM skill_revision \
+         WHERE skill_id = ? AND origin = ? AND semver = ? AND kind = ?",
+    )
+    .bind(&rev.skill_id)
+    .bind(rev.origin.as_str())
+    .bind(&rev.semver)
+    .bind(rev.kind.as_str())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if let Some(row) = by_semver {
+        let digest: String = row.get("content_digest");
+        if digest == rev.content_digest {
+            return Ok(SkillRevisionInsert::Existing {
+                revision_id: row.get("revision_id"),
+            });
+        }
+        return Err(StoreError::SkillRevisionConflict);
+    }
     let by_digest = sqlx::query(
         "SELECT revision_id FROM skill_revision \
          WHERE skill_id = ? AND origin = ? AND kind = ? AND content_digest = ?",
@@ -689,20 +726,27 @@ async fn adopt_or_insert(
             revision_id: row.get("revision_id"),
         });
     }
-    let by_semver = sqlx::query(
-        "SELECT revision_id, content_digest, content FROM skill_revision \
-         WHERE skill_id = ? AND origin = ? AND semver = ? AND kind = ?",
-    )
-    .bind(&rev.skill_id)
-    .bind(rev.origin.as_str())
-    .bind(&rev.semver)
-    .bind(rev.kind.as_str())
-    .fetch_optional(&mut **tx)
-    .await?;
-    if let Some(row) = by_semver {
-        return same_bytes_or_conflict(&row, rev);
-    }
     insert_pair_row(tx, rev).await
+}
+
+/// `adopting` is the revision a dedupe hit would return. The requested id may
+/// be that same row. Any other stored row with the requested id is
+/// [`StoreError::Conflict`], including when the bytes would otherwise dedupe.
+async fn ensure_revision_id_free_or_same(
+    tx: &mut Transaction<'_, Sqlite>,
+    requested: &str,
+    adopting: Option<&str>,
+) -> Result<()> {
+    let taken = sqlx::query("SELECT 1 AS present FROM skill_revision WHERE revision_id = ?")
+        .bind(requested)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if taken.is_some() && adopting != Some(requested) {
+        return Err(StoreError::Conflict(
+            "skill revision_id already stored".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn meta_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<SkillRevisionMeta> {
@@ -3299,7 +3343,7 @@ mod tests {
             "notes",
             "0.1.0",
             SkillRevisionKind::Evals,
-            "digest-evals",
+            &content_digest_of(b"evals-v1"),
             b"evals-v1",
         );
         let inserted = store.install_skill_pair(&body, &evals).await.unwrap();
@@ -3358,7 +3402,7 @@ mod tests {
             "fresh",
             "1.0.0",
             SkillRevisionKind::Evals,
-            "fresh-evals",
+            &content_digest_of(b"fresh evals"),
             b"fresh evals",
         );
         let err = store.install_skill_pair(&fresh, &clash).await.unwrap_err();
@@ -3369,6 +3413,204 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn semver_hit_with_another_digest_conflicts_before_digest_dedup() {
+        let store = Store::open_memory().await.unwrap();
+        let evals_a = content_digest_of(b"evals-a");
+        let evals_b = content_digest_of(b"evals-b");
+        store
+            .install_skill_pair(
+                &pair_row(
+                    "b1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A",
+                ),
+                &pair_row(
+                    "e1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals_a,
+                    b"evals-a",
+                ),
+            )
+            .await
+            .unwrap();
+        store
+            .install_skill_pair(
+                &pair_row(
+                    "b2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-b",
+                    b"B",
+                ),
+                &pair_row(
+                    "e2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals_b,
+                    b"evals-b",
+                ),
+            )
+            .await
+            .unwrap();
+        let err = store
+            .install_skill_pair(
+                &pair_row(
+                    "b3",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A-again",
+                ),
+                &pair_row(
+                    "e3",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals_b,
+                    b"evals-b",
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::SkillRevisionConflict), "{err:?}");
+        assert_eq!(revision_count(&store).await, 4);
+        assert_eq!(
+            store
+                .get_skill_revision("b2")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"B"
+        );
+        assert!(store.get_skill_revision("b3").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn same_manifest_digest_and_different_bytes_reuse_the_body_row() {
+        let store = Store::open_memory().await.unwrap();
+        let evals = content_digest_of(b"evals");
+        let first = store
+            .install_skill_pair(
+                &pair_row(
+                    "b1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"version: 1.0.0\nhello\n",
+                ),
+                &pair_row(
+                    "e1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first.0, SkillRevisionInsert::Inserted { .. }));
+        let again = store
+            .install_skill_pair(
+                &pair_row(
+                    "b2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"version: 2.0.0\nhello\n",
+                ),
+                &pair_row(
+                    "e2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            again.0,
+            SkillRevisionInsert::Existing {
+                revision_id: "b1".to_owned()
+            }
+        );
+        assert_eq!(
+            again.1,
+            SkillRevisionInsert::Existing {
+                revision_id: "e1".to_owned()
+            }
+        );
+        assert_eq!(revision_count(&store).await, 2);
+        assert_eq!(
+            store
+                .get_skill_revision("b1")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"version: 1.0.0\nhello\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn dedupe_hit_rejects_a_revision_id_owned_by_another_row() {
+        let store = Store::open_memory().await.unwrap();
+        let first = revision(
+            "rev-body-1",
+            "notes",
+            SkillOrigin::User,
+            "1.0.0",
+            SkillRevisionKind::Body,
+            "digest-a",
+            b"hello skill",
+        );
+        put(&store, &first).await;
+        put(
+            &store,
+            &revision(
+                "taken",
+                "other",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "other",
+                b"other",
+            ),
+        )
+        .await;
+        let mut again = first.clone();
+        again.revision_id = "taken".to_owned();
+        let err = store.insert_skill_revision(&again).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message.contains("revision_id")),
+            "{err:?}"
+        );
+        assert_eq!(revision_count(&store).await, 2);
+        assert_eq!(
+            store
+                .get_skill_revision("rev-body-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"hello skill"
         );
     }
 }

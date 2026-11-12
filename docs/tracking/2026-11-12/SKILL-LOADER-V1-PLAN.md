@@ -93,13 +93,23 @@ v1 不做分发来源、不做内置技能、不做默认提供者表、不做�
 
 一条修订是不可变的一行。身份是独立的 `revision_id`。`version`（semver）只是清单上的元数据，不参与「是不是同一条修订」。
 
-修订行至少含：`revision_id`、`skill_id`、`semver`、`kind`（`body` 或 `evals`）、`origin`（`user` 或 `imported`）、`content_digest`（该行 `content` 字节的小写十六进制 SHA-256；store 重算，与传入不一致则 Conflict）、正文或评测原文、`created_at`。来源和内容摘要都是这行的字段，也写进注入给模型的技能段开头（§4.4 的渲染结果），供冲突判定、确认摘要和评测使用。
+修订行至少含：`revision_id`、`skill_id`、`semver`、`kind`（`body` 或 `evals`）、`origin`（`user` 或 `imported`）、`content_digest`、正文或评测原文、`created_at`。来源和内容摘要都是这行的字段，也写进注入给模型的技能段开头（§4.4 的渲染结果），供冲突判定、确认摘要和评测使用。
+
+`content_digest` 按 kind 分两种口径，不要混用：
+
+- **正文行**（`kind=body`）：清单摘要，即 `agent24-skill` 的 `SkillManifest::content_digest`。它不含 `version`。只改 `version`，或改动落在解析的空白规范化范围内、解析结果不变，清单摘要就不变。store 不依赖 skill crate，不在入库时把正文摘要重算成字节 SHA-256。成对写入的路由层用这次解析结果再算一次清单摘要并断言；断言失败是内部错误，不入库。同一 `(skill_id, origin, semver, kind)` 命中且摘要相同，返回已有行，即使原始字节不同。
+- **评测行**（`kind=evals`）：该行 `content` 字节的小写十六进制 SHA-256。成对写入在 store 内重算，与传入不一致则 `StoreError::Conflict`。
+
+`insert_skill_revision` 是 SL-2 的单条入口，把两种行的 `content_digest` 都当成字节 SHA-256，不一致就 Conflict。目前只有 `agent24-store` 自己的测试调用它。安装和扫描的正文行今后只走成对写入 `install_skill_pair`。
+
+导入响应里的 `semver` 取这次解析结果，不取被复用的旧行上的 semver。
 
 判定：
 
-- 同一 `skill_id + origin + semver + kind` 已经有一行，且 `content_digest` 不同：拒绝，错误码 `skill_revision_conflict`，提示升 `version`。不覆盖旧行。
-- 同一内容（同一 `content_digest`）再次导入或再次扫到：返回已有的 `revision_id`，不新插一行。
-- 用户目录里文件变了但 semver 没变：走冲突，不自动变成新修订。用户升版本后才插入新行。新行不移动指针。
+- 先查 `(skill_id, origin, semver, kind)`。命中且摘要相同：返回已有 `revision_id`，不新插一行。命中且摘要不同：拒绝，错误码 `skill_revision_conflict`，提示升 `version`。不覆盖旧行，也不改用摘要去重绕过这次冲突。
+- semver 没命中，才按 `(skill_id, origin, kind, content_digest)` 返回已有行。
+- 用户目录里文件变了但 semver 没变、清单摘要也变了：走冲突，不自动变成新修订。用户升版本后才插入新行。新行不移动指针。
+- `insert_revision_tx` 在去重命中之前，若请求的 `revision_id` 已经属于另一条修订：`StoreError::Conflict`，不把这次请求当成已有行。
 
 正文修订和评测修订是两行。指针分别指向它们。
 
@@ -116,6 +126,14 @@ frontmatter：
 正文大小上限 **32 KiB**（32768 字节，按 UTF-8 计）。超过则 `skill_body_too_large`，不入库。单条评测文件同样不超过 32 KiB。
 
 用户目录只可能由扫描器读取，规则和下面的目录快照相同。扫描器不写目录。
+
+扫描从 `<data_dir>/skills` 起，用 rustix 的 `openat` 逐级打开，不按拼出来的路径打开子项。目录用 `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`，文件用 `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`。打开后 `fstat` 必须是目录或普通文件，否则拒绝该技能。macOS 对符号链接加 `O_DIRECTORY|O_NOFOLLOW` 返回 `ENOTDIR` 而不是 `ELOOP`；这时用父句柄上的 `statat(AT_SYMLINK_NOFOLLOW)` 把它和普通非目录分开，不打开链接目标。读取用 `take(剩余配额+1)`，读到的字节超过剩余配额即拒绝。目录配额按实际读到的字节累计，不按 `st_size`。`evals/` 相对已经打开的技能目录句柄打开。技能目录本身或 `evals/` 是符号链接时拒绝，并且不登记。
+
+上限写在 `skill_routes`：`<data_dir>/skills` 下直接子目录最多 **64** 个；一个技能内打开的目录最多 **8** 个（含技能目录自己）；深度最多 **2**（技能目录为 1，`evals/` 为 2）。超过则拒绝该技能，不插入半份修订。原有的 32 个普通文件、合计 256 KiB 仍然有效。
+
+`serve` 发出就绪行并开始监听之后，才用 `tokio::spawn` 在后台跑这次扫描。扫描失败只打 `warn`，不挡住就绪，也不让进程退出。
+
+`scans` 是保留的 skill id（`POST /api/v1/skills/scans` 的集合名）。解析和安装都拒绝，错误码 `skill_id_reserved`。导入请求里的评测名和清单里的 `evals` 一样，必须通过同一条 `constrained_eval_key`：形状是 `evals/<file>.jsonl`，拒绝 `..`、绝对路径和空段。
 
 桌面若让用户选一个目录来导入（仍然算 `imported`），由主进程做目录约束快照，再把读到的字节交给上面的 POST。快照规则：
 
@@ -277,6 +295,9 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 | 码 | 何时抛 | HTTP |
 |---|---|---|
 | `skill_manifest_invalid` | SL-1 解析失败（缺必填字段、字段类型错、能力 id 字符集不合法） | 400 |
+| `skill_id_reserved` | skill id 是保留名 `scans` | 400 |
+| `invalid_request` | 请求不是这条路由接受的 JSON（重扫带了路径，或正文无法解析） | 400 |
+| `not_found` | `GET /api/v1/skills/{id}` 没有这个技能的修订 | 404 |
 | `skill_proactive_unsupported` | frontmatter 声明主动技能（D6，v1 不做） | 400 |
 | `skill_body_too_large` | 正文超过 32 KiB | 413 |
 | `skill_revision_conflict` | 同来源同 semver 但内容摘要不同（提示升版本） | 409 |
@@ -313,7 +334,8 @@ CLI 可以激活，但只有桌面确认这一条路：CLI 发起提升，桌面
 
 技能表一张迁移（SL-2）：
 
-- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」：摘要不同返回 `skill_revision_conflict`，不覆盖。另有唯一索引 `(skill_id, origin, kind, content_digest)`（§4.3）：只升 semver、摘要和字节都相同则返回已有 `revision_id`。
+- `skill_revision`：§4.2 的列。唯一约束覆盖「同来源同 semver 同 kind」：摘要不同返回 `skill_revision_conflict`，不覆盖；摘要相同返回已有 `revision_id`（正文行的摘要是清单摘要，原始字节可以不同）。另有唯一索引 `(skill_id, origin, kind, content_digest)`（§4.3）：只在 semver 未命中时用来去重。`insert_revision_tx` 在采纳去重命中之前，若请求的 `revision_id` 已属于另一条修订，返回 Conflict。
+- v1 没有「一次安装写了哪一对」的关联表。详情的 `text_consistency` 用同一 `skill_id + origin` 下按 `created_at` 最新的正文行，配合同来源下最新的评测行，不按 semver 配对。这是 v1 口径：它等于最近一次安装写入或复用的那一对，前提是两次安装不会把更新的评测行和更旧的正文行交错开。
 - `skill_pointer`：每个 `skill_id` 一行（主键就是 `skill_id`），`body_revision_id`、`evals_revision_id`、`generation`。没有这行就是未激活，当前代次按 0。读出的视图带上两侧修订共同的 `origin`。
 - `skill_activation`：历史组合，含 §4.5 的结果绑定。回滚按这张表的 `activation_id` 引用。自增 `seq` 是顺序，不按 `created_at` 排。
 - `skill_eval_result`：绑定上的 `accepted_json` 是 JSON 数组，元素必须是这一次 `cases_json` 里失败用例的 id。

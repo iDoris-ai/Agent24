@@ -4,16 +4,22 @@
 //! not accept a path and does not open one. Import is always `origin=imported`
 //! and goes through [`agent24_skill::parse_imported`].
 //!
-//! The scanner reads `<data_dir>/skills/<name>/` only. It rejects `..`,
-//! absolute paths, symlinks, and non-regular files before inserting, and it
-//! caps a skill directory at 32 regular files and 256 KiB. Validation, the
-//! content digest, and the stored eval bytes all come from that one snapshot.
+//! The scanner reads `<data_dir>/skills/<name>/` only, by `openat` from that
+//! root. Directories use `O_DIRECTORY|O_NOFOLLOW|O_CLOEXEC`. Files use
+//! `O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC`. `fstat` must show a directory or a
+//! regular file. Reads use `take(remaining + 1)` and the directory quota
+//! counts bytes actually read. `evals/` is opened from the skill directory
+//! handle. Caps: 64 skill directories, 8 directories and depth 2 inside one
+//! skill, 32 regular files, 256 KiB. Validation, the manifest digest, and the
+//! stored eval bytes all come from that one snapshot.
 //!
 //! Neither path moves the skill pointer. Activation is SL-4. Provider status
 //! is SL-5 and is omitted here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
 
 use agent24_skill::{SkillError, SkillManifest};
 use agent24_store::{NewSkillRevision, SkillOrigin, SkillRevisionInsert, SkillRevisionKind, Store};
@@ -28,6 +34,12 @@ use crate::server::{AppState, error_response};
 
 const MAX_FILES: usize = 32;
 const MAX_TOTAL_BYTES: u64 = 256 * 1024;
+/// Direct children of `<data_dir>/skills`. Plan §4.3.
+const MAX_SKILL_DIRS: usize = 64;
+/// Directories opened under one skill, including the skill directory.
+const MAX_WALK_DIRS: usize = 8;
+/// Skill directory is depth 1. `evals/` is depth 2.
+const MAX_DIR_DEPTH: usize = 2;
 const REQUEST_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
@@ -91,8 +103,9 @@ struct SkillDetail {
     pointer: Option<PointerView>,
     generation: i64,
     revisions: Vec<RevisionView>,
-    /// Text-consistency counts for the newest body paired with the evals row
-    /// of the same origin and semver. Provider status is SL-5 and is omitted.
+    /// Text-consistency counts for the newest body row and the newest evals
+    /// row of that same origin. v1 has no install-pair table, so this is not
+    /// matched by semver. Provider status is SL-5 and is omitted.
     text_consistency: Option<ConsistencyView>,
 }
 
@@ -334,7 +347,14 @@ fn select_import_eval(
             detail: "evals were not declared".to_owned(),
         });
     }
-    if evals.len() != 1 || evals[0].name != manifest.evals {
+    let key = constrained_eval_key(&manifest.evals)?;
+    if evals.len() != 1 {
+        return Err(SkillError::EvalInvalid {
+            detail: "evals entry does not match the manifest path".to_owned(),
+        });
+    }
+    let name = constrained_eval_key(&evals[0].name)?;
+    if name != key {
         return Err(SkillError::EvalInvalid {
             detail: "evals entry does not match the manifest path".to_owned(),
         });
@@ -377,13 +397,20 @@ async fn store_pair(
     ineffective: Vec<String>,
 ) -> Result<StoredSkill, Fail> {
     let created_at = chrono::Utc::now().to_rfc3339();
+    // Body rows store the manifest digest, recomputed from this parse. The
+    // store does not depend on the skill crate, so the check stays here.
+    let content_digest = manifest.content_digest();
+    let recomputed = manifest.content_digest();
+    if content_digest != recomputed {
+        return Err(Fail::internal("recompute body digest"));
+    }
     let body = NewSkillRevision {
         revision_id: uuid::Uuid::new_v4().to_string(),
         skill_id: manifest.name.clone(),
         origin,
         semver: manifest.version.clone(),
         kind: SkillRevisionKind::Body,
-        content_digest: manifest.content_digest(),
+        content_digest: content_digest.clone(),
         content: markdown.as_bytes().to_vec(),
         created_at: created_at.clone(),
     };
@@ -414,7 +441,7 @@ async fn store_pair(
             semver: manifest.version.clone(),
             body_revision_id: revision_id_of(body_row),
             evals_revision_id: revision_id_of(evals_row),
-            content_digest: manifest.content_digest(),
+            content_digest,
             ineffective,
             inserted,
             pointer: pointer.map(pointer_view),
@@ -538,11 +565,12 @@ async fn text_consistency(
     let Some(body) = body else {
         return Ok(None);
     };
-    let evals = rows.iter().rev().find(|row| {
-        row.kind == SkillRevisionKind::Evals
-            && row.origin == body.origin
-            && row.semver == body.semver
-    });
+    // v1 has no pair table. The newest body and the newest evals row of the
+    // same origin are the pair the latest install wrote or reused.
+    let evals = rows
+        .iter()
+        .rev()
+        .find(|row| row.kind == SkillRevisionKind::Evals && row.origin == body.origin);
     let Some(evals) = evals else {
         return Ok(None);
     };
@@ -638,6 +666,7 @@ impl Fail {
             SkillError::CapabilityUnknown { id } => format!("未知能力 {id}"),
             SkillError::EvalInvalid { detail } => detail.clone(),
             SkillError::EvalEmpty => "评测没有用例".to_owned(),
+            SkillError::IdReserved => "技能 id 是保留名".to_owned(),
         };
         Self::Http(status, err.code(), message)
     }
@@ -649,11 +678,14 @@ impl Fail {
                 "skill_revision_conflict",
                 "同版本内容不同，请升 version".to_owned(),
             ),
-            other => Self::Http(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal",
-                other.to_string(),
-            ),
+            other => {
+                tracing::error!(error = %other, "skill store failed");
+                Self::Http(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal",
+                    "skill store failed".to_owned(),
+                )
+            }
         }
     }
 
@@ -727,109 +759,179 @@ enum Prepared {
     Loaded(LoadedSkill),
 }
 
-fn prepare_root(root: &Path) -> Vec<Prepared> {
-    let meta = match std::fs::symlink_metadata(root) {
-        Ok(meta) => meta,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(err) => {
-            return vec![failed(
-                root.display().to_string(),
-                "skill_manifest_invalid",
-                &err.to_string(),
-            )];
+#[cfg(unix)]
+fn dir_flags() -> rustix::fs::OFlags {
+    rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::DIRECTORY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::CLOEXEC
+}
+
+#[cfg(unix)]
+fn file_flags() -> rustix::fs::OFlags {
+    rustix::fs::OFlags::RDONLY
+        | rustix::fs::OFlags::NOFOLLOW
+        | rustix::fs::OFlags::NONBLOCK
+        | rustix::fs::OFlags::CLOEXEC
+}
+
+#[cfg(unix)]
+enum OpenDir {
+    Dir(OwnedFd),
+    NotDirectory,
+    Symlink,
+    Missing,
+    Error(String),
+}
+
+#[cfg(unix)]
+fn open_directory(parent: impl AsFd + Copy, path: impl rustix::path::Arg + Copy) -> OpenDir {
+    match rustix::fs::openat(parent, path, dir_flags(), rustix::fs::Mode::empty()) {
+        Ok(fd) => match file_type(&fd) {
+            Ok(rustix::fs::FileType::Directory) => OpenDir::Dir(fd),
+            Ok(_) => OpenDir::NotDirectory,
+            Err(err) => OpenDir::Error(err),
+        },
+        Err(rustix::io::Errno::LOOP) | Err(rustix::io::Errno::MLINK) => OpenDir::Symlink,
+        // macOS returns ENOTDIR, not ELOOP, for O_DIRECTORY|O_NOFOLLOW on a symlink.
+        Err(rustix::io::Errno::NOTDIR) if nofollow_symlink(parent, path) => OpenDir::Symlink,
+        Err(rustix::io::Errno::NOTDIR) => OpenDir::NotDirectory,
+        Err(rustix::io::Errno::NOENT) => OpenDir::Missing,
+        Err(err) => OpenDir::Error(io_message(err)),
+    }
+}
+
+/// `AT_SYMLINK_NOFOLLOW` on the already-open parent. Does not open the target.
+#[cfg(unix)]
+fn nofollow_symlink(parent: impl AsFd, path: impl rustix::path::Arg) -> bool {
+    rustix::fs::statat(parent, path, rustix::fs::AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
+        rustix::fs::FileType::from_raw_mode(stat.st_mode) == rustix::fs::FileType::Symlink
+    })
+}
+
+#[cfg(unix)]
+fn file_type(fd: impl AsFd) -> Result<rustix::fs::FileType, String> {
+    let stat = rustix::fs::fstat(fd).map_err(io_message)?;
+    Ok(rustix::fs::FileType::from_raw_mode(stat.st_mode))
+}
+
+#[cfg(unix)]
+fn io_message(err: rustix::io::Errno) -> String {
+    std::io::Error::from(err).to_string()
+}
+
+#[cfg(unix)]
+fn entry_names(dir: &OwnedFd) -> Result<Vec<String>, String> {
+    let listed = rustix::fs::Dir::read_from(dir).map_err(io_message)?;
+    let mut names = Vec::new();
+    for entry in listed {
+        let entry = entry.map_err(io_message)?;
+        let name = entry
+            .file_name()
+            .to_str()
+            .map_err(|_| "skill directory entry is not utf-8".to_owned())?;
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
         }
-    };
-    if meta.file_type().is_symlink() || !meta.is_dir() {
+        if name.contains('/') || name.contains('\\') {
+            return Err(format!("skill directory entry escapes: {name}"));
+        }
+        names.push(name.to_owned());
+    }
+    names.sort();
+    Ok(names)
+}
+
+fn prepare_root(root: &Path) -> Vec<Prepared> {
+    #[cfg(not(unix))]
+    {
+        let _ = root;
         return vec![failed(
             root.display().to_string(),
             "skill_manifest_invalid",
-            "skills root is not a directory",
+            "skill scan requires unix",
         )];
     }
-    let entries = match std::fs::read_dir(root) {
-        Ok(entries) => entries,
-        Err(err) => {
-            return vec![failed(
-                root.display().to_string(),
-                "skill_manifest_invalid",
-                &err.to_string(),
-            )];
-        }
-    };
-    let mut prepared = Vec::new();
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                prepared.push(failed(
+    #[cfg(unix)]
+    {
+        let root_fd = match open_directory(rustix::fs::CWD, root) {
+            OpenDir::Dir(fd) => fd,
+            OpenDir::NotDirectory => {
+                return vec![failed(
                     root.display().to_string(),
                     "skill_manifest_invalid",
-                    &err.to_string(),
-                ));
-                continue;
+                    "skills root is not a directory",
+                )];
+            }
+            OpenDir::Symlink => {
+                return vec![failed(
+                    root.display().to_string(),
+                    "skill_manifest_invalid",
+                    "symlink rejected",
+                )];
+            }
+            OpenDir::Missing => return Vec::new(),
+            OpenDir::Error(message) => {
+                return vec![failed(
+                    root.display().to_string(),
+                    "skill_manifest_invalid",
+                    &message,
+                )];
             }
         };
-        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-            prepared.push(failed(
-                root.display().to_string(),
-                "skill_manifest_invalid",
-                "skill directory name is not utf-8",
-            ));
-            continue;
-        };
-        if name.is_empty()
-            || name == "."
-            || name == ".."
-            || name.contains('/')
-            || name.contains('\\')
-        {
-            prepared.push(failed(
-                name,
-                "skill_manifest_invalid",
-                "skill directory name escapes",
-            ));
-            continue;
-        }
-        let dir = root.join(&name);
-        let meta = match std::fs::symlink_metadata(&dir) {
-            Ok(meta) => meta,
-            Err(err) => {
-                prepared.push(failed(&name, "skill_manifest_invalid", &err.to_string()));
-                continue;
+        let names = match entry_names(&root_fd) {
+            Ok(names) => names,
+            Err(message) => {
+                return vec![failed(
+                    root.display().to_string(),
+                    "skill_manifest_invalid",
+                    &message,
+                )];
             }
         };
-        if meta.file_type().is_symlink() {
-            prepared.push(failed(&name, "skill_manifest_invalid", "symlink rejected"));
-            continue;
+        let mut prepared = Vec::new();
+        let mut skill_dirs = 0usize;
+        for name in names {
+            match open_directory(&root_fd, name.as_str()) {
+                OpenDir::Dir(fd) => {
+                    skill_dirs += 1;
+                    if skill_dirs > MAX_SKILL_DIRS {
+                        prepared.push(failed(
+                            name,
+                            "skill_manifest_invalid",
+                            "skill directory count exceeds 64",
+                        ));
+                        continue;
+                    }
+                    prepared.push(prepare_skill(&name, fd));
+                }
+                OpenDir::NotDirectory => {}
+                OpenDir::Symlink => {
+                    prepared.push(failed(&name, "skill_manifest_invalid", "symlink rejected"));
+                }
+                OpenDir::Missing => {
+                    prepared.push(failed(
+                        &name,
+                        "skill_manifest_invalid",
+                        "skill directory is missing",
+                    ));
+                }
+                OpenDir::Error(message) => {
+                    prepared.push(failed(name, "skill_manifest_invalid", &message));
+                }
+            }
         }
-        if !meta.is_dir() {
-            continue;
-        }
-        prepared.push(prepare_skill(&name, &dir));
+        prepared
     }
-    prepared
 }
 
-fn prepare_skill(name: &str, dir: &Path) -> Prepared {
-    let walked = match walk_skill(dir) {
-        Ok(walked) => walked,
-        Err(message) => return failed(name, "skill_manifest_invalid", &message),
-    };
+#[cfg(unix)]
+fn prepare_skill(name: &str, dir: OwnedFd) -> Prepared {
     let mut ingested = BTreeMap::new();
     let mut skipped = Vec::new();
-    for (rel, _) in &walked {
-        if is_ingested(rel) {
-            let bytes = match read_nofollow(&abs_from(dir, rel)) {
-                Ok(bytes) => bytes,
-                Err(err) => return failed(name, "skill_manifest_invalid", &err.to_string()),
-            };
-            let Ok(text) = String::from_utf8(bytes) else {
-                return failed(name, "skill_manifest_invalid", "skill file is not utf-8");
-            };
-            ingested.insert(rel.clone(), text);
-        } else {
-            skipped.push(rel.clone());
-        }
+    let mut quota = Quota::default();
+    if let Err(message) = walk_skill(&dir, "", 1, &mut quota, &mut ingested, &mut skipped) {
+        return failed(name, "skill_manifest_invalid", &message);
     }
     let Some(markdown) = ingested.get("SKILL.md").cloned() else {
         return failed(name, "skill_manifest_invalid", "missing SKILL.md");
@@ -842,61 +944,108 @@ fn prepare_skill(name: &str, dir: &Path) -> Prepared {
     })
 }
 
-fn walk_skill(dir: &Path) -> Result<Vec<(String, u64)>, String> {
-    let mut files = Vec::new();
-    let mut pending = vec![String::new()];
-    while let Some(rel_dir) = pending.pop() {
-        let abs = if rel_dir.is_empty() {
-            dir.to_path_buf()
-        } else {
-            abs_from(dir, &rel_dir)
-        };
-        let entries = std::fs::read_dir(&abs)
-            .map_err(|err| format!("skill directory cannot be read: {err}"))?;
-        for entry in entries {
-            let entry = entry.map_err(|err| format!("skill directory cannot be read: {err}"))?;
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                return Err("skill directory entry is not utf-8".to_owned());
-            };
-            if name.is_empty()
-                || name == "."
-                || name == ".."
-                || name.contains('/')
-                || name.contains('\\')
-            {
-                return Err(format!("skill directory entry escapes: {name}"));
-            }
-            let rel = if rel_dir.is_empty() {
-                name.clone()
-            } else {
-                format!("{rel_dir}/{name}")
-            };
-            let meta =
-                std::fs::symlink_metadata(abs_from(dir, &rel)).map_err(|err| err.to_string())?;
-            let kind = meta.file_type();
-            if kind.is_symlink() {
-                return Err(format!("symlink rejected: {rel}"));
-            }
-            if kind.is_dir() {
-                pending.push(rel);
-                continue;
-            }
-            if !kind.is_file() {
-                return Err(format!("not a regular file: {rel}"));
-            }
-            files.push((rel, meta.len()));
-            if files.len() > MAX_FILES {
-                return Err("skill directory exceeds 32 files".to_owned());
-            }
-            let total: u64 = files.iter().map(|(_, len)| *len).sum();
-            if total > MAX_TOTAL_BYTES {
-                return Err("skill directory exceeds 256 KiB".to_owned());
-            }
-        }
-    }
-    Ok(files)
+#[cfg(unix)]
+#[derive(Default)]
+struct Quota {
+    dirs: usize,
+    files: usize,
+    bytes: u64,
 }
 
+#[cfg(unix)]
+fn walk_skill(
+    dir: &OwnedFd,
+    rel_dir: &str,
+    depth: usize,
+    quota: &mut Quota,
+    ingested: &mut BTreeMap<String, String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), String> {
+    if depth > MAX_DIR_DEPTH {
+        return Err("skill directory exceeds depth 2".to_owned());
+    }
+    quota.dirs += 1;
+    if quota.dirs > MAX_WALK_DIRS {
+        return Err("skill directory exceeds 8 directories".to_owned());
+    }
+    for name in entry_names(dir)? {
+        let rel = if rel_dir.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel_dir}/{name}")
+        };
+        match open_directory(dir, name.as_str()) {
+            OpenDir::Dir(child) => {
+                walk_skill(&child, &rel, depth + 1, quota, ingested, skipped)?;
+            }
+            OpenDir::Symlink => return Err(format!("symlink rejected: {rel}")),
+            OpenDir::NotDirectory => read_regular(dir, &name, &rel, quota, ingested, skipped)?,
+            OpenDir::Missing => return Err(format!("skill directory entry is missing: {rel}")),
+            OpenDir::Error(message) => return Err(message),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_regular(
+    dir: &OwnedFd,
+    name: &str,
+    rel: &str,
+    quota: &mut Quota,
+    ingested: &mut BTreeMap<String, String>,
+    skipped: &mut Vec<String>,
+) -> Result<(), String> {
+    let fd =
+        rustix::fs::openat(dir, name, file_flags(), rustix::fs::Mode::empty()).map_err(|err| {
+            match err {
+                rustix::io::Errno::LOOP | rustix::io::Errno::MLINK => {
+                    format!("symlink rejected: {rel}")
+                }
+                other => io_message(other),
+            }
+        })?;
+    if file_type(&fd)? != rustix::fs::FileType::RegularFile {
+        return Err(format!("not a regular file: {rel}"));
+    }
+    let remaining = MAX_TOTAL_BYTES.saturating_sub(quota.bytes);
+    let buf = read_capped(fd, remaining)?;
+    quota.bytes += buf.len() as u64;
+    quota.files += 1;
+    if quota.files > MAX_FILES {
+        return Err("skill directory exceeds 32 files".to_owned());
+    }
+    if quota.bytes > MAX_TOTAL_BYTES {
+        return Err("skill directory exceeds 256 KiB".to_owned());
+    }
+    if is_ingested(rel) {
+        let text = String::from_utf8(buf).map_err(|_| "skill file is not utf-8".to_owned())?;
+        ingested.insert(rel.to_owned(), text);
+    } else {
+        skipped.push(rel.to_owned());
+    }
+    Ok(())
+}
+
+/// Read at most `remaining + 1` bytes. More than `remaining` means the file,
+/// including bytes appended after the scan opened it, is over the quota.
+#[cfg(unix)]
+fn read_capped(fd: OwnedFd, remaining: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+    let mut file = std::fs::File::from(fd);
+    let allowance = remaining.saturating_add(1);
+    let mut limited = (&mut file).take(allowance);
+    let mut buf = Vec::new();
+    limited
+        .read_to_end(&mut buf)
+        .map_err(|err| err.to_string())?;
+    if buf.len() as u64 > remaining {
+        return Err("skill directory exceeds 256 KiB".to_owned());
+    }
+    Ok(buf)
+}
+
+#[cfg(unix)]
 fn is_ingested(rel: &str) -> bool {
     if rel == "SKILL.md" {
         return true;
@@ -905,42 +1054,6 @@ fn is_ingested(rel: &str) -> bool {
     match (parts.next(), parts.next(), parts.next()) {
         (Some("evals"), Some(file), None) => file.ends_with(".jsonl") && !file.is_empty(),
         _ => false,
-    }
-}
-
-fn abs_from(root: &Path, rel: &str) -> PathBuf {
-    let mut path = root.to_path_buf();
-    for part in rel.split('/') {
-        path.push(part);
-    }
-    path
-}
-
-fn read_nofollow(path: &Path) -> std::io::Result<Vec<u8>> {
-    #[cfg(unix)]
-    {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let flag = if cfg!(target_os = "linux") {
-            0x20000
-        } else {
-            0x0100
-        };
-        let mut file = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(flag)
-            .open(path)?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)?;
-        Ok(buf)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "skill scan requires unix",
-        ))
     }
 }
 
@@ -1398,13 +1511,247 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_scan_rejects_a_symlinked_skill_dir_and_evals_dir() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real-skill");
+        std::fs::create_dir_all(real.join("evals")).unwrap();
+        std::fs::write(
+            real.join("SKILL.md"),
+            user_md("evals/check.jsonl", "hello\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            real.join("evals").join("check.jsonl"),
+            "{\"input\":\"x\",\"expect\":\"hello\",\"judge\":\"contains\"}\n",
+        )
+        .unwrap();
+        let skills = root.path().join("skills");
+        std::fs::create_dir(&skills).unwrap();
+        std::os::unix::fs::symlink(&real, skills.join("weekly-report")).unwrap();
+        let report = scan_root(&state.store, &skills).await;
+        assert!(report.skills.is_empty(), "{report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.message.contains("symlink")),
+            "{report:?}"
+        );
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+
+        std::fs::remove_file(skills.join("weekly-report")).unwrap();
+        let skill = skills.join("weekly-report");
+        std::fs::create_dir(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            user_md("evals/check.jsonl", "hello\n"),
+        )
+        .unwrap();
+        let outside = root.path().join("outside-evals");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(
+            outside.join("check.jsonl"),
+            "{\"input\":\"x\",\"expect\":\"SECRETTOKEN1827\",\"judge\":\"contains\"}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&outside, skill.join("evals")).unwrap();
+        let report = scan_root(&state.store, &skills).await;
+        assert!(report.skills.is_empty(), "{report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.message.contains("symlink")),
+            "{report:?}"
+        );
+        assert!(!stored_text(&state.store).await.contains("SECRETTOKEN1827"));
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_scan_rejects_a_file_that_grows_past_the_cap() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        let skill = skills.join("weekly-report");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), user_md("[]", "hello\n")).unwrap();
+        let pad = skill.join("pad.bin");
+        std::fs::write(&pad, b"x").unwrap();
+        let mut grown = std::fs::OpenOptions::new().append(true).open(&pad).unwrap();
+        std::io::Write::write_all(&mut grown, &vec![b'Z'; (256 * 1024) + 1]).unwrap();
+        drop(grown);
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let flag = running.clone();
+        let pad_for_writer = pad.clone();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(pad_for_writer)
+                .unwrap();
+            let chunk = vec![b'Y'; 4096];
+            while flag.load(std::sync::atomic::Ordering::Relaxed) {
+                if std::io::Write::write_all(&mut file, &chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let scanned =
+            tokio::time::timeout(Duration::from_secs(2), scan_root(&state.store, &skills))
+                .await
+                .expect("scan blocked on a growing file");
+        running.store(false, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(scanned.skills.is_empty(), "{scanned:?}");
+        assert!(
+            scanned.errors.iter().any(|err| err.message.contains("256")),
+            "{scanned:?}"
+        );
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+        assert!(!stored_text(&state.store).await.contains("ZZZZ"));
+    }
+
+    #[tokio::test]
+    async fn user_scan_rejects_a_directory_deeper_than_evals() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("skills").join("weekly-report");
+        std::fs::create_dir_all(skill.join("evals").join("nested")).unwrap();
+        std::fs::write(skill.join("SKILL.md"), user_md("[]", "hello\n")).unwrap();
+        std::fs::write(skill.join("evals").join("nested").join("x.txt"), b"x").unwrap();
+        let report = scan_root(&state.store, &root.path().join("skills")).await;
+        assert!(report.skills.is_empty(), "{report:?}");
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|err| err.message.contains("depth")),
+            "{report:?}"
+        );
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn version_only_edit_reuses_the_body_and_an_upgrade_keeps_text_consistency() {
+        let state = crate::server::tests::state().await;
+        let v1 = "---\nname: weekly-report\nversion: 1.0.0\ndescription: 周报\n---\nhello\n";
+        let v2 = "---\nname: weekly-report\nversion: 2.0.0\ndescription: 周报\n---\nhello\n";
+        let (status, first) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": v1 }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{first}");
+        let quoted =
+            "---\nname: weekly-report\nversion: 1.0.0\ndescription: \"周报\"\n---\nhello\n";
+        let (status, normalized) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": quoted }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{normalized}");
+        assert_eq!(normalized["inserted"], false);
+        assert_eq!(normalized["body_revision_id"], first["body_revision_id"]);
+        let (status, second) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": v2 }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{second}");
+        assert_eq!(second["semver"], "2.0.0");
+        assert_eq!(second["inserted"], false);
+        assert_eq!(second["body_revision_id"], first["body_revision_id"]);
+        let stored = stored_text(&state.store).await;
+        assert!(stored.contains("version: 1.0.0"), "{stored}");
+        assert!(!stored.contains("version: 2.0.0"), "{stored}");
+
+        let eval = "{\"input\":\"x\",\"expect\":\"hello\",\"judge\":\"contains\"}\n";
+        let body_v1 = "---\nname: weekly-notes\nversion: 1.0.0\ndescription: 周报\nevals: evals/check.jsonl\n---\nhello\n";
+        let body_v2 = "---\nname: weekly-notes\nversion: 2.0.0\ndescription: 周报\nevals: evals/check.jsonl\n---\ngoodbye\n";
+        let (status, installed) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": body_v1, "evals": [{ "name": "evals/check.jsonl", "content": eval }] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{installed}");
+        let (status, upgraded) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": body_v2, "evals": [{ "name": "evals/check.jsonl", "content": eval }] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{upgraded}");
+        assert_eq!(upgraded["semver"], "2.0.0");
+        assert_ne!(upgraded["body_revision_id"], installed["body_revision_id"]);
+        assert_eq!(
+            upgraded["evals_revision_id"],
+            installed["evals_revision_id"]
+        );
+        let (status, detail) = call(&state, "GET", "/api/v1/skills/weekly-notes", None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert!(!detail["text_consistency"].is_null(), "{detail}");
+        assert_eq!(detail["text_consistency"]["total"], 1);
+        assert_eq!(detail["text_consistency"]["consistent"], 0);
+
+        let again = "---\nname: weekly-notes\nversion: 2.0.0\ndescription: 周报\nevals: evals/check.jsonl\n---\nhello\n";
+        let (status, conflict) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": again, "evals": [{ "name": "evals/check.jsonl", "content": eval }] }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_eq!(conflict["error"]["code"], "skill_revision_conflict");
+    }
+
+    #[tokio::test]
+    async fn scans_and_an_escaping_import_eval_name_are_rejected() {
+        let state = crate::server::tests::state().await;
+        let reserved = "---\nname: scans\ndescription: 周报\n---\nhello\n";
+        let (status, value) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": reserved }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["code"], "skill_id_reserved");
+        let escaped =
+            "---\nname: weekly-report\ndescription: 周报\nevals: ../secret.jsonl\n---\nhello\n";
+        let (status, value) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(
+                &json!({
+                    "markdown": escaped,
+                    "evals": [{ "name": "../secret.jsonl", "content": "SECRETTOKEN1827\n" }]
+                })
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
+        assert_eq!(value["error"]["code"], "skill_eval_invalid");
+        assert!(!stored_text(&state.store).await.contains("SECRETTOKEN1827"));
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn rescan_route_rejects_a_path() {
         let state = crate::server::tests::state().await;
-        let (status, value) = call(&state, "POST", "/api/v1/skills/scans", Some("{}")).await;
-        assert_eq!(status, StatusCode::OK, "{value}");
-        assert_eq!(value["origin"], "user");
-        assert!(value["skills"].is_array());
-        assert!(value["errors"].is_array());
         let (status, value) = call(
             &state,
             "POST",
@@ -1414,15 +1761,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{value}");
         assert_eq!(value["error"]["code"], "invalid_request");
-    }
-
-    #[test]
-    fn serve_scans_the_user_directory_on_startup() {
-        let src = include_str!("server.rs");
-        let start = src.find("pub async fn serve(").unwrap();
-        let body = &src[start..];
-        let end = body.find("\n}\n").unwrap();
-        assert!(body[..end].contains("scan_installed_user_skills"));
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
     }
 
     fn walk_names(root: &Path) -> BTreeSet<String> {
