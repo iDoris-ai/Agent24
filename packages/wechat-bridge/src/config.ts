@@ -4,6 +4,9 @@
 // local agent24d over its v1 HTTP API. The iLink constants are ground-truth
 // values (ported from heinu1 / weixin-bot-ilink); the agent24d endpoint is
 // discovered from the daemon's state file, overridable by env.
+//
+// The bridge does not keep an allowlist. Who may start a run is the daemon's
+// `inbound_allowlist`, seeded in development from `A24_INBOUND_DEV_ALLOWLIST`.
 
 import { DaemonStateError, dataDir, joinLiteral, requireDaemonBearer } from '@agent24/data-dir'
 
@@ -16,44 +19,18 @@ export const CONFIG = {
   get TOKEN_FILE(): string {
     return joinLiteral(dataDir(), 'wechat-token.json')
   },
-  // Sibling of TOKEN_FILE. joinLiteral, not path.join: an AGENT24_DATA_DIR that
-  // contains a symlink plus `..` must stay literal, or the session file and the
-  // token file land in different directories.
-  get SESSION_FILE(): string {
-    return joinLiteral(dataDir(), 'wechat-sessions.json')
-  },
   POLL_TIMEOUT_MS: 40_000,
   RECONNECT_DELAY_MS: 3_000,
   MAX_MSG_LEN: 1800,
 
-  // ── Authorization (SECURITY, fail-closed) ────────────────────────────────
-  // Every inbound message becomes an owner-level agent24d run with tool /
-  // filesystem access, so only explicitly listed WeChat `from_user_id`s may
-  // drive the bridge. With none configured, nobody is authorized (the bridge
-  // drops every message). Set A24_WECHAT_ALLOWED_UIDS to a comma/space-separated
-  // list of ids (an unauthorized sender's full id is logged so you can add it).
-  ALLOWED_UIDS: parseAllowedUids(process.env.A24_WECHAT_ALLOWED_UIDS),
-
-  // ── agent24d (the local daemon this bridge drives) ───────────────────────
+  // ── agent24d (the local daemon this bridge posts events to) ──────────────
   // The daemon writes its dynamic port + token to this discovery file (Rust
   // side). Env overrides win for tests / non-standard setups.
   get DAEMON_STATE_FILE(): string {
     return joinLiteral(dataDir(), 'daemon.json')
   },
-  // How long to wait for a run to finish before telling the user it is still
-  // going (the run keeps running on the daemon).
-  RUN_WAIT_TIMEOUT_MS: 600_000,
-  RUN_POLL_INTERVAL_MS: 1_500,
-}
-
-/** Parse a comma/space-separated allowlist of WeChat user ids into a Set. */
-export function parseAllowedUids(raw: string | undefined): Set<string> {
-  return new Set(
-    (raw ?? '')
-      .split(/[,\s]+/)
-      .map((s) => s.trim())
-      .filter(Boolean),
-  )
+  // Development ingest. The route fixes source to wechat.
+  INBOUND_EVENTS_PATH: '/api/v1/inbound/events',
 }
 
 // iLink `base_info.channel_version`, from the reference implementation.
