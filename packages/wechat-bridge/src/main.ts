@@ -5,8 +5,8 @@
 //   A24_DEV_TOOL=1 pnpm --filter @agent24/wechat-bridge bridge
 //
 // First run prints a QR: scan it in WeChat to add the bot. A finished user
-// message with text is posted to the daemon. `started` and `duplicate` are
-// answered with 「已记录」. An ignored sender is not answered.
+// message with text is posted to the daemon. Only `started` is answered with
+// 「已记录」; ignored senders and duplicates are not answered.
 // Approvals stay on the desktop.
 
 import { login } from './ilink/auth.js'
