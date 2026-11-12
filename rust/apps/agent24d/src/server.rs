@@ -605,6 +605,10 @@ async fn open_memory_base(ephemeral: bool) -> Option<agent24_memory::KvStore> {
 #[path = "../tests/session_memory/mod.rs"]
 mod session_memory_tests;
 
+#[cfg(test)]
+#[path = "../tests/inbound_admission/positive.rs"]
+mod inbound_admission_positive;
+
 /// Pair the memory base with a router-backed summarizer for D1 session memory.
 /// The session owner is the durable personal partition recorded by the OS
 /// memory catalog, so replay and module memory use the same org identity.

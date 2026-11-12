@@ -1,7 +1,7 @@
 # 入站准入里程碑实施方案（X11 ②③④）
 
 - 日期：2026-11-10（基线：`origin/main` @ `2fa86db3b`；第 2 版吸收 Opus 独立评审）
-- 状态：方案草案，待评审。只写文档，没有改代码。
+- 状态：已实施。2a–2d、2f、2g 已合入 main；2e 迁移 #1820 已合（bb03081e）；2e 第 2 部分（Hyphae 轮询）#1821 已合（a93f5df3）；2h 为本收口。对照见 §4.1。
 - 依据：[ADR-041](../../adr/ADR-041-inbound-events-admission-and-work-items.md) 的 041a（D1–D4、D10，已接受）；[ADR-044](../../adr/ADR-044-communication.md) D5（X11 结论）；[MILESTONES-AND-TASKS §2.4](MILESTONES-AND-TASKS.md)「尾巴 3a：X11」。
 - 不实现 ADR-041b（工单，D5–D9）。
 - §7 四条取舍 jason 2026-11-11 已拍板，均按推荐。
@@ -191,6 +191,31 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 | X11-2f | 名单、接受模式、事件列表 API。写接口（`PUT /api/v1/inbound/allowlist`、`PUT /api/v1/inbound/policy`）加入 `host_only_route`（`capabilities/middleware.rs:49`），只许 ProductHost；读接口 `GET .../allowlist`、`GET .../policy`、`GET .../events`（只回元数据 + 前 50 字，不进 WS `/events`）。CORE-2 `Operation` **拆成读、写两个** | `agent24d/src/inbound/routes.rs`（新）、`capabilities/middleware.rs`、`capabilities/operations.rs`、OpenAPI 与 `packages/api-client` 生成物 | M | 2a | 在 capabilities 模式下：FirstPartyShell 令牌（无提升头）写名单 → 拒；legacy 单令牌写名单 → 拒（`host_only_route` 的 legacy 分支，`middleware.rs:75`）；ProductHost → 通过；读接口 FirstPartyShell 可读。列表不含全文；WS `/events` 抓包无入站内容。contract-tests 覆盖 | 生成物体量大 | Grok |
 | X11-2g | wechat-bridge 改只传输，并实现开发态名单种子（§3.4）。daemon 侧 `POST /api/v1/inbound/events`：**`source` 由路由固定为 `wechat`，请求体里写别的来源一律 400**；只在 legacy / 开发态挂载，产品（capabilities）模式不挂。桥：id 用 `wechat:<message_id>`，只处理 `message_state=FINISH` 且 `message_type=USER` 的消息（过滤未完成与自己发的）；**删桥内名单与 y/n 审批**；回一句「已记录」，不回发结果 | `packages/wechat-bridge/src/{bridge,agent24,config,main}.ts` 及测试；`agent24d/src/inbound/routes.rs` | M | 2c、2f | ① 桥源码无 `/api/v1/runs` 的 POST。② 名单外微信用户：daemon 记 `ignore`，0 个 run。③ 同一 `message_id` 重投：1 个 run。④ `message_state=GENERATING` 与 `BOT` 消息：不入表。⑤ 请求体带 `source:"hyphae"`：400（变异：去掉固定来源，变红）。⑥ capabilities 模式下该路由 404。⑦ 仍需 `A24_DEV_TOOL=1`。⑧ **正向格**：`A24_DEV_TOOL=1` 且种子名单含该微信 uid → 该用户 FINISH 的 USER 消息恰好 1 个 run，`run_source_tags` 为 Unknown；同条件去掉种子 → 0 个 run；capabilities 模式下种子环境变量不生效（变异：让种子在 capabilities 下也生效，变红）。⑨ **行为变化**：微信里不再能回 y/n 批准，审批只在桌面做；桥回复只有「已记录」，用例钉住 | 桥现有测试大改；行为变化需在 README 和 PR 里写明 | Sonnet + Opus 验收 |
 | X11-2h | 防绕过测试与文档收口。**FU（2e）**：私信 `history inbox` 与群 `groupchat history` 每轮最多 200 条（最新一页）。更早的消息本轮看不见。不把积压起成 run 是安全方向，同时是可用性缺口：陌生人可以刷满这 200 条，把名单内的人的消息挤出本轮。收口时写进限制说明 | `agent24d/tests/inbound_*.rs`；`docs/adr/ADR-044-communication.md`（回写 T2/T3 与 X11 状态）；`COMM-HYPHAE.md`；ADR-041 D10 修订（若 §7-4 采纳推荐），**并在 ADR-041 §4「后果」把「所有新表都在 CORE-5 5f–5g 接线之后才进 main」改写为：入站表（`inbound_events` 等）经 jason 2026-11-11 豁免，因为是只新增、不改旧表的独立表，其余新表（工单等，041b）仍按原约束** | S | 2a–2g | ① 静态断言：`packages/*` 与 `agent24-comm` 源码里没有对 `/api/v1/runs` 的 POST；`/runs` 的调用方白名单仅为桌面、ACP（`acp.rs`）、MCP（`agent24-mcp`）、CLI、`wechat-bridge` 已移除（变异：在 comm 里加一处 POST，变红）。② `agent24d/src` 内 `start_run*` 的外部调用点只有 `runs.rs`、`inbound/service.rs`、调度投递。③ 桌面聊天 / ACP / MCP 起 run 后 `inbound_events` 行数不变（正对照）。④ 文档里的待办状态与代码一致，ADR-041 §4 已写入豁免与 D10 修订 | 源码扫描类测试易误报，需白名单与说明 | Sonnet |
+
+### 4.1 实施状态（2026-11-12，X11-2h）
+
+上表是开工时的计划，不改写。实际合入与偏差记在这里。
+
+| 片 | 状态 | PR |
+|---|---|---|
+| X11-2a | 已合入 main | #1805、#1806 |
+| X11-2b | 已合入 main | #1803 |
+| X11-2c | 已合入 main | #1810、#1813、#1816 |
+| X11-2d | 已合入 main | #1808、#1812 |
+| X11-2e | 迁移 #1820 已合（bb03081e）；第 2 部分 Hyphae 轮询 #1821 已合（a93f5df3）。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用 | #1820、#1821 |
+| X11-2f | 已合入 main | #1809、#1811 |
+| X11-2g | 已合入 main | #1818、#1819 |
+| X11-2h | 本收口，尚未开 PR | — |
+
+X11 ① 产品隔离是 #1785。方案文档是 #1797。
+
+和原方案的偏差：
+
+- **拆分**：2a、2c、2d、2e、2f、2g 都不是一片一个 PR。2e 拆成迁移与 Hyphae 轮询两段，轮询还没自己的已合并 PR。
+- **默认不拉取**（jason 2026-11-12）：有 CLI，且名单里有 hyphae 或 `accept_mode` 明确为 `observe` / `auto`，才拉。`accept_mode=off` 一律停。这和 §3.4「接受模式本轮只存不判」不完全一样：模式仍不进 `admit()`，但已经是拉不拉的开关。
+- **名单外不回复，含 duplicate**：微信桥只在 daemon 报告这次真的起了 run 时回「已记录」。`ignored`、`duplicate`、`already_linked` 都不回。原 2g 验收写的是桥回复只有「已记录」，没有把 duplicate 排除在外。
+- **群聊与私信每轮各最多取最新 200 条**，更早的漏看（安全方向，见 followups）。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用。只轮询 `state=active` 的群。见 `COMM-HYPHAE.md` §7.1。
+- **`INBOUND_RATE_LIMIT` / `INBOUND_MAX_AGE_SECS` 仍是占位**（每分钟 3 条、10 分钟），正式上线前确认。见 followups。代码里的名字是 `INBOUND_MAX_AGE_SECS`（`inbound/service.rs`）。
 
 推荐顺序：2a → 2b → 2c → 2d →（2e、2f 并行）→ 2g → 2h。2a–2d 合入后 daemon 已有可测试的完整「记录 → 准入 → 起 run」闭环，只是还没有真实来源。
 

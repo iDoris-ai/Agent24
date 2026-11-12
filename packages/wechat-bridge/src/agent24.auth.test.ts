@@ -28,4 +28,27 @@ describe('Agent24Client without a bearer sends nothing', () => {
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer b')
     expect(JSON.parse(String(init.body))).toEqual(event)
   })
+
+  // Without the status check a 5xx body would be parsed as a record with no
+  // `outcome`, and the bridge would drop the failure instead of answering
+  // 「记录失败」.
+  for (const status of [400, 401, 404, 413, 500]) {
+    it(`HTTP ${status} rejects instead of returning a record`, async () => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(JSON.stringify({ error: { message: 'SECRET' } }), { status })),
+      )
+      const c = new Agent24Client({ base: 'http://127.0.0.1:1', token: 'b' })
+      let thrown: unknown
+      try {
+        await c.recordInbound(event)
+      } catch (err) {
+        thrown = err
+      }
+      expect(thrown).toBeInstanceOf(Error)
+      const message = thrown instanceof Error ? thrown.message : String(thrown)
+      expect(message).toMatch(new RegExp(`HTTP ${status}`))
+      expect(message).not.toContain('SECRET')
+    })
+  }
 })
