@@ -9,6 +9,7 @@ pub mod middleware;
 mod mint;
 mod operations;
 pub mod presence;
+pub(crate) mod requires;
 mod revoke;
 mod route_policy;
 mod store;
