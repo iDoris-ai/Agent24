@@ -16,12 +16,26 @@ describe('parseComponentList', () => {
   it('accepts a full row and a redacted row', () => {
     const rows = parseComponentList({
       components: [
-        { ...ROW, form: 'resident', reason: 'ok' },
+        {
+          ...ROW,
+          form: 'resident',
+          reason: 'ok',
+          kernel_grants: ['events'],
+          declared: { kernel: ['events', 'models'], operations: [] },
+          denied: [{ item: 'models', code: 'no_channel' }],
+        },
         { id: 'hyphae', version: null, state: 'stopped', provides: [] },
       ],
     })
     expect(rows).toEqual([
-      { ...ROW, form: 'resident', reason: 'ok' },
+      {
+        ...ROW,
+        form: 'resident',
+        reason: 'ok',
+        kernel_grants: ['events'],
+        declared: { kernel: ['events', 'models'], operations: [] },
+        denied: [{ item: 'models', code: 'no_channel' }],
+      },
       { id: 'hyphae', version: null, state: 'stopped', provides: [] },
     ])
   })
@@ -41,6 +55,28 @@ describe('parseComponentList', () => {
     ['reason is not a string', { components: [{ ...ROW, reason: 7 }] }],
   ])('rejects a payload whose %s', (_label, payload) => {
     expect(code(() => parseComponentList(payload))).toBe('invalid_response')
+  })
+
+  it('drops a malformed kernel field and keeps the rest of the row', () => {
+    const rows = parseComponentList({
+      components: [{
+        ...ROW,
+        form: 'resident',
+        kernel_grants: ['events', 1],
+        declared: { kernel: [] },
+        denied: [{ item: 1, code: 'no_channel' }],
+      }, {
+        ...ROW,
+        id: 'hyphae',
+        kernel_grants: null,
+        declared: null,
+        denied: { item: 'events', code: 'no_channel' },
+      }],
+    })
+    expect(rows).toEqual([
+      { ...ROW, form: 'resident' },
+      { ...ROW, id: 'hyphae' },
+    ])
   })
 })
 

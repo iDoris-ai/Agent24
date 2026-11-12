@@ -12,6 +12,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use agent24_domain::{Capability, DomainOsManifest, Grants};
+use serde::Serialize;
 
 use super::Operation;
 
@@ -151,8 +152,9 @@ impl fmt::Display for ModuleOrigin {
     }
 }
 
-/// Closed denial reasons (C9-A).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Closed denial reasons (C9-A). Serialized as the wire `code`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum DenyReason {
     NotDeclared,
     AboveCeiling,

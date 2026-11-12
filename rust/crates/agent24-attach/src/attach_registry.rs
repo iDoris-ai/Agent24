@@ -146,6 +146,9 @@ struct LiveCalls {
 pub struct AttachGrant {
     pub provides: Vec<String>,
     pub methods_for: MethodsFor,
+    /// Kernel capabilities this admission actually holds. The manifest list
+    /// is not enough: a requested capability with no callback is absent.
+    pub kernel_grants: Vec<String>,
 }
 
 /// Builds an admission's grant. The registry stores one `Arc` of this and
@@ -177,6 +180,10 @@ pub struct AttachDeps {
 struct Grant {
     offer: Offer,
     methods_for: MethodsFor,
+    /// What [`AttachGrant::kernel_grants`] reported for this admission.
+    kernel_grants: Vec<String>,
+    /// Manifest `kernel_capabilities`, in declaration order.
+    declared_kernel: Vec<String>,
 }
 
 fn build_grant(name: &str, manifest: &DomainOsManifest, deps: &AttachDeps) -> Grant {
@@ -186,6 +193,12 @@ fn build_grant(name: &str, manifest: &DomainOsManifest, deps: &AttachDeps) -> Gr
             provides: built.provides,
         },
         methods_for: built.methods_for,
+        kernel_grants: built.kernel_grants,
+        declared_kernel: manifest
+            .kernel_capabilities()
+            .iter()
+            .map(|cap| cap.as_str().to_owned())
+            .collect(),
     }
 }
 
@@ -205,6 +218,10 @@ pub struct AttachSnap {
     pub disabled: bool,
     pub drain: Option<DrainState>,
     pub mismatch: Option<ContractMismatch>,
+    /// Capabilities the stored admission grant actually holds.
+    pub kernel_grants: Vec<String>,
+    /// Manifest `kernel_capabilities` for this registration.
+    pub declared_kernel: Vec<String>,
 }
 
 /// One registered module's live state: the record facts a handshake
@@ -721,6 +738,8 @@ impl AttachRegistry {
                     disabled: e.disabled,
                     drain,
                     mismatch,
+                    kernel_grants: e.grant.kernel_grants.clone(),
+                    declared_kernel: e.grant.declared_kernel.clone(),
                 }
             })
             .collect()
@@ -894,17 +913,23 @@ mod tests {
 
     impl AttachGrantBuilder for EventsGrant {
         fn build(&self, _name: &str, manifest: &DomainOsManifest) -> AttachGrant {
-            let provides = if manifest
+            let events = manifest
                 .kernel_capabilities()
-                .contains(&agent24_domain::Capability::Events)
-            {
+                .contains(&agent24_domain::Capability::Events);
+            let provides = if events {
                 vec!["_a24/events/".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let kernel_grants = if events {
+                vec![agent24_domain::Capability::Events.as_str().to_owned()]
             } else {
                 Vec::new()
             };
             AttachGrant {
                 provides,
                 methods_for: Arc::new(|_generation| Methods::none()),
+                kernel_grants,
             }
         }
     }
@@ -1010,6 +1035,9 @@ mod tests {
         // registry passes `provides` through. The real grant is pinned by
         // agent24d's `attach_grant` test and the A3-2b black-box C2 case.
         assert_eq!(exp.offer.provides, vec!["_a24/events/".to_owned()]);
+        let snap = &registry.snapshot()[0];
+        assert_eq!(snap.kernel_grants, ["events"]);
+        assert_eq!(snap.declared_kernel, ["events"]);
 
         let claim = accepted("agentear", &token_id);
         let (number, generation, _methods) = registry.commit(&claim).unwrap();

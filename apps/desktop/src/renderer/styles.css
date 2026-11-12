@@ -485,6 +485,7 @@ button { cursor: pointer; font-family: var(--font); }
 }
 .cap-name:hover { color: var(--accent); }
 .cap-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.cap-grants { font-size: 12px; color: var(--muted); margin-top: 2px; }
 .cap-actions { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
 .cap-actions .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .cap-count { font-weight: 700; color: var(--text); }

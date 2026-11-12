@@ -41,6 +41,7 @@ function renderPage(opts: {
   prefs?: NavPrefs
   approvalsWaiting?: number
   statusFor?: (id: string) => string | undefined
+  grantsFor?: (id: string) => readonly string[] | undefined
   onOpenSettings?: () => void
 } = {}) {
   cleanup()
@@ -51,7 +52,7 @@ function renderPage(opts: {
   render(
     <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open, approvalsWaiting: opts.approvalsWaiting ?? 0 }}>
       <NavPrefsContext.Provider value={{ prefs, setPrefs: next => setPrefs(typeof next === 'function' ? next(prefs) : next) }}>
-        <CapabilitiesPage statusFor={opts.statusFor} onOpenSettings={onOpenSettings} />
+        <CapabilitiesPage statusFor={opts.statusFor} grantsFor={opts.grantsFor} onOpenSettings={onOpenSettings} />
       </NavPrefsContext.Provider>
     </CapabilitiesContext.Provider>,
   )
@@ -163,6 +164,24 @@ describe('CapabilitiesPage', () => {
     renderPage({ approvalsWaiting: 4 })
     expect(screen.queryByRole('status', { name: /waiting/ })).not.toBeInTheDocument()
     expect(screen.queryByText('Approvals')).not.toBeInTheDocument()
+  })
+
+  it('shows the kernel capabilities a component was actually granted, read-only', () => {
+    renderPage({
+      grantsFor: (id) => id === 'documents' ? ['events'] : id === 'sin90' ? [] : undefined,
+    })
+    expect(within(row('Documents')).getByText('Kernel capabilities: events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('Kernel capabilities: none')).toBeInTheDocument()
+    expect(within(row('Assistant')).queryByText(/Kernel capabilities/)).not.toBeInTheDocument()
+    expect(within(row('Documents')).queryByRole('textbox')).not.toBeInTheDocument()
+
+    act(() => setLocale('zh'))
+    expect(within(row('文档')).getByText('内核能力：events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('内核能力：无')).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(within(row('เอกสาร')).getByText('ความสามารถเคอร์เนล: events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('ความสามารถเคอร์เนล: ไม่มี')).toBeInTheDocument()
+    act(() => setLocale('en'))
   })
 
   it('labels builtin rows Built-in, other rows Open, and lets statusFor replace either', () => {
