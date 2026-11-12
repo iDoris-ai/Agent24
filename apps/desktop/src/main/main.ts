@@ -7,11 +7,14 @@ import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
+import { registerResidentService } from './ipc/resident-service'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, onDaemonReady, setBundledPackaged } from './backend-manager'
-import { PresencePoller, defaultPresenceDeps, showPresenceDialog } from './presence-poller'
+import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
+import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
 import { cliBinary } from './documents-cli'
@@ -64,6 +67,28 @@ import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
 const backendManager = new BackendManager({ isPackaged: app.isPackaged })
+// M5 B5: the service daemon brought up to the agent24d this app ships.
+let bundledVersion: string | null = null
+if (upgradesFromBundle(app.isPackaged, process.env)) void bundledDaemonVersion(resolveRustBinary(app.isPackaged)).then((v) => { bundledVersion = v })
+const serviceUpgrader = new ServiceUpgrader({
+  bundled: () => bundledVersion,
+  running: () => backendManager.serviceDaemonVersion(),
+  installed: launchAgentPlistExists,
+  pid: () => (backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null),
+  run: async (pid) => {
+    const dataDir = tryDataDir()
+    if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
+    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
+    return upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold }))
+  },
+})
+const crashLoop = new CrashLoopDetector({
+  now: () => Date.now(),
+  installed: () => process.platform === 'darwin' && launchAgentPlistExists(),
+  enrolled: () => backendManager.presenceTarget() !== null,
+  recordPid: () => serviceRecordPid(readExternalDaemonState(), (pid) => backendManager.spawned(pid)),
+  runs: () => serviceRuns(process.getuid!()),
+})
 // A3-4 review M5: the sequenced/capped event log lives here, in main, so it
 // survives the renderer's VoicePanel unmounting when the user switches
 // sidebar pages (design §7.2's intent — a host-side log, not a per-tab one).
@@ -212,6 +237,8 @@ let knowledge: KnowledgeController | null = null
 let knowledgeView: KnowledgeViewHost | null = null
 // CORE-2 AgentEar S3: long-polls the daemon for native confirmation challenges.
 let presencePoller: PresencePoller | null = null
+// M5 B3: the same, over the presence connection, with the daemon the LaunchAgent runs.
+let presenceConnection: PresenceConnection | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
 let openDesignReporter: OpenDesignStatusReporter | null = null
 let stopOpenDesignReady: (() => void) | null = null
@@ -504,14 +531,23 @@ app.whenReady().then(async () => {
   // CORE-2 AgentEar S3: native confirmation for elevated operations. Idle until
   // the daemon runs in capabilities mode (main then holds the ProductHost
   // token); a daemon without the routes answers 404 and is re-checked rarely.
+  const showBox = (opts: Parameters<typeof showPresenceDialog>[1], signal: AbortSignal) => {
+    if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
+    return showPresenceDialog(mainWin, opts, signal, (parent, options) => dialog.showMessageBox(parent, options))
+  }
   presencePoller = new PresencePoller(defaultPresenceDeps({
-    connection: daemonConnection,
-    showDialog: (opts, signal) => {
-      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
-      return showPresenceDialog(mainWin, opts, signal, (parent, options) => dialog.showMessageBox(parent, options))
-    },
+    // Enrolled with the service daemon, main holds no host token to poll as:
+    // the presence connection below asks instead.
+    connection: () => (backendManager.presenceTarget() ? null : daemonConnection()),
+    showDialog: showBox,
   }))
   presencePoller.start()
+  // M5 B3: idle until enrolled with the daemon the LaunchAgent runs.
+  presenceConnection = new PresenceConnection({
+    target: () => backendManager.presenceTarget(),
+    ask: async (challenge, signal) => ((await showBox(presenceDialogOptions(challenge, mt), signal)).response === 0 ? 'allow' : 'deny'),
+  })
+  presenceConnection.start()
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
   const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
@@ -568,7 +604,25 @@ app.whenReady().then(async () => {
     },
   })
   void cliTool.refresh()
+  // M5 B4c2: Settings → General → background service.
+  const residentAvailable = () => process.platform === 'darwin' && upgradesFromBundle(app.isPackaged, process.env)
+  registerResidentService({
+    guard,
+    status: () => ({ available: residentAvailable(), installed: launchAgentPlistExists() }),
+    set: async (on) => {
+      if (!residentAvailable()) return { ok: false, stage: 'unavailable', code: 'unavailable' }
+      const result = await setResident(on, {
+        installed: launchAgentPlistExists,
+        install: () => residentInstall(documentsModuleReady),
+        stop: residentStop,
+        record: recordConsent,
+      })
+      refreshTray()
+      return result
+    },
+  })
   mainWin = createMainWindow()
+  void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   knowledgeView = new KnowledgeViewHost({
@@ -690,6 +744,8 @@ app.whenReady().then(async () => {
   // Poll so the menu-bar title/tooltip and menu track the daemon as it starts,
   // crashes, or is toggled from the menu itself.
   trayTimer = setInterval(() => {
+    serviceUpgrader.tick()
+    void crashLoop.sample()
     refreshTray()
     if (++cliCheckTicks % 15 === 0) void cliTool?.refresh()
     // Replays the wanted Knowledge bindings on a restarted daemon and retries
@@ -703,6 +759,96 @@ app.whenReady().then(async () => {
   app.on('activate', () => showOrCreateWindow())
 })
 
+// M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
+// Settings switch and the tray's 「完全退出」, one at a time (B4c3).
+const residentOp = residentOps()
+
+function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutcome> {
+  return residentOp('install', () => installedAndEnrolled(() => installService(serviceInstallDeps({
+    cli: resolveBundledRustBinary('agent24', app.isPackaged),
+    daemonBin: resolveRustBinary(app.isPackaged),
+    ready: documentsReady,
+    hold: (work) => backendManager.whileStopped(work),
+    spawned: (pid) => backendManager.spawned(pid),
+    installed: launchAgentPlistExists,
+  })),
+  // Enrolled at the next tick (≤ 5 s), the presence connection up at its next
+  // look (≤ 5 s more): then a stop can ask (Codex B4c3 R2 C1).
+  () => backendManager.presenceTarget() !== null && presenceConnection?.ready === true, 15_000))
+}
+
+function residentStop(): Promise<StopOutcome> {
+  return residentOp('stop', () => stopService(serviceStopDeps({
+    cli: resolveBundledRustBinary('agent24', app.isPackaged),
+    pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
+    spawned: (pid) => backendManager.spawned(pid),
+    hold: (work) => backendManager.whileServiceRestarts(work),
+    record: () => recordConsent('declined'),
+  })))
+}
+
+function recordConsent(answer: ConsentAnswer): void {
+  const dataDir = tryDataDir()
+  if (dataDir !== null) writeConsent(consentPath(dataDir), answer, new Date())
+}
+
+// M5 B4b: asked once, with the window up. Allow installs the LaunchAgent,
+// after the bundled documents module's launch install, with this app's own
+// daemon stopped meanwhile; a failed install is undone and not
+// kept, so the next launch asks again (PM r1 ②).
+async function askResidentConsent(documentsReady: Promise<unknown>): Promise<void> {
+  const dataDir = tryDataDir()
+  if (dataDir === null) return
+  const file = consentPath(dataDir)
+  const fromBundle = upgradesFromBundle(app.isPackaged, process.env)
+  if (!shouldAskConsent({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
+  const outcome = await runConsent({
+    ask: async () => {
+      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
+      const { response } = await dialog.showMessageBox(mainWin, {
+        type: 'question',
+        buttons: [mt('consent.allow'), mt('consent.deny')],
+        defaultId: 0,
+        cancelId: 1,
+        message: mt('consent.message'),
+        detail: mt('consent.detail'),
+      })
+      return response === 0 ? 'allow' : 'declined'
+    },
+    install: () => residentInstall(documentsReady),
+    record: (answer) => writeConsent(file, answer, new Date()),
+  })
+  if (typeof outcome === 'object') {
+    console.warn('[main] resident service not installed:', outcome.failed)
+    if (mainWin && !mainWin.isDestroyed()) void dialog.showMessageBox(mainWin, { type: 'warning', message: mt('consent.failed', { code: outcome.failed }) })
+  }
+  refreshTray()
+}
+
+// M5 B4c: 「完全退出」: the service stopped (the presence box while enrolled),
+// its LaunchAgent removed and the answer kept as declined, then quit. A
+// refused or timed-out box changes nothing and says so (PM r1 ①).
+let quittingService = false
+async function quitStoppingService(): Promise<void> {
+  if (quittingService) return
+  quittingService = true
+  try {
+    const outcome = await residentStop()
+    if (outcome.ok) {
+      // Nothing spawned while the quit runs (Open Design's stop can take
+      // seconds): the hold ended with the uninstall (Codex B4c1 C2).
+      backendManager.stop()
+      tray = null
+      app.quit()
+      return
+    }
+    console.warn('[main] background service not stopped:', outcome.stage, outcome.code)
+    void dialog.showMessageBox({ type: 'warning', message: mt(stopFailureKey(outcome), { code: outcome.code }) })
+  } finally {
+    quittingService = false
+  }
+}
+
 // Rebuild the tray title, tooltip, and context menu from the live daemon status
 // and the current UI language. Cheap and idempotent — safe to call on a timer,
 // and called again whenever the language changes.
@@ -712,10 +858,15 @@ function refreshTray(): void {
     status: backendManager.status(),
     detail: backendManager.statusDetail(),
     external: backendManager.isExternalDaemon(),
+    enrolled: backendManager.presenceTarget() !== null,
     externalPid: backendManager.externalDaemonPid() ?? null,
     foreignPid: backendManager.foreignDaemonPid(),
     backendKind: backendManager.backendKind(),
     cliTool: cliTool?.status(),
+    upgrade: serviceUpgrader.hint(),
+    crashLoop: crashLoop.looping(),
+    serviceWaitMs: backendManager.serviceWaitMs(),
+    serviceInstalled: process.platform === 'darwin' && launchAgentPlistExists(),
   })
   if (process.platform === 'darwin') tray.setTitle(view.title)
   tray.setToolTip(view.tooltip)
@@ -732,6 +883,7 @@ function refreshTray(): void {
       tray = null
       app.quit()
     },
+    'quit-service': () => { void quitStoppingService() },
   }
   tray.setContextMenu(Menu.buildFromTemplate(view.items.map((item): MenuItemConstructorOptions =>
     'type' in item ? { type: 'separator' }
@@ -747,6 +899,7 @@ const shutdown = createCreativeShutdown({
     void ensureOwnedOmlxQuit()
     openDesignComponent?.abort('Agent24 is quitting')
     void presencePoller?.stop()
+    void presenceConnection?.stop()
     try {
       hideCreativeView()
       if (creativeView && !creativeView.webContents.isDestroyed()) {

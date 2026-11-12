@@ -121,10 +121,13 @@ vi.mock('node:child_process', async (orig) => ({
 }))
 
 const endpoint = { port: 0, token: 'daemon-secret' }
+type Elevate = (r: { method: string; path: string; body: string; summary: string }) => Promise<string>
+const elevation: { current: ((fn: (elevate: Elevate, token: string) => Promise<unknown>) => Promise<unknown>) | null } = { current: null }
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: endpoint.port }),
   daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
   daemonCliEndpoint: () => ({ port: endpoint.port, token: endpoint.token }),
+  daemonElevation: () => elevation.current,
 }))
 
 import { IpcChannels } from '../../shared/ipc-types'
@@ -152,6 +155,9 @@ let identityListHasDefault = true
 let identityListFails = false
 // what GET /api/v1/comm/relay answers
 let currentRelays: { relays: string[]; configured: boolean } = { relays: [], configured: false }
+// M5 B3: POST /api/v1/schedules needs a grant, as an Elevated route does for a daily token.
+let presenceGate = false
+let elevationHeaders: (string | undefined)[] = []
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
@@ -160,7 +166,14 @@ beforeAll(async () => {
     req.on('end', () => {
       if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached') && !(req.method === 'GET' && req.url === '/api/v1/comm/relay')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
-      if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
+      if (presenceGate && req.method === 'POST' && (req.url === '/api/v1/schedules' || req.url?.startsWith('/api/v1/approvals/'))) {
+        const grant = req.headers['x-agent24-elevation']
+        elevationHeaders.push(typeof grant === 'string' ? grant : undefined)
+        if (grant !== 'grant-1') {
+          res.statusCode = 403
+          res.end(JSON.stringify({ error: { code: 'presence_required', message: 'Presence confirmation required' } }))
+        } else res.end(JSON.stringify({ id: 'sch_1' }))
+      } else if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
         res.end(JSON.stringify({ error: 'unauthorized' }))
       } else if (req.url === '/v1/models' && reflectAuthAsModel) {
@@ -277,6 +290,9 @@ afterAll(() => {
 })
 
 beforeEach(() => {
+  presenceGate = false
+  elevationHeaders = []
+  elevation.current = null
   modelsRequireKey = null
   reflectAuthAsModel = false
   reflectedKeyEncoding = null
@@ -345,6 +361,25 @@ describe('A1 backendProxy allowlist', () => {
     expect(seen).toHaveLength(0)
   })
 
+  it('service mode: an elevated write is confirmed on the enrolment once, then retried with the grant (M5 B3)', async () => {
+    presenceGate = true
+    const asked: { method: string; path: string; body: string }[] = []
+    elevation.current = (fn) => fn(async (r) => { asked.push({ method: r.method, path: r.path, body: r.body }); return 'grant-1' }, endpoint.token)
+    const body = { name: 'daily', cron: '0 9 * * *' }
+    const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body })
+    expect(res).toMatchObject({ ok: true, status: 200, data: { id: 'sch_1' } })
+    expect(asked).toEqual([{ method: 'POST', path: '/api/v1/schedules', body: JSON.stringify(body) }])
+    expect(elevationHeaders).toEqual([undefined, undefined, 'grant-1'])
+    expect(seen.map((s) => s.body)).toEqual([JSON.stringify(body), JSON.stringify(body), JSON.stringify(body)])
+  })
+
+  it('with our own child (no enrolment) the 403 comes back as it is and nothing is retried (M5 B3)', async () => {
+    presenceGate = true
+    const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body: { name: 'x' } })
+    expect(res).toMatchObject({ ok: false, status: 403, data: { error: { code: 'presence_required' } } })
+    expect(elevationHeaders).toEqual([undefined])
+  })
+
   it('forwards an allowed read with the daemon bearer token', async () => {
     const res = await call(IpcChannels.BackendProxy, { method: 'GET', path: '/api/v1/runs/r1?x=1' })
     expect(res.ok).toBe(true)
@@ -363,6 +398,42 @@ describe('A1 backendProxy allowlist', () => {
       expect(seen[0]?.method).toBe('POST')
       expect(seen[0]?.url).toBe('/api/v1/approvals/ap_1')
       expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'approve' })
+    })
+    it('service mode: one box, the daemon\'s presence box; its own is skipped (M5 B3, General 11-09)', async () => {
+      presenceGate = true
+      const presenceBoxes: string[] = []
+      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(`${r.method} ${r.path}`); return 'grant-1' }, endpoint.token)
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(presenceBoxes).toEqual(['POST /api/v1/approvals/ap_1'])
+      expect(res.ok).toBe(true)
+      expect(elevationHeaders).toEqual([undefined, undefined, 'grant-1'])
+    })
+    it('service mode, the presence box refused: nothing approved, still no box of its own', async () => {
+      presenceGate = true
+      elevation.current = (fn) => fn(async () => { throw new Error('denied') }, endpoint.token)
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(res).toMatchObject({ ok: false, status: 403 })
+      expect(elevationHeaders).toEqual([undefined, undefined])
+    })
+    it('service mode, then our own child published before the turn: no box, nothing approved (Codex B3b r2 C1)', async () => {
+      presenceGate = true
+      const presenceBoxes: string[] = []
+      // The turn is the old enrolment's; the connection now carries another token.
+      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(r.path); return 'grant-1' }, 'old-daily-token')
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(presenceBoxes).toEqual([])
+      expect(res).toMatchObject({ ok: false, status: 503 })
+      expect(elevationHeaders).toEqual([undefined])
+    })
+    it('our own child: one box, its own, and no presence asked', async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).toHaveBeenCalledTimes(1)
+      expect(res.ok).toBe(true)
+      expect(elevation.current).toBeNull()
     })
     it('sends nothing when the user cancels', async () => {
       showMessageBox.mockResolvedValue({ response: 1 })
@@ -2132,13 +2203,13 @@ describe('UI-02 chat history IPC', () => {
   it('saves, lists, reads, deletes and clears through the guarded handlers', async () => {
     fs.rmSync(path.join(settingsDir, 'chat-history'), { recursive: true, force: true })
     const record = {
-      format: 'agent24.desktop.chat-history', version: 2, id: 'chat_ipc_1', title: '你好',
-      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
+      format: 'agent24.desktop.chat-history', version: 3, id: 'chat_ipc_1', title: '你好',
+      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [], initiator: 'user', unseen: [],
       created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z',
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [] }
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [], initiator: 'user', unseen: [] }
     expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])
     expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual(record)
@@ -2146,6 +2217,10 @@ describe('UI-02 chat history IPC', () => {
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '模型', 'model')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     await expect(call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '名', 'prompt')).rejects.toThrow('Invalid chat history title source')
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_none', '名', 'user')).toBeNull()
+    // M6 C1: marking a conversation seen goes through the same guarded handlers.
+    expect(await call(IpcChannels.ChatHistoryMarkSeen, 'chat_ipc_1')).toEqual({ ...summary, title: '问候', title_source: 'user' })
+    expect(await call(IpcChannels.ChatHistoryMarkSeen, 'chat_ipc_none')).toBeNull()
+    await expect(call(IpcChannels.ChatHistoryMarkSeen, '../x')).rejects.toThrow('Invalid chat history id')
     // UI-06: groups and archiving go through the same guarded handlers.
     const { groups: [group] } = await call(IpcChannels.ChatGroupsCreate, '工作') as { groups: Array<{ id: string; name: string }> }
     expect(group).toMatchObject({ name: '工作', collapsed: false })

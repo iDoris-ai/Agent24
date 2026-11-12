@@ -519,7 +519,7 @@ describe('a schedule\'s conversation (M4 A6)', () => {
     const open = vi.fn()
     const opened = vi.fn()
     registerChatPage(opened, vi.fn())
-    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><SchedulesPage /></CapabilitiesContext.Provider>)
+    render(<CapabilitiesContext.Provider value={{ defs: [], open }}><SchedulesPage /></CapabilitiesContext.Provider>)
     const button = await screen.findByRole('button', { name: '打开它的对话' })
     expect(screen.getAllByRole('button', { name: '打开它的对话' })).toHaveLength(1)
     expect(ofSchedule).toHaveBeenCalledWith('sch_1')

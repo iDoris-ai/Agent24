@@ -1,7 +1,9 @@
 // M4 A5: each schedule has a conversation of its own, its "home"
 // (design r3 §3.4): the first run of a schedule starts a conversation named
 // after it, and every later run of that schedule goes to the same one, as a
-// `schedule` run with a card (A4). docs/ui/ASSISTANT-A.md §7.
+// `schedule` run with a card (A4). docs/ui/ASSISTANT-A.md §7. M6 C1: the
+// conversation is the schedule's (`initiator = 'schedule'`), so each run
+// recorded in it is unseen until the user opens it (docs/ui/ASSISTANT-C.md §3).
 //
 // The daemon says which runs are a schedule's: `run.started` carries the
 // schedule's id (null for others), for a run of its tick and for `run_now`
@@ -23,7 +25,7 @@
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { CHAT_HISTORY_ID, type ChatHistorySummary, type ChatHistoryTitleSource } from '../shared/chat-history'
+import { CHAT_HISTORY_ID, type ChatHistoryInitiator, type ChatHistorySummary, type ChatHistoryTitleSource } from '../shared/chat-history'
 
 export const SCHEDULE_CONVERSATIONS_FORMAT = 'agent24.schedule-conversations'
 export const SCHEDULE_CONVERSATIONS_VERSION = 1
@@ -45,7 +47,7 @@ export interface ScheduleConversationsDeps {
   /** The chat history store's calls this module uses (A2, A5). */
   history: {
     get(id: unknown): unknown
-    create(input: { title: string; title_source: ChatHistoryTitleSource }): ChatHistorySummary
+    create(input: { title: string; title_source: ChatHistoryTitleSource; initiator: ChatHistoryInitiator }): ChatHistorySummary
     appendRun(id: unknown, runId: unknown, kind: unknown): ChatHistorySummary | null
   }
   /** The schedule's name, or null when the daemon could not tell. */
@@ -178,7 +180,7 @@ export function createScheduleConversations(deps: ScheduleConversationsDeps): Sc
    *  replaces because it filled up, kept as the schedule's. */
   const startConversation = async (scheduleId: string, full: string | null): Promise<string> => {
     const name = (await deps.scheduleName(scheduleId).catch(() => null))?.trim().slice(0, MAX_NAME) || scheduleId
-    const conversation = deps.history.create({ title: deps.title(name), title_source: 'schedule' }).id
+    const conversation = deps.history.create({ title: deps.title(name), title_source: 'schedule', initiator: 'schedule' }).id
     const state = read()
     // Last in the file: the one kept longest when it is full.
     delete state.bindings[scheduleId]

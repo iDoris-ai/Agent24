@@ -329,6 +329,23 @@ export async function loadConversation(id: string): Promise<ChatHistoryRecord | 
   return record && !removedSince(id, mark) ? record : null
 }
 
+/** M6 C1 (docs/ui/ASSISTANT-C.md §4): the page opened a saved conversation,
+ *  so nothing of it is unseen any more: main is asked to mark it seen, and
+ *  the list takes the summary main answers. Best effort: when the bridge
+ *  has no markSeen or the call fails, it stays unseen until it is opened
+ *  again; a conversation deleted or cleared meanwhile stays gone. */
+export async function markConversationSeen(id: string): Promise<void> {
+  // As `retitle` does: the list takes main's answer, unless the conversation
+  // was deleted or everything cleared since; a failure leaves it unseen.
+  const history = api()
+  if (!history || typeof history.markSeen !== 'function') return
+  const mine = ++seq
+  const summary = await history.markSeen(id).catch(() => null)
+  if (!summary || removedSince(id, mine)) return
+  publishedAt.set(id, ++seq)
+  set({ items: byNewest([summary, ...state.items.filter(item => item.id !== id)]) })
+}
+
 export function setActiveConversation(id: string | null): void {
   if (state.activeId !== id) set({ activeId: id })
 }

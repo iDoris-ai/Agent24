@@ -17,6 +17,9 @@ export const IpcChannels = {
   // runs and waiting items, pushed to the window.
   ChatHistoryPromoteRun: 'chat-history:promote-run',
   ChatHistoryChanged: 'chat-history:changed',
+  // M6 C1: the user opened a conversation (or has it open): nothing of it
+  // is unseen any more (docs/ui/ASSISTANT-C.md §4).
+  ChatHistoryMarkSeen: 'chat-history:mark-seen',
   // M4 A3: a run's or an approval's change, from the daemon's /events.
   RunEvent: 'run:event',
   // M4 A6: the conversation a schedule's runs go to (A5), for its page.
@@ -30,6 +33,9 @@ export const IpcChannels = {
   CliToolStatus: 'cli-tool:status',
   CliToolInstall: 'cli-tool:install',
   CliToolRepairUser: 'cli-tool:repair-user',
+  // M5 B4c2: Settings → General → background service switch.
+  ResidentServiceStatus: 'resident-service:status',
+  ResidentServiceSet: 'resident-service:set',
   AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
@@ -567,6 +573,16 @@ export interface CliToolStatus {
 export type CliInstallResult =
   | { state: 'installed'; backup: string | null }
   | { state: 'cancelled' | 'failed' | 'move-app' }
+
+/** M5 B4c2: whether this app can run the LaunchAgent (a packaged macOS app
+ *  that ships its daemon) and whether its plist is there now. */
+export interface ResidentServiceStatus { available: boolean; installed: boolean }
+
+/** The switch's outcome; a failure names the step and the daemon's or the
+ *  CLI's code (`install`/`start` when turning on, `shutdown`/`uninstall` off). */
+export type ResidentServiceResult =
+  | { ok: true }
+  | { ok: false; stage: 'install' | 'start' | 'shutdown' | 'uninstall' | 'unavailable'; code: string }
 
 /** M4 A3: the daemon events that change what a run is waiting on or where
  *  it stands (agent24-protocol `EventBody`). */

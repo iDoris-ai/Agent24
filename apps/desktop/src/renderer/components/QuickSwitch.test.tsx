@@ -15,7 +15,7 @@ const defs: CapabilityDef[] = [
 function setup(capabilities = defs) {
   const open = vi.fn()
   const view = render(
-    <CapabilitiesContext.Provider value={{ defs: capabilities, open, approvalsWaiting: 0 }}>
+    <CapabilitiesContext.Provider value={{ defs: capabilities, open }}>
       <NavPrefsContext.Provider value={{ prefs: { pinned: ['documents'], slotCount: 1, showOverview: true }, setPrefs: vi.fn() }}>
         <input aria-label="Previous input" />
         <button>Outside</button>

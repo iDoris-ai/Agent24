@@ -7,7 +7,9 @@
 // another channel) would have no card: main puts each, on its first
 // approval, as a task in one conversation of the assistant's own, titled
 // "Started by the assistant" (`title_source = 'assistant'`), where its card
-// can confirm or deny. docs/ui/ASSISTANT-A.md §8.
+// can confirm or deny. docs/ui/ASSISTANT-A.md §8. M6 C1: the conversation
+// is the assistant's (`initiator = 'assistant'`), so each run put in it is
+// unseen until the user opens it (docs/ui/ASSISTANT-C.md §3).
 //
 // Which run is whose comes from the daemon: `GET /api/v1/runs/{id}` gives
 // its schedule and session, `GET /api/v1/sessions/{id}` the session's
@@ -29,7 +31,7 @@
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { CHAT_HISTORY_ID, type ChatHistorySummary, type ChatHistoryTitleSource } from '../shared/chat-history'
+import { CHAT_HISTORY_ID, type ChatHistoryInitiator, type ChatHistorySummary, type ChatHistoryTitleSource } from '../shared/chat-history'
 
 export const ASSISTANT_APPROVALS_FORMAT = 'agent24.assistant-approvals'
 export const ASSISTANT_APPROVALS_VERSION = 1
@@ -53,7 +55,7 @@ export interface AssistantApprovalsDeps {
   /** The chat history store's calls this module uses. */
   history: {
     get(id: unknown): unknown
-    create(input: { title: string; title_source: ChatHistoryTitleSource }): ChatHistorySummary
+    create(input: { title: string; title_source: ChatHistoryTitleSource; initiator: ChatHistoryInitiator }): ChatHistorySummary
     appendRun(id: unknown, runId: unknown, kind: unknown): ChatHistorySummary | null
   }
   /** Whose the run is; throws when the daemon could not tell. */
@@ -146,7 +148,7 @@ export function createAssistantApprovals(deps: AssistantApprovalsDeps): Assistan
     const state = read()
     let conversation = state.conversation
     if (!onFile(conversation)) {
-      conversation = deps.history.create({ title: deps.title(), title_source: 'assistant' }).id
+      conversation = deps.history.create({ title: deps.title(), title_source: 'assistant', initiator: 'assistant' }).id
       write({ ...state, conversation })
     }
     let summary: ChatHistorySummary | null
@@ -156,7 +158,7 @@ export function createAssistantApprovals(deps: AssistantApprovalsDeps): Assistan
       // Full (its runs are all tasks): a new one takes the runs from now on
       // (Codex A6 C6).
       if (!(err instanceof Error && err.message === FULL)) throw err
-      conversation = deps.history.create({ title: deps.title(), title_source: 'assistant' }).id
+      conversation = deps.history.create({ title: deps.title(), title_source: 'assistant', initiator: 'assistant' }).id
       write({ ...read(), conversation })
       summary = deps.history.appendRun(conversation, runId, 'task')
     }

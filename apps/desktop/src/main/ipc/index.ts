@@ -10,8 +10,9 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
-import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
-import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint } from '../backend-manager'
+import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import { approvalConfirmShown, sendElevating } from '../elevated-request'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
@@ -347,12 +348,12 @@ async function documentsOsEntry(timeoutMs?: number): Promise<{ name?: unknown; e
 function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<BackendProxyResponse> {
   // Port and credential come from the backend's ready line (dynamic port +
   // token for agent24d; fixed 8765 and no credential for the node mock).
-  // Without a usable credential nothing is sent.
-  const conn = daemonConnection()
-  if (!conn) {
-    return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)'))
-  }
-  return proxyRequest(conn, req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
+  // Without a usable credential nothing is sent. With the service daemon an
+  // elevated route is confirmed once and retried (M5 B3, elevated-request.ts).
+  return sendElevating(req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) }, {
+    connection: daemonConnection,
+    elevation: daemonElevation,
+  })
 }
 
 function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
@@ -794,6 +795,7 @@ export function registerIpcHandlers(options: {
     chatHistory().setTitle(id, title, source))
   handle(IpcChannels.ChatHistoryOrganize, (_event, id: unknown, patch: unknown) => chatHistory().organize(id, patch))
   handle(IpcChannels.ChatHistoryPromoteRun, (_event, id: unknown, runId: unknown) => chatHistory().promoteRun(id, runId))
+  handle(IpcChannels.ChatHistoryMarkSeen, (_event, id: unknown) => chatHistory().markSeen(id))
   handle(IpcChannels.ScheduleConversation, (_event, scheduleId: unknown) =>
     (typeof scheduleId === 'string' ? options.scheduleConversation?.(scheduleId) ?? null : null))
   handle(IpcChannels.ChatGroupsGet, () => chatHistory().groups())
@@ -1298,8 +1300,11 @@ export function registerIpcHandlers(options: {
         typeof d.reason === 'string' && d.reason ? mt('approval.note', { value: clip(d.reason, 200) }) : '',
         mt('approval.warning'),
       ].filter(Boolean).join('\n')
-      const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
-      if (!ok) return cancelled()
+      // In service mode the daemon's presence box asks again (M5 B3); the switch is in elevated-request.ts.
+      if (approvalConfirmShown(daemonElevation() !== null)) {
+        const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
+        if (!ok) return cancelled()
+      }
       return proxyToBackend({
         method: 'POST',
         path: `/api/v1/approvals/${id}`,
