@@ -21,19 +21,26 @@
 //! Group `groupchat history --json` needs the keystore password. `data` is
 //! `{"messages":[...]}`, oldest first. `GroupMessage` (`pkg/types/group.go`,
 //! same fields as Hyphae `docs/agent/group-chat-agent24-interface-20261025.md`):
-//! `id` (logical id, the `--after-id` / `--before-id` cursor), `event_id`
-//! (empty on the sender's own row), `group_id`, `sender` (npub), `content`,
-//! `plaintext`, `created_at` (unix seconds), `is_encrypted`. No mention
-//! field. `--after-id` returns messages newer than that logical id, oldest
-//! of those first. Unknown cursor is a user error.
+//! `id` (logical id), `event_id` (empty on the sender's own row), `group_id`,
+//! `sender` (npub), `content`, `plaintext`, `created_at` (unix seconds),
+//! `is_encrypted`. No mention field. With no cursor Hyphae returns the newest
+//! `limit` rows, oldest first (`GroupMessagesPage` orders `DESC` then
+//! `sortGroupMessages`). `--after-id` is `(created_at, logical_id) > cursor`,
+//! not local receive order: a late row with an earlier `created_at` is missed
+//! forever, and a future `created_at` pins the cursor in the future. This
+//! poller does not pass `--after-id`. `inbound_cursor` stays in the store
+//! (the table and its read/write API are unused here). 游标表保留，当前按最新页
+//! + 去重；Hyphae 若提供按本地接收序的游标再启用。
 //!
 //! `identity list` `data` is an array of `{nickname, npub, ...}`.
 //! `groupchat list` `data` is `{"groups":[{"group_id", ...}]}`.
 //!
 //! Unverified and therefore conservative: a group @ is only the local npub
 //! or `@nickname` in the text (no mention array → not a mention →
-//! `addressed=none`). `@nickname` needs a left boundary (start, whitespace,
-//! or punctuation), so `bob@me.com` is not a mention. There is no
+//! `addressed=none`). `@nickname` needs a boundary on both sides: the
+//! neighbor is the end of the text, or a character that is not a Unicode
+//! alphanumeric and not `-`, `_`, or `.`. `bob@me.com`, `@ann-bot`,
+//! `@ann.x`, and `@ann其他` are not mentions. There is no
 //! per-message human/bot flag; `human` is the content rule below, and a
 //! body we cannot classify as protocol is `human=true` (the written §3.3
 //! rule). An empty `event_id` is not ingested. A body whose trimmed text
@@ -47,8 +54,10 @@
 //! `source=hyphae` row, or `inbound_policy` exists with `accept_mode` of
 //! `observe` or `auto` (a value the user stored). No policy row and an
 //! empty allowlist does not pull. A stored `accept_mode=off` always stops
-//! pulling, allowlist or not: off means off. The decision and the CLI are
-//! read every round, not frozen at process start.
+//! pulling, allowlist or not: off means off. The decision is read from the
+//! store before every CLI call and before every ingest, not frozen at
+//! process start or at the start of the round. `off` drops the rest of
+//! that round.
 //!
 //! # `human`
 //!
@@ -76,9 +85,10 @@ use super::service::{INBOUND_MAX_AGE_SECS, InboundMessage, InboundService};
 /// Background poll period. Fixed; the task also wakes on the stop token.
 pub(crate) const HYPHAE_POLL_INTERVAL: Duration = Duration::from_secs(15);
 /// `history inbox` / `groupchat history` page size. Comm caps both at 200.
+/// One round reads one page. Rows older than that page are left unseen.
+/// That is the safe direction: they do not start a run. X11-2h follows up
+/// on the same cap for DMs and groups (at most 200 per round).
 const HISTORY_LIMIT: u32 = 200;
-/// How many group pages one poll will walk so a backlog can catch up.
-const MAX_GROUP_PAGES: u32 = 8;
 /// Locked keystore / missing binary: warn at most this often, per category.
 const QUIET_WARN_INTERVAL: Duration = Duration::from_secs(10 * 60);
 /// Same unreadable group row for this many rounds, then skip it.
@@ -88,8 +98,6 @@ const SOURCE: &str = "hyphae";
 const CANARY_PREFIX: &str = "a24-liveness-canary";
 const FRIEND_PREFIX: &str = "agent24.friend/v1";
 const GROUP_PREFIX: &str = "hyphae.group/";
-/// Hyphae `ErrCursorNotFound` (`internal/groupchat/store.go`).
-const UNKNOWN_CURSOR: &str = "history cursor is not a message of this group";
 
 /// Something the poller calls at the start of every round to get the CLI
 /// the comm slot currently holds. `None` means Hyphae is not configured.
@@ -227,7 +235,10 @@ impl HyphaeInbound {
             )
             .await
             .map_err(|err| err.to_string())?;
-        let identities = match cli.run(&args(&["identity", "list"]), false).await {
+        let identities = match self
+            .call_cli(cli, &args(&["identity", "list"]), false)
+            .await
+        {
             Ok(data) => match identity_rows(&data) {
                 Some(rows) => rows,
                 None => {
@@ -235,18 +246,29 @@ impl HyphaeInbound {
                     return Ok(());
                 }
             },
-            Err(err) => {
+            Err(PullError::Off) => return Ok(()),
+            Err(PullError::Cli(err)) => {
                 self.note_cli(err);
                 return Ok(());
             }
+            Err(PullError::Store(err)) => return Err(err),
         };
         let locals: HashSet<String> = identities.iter().map(|(_, npub)| npub.clone()).collect();
         for (nickname, npub) in &identities {
-            if let Err(err) = self.poll_direct(cli, nickname, npub, &locals).await {
-                self.note_cli(err);
+            match self.poll_direct(cli, nickname, npub, &locals).await {
+                Ok(()) => {}
+                Err(PullError::Off) => return Ok(()),
+                Err(PullError::Cli(err)) => self.note_cli(err),
+                // This identity's inbox stops. Its groups, and later
+                // identities, still run. The missed rows are still on the
+                // next latest page.
+                Err(PullError::Store(err)) => self.quiet_warn("store", &err),
             }
-            if let Err(err) = self.poll_groups(cli, nickname, npub, &locals).await {
-                self.note_cli(err);
+            match self.poll_groups(cli, nickname, npub, &locals).await {
+                Ok(()) => {}
+                Err(PullError::Off) => return Ok(()),
+                Err(PullError::Cli(err)) => self.note_cli(err),
+                Err(PullError::Store(err)) => self.quiet_warn("store", &err),
             }
         }
         Ok(())
@@ -258,19 +280,24 @@ impl HyphaeInbound {
         nickname: &str,
         npub: &str,
         locals: &HashSet<String>,
-    ) -> Result<(), HyphaeCliError> {
-        let data = cli
-            .run(&args_limit(&["history", "inbox", "--as", nickname]), false)
+    ) -> Result<(), PullError> {
+        let data = self
+            .call_cli(
+                cli,
+                &args_limit(&["history", "inbox", "--as", nickname]),
+                false,
+            )
             .await?;
         let Some(mut rows) = array_rows(&data) else {
-            return Err(HyphaeCliError::Failed(
+            return Err(PullError::Cli(HyphaeCliError::Failed(
                 "history inbox data is not an array".to_owned(),
-            ));
+            )));
         };
         // Inbox is newest first. The earliest of a burst has to be the one
         // that can start a run.
         rows.sort_by(|left, right| direct_order(left).cmp(&direct_order(right)));
         for row in rows {
+            self.ensure_polling().await?;
             if own_direct(row, locals) {
                 continue;
             }
@@ -284,13 +311,14 @@ impl HyphaeInbound {
                     Ok(Some(_)) => continue,
                     Ok(None) => {}
                     Err(err) => {
-                        self.quiet_warn("store", &format!("direct lookup {stored_id}: {err}"));
-                        continue;
+                        return Err(PullError::Store(format!(
+                            "direct lookup {stored_id}: {err}"
+                        )));
                     }
                 }
             }
             self.count_direct_attempt();
-            self.ingest_direct(npub, nickname, row).await;
+            self.ingest_direct(npub, nickname, row).await?;
         }
         Ok(())
     }
@@ -301,72 +329,52 @@ impl HyphaeInbound {
         nickname: &str,
         npub: &str,
         locals: &HashSet<String>,
-    ) -> Result<(), HyphaeCliError> {
-        let data = cli
-            .run(&args(&["groupchat", "list", "--identity", nickname]), true)
+    ) -> Result<(), PullError> {
+        let data = self
+            .call_cli(
+                cli,
+                &args(&["groupchat", "list", "--identity", nickname]),
+                true,
+            )
             .await?;
         let Some(groups) = active_group_ids(&data) else {
-            return Err(HyphaeCliError::Failed(
+            return Err(PullError::Cli(HyphaeCliError::Failed(
                 "groupchat list data has no groups array".to_owned(),
-            ));
+            )));
         };
         for group_id in groups {
-            if let Err(err) = self
+            match self
                 .poll_group(cli, nickname, npub, &group_id, locals)
                 .await
             {
-                self.note_group_error(cli, nickname, npub, &group_id, locals, err)
-                    .await;
+                Ok(()) => {}
+                Err(PullError::Off) => return Err(PullError::Off),
+                // Stop this group only. The next group still runs.
+                Err(PullError::Store(err)) => {
+                    self.quiet_warn("store", &format!("group {group_id}: {err}"));
+                }
+                Err(PullError::Cli(err)) => {
+                    self.quiet_warn(
+                        &format!("group:{group_id}"),
+                        &format!("group {group_id} history: {}", err.text()),
+                    );
+                }
             }
         }
         Ok(())
     }
 
-    /// One group's history failed. An unknown cursor is dropped and that
-    /// group is retried once. Anything else is a rate-limited warning.
-    /// The next group still runs. The watermark is not touched.
-    async fn note_group_error(
-        &self,
-        cli: &dyn HyphaeCli,
-        nickname: &str,
-        npub: &str,
-        group_id: &str,
-        locals: &HashSet<String>,
-        err: HyphaeCliError,
-    ) {
-        if unknown_cursor(&err) {
-            match self
-                .store
-                .clear_inbound_cursor(SOURCE, npub, group_id)
-                .await
-            {
-                Ok(()) => {
-                    if let Err(retry) = self.poll_group(cli, nickname, npub, group_id, locals).await
-                    {
-                        self.quiet_warn(
-                            &format!("group:{group_id}"),
-                            &format!(
-                                "group {group_id} history after clearing cursor: {}",
-                                retry.text()
-                            ),
-                        );
-                    }
-                }
-                Err(clear_err) => {
-                    self.quiet_warn(
-                        "store",
-                        &format!("group {group_id} clear cursor: {clear_err}"),
-                    );
-                }
-            }
-            return;
-        }
-        self.quiet_warn(
-            &format!("group:{group_id}"),
-            &format!("group {group_id} history: {}", err.text()),
-        );
-    }
-
+    /// Latest page only. No `--after-id`: that cursor is
+    /// `(created_at, logical_id)`, so a late earlier row never returns and a
+    /// future stamp moves the cursor ahead of every later real message.
+    /// Already-stored ids are skipped; anything else is ingested. A retryable
+    /// ingest error stops this group for the round. The next round reads the
+    /// latest page again.
+    ///
+    /// Hyphae with no cursor returns the newest [`HISTORY_LIMIT`] rows,
+    /// oldest first. A backlog past that page is not fetched. Missing those
+    /// older rows is the safe direction (they do not start a run). X11-2h:
+    /// DMs and groups are at most 200 messages per round.
     async fn poll_group(
         &self,
         cli: &dyn HyphaeCli,
@@ -374,100 +382,112 @@ impl HyphaeInbound {
         npub: &str,
         group_id: &str,
         locals: &HashSet<String>,
-    ) -> Result<(), HyphaeCliError> {
-        for _ in 0..MAX_GROUP_PAGES {
-            let cursor = self
-                .store
-                .inbound_cursor(SOURCE, npub, group_id)
-                .await
-                .map_err(|err| HyphaeCliError::Failed(format!("store: {err}")))?;
-            let mut argv = vec![
-                "groupchat".to_owned(),
-                "history".to_owned(),
-                "--group-id".to_owned(),
-                group_id.to_owned(),
-                "--identity".to_owned(),
-                nickname.to_owned(),
-                "--limit".to_owned(),
-                HISTORY_LIMIT.to_string(),
-            ];
-            if let Some(cursor) = cursor.as_deref() {
-                argv.push("--after-id".to_owned());
-                argv.push(cursor.to_owned());
+    ) -> Result<(), PullError> {
+        let argv = vec![
+            "groupchat".to_owned(),
+            "history".to_owned(),
+            "--group-id".to_owned(),
+            group_id.to_owned(),
+            "--identity".to_owned(),
+            nickname.to_owned(),
+            "--limit".to_owned(),
+            HISTORY_LIMIT.to_string(),
+        ];
+        let data = self.call_cli(cli, &argv, true).await?;
+        let Some(rows) = data.get("messages").and_then(array_rows).or_else(|| {
+            // A missing key is an empty page. A non-array is an error.
+            if data.get("messages").is_none() || data["messages"].is_null() {
+                Some(Vec::new())
+            } else {
+                None
             }
-            let data = cli.run(&argv, true).await?;
-            let Some(rows) = data.get("messages").and_then(array_rows).or_else(|| {
-                // A missing key is an empty page. A non-array is an error.
-                if data.get("messages").is_none() || data["messages"].is_null() {
-                    Some(Vec::new())
-                } else {
-                    None
-                }
-            }) else {
-                return Err(HyphaeCliError::Failed(
-                    "groupchat history messages is not an array".to_owned(),
-                ));
-            };
-            let len = rows.len();
-            let mut advanced: Option<String> = None;
-            for (index, row) in rows.iter().enumerate() {
-                match self
-                    .ingest_group(npub, locals, nickname, group_id, row)
-                    .await
-                {
-                    Handled::Done { logical_id } => advanced = Some(logical_id),
-                    Handled::Stop { logical_id, reason } => {
-                        let key = logical_id.clone().unwrap_or_else(|| format!("idx:{index}"));
-                        let rounds = self.note_stuck(npub, group_id, &key);
-                        self.quiet_warn(
-                            &format!("stuck:{group_id}"),
-                            &format!("group {group_id} row {key} stuck ({reason})"),
-                        );
-                        if rounds >= STUCK_ROUNDS {
-                            self.record_filtered(npub, group_id, row, logical_id.as_deref(), index)
-                                .await;
-                            if let Some(logical_id) = logical_id {
-                                advanced = Some(logical_id);
-                            }
-                            continue;
-                        }
-                        break;
-                    }
-                }
-            }
-            if let Some(logical_id) = advanced.as_deref()
-                && logical_id != cursor.as_deref().unwrap_or("")
+        }) else {
+            return Err(PullError::Cli(HyphaeCliError::Failed(
+                "groupchat history messages is not an array".to_owned(),
+            )));
+        };
+        for (index, row) in rows.iter().enumerate() {
+            self.ensure_polling().await?;
+            match self
+                .ingest_group(npub, locals, nickname, group_id, row)
+                .await?
             {
-                self.store
-                    .set_inbound_cursor(SOURCE, npub, group_id, logical_id)
-                    .await
-                    .map_err(|err| HyphaeCliError::Failed(format!("store: {err}")))?;
-            }
-            if (len as u32) < HISTORY_LIMIT || advanced.is_none() {
-                break;
+                Handled::Done => {}
+                Handled::Stop { logical_id, reason } => {
+                    let key = logical_id.clone().unwrap_or_else(|| format!("idx:{index}"));
+                    let rounds = self.note_stuck(npub, group_id, &key);
+                    self.quiet_warn(
+                        &format!("stuck:{group_id}"),
+                        &format!("group {group_id} row {key} stuck ({reason})"),
+                    );
+                    if rounds >= STUCK_ROUNDS {
+                        self.record_filtered(npub, group_id, row, logical_id.as_deref(), index)
+                            .await;
+                        continue;
+                    }
+                    break;
+                }
             }
         }
         Ok(())
     }
 
-    async fn ingest_direct(&self, npub: &str, nickname: &str, row: &Value) {
+    /// Read the opt-in from the store. `off` is [`PullError::Off`].
+    async fn ensure_polling(&self) -> Result<(), PullError> {
+        if self.polling_enabled().await? {
+            Ok(())
+        } else {
+            Err(PullError::Off)
+        }
+    }
+
+    async fn polling_enabled(&self) -> Result<bool, PullError> {
+        let mode = self
+            .store
+            .inbound_accept_mode()
+            .await
+            .map_err(|err| PullError::Store(err.to_string()))?;
+        let allowlisted = self
+            .store
+            .inbound_source_allowlisted(SOURCE)
+            .await
+            .map_err(|err| PullError::Store(err.to_string()))?;
+        Ok(hyphae_poll_enabled(mode.as_deref(), allowlisted))
+    }
+
+    async fn call_cli(
+        &self,
+        cli: &dyn HyphaeCli,
+        argv: &[String],
+        with_password: bool,
+    ) -> Result<Value, PullError> {
+        self.ensure_polling().await?;
+        cli.run(argv, with_password).await.map_err(PullError::Cli)
+    }
+
+    async fn ingest_direct(
+        &self,
+        npub: &str,
+        nickname: &str,
+        row: &Value,
+    ) -> Result<(), PullError> {
         // Own messages are filtered by the caller, which sees every local npub.
         let Some(event_id) = row
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         else {
-            return;
+            return Ok(());
         };
         let Some(actor) = row
             .get("sender_npub")
             .and_then(Value::as_str)
             .filter(|actor| !actor.is_empty())
         else {
-            return;
+            return Ok(());
         };
         let Some(at) = created_at(row) else {
-            return;
+            return Ok(());
         };
         let text = body_text(row);
         let protocol = is_protocol(&text);
@@ -492,7 +512,7 @@ impl HyphaeInbound {
             text: Some(text),
             meta: Some(format!("{{\"nickname\":{}}}", json_string(nickname))),
         })
-        .await;
+        .await
     }
 
     async fn ingest_group(
@@ -502,20 +522,20 @@ impl HyphaeInbound {
         nickname: &str,
         group_id: &str,
         row: &Value,
-    ) -> Handled {
+    ) -> Result<Handled, PullError> {
         let Some(logical_id) = row
             .get("id")
             .and_then(Value::as_str)
             .filter(|id| !id.is_empty())
         else {
-            return Handled::Stop {
+            return Ok(Handled::Stop {
                 logical_id: None,
                 reason: "missing logical id",
-            };
+            });
         };
         let logical_id = logical_id.to_owned();
         if own_group(row, locals) {
-            return Handled::Done { logical_id };
+            return Ok(Handled::Done);
         }
         let Some(event_id) = row
             .get("event_id")
@@ -524,26 +544,34 @@ impl HyphaeInbound {
         else {
             // Incoming row with no event id cannot be deduped. Do not skip
             // past it until it has been stuck for STUCK_ROUNDS.
-            return Handled::Stop {
+            return Ok(Handled::Stop {
                 logical_id: Some(logical_id),
                 reason: "missing event id",
-            };
+            });
         };
+        let stored_id = format!("hyphae:{event_id}");
+        match self.store.get_inbound_event(&stored_id).await {
+            Ok(Some(_)) => return Ok(Handled::Done),
+            Ok(None) => {}
+            Err(err) => {
+                return Err(PullError::Store(format!("group lookup {stored_id}: {err}")));
+            }
+        }
         let Some(actor) = row
             .get("sender")
             .and_then(Value::as_str)
             .filter(|actor| !actor.is_empty())
         else {
-            return Handled::Stop {
+            return Ok(Handled::Stop {
                 logical_id: Some(logical_id),
                 reason: "missing sender",
-            };
+            });
         };
         let Some(at) = created_at(row) else {
-            return Handled::Stop {
+            return Ok(Handled::Stop {
                 logical_id: Some(logical_id),
                 reason: "missing created_at",
-            };
+            });
         };
         let text = body_text(row);
         let protocol = is_protocol(&text);
@@ -564,7 +592,7 @@ impl HyphaeInbound {
             .filter(|id| !id.is_empty())
             .unwrap_or(group_id);
         self.ingest(InboundMessage {
-            id: format!("hyphae:{event_id}"),
+            id: stored_id,
             source: SOURCE.to_owned(),
             category: category.to_owned(),
             recipient_identity: Some(npub.to_owned()),
@@ -576,8 +604,8 @@ impl HyphaeInbound {
             text: Some(text),
             meta: None,
         })
-        .await;
-        Handled::Done { logical_id }
+        .await?;
+        Ok(Handled::Done)
     }
 
     async fn allowlisted(&self, actor: &str) -> bool {
@@ -590,13 +618,24 @@ impl HyphaeInbound {
         }
     }
 
-    async fn ingest(&self, message: InboundMessage) {
-        if let Err(err) = self.service.ingest(message).await {
-            self.quiet_warn("ingest", &format!("ingest failed: {err:?}"));
+    /// Retryable failures (`Store`, `Start`) propagate. The caller stops the
+    /// rest of this inbox or group. Invalid input is warned and skipped so
+    /// one bad row does not hold the page.
+    async fn ingest(&self, message: InboundMessage) -> Result<(), PullError> {
+        self.ensure_polling().await?;
+        match self.service.ingest(message).await {
+            Ok(_) => Ok(()),
+            Err(super::service::IngestError::Store(err)) => Err(PullError::Store(err.to_string())),
+            Err(super::service::IngestError::Start(err)) => Err(PullError::Store(err)),
+            Err(err) => {
+                self.quiet_warn("ingest", &format!("ingest failed: {err:?}"));
+                Ok(())
+            }
         }
     }
 
-    /// Leave a `disposition=filtered` row and let the cursor move past.
+    /// Leave a `disposition=filtered` row so a row with no event id is not
+    /// retried forever. The latest page is read again next round either way.
     async fn record_filtered(
         &self,
         npub: &str,
@@ -684,13 +723,31 @@ impl HyphaeInbound {
 }
 
 enum Handled {
-    Done {
-        logical_id: String,
-    },
+    Done,
     Stop {
         logical_id: Option<String>,
         reason: &'static str,
     },
+}
+
+/// A pull stopped early. `Off` is not a failure: the rest of the round is
+/// dropped. `Store` is retryable; the caller stops the current inbox or
+/// group and lets the next round read the latest page again.
+enum PullError {
+    Cli(HyphaeCliError),
+    Store(String),
+    Off,
+}
+
+impl PullError {
+    #[cfg(test)]
+    fn text(&self) -> String {
+        match self {
+            Self::Cli(err) => err.text(),
+            Self::Store(message) => message.clone(),
+            Self::Off => "inbound polling is off".to_owned(),
+        }
+    }
 }
 
 fn args(parts: &[&str]) -> Vec<String> {
@@ -807,9 +864,9 @@ fn is_protocol(text: &str) -> bool {
 }
 
 /// No mention field on the wire. The local npub as a substring, or
-/// `@nickname` with a boundary on both sides. The character before `@`
-/// is the start of the text, whitespace, or punctuation. `bob@me.com`
-/// is an address, not a mention.
+/// `@nickname` with a boundary on both sides. A neighbor that is a Unicode
+/// alphanumeric, or `-`, `_`, or `.`, is still part of the token, so
+/// `bob@me.com`, `@ann-bot`, `@ann.x`, and `@ann其他` are not mentions.
 fn mentions(text: &str, npub: &str, nickname: &str) -> bool {
     if !npub.is_empty() && text.contains(npub) {
         return true;
@@ -823,43 +880,19 @@ fn mentions(text: &str, npub: &str, nickname: &str) -> bool {
             || text[..index]
                 .chars()
                 .next_back()
-                .is_some_and(is_mention_boundary);
+                .is_some_and(|ch| !mention_token_char(ch));
         let right = text[index + needle.len()..]
             .chars()
             .next()
-            .is_none_or(|ch| !ch.is_ascii_alphanumeric() && ch != '_');
+            .is_none_or(|ch| !mention_token_char(ch));
         left && right
     })
 }
 
-fn is_mention_boundary(ch: char) -> bool {
-    ch.is_whitespace() || ch.is_ascii_punctuation() || is_cjk_punctuation(ch)
-}
-
-fn is_cjk_punctuation(ch: char) -> bool {
-    matches!(
-        ch,
-        '，' | '。'
-            | '、'
-            | '；'
-            | '：'
-            | '！'
-            | '？'
-            | '（'
-            | '）'
-            | '「'
-            | '」'
-            | '『'
-            | '』'
-            | '《'
-            | '》'
-            | '【'
-            | '】'
-            | '…'
-            | '—'
-            | '～'
-            | '·'
-    )
+/// Character that continues a nickname token. Either side of `@nickname`
+/// must not be one of these.
+fn mention_token_char(ch: char) -> bool {
+    ch.is_alphanumeric() || matches!(ch, '-' | '_' | '.')
 }
 
 /// Inbox order is newest first. Missing `created_at` sorts last.
@@ -870,13 +903,6 @@ fn direct_order(row: &Value) -> (i64, &str) {
         .unwrap_or(i64::MAX);
     let id = row.get("id").and_then(Value::as_str).unwrap_or("");
     (secs, id)
-}
-
-fn unknown_cursor(err: &HyphaeCliError) -> bool {
-    match err {
-        HyphaeCliError::Failed(message) => message.contains(UNKNOWN_CURSOR),
-        _ => false,
-    }
 }
 
 /// `true` when this category should emit a warning now.
@@ -1454,10 +1480,12 @@ mod tests {
         );
     }
 
-    /// Mutation: stop persisting the group cursor. The second poll's
-    /// `groupchat history` lacks `--after-id` and this assert goes red.
+    /// Mutation: persist a `(created_at, logical_id)` cursor and pass it as
+    /// `--after-id` on the second poll. `Script` then returns an empty page,
+    /// which still happens to avoid a replay, but the late-row test goes red
+    /// because that cursor never sees `(100, a)` after `(100, z)`.
     #[tokio::test]
-    async fn group_cursor_survives_a_new_poller_and_does_not_replay() {
+    async fn group_page_is_reread_without_a_cursor_and_does_not_replay() {
         let now_at = wall_now();
         let now = now_at.timestamp();
         let script = Arc::new(Script {
@@ -1476,13 +1504,13 @@ mod tests {
         allow(&store, PEER).await;
         first.poll_round().await.unwrap();
         assert_eq!(runs(&store).await, 1);
-        assert_eq!(
+        assert!(
             store
                 .inbound_cursor(SOURCE, SELF_NPUB, GROUP)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-one")
+                .is_none(),
+            "the poller does not write inbound_cursor"
         );
 
         let (second, _) = open(Arc::clone(&script), now_at).await;
@@ -1510,12 +1538,9 @@ mod tests {
         assert!(history.len() >= 2, "{history:?}");
         assert!(
             history
-                .last()
-                .unwrap()
-                .0
-                .windows(2)
-                .any(|pair| pair[0] == "--after-id" && pair[1] == "logical-one"),
-            "second poll must pass the stored cursor: {history:?}"
+                .iter()
+                .all(|(argv, _)| !argv.iter().any(|arg| arg == "--after-id")),
+            "group history is the latest page, not a cursor: {history:?}"
         );
     }
 
@@ -1574,6 +1599,22 @@ mod tests {
         assert!(!mentions("bob@me.com", SELF_NPUB, "me"));
         assert!(mentions("(@me)", SELF_NPUB, "me"));
         assert!(mentions("hi,@me", SELF_NPUB, "me"));
+    }
+
+    /// Mutation: treat the right edge as ASCII only (`is_ascii_alphanumeric`
+    /// plus `_`). `@ann其他` then counts as a mention and this test goes red.
+    #[test]
+    fn nickname_ann_rejects_a_longer_token() {
+        assert!(!mentions("@ann-bot", SELF_NPUB, "ann"));
+        assert!(!mentions("@ann其他", SELF_NPUB, "ann"));
+        assert!(!mentions("@ann.x", SELF_NPUB, "ann"));
+        assert!(mentions("@ann 你好", SELF_NPUB, "ann"));
+        assert!(mentions("@ann，", SELF_NPUB, "ann"));
+        assert!(
+            !mentions("ann@ann", SELF_NPUB, "ann"),
+            "left edge is Unicode too"
+        );
+        assert!(!mentions(".@ann", SELF_NPUB, "ann"));
     }
 
     #[test]
@@ -1801,10 +1842,9 @@ mod tests {
     }
 
     /// Mutation: treat only the npub currently being polled as self. B then
-    /// stores A's message. Drop the identity from the cursor key and both
-    /// cursors read back as `logical-b`.
+    /// stores A's message.
     #[tokio::test]
-    async fn every_local_npub_is_self_and_cursors_stay_per_identity() {
+    async fn every_local_npub_is_self() {
         let now_at = wall_now();
         let cli = Arc::new(TwoIdentities {
             now: now_at.timestamp(),
@@ -1836,21 +1876,21 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
-        assert_eq!(
+        assert!(
             store
-                .inbound_cursor(SOURCE, NPUB_A, GROUP)
+                .get_inbound_event("hyphae:evt-peer-a")
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-a")
+                .is_some(),
+            "A still stores the peer's group message"
         );
-        assert_eq!(
+        assert!(
             store
-                .inbound_cursor(SOURCE, NPUB_B, GROUP)
+                .get_inbound_event("hyphae:evt-peer-b-group")
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-b")
+                .is_some(),
+            "B stores the peer's group message"
         );
     }
 
@@ -1898,56 +1938,291 @@ mod tests {
         );
     }
 
-    /// Mutation: keep the unknown cursor. The retry never runs, so the fresh
-    /// message is missing and this assert goes red. Clearing the watermark
-    /// as well makes the fresh row `stale`.
+    /// Mutation: page with `--after-id` of `z`. Hyphae then hides `(100, a)`
+    /// (`(created_at, logical_id)` is not greater) and the second assert goes
+    /// red. `OrderingPage` applies that comparison when the flag is present.
     #[tokio::test]
-    async fn an_unknown_cursor_is_cleared_and_history_recovers() {
+    async fn a_late_row_with_an_earlier_logical_id_lands_on_the_next_page() {
         let now_at = wall_now();
-        let now = now_at.timestamp();
-        let cli = Arc::new(UnknownCursor { now });
+        let z = group_msg("z", "evt-z", PEER, 100, "first");
+        let a = group_msg("a", "evt-a", PEER, 100, "late");
+        let cli = Arc::new(OrderingPage {
+            calls: StdMutex::new(Vec::new()),
+            pages: StdMutex::new(vec![vec![z.clone()], vec![a.clone(), z.clone()]]),
+            known: vec![a.clone(), z],
+        });
         let (inbound, store) = open_cli(Arc::clone(&cli) as Arc<dyn HyphaeCli>, now_at).await;
         allow(&store, PEER).await;
-        let activated =
-            format_inbound_timestamp(Utc.timestamp_opt(now - 3600, 0).single().unwrap());
-        store
-            .ensure_inbound_watermark(SOURCE, &activated, 600)
-            .await
-            .unwrap();
-        store
-            .set_inbound_cursor(SOURCE, SELF_NPUB, GROUP, "not-a-message")
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-z")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-a")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-a")
+                .await
+                .unwrap()
+                .is_some(),
+            "the late (100, a) is on the next latest page"
+        );
+        assert!(
+            cli.calls.lock().unwrap().iter().all(|argv| {
+                argv.first().map(String::as_str) != Some("groupchat")
+                    || argv.get(1).map(String::as_str) != Some("history")
+                    || !argv.iter().any(|arg| arg == "--after-id")
+            }),
+            "group history must not pass --after-id"
+        );
+    }
+
+    /// Mutation: advance a cursor to the future row. The next poll's
+    /// `--after-id` drops the normal stamp and this assert goes red.
+    #[tokio::test]
+    async fn a_future_stamp_does_not_hide_a_later_normal_message() {
+        let now_at = wall_now();
+        let now = now_at.timestamp();
+        let future = group_msg("future", "evt-future", PEER, now + 1_000_000_000, "ahead");
+        let normal = group_msg("normal", "evt-normal", PEER, now, "on time");
+        let cli = Arc::new(OrderingPage {
+            calls: StdMutex::new(Vec::new()),
+            pages: StdMutex::new(vec![
+                vec![future.clone()],
+                vec![normal.clone(), future.clone()],
+            ]),
+            known: vec![normal.clone(), future],
+        });
+        let (inbound, store) = open_cli(Arc::clone(&cli) as Arc<dyn HyphaeCli>, now_at).await;
+        allow(&store, PEER).await;
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-future")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-normal")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-normal")
+                .await
+                .unwrap()
+                .is_some(),
+            "a future stamp must not block the next real message"
+        );
+    }
+
+    /// A page past 200 is not walked. Hyphae without a cursor already returns
+    /// only the newest [`HISTORY_LIMIT`] rows. Older rows stay unseen: that
+    /// is the safe direction (they do not start a run). X11-2h records the
+    /// same cap for DMs and groups.
+    ///
+    /// Mutation: drop `--limit` or follow the page with `--before-id`.
+    /// `LatestPage` then includes `evt-0000` and the first assert goes red.
+    #[tokio::test]
+    async fn a_backlog_past_one_page_leaves_the_older_rows_unseen() {
+        let now_at = wall_now();
+        let cli = Arc::new(LatestPage {
+            calls: StdMutex::new(Vec::new()),
+            now: now_at.timestamp(),
+        });
+        let (inbound, store) = open_cli(Arc::clone(&cli) as Arc<dyn HyphaeCli>, now_at).await;
+        allow(&store, PEER).await;
+        inbound.poll_round().await.unwrap();
+
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-0000")
+                .await
+                .unwrap()
+                .is_none(),
+            "the row older than the latest page is not ingested"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-0001")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-0200")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(runs(&store).await, 0, "an unseen older row starts nothing");
+        let history: Vec<_> = cli
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|argv| argv.get(1).map(String::as_str) == Some("history"))
+            .cloned()
+            .collect();
+        assert_eq!(history.len(), 1, "one group, one page: {history:?}");
+        assert!(
+            history[0]
+                .windows(2)
+                .any(|pair| pair[0] == "--limit" && pair[1] == "200"),
+            "{history:?}"
+        );
+        assert!(
+            history.iter().all(|argv| {
+                !argv
+                    .iter()
+                    .any(|arg| arg == "--after-id" || arg == "--before-id")
+            }),
+            "{history:?}"
+        );
+    }
+
+    /// Mutation: read the switch only at the start of the round. The second
+    /// message is stored and starts a run, so both asserts go red.
+    #[tokio::test]
+    async fn turning_accept_mode_off_during_the_page_stops_the_rest() {
+        let now_at = wall_now();
+        let now = now_at.timestamp();
+        let script = Arc::new(Script {
+            calls: StdMutex::new(Vec::new()),
+            directs: StdMutex::new(vec![
+                direct("evt-first", PEER, now, r#"{"version":"f4/1"}"#, true),
+                direct("evt-second", PEER, now, "please run", true),
+            ]),
+            groups: StdMutex::new(Vec::new()),
+            fail: StdMutex::new(None),
+        });
+        let (inbound, store) = open(Arc::clone(&script), now_at).await;
+        allow(&store, PEER).await;
+        observe(&store, "observe").await;
+        sqlx::query(
+            "CREATE TRIGGER hyphae_flip_off AFTER INSERT ON inbound_events \
+             BEGIN \
+               UPDATE inbound_policy SET accept_mode = 'off' WHERE id = 1; \
+             END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-first")
+                .await
+                .unwrap()
+                .is_some(),
+            "the message already in hand is stored"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-second")
+                .await
+                .unwrap()
+                .is_none(),
+            "off stops the rest of the page"
+        );
+        assert_eq!(runs(&store).await, 0, "the remaining message starts no run");
+        assert!(
+            script
+                .calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(argv, _)| argv[0] != "groupchat"),
+            "off stops the rest of the round, including later CLI calls"
+        );
+    }
+
+    /// Mutation: swallow the store error and keep walking the page. `evt-later`
+    /// is stored in the first round and this assert goes red. Aborting the
+    /// whole identity (not just the group) leaves `evt-other` missing.
+    #[tokio::test]
+    async fn a_retryable_ingest_error_retries_on_the_next_page() {
+        let now_at = wall_now();
+        let cli = Arc::new(TwoGroups {
+            calls: StdMutex::new(Vec::new()),
+            now: now_at.timestamp(),
+        });
+        let (inbound, store) = open_cli(Arc::clone(&cli) as Arc<dyn HyphaeCli>, now_at).await;
+        allow(&store, PEER).await;
+        sqlx::query(
+            "CREATE TRIGGER hyphae_fail_once BEFORE INSERT ON inbound_events \
+             WHEN NEW.id = 'hyphae:evt-fail' \
+             BEGIN \
+               SELECT RAISE(ABORT, 'injected'); \
+             END",
+        )
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-fail")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-later")
+                .await
+                .unwrap()
+                .is_none(),
+            "the rest of this group waits for the next round"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-other")
+                .await
+                .unwrap()
+                .is_some(),
+            "another group still lands"
+        );
+
+        sqlx::query("DROP TRIGGER hyphae_fail_once")
+            .execute(agent24_store::test_hooks::pool(&store))
             .await
             .unwrap();
         inbound.poll_round().await.unwrap();
-
-        let old = store
-            .get_inbound_event("hyphae:evt-old-group")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(old.disposition_reason.as_deref(), Some("stale"));
-        let fresh = store
-            .get_inbound_event("hyphae:evt-fresh-group")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_ne!(fresh.disposition_reason.as_deref(), Some("stale"));
-        assert_eq!(
+        assert!(
             store
-                .inbound_watermark_activated_at(SOURCE)
+                .get_inbound_event("hyphae:evt-fail")
                 .await
                 .unwrap()
-                .as_deref(),
-            Some(activated.as_str()),
-            "clearing the cursor must leave the watermark"
+                .is_some(),
+            "the next latest page stores the row the store rejected"
         );
-        assert_eq!(
+        assert!(
             store
-                .inbound_cursor(SOURCE, SELF_NPUB, GROUP)
+                .get_inbound_event("hyphae:evt-later")
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-fresh")
+                .is_some()
         );
     }
 
@@ -2155,17 +2430,23 @@ mod tests {
         }
     }
 
-    struct UnknownCursor {
-        now: i64,
+    /// Group history whose uncursored page changes per call. `--after-id`
+    /// applies Hyphae's `(created_at, logical_id)` comparison so a cursor
+    /// regression fails the late-row and future-stamp tests.
+    struct OrderingPage {
+        calls: StdMutex<Vec<Vec<String>>>,
+        pages: StdMutex<Vec<Vec<Value>>>,
+        known: Vec<Value>,
     }
 
     #[async_trait]
-    impl HyphaeCli for UnknownCursor {
+    impl HyphaeCli for OrderingPage {
         async fn run(
             &self,
             args: &[String],
             _with_password: bool,
         ) -> Result<Value, HyphaeCliError> {
+            self.calls.lock().unwrap().push(args.to_vec());
             if args.first().map(String::as_str) == Some("identity") {
                 return Ok(json!([{ "nickname": NICK, "npub": SELF_NPUB }]));
             }
@@ -2175,31 +2456,128 @@ mod tests {
             if args.get(1).map(String::as_str) == Some("list") {
                 return Ok(json!({ "groups": [{ "group_id": GROUP, "state": "active" }] }));
             }
-            if args.windows(2).any(|pair| pair[0] == "--after-id") {
-                return Err(HyphaeCliError::Failed(format!(
-                    "user_error: {UNKNOWN_CURSOR}"
-                )));
+            let mut pages = self.pages.lock().unwrap();
+            let page = if pages.len() > 1 {
+                pages.remove(0)
+            } else {
+                pages.first().cloned().unwrap_or_default()
+            };
+            let Some(cursor) = args
+                .windows(2)
+                .find(|pair| pair[0] == "--after-id")
+                .map(|pair| pair[1].as_str())
+            else {
+                return Ok(json!({ "messages": page }));
+            };
+            let Some(cursor_at) = self
+                .known
+                .iter()
+                .find(|row| row.get("id").and_then(Value::as_str) == Some(cursor))
+                .and_then(|row| row.get("created_at").and_then(Value::as_i64))
+            else {
+                return Err(HyphaeCliError::Failed(
+                    "history cursor is not a message of this group".to_owned(),
+                ));
+            };
+            let messages: Vec<_> = page
+                .into_iter()
+                .filter(|row| {
+                    let at = row.get("created_at").and_then(Value::as_i64).unwrap_or(0);
+                    let id = row.get("id").and_then(Value::as_str).unwrap_or("");
+                    (at, id) > (cursor_at, cursor)
+                })
+                .collect();
+            Ok(json!({ "messages": messages }))
+        }
+    }
+
+    /// 201 rows. A single `--limit 200` call receives the newest 200.
+    /// A missing limit, or a cursor flag, also receives the older row so the
+    /// cap test goes red.
+    struct LatestPage {
+        calls: StdMutex<Vec<Vec<String>>>,
+        now: i64,
+    }
+
+    #[async_trait]
+    impl HyphaeCli for LatestPage {
+        async fn run(
+            &self,
+            args: &[String],
+            _with_password: bool,
+        ) -> Result<Value, HyphaeCliError> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if args.first().map(String::as_str) == Some("identity") {
+                return Ok(json!([{ "nickname": NICK, "npub": SELF_NPUB }]));
+            }
+            if args.first().map(String::as_str) == Some("history") {
+                return Ok(json!([]));
+            }
+            if args.get(1).map(String::as_str) == Some("list") {
+                return Ok(json!({ "groups": [{ "group_id": GROUP, "state": "active" }] }));
+            }
+            let capped = args
+                .windows(2)
+                .any(|pair| pair[0] == "--limit" && pair[1] == "200")
+                && !args
+                    .iter()
+                    .any(|arg| arg == "--after-id" || arg == "--before-id");
+            let start = u32::from(capped);
+            let messages: Vec<_> = (start..=200)
+                .map(|index| {
+                    group_msg(
+                        &format!("{index:04}"),
+                        &format!("evt-{index:04}"),
+                        PEER,
+                        self.now,
+                        "plain",
+                    )
+                })
+                .collect();
+            Ok(json!({ "messages": messages }))
+        }
+    }
+
+    struct TwoGroups {
+        calls: StdMutex<Vec<Vec<String>>>,
+        now: i64,
+    }
+
+    #[async_trait]
+    impl HyphaeCli for TwoGroups {
+        async fn run(
+            &self,
+            args: &[String],
+            _with_password: bool,
+        ) -> Result<Value, HyphaeCliError> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if args.first().map(String::as_str) == Some("identity") {
+                return Ok(json!([{ "nickname": NICK, "npub": SELF_NPUB }]));
+            }
+            if args.first().map(String::as_str) == Some("history") {
+                return Ok(json!([]));
+            }
+            if args.get(1).map(String::as_str) == Some("list") {
+                return Ok(json!({
+                    "groups": [
+                        { "group_id": GROUP, "state": "active" },
+                        { "group_id": GOOD, "state": "active" }
+                    ]
+                }));
+            }
+            let group = args
+                .windows(2)
+                .find(|pair| pair[0] == "--group-id")
+                .map(|pair| pair[1].as_str());
+            if group == Some(GOOD) {
+                return Ok(json!({
+                    "messages": [group_msg("logical-other", "evt-other", PEER, self.now, "other group")]
+                }));
             }
             Ok(json!({
                 "messages": [
-                    {
-                        "id": "logical-old",
-                        "event_id": "evt-old-group",
-                        "group_id": GROUP,
-                        "sender": PEER,
-                        "content": "before the watermark",
-                        "plaintext": "before the watermark",
-                        "created_at": self.now - 7200,
-                    },
-                    {
-                        "id": "logical-fresh",
-                        "event_id": "evt-fresh-group",
-                        "group_id": GROUP,
-                        "sender": PEER,
-                        "content": "after the watermark",
-                        "plaintext": "after the watermark",
-                        "created_at": self.now,
-                    }
+                    group_msg("logical-fail", "evt-fail", PEER, self.now, "fails once"),
+                    group_msg("logical-later", "evt-later", PEER, self.now, "same group"),
                 ]
             }))
         }
@@ -2429,13 +2807,13 @@ mod tests {
             warned(&inbound, "cli-failed"),
             "the bad inbox is warned, not a silent empty page"
         );
-        assert_eq!(
+        assert!(
             store
                 .inbound_cursor(SOURCE, SELF_NPUB, GROUP)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-after-inbox")
+                .is_none(),
+            "a stored group message does not write a cursor"
         );
     }
 
@@ -2497,13 +2875,13 @@ mod tests {
             Some("logical-held"),
             "the bad list must not move the cursor"
         );
-        assert_eq!(
+        assert!(
             store
                 .inbound_cursor(SOURCE, NPUB_B, GOOD)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-bob")
+                .is_none(),
+            "the next identity's page does not write a cursor"
         );
         assert!(!script.saw_group(GROUP));
         assert!(script.saw_group(GOOD));
@@ -2571,13 +2949,13 @@ mod tests {
             Some("logical-held"),
             "the bad page must not advance the cursor"
         );
-        assert_eq!(
+        assert!(
             store
                 .inbound_cursor(SOURCE, SELF_NPUB, GOOD)
                 .await
                 .unwrap()
-                .as_deref(),
-            Some("logical-good-page")
+                .is_none(),
+            "the next group does not write a cursor"
         );
         assert!(
             warned(&inbound, &format!("group:{BAD}")),

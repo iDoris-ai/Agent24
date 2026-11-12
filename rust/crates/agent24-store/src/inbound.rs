@@ -441,6 +441,10 @@ impl Store {
     /// `recipient_identity` is the local npub the cursor belongs to. Two
     /// identities in one group do not share a row.
     ///
+    /// Hyphae 入站当前不调用本方法和 [`Self::set_inbound_cursor`] /
+    /// [`Self::clear_inbound_cursor`]。群历史按最新一页加事件 id 去重。
+    /// 游标表保留，Hyphae 若提供按本地接收序的游标再启用。
+    ///
     /// # Errors
     /// Storage.
     pub async fn inbound_cursor(
