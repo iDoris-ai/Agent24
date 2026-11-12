@@ -976,6 +976,11 @@ mod tests {
                                 // debug-only black-box fixture signatures, never persisted
                                 // into a service environment or compiled into release.
                                     | "A24_TEST_ACCEPT_ADHOC_SIGNATURES"
+                                // development-only wechat inbound switches (X11-2g):
+                                // they must not reach a LaunchAgent-started daemon,
+                                // the same rule `daemonChildEnv` enforces for the desktop.
+                                    | "A24_DEV_TOOL"
+                                    | "A24_INBOUND_DEV_ALLOWLIST"
                             )
                         {
                             found.push(name);
