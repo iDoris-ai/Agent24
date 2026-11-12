@@ -5453,8 +5453,9 @@ components:
           description: >-
             Kernel capabilities actually held. A mounted package copies
             `MountReport.granted`. An attached module copies the admission grant
-            (events, and models when a model callback was built). Empty when
-            nothing was handed out. Not the resolver's grant set: a missing model
+            (events, and models when a model callback was built); for attach rows
+            this is the admission grant and does not change with whether the module
+            is currently connected. Empty when nothing was handed out. Not the resolver's grant set: a missing model
             callback omits `models` even when the declaration and the ceiling would allow it.
         declared:
           description: >-
@@ -5497,7 +5498,8 @@ components:
         components:
           type: array
           items:
-            # anyOf, not oneOf: a full view also satisfies the redacted schema.
+            # Host rows match ComponentView; other audiences get ComponentRedactedView
+            # (additionalProperties: false, so a full row cannot pass as redacted).
             anyOf:
               - $ref: "#/components/schemas/ComponentView"
               - $ref: "#/components/schemas/ComponentRedactedView"
