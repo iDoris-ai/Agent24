@@ -249,6 +249,33 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// Move `start_failed` back to `starting` so a later dispatch can retry.
+    ///
+    /// The `WHERE` requires `disposition='explicit'`, `run_state='start_failed'`,
+    /// and no `inbound_runs` row. A missing id or any other state returns
+    /// `false` and writes nothing. A clash on `idx_inbound_events_inflight`
+    /// (this sender already has a `starting` or `started` explicit row) is
+    /// also `false`: the row stays `start_failed`.
+    ///
+    /// # Errors
+    /// Storage, other than that in-flight index.
+    pub async fn reopen_inbound_start_failed(&self, id: &str) -> Result<bool> {
+        let updated = sqlx::query(
+            "UPDATE inbound_events SET run_state = 'starting' \
+             WHERE id = ? AND run_state = 'start_failed' AND disposition = 'explicit' \
+               AND NOT EXISTS (SELECT 1 FROM inbound_runs WHERE event_id = ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(self.pool())
+        .await;
+        match updated {
+            Ok(done) => Ok(done.rows_affected() > 0),
+            Err(sqlx::Error::Database(err)) if is_inflight_conflict(err.as_ref()) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Link a run to the inbound event that started it.
     ///
     /// `run_id` and `event_id` are both unique. The run row must already exist.
@@ -341,18 +368,54 @@ impl Store {
         actor: &str,
         since: &str,
     ) -> Result<i64> {
+        self.count_inbound_window_except(source, actor, since, None)
+            .await
+    }
+
+    /// As [`Self::count_inbound_window`], skipping `except_id` when it is set.
+    ///
+    /// A retry already has its row stored. Passing that id keeps the window
+    /// the same shape as the first admission, which did not count the row
+    /// under consideration. `None` counts every matching row.
+    ///
+    /// # Errors
+    /// Storage, or a `since` that is not [`format_inbound_timestamp`].
+    pub async fn count_inbound_window_except(
+        &self,
+        source: &str,
+        actor: &str,
+        since: &str,
+        except_id: Option<&str>,
+    ) -> Result<i64> {
         require_inbound_timestamp("since", since)?;
+        let except_id = except_id.map(str::to_owned);
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM inbound_events \
              WHERE source = ? AND actor = ? AND received_at >= ? \
-               AND category <> 'protocol' AND disposition <> 'filtered'",
+               AND category <> 'protocol' AND disposition <> 'filtered' \
+               AND (? IS NULL OR id <> ?)",
         )
         .bind(source)
         .bind(actor)
         .bind(since)
+        .bind(except_id.clone())
+        .bind(except_id)
         .fetch_one(self.pool())
         .await?;
         Ok(count)
+    }
+
+    /// Whether any `inbound_allowlist` row has this `source`.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_source_allowlisted(&self, source: &str) -> Result<bool> {
+        let hit: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM inbound_allowlist WHERE source = ? LIMIT 1")
+                .bind(source)
+                .fetch_optional(self.pool())
+                .await?;
+        Ok(hit.is_some())
     }
 
     /// Whether `(source, actor)` is on `inbound_allowlist`.
@@ -393,6 +456,114 @@ impl Store {
         .fetch_optional(self.pool())
         .await?;
         Ok(at)
+    }
+
+    /// Insert the source watermark if that source has none yet.
+    ///
+    /// A row that is already there is left as it was (`ON CONFLICT DO
+    /// NOTHING`), so a restart does not move the activation time.
+    /// `activated_at` is [`format_inbound_timestamp`]. `max_age_secs` is
+    /// stored for the row; admission reads the caller's own constant.
+    ///
+    /// # Errors
+    /// Storage, or an `activated_at` that is not [`format_inbound_timestamp`].
+    pub async fn ensure_inbound_watermark(
+        &self,
+        source: &str,
+        activated_at: &str,
+        max_age_secs: i64,
+    ) -> Result<()> {
+        require_inbound_timestamp("activated_at", activated_at)?;
+        sqlx::query(
+            "INSERT INTO inbound_source_watermark (source, activated_at, max_age_secs) \
+             VALUES (?, ?, ?) ON CONFLICT(source) DO NOTHING",
+        )
+        .bind(source)
+        .bind(activated_at)
+        .bind(max_age_secs)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Group-history cursor for `(source, recipient_identity, thread_key)`.
+    ///
+    /// `recipient_identity` is the local npub the cursor belongs to. Two
+    /// identities in one group do not share a row.
+    ///
+    /// Hyphae 入站当前不调用本方法和 [`Self::set_inbound_cursor`] /
+    /// [`Self::clear_inbound_cursor`]。群历史按最新一页加事件 id 去重。
+    /// 游标表保留，Hyphae 若提供按本地接收序的游标再启用。
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn inbound_cursor(
+        &self,
+        source: &str,
+        recipient_identity: &str,
+        thread_key: &str,
+    ) -> Result<Option<String>> {
+        let cursor: Option<String> = sqlx::query_scalar(
+            "SELECT cursor FROM inbound_cursor \
+             WHERE source = ? AND recipient_identity = ? AND thread_key = ?",
+        )
+        .bind(source)
+        .bind(recipient_identity)
+        .bind(thread_key)
+        .fetch_optional(self.pool())
+        .await?;
+        Ok(cursor)
+    }
+
+    /// Insert or replace the group-history cursor for one local identity.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn set_inbound_cursor(
+        &self,
+        source: &str,
+        recipient_identity: &str,
+        thread_key: &str,
+        cursor: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO inbound_cursor (source, recipient_identity, thread_key, cursor) \
+             VALUES (?, ?, ?, ?) \
+             ON CONFLICT(source, recipient_identity, thread_key) \
+             DO UPDATE SET cursor = excluded.cursor",
+        )
+        .bind(source)
+        .bind(recipient_identity)
+        .bind(thread_key)
+        .bind(cursor)
+        .execute(self.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// Drop the group-history cursor for one local identity.
+    ///
+    /// The source watermark is a different row and is left in place. A
+    /// missing row is success.
+    ///
+    /// # Errors
+    /// Storage.
+    pub async fn clear_inbound_cursor(
+        &self,
+        source: &str,
+        recipient_identity: &str,
+        thread_key: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "DELETE FROM inbound_cursor \
+             WHERE source = ? AND recipient_identity = ? AND thread_key = ?",
+        )
+        .bind(source)
+        .bind(recipient_identity)
+        .bind(thread_key)
+        .execute(self.pool())
+        .await?;
+        Ok(())
     }
 
     /// Insert `session`, `run`, and `inbound_runs` in one `BEGIN IMMEDIATE`.
@@ -1737,6 +1908,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reopen_start_failed_requires_explicit_unlinked_and_a_free_slot() {
+        let store = Store::open_memory().await.unwrap();
+        let hold = sample("hyphae:hold", "npub1", "explicit", Some("starting"));
+        let failed = sample("hyphae:retry", "npub1", "explicit", Some("start_failed"));
+        assert_eq!(
+            store.insert_inbound_event(&hold).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        assert_eq!(
+            store.insert_inbound_event(&failed).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:retry")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("start_failed")
+        );
+
+        assert!(
+            store
+                .mark_inbound_run_state("hyphae:hold", "started")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .mark_inbound_run_state("hyphae:hold", "done")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .reopen_inbound_start_failed("hyphae:retry")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:retry")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("starting")
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:retry")
+                .await
+                .unwrap()
+        );
+
+        let linked = sample(
+            "hyphae:linked-fail",
+            "npub9",
+            "explicit",
+            Some("start_failed"),
+        );
+        assert_eq!(
+            store.insert_inbound_event(&linked).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        seed_run(&store, "run_linked_fail").await;
+        store
+            .insert_inbound_run("run_linked_fail", "hyphae:linked-fail")
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:linked-fail")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store
+                .get_inbound_event("hyphae:linked-fail")
+                .await
+                .unwrap()
+                .unwrap()
+                .run_state
+                .as_deref(),
+            Some("start_failed")
+        );
+
+        let ignored = sample("hyphae:ignored", "npub8", "ignore", Some("start_failed"));
+        assert_eq!(
+            store.insert_inbound_event(&ignored).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:ignored")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .reopen_inbound_start_failed("hyphae:missing")
+                .await
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
     async fn inbound_timestamps_must_be_utc_seconds() {
         let stamped = "2026-11-11T00:00:01.500Z".parse::<DateTime<Utc>>().unwrap();
         assert_eq!(format_inbound_timestamp(stamped), "2026-11-11T00:00:01Z");
@@ -1820,6 +2107,13 @@ mod tests {
         let store = Store::open(&path).await.unwrap();
         // 0034 入站表 + 0035 游标；升级后旧行不变，schema 停在当前最新。
         assert_eq!(store.latest_applied_migration().await.unwrap(), 35);
+        let cursor_table: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'inbound_cursor'",
+        )
+        .fetch_one(crate::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        assert_eq!(cursor_table, 1);
         let input: String = sqlx::query_scalar("SELECT input FROM runs WHERE id = 'old_run'")
             .fetch_one(crate::test_hooks::pool(&store))
             .await
@@ -1884,6 +2178,27 @@ mod tests {
         assert_eq!(
             store
                 .count_inbound_window("hyphae", "npub1", "2026-11-11T00:00:00Z")
+                .await
+                .unwrap(),
+            3
+        );
+        // The row being retried is already stored. Mutation: drop the
+        // `id <> ?` arm and this stays 3.
+        assert_eq!(
+            store
+                .count_inbound_window_except(
+                    "hyphae",
+                    "npub1",
+                    "2026-11-11T00:00:00Z",
+                    Some("hyphae:in-explicit"),
+                )
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            store
+                .count_inbound_window_except("hyphae", "npub1", "2026-11-11T00:00:00Z", None)
                 .await
                 .unwrap(),
             3
@@ -2607,5 +2922,71 @@ mod tests {
         );
         let listed = store.list_inbound_allowlist().await.unwrap();
         assert!(listed.iter().all(|row| row.actor != "alice"));
+    }
+
+    /// Two local identities in one group keep their own cursors.
+    /// Mutation: drop `recipient_identity` from the primary key and the
+    /// second `set` overwrites the first, so the `logical-a` assert goes red.
+    #[tokio::test]
+    async fn two_identities_in_one_group_keep_separate_cursors() {
+        let store = Store::open_memory().await.unwrap();
+        store
+            .set_inbound_cursor("hyphae", "npub-a", "group-1", "logical-a")
+            .await
+            .unwrap();
+        store
+            .set_inbound_cursor("hyphae", "npub-b", "group-1", "logical-b")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-a", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-a")
+        );
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-b", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-b")
+        );
+        store
+            .set_inbound_cursor("hyphae", "npub-a", "group-1", "logical-a2")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-b", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-b"),
+            "advancing one identity must not move the other"
+        );
+        store
+            .clear_inbound_cursor("hyphae", "npub-a", "group-1")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .inbound_cursor("hyphae", "npub-a", "group-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .inbound_cursor("hyphae", "npub-b", "group-1")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-b"),
+            "clearing one identity must leave the other cursor"
+        );
+        assert!(!store.inbound_source_allowlisted("hyphae").await.unwrap());
     }
 }

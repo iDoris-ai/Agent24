@@ -21,6 +21,8 @@ pub use session_memory::{RECALL_END_MARKER, RECALL_PREFIX, SessionMemory};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+#[cfg(any(test, feature = "test-support"))]
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use tokio::sync::Mutex;
 
@@ -606,6 +608,13 @@ pub struct RunManager {
     /// `start_run` never inserts here. Process-local: a restart does not
     /// resume `execute` (orphan sweep cancels the run).
     inbound_origins: Mutex<HashMap<String, String>>,
+    /// One-shot failures for [`RunManager::start_run_inbound`]. Tests call
+    /// [`RunManager::fail_next_inbound_start`] so a stored explicit row can
+    /// land `start_failed` without a SQL trigger. Compiled only for this
+    /// crate's tests or the `test-support` feature. Each taken fault
+    /// consumes one.
+    #[cfg(any(test, feature = "test-support"))]
+    inbound_start_faults: AtomicU32,
 }
 
 /// Process-local origin for [`RunManager::start_run_inbound`]. Not a field of
@@ -769,7 +778,37 @@ impl RunManager {
             shutdown,
             cancels: Mutex::new(HashMap::new()),
             inbound_origins: Mutex::new(HashMap::new()),
+            #[cfg(any(test, feature = "test-support"))]
+            inbound_start_faults: AtomicU32::new(0),
         })
+    }
+
+    /// Fail the next [`Self::start_run_inbound`] before it writes a run.
+    ///
+    /// The inbound event row is already committed by the caller. This is the
+    /// transient start error that marks that row `start_failed`. Not present
+    /// in a release build: the method exists only under `cfg(test)` or the
+    /// `test-support` feature.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn fail_next_inbound_start(&self) {
+        self.inbound_start_faults.fetch_add(1, Ordering::AcqRel);
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn take_inbound_start_fault(&self) -> bool {
+        let mut current = self.inbound_start_faults.load(Ordering::Acquire);
+        while current > 0 {
+            match self.inbound_start_faults.compare_exchange(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+        false
     }
 
     async fn tool_context_for(
@@ -1499,6 +1538,12 @@ impl RunManager {
         create: RunCreate,
         origin: InboundOrigin,
     ) -> Result<InboundRunStart, AgentError> {
+        #[cfg(any(test, feature = "test-support"))]
+        if self.take_inbound_start_fault() {
+            return Err(AgentError::Store(StoreError::Conflict(
+                "injected inbound start failure".to_owned(),
+            )));
+        }
         match self
             .start_run_inner(create, None, |_| {}, Some(origin))
             .await?

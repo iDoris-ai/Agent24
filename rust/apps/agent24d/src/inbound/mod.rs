@@ -2,25 +2,23 @@
 //! and ingest (X11-2c).
 //!
 //! `admit` is the pure policy hash and the §3.3 table. `routes` serves HTTP.
-//! `service` ingests, starts runs, and reconciles at startup. `policy_version`
-//! is already called from `routes`. The development wechat POST calls
+//! `service` ingests, starts runs, and reconciles at startup. `hyphae_source`
+//! polls Hyphae into that ingest path (X11-2e). `policy_version` is already
+//! called from `routes`. The development wechat POST calls
 //! `InboundService::ingest`, which calls `admit`, so the table types are live
 //! in the bin.
 
 mod admit;
+mod hyphae_source;
 mod maintenance;
 mod routes;
 mod service;
 
+pub(crate) use hyphae_source::{HyphaeCli, HyphaeCliError, start_hyphae_inbound};
 pub(crate) use routes::{
     get_allowlist, get_events, get_policy, post_wechat_event, put_allowlist, put_policy,
     seed_dev_allowlist,
 };
-#[allow(
-    unused_imports,
-    reason = "X11-2e and X11-2g call InboundService; this slice wires startup reconcile only"
-)]
-pub(crate) use service::InboundService;
 pub(crate) use service::reconcile_inbound_runs;
 
 use agent24_agent::RunManager;

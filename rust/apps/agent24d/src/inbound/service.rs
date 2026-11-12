@@ -7,7 +7,12 @@
 //! commit and before `run_state` leaves `starting` is what
 //! [`reconcile_inbound_runs`] closes: a link with a live run becomes
 //! `started`; a link whose run has ended becomes `done`; `starting` with no
-//! link becomes `interrupted` and is not started again.
+//! link becomes `interrupted` and is not started again. `start_failed` is
+//! not that path. [`InboundService::redispatch_failed`] may move it back to
+//! `starting` while `received_at` is still inside [`INBOUND_MAX_AGE_SECS`].
+//! `interrupted` is still not started again. A retry runs admission again
+//! before it reopens the row. The 600s bound is `received_at` against the
+//! injected clock, not the event time `at`.
 //!
 //! 评审 N1：没有 run 级墙钟超时。`MAX_ITERATIONS`
 //! （`agent24-agent/src/lib.rs:62`，循环在同文件约 2751 行）只限制模型
@@ -15,16 +20,8 @@
 //! 盖不住卡在模型请求上的 run。取消该 run 后，入站行变为 `done`，同一
 //! actor 的下一条才能再起。
 //!
-//! X11-2e / X11-2g call [`InboundService`]. This slice has no HTTP route, so
-//! the ingest types are unused in a non-test build.
-
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "X11-2e and X11-2g call InboundService; this slice wires startup reconcile only"
-    )
-)]
+//! X11-2e calls [`InboundService`] from the Hyphae poller. X11-2g will call
+//! it from the dev bridge. This slice has no HTTP route of its own.
 
 use std::sync::Arc;
 
@@ -50,9 +47,12 @@ pub(crate) const INBOUND_TEXT_MAX_CHARS: usize = 4000;
 
 const TRUNCATION_NOTE: &str = "\n[truncated, original exceeded 4000 chars]";
 
+pub(crate) type InboundNow = Arc<dyn Fn() -> DateTime<Utc> + Send + Sync>;
+
 pub(crate) struct InboundService {
     store: Store,
     runs: Arc<RunManager>,
+    now: InboundNow,
 }
 
 /// One external message. `source` / `category` / `addressed` are the wire words.
@@ -88,7 +88,10 @@ pub(crate) enum IngestOutcome {
 }
 
 #[derive(Debug)]
-#[allow(dead_code, reason = "error payloads are for X11-2e and X11-2g callers")]
+#[allow(
+    dead_code,
+    reason = "variant payloads are observed through Debug; that does not count as a read"
+)]
 pub(crate) enum IngestError {
     Invalid(String),
     /// `source` is scheduler or self, or `category` is internal.
@@ -113,7 +116,13 @@ pub(crate) struct InboundStartupReconcile {
 
 impl InboundService {
     pub(crate) fn new(store: Store, runs: Arc<RunManager>) -> Self {
-        Self { store, runs }
+        Self::with_clock(store, runs, Arc::new(Utc::now))
+    }
+
+    /// `now` is the poller's clock. [`Self::redispatch_failed`] reads it.
+    /// [`Self::ingest`] still stamps `received_at` from `Utc::now`.
+    pub(crate) fn with_clock(store: Store, runs: Arc<RunManager>, now: InboundNow) -> Self {
+        Self { store, runs, now }
     }
 
     /// Admit, insert, and (only for `explicit`) start one run.
@@ -218,6 +227,68 @@ impl InboundService {
         result
     }
 
+    /// Retry a start that failed before any run was linked.
+    ///
+    /// The row must still be `explicit` and `start_failed`. The 600s window
+    /// ([`INBOUND_MAX_AGE_SECS`]) is `received_at` against the injected clock,
+    /// the same clock the poller uses. That is not the admission latency
+    /// check: admission compares the event time `at` with that clock. Older
+    /// than the window is expired: the row stays `start_failed` and this does
+    /// not call [`Self::dispatch`].
+    ///
+    /// Before the row is reopened, admission runs again ([`Self::decide`]):
+    /// allowlist, rate window, watermark, and latency, the same rules as the
+    /// first insert. The rate window does not count this row. Anything other
+    /// than `explicit` returns [`IngestOutcome::Ignored`] and leaves the row
+    /// `start_failed`.
+    ///
+    /// A sender who already has an in-flight explicit row fails the
+    /// `start_failed` → `starting` transition (the partial unique index).
+    /// That stays `start_failed` and is reported as `rate_limited`, so a
+    /// later round can try again. This does not insert an `ignore` row.
+    pub(crate) async fn redispatch_failed(
+        &self,
+        event_id: &str,
+    ) -> Result<IngestOutcome, IngestError> {
+        let event = self
+            .store
+            .get_inbound_event(event_id)
+            .await?
+            .ok_or_else(|| IngestError::Invalid(format!("unknown inbound event {event_id}")))?;
+        if event.run_state.as_deref() != Some("start_failed")
+            || event.disposition != Disposition::Explicit.as_str()
+        {
+            return Ok(IngestOutcome::Duplicate);
+        }
+        let now = (self.now)();
+        let received = parse_unix("received_at", &event.received_at).unwrap_or(i64::MIN);
+        let age = now.timestamp().saturating_sub(received);
+        let max_age = i64::try_from(INBOUND_MAX_AGE_SECS).unwrap_or(i64::MAX);
+        if age > max_age {
+            return Ok(IngestOutcome::Ignored {
+                reason: "stale".to_owned(),
+            });
+        }
+        let prepared = prepared_from_stored(&event)?;
+        let decision = self
+            .decide_excluding(&prepared, now, Some(event_id))
+            .await?;
+        if decision.disposition != Disposition::Explicit {
+            return Ok(IngestOutcome::Ignored {
+                reason: decision
+                    .reason
+                    .map(|reason| reason.as_str().to_owned())
+                    .unwrap_or_else(|| "ignore".to_owned()),
+            });
+        }
+        if !self.store.reopen_inbound_start_failed(event_id).await? {
+            return Ok(IngestOutcome::Ignored {
+                reason: "rate_limited".to_owned(),
+            });
+        }
+        self.dispatch(event_id).await
+    }
+
     async fn dispatch_inner(&self, event_id: &str) -> Result<IngestOutcome, IngestError> {
         let event = self
             .store
@@ -281,6 +352,17 @@ impl InboundService {
         prepared: &Prepared,
         now: DateTime<Utc>,
     ) -> Result<Decided, IngestError> {
+        self.decide_excluding(prepared, now, None).await
+    }
+
+    /// `except_id` is a row already stored for this attempt. The rate window
+    /// skips it. `None` is a first admission, whose row is not inserted yet.
+    async fn decide_excluding(
+        &self,
+        prepared: &Prepared,
+        now: DateTime<Utc>,
+        except_id: Option<&str>,
+    ) -> Result<Decided, IngestError> {
         let mode = match self.store.inbound_accept_mode().await? {
             Some(raw) => parse_mode(&raw)?,
             None => AcceptMode::Observe,
@@ -315,7 +397,12 @@ impl InboundService {
         let since = format_inbound_timestamp(now - Duration::seconds(INBOUND_RATE_WINDOW_SECS));
         let window = self
             .store
-            .count_inbound_window(prepared.source.as_str(), &prepared.actor, &since)
+            .count_inbound_window_except(
+                prepared.source.as_str(),
+                &prepared.actor,
+                &since,
+                except_id,
+            )
             .await?;
         let window_count = u32::try_from(window.max(0)).unwrap_or(u32::MAX);
         let decision = admit(&AdmitInput {
@@ -358,6 +445,36 @@ struct Decided {
     disposition: Disposition,
     reason: Option<super::admit::Reason>,
     policy_version: String,
+}
+
+fn prepared_from_stored(event: &agent24_store::InboundEvent) -> Result<Prepared, IngestError> {
+    let actor = event
+        .actor
+        .clone()
+        .filter(|actor| !actor.is_empty())
+        .ok_or_else(|| IngestError::Invalid(format!("event {} has no actor", event.id)))?;
+    let source = parse_source(&event.source)
+        .ok_or_else(|| IngestError::Invalid(format!("unknown source {}", event.source)))?;
+    let category = parse_category(&event.category)
+        .ok_or_else(|| IngestError::Invalid(format!("unknown category {}", event.category)))?;
+    let addressed = parse_addressed(&event.addressed)
+        .ok_or_else(|| IngestError::Invalid(format!("unknown addressed {}", event.addressed)))?;
+    parse_unix("at", &event.at)?;
+    Ok(Prepared {
+        id: event.id.clone(),
+        source,
+        category,
+        recipient_identity: event.recipient_identity.clone(),
+        thread_key: event.thread_key.clone(),
+        actor,
+        human: event.human,
+        addressed,
+        at: event.at.clone(),
+        // Already bounded at insert. Running [`prepare`] again would append
+        // a second truncation note.
+        text: event.text.clone(),
+        meta: event.meta.clone(),
+    })
 }
 
 fn prepare(message: &InboundMessage) -> Result<Prepared, IngestError> {

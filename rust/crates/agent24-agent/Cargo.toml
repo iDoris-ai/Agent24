@@ -6,6 +6,12 @@ license.workspace = true
 repository.workspace = true
 description = "Agent24 run manager — the agent loop (C2 scope: run lifecycle with first-class cancellation, persistence and events)"
 
+[features]
+# `RunManager::fail_next_inbound_start`. Off unless a test build asks for it.
+# agent24d enables this only as a dev-dependency, so a release daemon does not
+# carry the injector.
+test-support = []
+
 [dependencies]
 agent24-scheduler = { path = "../agent24-scheduler" }
 agent24-core = { path = "../agent24-core" }
