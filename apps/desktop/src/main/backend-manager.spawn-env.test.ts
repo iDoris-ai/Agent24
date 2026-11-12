@@ -27,7 +27,7 @@ function absent(): ExternalDaemonSource {
     read: () => null,
     checkHealth: vi.fn().mockResolvedValue(false),
     fetchHealth: vi.fn().mockResolvedValue({ ok: false, protocolVersion: null }),
-    serviceManaged: () => false,
+    serviceInstalled: () => false,
     acceptsToken: vi.fn().mockResolvedValue(false),
     requestShutdown: vi.fn().mockResolvedValue(null),
     isAlive: () => false,
