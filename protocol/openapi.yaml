@@ -5459,9 +5459,11 @@ components:
             callback omits `models` even when the declaration and the ceiling would allow it.
         declared:
           description: >-
-            The component's `requires` declaration. Null when the manifest was not
-            read: the declaration is unknown, denials are not computed, and the
-            out-of-process ceiling is not applied.
+            The component's `requires` declaration. Null when no declaration was
+            read (the manifest was not read, or the component has no `requires`
+            lock, such as built-in MCP or knowledge rows): the declaration is
+            unknown, denials are not computed, and the out-of-process ceiling is
+            not applied.
           oneOf:
             - $ref: "#/components/schemas/ComponentRequires"
             - type: "null"

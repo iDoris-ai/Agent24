@@ -2512,7 +2512,7 @@ export interface components {
             reason?: string;
             /** @description Kernel capabilities actually held. A mounted package copies `MountReport.granted`. An attached module copies the admission grant (events, and models when a model callback was built); for attach rows this is the admission grant and does not change with whether the module is currently connected. Empty when nothing was handed out. Not the resolver's grant set: a missing model callback omits `models` even when the declaration and the ceiling would allow it. */
             kernel_grants: string[];
-            /** @description The component's `requires` declaration. Null when the manifest was not read: the declaration is unknown, denials are not computed, and the out-of-process ceiling is not applied. */
+            /** @description The component's `requires` declaration. Null when no declaration was read (the manifest was not read, or the component has no `requires` lock, such as built-in MCP or knowledge rows): the declaration is unknown, denials are not computed, and the out-of-process ceiling is not applied. */
             declared: components["schemas"]["ComponentRequires"] | null;
             /** @description Host only. Closed reasons an item is not in `kernel_grants`. */
             denied: components["schemas"]["ComponentDenial"][];

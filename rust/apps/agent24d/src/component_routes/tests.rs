@@ -115,6 +115,10 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     );
     assert_eq!(find(&body, "knowledge")["state"], "stopped");
     assert_eq!(find(&body, "documents")["state"], "absent");
+    // Rows with no `requires` lock leave the declaration unknown, not empty.
+    for id in ["knowledge", "open-design", "idoris"] {
+        assert!(find(&body, id)["declared"].is_null(), "{id}");
+    }
 }
 
 /// The row copies `MountReport.granted`. The resolver would also grant

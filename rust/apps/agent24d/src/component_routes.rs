@@ -129,7 +129,8 @@ impl Item {
             reason: None,
             detail: None,
             kernel_grants: Vec::new(),
-            declared: Some(Declared::default()),
+            // Unknown until a row reads a declaration (`set_kernel` or a lock).
+            declared: None,
             denied: Vec::new(),
         }
     }
@@ -186,7 +187,7 @@ fn denials_of(denied: &[requires::Denial]) -> Vec<Denial> {
         .collect()
 }
 
-/// First denial wins. Hyphae's list repeats a token that sits in both
+/// First denial wins. A declaration can repeat a token that sits in both
 /// `kernel` and `operations`, or twice in one of them.
 fn unique_by_item(denied: Vec<Denial>) -> Vec<Denial> {
     let mut seen = BTreeSet::new();
@@ -257,7 +258,7 @@ fn kernel_from_mount(
     KernelView {
         kernel_grants: actual.to_vec(),
         declared: Some(declared_of(kernel, operations)),
-        denied,
+        denied: unique_by_item(denied),
     }
 }
 
