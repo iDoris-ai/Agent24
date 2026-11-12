@@ -5420,7 +5420,9 @@ components:
             not_declared: in the form's ceiling but not declared. above_ceiling: declared
             but outside the ceiling. no_channel: declared and inside the ceiling, but the
             mount handed out no handle (Hyphae always; a model callback that did not build).
-            requires_invalid: the declaration did not parse, so nothing was granted.
+            This also includes a capability withheld by policy (lease, partition, grant,
+            or ephemeral). requires_invalid: the declaration did not parse, so nothing
+            was granted.
     ComponentView:
       type: object
       description: Host view of one component.
@@ -5449,11 +5451,19 @@ components:
           type: array
           items: { type: string }
           description: >-
-            Kernel capabilities the mount actually handed out (`MountReport.granted`).
-            Empty when nothing is mounted. Not the resolver's grant set: a missing model
+            Kernel capabilities actually held. A mounted package copies
+            `MountReport.granted`. An attached module copies the admission grant
+            (events, and models when a model callback was built). Empty when
+            nothing was handed out. Not the resolver's grant set: a missing model
             callback omits `models` even when the declaration and the ceiling would allow it.
         declared:
-          $ref: "#/components/schemas/ComponentRequires"
+          description: >-
+            The component's `requires` declaration. Null when the manifest was not
+            read: the declaration is unknown, denials are not computed, and the
+            out-of-process ceiling is not applied.
+          oneOf:
+            - $ref: "#/components/schemas/ComponentRequires"
+            - type: "null"
         denied:
           type: array
           description: Host only. Closed reasons an item is not in `kernel_grants`.
@@ -5473,6 +5483,7 @@ components:
       description: >-
         What every audience other than the host sees. No path, pid, port, message, team id,
         commit, kernel grant, denial, or Hyphae health probes.
+      additionalProperties: false
       required: [id, version, state, provides]
       properties:
         id: { type: string }

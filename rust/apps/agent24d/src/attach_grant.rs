@@ -55,11 +55,14 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
             &granted,
             self.models.as_ref(),
         );
+        let mut kernel_grants = Vec::new();
         let mut provides = Vec::new();
         if granted.has(Capability::Events) {
+            kernel_grants.push(Capability::Events.as_str().to_owned());
             provides.push("_a24/events/".to_owned());
         }
         if model_grant.is_some() {
+            kernel_grants.push(Capability::Models.as_str().to_owned());
             provides.push("_a24/model/".to_owned());
         }
         let methods_for = crate::domain::build_methods_for(
@@ -77,6 +80,7 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
         AttachGrant {
             provides,
             methods_for,
+            kernel_grants,
         }
     }
 }
@@ -249,10 +253,15 @@ mod tests {
 
         let bare_both = bare.build("agentear", &events_and_models);
         assert_eq!(bare_both.provides, vec!["_a24/events/".to_owned()]);
+        assert_eq!(bare_both.kernel_grants, vec!["events".to_owned()]);
         let wired_both = wired.build("agentear", &events_and_models);
         assert_eq!(
             wired_both.provides,
             vec!["_a24/events/".to_owned(), "_a24/model/".to_owned()]
+        );
+        assert_eq!(
+            wired_both.kernel_grants,
+            vec!["events".to_owned(), "models".to_owned()]
         );
 
         assert_eq!(

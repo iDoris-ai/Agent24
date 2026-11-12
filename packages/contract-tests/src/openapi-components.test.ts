@@ -56,6 +56,7 @@ describe('ComponentList kernel grants', () => {
       ],
     }
     expect(validateList({ components: [hostRow, mounted, redactedRow] }), JSON.stringify(validateList.errors)).toBe(true)
+    expect(validateList({ components: [{ ...hostRow, declared: null }] }), JSON.stringify(validateList.errors)).toBe(true)
     expect(validateView(hostRow), JSON.stringify(validateView.errors)).toBe(true)
     expect(validateRedacted(redactedRow), JSON.stringify(validateRedacted.errors)).toBe(true)
   })
@@ -65,8 +66,20 @@ describe('ComponentList kernel grants', () => {
     expect(validateView(withoutGrants)).toBe(false)
     expect(validateView({ ...hostRow, denied: [{ item: 'events', code: 'resolver_said_so' }] })).toBe(false)
     expect(openapi.components.schemas.ComponentDenial.properties.code.enum).toEqual(CODES)
+    expect(openapi.components.schemas.ComponentRedactedView.additionalProperties).toBe(false)
     const redactedProps = Object.keys(openapi.components.schemas.ComponentRedactedView.properties)
     expect(redactedProps).not.toContain('denied')
     expect(redactedProps).not.toContain('kernel_grants')
+  })
+
+  it('rejects an illegal code, a host row missing a field, and a redacted row that carries denied', () => {
+    expect(validateList({
+      components: [{ ...hostRow, denied: [{ item: 'events', code: 'resolver_said_so' }] }],
+    })).toBe(false)
+    const { kernel_grants: _dropped, ...withoutGrants } = hostRow
+    expect(validateList({ components: [withoutGrants] })).toBe(false)
+    expect(validateList({
+      components: [{ ...redactedRow, denied: [{ item: 'events', code: 'no_channel' }] }],
+    })).toBe(false)
   })
 })

@@ -67,17 +67,18 @@ struct Declared {
     operations: Vec<String>,
 }
 
-/// One closed denial. `code` is [`DenyReason::as_str`].
+/// One closed denial. `code` serializes as the snake_case [`DenyReason`].
 #[derive(Serialize, Clone, PartialEq, Eq)]
 struct Denial {
     item: String,
-    code: &'static str,
+    code: DenyReason,
 }
 
 /// Host-only kernel picture. `kernel_grants` is the mount's list.
+/// `declared` is `None` when the manifest was not read.
 struct KernelView {
     kernel_grants: Vec<String>,
-    declared: Declared,
+    declared: Option<Declared>,
     denied: Vec<Denial>,
 }
 
@@ -99,8 +100,9 @@ pub struct Item {
     /// Host-only. Empty when nothing is mounted. Not the resolver's grant set:
     /// a missing model callback leaves `models` out of this list.
     kernel_grants: Vec<String>,
-    /// The component's `requires` declaration. Host-only.
-    declared: Declared,
+    /// The component's `requires` declaration. Host-only. Null when the
+    /// manifest was not read (unknown; denials are not computed).
+    declared: Option<Declared>,
     /// Why a declared or ceiling item is not in [`Self::kernel_grants`].
     /// Host-only; the redacted view omits it.
     denied: Vec<Denial>,
@@ -127,7 +129,7 @@ impl Item {
             reason: None,
             detail: None,
             kernel_grants: Vec::new(),
-            declared: Declared::default(),
+            declared: Some(Declared::default()),
             denied: Vec::new(),
         }
     }
@@ -179,8 +181,18 @@ fn denials_of(denied: &[requires::Denial]) -> Vec<Denial> {
         .iter()
         .map(|denial| Denial {
             item: denial.item.clone(),
-            code: denial.reason.as_str(),
+            code: denial.reason,
         })
+        .collect()
+}
+
+/// First denial wins. Hyphae's list repeats a token that sits in both
+/// `kernel` and `operations`, or twice in one of them.
+fn unique_by_item(denied: Vec<Denial>) -> Vec<Denial> {
+    let mut seen = BTreeSet::new();
+    denied
+        .into_iter()
+        .filter(|denial| seen.insert(denial.item.clone()))
         .collect()
 }
 
@@ -197,8 +209,8 @@ fn kernel_without_channel(kernel: &[String], operations: &[String]) -> KernelVie
         );
         return KernelView {
             kernel_grants: Vec::new(),
-            declared,
-            denied: denials_of(&resolution.denied),
+            declared: Some(declared),
+            denied: unique_by_item(denials_of(&resolution.denied)),
         };
     }
     let denied = kernel
@@ -206,45 +218,45 @@ fn kernel_without_channel(kernel: &[String], operations: &[String]) -> KernelVie
         .chain(operations.iter())
         .map(|item| Denial {
             item: item.clone(),
-            code: DenyReason::NoChannel.as_str(),
+            code: DenyReason::NoChannel,
         })
         .collect();
     KernelView {
         kernel_grants: Vec::new(),
-        declared,
-        denied,
+        declared: Some(declared),
+        denied: unique_by_item(denied),
     }
 }
 
-/// `kernel_grants` copies `actual` (`MountReport.granted`). A capability the
-/// resolver would grant but the mount did not hand out (no model callback, so
-/// `model_grant` is `None`) is `no_channel` here, not listed as granted.
+/// `kernel_grants` copies `actual` (the mount's or the admission's list).
+/// `no_channel` is only for a live mount: a capability the resolver would
+/// grant and this form's ceiling allows, but `actual` does not hold. A
+/// module that is not [`MountOutcome::Mounted`] keeps the resolver's static
+/// denials and does not gain `no_channel`.
 fn kernel_from_mount(
-    in_process: bool,
+    form: GrantForm,
     kernel: &[String],
     operations: &[String],
     actual: &[String],
+    mounted: bool,
 ) -> KernelView {
     let spec = requires::RequiresSpec::parse(kernel, operations);
-    let form = if in_process {
-        GrantForm::InProcess
-    } else {
-        GrantForm::OutOfProcess
-    };
     let resolution = requires::resolve(&spec, form.host_cap(), Consent::FirstPartyEnabled);
     let mut denied = denials_of(&resolution.denied);
-    let held: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
-    for cap in resolution.granted.iter() {
-        if !held.contains(cap.as_str()) {
-            denied.push(Denial {
-                item: cap.as_str().to_owned(),
-                code: DenyReason::NoChannel.as_str(),
-            });
+    if mounted {
+        let held: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+        for cap in resolution.granted.iter() {
+            if !held.contains(cap.as_str()) {
+                denied.push(Denial {
+                    item: cap.as_str().to_owned(),
+                    code: DenyReason::NoChannel,
+                });
+            }
         }
     }
     KernelView {
         kernel_grants: actual.to_vec(),
-        declared: declared_of(kernel, operations),
+        declared: Some(declared_of(kernel, operations)),
         denied,
     }
 }
@@ -577,6 +589,16 @@ fn attach_items_from(mut modules: Vec<agent24_attach::attach_registry::AttachSna
                 } else {
                     item.reason = reason.map(str::to_owned);
                 }
+                // The admission already decided the channel. `mounted` stays
+                // true so a missing model callback is `no_channel` against
+                // the attach ceiling even while the module is stopped.
+                item.set_kernel(kernel_from_mount(
+                    GrantForm::Attach,
+                    &module.declared_kernel,
+                    &[],
+                    &module.kernel_grants,
+                    true,
+                ));
             })
         })
         .collect()
@@ -699,8 +721,9 @@ fn documents_shown(
     catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
 ) -> Item {
     let mut item = Item::new("documents", documents_form(), ComponentState::Absent);
+    let effective = outcome.or(report.map(|report| &report.outcome));
     if let Some(report) = report {
-        let outcome = outcome.unwrap_or(&report.outcome);
+        let outcome = effective.unwrap_or(&report.outcome);
         let (mapped, reason, detail) = documents_mapped(outcome, live);
         item.state = mapped;
         item.version = Some(report.version.clone());
@@ -715,22 +738,39 @@ fn documents_shown(
         Ok(catalog) => catalog.requires.kernel.clone(),
         Err(_) => Vec::new(),
     };
-    let (kernel, in_process, actual) = if let Some(report) = report {
-        let d9 = report.d9.as_ref();
-        (
-            match d9 {
-                Some(d9) => d9.requires_kernel.clone(),
-                None => catalog_kernel.clone(),
-            },
-            d9.is_some_and(|d9| d9.in_process),
-            report.granted.clone(),
-        )
-    } else {
-        (catalog_kernel, false, Vec::new())
-    };
+    let d9 = report.and_then(|report| report.d9.as_ref());
+    let actual = report
+        .map(|report| report.granted.clone())
+        .unwrap_or_default();
+    let mounted = effective.is_some_and(|outcome| matches!(outcome, MountOutcome::Mounted));
     apply_documents_catalog(&mut item, catalog, report);
-    if report.is_some() || !kernel.is_empty() || !operations.is_empty() {
-        item.set_kernel(kernel_from_mount(in_process, &kernel, &operations, &actual));
+    // D9 missing: keep the catalog as `declared` (the two sources stay).
+    // Do not run a ceiling and do not invent denials — the manifest was
+    // not read. A present D9 uses the mount outcome, and `no_channel` only
+    // when that outcome is Mounted.
+    match d9 {
+        Some(d9) => {
+            let form = if d9.in_process {
+                GrantForm::InProcess
+            } else {
+                GrantForm::OutOfProcess
+            };
+            item.set_kernel(kernel_from_mount(
+                form,
+                &d9.requires_kernel,
+                &operations,
+                &actual,
+                mounted,
+            ));
+        }
+        None if report.is_some() || !catalog_kernel.is_empty() || !operations.is_empty() => {
+            item.set_kernel(KernelView {
+                kernel_grants: actual,
+                declared: Some(declared_of(&catalog_kernel, &operations)),
+                denied: Vec::new(),
+            });
+        }
+        None => {}
     }
     item
 }
@@ -861,12 +901,24 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                     "package"
                 }
             });
-            let kernel = kernel_from_mount(
-                d9.is_some_and(|d9| d9.in_process),
-                d9.map(|d9| d9.requires_kernel.as_slice()).unwrap_or(&[]),
-                &[],
-                &report.granted,
-            );
+            let mounted = matches!(outcome, MountOutcome::Mounted);
+            // No D9: the manifest was not read. `declared` is unknown, so
+            // there is no denial list and no out-of-process ceiling.
+            let kernel = match d9 {
+                Some(d9) => {
+                    let form = if d9.in_process {
+                        GrantForm::InProcess
+                    } else {
+                        GrantForm::OutOfProcess
+                    };
+                    kernel_from_mount(form, &d9.requires_kernel, &[], &report.granted, mounted)
+                }
+                None => KernelView {
+                    kernel_grants: report.granted.clone(),
+                    declared: None,
+                    denied: Vec::new(),
+                },
+            };
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
                 // An integrity refusal with no trusted version is unknown,
                 // not the empty string.

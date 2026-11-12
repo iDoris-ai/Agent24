@@ -2495,7 +2495,7 @@ export interface components {
         ComponentDenial: {
             item: string;
             /**
-             * @description not_declared: in the form's ceiling but not declared. above_ceiling: declared but outside the ceiling. no_channel: declared and inside the ceiling, but the mount handed out no handle (Hyphae always; a model callback that did not build). requires_invalid: the declaration did not parse, so nothing was granted.
+             * @description not_declared: in the form's ceiling but not declared. above_ceiling: declared but outside the ceiling. no_channel: declared and inside the ceiling, but the mount handed out no handle (Hyphae always; a model callback that did not build). This also includes a capability withheld by policy (lease, partition, grant, or ephemeral). requires_invalid: the declaration did not parse, so nothing was granted.
              * @enum {string}
              */
             code: "not_declared" | "above_ceiling" | "no_channel" | "requires_invalid";
@@ -2510,9 +2510,10 @@ export interface components {
             provides: components["schemas"]["ComponentProvide"][];
             /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). An OS package that failed its integrity check is state failed (not absent, not incompatible) with one of integrity_manifest_missing, hash_mismatch, integrity_manifest_invalid, signature_rejected, or integrity_check_failed. State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
             reason?: string;
-            /** @description Kernel capabilities the mount actually handed out (`MountReport.granted`). Empty when nothing is mounted. Not the resolver's grant set: a missing model callback omits `models` even when the declaration and the ceiling would allow it. */
+            /** @description Kernel capabilities actually held. A mounted package copies `MountReport.granted`. An attached module copies the admission grant (events, and models when a model callback was built). Empty when nothing was handed out. Not the resolver's grant set: a missing model callback omits `models` even when the declaration and the ceiling would allow it. */
             kernel_grants: string[];
-            declared: components["schemas"]["ComponentRequires"];
+            /** @description The component's `requires` declaration. Null when the manifest was not read: the declaration is unknown, denials are not computed, and the out-of-process ceiling is not applied. */
+            declared: components["schemas"]["ComponentRequires"] | null;
             /** @description Host only. Closed reasons an item is not in `kernel_grants`. */
             denied: components["schemas"]["ComponentDenial"][];
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
