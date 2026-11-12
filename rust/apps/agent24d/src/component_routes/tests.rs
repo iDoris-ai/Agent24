@@ -115,6 +115,314 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     );
     assert_eq!(find(&body, "knowledge")["state"], "stopped");
     assert_eq!(find(&body, "documents")["state"], "absent");
+    // Rows with no `requires` lock leave the declaration unknown, not empty.
+    for id in ["knowledge", "open-design", "idoris"] {
+        assert!(find(&body, id)["declared"].is_null(), "{id}");
+    }
+}
+
+/// The row copies `MountReport.granted`. The resolver would also grant
+/// `models` (it is in the out-of-process ceiling and `no_channel` is empty
+/// there); a mount with no model callback leaves it out of `granted`. Reading
+/// `resolution.granted` instead of `report.granted` makes `kernel_grants`
+/// include `models` and this test fails.
+#[tokio::test]
+async fn components_show_the_mount_grant_not_the_resolver() {
+    use crate::capabilities::requires::{self, Consent, GrantForm};
+
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let mut report = os_report(
+        "modelnodeps",
+        MountOutcome::Mounted,
+        d9(
+            "modelnodeps",
+            false,
+            "modelnodeps-tasks",
+            &["events", "models"],
+        ),
+    );
+    report.granted = vec!["events".into()];
+    let spec = requires::RequiresSpec::parse(&["events", "models"], &[] as &[&str]);
+    let resolution = requires::resolve(
+        &spec,
+        GrantForm::OutOfProcess.host_cap(),
+        Consent::FirstPartyEnabled,
+    );
+    assert!(
+        resolution.granted.has(agent24_domain::Capability::Models),
+        "the resolver grants models; the row must not copy that"
+    );
+    assert!(resolution.granted.has(agent24_domain::Capability::Events));
+    state.os_reports = Arc::new(vec![report]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let row = find(&full, "modelnodeps");
+    assert_eq!(row["kernel_grants"], json!(["events"]));
+    assert_eq!(
+        row["declared"],
+        json!({"kernel": ["events", "models"], "operations": []})
+    );
+    let denied = row["denied"].as_array().unwrap();
+    assert!(
+        denied.iter().all(|item| item["item"] != "events"),
+        "events was mounted: {denied:?}"
+    );
+    assert!(
+        denied
+            .iter()
+            .any(|item| item["item"] == "models" && item["code"] == "no_channel"),
+        "withheld models is no_channel: {denied:?}"
+    );
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let row = find(&redacted, "modelnodeps");
+    assert!(row.get("denied").is_none());
+    assert!(row.get("kernel_grants").is_none());
+    assert!(!redacted.to_string().contains("no_channel"));
+}
+
+fn denial_code<'a>(row: &'a Value, item: &str) -> Option<&'a str> {
+    row["denied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|denial| denial["item"] == item)
+        .and_then(|denial| denial["code"].as_str())
+}
+
+fn has_no_channel(row: &Value) -> bool {
+    row["denied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|denial| denial["code"] == "no_channel")
+}
+
+/// `no_channel` is a mounted-channel fact. Disabled, refused, degraded, and
+/// an uninstalled Documents row keep it out. An unread manifest (no D9) does
+/// not grow an out-of-process denial list, and `declared` is null.
+#[tokio::test]
+async fn no_channel_tracks_the_effective_outcome_not_the_startup_report() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let mut was_mounted = os_report(
+        "wasmounted",
+        MountOutcome::Mounted,
+        d9(
+            "wasmounted",
+            false,
+            "wasmounted-tasks",
+            &["events", "models"],
+        ),
+    );
+    was_mounted.granted = vec!["events".into()];
+    let now_mounted = os_report(
+        "nowmounted",
+        MountOutcome::Disabled,
+        d9("nowmounted", false, "nowmounted-tasks", &["events"]),
+    );
+    let refused = os_report(
+        "refusedmod",
+        MountOutcome::Refused("dup".into()),
+        d9("refusedmod", false, "refusedmod-tasks", &["events"]),
+    );
+    let degraded = os_report(
+        "degradedmod",
+        MountOutcome::Degraded("disk".into()),
+        d9("degradedmod", false, "degradedmod-tasks", &["memory"]),
+    );
+    let mut unread = os_report(
+        "unread",
+        MountOutcome::Mounted,
+        d9("unread", false, "unread-tasks", &["events", "models"]),
+    );
+    unread.d9 = None;
+    unread.granted = vec!["events".into()];
+    state.set_os_outcome("wasmounted", MountOutcome::Disabled);
+    state.set_os_outcome("nowmounted", MountOutcome::Mounted);
+    state.os_reports = Arc::new(vec![was_mounted, now_mounted, refused, degraded, unread]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+
+    let was = find(&body, "wasmounted");
+    assert_eq!(was["state"], "stopped");
+    assert_eq!(was["kernel_grants"], json!(["events"]));
+    assert!(!has_no_channel(was), "startup Mounted must not win: {was}");
+    assert_eq!(denial_code(was, "memory"), Some("not_declared"));
+
+    let now = find(&body, "nowmounted");
+    assert_eq!(now["kernel_grants"], json!([]));
+    assert_eq!(
+        denial_code(now, "events"),
+        Some("no_channel"),
+        "the override is Mounted, so the empty grant is no_channel: {now}"
+    );
+
+    for id in ["refusedmod", "degradedmod", "documents"] {
+        let row = find(&body, id);
+        assert!(!has_no_channel(row), "{id} is not mounted: {row}");
+    }
+    assert_eq!(find(&body, "documents")["state"], "absent");
+    assert!(
+        find(&body, "documents")["denied"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "uninstalled Documents does not invent denials"
+    );
+
+    let unread = find(&body, "unread");
+    assert!(unread["declared"].is_null(), "{unread}");
+    assert_eq!(unread["denied"], json!([]));
+    assert_eq!(unread["kernel_grants"], json!(["events"]));
+    assert!(
+        !unread.to_string().contains("not_declared"),
+        "an unread manifest does not take the out-of-process ceiling: {unread}"
+    );
+}
+
+#[test]
+fn documents_that_are_not_mounted_keep_static_denials_only() {
+    for outcome in [
+        MountOutcome::Disabled,
+        MountOutcome::Refused("dup".into()),
+        MountOutcome::Degraded("disk".into()),
+    ] {
+        let report = report_with(outcome.clone(), "0.2.0", vec![]);
+        let item = documents_shown(
+            Some(&report),
+            Some(&outcome),
+            None,
+            documents_catalog::DocumentsCatalog::embedded(),
+        );
+        let value = serde_json::to_value(&item).unwrap();
+        assert!(!has_no_channel(&value), "{outcome:?} {value}");
+        assert_eq!(denial_code(&value, "memory"), Some("not_declared"));
+    }
+
+    let mut startup = report_with(MountOutcome::Mounted, "0.2.0", vec![]);
+    startup.granted = vec!["events".into()];
+    let stopped = documents_shown(
+        Some(&startup),
+        Some(&MountOutcome::Disabled),
+        None,
+        documents_catalog::DocumentsCatalog::embedded(),
+    );
+    let stopped = serde_json::to_value(&stopped).unwrap();
+    assert!(!has_no_channel(&stopped), "{stopped}");
+
+    let absent = documents_from(None, None, documents_catalog::DocumentsCatalog::embedded());
+    let absent = serde_json::to_value(&absent).unwrap();
+    assert_eq!(absent["declared"]["kernel"], json!(["events", "models"]));
+    assert_eq!(absent["denied"], json!([]));
+}
+
+#[test]
+fn hyphae_denials_list_each_item_once() {
+    let view = kernel_without_channel(&["events".into(), "events".into()], &[]);
+    assert_eq!(view.denied.len(), 1);
+    assert_eq!(view.denied[0].item, "events");
+    assert_eq!(view.denied[0].code, DenyReason::NoChannel);
+
+    let invalid = kernel_without_channel(&["nope".into(), "nope".into()], &[]);
+    assert_eq!(invalid.denied.len(), 1);
+    assert_eq!(invalid.denied[0].item, "nope");
+    assert_eq!(invalid.denied[0].code, DenyReason::RequiresInvalid);
+}
+
+#[tokio::test]
+async fn an_attached_module_shows_the_admission_grant() {
+    use agent24_attach::attach_registry::AttachGrantBuilder;
+    let manifest = agent24_domain::DomainOsManifest::from_yaml(
+        "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\
+         event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
+         impl_kind: attached_process\nkernel_capabilities: [events, models, memory]\n",
+    )
+    .unwrap();
+    for with_models in [false, true] {
+        let builder = admission_builder(with_models).await;
+        let held = builder.build("agentear", &manifest).kernel_grants.clone();
+        let registry = agent24_attach::attach_registry::AttachRegistry::new(
+            agent24_attach::attach_registry::AttachDeps {
+                grants: Arc::new(builder),
+            },
+        );
+        registry.on_change(&agent24_attach::attached::Change::Registered {
+            name: "agentear",
+            rotated: false,
+            manifest: &manifest,
+            manifest_digest: "sha256:deadbeef",
+            token_sha256_hex: &"ab".repeat(32),
+            token_id: "tok_agentear",
+            disabled: false,
+        });
+        let snap = registry.snapshot();
+        assert_eq!(snap[0].kernel_grants, held);
+        assert_eq!(snap[0].declared_kernel, ["events", "models", "memory"]);
+        let row = serde_json::to_value(&attach_items_from(snap)[0]).unwrap();
+        assert_eq!(row["kernel_grants"], json!(held));
+        assert_eq!(
+            row["declared"],
+            json!({"kernel": ["events", "models", "memory"], "operations": []})
+        );
+        if with_models {
+            assert_eq!(row["kernel_grants"], json!(["events", "models"]));
+            assert!(denial_code(&row, "models").is_none(), "{row}");
+        } else {
+            assert_eq!(row["kernel_grants"], json!(["events"]));
+            assert_eq!(denial_code(&row, "models"), Some("no_channel"), "{row}");
+        }
+        assert_eq!(denial_code(&row, "memory"), Some("above_ceiling"), "{row}");
+    }
+}
+
+struct NoopTrigger;
+
+#[async_trait::async_trait]
+impl agent24_scheduler::RunTrigger for NoopTrigger {
+    async fn trigger(
+        &self,
+        _invocation: &agent24_scheduler::ScheduleInvocation,
+    ) -> agent24_scheduler::FireOutcome {
+        agent24_scheduler::FireOutcome::Deferred {
+            reason: agent24_scheduler::DeferReason::MountPending,
+        }
+    }
+}
+
+async fn admission_builder(with_models: bool) -> crate::attach_grant::DaemonAttachGrantBuilder {
+    let store = agent24_store::Store::open_memory().await.unwrap();
+    let events = crate::events::EventsHub::default();
+    crate::attach_grant::DaemonAttachGrantBuilder {
+        scheduler: agent24_scheduler::Scheduler::new(
+            store.clone(),
+            Arc::new(NoopTrigger),
+            Arc::new(|_| {}),
+        ),
+        models: with_models.then(|| crate::model_callback::ModelCallbackDeps {
+            router: Arc::new(agent24_models::router::ModelRouter::with_defaults(vec![])),
+            usage: Arc::new(crate::model_callback::MemoryUsageSink::default()),
+            cancel_root: CancellationToken::new(),
+            admission: crate::model_callback::ModelAdmission::new(
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+            ),
+            events: events.clone(),
+            timings: Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
+        }),
+        approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
+            store,
+            events.clone(),
+        ),
+        events,
+    }
 }
 
 #[tokio::test]
@@ -132,6 +440,15 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "crash at /Users/x/od ws://relay.example"
     );
     assert!(find(&full, "hyphae").get("detail").is_some());
+    // Hyphae declares `events` and has no kernel channel. The host sees that
+    // denial; the grant list stays empty because nothing was mounted.
+    let hyphae = find(&full, "hyphae");
+    assert_eq!(hyphae["kernel_grants"], json!([]));
+    assert_eq!(hyphae["declared"]["kernel"], json!(["events"]));
+    assert_eq!(
+        hyphae["denied"],
+        json!([{"item": "events", "code": "no_channel"}])
+    );
 
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
@@ -145,6 +462,10 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "contract",
         "port",
         "pid",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -509,6 +830,8 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         disabled: false,
         drain: Some(DrainState::Running),
         mismatch: None,
+        kernel_grants: Vec::new(),
+        declared_kernel: Vec::new(),
     })
     .collect();
     let items = attach_items_from(modules);
@@ -1093,6 +1416,10 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
         "binding",
         "in_process",
         "memory",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }

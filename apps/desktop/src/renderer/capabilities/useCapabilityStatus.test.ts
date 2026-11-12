@@ -6,7 +6,15 @@ import { COMPONENT_STATES, type ComponentState } from '../../shared/component-st
 import { setLocale, type Locale } from '../i18n'
 import { useCapabilityStatus } from './useCapabilityStatus'
 
-interface Row { id: string; version: string | null; state: ComponentState; reason?: string; provides: [] }
+interface Row {
+  id: string
+  version: string | null
+  state: ComponentState
+  reason?: string
+  provides: []
+  kernel_grants?: string[]
+  declared?: { kernel: string[]; operations: string[] }
+}
 
 let rows: Row[]
 let fail = false
@@ -156,6 +164,19 @@ describe('communication capability status', () => {
     const { result } = renderHook(() => useCapabilityStatus(true))
     await act(async () => {})
     expect(result.current('communication')).toBe(label)
+  })
+
+  it('reads kernel grants from the mount, including an empty grant for Hyphae', async () => {
+    rows = [
+      { ...row('documents', 'ready'), kernel_grants: ['events'], declared: { kernel: ['events', 'models'], operations: [] } },
+      { ...row('hyphae', 'absent'), kernel_grants: [], declared: { kernel: ['events'], operations: [] } },
+      row('idoris', 'absent'),
+    ]
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    expect(result.current.grantsFor('documents')).toEqual(['events'])
+    expect(result.current.grantsFor('communication')).toEqual([])
+    expect(result.current.grantsFor('localModels')).toBeUndefined()
   })
 
   it('shows missing when hyphae is absent from the list', async () => {

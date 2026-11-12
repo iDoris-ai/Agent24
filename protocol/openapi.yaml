@@ -515,9 +515,12 @@ paths:
         One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
         Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
         refused (403). The ProductHost audience, and legacy mode (one shared token that already
-        reads every full status route), get `ComponentView`. Every other audience gets
+        reads every full status route), get `ComponentView`, including `kernel_grants` (what the
+        mount actually handed out, `MountReport.granted`), `declared` (the `requires` declaration)
+        and `denied` (`{item, code}` with a closed code). Hyphae's declared kernel items are
+        `no_channel`: it has no kernel callback. Every other audience gets
         `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
-        port, error message, team id, commit, or Hyphae health probes. While the Hyphae daemon is
+        port, error message, team id, commit, denial, or Hyphae health probes. While the Hyphae daemon is
         running, the host view's `detail.health` lists each probe (`relays`, `keystore`, `daemon`,
         or `health` when the command itself did not finish) with `ok` and `consecutive_failures`.
         Three consecutive failures set state `degraded` and `reason` to those probe names; one
@@ -5588,10 +5591,38 @@ components:
             zh: { type: string }
             en: { type: string }
             th: { type: string }
+    ComponentRequires:
+      type: object
+      additionalProperties: false
+      description: The component's `requires` declaration (`kernel` capabilities and canonical operations).
+      required: [kernel, operations]
+      properties:
+        kernel:
+          type: array
+          items: { type: string }
+        operations:
+          type: array
+          items: { type: string }
+    ComponentDenial:
+      type: object
+      additionalProperties: false
+      required: [item, code]
+      properties:
+        item: { type: string }
+        code:
+          type: string
+          enum: [not_declared, above_ceiling, no_channel, requires_invalid]
+          description: >-
+            not_declared: in the form's ceiling but not declared. above_ceiling: declared
+            but outside the ceiling. no_channel: declared and inside the ceiling, but the
+            mount handed out no handle (Hyphae always; a model callback that did not build).
+            This also includes a capability withheld by policy (lease, partition, grant,
+            or ephemeral). requires_invalid: the declaration did not parse, so nothing
+            was granted.
     ComponentView:
       type: object
       description: Host view of one component.
-      required: [id, version, state, form, provides]
+      required: [id, version, state, form, provides, kernel_grants, declared, denied]
       properties:
         id: { type: string }
         version: { type: [string, "null"] }
@@ -5612,6 +5643,31 @@ components:
             State incompatible uses contract_mismatch. State degraded lists the failed probe
             names (for example relays), never a relay URL. A Hyphae that is simply not
             installed is state absent with no reason.
+        kernel_grants:
+          type: array
+          items: { type: string }
+          description: >-
+            Kernel capabilities actually held. A mounted package copies
+            `MountReport.granted`. An attached module copies the admission grant
+            (events, and models when a model callback was built); for attach rows
+            this is the admission grant and does not change with whether the module
+            is currently connected. Empty when nothing was handed out. Not the resolver's grant set: a missing model
+            callback omits `models` even when the declaration and the ceiling would allow it.
+        declared:
+          description: >-
+            The component's `requires` declaration. Null when no declaration was
+            read (the manifest was not read, or the component has no `requires`
+            lock, such as built-in MCP or knowledge rows): the declaration is
+            unknown, denials are not computed, and the out-of-process ceiling is
+            not applied.
+          oneOf:
+            - $ref: "#/components/schemas/ComponentRequires"
+            - type: "null"
+        denied:
+          type: array
+          description: Host only. Closed reasons an item is not in `kernel_grants`.
+          items:
+            $ref: "#/components/schemas/ComponentDenial"
         detail:
           type: object
           additionalProperties: true
@@ -5625,7 +5681,8 @@ components:
       type: object
       description: >-
         What every audience other than the host sees. No path, pid, port, message, team id,
-        commit, or Hyphae health probes.
+        commit, kernel grant, denial, or Hyphae health probes.
+      additionalProperties: false
       required: [id, version, state, provides]
       properties:
         id: { type: string }
@@ -5639,7 +5696,8 @@ components:
         components:
           type: array
           items:
-            # anyOf, not oneOf: a full view also satisfies the redacted schema.
+            # Host rows match ComponentView; other audiences get ComponentRedactedView
+            # (additionalProperties: false, so a full row cannot pass as redacted).
             anyOf:
               - $ref: "#/components/schemas/ComponentView"
               - $ref: "#/components/schemas/ComponentRedactedView"

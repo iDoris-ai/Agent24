@@ -469,11 +469,16 @@ mod tests {
             _name: &str,
             manifest: &agent24_domain::DomainOsManifest,
         ) -> crate::attach_registry::AttachGrant {
-            let provides = if manifest
+            let events = manifest
                 .kernel_capabilities()
-                .contains(&agent24_domain::Capability::Events)
-            {
+                .contains(&agent24_domain::Capability::Events);
+            let provides = if events {
                 vec!["_a24/events/".to_owned()]
+            } else {
+                Vec::new()
+            };
+            let kernel_grants = if events {
+                vec![agent24_domain::Capability::Events.as_str().to_owned()]
             } else {
                 Vec::new()
             };
@@ -482,6 +487,7 @@ mod tests {
                 methods_for: std::sync::Arc::new(|_generation| {
                     agent24_os_proto::rpc::Methods::none()
                 }),
+                kernel_grants,
             }
         }
     }
