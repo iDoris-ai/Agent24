@@ -1135,8 +1135,8 @@ mod tests {
         assert!(hyphae_poll_enabled(Some("observe"), false));
         assert!(hyphae_poll_enabled(Some("auto"), false));
         assert!(!hyphae_poll_enabled(Some("off"), false));
-        // A hyphae allowlist row is an opt-in on its own, including when
-        // the stored mode is off.
+        // `accept_mode=off` is not an opt-in. A hyphae allowlist row does
+        // not pull while the stored mode is off.
         assert!(
             !hyphae_poll_enabled(Some("off"), true),
             "off overrides the allowlist"
@@ -2203,6 +2203,386 @@ mod tests {
                 ]
             }))
         }
+    }
+
+    /// CLI shapes the production guards reject: inbox is an object (no
+    /// array), `groups` is a string, or `messages` is one object. A missing
+    /// `groups` / `messages` key is an empty page and is not produced here.
+    #[derive(Clone, Copy)]
+    enum ShapeFault {
+        InboxObject,
+        GroupsString,
+        MessagesObject,
+    }
+
+    struct ShapeScript {
+        fault: ShapeFault,
+        now: i64,
+        calls: StdMutex<Vec<Vec<String>>>,
+    }
+
+    impl ShapeScript {
+        fn new(fault: ShapeFault, now: i64) -> Self {
+            Self {
+                fault,
+                now,
+                calls: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn saw_group(&self, group_id: &str) -> bool {
+            self.calls.lock().unwrap().iter().any(|argv| {
+                argv.windows(2)
+                    .any(|pair| pair[0] == "--group-id" && pair[1] == group_id)
+            })
+        }
+
+        fn arg<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+            args.windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].as_str())
+        }
+
+        fn message(&self, logical: &str, event_id: &str, group_id: &str, text: &str) -> Value {
+            json!({
+                "id": logical,
+                "event_id": event_id,
+                "group_id": group_id,
+                "sender": PEER,
+                "content": text,
+                "plaintext": text,
+                "created_at": self.now,
+            })
+        }
+
+        fn list_body(&self, args: &[String]) -> Value {
+            match self.fault {
+                ShapeFault::GroupsString => {
+                    if Self::arg(args, "--identity") == Some("bob") {
+                        json!({ "groups": [{ "group_id": GOOD, "state": "active" }] })
+                    } else {
+                        json!({ "groups": GROUP })
+                    }
+                }
+                ShapeFault::MessagesObject => json!({
+                    "groups": [
+                        { "group_id": BAD, "state": "active" },
+                        { "group_id": GOOD, "state": "active" }
+                    ]
+                }),
+                ShapeFault::InboxObject => {
+                    json!({ "groups": [{ "group_id": GROUP, "state": "active" }] })
+                }
+            }
+        }
+
+        fn history_body(&self, group: Option<&str>) -> Value {
+            let page = |logical: &str, event_id: &str, group_id: &str, text: &str| json!({ "messages": [self.message(logical, event_id, group_id, text)] });
+            match (self.fault, group) {
+                (ShapeFault::MessagesObject, Some(BAD)) => json!({
+                    "messages": self.message(
+                        "logical-bad-page",
+                        "evt-bad-page",
+                        BAD,
+                        "@me should not land",
+                    )
+                }),
+                (ShapeFault::GroupsString, Some(GROUP)) => page(
+                    "logical-from-string",
+                    "evt-from-string",
+                    GROUP,
+                    "@ann from the string",
+                ),
+                (ShapeFault::GroupsString, Some(GOOD)) => page(
+                    "logical-bob",
+                    "evt-bob-good",
+                    GOOD,
+                    "@bob after the bad list",
+                ),
+                (ShapeFault::InboxObject, _) => page(
+                    "logical-after-inbox",
+                    "evt-after-bad-inbox",
+                    GROUP,
+                    "@me after the bad inbox",
+                ),
+                (ShapeFault::MessagesObject, _) => page(
+                    "logical-good-page",
+                    "evt-good-page",
+                    GOOD,
+                    "@me after the bad page",
+                ),
+                _ => json!({ "messages": [] }),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HyphaeCli for ShapeScript {
+        async fn run(
+            &self,
+            args: &[String],
+            _with_password: bool,
+        ) -> Result<Value, HyphaeCliError> {
+            self.calls.lock().unwrap().push(args.to_vec());
+            if args.first().map(String::as_str) == Some("identity") {
+                let rows = if matches!(self.fault, ShapeFault::GroupsString) {
+                    json!([
+                        { "nickname": "ann", "npub": NPUB_A },
+                        { "nickname": "bob", "npub": NPUB_B }
+                    ])
+                } else {
+                    json!([{ "nickname": NICK, "npub": SELF_NPUB }])
+                };
+                return Ok(rows);
+            }
+            if args.first().map(String::as_str) == Some("history") {
+                if matches!(self.fault, ShapeFault::InboxObject) {
+                    // One DM object where an array belongs. Complete enough
+                    // that treating it as a row would ingest `evt-bad-inbox`.
+                    return Ok(json!({
+                        "id": "evt-bad-inbox",
+                        "sender_npub": PEER,
+                        "recipient_npub": SELF_NPUB,
+                        "content": "not an array",
+                        "plaintext": "not an array",
+                        "created_at": self.now,
+                        "is_incoming": true
+                    }));
+                }
+                return Ok(json!([]));
+            }
+            if args.get(1).map(String::as_str) == Some("list") {
+                return Ok(self.list_body(args));
+            }
+            Ok(self.history_body(Self::arg(args, "--group-id")))
+        }
+    }
+
+    async fn open_shape(
+        fault: ShapeFault,
+        now_at: DateTime<Utc>,
+    ) -> (HyphaeInbound, Store, Arc<ShapeScript>) {
+        let script = Arc::new(ShapeScript::new(fault, now_at.timestamp()));
+        let (inbound, store) = open_cli(Arc::clone(&script) as Arc<dyn HyphaeCli>, now_at).await;
+        allow(&store, PEER).await;
+        (inbound, store, script)
+    }
+
+    fn warned(inbound: &HyphaeInbound, category: &str) -> bool {
+        inbound.warned_at.lock().unwrap().contains_key(category)
+    }
+
+    /// Mutation: feed the object into `sort` / `ingest_direct`. `evt-bad-inbox`
+    /// is stored, `direct_attempts` is not 0, and this assert goes red.
+    /// Treating the object as an empty page returns `Ok` and skips the warn.
+    #[tokio::test]
+    async fn inbox_object_is_an_error_and_the_group_after_it_is_stored() {
+        let now_at = wall_now();
+        let (inbound, store, _) = open_shape(ShapeFault::InboxObject, now_at).await;
+        let locals = std::collections::HashSet::from([SELF_NPUB.to_owned()]);
+        let cli = (inbound.cli)().expect("cli");
+        let err = inbound
+            .poll_direct(cli.as_ref(), NICK, SELF_NPUB, &locals)
+            .await
+            .unwrap_err();
+        assert_eq!(err.text(), "history inbox data is not an array");
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-bad-inbox")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            inbound
+                .direct_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-bad-inbox")
+                .await
+                .unwrap()
+                .is_none(),
+            "a non-array inbox is not ingested"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-after-bad-inbox")
+                .await
+                .unwrap()
+                .is_some(),
+            "the group after the bad inbox still lands"
+        );
+        assert_eq!(runs(&store).await, 1, "only the group mention starts a run");
+        assert_eq!(
+            inbound
+                .direct_attempts
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "the object never reached ingest"
+        );
+        assert!(
+            warned(&inbound, "cli-failed"),
+            "the bad inbox is warned, not a silent empty page"
+        );
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, SELF_NPUB, GROUP)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-after-inbox")
+        );
+    }
+
+    /// Mutation: drop the error and treat a non-array `groups` as an empty
+    /// page. `poll_groups` returns `Ok`, no `cli-failed` warn, and this
+    /// assert goes red. Using the string as a group id stores
+    /// `evt-from-string` and moves `logical-held`.
+    #[tokio::test]
+    async fn group_list_string_is_an_error_and_does_not_advance_the_cursor() {
+        let now_at = wall_now();
+        let (inbound, store, script) = open_shape(ShapeFault::GroupsString, now_at).await;
+        store
+            .set_inbound_cursor(SOURCE, NPUB_A, GROUP, "logical-held")
+            .await
+            .unwrap();
+        let locals = std::collections::HashSet::from([NPUB_A.to_owned(), NPUB_B.to_owned()]);
+        let cli = (inbound.cli)().expect("cli");
+        let err = inbound
+            .poll_groups(cli.as_ref(), "ann", NPUB_A, &locals)
+            .await
+            .unwrap_err();
+        assert_eq!(err.text(), "groupchat list data has no groups array");
+        assert!(
+            !script.saw_group(GROUP),
+            "the string must not be polled as a group id"
+        );
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, NPUB_A, GROUP)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-held")
+        );
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-from-string")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-bob-good")
+                .await
+                .unwrap()
+                .is_some(),
+            "the next identity's group still lands"
+        );
+        assert_eq!(runs(&store).await, 1);
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, NPUB_A, GROUP)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-held"),
+            "the bad list must not move the cursor"
+        );
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, NPUB_B, GOOD)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-bob")
+        );
+        assert!(!script.saw_group(GROUP));
+        assert!(script.saw_group(GOOD));
+        assert!(warned(&inbound, "cli-failed"));
+    }
+
+    /// Mutation: ingest the `messages` object as one row. `evt-bad-page` is
+    /// stored and the cursor moves off `logical-held`. Treating it as an
+    /// empty page returns `Ok` and never warns `group:{BAD}`.
+    #[tokio::test]
+    async fn group_history_object_is_an_error_and_the_next_group_is_stored() {
+        let now_at = wall_now();
+        let (inbound, store, _) = open_shape(ShapeFault::MessagesObject, now_at).await;
+        store
+            .set_inbound_cursor(SOURCE, SELF_NPUB, BAD, "logical-held")
+            .await
+            .unwrap();
+        let locals = std::collections::HashSet::from([SELF_NPUB.to_owned()]);
+        let cli = (inbound.cli)().expect("cli");
+        let err = inbound
+            .poll_group(cli.as_ref(), NICK, SELF_NPUB, BAD, &locals)
+            .await
+            .unwrap_err();
+        assert_eq!(err.text(), "groupchat history messages is not an array");
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-bad-page")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, SELF_NPUB, BAD)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-held")
+        );
+
+        inbound.poll_round().await.unwrap();
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-bad-page")
+                .await
+                .unwrap()
+                .is_none(),
+            "a non-array messages field is not ingested"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:evt-good-page")
+                .await
+                .unwrap()
+                .is_some(),
+            "the group after the bad page still lands"
+        );
+        assert_eq!(runs(&store).await, 1);
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, SELF_NPUB, BAD)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-held"),
+            "the bad page must not advance the cursor"
+        );
+        assert_eq!(
+            store
+                .inbound_cursor(SOURCE, SELF_NPUB, GOOD)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("logical-good-page")
+        );
+        assert!(
+            warned(&inbound, &format!("group:{BAD}")),
+            "the bad page is warned, not a silent empty page"
+        );
     }
 
     async fn open_cli(cli: Arc<dyn HyphaeCli>, now: DateTime<Utc>) -> (HyphaeInbound, Store) {
