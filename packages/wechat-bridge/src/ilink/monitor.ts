@@ -25,12 +25,13 @@ export class Monitor {
     private readonly client: ILinkClient,
     private readonly onMessage: MessageHandler,
     cursor = '',
+    private readonly account = '',
   ) {
     this.cursor = cursor
   }
 
-  /** Runs until `stop`, or until a handler returns `stop` / `capabilities`. */
-  start(): Promise<'auth' | 'capabilities' | 'stopped'> {
+  /** Runs until `stop`, or until a handler returns `stop` / `dev_tool` / `capabilities`. */
+  start(): Promise<'auth' | 'dev_tool' | 'capabilities' | 'stopped'> {
     this.running = true
     return this.loop()
   }
@@ -39,7 +40,7 @@ export class Monitor {
     this.running = false
   }
 
-  private async loop(): Promise<'auth' | 'capabilities' | 'stopped'> {
+  private async loop(): Promise<'auth' | 'dev_tool' | 'capabilities' | 'stopped'> {
     console.log('[wechat] 开始长轮询接收消息...')
     while (this.running) {
       try {
@@ -62,6 +63,10 @@ export class Monitor {
             this.running = false
             return 'auth'
           }
+          if (step === 'dev_tool') {
+            this.running = false
+            return 'dev_tool'
+          }
           if (step === 'capabilities') {
             this.running = false
             return 'capabilities'
@@ -76,15 +81,19 @@ export class Monitor {
           await this.backoff('记录失败')
           continue
         }
-        this.holdDelay = CONFIG.RECONNECT_DELAY_MS
-        if (next) {
-          this.cursor = next
+        if (next && next !== this.cursor) {
           try {
-            saveBridgeCursor(next)
+            saveBridgeCursor(next, this.account)
           } catch (err) {
+            // The batch was delivered, but the cursor is not durable. Keep the
+            // in-memory cursor so the next poll redelivers, and back off.
             console.error('[wechat] 游标没有写入:', err instanceof Error ? err.message : err)
+            await this.backoff('游标没有写入')
+            continue
           }
         }
+        this.holdDelay = CONFIG.RECONNECT_DELAY_MS
+        if (next) this.cursor = next
       } catch (err) {
         const m = err instanceof Error ? err.message : String(err)
         if (err instanceof Error && (err.name === 'TimeoutError' || m.includes('timeout'))) {

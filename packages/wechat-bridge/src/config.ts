@@ -9,6 +9,7 @@
 // `inbound_allowlist`. The bearer is the dev-bridge file under `dataDir()`,
 // not a field of `daemon.json`.
 
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs'
 
 import { DaemonStateError, dataDir, joinLiteral, readDaemonState } from '@agent24/data-dir'
@@ -59,7 +60,9 @@ export interface BridgeCredential {
   expiresAt: number
 }
 
-const OPEN_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW
+// O_NONBLOCK: a planted FIFO must not stall this synchronous open. A real
+// file ignores the flag; fstat below still requires a regular file.
+const OPEN_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK
 
 function assertPrivateDir(dir: string): void {
   let st: fs.Stats
@@ -119,8 +122,15 @@ export function loadBridgeCredential(nowMs = Date.now()): BridgeCredential {
   return { token: parsed.token, expiresAt: parsed.expires_at }
 }
 
-/** Last committed cursor. Missing, unreadable, or a symlink: start from empty. */
-export function loadBridgeCursor(): string {
+/** Stable id for one iLink login. The saved token has no separate bot id;
+ * this is the sha256 of `bot_token`, so the cursor file does not store the bearer. */
+export function ilinkAccountKey(botToken: string): string {
+  return createHash('sha256').update(botToken).digest('hex')
+}
+
+/** Last committed cursor for `account`. Missing, unreadable, a symlink, or a
+ * different iLink account: start from empty. A mismatch is logged. */
+export function loadBridgeCursor(account = ''): string {
   const path = CONFIG.BRIDGE_CURSOR_FILE
   let fd: number
   try {
@@ -131,7 +141,7 @@ export function loadBridgeCursor(): string {
   try {
     const st = fs.fstatSync(fd)
     if (!st.isFile() || (st.mode & 0o777) !== 0o600) return ''
-    return fs.readFileSync(fd, 'utf8')
+    return cursorForAccount(fs.readFileSync(fd, 'utf8'), account)
   } catch {
     return ''
   } finally {
@@ -139,12 +149,29 @@ export function loadBridgeCursor(): string {
   }
 }
 
-/** Atomically publish the cursor next to the token (0600, temp file + rename). */
-export function saveBridgeCursor(cursor: string): void {
+function cursorForAccount(text: string, account: string): string {
+  let parsed: { account?: unknown; cursor?: unknown }
+  try {
+    parsed = JSON.parse(text) as { account?: unknown; cursor?: unknown }
+  } catch {
+    console.error('[wechat] 游标账号与当前 iLink 登录不一致，忽略旧游标')
+    return ''
+  }
+  if (parsed.account !== account || typeof parsed.cursor !== 'string') {
+    console.error('[wechat] 游标账号与当前 iLink 登录不一致，忽略旧游标')
+    return ''
+  }
+  return parsed.cursor
+}
+
+/** Atomically publish the cursor next to the token (0600, temp file + rename).
+ * The file records `account` so a later login does not resume another bot's cursor. */
+export function saveBridgeCursor(cursor: string, account = ''): void {
   const path = CONFIG.BRIDGE_CURSOR_FILE
   const dir = path.slice(0, path.lastIndexOf('/'))
   assertPrivateDir(dir)
-  const tmp = `${path}.${process.pid}.tmp`
+  const tmp = `${path}.${randomUUID()}.tmp`
+  const body = JSON.stringify({ account, cursor })
   let fd: number
   try {
     fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o600)
@@ -152,7 +179,7 @@ export function saveBridgeCursor(cursor: string): void {
     throw new Error(`无法写入微信桥游标 ${path}: ${err instanceof Error ? err.message : err}`)
   }
   try {
-    fs.writeFileSync(fd, cursor, 'utf8')
+    fs.writeFileSync(fd, body, 'utf8')
     fs.fchmodSync(fd, 0o600)
     fs.fsyncSync(fd)
   } finally {
@@ -163,6 +190,27 @@ export function saveBridgeCursor(cursor: string): void {
   } catch (err) {
     fs.rmSync(tmp, { force: true })
     throw err
+  }
+  fsyncDir(dir)
+}
+
+/** fsync the directory so the rename is durable. A failure is logged; the
+ * rename already published the file. */
+function fsyncDir(dir: string): void {
+  let fd: number | undefined
+  try {
+    fd = fs.openSync(dir, 'r')
+    fs.fsyncSync(fd)
+  } catch (err) {
+    console.error('[wechat] 游标目录 fsync 失败:', err instanceof Error ? err.message : err)
+  } finally {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd)
+      } catch {
+        // The fsync error, if any, was already logged.
+      }
+    }
   }
 }
 

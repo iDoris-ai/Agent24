@@ -212,6 +212,26 @@ async fn shell_revokes_the_bridge_token_it_issued() {
     assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
 }
 
+/// After a restart the id is gone. The shell hears 404
+/// `bridge_token_unknown` and is not asked to elevate. Answering
+/// `presence_required` or `not_elevated_operation` turns this red.
+#[tokio::test]
+async fn shell_revoke_of_an_unknown_id_is_not_an_elevation_failure() {
+    let (state, token) = setup().await;
+    let response = build_router(state)
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/deadbeef/revoke",
+            "",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(response).await, "bridge_token_unknown");
+}
+
 /// A shell grant is refused for another shell token, a creative token, and
 /// an id that is not in the store. Those bearers stay valid. ProductHost
 /// still revokes the creative token. Dropping the bridge check in

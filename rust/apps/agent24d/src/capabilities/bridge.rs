@@ -276,10 +276,14 @@ pub(crate) fn is_dev_bridge(claims: &CapabilityClaims) -> bool {
         && claims.component_id.as_deref() == Some(DEV_BRIDGE_COMPONENT_ID)
 }
 
-/// Mark the token revoked before the audit write. A write failure must not
-/// put the old bearer back into service. The in-memory record is marked
-/// audit-pending, and the next revoke of the same id writes that one
-/// `Revoked` row. A revoke whose audit already succeeded writes nothing.
+/// Mark the token revoked and `pending` under one lock, then write one
+/// `Revoked` row. `pending` is set before the write (in progress). Success
+/// clears it; failure leaves it so the next call writes the row.
+///
+/// The same id takes one gate. A caller that finds the gate held returns
+/// [`BridgeRevokeError::AuditFailed`] and does not answer success. A call
+/// that returns `Ok` has either stored the row itself or observed `pending`
+/// already clear after a previous store. Two calls do not append two rows.
 pub async fn revoke_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     capability_id: &str,
@@ -295,11 +299,28 @@ where
     if !is_dev_bridge(&claims) {
         return Err(BridgeRevokeError::NotComponent);
     }
-    let transitioned = store.revoke_by_id(capability_id);
-    let pending = store.revoke_audit_pending(capability_id);
+    let gate = {
+        let mut gates = store
+            .shared
+            .revoke_gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        gates
+            .entry(capability_id.to_owned())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    // Held across the audit write. Dropping it early would let the next
+    // caller observe `pending` and write a second row.
+    let Ok(_gate_hold) = gate.try_lock() else {
+        return Err(BridgeRevokeError::AuditFailed);
+    };
     // Already revoked and the row was written: do not append another.
-    if !transitioned && !pending {
-        return Ok(());
+    // `pending` is set in this same lock when a row still has to be written.
+    match store.start_revoke_audit(capability_id) {
+        Some(super::revoke::RevokeAuditStart::Stored) => return Ok(()),
+        Some(super::revoke::RevokeAuditStart::Write) => {}
+        None => return Err(BridgeRevokeError::AuditFailed),
     }
     let event = CapabilityTokenAuditEvent::Revoked {
         component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID)
@@ -308,7 +329,6 @@ where
         reason: CapabilityRevokeReason::Explicit,
     };
     if audit(event).await.is_err() {
-        store.set_revoke_audit_pending(capability_id, true);
         return Err(BridgeRevokeError::AuditFailed);
     }
     store.set_revoke_audit_pending(capability_id, false);
@@ -784,6 +804,111 @@ mod tests {
         .await;
         assert_eq!(third, Ok(()));
         assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two overlapping revokes write one row. The call that finds the gate
+    /// held does not return success. Returning `Ok` from that path turns
+    /// the second assertion into `Ok`.
+    #[tokio::test]
+    async fn concurrent_revoke_writes_one_row_and_the_other_does_not_return_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        let db = agent24_store::Store::open_memory().await.unwrap();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = {
+            let store = store.clone();
+            let id = id.clone();
+            let db = db.clone();
+            let writes = writes.clone();
+            tokio::spawn(async move {
+                revoke_wechat_bridge(&store, &id, move |event| {
+                    let db = db.clone();
+                    let writes = writes.clone();
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        let ts = audit_now().unwrap();
+                        db.append_capability_token_audit(&ts, &event)
+                            .await
+                            .map(|_| ())
+                            .map_err(|_| ())
+                    }
+                })
+                .await
+            })
+        };
+        started_rx.await.unwrap();
+        let second = revoke_wechat_bridge(&store, &id, |_| async { Ok(()) }).await;
+        assert_eq!(second, Err(BridgeRevokeError::AuditFailed));
+        let _ = release_tx.send(());
+        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(!store.revoke_audit_pending(&id));
+        let revoked = db
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "capability.token.revoked")
+            .count();
+        assert_eq!(revoked, 1);
+    }
+
+    /// While the first audit is still running and then fails, the overlapping
+    /// call does not return success. Answering `Ok` there turns this red.
+    #[tokio::test]
+    async fn slow_failed_revoke_audit_does_not_let_the_second_call_return_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = {
+            let store = store.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                revoke_wechat_bridge(&store, &id, move |_| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Err(())
+                })
+                .await
+            })
+        };
+        started_rx.await.unwrap();
+        let second_writes = writes.clone();
+        let second = revoke_wechat_bridge(&store, &id, |_| {
+            second_writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(second, Err(BridgeRevokeError::AuditFailed));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        let _ = release_tx.send(());
+        assert_eq!(first.await.unwrap(), Err(BridgeRevokeError::AuditFailed));
+        assert!(store.revoke_audit_pending(&id));
+        let third_writes = writes.clone();
+        let third = revoke_wechat_bridge(&store, &id, |_| {
+            third_writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(third, Ok(()));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(!store.revoke_audit_pending(&id));
     }
 
     /// The second revoke does not append another `Revoked` row. Ignoring

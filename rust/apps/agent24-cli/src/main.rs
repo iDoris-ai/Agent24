@@ -1272,6 +1272,14 @@ async fn cmd_bridge_token_revoke() -> Result<(), String> {
         let status = reply.status;
         let body = reply.json_value().await;
         finish(ep).await;
+        if let Some(outcome) = bridge_token::revoke_reply_when_daemon_lost_the_id(
+            &root,
+            &capability_id,
+            status.as_u16(),
+            &body,
+        ) {
+            return outcome;
+        }
         return Err(bridge_token::http_failure(status.as_u16(), &body));
     }
     finish(ep).await;

@@ -10,7 +10,7 @@
 - 只投递有文字的消息。纯图片、空文本、只有空白的消息不投递，也不回复。这类消息仍推进游标。
 - 只有 daemon 返回 `started`（记下并起了 run）时，回一句「已记录」。不回发 run 结果。`ignored`（名单外、过期、限流等）、`duplicate`（同一条消息再次投递，可能是名单外消息的重放）都不回复。
 - 「y」「n」是普通文本，不再批准或拒绝。审批只在桌面端做。
-- 投递失败回「记录失败，请稍后重试」，不带 daemon 的错误原文。运行中 POST 返回 401 时桥退出，并提示重新签发。
+- 投递失败回「记录失败，请稍后重试」，不带 daemon 的错误原文。运行中 POST 返回 401 时桥退出，并提示重新签发。返回 404 时桥退出，并提示 daemon 未挂载开发入站路由（需 `A24_DEV_TOOL=1`）。400/403/413/422 记一条失败后前进；408 和其余 4xx 保持游标并退避。
 
 令牌不在 `daemon.json` 里。`agent24 dev bridge-token` 走现有的本机登记和桌面确认，请求 `POST /api/v1/capabilities/bridge`，把 8 小时的组件令牌写到状态目录 `dev/wechat-bridge.token`（目录 0700，文件 0600，JSON 里还有 `capability_id`）。桥只读这个文件里的 `token` 和 `expires_at`。文件缺失、权限不是 0600、或已过期时，桥拒绝启动。
 
@@ -33,3 +33,7 @@ A24_DEV_TOOL=1 pnpm --filter @agent24/wechat-bridge bridge
 ```
 
 首次运行打印二维码。端口来自 daemon 状态文件；测试可以用 `A24_BASE_URL` 改端口，不能用环境变量代替令牌文件。桌面打包配置不得引用 `packages/*-bridge`（由桌面打包测试检查）。参见 [ADR-044](../../docs/adr/ADR-044-communication.md)。
+
+## 已知限制
+
+同一用户的并发进程在检查与使用之间替换 `dev/` 父目录，或签发与 `--revoke` 并发时，CLI 和桥无法完全防住。Node 没有 `openat`。这是开发工具，需要 `A24_DEV_TOOL=1`。本轮不修这一条。

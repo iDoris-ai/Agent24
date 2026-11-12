@@ -20,9 +20,9 @@ pub(crate) const DENY_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 pub(crate) struct Record {
     pub(crate) claims: CapabilityClaims,
     pub(crate) revoked: bool,
-    /// The in-memory revoke already happened and the `Revoked` audit row
-    /// did not. A later revoke of this id writes that one row, then clears
-    /// the flag. A successful audit leaves this false.
+    /// Set before the `Revoked` row is written, and left set when that write
+    /// fails. Cleared only after the row is stored. A caller that sees it
+    /// set, or that cannot take the per-id gate, must not answer success.
     pub(crate) revoke_audit_pending: bool,
 }
 
@@ -55,6 +55,9 @@ pub(crate) struct Shared {
     pub(crate) changed: watch::Sender<u64>,
     pub(crate) deny_audit_at:
         Mutex<HashMap<(String, agent24_store::CapabilityDenyReason), tokio::time::Instant>>,
+    /// One in-flight revoke audit per capability id. A second caller that
+    /// finds the gate held does not answer success.
+    pub(crate) revoke_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// In-memory capability authority. It stores only token digests and claims.
@@ -76,6 +79,7 @@ impl CapabilityStore {
                 }),
                 changed: watch::channel(0).0,
                 deny_audit_at: Mutex::new(HashMap::new()),
+                revoke_gates: Mutex::new(HashMap::new()),
             }),
         }
     }

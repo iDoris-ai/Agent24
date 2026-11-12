@@ -2418,10 +2418,15 @@ paths:
         only when this call changes it from live to revoked. The
         `capability.token.revoked` row is written only for that transition.
         If that write fails the response is 503 `audit_unavailable` and the
-        bearer stays revoked. A later call sees an already-revoked id,
-        answers 200, and does not append or backfill the row. Unknown ids,
-        already-revoked ids, and tokens outside the dev-bridge profile
-        answer 200 `revoked` and do not write that row. Revoking the shell
+        bearer stays revoked. A call that arrives while that write is still
+        in progress is also 503 and does not answer 200. A later call after
+        the row is stored answers 200 and does not append another. A 200
+        means the `Revoked` row is already stored. Unknown ids for a caller
+        that is not a first-party shell, already-revoked ids, and tokens
+        outside the dev-bridge profile answer 200 `revoked` and do not write
+        that row. A first-party shell revoking an id this process does not
+        have (the daemon restarted) gets 404 `bridge_token_unknown` and is
+        not asked to elevate. Revoking the shell
         that issued a bridge token does not revoke the bridge token. The
         bridge token still expires after 8 hours, and a daemon restart
         makes its generation stale.
@@ -2457,6 +2462,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "404":
+          description: >-
+            First-party shell revoked an id this daemon process does not
+            have (`bridge_token_unknown`). No elevation was requested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "409":
           description: Daemon is not in capabilities mode
           content:
@@ -2466,8 +2479,10 @@ paths:
         "503":
           description: >-
             The revoke transition happened and `capability.token.revoked`
-            could not be written (`audit_unavailable`). The bearer stays
-            revoked. Retrying answers 200 and does not append the missing row.
+            could not be written (`audit_unavailable`), or another revoke of
+            this id is still writing that row. The bearer stays revoked.
+            Retrying after a failed write stores the one missing row and
+            then answers 200. A 200 means that row is already stored.
           content:
             application/json:
               schema:

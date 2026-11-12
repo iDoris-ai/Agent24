@@ -273,13 +273,15 @@ pub(super) async fn mint_bridge_capability(
 
 /// Revoke one capability by id.
 ///
-/// A live dev-bridge token is revoked in memory first. The
-/// `capability.token.revoked` row is written when `revoke_by_id` returns
-/// true, or when that write previously failed and the record is still
-/// marked audit-pending. If the write fails the response is 503
-/// `audit_unavailable` and the bearer stays unusable. The next call for
-/// that id writes the missing row and then answers 200. A later call, once
-/// the row exists, answers 200 and does not append another.
+/// A live dev-bridge token is revoked in memory first, and `pending` is set
+/// in that same lock before the audit write. The `capability.token.revoked`
+/// row is written once. If the write fails the response is 503
+/// `audit_unavailable`, `pending` stays set, and the bearer stays unusable.
+/// A second call that arrives while that write is still in progress also
+/// gets 503 and does not answer 200. The next call after a failed write
+/// stores the missing row and then answers 200. A later call, once the row
+/// exists, answers 200 and does not append another. Any 200 means the row
+/// is already stored.
 ///
 /// 503 is only returned for a bridge id whose revoke audit is still
 /// outstanding. The body contains no bearer. Unknown ids and tokens
