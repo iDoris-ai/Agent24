@@ -1,7 +1,7 @@
 # 入站准入里程碑实施方案（X11 ②③④）
 
 - 日期：2026-11-10（基线：`origin/main` @ `2fa86db3b`；第 2 版吸收 Opus 独立评审）
-- 状态：已实施。2a–2d、2f、2g 已合入 main；2e 迁移 #1820 已合（bb03081e）；2e 第 2 部分（Hyphae 轮询）走 #1821，尚未合入 main；2h 为本收口。对照见 §4.1。
+- 状态：已实施。2a–2d、2f、2g 已合入 main；2e 迁移 #1820 已合（bb03081e）；2e 第 2 部分（Hyphae 轮询）#1821 已合（a93f5df3）；2h 为本收口。对照见 §4.1。
 - 依据：[ADR-041](../../adr/ADR-041-inbound-events-admission-and-work-items.md) 的 041a（D1–D4、D10，已接受）；[ADR-044](../../adr/ADR-044-communication.md) D5（X11 结论）；[MILESTONES-AND-TASKS §2.4](MILESTONES-AND-TASKS.md)「尾巴 3a：X11」。
 - 不实现 ADR-041b（工单，D5–D9）。
 - §7 四条取舍 jason 2026-11-11 已拍板，均按推荐。
@@ -202,7 +202,7 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 | X11-2b | 已合入 main | #1803 |
 | X11-2c | 已合入 main | #1810、#1813、#1816 |
 | X11-2d | 已合入 main | #1808、#1812 |
-| X11-2e | 迁移 #1820 已合（bb03081e）；第 2 部分 Hyphae 轮询走 #1821，尚未合入 main。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用 | #1820、#1821 |
+| X11-2e | 迁移 #1820 已合（bb03081e）；第 2 部分 Hyphae 轮询 #1821 已合（a93f5df3）。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用 | #1820、#1821 |
 | X11-2f | 已合入 main | #1809、#1811 |
 | X11-2g | 已合入 main | #1818、#1819 |
 | X11-2h | 本收口，尚未开 PR | — |
