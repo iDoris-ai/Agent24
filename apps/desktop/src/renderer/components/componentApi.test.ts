@@ -16,12 +16,24 @@ describe('parseComponentList', () => {
   it('accepts a full row and a redacted row', () => {
     const rows = parseComponentList({
       components: [
-        { ...ROW, form: 'resident', reason: 'ok' },
+        {
+          ...ROW,
+          form: 'resident',
+          reason: 'ok',
+          kernel_grants: ['events'],
+          declared: { kernel: ['events', 'models'], operations: [] },
+        },
         { id: 'hyphae', version: null, state: 'stopped', provides: [] },
       ],
     })
     expect(rows).toEqual([
-      { ...ROW, form: 'resident', reason: 'ok' },
+      {
+        ...ROW,
+        form: 'resident',
+        reason: 'ok',
+        kernel_grants: ['events'],
+        declared: { kernel: ['events', 'models'], operations: [] },
+      },
       { id: 'hyphae', version: null, state: 'stopped', provides: [] },
     ])
   })
@@ -39,6 +51,8 @@ describe('parseComponentList', () => {
     ['a provide has no id', { components: [{ ...ROW, provides: [{}] }] }],
     ['form is unknown', { components: [{ ...ROW, form: 'daemon' }] }],
     ['reason is not a string', { components: [{ ...ROW, reason: 7 }] }],
+    ['kernel_grants is not a string list', { components: [{ ...ROW, kernel_grants: ['events', 1] }] }],
+    ['declared omits operations', { components: [{ ...ROW, declared: { kernel: [] } }] }],
   ])('rejects a payload whose %s', (_label, payload) => {
     expect(code(() => parseComponentList(payload))).toBe('invalid_response')
   })

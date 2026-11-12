@@ -33,13 +33,18 @@ export interface CapabilitiesPageProps {
    */
   statusFor?: (id: CapabilityId) => string | undefined
   /**
+   * Kernel capabilities the matching component was actually granted.
+   * `undefined` hides the line. An empty list reads as none.
+   */
+  grantsFor?: (id: CapabilityId) => readonly string[] | undefined
+  /**
    * Slots-full note. Settings is not a capability id, so the link cannot go
    * through `open`.
    */
   onOpenSettings?: () => void
 }
 
-export default function CapabilitiesPage({ statusFor, onOpenSettings }: CapabilitiesPageProps) {
+export default function CapabilitiesPage({ statusFor, grantsFor, onOpenSettings }: CapabilitiesPageProps) {
   const { defs, open } = useContext(CapabilitiesContext)
   const { prefs, pinnedCount = prefs.pinned.length, setPrefs } = useContext(NavPrefsContext)
   const t = useT(capabilitiesMessages)
@@ -129,6 +134,9 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
                 {items.map((def) => {
                   const name = c(def.nameKey)
                   const pin = pinOf(def)
+                  const grants = grantsFor?.(def.id)
+                  const grantText = grants === undefined ? undefined
+                    : t('grants.line', { grants: grants.length === 0 ? t('grants.none') : grants.join(t('grants.sep')) })
                   return (
                     <li key={def.id} className="cap-row" aria-label={name}>
                       <div className="cap-copy">
@@ -138,6 +146,7 @@ export default function CapabilitiesPage({ statusFor, onOpenSettings }: Capabili
                           </button>
                         </div>
                         <p className="cap-desc">{c(def.descKey)}</p>
+                        {grantText !== undefined && <p className="cap-grants">{grantText}</p>}
                       </div>
                       <div className="cap-actions">
                         <span className="tag cap-status">{statusText(def)}</span>

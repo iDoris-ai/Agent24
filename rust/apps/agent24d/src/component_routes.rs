@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::capabilities::requires::{self, Consent, DenyReason, GrantForm};
 use crate::capabilities::{Audience, Authorization};
 use crate::comm_routes::BuildMark;
 use crate::domain::{MountOutcome, MountReport};
@@ -59,6 +60,27 @@ pub struct Provide {
     availability: Option<&'static str>,
 }
 
+/// `requires` as declared. Not what the mount handed out.
+#[derive(Serialize, Clone, PartialEq, Eq, Default)]
+struct Declared {
+    kernel: Vec<String>,
+    operations: Vec<String>,
+}
+
+/// One closed denial. `code` is [`DenyReason::as_str`].
+#[derive(Serialize, Clone, PartialEq, Eq)]
+struct Denial {
+    item: String,
+    code: &'static str,
+}
+
+/// Host-only kernel picture. `kernel_grants` is the mount's list.
+struct KernelView {
+    kernel_grants: Vec<String>,
+    declared: Declared,
+    denied: Vec<Denial>,
+}
+
 /// The host view of one component.
 #[derive(Serialize, Clone)]
 pub struct Item {
@@ -73,6 +95,15 @@ pub struct Item {
     /// Ports, contract expectations, counters. Host-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<Value>,
+    /// Capabilities the mount actually handed out (`MountReport.granted`).
+    /// Host-only. Empty when nothing is mounted. Not the resolver's grant set:
+    /// a missing model callback leaves `models` out of this list.
+    kernel_grants: Vec<String>,
+    /// The component's `requires` declaration. Host-only.
+    declared: Declared,
+    /// Why a declared or ceiling item is not in [`Self::kernel_grants`].
+    /// Host-only; the redacted view omits it.
+    denied: Vec<Denial>,
 }
 
 /// What a non-host audience sees in capability mode (see [`sees_everything`]): the fields are
@@ -95,6 +126,9 @@ impl Item {
             provides: Vec::new(),
             reason: None,
             detail: None,
+            kernel_grants: Vec::new(),
+            declared: Declared::default(),
+            denied: Vec::new(),
         }
     }
     fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
@@ -124,6 +158,94 @@ impl Item {
             state: self.state,
             provides: &self.provides,
         }
+    }
+
+    fn set_kernel(&mut self, view: KernelView) {
+        self.kernel_grants = view.kernel_grants;
+        self.declared = view.declared;
+        self.denied = view.denied;
+    }
+}
+
+fn declared_of(kernel: &[String], operations: &[String]) -> Declared {
+    Declared {
+        kernel: kernel.to_vec(),
+        operations: operations.to_vec(),
+    }
+}
+
+fn denials_of(denied: &[requires::Denial]) -> Vec<Denial> {
+    denied
+        .iter()
+        .map(|denial| Denial {
+            item: denial.item.clone(),
+            code: denial.reason.as_str(),
+        })
+        .collect()
+}
+
+/// A resident with no kernel callback (Hyphae). Declared tokens are
+/// `no_channel`; an invalid declaration is `requires_invalid` and grants nothing.
+fn kernel_without_channel(kernel: &[String], operations: &[String]) -> KernelView {
+    let spec = requires::RequiresSpec::parse(kernel, operations);
+    let declared = declared_of(kernel, operations);
+    if !spec.is_valid() {
+        let resolution = requires::resolve(
+            &spec,
+            GrantForm::InProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        );
+        return KernelView {
+            kernel_grants: Vec::new(),
+            declared,
+            denied: denials_of(&resolution.denied),
+        };
+    }
+    let denied = kernel
+        .iter()
+        .chain(operations.iter())
+        .map(|item| Denial {
+            item: item.clone(),
+            code: DenyReason::NoChannel.as_str(),
+        })
+        .collect();
+    KernelView {
+        kernel_grants: Vec::new(),
+        declared,
+        denied,
+    }
+}
+
+/// `kernel_grants` copies `actual` (`MountReport.granted`). A capability the
+/// resolver would grant but the mount did not hand out (no model callback, so
+/// `model_grant` is `None`) is `no_channel` here, not listed as granted.
+fn kernel_from_mount(
+    in_process: bool,
+    kernel: &[String],
+    operations: &[String],
+    actual: &[String],
+) -> KernelView {
+    let spec = requires::RequiresSpec::parse(kernel, operations);
+    let form = if in_process {
+        GrantForm::InProcess
+    } else {
+        GrantForm::OutOfProcess
+    };
+    let resolution = requires::resolve(&spec, form.host_cap(), Consent::FirstPartyEnabled);
+    let mut denied = denials_of(&resolution.denied);
+    let held: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+    for cap in resolution.granted.iter() {
+        if !held.contains(cap.as_str()) {
+            denied.push(Denial {
+                item: cap.as_str().to_owned(),
+                code: DenyReason::NoChannel.as_str(),
+            });
+        }
+    }
+    KernelView {
+        kernel_grants: actual.to_vec(),
+        declared: declared_of(kernel, operations),
+        denied,
     }
 }
 
@@ -362,12 +484,14 @@ fn hyphae_item(state: &AppState) -> Item {
         }
     };
     let lock = lock.component();
+    let kernel = kernel_without_channel(&lock.requires.kernel, &lock.requires.operations);
     let item = Item::new("hyphae", Form::Resident, ComponentState::Absent).with(|i| {
         i.provides = Item::provides_of(lock);
         i.detail = Some(json!({"contract": {
             "name": lock.contract.name, "major": lock.contract.major,
             "min_minor": lock.contract.min_minor,
         }}));
+        i.set_kernel(kernel);
     });
     // A binary the last start (or install rebuild) refused is `failed` with the stable
     // code, ahead of any supervisor left registered from before. Host view only: the
@@ -583,7 +707,31 @@ fn documents_shown(
         item.reason = reason.map(str::to_owned);
         item.detail = detail.map(|why| json!({"message": why}));
     }
+    let operations = match &catalog {
+        Ok(catalog) => catalog.requires.operations.clone(),
+        Err(_) => Vec::new(),
+    };
+    let catalog_kernel = match &catalog {
+        Ok(catalog) => catalog.requires.kernel.clone(),
+        Err(_) => Vec::new(),
+    };
+    let (kernel, in_process, actual) = if let Some(report) = report {
+        let d9 = report.d9.as_ref();
+        (
+            match d9 {
+                Some(d9) => d9.requires_kernel.clone(),
+                None => catalog_kernel.clone(),
+            },
+            d9.is_some_and(|d9| d9.in_process),
+            report.granted.clone(),
+        )
+    } else {
+        (catalog_kernel, false, Vec::new())
+    };
     apply_documents_catalog(&mut item, catalog, report);
+    if report.is_some() || !kernel.is_empty() || !operations.is_empty() {
+        item.set_kernel(kernel_from_mount(in_process, &kernel, &operations, &actual));
+    }
     item
 }
 
@@ -713,9 +861,16 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                     "package"
                 }
             });
+            let kernel = kernel_from_mount(
+                d9.is_some_and(|d9| d9.in_process),
+                d9.map(|d9| d9.requires_kernel.as_slice()).unwrap_or(&[]),
+                &[],
+                &report.granted,
+            );
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
                 // An integrity refusal with no trusted version is unknown,
                 // not the empty string.
+                i.set_kernel(kernel);
                 i.version = if report.version.is_empty() {
                     None
                 } else {

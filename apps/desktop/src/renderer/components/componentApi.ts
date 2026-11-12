@@ -14,6 +14,11 @@ export interface ComponentProvide {
  * audience. A redacted audience omits both. `reason` is also absent when the
  * daemon has none.
  */
+export interface ComponentDeclared {
+  kernel: string[]
+  operations: string[]
+}
+
 export interface ComponentView {
   id: string
   version: string | null
@@ -21,6 +26,10 @@ export interface ComponentView {
   form?: string
   provides: ComponentProvide[]
   reason?: string
+  /** Present on the host view. What the mount actually handed out. */
+  kernel_grants?: string[]
+  /** Present on the host view. The component's requires declaration. */
+  declared?: ComponentDeclared
 }
 
 export class ComponentApiError extends Error {
@@ -40,6 +49,13 @@ function parseProvide(value: unknown): ComponentProvide {
   const row = object(value)
   if (typeof row.id !== 'string' || row.id.length === 0) throw new ComponentApiError('invalid_response')
   return { id: row.id }
+}
+
+function parseStringList(value: unknown): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== 'string')) {
+    throw new ComponentApiError('invalid_response')
+  }
+  return value as string[]
 }
 
 export function parseComponentView(value: unknown): ComponentView {
@@ -64,6 +80,14 @@ export function parseComponentView(value: unknown): ComponentView {
   if (row.reason !== undefined) {
     if (typeof row.reason !== 'string') throw new ComponentApiError('invalid_response')
     view.reason = row.reason
+  }
+  if (row.kernel_grants !== undefined) view.kernel_grants = parseStringList(row.kernel_grants)
+  if (row.declared !== undefined) {
+    const declared = object(row.declared)
+    view.declared = {
+      kernel: parseStringList(declared.kernel),
+      operations: parseStringList(declared.operations),
+    }
   }
   return view
 }

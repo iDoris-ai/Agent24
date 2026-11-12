@@ -117,6 +117,74 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     assert_eq!(find(&body, "documents")["state"], "absent");
 }
 
+/// The row copies `MountReport.granted`. The resolver would also grant
+/// `models` (it is in the out-of-process ceiling and `no_channel` is empty
+/// there); a mount with no model callback leaves it out of `granted`. Reading
+/// `resolution.granted` instead of `report.granted` makes `kernel_grants`
+/// include `models` and this test fails.
+#[tokio::test]
+async fn components_show_the_mount_grant_not_the_resolver() {
+    use crate::capabilities::requires::{self, Consent, GrantForm};
+
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let mut report = os_report(
+        "modelnodeps",
+        MountOutcome::Mounted,
+        d9(
+            "modelnodeps",
+            false,
+            "modelnodeps-tasks",
+            &["events", "models"],
+        ),
+    );
+    report.granted = vec!["events".into()];
+    let spec = requires::RequiresSpec::parse(&["events", "models"], &[] as &[&str]);
+    let resolution = requires::resolve(
+        &spec,
+        GrantForm::OutOfProcess.host_cap(),
+        Consent::FirstPartyEnabled,
+    );
+    assert!(
+        resolution.granted.has(agent24_domain::Capability::Models),
+        "the resolver grants models; the row must not copy that"
+    );
+    assert!(resolution.granted.has(agent24_domain::Capability::Events));
+    state.os_reports = Arc::new(vec![report]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let row = find(&full, "modelnodeps");
+    assert_eq!(row["kernel_grants"], json!(["events"]));
+    assert_eq!(
+        row["declared"],
+        json!({"kernel": ["events", "models"], "operations": []})
+    );
+    let denied = row["denied"].as_array().unwrap();
+    assert!(
+        denied.iter().all(|item| item["item"] != "events"),
+        "events was mounted: {denied:?}"
+    );
+    assert!(
+        denied
+            .iter()
+            .any(|item| item["item"] == "models" && item["code"] == "no_channel"),
+        "withheld models is no_channel: {denied:?}"
+    );
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let row = find(&redacted, "modelnodeps");
+    assert!(row.get("denied").is_none());
+    assert!(row.get("kernel_grants").is_none());
+    assert!(!redacted.to_string().contains("no_channel"));
+}
+
 #[tokio::test]
 async fn other_audiences_get_only_id_version_state_provides() {
     let (app, host, creative, first_party) = app().await;
@@ -132,6 +200,15 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "crash at /Users/x/od ws://relay.example"
     );
     assert!(find(&full, "hyphae").get("detail").is_some());
+    // Hyphae declares `events` and has no kernel channel. The host sees that
+    // denial; the grant list stays empty because nothing was mounted.
+    let hyphae = find(&full, "hyphae");
+    assert_eq!(hyphae["kernel_grants"], json!([]));
+    assert_eq!(hyphae["declared"]["kernel"], json!(["events"]));
+    assert_eq!(
+        hyphae["denied"],
+        json!([{"item": "events", "code": "no_channel"}])
+    );
 
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
@@ -145,6 +222,10 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "contract",
         "port",
         "pid",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -1093,6 +1174,10 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
         "binding",
         "in_process",
         "memory",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
