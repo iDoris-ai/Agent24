@@ -43,6 +43,8 @@ security:
 tags:
   - name: idoris
     description: Host-only managed iDoris lifecycle (IL-10). CLI coverage deferred to IL-12.
+  - name: skills
+    description: Skill import and user-directory scan (skill loader SL-3). Activation is SL-4. CLI coverage is SL-7.
   - name: system
     description: Health, version, and process-level daemon endpoints.
   - name: attached
@@ -4772,6 +4774,118 @@ paths:
         "404":
           $ref: "#/components/responses/IdorisFailure"
 
+  /skills:
+    get:
+      operationId: listSkills
+      tags: [skills]
+      summary: List installed skills without bodies
+      description: |
+        Everyday `skills.read`. One row per installed skill and origin.
+        Bodies are not included. An empty pointer means the skill is not active
+        and the generation is 0.
+      responses:
+        "200":
+          description: Installed skills
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: postSkill
+      tags: [skills]
+      summary: Import a skill from a request body
+      description: |
+        Everyday `skills.install`. The JSON body is `markdown` plus optional
+        `evals` (`name` and `content`). A path, an origin, or any other field
+        is rejected. The server does not open a caller path. Origin is always
+        `imported`. The pointer does not move.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SkillImportRequest"
+      responses:
+        "200":
+          description: Installed or adopted revision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillInstall"
+        "400":
+          description: Manifest, eval, or request rejection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Same semver and a different content digest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: Body or one eval file is over 32 KiB
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /skills/scans:
+    post:
+      operationId: postSkillScan
+      tags: [skills]
+      summary: Rescan the user skill directory
+      description: |
+        Everyday `skills.install`. The body is empty or `{}`. No path is
+        accepted. The scan reads `<data_dir>/skills` and stores `origin=user`.
+        One bad skill is reported in `errors` and does not fail the others.
+      responses:
+        "200":
+          description: Scan result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillScan"
+        "400":
+          description: The body carried a path or another field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /skills/{id}:
+    get:
+      operationId: getSkill
+      tags: [skills]
+      summary: Read one installed skill
+      description: |
+        Everyday `skills.read`. Returns the pointer, generation (0 when there
+        is no pointer), installed revision metadata, and a text-consistency
+        summary. Bodies are not included. Provider resolution is SL-5 and is
+        not in this response.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Skill detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No revision is installed for this id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -6978,6 +7092,147 @@ components:
       properties:
         error:
           $ref: "#/components/schemas/ErrorBody"
+
+    SkillImportEval:
+      type: object
+      required: [name, content]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: Relative eval path declared in the manifest. Not a filesystem path the server opens.
+        content:
+          type: string
+          description: UTF-8 eval document, at most 32 KiB.
+    SkillImportRequest:
+      type: object
+      required: [markdown]
+      additionalProperties: false
+      properties:
+        markdown:
+          type: string
+          description: Full SKILL.md text, at most 32 KiB UTF-8.
+        evals:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillImportEval"
+    SkillInstall:
+      type: object
+      required:
+        - skill_id
+        - origin
+        - semver
+        - body_revision_id
+        - evals_revision_id
+        - content_digest
+        - ineffective
+        - inserted
+        - pointer
+        - generation
+        - text_consistency
+      properties:
+        skill_id: { type: string }
+        origin: { type: string, enum: [imported, user] }
+        semver: { type: string }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        content_digest: { type: string }
+        ineffective:
+          type: array
+          items: { type: string }
+          description: Field and file names that did not take effect on this parse.
+        inserted: { type: boolean }
+        pointer:
+          oneOf:
+            - $ref: "#/components/schemas/SkillPointer"
+            - type: "null"
+        generation: { type: integer }
+        text_consistency:
+          description: >-
+            Counts for the body and evals this install wrote or reused.
+            Null when that pair cannot be checked.
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
+    SkillPointer:
+      type: object
+      required: [origin, body_revision_id, evals_revision_id, generation]
+      properties:
+        origin: { type: string, enum: [imported, user] }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        generation: { type: integer }
+    SkillListItem:
+      type: object
+      required: [skill_id, origin, semver, generation, active]
+      properties:
+        skill_id: { type: string }
+        origin: { type: string, enum: [imported, user] }
+        semver: { type: string }
+        generation: { type: integer }
+        active: { type: boolean }
+    SkillList:
+      type: object
+      required: [skills]
+      properties:
+        skills:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillListItem"
+    SkillRevisionMeta:
+      type: object
+      required: [revision_id, origin, semver, kind, content_digest, created_at]
+      properties:
+        revision_id: { type: string }
+        origin: { type: string, enum: [imported, user] }
+        semver: { type: string }
+        kind: { type: string, enum: [body, evals] }
+        content_digest: { type: string }
+        created_at: { type: string }
+    SkillConsistency:
+      type: object
+      required: [consistent, total]
+      properties:
+        consistent: { type: integer }
+        total: { type: integer }
+    SkillDetail:
+      type: object
+      required: [skill_id, pointer, generation, revisions, text_consistency]
+      properties:
+        skill_id: { type: string }
+        pointer:
+          oneOf:
+            - $ref: "#/components/schemas/SkillPointer"
+            - type: "null"
+        generation: { type: integer }
+        revisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillRevisionMeta"
+        text_consistency:
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
+    SkillScanError:
+      type: object
+      required: [path, code, message]
+      properties:
+        path: { type: string }
+        code: { type: string }
+        message: { type: string }
+    SkillScan:
+      type: object
+      required: [origin, skills, errors]
+      properties:
+        origin: { type: string, enum: [user] }
+        skills:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillInstall"
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillScanError"
 
     # ---- Documenting OS (ADR-DOC-02) ----
     DocumentIdString:

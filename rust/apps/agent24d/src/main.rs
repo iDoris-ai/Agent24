@@ -110,6 +110,7 @@ mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+mod skill_routes;
 mod source_floor;
 
 const _: () = assert!(!migration_coordinator::ENABLED);

@@ -68,6 +68,19 @@ fn name_uses_the_capability_id_charset() {
 }
 
 #[test]
+fn scans_is_a_reserved_skill_id() {
+    assert_eq!(
+        code_of(&skill("", "x").replace("weekly-report", "scans")),
+        "skill_id_reserved"
+    );
+    let imported = "---\nname: scans\ndescription: 周报\n---\nhello\n";
+    assert_eq!(
+        parse_imported(imported).unwrap_err().code(),
+        "skill_id_reserved"
+    );
+}
+
+#[test]
 fn version_is_semver_metadata_and_is_not_part_of_the_digest() {
     let low = parsed("", "hello");
     let high =

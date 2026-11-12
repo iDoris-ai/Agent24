@@ -167,3 +167,15 @@ exemptions:
   - operationId: mintBridgeCapability
     category: planned-tui-2
     fallback: "C9-C 的 agent24 dev bridge-token；本片只有 daemon 路由，签发前要桌面确认"
+  - operationId: listSkills
+    category: planned-tui-2
+    fallback: "raw-http，技能列表留给 SL-7；TUI-2 增加对应 agent24 子命令"
+  - operationId: getSkill
+    category: planned-tui-2
+    fallback: "raw-http，技能详情留给 SL-7；TUI-2 增加对应 agent24 子命令"
+  - operationId: postSkill
+    category: planned-tui-2
+    fallback: "raw-http，技能导入留给 SL-7；TUI-2 增加对应 agent24 子命令"
+  - operationId: postSkillScan
+    category: planned-tui-2
+    fallback: "raw-http，用户目录重扫留给 SL-7；TUI-2 增加对应 agent24 子命令"
