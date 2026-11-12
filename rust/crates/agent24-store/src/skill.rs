@@ -23,11 +23,13 @@
 //!
 //! - a required text field is empty
 //! - `content_digest` is not the SHA-256 of `content`
-//! - `revision_id`, `result_id`, or `activation_id` is already stored
+//! - `revision_id`, `result_id`, or `activation_id` is already stored,
+//!   including when the pointer is already on this pair and the stored row
+//!   is not this skill's row for that pair
 //! - the digest row exists but the bytes differ
 //! - the revision's skill or kind is not the one requested
 //! - the rollback source belongs to another skill
-//! - an accepted id is not a failed case id in this binding
+//! - an accepted id is not a failed case id in this binding, or is repeated
 //! - `cases_json` or `accepted_json` is not a JSON array of the required shape
 //! - a stored origin, kind, or result code is outside its closed set
 //! - the generation would overflow
@@ -162,7 +164,7 @@ pub struct SkillPointer {
 /// Eval binding written with an activation.
 ///
 /// `cases_json` is a JSON array of case summaries. `accepted_json` is a JSON
-/// array of ids, and every id is a failed case in `cases_json`.
+/// array of ids. Each id appears once and is a failed case in `cases_json`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SkillEvalBinding {
     pub result_id: String,
@@ -205,7 +207,8 @@ pub enum SkillActivationOutcome {
         generation: i64,
         activation_id: String,
     },
-    /// The pointer already named this pair. Generation and history are unchanged.
+    /// The pointer already named this pair. Nothing was written. The request's
+    /// eval binding was not validated.
     Unchanged { generation: i64 },
 }
 
@@ -327,12 +330,16 @@ fn require_accepted(cases_json: &str, accepted_json: &str) -> Result<()> {
                 "skill accepted id is not a string".to_owned(),
             ));
         };
+        if !accepted.insert(id.to_owned()) {
+            return Err(StoreError::Conflict(
+                "skill accepted id is duplicated".to_owned(),
+            ));
+        }
         if !failed.contains(id) {
             return Err(StoreError::Conflict(
                 "skill accepted id is not a failed case".to_owned(),
             ));
         }
-        accepted.insert(id.to_owned());
     }
     if failed.iter().any(|id| !accepted.contains(id)) {
         return Err(StoreError::SkillEvalFailed);
@@ -451,7 +458,11 @@ impl Store {
     ///
     /// The whole move, including the history row and the audit row, is one
     /// transaction. A generation mismatch writes nothing. Repeating the pair
-    /// that is already current writes nothing.
+    /// that is already current writes nothing and returns
+    /// [`SkillActivationOutcome::Unchanged`]. That outcome means nothing was
+    /// written. It does not mean this request's eval binding was checked and
+    /// accepted. An `activation_id` or `result_id` already stored for another
+    /// skill or another pair is still [`StoreError::Conflict`].
     ///
     /// # Errors
     /// [`StoreError::SkillPointerConflict`], [`StoreError::SkillActivationMixed`],
@@ -793,6 +804,59 @@ async fn insert_activation_row(
     Ok(())
 }
 
+/// The pair is already current, so the move writes nothing. An id that
+/// already names another skill or another pair is still a conflict.
+/// Rollback supplies no new eval binding, so only `activation_id` is checked
+/// on that path.
+async fn reject_idempotent_id_reuse(
+    tx: &mut Transaction<'_, Sqlite>,
+    move_req: &PointerMove<'_>,
+) -> Result<()> {
+    if let Some(row) = sqlx::query(
+        "SELECT skill_id, body_revision_id, evals_revision_id \
+         FROM skill_activation WHERE activation_id = ?",
+    )
+    .bind(move_req.activation_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let same = row.get::<String, _>("skill_id") == move_req.skill_id
+            && row.get::<String, _>("body_revision_id") == move_req.body_revision_id
+            && row.get::<String, _>("evals_revision_id") == move_req.evals_revision_id;
+        if !same {
+            return Err(StoreError::Conflict(
+                "skill activation_id already stored".to_owned(),
+            ));
+        }
+    }
+    let Some(binding) = move_req.binding else {
+        return Ok(());
+    };
+    if let Some(row) = sqlx::query(
+        "SELECT r.body_revision_id, r.evals_revision_id, b.skill_id \
+         FROM skill_eval_result r \
+         LEFT JOIN skill_revision b ON b.revision_id = r.body_revision_id \
+         WHERE r.result_id = ?",
+    )
+    .bind(&binding.result_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    {
+        let body: String = row.get("body_revision_id");
+        let evals: String = row.get("evals_revision_id");
+        let skill_id: Option<String> = row.get("skill_id");
+        let same = skill_id.as_deref() == Some(move_req.skill_id)
+            && body == move_req.body_revision_id
+            && evals == move_req.evals_revision_id;
+        if !same {
+            return Err(StoreError::Conflict(
+                "skill result_id already stored".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn id_stored(tx: &mut Transaction<'_, Sqlite>, sql: &'static str, id: &str) -> Result<bool> {
     let row = sqlx::query(sql).bind(id).fetch_optional(&mut **tx).await?;
     Ok(row.is_some())
@@ -830,6 +894,7 @@ async fn move_pointer(
         move_req.evals_revision_id,
     )?;
     let Some(expected) = expected else {
+        reject_idempotent_id_reuse(tx, move_req).await?;
         let generation = pointer
             .as_ref()
             .map(|row| row.generation)
@@ -2829,6 +2894,224 @@ mod tests {
                 generation: 2,
                 activation_id: "act-2".to_owned()
             }
+        );
+    }
+
+    async fn activate_pair(
+        store: &Store,
+        skill_id: &str,
+        body_id: &str,
+        evals_id: &str,
+        activation_id: &str,
+        result_id: &str,
+    ) {
+        put(
+            store,
+            &revision(
+                body_id,
+                skill_id,
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "body",
+                body_id.as_bytes(),
+            ),
+        )
+        .await;
+        put(
+            store,
+            &revision(
+                evals_id,
+                skill_id,
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "evals",
+                evals_id.as_bytes(),
+            ),
+        )
+        .await;
+        store
+            .activate_skill(&activation(
+                activation_id,
+                skill_id,
+                0,
+                body_id,
+                evals_id,
+                result_id,
+                "2026-11-12T00:00:01Z",
+            ))
+            .await
+            .unwrap();
+    }
+
+    async fn row_count(store: &Store, table: &str) -> i64 {
+        let sql = match table {
+            "skill_activation" => "SELECT COUNT(*) FROM skill_activation",
+            "skill_eval_result" => "SELECT COUNT(*) FROM skill_eval_result",
+            other => panic!("unexpected table {other}"),
+        };
+        sqlx::query_scalar(sql)
+            .fetch_one(test_hooks::pool(store))
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn idempotent_activate_rejects_another_skills_ids() {
+        let store = Store::open_memory().await.unwrap();
+        activate_pair(&store, "alpha", "body-a", "evals-a", "act-a", "result-a").await;
+        activate_pair(&store, "beta", "body-b", "evals-b", "act-b", "result-b").await;
+
+        let stolen_activation = store
+            .activate_skill(&activation(
+                "act-a",
+                "beta",
+                1,
+                "body-b",
+                "evals-b",
+                "result-fresh",
+                "2026-11-12T00:00:02Z",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(stolen_activation, StoreError::Conflict(ref message) if message.contains("activation_id")),
+            "{stolen_activation:?}"
+        );
+
+        let stolen_result = store
+            .activate_skill(&activation(
+                "act-fresh",
+                "beta",
+                1,
+                "body-b",
+                "evals-b",
+                "result-a",
+                "2026-11-12T00:00:03Z",
+            ))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(stolen_result, StoreError::Conflict(ref message) if message.contains("result_id")),
+            "{stolen_result:?}"
+        );
+
+        let activations = row_count(&store, "skill_activation").await;
+        let results = row_count(&store, "skill_eval_result").await;
+        let repeat = store
+            .activate_skill(&activation(
+                "act-new",
+                "beta",
+                0,
+                "body-b",
+                "evals-b",
+                "result-new",
+                "2026-11-12T00:00:04Z",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(repeat, SkillActivationOutcome::Unchanged { generation: 1 });
+        assert_eq!(row_count(&store, "skill_activation").await, activations);
+        assert_eq!(row_count(&store, "skill_eval_result").await, results);
+        let pointer = store.get_skill_pointer("beta").await.unwrap().unwrap();
+        assert_eq!(pointer.generation, 1);
+        assert_eq!(pointer.body_revision_id, "body-b");
+    }
+
+    #[tokio::test]
+    async fn idempotent_rollback_rejects_another_skills_activation_id() {
+        let store = Store::open_memory().await.unwrap();
+        activate_pair(&store, "alpha", "body-a", "evals-a", "act-a", "result-a").await;
+        activate_pair(&store, "beta", "body-b", "evals-b", "act-b", "result-b").await;
+
+        let stolen = store
+            .rollback_skill(&SkillRollback {
+                activation_id: "act-a".to_owned(),
+                skill_id: "beta".to_owned(),
+                expected_generation: 1,
+                source_activation_id: "act-b".to_owned(),
+                created_at: "2026-11-12T00:00:02Z".to_owned(),
+                actor: "host".to_owned(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(stolen, StoreError::Conflict(ref message) if message.contains("activation_id")),
+            "{stolen:?}"
+        );
+
+        let activations = row_count(&store, "skill_activation").await;
+        let results = row_count(&store, "skill_eval_result").await;
+        let repeat = store
+            .rollback_skill(&SkillRollback {
+                activation_id: "act-new".to_owned(),
+                skill_id: "beta".to_owned(),
+                expected_generation: 0,
+                source_activation_id: "act-b".to_owned(),
+                created_at: "2026-11-12T00:00:03Z".to_owned(),
+                actor: "host".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(repeat, SkillActivationOutcome::Unchanged { generation: 1 });
+        assert_eq!(row_count(&store, "skill_activation").await, activations);
+        assert_eq!(row_count(&store, "skill_eval_result").await, results);
+        assert_eq!(store.list_skill_activations("beta").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_accepted_id_is_a_conflict() {
+        let store = Store::open_memory().await.unwrap();
+        put(
+            &store,
+            &revision(
+                "body-1",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "b1",
+                b"body",
+            ),
+        )
+        .await;
+        put(
+            &store,
+            &revision(
+                "evals-1",
+                "notes",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Evals,
+                "e1",
+                b"evals",
+            ),
+        )
+        .await;
+        let mut req = activation(
+            "act-dup",
+            "notes",
+            0,
+            "body-1",
+            "evals-1",
+            "result-dup",
+            "2026-11-12T00:00:01Z",
+        );
+        req.binding.cases_json = r#"[{"id":"a","passed":false}]"#.to_owned();
+        req.binding.accepted_json = r#"["a","a"]"#.to_owned();
+        let err = store.activate_skill(&req).await.unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message.contains("duplicated")),
+            "{err:?}"
+        );
+        assert!(store.get_skill_pointer("notes").await.unwrap().is_none());
+        assert!(
+            store
+                .list_skill_activations("notes")
+                .await
+                .unwrap()
+                .is_empty()
         );
     }
 }
