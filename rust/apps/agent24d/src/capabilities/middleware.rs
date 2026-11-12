@@ -109,7 +109,12 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
         if let Some(denied) = capability_token_rejected(&state, &req) {
             return denied;
         }
-        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+        // The dev gate opens the route in both auth modes. The handler, not
+        // the catalog operation, accepts only a wechat-bridge component token.
+        if !state.dev_wechat_events {
+            return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+        }
+        return admit_inbound_ingest(state, req, next).await;
     }
     let matched = req
         .extensions()
@@ -149,6 +154,41 @@ async fn capability_auth(state: AppState, req: Request<Body>, next: Next) -> Res
             let template = matched.as_deref().unwrap_or("");
             authorize(&state, req, next, operation, template, &method).await
         }
+    }
+}
+
+/// Live bearer, no operation check. `post_wechat_event` checks audience,
+/// component id, and `InboundIngest` itself.
+async fn admit_inbound_ingest(state: AppState, mut req: Request<Body>, next: Next) -> Response {
+    let Some(store) = state.capabilities.as_ref() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "host_authority_unavailable",
+            "Capability authority unavailable",
+        );
+    };
+    let Some(bearer) = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+    else {
+        return error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        );
+    };
+    match store.authenticate_bearer(bearer, crate::capabilities::unix_now()) {
+        Ok(authorization) => {
+            req.extensions_mut().insert(authorization);
+            next.run(req).await
+        }
+        Err(_) => error_response(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing or invalid bearer token",
+        ),
     }
 }
 
@@ -227,6 +267,15 @@ async fn authorize(
             // this mapping newly exposed. Resource scope is not this gate.
             if authorization.claims.audience == crate::capabilities::Audience::CreativeRuntime
                 && !crate::capabilities::creative_route_permitted(method, template)
+            {
+                return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
+            }
+            // Same shape as the creative gate: operation equality is not
+            // enough, and host-only / module routes are not on the list.
+            if authorization.claims.audience == crate::capabilities::Audience::ComponentRuntime
+                && (host_only_route(method, req.uri().path())
+                    || operation == crate::capabilities::Operation::ModuleRoute
+                    || !crate::capabilities::component_route_permitted(method, template))
             {
                 return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
             }

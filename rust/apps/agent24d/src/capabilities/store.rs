@@ -58,6 +58,15 @@ impl CapabilityStore {
         self.daemon_generation.as_str()
     }
 
+    pub fn claims_by_id(&self, capability_id: &str) -> Option<super::CapabilityClaims> {
+        let state = self.shared.state.lock().ok()?;
+        let digest = *state.ids.get(capability_id)?;
+        state
+            .records
+            .get(&digest)
+            .map(|record| record.claims.clone())
+    }
+
     pub(crate) fn insert(
         &self,
         claims: CapabilityClaims,

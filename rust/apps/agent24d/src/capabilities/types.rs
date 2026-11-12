@@ -15,6 +15,8 @@ pub enum Audience {
     ProductHost,
     FirstPartyShell,
     CreativeRuntime,
+    /// Hardcoded dev-bridge tier. Not a general component audience.
+    ComponentRuntime,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -107,6 +109,9 @@ pub struct CapabilityClaims {
     pub first_party: Option<FirstPartyClaims>,
     pub capability_id: String,
     pub audience: Audience,
+    /// Set only for [`Audience::ComponentRuntime`]. The dev-bridge tier is
+    /// `wechat-bridge`; other audiences leave this empty.
+    pub component_id: Option<String>,
     pub workspace_id: Option<String>,
     pub attachment_id: Option<String>,
     pub principal_id: Option<String>,

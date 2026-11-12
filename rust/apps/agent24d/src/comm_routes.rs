@@ -2413,6 +2413,7 @@ mod hy1_regression_tests {
                         first_party: None,
                         capability_id: "cap-forward".to_owned(),
                         audience: crate::capabilities::Audience::ProductHost,
+                        component_id: None,
                         workspace_id: None,
                         attachment_id: None,
                         principal_id: None,

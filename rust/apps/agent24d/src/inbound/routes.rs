@@ -6,10 +6,10 @@
 //! these handlers. Reads are everyday: a first-party shell may call them.
 //!
 //! The POST is registered on the kernel router so the route scan and the
-//! operation catalog stay in step. It answers only in legacy mode when
-//! `AppState::dev_wechat_events` is set (`A24_DEV_TOOL=1` at startup).
-//! Capabilities mode answers 404 from the auth middleware before this
-//! handler runs, and the handler repeats that 404.
+//! operation catalog stay in step. `A24_DEV_TOOL=1` opens it in both auth
+//! modes. Legacy keeps the shared bearer. Capabilities mode accepts only the
+//! dev-bridge component token; anything else is 403, and the route stays 404
+//! when the dev gate is off.
 //!
 //! Nothing here publishes on the WebSocket `/api/v1/events` hub. The list
 //! returns metadata plus the first 50 characters of `text`. Full text and
@@ -30,7 +30,7 @@ use agent24_store::{
     format_inbound_timestamp,
 };
 use axum::extract::rejection::{BytesRejection, FailedToBufferBody, JsonRejection};
-use axum::extract::{RawQuery, State};
+use axum::extract::{Extension, RawQuery, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json, Response};
 use chrono::{DateTime, Utc};
@@ -165,14 +165,30 @@ pub(crate) async fn get_events(State(state): State<AppState>, RawQuery(raw): Raw
 /// Development wechat ingest. `source` is always `wechat`. A body `source`
 /// other than `wechat` is 400. The handler does not copy that field through.
 ///
-/// Legacy mode and `dev_wechat_events` are both required. Anything else is
-/// 404, the same answer capabilities mode gives in the auth middleware.
+/// The route is mounted only when `dev_wechat_events` is set (`A24_DEV_TOOL=1`).
+/// Legacy mode keeps the shared bearer. Capabilities mode accepts only a
+/// `ComponentRuntime` token for `wechat-bridge` that holds `InboundIngest`.
 pub(crate) async fn post_wechat_event(
     State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
     RawQuery(raw): RawQuery,
     body: Result<Json<PostWechatEvent>, JsonRejection>,
 ) -> Response {
-    if state.auth_mode != AuthMode::LegacySingleToken || !state.dev_wechat_events {
+    if !state.dev_wechat_events {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    }
+    if state.auth_mode == AuthMode::Capabilities {
+        let Some(Extension(authorization)) = authorization else {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            );
+        };
+        if crate::capabilities::bridge::component_may_ingest(&authorization).is_err() {
+            return error_response(StatusCode::FORBIDDEN, "forbidden", "Operation not allowed");
+        }
+    } else if state.auth_mode != AuthMode::LegacySingleToken {
         return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
     }
     if let Err(message) = reject_query(raw.as_deref()) {
@@ -1767,12 +1783,13 @@ mod tests {
         assert!(!rendered.contains(secret), "{rendered}");
     }
 
-    /// Capabilities mode is 404 for a live host token, a creative token, and
-    /// after the bearer check. No row is written. Dropping the middleware
-    /// short-circuit and the handler's auth-mode check turns the host call
-    /// into a 200.
+    /// With the dev gate on, capabilities mode still refuses a host token and
+    /// a creative token, and it does not import the seed. No row is written.
+    /// Dropping the handler's audience check, while the token also carries
+    /// `wechat-bridge` and `InboundIngest`, is what the impostor tests cover.
+    /// A missing bearer is still 401.
     #[tokio::test]
-    async fn capabilities_mode_does_not_mount_wechat_ingest() {
+    async fn capabilities_mode_rejects_non_bridge_tokens_and_skips_the_seed() {
         let (mut app_state, host, creative) = capability_state().await;
         app_state.dev_wechat_events = true;
         let seeded = seed_dev_allowlist(
@@ -1802,13 +1819,15 @@ mod tests {
         );
         let at = format_inbound_timestamp(Utc::now());
         let body = wechat_body("wechat:1", "alice", &at, "hello");
+        let store = app_state.store.clone();
         let app = crate::server::build_router(app_state);
         for bearer in [host.as_str(), creative.as_str()] {
             let (status, json) =
                 call(&app, "POST", "/api/v1/inbound/events", bearer, Some(&body)).await;
-            assert_eq!(status, StatusCode::NOT_FOUND, "{bearer} {json}");
-            assert_eq!(error_code(&json), "not_found", "{json}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{bearer} {json}");
+            assert_eq!(error_code(&json), "forbidden", "{json}");
         }
+        assert!(store.get_inbound_event("wechat:1").await.unwrap().is_none());
         let missing = app
             .oneshot(
                 Request::builder()
@@ -1840,6 +1859,182 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{json}");
         assert_eq!(error_code(&json), "not_found");
+    }
+
+    /// Bridge token: one run, Unknown tag. Each handler check refuses a token
+    /// that fails only that check. Dropping one check lets that post start a
+    /// second run.
+    #[tokio::test]
+    async fn bridge_token_starts_one_unknown_run_and_impostors_do_not() {
+        use std::collections::BTreeSet;
+
+        use crate::capabilities::{
+            Audience, CapabilityClaims, Operation, Resource,
+            bridge::{self, component_may_ingest},
+            first_party::{FirstPartyAuthority, test_peer},
+            unix_now,
+        };
+
+        let mut app = dev_legacy(true).await;
+        let db = app.store.clone();
+        let cap = crate::capabilities::CapabilityStore::new("daemon-test");
+        let shell = FirstPartyAuthority::new(cap.clone())
+            .issue(&test_peer("daemon-test"))
+            .unwrap();
+        let auth = cap
+            .validate_bearer(
+                &shell.secret,
+                Operation::CapabilityMint,
+                &Resource::global(),
+                unix_now(),
+            )
+            .unwrap();
+        let bridge = bridge::issue_wechat_bridge(&cap, &auth, unix_now()).unwrap();
+        let (bridge_bearer, _, claims) = bridge.into_bearer_parts();
+        assert_eq!(
+            claims.expires_at - claims.created_at,
+            bridge::BRIDGE_TTL_SECONDS
+        );
+        assert_eq!(claims.component_id.as_deref(), Some("wechat-bridge"));
+        assert_eq!(claims.daemon_generation, "daemon-test");
+
+        let now = unix_now();
+        let forged = |id: &str, audience: Audience, component: Option<&str>, op: bool| {
+            let mut allowed = BTreeSet::new();
+            if op {
+                allowed.insert(Operation::InboundIngest);
+            }
+            cap.insert(CapabilityClaims {
+                first_party: None,
+                capability_id: id.to_owned(),
+                audience,
+                component_id: component.map(str::to_owned),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "daemon-test".to_owned(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 600,
+                allowed_operations: allowed,
+            })
+            .unwrap()
+            .into_bearer_parts()
+            .0
+        };
+        let other = forged(
+            "other-component",
+            Audience::ComponentRuntime,
+            Some("other-bridge"),
+            true,
+        );
+        let shell_shaped = forged(
+            "shell-shaped",
+            Audience::FirstPartyShell,
+            Some("wechat-bridge"),
+            true,
+        );
+        let no_operation = forged(
+            "bridge-without-op",
+            Audience::ComponentRuntime,
+            Some("wechat-bridge"),
+            false,
+        );
+        assert!(component_may_ingest(&cap.authenticate_bearer(&other, now).unwrap()).is_err());
+        assert!(
+            component_may_ingest(&cap.authenticate_bearer(&shell_shaped, now).unwrap()).is_err()
+        );
+        assert!(
+            component_may_ingest(&cap.authenticate_bearer(&no_operation, now).unwrap()).is_err()
+        );
+
+        app.enable_capability_auth(cap);
+        app.dev_wechat_events = true;
+        let at = format_inbound_timestamp(Utc::now());
+        db.insert_inbound_allowlist_if_absent("wechat", "alice", &at, Some("host"))
+            .await
+            .unwrap();
+        db.ensure_inbound_source_watermark("wechat", &at, 86_400)
+            .await
+            .unwrap();
+        assert_eq!(
+            seed_dev_allowlist(&db, AuthMode::Capabilities, true, "wechat:mallory")
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.list_inbound_allowlist().await.unwrap().len(), 1);
+
+        let router = crate::server::build_router(app);
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &bridge_bearer,
+            Some(&wechat_body("wechat:9", "alice", &at, "hello-bridge")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["outcome"], "started", "{json}");
+        let run_id = json["run_id"].as_str().unwrap().to_owned();
+        assert_eq!(run_count(&db).await, 1);
+        wait_terminal(&db, &run_id).await;
+        let tags = db.list_run_source_tags(&run_id).await.unwrap();
+        let user = tags
+            .iter()
+            .find(|tag| tag.source.kind == SourceKind::UserInput)
+            .unwrap();
+        assert_eq!(user.source.classification, SourceClassification::Unknown);
+
+        for (bearer, id) in [
+            (other.as_str(), "wechat:10"),
+            (shell_shaped.as_str(), "wechat:11"),
+            (no_operation.as_str(), "wechat:12"),
+        ] {
+            let (status, json) = call(
+                &router,
+                "POST",
+                "/api/v1/inbound/events",
+                bearer,
+                Some(&wechat_body(id, "alice", &at, "nope")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{id} {json}");
+        }
+        assert_eq!(run_count(&db).await, 1);
+
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            "testtoken",
+            Some(&wechat_body("wechat:13", "alice", &at, "legacy")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{json}");
+
+        let (status, json) = call(&router, "GET", "/api/v1/models", &bridge_bearer, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{json}");
+
+        let hyphae = json!({
+            "id": "wechat:14",
+            "source": "hyphae",
+            "actor": "alice",
+            "at": at,
+            "text": "nope",
+        })
+        .to_string();
+        let (status, json) = call(
+            &router,
+            "POST",
+            "/api/v1/inbound/events",
+            &bridge_bearer,
+            Some(&hyphae),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+        assert_eq!(run_count(&db).await, 1);
     }
 
     /// A body `source` other than `wechat` returns in `checked_wechat_event`

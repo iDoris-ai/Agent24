@@ -188,6 +188,56 @@ pub(super) async fn mint_creative_capability(
         .into_response()
 }
 
+pub(super) async fn mint_bridge_capability(
+    State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
+) -> Response {
+    let Some(store) = state.capabilities.clone() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Bridge capabilities require capability auth mode",
+        );
+    };
+    let Some(Extension(authorization)) = authorization else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Shell authority required",
+        );
+    };
+    let minted = match crate::capabilities::bridge::issue_wechat_bridge(
+        &store,
+        &authorization,
+        crate::capabilities::unix_now(),
+    ) {
+        Ok(minted) => minted,
+        Err(crate::capabilities::bridge::BridgeIssueError::Rejected) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Shell authority required",
+            );
+        }
+    };
+    let (token, capability_id, claims) = minted.into_bearer_parts();
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "capability_id": capability_id,
+            "token": token,
+            "audience": "component_runtime",
+            "component_id": claims.component_id,
+            "daemon_generation": claims.daemon_generation,
+            "created_at": claims.created_at,
+            "expires_at": claims.expires_at,
+            "ttl_seconds": crate::capabilities::bridge::BRIDGE_TTL_SECONDS,
+            "allowed_operations": claims.allowed_operations.iter().copied().map(operation_name).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn revoke_capability(
     State(state): State<AppState>,
     Path(capability_id): Path<String>,
@@ -206,9 +256,16 @@ pub(super) async fn revoke_capability(
             "Invalid capability id",
         );
     }
-    // Deliberately do not expose whether the ID existed or was already
-    // revoked. The endpoint is idempotent and is not a capability oracle.
-    let _ = store.revoke_by_id(&capability_id);
+    if store
+        .claims_by_id(&capability_id)
+        .is_some_and(|claims| claims.audience == crate::capabilities::Audience::ComponentRuntime)
+    {
+        if crate::capabilities::bridge::revoke_wechat_bridge(store, &capability_id).is_err() {
+            let _ = store.revoke_by_id(&capability_id);
+        }
+    } else {
+        let _ = store.revoke_by_id(&capability_id);
+    }
     Json(serde_json::json!({
         "capability_id": capability_id,
         "state": "revoked",

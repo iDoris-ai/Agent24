@@ -59,6 +59,9 @@ pub enum Operation {
     // check never fires.
     InboundRead,
     InboundWrite,
+    /// C9-B dev-bridge ingest. Everyday, and not on a shell or creative token.
+    /// Route admission is [`super::component_route_permitted`], not this variant.
+    InboundIngest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -148,6 +151,7 @@ impl Operation {
             Self::ComponentsReport => "components.report",
             Self::InboundRead => "inbound.read",
             Self::InboundWrite => "inbound.write",
+            Self::InboundIngest => "inbound.ingest",
         }
     }
 
@@ -208,6 +212,7 @@ impl Operation {
             "components.report" => Self::ComponentsReport,
             "inbound.read" => Self::InboundRead,
             "inbound.write" => Self::InboundWrite,
+            "inbound.ingest" => Self::InboundIngest,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,

@@ -80,6 +80,48 @@ async fn grant(
         .secret
 }
 #[tokio::test]
+async fn bridge_mint_uses_the_host_summary() {
+    let (state, token) = setup().await;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .set_provider(Some(Arc::new(Allow)));
+    let blocked = build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/bridge",
+            "",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(blocked).await, "presence_required");
+
+    let secret = grant(&state, &token, "POST", "/api/v1/capabilities/bridge", "").await;
+    let response = build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/bridge",
+            "",
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["audience"], "component_runtime");
+    assert_eq!(body["component_id"], "wechat-bridge");
+    assert_eq!(body["ttl_seconds"], 28_800);
+    assert_eq!(body["allowed_operations"][0], "inbound.ingest");
+    assert!(!body.to_string().contains("客户端"));
+}
+
+#[tokio::test]
 async fn daily_http_and_unknown_routes_and_no_http_renewal() {
     let (state, token) = setup().await;
     let router = build_router(state);

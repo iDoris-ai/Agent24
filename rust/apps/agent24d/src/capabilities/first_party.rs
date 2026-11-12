@@ -228,6 +228,9 @@ impl FirstPartyAuthority {
                         .to_owned(),
                 );
             }
+            "/api/v1/capabilities/bridge" => {
+                return Some("签发 8 小时微信桥开发令牌，只能写入入站事件".to_owned());
+            }
             "/api/v1/idoris/operations/{id}/cancel" => {
                 let id = target
                     .path
@@ -350,6 +353,7 @@ impl FirstPartyAuthority {
                 CapabilityClaims {
                     capability_id: random_capability_id(),
                     audience: Audience::FirstPartyShell,
+                    component_id: None,
                     first_party: Some(FirstPartyClaims {
                         peer: peer.clone(),
                         tier: FirstPartyTier::Daily,
@@ -368,9 +372,9 @@ impl FirstPartyAuthority {
                     // or an enrolled CLI could approve itself (#1447 F1).
                     // `presence_desktop::gate` is the second, independent layer.
                     // `InboundWrite` is ProductHost-only the same way.
-                    // `host_only_route` is the request gate; leaving the
-                    // operation off this token means a later inbound write
-                    // route that forgets that gate still stays closed.
+                    // `InboundIngest` is the dev-bridge component token only.
+                    // Leaving both off this token means a later route that
+                    // forgets its gate still stays closed to a shell.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
                     } else {
@@ -378,7 +382,9 @@ impl FirstPartyAuthority {
                             .iter()
                             .map(|p| p.operation)
                             .filter(|op| {
-                                !op.is_presence_channel() && *op != Operation::InboundWrite
+                                !op.is_presence_channel()
+                                    && *op != Operation::InboundWrite
+                                    && *op != Operation::InboundIngest
                             })
                             .chain([Operation::ModuleRoute])
                             .collect()
@@ -515,6 +521,11 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                     | ("POST", "/api/v1/idoris/stop")
                     | ("POST", "/api/v1/idoris/operations/{id}/cancel")
                     | ("GET", "/api/v1/idoris/omlx/candidates")
+            ))
+        || (policy.operation == Operation::CapabilityMint
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/bridge")
             ));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -807,6 +818,7 @@ mod tests {
             .allowed_operations
             .clone();
         assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
+        assert!(!allowed.contains(&Operation::InboundIngest), "{allowed:?}");
         assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
         assert!(
             store
@@ -819,6 +831,28 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn bridge_summary_is_fixed_and_ignores_client_text() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: "/api/v1/capabilities/bridge".into(),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "签发 8 小时微信桥开发令牌，只能写入入站事件");
+        assert!(!details.contains("客户端"));
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn daily_token_ttl_ignores_wall_clock_jumps() {
         let store = CapabilityStore::new("g");

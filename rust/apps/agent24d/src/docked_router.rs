@@ -365,6 +365,7 @@ mod tests {
                 first_party: None,
                 capability_id: "scoped-health-only".into(),
                 audience: Audience::FirstPartyShell,
+                component_id: None,
                 workspace_id: None,
                 attachment_id: None,
                 principal_id: None,
