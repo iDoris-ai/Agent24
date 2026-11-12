@@ -246,6 +246,63 @@ fn body_limit_is_32768_utf8_bytes() {
     );
 }
 
+fn detail(markdown: &str) -> String {
+    parse_skill_markdown(markdown).unwrap_err().to_string()
+}
+
+#[test]
+fn malformed_manifests_and_evals_are_refused() {
+    let front =
+        "name: ab\nversion: 1.0.0\ndescription: { zh: 周报 }\nrequires: []\nevals: evals/a.jsonl\n";
+    assert!(detail("---\n- item\n---\n").contains("not a map"));
+    assert!(detail("hello\n").contains("missing frontmatter"));
+    assert!(detail(&format!("---\n{front}")).contains("not closed"));
+    assert!(detail(&format!("---\n? [1, 2]\n: x\n{front}---\n")).contains("key is not a string"));
+    assert!(
+        detail(&skill("", "x").replace("description: { zh: 周报 }", "description: \"\""))
+            .contains("description is empty")
+    );
+    assert!(
+        detail(&skill("", "x").replace("{ zh: 周报 }", "{ zh: 1 }"))
+            .contains("value is not a string")
+    );
+    assert!(
+        detail(&skill("", "x").replace("{ zh: 周报 }", "{ zh: \"\" }")).contains("value is empty")
+    );
+    assert!(
+        detail(&skill("", "x").replace("{ zh: 周报 }", "{ ? [1] : 周报 }"))
+            .contains("key is not a string")
+    );
+    assert!(
+        detail(&skill("", "x").replace("{ zh: 周报 }", "{ fr: 其他 }"))
+            .contains("description is empty")
+    );
+    assert!(
+        detail(&skill("", "x").replace("requires: [documents]", "requires: documents"))
+            .contains("not a list")
+    );
+    assert!(
+        detail(&skill("", "x").replace("requires: [documents]", "requires: [1]"))
+            .contains("not a string")
+    );
+    assert!(
+        check("evals/check.jsonl", "[]\n", "step")
+            .unwrap_err()
+            .to_string()
+            .contains("not an object")
+    );
+    assert!(
+        check(
+            "evals/check.jsonl",
+            r#"{"input":"x","expect":"step","judge":"shrug"}"#,
+            "step"
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("judge is not supported")
+    );
+}
+
 #[test]
 fn proactive_is_refused_and_a_missing_mode_is_manual() {
     assert_eq!(parsed("", "hello").mode, SkillMode::Manual);
