@@ -612,6 +612,17 @@ impl KvStore {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
     }
 
+    /// Delete every embedding row stored for `owner`, across models and
+    /// revisions. A later [`vector::VectorRetriever::reindex`] fills the
+    /// current key back in. This is a standalone statement and there is no
+    /// `AFTER DELETE` trigger on `mem_assertions`, so full-account purge must
+    /// fence the owner first and delete the facts and their vectors in one
+    /// transaction; otherwise a concurrent reindex can re-insert rows that
+    /// nothing later removes. The purge body itself is a separate change.
+    pub async fn delete_owner_embeddings(&self, owner: &str) -> Result<u64> {
+        vector::delete_owner_rows(&self.pool, owner).await
+    }
+
     /// Ensure that `owner_key` is durably recorded as the memory partition of
     /// `(user, module)`. Does **not** advance `last_seen_at` — T8.5c-W-mount
     /// decision 5: this call happens before the kernel knows whether the
