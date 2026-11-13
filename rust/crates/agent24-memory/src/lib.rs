@@ -14,10 +14,12 @@ pub mod condenser;
 mod conn_phase;
 pub mod consolidator;
 pub mod disk_gate;
+pub mod embedder;
 pub mod eval;
 #[cfg(test)]
 mod eval_m1;
 pub mod event;
+pub mod hybrid;
 pub mod knowledge;
 pub mod reconcile;
 pub mod rejections;
@@ -379,6 +381,15 @@ pub mod test_hooks {
     pub fn pool(store: &super::KvStore) -> &sqlx::SqlitePool {
         &store.pool
     }
+
+    /// Hybrid retriever with a test embedder. Production code uses
+    /// [`super::KvStore::local_hybrid`], which only accepts the loopback embedder.
+    pub fn hybrid_retriever(
+        store: &super::KvStore,
+        embedder: std::sync::Arc<dyn super::vector::Embedder>,
+    ) -> super::hybrid::HybridRetriever {
+        store.hybrid_retriever(embedder)
+    }
 }
 
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
@@ -462,6 +473,12 @@ impl KvStore {
     pub fn with_disk_gate(mut self, gate: disk_gate::DiskGate) -> Self {
         self.disk = gate;
         self
+    }
+
+    /// Crate-internal pool, so a caller can hold one `BEGIN IMMEDIATE` across
+    /// a read and the write of the same row.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     pub(crate) async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
@@ -603,13 +620,46 @@ impl KvStore {
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
-    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied (`OmlxEmbedder`
-    /// in production, pending D4b) so the store never hard-depends on a model runtime.
+    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied
+    /// ([`embedder::LocalEmbedder`] once the daemon wires it) so the store never
+    /// hard-depends on a model process being up.
     pub fn vector_retriever<E: vector::Embedder + Clone>(
         &self,
         embedder: E,
     ) -> vector::VectorRetriever<E> {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
+    }
+
+    /// Hybrid recall bound to the loopback embedder. The breaker state lives in
+    /// the returned value, so keep one per owner rather than one per query.
+    pub fn local_hybrid(
+        &self,
+        embedder: std::sync::Arc<embedder::LocalEmbedder>,
+    ) -> hybrid::HybridRetriever {
+        use vector::Embedder;
+        let embedder: std::sync::Arc<dyn Embedder> = embedder;
+        self.hybrid_retriever(embedder)
+    }
+
+    /// A [`hybrid::HybridRetriever`] (FTS + vector, RRF) over the SAME database
+    /// file. Crate-private so a caller outside this crate cannot pass an
+    /// arbitrary embedder (review #1847 M1). Production uses [`Self::local_hybrid`].
+    pub(crate) fn hybrid_retriever(
+        &self,
+        embedder: std::sync::Arc<dyn vector::Embedder>,
+    ) -> hybrid::HybridRetriever {
+        hybrid::HybridRetriever::new(self.pool.clone(), embedder)
+    }
+
+    /// Delete every embedding row stored for `owner`, across models and
+    /// revisions. A later [`vector::VectorRetriever::reindex`] fills the
+    /// current key back in. This is a standalone statement and there is no
+    /// `AFTER DELETE` trigger on `mem_assertions`, so full-account purge must
+    /// fence the owner first and delete the facts and their vectors in one
+    /// transaction; otherwise a concurrent reindex can re-insert rows that
+    /// nothing later removes. The purge body itself is a separate change.
+    pub async fn delete_owner_embeddings(&self, owner: &str) -> Result<u64> {
+        vector::delete_owner_rows(&self.pool, owner).await
     }
 
     /// Ensure that `owner_key` is durably recorded as the memory partition of

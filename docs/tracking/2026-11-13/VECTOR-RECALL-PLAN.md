@@ -220,14 +220,36 @@
 - 共享空间、多用户、跨 owner 检索。
 - 后台巩固、自动抽取候选事实。
 
-## 7. 开工时先核实
+## 7. 开工核实与 VR-0 / VR-5 回填
 
-1. **嵌入模型能不能被 oMLX 加载。** 2026-11-13 实测：`GET /v1/models` 列出了 `jina-embeddings-v2-base-zh`，但 `POST /v1/embeddings` 报 `Model 'jina-embeddings-v2-base-zh' failed to load: Received 60 parameters not in model`。bge-m3、Qwen3-Embedding 在本机 oMLX 上能否加载、维度多少、是否归一化，都没测（VR-0）。
-2. **直连 oMLX 时加载嵌入模型会不会挤掉主模型**，oMLX 的驻留策略没查。
-3. **iDoris 默认有没有 `embed` 角色的本地模型卡**，以及 `/v1/embeddings` 回包是否带 `x-idoris-served-locality`。只读了 iDoris 路由代码，没起服务验证。
-4. **探针定 `revision` 是否稳定**：同一模型两次加载的 fp16 输出差异有多大，0.999 的阈值是估计值。
-5. **memory 迁移编号**：今天最新是 `0020_write_rejections.sql`，开工时再看。
-6. **`chat_memory_prelude` 的生产调用方**（REST chat 还是桌面在用）没追，只确认它调了同一个 `recall`。
-7. **全个人域 purge 的实现状态**：生命周期 ADR 写的是「已接受、待实现」，没逐个核对 P1-04 至 P1-09 的进度。
-8. **磁盘**：bge-m3 约 1.1 GB（分档文档的数）；向量表按 1024 维每条 4 KiB 估算，没在真库上测。本机真库目前只有 1 条事实。
-9. **混合检索给每轮增加的延迟**：1.5 s 超时和「几十毫秒」都是估计，VR-0 实测后回填。
+2026-11-13，笔记本，oMLX `http://127.0.0.1:8088`，模型 `bge-m3-mlx-fp16`。没有停或重启 oMLX，没有用 admin 接口。jina 仍列在 `/v1/models` 里，但加载失败（开工时那条 `Received 60 parameters not in model`）没有再测。
+
+1. **嵌入模型能不能被 oMLX 加载。已测，能。** `POST /v1/embeddings` 返回 1024 维，向量 L2 范数 1.0。同一探针句两次嵌入余弦 **1.000000**。近义裸句：中文「我喜欢在雨天读书 / 下雨的时候我爱看书」**0.933**，英文 **0.920**，泰文 **0.963**。带生产前缀 `user said_to_remember` 的中文近义 **0.817**。无关：股票 **0.399**，蒸鱼 **0.370**。英文近义对泰文近义 **0.923**（跨语言很近，不当成无关）。
+2. **直连 oMLX 时会不会挤掉主模型。这次没测。** 按约束不重启、不用 admin，看不到驻留和挤占。
+3. **iDoris 的 embed 角色卡和 `x-idoris-served-locality`。这次没测。** 没起 iDoris。真模型评测用 `EmbeddingClient::direct`，不读 `IDORIS_URL`。
+4. **探针定 `revision`。** 同一句两次余弦 1.000000，`LocalEmbedder` 的 0.999 阈值在这次输出上过。没有做两次进程重启对照。
+5. **memory 迁移编号。** 本分支最新是 `0021_embedding_close.sql`（开工清单写的 0020 已经过时）。
+6. **`chat_memory_prelude` 的生产调用方。** 仍只确认它调同一个 `recall`，没有在这次改调用方。
+7. **全个人域 purge。** 本体仍未做。向量侧已有 `delete_owner_embeddings`；当前 key 完整后 `reindex` 删该 owner 其它 revision。见生命周期 ADR 向量行。
+8. **磁盘。** bge-m3 约 1.1 GB 仍是分档文档的数，这次没重称。1024 维、已归一化已实测。没有在用户真库上量向量表体积。
+9. **延迟（服务已热）。** 单条探针：偏冷 **0.035 s**，热 **0.030 s**。60 条一批 **10.8 s**（约 0.18 s/条）。查询超时仍是 1.5 s；`eval_m1_omlx` 把建索引超时放到 60 s，避免冷启动误开熔断。
+
+### VR-5 真模型评测（2026-11-13，不进 CI）
+
+同一套 `eval_m1` 用例：原有可答 14 条 + 中文换说法 20 条 + 无答案反例 4 条。事实按生产格式嵌入（`user said_to_remember {事实}`），查询嵌裸问句。`MIN_COSINE` **保留 0.62**：换说法对目标事实的余弦最低 **0.648**（`p15-mail`），4 条无答案对全库最高 **0.516**（比特币助记词）。0.62 在这道缝里。升到 0.65 会丢掉 0.648 的邮箱；降到 0.55 会贴近 0.516 的无答案。
+
+| | Hit@5 | 换说法 Hit@5 | 无答案注入 |
+|---|---|---|---|
+| 纯 FTS（同一库再跑 `search_any`） | 原 14 条仍单独记；换说法不进原分母 | **0/20** | **0/4** |
+| 混合（FTS + 向量 + RRF） | **34/34**（原 14 + 换说法 20） | **20/20** | **0/4** |
+
+混合高于纯 FTS。英语/中性无答案注入 0/6，security leak 0。CI 用测试嵌入器跑 `eval_m1` 与 `eval_m1_hybrid`，同样两条硬门（Hit@5 按 13/14 扩到含换说法的集合；无答案注入 0，且分母至少 4）。
+
+命令（`--exact` 必须带模块路径，否则滤不到这个测试）：
+
+```text
+export PATH="$HOME/Library/Application Support/mbx/bin:$PATH"
+export OMLX_URL=http://127.0.0.1:8088
+export OMLX_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.omlx/settings.json")))["auth"]["api_key"])')"
+cd rust && cargo test -j 4 -p agent24-memory --lib eval_m1::eval_m1_omlx -- --ignored --exact --nocapture
+```
