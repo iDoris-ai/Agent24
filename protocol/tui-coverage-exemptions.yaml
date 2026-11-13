@@ -164,18 +164,3 @@ exemptions:
   - operationId: postWechatInboundEvent
     category: visual
     fallback: "开发态微信桥专用（A24_DEV_TOOL=1）。capabilities 只收 ComponentRuntime 桥令牌。终端不做，TUI 不提供入口"
-  - operationId: listSkills
-    category: planned-tui-2
-    fallback: "raw-http，技能列表留给 SL-7；TUI-2 增加对应 agent24 子命令"
-  - operationId: getSkill
-    category: planned-tui-2
-    fallback: "raw-http，技能详情留给 SL-7；TUI-2 增加对应 agent24 子命令"
-  - operationId: postSkill
-    category: planned-tui-2
-    fallback: "raw-http，技能导入留给 SL-7；TUI-2 增加对应 agent24 子命令"
-  - operationId: postSkillScan
-    category: planned-tui-2
-    fallback: "raw-http，用户目录重扫留给 SL-7；TUI-2 增加对应 agent24 子命令"
-  - operationId: activateSkill
-    category: planned-tui-2
-    fallback: "桌面技能栏经主进程 IPC；CLI 的 activate 留给 SL-7（提升令牌 + 桌面确认）"

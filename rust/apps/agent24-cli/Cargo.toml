@@ -24,6 +24,8 @@ tempfile = "3"
 agent24-documents-client = { path = "../../crates/agent24-documents-client" }
 agent24-hw = { path = "../../crates/agent24-hw" }
 agent24-protocol = { path = "../../crates/agent24-protocol" }
+# install 读清单里的评测路径，与 POST /api/v1/skills 用同一份解析。
+agent24-skill = { path = "../../crates/agent24-skill" }
 agent24-mcp = { path = "../../crates/agent24-mcp" }
 agent24-os-packages = { path = "../../crates/agent24-os-packages" }
 # Decision-log export/delete have no daemon route. They open agent24.db only

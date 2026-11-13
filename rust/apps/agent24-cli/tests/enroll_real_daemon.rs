@@ -486,6 +486,397 @@ fn sqlite(home: &Path, statement: &str) -> String {
         .to_owned()
 }
 
+fn skill_markdown(name: &str, version: &str, body: &str) -> String {
+    format!(
+        "---\nname: {name}\nversion: {version}\ndescription: d\nrequires: []\nevals: evals/check.jsonl\n---\n{body}"
+    )
+}
+
+fn write_import(home: &Path, name: &str, body: &str, evals: &str) -> (PathBuf, PathBuf) {
+    let dir = home.join("imports").join(name);
+    std::fs::create_dir_all(dir.join("evals")).unwrap();
+    let skill = dir.join("SKILL.md");
+    let eval_path = dir.join("evals").join("check.jsonl");
+    std::fs::write(&skill, skill_markdown(name, "1.2.0", body)).unwrap();
+    std::fs::write(&eval_path, evals).unwrap();
+    (skill, eval_path)
+}
+
+fn evals_lines(expects: &[&str]) -> String {
+    expects
+        .iter()
+        .map(|expect| json!({"input": "i", "expect": expect, "judge": "contains"}).to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn cli_text(out: &Output) -> (String, String) {
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+fn pointer_generation(home: &Path, id: &str) -> String {
+    sqlite(
+        home,
+        &format!(
+            "SELECT COALESCE((SELECT generation FROM skill_pointer WHERE skill_id='{id}'), -1);"
+        ),
+    )
+}
+
+/// install 之后 list 能看到，show 不打印正文。重扫写入的是用户目录里的另一条。
+#[test]
+fn real_skill_install_is_listed_and_show_omits_the_body() {
+    let host = Host::start("deny");
+    let (skill, evals) = write_import(
+        host.home(),
+        "weekly-report",
+        "hello world\n",
+        &evals_lines(&["hello world"]),
+    );
+    let installed = host.cli(&[
+        "skill",
+        "install",
+        skill.to_str().unwrap(),
+        "--evals",
+        evals.to_str().unwrap(),
+    ]);
+    let (stdout, stderr) = cli_text(&installed);
+    assert!(
+        installed.status.success(),
+        "stdout={stdout} stderr={stderr}"
+    );
+    assert!(stdout.contains("weekly-report"), "{stdout}");
+    assert!(!stdout.contains("hello world"), "{stdout}");
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "-1");
+
+    let listed = host.cli(&["skill", "list"]);
+    let (stdout, stderr) = cli_text(&listed);
+    assert!(listed.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("名称"), "{stdout}");
+    assert!(stdout.contains("weekly-report"), "{stdout}");
+    assert!(stdout.contains("1.2.0"), "{stdout}");
+    assert!(stdout.contains("imported"), "{stdout}");
+    assert!(stdout.contains("未激活"), "{stdout}");
+
+    let raw = host.cli(&["skill", "list", "--json"]);
+    let (stdout, stderr) = cli_text(&raw);
+    assert!(raw.status.success(), "stdout={stdout} stderr={stderr}");
+    let body: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(body["skills"][0]["skill_id"], "weekly-report");
+    assert!(body["skills"][0].get("pointer").is_none(), "{body}");
+
+    let shown = host.cli(&["skill", "show", "weekly-report"]);
+    let (stdout, stderr) = cli_text(&shown);
+    assert!(shown.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("未激活"), "{stdout}");
+    assert!(!stdout.contains("hello world"), "{stdout}");
+
+    let user = host.home().join(".agent24/skills/desk-note/evals");
+    std::fs::create_dir_all(&user).unwrap();
+    std::fs::write(
+        user.parent().unwrap().join("SKILL.md"),
+        skill_markdown("desk-note", "1.2.0", "desk\n"),
+    )
+    .unwrap();
+    std::fs::write(user.join("check.jsonl"), evals_lines(&["desk"])).unwrap();
+    let scanned = host.cli(&["skill", "rescan"]);
+    let (stdout, stderr) = cli_text(&scanned);
+    assert!(scanned.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stdout.contains("desk-note") || stdout.contains("写入: 1"),
+        "{stdout}"
+    );
+    let listed = host.cli(&["skill", "list"]);
+    let (stdout, _) = cli_text(&listed);
+    assert!(stdout.contains("desk-note"), "{stdout}");
+    assert!(stdout.contains("user"), "{stdout}");
+}
+
+/// 没有桌面确认时激活失败，指针不动。带上假提升头会变成 elevation_invalid，
+/// 这条对 presence_denied 和 Waiting 的断言会红。
+#[test]
+fn real_skill_activate_without_confirmation_does_not_move_the_pointer() {
+    let host = Host::start("deny");
+    let (skill, evals) = write_import(
+        host.home(),
+        "weekly-report",
+        "hello world\n",
+        &evals_lines(&["hello world"]),
+    );
+    let installed = host.cli(&[
+        "skill",
+        "install",
+        skill.to_str().unwrap(),
+        "--evals",
+        evals.to_str().unwrap(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let out = host.cli_env(
+        &["skill", "activate", "weekly-report"],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&out);
+    assert!(!out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(
+        stderr.contains("Waiting for approval"),
+        "跳过预检直接请求提升以外的失败不会停在桌面确认: {stderr}"
+    );
+    assert!(
+        stderr.contains("presence_denied"),
+        "日常令牌直接带假提升头不会得到 presence_denied: {stderr}"
+    );
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "-1");
+    assert_eq!(
+        sqlite(host.home(), "SELECT COUNT(*) FROM skill_activation;"),
+        "0"
+    );
+}
+
+/// 确认之后指针变化。同一目标再激活是 unchanged，代次不变，不再请求确认。
+/// 跳过预检会在第二次打出 Waiting；假提升头则第一次就到不了 activated。
+#[test]
+fn real_skill_activate_confirm_then_unchanged_skips_confirmation() {
+    let host = Host::start("allow");
+    let (skill, evals) = write_import(
+        host.home(),
+        "weekly-report",
+        "hello world\n",
+        &evals_lines(&["hello world"]),
+    );
+    let installed = host.cli(&[
+        "skill",
+        "install",
+        skill.to_str().unwrap(),
+        "--evals",
+        evals.to_str().unwrap(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let out = host.cli_env(
+        &["skill", "activate", "weekly-report"],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&out);
+    assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(stdout.contains("activated"), "{stdout}");
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "1");
+    let listed = host.cli(&["skill", "list"]);
+    let (list_out, _) = cli_text(&listed);
+    assert!(list_out.contains('/'), "{list_out}");
+    assert!(!list_out.contains("未激活"), "{list_out}");
+    assert!(list_out.contains("1/1"), "{list_out}");
+
+    let again = host.cli_env(
+        &["skill", "activate", "weekly-report"],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&again);
+    assert!(again.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stdout.contains("unchanged"), "{stdout}");
+    assert!(
+        !stderr.contains("Waiting for approval"),
+        "同一目标再激活不应请求确认: {stderr}"
+    );
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "1");
+    assert_eq!(
+        sqlite(
+            host.home(),
+            "SELECT COUNT(*) FROM skill_activation WHERE skill_id='weekly-report';"
+        ),
+        "1"
+    );
+}
+
+/// 未接受的失败打印 skill_eval_failed 和用例摘要，指针不动，也不请求确认。
+/// 假提升头得不到这个码；跳过预检则会打出 Waiting。
+#[test]
+fn real_skill_activate_prints_unaccepted_eval_failure_without_asking() {
+    let host = Host::start("allow");
+    let (skill, evals) = write_import(
+        host.home(),
+        "weekly-report",
+        "hello world\n",
+        &evals_lines(&["hello world", "absent text"]),
+    );
+    let installed = host.cli(&[
+        "skill",
+        "install",
+        skill.to_str().unwrap(),
+        "--evals",
+        evals.to_str().unwrap(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let out = host.cli_env(
+        &["skill", "activate", "weekly-report"],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&out);
+    assert!(!out.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("skill_eval_failed"), "{stderr}");
+    assert!(stderr.contains("用例:"), "{stderr}");
+    assert!(stderr.contains("passed=false"), "{stderr}");
+    assert!(stderr.contains("失败:"), "{stderr}");
+    assert!(!stderr.contains("absent text"), "{stderr}");
+    assert!(
+        !stderr.contains("Waiting for approval"),
+        "预检就该返回评测失败，不应请求确认: {stderr}"
+    );
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "-1");
+
+    let failed_line = stderr
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("失败:"))
+        .unwrap()
+        .trim();
+    assert!(
+        failed_line.starts_with("--accept "),
+        "失败提示要能直接复制: {stderr}"
+    );
+    let failed = failed_line.trim_start_matches("--accept ").trim();
+    assert!(!failed.is_empty() && !failed.contains(' '), "{failed_line}");
+    let accepted = host.cli_env(
+        &["skill", "activate", "weekly-report", "--accept", failed],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&accepted);
+    assert!(accepted.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(stdout.contains("activated"), "{stdout}");
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "1");
+}
+
+/// 激活两次后回滚到第一次，指针回到那一对。确认夹具与其它 activate 用例相同。
+#[test]
+fn real_skill_activate_rollback_restores_the_first_pair() {
+    let host = Host::start("allow");
+    let (skill, evals) = write_import(
+        host.home(),
+        "weekly-report",
+        "hello world\n",
+        &evals_lines(&["hello world"]),
+    );
+    let installed = host.cli(&[
+        "skill",
+        "install",
+        skill.to_str().unwrap(),
+        "--evals",
+        evals.to_str().unwrap(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let first = host.cli_env(
+        &["skill", "activate", "weekly-report"],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&first);
+    assert!(first.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "1");
+    let first_pair = pointer_revisions(host.home(), "weekly-report");
+
+    // 同 semver 改正文会被拒。只升版本，评测字节不动，第二次激活只换正文一侧。
+    std::fs::write(
+        &skill,
+        skill_markdown("weekly-report", "1.2.1", "hello world again\n"),
+    )
+    .unwrap();
+    let installed = host.cli(&[
+        "skill",
+        "install",
+        skill.to_str().unwrap(),
+        "--evals",
+        evals.to_str().unwrap(),
+    ]);
+    assert!(
+        installed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&installed.stderr)
+    );
+    let second = host.cli_env(
+        &["skill", "activate", "weekly-report"],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&second);
+    assert!(second.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(stdout.contains("activated"), "{stdout}");
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "2");
+    assert_ne!(pointer_revisions(host.home(), "weekly-report"), first_pair);
+
+    let shown = host.cli(&["skill", "show", "weekly-report", "--json"]);
+    let (stdout, stderr) = cli_text(&shown);
+    assert!(shown.status.success(), "stdout={stdout} stderr={stderr}");
+    let detail: Value = serde_json::from_str(stdout.trim()).unwrap();
+    let activation_id = detail["activations"][0]["activation_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        format!(
+            "{}/{}",
+            detail["activations"][0]["body_revision_id"]
+                .as_str()
+                .unwrap(),
+            detail["activations"][0]["evals_revision_id"]
+                .as_str()
+                .unwrap()
+        ),
+        first_pair
+    );
+
+    let rolled = host.cli_env(
+        &[
+            "skill",
+            "activate",
+            "weekly-report",
+            "--rollback",
+            &activation_id,
+        ],
+        &[],
+        Duration::from_secs(30),
+    );
+    let (stdout, stderr) = cli_text(&rolled);
+    assert!(rolled.status.success(), "stdout={stdout} stderr={stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(stdout.contains("rolled_back"), "{stdout}");
+    assert_eq!(pointer_revisions(host.home(), "weekly-report"), first_pair);
+    assert_eq!(pointer_generation(host.home(), "weekly-report"), "3");
+}
+
+fn pointer_revisions(home: &Path, id: &str) -> String {
+    sqlite(
+        home,
+        &format!(
+            "SELECT body_revision_id || '/' || evals_revision_id FROM skill_pointer WHERE skill_id='{id}';"
+        ),
+    )
+}
+
 /// `YYYY-MM-DDTHH:MM:SSZ` from a unix second. Same spelling the daemon stores.
 fn stamp(unix: i64) -> String {
     let days = unix.div_euclid(86_400);

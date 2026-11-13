@@ -35,6 +35,7 @@ mod query;
 mod runs;
 mod schedules;
 mod service;
+mod skills;
 mod tui;
 
 #[derive(Parser)]
@@ -207,6 +208,14 @@ enum Command {
     Tools {
         #[command(subcommand)]
         action: query::ToolsAction,
+    },
+    /// 技能：列出、查看、导入、重扫，以及经桌面确认的激活
+    Skill {
+        #[command(subcommand)]
+        action: skills::SkillAction,
+        /// 原样输出 JSON 响应
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// 开发工具。`A24_DEV_TOOL=1` 才可用。
     Dev {
@@ -3462,6 +3471,7 @@ async fn main() -> std::process::ExitCode {
         Command::Consent { action } => query::consent(action).await,
         Command::Approval { action } => query::approval(action).await,
         Command::Tools { action } => query::tools(action).await,
+        Command::Skill { action, json } => skills::run(action, json).await,
         Command::Dev { action } => cmd_dev(action).await,
     };
     match result {
