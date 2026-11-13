@@ -147,6 +147,7 @@ async fn run(rig: &Rig, session: &str, prompt: &str) -> Run {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -380,6 +381,7 @@ async fn a_failed_legacy_import_fails_the_run_typed_and_a_retry_recovers_the_his
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

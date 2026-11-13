@@ -84,7 +84,7 @@ async fn upgrading_from_0035_leaves_old_rows_unchanged() {
     raw.close().await;
 
     let store = Store::open(&path).await.unwrap();
-    assert_eq!(store.latest_applied_migration().await.unwrap(), 36);
+    assert_eq!(store.latest_applied_migration().await.unwrap(), 37);
     let input: String = sqlx::query_scalar("SELECT input FROM runs WHERE id = 'old_run'")
         .fetch_one(pool(&store))
         .await

@@ -487,6 +487,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     // Normal.
                     mode: agent24_protocol::RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 };
                 match self
                     .runs
@@ -7438,6 +7439,7 @@ pub fn build_router_with_modules() {
                 mode: agent24_protocol::RunMode::Normal,
                 workspace_id: None,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();

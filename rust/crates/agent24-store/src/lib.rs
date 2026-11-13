@@ -84,6 +84,7 @@ mod run_workspace_authority;
 mod run_workspace_orphan;
 mod run_workspace_terminal;
 mod skill;
+mod skill_pin;
 pub mod source_policy;
 #[doc(hidden)]
 pub mod sqlite_phase;
@@ -181,6 +182,7 @@ pub use skill::{
     SkillEvalBinding, SkillOrigin, SkillPointer, SkillRevision, SkillRevisionInsert,
     SkillRevisionKind, SkillRevisionMeta, SkillRollback,
 };
+pub use skill_pin::{PinnedSkill, SkillPin, SkillPinOutcome, SkillPinRequest};
 pub use source_policy::{
     ASSERTION_SOURCE_REF_SCHEMA_VERSION, AssertionSourceRef, PolicySnapshot,
     SOURCE_TAG_SCHEMA_VERSION, SourceClassification, SourceKind, SourceMode, SourceRef,
@@ -236,6 +238,11 @@ pub enum StoreError {
     /// rollback. Nothing was written.
     #[error("skill_activation_mixed")]
     SkillActivationMixed,
+    /// A stored skill row or pin contradicts another stored row, or the store
+    /// was asked to pin with a request no caller should build (SL-5). The
+    /// caller cannot fix it by changing the request: a 500, never a 409.
+    #[error("skill_state_corrupt: {0}")]
+    SkillStateCorrupt(String),
     /// Body revision and evals revision do not share an origin. The pointer
     /// primary key stays `skill_id`. Nothing was written.
     #[error("skill_origin_mismatch")]

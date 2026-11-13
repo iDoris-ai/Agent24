@@ -110,7 +110,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | worker | L3 | protocol | — |
 | comm | L3（例外：自带 REST 面） | （无） | components |
 | documents-client | L3（客户端库） | （无） | — |
-| agent | L4 | core, domain, memory, models, protocol, scheduler, store, tools, workspace | policy |
+| agent | L4 | core, domain, memory, models, protocol, scheduler, skill, store, tools, workspace | policy |
 | attach | L4½ | domain, os-proto, protocol | — |
 | os-fd | L4½ | （无） | — |
 | os-packages | L4½ | components, domain, os-proc, os-proto, protocol | — |
