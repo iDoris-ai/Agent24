@@ -14,6 +14,7 @@ pub mod condenser;
 mod conn_phase;
 pub mod consolidator;
 pub mod disk_gate;
+pub mod embedder;
 pub mod eval;
 #[cfg(test)]
 mod eval_m1;
@@ -464,6 +465,12 @@ impl KvStore {
         self
     }
 
+    /// Crate-internal pool, so a caller can hold one `BEGIN IMMEDIATE` across
+    /// a read and the write of the same row.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub(crate) async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
         let marker: Option<String> =
             sqlx::query_scalar("SELECT v FROM mem_fts_state WHERE k = 'needs_rebuild'")
@@ -603,8 +610,9 @@ impl KvStore {
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
-    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied (`OmlxEmbedder`
-    /// in production, pending D4b) so the store never hard-depends on a model runtime.
+    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied
+    /// ([`embedder::LocalEmbedder`] once the daemon wires it) so the store never
+    /// hard-depends on a model process being up.
     pub fn vector_retriever<E: vector::Embedder + Clone>(
         &self,
         embedder: E,

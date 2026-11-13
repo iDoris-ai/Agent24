@@ -22,11 +22,11 @@
 //!   so an interrupted run resumes where it left off. A finished run whose key
 //!   is already complete inserts nothing, and still deletes the other keys.
 //!
-//! The real [`Embedder`] is `OmlxEmbedder` (oMLX, local) — pending D4b's model
-//! worker, so it is a documented boundary here; this slice ships the trait seam +
-//! storage + cosine + reindex/fallback mechanics with deterministic test
-//! embedders. The "semantic recall beats pure FTS" benchmark likewise needs a
-//! real model and is deferred, not faked.
+//! The production embedder is [`crate::embedder::LocalEmbedder`] (loopback oMLX
+//! or iDoris). Daemon startup wiring is a later slice. This module is the trait,
+//! the storage, and the cosine / reindex mechanics, exercised with deterministic
+//! test embedders. The "semantic recall beats pure FTS" benchmark needs a real
+//! model and stays deferred.
 
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};
@@ -45,9 +45,10 @@ pub struct Embedding {
     pub vector: Vec<f32>,
 }
 
-/// Produces embeddings. The seam `OmlxEmbedder` (pending D4b) slots into; tests
-/// use deterministic embedders. An embedder MUST be deterministic — the same text
-/// yields the same vector — or reindex/search stop being reproducible.
+/// Produces embeddings. [`crate::embedder::LocalEmbedder`] is the loopback
+/// client; tests use deterministic embedders. An embedder MUST be deterministic
+/// for a fixed `(model_id, revision)` — the same text yields the same vector —
+/// or reindex and search stop being reproducible.
 #[async_trait]
 pub trait Embedder: Send + Sync {
     fn model_id(&self) -> &str;
@@ -103,7 +104,7 @@ fn blob_to_vec(b: &[u8]) -> Vec<f32> {
 
 /// Cosine similarity of two equal-length vectors; 0.0 if either is zero-norm or
 /// the lengths differ (a mismatched-dims row simply cannot match).
-fn cosine(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
