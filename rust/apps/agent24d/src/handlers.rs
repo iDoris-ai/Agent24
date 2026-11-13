@@ -217,12 +217,15 @@ pub(super) async fn mint_bridge_capability(
         &store,
         &authorization,
         crate::capabilities::unix_now(),
-        |event| async move {
-            let ts = crate::capabilities::bridge::audit_now()?;
-            db.append_capability_token_audit(&ts, &event)
-                .await
-                .map(|_| ())
-                .map_err(|_| ())
+        |event| {
+            let db = db.clone();
+            async move {
+                let ts = crate::capabilities::bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
         },
     )
     .await
@@ -270,22 +273,31 @@ pub(super) async fn mint_bridge_capability(
 
 /// Revoke one capability by id.
 ///
-/// A live dev-bridge token is revoked in memory first. The audit row is
-/// `capability.token.revoked`. If that write fails the response is 503
-/// `audit_unavailable` and the bearer stays unusable; the caller retries the
-/// row. Every other id (unknown, already revoked, or not the dev-bridge
-/// profile) still answers 200 `revoked` and does not try to write that closed
-/// row.
+/// A live dev-bridge token is revoked in memory first, and `pending` is set
+/// in that same lock before the audit write. The `capability.token.revoked`
+/// row is written once. If the write fails the response is 503
+/// `audit_unavailable`, `pending` stays set, and the bearer stays unusable.
+/// A second call that arrives while that write is still in progress also
+/// gets 503 and does not answer 200. The next call after a failed write
+/// stores the missing row and then answers 200. A later call, once the row
+/// exists, answers 200 and does not append another. Any 200 means the row
+/// is already stored.
 ///
-/// 503 is therefore only returned for a bridge id while the audit store is
-/// failing. That tells the caller this id was a dev-bridge token. The
-/// difference is acceptable: the route already requires the elevated shell
-/// that issued the id, the body contains no bearer, and a uniform 200 would
-/// hide the missing row so the host would not retry. Unknown ids stay 200,
-/// including while the audit store is down, so this is not an existence
-/// oracle for arbitrary ids.
+/// 503 is only returned for a bridge id whose revoke audit is still
+/// outstanding. The body contains no bearer. Unknown ids and tokens
+/// outside the dev-bridge profile answer 200 `revoked` when the caller is
+/// not a first-party shell, including while the audit store is down.
+///
+/// A first-party shell may revoke only the wechat-bridge token, after
+/// desktop confirmation. Any other id, including another shell token, a
+/// creative token, or an id that is not in the store, is refused here even
+/// if an elevation grant was presented. ProductHost keeps the previous
+/// revoke for every audience. Revoking the shell does not revoke the
+/// bridge token. The token still dies at its 8-hour TTL, or when this
+/// daemon process is gone and the generation no longer matches.
 pub(super) async fn revoke_capability(
     State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
     Path(capability_id): Path<String>,
 ) -> Response {
     let Some(store) = state.capabilities.as_ref() else {
@@ -302,9 +314,24 @@ pub(super) async fn revoke_capability(
             "Invalid capability id",
         );
     }
-    // A dev-bridge token is revoked in memory before the audit row. If the
-    // row cannot be written the bearer stays unusable and the caller retries.
-    // Other audiences keep the previous idempotent revoke, with no audit.
+    let shell = authorization.as_ref().is_some_and(|Extension(auth)| {
+        auth.claims.audience == crate::capabilities::Audience::FirstPartyShell
+    });
+    if shell
+        && !store
+            .claims_by_id(&capability_id)
+            .is_some_and(|claims| crate::capabilities::bridge::is_dev_bridge(&claims))
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Shell may revoke only the wechat-bridge token",
+        );
+    }
+    // A dev-bridge token is revoked in memory before the audit row. A failed
+    // write leaves the bearer unusable and the record audit-pending. The
+    // next call writes that one row. Other audiences keep the previous
+    // idempotent revoke, with no audit. ProductHost still reaches them.
     if store
         .claims_by_id(&capability_id)
         .is_some_and(|claims| claims.audience == crate::capabilities::Audience::ComponentRuntime)

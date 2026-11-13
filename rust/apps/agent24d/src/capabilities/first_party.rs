@@ -256,6 +256,24 @@ impl FirstPartyAuthority {
             "/api/v1/capabilities/bridge" => {
                 return Some("签发 8 小时微信桥开发令牌，只能写入入站事件".to_owned());
             }
+            "/api/v1/capabilities/{capability_id}/revoke" => {
+                // Elevation is only for a live or already-revoked dev-bridge
+                // token. A shell token, a creative token, or a missing id
+                // has no summary, so the grant is refused.
+                let id = target
+                    .path
+                    .strip_prefix("/api/v1/capabilities/")?
+                    .strip_suffix("/revoke")?;
+                if id.is_empty() || id.contains('/') {
+                    return None;
+                }
+                let claims = self.store.claims_by_id(id)?;
+                if !super::bridge::is_dev_bridge(&claims) {
+                    return None;
+                }
+                let prefix = id.get(..8).unwrap_or(id);
+                return Some(format!("撤销微信桥开发令牌 {prefix}"));
+            }
             "/api/v1/idoris/operations/{id}/cancel" => {
                 let id = target
                     .path
@@ -552,6 +570,11 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
             && matches!(
                 (method.as_str(), policy.template),
                 ("POST", "/api/v1/capabilities/bridge")
+            ))
+        || (policy.operation == Operation::CapabilityRevoke
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/{capability_id}/revoke")
             ))
         // SL-4: skill activation and rollback, summarised from stored rows.
         || (policy.operation == Operation::SkillsActivate
@@ -950,6 +973,83 @@ mod tests {
         };
         let target = resolve_target(&dirty).unwrap();
         assert!(authority.target_summary("absent", &target).is_none());
+    }
+
+    /// Dropping `CapabilityRevoke` from `resolve_target` turns the first
+    /// `unwrap` red. Dropping the summary arm, or the `claims_by_id` bridge
+    /// check, turns the details `unwrap` red or lets a non-bridge id through.
+    #[test]
+    fn bridge_revoke_summary_names_the_bridge_id_prefix() {
+        use std::collections::BTreeSet;
+
+        let store = CapabilityStore::new("g");
+        let authority = FirstPartyAuthority::new(store.clone());
+        let bridge_id = "aabbccddeeff00112233445566778899";
+        let now = unix_now();
+        store
+            .insert(CapabilityClaims {
+                first_party: None,
+                capability_id: bridge_id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some("wechat-bridge".into()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "g".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 3600,
+                deadline: None,
+                allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+            })
+            .unwrap();
+        let shell = authority.issue(&test_peer("g")).unwrap();
+        let mut creative = store.claims_by_id(bridge_id).unwrap();
+        creative.capability_id = "cc11223344556677889900aabbccddee".into();
+        creative.audience = Audience::CreativeRuntime;
+        creative.component_id = None;
+        creative.allowed_operations = BTreeSet::from([Operation::ModelsRead]);
+        store.insert(creative).unwrap();
+
+        let request = |id: &str| ElevateRequest {
+            method: "POST".into(),
+            path: format!("/api/v1/capabilities/{id}/revoke"),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request(bridge_id)).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "撤销微信桥开发令牌 aabbccdd");
+        assert!(!details.contains("客户端"));
+        assert!(details.contains(&bridge_id[..8]));
+        for id in [
+            shell.token_id.as_str(),
+            "cc11223344556677889900aabbccddee",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        ] {
+            let target = resolve_target(&request(id)).unwrap();
+            assert!(
+                authority.target_summary("absent", &target).is_none(),
+                "{id}"
+            );
+        }
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request(bridge_id)
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+        assert!(
+            store
+                .validate_bearer(
+                    &shell.secret,
+                    Operation::ModelsRead,
+                    &Resource::global(),
+                    unix_now(),
+                )
+                .is_ok()
+        );
     }
 
     #[tokio::test(start_paused = true)]

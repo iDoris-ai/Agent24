@@ -8,12 +8,22 @@ use super::token::{CapabilityToken, MintedCapability, digest};
 use super::types::CapabilityClaims;
 
 /// Same capability id and deny reason write at most one audit row per window.
+///
+/// The key is `(capability_id, reason)`, not the route. Two routes that
+/// refuse the same token for the same reason share one slot. The denial
+/// row's operation is always `inbound.ingest` (the only profile this process
+/// issues), so the route name is not a stored fact. Folding the route into
+/// the key would repeat that same row once per path.
 pub(crate) const DENY_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub(crate) struct Record {
     pub(crate) claims: CapabilityClaims,
     pub(crate) revoked: bool,
+    /// Set before the `Revoked` row is written, and left set when that write
+    /// fails. Cleared only after the row is stored. A caller that sees it
+    /// set, or that cannot take the per-id gate, must not answer success.
+    pub(crate) revoke_audit_pending: bool,
 }
 
 impl Record {
@@ -45,6 +55,9 @@ pub(crate) struct Shared {
     pub(crate) changed: watch::Sender<u64>,
     pub(crate) deny_audit_at:
         Mutex<HashMap<(String, agent24_store::CapabilityDenyReason), tokio::time::Instant>>,
+    /// One in-flight revoke audit per capability id. A second caller that
+    /// finds the gate held does not answer success.
+    pub(crate) revoke_gates: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// In-memory capability authority. It stores only token digests and claims.
@@ -66,20 +79,28 @@ impl CapabilityStore {
                 }),
                 changed: watch::channel(0).0,
                 deny_audit_at: Mutex::new(HashMap::new()),
+                revoke_gates: Mutex::new(HashMap::new()),
             }),
         }
     }
 
     /// The timestamp just stored when this id and reason should be written.
     /// A repeat inside [`DENY_AUDIT_INTERVAL`] returns `None`. A poisoned
-    /// lock records and returns `Some(now)`.
+    /// lock also returns `None` and logs a warning: the denial is not
+    /// written. Returning `Some` here would append a row with no throttle
+    /// record, so a poisoned lock would fail open.
     pub(crate) fn claim_deny_audit(
         &self,
         capability_id: &str,
         reason: agent24_store::CapabilityDenyReason,
     ) -> Option<tokio::time::Instant> {
         let Ok(mut slots) = self.shared.deny_audit_at.lock() else {
-            return Some(tokio::time::Instant::now());
+            tracing::warn!(
+                capability_id,
+                ?reason,
+                "capability denial audit skipped; deny-audit lock is poisoned"
+            );
+            return None;
         };
         let now = tokio::time::Instant::now();
         let key = (capability_id.to_owned(), reason);
@@ -153,6 +174,7 @@ impl CapabilityStore {
             Record {
                 claims: claims.clone(),
                 revoked: false,
+                revoke_audit_pending: false,
             },
         );
         Ok(MintedCapability { token, claims })

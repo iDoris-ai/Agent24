@@ -72,16 +72,24 @@ impl Drop for Host {
 
 impl Host {
     fn start(decision: &str) -> Self {
+        Self::start_with(decision, &[])
+    }
+
+    fn start_with(decision: &str, extra: &[(&str, &str)]) -> Self {
         let home = tempfile::Builder::new()
             .prefix("a24real")
             .tempdir_in("/tmp")
             .unwrap();
         let stderr_path = home.path().join("daemon-stderr.log");
         let stderr = std::fs::File::create(&stderr_path).unwrap();
-        let mut child = signature_command::clear_command(daemon_binary())
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        let mut cmd = signature_command::clear_command(daemon_binary());
+        cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", home.path())
-            .env("AGENT24_TEST_PRESENCE", decision)
+            .env("AGENT24_TEST_PRESENCE", decision);
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .args([
                 "serve",
                 "--auth-mode",
@@ -131,12 +139,17 @@ impl Host {
     }
 
     fn request(&self, method: &str, path: &str, body: &Value) -> (u16, Value) {
+        let bearer = self.token.clone();
+        self.request_as(method, path, &bearer, body)
+    }
+
+    fn request_as(&self, method: &str, path: &str, bearer: &str, body: &Value) -> (u16, Value) {
         let body = body.to_string();
         let mut stream = TcpStream::connect(("127.0.0.1", self.port)).unwrap();
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
-        write!(stream, "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nauthorization: Bearer {}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", self.port, self.token, body.len()).unwrap();
+        write!(stream, "{method} {path} HTTP/1.1\r\nhost: 127.0.0.1:{}\r\nauthorization: Bearer {bearer}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", self.port, body.len()).unwrap();
         let mut response = String::new();
         stream.read_to_string(&mut response).unwrap();
         let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
@@ -146,20 +159,28 @@ impl Host {
 
     /// Run the real CLI with `args`, under the same isolation as [`Self::add`].
     fn cli(&self, args: &[&str]) -> Output {
-        let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        self.cli_env(args, &[], Duration::from_secs(15))
+    }
+
+    fn cli_env(&self, args: &[&str], extra: &[(&str, &str)], limit: Duration) -> Output {
+        let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"));
+        cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", self._home.path())
             .env(
                 "AGENT24D_BIN",
                 self._home.path().join("no-ephemeral-daemon"),
-            )
+            );
+        for (key, value) in extra {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
             .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(15);
+        let deadline = Instant::now() + limit;
         while child.try_wait().unwrap().is_none() {
             if Instant::now() > deadline {
                 let _ = child.kill();
@@ -305,4 +326,184 @@ fn real_capabilities_idoris_stop_elevates() {
             assert_eq!(body["error"]["code"], "presence_denied", "{body}");
         }
     }
+}
+
+/// Desktop confirm in this process is `AGENT24_TEST_PRESENCE=allow` on the
+/// daemon (`test-enrollment`). There is no desktop window in the test.
+#[test]
+fn real_bridge_token_ingests_one_wechat_message() {
+    assert_eq!(stamp(0), "1970-01-01T00:00:00Z");
+    let host = Host::start_with("allow", &[("A24_DEV_TOOL", "1")]);
+    let (status, listed) = host.request(
+        "PUT",
+        "/api/v1/inbound/allowlist",
+        &json!({"entries":[{"source":"wechat","actor":"alice"}]}),
+    );
+    assert_eq!(status, 200, "{listed}");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let activated = stamp(now - 120);
+    let at = stamp(now);
+    sqlite(
+        host.home(),
+        &format!(
+            "INSERT INTO inbound_source_watermark (source, activated_at, max_age_secs) \
+             VALUES ('wechat', '{activated}', 600);"
+        ),
+    );
+    let out = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success(),
+        "stderr={stderr} stdout_has_tokenish={}",
+        out.stdout
+            .windows(8)
+            .any(|w| w == b"eyJ" || w.starts_with(b"a24"))
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let path = host.home().join(".agent24/dev/wechat-bridge.token");
+    assert_eq!(mode(path.parent().unwrap()), 0o700);
+    assert_eq!(mode(&path), 0o600);
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let token = file["token"].as_str().unwrap();
+    let expires_at = file["expires_at"].as_u64().unwrap();
+    assert!(!token.is_empty());
+    assert!(!stdout.contains(token), "stdout leaked the bearer");
+    assert!(!stderr.contains(token), "stderr leaked the bearer");
+    assert_eq!(
+        stdout,
+        format!("{}\nexpires_at: {expires_at}\n", path.display())
+    );
+    let body = json!({
+        "id": "wechat:1001",
+        "actor": "alice",
+        "at": at,
+        "text": "hello",
+    });
+    let (status, first) = host.request_as("POST", "/api/v1/inbound/events", token, &body);
+    assert_eq!(status, 200, "{first}");
+    assert_eq!(first["outcome"], "started", "{first}");
+    let (status, again) = host.request_as("POST", "/api/v1/inbound/events", token, &body);
+    assert_eq!(status, 200, "{again}");
+    assert_eq!(again["outcome"], "duplicate", "{again}");
+    assert_eq!(sqlite(host.home(), "SELECT COUNT(*) FROM runs;"), "1");
+}
+
+/// The daemon gate is off. The CLI must not ask the desktop and then 404.
+/// Answering `presence_required` before the 404 turns the approval assertion red.
+#[test]
+fn bridge_token_does_not_elevate_when_the_daemon_gate_is_off() {
+    let host = Host::start("allow");
+    let out = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("没有设置 A24_DEV_TOOL=1"), "{stderr}");
+    assert!(!stderr.contains("Waiting for approval"), "{stderr}");
+}
+
+/// The shell revokes the bridge token it just wrote. The bearer is then 401
+/// and the file is gone. Skipping the delete leaves the path in place.
+#[test]
+fn real_shell_revokes_its_bridge_token() {
+    let host = Host::start_with("allow", &[("A24_DEV_TOOL", "1")]);
+    let out = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    assert!(
+        out.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path = host.home().join(".agent24/dev/wechat-bridge.token");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let token = file["token"].as_str().unwrap().to_owned();
+    assert!(!file["capability_id"].as_str().unwrap().is_empty());
+    let revoked = host.cli_env(
+        &["dev", "bridge-token", "--revoke"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&revoked.stderr);
+    assert!(revoked.status.success(), "{stderr}");
+    assert!(stderr.contains("Waiting for approval"), "{stderr}");
+    assert!(!path.exists());
+    let (status, body) = host.request_as(
+        "POST",
+        "/api/v1/inbound/events",
+        &token,
+        &json!({"id": "wechat:1001", "actor": "alice", "at": stamp(0), "text": "hello"}),
+    );
+    assert_eq!(status, 401, "{body}");
+}
+
+impl Host {
+    fn home(&self) -> &Path {
+        self._home.path()
+    }
+}
+
+fn mode(path: &Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+fn sqlite(home: &Path, statement: &str) -> String {
+    let db = home.join(".agent24/agent24.db");
+    let out = Command::new("sqlite3")
+        .arg(&db)
+        .arg(format!("PRAGMA busy_timeout=5000; {statement}"))
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "sqlite {statement}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // `PRAGMA busy_timeout` prints the value it set. The statement result is
+    // the last line.
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .rev()
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_owned()
+}
+
+/// `YYYY-MM-DDTHH:MM:SSZ` from a unix second. Same spelling the daemon stores.
+fn stamp(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let sod = unix.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = u64::try_from(z - era * 146_097).unwrap();
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let mut year = i64::try_from(yoe).unwrap() + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    let hour = sod / 3600;
+    let minute = (sod % 3600) / 60;
+    let second = sod % 60;
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
