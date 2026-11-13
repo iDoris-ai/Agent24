@@ -27,6 +27,7 @@ mod decide_routes;
 mod docked_router;
 mod docked_startup;
 mod domain;
+mod elevation_summaries;
 mod embed_backfill;
 #[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
 mod enroll_api;
@@ -105,6 +106,7 @@ mod os_routes;
 mod overrides;
 mod peer_runs;
 mod presence_desktop;
+mod presence_service;
 mod routes;
 mod runs;
 mod scheduler_callback;

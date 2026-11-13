@@ -1,12 +1,17 @@
 //! The daemon side of the private Knowledge host interface (KB-HOST-01 PR-B,
-//! #1085 design v2 §2). Only the desktop's ProductHost capability may use it:
-//! it activates and deactivates Knowledge bindings and hands the daemon the
+//! #1085 design v2 §2). Two hosts may use it. The desktop's ProductHost
+//! capability, keyed `product:{capability_id}`. And the desktop
+//! FirstPartyShell whose code-signing identifier is exactly
+//! `ai.auraai.agent24`, keyed `shell:ai.auraai.agent24`. FirstPartyShell is
+//! accepted only here, for the Knowledge host; it is not a ProductHost. The
+//! host activates and deactivates Knowledge bindings and hands the daemon the
 //! short-lived credential C of an active binding, or takes it back. C lives
 //! only in this process's memory; no response and no log line carries it.
 //!
-//! Every record belongs to the ProductHost capability that wrote it (decided
-//! 2026-10-24): a lookup always names the capability it is made for, so a
-//! binding cannot be found by its id alone (design v2 §3).
+//! Every record belongs to the host that wrote it (decided 2026-10-24): a
+//! lookup always names that host key, so a binding cannot be found by its id
+//! alone (design v2 §3). Renewal replaces a shell's capability id and leaves
+//! its code-signing identifier, and therefore its host key, unchanged.
 //!
 //! Each change carries a sequence number from the host, starting at 1, that
 //! must be greater than any it sent before for that binding; the binding and
@@ -26,9 +31,9 @@
 //! A run may name a binding (`RunCreate.knowledge_binding_id`, PR-C): only the
 //! host that activated it can, and the run is pinned to that host and that
 //! activation, its generation. The pin lives in memory, like the records
-//! (decided 2026-10-25): a restarted daemon has a new host capability, so a
-//! pin could not match again wherever it was kept, and a run that names a
-//! binding but has no pin is refused, never bound anew.
+//! (decided 2026-10-25). A restarted daemon has lost both, so a pin could not
+//! match again wherever it was kept, and a run that names a binding but has
+//! no pin is refused, never bound anew.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fmt;

@@ -4,10 +4,15 @@
 - **怎么跑**：在发布 head 的 checkout 里运行下面的命令：
 
   ```
-  python3 -I scripts/kb-r1-accept.py --old <main 的二进制目录> --new <发布 head 的二进制目录> [--work <目录>]
+  python3 -I scripts/kb-r1-accept.py --old <main 的二进制目录> --new <发布 head 的二进制目录> \
+      --enroll-new <发布 head 的 test-enrollment 版 agent24d 所在目录> [--work <目录>]
   ```
 
   - 两个二进制目录里都要有 `agent24d`、`agent24` 和 `agent24-documents`，用 `cargo build -p agent24d -p agent24-cli -p agent24-documents` 编出来。
+  - `--enroll-new` 目录里要有发布 head 用 `cargo build -p agent24d --features test-enrollment --bin agent24d` 编出的 `agent24d`，最好用单独的 `--target-dir`，免得和上面的产物互相覆盖。W7 只用它。
+    - 登记只认 Developer ID 签名的桌面，构建机上没有签名身份。测试版在 `AGENT24_TEST_PRESENCE=allow|deny` 时放行未签名的对端，按 `AGENT24_TEST_ENROLL_IDENTIFIER` 认身份，在场确认按这个变量直接答允许或拒绝。
+    - 这两个开关只在 test-enrollment 版里编入，release 版打开这个特性会编译失败，所以 W7 证明不了签名校验本身。签名校验由真机验收（M5 B7）覆盖。
+    - W7 只在 macOS 上有意义：别的平台没有对端审计令牌，登记一律被拒。
   - 脚本逐条打出 PASS 或 FAIL，并在工作目录里写 `report.md`。只要有一条 FAIL，就以非 0 退出。
   - 不需要模型：没有模型时，run 照样能建立，只是跑起来会失败，不影响这里的判定。
 - **按用户的操作走**：
@@ -21,6 +26,7 @@
   - 普通用户用 `agent24 daemon start` 起 daemon（legacy 模式），再按这个 daemon 的凭据调 HTTP。
   - W4 里，CLI 的 `daemon status`、`models`、`daemon stop` 都按用户的用法直接跑。
   - W4r 按 main 上桌面的方式拉起 daemon：`agent24d serve --port 0`，legacy 模式，stdin 不接。
+  - W7 按 M5 服务模式走：LaunchAgent 的启动参数是 `agent24d serve --port 0 --auth-mode capabilities --enroll-endpoint`（`rust/apps/agent24-cli/src/service.rs`），没有宿主管道，ready 行里没有令牌。外壳在 `<数据目录>/enroll.sock` 上登记：daemon 先发 `challenge`，外壳回 `hello`（带 nonce 和 ready 行里的 generation），拿到 `enrolled` 里的令牌。提升级操作先收到 403 `presence_required`，再在同一条登记连接上发 `elevate`（method、path、body 的 sha256），换一次性 grant，然后带 `X-Agent24-Elevation` 重发。帧格式与 `rust/apps/agent24-cli/src/enroll.rs`、桌面的 `daemon-enroll.ts` 一致。
   - W6 走桌面端文档功能的路径（documenting r6，`apps/desktop/src/main/documents-cli.ts`）。documents 包按模块 README 的方式组装：本 checkout 的 `domain-os.yml` 加上二进制目录里的 `agent24-documents`，不带读取引擎，因为 W6 只问模块能力、列文档，用不到。先 `agent24 os install`，再按桌面的方式拉起 daemon。然后像桌面那样调 `agent24 documents request --host-stdin --json`，daemon 的地址、凭据和请求都走 stdin。模块握手要一点时间，W6a 会反复问 `capabilities`，每次调用都以剩下的时间为限，总共最多等 30 秒；过了 30 秒才答上来也算 FAIL。
 - **不碰用户数据**：
   - 每个 daemon 和每次 CLI 调用都用工作目录下自己的 `AGENT24_DATA_DIR`、`A24_OS_PACKAGES`，`HOME` 也指到工作目录下。
@@ -31,9 +37,10 @@
   - `--work` 解析后的路径必须是可打印 ASCII，否则在创建任何东西之前就拒绝运行。原因是 reap 按 lsof 打出的工作目录认进程，而 lsof 会把其他字节转义（C locale 下连非 ASCII 字符也转义），这样的路径永远匹配不上，残留的 daemon 就会被放过。也不能带空格：reap 按 ps 打出的命令行认模块进程，命令行里的空格分隔参数，`/x/a b/m` 也可能是别人用参数 `b/m` 跑的 `/x/a`。
 - **不留进程**：
   - 宿主 daemon 靠关闭 stdin 来停：父进程租约结束，daemon 自己退出。legacy 方式拉起的发 SIGTERM。15 秒内没有退出就杀掉。
+  - W7 的服务模式 daemon 没有父进程租约，脚本退出后它不会自己停：用 SIGTERM 停；等 ready 行时被打断也当场停掉。下面的兜底同样认 `--enroll-new` 里的 `agent24d serve`。
   - CLI 起的 daemon 用 `agent24 daemon stop` 停。
   - documents 模块由 daemon 拉起，daemon 正常停下时会一并停掉它。兜底：二进制在 `--work` 下面的进程（也就是 `os install` 装进来的模块）在 reap 时一律杀掉。
-  - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old 或 --new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，查之后新出现的这类进程，只杀工作目录落在 `--work` 下的。脚本让每个 daemon 和每次 CLI 调用都在各自的数据目录里启动，daemon 和 CLI 都不切换目录，所以这次运行起的 daemon 都在 `--work` 下面。别的运行或用户自己从同一个目录起的 daemon 不碰，读不到工作目录的也不碰，只打一行提示。工作目录在 Linux 上读 `/proc/<pid>/cwd`，在 macOS 上用 `lsof -d cwd`（macOS 的 `ps -E` 读不到别的进程的环境变量）。不按状态文件里的 pid 杀，免得误杀。
+  - 兜底：`agent24 daemon start` 等不到 ready 就放弃时，daemon 不会随 CLI 退出，而且可能还没写出状态文件。所以运行开始时先记下已有的 `<--old、--new 或 --enroll-new>/agent24d serve` 进程；每条用例结束后，以及脚本退出时，查之后新出现的这类进程，只杀工作目录落在 `--work` 下的。脚本让每个 daemon 和每次 CLI 调用都在各自的数据目录里启动，daemon 和 CLI 都不切换目录，所以这次运行起的 daemon 都在 `--work` 下面。别的运行或用户自己从同一个目录起的 daemon 不碰，读不到工作目录的也不碰，只打一行提示。工作目录在 Linux 上读 `/proc/<pid>/cwd`，在 macOS 上用 `lsof -d cwd`（macOS 的 `ps -E` 读不到别的进程的环境变量）。不按状态文件里的 pid 杀，免得误杀。
   - 每个 daemon 都在 `try` 里构造，构造中途出错也会被清理。
 - **泄漏扫描**：W1c 和 W2e 在 daemon 停下之后才扫，停机时写出的内容也在范围内。只读普通文件（socket、FIFO 里没有可泄漏的字节）；读不了的普通文件不算「没找到」，检查直接判 FAIL。
 - **依赖**：python3，只用标准库，以 `-I` 运行；macOS 上还要 `lsof`（系统自带）。
@@ -47,32 +54,62 @@
 | W1c | 同上 | daemon 停下之后，在数据目录和 daemon 日志里找宿主凭据 | 找不到，凭据只走 ready 管道；不能有读不了的文件 |
 | W2a | run 指名 binding | 宿主 `POST /api/v1/runs`，不带 `knowledge_binding_id` | 202，`input` 里有 `knowledge_binding_id` 这个键（OpenAPI 定为必填），值为 null |
 | W2b | 同上 | 指名一个没激活的 binding | 409 `knowledge_binding_inactive` |
-| W2c | 宿主接口 | `PUT …/bindings/kb-accept?seq=1` 激活，再建 run 指名它，然后 `GET /api/v1/runs/{id}` | 激活 204，建 run 202，读回的 `knowledge_binding_id` 为 `kb-accept` |
-| W2d | 同上 | 再发一次 `seq=1` | 409 `stale_sequence`：先发出、后到达的变更不能覆盖更新的 |
-| W2e | 同上 | `PUT …/credential?seq=2` 推送一个随机凭据，再建 run | 推送 204，建 run 202。从推送起的所有应答（包括 W2f 的两次）里都没有这个凭据；daemon 停下之后，数据目录和日志里也没有；不能有读不了的文件 |
-| W2f | 同上 | `DELETE …/bindings/kb-accept?seq=3` 停用，再指名 | 停用 204，指名 409 `knowledge_binding_inactive` |
+| W2c | 宿主接口 | `PUT …/bindings/kb-accept`，body `{"seq":1}` 激活，再建 run 指名它，然后 `GET /api/v1/runs/{id}` | 激活 204，建 run 202，读回的 `knowledge_binding_id` 为 `kb-accept` |
+| W2d | 同上 | 再发一次 body `{"seq":1}` | 409 `stale_sequence`：先发出、后到达的变更不能覆盖更新的 |
+| W2e | 同上 | `PUT …/credential`，body `{"seq":2,…}` 推送一个随机凭据，再建 run | 推送 204，建 run 202。从推送起的所有应答（包括 W2f 的两次）里都没有这个凭据；daemon 停下之后，数据目录和日志里也没有；不能有读不了的文件 |
+| W2f | 同上 | `DELETE …/bindings/kb-accept`，body `{"seq":3}` 停用，再指名 | 停用 204，指名 409 `knowledge_binding_inactive` |
 | W2r | 反面对照 | 用 main 的 `agent24d` 做 W2c 的激活，并指名一个没激活的 binding 建 run | 激活不是 204（main 没有这个接口），建 run 202（main 不查）。说明 W2b–W2f 的检查是这次加的 |
 | W3a | 非宿主调用方 | 发布 head 的 `agent24 daemon start` 起 daemon，用它的凭据指名 binding 建 run | 403 `host_authority_required` |
-| W3b | 同上 | 用同一个凭据调 `PUT …/bindings/kb-accept?seq=1` | 403 `host_authority_required` |
+| W3b | 同上 | 用同一个凭据调 `PUT …/bindings/kb-accept`，body `{"seq":1}` | 403 `host_authority_required` |
 | W3c | 同上 | 不指名 binding 建 run | 202，普通用法不受影响 |
 | W3r | 反面对照 | main 的 `agent24 daemon start`，指名 binding 建 run | 202（main 不查）。说明 W3a 的拒绝是这次加的 |
 | W4a | CLI 与桌面托管的 daemon | 按 W1 的方式拉起 daemon，在同一个数据目录上跑 `agent24 daemon status` | 退出 0，说出这个 daemon 的 pid，并说 `shutdown report unavailable: host authority unavailable` |
-| W4b | 同上 | `agent24 models` | 非 0 退出，说 `host authority unavailable`；daemon 还在 |
-| W4c | 同上 | `agent24 daemon stop` | 非 0 退出，说 `host authority unavailable`；daemon 还在，宿主仍能调它 |
+| W4b | 同上（未签名构建） | `agent24 models` | 非 0 退出，说 `host authority unavailable`，或者（CLI 会在提供登记端点的 daemon 上先登记）说 `rejected this agent24 binary's identity`：构建机上的 CLI 没有签名，登记被拒；daemon 还在 |
+| W4c | 同上（未签名构建） | `agent24 daemon stop` | 非 0 退出，说 `host authority unavailable`；daemon 还在，宿主仍能调它 |
+| W4b′ | 同上，签名 CLI（脚本不跑，M5 B7 真机补测） | `agent24 models`；再用 CLI 登记得到的令牌改 binding、调 ProductHost 才能用的路由 | `models` 等日常操作成功；改 binding 得 403 `host_authority_required`，ProductHost 路由被拒：借不到宿主权限 |
+| W4c′ | 同上，签名 CLI（脚本不跑，M5 B7 真机补测） | `agent24 daemon stop` | 停不掉。#1760（K-B3b）合入前 elevate 得 `not_elevated_operation`；合入后要桌面在场确认，没确认就是 403 `presence_required`。daemon 一直在 |
 | W4r | 反面对照 | 按 main 上桌面的方式拉起 main 的 `agent24d`，再跑 main 的 `daemon status`、`models`、`daemon stop`。跑 `models` 时把 `AGENT24D_BIN` 指向一个不存在的文件：附着失败时 CLI 会另起一个临时 daemon，这样能堵住这条退路 | 都退出 0，`status` 说出这个 pid，`stop` 之后 daemon 退出。说明 W4 的变化是这次带来的 |
 | W5a | 保留路径段 `host` | 用 W3 的 daemon，`POST /api/v1/attached` 注册名为 `host` 的 attached 模块；再注册一个叫 `kbacceptmod` 的作对照 | `host` 得 400 `invalid_manifest`，消息里有 `reserved`；`kbacceptmod` 得 201 |
 | W5r | 反面对照 | 用 W3r 的 main daemon 注册 `host` | 201（main 不保留这个名字） |
+| W7a | 服务模式（M5） | 用 `--enroll-new` 的 `agent24d` 按 LaunchAgent 的参数拉起，在场确认答「允许」，登记身份为桌面（`ai.auraai.agent24`） | ready 行 `auth_mode` 为 `capabilities`，有 `port`、`generation`、`enroll_endpoint`，没有任何令牌字段；`enroll.sock` 存在 |
+| W7b | 未登记 | 不带令牌 `PUT …/bindings/kb-accept`，body `{"seq":1}` | 401 |
+| W7c | 登记了、没提升 | 登记成桌面外壳，用它的令牌发同样的请求 | 403 `presence_required` |
+| W7d | 提升后 | 在登记连接上 `elevate` 这个请求，带回来的 grant 重发；再用外壳令牌指名 binding 建 run，`GET /api/v1/runs/{id}` | 激活 204，建 run 202，读回的 `knowledge_binding_id` 为 `kb-accept`：服务模式下桌面外壳就是宿主（K-B6） |
+| W7e | grant 只能用一次 | 用同一个 grant 再发一次 | 403 `elevation_invalid` |
+| W7f | 在场确认被拒 | 另起一个服务模式 daemon，在场确认答「拒绝」；登记成桌面外壳，先发一次不带 grant 的请求，再 `elevate` | 先 403；`elevate` 得 `presence_denied`；指名 binding 建 run 得 409 `knowledge_binding_inactive` |
+| W7g | CLI 外壳不是宿主 | 另起一个服务模式 daemon，登记身份为 CLI（`agent24`），改 binding、指名 binding 建 run | 两个都直接 403 `host_authority_required`，不进在场确认 |
 | W6a | 桌面端的文档功能 | 装上 documents 包，按 W1 的方式拉起发布 head 的 daemon，用宿主凭据经 `agent24 documents request --host-stdin --json` 问 `{"op":"capabilities"}` | 30 秒内退出 0，`result` 行 `ok` 为 true，状态 200 |
 | W6b | 同上 | 同样的方式问 `{"op":"list"}` | 退出 0，200，`documents` 是空数组（新数据目录） |
 | W6c | 同上 | 同样的请求，凭据换成一个错的 | 退出 1，401 `unauthorized`。说明 W6a、W6b 的 200 确实经过了鉴权 |
 | W6r | 对照 | 按 main 上桌面的方式（legacy，W4r 那样）拉起 main 的 daemon，用 main 的 CLI 做 W6a | 同样 200。说明桌面端的文档功能在这次发布前后都能用 |
 | Z1 | 不碰用户数据 | 对比运行前后的 `~/.agent24`，包括它本身是否存在、它的 mtime | 没有变化：原来不存在的，不能被建出来，空目录也不行 |
 
+**W4 里签名与未签名分开（2026-11-10 起）**：
+
+- 桌面托管的子进程模式 daemon 也开登记端点（`docs/agent/CORE-2-ENROLL-DESIGN.md:71`、`:131`、Q5 `:342`），CLI 会先登记。
+- 签了名的 CLI 只自动取得日常级（`CORE-2-ENROLL-DESIGN.md:264`「插件调用合法 CLI」一行：仍可读记忆、建 run、取消 run，这是 ADR-037 已接受的残余）。`GET /models` 是日常级（同文件 `:154`）。
+- 所以「CLI 用不了桌面的 daemon」只对未签名构建成立。W4b、W4c 的原期望是 CORE-2 之前的前提，现在只对未签名构建保留。
+- 签名 CLI 借不到宿主权限、也停不掉 daemon，靠下面这几层运行时拦截，锁定测试为：
+  - 宿主判定只认 ProductHost 和 `ai.auraai.agent24` 的外壳（`knowledge_host.rs` `host_capability`）：`knowledge_host::tests::cli_shells_are_not_knowledge_hosts`，以及 W7g。
+  - 外壳令牌不含在场通道（#1447 F1）：`server::first_party_http_tests::first_party_token_is_not_granted_presence_operations`、`…::first_party_token_cannot_reach_presence_routes`、`presence_desktop::tests::gate_refuses_a_first_party_authorization`。
+  - 服务模式的在场角色只给桌面：`enroll_endpoint::presence_tests::only_the_desktop_app_may_hold_the_presence_role`、`…::outside_service_mode_the_presence_role_is_refused`。
+  - shutdown 的批准文字：#1760 的 `server::elevation_summaries_http_tests::shutdown_has_its_fixed_text`。
+- 构建机没有签名身份，W4b′、W4c′ 由 M5 B7 真机拿到签名包时补测。
+
 **整体反面对照**：把 `--new` 也指向 main 的二进制再跑一遍，下面这些应当 FAIL：
 
 - W2a：main 的 run 没有 `knowledge_binding_id` 这个键；
 - W2b–W2f；
 - W3a、W3b、W5a。
+
+W7 不用 `--old` 和 `--new`。它的反面对照是把 `--enroll-new` 指向 K-B6（#1714）之前的 test-enrollment 版。用 ab/weknora 的 ce52eb6d^1（dc9ed826）编，W7a–W7c 照常 PASS，下面四条应当 FAIL：
+
+- W7d：K-B6 之前绑定路由没有批准文字，`elevate` 得 `not_elevated_operation`；宿主接口只认 ProductHost，桌面外壳指名 binding 的 run 是 403 `host_authority_required`；
+- W7e：没有 grant 可以再用；
+- W7f：`elevate` 同样得 `not_elevated_operation`，不是 `presence_denied`；
+- W7g：CLI 外壳先进在场确认，得 `presence_required`，而不是直接 403。
+
+2026-11-10 在本机跑过（ab/weknora b9de59e6 加本片）：W7 七条全部 PASS；指向 dc9ed826 的反面对照正好是上面四条 FAIL。两次的 W6 都因为 `--old` 目录里没有 `agent24-documents` 中止，与 W7 无关。
 
 其余各条照常 PASS：
 

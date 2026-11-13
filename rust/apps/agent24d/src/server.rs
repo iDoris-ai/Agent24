@@ -82,6 +82,9 @@ pub struct AppState {
     /// CORE-2 AgentEar S3: the desktop confirmation queue behind
     /// `/api/v1/presence/challenges/*`.
     pub presence_desktop: Option<Arc<crate::presence_desktop::DesktopPresence>>,
+    /// K-B3 #1715: service mode's presence queue, fed by the desktop's
+    /// `role:"presence"` connection on the enrolment socket.
+    pub presence_service: Option<Arc<crate::presence_service::ServicePresence>>,
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
@@ -779,6 +782,7 @@ impl AppState {
             delegations: Arc::new(crate::capabilities::delegation::Delegations::default()),
             knowledge_host: Arc::new(agent24_knowledge::host::KnowledgeHostRegistry::default()),
             presence_desktop: None,
+            presence_service: None,
             mcp_servers: Arc::new(mcp_servers),
             mcp_roster: Arc::new(crate::mcp::McpRoster::default()),
             router,
@@ -877,6 +881,24 @@ impl AppState {
         self.presence_desktop = Some(presence);
     }
 
+    /// Service mode: the desktop is not our parent, so presence comes over
+    /// its own connection on the enrolment socket (K-B3 #1715).
+    fn enable_service_presence(&mut self) {
+        let presence = Arc::new(crate::presence_service::ServicePresence::new());
+        self.presence_provider = Some(presence.clone());
+        self.presence_service = Some(presence);
+    }
+
+    /// Where a capability daemon's presence confirmations go, by start mode:
+    /// the parent desktop over HTTP, or the desktop's presence connection.
+    fn enable_presence_for(&mut self, mode: StartupMode) {
+        match mode {
+            StartupMode::HostChild => self.enable_desktop_presence(),
+            StartupMode::Service => self.enable_service_presence(),
+            StartupMode::Legacy => {}
+        }
+    }
+
     /// Re-read the override set after the user changed it.
     ///
     /// A failed reload leaves the previous snapshot in place rather than
@@ -941,6 +963,10 @@ async fn establish_module_delegation(
 #[path = "tests/first_party_http.rs"]
 mod first_party_http_tests;
 
+#[cfg(test)]
+#[path = "tests/elevation_summaries_http.rs"]
+mod elevation_summaries_http_tests;
+
 /// The kernel router with NO domain OS mounted. Test-only since ME-1b: the real
 /// startup path always goes through [`build_router_with_modules`], and a
 /// production caller that skipped the mounter would silently serve a daemon with
@@ -960,6 +986,7 @@ pub fn build_router(state: AppState) -> Router {
 pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
     if let Some(authority) = &state.first_party {
         authority.set_provider(state.presence_provider.clone());
+        authority.set_presence_connection(state.presence_service.clone());
         authority.set_module_surfaces(state.module_surfaces.clone());
     }
     let kernel = Router::new()

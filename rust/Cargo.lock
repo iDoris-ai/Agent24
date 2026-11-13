@@ -659,6 +659,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "libproc",
+ "percent-encoding",
  "rand 0.9.5",
  "rustix 0.38.44",
  "serde",

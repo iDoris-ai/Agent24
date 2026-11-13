@@ -63,7 +63,7 @@ describe('KnowledgeUiClient (WeKnora#140 shapes)', () => {
   it('exchanges with the view proof and the ticket in the body only', async () => {
     const f = fake(200, { session_token: 'jwt', expires_in: 600, ops: ['kb.list'], effective_scope: { knowledge_base_ids: ['kb-a'] } })
     const result = await new KnowledgeUiClient(f.fetch, ORIGIN).exchange('tkt', VIEW)
-    expect(result).toEqual({ kind: 'ok', value: { sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'] } })
+    expect(result).toEqual({ kind: 'ok', value: { sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'], droppedOps: 0 } })
     const [url, init] = f.calls[0]
     expect(url).toBe(`${ORIGIN}/api/v1/agent24/knowledge/ui/exchange`)
     expect(init.headers).toEqual({ 'X-Agent24-View-Proof': VIEW.proof, 'Content-Type': 'application/json' })

@@ -64,6 +64,8 @@ serde_json = { workspace = true, features = ["raw_value"] }
 # one malformed key/value pair to hide an unrelated, well-formed `module=`
 # key elsewhere in the same query string.
 form_urlencoded = "1"
+# K-B6: a presence summary shows the binding id as axum's `Path` decodes it.
+percent-encoding = "2"
 # Capability and attached-module token hashing are both production daemon
 # responsibilities; one shared dependency serves both paths.
 sha2 = "0.10"

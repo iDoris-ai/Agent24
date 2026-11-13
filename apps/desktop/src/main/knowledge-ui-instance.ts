@@ -28,6 +28,8 @@ export type UiInstanceEvent =
   | { kind: 'unavailable' }
   /** U4.5 "恢复即重载": injection was paused and is back; reload the current document. Not an end. */
   | { kind: 'reload' }
+  /** An exchange dropped this many ops outside the host's closed set (#1670 c2): logged as a count. Not an end. */
+  | { kind: 'ops_dropped'; count: number }
 
 export interface KnowledgeUiInstanceDeps {
   client: KnowledgeUiClient
@@ -72,6 +74,7 @@ export class KnowledgeUiInstance {
       now: deps.now,
       sleep: deps.sleep,
       onResume: () => { if (!this.stopped) this.deps.onEvent({ kind: 'reload' }) },
+      onOpsDropped: (count) => { if (!this.stopped) this.deps.onEvent({ kind: 'ops_dropped', count }) },
     }, deps.view ?? newViewSecret())
   }
 

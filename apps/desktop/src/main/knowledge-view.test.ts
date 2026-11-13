@@ -1,6 +1,12 @@
+import fs from 'node:fs'
 import net from 'node:net'
+import os from 'node:os'
+import path from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { IpcChannels } from '../shared/ipc-types'
+import { createChatHistoryStore } from './chat-history'
+import { INTENT_CONFIRM_MS } from './knowledge-bridge'
+import { knowledgePending, type KnowledgePending } from './knowledge-pending'
 import {
   KNOWLEDGE_VIEW_DEV_URL_ENV,
   KNOWLEDGE_VIEW_PARTITION_PREFIX,
@@ -166,7 +172,7 @@ class FakeWindow extends FakeEmitter {
 const ALL_CLEARED = ['connections', 'storage', 'cache', 'auth']
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
 
-function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean; ui: (c: KnowledgeViewUiContext) => KnowledgeViewUi }> = {}) {
+function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof knowledgeViewTarget>; packaged: boolean; ui: (c: KnowledgeViewUiContext) => KnowledgeViewUi; pending: KnowledgePending; log: (message: string) => void }> = {}) {
   const views: FakeView[] = []
   const sessions: FakeSession[] = []
   const states: unknown[] = []
@@ -197,10 +203,11 @@ function setup(over: Partial<{ binding: string | null; target: ReturnType<typeof
       return timers.length
     },
     clearTimer: (handle: unknown) => { cleared.push(handle as number) },
-    log: () => {},
+    log: over.log ?? (() => {}),
     partitionName: () => `${KNOWLEDGE_VIEW_PARTITION_PREFIX}p${++seq}`,
     proxyPort: () => Promise.resolve(9),
     ...(over.ui ? { ui: over.ui } : {}),
+    ...(over.pending ? { pending: over.pending } : {}),
   } as unknown as KnowledgeViewHostDeps
   const host = new KnowledgeViewHost(deps)
   return { host, views, sessions, states, timers, loadTimers, cleared, env, advance: (ms: number) => { now += ms } }
@@ -1216,6 +1223,20 @@ describe('UI session wiring (KB-C2-04a, U4.5, U4.7, U3.8)', () => {
     }
   })
 
+  it('logs a dropped-ops count and keeps the view and its session (#1670 c2)', async () => {
+    const ui = fakeUi()
+    const lines: string[] = []
+    const t = setup({ ui: ui.factory, log: (m) => { lines.push(m) } })
+    let reloads = 0
+    await t.host.show(BOUNDS)
+    t.views[0].webContents.reload = () => { reloads++ }
+    ui.made[0].context.onEvent({ kind: 'ops_dropped', count: 2 })
+    expect(lines).toEqual(["[knowledge-view] UI exchange dropped 2 op(s) outside the host's closed set"])
+    expect(t.host.status()).toEqual({ state: 'ready' })
+    expect(reloads).toBe(0)
+    expect(ui.made).toHaveLength(1)
+  })
+
   it('a resume before loadURL alone never reloads the page that follows (U4.5)', async () => {
     let release: ((ok: boolean) => void) | undefined
     const ui = fakeUi(() => new Promise<boolean>((resolve) => { release = resolve }))
@@ -1263,10 +1284,11 @@ describe('registerKnowledgeViewIpc', () => {
     expect([...handlers.keys()]).toEqual([
       's', 'b', 'h', 'r',
       IpcChannels.KnowledgeViewAnswer,
+      IpcChannels.KnowledgeViewShown,
       IpcChannels.KnowledgeDraftList,
       IpcChannels.KnowledgeDraftRemove,
     ])
-    expect(guarded).toHaveLength(7)
+    expect(guarded).toHaveLength(8)
     await handlers.get('s')!({}, BOUNDS, 'dark')
     expect(host.show).toHaveBeenCalledWith(BOUNDS, 'dark')
     handlers.get('b')!({}, BOUNDS)
@@ -1582,9 +1604,9 @@ describe('return_to_chat_intent dialog and draft (U7.2)', () => {
       },
     }
   }
-  async function shown() {
+  async function shown(pending?: KnowledgePending) {
     const ui = intentUi()
-    const t = setup({ ui: ui.factory })
+    const t = setup({ ui: ui.factory, ...(pending ? { pending } : {}) })
     const sent = watch(t.env.win!)
     await t.host.show(BOUNDS)
     const contents = t.views[0].webContents
@@ -1602,8 +1624,8 @@ describe('return_to_chat_intent dialog and draft (U7.2)', () => {
   }
   const intentBody = (doc: string) => ({ v: 3, direction: 'page_to_host', type: 'return_to_chat_intent', id: INTENT_ID, generation: 3, document_id: doc, payload: { citations: [REF] } })
 
-  async function asked() {
-    const s = await shown()
+  async function asked(pending?: KnowledgePending) {
+    const s = await shown(pending)
     s.post(intentBody(s.doc))
     await flush()
     const ask = s.confirms()[0]?.[1] as { id: string; count: number; titles: Array<string | null> }
@@ -1624,6 +1646,88 @@ describe('return_to_chat_intent dialog and draft (U7.2)', () => {
     expect(Object.keys(listed[0].ref).sort()).toEqual(['chunk_id', 'knowledge_base_id', 'knowledge_id'])
     expect(s.drafts()).toEqual([[IpcChannels.KnowledgeDraftChanged, listed]])
     expect(s.viewSent.filter((args) => args[0] === IpcChannels.KnowledgeDraftChanged)).toEqual([])
+  })
+
+  describe('M4 A7: the dialog waits in the open conversation', () => {
+    const fake = () => ({ set: vi.fn(), clear: vi.fn() })
+    const CONV = 'chat_a7open'
+
+    it('shown with a conversation open: one confirm item with the cited title, and answering clears it (real chat history)', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knowledge-view-a7-'))
+      try {
+        const history = createChatHistoryStore(dir)
+        const conv = history.create({ title: 'A conversation', title_source: 'user' })
+        const s = await asked(knowledgePending(() => history, () => Date.UTC(2026, 10, 9), () => {}))
+        const waiting = () => history.list().find((c) => c.id === conv.id)!.pending
+        expect(waiting()).toEqual([])
+        s.t.host.confirmShown(s.ask.id, conv.id)
+        expect(waiting()).toEqual([{ id: s.ask.id, kind: 'confirm', label: 'Cited', at: '2026-11-09T00:00:00.000Z' }])
+        // Shown again (a re-render): still one.
+        s.t.host.confirmShown(s.ask.id, conv.id)
+        expect(waiting()).toHaveLength(1)
+        s.t.host.answerConfirm(s.ask.id, false)
+        await flush()
+        expect(waiting()).toEqual([])
+      } finally {
+        fs.rmSync(dir, { recursive: true, force: true })
+      }
+    })
+
+    it('a dialog that times out clears its item', async () => {
+      const pending = fake()
+      const s = await asked(pending)
+      s.t.host.confirmShown(s.ask.id, CONV)
+      expect(pending.set).toHaveBeenCalledWith(CONV, s.ask.id, 'Cited')
+      const timeout = s.t.timers.find((x) => x.ms === INTENT_CONFIRM_MS)!
+      timeout.fn()
+      await flush()
+      expect(pending.clear).toHaveBeenCalledTimes(1)
+      expect(pending.clear).toHaveBeenCalledWith(CONV, s.ask.id)
+    })
+
+    it('a view that goes clears its item', async () => {
+      const pending = fake()
+      const s = await asked(pending)
+      s.t.host.confirmShown(s.ask.id, CONV)
+      s.t.host.destroyAll('test')
+      await flush()
+      expect(pending.clear).toHaveBeenCalledTimes(1)
+      expect(pending.clear).toHaveBeenCalledWith(CONV, s.ask.id)
+    })
+
+    it('no conversation open (activeId null), another dialog\'s id, or a malformed IPC call: nothing written, and nothing to clear', async () => {
+      const pending = fake()
+      const s = await asked(pending)
+      s.t.host.confirmShown(s.ask.id, null)
+      s.t.host.confirmShown('B'.repeat(22), CONV)
+      const handlers = new Map<string, Listener>()
+      registerKnowledgeViewIpc({ handle: (c: string, h: Listener) => { handlers.set(c, h) } } as never, ((h: Listener) => h) as never,
+        { show: 's', bounds: 'b', hide: 'h', reload: 'r' }, () => s.t.host)
+      const shownIpc = handlers.get(IpcChannels.KnowledgeViewShown)!
+      await shownIpc({}, s.ask.id, 'not a conversation')
+      await shownIpc({}, s.ask.id, 42)
+      await shownIpc({}, 'nope', CONV)
+      expect(pending.set).not.toHaveBeenCalled()
+      s.t.host.answerConfirm(s.ask.id, true)
+      await flush()
+      expect(pending.clear).not.toHaveBeenCalled()
+      // A well-formed call does write (the handler is the one main registers).
+      const next = await asked(pending)
+      registerKnowledgeViewIpc({ handle: (c: string, h: Listener) => { handlers.set(c, h) } } as never, ((h: Listener) => h) as never,
+        { show: 's', bounds: 'b', hide: 'h', reload: 'r' }, () => next.t.host)
+      await handlers.get(IpcChannels.KnowledgeViewShown)!({}, next.ask.id, CONV)
+      expect(pending.set).toHaveBeenCalledWith(CONV, next.ask.id, 'Cited')
+    })
+
+    it('with no cited title the label is the generic words', async () => {
+      const pending = fake()
+      const s = await shown(pending)
+      const host = s.t.host as unknown as { confirmIntent: (ask: { count: number; titles: Array<string | null> }, signal: AbortSignal) => Promise<string> }
+      void host.confirmIntent({ count: 2, titles: [null, '  '] }, new AbortController().signal)
+      const ask = s.confirms().at(-1)?.[1] as { id: string }
+      s.t.host.confirmShown(ask.id, CONV)
+      expect(pending.set).toHaveBeenCalledWith(CONV, ask.id, 'Knowledge citations to confirm')
+    })
   })
 
   it('a second dialog while one is up is unavailable (not the user\'s no), and the first still works', async () => {

@@ -290,7 +290,7 @@ export class KnowledgeHost {
 
   /** Sends one change, again under a new number while the daemon calls it
    * stale. A PUT stops once its binding is no longer the one wanted. */
-  private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, body?: string): Promise<HostResult> {
+  private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, fields: Record<string, unknown> = {}): Promise<HostResult> {
     let last: Failure = 'stale_sequence'
     const entry = this.wanted.get(bindingId)
     for (let attempt = 0; attempt < MAX_STALE_RETRIES; attempt++) {
@@ -299,10 +299,11 @@ export class KnowledgeHost {
       if (this.wanted.get(bindingId) !== entry || (method === 'PUT' && entry === undefined)) return failure('binding_inactive')
       const conn = this.deps.connection()
       if (!conn) return failure('daemon_unavailable')
-      const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}?seq=${this.deps.clock.next()}`
+      const path = `${BINDINGS}/${encodeURIComponent(bindingId)}${suffix}`
+      const payload = JSON.stringify({ seq: this.deps.clock.next(), ...fields })
       let response: { status: number; code?: string }
       try {
-        response = await this.deps.transport(conn, method, path, body)
+        response = await this.deps.transport(conn, method, path, payload)
       } catch {
         return failure('daemon_unavailable')
       }
@@ -325,12 +326,12 @@ function classify(response: { status: number; code?: string }): Failure {
   return 'refused'
 }
 
-function activationBody(endpoint: KnowledgeEndpoint | null): string | undefined {
-  return endpoint ? JSON.stringify({ endpoint: endpoint.endpoint, knowledge_base_ids: endpoint.knowledgeBaseIds }) : undefined
+function activationBody(endpoint: KnowledgeEndpoint | null): Record<string, unknown> {
+  return endpoint ? { endpoint: endpoint.endpoint, knowledge_base_ids: endpoint.knowledgeBaseIds } : {}
 }
 
-function credentialBody(credential: KnowledgeCredential): string {
-  return JSON.stringify({ kind: credential.kind, value: credential.value, expires_at: credential.expiresAt })
+function credentialBody(credential: KnowledgeCredential): Record<string, unknown> {
+  return { kind: credential.kind, value: credential.value, expires_at: credential.expiresAt }
 }
 
 /** Loopback HTTP to the daemon; reads nothing from a response but its error code. */

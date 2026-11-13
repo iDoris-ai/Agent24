@@ -220,7 +220,7 @@ fn covered_fixtures_roundtrip() {
     println!("covered {} fixtures: {names:#?}", names.len());
     assert_eq!(
         names.len(),
-        40,
+        41,
         "manifest changed; review coverage: {names:#?}"
     );
     assert!(
@@ -597,6 +597,20 @@ fn ready_operations_shape() {
             json!({"state": "not_ready", "reason": "vector_store_unavailable"}),
             true,
         ),
+        // R8.2 (r13): the optional candidate key has the operation state shape.
+        (
+            "/operations",
+            "candidate",
+            json!({"state": "unknown"}),
+            false,
+        ),
+        ("/operations", "candidate", Value::Null, false),
+        (
+            "/operations",
+            "candidate",
+            json!({"state": "disabled", "reason": "routes_not_registered"}),
+            true,
+        ),
     ];
     for (ptr, key, v, ok) in cases {
         let body = mutated(file, ptr, key, v.clone());
@@ -637,13 +651,20 @@ fn unknown_accepted<T: DeserializeOwned>(v: &Value) -> Vec<String> {
 /// at every level.
 #[test]
 fn capabilities_fixture_roundtrip() {
+    // r13: the write operation classes of R9.2 round-trip too.
+    for file in [
+        "capabilities.integration.json",
+        "capabilities.write-operations.json",
+    ] {
+        let body = load(file)["response"]["body"].clone();
+        assert!(decode::<CapabilitiesData>(&body).is_ok(), "{file}");
+        let kc = body["integration"]["agent24_knowledge"].clone();
+        let rt = roundtrip::<KnowledgeCapabilities>(&kc);
+        assert!(rt.is_ok(), "{file}: {}", rt.unwrap_err());
+        let accepted = unknown_accepted::<KnowledgeCapabilities>(&kc);
+        assert!(accepted.is_empty(), "{file}: {accepted:?}");
+    }
     let body = load("capabilities.integration.json")["response"]["body"].clone();
-    assert!(decode::<CapabilitiesData>(&body).is_ok());
-    let kc = body["integration"]["agent24_knowledge"].clone();
-    let rt = roundtrip::<KnowledgeCapabilities>(&kc);
-    assert!(rt.is_ok(), "{}", rt.unwrap_err());
-    let accepted = unknown_accepted::<KnowledgeCapabilities>(&kc);
-    assert!(accepted.is_empty(), "{accepted:?}");
     let mut up = body.clone();
     obj(&mut up, "").insert("x_upstream".into(), json!(1));
     assert!(decode::<CapabilitiesData>(&up).is_ok());
@@ -667,6 +688,20 @@ fn capabilities_bounds() {
         ("", "mode", json!("direct"), false),
         ("", "mode", json!("standalone"), true),
         ("", "supported_operations", json!(["ingest"]), false),
+        // R9.2 (r13): operation class names, never the kb_* capability values.
+        (
+            "",
+            "supported_operations",
+            json!(["search", "kb_candidate_propose"]),
+            false,
+        ),
+        ("", "supported_operations", json!(["candidate.list"]), false),
+        (
+            "",
+            "supported_operations",
+            json!(["candidate.review", "candidate.approve", "entry.withdraw"]),
+            true,
+        ),
         ("", "supported_operations", json!([]), true),
         ("", "server_version", Value::Null, false),
         ("/limits", "max_results", json!(0), false),

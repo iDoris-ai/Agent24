@@ -6,7 +6,35 @@ const MIN = 60 * 1000
 
 describe('readUiExchange (Weknora C2-01b2)', () => {
   it('reads the session and ignores unknown fields', () => {
-    expect(readUiExchange({ ...EXCHANGE, extra: 1 })).toEqual({ sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list', 'chunk.list'], knowledgeBaseIds: ['kb-a'] })
+    expect(readUiExchange({ ...EXCHANGE, extra: 1 })).toEqual({ sessionToken: 'jwt', expiresInS: 600, ops: ['kb.list', 'chunk.list'], knowledgeBaseIds: ['kb-a'], droppedOps: 0 })
+  })
+
+  it('drops an op outside the closed set instead of refusing the session (#1670 c2; READONLY §0.3)', () => {
+    // A newer server may list an op this host does not know: the page still gets its session for what the host knows.
+    expect(readUiExchange({ ...EXCHANGE, ops: ['kb.list', 'search', 'future.op', 'chunk.list'] })?.ops).toEqual(['kb.list', 'chunk.list'])
+    expect(readUiExchange({ ...EXCHANGE, ops: ['future.op'] })?.ops).toEqual([])
+    // The two kinds of name a UI session may hold: read ops and the three write ops (R1.8 r13).
+    const all = ['kb.list', 'candidate.review', 'candidate.approve', 'entry.withdraw']
+    expect(readUiExchange({ ...EXCHANGE, ops: all })?.ops).toEqual(all)
+    // An op the server must never put in a UI session is just unknown here: it gets no route either.
+    expect(readUiExchange({ ...EXCHANGE, ops: ['candidate.propose', 'kb.list'] })?.ops).toEqual(['kb.list'])
+    // A known op twice is a malformed answer, not a new name.
+    expect(readUiExchange({ ...EXCHANGE, ops: ['entry.withdraw', 'future.op', 'entry.withdraw'] })).toBeNull()
+    expect(readUiExchange({ ...EXCHANGE, ops: ['candidate.approve', 'Candidate.approve', 'candidate.approve'] })).toBeNull()
+  })
+
+  it('counts what it drops, repeats included, and nothing else (David 2026-11-11: logged as a count)', () => {
+    expect(readUiExchange({ ...EXCHANGE, ops: ['kb.list', 'future.op', 'future.op', 'search'] })?.droppedOps).toBe(3)
+    expect(readUiExchange({ ...EXCHANGE, ops: ['future.op'] })).toMatchObject({ ops: [], droppedOps: 1 })
+    expect(readUiExchange({ ...EXCHANGE, ops: ['kb.list', 'candidate.approve'] })?.droppedOps).toBe(0)
+    expect(readUiExchange({ ...EXCHANGE, ops: [] })?.droppedOps).toBe(0)
+  })
+
+  it('matches op names exactly, and an unknown op repeated is still just dropped (Codex C4)', () => {
+    // Case and padding variants are not the write op: unknown, dropped.
+    expect(readUiExchange({ ...EXCHANGE, ops: ['Candidate.approve', 'candidate.approve ', ' entry.withdraw'] })?.ops).toEqual([])
+    expect(readUiExchange({ ...EXCHANGE, ops: ['future.op', 'future.op', 'kb.list'] })?.ops).toEqual(['kb.list'])
+    expect(readUiExchange({ ...EXCHANGE, ops: [] })?.ops).toEqual([])
   })
 
   it('takes the scope the server computed from C as it is (U2.1; David 2026-11-08, option C)', () => {
@@ -19,7 +47,8 @@ describe('readUiExchange (Weknora C2-01b2)', () => {
     ['no token', { ...EXCHANGE, session_token: '' }],
     ['lifetime not a positive integer', { ...EXCHANGE, expires_in: 0 }],
     ['lifetime fractional', { ...EXCHANGE, expires_in: 1.5 }],
-    ['op outside the closed set', { ...EXCHANGE, ops: ['kb.list', 'search'] }],
+    ['non-string op', { ...EXCHANGE, ops: ['kb.list', 7] }],
+    ['ops not a list', { ...EXCHANGE, ops: 'kb.list' }],
     ['duplicate op', { ...EXCHANGE, ops: ['kb.list', 'kb.list'] }],
     ['empty scope', { ...EXCHANGE, effective_scope: { knowledge_base_ids: [] } }],
     ['duplicate scope id', { ...EXCHANGE, effective_scope: { knowledge_base_ids: ['kb-a', 'kb-a'] } }],
