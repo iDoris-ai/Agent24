@@ -1376,3 +1376,242 @@ async fn an_elevation_grant_is_bound_to_the_knowledge_body() {
     assert!(response.contains("elevation_invalid"), "{response}");
     assert!(state.knowledge_host.is_empty());
 }
+
+// ── K-B6 on S2-3: the parser and the registry agree (kb6-port-validation-placement A)
+
+/// The approval text comes from [`parse_change_body`], the change from the
+/// registry. Each rule lives in both, so every input here must get the same
+/// answer from each side: accepted by both or refused by both. The inputs are
+/// the registry's own rule-by-rule cases (`host/tests.rs`) plus their edges.
+#[test]
+fn the_parser_and_the_registry_refuse_the_same_endpoints() {
+    use agent24_knowledge::host::{
+        ChangeError, Endpoint, KnowledgeHostRegistry, MAX_KNOWLEDGE_BASE_ID_CHARS,
+    };
+    let ids = |list: &[&str]| list.iter().map(|id| (*id).to_owned()).collect::<Vec<_>>();
+    let numbered = |n: usize| (0..n).map(|i| format!("kb-{i}")).collect::<Vec<_>>();
+    let url = "https://kb.example/api/v1";
+    let cases: Vec<(&str, &str, Vec<String>, bool)> = vec![
+        ("valid", url, ids(&["kb-a"]), true),
+        (
+            "loopback http",
+            "http://127.0.0.1:8088/api/v1",
+            ids(&["kb-a"]),
+            true,
+        ),
+        (
+            "plain http",
+            "http://kb.example/api/v1",
+            ids(&["kb-a"]),
+            false,
+        ),
+        (
+            "other scheme",
+            "ftp://kb.example/api/v1",
+            ids(&["kb-a"]),
+            false,
+        ),
+        ("not a url", "kb.example/api/v1", ids(&["kb-a"]), false),
+        (
+            "user info",
+            "https://u:p@kb.example/api/v1",
+            ids(&["kb-a"]),
+            false,
+        ),
+        (
+            "query",
+            "https://kb.example/api/v1?x=1",
+            ids(&["kb-a"]),
+            false,
+        ),
+        ("no ids", url, Vec::new(), false),
+        ("blank id", url, ids(&[" "]), false),
+        ("duplicate ids", url, ids(&["kb-a", "kb-a"]), false),
+        (
+            "longest id",
+            url,
+            vec!["k".repeat(MAX_KNOWLEDGE_BASE_ID_CHARS)],
+            true,
+        ),
+        (
+            "id too long",
+            url,
+            vec!["k".repeat(MAX_KNOWLEDGE_BASE_ID_CHARS + 1)],
+            false,
+        ),
+        // Characters, not bytes: an id of multi-byte characters at the limit.
+        (
+            "longest id, two-byte characters",
+            url,
+            vec!["\u{e9}".repeat(MAX_KNOWLEDGE_BASE_ID_CHARS)],
+            true,
+        ),
+        (
+            "id too long, two-byte characters",
+            url,
+            vec!["\u{e9}".repeat(MAX_KNOWLEDGE_BASE_ID_CHARS + 1)],
+            false,
+        ),
+        ("most ids", url, numbered(MAX_KNOWLEDGE_BASES), true),
+        (
+            "too many ids",
+            url,
+            numbered(MAX_KNOWLEDGE_BASES + 1),
+            false,
+        ),
+    ];
+    for (name, base_url, knowledge_base_ids, valid) in cases {
+        let body = serde_json::json!({
+            "seq": 1,
+            "endpoint": base_url,
+            "knowledge_base_ids": knowledge_base_ids,
+        })
+        .to_string();
+        let parsed = parse_change_body("PUT", false, body.as_bytes());
+        assert_eq!(
+            matches!(
+                parsed,
+                Some(ParsedChange::Activate {
+                    endpoint: Some(_),
+                    ..
+                })
+            ),
+            valid,
+            "parser: {name}"
+        );
+        let registry = KnowledgeHostRegistry::default();
+        let applied = registry.activate(
+            "host",
+            "b1",
+            1,
+            Endpoint {
+                base_url: base_url.to_owned(),
+                knowledge_base_ids,
+            },
+        );
+        if valid {
+            assert_eq!(applied, Ok(()), "registry: {name}");
+        } else {
+            assert!(
+                matches!(applied, Err(ChangeError::Invalid(_))),
+                "registry: {name} {applied:?}"
+            );
+        }
+    }
+}
+
+/// Same agreement for a pushed credential. The expired case is an hour in the
+/// past and the valid ones an hour ahead, so the two `unix_now()` reads cannot
+/// fall on either side of the boundary.
+#[test]
+fn the_parser_and_the_registry_refuse_the_same_credentials() {
+    use agent24_knowledge::host::{Change, ChangeError, Credential, KnowledgeHostRegistry};
+    let ahead = unix_now() + 3_600;
+    let past = unix_now() - 3_600;
+    let cases: Vec<(&str, &str, String, u64, bool)> = vec![
+        ("bearer", "bearer", "token".into(), ahead, true),
+        ("api key", "api_key", "key".into(), ahead, true),
+        ("empty", "bearer", String::new(), ahead, false),
+        (
+            "at the cap",
+            "bearer",
+            "x".repeat(MAX_CREDENTIAL_BYTES),
+            ahead,
+            true,
+        ),
+        (
+            "past the cap",
+            "bearer",
+            "x".repeat(MAX_CREDENTIAL_BYTES + 1),
+            ahead,
+            false,
+        ),
+        (
+            "control character",
+            "bearer",
+            "SECRET\n".into(),
+            ahead,
+            false,
+        ),
+        ("space", "bearer", "a b".into(), ahead, false),
+        ("not ascii", "bearer", "s\u{e9}cret".into(), ahead, false),
+        ("expired", "api_key", "key".into(), past, false),
+    ];
+    for (name, kind, value, expires_at, valid) in cases {
+        let body = serde_json::json!({
+            "seq": 2,
+            "kind": kind,
+            "value": value,
+            "expires_at": expires_at,
+        })
+        .to_string();
+        let parsed = parse_change_body("PUT", true, body.as_bytes());
+        assert_eq!(
+            matches!(parsed, Some(ParsedChange::PushCredential { .. })),
+            valid,
+            "parser: {name}"
+        );
+        let registry = KnowledgeHostRegistry::default();
+        registry.apply("host", "b1", 1, Change::Activate).unwrap();
+        let credential = if kind == "bearer" {
+            Credential::Bearer(value)
+        } else {
+            Credential::ApiKey(value)
+        };
+        let applied = registry.push_credential("host", "b1", 2, credential, expires_at);
+        if valid {
+            assert_eq!(applied, Ok(()), "registry: {name}");
+        } else {
+            assert!(
+                matches!(applied, Err(ChangeError::Invalid(_))),
+                "registry: {name} {applied:?}"
+            );
+        }
+    }
+}
+
+/// K-B6 had no case for this: a well-formed activation whose endpoint the
+/// registry would refuse leaves nothing to approve, so no dialog is shown
+/// for a change that could not run.
+#[tokio::test]
+async fn an_endpoint_the_registry_would_refuse_is_not_an_elevated_operation() {
+    let (state, peer, token, capture) = captured_shell().await;
+    let body = serde_json::json!({
+        "seq": 1,
+        "endpoint": "http://kb.example/api/v1",
+        "knowledge_base_ids": ["kb-a"],
+    })
+    .to_string();
+    let before = capture.0.lock().unwrap().len();
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .remember_knowledge_request(
+            &token.token_id,
+            "PUT",
+            BINDING_TEMPLATE,
+            BINDING,
+            body.as_bytes(),
+        );
+    let (pending, _challenge) = tokio::sync::oneshot::channel();
+    let refused = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .elevate(
+            &peer,
+            &token.token_id,
+            ElevateRequest {
+                method: "PUT".into(),
+                path: BINDING.into(),
+                body_sha256: body_digest(body.as_bytes()),
+                client_summary: "ignored".into(),
+            },
+            pending,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(refused.unwrap_err(), EnrollErrorCode::NotElevatedOperation);
+    assert_eq!(capture.0.lock().unwrap().len(), before);
+}

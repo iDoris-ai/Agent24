@@ -783,7 +783,7 @@ async fn serve_presence(
     use crate::presence_service::{Decision, Event};
     // Only the desktop app vouches for presence; `role` is a request, the
     // identity is the daemon's own check (#1715 §1).
-    if peer.identity.identifier != crate::knowledge_host::DESKTOP_SHELL_IDENTIFIER {
+    if peer.identity.identifier != crate::knowledge_routes::DESKTOP_SHELL_IDENTIFIER {
         send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
         return;
     }

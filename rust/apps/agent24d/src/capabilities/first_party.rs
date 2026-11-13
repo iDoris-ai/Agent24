@@ -212,7 +212,7 @@ impl FirstPartyAuthority {
             ("PUT" | "DELETE", "/api/v1/host/knowledge/bindings/{binding_id}/credential") => true,
             _ => return,
         };
-        let Some(parsed) = crate::knowledge_host::parse_change_body(method, is_credential, bytes)
+        let Some(parsed) = crate::knowledge_routes::parse_change_body(method, is_credential, bytes)
         else {
             return;
         };
@@ -871,7 +871,7 @@ fn binding_id_of(path: &str, credential_route: bool) -> Option<String> {
         .decode_utf8()
         .ok()?
         .into_owned();
-    crate::knowledge_host::valid_binding_id(&id).then_some(id)
+    crate::knowledge_routes::valid_binding_id(&id).then_some(id)
 }
 
 fn expires_rfc3339(secs: u64) -> Option<String> {
@@ -886,9 +886,10 @@ fn expires_rfc3339(secs: u64) -> Option<String> {
 fn knowledge_summary(
     path: &str,
     credential_route: bool,
-    parsed: &crate::knowledge_host::ParsedChange,
+    parsed: &crate::knowledge_routes::ParsedChange,
 ) -> Option<String> {
-    use crate::knowledge_host::{Credential, ParsedChange};
+    use crate::knowledge_routes::ParsedChange;
+    use agent24_knowledge::host::Credential;
     let id = shown(&binding_id_of(path, credential_route)?)?;
     match parsed {
         ParsedChange::Activate {

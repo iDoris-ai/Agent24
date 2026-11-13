@@ -90,7 +90,7 @@
 - 签了名的 CLI 只自动取得日常级（`CORE-2-ENROLL-DESIGN.md:264`「插件调用合法 CLI」一行：仍可读记忆、建 run、取消 run，这是 ADR-037 已接受的残余）。`GET /models` 是日常级（同文件 `:154`）。
 - 所以「CLI 用不了桌面的 daemon」只对未签名构建成立。W4b、W4c 的原期望是 CORE-2 之前的前提，现在只对未签名构建保留。
 - 签名 CLI 借不到宿主权限、也停不掉 daemon，靠下面这几层运行时拦截，锁定测试为：
-  - 宿主判定只认 ProductHost 和 `ai.auraai.agent24` 的外壳（`knowledge_host.rs` `host_capability`）：`knowledge_host::tests::cli_shells_are_not_knowledge_hosts`，以及 W7g。
+  - 宿主判定只认 ProductHost 和 `ai.auraai.agent24` 的外壳（`knowledge_routes.rs` `host_capability`，S2-3 之后的位置）：`knowledge_routes::tests::cli_shells_are_not_knowledge_hosts`，以及 W7g。
   - 外壳令牌不含在场通道（#1447 F1）：`server::first_party_http_tests::first_party_token_is_not_granted_presence_operations`、`…::first_party_token_cannot_reach_presence_routes`、`presence_desktop::tests::gate_refuses_a_first_party_authorization`。
   - 服务模式的在场角色只给桌面：`enroll_endpoint::presence_tests::only_the_desktop_app_may_hold_the_presence_role`、`…::outside_service_mode_the_presence_role_is_refused`。
   - shutdown 的批准文字：#1760 的 `server::elevation_summaries_http_tests::shutdown_has_its_fixed_text`。
