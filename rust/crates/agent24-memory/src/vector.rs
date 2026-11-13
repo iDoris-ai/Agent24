@@ -63,7 +63,7 @@ pub trait Embedder: Send + Sync {
 /// probe sentence so the probe digest moves when the format changes.
 pub const EMBED_TEXT_FORMAT: &str = "txt1";
 
-fn index_revision(model_revision: &str) -> String {
+pub(crate) fn index_revision(model_revision: &str) -> String {
     format!("{model_revision}:{EMBED_TEXT_FORMAT}")
 }
 
@@ -81,7 +81,7 @@ fn embed_input(subject: &str, predicate: &str, object_json: &str) -> String {
     format!("{subject} {predicate} {}", object_plain_text(object_json))
 }
 
-fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+pub(crate) fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(v.len() * 4);
     for f in v {
         out.extend_from_slice(&f.to_le_bytes());
@@ -89,7 +89,7 @@ fn vec_to_blob(v: &[f32]) -> Vec<u8> {
     out
 }
 
-fn blob_to_vec(b: &[u8]) -> Vec<f32> {
+pub(crate) fn blob_to_vec(b: &[u8]) -> Vec<f32> {
     // Manual 4-byte stride rather than `chunks_exact(4)` (CI clippy flags a
     // constant chunk size); trailing <4 bytes are impossible given the migration's
     // `CHECK(length(vec) = dims * 4)` but are simply ignored here.
@@ -121,6 +121,35 @@ pub(crate) fn cosine(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// Reject a misbehaving embedder's output (see [`VectorRetriever::check_embedding`]).
+pub(crate) fn validate_embedding<E: Embedder + ?Sized>(
+    embedder: &E,
+    emb: &Embedding,
+) -> Result<()> {
+    if emb.model_id != embedder.model_id() || emb.revision != embedder.revision() {
+        return Err(MemoryError::Embedder(format!(
+            "declared {}/{} but returned {}/{}",
+            embedder.model_id(),
+            embedder.revision(),
+            emb.model_id,
+            emb.revision
+        )));
+    }
+    if emb.dims as usize != emb.vector.len() {
+        return Err(MemoryError::Embedder(format!(
+            "dims {} != vector length {}",
+            emb.dims,
+            emb.vector.len()
+        )));
+    }
+    if !emb.vector.iter().all(|x| x.is_finite()) {
+        return Err(MemoryError::Embedder(
+            "non-finite vector component".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// SQLite-backed local vector retriever over the shared memory DB, with an FTS
 /// fallback for owners/queries with no current-model vectors.
 #[derive(Clone)]
@@ -145,28 +174,7 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
     /// would embed forever and search never find it, review #123 M1), the vector
     /// length must equal `dims` (M2), and every component must be finite (M3).
     fn check_embedding(&self, emb: &Embedding) -> Result<()> {
-        if emb.model_id != self.embedder.model_id() || emb.revision != self.embedder.revision() {
-            return Err(MemoryError::Embedder(format!(
-                "declared {}/{} but returned {}/{}",
-                self.embedder.model_id(),
-                self.embedder.revision(),
-                emb.model_id,
-                emb.revision
-            )));
-        }
-        if emb.dims as usize != emb.vector.len() {
-            return Err(MemoryError::Embedder(format!(
-                "dims {} != vector length {}",
-                emb.dims,
-                emb.vector.len()
-            )));
-        }
-        if !emb.vector.iter().all(|x| x.is_finite()) {
-            return Err(MemoryError::Embedder(
-                "non-finite vector component".to_owned(),
-            ));
-        }
-        Ok(())
+        validate_embedding(&self.embedder, emb)
     }
 
     /// Embed the owner's current, qualified assertions that LACK a vector under

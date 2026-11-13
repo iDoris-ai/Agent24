@@ -3962,6 +3962,9 @@ pub(crate) mod tests {
     mod session_memory_tests {
         include!("session_memory_tests.rs");
     }
+    mod hybrid_recall_tests {
+        include!("hybrid_recall_tests.rs");
+    }
     mod session_failure_tests {
         include!("session_failure_tests.rs");
     }

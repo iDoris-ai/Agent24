@@ -64,6 +64,9 @@ pub struct SessionMemory {
     summarizer: Arc<dyn Summarizer>,
     policy: CompactionPolicy,
     recall_budget: usize,
+    /// VR-3: hybrid (FTS + vector) recall. `None` is today's pure-FTS recall.
+    /// Held here, not rebuilt per call, because it owns the embedder breaker.
+    hybrid: Option<Arc<agent24_memory::hybrid::HybridRetriever>>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(test)]
     commit_probe: Option<Arc<CommitAcknowledgementProbe>>,
@@ -89,6 +92,7 @@ impl SessionMemory {
             summarizer,
             policy: CompactionPolicy::default(),
             recall_budget: DEFAULT_RECALL_BUDGET,
+            hybrid: None,
             locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             commit_probe: None,
@@ -131,6 +135,26 @@ impl SessionMemory {
         &self.kv
     }
 
+    /// VR-3: recall through the hybrid retriever (keyword + vector, RRF) with
+    /// this embedder. Without it recall is pure FTS. The embedder is only ever
+    /// called from [`Self::recall`], after the pause check.
+    ///
+    /// Safety contract for VR-4: pass ONLY VR-1's local (loopback-only)
+    /// embedder. Outbound safety relies on it — the prompt and the facts are
+    /// sent to the embedder, and recalled labels assume that never leaves the
+    /// machine. Never wire a remote or cloud embedder here.
+    #[must_use]
+    pub fn with_embedder(mut self, embedder: Arc<dyn agent24_memory::vector::Embedder>) -> Self {
+        self.hybrid = Some(Arc::new(self.kv.hybrid_retriever(embedder)));
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_hybrid(mut self, hybrid: agent24_memory::hybrid::HybridRetriever) -> Self {
+        self.hybrid = Some(Arc::new(hybrid));
+        self
+    }
+
     #[must_use]
     pub fn with_policy(mut self, policy: CompactionPolicy) -> Self {
         self.policy = policy;
@@ -165,11 +189,21 @@ impl SessionMemory {
             return Ok(None);
         }
 
-        let hits = self
-            .kv
-            .retriever()
-            .search_any(prompt, &self.owner, DEFAULT_RECALL_TOP_K)
-            .await?;
+        // Hits are ledger rows either way: classification and `source_ref`
+        // below come from the row, never from which route found it.
+        let hits = match &self.hybrid {
+            Some(hybrid) => {
+                hybrid
+                    .search(prompt, &self.owner, DEFAULT_RECALL_TOP_K)
+                    .await?
+            }
+            None => {
+                self.kv
+                    .retriever()
+                    .search_any(prompt, &self.owner, DEFAULT_RECALL_TOP_K)
+                    .await?
+            }
+        };
         let mut content = String::from(RECALL_PREFIX);
         // Reserve room for the end marker up front — it is always appended
         // once at least one item made it in, so it must count against the
