@@ -615,14 +615,69 @@ fn start(
             "stderr",
         )));
     }
-    ModuleProcess::new(
+    let process = ModuleProcess::new(
         child,
         Generation::serving_package(upstream, artifact),
         token,
         drains,
         spec.http_path,
     )
-    .map_err(LaunchError::Spawn)
+    .map_err(LaunchError::Spawn)?;
+    // The child exists and `spawn` has not returned. A supervisor racing this
+    // against its shutdown token polls that token before it polls `spawn`, in
+    // the same `select`, so a cancel here is invisible to that poll.
+    #[cfg(test)]
+    note_child_spawned(spec.name, process.pid());
+    Ok(process)
+}
+
+/// Parks a callback in [`start`], after the child exists and before [`spawn`]
+/// returns. Several tests may arm one at once; each guard removes only its own.
+/// A hook ignores spawns whose name is not the module that test started.
+#[cfg(test)]
+type SpawnedHook = std::sync::Arc<dyn Fn(&str, i32) + Send + Sync>;
+
+#[cfg(test)]
+static SPAWNED_FOR_TEST: std::sync::Mutex<Vec<(u64, SpawnedHook)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+static SPAWNED_HOOK_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+#[cfg(test)]
+fn note_child_spawned(name: &str, pid: i32) {
+    let hooks = SPAWNED_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for (_, hook) in hooks {
+        hook(name, pid);
+    }
+}
+
+/// Arm `hook` until the returned guard drops, including when the test panics.
+#[cfg(test)]
+pub(crate) fn arm_spawned_for_test(hook: SpawnedHook) -> ClearSpawnedHook {
+    let id = SPAWNED_HOOK_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    SPAWNED_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((id, hook));
+    ClearSpawnedHook(id)
+}
+
+/// Removes the hook [`arm_spawned_for_test`] installed.
+#[cfg(test)]
+pub(crate) struct ClearSpawnedHook(u64);
+
+#[cfg(test)]
+impl Drop for ClearSpawnedHook {
+    fn drop(&mut self) {
+        SPAWNED_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, _)| *id != self.0);
+    }
 }
 
 /// The test binary is its own trampoline: started with `--exact` on

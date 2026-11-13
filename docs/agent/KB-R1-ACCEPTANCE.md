@@ -78,6 +78,7 @@
 | W7e | grant 只能用一次 | 用同一个 grant 再发一次 | 403 `elevation_invalid` |
 | W7f | 在场确认被拒 | 另起一个服务模式 daemon，在场确认答「拒绝」；登记成桌面外壳，先发一次不带 grant 的请求，再 `elevate` | 先 403；`elevate` 得 `presence_denied`；指名 binding 建 run 得 409 `knowledge_binding_inactive` |
 | W7g | CLI 外壳不是宿主 | 另起一个服务模式 daemon，登记身份为 CLI（`agent24`），改 binding、指名 binding 建 run | 两个都直接 403 `host_authority_required`，不进在场确认 |
+| W7h | 其余三个绑定路由（M5 B6） | 接着 W7d 做：推凭据 `PUT …/credential`（seq 2）、撤凭据 `DELETE …/credential`（seq 3）、停用 `DELETE …/bindings/kb-accept`（seq 4）。每个先不带 grant 发一次，`elevate` 后带 grant 重发；最后指名 binding 建 run | 每个都是先 403 `presence_required`，带 grant 后 204；建 run 得 409 `knowledge_binding_inactive`。桌面的 KnowledgeHost 在服务模式下也是这样逐个确认（knowledge-host.ts `elevatingTransport`） |
 | W6a | 桌面端的文档功能 | 装上 documents 包，按 W1 的方式拉起发布 head 的 daemon，用宿主凭据经 `agent24 documents request --host-stdin --json` 问 `{"op":"capabilities"}` | 30 秒内退出 0，`result` 行 `ok` 为 true，状态 200 |
 | W6b | 同上 | 同样的方式问 `{"op":"list"}` | 退出 0，200，`documents` 是空数组（新数据目录） |
 | W6c | 同上 | 同样的请求，凭据换成一个错的 | 退出 1，401 `unauthorized`。说明 W6a、W6b 的 200 确实经过了鉴权 |
@@ -90,7 +91,7 @@
 - 签了名的 CLI 只自动取得日常级（`CORE-2-ENROLL-DESIGN.md:264`「插件调用合法 CLI」一行：仍可读记忆、建 run、取消 run，这是 ADR-037 已接受的残余）。`GET /models` 是日常级（同文件 `:154`）。
 - 所以「CLI 用不了桌面的 daemon」只对未签名构建成立。W4b、W4c 的原期望是 CORE-2 之前的前提，现在只对未签名构建保留。
 - 签名 CLI 借不到宿主权限、也停不掉 daemon，靠下面这几层运行时拦截，锁定测试为：
-  - 宿主判定只认 ProductHost 和 `ai.auraai.agent24` 的外壳（`knowledge_host.rs` `host_capability`）：`knowledge_host::tests::cli_shells_are_not_knowledge_hosts`，以及 W7g。
+  - 宿主判定只认 ProductHost 和 `ai.auraai.agent24` 的外壳（`knowledge_routes.rs` `host_capability`，S2-3 之后的位置）：`knowledge_routes::tests::cli_shells_are_not_knowledge_hosts`，以及 W7g。
   - 外壳令牌不含在场通道（#1447 F1）：`server::first_party_http_tests::first_party_token_is_not_granted_presence_operations`、`…::first_party_token_cannot_reach_presence_routes`、`presence_desktop::tests::gate_refuses_a_first_party_authorization`。
   - 服务模式的在场角色只给桌面：`enroll_endpoint::presence_tests::only_the_desktop_app_may_hold_the_presence_role`、`…::outside_service_mode_the_presence_role_is_refused`。
   - shutdown 的批准文字：#1760 的 `server::elevation_summaries_http_tests::shutdown_has_its_fixed_text`。
@@ -102,12 +103,13 @@
 - W2b–W2f；
 - W3a、W3b、W5a。
 
-W7 不用 `--old` 和 `--new`。它的反面对照是把 `--enroll-new` 指向 K-B6（#1714）之前的 test-enrollment 版。用 ab/weknora 的 ce52eb6d^1（dc9ed826）编，W7a–W7c 照常 PASS，下面四条应当 FAIL：
+W7 不用 `--old` 和 `--new`。它的反面对照是把 `--enroll-new` 指向 K-B6（#1714）之前的 test-enrollment 版。用 ab/weknora 的 ce52eb6d^1（dc9ed826）编，W7a–W7c 照常 PASS，下面五条应当 FAIL：
 
 - W7d：K-B6 之前绑定路由没有批准文字，`elevate` 得 `not_elevated_operation`；宿主接口只认 ProductHost，桌面外壳指名 binding 的 run 是 403 `host_authority_required`；
 - W7e：没有 grant 可以再用；
 - W7f：`elevate` 同样得 `not_elevated_operation`，不是 `presence_denied`；
 - W7g：CLI 外壳先进在场确认，得 `presence_required`，而不是直接 403。
+- W7h：同 W7d，K-B6 之前这三个路由也没有批准文字，`elevate` 得 `not_elevated_operation`。
 
 2026-11-10 在本机跑过（ab/weknora b9de59e6 加本片）：W7 七条全部 PASS；指向 dc9ed826 的反面对照正好是上面四条 FAIL。两次的 W6 都因为 `--old` 目录里没有 `agent24-documents` 中止，与 W7 无关。
 

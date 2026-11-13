@@ -73,6 +73,7 @@ async fn present_prompt_without_recall_or_pause_still_forms_a_provider_request()
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -214,6 +215,7 @@ async fn pause_notice_completes_the_run_and_keeps_snapshot_rows() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -273,6 +275,7 @@ async fn paused_remember_run_completes_and_provider_gets_notice() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

@@ -49,10 +49,19 @@ export async function createChatSession(proxy: Proxy): Promise<string | null> {
 /** Asks `prompt` as a run in `sessionId` and waits for its answer.
  * `headroomConfirmed`: the user confirmed iDoris's reserved memory for this
  * turn (RunCreate `idoris_headroom_confirmed`), as on `/api/v1/chat`. */
-export async function askWithKnowledge(prompt: string, sessionId: string, deps: TurnDeps, headroomConfirmed = false): Promise<KnowledgeTurn> {
+export async function askWithKnowledge(
+  prompt: string,
+  sessionId: string,
+  deps: TurnDeps,
+  headroomConfirmed = false,
+  skillId: string | null = null,
+): Promise<KnowledgeTurn> {
   const sleep = deps.sleep ?? sleepFor
   const now = deps.now ?? Date.now
-  const body = headroomConfirmed ? { prompt, session_id: sessionId, idoris_headroom_confirmed: true } : { prompt, session_id: sessionId }
+  const body: { prompt: string; session_id: string; idoris_headroom_confirmed?: boolean; skill_id?: string } =
+    headroomConfirmed ? { prompt, session_id: sessionId, idoris_headroom_confirmed: true } : { prompt, session_id: sessionId }
+  // Every round of this conversation names the skill again. The daemon does not remember it.
+  if (skillId) body.skill_id = skillId
   const created = await deps.proxy({ method: 'POST', path: '/api/v1/runs', body })
   const runId = (created.data as { id?: unknown } | null)?.id
   if (!created.ok || typeof runId !== 'string') return failure(created.data, 'run_not_started')

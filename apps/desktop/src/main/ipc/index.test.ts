@@ -7,7 +7,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import http from 'node:http'
+import { EventEmitter } from 'node:events'
 import type { AddressInfo } from 'node:net'
+import type { ChildProcess } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const handlers = new Map<string, (event: unknown, ...args: unknown[]) => unknown>()
@@ -21,6 +24,15 @@ const promptRestorePassword = vi.fn()
 const promptUnlockPassword = vi.fn()
 const promptHomeImportPassword = vi.fn()
 const execFileMock = vi.fn()
+/** When set, the execFile mock returns this child instead of a dummy. */
+const omlxExecFile: { current: ((...args: unknown[]) => unknown) | null } = { current: null }
+/** What registerIpcHandlers' keepOwnedOmlxOnQuit answers (the resident service installed). */
+const keepOmlx = { current: false }
+/** What registerIpcHandlers' rememberKeptOmlx was told (ruling 乙). */
+const keptOmlx: Array<{ pid: number; port: number }> = []
+const rememberThrows = { current: false }
+/** What registerIpcHandlers' stopKeptOmlx does and how often it was asked (ruling A). */
+const keptStop: { calls: number; impl: () => Promise<void> } = { calls: 0, impl: () => Promise.resolve() }
 const appListeners = new Map<string, Set<() => void>>()
 const appFocus = vi.fn()
 function listenApp(event: string, fn: () => void): void {
@@ -108,20 +120,26 @@ vi.mock('node:child_process', async (orig) => ({
   ...(await orig<typeof import('node:child_process')>()),
   execFile: (...a: unknown[]) => {
     execFileMock(...a)
+    // Only the omlx spawn is replaced. A `pkill` call is recorded and not executed,
+    // so the suite cannot signal a server the user started themselves.
+    if (a[0] === 'omlx' && omlxExecFile.current) return omlxExecFile.current(...a)
     return { on: vi.fn(), kill: vi.fn() }
   },
 }))
 
 const endpoint = { port: 0, token: 'daemon-secret' }
+type Elevate = (r: { method: string; path: string; body: string; summary: string }) => Promise<string>
+const elevation: { current: ((fn: (elevate: Elevate, token: string) => Promise<unknown>) => Promise<unknown>) | null } = { current: null }
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: endpoint.port }),
   daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
   daemonCliEndpoint: () => ({ port: endpoint.port, token: endpoint.token }),
+  daemonElevation: () => elevation.current,
 }))
 
 import { IpcChannels } from '../../shared/ipc-types'
 import { createIpcGuard } from './guard'
-import { reachesHostInterface, reachesPresenceChannel, registerIpcHandlers, resetLastCommExportForTests } from './index'
+import { ensureOwnedOmlxQuit, OMLX_QUIT_STOP_BUDGET_MS, reachesHostInterface, reachesPresenceChannel, registerIpcHandlers, resetLastCommExportForTests, resetOmlxProcessForTests, setOmlxKillFallbackMsForTests, setOmlxStopGraceMsForTests, stopOwnedOmlx } from './index'
 
 const APP_URL = 'file:///app/renderer/index.html'
 const mainFrame = { url: APP_URL }
@@ -144,6 +162,9 @@ let identityListHasDefault = true
 let identityListFails = false
 // what GET /api/v1/comm/relay answers
 let currentRelays: { relays: string[]; configured: boolean } = { relays: [], configured: false }
+// M5 B3: POST /api/v1/schedules needs a grant, as an Elevated route does for a daily token.
+let presenceGate = false
+let elevationHeaders: (string | undefined)[] = []
 
 beforeAll(async () => {
   daemon = http.createServer((req, res) => {
@@ -152,7 +173,14 @@ beforeAll(async () => {
     req.on('end', () => {
       if (!(req.method === 'GET' && req.url === '/api/v1/comm/identity') && !(req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/')) && !(req.method === 'GET' && req.url === '/api/v1/os') && !(req.method === 'GET' && req.url === '/api/v1/attached') && !(req.method === 'GET' && req.url === '/api/v1/comm/relay')) seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, body: Buffer.concat(chunks).toString() })
       res.setHeader('Content-Type', 'application/json')
-      if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
+      if (presenceGate && req.method === 'POST' && (req.url === '/api/v1/schedules' || req.url?.startsWith('/api/v1/approvals/'))) {
+        const grant = req.headers['x-agent24-elevation']
+        elevationHeaders.push(typeof grant === 'string' ? grant : undefined)
+        if (grant !== 'grant-1') {
+          res.statusCode = 403
+          res.end(JSON.stringify({ error: { code: 'presence_required', message: 'Presence confirmation required' } }))
+        } else res.end(JSON.stringify({ id: 'sch_1' }))
+      } else if (req.url === '/v1/models' && modelsRequireKey && req.headers.authorization !== `Bearer ${modelsRequireKey}`) {
         res.statusCode = 401
         res.end(JSON.stringify({ error: 'unauthorized' }))
       } else if (req.url === '/v1/models' && reflectAuthAsModel) {
@@ -193,6 +221,18 @@ beforeAll(async () => {
           res.statusCode = 409
           res.end(JSON.stringify({ ok: false, error: 'nickname_exists', message: 'exists' }))
         } else res.end(JSON.stringify({ ok: true, data: { status: 'imported', nickname: 'r1', npub: 'npub1x', default: false } }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/skills/demo') {
+        res.end(JSON.stringify({
+          skill_id: 'demo', generation: 2, text_consistency: null, activations: [],
+          pointer: { origin: 'imported', body_revision_id: 'b1', evals_revision_id: 'e1', generation: 2 },
+          revisions: [
+            { revision_id: 'b1', origin: 'imported', semver: '1.0.0', kind: 'body', content_digest: 'aaaaaaaa11', created_at: 't' },
+            { revision_id: 'e1', origin: 'imported', semver: '1.0.0', kind: 'evals', content_digest: 'bbbbbbbb22', created_at: 't' },
+            { revision_id: 'b2', origin: 'imported', semver: '2.0.0', kind: 'body', content_digest: 'cafef00d99', created_at: 't' },
+          ],
+        }))
+      } else if (req.method === 'POST' && req.url === '/api/v1/skills/demo/activate') {
+        res.end(JSON.stringify({ result: 'activated' }))
       } else if (req.method === 'GET' && req.url === '/api/v1/comm/relay') {
         res.end(JSON.stringify({ ok: true, data: { relays: currentRelays.relays, source: 'config', configured: currentRelays.configured } }))
       } else if (req.method === 'PUT' && req.url === '/api/v1/comm/relay') {
@@ -242,6 +282,12 @@ beforeAll(async () => {
     promptUnlockPassword: (...a: unknown[]) => promptUnlockPassword(...a) as never,
     promptHomeImportPassword: (...a: unknown[]) => promptHomeImportPassword(...a) as never,
     exportTimeoutMs,
+    keepOwnedOmlxOnQuit: () => keepOmlx.current,
+    rememberKeptOmlx: (k: { pid: number; port: number }) => {
+      if (rememberThrows.current) throw new Error('disk full')
+      keptOmlx.push(k)
+    },
+    stopKeptOmlx: () => { keptStop.calls++; return keptStop.impl() },
     documentsModule: () => docStatus,
     documentsModuleActions: { uninstall: () => docUninstall(), install: () => docInstall() },
     guard: createIpcGuard({
@@ -257,6 +303,9 @@ afterAll(() => {
 })
 
 beforeEach(() => {
+  presenceGate = false
+  elevationHeaders = []
+  elevation.current = null
   modelsRequireKey = null
   reflectAuthAsModel = false
   reflectedKeyEncoding = null
@@ -284,6 +333,13 @@ beforeEach(() => {
   for (const r of hungExports.splice(0)) r.end(JSON.stringify({ ok: true, data: {} }))
   resetLastCommExportForTests()
   execFileMock.mockReset()
+  omlxExecFile.current = null
+  keepOmlx.current = false
+  keptOmlx.length = 0
+  rememberThrows.current = false
+  keptStop.calls = 0
+  keptStop.impl = () => Promise.resolve()
+  resetOmlxProcessForTests()
 })
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any -- tests poke at several result shapes
@@ -323,6 +379,25 @@ describe('A1 backendProxy allowlist', () => {
     expect(seen).toHaveLength(0)
   })
 
+  it('service mode: an elevated write is confirmed on the enrolment once, then retried with the grant (M5 B3)', async () => {
+    presenceGate = true
+    const asked: { method: string; path: string; body: string }[] = []
+    elevation.current = (fn) => fn(async (r) => { asked.push({ method: r.method, path: r.path, body: r.body }); return 'grant-1' }, endpoint.token)
+    const body = { name: 'daily', cron: '0 9 * * *' }
+    const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body })
+    expect(res).toMatchObject({ ok: true, status: 200, data: { id: 'sch_1' } })
+    expect(asked).toEqual([{ method: 'POST', path: '/api/v1/schedules', body: JSON.stringify(body) }])
+    expect(elevationHeaders).toEqual([undefined, undefined, 'grant-1'])
+    expect(seen.map((s) => s.body)).toEqual([JSON.stringify(body), JSON.stringify(body), JSON.stringify(body)])
+  })
+
+  it('with our own child (no enrolment) the 403 comes back as it is and nothing is retried (M5 B3)', async () => {
+    presenceGate = true
+    const res = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/schedules', body: { name: 'x' } })
+    expect(res).toMatchObject({ ok: false, status: 403, data: { error: { code: 'presence_required' } } })
+    expect(elevationHeaders).toEqual([undefined])
+  })
+
   it('forwards an allowed read with the daemon bearer token', async () => {
     const res = await call(IpcChannels.BackendProxy, { method: 'GET', path: '/api/v1/runs/r1?x=1' })
     expect(res.ok).toBe(true)
@@ -341,6 +416,42 @@ describe('A1 backendProxy allowlist', () => {
       expect(seen[0]?.method).toBe('POST')
       expect(seen[0]?.url).toBe('/api/v1/approvals/ap_1')
       expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'approve' })
+    })
+    it('service mode: one box, the daemon\'s presence box; its own is skipped (M5 B3, General 11-09)', async () => {
+      presenceGate = true
+      const presenceBoxes: string[] = []
+      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(`${r.method} ${r.path}`); return 'grant-1' }, endpoint.token)
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(presenceBoxes).toEqual(['POST /api/v1/approvals/ap_1'])
+      expect(res.ok).toBe(true)
+      expect(elevationHeaders).toEqual([undefined, undefined, 'grant-1'])
+    })
+    it('service mode, the presence box refused: nothing approved, still no box of its own', async () => {
+      presenceGate = true
+      elevation.current = (fn) => fn(async () => { throw new Error('denied') }, endpoint.token)
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(res).toMatchObject({ ok: false, status: 403 })
+      expect(elevationHeaders).toEqual([undefined, undefined])
+    })
+    it('service mode, then our own child published before the turn: no box, nothing approved (Codex B3b r2 C1)', async () => {
+      presenceGate = true
+      const presenceBoxes: string[] = []
+      // The turn is the old enrolment's; the connection now carries another token.
+      elevation.current = (fn) => fn(async (r) => { presenceBoxes.push(r.path); return 'grant-1' }, 'old-daily-token')
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(presenceBoxes).toEqual([])
+      expect(res).toMatchObject({ ok: false, status: 503 })
+      expect(elevationHeaders).toEqual([undefined])
+    })
+    it('our own child: one box, its own, and no presence asked', async () => {
+      showMessageBox.mockResolvedValue({ response: 0 })
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve' })
+      expect(showMessageBox).toHaveBeenCalledTimes(1)
+      expect(res.ok).toBe(true)
+      expect(elevation.current).toBeNull()
     })
     it('sends nothing when the user cancels', async () => {
       showMessageBox.mockResolvedValue({ response: 1 })
@@ -1402,6 +1513,31 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
     expect(seen.map((r) => JSON.parse(r.body).password)).toEqual(['wrong-home', 'home-pass-1'])
   })
 
+  it('skills: the confirmation is built in main from the daemon record, then one POST with the daemon generation', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    const result = await call(IpcChannels.SkillsActivate, {
+      skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1', summary: 'FORGED', expectedGeneration: 99,
+    })
+    expect(result.ok).toBe(true)
+    const opts = showMessageBox.mock.calls.at(-1)!.at(-1) as { message: string; detail: string }
+    expect(opts.message).toContain('"demo"')
+    expect(opts.detail).toContain('2.0.0')
+    expect(opts.detail).toContain('cafef00d')
+    expect(`${opts.message}${opts.detail}`).not.toContain('FORGED')
+    const posts = seen.filter((r) => r.method === 'POST')
+    expect(posts).toHaveLength(1)
+    expect(posts[0]!.url).toBe('/api/v1/skills/demo/activate')
+    expect(JSON.parse(posts[0]!.body)).toEqual({ expected_generation: 2, body_revision_id: 'b2', evals_revision_id: 'e1', accepted: [] })
+  })
+  it('skills: declining sends no POST, and the page cannot reach the route through the proxy', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    expect((await call(IpcChannels.SkillsActivate, { skillId: 'demo', bodyRevisionId: 'b2', evalsRevisionId: 'e1' })).data.error.code).toBe('cancelled')
+    expect(seen.filter((r) => r.method === 'POST')).toHaveLength(0)
+    const proxied = await call(IpcChannels.BackendProxy, { method: 'POST', path: '/api/v1/skills/demo/activate', body: {} })
+    expect(proxied.ok).toBe(false)
+    expect(seen.filter((r) => r.method === 'POST')).toHaveLength(0)
+  })
+
   it('relay: a changed list is confirmed natively, then PUT exactly as validated', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 0 })
     const list = ['wss://a.example', 'ws://localhost:7777']
@@ -1835,6 +1971,406 @@ describe('A4 oMLX IPC hardening', () => {
   })
 })
 
+describe('FU-114 OmlxStop only kills the process this app started', () => {
+  function alive(pid: number): boolean {
+    try {
+      process.kill(pid, 0)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** Fields ChildProcess marks readonly; the fakes assign them. */
+  type MutableChild = EventEmitter & {
+    pid: number
+    exitCode: number | null
+    signalCode: NodeJS.Signals | null
+    kill: ChildProcess['kill']
+    signals: Array<NodeJS.Signals | number | undefined>
+  }
+
+  function asChild(child: MutableChild): ChildProcess {
+    return child as unknown as ChildProcess
+  }
+
+  /** Exits on the first signal, so stop resolves without waiting out the grace. */
+  function dyingChild(): ChildProcess {
+    const child: MutableChild = Object.assign(new EventEmitter(), {
+      pid: 42,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      signals: [] as Array<NodeJS.Signals | number | undefined>,
+      kill: (() => true) as ChildProcess['kill'],
+    })
+    child.kill = (() => {
+      setImmediate(() => child.emit('exit', null, 'SIGTERM'))
+      return true
+    }) as ChildProcess['kill']
+    return asChild(child)
+  }
+
+  /** Records signals and stays up until the test emits `exit`. */
+  function heldChild(pid: number): MutableChild {
+    const child: MutableChild = Object.assign(new EventEmitter(), {
+      pid,
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      signals: [] as Array<NodeJS.Signals | number | undefined>,
+      kill: (() => true) as ChildProcess['kill'],
+    })
+    child.kill = ((signal?: NodeJS.Signals | number) => {
+      child.signals.push(signal)
+      return true
+    }) as ChildProcess['kill']
+    return child
+  }
+
+  function spawnNode(script: string, extraArgs: string[] = []): ChildProcess {
+    // stdout stays paused so `untilReady` still sees the buffered "ready" line.
+    return spawn(process.execPath, ['-e', script, ...extraArgs], { stdio: ['ignore', 'pipe', 'ignore'] })
+  }
+
+  async function untilReady(child: ChildProcess): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('child did not become ready')), 2_000)
+      const onData = (buf: Buffer): void => {
+        if (!buf.toString().includes('ready')) return
+        clearTimeout(timer)
+        child.stdout?.off('data', onData)
+        resolve()
+      }
+      child.stdout?.on('data', onData)
+      child.once('exit', () => {
+        clearTimeout(timer)
+        reject(new Error('child exited before ready'))
+      })
+    })
+  }
+
+  function killQuiet(pid: number | undefined): void {
+    if (pid == null) return
+    try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+  }
+
+  it('OmlxStop never invokes pkill', async () => {
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: false })
+    omlxExecFile.current = () => dyingChild()
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+    expect(execFileMock.mock.calls.map((c) => c[0])).not.toContain('pkill')
+  })
+
+  it('does not call pkill when the slot is empty', async () => {
+    // pkill is mocked and never runs (see the execFile mock). This locks
+    // "OmlxStop does not invoke pkill", not that a real pkill would spare a
+    // process. The child below only shows this handler sent it no signal.
+    // Its argv contains "omlx serve", which `pkill -f 'omlx serve'` would match.
+    const external = spawnNode(
+      'process.stdout.write("ready\\n"); setInterval(() => {}, 1000)',
+      ['omlx', 'serve'],
+    )
+    try {
+      await untilReady(external)
+      expect(external.pid).toEqual(expect.any(Number))
+      expect(alive(external.pid!)).toBe(true)
+      expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: false })
+      expect(alive(external.pid!)).toBe(true)
+      expect(execFileMock.mock.calls.map((c) => c[0])).not.toContain('pkill')
+    } finally {
+      killQuiet(external.pid)
+    }
+  })
+
+  it('stops the process this app spawned', async () => {
+    const owned: { current: ChildProcess | null } = { current: null }
+    omlxExecFile.current = () => {
+      owned.current = spawnNode('process.stdout.write("ready\\n"); setInterval(() => {}, 1000)')
+      return owned.current
+    }
+    try {
+      await call(IpcChannels.OmlxStart, 8123, 'k')
+      const child = owned.current
+      if (!child?.pid) throw new Error('owned child missing')
+      await untilReady(child)
+      const started = Date.now()
+      expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+      expect(alive(child.pid)).toBe(false)
+      // Died on SIGTERM, inside the grace window.
+      expect(Date.now() - started).toBeLessThan(5_000)
+    } finally {
+      killQuiet(owned.current?.pid)
+    }
+  })
+
+  it('escalates to SIGKILL when SIGTERM is ignored', async () => {
+    const graceMs = 400
+    setOmlxStopGraceMsForTests(graceMs)
+    const owned: { current: ChildProcess | null } = { current: null }
+    omlxExecFile.current = () => {
+      owned.current = spawnNode('process.on("SIGTERM", () => {}); process.stdout.write("ready\\n"); setInterval(() => {}, 1000)')
+      return owned.current
+    }
+    try {
+      await call(IpcChannels.OmlxStart, 8123, 'k')
+      const child = owned.current
+      if (!child?.pid) throw new Error('owned child missing')
+      await untilReady(child)
+      const started = Date.now()
+      expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+      const elapsed = Date.now() - started
+      expect(alive(child.pid)).toBe(false)
+      expect(elapsed).toBeGreaterThanOrEqual(graceMs - 50)
+    } finally {
+      killQuiet(owned.current?.pid)
+    }
+  })
+
+  it('resolves when exit never follows SIGKILL', async () => {
+    setOmlxStopGraceMsForTests(20)
+    setOmlxKillFallbackMsForTests(30)
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7101)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    const started = Date.now()
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+    expect(children[0]!.signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('treats kill() returning false as the pid already being gone', async () => {
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7102)
+      child.kill = (() => false) as ChildProcess['kill']
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    const started = Date.now()
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+    expect(Date.now() - started).toBeLessThan(500)
+    expect(children[0]!.signals).toEqual([])
+  })
+
+  it('start during stop spawns only after the old process exits', async () => {
+    setOmlxStopGraceMsForTests(400)
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7_000 + children.length)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    const stopping = call(IpcChannels.OmlxStop)
+    await vi.waitFor(() => expect(children[0]!.signals).toContain('SIGTERM'))
+    const starting = call(IpcChannels.OmlxStart, 8124, 'k')
+    await new Promise((r) => setTimeout(r, 40))
+    expect(children).toHaveLength(1)
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await stopping).toEqual({ ok: true, stopped: true })
+    expect(await starting).toMatchObject({ ok: true })
+    expect(children).toHaveLength(2)
+    expect(children[1]!.signals).toEqual([])
+    const stoppingNext = call(IpcChannels.OmlxStop)
+    await vi.waitFor(() => expect(children[1]!.signals).toContain('SIGTERM'))
+    children[1]!.emit('exit', null, 'SIGTERM')
+    expect(await stoppingNext).toEqual({ ok: true, stopped: true })
+  })
+
+  it('before-quit sends SIGTERM before the caller awaits, and bounds the wait', async () => {
+    expect(OMLX_QUIT_STOP_BUDGET_MS).toBe(5_000 + 2_000 + 1_000)
+    expect(OMLX_QUIT_STOP_BUDGET_MS).toBeLessThan(22_000)
+    setOmlxStopGraceMsForTests(20)
+    setOmlxKillFallbackMsForTests(30)
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7103)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    const pending = stopOwnedOmlx()
+    expect(children[0]!.signals[0]).toBe('SIGTERM')
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await pending).toBe(true)
+    omlxExecFile.current = () => {
+      const child = heldChild(7104)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8124, 'k')
+    emitApp('before-quit')
+    expect(children[1]!.signals[0]).toBe('SIGTERM')
+    const started = Date.now()
+    const quit = ensureOwnedOmlxQuit()
+    children[1]!.emit('exit', null, 'SIGTERM')
+    await quit
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  // PR#1 F1 (ruling 2026-11-13-pr1-omlx-quit-resident, A): with the resident
+  // service installed the daemon keeps running after the app quits and uses
+  // this oMLX, so quitting leaves it running; the user's own stop still stops it.
+  it('leaves the oMLX this app started running on quit when the resident service is installed', async () => {
+    keepOmlx.current = true
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7105)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    emitApp('before-quit')
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(children[0]!.signals).toEqual([])
+    // Recorded once, with the port it was started on (ruling 乙).
+    expect(keptOmlx).toEqual([{ pid: 7105, port: 8123 }])
+    // A quit that keeps stops nothing kept earlier either (ruling A).
+    expect(keptStop.calls).toBe(0)
+    const stopping = call(IpcChannels.OmlxStop)
+    await vi.waitFor(() => expect(children[0]!.signals).toContain('SIGTERM'))
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await stopping).toEqual({ ok: true, stopped: true })
+  })
+
+  it('reads whether to keep it at the quit, not when the handlers were registered', async () => {
+    keepOmlx.current = true
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7106)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    // 「完全退出」 removed the LaunchAgent before it quits.
+    keepOmlx.current = false
+    emitApp('before-quit')
+    expect(children[0]!.signals[0]).toBe('SIGTERM')
+    const quit = ensureOwnedOmlxQuit()
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await quit).toBe(true)
+    // Stopped, so nothing is left to record.
+    expect(keptOmlx).toEqual([])
+  })
+
+  // Ruling 2026-11-13-pr1-omlx-kept-deactivate (A): a quit with the plist gone
+  // stops what earlier quits left running, once, inside the same budget.
+  it('a quit that stops also stops what earlier quits left running, once for all its entries', async () => {
+    let release = () => {}
+    keptStop.impl = () => new Promise<void>((r) => { release = r })
+    emitApp('before-quit')
+    const quits = [ensureOwnedOmlxQuit(), ensureOwnedOmlxQuit()]
+    expect(keptStop.calls).toBe(1)
+    release()
+    expect(await Promise.all(quits)).toEqual([true, true])
+  })
+
+  it('the quit waits for the stop of what earlier quits left running, but no longer than its budget', async () => {
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    try {
+      keptStop.impl = () => new Promise<void>(() => {})
+      let settled: boolean | null = null
+      void ensureOwnedOmlxQuit().then((v) => { settled = v })
+      await vi.advanceTimersByTimeAsync(OMLX_QUIT_STOP_BUDGET_MS - 1)
+      expect(settled).toBeNull()
+      await vi.advanceTimersByTimeAsync(1)
+      expect(settled).toBe(false)
+      expect(keptStop.calls).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('looks at what earlier quits left running once per process, even when a quit enters again later', async () => {
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    // app.quit() fires before-quit again after the latch cleared.
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    expect(keptStop.calls).toBe(1)
+  })
+
+  it('a quit that stops goes on when stopping what earlier quits left running throws or fails', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    keptStop.impl = () => { throw new Error('ps failed') }
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    resetOmlxProcessForTests()
+    keptStop.impl = () => Promise.reject(new Error('lsof failed'))
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    expect(keptStop.calls).toBe(2)
+  })
+
+  it('a quit that keeps goes on when recording it fails', async () => {
+    keepOmlx.current = true
+    rememberThrows.current = true
+    omlxExecFile.current = () => asChild(heldChild(7109))
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    expect(() => emitApp('before-quit')).not.toThrow()
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+  })
+
+  it('an older child exiting late does not clear the port of the one started after it', async () => {
+    setOmlxStopGraceMsForTests(10)
+    setOmlxKillFallbackMsForTests(10)
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7110 + children.length)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    // It ignores both signals: the stop gives up after the kill fallback.
+    expect(await call(IpcChannels.OmlxStop)).toEqual({ ok: true, stopped: true })
+    await call(IpcChannels.OmlxStart, 8124, 'k')
+    expect(children).toHaveLength(2)
+    children[0]!.emit('exit', null, 'SIGKILL')
+    keepOmlx.current = true
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(keptOmlx).toEqual([{ pid: 7111, port: 8124 }])
+  })
+
+  it('records nothing on a quit that keeps when this app started no oMLX, or it already exited', async () => {
+    keepOmlx.current = true
+    emitApp('before-quit')
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(keptOmlx).toEqual([])
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7108)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    children[0]!.emit('exit', 0, null)
+    expect(await ensureOwnedOmlxQuit()).toBe(false)
+    expect(keptOmlx).toEqual([])
+  })
+
+  it('a stop the quit already started is waited for, whatever is read after it', async () => {
+    const children: MutableChild[] = []
+    omlxExecFile.current = () => {
+      const child = heldChild(7107)
+      children.push(child)
+      return asChild(child)
+    }
+    await call(IpcChannels.OmlxStart, 8123, 'k')
+    emitApp('before-quit')
+    expect(children[0]!.signals[0]).toBe('SIGTERM')
+    keepOmlx.current = true
+    let settled = false
+    const quit = ensureOwnedOmlxQuit().then((v) => { settled = true; return v })
+    await new Promise((r) => setTimeout(r, 10))
+    expect(settled).toBe(false)
+    children[0]!.emit('exit', null, 'SIGTERM')
+    expect(await quit).toBe(true)
+  })
+})
+
 // The node-daemon-era `modules:*` IPC (A5 on main) was deleted outright by
 // REV-01 on ab/core: its tests went with the handlers.
 
@@ -1842,13 +2378,13 @@ describe('UI-02 chat history IPC', () => {
   it('saves, lists, reads, deletes and clears through the guarded handlers', async () => {
     fs.rmSync(path.join(settingsDir, 'chat-history'), { recursive: true, force: true })
     const record = {
-      format: 'agent24.desktop.chat-history', version: 2, id: 'chat_ipc_1', title: '你好',
-      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
+      format: 'agent24.desktop.chat-history', version: 3, id: 'chat_ipc_1', title: '你好',
+      title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [], initiator: 'user', unseen: [],
       created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z',
       messages: [{ role: 'user', content: '你好', at: '2026-11-08T00:00:00.000Z', delivered: true }],
     }
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([])
-    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [] }
+    const summary = { id: 'chat_ipc_1', title: '你好', title_source: 'prompt', group_id: null, archived_at: null, created_at: '2026-11-08T00:00:00.000Z', updated_at: '2026-11-08T00:00:01.000Z', first_prompt: '你好', tasks: [], pending: [], initiator: 'user', unseen: [] }
     expect(await call(IpcChannels.ChatHistorySave, record)).toEqual(summary)
     expect(await call(IpcChannels.ChatHistoryList)).toEqual([summary])
     expect(await call(IpcChannels.ChatHistoryGet, 'chat_ipc_1')).toEqual(record)
@@ -1856,6 +2392,10 @@ describe('UI-02 chat history IPC', () => {
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '模型', 'model')).toEqual({ ...summary, title: '问候', title_source: 'user' })
     await expect(call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_1', '名', 'prompt')).rejects.toThrow('Invalid chat history title source')
     expect(await call(IpcChannels.ChatHistorySetTitle, 'chat_ipc_none', '名', 'user')).toBeNull()
+    // M6 C1: marking a conversation seen goes through the same guarded handlers.
+    expect(await call(IpcChannels.ChatHistoryMarkSeen, 'chat_ipc_1')).toEqual({ ...summary, title: '问候', title_source: 'user' })
+    expect(await call(IpcChannels.ChatHistoryMarkSeen, 'chat_ipc_none')).toBeNull()
+    await expect(call(IpcChannels.ChatHistoryMarkSeen, '../x')).rejects.toThrow('Invalid chat history id')
     // UI-06: groups and archiving go through the same guarded handlers.
     const { groups: [group] } = await call(IpcChannels.ChatGroupsCreate, '工作') as { groups: Array<{ id: string; name: string }> }
     expect(group).toMatchObject({ name: '工作', collapsed: false })

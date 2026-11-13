@@ -83,6 +83,16 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
   })
+  // SL-4. Mutation: add ('POST', '/api/v1/skills/{id}/activate') to ALLOWED_PROXY_ROUTES and this goes red.
+  it('keeps skill activation and rollback off the proxy (main-process IPC only)', () => {
+    expect(isAllowedProxyRoute('POST', '/api/v1/skills/demo/activate')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/skills/{id}/activate')).toBe(false)
+    expect(findAllowedRoute('POST', '/api/v1/skills/demo/activate')).toBeNull()
+    expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/activate'))).toBe(false)
+    expect(isAllowedProxyRoute('GET', '/api/v1/skills')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/skills/demo')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/skills')).toBe(false)
+  })
   it('lets the renderer read the component list and keeps the host report off the proxy', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/components')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/components?audience=host')).toBe(true)

@@ -1,8 +1,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::process::Command;
 
 #[test]
 fn chat_headroom_flag_and_confirmation_hint() {
@@ -50,7 +52,7 @@ fn chat_headroom_flag_and_confirmation_hint() {
         let ready = serde_json::json!({"type":"ready", "port":port, "token":"fixture", "version":"fixture"});
         std::fs::write(&daemon, format!("#!/bin/sh\nprintf '%s\\n' '{ready}'\n")).unwrap();
         std::fs::set_permissions(&daemon, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_agent24"));
+        let mut command = signature_command::command(env!("CARGO_BIN_EXE_agent24"));
         command
             .env("HOME", home.path())
             .env("AGENT24D_BIN", daemon)

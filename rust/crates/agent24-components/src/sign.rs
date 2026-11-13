@@ -72,6 +72,17 @@ pub fn signing_requirement<'a>(
 }
 
 pub trait SignatureVerifier {
+    /// Debug OS-package fixtures only; never substitutes for Developer ID verification.
+    #[cfg(debug_assertions)]
+    fn verify_adhoc(&self, _executable: &Path) -> Result<(), InstallError> {
+        Err(InstallError::SignatureMismatch)
+    }
+
+    /// Read the claimed team; callers must still verify its signature requirement.
+    fn team_id(&self, _executable: &Path) -> Result<String, InstallError> {
+        Err(InstallError::SignatureMismatch)
+    }
+
     fn check_platform(&self) -> Result<(), InstallError> {
         Ok(())
     }
@@ -160,6 +171,15 @@ const SPCTL: &str = "/usr/sbin/spctl";
 /// The system verifier: `codesign` + `spctl`, on any macOS architecture.
 pub struct Codesign;
 impl SignatureVerifier for Codesign {
+    #[cfg(debug_assertions)]
+    fn verify_adhoc(&self, executable: &Path) -> Result<(), InstallError> {
+        CodesignWith(SystemRunner).verify_adhoc(executable)
+    }
+
+    fn team_id(&self, executable: &Path) -> Result<String, InstallError> {
+        CodesignWith(SystemRunner).team_id(executable)
+    }
+
     fn check_platform(&self) -> Result<(), InstallError> {
         CodesignWith(SystemRunner).check_platform()
     }
@@ -216,6 +236,45 @@ impl<R: CommandRunner> CodesignWith<R> {
 }
 
 impl<R: CommandRunner> SignatureVerifier for CodesignWith<R> {
+    #[cfg(debug_assertions)]
+    fn verify_adhoc(&self, executable: &Path) -> Result<(), InstallError> {
+        let path = executable.to_string_lossy();
+        let details = self.0.run(CODESIGN, &["-dv", "--verbose=4", &path])?;
+        let signatures: Vec<_> = details
+            .stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("Signature="))
+            .collect();
+        let teams: Vec<_> = details
+            .stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("TeamIdentifier="))
+            .collect();
+        if !details.success || signatures != ["adhoc"] || teams != ["not set"] {
+            return Err(InstallError::SignatureMismatch);
+        }
+        let verified = self.0.run(CODESIGN, &["--verify", "--strict", &path])?;
+        if verified.success {
+            Ok(())
+        } else {
+            Err(InstallError::SignatureMismatch)
+        }
+    }
+
+    fn team_id(&self, executable: &Path) -> Result<String, InstallError> {
+        let path = executable.to_string_lossy();
+        let details = self.0.run(CODESIGN, &["-dv", "--verbose=4", &path])?;
+        let teams: Vec<_> = details
+            .stderr
+            .lines()
+            .filter_map(|line| line.strip_prefix("TeamIdentifier="))
+            .collect();
+        match teams.as_slice() {
+            [team] if details.success && valid_team_id(team) => Ok((*team).to_owned()),
+            _ => Err(InstallError::SignatureMismatch),
+        }
+    }
+
     fn check_platform(&self) -> Result<(), InstallError> {
         if cfg!(target_os = "macos") {
             Ok(())

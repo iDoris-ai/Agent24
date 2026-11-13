@@ -41,7 +41,7 @@
 //!    verified by mutation (swap the two lines and it goes 401 → 200).
 //! 5. **A name that is already a kernel route segment is refused.** axum PANICS on
 //!    an exact route overlap, so a module called `health` would kill the daemon at
-//!    startup rather than lose a routing contest — see [`RESERVED_KERNEL_SEGMENTS`].
+//!    startup rather than lose a routing contest — see [`agent24_attach::attached::RESERVED_KERNEL_SEGMENTS`].
 //!
 //! The pass runs `identity → admission → registry policy → construction → mount`,
 //! and the position of CONSTRUCTION is load-bearing: a module the user switched off
@@ -57,69 +57,9 @@ use std::sync::Arc;
 
 use agent24_domain::{Capability, DomainModule, EventBroadcast, EventSink, Grants, KernelCtx};
 use agent24_protocol::EventBody;
+
+use crate::capabilities::requires::{self, Consent, GrantForm, RequiresSpec};
 use axum::Router;
-
-/// What the kernel is willing to lend a domain OS today. A module may REQUEST
-/// more in its manifest; [`Grants::granting`] intersects, so asking gains
-/// nothing. The list grows as `KernelCtx` gains handles — `Models` and
-/// `Scheduler` are deliberately absent because there is nothing to hand out
-/// yet, and granting a capability with no handle would be a lie.
-///
-/// `Memory` joined the list in F1, when `KernelCtx::memory` gained a handle to
-/// give: a module that asks for it gets a view of the shared memory base scoped
-/// to ITS OWN partition (see [`crate::os_memory`]). Before that handle existed,
-/// two domain OSes under one user shared that base.
-///
-/// `Approval` joined in T7b/ME-3e, when `KernelCtx::approval` gained a handle
-/// (`ApprovalRequester`, backed by [`PolicyApprovalBackend`] below).
-const KERNEL_GRANTS: &[Capability] =
-    &[Capability::Events, Capability::Memory, Capability::Approval];
-
-/// What an out-of-process module may be granted. A SEPARATE list from
-/// [`KERNEL_GRANTS`] on purpose — see `docs/design/T7a-ME3e-grants-and-events.md`
-/// §1 for why this list exists at all. It used to be strictly narrower than
-/// [`KERNEL_GRANTS`]; ME4-1.4.1 (`docs/design/ME4-S1-scheduler-callback.md`
-/// §6.5) broke that: `Scheduler` is now WIDER here, because out-of-process
-/// modules have a real handle (`CallbackDeps.scheduler`) that no in-process
-/// module does. Each list only ever promises what its own side can actually
-/// back with a handle — the two are independent for that reason, not because
-/// one is meant to contain the other.
-/// `Approval` joined in T7b/ME-3e, alongside the wire handlers in
-/// `crate::approval_callback` that give it a real handler.
-///
-/// `Memory` joined in T8.5c-W-mount. Out-of-process access to the shared
-/// memory base goes through the OOP wire surface (`_a24/memory/private/*`,
-/// T8.5c-W-wire), gated by [`crate::os_memory::MemoryEntitlement`] rather
-/// than by this list alone — a module may be in this grant set and still
-/// receive `MemoryEntitlement::NONE` (its partition could not be recorded,
-/// or the daemon has no connection-admission budget to offer — see
-/// `MemoryLease::admission()`). This list only says the kernel is WILLING to
-/// consider lending memory to an out-of-process module; whether it actually
-/// can is decided per mount.
-///
-/// `Scheduler` joined in ME4-1.4.1 (`docs/design/ME4-S1-scheduler-callback.md`
-/// §6.5): out-of-process modules now have a real handle
-/// (`CallbackDeps.scheduler`) and a real handler surface
-/// (`_a24/scheduler/{upsert,delete,list}`, `crate::scheduler_callback`).
-/// Deliberately **not** added to [`KERNEL_GRANTS`] — there is still no
-/// in-process scheduler handle to hand out, and this list's own doc comment
-/// above says why that matters (`a_capability_the_kernel_cannot_serve_is_not_granted`
-/// keeps that promise honest for in-process modules).
-///
-/// `Models` joined in ME4-4.2.2b2 (`docs/design/ME4-S2-model-callback.md`
-/// §2.4): out-of-process modules may now hold a real handle
-/// (`CallbackDeps.models: Option<ModelCallbackDeps>` — `Option` because a
-/// daemon that built no router still runs) and a real handler surface
-/// (`_a24/model/complete`, `crate::model_callback`). Same reasoning as
-/// `Scheduler` for why it is not in [`KERNEL_GRANTS`]: `KernelCtx` has no
-/// model handle to lend an in-process module.
-const KERNEL_OOP_GRANTS: &[Capability] = &[
-    Capability::Events,
-    Capability::Approval,
-    Capability::Memory,
-    Capability::Scheduler,
-    Capability::Models,
-];
 
 /// The daemon-level dependencies the OOP callback handlers need, threaded
 /// through [`mount_all`] **by value** and lent to each [`mount_package`] as
@@ -150,99 +90,10 @@ pub struct CallbackDeps {
     pub models: Option<crate::model_callback::ModelCallbackDeps>,
 }
 
-/// Names a module may not take, because the kernel already serves
-/// `/api/v1/<segment>` and axum PANICS on an exact route overlap:
-///
-/// ```text
-/// Overlapping method route. Handler for `GET /api/v1/health` already exists
-/// ```
-///
-/// A module called `health` with a route at `/` would therefore kill the daemon
-/// AT STARTUP — a third-party domain OS could brick the process by choosing a
-/// name. Refusing it here turns that into one refused module and a running
-/// daemon. (A FALLBACK-ONLY nested router does not shadow kernel routes —
-/// verified: a degraded module named `runs` leaves `/api/v1/runs/{id}` answering
-/// from the kernel. A module with an explicit STATIC route can still outrank a
-/// dynamic kernel one, e.g. `/api/v1/runs/foo` over `/api/v1/runs/{id}`; the
-/// reservation below is what prevents that, not axum's precedence rules.)
-///
-/// This list must track [`crate::server::build_router_with_modules`], and
-/// `reserved_segments_match_the_kernel_routes_exactly` fails if it drifts EITHER
-/// way — a missing entry reappears as a startup panic, a stale one silently
-/// refuses a legitimate module. That test scans literal `/api/v1/<segment>`
-/// strings in that function's source, so it catches how routes are written here
-/// today; it is a heuristic, not a proof (see its own doc for what it cannot
-/// see).
-///
-/// The structural alternative is to namespace domain OSes under `/api/v1/os/<name>`,
-/// which makes the collision unrepresentable rather than checked. That is the
-/// better shape, but the namespace is fixed by ADR-029 / SPEC-MD-ME §2, so it is
-/// raised there rather than changed here.
-const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
-    "idoris",
-    // A3-2a (`docs/design/A3-ATTACHED-MODULE.md` §3.2 M7): the attached-module
-    // registry lives at `/api/v1/attached`, so no domain OS may be named
-    // `attached` — same reservation mechanism as every other kernel segment
-    // below, and `reserved_segments_match_the_kernel_routes_exactly` pins it
-    // against `crate::server::build_router_with_modules` the same way.
-    "attached",
-    "approvals",
-    "capabilities",
-    "chat",
-    // COMM-2a: `/api/v1/comm/*` (`crate::comm_routes::build`) is kernel code,
-    // merged into `module_routes` by `server::serve` itself rather than
-    // registered as a literal route inside `build_router_with_modules` — so
-    // it does NOT show up in `reserved_segments_match_the_kernel_routes_exactly`'s
-    // scan of that function's source, and that test's `EXTRA_RESERVED` list
-    // (below) carries it instead. Reserved here regardless, so a domain-OS
-    // package cannot claim `name: comm` and collide with (or, depending on
-    // merge order, shadow) the real mount.
-    "comm",
-    // ADR-038 C3: `/api/v1/components` (status of every component) and its report route.
-    "components",
-    // D0-3 (`docs/agent/PLAN-DECIDE.md` §1.1): `/api/v1/decide/profile` is
-    // kernel code. A domain OS named `decide` would collide with it.
-    "decide",
-    "events",
-    "health",
-    // KB-HOST-01: `/api/v1/host/knowledge/*`, the desktop host's private interface.
-    "host",
-    // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
-    // `/api/v1/memory/settings` — the personal-memory REST surface.
-    "memory",
-    // T7b/ME-3e: `/api/v1/module-approvals`.
-    "module-approvals",
-    // K1-6a.4: `/api/v1/module-consents` management endpoints.
-    "module-consents",
-    "models",
-    // ME-2b's own registry endpoint. A domain OS named `os` would collide with it
-    // — and the set-equality test below is what forced this entry the moment the
-    // route was added, rather than leaving it to be discovered by whoever shipped
-    // that module.
-    "os",
-    // K1-6b.5c-2: `/api/v1/peer/runs`, the run views peer bridges relay.
-    "peer",
-    // CORE-2 AgentEar S3: `/api/v1/presence/challenges/*`, the desktop confirmation channel.
-    "presence",
-    "runs",
-    "schedules",
-    "sessions",
-    "shutdown",
-    "standing-grants",
-    // ME4-desktop-model-ui: `/api/v1/timings` + `/api/v1/timings/summary`.
-    "timings",
-    "tool-overrides",
-    "tools",
-    "usage",
-];
-
-/// Whether `name` is a kernel route segment no module (mounted OR attached,
-/// A3-2a) may claim. Exposed for [`crate::attached`], which has no manifest
-/// mount pass of its own to run this check inside — it validates a name at
-/// `POST /api/v1/attached` time, before ever touching the registry file.
-pub(crate) fn is_reserved_kernel_segment(name: &str) -> bool {
-    RESERVED_KERNEL_SEGMENTS.contains(&name)
-}
+// Single definition lives in `attached` so attach validation and mount
+// admission share one list. The mount pass only needs the predicate; the
+// route-equality test imports the slice from `agent24_attach::attached` itself.
+pub(crate) use agent24_attach::attached::is_reserved_kernel_segment;
 
 /// Adapts the daemon's WS hub to the contract's transport. Only the kernel builds
 /// one of these, which is what makes a module's sink reach real subscribers —
@@ -486,7 +337,8 @@ pub struct MountReport {
     pub enabled_at_start: Option<bool>,
     pub outcome: MountOutcome,
     /// Capabilities a LIVE module holds: the intersection of what its manifest
-    /// asked for and [`KERNEL_GRANTS`].
+    /// asked for and the form's ceiling (`capabilities::requires::KERNEL_GRANTS`
+    /// in process, `KERNEL_OOP_GRANTS` out of process).
     ///
     /// Empty for every outcome other than [`MountOutcome::Mounted`], because no
     /// `KernelCtx` was handed over — for a disabled entry the manifest was never
@@ -539,6 +391,10 @@ pub enum RefusalReason {
     ReservedComponentName,
     /// Another module, earlier in the catalogue, already declared the same id.
     DuplicateCapabilityId,
+    /// Scan or pre-spawn recheck refused the package. The code is
+    /// [`agent24_components::integrity::IntegrityReason::code`], copied from
+    /// the typed error, never parsed out of the message.
+    PackageIntegrity(agent24_components::integrity::IntegrityReason),
 }
 
 impl RefusalReason {
@@ -549,8 +405,193 @@ impl RefusalReason {
             Self::ReservedCapabilityId => "reserved_capability_id",
             Self::ReservedComponentName => "reserved_component_name",
             Self::DuplicateCapabilityId => "duplicate_capability_id",
+            Self::PackageIntegrity(reason) => reason.code(),
         }
     }
+}
+
+/// Drop packages whose tree no longer matches the digest discovery froze.
+///
+/// Scan and the first spawn are not the same moment. A package that fails
+/// here is not registered and not mounted. A cancelled recheck drops the
+/// package without an integrity reason: shutdown is not a refusal.
+/// Returns the integrity refusals, in catalogue order.
+pub fn retain_rechecked(
+    catalogue: &mut Vec<Installed>,
+    cancel: &tokio_util::sync::CancellationToken,
+    policy: &agent24_os_packages::signature::Policy,
+) -> Vec<agent24_os_packages::discovery::Refused> {
+    let mut dropped = Vec::new();
+    catalogue.retain(|entry| {
+        let Build::Package(package) = &entry.build else {
+            return true;
+        };
+        match agent24_os_packages::discovery::recheck_with_policy(
+            &package.dir,
+            &package.digest,
+            cancel,
+            policy,
+        ) {
+            Ok(()) => true,
+            Err(agent24_os_packages::discovery::RecheckError::Cancelled) => false,
+            Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message }) => {
+                dropped.push(agent24_os_packages::discovery::Refused {
+                    dir: package.dir.clone(),
+                    why: message,
+                    integrity,
+                    declared: Some((entry.name.clone(), entry.version.clone())),
+                });
+                false
+            }
+        }
+    });
+    dropped
+}
+
+fn directory_identity(file_name: &str, taken: &std::collections::BTreeSet<String>) -> String {
+    let mut base: String = file_name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    if base.is_empty() {
+        base = "pkg".to_owned();
+    }
+    // `dir-` plus a numeric suffix must stay inside the module-name limit.
+    base.truncate(48);
+    let mut n = 1u32;
+    loop {
+        let candidate = if n == 1 {
+            format!("dir-{base}")
+        } else {
+            format!("dir-{base}-{n}")
+        };
+        if agent24_domain::is_valid_module_name(&candidate) && !taken.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+        if n > 10_000 {
+            return format!("dir-pkg-{n}");
+        }
+    }
+}
+
+/// One integrity refusal's component id. The declared name is kept only when
+/// the manifest parsed and the name is not already a component. Otherwise
+/// the host invents a directory identity, so a forged `name:` cannot cover
+/// a real component.
+struct RefusalIdentity {
+    name: String,
+    version: String,
+    reason: agent24_components::integrity::IntegrityReason,
+    why: String,
+}
+
+fn refusal_identities(
+    refusals: &[agent24_os_packages::discovery::Refused],
+    existing_names: &BTreeSet<String>,
+) -> Vec<RefusalIdentity> {
+    let mut taken = existing_names.clone();
+    // `documents` is not reserved here. The desktop installs that package
+    // under this name; pre-claiming it renamed the package's own integrity
+    // refusal to `dir-*`, so the official row stayed `absent`. Other builtin
+    // ids stay reserved so a forged `name:` cannot cover them.
+    for id in crate::component_routes::BUILTIN_COMPONENT_IDS {
+        if *id != "documents" {
+            taken.insert((*id).to_owned());
+        }
+    }
+    let mut out = Vec::new();
+    for refused in refusals {
+        let Some(reason) = refused.integrity else {
+            continue;
+        };
+        let (name, version) = match &refused.declared {
+            Some((name, version)) if declared_name_kept(name, &refused.dir, &taken) => {
+                (name.clone(), version.clone())
+            }
+            _ => {
+                let file_name = refused
+                    .dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("package");
+                (directory_identity(file_name, &taken), String::new())
+            }
+        };
+        taken.insert(name.clone());
+        out.push(RefusalIdentity {
+            name,
+            version,
+            reason,
+            why: refused.why.clone(),
+        });
+    }
+    out
+}
+
+/// Names [`OsConfig::unknown_disabled`](crate::os_config::OsConfig::unknown_disabled)
+/// may see. Catalogue names, plus each integrity refusal's component id
+/// (the declared name, or `dir-*` when that name is not kept). Disabling a
+/// refused package is a real configuration: the package is on disk and
+/// `/os` can write the entry. Leaving the name out of this set makes that
+/// entry look like a typo and degrades every module.
+pub(crate) fn registry_provided_names(
+    catalogue: &[Installed],
+    integrity_refusals: &[agent24_os_packages::discovery::Refused],
+) -> BTreeSet<String> {
+    let mut names: BTreeSet<String> = catalogue.iter().map(|entry| entry.name.clone()).collect();
+    for identity in refusal_identities(integrity_refusals, &names) {
+        names.insert(identity.name);
+    }
+    names
+}
+
+/// Component rows for integrity refusals. `provides` stays empty: a damaged
+/// manifest's capability list is not usable. The name is the same one
+/// [`registry_provided_names`] counts, so a disable of the row `/os` shows
+/// is not `unknown_disabled`.
+pub fn integrity_refusal_reports(
+    refusals: &[agent24_os_packages::discovery::Refused],
+    existing: &[MountReport],
+) -> Vec<MountReport> {
+    let existing_names = existing.iter().map(|report| report.name.clone()).collect();
+    refusal_identities(refusals, &existing_names)
+        .into_iter()
+        .map(|identity| MountReport {
+            name: identity.name.clone(),
+            namespace: agent24_domain::DomainOsManifest::declared_namespace(&identity.name),
+            version: identity.version,
+            enabled_at_start: None,
+            outcome: MountOutcome::RefusedFor(
+                RefusalReason::PackageIntegrity(identity.reason),
+                identity.why,
+            ),
+            granted: Vec::new(),
+            resources: ResourceStatus::NotChecked,
+            d9: None,
+        })
+        .collect()
+}
+
+/// Whether a parsed manifest name may be the component id.
+///
+/// A forged builtin name is rejected. `documents` is allowed only when the
+/// package directory itself is `documents` — the copy the app installs. A
+/// manifest in some other directory that says `name: documents` is still a
+/// forgery and keeps a `dir-*` identity.
+fn declared_name_kept(
+    name: &str,
+    dir: &std::path::Path,
+    taken: &std::collections::BTreeSet<String>,
+) -> bool {
+    if !agent24_domain::is_valid_module_name(name)
+        || !component_name_allowed(name)
+        || taken.contains(name)
+    {
+        return false;
+    }
+    name != "documents" || dir.file_name().and_then(|file| file.to_str()) == Some("documents")
 }
 
 /// Whether a package may carry the name `name`. Every builtin component name is
@@ -685,6 +726,8 @@ fn check_resources(inv: &dyn ModelInventory, required: &[String]) -> ResourceSta
 /// module directory on a slow or network filesystem should not stall the runtime.
 async fn prepare_dir(dir: &Path) -> std::result::Result<(), String> {
     let dir = dir.to_path_buf();
+    #[cfg(test)]
+    let prepared = dir.clone();
     tokio::task::spawn_blocking(move || {
         match std::fs::symlink_metadata(&dir) {
             // A symlink at the module's own directory. Windows junctions are
@@ -714,7 +757,49 @@ async fn prepare_dir(dir: &Path) -> std::result::Result<(), String> {
         std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
     })
     .await
-    .unwrap_or_else(|e| Err(format!("directory preparation task failed: {e}")))
+    .unwrap_or_else(|e| Err(format!("directory preparation task failed: {e}")))?;
+    #[cfg(test)]
+    note_prepared_dir(&prepared);
+    Ok(())
+}
+
+/// A test cancels the shutdown token once `prepare_dir` has succeeded and
+/// before `mount_package` goes on to register a supervisor.
+#[cfg(test)]
+type PrepareHook = std::sync::Arc<dyn Fn(&Path) + Send + Sync>;
+
+#[cfg(test)]
+static AFTER_PREPARE_DIR: std::sync::Mutex<Option<PrepareHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_prepared_dir(dir: &Path) {
+    let hook = AFTER_PREPARE_DIR
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(dir);
+    }
+}
+
+/// A test cancels after the supervisor is registered and before the namespace
+/// route is published. `mark_mounted` is the await in that gap; the hook is
+/// how a test stands in it without depending on the lend.
+#[cfg(test)]
+type PublishHook = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
+#[cfg(test)]
+static BEFORE_ROUTE_PUBLISH: std::sync::Mutex<Option<PublishHook>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn note_before_route_publish(name: &str) {
+    let hook = BEFORE_ROUTE_PUBLISH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    if let Some(hook) = hook {
+        hook(name);
+    }
 }
 
 /// Nest the KERNEL's 503 under `namespace`, for a module that could not be
@@ -846,6 +931,7 @@ pub struct Package {
 /// What the daemon lends every out-of-process module: where their callback
 /// sockets live, how to start them, and how long to wait for them.
 pub struct ProcessHost {
+    pub signature: agent24_os_packages::signature::Policy,
     pub callback_dir: Arc<agent24_os_proto::endpoint::CallbackDir>,
     pub trampoline: agent24_os_proto::launch::Trampoline,
     pub timings: agent24_os_proto::supervisor::Timings,
@@ -854,6 +940,9 @@ pub struct ProcessHost {
     /// earlier ones too — and closed by the shutdown, after which nothing
     /// starts (review of SUP-4, rounds 2 and 3).
     pub supervisors: Arc<Supervisors>,
+    /// Daemon shutdown. `recheck` hashes on this token so a shutdown stops
+    /// the hash and does not spawn the next run.
+    pub shutdown: tokio_util::sync::CancellationToken,
 }
 
 /// The daemon's supervised modules: a list the shutdown closes and takes.
@@ -1135,8 +1224,44 @@ pub struct Supervised {
 /// `Router<()>`: each module has already bound its own state. `registry` decides
 /// which entries are active (ME-2); `inventory` answers the declared-resource
 /// check once for the whole pass.
+///
+/// [`mount_all`] passes no integrity refusals. [`serve`](crate::server::serve)
+/// uses [`mount_all_with_refusals`] so a disabled refused package stays a
+/// legal `os.json` entry. The binary crate's non-test build has no caller:
+/// every other call is a test that does not pass refusals.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub async fn mount_all(
+    catalogue: &[Installed],
+    root: &Path,
+    events: &crate::events::EventsHub,
+    registry: std::result::Result<&crate::os_config::OsConfig, &str>,
+    inventory: &dyn ModelInventory,
+    memory: Option<&MemoryLease>,
+    host: std::result::Result<&ProcessHost, &str>,
+    approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
+    deps: CallbackDeps,
+) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
+    mount_all_with_refusals(
+        catalogue,
+        root,
+        events,
+        registry,
+        inventory,
+        memory,
+        host,
+        approval_broker,
+        &[],
+        deps,
+    )
+    .await
+}
+
+/// [`mount_all`], counting `integrity_refusals` in the registry's `provided`
+/// set. The names are the component ids [`integrity_refusal_reports`] shows
+/// (declared name or `dir-*`), not a second naming pass.
+#[allow(clippy::too_many_arguments)]
+pub async fn mount_all_with_refusals(
     catalogue: &[Installed],
     root: &Path,
     events: &crate::events::EventsHub,
@@ -1149,6 +1274,7 @@ pub async fn mount_all(
     // both need the SAME broker `AppState` holds, so `module-approval.*`
     // events land on the one WS hub clients are subscribed to.
     approval_broker: &Arc<crate::module_approval_broker::ModuleApprovalBroker>,
+    integrity_refusals: &[agent24_os_packages::discovery::Refused],
     // ME4-1.4.1 (design §10.3, v3 M-B): by VALUE, not `&CallbackDeps` — see
     // `CallbackDeps`'s own doc comment for why. Lent to each `mount_package`
     // call below as `&deps`; dropped when this function returns.
@@ -1174,10 +1300,13 @@ pub async fn mount_all(
     // harmless by comparison (it asks for something absent, and nothing happens),
     // so that stays a warning.
     //
-    // `provided` is the CATALOGUE, not the constructed subset — otherwise
-    // disabling a module would make its own entry look like a typo for something
-    // this build does not have.
-    let provided: BTreeSet<&str> = catalogue.iter().map(|e| e.name.as_str()).collect();
+    // `provided` is the CATALOGUE plus integrity-refusal component ids, not
+    // the constructed subset — otherwise disabling a module (including one
+    // this build refused) would make its own entry look like a typo for
+    // something this build does not have. `/os` uses the same ids: they are
+    // the `os_reports` names, catalogue rows and [`integrity_refusal_reports`].
+    let provided_names = registry_provided_names(catalogue, integrity_refusals);
+    let provided: BTreeSet<&str> = provided_names.iter().map(String::as_str).collect();
     let mut registry = registry;
     let unknown_disabled: Vec<String> = registry
         .into_iter()
@@ -1215,7 +1344,7 @@ pub async fn mount_all(
     // "Cannot read" and "genuinely empty" are kept apart on purpose (pre-PR
     // review D1): a MISSING file (`config_path()` finding nothing to open,
     // or `list()`'s own "not found" case) is the true empty registry — see
-    // `crate::attached::list`'s doc. A file that EXISTS but fails to parse is
+    // `agent24_attach::attached::list`'s doc. A file that EXISTS but fails to parse is
     // different: silently treating that as "nothing attached" would let a
     // package steal a name this daemon actually has a live attach
     // registration for, the exact contamination this check exists to
@@ -1224,8 +1353,8 @@ pub async fn mount_all(
     // `attached_names` stays whatever it already was (empty, on the first
     // failure), which matches this pass's existing behaviour for a missing
     // file and is no worse than A3-2b not existing at all for this one boot.
-    let attached_names: BTreeSet<String> = match crate::attached::config_path() {
-        Some(path) => match crate::attached::list(&path) {
+    let attached_names: BTreeSet<String> = match agent24_attach::attached::config_path() {
+        Some(path) => match agent24_attach::attached::list(&path) {
             Ok(views) => views.into_iter().map(|v| v.name).collect(),
             Err(e) => {
                 tracing::error!(
@@ -1341,7 +1470,7 @@ pub async fn mount_all(
         // otherwise CONCEAL it: turning it back on would fail in a way the earlier
         // report gave no hint of. It also stops two truths at once — an entry named
         // `health` reported Disabled while `/api/v1/health` answered 200.
-        if RESERVED_KERNEL_SEGMENTS.contains(&name.as_str()) {
+        if is_reserved_kernel_segment(&name) {
             refuse(
                 format!(
                     "the name {name:?} is a kernel route segment; mounting it would \
@@ -1525,7 +1654,12 @@ pub async fn mount_all(
             );
             continue;
         }
-        let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_GRANTS);
+        let granted = requires::resolve(
+            &RequiresSpec::from_manifest(manifest),
+            GrantForm::InProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        )
+        .granted;
         let granted_names: Vec<String> = granted.iter().map(|c| c.as_str().to_owned()).collect();
 
         // The module's directory is DERIVED from its validated name, never from
@@ -1666,7 +1800,7 @@ struct MountTarget {
 /// is the deliberate contrast: built INSIDE the closure, so a restart always
 /// gets a full bucket.
 ///
-/// `pub(crate)`, not private: `crate::attach_registry` (A3-2b) builds an
+/// `pub(crate)`, not private: `agent24_attach::attach_registry` (A3-2b) builds an
 /// attached module's `Methods` the same way a mounted package's are built —
 /// the closure this returns is agnostic to WHICH kind of `Generation` it is
 /// handed (`Process` or `Attached`), so there is no reason for A3 to grow a
@@ -1962,6 +2096,18 @@ async fn mount_package(
     if host.supervisors.is_closed() {
         return degraded(app, SHUTTING_DOWN.to_owned());
     }
+    // Scan finished and the token fired before `close()` took the list.
+    // Do not prepare a data directory, do not start a supervisor, and do
+    // not publish the proxy route. A 503 namespace would still be a route.
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
     let data_dir = manifest.data_dir_under(root);
     if let Err(why) = prepare_dir(&data_dir).await {
         return degraded(app, why);
@@ -1971,7 +2117,12 @@ async fn mount_package(
     // T7a/ME-3e: computed once, before `supervise` — `Offer` and the
     // `MethodsFor` closure both need it, and it must be the SAME `Grants` that
     // ends up in `MountReport.granted` below (judgement 10's consistency).
-    let granted = Grants::granting(manifest.kernel_capabilities(), KERNEL_OOP_GRANTS);
+    let granted = requires::resolve(
+        &RequiresSpec::from_manifest(manifest),
+        GrantForm::OutOfProcess.host_cap(),
+        Consent::FirstPartyEnabled,
+    )
+    .granted;
     let broadcast: Arc<dyn EventBroadcast> = Arc::new(HubBroadcast(events.clone()));
     let event_sink = granted
         .has(Capability::Events)
@@ -2079,9 +2230,89 @@ async fn mount_package(
     // format (`ModuleSpec` already treats `package_dir`/`manifest_digest` as
     // opaque values), so the check itself lives here and travels in as an
     // opaque closure.
-    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(|spec| {
-        agent24_os_packages::discovery::recheck(&spec.package_dir, &spec.manifest_digest).err()
+    // Cancel stops the hash. `Err` — including `cancelled` — is not a
+    // finished check: the supervisor must not spawn. A shutdown is not a
+    // hash mismatch, and a matching stat is not a reason to skip the hash.
+    let shutdown = host.shutdown.clone();
+    let signature = host.signature.clone();
+    let package_check: agent24_os_proto::supervisor::PackageCheck = Arc::new(move |spec| {
+        match agent24_os_packages::discovery::recheck_with_policy(
+            &spec.package_dir,
+            &spec.manifest_digest,
+            &shutdown,
+            &signature,
+        ) {
+            Ok(()) => None,
+            Err(agent24_os_packages::discovery::RecheckError::Cancelled) => {
+                Some(agent24_os_proto::supervisor::PackageFailure::cancelled())
+            }
+            Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message }) => {
+                Some(agent24_os_proto::supervisor::PackageFailure {
+                    message,
+                    code: integrity.map(agent24_components::integrity::IntegrityReason::code),
+                })
+            }
+        }
     });
+    // `prepare_dir` and the lends above can outlive the cancel check that
+    // ran before them. A token that fired in that gap must not register a
+    // supervisor or publish the namespace — the same report as that earlier
+    // check. `is_closed` above stays the 503 path; this is the token.
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
+    // First spawn is not covered by the scan hash. Recheck here, before any
+    // route exists. The supervisor repeats the check on attempt 1 (the gap
+    // after this gate) and again before every restart.
+    let checked = {
+        let dir = spec.package_dir.clone();
+        let digest = spec.manifest_digest.clone();
+        let shutdown = host.shutdown.clone();
+        let signature = host.signature.clone();
+        tokio::task::spawn_blocking(move || {
+            agent24_os_packages::discovery::recheck_with_policy(
+                &dir, &digest, &shutdown, &signature,
+            )
+        })
+        .await
+    };
+    match checked {
+        Ok(Ok(())) => {}
+        Ok(Err(agent24_os_packages::discovery::RecheckError::Cancelled)) => {
+            return (
+                app,
+                report(
+                    MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                    ResourceStatus::NotChecked,
+                ),
+            );
+        }
+        Ok(Err(agent24_os_packages::discovery::RecheckError::Failed { integrity, message })) => {
+            let outcome = match integrity {
+                Some(reason) => {
+                    MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), message)
+                }
+                None => MountOutcome::Refused(message),
+            };
+            tracing::error!("domain OS {name:?} not mounted: {outcome:?}");
+            return (app, report(outcome, ResourceStatus::NotChecked));
+        }
+        Err(err) => {
+            return (
+                app,
+                report(
+                    MountOutcome::Degraded(format!("the package check panicked: {err}")),
+                    ResourceStatus::NotChecked,
+                ),
+            );
+        }
+    }
     // Started and registered in one step, unless the shutdown has closed the
     // list — which it may have while the directory was being prepared.
     let started = host.supervisors.start_with(|| {
@@ -2093,6 +2324,7 @@ async fn mount_package(
             offer,
             host.timings,
             package_check,
+            host.shutdown.clone(),
         )
         .map(|handle| Supervised {
             name: name.clone(),
@@ -2131,6 +2363,21 @@ async fn mount_package(
             .mark_mounted(partition, &lease.kv, &agent24_memory::SystemClock)
             .await;
     }
+    // `mark_mounted` awaits. A cancel in that gap has already registered the
+    // supervisor; do not publish the namespace over it. The supervisor stays
+    // in the list for the shutdown to stop. The report matches the token
+    // check before `prepare_dir`: no route.
+    #[cfg(test)]
+    note_before_route_publish(&name);
+    if host.shutdown.is_cancelled() {
+        return (
+            app,
+            report(
+                MountOutcome::Degraded(SHUTTING_DOWN.to_owned()),
+                ResourceStatus::NotChecked,
+            ),
+        );
+    }
     tracing::info!(
         "domain OS {name:?} started from {} and proxied at {namespace} (grants: {granted_names:?})",
         package.dir.display()
@@ -2150,6 +2397,8 @@ pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use crate::capabilities::requires::KERNEL_OOP_GRANTS;
+    use agent24_attach::attached::RESERVED_KERNEL_SEGMENTS;
     use agent24_domain::{DomainOsManifest, ModelAccess, Result as DomainResult};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -2583,38 +2832,47 @@ while f.readline():
     fn write_package_with(packages: &Path, name: &str, kernel_capabilities: &str, script: &str) {
         let dir = packages.join(name);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("domain-os.yml"),
-            format!(
-                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
-                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
-                 kernel_capabilities: {kernel_capabilities}\nimpl_kind: out_of_process_provider\n\
-                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
-            ),
-        )
-        .unwrap();
+        let yaml = format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: {kernel_capabilities}\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/launch\n"
+        );
+        std::fs::write(dir.join("domain-os.yml"), &yaml).unwrap();
         std::fs::write(
             dir.join("mod.py"),
             script.replace("os.environ[\"A24_MODULE_NAME\"]", &format!("{name:?}")),
         )
         .unwrap();
+        // `bin/launch` is a native binary. It execs the system python on
+        // `mod.py` — a test double; the product still rejects `command: python3`.
+        // An unparseable manifest (an unknown capability, for example) is
+        // refused at `from_yaml`, before integrity is read. `generate` uses
+        // that same parser, so it cannot seal one. Leave it unsealed: the
+        // refusal stays the parse error, which is what the test asserts.
+        if agent24_domain::DomainOsManifest::from_yaml(&yaml).is_ok() {
+            agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
+        }
     }
 
     /// The catalogue entries `serve` would make of `packages`.
     fn discovered(packages: &Path) -> Vec<Installed> {
-        agent24_os_packages::discovery::scan(packages)
-            .found
-            .into_iter()
-            .map(|d| Installed {
-                name: d.manifest.name().to_owned(),
-                version: d.manifest.version().to_owned(),
-                build: Build::Package(Box::new(Package {
-                    manifest: d.manifest,
-                    dir: d.dir,
-                    digest: d.digest,
-                })),
-            })
-            .collect()
+        agent24_os_packages::test_support::scan(
+            packages,
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .found
+        .into_iter()
+        .map(|d| Installed {
+            name: d.manifest.name().to_owned(),
+            version: d.manifest.version().to_owned(),
+            build: Build::Package(Box::new(Package {
+                manifest: d.manifest,
+                dir: d.dir,
+                digest: d.digest,
+            })),
+        })
+        .collect()
     }
 
     /// A process host for tests: a callback directory under a short path, and
@@ -2630,6 +2888,7 @@ while f.readline():
         .unwrap();
         std::fs::set_permissions(&trampoline, std::fs::Permissions::from_mode(0o755)).unwrap();
         ProcessHost {
+            signature: agent24_os_packages::test_support::signature_policy(),
             callback_dir: Arc::new(agent24_os_proto::endpoint::CallbackDir::create(tmp).unwrap()),
             trampoline: agent24_os_proto::launch::Trampoline {
                 program: trampoline,
@@ -2640,6 +2899,7 @@ while f.readline():
                 ..agent24_os_proto::supervisor::Timings::default()
             },
             supervisors: Arc::new(Supervisors::default()),
+            shutdown: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -2744,6 +3004,139 @@ while f.readline():
         );
     }
 
+    /// `prepare_dir` has returned and the earlier cancel check has already
+    /// passed. Cancelling in that hook must not register a supervisor or
+    /// publish the namespace.
+    #[tokio::test]
+    async fn a_cancel_after_prepare_dir_registers_nothing_and_publishes_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "afterprep");
+        let host = test_host(tmp.path());
+        let shutdown = host.shutdown.clone();
+        *super::AFTER_PREPARE_DIR
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::new(move |dir| {
+                if dir.ends_with("afterprep") {
+                    shutdown.cancel();
+                }
+            }));
+        let _clear = ClearPrepareDir;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("mounted after prepare_dir: {other:?}"),
+        }
+        assert_eq!(reports[0].resources, ResourceStatus::NotChecked);
+        assert!(
+            root.join("afterprep").is_dir(),
+            "prepare_dir did not finish before the cancel"
+        );
+        assert!(
+            host.supervisors.statuses().is_empty(),
+            "a supervisor was registered"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/afterprep/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// The supervisor is already in the list. Cancelling before the route is
+    /// published must leave the namespace unpublished. The supervisor stays
+    /// registered; the shutdown still stops it.
+    #[tokio::test]
+    async fn a_cancel_after_registration_does_not_publish_the_route() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "afterreg");
+        let host = test_host(tmp.path());
+        let shutdown = host.shutdown.clone();
+        *super::BEFORE_ROUTE_PUBLISH
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some(std::sync::Arc::new(move |name| {
+                if name == "afterreg" {
+                    shutdown.cancel();
+                }
+            }));
+        let _clear = ClearRoutePublish;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &discovered(&packages),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("route published after registration: {other:?}"),
+        }
+        assert_eq!(reports[0].resources, ResourceStatus::NotChecked);
+        assert_eq!(
+            host.supervisors.statuses().len(),
+            1,
+            "the supervisor was not registered, so this did not reach the publish check"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/afterreg/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    struct ClearPrepareDir;
+
+    impl Drop for ClearPrepareDir {
+        fn drop(&mut self) {
+            *super::AFTER_PREPARE_DIR
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
+    struct ClearRoutePublish;
+
+    impl Drop for ClearRoutePublish {
+        fn drop(&mut self) {
+            *super::BEFORE_ROUTE_PUBLISH
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        }
+    }
+
     // ── T7a/ME-3e: out-of-process capability grants + `_a24/events/emit` ──
 
     /// Judgement 9: `Capability::parse` already rejects an unrecognised
@@ -2758,7 +3151,10 @@ while f.readline():
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package_with(&packages, "typo", "[events, telepthy]", PACKAGE_MODULE);
-        let scan = agent24_os_packages::discovery::scan(&packages);
+        let scan = agent24_os_packages::test_support::scan(
+            &packages,
+            &tokio_util::sync::CancellationToken::new(),
+        );
         assert!(
             scan.found.is_empty(),
             "a manifest with an unknown capability must not be mountable"
@@ -3060,7 +3456,7 @@ while f.readline():
                 "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
                  event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
                  kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-                 spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n"
+                 spawn:\n  command: bin/launch\n"
             ),
         )
         .unwrap();
@@ -3085,6 +3481,7 @@ raise SystemExit(3)
             ),
         )
         .unwrap();
+        agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
     }
 
     /// FU-61: the REAL `discovery::recheck`-backed `PackageCheck` built at
@@ -3139,14 +3536,20 @@ raise SystemExit(3)
         // Change the manifest during the backoff window — the package
         // directory itself stays, so an unguarded restart would spawn
         // successfully and only fail much later, at the handshake.
+        let crashy = packages.join("crashy");
+        let yml = crashy.join("domain-os.yml");
+        agent24_os_packages::test_support::make_writable(&yml).unwrap();
         std::fs::write(
-            packages.join("crashy").join("domain-os.yml"),
+            &yml,
             "name: crashy\nversion: \"0.2.0\"\nroute_namespace: /api/v1/crashy\n\
              event_module: crashy\ndata_dir: ~/.agent24/os/crashy/\n\
              kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-             spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+             spawn:\n  command: bin/launch\n",
         )
         .unwrap();
+        // Same launcher and script; only the manifest version moves, so
+        // recheck reports a changed digest rather than a missing seal.
+        agent24_os_packages::test_support::seal(&crashy, &["bin/launch"]).unwrap();
 
         let status = tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -3162,10 +3565,15 @@ raise SystemExit(3)
         .expect("never settled")
         .unwrap()
         .clone();
-        let agent24_os_proto::supervisor::Status::PackageChanged { reason } = &status else {
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason, code } = &status else {
             panic!("restarted against the replaced manifest instead of stopping: {status:?}");
         };
         assert!(reason.contains("manifest changed"), "{reason}");
+        assert_eq!(
+            *code,
+            Some("hash_mismatch"),
+            "the restart refusal must carry the typed code, not a parsed sentence: {reason}"
+        );
         // The rendered hint text (naming the one recovery that actually
         // works) is pinned separately, at the unit level, by
         // `os_routes::tests::a_package_changed_module_is_told_to_restart_
@@ -3190,6 +3598,563 @@ raise SystemExit(3)
         for s in host.supervisors.close().running {
             s.handle.stop().await.expect("a clean stop");
         }
+    }
+
+    /// The real `recheck` closure sees the daemon shutdown token. Cancelling
+    /// it during backoff must not spawn again, and the reason is `cancelled`,
+    /// not a hash mismatch. Wiring a fresh `CancellationToken::new()` into
+    /// the closure turns this into a second `Backoff`.
+    #[tokio::test]
+    async fn a_cancelled_recheck_does_not_spawn_again() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_crashing_package(&packages, "crashy");
+        let mut host = test_host(tmp.path());
+        host.timings.backoff_base = std::time::Duration::from_secs(3);
+        let shutdown = host.shutdown.clone();
+        let hub = crate::events::EventsHub::default();
+        let (_, _, _) = mount_all(
+            &discovered(&packages),
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+
+        let mut status = host.supervisors.statuses().remove("crashy").unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::Backoff { failures: 1, .. }
+                )
+            }),
+        )
+        .await
+        .expect("the module never crashed into backoff")
+        .unwrap();
+        shutdown.cancel();
+
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::PackageChanged { .. }
+                        | agent24_os_proto::supervisor::Status::Backoff { failures: 2, .. }
+                )
+            }),
+        )
+        .await
+        .expect("never settled")
+        .unwrap()
+        .clone();
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason, code } = &settled else {
+            panic!("spawned again after the recheck was cancelled: {settled:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
+        assert!(
+            !reason.contains("hash_mismatch"),
+            "cancel must not look like a bad hash: {reason}"
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// A package whose process appends one line to `executed` in its data
+    /// directory, and which declares one tool so registration is visible.
+    fn write_tooled_package(packages: &Path, name: &str) {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/launch\n\
+                 tools:\n  - operation: list-notes\n    description: lists notes\n    \
+                 input_schema: {{type: object, properties: {{}}}}\n    risk: read\n    \
+                 output_privacy: local_only\n    timeout_ms: 5000\n    inline_wait_ms: 1000\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("mod.py"),
+            "import os\n\
+             open(os.path.join(os.environ['A24_DATA_DIR'], 'executed'), 'a').write('ran\\n')\n",
+        )
+        .unwrap();
+        agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
+    }
+
+    fn catalogue_from_found(
+        found: Vec<agent24_os_packages::discovery::Discovered>,
+    ) -> Vec<Installed> {
+        found
+            .into_iter()
+            .map(|d| Installed {
+                name: d.manifest.name().to_owned(),
+                version: d.manifest.version().to_owned(),
+                build: Build::Package(Box::new(Package {
+                    manifest: d.manifest,
+                    dir: d.dir,
+                    digest: d.digest,
+                })),
+            })
+            .collect()
+    }
+
+    /// Scan has already accepted the package. Cancelling before the first
+    /// spawn must not register its tool, must not publish its route, and
+    /// must not run it. `supervisors.close()` is not what stops it: the
+    /// token is.
+    #[tokio::test]
+    async fn a_cancel_after_scan_registers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_tooled_package(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let scan = agent24_os_packages::test_support::scan(&packages, &shutdown);
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+        let catalogue = catalogue_from_found(scan.found);
+
+        let mut live = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut live_ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &tokio_util::sync::CancellationToken::new(),
+            &mut live,
+            &mut live_ops,
+        );
+        assert!(
+            live.get("remote.list-notes").is_some(),
+            "the tool was not registered while the token was live"
+        );
+        let (live, _) = crate::server::module_tools_if_live(
+            &tokio_util::sync::CancellationToken::new(),
+            live,
+            live_ops,
+        );
+        assert!(live.get("remote.list-notes").is_some());
+
+        shutdown.cancel();
+        let mut registry = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &shutdown,
+            &mut registry,
+            &mut ops,
+        );
+        assert!(
+            registry.is_empty(),
+            "tools were registered after the scan's token was cancelled"
+        );
+        let (published, published_ops) =
+            crate::server::module_tools_if_live(&shutdown, live, std::collections::HashSet::new());
+        assert!(
+            published.is_empty(),
+            "a filled registry was published after cancel"
+        );
+        assert!(published_ops.is_empty());
+
+        let mut host = test_host(tmp.path());
+        host.shutdown = shutdown;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::Degraded(why) => assert!(why.contains("shutting down"), "{why}"),
+            other => panic!("mounted after cancel: {other:?}"),
+        }
+        assert!(
+            host.supervisors.statuses().is_empty(),
+            "a supervisor was started"
+        );
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND,
+            "the package route was published"
+        );
+        assert!(
+            !root.join("remote").join("executed").exists(),
+            "the package ran"
+        );
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// `bin/mod` is a tiny C program compiled with the system `cc`: a native
+    /// executable for this machine (the package must pass the native-format
+    /// check), far under the payload limit (a copy of this debug test binary
+    /// is over 512 MiB on Linux), and not a platform binary macOS would kill
+    /// when copied (a copy of `/bin/sh` is). It appends one marker line per
+    /// run to `$A24_DATA_DIR/executed` and exits 3.
+    fn write_integrity_marker(packages: &Path, name: &str) -> std::path::PathBuf {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/mod\n"
+            ),
+        )
+        .unwrap();
+        agent24_os_packages::test_support::compile_c(
+            &dir,
+            "bin/mod",
+            "#include <stdio.h>\n#include <stdlib.h>\n\
+             int main(void) {\n\
+               const char *d = getenv(\"A24_DATA_DIR\");\n\
+               if (d) { char p[4096]; snprintf(p, sizeof p, \"%s/executed\", d);\n\
+                 FILE *f = fopen(p, \"a\"); if (f) { fputs(\"ran\\n\", f); fclose(f); } }\n\
+               return 3;\n}\n",
+        )
+        .expect("these tests need a C compiler (`cc`) to build a native module");
+        agent24_os_packages::test_support::seal(&dir, &["bin/mod"]).unwrap();
+        dir
+    }
+
+    fn arm_hash_pause(
+        prefix: &std::path::Path,
+        pause_at_session: u32,
+    ) -> (
+        agent24_components::integrity::HashProgressGuard,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let once = Arc::new(AtomicBool::new(false));
+        let release_rx = Arc::new(Mutex::new(Some(release_rx)));
+        let guard = agent24_components::integrity::install_hash_progress_hook(
+            prefix,
+            Arc::new(move || {
+                if agent24_components::integrity::hash_sessions() < pause_at_session {
+                    return;
+                }
+                if once.swap(true, Ordering::SeqCst) {
+                    return;
+                }
+                let _ = entered_tx.send(());
+                if let Some(rx) = release_rx
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take()
+                {
+                    let _ = rx.recv();
+                }
+            }),
+        );
+        (guard, entered_rx, release_tx)
+    }
+
+    /// The startup hash is already inside a file when shutdown fires.
+    /// Nothing is discovered and the marker script does not run.
+    #[tokio::test]
+    async fn a_cancel_during_startup_hash_discovers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let scan = {
+            let (_guard, entered, release) = arm_hash_pause(&dir, 1);
+            let scan_root = packages.clone();
+            let scan_cancel = cancel.clone();
+            let worker = std::thread::spawn(move || {
+                agent24_os_packages::test_support::scan(&scan_root, &scan_cancel)
+            });
+            tokio::task::spawn_blocking(move || {
+                entered.recv_timeout(std::time::Duration::from_secs(30))
+            })
+            .await
+            .unwrap()
+            .expect("startup hash never paused");
+            cancel.cancel();
+            release.send(()).unwrap();
+            worker.join().unwrap()
+        };
+        assert!(
+            scan.found.is_empty(),
+            "discovered: {:?}",
+            scan.found
+                .iter()
+                .map(|d| d.manifest.name())
+                .collect::<Vec<_>>()
+        );
+        assert!(scan.cancelled.iter().any(|path| path == &dir));
+        assert!(
+            scan.refused
+                .iter()
+                .all(|r| !r.why.contains("hash_mismatch")),
+            "{:?}",
+            scan.refused
+        );
+        let mut host = test_host(tmp.path());
+        host.shutdown = cancel;
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue_from_found(scan.found),
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert!(reports.is_empty(), "{reports:?}");
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+    }
+
+    /// Recheck is inside the payload hash, not waiting to start, when the
+    /// token fires. The crash loop must not spawn a second time.
+    #[tokio::test]
+    async fn a_cancel_during_recheck_hash_does_not_spawn_again() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_integrity_marker(&packages, "remote");
+        let mut host = test_host(tmp.path());
+        host.timings.backoff_base = std::time::Duration::from_millis(50);
+        let shutdown = host.shutdown.clone();
+        let catalogue = discovered(&packages);
+        let package_dir = packages.join("remote");
+        // Session 1 is the pre-route recheck, session 2 is the supervisor's
+        // attempt-1 recheck, session 3 is the restart recheck. Pausing earlier
+        // cancels the first spawn. Dropping either pre-spawn check or the
+        // restart check means session 3 never starts and this wait times out.
+        let (_guard, entered, release) = arm_hash_pause(&package_dir, 3);
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (_, _, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        tokio::task::spawn_blocking(move || {
+            entered.recv_timeout(std::time::Duration::from_secs(30))
+        })
+        .await
+        .unwrap()
+        .expect("recheck never reached the hash");
+        shutdown.cancel();
+        release.send(()).unwrap();
+        let mut status = host.supervisors.statuses().remove("remote").unwrap();
+        let settled = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            status.wait_for(|s| {
+                matches!(
+                    s,
+                    agent24_os_proto::supervisor::Status::PackageChanged { .. }
+                        | agent24_os_proto::supervisor::Status::Backoff { failures: 2, .. }
+                        | agent24_os_proto::supervisor::Status::Running
+                )
+            }),
+        )
+        .await
+        .expect("never settled")
+        .unwrap()
+        .clone();
+        let agent24_os_proto::supervisor::Status::PackageChanged { reason, code } = &settled else {
+            panic!("spawned again after the hash was cancelled: {settled:?}");
+        };
+        assert_eq!(reason, "cancelled");
+        assert!(
+            code.is_none(),
+            "cancel is not an integrity refusal: {code:?}"
+        );
+        let marker =
+            std::fs::read_to_string(root.join("remote").join("executed")).unwrap_or_default();
+        assert_eq!(marker.lines().count(), 1, "runs: {marker:?}");
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// T7. The scan already accepted the package. A byte changed before the
+    /// pre-spawn recheck must not register a tool, must not publish a route,
+    /// and must not run. Making [`retain_rechecked`] keep every package turns
+    /// the tool assertion red.
+    #[tokio::test]
+    async fn t7_a_file_changed_after_scan_registers_nothing_and_spawns_nothing() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = agent24_os_packages::test_support::signature_policy();
+        let scan = agent24_os_packages::test_support::scan(&packages, &shutdown);
+        assert_eq!(scan.found.len(), 1, "refused: {:?}", scan.refused);
+        let mut catalogue = catalogue_from_found(scan.found);
+        let bin = dir.join("bin/mod");
+        agent24_os_packages::test_support::make_writable(&bin).unwrap();
+        let mut bytes = std::fs::read(&bin).unwrap();
+        bytes.push(0);
+        std::fs::write(&bin, bytes).unwrap();
+
+        let dropped = retain_rechecked(&mut catalogue, &shutdown, &policy);
+        assert!(
+            catalogue.is_empty(),
+            "a tampered package stayed on the catalogue"
+        );
+        assert_eq!(
+            dropped[0].integrity,
+            Some(agent24_components::integrity::IntegrityReason::HashMismatch)
+        );
+
+        let mut registry = agent24_domain::tool::ModuleToolRegistry::new();
+        let mut ops = std::collections::HashSet::new();
+        crate::server::register_discovered_module_tools(
+            &catalogue,
+            &tokio_util::sync::CancellationToken::new(),
+            &mut registry,
+            &mut ops,
+        );
+        assert!(
+            registry.is_empty(),
+            "the tampered package registered a tool"
+        );
+
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        assert!(
+            reports.iter().all(|r| r.name != "remote"),
+            "the tampered package was mounted: {reports:?}"
+        );
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+        assert!(host.supervisors.close().is_empty());
+    }
+
+    /// T7. The catalogue was already filtered. A byte changed before
+    /// `mount_package` publishes routes must still 404 and must not run.
+    /// Deleting the pre-route recheck publishes the namespace (this assertion
+    /// goes red) even when the supervisor's attempt-1 check still blocks the
+    /// process.
+    #[tokio::test]
+    async fn t7_a_file_changed_before_the_route_is_not_mounted() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = write_integrity_marker(&packages, "remote");
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let policy = agent24_os_packages::test_support::signature_policy();
+        let scan = agent24_os_packages::test_support::scan(&packages, &shutdown);
+        let mut catalogue = catalogue_from_found(scan.found);
+        assert!(retain_rechecked(&mut catalogue, &shutdown, &policy).is_empty());
+        let bin = dir.join("bin/mod");
+        agent24_os_packages::test_support::make_writable(&bin).unwrap();
+        let mut bytes = std::fs::read(&bin).unwrap();
+        bytes.push(1);
+        std::fs::write(&bin, bytes).unwrap();
+
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let root = tmp.path().join("os");
+        let (app, reports, _) = mount_all(
+            &catalogue,
+            &root,
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            test_callback_deps().await,
+        )
+        .await;
+        match &reports[0].outcome {
+            MountOutcome::RefusedFor(RefusalReason::PackageIntegrity(reason), _) => {
+                assert_eq!(
+                    *reason,
+                    agent24_components::integrity::IntegrityReason::HashMismatch
+                );
+            }
+            other => panic!("expected an integrity refusal, got {other:?}"),
+        }
+        assert!(host.supervisors.statuses().is_empty());
+        assert_eq!(
+            get(&app, "/api/v1/remote/hi").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert!(!root.join("remote").join("executed").exists());
+        assert!(host.supervisors.close().is_empty());
     }
 
     /// A host with one package, `remote`, started and Running.
@@ -3475,10 +4440,7 @@ raise SystemExit(3)
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package(&packages, "remote");
-        let yml = packages.join("remote").join("domain-os.yml");
-        let mut text = std::fs::read_to_string(&yml).unwrap();
-        text.push_str("provides:\n  - id: remote-ping\n");
-        std::fs::write(&yml, text).unwrap();
+        amend_manifest(&packages, "remote", "provides:\n  - id: remote-ping\n");
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
         let (_, reports, _) = mount_all(
@@ -3542,10 +4504,7 @@ raise SystemExit(3)
             let tmp = tempfile::tempdir().unwrap();
             let packages = tmp.path().join("packages");
             write_package(&packages, "remote");
-            let yml = packages.join("remote").join("domain-os.yml");
-            let mut text = std::fs::read_to_string(&yml).unwrap();
-            text.push_str(&format!("provides:\n  - id: {id}\n"));
-            std::fs::write(&yml, text).unwrap();
+            amend_manifest(&packages, "remote", &format!("provides:\n  - id: {id}\n"));
             let hub = crate::events::EventsHub::default();
             let cfg = config_from(&format!(
                 r#"{{"domainOs": {{"remote": {{"enabled": {enabled}}}}}}}"#
@@ -3582,10 +4541,7 @@ raise SystemExit(3)
         let tmp = tempfile::tempdir().unwrap();
         let packages = tmp.path().join("packages");
         write_package(&packages, "remote");
-        let yml = packages.join("remote").join("domain-os.yml");
-        let mut text = std::fs::read_to_string(&yml).unwrap();
-        text.push_str("provides:\n  - id: remote-ping\n");
-        std::fs::write(&yml, text).unwrap();
+        amend_manifest(&packages, "remote", "provides:\n  - id: remote-ping\n");
         let hub = crate::events::EventsHub::default();
         let cfg = config_from(r#"{"domainOs": {"remote": {"enabled": false}}}"#);
         let (_, reports, _) = mount_all(
@@ -3660,14 +4616,24 @@ raise SystemExit(3)
         reports
     }
 
-    fn append_provides(packages: &Path, name: &str, ids: &[&str]) {
-        let yml = packages.join(name).join("domain-os.yml");
+    /// Append YAML and seal again. `generate` republishes mode 0400, so the
+    /// file is made writable first.
+    fn amend_manifest(packages: &Path, name: &str, extra: &str) {
+        let dir = packages.join(name);
+        let yml = dir.join("domain-os.yml");
+        agent24_os_packages::test_support::make_writable(&yml).unwrap();
         let mut text = std::fs::read_to_string(&yml).unwrap();
-        text.push_str("provides:\n");
-        for id in ids {
-            text.push_str(&format!("  - id: {id}\n"));
-        }
+        text.push_str(extra);
         std::fs::write(&yml, text).unwrap();
+        agent24_os_packages::test_support::seal(&dir, &["bin/launch"]).unwrap();
+    }
+
+    fn append_provides(packages: &Path, name: &str, ids: &[&str]) {
+        let mut extra = String::from("provides:\n");
+        for id in ids {
+            extra.push_str(&format!("  - id: {id}\n"));
+        }
+        amend_manifest(packages, name, &extra);
     }
 
     fn outcome_of<'a>(reports: &'a [MountReport], name: &str) -> &'a MountOutcome {
@@ -5348,6 +6314,290 @@ raise SystemExit(3)
         assert_eq!(reports[1].outcome, MountOutcome::Disabled);
         assert_eq!(
             get(&app, "/api/v1/newcomer/ping").await.status(),
+            StatusCode::OK
+        );
+    }
+
+    /// Catalogue entries plus integrity refusals, the same split `serve` makes.
+    fn discover_pass(
+        packages: &Path,
+    ) -> (Vec<Installed>, Vec<agent24_os_packages::discovery::Refused>) {
+        let scan = agent24_os_packages::test_support::scan(
+            packages,
+            &tokio_util::sync::CancellationToken::new(),
+        );
+        let catalogue = scan
+            .found
+            .into_iter()
+            .map(|d| Installed {
+                name: d.manifest.name().to_owned(),
+                version: d.manifest.version().to_owned(),
+                build: Build::Package(Box::new(Package {
+                    manifest: d.manifest,
+                    dir: d.dir,
+                    digest: d.digest,
+                })),
+            })
+            .collect();
+        let refusals = scan
+            .refused
+            .into_iter()
+            .filter(|refused| refused.integrity.is_some() && refused.dir.as_path() != packages)
+            .collect();
+        (catalogue, refusals)
+    }
+
+    fn write_unsealed_package(packages: &Path, name: &str) {
+        let dir = packages.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("domain-os.yml"),
+            format!(
+                "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+                 event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+                 kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+                 spawn:\n  command: bin/launch\n"
+            ),
+        )
+        .unwrap();
+    }
+
+    async fn mount_refused(
+        catalogue: &[Installed],
+        refusals: &[agent24_os_packages::discovery::Refused],
+        root: &Path,
+        cfg: &crate::os_config::OsConfig,
+        host: std::result::Result<&ProcessHost, &str>,
+    ) -> (Router, Vec<MountReport>) {
+        let hub = crate::events::EventsHub::default();
+        let (app, reports, _) = mount_all_with_refusals(
+            catalogue,
+            root,
+            &hub,
+            Ok(cfg),
+            &no_models(),
+            None,
+            host,
+            &test_approval_broker(&hub).await,
+            refusals,
+            test_callback_deps().await,
+        )
+        .await;
+        (app, reports)
+    }
+
+    async fn wait_hello(app: &Router, name: &str) -> String {
+        let uri = format!("/api/v1/{name}/hi");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let res = get(app, &uri).await;
+            if res.status() == StatusCode::OK {
+                let bytes = axum::body::to_bytes(res.into_body(), 1024).await.unwrap();
+                return String::from_utf8_lossy(&bytes).into_owned();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{name} never served; last status {}",
+                res.status()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    fn reports_for_os(
+        mounted: &[MountReport],
+        refusals: &[agent24_os_packages::discovery::Refused],
+    ) -> Vec<MountReport> {
+        let mut shown = mounted.to_vec();
+        shown.extend(integrity_refusal_reports(refusals, mounted));
+        shown
+    }
+
+    /// B1. A parseable package with no integrity manifest can be disabled.
+    /// The next mount keeps the registry usable and the healthy sibling
+    /// serving. Dropping the refusal id from `registry_provided_names` turns
+    /// `pkgy` into `Degraded` and this assertion red.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn disabling_a_refused_package_leaves_the_sibling_serving_after_remount() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "pkgy");
+        write_unsealed_package(&packages, "pkgx");
+        let (catalogue, refusals) = discover_pass(&packages);
+        assert_eq!(catalogue.len(), 1);
+        assert_eq!(catalogue[0].name, "pkgy");
+        let mut existing = Vec::new();
+        for entry in &catalogue {
+            existing.push(MountReport {
+                name: entry.name.clone(),
+                namespace: String::new(),
+                version: String::new(),
+                enabled_at_start: None,
+                outcome: MountOutcome::Mounted,
+                granted: Vec::new(),
+                resources: ResourceStatus::NotChecked,
+                d9: None,
+            });
+        }
+        let refused_rows = integrity_refusal_reports(&refusals, &existing);
+        assert_eq!(refused_rows.len(), 1, "{refused_rows:?}");
+        assert_eq!(refused_rows[0].name, "pkgx");
+
+        let mut state = crate::server::tests::state().await;
+        state.os_reports = std::sync::Arc::new({
+            let mut rows = existing;
+            rows.extend(refused_rows);
+            rows
+        });
+        let path = tmp.path().join("os.json");
+        let response = crate::os_routes::patch_os_at(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("pkgx".to_owned()),
+            Request::builder()
+                .method("PATCH")
+                .uri("/api/v1/os/pkgx")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"enabled": false}"#))
+                .unwrap(),
+            Some(path.clone()),
+        )
+        .await;
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "{:?}",
+            body_json(response).await
+        );
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        assert!(!cfg.is_enabled("pkgx"));
+
+        let host = test_host(tmp.path());
+        let (app, reports) = mount_refused(
+            &catalogue,
+            &refusals,
+            &tmp.path().join("os"),
+            &cfg,
+            Ok(&host),
+        )
+        .await;
+        assert!(
+            matches!(
+                reports
+                    .iter()
+                    .find(|r| r.name == "pkgy")
+                    .map(|r| &r.outcome),
+                Some(MountOutcome::Mounted)
+            ),
+            "disabling the refused package must not degrade pkgy: {reports:?}"
+        );
+        assert_eq!(wait_hello(&app, "pkgy").await, "hello from pkgy");
+
+        state.os_reports = std::sync::Arc::new(reports_for_os(&reports, &refusals));
+        let listed = body_json(crate::os_routes::render_at(&state, Some(path))).await;
+        assert!(
+            listed.get("registry_error").is_none(),
+            "/os must agree with the mount: {listed}"
+        );
+        for supervised in host.supervisors.close().running {
+            supervised.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// B1, the upgrade path. os.json already disables the old package, and
+    /// this build refuses it for a missing integrity manifest. Startup must
+    /// stay Ok. The same omission in `registry_provided_names` degrades pkgy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_refused_package_disabled_before_upgrade_does_not_degrade_startup() {
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package(&packages, "pkgy");
+        write_unsealed_package(&packages, "pkgx");
+        let (catalogue, refusals) = discover_pass(&packages);
+        let path = tmp.path().join("os.json");
+        crate::os_config::OsConfig::set_enabled(&path, "pkgx", false).unwrap();
+        let cfg = crate::os_config::OsConfig::load(&path).unwrap();
+        let host = test_host(tmp.path());
+        let (app, reports) = mount_refused(
+            &catalogue,
+            &refusals,
+            &tmp.path().join("os"),
+            &cfg,
+            Ok(&host),
+        )
+        .await;
+        assert!(
+            matches!(
+                reports
+                    .iter()
+                    .find(|r| r.name == "pkgy")
+                    .map(|r| &r.outcome),
+                Some(MountOutcome::Mounted)
+            ),
+            "a pre-existing disable of the refused package must not degrade pkgy: {reports:?}"
+        );
+        assert_eq!(wait_hello(&app, "pkgy").await, "hello from pkgy");
+        let mut state = crate::server::tests::state().await;
+        state.os_reports = std::sync::Arc::new(reports_for_os(&reports, &refusals));
+        let listed = body_json(crate::os_routes::render_at(&state, Some(path))).await;
+        assert!(
+            listed.get("registry_error").is_none(),
+            "/os must agree with startup: {listed}"
+        );
+        for supervised in host.supervisors.close().running {
+            supervised.handle.stop().await.expect("a clean stop");
+        }
+    }
+
+    /// A manifest that does not parse is shown as `dir-*`. Disabling that
+    /// id is still a legal config. Counting only declared names leaves this
+    /// red: the sibling degrades.
+    #[tokio::test]
+    async fn disabling_a_dir_identity_refusal_does_not_degrade_the_registry() {
+        let tmp = tempfile::tempdir().unwrap();
+        let packages = tmp.path().join("packages");
+        let dir = packages.join("oldpkg");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("domain-os.yml"), "name: [\n").unwrap();
+        let (_found, refusals) = discover_pass(&packages);
+        let rows = integrity_refusal_reports(&refusals, &[]);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            rows[0].name.starts_with("dir-"),
+            "an unparseable manifest must not keep a declared name: {}",
+            rows[0].name
+        );
+        let cfg = config_from(&format!(
+            r#"{{"domainOs": {{"{}": {{"enabled": false}}}}}}"#,
+            rows[0].name
+        ));
+        let hub = crate::events::EventsHub::default();
+        let (app, reports, _) = mount_all_with_refusals(
+            &[entry(FakeModule::new("pkgy"))],
+            tmp.path(),
+            &hub,
+            Ok(&cfg),
+            &no_models(),
+            None,
+            Err("no process host in this test"),
+            &test_approval_broker(&hub).await,
+            &refusals,
+            test_callback_deps().await,
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "disabling {} must not degrade pkgy",
+            rows[0].name
+        );
+        assert_eq!(
+            get(&app, "/api/v1/pkgy/ping").await.status(),
             StatusCode::OK
         );
     }

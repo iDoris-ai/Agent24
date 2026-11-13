@@ -35,7 +35,9 @@ const err = (code: string, details: Record<string, unknown> = { retryable: false
 const kernelErr = (code: string) => ({ error: { code, message: 'm' } })
 
 describe('upload routes', () => {
-  const proxy = { '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure' }
+  // 409 os_package.<reason>: the kernel proxy refuses a package that failed its
+  // integrity check (S1-9). A route with its own 409 keeps that one (see `errors`).
+  const proxy = { '409': 'OsPackageConflict', '500': 'DocumentsProxyFailure', '502': 'DocumentsProxyFailure', '503': 'DocumentsUnavailable', '504': 'DocumentsProxyFailure' }
   const routes: Array<[string, string, string, Record<string, string>]> = [
     ['/documents/uploads', 'post', 'documentsCreateUpload', { '400': 'DocumentsBadRequest', '422': 'DocumentsUploadUnprocessable' }],
     ['/documents/uploads/{upload_id}/chunks', 'post', 'documentsAppendUploadChunk',
@@ -47,7 +49,7 @@ describe('upload routes', () => {
       const op = openapi.paths[path]?.[method]
       expect(op?.operationId, `${method} ${path}`).toBe(operationId)
       expect(op.tags).toEqual(['documents'])
-      for (const [status, response] of Object.entries({ ...errors, ...proxy })) {
+      for (const [status, response] of Object.entries({ ...proxy, ...errors })) {
         expect(op.responses[status]?.$ref, `${path} ${status}`).toBe(`#/components/responses/${response}`)
       }
     }

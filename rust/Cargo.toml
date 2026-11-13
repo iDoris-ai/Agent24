@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/agent24-agent",
+    "crates/agent24-attach",
     "crates/agent24-comm",
     "crates/agent24-components",
     "crates/agent24-core",
@@ -25,6 +26,7 @@ members = [
     "crates/agent24-models",
     "crates/agent24-protocol",
     "crates/agent24-scheduler",
+    "crates/agent24-skill",
     "crates/agent24-policy",
     "crates/agent24-store",
     "crates/agent24-workspace",
@@ -41,6 +43,7 @@ members = [
 # (no `--workspace`) skips it.
 default-members = [
     "crates/agent24-agent",
+    "crates/agent24-attach",
     "crates/agent24-comm",
     "crates/agent24-components",
     "crates/agent24-core",
@@ -64,6 +67,7 @@ default-members = [
     "crates/agent24-models",
     "crates/agent24-protocol",
     "crates/agent24-scheduler",
+    "crates/agent24-skill",
     "crates/agent24-policy",
     "crates/agent24-store",
     "crates/agent24-workspace",

@@ -9,7 +9,10 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::process::{Command, Stdio};
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 const PROBE: &str = r#"import os
@@ -26,9 +29,8 @@ open(os.environ["OUT"], "w").write(" ".join(map(str, fds)) + "\n" + "\n".join(os
 fn run(env: &[(&str, &str)], args: &[&str]) -> (std::process::ExitStatus, String) {
     let home = tempfile::tempdir().unwrap();
     let out = home.path().join("out");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
-    cmd.env_clear()
-        .env("PATH", "/usr/bin:/bin")
+    let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
+    cmd.env("PATH", "/usr/bin:/bin")
         // Should the hand-over be missing, the binary starts as a daemon: keep
         // anything it writes inside this directory, and stop it below.
         .env("HOME", home.path())
@@ -90,8 +92,7 @@ fn the_daemon_binary_becomes_the_module_and_keeps_its_own_fds_from_it() {
 /// version — not exec anything.
 #[test]
 fn the_variable_alone_does_not_make_the_daemon_a_trampoline() {
-    let out = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let out = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", "/usr/bin:/bin")
         .env("A24_TRAMPOLINE", "1")
         .arg("--version")

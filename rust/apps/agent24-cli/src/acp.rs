@@ -199,6 +199,7 @@ async fn run_prompt(
         model_override: None,
         mode: RunMode::Normal,
         knowledge_binding_id: None,
+        skill_id: None,
     };
     let response = bearer(
         ep,

@@ -31,7 +31,12 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { joinLiteral } from '@agent24/data-dir'
-import type { SessionStore } from './bridge.js'
+
+/** Kept for the crash-safety tests. The bridge no longer maps WeChat users to sessions. */
+export interface SessionStore {
+  load(): Map<string, string>
+  save(map: Map<string, string>): void
+}
 
 /** Directory-fsync failures that mean "this platform/filesystem does not offer
  * it", as opposed to a storage error that the operator needs to hear about. */

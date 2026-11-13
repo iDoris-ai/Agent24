@@ -204,7 +204,7 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 23] = [
+pub const PASSTHROUGH_VARS: [&str; 24] = [
     // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
     // workspace). Without it a LaunchAgent-started daemon keeps using
     // `~/.agent24` while the CLI that ran `service install` and the desktop app
@@ -218,6 +218,10 @@ pub const PASSTHROUGH_VARS: [&str; 23] = [
     "OMLX_URL",
     "OMLX_API_KEY",
     "DEFAULT_MODEL",
+    // VR-1: `EmbeddingClient::from_env` reads this. Unset means bge-m3-mlx-fp16.
+    // A LaunchAgent that should pin another local embedding model only sees it
+    // if install snapshotted it.
+    "A24_EMBED_MODEL",
     // ME4-S2 v3 N2 / ME4-4.2.2a: `ModelRouter::from_env` reads this (was
     // hard-coded) so the Ollama endpoint can be pointed off the default port
     // too; a launchd-started daemon must see it or it silently falls back.
@@ -973,6 +977,19 @@ mod tests {
                                 // debug-only seam behind `--features test-enrollment`
                                 // (a compile_error in release); never set in a LaunchAgent
                                     | "AGENT24_TEST_MIGRATION_GUARD"
+                                // debug-only black-box fixture signatures, never persisted
+                                // into a service environment or compiled into release.
+                                    | "A24_TEST_ACCEPT_ADHOC_SIGNATURES"
+                                // development-only wechat inbound switches (X11-2g):
+                                // they must not reach a LaunchAgent-started daemon,
+                                // the same rule `daemonChildEnv` enforces for the desktop.
+                                    | "A24_DEV_TOOL"
+                                    | "A24_INBOUND_DEV_ALLOWLIST"
+                                // Debug-only (`debug_assertions`) delay of the
+                                // startup skill scan in the `serve` spawn.
+                                // HTTP rescan does not read it. A LaunchAgent
+                                // must not keep this.
+                                    | "AGENT24_SKILL_SCAN_DELAY_MS"
                             )
                         {
                             found.push(name);

@@ -23,13 +23,16 @@ import {
   daemonCliEndpoint,
   daemonAuthMode,
   daemonConnection,
+  daemonElevation,
   onDaemonReady,
   selectedAuthMode,
   type DaemonAuthMode,
   type ExternalDaemonSource,
   type ExternalDaemonState,
 } from './backend-manager'
+import { serviceDaemonOf } from './service-daemon'
 import { CLIENT_PROTOCOL_VERSION } from './protocol-compatibility'
+import { EnrolError } from './daemon-enroll'
 
 describe('deriveStatus (F1b tray daemon status)', () => {
   it('a user-initiated stop pins `stopped`, even if a stale endpoint lingers', () => {
@@ -180,11 +183,12 @@ describe('readExternalDaemonState (DEP-A5 daemon.json discovery)', () => {
   })
 })
 
-/** The pre-T1-0 world: a daemon the LaunchAgent manages, whose token its port
- * accepts — so a healthy legacy record is reused, never taken over. */
-function launchAgent(): Pick<ExternalDaemonSource, 'serviceManaged' | 'acceptsToken' | 'requestShutdown' | 'isAlive'> {
+/** No LaunchAgent installed; a port that accepts its recorded token, so a
+ * legacy-mode app reuses a healthy legacy record (a capability-mode app takes
+ * it over, M5 B4a). */
+function launchAgent(): Pick<ExternalDaemonSource, 'serviceInstalled' | 'acceptsToken' | 'requestShutdown' | 'isAlive'> {
   return {
-    serviceManaged: () => true,
+    serviceInstalled: () => false,
     acceptsToken: vi.fn().mockResolvedValue(true),
     requestShutdown: vi.fn().mockResolvedValue(202),
     isAlive: () => true,
@@ -326,6 +330,16 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
     })
 
+    it('remembers every daemon it spawned, not only the current one (M5 B5, Codex B5b C1)', async () => {
+      const spawnProcess = vi.fn().mockReturnValueOnce(fakeChild(111)).mockReturnValue(fakeChild(222))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      manager.restart()
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      expect([manager.spawned(111), manager.spawned(222), manager.spawned(333)]).toEqual([true, true, false])
+      manager.stop()
+    })
+
     it('a daemon the user had stopped stays stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const manager = new BackendManager({ external: absent(), spawnProcess })
@@ -402,6 +416,44 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       manager.stop()
     })
 
+    it('two at once run one after the other, and the daemon comes back once, after both (Codex B4b C1)', async () => {
+      const first = fakeChild(111)
+      const second = fakeChild(222)
+      const spawnProcess = vi.fn().mockReturnValueOnce(first).mockReturnValueOnce(second).mockReturnValue(fakeChild(333))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      const seen: string[] = []
+      let finishA!: () => void
+      const a = manager.whileStopped(() => new Promise<string>((r) => { seen.push('a'); finishA = () => r('A') }))
+      const b = manager.whileStopped(async () => { seen.push(`b spawned=${spawnProcess.mock.calls.length}`); return 'B' })
+      ;(first as unknown as EventEmitter).emit('exit', 0)
+      await vi.waitFor(() => expect(finishA).toBeDefined())
+      await Promise.resolve()
+      expect(seen).toEqual(['a'])
+      finishA()
+      expect(await a).toBe('A')
+      // A's end brought the daemon back (222); B stops it again and waits for it.
+      expect(spawnProcess).toHaveBeenCalledTimes(2)
+      await vi.waitFor(() => expect(second.kill).toHaveBeenCalledWith('SIGTERM'))
+      ;(second as unknown as EventEmitter).emit('exit', 0)
+      expect(await b).toBe('B')
+      expect(seen).toEqual(['a', 'b spawned=2'])
+      expect(spawnProcess).toHaveBeenCalledTimes(3)
+      manager.stop()
+    })
+
+    it('one failing does not stop the next from running', async () => {
+      const spawnProcess = vi.fn(() => fakeChild(111))
+      const manager = new BackendManager({ external: absent(), spawnProcess })
+      await manager.start()
+      manager.stopDaemon()
+      const a = manager.whileStopped(async () => { throw new Error('boom') })
+      const b = manager.whileStopped(async () => 'ran')
+      await expect(a).rejects.toThrow('boom')
+      expect(await b).toBe('ran')
+      manager.stop()
+    })
+
     it('a reused external daemon is not stopped', async () => {
       const spawnProcess = vi.fn(() => fakeChild(111))
       const external: ExternalDaemonSource = {
@@ -410,7 +462,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
         checkHealth: vi.fn().mockResolvedValue(true),
         fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
       }
-      const manager = new BackendManager({ external, spawnProcess })
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
       await manager.start()
       expect(await manager.whileStopped(async () => 'ran')).toBe('ran')
       expect(manager.isExternalDaemon()).toBe(true)
@@ -427,7 +479,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
     }
-    const manager = new BackendManager({ external, spawnProcess })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
 
     await manager.start()
 
@@ -488,7 +540,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
     }
-    const manager = new BackendManager({ external, spawnProcess })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
     await manager.start()
     expect(getBackendEndpoint()).not.toBeNull()
 
@@ -514,7 +566,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
     }
-    const manager = new BackendManager({ external, spawnProcess })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
     await manager.start()
 
     manager.stop()
@@ -533,7 +585,7 @@ describe('BackendManager daemon reuse (DEP-A5)', () => {
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
     }
-    const manager = new BackendManager({ external, spawnProcess })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
     await manager.start()
     expect(manager.isExternalDaemon()).toBe(true)
 
@@ -691,7 +743,7 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
       read: () => record,
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
-      serviceManaged: () => false,
+      serviceInstalled: () => false,
       acceptsToken: vi.fn().mockResolvedValue(true),
       requestShutdown: vi.fn().mockResolvedValue(202),
       isAlive: vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(true).mockReturnValue(false),
@@ -748,8 +800,11 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
     expect(logged()).toContain('pid 4242 still running')
   })
 
-  it('a LaunchAgent daemon, or any for a legacy-mode app, is reused once its port accepts the token', async () => {
-    for (const [external, authMode] of [[cliDaemon({ serviceManaged: () => true }), 'capabilities'], [cliDaemon(), 'legacy']] as const) {
+  // M5 B4a: a capability-mode app takes over every legacy daemon, LaunchAgent or
+  // not (`with the LaunchAgent installed, a legacy daemon is taken over…`); only
+  // a legacy-mode app still reuses one.
+  it('a legacy-mode app reuses a legacy daemon once its port accepts the token, LaunchAgent installed or not', async () => {
+    for (const [external, authMode] of [[cliDaemon({ serviceInstalled: () => true }), 'legacy'], [cliDaemon(), 'legacy']] as const) {
       const spawnProcess = vi.fn(child)
       const manager = new BackendManager({ external, spawnProcess, authMode })
       await manager.start()
@@ -758,6 +813,97 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
       expect(external.acceptsToken).toHaveBeenCalledWith({ port: 5555 }, 'tok')
       expect(external.requestShutdown).not.toHaveBeenCalled()
       expect(spawnProcess).not.toHaveBeenCalled()
+    }
+  })
+
+  it('with the LaunchAgent installed, a legacy daemon that does not go is asked to shut down once, not on every tick (Codex B4a C2)', async () => {
+    vi.useFakeTimers()
+    for (const requestShutdown of [vi.fn().mockResolvedValue(404), vi.fn().mockResolvedValue(202)]) {
+      const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+      const spawnProcess = vi.fn(child)
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      const starting = manager.start()
+      await vi.advanceTimersByTimeAsync(11_000)
+      await starting
+      try {
+        await vi.advanceTimersByTimeAsync(60_000)
+        expect(requestShutdown).toHaveBeenCalledTimes(1)
+        expect(spawnProcess).not.toHaveBeenCalled()
+        expect(manager.serviceWaitMs()).not.toBeNull()
+      } finally {
+        manager.stop()
+      }
+    }
+  })
+
+  it('a tray Stop while the shutdown is in flight, then Start: the legacy daemon is asked again, once (PR-Daemon B4a N2)', async () => {
+    vi.useFakeTimers()
+    let answer!: (status: number) => void
+    const requestShutdown = vi.fn()
+      .mockImplementationOnce(() => new Promise<number>((r) => { answer = r }))
+      .mockResolvedValue(404)
+    const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(11_000)
+    try {
+      expect(requestShutdown).toHaveBeenCalledTimes(1)
+      manager.stopDaemon()
+      answer(202)
+      await vi.advanceTimersByTimeAsync(1_000)
+      await starting
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(90_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(2)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray Restart while the shutdown is in flight: that ask is superseded, so the next probe asks again, once (PR-Daemon B4a N2)', async () => {
+    vi.useFakeTimers()
+    let answer!: (status: number) => void
+    const requestShutdown = vi.fn()
+      .mockImplementationOnce(() => new Promise<number>((r) => { answer = r }))
+      .mockResolvedValue(404)
+    const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(11_000)
+    try {
+      expect(requestShutdown).toHaveBeenCalledTimes(1)
+      manager.restart()
+      answer(404)
+      await vi.advanceTimersByTimeAsync(1_000)
+      await starting
+      await vi.advanceTimersByTimeAsync(90_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(2)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray Stop then Start after a refused shutdown asks once more, not on every tick (PR-Daemon B4a N2)', async () => {
+    vi.useFakeTimers()
+    const requestShutdown = vi.fn().mockResolvedValue(404)
+    const external = cliDaemon({ serviceInstalled: () => true, requestShutdown, isAlive: () => true })
+    const manager = new BackendManager({ external, spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.advanceTimersByTimeAsync(11_000)
+    await starting
+    try {
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(1)
+      manager.stopDaemon()
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(requestShutdown).toHaveBeenCalledTimes(2)
+    } finally {
+      manager.stop()
     }
   })
 
@@ -781,11 +927,11 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
       await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
     })
     afterEach(() => new Promise((resolve) => server.close(resolve)))
-    const forged = (serviceManaged: boolean): ExternalDaemonSource => ({
+    const forged = (serviceInstalled: boolean): ExternalDaemonSource => ({
       read: () => ({ ...record, port: (server.address() as { port: number }).port, token: 'forged' }),
       checkHealth: vi.fn().mockResolvedValue(false),
       fetchHealth: fetchDaemonHealth,
-      serviceManaged: () => serviceManaged,
+      serviceInstalled: () => serviceInstalled,
       acceptsToken: daemonAcceptsToken,
       requestShutdown: requestDaemonShutdown,
       isAlive: () => true,
@@ -797,12 +943,18 @@ describe('BackendManager takes over a CLI daemon so Knowledge works (T1-0)', () 
       expect(spawnProcess).toHaveBeenCalledTimes(1)
     })
 
-    it('LaunchAgent: the port refuses the token, so it is not reused and nothing else gets the token', async () => {
-      const { spawnProcess, reused } = await started(forged(true))
+    it('a legacy-mode app: the port refuses the token, so it is not reused and nothing else gets the token', async () => {
+      const { spawnProcess, reused } = await started(forged(false), 'legacy')
       expect(seen).toEqual(['GET /api/v1/health -', 'GET /api/v1/os Bearer forged'])
       expect(reused).toBe(false)
       expect(spawnProcess).toHaveBeenCalledTimes(1)
       expect(logged()).toContain('token not accepted by port')
+    })
+
+    it('LaunchAgent installed: the same takeover, one /shutdown, and then a wait instead of a spawn (M5 B4a)', async () => {
+      const { spawnProcess } = await started(forged(true))
+      expect(seen).toEqual(['GET /api/v1/health -', 'POST /api/v1/shutdown Bearer forged'])
+      expect(spawnProcess).not.toHaveBeenCalled()
     })
   })
 })
@@ -821,6 +973,14 @@ describe('fetchDaemonHealth', () => {
       ok: true,
       protocolVersion: null,
     })
+  })
+
+  it("reads /health's version when it is a string (M5 B5)", async () => {
+    const body = (version: unknown) => vi.fn(async () => Response.json({ protocol_version: 1, version }))
+    vi.stubGlobal('fetch', body('0.6.0'))
+    await expect(fetchDaemonHealth({ port: 5555, token: 'tok' })).resolves.toEqual({ ok: true, protocolVersion: 1, version: '0.6.0' })
+    vi.stubGlobal('fetch', body(6))
+    await expect(fetchDaemonHealth({ port: 5555, token: 'tok' })).resolves.toEqual({ ok: true, protocolVersion: 1, version: null })
   })
 
   it('treats a network failure as absent', async () => {
@@ -889,7 +1049,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
         return Promise.resolve({ ok: false, protocolVersion: null })
       }),
     }
-    const manager = new BackendManager({ external, spawnProcess })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
 
     await manager.start()
     expect(spawnProcess).toHaveBeenCalledTimes(1) // step 1: missed external, spawned its own
@@ -1126,7 +1286,7 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       checkHealth: vi.fn().mockResolvedValue(true),
       fetchHealth,
     }
-    const manager = new BackendManager({ external, spawnProcess })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
     try {
       await manager.start()
       expect(spawnProcess).not.toHaveBeenCalled()
@@ -1143,6 +1303,55 @@ describe('BackendManager near-simultaneous startup recovery (PR #602 review, Med
       expect(manager.externalDaemonPid()).toBe(4242)
       expect(getBackendEndpoint()).toEqual({ port: 5555 })
       expect(manager.statusDetail()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('blocked, then a hold whose work fails (a rolled-back install): supervision comes back, so the occupant going lets a later tick spawn (PR-Daemon B4b B1)', async () => {
+    vi.useFakeTimers()
+    let health: { ok: boolean; protocolVersion: number | null } = { ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION + 1 }
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth: vi.fn(async () => health),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      expect(manager.status()).toBe('error')
+      await expect(manager.whileStopped(async () => { throw new Error('not_started') })).rejects.toThrow('not_started')
+      expect(manager.status()).toBe('error')
+      health = { ok: false, protocolVersion: null }
+      await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.status()).not.toBe('stopped')
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray stop while blocked is kept through a hold: still stopped afterwards', async () => {
+    vi.useFakeTimers()
+    let health: { ok: boolean; protocolVersion: number | null } = { ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION + 1 }
+    const spawnProcess = vi.fn(() => fakeChild(111))
+    const external: ExternalDaemonSource = {
+      ...launchAgent(),
+      read: () => ({ port: 5555, token: 'tok', pid: 4242, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      checkHealth: vi.fn().mockResolvedValue(false),
+      fetchHealth: vi.fn(async () => health),
+    }
+    const manager = new BackendManager({ external, spawnProcess })
+    try {
+      await manager.start()
+      manager.stopDaemon()
+      expect(await manager.whileStopped(async () => 'ran')).toBe('ran')
+      health = { ok: false, protocolVersion: null }
+      // The occupant gone: only a manager the user had not stopped spawns now.
+      await vi.advanceTimersByTimeAsync(HEALTH_INTERVAL_MS * 3)
+      expect(spawnProcess).not.toHaveBeenCalled()
     } finally {
       manager.stop()
     }
@@ -1401,7 +1610,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
       Object.assign(ee, { pid: 9, stdout: null, stderr: null, kill: vi.fn().mockReturnValue(true) })
       return ee
     }
-    const manager = new BackendManager({ external, spawnProcess: silentChild })
+    const manager = new BackendManager({ external, spawnProcess: silentChild, authMode: 'legacy' })
     await manager.start()
     expect(daemonConnection()).not.toBeNull()
     expect(daemonAuthMode()).toBe('legacy')
@@ -1427,7 +1636,7 @@ describe('daemon credential stays out of the endpoint (KB-HOST-01 PR-A1)', () =>
       read: () => ({ port: 5556, token: '', pid: 4243, authMode: 'legacy' }),
       checkHealth: vi.fn().mockResolvedValue(true),
     })
-    const manager = new BackendManager({ external, spawnProcess: vi.fn() })
+    const manager = new BackendManager({ external, spawnProcess: vi.fn(), authMode: 'legacy' })
     await manager.start()
     expect(getBackendEndpoint()).toEqual({ port: 5556 })
     expect(daemonConnection()).toBeNull()
@@ -1579,7 +1788,7 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
       // The legacy daemon answers until it dies; the other host's always does.
       checkHealth: ({ port }) => Promise.resolve(port === 5562 || (port === 5561 && healthyLegacy)),
     })
-    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
     await manager.start()
     expect(manager.isExternalDaemon()).toBe(true)
 
@@ -1604,7 +1813,7 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
         read: () => ({ port: 5563, token: '', pid: 4250, authMode: 'capabilities' }),
         checkHealth: vi.fn().mockResolvedValue(true),
       })
-      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
       const holdNextProbe = () => {
         vi.mocked(external.checkHealth).mockImplementationOnce(() => new Promise((resolve) => { probe = resolve }))
       }
@@ -1664,7 +1873,7 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
       const spawnProcess = vi.fn(() => childAnnouncing({ port: 4312, auth_mode: 'capabilities', product_host_token: 'mine' }))
       let probe: ((alive: boolean) => void) | null = null
       const external: ExternalDaemonSource = withProbe({ read: () => null, checkHealth: vi.fn().mockResolvedValue(false) })
-      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'legacy' })
       await manager.start()
       const tick = (manager as unknown as { tick(): Promise<void> }).tick.bind(manager)
       for (let i = 0; i < 2; i++) await tick() // one short of MAX_HEALTH_FAILURES
@@ -1755,5 +1964,772 @@ describe('capability-mode startup (KB-HOST-01 PR-A2)', () => {
       stop()
       manager.stop()
     }
+  })
+})
+
+describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
+  const record: ExternalDaemonState = {
+    port: 5555, token: '', pid: 4242, authMode: 'capabilities', protocolVersion: CLIENT_PROTOCOL_VERSION,
+    enrollEndpoint: '/data/enroll.sock', generation: 'gen-1',
+  }
+  const child = (): ChildProcess => Object.assign(new EventEmitter(), { pid: 111, stdout: null, stderr: null, kill: vi.fn() }) as unknown as ChildProcess
+  let logged: () => string
+  beforeEach(() => {
+    const spies = [vi.spyOn(console, 'log').mockImplementation(() => {}), vi.spyOn(console, 'warn').mockImplementation(() => {})]
+    logged = () => spies.flatMap((spy) => spy.mock.calls.flat()).join('\n')
+  })
+  afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers() })
+
+  /** A session double: `renew` hands out `daily-2`, `daily-3`, …; `end` plays the daemon closing it. */
+  function session(token = 'daily-1') {
+    let n = 1
+    const listeners: Array<(why: EnrolError) => void> = []
+    const s = {
+      token,
+      renew: vi.fn(async () => { n += 1; s.token = `daily-${n}`; return s.token }),
+      onClose: (l: (why: EnrolError) => void) => { listeners.push(l) },
+      close: vi.fn(),
+      turn: vi.fn(async (fn: (elevate: () => Promise<string>, token: string) => Promise<unknown>) => fn(async () => `grant-for-${s.token}`, s.token)),
+      end: (code: string) => { for (const l of listeners.splice(0)) l(new EnrolError(code, code)) },
+    }
+    return s
+  }
+  function serviceDaemon(over: Partial<ExternalDaemonSource> = {}): ExternalDaemonSource {
+    return {
+      read: () => record,
+      checkHealth: vi.fn().mockResolvedValue(true),
+      fetchHealth: vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
+      serviceInstalled: () => true,
+      acceptsToken: vi.fn().mockResolvedValue(true),
+      requestShutdown: vi.fn().mockResolvedValue(202),
+      isAlive: () => true,
+      ...over,
+    }
+  }
+
+  it('enrols on the advertised socket, uses the daily token, and never spawns', async () => {
+    const s = session()
+    const external = serviceDaemon({ enrol: vi.fn().mockResolvedValue(s) })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(external.enrol).toHaveBeenCalledWith({ socketPath: '/data/enroll.sock', generation: 'gen-1', httpPort: 5555 })
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(external.requestShutdown).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(manager.status()).toBe('running')
+      expect(daemonConnection()).toEqual({ port: 5555, authHeaders: { Authorization: 'Bearer daily-1' } })
+      expect(daemonAuthMode()).toBe('capabilities')
+      expect(logged()).toContain('enrolled as first-party shell')
+      expect(logged()).not.toContain('daily-1')
+    } finally {
+      manager.stop()
+    }
+    expect(s.close).toHaveBeenCalled()
+    expect(daemonConnection()).toBeNull()
+  })
+
+  it('the service daemon is enrolled whatever serviceInstalled says: never taken over, never spawned over (M5 B6)', async () => {
+    for (const managed of [true, false]) {
+      const s = session()
+      const external = serviceDaemon({ serviceInstalled: () => managed, enrol: vi.fn().mockResolvedValue(s) })
+      const spawnProcess = vi.fn(child)
+      const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+      await manager.start()
+      try {
+        expect(external.enrol).toHaveBeenCalledTimes(1)
+        expect(external.requestShutdown).not.toHaveBeenCalled()
+        expect(external.acceptsToken).not.toHaveBeenCalled()
+        expect(spawnProcess).not.toHaveBeenCalled()
+        expect(manager.isExternalDaemon()).toBe(true)
+        expect(logged()).not.toContain('taking over CLI daemon')
+      } finally {
+        manager.stop()
+      }
+    }
+  })
+
+  it('with the LaunchAgent installed and nothing up yet: no spawn, it waits, then enrols once the service daemon writes its record (M5 B4a)', async () => {
+    vi.useFakeTimers()
+    let current: ExternalDaemonState | null = null
+    const s = session()
+    const spawnProcess = vi.fn(child)
+    const external = serviceDaemon({ read: () => current, enrol: vi.fn().mockResolvedValue(s) })
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.serviceWaitMs()).toBe(0)
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.serviceWaitMs()).toBe(30_000)
+      current = record
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(external.enrol).toHaveBeenCalledTimes(1)
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(manager.serviceWaitMs()).toBeNull()
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('with the LaunchAgent installed, a legacy daemon is taken over and then waited on, never spawned over (M5 B4a)', async () => {
+    const legacy: ExternalDaemonState = { port: 5557, token: 'tok', pid: 4243, authMode: 'legacy', protocolVersion: CLIENT_PROTOCOL_VERSION }
+    let alive = true
+    const external = serviceDaemon({
+      read: () => (alive ? legacy : null),
+      requestShutdown: vi.fn(async () => { alive = false; return 202 }),
+      isAlive: () => alive,
+    })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external, spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(external.requestShutdown).toHaveBeenCalledWith({ port: 5557 }, 'tok')
+      expect(external.acceptsToken).not.toHaveBeenCalled()
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.serviceWaitMs()).not.toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('with the LaunchAgent installed, a service daemon that dies is waited on, not spawned over (M5 B4a)', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    const spawnProcess = vi.fn(child)
+    const checkHealth = vi.fn(async () => alive)
+    const manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), isAlive: () => alive, checkHealth }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      expect(manager.serviceWaitMs()).toBeNull()
+      alive = false
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(s.close).toHaveBeenCalled()
+      expect(manager.serviceWaitMs()).not.toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray stop while waiting for the service daemon: not waiting any more, and still nothing spawned (M5 B4a)', async () => {
+    vi.useFakeTimers()
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ read: () => null }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.serviceWaitMs()).not.toBeNull()
+      manager.stopDaemon()
+      expect(manager.serviceWaitMs()).toBeNull()
+      await vi.advanceTimersByTimeAsync(60_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('stopped from the tray and started again: the wait counts from the new start, not from before the stop (M5 B4a)', async () => {
+    vi.useFakeTimers()
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ read: () => null }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(40_000)
+      manager.stopDaemon()
+      await vi.advanceTimersByTimeAsync(40_000)
+      expect(manager.serviceWaitMs()).toBeNull()
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(5_000)
+      const waited = manager.serviceWaitMs()
+      expect(waited).not.toBeNull()
+      expect(waited!).toBeLessThanOrEqual(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('waiting, then the service daemon is up but refuses this app: the refusal is shown, not a wait (Codex B4a C3)', async () => {
+    vi.useFakeTimers()
+    let current: ExternalDaemonState | null = null
+    const enrol = vi.fn().mockRejectedValue(new EnrolError('identity_rejected', 'unsigned'))
+    const manager = new BackendManager({ external: serviceDaemon({ read: () => current, enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.serviceWaitMs()).not.toBeNull()
+      current = record
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalled()
+      expect(manager.statusDetail()).toMatchObject({ kind: 'enrol_refused' })
+      expect(manager.serviceWaitMs()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('renews before the daemon idles the connection out, and publishes each new token', async () => {
+    vi.useFakeTimers()
+    const s = session()
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s) }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(s.renew).toHaveBeenCalledTimes(1)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer daily-2' })
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer daily-3' })
+      expect(logged()).not.toMatch(/daily-\d/)
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a connection that ends under a live daemon is enrolled again on the next tick', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const second = session('again-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(second)
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      expect(daemonConnection()).toBeNull()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it.each([
+    ['identity_rejected', '登记被拒'],
+    ['unsupported_version', '登记被拒'],
+    ['timeout', '登记失败'],
+  ])('an enrolment that fails with %s has its own state: no spawn, not absent, not foreign', async (code) => {
+    vi.useFakeTimers()
+    const enrol = vi.fn().mockRejectedValue(new EnrolError(code, `daemon said ${code}`))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.status()).toBe('error')
+      expect(manager.statusDetail()).toEqual({ kind: 'enrol_refused', code, pid: 4242 })
+      expect(manager.foreignDaemonPid()).toBeNull()
+      expect(manager.isExternalDaemon()).toBe(false)
+      expect(daemonConnection()).toBeNull()
+      // The tray cannot start one over it either; the next probes retry, logged once.
+      manager.startDaemon()
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(enrol.mock.calls.length).toBeGreaterThan(1)
+      expect(logged().split(`did not enrol this app (${code})`).length - 1).toBe(1)
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a service daemon that dies is let go: its connection is closed before the app spawns its own', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    const spawnProcess = vi.fn(child)
+    const checkHealth = vi.fn(async () => alive)
+    // The LaunchAgent is gone too (uninstalled): only then may the app spawn (M5 B4a).
+    const manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), isAlive: () => alive, checkHealth, serviceInstalled: () => false }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      alive = false
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(s.close).toHaveBeenCalled()
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(s.renew).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('the service daemon identity is gone before our own child is spawned (M5 B6 c2)', async () => {
+    // The reverse of enrolment: knowledge-host.ts must not take our own
+    // child's connection for the service daemon's.
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    let manager: BackendManager | null = null
+    const atSpawn: Array<ReturnType<typeof serviceDaemonOf>> = []
+    const spawnProcess = vi.fn(() => {
+      atSpawn.push(serviceDaemonOf(manager!))
+      return child()
+    })
+    manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), isAlive: () => alive, checkHealth: vi.fn(async () => alive), serviceInstalled: () => false }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      expect(serviceDaemonOf(manager)).toEqual({ pid: 4242, generation: 'gen-1' })
+      alive = false
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(atSpawn).toEqual([null])
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('once the refusing daemon is gone, the app spawns its own', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const enrol = vi.fn().mockRejectedValue(new EnrolError('identity_rejected', 'unsigned'))
+    const spawnProcess = vi.fn(child)
+    // The LaunchAgent is gone too (uninstalled): only then may the app spawn (M5 B4a).
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, isAlive: () => alive, serviceInstalled: () => false }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      alive = false
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.statusDetail()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a capability record without an enrolment socket stays foreign and is never enrolled', async () => {
+    const enrol = vi.fn()
+    const noSocket: ExternalDaemonState = { ...record }
+    delete noSocket.enrollEndpoint
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ read: () => noSocket, enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(enrol).not.toHaveBeenCalled()
+      expect(manager.foreignDaemonPid()).toBe(4242)
+      expect(manager.status()).toBe('blocked')
+      expect(spawnProcess).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray start or restart while enrolling spawns nothing and lets the enrolment finish (Codex B2 C1)', async () => {
+    const s = session()
+    let finish: (v: unknown) => void = () => {}
+    const enrol = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: enrol as ExternalDaemonSource['enrol'] }), spawnProcess, authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.waitFor(() => expect(enrol).toHaveBeenCalled())
+    try {
+      manager.restart()
+      manager.startDaemon()
+      finish(s)
+      await starting
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(manager.isExternalDaemon()).toBe(true)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer daily-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray restart between a lost connection and the next enrolment spawns nothing (Codex B2 C1)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(session('again-1'))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('lost, then stopped from the tray, then started: the app enrols again, it is not stuck stopped (Codex B2 r2 C1)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(session('again-1'))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      manager.stopDaemon()
+      expect(manager.status()).toBe('stopped')
+      manager.startDaemon()
+      expect(manager.status()).not.toBe('stopped')
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray restart during the probe of a re-enrolment spawns nothing (Codex B2 r2 C2)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValueOnce(session('again-1'))
+    let answer: (v: { ok: boolean; protocolVersion: number }) => void = () => {}
+    const fetchHealth = vi.fn()
+      .mockResolvedValueOnce({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+      .mockImplementationOnce(() => new Promise((resolve) => { answer = resolve }))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, fetchHealth }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(fetchHealth).toHaveBeenCalledTimes(2)
+      manager.restart()
+      manager.startDaemon()
+      answer({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+      await vi.advanceTimersByTimeAsync(0)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a connection lost while the health loop gives up on the daemon does not outlive the spawn (Codex B2 C2)', async () => {
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    let probes = 0
+    const checkHealth = vi.fn(async () => {
+      probes += 1
+      // The third failed probe: the connection ends while it is awaited.
+      if (probes === 3) { alive = false; s.end('daemon_unavailable') }
+      return false
+    })
+    const spawnProcess = vi.fn(child)
+    // The LaunchAgent is gone too (uninstalled): only then may the app spawn (M5 B4a).
+    const manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), checkHealth, isAlive: () => alive, serviceInstalled: () => false }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      // Our own child now: the next ticks probe it, they do not go back to the record.
+      await vi.advanceTimersByTimeAsync(10_000)
+      expect(spawnProcess).toHaveBeenCalledTimes(1)
+      expect(manager.foreignDaemonPid()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('while enrolled, the service daemon is the presence target; not once the connection ends or is stopped (M5 B3)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    expect(manager.presenceTarget()).toBeNull()
+    await manager.start()
+    try {
+      expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
+      first.end('daemon_unavailable')
+      expect(manager.presenceTarget()).toBeNull()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
+      manager.stopDaemon()
+      expect(manager.presenceTarget()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('the service daemon identity is set before each connection is published, and a renewal leaves it alone (M5 B6 c2)', async () => {
+    // knowledge-host.ts tells daemons apart by serviceDaemonOf(): a listener
+    // that already sees the new connection must see the new identity too.
+    vi.useFakeTimers()
+    const s = session()
+    const seen: Array<{ token: string | undefined; daemon: ReturnType<typeof serviceDaemonOf> }> = []
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s) }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    const off = onDaemonReady(() => {
+      seen.push({ token: daemonConnection()?.authHeaders.Authorization, daemon: serviceDaemonOf(manager) })
+    })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(seen).toEqual([
+        { token: 'Bearer daily-1', daemon: { pid: 4242, generation: 'gen-1' } },
+        { token: 'Bearer daily-2', daemon: { pid: 4242, generation: 'gen-1' } },
+      ])
+    } finally {
+      off()
+      manager.stop()
+    }
+  })
+
+  it("while enrolled, the service daemon's /health version; null once the connection ends (M5 B5)", async () => {
+    const s = session('daily-1')
+    const fetchHealth = vi.fn().mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION, version: '0.5.9' })
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), fetchHealth }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      expect(manager.serviceDaemonVersion()).toBe('0.5.9')
+      s.end('daemon_unavailable')
+      expect(manager.serviceDaemonVersion()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('while the service daemon restarts, nothing is spawned over it; afterwards it is enrolled with again (M5 B5)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    let alive = true
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, isAlive: () => alive }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      await manager.whileServiceRestarts(async () => {
+        alive = false
+        first.end('daemon_unavailable')
+        await vi.advanceTimersByTimeAsync(30_000)
+        expect(spawnProcess).not.toHaveBeenCalled()
+        alive = true
+      })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(manager.presenceTarget()).toEqual({ socketPath: '/data/enroll.sock', generation: 'gen-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('overlapping service holds: nothing is spawned until the last one ends (PR-Daemon #1783 N1)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    let alive = true
+    let plist = true
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, isAlive: () => alive, serviceInstalled: () => plist }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      let endSecond = () => {}
+      const second = new Promise<void>((resolve) => { endSecond = resolve })
+      let held: Promise<void> | null = null
+      await manager.whileServiceRestarts(async () => {
+        held = manager.whileServiceRestarts(() => second)
+        // A stop: the service daemon gone, its LaunchAgent removed.
+        alive = false
+        plist = false
+        first.end('daemon_unavailable')
+      })
+      // The first has ended; the second still holds.
+      await vi.advanceTimersByTimeAsync(30_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      endSecond()
+      await held
+      await vi.advanceTimersByTimeAsync(30_000)
+      // Then, with no LaunchAgent, this app runs its own again.
+      expect(spawnProcess).toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('while enrolled, daemonElevation elevates on the current token connection; not once it ends or is stopped (M5 B3)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    expect(daemonElevation()).toBeNull()
+    await manager.start()
+    try {
+      const request = { method: 'POST', path: '/api/v1/shutdown', body: '', summary: 's' }
+      await expect(daemonElevation()?.(async (elevate) => elevate(request))).resolves.toBe('grant-for-daily-1')
+      expect(first.turn).toHaveBeenCalledTimes(1)
+      // Renewed: still this connection.
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      await expect(daemonElevation()?.(async (elevate) => elevate(request))).resolves.toBe('grant-for-daily-2')
+      first.end('daemon_unavailable')
+      expect(daemonElevation()).toBeNull()
+      await vi.advanceTimersByTimeAsync(5_000)
+      await expect(daemonElevation()?.(async (elevate) => elevate(request))).resolves.toBe('grant-for-again-1')
+      manager.stopDaemon()
+      expect(daemonElevation()).toBeNull()
+    } finally {
+      manager.stop()
+    }
+    expect(daemonElevation()).toBeNull()
+  })
+
+  it('a steady disconnect, then start, attaches to the service daemon again instead of spawning (B3a, PR-Daemon #1726)', async () => {
+    vi.useFakeTimers()
+    const enrol = vi.fn().mockResolvedValueOnce(session('daily-1')).mockResolvedValueOnce(session('again-1'))
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      manager.stopDaemon()
+      expect(daemonConnection()).toBeNull()
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+      // restart on the reused service daemon enrols again too.
+      enrol.mockResolvedValueOnce(session('third-1'))
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer third-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a stop that supersedes a re-enrolment probe, then start: enrolled again at the next tick, nothing spawned (B3a, PR-Daemon #1726 P2)', async () => {
+    vi.useFakeTimers()
+    const first = session('daily-1')
+    const enrol = vi.fn().mockResolvedValueOnce(first).mockResolvedValue(session('again-1'))
+    let answer: (v: { ok: boolean; protocolVersion: number }) => void = () => {}
+    const fetchHealth = vi.fn()
+      .mockResolvedValueOnce({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+      .mockImplementationOnce(() => new Promise((resolve) => { answer = resolve }))
+      .mockResolvedValue({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+    const spawnProcess = vi.fn(child)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, fetchHealth }), spawnProcess, authMode: 'capabilities' })
+    await manager.start()
+    try {
+      first.end('daemon_unavailable')
+      await vi.advanceTimersByTimeAsync(5_000)
+      manager.stopDaemon()
+      answer({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION })
+      await vi.advanceTimersByTimeAsync(0)
+      manager.startDaemon()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(spawnProcess).not.toHaveBeenCalled()
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a refused enrolment is tried again on a doubling backoff, not every tick (B3a, PR-Daemon #1726)', async () => {
+    vi.useFakeTimers()
+    const enrol = vi.fn().mockRejectedValue(new EnrolError('identity_rejected', 'unsigned'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      // Tries at 0, then after 5, 10, 20, 40, 80 s: six in the first 155 s, against 32 ticks.
+      await vi.advanceTimersByTimeAsync(160_000)
+      expect(enrol).toHaveBeenCalledTimes(6)
+      expect(manager.statusDetail()).toEqual({ kind: 'enrol_refused', code: 'identity_rejected', pid: 4242 })
+      // Capped at five minutes.
+      enrol.mockClear()
+      await vi.advanceTimersByTimeAsync(30 * 60_000)
+      expect(enrol.mock.calls.length).toBeLessThanOrEqual(7)
+      expect(enrol.mock.calls.length).toBeGreaterThanOrEqual(5)
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a tray start while the enrolment is refused leaves nothing behind: once it succeeds it is not redone (B3a)', async () => {
+    vi.useFakeTimers()
+    const s = session('ok-1')
+    const enrol = vi.fn().mockRejectedValueOnce(new EnrolError('identity_rejected', 'unsigned')).mockResolvedValue(s)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      manager.startDaemon()
+      manager.restart()
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer ok-1' })
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      expect(s.close).not.toHaveBeenCalled()
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a success clears the backoff: a later failure against the same daemon starts again from one tick (Codex B3a C1)', async () => {
+    vi.useFakeTimers()
+    const ok = session('ok-1')
+    const enrol = vi.fn()
+    for (let i = 0; i < 4; i++) enrol.mockRejectedValueOnce(new EnrolError('timeout', 'slow'))
+    enrol.mockResolvedValueOnce(ok).mockRejectedValueOnce(new EnrolError('timeout', 'slow')).mockResolvedValue(session('again-1'))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      // Four failures (0, 5, 15, 35 s) then success at 75 s: the backoff had reached 40 s.
+      await vi.advanceTimersByTimeAsync(80_000)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer ok-1' })
+      ok.end('daemon_unavailable')
+      // Re-enrolled at the next tick: fails once, then is tried again a tick later, not 80 s later.
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(manager.statusDetail()).toMatchObject({ kind: 'enrol_refused', code: 'timeout' })
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer again-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('a refused enrolment is tried again at the next tick when the daemon is a new one (B3a)', async () => {
+    vi.useFakeTimers()
+    let current: ExternalDaemonState = record
+    const s = session('new-1')
+    const enrol = vi.fn().mockRejectedValueOnce(new EnrolError('identity_rejected', 'unsigned'))
+      .mockRejectedValueOnce(new EnrolError('identity_rejected', 'unsigned'))
+      .mockResolvedValue(s)
+    const manager = new BackendManager({ external: serviceDaemon({ enrol, read: () => current }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalledTimes(2)
+      // The backoff is now 10 s; a daemon with a new generation is tried at once.
+      current = { ...record, generation: 'gen-2' }
+      await vi.advanceTimersByTimeAsync(5_000)
+      expect(enrol).toHaveBeenCalledTimes(3)
+      expect(enrol).toHaveBeenLastCalledWith(expect.objectContaining({ generation: 'gen-2' }))
+      expect(daemonConnection()?.authHeaders).toEqual({ Authorization: 'Bearer new-1' })
+    } finally {
+      manager.stop()
+    }
+  })
+
+  it('an enrolment that lands after the app quit is closed, not used', async () => {
+    const s = session()
+    let finish: (v: unknown) => void = () => {}
+    const enrol = vi.fn(() => new Promise((resolve) => { finish = resolve }))
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: enrol as ExternalDaemonSource['enrol'] }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    const starting = manager.start()
+    await vi.waitFor(() => expect(enrol).toHaveBeenCalled())
+    manager.stop()
+    finish(s)
+    await starting
+    expect(s.close).toHaveBeenCalled()
+    expect(daemonConnection()).toBeNull()
   })
 })

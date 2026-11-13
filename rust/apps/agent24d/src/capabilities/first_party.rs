@@ -126,7 +126,7 @@ impl FirstPartyAuthority {
         let summary = match template {
             "/api/v1/idoris/install" => {
                 let Ok(body) =
-                    serde_json::from_slice::<agent24d::idoris_host::InstallRequest>(bytes)
+                    serde_json::from_slice::<agent24_idoris::idoris_host::InstallRequest>(bytes)
                 else {
                     return;
                 };
@@ -137,7 +137,7 @@ impl FirstPartyAuthority {
             }
             "/api/v1/idoris/connect" => {
                 let Ok(body) =
-                    serde_json::from_slice::<agent24d::idoris_host::ConnectRequest>(bytes)
+                    serde_json::from_slice::<agent24_idoris::idoris_host::ConnectRequest>(bytes)
                 else {
                     return;
                 };
@@ -173,6 +173,28 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// SL-4: the summary the daemon built from stored revisions for a rejected
+    /// `POST /api/v1/skills/{id}/activate`. The body hash binds it to this
+    /// exact request; a different body finds nothing to approve.
+    pub fn remember_skill_activation(
+        &self,
+        token_id: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::SkillsActivate,
+                method: "POST".into(),
+                template: "/api/v1/skills/{id}/activate".into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     /// K-B6: derive the presence summary for a Knowledge host change from the
     /// rejected request's body. A body the handler would refuse, or a binding
     /// id that cannot be shown, leaves nothing to approve. The summary never
@@ -190,7 +212,7 @@ impl FirstPartyAuthority {
             ("PUT" | "DELETE", "/api/v1/host/knowledge/bindings/{binding_id}/credential") => true,
             _ => return,
         };
-        let Some(parsed) = crate::knowledge_host::parse_change_body(method, is_credential, bytes)
+        let Some(parsed) = crate::knowledge_routes::parse_change_body(method, is_credential, bytes)
         else {
             return;
         };
@@ -285,6 +307,7 @@ impl FirstPartyAuthority {
             "/api/v1/attached"
                 | "/api/v1/idoris/install"
                 | "/api/v1/idoris/connect"
+                | "/api/v1/skills/{id}/activate"
                 | "/api/v1/host/knowledge/bindings/{binding_id}"
                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
         ) || derived_route(&target.method, &target.template)
@@ -309,12 +332,45 @@ impl FirstPartyAuthority {
                         .to_owned(),
                 );
             }
+            "/api/v1/capabilities/bridge" => {
+                return Some("签发 8 小时微信桥开发令牌，只能写入入站事件".to_owned());
+            }
+            "/api/v1/capabilities/{capability_id}/revoke" => {
+                // Elevation is only for a live or already-revoked dev-bridge
+                // token. A shell token, a creative token, or a missing id
+                // has no summary, so the grant is refused.
+                let id = target
+                    .path
+                    .strip_prefix("/api/v1/capabilities/")?
+                    .strip_suffix("/revoke")?;
+                if id.is_empty() || id.contains('/') {
+                    return None;
+                }
+                let claims = self.store.claims_by_id(id)?;
+                if !super::bridge::is_dev_bridge(&claims) {
+                    return None;
+                }
+                let prefix = id.get(..8).unwrap_or(id);
+                return Some(format!("撤销微信桥开发令牌 {prefix}"));
+            }
             "/api/v1/idoris/operations/{id}/cancel" => {
                 let id = target
                     .path
                     .strip_prefix("/api/v1/idoris/operations/")?
                     .strip_suffix("/cancel")?;
                 return Some(format!("cancel iDoris operation {}", shown(id)?));
+            }
+            "/api/v1/os/trusted-teams/{team}" => {
+                let team = target.path.strip_prefix("/api/v1/os/trusted-teams/")?;
+                if team.contains('/') {
+                    return None;
+                }
+                let team = shown(team)?;
+                return Some(match target.method.as_str() {
+                    "PUT" => format!("trust OS package team {team}"),
+                    "DELETE" => format!("stop trusting OS package team {team}"),
+                    _ => return None,
+                });
             }
             _ => {}
         }
@@ -427,6 +483,7 @@ impl FirstPartyAuthority {
                 CapabilityClaims {
                     capability_id: random_capability_id(),
                     audience: Audience::FirstPartyShell,
+                    component_id: None,
                     first_party: Some(FirstPartyClaims {
                         peer: peer.clone(),
                         tier: FirstPartyTier::Daily,
@@ -440,17 +497,26 @@ impl FirstPartyAuthority {
                     sidecar_generation: None,
                     created_at: now,
                     expires_at: now + TOKEN_TTL,
+                    deadline: None,
                     // The presence channel answers this token's own elevation
                     // challenges: a first-party shell must never reach it,
                     // or an enrolled CLI could approve itself (#1447 F1).
                     // `presence_desktop::gate` is the second, independent layer.
+                    // `InboundWrite` is ProductHost-only the same way.
+                    // `InboundIngest` is the dev-bridge component token only.
+                    // Leaving both off this token means a later route that
+                    // forgets its gate still stays closed to a shell.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
                     } else {
                         policies()
                             .iter()
                             .map(|p| p.operation)
-                            .filter(|op| !op.is_presence_channel())
+                            .filter(|op| {
+                                !op.is_presence_channel()
+                                    && *op != Operation::InboundWrite
+                                    && *op != Operation::InboundIngest
+                            })
                             .chain([Operation::ModuleRoute])
                             .collect()
                     },
@@ -569,10 +635,12 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
     // Full CORE-2 will enable elevated operations individually; each must first
     // have a daemon-generated summary derived from its actual request body.
     let supported = (policy.operation == Operation::ModuleAdmin
-        && method == Method::POST
         && matches!(
-            policy.template,
-            "/api/v1/attached" | "/api/v1/os/{name}/delegation"
+            (method.as_str(), policy.template),
+            ("POST", "/api/v1/attached")
+                | ("POST", "/api/v1/os/{name}/delegation")
+                | ("PUT", "/api/v1/os/trusted-teams/{team}")
+                | ("DELETE", "/api/v1/os/trusted-teams/{team}")
         ))
         // I-1: the iDoris lifecycle, each with a daemon-derived summary.
         || (policy.operation == Operation::IdorisLifecycle
@@ -584,6 +652,22 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                     | ("POST", "/api/v1/idoris/stop")
                     | ("POST", "/api/v1/idoris/operations/{id}/cancel")
                     | ("GET", "/api/v1/idoris/omlx/candidates")
+            ))
+        || (policy.operation == Operation::CapabilityMint
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/bridge")
+            ))
+        || (policy.operation == Operation::CapabilityRevoke
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/{capability_id}/revoke")
+            ))
+        // SL-4: skill activation and rollback, summarised from stored rows.
+        || (policy.operation == Operation::SkillsActivate
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/skills/{id}/activate")
             ))
         || (policy.operation == Operation::KnowledgeHost
             && matches!(
@@ -787,7 +871,7 @@ fn binding_id_of(path: &str, credential_route: bool) -> Option<String> {
         .decode_utf8()
         .ok()?
         .into_owned();
-    crate::knowledge_host::valid_binding_id(&id).then_some(id)
+    crate::knowledge_routes::valid_binding_id(&id).then_some(id)
 }
 
 fn expires_rfc3339(secs: u64) -> Option<String> {
@@ -802,9 +886,10 @@ fn expires_rfc3339(secs: u64) -> Option<String> {
 fn knowledge_summary(
     path: &str,
     credential_route: bool,
-    parsed: &crate::knowledge_host::ParsedChange,
+    parsed: &crate::knowledge_routes::ParsedChange,
 ) -> Option<String> {
-    use crate::knowledge_host::{Credential, ParsedChange};
+    use crate::knowledge_routes::ParsedChange;
+    use agent24_knowledge::host::Credential;
     let id = shown(&binding_id_of(path, credential_route)?)?;
     match parsed {
         ParsedChange::Activate {
@@ -1023,6 +1108,201 @@ mod tests {
             "control: a normal token still reaches more"
         );
     }
+
+    /// Dropping `InboundWrite` from the filter in `issue` turns the first
+    /// assertion red. `InboundRead` is the control: this is a normal shell
+    /// grant, not an empty one.
+    #[test]
+    fn shell_token_is_not_granted_inbound_write() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let parsed = CapabilityToken::parse_bearer(&token.secret).unwrap();
+        let allowed = store.shared.state.lock().unwrap().records[&digest(&parsed)]
+            .claims
+            .allowed_operations
+            .clone();
+        assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
+        assert!(!allowed.contains(&Operation::InboundIngest), "{allowed:?}");
+        assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
+        assert!(
+            store
+                .validate_bearer(
+                    &token.secret,
+                    Operation::InboundWrite,
+                    &Resource::global(),
+                    unix_now(),
+                )
+                .is_err()
+        );
+    }
+
+    /// `mint` copies route-table operations except presence and `InboundWrite`.
+    /// Skill list / show / install use this daily token (skill-loader §4.9).
+    /// Filtering `skills.*` out of `issue` turns the assertions red.
+    #[test]
+    fn shell_token_keeps_skill_read_and_install() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let parsed = CapabilityToken::parse_bearer(&token.secret).unwrap();
+        let allowed = store.shared.state.lock().unwrap().records[&digest(&parsed)]
+            .claims
+            .allowed_operations
+            .clone();
+        assert!(allowed.contains(&Operation::SkillsRead), "{allowed:?}");
+        assert!(allowed.contains(&Operation::SkillsInstall), "{allowed:?}");
+    }
+
+    /// SL-4. Removing the activate row from `resolve_target`'s supported set
+    /// turns the first assertion into `NotElevatedOperation`, which is how a
+    /// CLI elevation would fail. The summary needs the remembered request.
+    #[test]
+    fn skill_activate_is_elevatable_with_a_remembered_summary_only() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let path = "/api/v1/skills/demo/activate";
+        let body = br#"{"expected_generation":0}"#;
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: path.into(),
+            body_sha256: body_digest(body),
+            client_summary: "CLIENT SECRET".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        assert_eq!(target.operation, Operation::SkillsActivate);
+        assert!(authority.target_summary("id", &target).is_none());
+        authority.remember_skill_activation("id", path, body, "激活技能 \"demo\"".to_owned());
+        assert_eq!(
+            authority.target_summary("id", &target).unwrap(),
+            "激活技能 \"demo\""
+        );
+        // Another body, or another skill's path, finds nothing to approve.
+        let other_body = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let other = resolve_target(&other_body).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        let elsewhere = ElevateRequest {
+            path: "/api/v1/skills/other/activate".into(),
+            body_sha256: body_digest(body),
+            ..other_body
+        };
+        let other = resolve_target(&elsewhere).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        // Reading a skill is Everyday, not elevatable.
+        let read = ElevateRequest {
+            method: "GET".into(),
+            path: "/api/v1/skills/demo".into(),
+            body_sha256: body_digest(b""),
+            client_summary: String::new(),
+        };
+        assert_eq!(
+            resolve_target(&read).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
+    }
+
+    #[test]
+    fn bridge_summary_is_fixed_and_ignores_client_text() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: "/api/v1/capabilities/bridge".into(),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "签发 8 小时微信桥开发令牌，只能写入入站事件");
+        assert!(!details.contains("客户端"));
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+    }
+
+    /// Dropping `CapabilityRevoke` from `resolve_target` turns the first
+    /// `unwrap` red. Dropping the summary arm, or the `claims_by_id` bridge
+    /// check, turns the details `unwrap` red or lets a non-bridge id through.
+    #[test]
+    fn bridge_revoke_summary_names_the_bridge_id_prefix() {
+        use std::collections::BTreeSet;
+
+        let store = CapabilityStore::new("g");
+        let authority = FirstPartyAuthority::new(store.clone());
+        let bridge_id = "aabbccddeeff00112233445566778899";
+        let now = unix_now();
+        store
+            .insert(CapabilityClaims {
+                first_party: None,
+                capability_id: bridge_id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some("wechat-bridge".into()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "g".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 3600,
+                deadline: None,
+                allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+            })
+            .unwrap();
+        let shell = authority.issue(&test_peer("g")).unwrap();
+        let mut creative = store.claims_by_id(bridge_id).unwrap();
+        creative.capability_id = "cc11223344556677889900aabbccddee".into();
+        creative.audience = Audience::CreativeRuntime;
+        creative.component_id = None;
+        creative.allowed_operations = BTreeSet::from([Operation::ModelsRead]);
+        store.insert(creative).unwrap();
+
+        let request = |id: &str| ElevateRequest {
+            method: "POST".into(),
+            path: format!("/api/v1/capabilities/{id}/revoke"),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request(bridge_id)).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "撤销微信桥开发令牌 aabbccdd");
+        assert!(!details.contains("客户端"));
+        assert!(details.contains(&bridge_id[..8]));
+        for id in [
+            shell.token_id.as_str(),
+            "cc11223344556677889900aabbccddee",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        ] {
+            let target = resolve_target(&request(id)).unwrap();
+            assert!(
+                authority.target_summary("absent", &target).is_none(),
+                "{id}"
+            );
+        }
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request(bridge_id)
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+        assert!(
+            store
+                .validate_bearer(
+                    &shell.secret,
+                    Operation::ModelsRead,
+                    &Resource::global(),
+                    unix_now(),
+                )
+                .is_ok()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn daily_token_ttl_ignores_wall_clock_jumps() {
         let store = CapabilityStore::new("g");
@@ -1529,6 +1809,36 @@ mod tests {
                 "{path}"
             );
         }
+    }
+
+    /// Dropping the trusted-team templates from `resolve_target`'s supported
+    /// set turns the PUT/DELETE assertions into `NotElevatedOperation`.
+    #[test]
+    fn trusted_team_writes_are_elevatable_and_reads_are_not() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        assert_eq!(
+            resolve_target(&idoris("GET", "/api/v1/os/trusted-teams", b"")).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
+        let put =
+            resolve_target(&idoris("PUT", "/api/v1/os/trusted-teams/ABCDE12345", b"")).unwrap();
+        assert_eq!(put.operation, Operation::ModuleAdmin);
+        let summary = authority.target_summary("id", &put).unwrap();
+        assert!(summary.contains("ABCDE12345"), "{summary}");
+        assert!(summary.contains("trust OS package team"), "{summary}");
+        let with_body =
+            resolve_target(&idoris("PUT", "/api/v1/os/trusted-teams/ABCDE12345", b"{}")).unwrap();
+        assert!(authority.target_summary("id", &with_body).is_none());
+        let del = resolve_target(&idoris(
+            "DELETE",
+            "/api/v1/os/trusted-teams/ABCDE12345",
+            b"",
+        ))
+        .unwrap();
+        assert_eq!(del.operation, Operation::ModuleAdmin);
+        let summary = authority.target_summary("id", &del).unwrap();
+        assert!(summary.contains("ABCDE12345"), "{summary}");
+        assert!(summary.contains("stop trusting"), "{summary}");
     }
 
     #[test]

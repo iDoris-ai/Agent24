@@ -147,6 +147,7 @@ async fn run(rig: &Rig, session: &str, prompt: &str) -> Run {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -216,7 +217,7 @@ async fn chat_turn_outcomes_carry_the_typed_code_on_a_full_partition() {
     let r = rig(Arc::new(UnusedSummarizer), roomy_policy()).await;
     set_rows(&r.path, 0).await;
     for prompt in ["今天天气", "记住我喜欢茶"] {
-        let outcome = r.manager.chat_remember_turn("s-chat", prompt, "好的", test_source_ref()).await;
+        let outcome = r.manager.chat_remember_turn("run_chat", "s-chat", prompt, "好的", test_source_ref()).await;
         assert_eq!(
             outcome,
             MemoryWriteOutcome::Failed(MemoryFailure {
@@ -240,7 +241,7 @@ async fn explicit_remember_whose_turn_fits_but_assertion_does_not_is_partial() {
     set_rows(&r.path, 2).await;
     let outcome = r
         .manager
-        .chat_remember_turn("s-partial", "记住我喜欢茶", "好的", test_source_ref())
+        .chat_remember_turn("run_chat", "s-partial", "记住我喜欢茶", "好的", test_source_ref())
         .await;
     assert_eq!(
         outcome,
@@ -277,7 +278,7 @@ async fn a_summary_that_cannot_be_written_emits_a_typed_session_summary_failure(
     let r = rig(Arc::new(FixedSummarizer), policy).await;
     // The turn's two rows fit exactly; the summary would be the third.
     set_rows(&r.path, 2).await;
-    let outcome = r.manager.chat_remember_turn("s-sum", "你好", "好的", test_source_ref()).await;
+    let outcome = r.manager.chat_remember_turn("run_chat", "s-sum", "你好", "好的", test_source_ref()).await;
     assert_eq!(outcome, MemoryWriteOutcome::NotApplicable);
     assert!(outcome.persisted(), "the turn itself was saved");
 
@@ -303,7 +304,7 @@ async fn a_double_failure_reports_both_the_partial_and_the_summary() {
     set_rows(&r.path, 2).await;
     let outcome = r
         .manager
-        .chat_remember_turn("s-double", "记住我喜欢茶", "好的", test_source_ref())
+        .chat_remember_turn("run_chat", "s-double", "记住我喜欢茶", "好的", test_source_ref())
         .await;
     assert!(matches!(outcome, MemoryWriteOutcome::Partial(_)), "{outcome:?}");
 
@@ -329,7 +330,7 @@ async fn a_summariser_failure_is_not_reported_as_a_write_failure() {
         max_summary_chars: 500,
     };
     let r = rig(Arc::new(FailingSummarizer), policy).await;
-    let outcome = r.manager.chat_remember_turn("s-sum2", "你好", "好的", test_source_ref()).await;
+    let outcome = r.manager.chat_remember_turn("run_chat", "s-sum2", "你好", "好的", test_source_ref()).await;
     assert!(outcome.persisted());
     assert!(r.sink.of_type("memory.write_failed").is_empty());
 }
@@ -380,6 +381,7 @@ async fn a_failed_legacy_import_fails_the_run_typed_and_a_retry_recovers_the_his
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

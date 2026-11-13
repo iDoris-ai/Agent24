@@ -5,6 +5,8 @@ declare global {
   interface Window { agent24: Agent24API }
 }
 import ChatPage from './pages/Chat'
+import { ProactiveBanner } from './pages/chat/ProactiveBanner'
+import { useSeeingOpenConversation } from './pages/chat/proactive'
 import HomePage from './pages/Home'
 import ModelsPage from './pages/Models'
 import SettingsPage from './pages/Settings'
@@ -85,6 +87,9 @@ function AppShell(): JSX.Element {
   const page = route.kind === 'page' ? route.page : selected?.page
   const c = useT(capabilitiesMessages)
   const statusFor = useCapabilityStatus(page === 'capabilities')
+  // M6 C2: the open conversation is seen while the main chat shows and the
+  // window has the focus (docs/ui/ASSISTANT-C.md §7).
+  useSeeingOpenConversation(page === 'assistant')
   useEffect(() => window.agent24.onCliToolSettings?.(() => navigate('settings')), [navigate])
   useEffect(() => {
     if (!prefs.showOverview && route.kind === 'page' && route.page === 'home') open('assistant', 'other')
@@ -256,6 +261,8 @@ function AppShell(): JSX.Element {
               : { display: 'none' }
           }
         >
+          {/* M6 C2: "The assistant has something to say (n)". */}
+          <ProactiveBanner />
           <ChatPage />
         </div>
         {page === 'home' && (
@@ -281,7 +288,7 @@ function AppShell(): JSX.Element {
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
-        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
+        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} grantsFor={statusFor.grantsFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {selected && !['assistant', 'documents', 'schedules', 'communication', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}

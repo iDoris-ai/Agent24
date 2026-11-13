@@ -224,9 +224,12 @@ export interface paths {
          * @description One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
          *     Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
          *     refused (403). The ProductHost audience, and legacy mode (one shared token that already
-         *     reads every full status route), get `ComponentView`. Every other audience gets
+         *     reads every full status route), get `ComponentView`, including `kernel_grants` (what the
+         *     mount actually handed out, `MountReport.granted`), `declared` (the `requires` declaration)
+         *     and `denied` (`{item, code}` with a closed code). Hyphae's declared kernel items are
+         *     `no_channel`: it has no kernel callback. Every other audience gets
          *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
-         *     port, error message, team id, commit, or Hyphae health probes. While the Hyphae daemon is
+         *     port, error message, team id, commit, denial, or Hyphae health probes. While the Hyphae daemon is
          *     running, the host view's `detail.health` lists each probe (`relays`, `keystore`, `daemon`,
          *     or `health` when the command itself did not finish) with `ok` and `consecutive_failures`.
          *     Three consecutive failures set state `degraded` and `reason` to those probe names; one
@@ -327,6 +330,47 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/trusted-teams": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List trusted Developer ID teams */
+        get: operations["listTrustedTeams"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/trusted-teams/{team}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Trust a Developer ID team
+         * @description Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+         */
+        put: operations["trustTeam"];
+        post?: never;
+        /**
+         * Remove trust for a Developer ID team
+         * @description Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+         */
+        delete: operations["untrustTeam"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1072,6 +1116,118 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/inbound/allowlist": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the inbound allowlist
+         * @description Everyday read. Returns every `(source, actor)` the host has stored, plus `policy_version`. An empty list is `entries: []`. An unknown query parameter is 400.
+         */
+        get: operations["getInboundAllowlist"];
+        /**
+         * Replace the inbound allowlist
+         * @description ProductHost only. Legacy mode and every other audience get 403. Last writer wins: the body replaces the whole list. There is no `expected_policy_version`, and this round does not do optimistic concurrency. A `(source, actor)` that is already stored keeps its `added_at`; a new pair is stamped by the daemon. A repeated `(source, actor)` in one body is 400. `scheduler` and `self` are not allowlist sources.
+         */
+        put: operations["putInboundAllowlist"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/inbound/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the inbound accept mode
+         * @description Everyday read. No stored row yet answers `accept_mode: observe` and `updated_at: null`. `policy_version` is the admit hash. It changes when the mode or the allowlist changes, and it does not depend on `updated_at`. An unknown query parameter is 400.
+         */
+        get: operations["getInboundPolicy"];
+        /**
+         * Set the inbound accept mode
+         * @description ProductHost only. Legacy mode and every other audience get 403. Last writer wins: there is no `expected_policy_version`, and this round does not do optimistic concurrency. `accept_mode` is stored and is not consulted by admission in this milestone. `policy_version` changes when the stored mode changes, and stays the same when the same mode is written again.
+         */
+        put: operations["putInboundPolicy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/capabilities/bridge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Issue an 8-hour wechat-bridge development token
+         * @description Elevated `capability.mint`, same confirmation path as other elevated shell routes. The desktop summary is generated by the daemon ("签发 8 小时微信桥开发令牌，只能写入入站事件") and does not include client text. The body is empty. The token audience is `component_runtime`, component id `wechat-bridge`, operation `inbound.ingest`, TTL 8 hours, not renewable. It is bound to the current daemon generation. The route is absent (`not_found`) unless the daemon was started with `A24_DEV_TOOL=1`; a missing bearer is still 401, and a closed gate does not issue or write `capability.token.issued`. Legacy mode with the gate on answers `capability_mode_required`. A first-party shell without an elevation grant answers `presence_required`. If the audit row cannot be written the token is not issued (`audit_unavailable`). If the issue row is written and the caller is no longer live, `capability.token.issued` is followed by `capability.token.issue_aborted` for the same id and the answer is 401. No bearer exists. If that compensating row cannot be written the answer is 503 `audit_unavailable`. The issued row names `issuer_capability_id`, the shell that asked. Revoking that shell does not revoke the bridge token.
+         */
+        post: operations["mintBridgeCapability"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/capabilities/{capability_id}/revoke": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revoke one capability by id
+         * @description Elevated `capability.revoke`. The desktop summary is generated by the daemon ("撤销微信桥开发令牌") and does not include client text. The body is empty. A dev-bridge token is marked revoked in memory only when this call changes it from live to revoked. The `capability.token.revoked` row is written only for that transition. If that write fails the response is 503 `audit_unavailable` and the bearer stays revoked. A call that arrives while that write is still in progress is also 503 and does not answer 200. A later call after the row is stored answers 200 and does not append another. A 200 means the `Revoked` row is already stored. Unknown ids for a caller that is not a first-party shell, already-revoked ids, and tokens outside the dev-bridge profile answer 200 `revoked` and do not write that row. A first-party shell revoking an id this process does not have (the daemon restarted) gets 404 `bridge_token_unknown` and is not asked to elevate. Revoking the shell that issued a bridge token does not revoke the bridge token. The bridge token still expires after 8 hours, and a daemon restart makes its generation stale.
+         */
+        post: operations["revokeCapability"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/inbound/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List inbound events without the full body
+         * @description Everyday read. Newest `at` first, then `id`. Each item is metadata plus `text_preview`, the first 50 characters of `text`. The full body and `meta` are not returned. This list is not pushed on `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above 100 are 400. `before_at` and `before_id` page backward and must be sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`. An unknown query parameter, including a misspelled `limit`, is 400.
+         */
+        get: operations["listInboundEvents"];
+        put?: never;
+        /**
+         * Record one development WeChat message
+         * @description Development transport for the wechat bridge. Mounted when the daemon was started with `A24_DEV_TOOL=1`, in legacy mode and in capabilities mode. Without that flag the answer is 404 (`No v1 route`). Legacy mode rejects this POST with 409 `capability_mode_required`: the shared bearer is not accepted, while that auth mode itself stays for the other routes. Capabilities mode accepts only a component-runtime token whose component id is `wechat-bridge` and whose only operation is `inbound.ingest`. ProductHost, a first-party shell, a creative token, and the legacy bearer are forbidden there. The legacy allowlist seed is not applied in capabilities mode. `source` is fixed to `wechat`: a body `source` other than `wechat` is 400, and the stored row is always `wechat` / `dev_bridge` / `direct` / `human=true`. The route does not copy `category`, `human`, or `addressed` from the body. Admission (allowlist, watermark, rate) still decides whether a run starts. A duplicate `id` does not start a second run. The response does not echo `text`. A storage failure is a generic `storage error`. A start failure is a generic `internal error`. Neither body includes the store text or the prompt. An allowlisted message with no text is 400 and is not stored. An unknown query parameter is 400. A body over the daemon limit is 413 `payload_too_large`.
+         */
+        post: operations["postWechatInboundEvent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sin90/directions": {
         parameters: {
             query?: never;
@@ -1276,7 +1432,7 @@ export interface paths {
         put?: never;
         /**
          * Append one chunk of raw bytes at the given offset
-         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires. An upload that is complete or imported takes no new chunk: 409 `upload_offset_mismatch` with `details.received_offset`, decided before the `total_size` and `Chunk-Sha256` checks (a received chunk still replays). For an upload still receiving, a new chunk that would run past `total_size` is 400 `invalid_request`. An unknown upload, or one 24 h after its last chunk, is 404 `not_found`. A body over 768 KiB is 413 `payload_too_large`.
+         * @description At most 786432 bytes (768 KiB) of raw body per chunk, counted in bytes by the OS, leaving room under the 1 MiB proxy body limit. An offset equal to the bytes received so far appends; a chunk already received with the same hash is a 200 replay; anything else is `upload_offset_mismatch` with `details.received_offset` (§5.6). The checks run in that order: for a new chunk (offset equal to the bytes received so far), a `Chunk-Sha256` that does not match the body's bytes is 400 `invalid_request`; for a range already received, any hash other than the stored one is the 409 above, as §5.6 requires. An upload that is complete or imported takes no new chunk: 409 `upload_offset_mismatch` with `details.received_offset`, decided before the `total_size` and `Chunk-Sha256` checks (a received chunk still replays). For an upload still receiving, a new chunk that would run past `total_size` is 400 `invalid_request`. An unknown upload, or one 24 h after its last chunk, is 404 `not_found`. A body over 768 KiB is 413 `payload_too_large`. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. That body is not `DocumentsConflict`, which stays `upload_offset_mismatch`.
          */
         post: operations["documentsAppendUploadChunk"];
         delete?: never;
@@ -2159,6 +2315,115 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/skills": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List installed skills without bodies
+         * @description Everyday `skills.read`. One row per installed skill and origin.
+         *     Bodies are not included. An empty pointer means the skill is not active
+         *     and the generation is 0.
+         */
+        get: operations["listSkills"];
+        put?: never;
+        /**
+         * Import a skill from a request body
+         * @description Everyday `skills.install`. The JSON body is `markdown` plus optional
+         *     `evals` (`name` and `content`). A path, an origin, or any other field
+         *     is rejected. The server does not open a caller path. Origin is always
+         *     `imported`. The pointer does not move.
+         */
+        post: operations["postSkill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/skills/scans": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Rescan the user skill directory
+         * @description Everyday `skills.install`. The body is empty or `{}`. No path is
+         *     accepted. The scan reads `<data_dir>/skills` and stores `origin=user`.
+         *     One bad skill is reported in `errors` and does not fail the others.
+         */
+        post: operations["postSkillScan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/skills/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read one installed skill
+         * @description Everyday `skills.read`. Returns the pointer, generation (0 when there
+         *     is no pointer), installed revision metadata, and a text-consistency
+         *     summary. Bodies are not included. Provider resolution is SL-5 and is
+         *     not in this response.
+         */
+        get: operations["getSkill"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/skills/{id}/activate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Activate a skill pair, or roll back to a recorded one
+         * @description Elevated `skills.activate`. Not proxied by the desktop backend proxy:
+         *     only the desktop main process (host credentials) and an elevated CLI
+         *     token reach it. The legacy shared token is refused.
+         *
+         *     Send either `body_revision_id` + `evals_revision_id` (+ `accepted`)
+         *     or `rollback_activation_id`. No pass flag, score, or body text is
+         *     accepted (`400 invalid_request`). The server reruns the evals from the
+         *     stored revisions and binds that result. A rollback does not rerun.
+         *
+         *     A first-party shell token gets these errors, and `unchanged`, without
+         *     elevation: the daemon runs the same checks and the eval rerun first and
+         *     asks for presence only when the pointer would really move.
+         *
+         *     `unchanged: true` means the pointer already named the pair. Nothing
+         *     was written, and it does not mean this request's evals or accepted
+         *     list were checked or stored.
+         */
+        post: operations["activateSkill"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -2277,6 +2542,19 @@ export interface components {
             resources: string;
             restart_required: boolean;
         };
+        TrustTeamError: {
+            /** @enum {string} */
+            code: "trust_store_unavailable" | "trust_team_failed";
+            message: string;
+            /** @constant */
+            retryable: false;
+        };
+        TrustedTeams: {
+            teams: {
+                team_id: string;
+                builtin: boolean;
+            }[];
+        };
         DomainOsList: {
             modules: components["schemas"]["DomainOsView"][];
             registry_error?: string;
@@ -2338,6 +2616,19 @@ export interface components {
                 th: string;
             };
         };
+        /** @description The component's `requires` declaration (`kernel` capabilities and canonical operations). */
+        ComponentRequires: {
+            kernel: string[];
+            operations: string[];
+        };
+        ComponentDenial: {
+            item: string;
+            /**
+             * @description not_declared: in the form's ceiling but not declared. above_ceiling: declared but outside the ceiling. no_channel: declared and inside the ceiling, but the mount handed out no handle (Hyphae always; a model callback that did not build). This also includes a capability withheld by policy (lease, partition, grant, or ephemeral). requires_invalid: the declaration did not parse, so nothing was granted.
+             * @enum {string}
+             */
+            code: "not_declared" | "above_ceiling" | "no_channel" | "requires_invalid";
+        };
         /** @description Host view of one component. */
         ComponentView: {
             id: string;
@@ -2346,14 +2637,20 @@ export interface components {
             /** @enum {string} */
             form: "resident" | "sidecar" | "cli" | "attach" | "remote" | "mcp";
             provides: components["schemas"]["ComponentProvide"][];
-            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
+            /** @description Short machine-readable cause; host only. For hyphae with state failed this includes signature_rejected, hash_mismatch (see HyphaeRejection), and contract_check_failed (the contract command did not return a readable envelope). An OS package that failed its integrity check is state failed (not absent, not incompatible) with one of integrity_manifest_missing, hash_mismatch, integrity_manifest_invalid, signature_rejected, or integrity_check_failed. State incompatible uses contract_mismatch. State degraded lists the failed probe names (for example relays), never a relay URL. A Hyphae that is simply not installed is state absent with no reason. */
             reason?: string;
+            /** @description Kernel capabilities actually held. A mounted package copies `MountReport.granted`. An attached module copies the admission grant (events, and models when a model callback was built); for attach rows this is the admission grant and does not change with whether the module is currently connected. Empty when nothing was handed out. Not the resolver's grant set: a missing model callback omits `models` even when the declaration and the ceiling would allow it. */
+            kernel_grants: string[];
+            /** @description The component's `requires` declaration. Null when no declaration was read (the manifest was not read, or the component has no `requires` lock, such as built-in MCP or knowledge rows): the declaration is unknown, denials are not computed, and the out-of-process ceiling is not applied. */
+            declared: components["schemas"]["ComponentRequires"] | null;
+            /** @description Host only. Closed reasons an item is not in `kernel_grants`. */
+            denied: components["schemas"]["ComponentDenial"][];
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
                 [key: string]: unknown;
             };
         };
-        /** @description What every audience other than the host sees. No path, pid, port, message, team id, commit, or Hyphae health probes. */
+        /** @description What every audience other than the host sees. No path, pid, port, message, team id, commit, kernel grant, denial, or Hyphae health probes. */
         ComponentRedactedView: {
             id: string;
             version: string | null;
@@ -2688,6 +2985,8 @@ export interface components {
             mode?: components["schemas"]["RunMode"];
             /** @description KB-HOST-01: a Knowledge binding the product host activated over its private interface. A selector, not an authority: only the product host may name one, and only one it has active; the run is pinned to that activation. Omit/null for a run without Knowledge. */
             knowledge_binding_id?: string | null;
+            /** @description A skill to run under (SL-5). Only the id: the server reads the skill's current activation pointer when the run is admitted and pins that revision, so there is no version field. A skill with no pointer (installed, never activated) is refused with `skill_not_active`; it never falls back to the latest revision. Imported skill text is labelled `Unknown` + `LocalOnly`. Inbound events and scheduled self-wake runs cannot carry one (`skill_not_admitted`), and neither can a workspace-bound run in v1. Omit/null for a run without a skill. */
+            skill_id?: string | null;
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";
@@ -3135,13 +3434,124 @@ export interface components {
             /** @description The persistent personal-memory switch. `false` stops new writes and cross-session recall; existing assertions are kept, and the setting survives a daemon restart. */
             enabled: boolean;
         };
+        InboundAllowEntry: {
+            /**
+             * @description External sources that go through admission. `scheduler` and `self` are not allowlist sources.
+             * @enum {string}
+             */
+            source: "hyphae" | "wechat" | "remote";
+            actor: string;
+            /** @description UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`. Kept when the same `(source, actor)` is written again. A new pair is stamped at that write. */
+            added_at: string;
+            note?: string | null;
+        };
+        InboundAllowlist: {
+            entries: components["schemas"]["InboundAllowEntry"][];
+            /** @description Admit hash: sha256 of the sorted allowlist, the accept mode, and the admit rule version. 64 lowercase hex digits. It does not depend on `updated_at`. */
+            policy_version: string;
+        };
+        InboundAllowlistWrite: {
+            entries: {
+                /** @enum {string} */
+                source: "hyphae" | "wechat" | "remote";
+                actor: string;
+                note?: string | null;
+            }[];
+        };
+        InboundPolicy: {
+            /** @enum {string} */
+            accept_mode: "off" | "observe" | "auto";
+            /** @description Null until the first write. */
+            updated_at?: string | null;
+            policy_version: string;
+        };
+        InboundPolicyWrite: {
+            /** @enum {string} */
+            accept_mode: "off" | "observe" | "auto";
+        };
+        InboundEventSummary: {
+            id: string;
+            source: string;
+            category: string;
+            recipient_identity?: string | null;
+            thread_key?: string | null;
+            actor?: string | null;
+            human: boolean;
+            /** @enum {string} */
+            addressed: "none" | "mention" | "direct";
+            at: string;
+            received_at: string;
+            /** @description First 50 characters of the body, or null when the body is gone. */
+            text_preview?: string | null;
+            text_scrubbed_at?: string | null;
+            disposition: string;
+            disposition_reason?: string | null;
+            policy_version?: string | null;
+            run_state?: string | null;
+        };
+        InboundEventPage: {
+            events: components["schemas"]["InboundEventSummary"][];
+            /** @description Present when another older page exists. Send both values back as query parameters. */
+            next?: {
+                before_at: string;
+                before_id: string;
+            } | null;
+        };
+        BridgeCapability: {
+            capability_id: string;
+            /** @description Bearer secret. Returned once. Not written to the audit log. */
+            token: string;
+            /** @enum {string} */
+            audience: "component_runtime";
+            /** @enum {string} */
+            component_id: "wechat-bridge";
+            daemon_generation: string;
+            created_at: number;
+            expires_at: number;
+            /** @enum {integer} */
+            ttl_seconds: 28800;
+            allowed_operations: "inbound.ingest"[];
+        };
+        CapabilityRevocation: {
+            capability_id: string;
+            /** @enum {string} */
+            state: "revoked";
+        };
+        WechatInboundEventWrite: {
+            /** @description `wechat:` plus the iLink decimal `message_id`. */
+            id: string;
+            /**
+             * @description Optional. Omitted or `wechat` is accepted. Any other value is 400. The route stores `wechat` either way.
+             * @enum {string}
+             */
+            source?: "wechat";
+            /** @description WeChat `from_user_id`, NFC, no control or format characters. */
+            actor: string;
+            /** @description Message time, `YYYY-MM-DDTHH:MM:SSZ`, no fractional seconds. */
+            at: string;
+            /** @description Message text. Empty or omitted is no body. An allowlisted message with no body is 400 and is not stored. */
+            text?: string;
+        };
+        WechatInboundEventResult: {
+            id: string;
+            /** @enum {string} */
+            outcome: "duplicate" | "ignored" | "started" | "already_linked";
+            /** @description Present when `outcome` is `ignored`. */
+            reason?: string;
+            /** @description Present for `started`, and for `already_linked` when the link row is still there. Omitted when that row is gone. */
+            run_id?: string;
+        };
         ErrorBody: {
             /**
              * @description Open enum: invalid_request, unauthorized, not_found, conflict,
              *     approval_already_resolved, provider_unavailable,
              *     run_not_cancellable (reserved), internal,
              *     admission_refused, module_panicked, module_killed,
-             *     module_owned_schedule, not_a_module_schedule, schedule_conflict
+             *     module_owned_schedule, not_a_module_schedule, schedule_conflict.
+             *     A proxied call whose package failed an integrity re-check uses
+             *     `os_package.<reason>` with HTTP 409 and `details.retryable: false`
+             *     (see OsPackageConflict). `package_changed` remains the 503 code
+             *     only when that re-check has no integrity code.
              */
             code: string;
             message: string;
@@ -3156,6 +3566,121 @@ export interface components {
         };
         Error: {
             error: components["schemas"]["ErrorBody"];
+        };
+        SkillImportEval: {
+            /** @description Relative eval path declared in the manifest. Not a filesystem path the server opens. */
+            name: string;
+            /** @description UTF-8 eval document, at most 32 KiB. */
+            content: string;
+        };
+        SkillImportRequest: {
+            /** @description Full SKILL.md text, at most 32 KiB UTF-8. */
+            markdown: string;
+            evals?: components["schemas"]["SkillImportEval"][];
+        };
+        SkillInstall: {
+            skill_id: string;
+            /** @enum {string} */
+            origin: "imported" | "user";
+            semver: string;
+            body_revision_id: string;
+            evals_revision_id: string;
+            content_digest: string;
+            /** @description Field and file names that did not take effect on this parse. */
+            ineffective: string[];
+            inserted: boolean;
+            pointer: components["schemas"]["SkillPointer"] | null;
+            generation: number;
+            /** @description Counts for the body and evals this install wrote or reused. Null when that pair cannot be checked. */
+            text_consistency: components["schemas"]["SkillConsistency"] | null;
+        };
+        SkillPointer: {
+            /** @enum {string} */
+            origin: "imported" | "user";
+            body_revision_id: string;
+            evals_revision_id: string;
+            generation: number;
+        };
+        SkillListItem: {
+            skill_id: string;
+            /** @enum {string} */
+            origin: "imported" | "user";
+            semver: string;
+            generation: number;
+            active: boolean;
+        };
+        SkillList: {
+            skills: components["schemas"]["SkillListItem"][];
+        };
+        SkillRevisionMeta: {
+            revision_id: string;
+            /** @enum {string} */
+            origin: "imported" | "user";
+            semver: string;
+            /** @enum {string} */
+            kind: "body" | "evals";
+            content_digest: string;
+            created_at: string;
+            /** @description Capability ids declared by this body revision. Omitted on evals revisions, and when the stored body no longer parses. */
+            requires?: string[];
+        };
+        SkillConsistency: {
+            consistent: number;
+            total: number;
+        };
+        SkillActivationRecord: {
+            activation_id: string;
+            seq: number;
+            body_revision_id: string;
+            evals_revision_id: string;
+            /** @enum {string} */
+            result_code: "activated" | "rolled_back";
+            /** @enum {string|null} */
+            origin_from: "imported" | "user" | null;
+            /** @enum {string} */
+            origin_to: "imported" | "user";
+            created_at: string;
+            /** @description How many failing cases this activation accepted. Omitted when the binding's accepted list is not a JSON array. Case text is not included. */
+            accepted_count?: number;
+        };
+        SkillDetail: {
+            skill_id: string;
+            pointer: components["schemas"]["SkillPointer"] | null;
+            generation: number;
+            revisions: components["schemas"]["SkillRevisionMeta"][];
+            /** @description Activation and rollback history, oldest first. No eval cases or text. */
+            activations: components["schemas"]["SkillActivationRecord"][];
+            text_consistency: components["schemas"]["SkillConsistency"] | null;
+        };
+        /** @description Pair form: both revision ids, plus `accepted` (exactly the failed case ids of the server's own run). Rollback form: `rollback_activation_id` alone. */
+        SkillActivateRequest: {
+            expected_generation: number;
+            body_revision_id?: string;
+            evals_revision_id?: string;
+            accepted?: string[];
+            rollback_activation_id?: string;
+        };
+        SkillActivation: {
+            skill_id: string;
+            /** @enum {string} */
+            result: "activated" | "rolled_back" | "unchanged";
+            unchanged: boolean;
+            activation_id: string | null;
+            generation: number;
+            pointer: components["schemas"]["SkillPointer"];
+            text_consistency: components["schemas"]["SkillConsistency"] | null;
+            note: string | null;
+        };
+        SkillScanError: {
+            path: string;
+            code: string;
+            message: string;
+        };
+        SkillScan: {
+            /** @enum {string} */
+            origin: "user";
+            skills: components["schemas"]["SkillInstall"][];
+            errors: components["schemas"]["SkillScanError"][];
         };
         /** @description `doc_` + ULID, generated by the OS (ADR-DOC-02 §3). The first ULID character is 0–7: larger values overflow 128 bits. */
         DocumentIdString: string;
@@ -3247,7 +3772,18 @@ export interface components {
                 code?: "idempotency_key_reused" | "upload_checksum_mismatch" | "unsupported_format";
             };
         };
-        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. The rule holds wherever this schema is used: the 500 response and, through `DocumentsUnavailable`, the 503 one. */
+        /** @description D6 envelope for an integrity refusal on a proxied call. HTTP 409. Not the old 503 `package_changed` shape. */
+        OsPackageConflictError: components["schemas"]["Error"] & {
+            error?: {
+                code: string;
+                message: string;
+                details: {
+                    /** @constant */
+                    retryable: false;
+                };
+            };
+        };
+        /** @description An error produced by the kernel or its proxy: the generic envelope, with any code except the ones only the Documenting OS uses. `invalid_request`, `not_found` and `payload_too_large` are shared with the kernel and stay allowed. One exception comes from the OS itself: a 500 `internal` for a failure it did not expect (ADR-DOC-02 §6). The OS's `internal` always has `details.retryable: false`; a kernel `internal` may have no details, but an `internal` is never retryable. The rule holds wherever this schema is used: the 500 response and, through `DocumentsUnavailable`, the 503 one. An integrity refusal of the mounted package is not this schema: it is 409 `OsPackageConflict` (`os_package.<reason>`, `retryable: false`). 503 `package_changed` remains only for a package change with no integrity code. */
         ModuleProxyError: components["schemas"]["Error"] & unknown & {
             error?: {
                 code?: unknown;
@@ -4112,7 +4648,16 @@ export interface components {
                 "application/json": components["schemas"]["DocumentsImportUnprocessableError"];
             };
         };
-        /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
+        /** @description 409 from the kernel proxy when a mounted package fails its integrity re-check. `error.code` is `os_package.<reason>` (`integrity_manifest_missing`, `hash_mismatch`, `integrity_manifest_invalid`, `signature_rejected`, or `integrity_check_failed`) and `error.details.retryable` is false. A re-check with no integrity code, such as shutdown cancellation, stays 503 `package_changed` on the generic envelope, not this response. */
+        OsPackageConflict: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["OsPackageConflictError"];
+            };
+        };
+        /** @description Exactly one of: the OS reports `storage_unavailable`, `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or the kernel proxy reports the module unreachable (`module_not_ready`, `module_draining`, … in the generic envelope). An integrity failure of the mounted package is not this 503: it is 409 `os_package.<reason>` (`OsPackageConflict`), `retryable: false`. ADR-DOC-02 §6 lists which proxy codes are safe to retry. */
         DocumentsUnavailable: {
             headers: {
                 [name: string]: unknown;
@@ -4727,6 +5272,121 @@ export interface operations {
             };
         };
     };
+    listTrustedTeams: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current trusted teams, including the built-in team */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedTeams"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Trust store unavailable or trust operation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+        };
+    };
+    trustTeam: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current trusted teams, including the built-in team */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedTeams"];
+                };
+            };
+            /** @description Invalid team, built-in team removal, or trust store update failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Trust store unavailable or trust operation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+        };
+    };
+    untrustTeam: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                team: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current trusted teams, including the built-in team */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustedTeams"];
+                };
+            };
+            /** @description Invalid team, built-in team removal, or trust store update failed */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description Trust store unavailable or trust operation failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+        };
+    };
     updateDomainOs: {
         parameters: {
             query?: never;
@@ -5318,7 +5978,15 @@ export interface operations {
                     "application/json": components["schemas"]["Run"];
                 };
             };
-            400: components["responses"]["BadRequest"];
+            /** @description invalid_request, or skill_not_admitted: skill_id was named on a workspace-bound request or session (a v1 restriction). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             /** @description host_authority_required: knowledge_binding_id was named by a caller other than the product host */
             403: {
                 headers: {
@@ -5329,7 +5997,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id. knowledge_session_rebound: the session's runs used another activation of that binding, or it holds Knowledge results from before a daemon restart; start a new session. Also returned for a session not yet pinned once the daemon has reached its limit of pinned sessions; then a new session is refused too, until the daemon restarts. */
+            /** @description knowledge_binding_inactive: the product host has no active Knowledge binding by that id. knowledge_session_rebound: the session's runs used another activation of that binding, or it holds Knowledge results from before a daemon restart; start a new session. Also returned for a session not yet pinned once the daemon has reached its limit of pinned sessions; then a new session is refused too, until the daemon restarts. Skill runs: skill_not_active (no activation pointer), skill_capability_missing (a required capability has no ready provider), skill_provider_ambiguous (more than one), and skill_pointer_conflict (the pointer moved during admission; retry). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6292,6 +6960,409 @@ export interface operations {
             };
         };
     };
+    getInboundAllowlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundAllowlist"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    putInboundAllowlist: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InboundAllowlistWrite"];
+            };
+        };
+        responses: {
+            /** @description The stored allowlist */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundAllowlist"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not the desktop ProductHost credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getInboundPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The stored accept mode */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundPolicy"];
+                };
+            };
+            /** @description Unknown query parameter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    putInboundPolicy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InboundPolicyWrite"];
+            };
+        };
+        responses: {
+            /** @description The stored accept mode */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundPolicy"];
+                };
+            };
+            /** @description Malformed request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not the desktop ProductHost credential */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    mintBridgeCapability: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new bearer. The token is returned once. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BridgeCapability"];
+                };
+            };
+            /** @description Missing bearer, or the shell was not live when the token would have been inserted. In the second case the audit log has `capability.token.issued` then `capability.token.issue_aborted`, and no bearer exists. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing elevation, or the caller is not a first-party shell */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Development gate is off (`A24_DEV_TOOL` is not `1`). No token is issued and no issue audit is written. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Daemon is not in capabilities mode */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The audit row could not be written (`audit_unavailable`). No token was issued. This includes a failed `issue_aborted` row after the caller failed the live check. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeCapability: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                capability_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The id is revoked, or was already unknown or revoked. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CapabilityRevocation"];
+                };
+            };
+            /** @description Invalid capability id */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing or invalid bearer */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing elevation, or the caller is not allowed to revoke */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description First-party shell revoked an id this daemon process does not have (`bridge_token_unknown`). No elevation was requested. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Daemon is not in capabilities mode */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description The revoke transition happened and `capability.token.revoked` could not be written (`audit_unavailable`), or another revoke of this id is still writing that row. The bearer stays revoked. Retrying after a failed write stores the one missing row and then answers 200. A 200 means that row is already stored. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    listInboundEvents: {
+        parameters: {
+            query?: {
+                limit?: number;
+                before_at?: string;
+                before_id?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One page of inbound event metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InboundEventPage"];
+                };
+            };
+            /** @description Invalid query */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    postWechatInboundEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WechatInboundEventWrite"];
+            };
+        };
+        responses: {
+            /** @description Recorded. `outcome` says whether a run started. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WechatInboundEventResult"];
+                };
+            };
+            /** @description Malformed body, unknown field, unknown query parameter, a source other than wechat, or an allowlisted message with no text */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Capabilities mode with the dev gate on, but the bearer is not the wechat-bridge component token */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Not mounted (`A24_DEV_TOOL` is not `1`) */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Legacy mode with the dev gate on (`capability_mode_required`). The shared bearer is valid for other routes and is not accepted for this POST. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description payload_too_large: the request exceeded the daemon-wide body limit */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Storage failure (`storage error`) or start failure (`internal error`). The body does not include the store text or the prompt. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
     sin90ListDirections: {
         parameters: {
             query?: never;
@@ -6312,6 +7383,7 @@ export interface operations {
                     };
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6342,6 +7414,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6365,6 +7438,7 @@ export interface operations {
                     };
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6396,6 +7470,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6427,7 +7502,7 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
-            /** @description Illegal transition */
+            /** @description Illegal transition. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6459,6 +7534,7 @@ export interface operations {
                     };
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6489,7 +7565,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
-            /** @description Same id already exists with different ops */
+            /** @description Same id already exists with different ops. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6522,6 +7598,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6546,7 +7623,7 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
-            /** @description Proposal not pending */
+            /** @description Proposal not pending. The kernel proxy may also answer 409 `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when the mounted package fails its integrity re-check. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6591,6 +7668,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             503: components["responses"]["Sin90Unavailable"];
         };
     };
@@ -6612,6 +7690,7 @@ export interface operations {
                     "application/json": components["schemas"]["DocumentsCapabilities"];
                 };
             };
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6641,6 +7720,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["DocumentsBadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6669,6 +7749,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6710,6 +7791,7 @@ export interface operations {
                 };
             };
             400: components["responses"]["DocumentsBadRequest"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsUploadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -6787,6 +7869,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsImportUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -6816,6 +7899,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6844,6 +7928,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6872,6 +7957,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -6909,6 +7995,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             413: components["responses"]["DocumentsTooLarge"];
             422: components["responses"]["DocumentsRenderUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
@@ -6948,6 +8035,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsReadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -6981,6 +8069,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsReadUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -7026,6 +8115,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             422: components["responses"]["DocumentsExtractUnprocessable"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
@@ -7059,6 +8149,7 @@ export interface operations {
             };
             400: components["responses"]["DocumentsBadRequest"];
             404: components["responses"]["DocumentsNotFound"];
+            409: components["responses"]["OsPackageConflict"];
             500: components["responses"]["DocumentsProxyFailure"];
             502: components["responses"]["DocumentsProxyFailure"];
             503: components["responses"]["DocumentsUnavailable"];
@@ -8376,6 +9467,246 @@ export interface operations {
             502: components["responses"]["IdorisFailure"];
             503: components["responses"]["IdorisFailure"];
             504: components["responses"]["IdorisFailure"];
+        };
+    };
+    listSkills: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Installed skills */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillList"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+        };
+    };
+    postSkill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Installed or adopted revision */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillInstall"];
+                };
+            };
+            /** @description Manifest, eval, or request rejection */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Same semver and a different content digest */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /**
+             * @description The request body is over 1 MiB, or the skill body or one eval
+             *     file is over 32 KiB.
+             */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Skill store failed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    postSkillScan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Scan result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillScan"];
+                };
+            };
+            /** @description The body carried a path or another field */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description The request body is over 1 MiB */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Internal failure while reading the request */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    getSkill: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Skill detail */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillDetail"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description No revision is installed for this id */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    activateSkill: {
+        parameters: {
+            query?: never;
+            header?: {
+                /** @description Elevation grant for a first-party shell token. */
+                "X-Agent24-Elevation"?: string;
+            };
+            path: {
+                id: components["parameters"]["PathId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SkillActivateRequest"];
+            };
+        };
+        responses: {
+            /** @description Activated, rolled back, or unchanged */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SkillActivation"];
+                };
+            };
+            /** @description `invalid_request`, `skill_activation_mixed`, `skill_origin_mismatch`, `skill_revision_mismatch`, or a manifest or eval rejection */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description Not permitted, or `presence_required` without a grant */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `skill_revision_not_found` or `skill_activation_not_found` */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `skill_pointer_conflict`, `skill_eval_empty`, or `skill_eval_failed` (`error.details.cases` and `failed` carry the server-computed run; the pointer did not move) */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Storage failure, or a corrupt pointer row */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
         };
     };
 }

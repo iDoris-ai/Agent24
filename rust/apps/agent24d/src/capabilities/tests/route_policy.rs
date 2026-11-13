@@ -79,7 +79,7 @@ fn method(name: &str) -> Method {
 #[test]
 fn section_3_rows_match_operation_and_level() {
     let (mut fixed, module) = design_tables();
-    assert_eq!(fixed.len(), 93);
+    assert_eq!(fixed.len(), 96);
     assert_eq!(module.len(), 2);
     // Slice S2 adds the explicit R1 delegation entry point; the frozen §3
     // table predates that route, so keep the original rows as the oracle.
@@ -215,6 +215,83 @@ fn section_3_rows_match_operation_and_level() {
         level: AssuranceLevel::Everyday,
     });
 
+    // X11-2f: read and write stay separate operations. One operation at both
+    // levels makes assurance_level() return None.
+    for (method, path, operation, level) in [
+        (
+            "GET",
+            "/inbound/allowlist",
+            "InboundRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "PUT",
+            "/inbound/allowlist",
+            "InboundWrite",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "GET",
+            "/inbound/policy",
+            "InboundRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "PUT",
+            "/inbound/policy",
+            "InboundWrite",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "GET",
+            "/inbound/events",
+            "InboundRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/inbound/events",
+            "InboundIngest",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/capabilities/bridge",
+            "CapabilityMint",
+            AssuranceLevel::Elevated,
+        ),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: operation.into(),
+            level,
+        });
+    }
+
+    // Skill loader SL-3.
+    for (method, path, operation) in [
+        ("GET", "/skills", "SkillsRead"),
+        ("GET", "/skills/{id}", "SkillsRead"),
+        ("POST", "/skills", "SkillsInstall"),
+        ("POST", "/skills/scans", "SkillsInstall"),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: operation.into(),
+            level: AssuranceLevel::Everyday,
+        });
+    }
+
+    // SL-4: activation and rollback are Elevated.
+    fixed.push(DesignRow {
+        method: "POST".into(),
+        path: "/skills/{id}/activate".into(),
+        operation: "SkillsActivate".into(),
+        level: AssuranceLevel::Elevated,
+    });
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(
@@ -340,6 +417,43 @@ fn creative_allowlist_is_unchanged_and_new_routes_stay_closed() {
     assert!(Operation::from_action("not.an.operation").is_none());
 }
 
+/// A second route that reuses `InboundIngest` is not on the explicit list.
+/// Changing `component_route_permitted` to `true`, or to "the catalog
+/// operation is InboundIngest", turns the extra-row assertion red.
+#[test]
+fn an_extra_inbound_ingest_route_is_not_admitted() {
+    let extra = RoutePolicy {
+        method: "POST",
+        template: "/api/v1/inbound/events/replay",
+        operation: Operation::InboundIngest,
+        level: AssuranceLevel::Everyday,
+    };
+    assert_eq!(extra.operation, Operation::InboundIngest);
+    assert!(!component_route_permitted(&Method::POST, extra.template));
+    assert!(component_route_permitted(
+        &Method::POST,
+        "/api/v1/inbound/events"
+    ));
+    for policy in policies() {
+        let open = policy.method == "POST" && policy.template == "/api/v1/inbound/events";
+        assert_eq!(
+            component_route_permitted(&method(policy.method), policy.template),
+            open,
+            "{} {}",
+            policy.method,
+            policy.template
+        );
+    }
+    assert!(!component_route_permitted(
+        &Method::POST,
+        "/api/v1/documents/x"
+    ));
+    assert!(!component_route_permitted(
+        &Method::GET,
+        "/api/v1/inbound/events"
+    ));
+}
+
 #[test]
 fn method_splits_shutdown_and_memory_settings() {
     assert_eq!(
@@ -392,6 +506,30 @@ fn method_splits_shutdown_and_memory_settings() {
     );
     assert_eq!(
         Operation::ApprovalDecision.assurance_level(),
+        Some(AssuranceLevel::Elevated)
+    );
+    assert_eq!(
+        required_operation(&Method::GET, "/api/v1/inbound/events"),
+        Some(Operation::InboundRead)
+    );
+    assert_eq!(
+        required_operation(&Method::POST, "/api/v1/inbound/events"),
+        Some(Operation::InboundIngest)
+    );
+    assert_eq!(
+        Operation::InboundIngest.assurance_level(),
+        Some(AssuranceLevel::Everyday)
+    );
+    assert_eq!(
+        required_operation(&Method::PUT, "/api/v1/inbound/allowlist"),
+        Some(Operation::InboundWrite)
+    );
+    assert_eq!(
+        Operation::InboundRead.assurance_level(),
+        Some(AssuranceLevel::Everyday)
+    );
+    assert_eq!(
+        Operation::InboundWrite.assurance_level(),
         Some(AssuranceLevel::Elevated)
     );
 }

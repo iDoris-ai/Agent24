@@ -1656,7 +1656,7 @@ describe('return_to_chat_intent dialog and draft (U7.2)', () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'knowledge-view-a7-'))
       try {
         const history = createChatHistoryStore(dir)
-        const conv = history.create({ title: 'A conversation', title_source: 'user' })
+        const conv = history.create({ title: 'A conversation', title_source: 'user', initiator: 'assistant' })
         const s = await asked(knowledgePending(() => history, () => Date.UTC(2026, 10, 9), () => {}))
         const waiting = () => history.list().find((c) => c.id === conv.id)!.pending
         expect(waiting()).toEqual([])

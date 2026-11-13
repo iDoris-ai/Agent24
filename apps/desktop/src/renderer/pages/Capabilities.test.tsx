@@ -39,8 +39,8 @@ const ROOMY: NavPrefs = { pinned: ['documents'], slotCount: 3, showOverview: tru
 function renderPage(opts: {
   defs?: readonly CapabilityDef[]
   prefs?: NavPrefs
-  approvalsWaiting?: number
   statusFor?: (id: string) => string | undefined
+  grantsFor?: (id: string) => readonly string[] | undefined
   onOpenSettings?: () => void
 } = {}) {
   cleanup()
@@ -49,9 +49,9 @@ function renderPage(opts: {
   const onOpenSettings = opts.onOpenSettings ?? vi.fn()
   const prefs = opts.prefs ?? ROOMY
   render(
-    <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open, approvalsWaiting: opts.approvalsWaiting ?? 0 }}>
+    <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open }}>
       <NavPrefsContext.Provider value={{ prefs, setPrefs: next => setPrefs(typeof next === 'function' ? next(prefs) : next) }}>
-        <CapabilitiesPage statusFor={opts.statusFor} onOpenSettings={onOpenSettings} />
+        <CapabilitiesPage statusFor={opts.statusFor} grantsFor={opts.grantsFor} onOpenSettings={onOpenSettings} />
       </NavPrefsContext.Provider>
     </CapabilitiesContext.Provider>,
   )
@@ -71,9 +71,10 @@ describe('CapabilitiesPage', () => {
     renderPage({
       defs: DEFS.filter((d) => d.group !== 'tools'),
     })
-    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(
-      GROUP_TITLES.filter((title) => title !== 'Tools'),
-    )
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual([
+      ...GROUP_TITLES.filter((title) => title !== 'Tools'),
+      'Skills',
+    ])
     for (const blurb of GROUP_BLURBS.filter((text) => text !== GROUP_BLURBS[4])) {
       expect(screen.getByText(blurb)).toBeInTheDocument()
     }
@@ -160,9 +161,27 @@ describe('CapabilitiesPage', () => {
   })
 
   it('has no approvals row or count: approvals are decided in the assistant (M4 A6)', () => {
-    renderPage({ approvalsWaiting: 4 })
+    renderPage()
     expect(screen.queryByRole('status', { name: /waiting/ })).not.toBeInTheDocument()
     expect(screen.queryByText('Approvals')).not.toBeInTheDocument()
+  })
+
+  it('shows the kernel capabilities a component was actually granted, read-only', () => {
+    renderPage({
+      grantsFor: (id) => id === 'documents' ? ['events'] : id === 'sin90' ? [] : undefined,
+    })
+    expect(within(row('Documents')).getByText('Kernel capabilities: events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('Kernel capabilities: none')).toBeInTheDocument()
+    expect(within(row('Assistant')).queryByText(/Kernel capabilities/)).not.toBeInTheDocument()
+    expect(within(row('Documents')).queryByRole('textbox')).not.toBeInTheDocument()
+
+    act(() => setLocale('zh'))
+    expect(within(row('文档')).getByText('内核能力：events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('内核能力：无')).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(within(row('เอกสาร')).getByText('ความสามารถเคอร์เนล: events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('ความสามารถเคอร์เนล: ไม่มี')).toBeInTheDocument()
+    act(() => setLocale('en'))
   })
 
   it('labels builtin rows Built-in, other rows Open, and lets statusFor replace either', () => {

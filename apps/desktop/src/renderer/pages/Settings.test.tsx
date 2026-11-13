@@ -104,7 +104,7 @@ async function renderPrefs(
 ) {
   await act(async () => {
     render(
-      <CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn(), approvalsWaiting: 0 }}>
+      <CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn() }}>
         <PrefsHarness initial={initial} apply={apply}><SettingsPage /></PrefsHarness>
       </CapabilitiesContext.Provider>,
     )
@@ -200,7 +200,7 @@ describe('SettingsPage', () => {
       apiKey: 'test',
       models: ['Qwen3-8B'],
     })
-    mockOmlxStop.mockResolvedValue(undefined)
+    mockOmlxStop.mockResolvedValue({ ok: true, stopped: true })
 
     await renderPage()
     await openTab('Models')
@@ -213,6 +213,27 @@ describe('SettingsPage', () => {
     await waitFor(() => {
       expect(screen.getByText('Disconnected')).toBeInTheDocument()
     })
+  })
+
+  it('stays connected when stop reports the oMLX was not started here', async () => {
+    mockOmlxDetect.mockResolvedValue({
+      url: 'http://127.0.0.1:8088',
+      apiKey: 'test',
+      models: ['Qwen3-8B'],
+    })
+    mockOmlxStop.mockResolvedValue({ ok: true, stopped: false })
+
+    await renderPage()
+    await openTab('Models')
+    await waitFor(() => screen.getByText('Connected'))
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: /Stop/i }))
+    })
+    expect(mockOmlxStop).toHaveBeenCalled()
+    expect(screen.getByText('Connected')).toBeInTheDocument()
+    expect(screen.getByText(/1 model/)).toBeInTheDocument()
+    expect(screen.getByText('This oMLX was not started by this app. Stop it in the terminal that started it.')).toBeInTheDocument()
   })
 
   it('test connection shows result', async () => {
@@ -433,7 +454,7 @@ describe('Settings sidebar prefs', () => {
     const defs = withDynamicCapabilities([{ id: 'hello', type: 'ui', name: 'Hello workspace' }])
     await act(async () => {
       render(
-        <CapabilitiesContext.Provider value={{ defs, open: vi.fn(), approvalsWaiting: 0 }}>
+        <CapabilitiesContext.Provider value={{ defs, open: vi.fn() }}>
           <PrefsHarness initial={{ pinned: ['documents', 'hello'], slotCount: 2, showOverview: true }}
             apply={next => ({ prefs: { ...next, pinned: ['documents'] }, dropped: ['hello'] })}>
             <SettingsPage />
@@ -650,7 +671,7 @@ describe('Settings voice link and previous blocks', () => {
     const voice: CapabilityDef = { id: 'agent-ear', group: 'office', nameKey: 'n', descKey: 'd', builtin: false, page: 'voice' }
     await act(async () => {
       render(
-        <CapabilitiesContext.Provider value={{ defs: [voice], open, approvalsWaiting: 0 }}>
+        <CapabilitiesContext.Provider value={{ defs: [voice], open }}>
           <SettingsPage />
         </CapabilitiesContext.Provider>,
       )
@@ -664,7 +685,7 @@ describe('Settings voice link and previous blocks', () => {
     const open = vi.fn()
     await act(async () => {
       render(
-        <CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}>
+        <CapabilitiesContext.Provider value={{ defs: [], open }}>
           <SettingsPage />
         </CapabilitiesContext.Provider>,
       )

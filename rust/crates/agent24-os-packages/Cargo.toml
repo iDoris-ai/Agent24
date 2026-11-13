@@ -7,22 +7,39 @@ repository.workspace = true
 description = "Agent24 domain-OS packages on disk (ME-3a): discovery and atomic install"
 
 [dependencies]
+agent24-os-proc = { path = "../agent24-os-proc" }
+agent24-protocol = { path = "../agent24-protocol" }
+serde_json = "1"
+fs2 = "0.4"
+tracing = "0.1"
+
 agent24-components = { path = "../agent24-components" }
 agent24-domain = { path = "../agent24-domain" }
 # ME4-S3 §4.4 (M4): `manifest_digest` moved into proto so the kernel's
 # discovery and a module's handshake compute it with the same function.
 agent24-os-proto = { path = "../agent24-os-proto" }
+# S1-9 N3: recognise native executables (Mach-O incl. fat, ELF, PE) with a
+# maintained parser instead of hand-rolled header checks. Read-only formats.
+object = { version = "0.36", default-features = false, features = ["read_core", "std", "elf", "macho", "pe", "coff"] }
 serde_yaml = "0.9"
 # For `geteuid` — a SAFE wrapper over the syscall. See `effective_uid`: the
 # dependency-free alternative (create a file, ask who owns it) was attacker-
 # influenceable, which is a worse trade than one small crate.
-rustix = { version = "0.38", features = ["process"] }
+rustix = { version = "0.38", features = ["process", "fs"] }
 # The manifest digest a module reports in its handshake (SUP-4).
 sha2 = "0.10"
 tokio-util = "0.7"
 
+[features]
+# Fixtures other crates need when they build a package the daemon will scan.
+# Off for a normal build of this library.
+test-support = []
+
 [dev-dependencies]
 tempfile = "3"
+# The hash-pause hook is cfg'd out unless this feature is on. Tests in this
+# crate call it; a production build of the dependency does not.
+agent24-components = { path = "../agent24-components", features = ["test-support"] }
 
 [lints]
 workspace = true

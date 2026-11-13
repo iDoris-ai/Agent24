@@ -12,7 +12,7 @@ import {
   validKnowledgeBaseIds,
 } from './knowledge-settings'
 
-vi.mock('./backend-manager', () => ({ daemonConnection: () => null }))
+vi.mock('./backend-manager', () => ({ daemonConnection: () => null, daemonElevation: () => null }))
 
 const box: SecretBox = {
   isEncryptionAvailable: () => true,
@@ -366,5 +366,235 @@ describe('KnowledgeController (M3)', () => {
     expect(JSON.parse(sent[0]!.body!)).toEqual({ seq: expect.any(Number), endpoint: GOOD.endpoint, knowledge_base_ids: ['kb-a'] })
     const file = fs.readFileSync(path.join(dir, 'knowledge-settings.json'), 'utf8')
     expect(file).not.toContain('SECRET')
+  })
+})
+
+// (c2) F1 (ruling 2026-11-13-c-fix-f1-f3): in service mode a push waits for
+// the user's confirmation. The 4 s tick must not stack pushes behind one that
+// is waiting, nor ask again on its own after the user said no.
+describe('KnowledgeController and confirmation (M5 B6 c2)', () => {
+  let dir = ''
+  let sent: Sent[] = []
+  let now = 1_800_000_000
+  let logins: KnowledgeLoginStore
+  let host: KnowledgeHost
+  let respond: (req: Sent) => Promise<{ status: number; code?: string }> = async () => ({ status: 204 })
+
+  const transport: HostTransport = async (_conn, method, requestPath, body) => {
+    const req = { method, path: requestPath, body }
+    sent.push(req)
+    return respond(req)
+  }
+  const make = () => new KnowledgeController(host, logins, new KnowledgeSettingsStore(dir), { nowSeconds: () => now })
+  const pushes = () => sent.filter((s) => s.method === 'PUT' && s.path === `${BINDING}/credential`).length
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20))
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-settings-c2-'))
+    sent = []
+    now = 1_800_000_000
+    respond = async () => ({ status: 204 })
+    logins = new KnowledgeLoginStore(dir, box, 'darwin')
+    host = new KnowledgeHost(logins, {
+      connection: () => ({ port: 1, authHeaders: { Authorization: 'Bearer t' } }),
+      transport,
+      clock: new SequenceClock(() => 1_000),
+      nowSeconds: () => now,
+      nowMs: () => now * 1000,
+    })
+    host.start()
+  })
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  async function onAndDue() {
+    const c = make()
+    await c.configure(GOOD)
+    await c.setEnabled(true)
+    expect(c.bindingForRun()).not.toBeNull()
+    sent = []
+    // C is about to run out: the tick pushes it again.
+    now += 23 * 3600 + 1
+    return c
+  }
+
+  it('starts no second push on the tick while one waits for the confirmation', async () => {
+    const c = await onAndDue()
+    let release = () => {}
+    const asked = new Promise<void>((resolve) => { release = resolve })
+    respond = async (req) => {
+      if (req.path.endsWith('/credential')) await asked
+      return { status: 204 }
+    }
+    const ticks = Array.from({ length: 10 }, () => c.tick())
+    await settle()
+    expect(pushes()).toBe(1)
+    release()
+    await Promise.all(ticks)
+    await settle()
+    // The ten ticks shared the one push; nothing was queued behind it.
+    expect(pushes()).toBe(1)
+    await c.tick()
+    expect(pushes()).toBe(1)
+  })
+
+  it('after the user refused a push, the tick never asks again on its own', async () => {
+    const c = await onAndDue()
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_denied' } : { status: 204 })
+    await c.tick()
+    expect(pushes()).toBe(1)
+    for (const later of [4, 4, 600, 3600, 30 * 24 * 3600]) {
+      now += later
+      await c.tick()
+      host.sync()
+      await settle()
+    }
+    expect(pushes()).toBe(1)
+    // Not in effect from the refusal on (fail-closed), until the user acts.
+    expect(c.bindingForRun()).toBeNull()
+    expect(c.status().active).toBe(false)
+  })
+
+  it('a push refused on the same daemon is not in effect at once; the user switching it on again restores it', async () => {
+    const c = await onAndDue()
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_denied' } : { status: 204 })
+    await c.tick()
+    // The old C has about an hour left; it is not counted on.
+    expect(c.bindingForRun()).toBeNull()
+    respond = async () => ({ status: 204 })
+    expect(await c.setEnabled(true)).toEqual({ ok: true })
+    expect(c.bindingForRun()).not.toBeNull()
+    expect(c.status().active).toBe(true)
+  })
+
+  // presence_timeout: not answered in time; not_elevated_operation: the daemon
+  // would not ask (#1852 B1).
+  it.each(['presence_timeout', 'not_elevated_operation'])('a push %s is not asked again by the tick: the host replays it after its backoff', async (code) => {
+    const c = await onAndDue()
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code } : { status: 204 })
+    await c.tick()
+    expect(pushes()).toBe(1)
+    respond = async () => ({ status: 204 })
+    for (let i = 0; i < 5; i++) {
+      now += 4
+      await c.tick()
+      host.sync()
+      await settle()
+    }
+    expect(pushes()).toBe(1)
+    now += 10 * 60
+    host.sync()
+    await vi.waitFor(() => expect(pushes()).toBe(2))
+    expect(sent.map((s) => `${s.method} ${s.path}`).slice(-2)).toEqual([`PUT ${BINDING}`, `PUT ${BINDING}/credential`])
+    await c.tick()
+    expect(pushes()).toBe(2)
+  })
+
+  it('after a refused push and another daemon, the binding is not replayed and shows as not in effect', async () => {
+    let conn = { port: 1, authHeaders: { Authorization: 'Bearer t' } }
+    let identity = '100:g1'
+    host = new KnowledgeHost(logins, {
+      connection: () => conn,
+      transport,
+      clock: new SequenceClock(() => 1_000),
+      nowSeconds: () => now,
+      nowMs: () => now * 1000,
+      daemonIdentity: () => identity,
+    })
+    host.start()
+    const c = await onAndDue()
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_denied' } : { status: 204 })
+    await c.tick()
+    expect(pushes()).toBe(1)
+    respond = async () => ({ status: 204 })
+    identity = '100:g2'
+    conn = { port: 9, authHeaders: { Authorization: 'Bearer new' } }
+    host.sync()
+    await settle()
+    await c.tick()
+    expect(sent.filter((s) => s.method === 'PUT' && s.path === BINDING)).toEqual([])
+    expect(c.bindingForRun()).toBeNull()
+    expect(c.status().active).toBe(false)
+  })
+
+  it('a refusal of a tick push the user overtook with a change does not stop the pushes after it', async () => {
+    const c = await onAndDue()
+    let release = () => {}
+    const asked = new Promise<void>((resolve) => { release = resolve })
+    let refuseNext = true
+    respond = async (req) => {
+      if (req.path.endsWith('/credential') && refuseNext) {
+        refuseNext = false
+        await asked
+        return { status: 403, code: 'presence_denied' }
+      }
+      return { status: 204 }
+    }
+    const tick = c.tick()
+    await settle()
+    // The user switches Knowledge on again while the tick's push waits, then refuses that one.
+    const activate = vi.spyOn(host, 'activate')
+    const change = c.setEnabled(true)
+    // Saved, and its apply() under way (its activation queued behind the push) before the refusal.
+    await vi.waitFor(() => expect(activate).toHaveBeenCalled())
+    expect(pushes()).toBe(1)
+    release()
+    await tick
+    expect(await change).toEqual({ ok: true })
+    expect(pushes()).toBe(2)
+    now += 23 * 3600 + 1
+    await c.tick()
+    expect(pushes()).toBe(3)
+  })
+
+  it('a C replay the user refused on another daemon is not asked again by the tick', async () => {
+    let conn = { port: 1, authHeaders: { Authorization: 'Bearer t' } }
+    let identity = '100:g1'
+    host = new KnowledgeHost(logins, {
+      connection: () => conn,
+      transport,
+      clock: new SequenceClock(() => 1_000),
+      nowSeconds: () => now,
+      nowMs: () => now * 1000,
+      daemonIdentity: () => identity,
+    })
+    host.start()
+    const c = make()
+    await c.configure(GOOD)
+    await c.setEnabled(true)
+    sent = []
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_denied' } : { status: 204 })
+    identity = '100:g2'
+    conn = { port: 9, authHeaders: { Authorization: 'Bearer new' } }
+    host.sync()
+    await vi.waitFor(() => expect(pushes()).toBe(1))
+    await settle()
+    respond = async () => ({ status: 204 })
+    for (const later of [4, 23 * 3600, 3600]) {
+      now += later
+      await c.tick()
+    }
+    expect(pushes()).toBe(1)
+    // The new daemon has no C: not in effect, until the user acts.
+    expect(c.bindingForRun()).toBeNull()
+    expect(await c.setEnabled(true)).toEqual({ ok: true })
+    expect(c.bindingForRun()).not.toBeNull()
+  })
+
+  it('asks again at once when the user changes something, after a refusal', async () => {
+    const c = await onAndDue()
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_denied' } : { status: 204 })
+    await c.tick()
+    expect(pushes()).toBe(1)
+    respond = async () => ({ status: 204 })
+    // The user switches Knowledge on again: the change is theirs, so it is asked.
+    await c.setEnabled(true)
+    expect(pushes()).toBe(2)
+    expect(c.bindingForRun()).not.toBeNull()
+    // And the tick is back to its own pace.
+    now += 23 * 3600 + 1
+    await c.tick()
+    expect(pushes()).toBe(3)
   })
 })

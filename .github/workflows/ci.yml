@@ -83,6 +83,10 @@ jobs:
       - name: Rust toolchain
         run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
 
+      # cargo metadata --no-deps only; fails before cache, fmt, and the long test run.
+      - name: Layer dependency table drift
+        run: python3 scripts/gen-layer-deps.py --check
+
       - name: Cache cargo
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4
         with:
@@ -128,13 +132,17 @@ jobs:
         working-directory: rust
         run: cargo test -p agent24-store --features dormant-workspace
 
-      - name: knowledge-store clippy (agent24d)
+      - name: knowledge-store clippy (agent24-knowledge)
+        working-directory: rust
+        run: cargo clippy -p agent24-knowledge --features knowledge-store --all-targets -- -D warnings
+
+      - name: knowledge-store clippy (agent24d forwards the feature)
         working-directory: rust
         run: cargo clippy -p agent24d --features knowledge-store --all-targets -- -D warnings
 
-      - name: knowledge-store test (agent24d)
+      - name: knowledge-store test (agent24-knowledge)
         working-directory: rust
-        run: cargo test -p agent24d --features knowledge-store --bin agent24d knowledge_store
+        run: cargo test -p agent24-knowledge --features knowledge-store --lib store::tests
 
       - name: Real Hyphae unlock
         working-directory: rust

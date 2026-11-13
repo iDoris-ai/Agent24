@@ -58,6 +58,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -100,9 +103,8 @@ impl Daemon {
 }
 
 fn start(home: &Path, extra_env: &[(&str, &str)]) -> Daemon {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home);
     for (k, v) in extra_env {
         cmd.env(k, v);
@@ -154,8 +156,7 @@ fn stop(d: Daemon) {
 /// parameter there and touching every existing call site) — this is the only
 /// test that needs it.
 fn start_ephemeral(home: &Path) -> Daemon {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .args(["serve", "--port", "0", "--ephemeral"])
@@ -347,7 +348,7 @@ fn register_attached(
 ///
 /// `argv`: `<manifest-file> <socket-path> <module-name> <token> <capabilities-json>`.
 /// The manifest file's bytes are hashed here (`sha256:` + hex) exactly the
-/// way the real registration digest is computed (`crate::attached::manifest_digest`,
+/// way the real registration digest is computed (`agent24_attach::attached::manifest_digest`,
 /// itself `agent24_os_proto::manifest::manifest_digest`) — both sides read
 /// the SAME file, so the digests agree by construction, not by coincidence.
 ///
@@ -1009,7 +1010,12 @@ fn c4_name_clashes_with_a_package_both_directions() {
         "name: sin90\nversion: \"0.1.0\"\nroute_namespace: /api/v1/sin90\n\
          event_module: sin90\ndata_dir: ~/.agent24/os/sin90/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"-c\", \"import time; time.sleep(60)\"]\n",
+         spawn:\n  command: bin/launch\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_python_argv(
+        &sin90_dir,
+        &["python3", "-I", "-S", "-c", "import time; time.sleep(60)"],
     )
     .unwrap();
 
@@ -1063,7 +1069,12 @@ fn c4_name_clashes_with_a_package_both_directions() {
         "name: agentear\nversion: \"0.1.0\"\nroute_namespace: /api/v1/agentear\n\
          event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
          kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"-c\", \"import time; time.sleep(60)\"]\n",
+         spawn:\n  command: bin/launch\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_python_argv(
+        &agentear_pkg_dir,
+        &["python3", "-I", "-S", "-c", "import time; time.sleep(60)"],
     )
     .unwrap();
 
@@ -1085,7 +1096,7 @@ fn c4_name_clashes_with_a_package_both_directions() {
 }
 
 /// `sha256:` + lowercase hex — the same digest format
-/// `crate::attached::manifest_digest` computes over the exact submitted
+/// `agent24_attach::attached::manifest_digest` computes over the exact submitted
 /// bytes, reimplemented here (not called into) so this file's own
 /// independence from the daemon's internals (module doc: "只按本文 §4 wire
 /// 规格写成") extends to its Rust-side raw-frame helpers too, not just the
@@ -1289,6 +1300,14 @@ while True:
             if not chunk:
                 break
             body_bytes += chunk
+        # VR-4 probes POST /v1/embeddings on this same origin after the ready
+        # line. That is not a completion: answer it and do not log it, so hang
+        # mode and request counts stay about chat.
+        request_line = lines[0].decode(errors="replace") if lines else ""
+        if "/v1/embeddings" in request_line:
+            out = b'{"error":{"message":"no embeddings","type":"not_found"}}'
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
+            continue
         mode = read_mode()
         if mode == "hang":
             dump_atomic("hang_result.json", {"phase": "waiting", "closed": None})
@@ -1546,7 +1565,7 @@ fn c8_local_only_never_reaches_the_remote_stub() {
 /// `me4_model_shutdown_wiring.rs::model_shutdown_wiring_lands_the_cancelled_call_in_the_store`
 /// (A1), applied to an attached module (A3) instead of a spawned one, which
 /// is exactly the "same `modules_cut_off()` tree" property `AttachDeps`
-/// (`crate::attach_registry`) exists to give.
+/// (`agent24_attach::attach_registry`) exists to give.
 #[test]
 fn c9_shutdown_with_an_inflight_model_call_lands_a_cancelled_usage_row() {
     let home = tmp_home();
@@ -1631,7 +1650,7 @@ fn c9_shutdown_with_an_inflight_model_call_lands_a_cancelled_usage_row() {
 
     // The cancelled call landed in the store BEFORE the process exited
     // (`stop_usage_writer` awaited, same J19 property A1 already proves —
-    // `AttachDeps.models` is the SAME `ModelCallbackDeps` clone, so the same
+    // the grant builder's `models` is the SAME `ModelCallbackDeps` clone, so the same
     // ordering guarantee applies here).
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {

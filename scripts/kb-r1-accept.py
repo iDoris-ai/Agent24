@@ -851,6 +851,29 @@ def case_w7():
         s, body, _ = host_change(p, t, "PUT", 1, grant=grant)
         check("W7e", "同一个 grant 不能再用", grant is not None and s == 403 and code_of(body) == "elevation_invalid",
               f"{s} {code_of(body)}" if grant is not None else "没有拿到 grant（见 W7d）")
+        # W7h (B6): the other three binding routes go through elevation the
+        # same way: refused without a grant, applied with their own one-shot
+        # grant. A deactivated binding then names no run.
+        cred = {"kind": "bearer", "value": "kb-r1-accept-c", "expires_at": int(time.time()) + 3600}
+        seen = []
+        for method, suffix, seq, extra in (("PUT", "/credential", 2, cred),
+                                           ("DELETE", "/credential", 3, None),
+                                           ("DELETE", "", 4, None)):
+            s0, b0, _ = host_change(p, t, method, seq, suffix, extra)
+            try:
+                g, why = shell.elevate(method, BINDING_PATH + suffix, host_payload(seq, extra)), None
+            except EnrolError as err:
+                g, why = None, err.code
+            s1, b1, _ = host_change(p, t, method, seq, suffix, extra, grant=g)
+            seen.append((f"{method} …{suffix or '/{id}'}", s0, code_of(b0), why, s1, code_of(b1)))
+        s, body, _ = start_run(p, t, BINDING)
+        ok = (grant is not None
+              and all(s0 == 403 and c0 == "presence_required" and why is None and s1 == 204
+                      for _, s0, c0, why, s1, _ in seen)
+              and s == 409 and code_of(body) == "knowledge_binding_inactive")
+        check("W7h", "推凭据、撤凭据、停用也各要一次在场确认：没有 grant 时 403，凭 grant 204；停用后指名 binding 建 run 409",
+              ok, "；".join(f"{r} 先 {s0} {c0}，elevate {why or '得到 grant'}，再 {s1} {c1 or ''}"
+                           for r, s0, c0, why, s1, c1 in seen) + f"；建 run {s} {code_of(body)}")
     finally:
         if shell:
             shell.close()

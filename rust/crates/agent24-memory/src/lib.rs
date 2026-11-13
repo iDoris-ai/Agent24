@@ -14,10 +14,12 @@ pub mod condenser;
 mod conn_phase;
 pub mod consolidator;
 pub mod disk_gate;
+pub mod embedder;
 pub mod eval;
 #[cfg(test)]
 mod eval_m1;
 pub mod event;
+pub mod hybrid;
 pub mod knowledge;
 pub mod reconcile;
 pub mod rejections;
@@ -379,6 +381,15 @@ pub mod test_hooks {
     pub fn pool(store: &super::KvStore) -> &sqlx::SqlitePool {
         &store.pool
     }
+
+    /// Hybrid retriever with a test embedder. Production code uses
+    /// [`super::KvStore::local_hybrid`], which only accepts the loopback embedder.
+    pub fn hybrid_retriever(
+        store: &super::KvStore,
+        embedder: std::sync::Arc<dyn super::vector::Embedder>,
+    ) -> super::hybrid::HybridRetriever {
+        store.hybrid_retriever(embedder)
+    }
 }
 
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
@@ -462,6 +473,12 @@ impl KvStore {
     pub fn with_disk_gate(mut self, gate: disk_gate::DiskGate) -> Self {
         self.disk = gate;
         self
+    }
+
+    /// Crate-internal pool, so a caller can hold one `BEGIN IMMEDIATE` across
+    /// a read and the write of the same row.
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     pub(crate) async fn rebuild_fts_if_needed(pool: &SqlitePool) -> Result<()> {
@@ -603,13 +620,46 @@ impl KvStore {
     }
 
     /// A [`vector::VectorRetriever`] over the SAME database file with a chosen
-    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied (`OmlxEmbedder`
-    /// in production, pending D4b) so the store never hard-depends on a model runtime.
+    /// [`vector::Embedder`] (MD-6). The embedder is caller-supplied
+    /// ([`embedder::LocalEmbedder`] once the daemon wires it) so the store never
+    /// hard-depends on a model process being up.
     pub fn vector_retriever<E: vector::Embedder + Clone>(
         &self,
         embedder: E,
     ) -> vector::VectorRetriever<E> {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
+    }
+
+    /// Hybrid recall bound to the loopback embedder. The breaker state lives in
+    /// the returned value, so keep one per owner rather than one per query.
+    pub fn local_hybrid(
+        &self,
+        embedder: std::sync::Arc<embedder::LocalEmbedder>,
+    ) -> hybrid::HybridRetriever {
+        use vector::Embedder;
+        let embedder: std::sync::Arc<dyn Embedder> = embedder;
+        self.hybrid_retriever(embedder)
+    }
+
+    /// A [`hybrid::HybridRetriever`] (FTS + vector, RRF) over the SAME database
+    /// file. Crate-private so a caller outside this crate cannot pass an
+    /// arbitrary embedder (review #1847 M1). Production uses [`Self::local_hybrid`].
+    pub(crate) fn hybrid_retriever(
+        &self,
+        embedder: std::sync::Arc<dyn vector::Embedder>,
+    ) -> hybrid::HybridRetriever {
+        hybrid::HybridRetriever::new(self.pool.clone(), embedder)
+    }
+
+    /// Delete every embedding row stored for `owner`, across models and
+    /// revisions. A later [`vector::VectorRetriever::reindex`] fills the
+    /// current key back in. This is a standalone statement and there is no
+    /// `AFTER DELETE` trigger on `mem_assertions`, so full-account purge must
+    /// fence the owner first and delete the facts and their vectors in one
+    /// transaction; otherwise a concurrent reindex can re-insert rows that
+    /// nothing later removes. The purge body itself is a separate change.
+    pub async fn delete_owner_embeddings(&self, owner: &str) -> Result<u64> {
+        vector::delete_owner_rows(&self.pool, owner).await
     }
 
     /// Ensure that `owner_key` is durably recorded as the memory partition of
@@ -2922,6 +2972,129 @@ mod session_log_tests {
             .await?;
         Ok(())
     }
+    #[tokio::test]
+    async fn purge_session_removes_one_session_whole_and_keeps_others() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "gone", 0, "u0", "a0").await?;
+        append(&log, "o", "gone", 1, "u1", "a1").await?;
+        append(&log, "o", "kept", 0, "k0", "ka0").await?;
+        append(&log, "other", "gone", 0, "x0", "xa0").await?;
+        kv.put("session", "gone", &CanonicalSession::new("gone"))
+            .await?;
+
+        let purge = log
+            .purge_session("o", "gone", "9999-01-01T00:00:00Z")
+            .await?;
+        assert_eq!(purge.events, 4);
+        assert_eq!(purge.legacy_blob, 1);
+        assert!(events(&kv, "o", "gone").await?.is_empty());
+        assert!(CanonicalSession::load(&kv, "gone").await?.is_none());
+        // Another session of the same owner, and the same session id under
+        // another owner, are untouched.
+        assert_eq!(events(&kv, "o", "kept").await?.len(), 2);
+        assert_eq!(events(&kv, "other", "gone").await?.len(), 2);
+        // Usage counters follow the delete.
+        let counted: i64 =
+            sqlx::query_scalar("SELECT row_count FROM mem_owner_usage WHERE owner = 'o'")
+                .fetch_one(&kv.pool)
+                .await?;
+        assert_eq!(counted, 2);
+        // Repeating it deletes nothing.
+        assert!(
+            log.purge_session("o", "gone", "9999-01-01T00:00:00Z")
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_session_keeps_a_session_the_user_wrote_into_later() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "s", 0, "inbound-q", "inbound-a").await?;
+        // Pretend the first turn happened long ago and a /chat turn is new.
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        append(&log, "o", "s", 1, "chat-q", "chat-a").await?;
+
+        // Events after `not_after` (the chat turn): nothing is deleted.
+        let kept = log.purge_session("o", "s", "2026-01-01T00:00:01Z").await?;
+        assert!(kept.kept_newer);
+        assert_eq!(kept.events, 0);
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+
+        // Positive control: with no later event the whole session goes.
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        let purged = log.purge_session("o", "s", "2026-01-01T00:00:01Z").await?;
+        assert!(!purged.kept_newer);
+        assert_eq!(purged.events, 4);
+        // An empty bound keeps everything.
+        append(&log, "o", "t", 0, "x", "y").await?;
+        assert!(log.purge_session("o", "t", "").await?.kept_newer);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_session_keeps_a_chat_turn_written_while_the_run_was_still_running() -> Result<()>
+    {
+        // The /chat turn is OLDER than `not_after` (the run ended hours
+        // later), so only its origin can tell it apart from the run's own.
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "s", 0, "inbound-q", "inbound-a").await?;
+        log.append_turn(
+            "o",
+            "s",
+            1,
+            &Msg::user("chat-q"),
+            Origin {
+                source: "chat".into(),
+                trust: Trust::UserSaid,
+            },
+            &assistant("chat-a"),
+            Origin {
+                source: "agent_loop".into(),
+                trust: Trust::Model,
+            },
+        )
+        .await?;
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        let kept = log.purge_session("o", "s", "2026-01-02T00:00:00Z").await?;
+        assert!(kept.kept_newer);
+        assert_eq!(events(&kv, "o", "s").await?.len(), 4);
+
+        // Positive control: the same session without the chat turn goes.
+        append(&log, "o", "t", 0, "x", "y").await?;
+        sqlx::query("UPDATE mem_events SET at = '2026-01-01T00:00:00Z'")
+            .execute(&kv.pool)
+            .await?;
+        let purged = log.purge_session("o", "t", "2026-01-02T00:00:00Z").await?;
+        assert!(!purged.kept_newer);
+        assert_eq!(purged.events, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purge_session_with_an_empty_bound_deletes_nothing_at_all() -> Result<()> {
+        let kv = KvStore::open_memory().await?;
+        let log = kv.session_log();
+        append(&log, "o", "s", 0, "q", "a").await?;
+        kv.put("session", "s", &CanonicalSession::new("s")).await?;
+        let report = log.purge_session("o", "s", "").await?;
+        assert!(report.kept_newer);
+        assert_eq!((report.events, report.gaps, report.legacy_blob), (0, 0, 0));
+        assert_eq!(events(&kv, "o", "s").await?.len(), 2);
+        assert!(CanonicalSession::load(&kv, "s").await?.is_some());
+        Ok(())
+    }
+
     fn turn_id(o: &str, s: &str, n: u64, role: &str) -> Result<String> {
         use sha2::{Digest, Sha256};
         Ok(format!(

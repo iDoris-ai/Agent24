@@ -19,12 +19,15 @@
 //! for how the Provider decodes what the server sends, `received.rs`;
 //! for what the model reads back from the Knowledge tools, `tool/` (KB-C1-05).
 
+pub mod backend;
 mod capabilities;
 mod common;
 mod error;
+pub mod host;
 mod http;
 mod local_cancelled;
 mod mock;
+pub mod probe;
 pub mod provider;
 mod read;
 mod ready;
@@ -32,6 +35,10 @@ pub mod received;
 mod search;
 pub mod tool;
 mod transport;
+// No production caller. knowledge-store has no production caller and stays
+// off; S2-3 moved the module and did not turn the feature on.
+#[cfg(feature = "knowledge-store")]
+pub mod store;
 
 pub use capabilities::*;
 pub use common::*;

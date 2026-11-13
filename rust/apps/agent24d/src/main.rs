@@ -3,13 +3,13 @@
 //! B2 scope: serve skeleton — `/api/v1/health`, bearer-token handshake via a
 //! ready pipe, dynamic port, CancellationToken-driven graceful shutdown.
 
-mod agentear_timings;
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("test-support must not be enabled in release builds");
+
 mod approval_callback;
 mod approvals;
 mod attach_commands;
-mod attach_listener;
-mod attach_registry;
-mod attached;
+mod attach_grant;
 mod attached_routes;
 mod authz;
 // Remaining public capability primitives are staged for the next endpoints.
@@ -28,6 +28,7 @@ mod docked_router;
 mod docked_startup;
 mod domain;
 mod elevation_summaries;
+mod embed_backfill;
 #[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
 mod enroll_api;
 mod enroll_endpoint;
@@ -46,17 +47,9 @@ mod hardware;
 mod host_bootstrap;
 mod hyphae_install;
 mod idoris_routes;
+mod inbound;
 mod knowledge_backend;
-mod knowledge_host;
-mod knowledge_probe;
-// No production caller. S2-3 enables `knowledge-store` when the host moves
-// into `agent24-knowledge`. The module stays; it is not deleted.
-#[cfg(feature = "knowledge-store")]
-#[allow(
-    dead_code,
-    reason = "knowledge-store has no production caller until S2-3 moves the host"
-)]
-mod knowledge_store;
+mod knowledge_routes;
 mod knowledge_tools;
 #[cfg(not(unix))]
 mod host_bootstrap {
@@ -120,6 +113,7 @@ mod scheduler_callback;
 mod scheduler_deliver;
 mod schedules;
 mod server;
+mod skill_routes;
 mod source_floor;
 
 const _: () = assert!(!migration_coordinator::ENABLED);

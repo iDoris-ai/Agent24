@@ -43,6 +43,8 @@ security:
 tags:
   - name: idoris
     description: Host-only managed iDoris lifecycle (IL-10). CLI coverage deferred to IL-12.
+  - name: skills
+    description: Skill import and user-directory scan (skill loader SL-3). Activation is SL-4. CLI coverage is SL-7.
   - name: system
     description: Health, version, and process-level daemon endpoints.
   - name: attached
@@ -77,6 +79,16 @@ tags:
       with provenance, retract one, and the persistent pause switch. Personal
       space only; `owner` is injected by the daemon from session identity and
       is never a request parameter.
+  - name: inbound
+    description: >-
+      X11-2f: who may start a run from an external message, the stored accept
+      mode, and the inbound event list. Allowlist and policy writes are
+      ProductHost only. The list returns metadata and the first 50 characters
+      of the body. It is not pushed on the WebSocket events stream.
+      X11-2g adds `POST /inbound/events` for the development wechat bridge.
+      `A24_DEV_TOOL=1` mounts that POST in legacy mode and in capabilities
+      mode. Capabilities mode accepts only a dev-bridge component token.
+      Without the flag the POST is 404.
   - name: sin90
     description: The Sin90 Personal-OS module (own store; degrades independently).
   - name: documents
@@ -503,9 +515,12 @@ paths:
         One status model for iDoris, Hyphae, attached modules, Documents, Knowledge and Open
         Design (whose state the desktop reports). Needs `components.read`; Creative tokens are
         refused (403). The ProductHost audience, and legacy mode (one shared token that already
-        reads every full status route), get `ComponentView`. Every other audience gets
+        reads every full status route), get `ComponentView`, including `kernel_grants` (what the
+        mount actually handed out, `MountReport.granted`), `declared` (the `requires` declaration)
+        and `denied` (`{item, code}` with a closed code). Hyphae's declared kernel items are
+        `no_channel`: it has no kernel callback. Every other audience gets
         `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
-        port, error message, team id, commit, or Hyphae health probes. While the Hyphae daemon is
+        port, error message, team id, commit, denial, or Hyphae health probes. While the Hyphae daemon is
         running, the host view's `detail.health` lists each probe (`relays`, `keystore`, `daemon`,
         or `health` when the command itself did not finish) with `ok` and `consecutive_failures`.
         Three consecutive failures set state `degraded` and `reason` to those probe names; one
@@ -623,6 +638,101 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+
+  /os/trusted-teams:
+    get:
+      operationId: listTrustedTeams
+      tags: [system]
+      summary: List trusted Developer ID teams
+      responses:
+        "200":
+          description: Current trusted teams, including the built-in team
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustedTeams"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Trust store unavailable or trust operation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+
+  /os/trusted-teams/{team}:
+    put:
+      operationId: trustTeam
+      tags: [system]
+      summary: Trust a Developer ID team
+      description: Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+      parameters:
+        - name: team
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Z0-9]{10}$"
+      responses:
+        "200":
+          description: Current trusted teams, including the built-in team
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustedTeams"
+        "400":
+          description: Invalid team, built-in team removal, or trust store update failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Trust store unavailable or trust operation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+    delete:
+      operationId: untrustTeam
+      tags: [system]
+      summary: Remove trust for a Developer ID team
+      description: Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
+      parameters:
+        - name: team
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Z0-9]{10}$"
+      responses:
+        "200":
+          description: Current trusted teams, including the built-in team
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustedTeams"
+        "400":
+          description: Invalid team, built-in team removal, or trust store update failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: Trust store unavailable or trust operation failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TrustTeamError"
 
   /os/{name}:
     patch:
@@ -1123,7 +1233,13 @@ paths:
               schema:
                 $ref: "#/components/schemas/Run"
         "400":
-          $ref: "#/components/responses/BadRequest"
+          description: >-
+            invalid_request, or skill_not_admitted: skill_id was named on a
+            workspace-bound request or session (a v1 restriction).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "403":
           description: "host_authority_required: knowledge_binding_id was named by a caller other than the product host"
           content:
@@ -1140,7 +1256,10 @@ paths:
             results from before a daemon restart; start a new session. Also
             returned for a session not yet pinned once the daemon has reached
             its limit of pinned sessions; then a new session is refused too,
-            until the daemon restarts.
+            until the daemon restarts. Skill runs: skill_not_active (no activation
+            pointer), skill_capability_missing (a required capability has no
+            ready provider), skill_provider_ambiguous (more than one), and
+            skill_pointer_conflict (the pointer moved during admission; retry).
           content:
             application/json:
               schema:
@@ -2100,6 +2219,425 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /inbound/allowlist:
+    get:
+      operationId: getInboundAllowlist
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Read the inbound allowlist
+      description: >-
+        Everyday read. Returns every `(source, actor)` the host has stored,
+        plus `policy_version`. An empty list is `entries: []`. An unknown
+        query parameter is 400.
+      responses:
+        "200":
+          description: The stored allowlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundAllowlist"
+        "400":
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      operationId: putInboundAllowlist
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Replace the inbound allowlist
+      description: >-
+        ProductHost only. Legacy mode and every other audience get 403.
+        Last writer wins: the body replaces the whole list. There is no
+        `expected_policy_version`, and this round does not do optimistic
+        concurrency. A `(source, actor)` that is already stored keeps its
+        `added_at`; a new pair is stamped by the daemon. A repeated
+        `(source, actor)` in one body is 400. `scheduler` and `self` are
+        not allowlist sources.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboundAllowlistWrite"
+      responses:
+        "200":
+          description: The stored allowlist
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundAllowlist"
+        "400":
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not the desktop ProductHost credential
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /inbound/policy:
+    get:
+      operationId: getInboundPolicy
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Read the inbound accept mode
+      description: >-
+        Everyday read. No stored row yet answers `accept_mode: observe` and
+        `updated_at: null`. `policy_version` is the admit hash. It changes
+        when the mode or the allowlist changes, and it does not depend on
+        `updated_at`. An unknown query parameter is 400.
+      responses:
+        "200":
+          description: The stored accept mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundPolicy"
+        "400":
+          description: Unknown query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    put:
+      operationId: putInboundPolicy
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: Set the inbound accept mode
+      description: >-
+        ProductHost only. Legacy mode and every other audience get 403.
+        Last writer wins: there is no `expected_policy_version`, and this
+        round does not do optimistic concurrency. `accept_mode` is stored
+        and is not consulted by admission in this milestone.
+        `policy_version` changes when the stored mode changes, and stays
+        the same when the same mode is written again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboundPolicyWrite"
+      responses:
+        "200":
+          description: The stored accept mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundPolicy"
+        "400":
+          description: Malformed request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Not the desktop ProductHost credential
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /capabilities/bridge:
+    post:
+      operationId: mintBridgeCapability
+      x-milestone: C9-B
+      tags: [inbound]
+      summary: Issue an 8-hour wechat-bridge development token
+      description: >-
+        Elevated `capability.mint`, same confirmation path as other elevated
+        shell routes. The desktop summary is generated by the daemon
+        ("签发 8 小时微信桥开发令牌，只能写入入站事件") and does not
+        include client text. The body is empty. The token audience is
+        `component_runtime`, component id `wechat-bridge`, operation
+        `inbound.ingest`, TTL 8 hours, not renewable. It is bound to the
+        current daemon generation. The route is absent (`not_found`) unless
+        the daemon was started with `A24_DEV_TOOL=1`; a missing bearer is
+        still 401, and a closed gate does not issue or write
+        `capability.token.issued`. Legacy mode with the gate on answers
+        `capability_mode_required`. A first-party shell without an elevation
+        grant answers `presence_required`. If the audit row cannot be written
+        the token is not issued (`audit_unavailable`). If the issue row is
+        written and the caller is no longer live, `capability.token.issued`
+        is followed by `capability.token.issue_aborted` for the same id and
+        the answer is 401. No bearer exists. If that compensating row cannot
+        be written the answer is 503 `audit_unavailable`. The issued row
+        names `issuer_capability_id`, the shell that asked. Revoking that
+        shell does not revoke the bridge token.
+      responses:
+        "201":
+          description: The new bearer. The token is returned once.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BridgeCapability"
+        "401":
+          description: >-
+            Missing bearer, or the shell was not live when the token would
+            have been inserted. In the second case the audit log has
+            `capability.token.issued` then `capability.token.issue_aborted`,
+            and no bearer exists.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Missing elevation, or the caller is not a first-party shell
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: >-
+            Development gate is off (`A24_DEV_TOOL` is not `1`). No token is
+            issued and no issue audit is written.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Daemon is not in capabilities mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: >-
+            The audit row could not be written (`audit_unavailable`). No
+            token was issued. This includes a failed `issue_aborted` row
+            after the caller failed the live check.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /capabilities/{capability_id}/revoke:
+    post:
+      operationId: revokeCapability
+      x-milestone: C9-C
+      tags: [inbound]
+      summary: Revoke one capability by id
+      description: >-
+        Elevated `capability.revoke`. The desktop summary is generated by
+        the daemon ("撤销微信桥开发令牌") and does not include client text.
+        The body is empty. A dev-bridge token is marked revoked in memory
+        only when this call changes it from live to revoked. The
+        `capability.token.revoked` row is written only for that transition.
+        If that write fails the response is 503 `audit_unavailable` and the
+        bearer stays revoked. A call that arrives while that write is still
+        in progress is also 503 and does not answer 200. A later call after
+        the row is stored answers 200 and does not append another. A 200
+        means the `Revoked` row is already stored. Unknown ids for a caller
+        that is not a first-party shell, already-revoked ids, and tokens
+        outside the dev-bridge profile answer 200 `revoked` and do not write
+        that row. A first-party shell revoking an id this process does not
+        have (the daemon restarted) gets 404 `bridge_token_unknown` and is
+        not asked to elevate. Revoking the shell
+        that issued a bridge token does not revoke the bridge token. The
+        bridge token still expires after 8 hours, and a daemon restart
+        makes its generation stale.
+      parameters:
+        - name: capability_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The id is revoked, or was already unknown or revoked.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CapabilityRevocation"
+        "400":
+          description: Invalid capability id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid bearer
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: >-
+            Missing elevation, or the caller is not allowed to revoke
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: >-
+            First-party shell revoked an id this daemon process does not
+            have (`bridge_token_unknown`). No elevation was requested.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: Daemon is not in capabilities mode
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: >-
+            The revoke transition happened and `capability.token.revoked`
+            could not be written (`audit_unavailable`), or another revoke of
+            this id is still writing that row. The bearer stays revoked.
+            Retrying after a failed write stores the one missing row and
+            then answers 200. A 200 means that row is already stored.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /inbound/events:
+    get:
+      operationId: listInboundEvents
+      x-milestone: X11-2f
+      tags: [inbound]
+      summary: List inbound events without the full body
+      description: >-
+        Everyday read. Newest `at` first, then `id`. Each item is metadata
+        plus `text_preview`, the first 50 characters of `text`. The full body
+        and `meta` are not returned. This list is not pushed on
+        `GET /api/v1/events`. `limit` defaults to 50. `0` and anything above
+        100 are 400. `before_at` and `before_id` page backward and must be
+        sent together; `before_at` is `YYYY-MM-DDTHH:MM:SSZ`. An unknown
+        query parameter, including a misspelled `limit`, is 400.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: before_at
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: before_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of inbound event metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboundEventPage"
+        "400":
+          description: Invalid query
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    post:
+      operationId: postWechatInboundEvent
+      x-milestone: X11-2g
+      tags: [inbound]
+      summary: Record one development WeChat message
+      description: >-
+        Development transport for the wechat bridge. Mounted when the daemon
+        was started with `A24_DEV_TOOL=1`, in legacy mode and in capabilities
+        mode. Without that flag the answer is 404 (`No v1 route`). Legacy
+        mode rejects this POST with 409 `capability_mode_required`: the shared
+        bearer is not accepted, while that auth mode itself stays for the
+        other routes. Capabilities mode accepts
+        only a component-runtime token whose component id is `wechat-bridge`
+        and whose only operation is `inbound.ingest`. ProductHost, a
+        first-party shell, a creative token, and the legacy bearer are
+        forbidden there.
+        The legacy allowlist seed is not applied in capabilities mode.
+        `source` is fixed to `wechat`: a body `source` other than `wechat` is
+        400, and the stored row is always `wechat` / `dev_bridge` / `direct` /
+        `human=true`. The route does not copy `category`, `human`, or
+        `addressed` from the body. Admission (allowlist, watermark, rate)
+        still decides whether a run starts. A duplicate `id` does not start a
+        second run. The response does not echo `text`. A storage failure is a
+        generic `storage error`. A start failure is a generic `internal error`.
+        Neither body includes the store text or the prompt. An allowlisted
+        message with no text is 400 and is not stored. An unknown query
+        parameter is 400. A body over the daemon limit is 413
+        `payload_too_large`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/WechatInboundEventWrite"
+      responses:
+        "200":
+          description: Recorded. `outcome` says whether a run started.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/WechatInboundEventResult"
+        "400":
+          description: >-
+            Malformed body, unknown field, unknown query parameter, a source
+            other than wechat, or an allowlisted message with no text
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: Missing or invalid bearer token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: >-
+            Capabilities mode with the dev gate on, but the bearer is not the
+            wechat-bridge component token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            Legacy mode with the dev gate on (`capability_mode_required`).
+            The shared bearer is valid for other routes and is not accepted
+            for this POST.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: Not mounted (`A24_DEV_TOOL` is not `1`)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "payload_too_large: the request exceeded the daemon-wide body limit"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: >-
+            Storage failure (`storage error`) or start failure (`internal error`).
+            The body does not include the store text or the prompt.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /sin90/directions:
     get:
       x-external-contract: iDoris-ai/Sin90
@@ -2118,6 +2656,7 @@ paths:
                   directions:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90Direction" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       x-external-contract: iDoris-ai/Sin90
@@ -2142,6 +2681,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Sin90Direction" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/schedule-blocks:
@@ -2162,6 +2702,7 @@ paths:
                   blocks:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       x-external-contract: iDoris-ai/Sin90
@@ -2188,6 +2729,7 @@ paths:
               schema: { $ref: "#/components/schemas/Sin90ScheduleBlock" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/schedule-blocks/{id}:
@@ -2220,7 +2762,10 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Illegal transition
+          description: >-
+            Illegal transition. The kernel proxy may also answer 409
+            `os_package.<reason>` (`OsPackageConflict`, `retryable: false`)
+            when the mounted package fails its integrity re-check.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2244,6 +2789,7 @@ paths:
                   proposals:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90StoredProposal" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
     post:
       x-external-contract: iDoris-ai/Sin90
@@ -2268,7 +2814,11 @@ paths:
                   status: { type: string, const: pending }
         "400": { $ref: "#/components/responses/BadRequest" }
         "409":
-          description: Same id already exists with different ops
+          description: >-
+            Same id already exists with different ops. The kernel proxy may
+            also answer 409 `os_package.<reason>` (`OsPackageConflict`,
+            `retryable: false`) when the mounted package fails its integrity
+            re-check.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2292,6 +2842,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Sin90StoredProposal" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /sin90/proposals/{id}/accept:
@@ -2313,7 +2864,10 @@ paths:
               schema: { $ref: "#/components/schemas/Sin90AppliedProposal" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409":
-          description: Proposal not pending
+          description: >-
+            Proposal not pending. The kernel proxy may also answer 409
+            `os_package.<reason>` (`OsPackageConflict`, `retryable: false`)
+            when the mounted package fails its integrity re-check.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2352,6 +2906,7 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Sin90AttentionRow" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "503": { $ref: "#/components/responses/Sin90Unavailable" }
 
   /documents/capabilities:
@@ -2365,6 +2920,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/DocumentsCapabilities" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2385,6 +2941,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/DocumentList" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2405,6 +2962,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentDetail" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2441,6 +2999,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsUpload" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "422": { $ref: "#/components/responses/DocumentsUploadUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2467,7 +3026,10 @@ paths:
         still replays). For an upload still receiving, a new chunk that would
         run past `total_size` is 400 `invalid_request`. An unknown upload, or one
         24 h after its last chunk, is 404 `not_found`. A body over 768 KiB
-        is 413 `payload_too_large`.
+        is 413 `payload_too_large`. The kernel proxy may also answer 409
+        `os_package.<reason>` (`OsPackageConflict`, `retryable: false`) when
+        the mounted package fails its integrity re-check. That body is not
+        `DocumentsConflict`, which stays `upload_offset_mismatch`.
       parameters:
         - $ref: "#/components/parameters/UploadId"
         - name: Upload-Offset
@@ -2536,6 +3098,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsImportUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2559,6 +3122,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsJob" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2579,6 +3143,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsJob" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2613,6 +3178,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsJob" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2673,6 +3239,7 @@ paths:
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "413": { $ref: "#/components/responses/DocumentsTooLarge" }
         "422": { $ref: "#/components/responses/DocumentsRenderUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2714,6 +3281,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsReadUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2745,6 +3313,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsReadUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2810,6 +3379,7 @@ paths:
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
         "422": { $ref: "#/components/responses/DocumentsExtractUnprocessable" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -2843,6 +3413,7 @@ paths:
               schema: { $ref: "#/components/schemas/DocumentsExtraction" }
         "400": { $ref: "#/components/responses/DocumentsBadRequest" }
         "404": { $ref: "#/components/responses/DocumentsNotFound" }
+        "409": { $ref: "#/components/responses/OsPackageConflict" }
         "500": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "502": { $ref: "#/components/responses/DocumentsProxyFailure" }
         "503": { $ref: "#/components/responses/DocumentsUnavailable" }
@@ -4326,6 +4897,220 @@ paths:
         "404":
           $ref: "#/components/responses/IdorisFailure"
 
+  /skills:
+    get:
+      operationId: listSkills
+      tags: [skills]
+      summary: List installed skills without bodies
+      description: |
+        Everyday `skills.read`. One row per installed skill and origin.
+        Bodies are not included. An empty pointer means the skill is not active
+        and the generation is 0.
+      responses:
+        "200":
+          description: Installed skills
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+    post:
+      operationId: postSkill
+      tags: [skills]
+      summary: Import a skill from a request body
+      description: |
+        Everyday `skills.install`. The JSON body is `markdown` plus optional
+        `evals` (`name` and `content`). A path, an origin, or any other field
+        is rejected. The server does not open a caller path. Origin is always
+        `imported`. The pointer does not move.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SkillImportRequest"
+      responses:
+        "200":
+          description: Installed or adopted revision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillInstall"
+        "400":
+          description: Manifest, eval, or request rejection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Same semver and a different content digest
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: |
+            The request body is over 1 MiB, or the skill body or one eval
+            file is over 32 KiB.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Skill store failed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /skills/scans:
+    post:
+      operationId: postSkillScan
+      tags: [skills]
+      summary: Rescan the user skill directory
+      description: |
+        Everyday `skills.install`. The body is empty or `{}`. No path is
+        accepted. The scan reads `<data_dir>/skills` and stores `origin=user`.
+        One bad skill is reported in `errors` and does not fail the others.
+      responses:
+        "200":
+          description: Scan result
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillScan"
+        "400":
+          description: The body carried a path or another field
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: The request body is over 1 MiB
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Internal failure while reading the request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /skills/{id}:
+    get:
+      operationId: getSkill
+      tags: [skills]
+      summary: Read one installed skill
+      description: |
+        Everyday `skills.read`. Returns the pointer, generation (0 when there
+        is no pointer), installed revision metadata, and a text-consistency
+        summary. Bodies are not included. Provider resolution is SL-5 and is
+        not in this response.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+      responses:
+        "200":
+          description: Skill detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No revision is installed for this id
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /skills/{id}/activate:
+    post:
+      operationId: activateSkill
+      tags: [skills]
+      summary: Activate a skill pair, or roll back to a recorded one
+      description: |
+        Elevated `skills.activate`. Not proxied by the desktop backend proxy:
+        only the desktop main process (host credentials) and an elevated CLI
+        token reach it. The legacy shared token is refused.
+
+        Send either `body_revision_id` + `evals_revision_id` (+ `accepted`)
+        or `rollback_activation_id`. No pass flag, score, or body text is
+        accepted (`400 invalid_request`). The server reruns the evals from the
+        stored revisions and binds that result. A rollback does not rerun.
+
+        A first-party shell token gets these errors, and `unchanged`, without
+        elevation: the daemon runs the same checks and the eval rerun first and
+        asks for presence only when the pointer would really move.
+
+        `unchanged: true` means the pointer already named the pair. Nothing
+        was written, and it does not mean this request's evals or accepted
+        list were checked or stored.
+      parameters:
+        - $ref: "#/components/parameters/PathId"
+        - name: X-Agent24-Elevation
+          in: header
+          required: false
+          description: Elevation grant for a first-party shell token.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SkillActivateRequest"
+      responses:
+        "200":
+          description: Activated, rolled back, or unchanged
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SkillActivation"
+        "400":
+          description: >-
+            `invalid_request`, `skill_activation_mixed`,
+            `skill_origin_mismatch`, `skill_revision_mismatch`, or a manifest
+            or eval rejection
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Not permitted, or `presence_required` without a grant
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: >-
+            `skill_revision_not_found` or `skill_activation_not_found`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: >-
+            `skill_pointer_conflict`, `skill_eval_empty`, or
+            `skill_eval_failed` (`error.details.cases` and `failed` carry the
+            server-computed run; the pointer did not move)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Storage failure, or a corrupt pointer row
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -4588,13 +5373,27 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/DocumentsImportUnprocessableError" }
+    OsPackageConflict:
+      description: >-
+        409 from the kernel proxy when a mounted package fails its integrity
+        re-check. `error.code` is `os_package.<reason>`
+        (`integrity_manifest_missing`, `hash_mismatch`,
+        `integrity_manifest_invalid`, `signature_rejected`, or
+        `integrity_check_failed`) and `error.details.retryable` is false.
+        A re-check with no integrity code, such as shutdown cancellation,
+        stays 503 `package_changed` on the generic envelope, not this response.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/OsPackageConflictError" }
     DocumentsUnavailable:
       description: >-
         Exactly one of: the OS reports `storage_unavailable`,
         `engine_unavailable` or `knowledge_unavailable` (DocumentsError), or
         the kernel proxy reports the module unreachable (`module_not_ready`,
-        `module_draining`, … in the generic envelope). ADR-DOC-02 §6 lists
-        which proxy codes are safe to retry.
+        `module_draining`, … in the generic envelope). An integrity failure
+        of the mounted package is not this 503: it is 409
+        `os_package.<reason>` (`OsPackageConflict`), `retryable: false`.
+        ADR-DOC-02 §6 lists which proxy codes are safe to retry.
       content:
         application/json:
           schema:
@@ -4815,6 +5614,35 @@ components:
           description: "Open enum: ok | missing | unknown | not_checked."
         restart_required:
           type: boolean
+    TrustTeamError:
+      type: object
+      required: [code, message, retryable]
+      properties:
+        code:
+          type: string
+          enum: [trust_store_unavailable, trust_team_failed]
+        message:
+          type: string
+        retryable:
+          type: boolean
+          const: false
+
+    TrustedTeams:
+      type: object
+      required: [teams]
+      properties:
+        teams:
+          type: array
+          items:
+            type: object
+            required: [team_id, builtin]
+            properties:
+              team_id:
+                type: string
+                pattern: "^[A-Z0-9]{10}$"
+              builtin:
+                type: boolean
+
     DomainOsList:
       type: object
       required: [modules]
@@ -4906,10 +5734,38 @@ components:
             zh: { type: string }
             en: { type: string }
             th: { type: string }
+    ComponentRequires:
+      type: object
+      additionalProperties: false
+      description: The component's `requires` declaration (`kernel` capabilities and canonical operations).
+      required: [kernel, operations]
+      properties:
+        kernel:
+          type: array
+          items: { type: string }
+        operations:
+          type: array
+          items: { type: string }
+    ComponentDenial:
+      type: object
+      additionalProperties: false
+      required: [item, code]
+      properties:
+        item: { type: string }
+        code:
+          type: string
+          enum: [not_declared, above_ceiling, no_channel, requires_invalid]
+          description: >-
+            not_declared: in the form's ceiling but not declared. above_ceiling: declared
+            but outside the ceiling. no_channel: declared and inside the ceiling, but the
+            mount handed out no handle (Hyphae always; a model callback that did not build).
+            This also includes a capability withheld by policy (lease, partition, grant,
+            or ephemeral). requires_invalid: the declaration did not parse, so nothing
+            was granted.
     ComponentView:
       type: object
       description: Host view of one component.
-      required: [id, version, state, form, provides]
+      required: [id, version, state, form, provides, kernel_grants, declared, denied]
       properties:
         id: { type: string }
         version: { type: [string, "null"] }
@@ -4924,9 +5780,37 @@ components:
             Short machine-readable cause; host only. For hyphae with state failed this
             includes signature_rejected, hash_mismatch (see HyphaeRejection), and
             contract_check_failed (the contract command did not return a readable envelope).
+            An OS package that failed its integrity check is state failed (not absent, not
+            incompatible) with one of integrity_manifest_missing, hash_mismatch,
+            integrity_manifest_invalid, signature_rejected, or integrity_check_failed.
             State incompatible uses contract_mismatch. State degraded lists the failed probe
             names (for example relays), never a relay URL. A Hyphae that is simply not
             installed is state absent with no reason.
+        kernel_grants:
+          type: array
+          items: { type: string }
+          description: >-
+            Kernel capabilities actually held. A mounted package copies
+            `MountReport.granted`. An attached module copies the admission grant
+            (events, and models when a model callback was built); for attach rows
+            this is the admission grant and does not change with whether the module
+            is currently connected. Empty when nothing was handed out. Not the resolver's grant set: a missing model
+            callback omits `models` even when the declaration and the ceiling would allow it.
+        declared:
+          description: >-
+            The component's `requires` declaration. Null when no declaration was
+            read (the manifest was not read, or the component has no `requires`
+            lock, such as built-in MCP or knowledge rows): the declaration is
+            unknown, denials are not computed, and the out-of-process ceiling is
+            not applied.
+          oneOf:
+            - $ref: "#/components/schemas/ComponentRequires"
+            - type: "null"
+        denied:
+          type: array
+          description: Host only. Closed reasons an item is not in `kernel_grants`.
+          items:
+            $ref: "#/components/schemas/ComponentDenial"
         detail:
           type: object
           additionalProperties: true
@@ -4940,7 +5824,8 @@ components:
       type: object
       description: >-
         What every audience other than the host sees. No path, pid, port, message, team id,
-        commit, or Hyphae health probes.
+        commit, kernel grant, denial, or Hyphae health probes.
+      additionalProperties: false
       required: [id, version, state, provides]
       properties:
         id: { type: string }
@@ -4954,7 +5839,8 @@ components:
         components:
           type: array
           items:
-            # anyOf, not oneOf: a full view also satisfies the redacted schema.
+            # Host rows match ComponentView; other audiences get ComponentRedactedView
+            # (additionalProperties: false, so a full row cannot pass as redacted).
             anyOf:
               - $ref: "#/components/schemas/ComponentView"
               - $ref: "#/components/schemas/ComponentRedactedView"
@@ -5520,6 +6406,17 @@ components:
             private interface. A selector, not an authority: only the product
             host may name one, and only one it has active; the run is pinned to
             that activation. Omit/null for a run without Knowledge.
+        skill_id:
+          type: [string, "null"]
+          description: >-
+            A skill to run under (SL-5). Only the id: the server reads the
+            skill's current activation pointer when the run is admitted and pins
+            that revision, so there is no version field. A skill with no pointer
+            (installed, never activated) is refused with `skill_not_active`; it
+            never falls back to the latest revision. Imported skill text is
+            labelled `Unknown` + `LocalOnly`. Inbound events and scheduled
+            self-wake runs cannot carry one (`skill_not_admitted`), and neither
+            can a workspace-bound run in v1. Omit/null for a run without a skill.
 
     ToolCallStatus:
       type: string
@@ -6177,6 +7074,236 @@ components:
             and cross-session recall; existing assertions are kept, and the
             setting survives a daemon restart.
 
+    InboundAllowEntry:
+      type: object
+      required: [source, actor, added_at]
+      properties:
+        source:
+          type: string
+          enum: [hyphae, wechat, remote]
+          description: >-
+            External sources that go through admission. `scheduler` and
+            `self` are not allowlist sources.
+        actor:
+          type: string
+        added_at:
+          type: string
+          description: >-
+            UTC timestamp `YYYY-MM-DDTHH:MM:SSZ`. Kept when the same
+            `(source, actor)` is written again. A new pair is stamped at
+            that write.
+        note:
+          type: [string, "null"]
+    InboundAllowlist:
+      type: object
+      required: [entries, policy_version]
+      properties:
+        entries:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboundAllowEntry"
+        policy_version:
+          type: string
+          description: >-
+            Admit hash: sha256 of the sorted allowlist, the accept mode, and
+            the admit rule version. 64 lowercase hex digits. It does not
+            depend on `updated_at`.
+    InboundAllowlistWrite:
+      type: object
+      required: [entries]
+      properties:
+        entries:
+          type: array
+          maxItems: 200
+          items:
+            type: object
+            required: [source, actor]
+            additionalProperties: false
+            properties:
+              source:
+                type: string
+                enum: [hyphae, wechat, remote]
+              actor:
+                type: string
+              note:
+                type: [string, "null"]
+    InboundPolicy:
+      type: object
+      required: [accept_mode, policy_version]
+      properties:
+        accept_mode:
+          type: string
+          enum: [off, observe, auto]
+        updated_at:
+          type: [string, "null"]
+          description: Null until the first write.
+        policy_version:
+          type: string
+    InboundPolicyWrite:
+      type: object
+      required: [accept_mode]
+      properties:
+        accept_mode:
+          type: string
+          enum: [off, observe, auto]
+    InboundEventSummary:
+      type: object
+      required:
+        - id
+        - source
+        - category
+        - human
+        - addressed
+        - at
+        - received_at
+        - disposition
+      properties:
+        id:
+          type: string
+        source:
+          type: string
+        category:
+          type: string
+        recipient_identity:
+          type: [string, "null"]
+        thread_key:
+          type: [string, "null"]
+        actor:
+          type: [string, "null"]
+        human:
+          type: boolean
+        addressed:
+          type: string
+          enum: [none, mention, direct]
+        at:
+          type: string
+        received_at:
+          type: string
+        text_preview:
+          type: [string, "null"]
+          description: First 50 characters of the body, or null when the body is gone.
+        text_scrubbed_at:
+          type: [string, "null"]
+        disposition:
+          type: string
+        disposition_reason:
+          type: [string, "null"]
+        policy_version:
+          type: [string, "null"]
+        run_state:
+          type: [string, "null"]
+    InboundEventPage:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboundEventSummary"
+        next:
+          type: [object, "null"]
+          required: [before_at, before_id]
+          properties:
+            before_at:
+              type: string
+            before_id:
+              type: string
+          description: Present when another older page exists. Send both values back as query parameters.
+    BridgeCapability:
+      type: object
+      required:
+        - capability_id
+        - token
+        - audience
+        - component_id
+        - daemon_generation
+        - created_at
+        - expires_at
+        - ttl_seconds
+        - allowed_operations
+      properties:
+        capability_id:
+          type: string
+        token:
+          type: string
+          description: Bearer secret. Returned once. Not written to the audit log.
+        audience:
+          type: string
+          enum: [component_runtime]
+        component_id:
+          type: string
+          enum: [wechat-bridge]
+        daemon_generation:
+          type: string
+        created_at:
+          type: integer
+        expires_at:
+          type: integer
+        ttl_seconds:
+          type: integer
+          enum: [28800]
+        allowed_operations:
+          type: array
+          items:
+            type: string
+            enum: [inbound.ingest]
+    CapabilityRevocation:
+      type: object
+      required: [capability_id, state]
+      properties:
+        capability_id:
+          type: string
+        state:
+          type: string
+          enum: [revoked]
+    WechatInboundEventWrite:
+      type: object
+      additionalProperties: false
+      required: [id, actor, at]
+      properties:
+        id:
+          type: string
+          pattern: "^wechat:[0-9]{1,32}$"
+          description: "`wechat:` plus the iLink decimal `message_id`."
+        source:
+          type: string
+          enum: [wechat]
+          description: >-
+            Optional. Omitted or `wechat` is accepted. Any other value is 400.
+            The route stores `wechat` either way.
+        actor:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: WeChat `from_user_id`, NFC, no control or format characters.
+        at:
+          type: string
+          pattern: "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          description: Message time, `YYYY-MM-DDTHH:MM:SSZ`, no fractional seconds.
+        text:
+          type: string
+          description: >-
+            Message text. Empty or omitted is no body. An allowlisted message
+            with no body is 400 and is not stored.
+    WechatInboundEventResult:
+      type: object
+      additionalProperties: false
+      required: [id, outcome]
+      properties:
+        id:
+          type: string
+        outcome:
+          type: string
+          enum: [duplicate, ignored, started, already_linked]
+        reason:
+          type: string
+          description: Present when `outcome` is `ignored`.
+        run_id:
+          type: string
+          description: >-
+            Present for `started`, and for `already_linked` when the link row
+            is still there. Omitted when that row is gone.
+
     ErrorBody:
       type: object
       required: [code, message]
@@ -6188,7 +7315,11 @@ components:
             approval_already_resolved, provider_unavailable,
             run_not_cancellable (reserved), internal,
             admission_refused, module_panicked, module_killed,
-            module_owned_schedule, not_a_module_schedule, schedule_conflict
+            module_owned_schedule, not_a_module_schedule, schedule_conflict.
+            A proxied call whose package failed an integrity re-check uses
+            `os_package.<reason>` with HTTP 409 and `details.retryable: false`
+            (see OsPackageConflict). `package_changed` remains the 503 code
+            only when that re-check has no integrity code.
         message:
           type: string
         hint:
@@ -6206,6 +7337,223 @@ components:
       properties:
         error:
           $ref: "#/components/schemas/ErrorBody"
+
+    SkillImportEval:
+      type: object
+      required: [name, content]
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          description: Relative eval path declared in the manifest. Not a filesystem path the server opens.
+        content:
+          type: string
+          description: UTF-8 eval document, at most 32 KiB.
+    SkillImportRequest:
+      type: object
+      required: [markdown]
+      additionalProperties: false
+      properties:
+        markdown:
+          type: string
+          description: Full SKILL.md text, at most 32 KiB UTF-8.
+        evals:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillImportEval"
+    SkillInstall:
+      type: object
+      required:
+        - skill_id
+        - origin
+        - semver
+        - body_revision_id
+        - evals_revision_id
+        - content_digest
+        - ineffective
+        - inserted
+        - pointer
+        - generation
+        - text_consistency
+      properties:
+        skill_id: { type: string }
+        origin: { type: string, enum: [imported, user] }
+        semver: { type: string }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        content_digest: { type: string }
+        ineffective:
+          type: array
+          items: { type: string }
+          description: Field and file names that did not take effect on this parse.
+        inserted: { type: boolean }
+        pointer:
+          oneOf:
+            - $ref: "#/components/schemas/SkillPointer"
+            - type: "null"
+        generation: { type: integer }
+        text_consistency:
+          description: >-
+            Counts for the body and evals this install wrote or reused.
+            Null when that pair cannot be checked.
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
+    SkillPointer:
+      type: object
+      required: [origin, body_revision_id, evals_revision_id, generation]
+      properties:
+        origin: { type: string, enum: [imported, user] }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        generation: { type: integer }
+    SkillListItem:
+      type: object
+      required: [skill_id, origin, semver, generation, active]
+      properties:
+        skill_id: { type: string }
+        origin: { type: string, enum: [imported, user] }
+        semver: { type: string }
+        generation: { type: integer }
+        active: { type: boolean }
+    SkillList:
+      type: object
+      required: [skills]
+      properties:
+        skills:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillListItem"
+    SkillRevisionMeta:
+      type: object
+      required: [revision_id, origin, semver, kind, content_digest, created_at]
+      properties:
+        revision_id: { type: string }
+        origin: { type: string, enum: [imported, user] }
+        semver: { type: string }
+        kind: { type: string, enum: [body, evals] }
+        content_digest: { type: string }
+        created_at: { type: string }
+        requires:
+          type: array
+          items: { type: string }
+          description: >-
+            Capability ids declared by this body revision. Omitted on evals
+            revisions, and when the stored body no longer parses.
+    SkillConsistency:
+      type: object
+      required: [consistent, total]
+      properties:
+        consistent: { type: integer }
+        total: { type: integer }
+    SkillActivationRecord:
+      type: object
+      required:
+        - activation_id
+        - seq
+        - body_revision_id
+        - evals_revision_id
+        - result_code
+        - origin_from
+        - origin_to
+        - created_at
+      properties:
+        activation_id: { type: string }
+        seq: { type: integer }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        result_code: { type: string, enum: [activated, rolled_back] }
+        origin_from: { type: [string, "null"], enum: [imported, user, null] }
+        origin_to: { type: string, enum: [imported, user] }
+        created_at: { type: string }
+        accepted_count:
+          type: integer
+          minimum: 0
+          description: >-
+            How many failing cases this activation accepted. Omitted when the
+            binding's accepted list is not a JSON array. Case text is not included.
+    SkillDetail:
+      type: object
+      required: [skill_id, pointer, generation, revisions, activations, text_consistency]
+      properties:
+        skill_id: { type: string }
+        pointer:
+          oneOf:
+            - $ref: "#/components/schemas/SkillPointer"
+            - type: "null"
+        generation: { type: integer }
+        revisions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillRevisionMeta"
+        activations:
+          type: array
+          description: Activation and rollback history, oldest first. No eval cases or text.
+          items:
+            $ref: "#/components/schemas/SkillActivationRecord"
+        text_consistency:
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
+    SkillActivateRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_generation]
+      description: >-
+        Pair form: both revision ids, plus `accepted` (exactly the failed case
+        ids of the server's own run). Rollback form: `rollback_activation_id`
+        alone.
+      properties:
+        expected_generation: { type: integer, minimum: 0 }
+        body_revision_id: { type: string }
+        evals_revision_id: { type: string }
+        accepted:
+          type: array
+          items: { type: string }
+        rollback_activation_id: { type: string }
+    SkillActivation:
+      type: object
+      required:
+        - skill_id
+        - result
+        - unchanged
+        - activation_id
+        - generation
+        - pointer
+        - text_consistency
+        - note
+      properties:
+        skill_id: { type: string }
+        result: { type: string, enum: [activated, rolled_back, unchanged] }
+        unchanged: { type: boolean }
+        activation_id: { type: [string, "null"] }
+        generation: { type: integer }
+        pointer: { $ref: "#/components/schemas/SkillPointer" }
+        text_consistency:
+          oneOf:
+            - $ref: "#/components/schemas/SkillConsistency"
+            - type: "null"
+        note: { type: [string, "null"] }
+    SkillScanError:
+      type: object
+      required: [path, code, message]
+      properties:
+        path: { type: string }
+        code: { type: string }
+        message: { type: string }
+    SkillScan:
+      type: object
+      required: [origin, skills, errors]
+      properties:
+        origin: { type: string, enum: [user] }
+        skills:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillInstall"
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/SkillScanError"
 
     # ---- Documenting OS (ADR-DOC-02) ----
     DocumentIdString:
@@ -6389,6 +7737,26 @@ components:
             error:
               properties:
                 code: { enum: [idempotency_key_reused, upload_checksum_mismatch, unsupported_format] }
+    OsPackageConflictError:
+      description: >-
+        D6 envelope for an integrity refusal on a proxied call. HTTP 409.
+        Not the old 503 `package_changed` shape.
+      allOf:
+        - $ref: "#/components/schemas/Error"
+        - type: object
+          properties:
+            error:
+              required: [code, message, details]
+              properties:
+                code:
+                  type: string
+                  pattern: "^os_package\\.(integrity_manifest_missing|hash_mismatch|integrity_manifest_invalid|signature_rejected|integrity_check_failed)$"
+                message: { type: string }
+                details:
+                  type: object
+                  required: [retryable]
+                  properties:
+                    retryable: { type: boolean, const: false }
     ModuleProxyError:
       description: >-
         An error produced by the kernel or its proxy: the generic envelope,
@@ -6399,7 +7767,11 @@ components:
         OS's `internal` always has `details.retryable: false`; a kernel
         `internal` may have no details, but an `internal` is never retryable.
         The rule holds wherever this schema is used: the 500 response and,
-        through `DocumentsUnavailable`, the 503 one.
+        through `DocumentsUnavailable`, the 503 one. An integrity refusal of
+        the mounted package is not this schema: it is 409
+        `OsPackageConflict` (`os_package.<reason>`, `retryable: false`).
+        503 `package_changed` remains only for a package change with no
+        integrity code.
       allOf:
         - $ref: "#/components/schemas/Error"
         - if: { properties: { error: { required: [code], properties: { code: { const: internal } } } } }

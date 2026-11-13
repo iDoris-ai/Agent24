@@ -35,42 +35,10 @@ pub const RETENTION_MAX_ROWS: u32 = 100_000;
 /// "定期清理" — every this many written rows, prune again.
 const PRUNE_EVERY: u32 = 200;
 
-/// One completed model call's timing facts — content-free BY CONSTRUCTION:
-/// there is no field here a prompt, a reply, or a transcript could end up
-/// in (mirrors `agent24_protocol::ModelCallPayload`'s same guarantee for the
-/// WS event this shares its call sites with).
-#[derive(Debug, Clone, Default)]
-pub struct TimingObservation {
-    /// `"chat"` (`/api/v1/chat`) or `"module:<name>"` (`_a24/model/complete`).
-    pub source: String,
-    pub model_id: Option<String>,
-    /// `"local"` | `"remote"`, or `None` when no provider ever answered.
-    pub tier: Option<String>,
-    pub served_by: Option<String>,
-    pub ok: bool,
-    pub error_kind: Option<String>,
-    /// A module's own finer-grained sub-step (AgentEar's asr/tts/…), when it
-    /// reports one — set by `agentear_timings.rs`, `None` from every other
-    /// call site.
-    pub step: Option<String>,
-    /// AgentEar's own per-turn correlation ids (opaque identifiers, never
-    /// content) — set by `agentear_timings.rs` only; every other call site
-    /// leaves both `None` (neither `_a24/model/complete` nor `/api/v1/chat`
-    /// is turn-scoped).
-    pub session_id: Option<String>,
-    pub seq: Option<u64>,
-    pub first_token_ms: Option<u64>,
-    pub total_ms: u64,
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-}
-
-/// Where a completed call's timing goes. Synchronous and non-blocking by
-/// contract, same as `model_callback.rs`'s `UsageSink` — it may be called
-/// from a context that must never await.
-pub trait TimingSink: Send + Sync {
-    fn record(&self, obs: TimingObservation);
-}
+// Single definition lives in `agentear_timings` so the attach-side bridge
+// and this writer share one type. Re-exported here; `model_callback` and
+// `routes` keep importing it from this module.
+pub use agent24_attach::agentear_timings::{TimingObservation, TimingSink};
 
 /// Test-only in-memory sink — nothing in the production path constructs it
 /// (production always goes through `TimingRecorder::spawn`'s channel sink).

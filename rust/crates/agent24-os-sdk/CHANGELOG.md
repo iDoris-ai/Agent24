@@ -7,7 +7,11 @@ separate from the Agent24 product version (`agent24d`/`agent24-cli`) — see
 `agent24-os-sdk-v<version>` and pushed on the `main` merge commit that
 contains the corresponding change (J-S14).
 
-## [Unreleased]
+## [0.2.0] — 未发布
+
+- N6：握手前自检 cwd 的 `domain-os.yml`，去掉顶层 `integrity` 后须与内嵌基准语义相等；握手和 facts 使用同一份磁盘原文。
+- 内核拉起时包目录缺 `domain-os.yml` 即失败（`SdkError::ManifestMissing`）；只有 `with_env` 注入的测试环境使用内嵌清单。拒绝链接、非普通文件、超限、读取失败及非法或不一致清单。新增 `SdkError::ManifestCheck`，错误不泄露清单值或未知键名。
+- YAML 比较及安全读取复用 proto 的现有依赖，SDK 不增加依赖。
 
 ### 新增
 

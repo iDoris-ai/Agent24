@@ -27,6 +27,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -79,10 +82,11 @@ fn install(home: &Path) {
         "name: probe\nversion: \"0.1.0\"\nroute_namespace: /api/v1/probe\n\
          event_module: probe\ndata_dir: ~/.agent24/os/probe/\n\
          kernel_capabilities: [models]\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+         spawn:\n  command: bin/launch\n",
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), MODULE).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 /// `method path` with the daemon's token and a JSON `body`: `(status, body)`.
@@ -134,8 +138,7 @@ struct Daemon {
 }
 
 fn start(home: &Path, omlx_port: u16) -> Daemon {
-    let daemon = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let daemon = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
@@ -207,23 +210,44 @@ fn start_hanging_provider() -> StubProvider {
     let closed = Arc::new(AtomicBool::new(false));
     let closed2 = closed.clone();
     std::thread::spawn(move || {
-        let Ok((mut stream, _)) = listener.accept() else {
-            return;
-        };
-        let mut buf = [0u8; 8192];
-        if stream.read(&mut buf).unwrap_or(0) > 0 {
-            let _ = tx.send(());
-        }
-        // Never write a response — just keep reading so a later close (the
-        // peer's FIN) is observable as `Ok(0)`.
-        let mut trailing = [0u8; 16];
+        // VR-4 probes POST /v1/embeddings on this origin after ready. Answer
+        // that and keep accepting until the module's completion, which is the
+        // connection this test hangs.
         loop {
-            match stream.read(&mut trailing) {
-                Ok(0) | Err(_) => {
-                    closed2.store(true, Ordering::SeqCst);
-                    break;
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = [0u8; 8192];
+            let n = stream.read(&mut buf).unwrap_or(0);
+            if n == 0 {
+                continue;
+            }
+            let head = String::from_utf8_lossy(&buf[..n]);
+            let line = head.lines().next().unwrap_or("");
+            if line.contains("/v1/embeddings") {
+                let body = br#"{"error":{"message":"no embeddings","type":"not_found"}}"#;
+                let resp = format!(
+                    "HTTP/1.1 404 Not Found\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                let _ = stream.write_all(body);
+                continue;
+            }
+            let _ = tx.send(());
+            let _ = stream.set_read_timeout(None);
+            // Never write a response — just keep reading so a later close (the
+            // peer's FIN) is observable as `Ok(0)`.
+            let mut trailing = [0u8; 16];
+            loop {
+                match stream.read(&mut trailing) {
+                    Ok(0) | Err(_) => {
+                        closed2.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                    Ok(_) => {}
                 }
-                Ok(_) => {}
             }
         }
     });

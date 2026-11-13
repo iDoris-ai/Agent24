@@ -496,6 +496,12 @@ pub struct RunCreate {
     /// private interface. A selector, not an authority; omit/null for none.
     #[serde(default)]
     pub knowledge_binding_id: Option<String>,
+    /// SL-5: a skill (its id, the manifest `name`) to run under. Only the
+    /// id: the server reads the current activation pointer when the run is
+    /// admitted and pins that revision. There is no version field.
+    /// Omit/null for a run without a skill.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_id: Option<String>,
 }
 
 /// K1-6b.5c-2 (ADR-K1-02 §2.4): a run as a peer bridge (the MCP server, the

@@ -4,6 +4,7 @@ import { LOCALES, isLocale, setLocale, useLocale, useT } from '../i18n'
 import { settingsMessages } from './Settings.i18n'
 import { ActivityTab } from './settings/ActivityTab'
 import { CliToolSettings } from './settings/CliToolSettings'
+import { ResidentServiceSettings } from './settings/ResidentServiceSettings'
 import { KnowledgeSettings } from './settings/KnowledgeSettings'
 import { ModelServiceSettings } from './settings/ModelServiceSettings'
 import { SidebarPrefs } from './settings/SidebarPrefs'
@@ -130,6 +131,7 @@ function GeneralTab() {
           </select>
         </div>
       </div>
+      <ResidentServiceSettings />
       <SidebarPrefs />
     </>
   )

@@ -78,6 +78,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/models", Operation::ModelsRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/decide/profile", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/capabilities/creative", Operation::CapabilityMint, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/capabilities/bridge", Operation::CapabilityMint, AssuranceLevel::Elevated),
     row("POST", "/api/v1/capabilities/{capability_id}/revoke", Operation::CapabilityRevoke, AssuranceLevel::Elevated),
     row("GET", "/api/v1/usage", Operation::UsageRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/timings", Operation::UsageRead, AssuranceLevel::Everyday),
@@ -117,6 +118,9 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/attached", Operation::ModuleRead, AssuranceLevel::Everyday),
     row("DELETE", "/api/v1/attached/{name}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("PATCH", "/api/v1/attached/{name}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/os/trusted-teams", Operation::ModuleRead, AssuranceLevel::Everyday),
+    row("PUT", "/api/v1/os/trusted-teams/{team}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
+    row("DELETE", "/api/v1/os/trusted-teams/{team}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("GET", "/api/v1/os", Operation::ModuleRead, AssuranceLevel::Everyday),
     row("PATCH", "/api/v1/os/{name}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/os/{name}/delegation", Operation::ModuleAdmin, AssuranceLevel::Elevated),
@@ -171,6 +175,24 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}", Operation::CommRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry", Operation::CommWrite, AssuranceLevel::Elevated),
     row("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept", Operation::CommWrite, AssuranceLevel::Elevated),
+    // X11-2f. Read and write are two operations: a shared one would mix
+    // Everyday and Elevated, and assurance_level() would return None.
+    row("GET", "/api/v1/inbound/allowlist", Operation::InboundRead, AssuranceLevel::Everyday),
+    row("PUT", "/api/v1/inbound/allowlist", Operation::InboundWrite, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/inbound/policy", Operation::InboundRead, AssuranceLevel::Everyday),
+    row("PUT", "/api/v1/inbound/policy", Operation::InboundWrite, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/inbound/events", Operation::InboundRead, AssuranceLevel::Everyday),
+    // C9-B. Everyday `inbound.ingest`. The component token's route list is
+    // [`component_route_permitted`], not "every row with this operation".
+    // Without `A24_DEV_TOOL=1` the middleware answers 404.
+    row("POST", "/api/v1/inbound/events", Operation::InboundIngest, AssuranceLevel::Everyday),
+    // Skill loader SL-3 and SL-4. These rows stay out of
+    // creative_route_permitted. Activate is Elevated and is not proxied.
+    row("GET", "/api/v1/skills", Operation::SkillsRead, AssuranceLevel::Everyday),
+    row("GET", "/api/v1/skills/{id}", Operation::SkillsRead, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills", Operation::SkillsInstall, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills/scans", Operation::SkillsInstall, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/skills/{id}/activate", Operation::SkillsActivate, AssuranceLevel::Elevated),
 ];
 
 pub fn policies() -> &'static [RoutePolicy] {
@@ -208,6 +230,13 @@ pub fn required_operation(method: &Method, matched_route_template: &str) -> Opti
 /// stops here after the bearer check.
 pub fn creative_route_permitted(method: &Method, template: &str) -> bool {
     method == Method::GET && template == "/api/v1/models"
+}
+
+/// Component-runtime tokens may call only this list. A new route mapped to
+/// [`Operation::InboundIngest`] is not admitted: this function does not read
+/// the catalog. `ModuleRoute` and host-only routes are not on the list.
+pub fn component_route_permitted(method: &Method, template: &str) -> bool {
+    method == Method::POST && template == "/api/v1/inbound/events"
 }
 
 pub fn decide(

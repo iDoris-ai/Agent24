@@ -31,7 +31,7 @@ const at = '2026-11-09T01:00:00.000Z'
 function record(id: string, prompt: string): ChatHistoryRecord {
   return {
     format: CHAT_HISTORY_FORMAT, version: CHAT_HISTORY_VERSION, id, title: prompt, title_source: 'prompt',
-    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [],
+    group_id: null, archived_at: null, created_at: at, updated_at: at, runs: [], pending: [], initiator: 'user', unseen: [],
     messages: [{ role: 'user', content: prompt, at, delivered: true }],
   }
 }
@@ -252,7 +252,7 @@ describe('task cards (M4 A4)', () => {
   })
 
   it('shows a card for a schedule\'s run in the schedule\'s conversation (M4 A5)', async () => {
-    const { id } = store.create({ title: '日程：周报', title_source: 'schedule' })
+    const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
     store.appendRun(id, 'run_s1', 'schedule')
     runs.run_s1 = { status: 'queued', started_at: at }
     await show(id)

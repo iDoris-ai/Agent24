@@ -13,9 +13,9 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use agent24_domain::http::{error_response, read_body_or_response};
+use agent24_idoris::idoris_host::{Action, State as IdorisState};
 use agent24_os_proto::drain::DrainState;
 use agent24_os_proto::supervisor::Status as Supervised;
-use agent24d::idoris_host::{Action, State as IdorisState};
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Extension, Path, State};
@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::capabilities::requires::{self, Consent, DenyReason, GrantForm};
 use crate::capabilities::{Audience, Authorization};
 use crate::comm_routes::BuildMark;
 use crate::domain::{MountOutcome, MountReport};
@@ -37,11 +38,8 @@ mod documents_catalog;
 /// silent desktop (crashed, quit) reads as "not reporting" rather than as a stale `ready`.
 /// There is no connection to watch: the report is a plain HTTP POST.
 pub const REPORT_TTL: Duration = Duration::from_secs(90);
-/// The ids of the components this daemon lists itself. No attached module may take one:
-/// `attached::register` refuses them for new registrations, and [`attach_items`] drops same-named entries
-/// from registrations that predate the rule. Pinned by a test.
-pub(crate) const BUILTIN_COMPONENT_IDS: &[&str] =
-    &["idoris", "hyphae", "documents", "knowledge", "open-design"];
+/// Single definition is [`agent24_attach::attached::BUILTIN_COMPONENT_IDS`].
+pub(crate) use agent24_attach::attached::BUILTIN_COMPONENT_IDS;
 /// Components whose state the desktop owns. Anything else is the daemon's to say.
 const DESKTOP_OWNED: &[&str] = &["open-design"];
 
@@ -62,6 +60,28 @@ pub struct Provide {
     availability: Option<&'static str>,
 }
 
+/// `requires` as declared. Not what the mount handed out.
+#[derive(Serialize, Clone, PartialEq, Eq, Default)]
+struct Declared {
+    kernel: Vec<String>,
+    operations: Vec<String>,
+}
+
+/// One closed denial. `code` serializes as the snake_case [`DenyReason`].
+#[derive(Serialize, Clone, PartialEq, Eq)]
+struct Denial {
+    item: String,
+    code: DenyReason,
+}
+
+/// Host-only kernel picture. `kernel_grants` is the mount's list.
+/// `declared` is `None` when the manifest was not read.
+struct KernelView {
+    kernel_grants: Vec<String>,
+    declared: Option<Declared>,
+    denied: Vec<Denial>,
+}
+
 /// The host view of one component.
 #[derive(Serialize, Clone)]
 pub struct Item {
@@ -76,6 +96,16 @@ pub struct Item {
     /// Ports, contract expectations, counters. Host-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<Value>,
+    /// Capabilities the mount actually handed out (`MountReport.granted`).
+    /// Host-only. Empty when nothing is mounted. Not the resolver's grant set:
+    /// a missing model callback leaves `models` out of this list.
+    kernel_grants: Vec<String>,
+    /// The component's `requires` declaration. Host-only. Null when the
+    /// manifest was not read (unknown; denials are not computed).
+    declared: Option<Declared>,
+    /// Why a declared or ceiling item is not in [`Self::kernel_grants`].
+    /// Host-only; the redacted view omits it.
+    denied: Vec<Denial>,
 }
 
 /// What a non-host audience sees in capability mode (see [`sees_everything`]): the fields are
@@ -98,6 +128,10 @@ impl Item {
             provides: Vec::new(),
             reason: None,
             detail: None,
+            kernel_grants: Vec::new(),
+            // Unknown until a row reads a declaration (`set_kernel` or a lock).
+            declared: None,
+            denied: Vec::new(),
         }
     }
     fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
@@ -128,6 +162,104 @@ impl Item {
             provides: &self.provides,
         }
     }
+
+    fn set_kernel(&mut self, view: KernelView) {
+        self.kernel_grants = view.kernel_grants;
+        self.declared = view.declared;
+        self.denied = view.denied;
+    }
+}
+
+fn declared_of(kernel: &[String], operations: &[String]) -> Declared {
+    Declared {
+        kernel: kernel.to_vec(),
+        operations: operations.to_vec(),
+    }
+}
+
+fn denials_of(denied: &[requires::Denial]) -> Vec<Denial> {
+    denied
+        .iter()
+        .map(|denial| Denial {
+            item: denial.item.clone(),
+            code: denial.reason,
+        })
+        .collect()
+}
+
+/// First denial wins. A declaration can repeat a token that sits in both
+/// `kernel` and `operations`, or twice in one of them.
+fn unique_by_item(denied: Vec<Denial>) -> Vec<Denial> {
+    let mut seen = BTreeSet::new();
+    denied
+        .into_iter()
+        .filter(|denial| seen.insert(denial.item.clone()))
+        .collect()
+}
+
+/// A resident with no kernel callback (Hyphae). Declared tokens are
+/// `no_channel`; an invalid declaration is `requires_invalid` and grants nothing.
+fn kernel_without_channel(kernel: &[String], operations: &[String]) -> KernelView {
+    let spec = requires::RequiresSpec::parse(kernel, operations);
+    let declared = declared_of(kernel, operations);
+    if !spec.is_valid() {
+        let resolution = requires::resolve(
+            &spec,
+            GrantForm::InProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        );
+        return KernelView {
+            kernel_grants: Vec::new(),
+            declared: Some(declared),
+            denied: unique_by_item(denials_of(&resolution.denied)),
+        };
+    }
+    let denied = kernel
+        .iter()
+        .chain(operations.iter())
+        .map(|item| Denial {
+            item: item.clone(),
+            code: DenyReason::NoChannel,
+        })
+        .collect();
+    KernelView {
+        kernel_grants: Vec::new(),
+        declared: Some(declared),
+        denied: unique_by_item(denied),
+    }
+}
+
+/// `kernel_grants` copies `actual` (the mount's or the admission's list).
+/// `no_channel` is only for a live mount: a capability the resolver would
+/// grant and this form's ceiling allows, but `actual` does not hold. A
+/// module that is not [`MountOutcome::Mounted`] keeps the resolver's static
+/// denials and does not gain `no_channel`.
+fn kernel_from_mount(
+    form: GrantForm,
+    kernel: &[String],
+    operations: &[String],
+    actual: &[String],
+    mounted: bool,
+) -> KernelView {
+    let spec = requires::RequiresSpec::parse(kernel, operations);
+    let resolution = requires::resolve(&spec, form.host_cap(), Consent::FirstPartyEnabled);
+    let mut denied = denials_of(&resolution.denied);
+    if mounted {
+        let held: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+        for cap in resolution.granted.iter() {
+            if !held.contains(cap.as_str()) {
+                denied.push(Denial {
+                    item: cap.as_str().to_owned(),
+                    code: DenyReason::NoChannel,
+                });
+            }
+        }
+    }
+    KernelView {
+        kernel_grants: actual.to_vec(),
+        declared: Some(declared_of(kernel, operations)),
+        denied: unique_by_item(denied),
+    }
 }
 
 /// `{components: [...]}`, full or redacted as [`sees_everything`] decided for this request.
@@ -147,7 +279,7 @@ fn render(items: &[Item], full: bool) -> Value {
 fn from_idoris(
     state: IdorisState,
     installing: bool,
-    error: Option<agent24d::idoris_host::Code>,
+    error: Option<agent24_idoris::idoris_host::Code>,
 ) -> (ComponentState, Option<&'static str>) {
     use ComponentState as S;
     if installing {
@@ -163,7 +295,9 @@ fn from_idoris(
         // contract version, but also a wrong `service`, an empty `instance_id` or dev-no-key.
         // Each means the installed binary is not the one this daemon can drive, so all are
         // `incompatible` rather than a crash.
-        IdorisState::Failed if error == Some(agent24d::idoris_host::Code::ContractMismatch) => {
+        IdorisState::Failed
+            if error == Some(agent24_idoris::idoris_host::Code::ContractMismatch) =>
+        {
             (S::Incompatible, Some("component_contract_mismatch"))
         }
         IdorisState::Failed => (S::Failed, None),
@@ -191,7 +325,9 @@ fn from_supervised(status: &Supervised) -> (ComponentState, Option<&'static str>
         Supervised::Stopped => (S::Stopped, None),
         Supervised::Backoff { .. } => (S::Failed, Some("restarting")),
         Supervised::GaveUp { .. } => (S::Failed, Some("gave_up")),
-        Supervised::PackageChanged { .. } => (S::Failed, Some("package_changed")),
+        Supervised::PackageChanged { code, .. } => {
+            (S::Failed, Some(code.unwrap_or("package_changed")))
+        }
         Supervised::StopFailed { .. } => (S::Failed, Some("stop_failed")),
         Supervised::Panicked => (S::Failed, Some("panicked")),
         Supervised::Killed => (S::Failed, Some("killed")),
@@ -361,12 +497,14 @@ fn hyphae_item(state: &AppState) -> Item {
         }
     };
     let lock = lock.component();
+    let kernel = kernel_without_channel(&lock.requires.kernel, &lock.requires.operations);
     let item = Item::new("hyphae", Form::Resident, ComponentState::Absent).with(|i| {
         i.provides = Item::provides_of(lock);
         i.detail = Some(json!({"contract": {
             "name": lock.contract.name, "major": lock.contract.major,
             "min_minor": lock.contract.min_minor,
         }}));
+        i.set_kernel(kernel);
     });
     // A binary the last start (or install rebuild) refused is `failed` with the stable
     // code, ahead of any supervisor left registered from before. Host view only: the
@@ -423,7 +561,7 @@ fn attach_items(state: &AppState) -> Vec<Item> {
     attach_items_from(state.attach_registry.snapshot())
 }
 
-fn attach_items_from(mut modules: Vec<crate::attach_registry::AttachSnap>) -> Vec<Item> {
+fn attach_items_from(mut modules: Vec<agent24_attach::attach_registry::AttachSnap>) -> Vec<Item> {
     // D9 has no catalog for an attached module: no component lock (D2 does
     // not apply), `kernel_capabilities` are `requires` (ADR-039 §4), and
     // `docs/capabilities/REGISTRY.md` is C7. `provides` stays empty.
@@ -452,6 +590,16 @@ fn attach_items_from(mut modules: Vec<crate::attach_registry::AttachSnap>) -> Ve
                 } else {
                     item.reason = reason.map(str::to_owned);
                 }
+                // The admission already decided the channel. `mounted` stays
+                // true so a missing model callback is `no_channel` against
+                // the attach ceiling even while the module is stopped.
+                item.set_kernel(kernel_from_mount(
+                    GrantForm::Attach,
+                    &module.declared_kernel,
+                    &[],
+                    &module.kernel_grants,
+                    true,
+                ));
             })
         })
         .collect()
@@ -558,20 +706,73 @@ fn apply_documents_catalog(
     }
 }
 
+#[cfg(test)]
 fn documents_from(
     report: Option<&MountReport>,
     live: Option<&Supervised>,
     catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
 ) -> Item {
+    documents_shown(report, report.map(|report| &report.outcome), live, catalog)
+}
+
+fn documents_shown(
+    report: Option<&MountReport>,
+    outcome: Option<&MountOutcome>,
+    live: Option<&Supervised>,
+    catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
+) -> Item {
     let mut item = Item::new("documents", documents_form(), ComponentState::Absent);
+    let effective = outcome.or(report.map(|report| &report.outcome));
     if let Some(report) = report {
-        let (mapped, reason, detail) = documents_mapped(&report.outcome, live);
+        let outcome = effective.unwrap_or(&report.outcome);
+        let (mapped, reason, detail) = documents_mapped(outcome, live);
         item.state = mapped;
         item.version = Some(report.version.clone());
         item.reason = reason.map(str::to_owned);
         item.detail = detail.map(|why| json!({"message": why}));
     }
+    let operations = match &catalog {
+        Ok(catalog) => catalog.requires.operations.clone(),
+        Err(_) => Vec::new(),
+    };
+    let catalog_kernel = match &catalog {
+        Ok(catalog) => catalog.requires.kernel.clone(),
+        Err(_) => Vec::new(),
+    };
+    let d9 = report.and_then(|report| report.d9.as_ref());
+    let actual = report
+        .map(|report| report.granted.clone())
+        .unwrap_or_default();
+    let mounted = effective.is_some_and(|outcome| matches!(outcome, MountOutcome::Mounted));
     apply_documents_catalog(&mut item, catalog, report);
+    // D9 missing: keep the catalog as `declared` (the two sources stay).
+    // Do not run a ceiling and do not invent denials — the manifest was
+    // not read. A present D9 uses the mount outcome, and `no_channel` only
+    // when that outcome is Mounted.
+    match d9 {
+        Some(d9) => {
+            let form = if d9.in_process {
+                GrantForm::InProcess
+            } else {
+                GrantForm::OutOfProcess
+            };
+            item.set_kernel(kernel_from_mount(
+                form,
+                &d9.requires_kernel,
+                &operations,
+                &actual,
+                mounted,
+            ));
+        }
+        None if report.is_some() || !catalog_kernel.is_empty() || !operations.is_empty() => {
+            item.set_kernel(KernelView {
+                kernel_grants: actual,
+                declared: Some(declared_of(&catalog_kernel, &operations)),
+                denied: Vec::new(),
+            });
+        }
+        None => {}
+    }
     item
 }
 
@@ -589,14 +790,16 @@ fn documents_item(state: &AppState) -> Item {
     // A package that only borrowed the name (refused as `reserved_component_name`)
     // is not Documents; it is listed on its own row by `os_module_items`.
     let report = documents_report(state);
+    let outcome = report.map(|report| state.os_outcome(&report.name, &report.outcome));
     let live = report.and_then(|_| {
         state
             .module_status
             .get("documents")
             .map(|rx| rx.borrow().clone())
     });
-    documents_from(
+    documents_shown(
         report,
+        outcome.as_ref(),
         live.as_ref(),
         documents_catalog::DocumentsCatalog::embedded(),
     )
@@ -675,7 +878,8 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 .module_status
                 .get(&report.name)
                 .map(|rx| rx.borrow().clone());
-            let (mapped, reason, message) = os_mapped(&report.outcome, live);
+            let outcome = state.os_outcome(&report.name, &report.outcome);
+            let (mapped, reason, message) = os_mapped(&outcome, live);
             let d9 = report.d9.as_ref();
             let provides = d9
                 .map(|d| {
@@ -698,8 +902,33 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                     "package"
                 }
             });
+            let mounted = matches!(outcome, MountOutcome::Mounted);
+            // No D9: the manifest was not read. `declared` is unknown, so
+            // there is no denial list and no out-of-process ceiling.
+            let kernel = match d9 {
+                Some(d9) => {
+                    let form = if d9.in_process {
+                        GrantForm::InProcess
+                    } else {
+                        GrantForm::OutOfProcess
+                    };
+                    kernel_from_mount(form, &d9.requires_kernel, &[], &report.granted, mounted)
+                }
+                None => KernelView {
+                    kernel_grants: report.granted.clone(),
+                    declared: None,
+                    denied: Vec::new(),
+                },
+            };
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
-                i.version = Some(report.version.clone());
+                // An integrity refusal with no trusted version is unknown,
+                // not the empty string.
+                i.set_kernel(kernel);
+                i.version = if report.version.is_empty() {
+                    None
+                } else {
+                    Some(report.version.clone())
+                };
                 i.provides = provides;
                 i.reason = reason.map(str::to_owned);
                 let mut detail = json!({
@@ -787,7 +1016,7 @@ fn dedupe_component_ids(items: &mut [Item]) {
 /// Knowledge, remote subset (ADR-038 D5, C5). No endpoint is `stopped`. A
 /// configured binding is whatever the cached `/system/capabilities` probe said.
 async fn knowledge_item(
-    registry: &crate::knowledge_host::KnowledgeHostRegistry,
+    registry: &agent24_knowledge::host::KnowledgeHostRegistry,
     now: Instant,
 ) -> Item {
     let view = registry.component_status(now).await;
@@ -825,6 +1054,55 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items
 }
 
+// ---- providers for a skill run (SL-5) -------------------------------------------------
+
+/// The components that provide a capability right now, for admitting a run that names a
+/// skill. One component view per admission; a component counts when it is `ready` and its own
+/// report has not marked that capability unavailable.
+pub(crate) struct ComponentProviders<'a> {
+    state: &'a AppState,
+    items: tokio::sync::OnceCell<Vec<Item>>,
+}
+
+impl<'a> ComponentProviders<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self {
+            state,
+            items: tokio::sync::OnceCell::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl agent24_agent::SkillProviderSource for ComponentProviders<'_> {
+    async fn providers(&self, capability: &str) -> Vec<agent24_agent::SkillProvider> {
+        let items = self
+            .items
+            .get_or_init(|| collect(self.state, Instant::now()))
+            .await;
+        items
+            .iter()
+            .filter(|item| item.state == ComponentState::Ready)
+            .filter(|item| {
+                item.provides
+                    .iter()
+                    .any(|p| p.id == capability && p.availability.is_none())
+            })
+            .map(|item| agent24_agent::SkillProvider {
+                component: item.id.clone(),
+                version: item.version.clone(),
+            })
+            .collect()
+    }
+
+    fn registered_provider(&self, capability: &str) -> Option<String> {
+        crate::component_manifest::REGISTERED_PROVIDERS
+            .iter()
+            .find(|(cap, _)| *cap == capability)
+            .map(|(_, provider)| (*provider).to_owned())
+    }
+}
+
 // ---- GET -------------------------------------------------------------------------------
 
 /// Host sees everything. In capability mode anyone else, and a request that somehow reached
@@ -836,6 +1114,13 @@ fn sees_everything(mode: AuthMode, authorization: Option<&Authorization>) -> boo
         (AuthMode::LegacySingleToken, None) => true,
         (AuthMode::Capabilities, None) => false,
     }
+}
+
+/// Host JSON of `GET /api/v1/components`, for tests that drive enable and then
+/// read the row the desktop reads.
+#[cfg(test)]
+pub(crate) async fn host_components_json(state: &AppState) -> Value {
+    render(&collect(state, Instant::now()).await, true)
 }
 
 pub async fn list(

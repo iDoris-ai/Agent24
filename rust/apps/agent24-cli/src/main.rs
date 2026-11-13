@@ -19,7 +19,11 @@ use clap::{Parser, Subcommand};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use zeroize::{Zeroize, Zeroizing};
 
+#[cfg(all(feature = "test-support", not(debug_assertions)))]
+compile_error!("test-support must not be enabled in release builds");
+
 mod acp;
+mod bridge_token;
 mod comm_groups;
 mod documents;
 mod enroll;
@@ -31,6 +35,7 @@ mod query;
 mod runs;
 mod schedules;
 mod service;
+mod skills;
 mod tui;
 
 #[derive(Parser)]
@@ -204,6 +209,31 @@ enum Command {
         #[command(subcommand)]
         action: query::ToolsAction,
     },
+    /// 技能：列出、查看、导入、重扫，以及经桌面确认的激活
+    Skill {
+        #[command(subcommand)]
+        action: skills::SkillAction,
+        /// 原样输出 JSON 响应
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// 开发工具。`A24_DEV_TOOL=1` 才可用。
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+}
+
+/// `agent24 dev …`
+#[derive(Subcommand)]
+enum DevAction {
+    /// 经桌面确认签发 8 小时微信桥令牌，写入状态目录 dev/wechat-bridge.token。
+    /// `--revoke` 撤销该文件里的令牌并删除文件。
+    BridgeToken {
+        /// 撤销令牌文件中的 capability id，成功后删除文件
+        #[arg(long)]
+        revoke: bool,
+    },
 }
 
 /// `agent24 hw …` (HW-1).
@@ -271,6 +301,12 @@ enum DecideDeleteAction {
 
 #[derive(Subcommand)]
 enum OsAction {
+    /// Explicitly trust a macOS Developer ID team (daemon required; next verification)
+    TrustTeam { team_id: String },
+    /// Remove an added team; the built-in team cannot be removed (does not stop running modules)
+    UntrustTeam { team_id: String },
+    /// List trusted teams; the built-in team is marked and cannot be removed
+    TrustedTeams,
     /// Show every domain OS the daemon knows about, and what it did with each
     List,
     // `Disable`'s line EXPIRED with SUP-5: the daemon's disable path now drains
@@ -312,8 +348,8 @@ enum OsAction {
     /// File removal works with the daemon down, same as install. If a daemon is
     /// reachable, a running module of it is also told to stop now (best-effort).
     /// If no daemon was reachable at all, a module of it still running elsewhere
-    /// keeps serving until its own next restart, which will report
-    /// `package_changed` instead of crash-looping. If a daemon WAS reachable but
+    /// keeps serving until its own next restart, which answers
+    /// 409 `os_package.<code>` instead of crash-looping. If a daemon WAS reachable but
     /// could not confirm the stop, `agent24 os list` shows why — that module will
     /// not restart on its own from this.
     Uninstall { name: String },
@@ -1090,6 +1126,235 @@ async fn cmd_acp() -> Result<(), String> {
     result
 }
 
+async fn cmd_dev(action: DevAction) -> Result<(), String> {
+    match action {
+        DevAction::BridgeToken { revoke } => cmd_bridge_token(revoke).await,
+    }
+}
+
+/// Enrol, ask the desktop to confirm, and write the dev-bridge file.
+///
+/// Stdout is the path and `expires_at` only. The bearer stays in the file.
+/// The development switch is checked before any daemon request, so a closed
+/// CLI gate never asks for elevation. A daemon that was not started with
+/// `A24_DEV_TOOL=1` answers 404 on the first POST; that is not
+/// `presence_required`, so this command does not ask the desktop either.
+async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
+    if !bridge_token::dev_tool_enabled() {
+        return Err(bridge_token::DEV_TOOL_REQUIRED.to_owned());
+    }
+    if revoke {
+        return cmd_bridge_token_revoke().await;
+    }
+    let Some(ep) = attach_only_with_enrollment(true).await? else {
+        return Err(
+            "找不到运行中的 agent24d。先以 capabilities 模式启动它（A24_DEV_TOOL=1），再运行 agent24 dev bridge-token。"
+                .to_owned(),
+        );
+    };
+    let root = match agent24_protocol::data_dir::data_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err.to_string());
+        }
+    };
+    // Remember the id before the new file replaces it. Revoke only after the
+    // new bearer is on disk, so a failed issue or write leaves the old bearer
+    // usable. A failed revoke is a warning and does not roll back the file.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let previous_id = bridge_token::live_bridge_id(&root, now);
+    let reply = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        "/api/v1/capabilities/bridge",
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await
+    .map_err(|err| {
+        let (code, message) = err.parts();
+        format!("{code}: {message}")
+    });
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err);
+        }
+    };
+    if !reply.status.is_success() {
+        let status = reply.status;
+        let body = reply.json_value().await;
+        finish(ep).await;
+        return Err(bridge_http_error(status, &body));
+    }
+    let body = reply.json_value().await;
+    let Some(token_text) = body["token"].as_str().filter(|token| !token.is_empty()) else {
+        finish(ep).await;
+        return Err("签发响应没有令牌".to_owned());
+    };
+    let token = Zeroizing::new(token_text.to_owned());
+    let expires_at = body["expires_at"].as_u64();
+    let capability_id = body["capability_id"]
+        .as_str()
+        .filter(|id| bridge_token::capability_id_ok(id))
+        .map(str::to_owned);
+    let (Some(expires_at), Some(capability_id)) = (expires_at, capability_id) else {
+        finish(ep).await;
+        return Err("签发响应没有 expires_at 或 capability_id".to_owned());
+    };
+    let path = match bridge_token::write_bridge_token_at(
+        &root,
+        token.as_str(),
+        expires_at,
+        capability_id.as_str(),
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            let note = match send_elevating(
+                &ep,
+                reqwest::Method::POST,
+                &format!("/api/v1/capabilities/{capability_id}/revoke"),
+                None,
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+            {
+                Ok(reply) if reply.status.is_success() => {
+                    let _ = reply.json_value().await;
+                    "已撤销刚签发的令牌。".to_owned()
+                }
+                Ok(reply) => {
+                    let status = reply.status;
+                    let body = reply.json_value().await;
+                    format!(
+                        "撤销刚签发的令牌没有成功（{}）。",
+                        bridge_token::http_failure(status.as_u16(), &body)
+                    )
+                }
+                Err(err) => {
+                    let (code, message) = err.parts();
+                    format!("撤销刚签发的令牌没有成功（{code}: {message}）。")
+                }
+            };
+            finish(ep).await;
+            return Err(format!("{err}。{note}"));
+        }
+    };
+    if let Some(old_id) = previous_id
+        .as_deref()
+        .filter(|id| *id != capability_id.as_str())
+    {
+        revoke_previous_bridge_id(&ep, old_id).await;
+    }
+    finish(ep).await;
+    print!("{}", bridge_token::stdout_lines(&path, expires_at));
+    Ok(())
+}
+
+/// Best-effort revoke of an id captured before the new file was published.
+///
+/// A 404 `bridge_token_unknown` means the daemon restarted and that id is
+/// already gone. That is not a warning. Any other failure is printed and
+/// does not remove the new file. The bearer is not part of the warning.
+async fn revoke_previous_bridge_id(ep: &Endpoint, old_id: &str) {
+    let reply = send_elevating(
+        ep,
+        reqwest::Method::POST,
+        &format!("/api/v1/capabilities/{old_id}/revoke"),
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await;
+    match reply {
+        Ok(reply) if reply.status.is_success() => {
+            let _ = reply.json_value().await;
+        }
+        Ok(reply) => {
+            let status = reply.status;
+            let body = reply.json_value().await;
+            if let Some(warning) = bridge_token::previous_revoke_warning(status.as_u16(), &body) {
+                eprintln!("{warning}");
+            }
+        }
+        Err(err) => {
+            let (code, message) = err.parts();
+            eprintln!("撤销上一枚桥令牌没有成功（{code}: {message}）。新令牌已经写入。");
+        }
+    }
+}
+
+/// Revoke the id stored in the token file, then delete the file.
+///
+/// The id is read before the daemon is contacted. A missing file does not
+/// request elevation.
+async fn cmd_bridge_token_revoke() -> Result<(), String> {
+    let root = agent24_protocol::data_dir::data_dir().map_err(|err| err.to_string())?;
+    let capability_id = bridge_token::read_bridge_capability_id(&root)?;
+    let Some(ep) = attach_only_with_enrollment(true).await? else {
+        return Err(
+            "找不到运行中的 agent24d。先以 capabilities 模式启动它（A24_DEV_TOOL=1），再运行 agent24 dev bridge-token --revoke。"
+                .to_owned(),
+        );
+    };
+    let reply = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        &format!("/api/v1/capabilities/{capability_id}/revoke"),
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await
+    .map_err(|err| {
+        let (code, message) = err.parts();
+        format!("{code}: {message}")
+    });
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err);
+        }
+    };
+    if !reply.status.is_success() {
+        let status = reply.status;
+        let body = reply.json_value().await;
+        finish(ep).await;
+        if let Some(outcome) = bridge_token::revoke_reply_when_daemon_lost_the_id(
+            &root,
+            &capability_id,
+            status.as_u16(),
+            &body,
+        ) {
+            return outcome;
+        }
+        return Err(bridge_token::http_failure(status.as_u16(), &body));
+    }
+    finish(ep).await;
+    let path = bridge_token::bridge_token_path(&root);
+    // Only a 2xx reply reaches here. A different id in the file is kept.
+    bridge_token::remove_bridge_token_if_id(&root, &capability_id)?;
+    print!("{}\nrevoked\n", path.display());
+    Ok(())
+}
+
+fn bridge_http_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
+    if status == reqwest::StatusCode::NOT_FOUND
+        && body["error"]["code"].as_str() == Some("not_found")
+    {
+        return bridge_token::DAEMON_DEV_TOOL_REQUIRED.to_owned();
+    }
+    bridge_token::http_failure(status.as_u16(), body)
+}
+
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
     if ep.token().is_empty() {
         rb
@@ -1482,7 +1747,8 @@ async fn install_with_consent(
     // Revoke before `install` creates directories. A busy or docked gate must
     // leave the packages root byte-for-byte unchanged.
     revoke_module_consent(&module, state_dir, online).await?;
-    match agent24_os_packages::install::install(src, packages_root) {
+    let signature = install_signature_policy();
+    match agent24_os_packages::install::install_with_policy(src, packages_root, &signature) {
         Ok(dest) => {
             println!("installed {}", dest.display());
             println!(
@@ -1646,9 +1912,9 @@ fn daemon_error_line(body: &serde_json::Value) -> String {
 
 /// Best-effort: tells an already-running daemon to stop serving `name` now,
 /// rather than leaving a healthy module to keep answering until it next
-/// happens to restart (which the daemon's own re-check then reports as
-/// `package_changed` — but only for a module that DOES eventually restart;
-/// for a long-healthy one that could be indefinite). Never starts a daemon
+/// happens to restart (which the daemon's own re-check then answers as
+/// 409 `os_package.<code>` — but only for a module that DOES eventually
+/// restart; for a long-healthy one that could be indefinite). Never starts a daemon
 /// (`attach_only`, not `connect`) and never turns into an `Err` of its own —
 /// `cmd_uninstall`'s result is decided by the removal and the consent
 /// revocation, not by this.
@@ -1657,8 +1923,8 @@ async fn hot_disable_best_effort(name: &str) {
         Ok(Some(ep)) => ep,
         Ok(None) => {
             println!(
-                "  no reachable daemon right now; a module of it running elsewhere will report \
-                 `package_changed` after its own next restart"
+                "  no reachable daemon right now; a module of it running elsewhere will answer \
+                 409 `os_package.<code>` after its own next restart"
             );
             return;
         }
@@ -1702,12 +1968,12 @@ async fn hot_disable_best_effort(name: &str) {
         }
         // Genuinely ambiguous: the request may never have reached the
         // daemon, or it may have applied the change and the response was
-        // lost. Neither "not stopped" nor "will report package_changed" can
+        // lost. Neither "not stopped" nor "will answer os_package.<code>" can
         // be asserted here — say so plainly instead of guessing.
         Err(e) => println!(
             "  could not confirm the daemon received this ({e}) — if it did not, a module of \
-             it still running there will report `package_changed` after its own next restart; \
-             if it did, that module has already been told to stop"
+             it still running there will answer 409 `os_package.<code>` after its own next \
+             restart; if it did, that module has already been told to stop"
         ),
     }
 }
@@ -1734,6 +2000,9 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     }
     if let OsAction::Delegate { name } = &action {
         return cmd_os_delegate(name).await;
+    }
+    if let OsAction::TrustTeam { team_id } | OsAction::UntrustTeam { team_id } = &action {
+        return cmd_os_trusted_team(matches!(action, OsAction::TrustTeam { .. }), team_id).await;
     }
     if let Some(done) = os_local(&action).await {
         return done;
@@ -1765,7 +2034,14 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         // Handled before the daemon lookup above; see `os_local`.
         OsAction::Install { .. } | OsAction::Uninstall { .. } => unreachable!(),
         // Handled at the top of this function, before it ever reaches here.
-        OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
+        OsAction::Attach { .. }
+        | OsAction::Delegate { .. }
+        | OsAction::TrustTeam { .. }
+        | OsAction::UntrustTeam { .. } => unreachable!(),
+        OsAction::TrustedTeams => bearer(
+            &ep,
+            client().get(format!("{}/api/v1/os/trusted-teams", ep.base)),
+        ),
         OsAction::List => bearer(&ep, client().get(format!("{}/api/v1/os", ep.base))),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let enabled = matches!(action, OsAction::Enable { .. });
@@ -1775,9 +2051,27 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     };
     let out = match req.timeout(Duration::from_secs(10)).send().await {
         Ok(res) if res.status().is_success() => {
-            let body: agent24_protocol::DomainOsList =
-                res.json().await.map_err(|e| e.to_string())?;
-            print_os(&body);
+            if matches!(action, OsAction::TrustedTeams) {
+                let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+                for team in body["teams"]
+                    .as_array()
+                    .ok_or("invalid trusted teams response")?
+                {
+                    println!(
+                        "{}{}",
+                        team["team_id"].as_str().ok_or("missing Team ID")?,
+                        if team["builtin"] == true {
+                            " (内置，不可移除)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            } else {
+                let body: agent24_protocol::DomainOsList =
+                    res.json().await.map_err(|e| e.to_string())?;
+                print_os(&body);
+            }
             Ok(())
         }
         // Surface the daemon's own message: for a bad name it names the modules
@@ -2438,6 +2732,69 @@ fn resolve_allow_relax(allow_remote: bool) -> bool {
     line.trim() == "yes"
 }
 
+/// `agent24 os trust-team` / `untrust-team`. Capabilities mode answers
+/// `403 presence_required` with one elevation round, the same way
+/// `os delegate` does. The body is empty; the daemon summary is the Team ID.
+async fn cmd_os_trusted_team(trust: bool, team_id: &str) -> Result<(), String> {
+    if !agent24_os_proc::valid_team_id(team_id) {
+        return Err("Team ID must be 10 uppercase letters or digits".into());
+    }
+    let ep = match attach_only_with_enrollment(true).await {
+        Ok(Some(ep)) => ep,
+        Err(err) => return Err(err),
+        Ok(None) => {
+            return Err("daemon not running; start it with `agent24 daemon start`".to_owned());
+        }
+    };
+    let sent = send_elevating(
+        &ep,
+        if trust {
+            reqwest::Method::PUT
+        } else {
+            reqwest::Method::DELETE
+        },
+        &format!("/api/v1/os/trusted-teams/{team_id}"),
+        None,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
+    let out = match sent {
+        Ok(res) if res.status.is_success() => {
+            let body = res.json_value().await;
+            for team in body["teams"]
+                .as_array()
+                .ok_or("invalid trusted teams response")?
+            {
+                println!(
+                    "{}{}",
+                    team["team_id"].as_str().ok_or("missing Team ID")?,
+                    if team["builtin"] == true {
+                        " (内置，不可移除)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status;
+            let body = res.json_value().await;
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else if let Some(message) = body["message"].as_str() {
+                message.to_owned()
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(e) => Err(e.parts().1),
+    };
+    finish(ep).await;
+    out
+}
+
 /// `agent24 os attach …` (A3-2a). Always goes through the daemon — see
 /// `cmd_os`'s doc comment on why `Attach` is intercepted before that
 /// function's own `req`/`out` match, which has different response shapes.
@@ -2768,6 +3125,9 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         // above are commented unreachable in `cmd_os`'s own match: `Attach`
         // returns from `cmd_os` before this function is ever called.
         OsAction::Attach { .. } | OsAction::Delegate { .. } => unreachable!(),
+        OsAction::TrustedTeams | OsAction::TrustTeam { .. } | OsAction::UntrustTeam { .. } => {
+            "start the daemon to manage trusted teams".to_owned()
+        }
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());
@@ -3158,6 +3518,8 @@ async fn main() -> std::process::ExitCode {
         Command::Consent { action } => query::consent(action).await,
         Command::Approval { action } => query::approval(action).await,
         Command::Tools { action } => query::tools(action).await,
+        Command::Skill { action, json } => skills::run(action, json).await,
+        Command::Dev { action } => cmd_dev(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -3165,6 +3527,21 @@ async fn main() -> std::process::ExitCode {
             eprintln!("error: {err}");
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// The signature policy `os install` checks a package against. Unit tests use the
+/// injected test policy; every other build uses the host's (codesign + trusted
+/// teams). Kept down here with the test code: `scripts/tui-coverage.mjs` reads
+/// the CLI source only up to the first `#[cfg(test)]`.
+fn install_signature_policy() -> agent24_os_packages::signature::Policy {
+    #[cfg(test)]
+    {
+        agent24_os_packages::test_support::signature_policy()
+    }
+    #[cfg(not(test))]
+    {
+        agent24_os_packages::signature::Policy::default()
     }
 }
 
@@ -3176,6 +3553,33 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn trusted_team_commands_parse_and_help_explains_builtin() {
+        use clap::CommandFactory;
+        for args in [
+            vec!["agent24", "os", "trust-team", "ABCDE12345"],
+            vec!["agent24", "os", "untrust-team", "ABCDE12345"],
+            vec!["agent24", "os", "trusted-teams"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("os")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("built-in team"));
+        let verify = command
+            .find_subcommand_mut("package-integrity")
+            .unwrap()
+            .find_subcommand_mut("verify")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(verify.contains("不验签"));
+    }
 
     #[test]
     fn service_status_says_the_daemons_mode_and_where_it_enrols() {
@@ -3209,6 +3613,7 @@ mod tests {
         let missing = tempfile::tempdir().unwrap();
         let err = package_integrity::run(package_integrity::Action::Verify {
             root: missing.path().to_path_buf(),
+            arch: std::env::consts::ARCH.to_owned(),
         })
         .unwrap_err();
         assert!(err.contains("integrity_manifest_invalid"), "{err}");
@@ -3227,9 +3632,15 @@ mod tests {
         .unwrap();
         match cli.command {
             Command::PackageIntegrity {
-                action: package_integrity::Action::Generate { root, executable },
+                action:
+                    package_integrity::Action::Generate {
+                        root,
+                        executable,
+                        arch,
+                    },
             } => {
                 assert_eq!(root, PathBuf::from("dist/sin90"));
+                assert_eq!(arch, std::env::consts::ARCH);
                 assert_eq!(executable, ["bin/sin90", "bin/helper"]);
             }
             _ => panic!("package-integrity generate was not parsed"),
@@ -3536,6 +3947,9 @@ mod tests {
             ),
         )
         .unwrap();
+        // In-process manifests have no spawn. The stub exists so the package
+        // carries a native executable in its integrity manifest.
+        agent24_os_packages::test_support::seal_exit_stub(dir, "bin/stub").unwrap();
     }
 
     /// Every directory and file under `root`, in order. Directory entries end

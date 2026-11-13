@@ -141,7 +141,7 @@ describe('KnowledgePage', () => {
   it('not connected: says so in plain words and offers Settings, not Reload', async () => {
     show.mockResolvedValue({ ok: false, code: 'knowledge_off' })
     const open = vi.fn()
-    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    render(<CapabilitiesContext.Provider value={{ defs: [], open }}><KnowledgePage /></CapabilitiesContext.Provider>)
     expect(await screen.findByText(/Knowledge is not connected yet/)).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Reload' })).toBeNull()
     fireEvent.click(screen.getByRole('button', { name: 'Open Settings' }))
@@ -245,7 +245,7 @@ describe('KnowledgePage', () => {
 
   it('accept answers true and opens the main chat, in that order', async () => {
     const open = vi.fn()
-    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    render(<CapabilitiesContext.Provider value={{ defs: [], open }}><KnowledgePage /></CapabilitiesContext.Provider>)
     await waitFor(() => expect(show).toHaveBeenCalled())
     act(() => confirmListener?.(ASK))
     fireEvent.click(screen.getByRole('button', { name: 'Add to conversation' }))
@@ -257,7 +257,7 @@ describe('KnowledgePage', () => {
 
   it('decline answers false and leaves the chat where it is', async () => {
     const open = vi.fn()
-    render(<CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}><KnowledgePage /></CapabilitiesContext.Provider>)
+    render(<CapabilitiesContext.Provider value={{ defs: [], open }}><KnowledgePage /></CapabilitiesContext.Provider>)
     await waitFor(() => expect(show).toHaveBeenCalled())
     act(() => confirmListener?.(ASK))
     fireEvent.click(screen.getByRole('button', { name: 'Not now' }))

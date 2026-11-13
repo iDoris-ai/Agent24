@@ -60,17 +60,168 @@ pub enum IntegrityError {
     CheckFailed {
         detail: String,
     },
+    /// The caller's token fired before the check finished. Not a hash
+    /// mismatch and not a damaged tree: the package must not be discovered
+    /// or spawned. Not an [`IntegrityReason`].
+    Cancelled,
+    SignatureInvalid {
+        path: String,
+    },
+    NotarizationFailed {
+        path: String,
+    },
+    UntrustedTeam {
+        path: String,
+        team: String,
+    },
+    NotNativeExecutable {
+        path: String,
+    },
+    /// Reserved for the platform signature check (S1-9 PR-3d). Nothing in
+    /// this crate produces it yet. The mapping in [`IntegrityError::reason`]
+    /// already sends it to [`IntegrityReason::SignatureRejected`].
+    SignatureRejected {
+        detail: String,
+    },
+}
+
+/// Machine-readable integrity refusal. Shutdown cancellation is not one of
+/// these. Callers copy [`IntegrityReason::code`]; they do not parse
+/// [`IntegrityError`]'s display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityReason {
+    ManifestMissing,
+    HashMismatch,
+    ManifestInvalid,
+    SignatureRejected,
+    CheckFailed,
+}
+
+impl IntegrityReason {
+    /// Stable `reason` on `GET /api/v1/components` and the suffix of
+    /// `os_package.<reason>`.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "integrity_manifest_missing",
+            Self::HashMismatch => "hash_mismatch",
+            Self::ManifestInvalid => "integrity_manifest_invalid",
+            Self::SignatureRejected => "signature_rejected",
+            Self::CheckFailed => "integrity_check_failed",
+        }
+    }
+
+    /// D6 operation code. `retryable` is always false at the call site.
+    #[must_use]
+    pub const fn operation_code(self) -> &'static str {
+        match self {
+            Self::ManifestMissing => "os_package.integrity_manifest_missing",
+            Self::HashMismatch => "os_package.hash_mismatch",
+            Self::ManifestInvalid => "os_package.integrity_manifest_invalid",
+            Self::SignatureRejected => "os_package.signature_rejected",
+            Self::CheckFailed => "os_package.integrity_check_failed",
+        }
+    }
+}
+
+impl IntegrityError {
+    /// The refusal code for this error. [`Self::Cancelled`] is not a refusal.
+    /// [`Self::NotNativeExecutable`] is an illegal manifest
+    /// ([`IntegrityReason::ManifestInvalid`]), the same bucket as a bad set,
+    /// type, or mode.
+    #[must_use]
+    pub const fn reason(&self) -> Option<IntegrityReason> {
+        match self {
+            Self::Missing => Some(IntegrityReason::ManifestMissing),
+            Self::HashMismatch { .. } => Some(IntegrityReason::HashMismatch),
+            Self::ManifestInvalid { .. } | Self::NotNativeExecutable { .. } => {
+                Some(IntegrityReason::ManifestInvalid)
+            }
+            Self::SignatureInvalid { .. }
+            | Self::NotarizationFailed { .. }
+            | Self::UntrustedTeam { .. }
+            | Self::SignatureRejected { .. } => Some(IntegrityReason::SignatureRejected),
+            Self::CheckFailed { .. } => Some(IntegrityReason::CheckFailed),
+            Self::Cancelled => None,
+        }
+    }
+
+    /// Text safe to put on a host-only component row: no absolute path and
+    /// no process stderr. Relative payload names stay, because the operator
+    /// needs to know which file failed.
+    #[must_use]
+    pub fn public_message(&self) -> String {
+        match self {
+            Self::Missing => "integrity manifest is missing".to_owned(),
+            Self::HashMismatch { path } => format!("hash_mismatch: {path}"),
+            Self::ManifestInvalid { detail } => public_detail(detail),
+            Self::NotNativeExecutable { path } => format!("not_native_executable: {path}"),
+            // Non-host and D6 text. No path and no codesign output. The host
+            // log line for an untrusted team is [`Display`], which may name
+            // the Team ID and the `trust-team` command.
+            Self::SignatureInvalid { .. }
+            | Self::NotarizationFailed { .. }
+            | Self::SignatureRejected { .. } => "signature_rejected".to_owned(),
+            Self::UntrustedTeam { team, .. } => match public_team(team) {
+                Some(team) => format!(
+                    "signature_rejected: {team}; 如信任该开发者：agent24 os trust-team {team}"
+                ),
+                None => "signature_rejected".to_owned(),
+            },
+            Self::CheckFailed { .. } => "integrity_check_failed".to_owned(),
+            Self::Cancelled => "cancelled".to_owned(),
+        }
+    }
+}
+
+/// A Team ID is the only signature detail a non-host message may carry.
+fn public_team(team: &str) -> Option<&str> {
+    if team.len() == 10
+        && team
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        Some(team)
+    } else {
+        None
+    }
+}
+
+fn public_detail(detail: &str) -> String {
+    let leaks = detail
+        .split_whitespace()
+        .any(|token| token.starts_with('/') || token.contains('\\') || token.contains("stderr"));
+    if leaks {
+        "integrity manifest is invalid".to_owned()
+    } else {
+        detail.to_owned()
+    }
 }
 
 impl fmt::Display for IntegrityError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::SignatureInvalid { path } => write!(
+                f,
+                "signature_invalid: {path} (requires Developer ID and Hardened Runtime)"
+            ),
+            Self::NotarizationFailed { path } => write!(
+                f,
+                "notarization_failed: {path}; Gatekeeper could not confirm notarization; 刚公证的包可能需几分钟，请稍后重试"
+            ),
+            Self::UntrustedTeam { path, team } => write!(
+                f,
+                "untrusted_team: {path}: {team}; 如信任该开发者：agent24 os trust-team {team}"
+            ),
             Self::Missing => f.write_str("integrity_manifest_missing"),
             Self::HashMismatch { path } => write!(f, "hash_mismatch: {path}"),
             Self::ManifestInvalid { detail } => {
                 write!(f, "integrity_manifest_invalid: {detail}")
             }
             Self::CheckFailed { detail } => write!(f, "integrity_check_failed: {detail}"),
+            Self::Cancelled => f.write_str("cancelled"),
+            Self::NotNativeExecutable { path } => write!(f, "not_native_executable: {path}"),
+            Self::SignatureRejected { detail } => write!(f, "signature_rejected: {detail}"),
         }
     }
 }
@@ -196,17 +347,144 @@ pub fn digest_reader(
             return Err(TreeError::Cancelled);
         }
         let n = reader.read(&mut buffer)?;
+        // The token can fire inside the read that returns EOF. Checking only
+        // before `read` then compares a digest the caller did not finish.
+        if cancel.is_cancelled() {
+            return Err(TreeError::Cancelled);
+        }
         if n == 0 {
             break;
         }
         size += n as u64;
         hash.update(&buffer[..n]);
+        // After a chunk is in the hasher, before the next read. Tests park
+        // here. The call is compiled out of production builds.
+        #[cfg(any(test, feature = "test-support"))]
+        hash_progress::note_hash_progress();
     }
     Ok(FileDigest {
         size,
         sha256: format!("{:x}", hash.finalize()),
     })
 }
+
+/// Pause hook for tests. Production builds do not contain it: every static,
+/// the installer, and both call sites below are behind this cfg.
+#[cfg(any(test, feature = "test-support"))]
+mod hash_progress {
+    use std::cell::Cell;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    static HASH_PROGRESS_ON: AtomicBool = AtomicBool::new(false);
+    static HASH_PROGRESS_HELD: AtomicBool = AtomicBool::new(false);
+    static HASH_PROGRESS: Mutex<Option<Arc<dyn Fn() + Send + Sync>>> = Mutex::new(None);
+    static HASH_PAUSE_PREFIX: Mutex<Option<PathBuf>> = Mutex::new(None);
+    /// How many trees under the installed prefix have started hashing since
+    /// the hook was installed. Tests pause a later check (the restart hash)
+    /// without parking the ones before it.
+    static HASH_SESSIONS: AtomicU32 = AtomicU32::new(0);
+
+    /// Sessions started under the current hook. Zero before the first bind.
+    #[must_use]
+    pub fn hash_sessions() -> u32 {
+        HASH_SESSIONS.load(Ordering::Acquire)
+    }
+
+    thread_local! {
+        static HASH_PROGRESS_DEPTH: Cell<u32> = const { Cell::new(0) };
+    }
+
+    pub(super) fn note_hash_progress() {
+        if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
+            return;
+        }
+        if HASH_PROGRESS_DEPTH.with(Cell::get) == 0 {
+            return;
+        }
+        let hook = HASH_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Turns the pause hook on for hashes of `root` on this thread. A hash of
+    /// any other directory keeps going, so a parallel test does not take this
+    /// test's handshake.
+    pub(super) struct HashProgressBind;
+
+    impl Drop for HashProgressBind {
+        fn drop(&mut self) {
+            HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+        }
+    }
+
+    pub(super) fn bind_hash_progress(root: &Path) -> Option<HashProgressBind> {
+        if !HASH_PROGRESS_ON.load(Ordering::Acquire) {
+            return None;
+        }
+        let prefix = HASH_PAUSE_PREFIX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        if !root.starts_with(&prefix) {
+            return None;
+        }
+        HASH_SESSIONS.fetch_add(1, Ordering::AcqRel);
+        HASH_PROGRESS_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
+        Some(HashProgressBind)
+    }
+
+    /// Parks the hasher on the next payload chunk. One test holds it at a time.
+    /// Drop clears the hook. The guard is `Send` so an async test can keep it
+    /// across an `.await`.
+    #[doc(hidden)]
+    pub struct HashProgressGuard(());
+
+    impl Drop for HashProgressGuard {
+        fn drop(&mut self) {
+            *HASH_PROGRESS
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            *HASH_PAUSE_PREFIX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            HASH_PROGRESS_ON.store(false, Ordering::Release);
+            HASH_PROGRESS_HELD.store(false, Ordering::Release);
+        }
+    }
+
+    /// Install `hook`, invoked after each hashed chunk of a tree under `prefix`.
+    /// The hook runs on the hashing thread and must not call this again.
+    #[doc(hidden)]
+    pub fn install_hash_progress_hook(
+        prefix: &Path,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> HashProgressGuard {
+        while HASH_PROGRESS_HELD
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            std::thread::yield_now();
+        }
+        HASH_SESSIONS.store(0, Ordering::Release);
+        *HASH_PAUSE_PREFIX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(prefix.to_path_buf());
+        *HASH_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+        HASH_PROGRESS_ON.store(true, Ordering::Release);
+        HashProgressGuard(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+pub use hash_progress::{HashProgressGuard, hash_sessions, install_hash_progress_hook};
 
 /// Declaration rules that do not read the tree: fixed manifest name, digest
 /// shape, no duplicates, executables are a subset, control files stay out of
@@ -462,6 +740,8 @@ pub fn verify_tree(
     control_files: &[&str],
     cancel: &CancellationToken,
 ) -> Result<(), TreeError> {
+    #[cfg(any(test, feature = "test-support"))]
+    let _hash_progress = hash_progress::bind_hash_progress(root);
     let root_meta = fs::symlink_metadata(root.components().collect::<std::path::PathBuf>())?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TreeError::Violation(
@@ -579,6 +859,8 @@ pub fn collect_payload(
     skip_root_files: &[&str],
     cancel: &CancellationToken,
 ) -> Result<BTreeMap<String, FileDigest>, TreeError> {
+    #[cfg(any(test, feature = "test-support"))]
+    let _hash_progress = hash_progress::bind_hash_progress(root);
     let root_meta = fs::symlink_metadata(root.components().collect::<std::path::PathBuf>())?;
     if root_meta.file_type().is_symlink() || !root_meta.is_dir() {
         return Err(TreeError::Violation(
@@ -684,9 +966,10 @@ pub fn map_tree_error(err: TreeError) -> IntegrityError {
         TreeError::Io(err) => IntegrityError::CheckFailed {
             detail: err.to_string(),
         },
-        TreeError::Cancelled => IntegrityError::CheckFailed {
-            detail: "cancelled".to_owned(),
-        },
+        // A shutdown is not a mismatched file. Callers must keep this
+        // distinct from [`IntegrityError::HashMismatch`]: only a finished
+        // check may accept the tree.
+        TreeError::Cancelled => IntegrityError::Cancelled,
     }
 }
 
@@ -695,6 +978,78 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+    use std::io::{self, Read};
+
+    #[test]
+    fn signature_rejected_maps_without_parsing_display_text() {
+        let err = IntegrityError::SignatureRejected {
+            detail: "team id mismatch stderr /tmp/secret".to_owned(),
+        };
+        assert_eq!(err.reason(), Some(IntegrityReason::SignatureRejected));
+        assert_eq!(err.reason().unwrap().code(), "signature_rejected");
+        assert_eq!(
+            err.reason().unwrap().operation_code(),
+            "os_package.signature_rejected"
+        );
+        assert_eq!(err.public_message(), "signature_rejected");
+        assert!(!err.public_message().contains("/tmp"));
+        assert!(!err.public_message().contains("stderr"));
+    }
+
+    /// The three macOS signature failures share `signature_rejected`.
+    /// Restoring a distinct reason, or copying a path / codesign line into
+    /// the public message, turns this red. The host `Display` of an
+    /// untrusted team may still name the Team ID and `trust-team`.
+    #[test]
+    fn macos_signature_failures_share_signature_rejected() {
+        let cases = [
+            IntegrityError::SignatureInvalid {
+                path: "bin/run".into(),
+            },
+            IntegrityError::NotarizationFailed {
+                path: "/tmp/secret stderr".into(),
+            },
+            IntegrityError::UntrustedTeam {
+                path: "bin/run".into(),
+                team: "ABCDE12345".into(),
+            },
+        ];
+        for err in &cases {
+            assert_eq!(err.reason(), Some(IntegrityReason::SignatureRejected));
+            assert_eq!(err.reason().unwrap().code(), "signature_rejected");
+            assert_eq!(
+                err.reason().unwrap().operation_code(),
+                "os_package.signature_rejected"
+            );
+            let public = err.public_message();
+            assert!(public.starts_with("signature_rejected"), "{public}");
+            assert!(!public.contains('/'), "{public}");
+            assert!(!public.contains("stderr"), "{public}");
+            assert!(!public.contains("codesign"), "{public}");
+        }
+        let untrusted = IntegrityError::UntrustedTeam {
+            path: "bin/run".into(),
+            team: "ABCDE12345".into(),
+        };
+        let public = untrusted.public_message();
+        assert!(public.contains("ABCDE12345"), "{public}");
+        assert!(public.contains("trust-team"), "{public}");
+        let shown = untrusted.to_string();
+        assert!(shown.contains("ABCDE12345"), "{shown}");
+        assert!(shown.contains("trust-team"), "{shown}");
+        let leaked = IntegrityError::UntrustedTeam {
+            path: "bin/run".into(),
+            team: "/tmp/not-a-team".into(),
+        };
+        assert_eq!(leaked.public_message(), "signature_rejected");
+        assert_eq!(
+            IntegrityError::SignatureInvalid {
+                path: "/var/run stderr".into(),
+            }
+            .public_message(),
+            "signature_rejected"
+        );
+    }
 
     fn digest(size: u64, fill: u8) -> FileDigest {
         FileDigest {
@@ -834,5 +1189,106 @@ mod tests {
             relative_name(root, &path),
             Err(TreeError::Violation(_))
         ));
+    }
+
+    /// Cancels on the second read, then ends. A hasher that only looks at
+    /// the token before the first byte would return `Ok` once this hits EOF.
+    struct CancelMidway<'a> {
+        cancel: &'a CancellationToken,
+        reads: usize,
+    }
+
+    impl Read for CancelMidway<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads += 1;
+            if self.reads == 2 {
+                self.cancel.cancel();
+            }
+            if self.reads > 2 {
+                return Ok(0);
+            }
+            buf[0] = self.reads as u8;
+            Ok(1)
+        }
+    }
+
+    /// Mid-hash cancel is `Cancelled`, and that must not be rewritten as a
+    /// hash mismatch. Dropping the in-loop token check, or mapping
+    /// `TreeError::Cancelled` onto `HashMismatch`, turns this red.
+    #[test]
+    fn digest_reader_cancel_mid_hash_is_not_a_hash_mismatch() {
+        let cancel = CancellationToken::new();
+        let err = digest_reader(
+            &mut CancelMidway {
+                cancel: &cancel,
+                reads: 0,
+            },
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TreeError::Cancelled), "{err:?}");
+        let mapped = map_tree_error(err);
+        assert!(matches!(mapped, IntegrityError::Cancelled), "{mapped}");
+        assert!(!mapped.to_string().contains("hash_mismatch"), "{mapped}");
+    }
+
+    /// Cancels as the read that ends the file returns. The bytes are not the
+    /// expected digest: a hasher that treats that EOF as a finished read
+    /// returns [`TreeError::HashMismatch`] from the caller. Cancel wins.
+    struct CancelOnEof<'a> {
+        cancel: &'a CancellationToken,
+        sent: bool,
+    }
+
+    impl Read for CancelOnEof<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.sent {
+                self.cancel.cancel();
+                return Ok(0);
+            }
+            self.sent = true;
+            buf[0] = 0xab;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn digest_reader_cancel_on_eof_beats_a_real_hash_mismatch() {
+        let cancel = CancellationToken::new();
+        let err = digest_reader(
+            &mut CancelOnEof {
+                cancel: &cancel,
+                sent: false,
+            },
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TreeError::Cancelled), "{err:?}");
+        let mapped = map_tree_error(err);
+        assert!(matches!(mapped, IntegrityError::Cancelled), "{mapped}");
+        assert!(!mapped.to_string().contains("hash_mismatch"), "{mapped}");
+    }
+
+    /// The payload really does not match, so a hasher that ignored the token
+    /// would return [`TreeError::HashMismatch`]. Cancel wins instead.
+    #[test]
+    fn verify_tree_cancel_beats_a_real_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("payload"), b"hello").unwrap();
+        let mut expected = BTreeMap::new();
+        expected.insert(
+            "payload".to_owned(),
+            FileDigest {
+                size: 5,
+                sha256: "ab".repeat(32),
+            },
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = verify_tree(dir.path(), &expected, &[], false, &[], &cancel).unwrap_err();
+        assert!(matches!(err, TreeError::Cancelled), "{err:?}");
+        let mapped = map_tree_error(err);
+        assert!(matches!(mapped, IntegrityError::Cancelled), "{mapped}");
+        assert!(!mapped.to_string().contains("hash_mismatch"), "{mapped}");
     }
 }

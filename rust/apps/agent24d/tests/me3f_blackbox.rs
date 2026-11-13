@@ -49,10 +49,13 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// The out-of-process module: declares `events`/`memory`/`approval`, does two
@@ -190,10 +193,11 @@ fn install(home: &Path) {
         "name: blackbox\nversion: \"0.1.0\"\nroute_namespace: /api/v1/blackbox\n\
          event_module: blackbox\ndata_dir: ~/.agent24/os/blackbox/\n\
          kernel_capabilities: [events, memory, approval]\nimpl_kind: out_of_process_provider\n\
-         spawn:\n  command: python3\n  args: [\"-I\", \"-S\", \"mod.py\"]\n",
+         spawn:\n  command: bin/launch\n",
     )
     .unwrap();
     std::fs::write(dir.join("mod.py"), BLACKBOX_MODULE).unwrap();
+    agent24_os_packages::test_support::seal_python_script(&dir).unwrap();
 }
 
 fn get(port: u16, token: &str, path: &str) -> Option<(u16, String)> {
@@ -287,8 +291,7 @@ impl Daemon {
 /// `Running`'s `Drop` and gets the same graceful-then-SIGKILL cleanup as
 /// every other exit path.
 fn start(home: &Path) -> Daemon {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_agent24d"))
-        .env_clear()
+    let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
         .args(["serve", "--port", "0"])
@@ -627,6 +630,9 @@ fn an_in_process_declaration_for_an_uncompiled_crate_is_still_refused() {
          kernel_capabilities: []\nimpl_kind: in_process_crate\n",
     )
     .unwrap();
+    // No spawn on an in-process manifest. The stub lets scan accept the
+    // package so the refusal below stays the delivery-mode one.
+    agent24_os_packages::test_support::seal_exit_stub(&dir, "bin/stub").unwrap();
     let d = start(home.path());
     let entry = os_list_entry(d.port, &d.token, "not-really-in-process");
     assert_eq!(

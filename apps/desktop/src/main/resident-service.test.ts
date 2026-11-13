@@ -1,0 +1,543 @@
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
+import {
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
+  type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
+} from './resident-service'
+import { buildTrayView, SERVICE_WAIT_HINT_MS } from './tray-menu'
+import { resetMainLocaleForTest, setMainLocale } from './main-i18n'
+
+const sha = (file: string) => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex')
+
+let root = ''
+afterEach(() => {
+  vi.restoreAllMocks()
+  resetMainLocaleForTest()
+  if (root) fs.rmSync(root, { recursive: true, force: true })
+  root = ''
+})
+
+function files(oldBytes: string | null, newBytes: string) {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), 'a24b5-'))
+  const src = path.join(root, 'app', 'agent24d')
+  fs.mkdirSync(path.dirname(src))
+  fs.writeFileSync(src, newBytes)
+  const dest = serviceDaemonCopyPath(path.join(root, 'data'))
+  if (oldBytes !== null) {
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.writeFileSync(dest, oldBytes, { mode: 0o755 })
+  }
+  return { src, dest, dir: path.dirname(dest) }
+}
+
+describe('versions', () => {
+  it('reads `agent24d --version`, and only two known versions that differ ask for an upgrade', () => {
+    expect(parseDaemonVersion('agent24d 0.6.0\n')).toBe('0.6.0')
+    expect(parseDaemonVersion('something else')).toBeNull()
+    expect(upgradeNeeded('0.6.1', '0.6.0')).toBe(true)
+    expect(upgradeNeeded('0.6.0', '0.6.0')).toBe(false)
+    expect(upgradeNeeded(null, '0.6.0')).toBe(false)
+    expect(upgradeNeeded('0.6.1', null)).toBe(false)
+  })
+
+  it('an older app never downgrades the service daemon; numbers compare as numbers (PR-Daemon B5a B1)', () => {
+    expect(upgradeNeeded('0.6.0', '0.6.1')).toBe(false)
+    expect(upgradeNeeded('0.5.9', '0.6.0')).toBe(false)
+    expect(upgradeNeeded('0.10.0', '0.9.9')).toBe(true)
+    expect(upgradeNeeded('1.0.0', '0.99.0')).toBe(true)
+    // A release is newer than its pre-release; two pre-releases are not ordered.
+    expect(upgradeNeeded('0.7.0', '0.7.0-rc.1')).toBe(true)
+    expect(upgradeNeeded('0.7.0-rc.1', '0.7.0')).toBe(false)
+    expect(upgradeNeeded('0.7.0-rc.2', '0.7.0-rc.1')).toBe(false)
+    expect(upgradeNeeded('0.6.1+abc', '0.6.0')).toBe(true)
+    expect(upgradeNeeded('v0.6.1', '0.6.0')).toBe(false)
+  })
+
+  it('only a packaged app with no AGENT24D_BIN upgrades from its bundle (PR-Daemon B5a N3)', () => {
+    expect(upgradesFromBundle(true, {})).toBe(true)
+    expect(upgradesFromBundle(false, {})).toBe(false)
+    expect(upgradesFromBundle(true, { AGENT24D_BIN: '/x/agent24d' })).toBe(false)
+  })
+
+  it("launchd's pid for the job is its own line, not a nested one, and none between runs", () => {
+    expect(jobPid('gui/501/ai.auraai.agent24 = {\n\tstate = running\n\tpid = 4242\n\tendpoints = {\n\t\tpid = 7\n\t}\n}')).toBe(4242)
+    expect(jobPid('gui/501/ai.auraai.agent24 = {\n\tstate = not running\n\tendpoints = {\n\t\tpid = 7\n\t}\n}')).toBeNull()
+  })
+})
+
+describe('copyDaemonIfChanged (as service.rs copy_daemon)', () => {
+  it('replaces a different copy whole: 0755 in an owner-only bin/, nothing left beside it, whatever the umask', () => {
+    const { src, dest, dir } = files('old', 'new')
+    const umask = process.umask(0o077)
+    try {
+      expect(copyDaemonIfChanged(src, dest)).toBe('copied')
+    } finally {
+      process.umask(umask)
+    }
+    expect(sha(dest)).toBe(sha(src))
+    expect(fs.statSync(dest).mode & 0o777).toBe(0o755)
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700)
+    expect(fs.readdirSync(dir)).toEqual(['agent24d'])
+  })
+
+  it('the same bytes in a file that is not runnable: still "same", made 0755 as copy_daemon does (PR-Daemon B5a N2)', () => {
+    const { src, dest } = files('same', 'same')
+    fs.chmodSync(dest, 0o644)
+    expect(copyDaemonIfChanged(src, dest)).toBe('same')
+    expect(fs.statSync(dest).mode & 0o777).toBe(0o755)
+  })
+
+  it('makes bin/ when there is none', () => {
+    const { src, dest } = files(null, 'new')
+    expect(copyDaemonIfChanged(src, dest)).toBe('copied')
+    expect(sha(dest)).toBe(sha(src))
+  })
+
+  it('a bin/ that is a link is refused, and nothing is written through it', () => {
+    const { src, dest } = files(null, 'new')
+    const elsewhere = path.join(root, 'elsewhere')
+    fs.mkdirSync(elsewhere)
+    fs.mkdirSync(path.dirname(path.dirname(dest)), { recursive: true })
+    fs.symlinkSync(elsewhere, path.dirname(dest))
+    expect(() => copyDaemonIfChanged(src, dest)).toThrow(/link is refused/)
+    expect(fs.readdirSync(elsewhere)).toEqual([])
+  })
+
+  it('the same bytes behind a link are not "the same": the link is replaced by a plain file (Codex B5a C1)', () => {
+    const { src, dest } = files(null, 'same')
+    const target = path.join(root, 'target')
+    fs.writeFileSync(target, 'same')
+    fs.mkdirSync(path.dirname(dest), { recursive: true })
+    fs.symlinkSync(target, dest)
+    expect(copyDaemonIfChanged(src, dest)).toBe('copied')
+    expect(fs.lstatSync(dest).isFile()).toBe(true)
+    expect(fs.readFileSync(target, 'utf8')).toBe('same')
+  })
+
+  it('a bin/ that is a link is refused even when the bytes behind it are the same (Codex B5a C1)', () => {
+    const { src, dest } = files(null, 'same')
+    const elsewhere = path.join(root, 'elsewhere')
+    fs.mkdirSync(elsewhere)
+    fs.writeFileSync(path.join(elsewhere, 'agent24d'), 'same')
+    fs.mkdirSync(path.dirname(path.dirname(dest)), { recursive: true })
+    fs.symlinkSync(elsewhere, path.dirname(dest))
+    expect(() => copyDaemonIfChanged(src, dest)).toThrow(/link is refused/)
+  })
+
+  it('a copy that fails part way leaves the old file\'s sha and no temp file (UN3)', () => {
+    const { src, dest, dir } = files('old', 'new')
+    const before = sha(dest)
+    vi.spyOn(fs, 'renameSync').mockImplementation(() => { throw Object.assign(new Error('EIO'), { code: 'EIO' }) })
+    expect(() => copyDaemonIfChanged(src, dest)).toThrow('EIO')
+    expect(sha(dest)).toBe(before)
+    expect(fs.readdirSync(dir)).toEqual(['agent24d'])
+  })
+})
+
+function steps(over: Partial<UpgradeDeps> = {}) {
+  const calls: string[] = []
+  const deps: UpgradeDeps = {
+    shutdown: async () => { calls.push('shutdown'); return { status: 202 } },
+    exited: async () => { calls.push('exited'); return true },
+    copy: () => { calls.push('copy'); return 'copied' },
+    kickstart: async () => { calls.push('kickstart') },
+    started: async () => { calls.push('started'); return true },
+    hold: async (work) => {
+      calls.push('hold')
+      try {
+        return await work()
+      } finally {
+        calls.push('release')
+      }
+    },
+    ...over,
+  }
+  return { calls, deps }
+}
+
+describe('upgradeService', () => {
+  it('in a hold: shutdown, its exit, the copy, kickstart, the new daemon on record', async () => {
+    const { calls, deps } = steps()
+    await expect(upgradeService(deps)).resolves.toEqual({ ok: true, copied: true })
+    expect(calls).toEqual(['hold', 'shutdown', 'exited', 'copy', 'kickstart', 'started', 'release'])
+  })
+
+  it('a refused presence for shutdown never kickstarts and never copies (UN6)', async () => {
+    const { calls, deps } = steps({ shutdown: async () => ({ status: 403, code: 'presence_denied' }) })
+    await expect(upgradeService(deps)).resolves.toEqual({ ok: false, stage: 'shutdown', code: 'presence_denied' })
+    expect(calls).toEqual(['hold', 'release'])
+  })
+
+  it('shutdown done, kickstart failed: the tray says so, never silent (UN7)', async () => {
+    const { deps } = steps({ kickstart: async () => { throw new Error('launchctl: 113') } })
+    const outcome = await upgradeService(deps)
+    expect(outcome).toEqual({ ok: false, stage: 'kickstart', code: 'kickstart_failed' })
+    const upgrader = new ServiceUpgrader({ bundled: () => '0.6.1', running: () => '0.6.0', installed: () => true, pid: () => 42, run: async () => outcome })
+    upgrader.tick()
+    await vi.waitFor(() => expect(upgrader.hint()).toEqual({ kind: 'failed', code: 'kickstart_failed' }))
+    setMainLocale('zh')
+    const tray = { status: 'running', external: true, enrolled: false, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
+    expect(buildTrayView({ ...tray, upgrade: upgrader.hint() }).tooltip).toContain('后台服务升级未完成（kickstart_failed）')
+  })
+
+  it('version differs but the stable copy already matches: no copy, still shutdown and kickstart (UN2)', async () => {
+    const { src, dest } = files('same', 'same')
+    const mtime = fs.statSync(dest).mtimeMs
+    const { calls, deps } = steps({ copy: () => { calls.push('copy'); return copyDaemonIfChanged(src, dest) } })
+    await expect(upgradeService(deps)).resolves.toEqual({ ok: true, copied: false })
+    expect(calls).toEqual(['hold', 'shutdown', 'exited', 'copy', 'kickstart', 'started', 'release'])
+    expect(fs.statSync(dest).mtimeMs).toBe(mtime)
+  })
+
+  it('the old daemon still running: nothing copied, and the service is started again from the old file (PR-Daemon B5a N1)', async () => {
+    const { calls, deps } = steps({ exited: async () => { calls.push('exited'); return false } })
+    await expect(upgradeService(deps)).resolves.toEqual({ ok: false, stage: 'exit', code: 'still_running' })
+    expect(calls).toEqual(['hold', 'shutdown', 'exited', 'kickstart', 'started', 'release'])
+  })
+
+  it('a failed copy still starts the old file, which it left whole, and says the copy failed', async () => {
+    const { calls, deps } = steps({ copy: () => { throw Object.assign(new Error('x'), { code: 'EACCES' }) } })
+    await expect(upgradeService(deps)).resolves.toEqual({ ok: false, stage: 'copy', code: 'EACCES' })
+    expect(calls).toContain('kickstart')
+  })
+
+  it('no new daemon on record after kickstart: not ok', async () => {
+    const { deps } = steps({ started: async () => false })
+    await expect(upgradeService(deps)).resolves.toEqual({ ok: false, stage: 'kickstart', code: 'not_started' })
+  })
+})
+
+describe('serviceUpgradeDeps: the real steps on the system (QA #1744)', () => {
+  function real(over: Partial<UpgradeSystem> = {}) {
+    const sys: UpgradeSystem = {
+      alive: vi.fn(() => false), jobPid: vi.fn(async () => null), record: vi.fn(() => null), exitWaitMs: 300, startWaitMs: 300, ...over,
+    }
+    const { src, dest } = files('old', 'new')
+    const deps = serviceUpgradeDeps({ bin: src, dataDir: path.join(root, 'data'), pid: 42, hold: (w) => w() }, sys)
+    return { sys, deps, src, dest }
+  }
+
+  it('the old pid still alive: not exited, and launchd is never asked in its place', async () => {
+    const { sys, deps } = real({ alive: vi.fn((pid: number) => pid === 42) })
+    await expect(deps.exited()).resolves.toBe(false)
+    expect(sys.jobPid).not.toHaveBeenCalled()
+  })
+
+  it('the old pid gone: exited only when launchd runs no process for the job either', async () => {
+    await expect(real().deps.exited()).resolves.toBe(true)
+    await expect(real({ jobPid: vi.fn(async () => 777) }).deps.exited()).resolves.toBe(false)
+  })
+
+  it('started: a new live daemon on record, not the old one, not a dead one', async () => {
+    const alive = (pid: number) => pid === 43
+    await expect(real({ alive, record: () => ({ pid: 43 }) }).deps.started()).resolves.toBe(true)
+    // The old pid, alive or not, is never the new daemon.
+    await expect(real({ alive: () => true, record: () => ({ pid: 42 }) }).deps.started()).resolves.toBe(false)
+    await expect(real({ alive, record: () => ({ pid: 44 }) }).deps.started()).resolves.toBe(false)
+    await expect(real({ alive, record: () => null }).deps.started()).resolves.toBe(false)
+  })
+
+  it('copy: the bundled binary onto <data_dir>/bin/agent24d', () => {
+    const { deps, src, dest } = real()
+    expect(deps.copy()).toBe('copied')
+    expect(sha(dest)).toBe(sha(src))
+  })
+})
+
+describe('ServiceUpgrader (PM 11-09: asked once per run, after enrolment)', () => {
+  function upgrader(o: { bundled?: string | null; running?: string | null; pid?: number | null; installed?: boolean; outcome?: UpgradeOutcome }) {
+    const run = vi.fn(async () => o.outcome ?? ({ ok: true, copied: true } as const))
+    const pick = <K extends 'bundled' | 'running' | 'pid'>(k: K, d: NonNullable<typeof o[K]>) => () => (k in o ? o[k] ?? null : d)
+    const u = new ServiceUpgrader({ bundled: pick('bundled', '0.6.1'), running: pick('running', '0.6.0'), installed: () => o.installed ?? true, pid: pick('pid', 42), run })
+    return { u, run }
+  }
+
+  it('versions that differ: one upgrade for that daemon, the hint until it is done', async () => {
+    const { u, run } = upgrader({})
+    expect(u.hint()).toEqual({ kind: 'needed' })
+    u.tick()
+    u.tick()
+    expect(run).toHaveBeenCalledTimes(1)
+    expect(run).toHaveBeenCalledWith(42)
+  })
+
+  it('the presence box refused: the hint stays, and nothing is asked again this run', async () => {
+    const { u, run } = upgrader({ outcome: { ok: false, stage: 'shutdown', code: 'presence_denied' } })
+    u.tick()
+    await Promise.resolve()
+    await Promise.resolve()
+    u.tick()
+    expect(run).toHaveBeenCalledTimes(1)
+    expect(u.hint()).toEqual({ kind: 'needed' })
+  })
+
+  it.each([
+    ['the same version', { running: '0.6.1' }],
+    ['not enrolled (no version either)', { pid: null, running: null }],
+    ['the bundled version unknown', { bundled: null }],
+  ] as const)('%s: nothing run, no hint', (_name, o) => {
+    const { u, run } = upgrader(o)
+    u.tick()
+    expect(run).not.toHaveBeenCalled()
+    expect(u.hint()).toBeNull()
+  })
+
+  it('no LaunchAgent plist: nothing run, since kickstart restarts that job only (Codex B5a C2)', () => {
+    const { u, run } = upgrader({ installed: false })
+    u.tick()
+    expect(run).not.toHaveBeenCalled()
+  })
+})
+
+describe('tray text (three languages)', () => {
+  const tray = { status: 'running', external: true, enrolled: false, externalPid: 42, foreignPid: null, backendKind: 'rust' } as const
+  it.each([
+    ['en', 'restart the background service to finish the upgrade'],
+    ['zh', '重启后台服务以完成升级'],
+    ['th', 'รีสตาร์ตบริการเบื้องหลังเพื่ออัปเกรดให้เสร็จ'],
+  ] as const)('%s: an upgrade needed and one that did not finish', (lang, restart) => {
+    setMainLocale(lang)
+    const needed = buildTrayView({ ...tray, upgrade: { kind: 'needed' } }).tooltip
+    const failed = buildTrayView({ ...tray, upgrade: { kind: 'failed', code: 'not_started' } }).tooltip
+    expect(needed).toContain(restart)
+    expect(buildTrayView(tray).tooltip).not.toContain(restart)
+    expect(failed).toContain('not_started')
+    expect(failed).toContain('`agent24 service install`')
+    // Reopening cannot work: with no service daemon nothing asks again (PR-Daemon B5a N1).
+    expect(failed.replace(buildTrayView(tray).tooltip, '')).not.toMatch(/Reopen|重新打开|เปิด Agent24 ใหม่/)
+  })
+})
+
+describe('CrashLoopDetector (M5 B5 ②)', () => {
+  function detector(o: { installed?: boolean; enrolled?: boolean } = {}) {
+    let now = 0
+    let pid: number | null = 100
+    let runs: number | null = 1
+    const runsFn = vi.fn(async () => runs)
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => o.installed ?? true, enrolled: () => o.enrolled ?? false, recordPid: () => pid, runs: runsFn,
+    })
+    return {
+      d, runsFn,
+      at: (ms: number) => { now = ms },
+      pid: (p: number | null) => { pid = p },
+      runs: (r: number | null) => { runs = r },
+    }
+  }
+
+  it('three daemons on record within a minute: looping', async () => {
+    const t = detector()
+    for (const [ms, p] of [[0, 100], [12_000, 101], [24_000, 102]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(true)
+  })
+
+  it('the same three spread over more than a minute: not looping', async () => {
+    const t = detector()
+    for (const [ms, p] of [[0, 100], [40_000, 101], [LOOP_WINDOW_MS + 1_000, 102]] as const) {
+      t.at(ms)
+      t.pid(p)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('fails before it writes a record, found running at every look, launchd started it twice more: looping (Codex on B1)', async () => {
+    const t = detector()
+    t.pid(null)
+    for (const [ms, r, want] of [[0, 4, false], [10_000, 5, false], [20_000, 6, true]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(want)
+    }
+  })
+
+  it('one restart (an upgrade), or two more than a minute apart: not looping', async () => {
+    const t = detector()
+    for (const [ms, r] of [[0, 1], [10_000, 2], [20_000, 2], [50_000, 2], [70_000, 3]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+    }
+  })
+
+  it('a healthy service daemon, not enrolled for minutes: launchd started it once, not looping (PR-Daemon B5b B1)', async () => {
+    const t = detector()
+    t.pid(947)
+    t.runs(1)
+    for (let ms = 0; ms <= 3 * LOOP_WINDOW_MS; ms += 2_000) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('launchd cannot be asked: no runs taken, nothing counted', async () => {
+    const t = detector()
+    t.pid(null)
+    t.runs(null)
+    for (const ms of [0, 10_000, 20_000]) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    t.runs(9)
+    t.at(30_000)
+    await t.d.sample()
+    expect(t.d.looping()).toBe(false)
+  })
+
+  it('the job loaded again (runs back to 1), then one restart: not looping (Codex on B1 R2 C1)', async () => {
+    const t = detector()
+    t.pid(null)
+    for (const [ms, r] of [[0, 8], [10_000, 1], [20_000, 2]] as const) {
+      t.at(ms)
+      t.runs(r)
+      await t.d.sample()
+      expect(t.d.looping()).toBe(false)
+    }
+    t.at(30_000)
+    t.runs(3)
+    await t.d.sample()
+    expect(t.d.looping()).toBe(true)
+  })
+
+  it('an answer from launchd that comes back after enrolment is dropped (Codex on B1 R2 C2)', async () => {
+    let enrolled = false
+    let now = 0
+    let answer: (r: number) => void = () => {}
+    let runs: number | Promise<number> = new Promise<number>((r) => { answer = r })
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => enrolled, recordPid: () => null, runs: async () => runs,
+    })
+    const slow = d.sample()
+    enrolled = true
+    now = 4_000
+    await d.sample()
+    answer(1)
+    await slow
+    enrolled = false
+    for (const [ms, r] of [[12_000, 2], [22_000, 3]] as const) {
+      now = ms
+      runs = r
+      await d.sample()
+    }
+    expect(d.looping()).toBe(false)
+  })
+
+  it('asks launchd at most every 10 s', async () => {
+    const t = detector()
+    for (const ms of [0, 4_000, 8_000, 12_000]) {
+      t.at(ms)
+      await t.d.sample()
+    }
+    expect(t.runsFn).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['enrolled with the service daemon', { enrolled: true }],
+    ['no LaunchAgent', { installed: false }],
+  ] as const)('%s: never looping, and what was seen is forgotten', async (_name, o) => {
+    const t = detector(o)
+    for (const [ms, p] of [[0, 100], [10_000, 101], [20_000, 102], [30_000, 103]] as const) {
+      t.at(ms)
+      t.pid(p)
+      t.runs(ms / 1_000)
+      await t.d.sample()
+    }
+    expect(t.d.looping()).toBe(false)
+    expect(t.runsFn).not.toHaveBeenCalled()
+  })
+
+  it('what was seen before enrolment is forgotten once enrolled', async () => {
+    let enrolled = false
+    let now = 0
+    let runs = 1
+    const d = new CrashLoopDetector({
+      now: () => now, installed: () => true, enrolled: () => enrolled, recordPid: () => null, runs: async () => runs,
+    })
+    await d.sample()
+    now = 10_000
+    runs = 2
+    await d.sample()
+    enrolled = true
+    now = 15_000
+    await d.sample()
+    enrolled = false
+    now = 20_000
+    runs = 3
+    await d.sample()
+    expect(d.looping()).toBe(false)
+  })
+
+  it("only the service's daemon on record counts, never one this app spawned, now or before (Codex B5b C1)", () => {
+    const ours = new Set([8, 9])
+    const spawned = (pid: number) => ours.has(pid)
+    const socket = '/data/enroll.sock'
+    expect(serviceRecordPid({ pid: 7, enrollEndpoint: socket }, spawned)).toBe(7)
+    expect(serviceRecordPid({ pid: 8, enrollEndpoint: socket }, spawned)).toBeNull()
+    expect(serviceRecordPid({ pid: 9, enrollEndpoint: socket }, spawned)).toBeNull()
+    // A legacy daemon (`agent24 daemon start`) names no enrolment socket (Codex B5b R3).
+    expect(serviceRecordPid({ pid: 10 }, spawned)).toBeNull()
+    expect(serviceRecordPid(null, spawned)).toBeNull()
+  })
+
+  it("reads the job's own runs, not a nested one", () => {
+    // As `launchctl print` shows a running job (checked on this machine).
+    expect(jobRuns('gui/501/ai.auraai.agent24 = {\n\tstate = running\n\truns = 1\n\tpid = 54386\n\tlast exit code = (never exited)\n}')).toBe(1)
+    expect(jobRuns('x = {\n\tstate = not running\n\truns = 17\n\tlast exit code = 78: EX_CONFIG\n}')).toBe(17)
+    expect(jobRuns('x = {\n\tstate = running\n\tsub = {\n\t\truns = 4\n\t}\n}')).toBeNull()
+    expect(jobRuns('')).toBeNull()
+  })
+
+  it.each([
+    ['en', 'keeps restarting'],
+    ['zh', '后台服务反复重启，可能是迁移失败'],
+    ['th', 'รีสตาร์ตซ้ำ'],
+  ] as const)('%s: the tray says so and gives the way back', (lang, says) => {
+    setMainLocale(lang)
+    const tray = { status: 'running', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
+    const tip = buildTrayView({ ...tray, crashLoop: true }).tooltip
+    expect(tip).toContain(says)
+    expect(tip).toContain('`agent24 service uninstall`')
+    expect(buildTrayView(tray).tooltip).not.toContain(says)
+  })
+
+  const idle = { status: 'starting', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust' } as const
+
+  it.each([
+    ['en', 'Waiting for the background service', 'has not started'],
+    ['zh', '正在等待后台服务启动', '后台服务没有启动'],
+    ['th', 'กำลังรอให้บริการเบื้องหลัง', 'ยังไม่เริ่มทำงาน'],
+  ] as const)('%s: waiting for the service daemon, then after a minute that it has not started, with the way back (M5 B4a)', (lang, waiting, notStarted) => {
+    setMainLocale(lang)
+    const early = buildTrayView({ ...idle, serviceWaitMs: SERVICE_WAIT_HINT_MS - 1 }).tooltip
+    expect(early).toContain(waiting)
+    expect(early).not.toContain(notStarted)
+    expect(early).not.toContain('`agent24 service uninstall`')
+    const late = buildTrayView({ ...idle, serviceWaitMs: SERVICE_WAIT_HINT_MS }).tooltip
+    expect(late).toContain(notStarted)
+    expect(late).not.toContain(waiting)
+    expect(late).toContain('`agent24 service uninstall`')
+    for (const tip of [buildTrayView({ ...idle, serviceWaitMs: null }).tooltip, buildTrayView(idle).tooltip]) {
+      expect(tip).not.toContain(waiting)
+      expect(tip).not.toContain(notStarted)
+    }
+  })
+
+  it('a crash loop and a wait at once: only the crash loop is said, with one way back (M5 B4a)', () => {
+    setMainLocale('en')
+    const tip = buildTrayView({ ...idle, crashLoop: true, serviceWaitMs: SERVICE_WAIT_HINT_MS * 2 }).tooltip
+    expect(tip).toContain('keeps restarting')
+    expect(tip).not.toContain('has not started')
+    expect(tip).not.toContain('Waiting for the background service')
+    expect(tip.split('`agent24 service uninstall`').length - 1).toBe(1)
+  })
+})

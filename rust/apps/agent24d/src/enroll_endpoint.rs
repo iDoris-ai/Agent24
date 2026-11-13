@@ -783,7 +783,7 @@ async fn serve_presence(
     use crate::presence_service::{Decision, Event};
     // Only the desktop app vouches for presence; `role` is a request, the
     // identity is the daemon's own check (#1715 §1).
-    if peer.identity.identifier != crate::knowledge_host::DESKTOP_SHELL_IDENTIFIER {
+    if peer.identity.identifier != crate::knowledge_routes::DESKTOP_SHELL_IDENTIFIER {
         send_error(&mut write, EnrollErrorCode::IdentityRejected).await;
         return;
     }
@@ -1148,7 +1148,8 @@ mod tests {
         }
         let support = std::fs::read_to_string(root.join("tests/support/enroll.rs")).unwrap();
         assert!(names.iter().all(|n| support.contains(n.as_str())));
-        let server = include_str!("server.rs");
+        // S2-1 moved serve() into serve_steps.rs: the switches are read there.
+        let server = include_str!("serve_steps.rs");
         let server = &server[..server.find("mod tests {").unwrap()];
         let uses: Vec<usize> = server
             .match_indices("crate::enroll_test_support::")

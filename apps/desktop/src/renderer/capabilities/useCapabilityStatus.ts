@@ -2,6 +2,7 @@ import { capabilitiesMessages } from './capabilities.i18n'
 import { useT } from '../i18n'
 import { useComponentList } from '../components/useComponentList'
 import type { ComponentView } from '../components/componentApi'
+import { packageIntegrityHint } from '../components/packageIntegrity'
 import { idorisMessages } from '../components/idoris/IdorisPanel.i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
 import { communicationMessages } from '../pages/comm/Communication.i18n'
@@ -13,12 +14,28 @@ function findComponent(components: readonly ComponentView[], id: string): Compon
   return components.find((item) => item.id === id)
 }
 
+/** Capability card id → the component row that carries its kernel grants. */
+function componentId(id: string): string {
+  switch (id) {
+    case 'localModels': return 'idoris'
+    case 'communication': return 'hyphae'
+    case 'voice': return 'agentear'
+    case 'design': return 'open-design'
+    case 'knowledgeBase': return 'knowledge'
+    default: return id
+  }
+}
+
+export type CapabilityStatusFn = ((id: string) => string | undefined) & {
+  grantsFor: (id: string) => readonly string[] | undefined
+}
+
 /**
  * Capability-card lifecycle. Installed / running comes from GET /api/v1/components.
  * Loading and failure are explicit so a missing read cannot fall through to
  * Built-in / Open.
  */
-export function useCapabilityStatus(active: boolean) {
+export function useCapabilityStatus(active: boolean): CapabilityStatusFn {
   const list = useComponentList(active)
   const cap = useT(capabilitiesMessages)
   const idorisText = useT(idorisMessages)
@@ -40,9 +57,13 @@ export function useCapabilityStatus(active: boolean) {
       case 'stopping': return idorisText('state.stopping')
       case 'stopped': return idorisText('state.stopped')
       case 'incompatible': return idorisText('state.incompatible')
-      case 'failed': return component.reason === 'instance_conflict'
-        ? idorisText('state.instance_conflict')
-        : idorisText('state.failed')
+      case 'failed': {
+        const integrity = packageIntegrityHint(component.reason)
+        if (integrity) return integrity
+        return component.reason === 'instance_conflict'
+          ? idorisText('state.instance_conflict')
+          : idorisText('state.failed')
+      }
       default: return cap('status.state', { state: component.state })
     }
   }
@@ -60,6 +81,8 @@ export function useCapabilityStatus(active: boolean) {
       if (component.reason === 'gave_up') return commText('process.gaveUp')
       if (component.reason === 'backoff') return commText('process.backoff')
       if (component.reason === 'starting') return commText('process.starting')
+      const integrity = packageIntegrityHint(component.reason)
+      if (integrity) return integrity
       return commText('component.failed')
     }
     if (component.state === 'installing') return commText('component.installing')
@@ -77,16 +100,43 @@ export function useCapabilityStatus(active: boolean) {
     if (component.state === 'stopped' && component.reason === 'disabled') return voiceText('attachment.disabled')
     if (component.state === 'stopped') return `${voiceText('attachment.detached')} · ${voiceText('attachment.open')}`
     if (component.state === 'starting') return voiceText('attachment.checking')
+    if (component.state === 'failed') {
+      const integrity = packageIntegrityHint(component.reason)
+      if (integrity) return integrity
+    }
     return cap('status.state', { state: component.state })
   }
 
-  return (id: string): string | undefined => {
-    if (!TRACKED.has(id)) return undefined
+  // Sin90, Cos72, Documents and any other OS package row share the capability
+  // id with the component id. A failed integrity reason replaces the default
+  // Built-in / Open label. Any other state leaves that label alone.
+  const osPackage = (id: string): string | undefined => {
+    if (list.status !== 'ready') return undefined
+    const component = findComponent(list.components, id)
+    if (!component || component.state !== 'failed') return undefined
+    return packageIntegrityHint(component.reason)
+  }
+
+  const status = (id: string): string | undefined => {
     if (!active) return undefined
+    if (!TRACKED.has(id)) return osPackage(id)
     if (list.status === 'idle' || list.status === 'loading') return cap('status.loading')
     if (list.status === 'error') return cap('status.unavailable')
     if (id === 'localModels') return localModels(findComponent(list.components, 'idoris'))
     if (id === 'communication') return communication(findComponent(list.components, 'hyphae'))
     return voice(findComponent(list.components, 'agentear'))
   }
+
+  // Read-only. Empty when the component declared a kernel capability and the
+  // mount handed nothing out (Hyphae). Hidden when the row says nothing.
+  const grantsFor = (id: string): readonly string[] | undefined => {
+    if (!active || list.status !== 'ready') return undefined
+    const component = findComponent(list.components, componentId(id))
+    if (!component || component.kernel_grants === undefined) return undefined
+    const declared = component.declared?.kernel ?? []
+    if (component.kernel_grants.length === 0 && declared.length === 0) return undefined
+    return component.kernel_grants
+  }
+
+  return Object.assign(status, { grantsFor })
 }

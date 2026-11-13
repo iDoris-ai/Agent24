@@ -6,6 +6,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 #![cfg(all(unix, feature = "test-enrollment"))]
 
+#[path = "support/signature_command.rs"]
+mod signature_command;
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -49,9 +52,8 @@ fn data_dir(with_marker: bool) -> (tempfile::TempDir, PathBuf) {
 }
 
 fn spawn(data: &Path, guard: bool, args: &[&str]) -> Child {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_agent24d"));
-    cmd.env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+    let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
+    cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", data.parent().unwrap())
         .env("AGENT24_DATA_DIR", data);
     if guard {

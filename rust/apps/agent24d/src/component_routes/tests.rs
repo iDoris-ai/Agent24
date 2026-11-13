@@ -115,6 +115,314 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     );
     assert_eq!(find(&body, "knowledge")["state"], "stopped");
     assert_eq!(find(&body, "documents")["state"], "absent");
+    // Rows with no `requires` lock leave the declaration unknown, not empty.
+    for id in ["knowledge", "open-design", "idoris"] {
+        assert!(find(&body, id)["declared"].is_null(), "{id}");
+    }
+}
+
+/// The row copies `MountReport.granted`. The resolver would also grant
+/// `models` (it is in the out-of-process ceiling and `no_channel` is empty
+/// there); a mount with no model callback leaves it out of `granted`. Reading
+/// `resolution.granted` instead of `report.granted` makes `kernel_grants`
+/// include `models` and this test fails.
+#[tokio::test]
+async fn components_show_the_mount_grant_not_the_resolver() {
+    use crate::capabilities::requires::{self, Consent, GrantForm};
+
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let mut report = os_report(
+        "modelnodeps",
+        MountOutcome::Mounted,
+        d9(
+            "modelnodeps",
+            false,
+            "modelnodeps-tasks",
+            &["events", "models"],
+        ),
+    );
+    report.granted = vec!["events".into()];
+    let spec = requires::RequiresSpec::parse(&["events", "models"], &[] as &[&str]);
+    let resolution = requires::resolve(
+        &spec,
+        GrantForm::OutOfProcess.host_cap(),
+        Consent::FirstPartyEnabled,
+    );
+    assert!(
+        resolution.granted.has(agent24_domain::Capability::Models),
+        "the resolver grants models; the row must not copy that"
+    );
+    assert!(resolution.granted.has(agent24_domain::Capability::Events));
+    state.os_reports = Arc::new(vec![report]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let row = find(&full, "modelnodeps");
+    assert_eq!(row["kernel_grants"], json!(["events"]));
+    assert_eq!(
+        row["declared"],
+        json!({"kernel": ["events", "models"], "operations": []})
+    );
+    let denied = row["denied"].as_array().unwrap();
+    assert!(
+        denied.iter().all(|item| item["item"] != "events"),
+        "events was mounted: {denied:?}"
+    );
+    assert!(
+        denied
+            .iter()
+            .any(|item| item["item"] == "models" && item["code"] == "no_channel"),
+        "withheld models is no_channel: {denied:?}"
+    );
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let row = find(&redacted, "modelnodeps");
+    assert!(row.get("denied").is_none());
+    assert!(row.get("kernel_grants").is_none());
+    assert!(!redacted.to_string().contains("no_channel"));
+}
+
+fn denial_code<'a>(row: &'a Value, item: &str) -> Option<&'a str> {
+    row["denied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|denial| denial["item"] == item)
+        .and_then(|denial| denial["code"].as_str())
+}
+
+fn has_no_channel(row: &Value) -> bool {
+    row["denied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|denial| denial["code"] == "no_channel")
+}
+
+/// `no_channel` is a mounted-channel fact. Disabled, refused, degraded, and
+/// an uninstalled Documents row keep it out. An unread manifest (no D9) does
+/// not grow an out-of-process denial list, and `declared` is null.
+#[tokio::test]
+async fn no_channel_tracks_the_effective_outcome_not_the_startup_report() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let mut was_mounted = os_report(
+        "wasmounted",
+        MountOutcome::Mounted,
+        d9(
+            "wasmounted",
+            false,
+            "wasmounted-tasks",
+            &["events", "models"],
+        ),
+    );
+    was_mounted.granted = vec!["events".into()];
+    let now_mounted = os_report(
+        "nowmounted",
+        MountOutcome::Disabled,
+        d9("nowmounted", false, "nowmounted-tasks", &["events"]),
+    );
+    let refused = os_report(
+        "refusedmod",
+        MountOutcome::Refused("dup".into()),
+        d9("refusedmod", false, "refusedmod-tasks", &["events"]),
+    );
+    let degraded = os_report(
+        "degradedmod",
+        MountOutcome::Degraded("disk".into()),
+        d9("degradedmod", false, "degradedmod-tasks", &["memory"]),
+    );
+    let mut unread = os_report(
+        "unread",
+        MountOutcome::Mounted,
+        d9("unread", false, "unread-tasks", &["events", "models"]),
+    );
+    unread.d9 = None;
+    unread.granted = vec!["events".into()];
+    state.set_os_outcome("wasmounted", MountOutcome::Disabled);
+    state.set_os_outcome("nowmounted", MountOutcome::Mounted);
+    state.os_reports = Arc::new(vec![was_mounted, now_mounted, refused, degraded, unread]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+
+    let was = find(&body, "wasmounted");
+    assert_eq!(was["state"], "stopped");
+    assert_eq!(was["kernel_grants"], json!(["events"]));
+    assert!(!has_no_channel(was), "startup Mounted must not win: {was}");
+    assert_eq!(denial_code(was, "memory"), Some("not_declared"));
+
+    let now = find(&body, "nowmounted");
+    assert_eq!(now["kernel_grants"], json!([]));
+    assert_eq!(
+        denial_code(now, "events"),
+        Some("no_channel"),
+        "the override is Mounted, so the empty grant is no_channel: {now}"
+    );
+
+    for id in ["refusedmod", "degradedmod", "documents"] {
+        let row = find(&body, id);
+        assert!(!has_no_channel(row), "{id} is not mounted: {row}");
+    }
+    assert_eq!(find(&body, "documents")["state"], "absent");
+    assert!(
+        find(&body, "documents")["denied"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "uninstalled Documents does not invent denials"
+    );
+
+    let unread = find(&body, "unread");
+    assert!(unread["declared"].is_null(), "{unread}");
+    assert_eq!(unread["denied"], json!([]));
+    assert_eq!(unread["kernel_grants"], json!(["events"]));
+    assert!(
+        !unread.to_string().contains("not_declared"),
+        "an unread manifest does not take the out-of-process ceiling: {unread}"
+    );
+}
+
+#[test]
+fn documents_that_are_not_mounted_keep_static_denials_only() {
+    for outcome in [
+        MountOutcome::Disabled,
+        MountOutcome::Refused("dup".into()),
+        MountOutcome::Degraded("disk".into()),
+    ] {
+        let report = report_with(outcome.clone(), "0.2.0", vec![]);
+        let item = documents_shown(
+            Some(&report),
+            Some(&outcome),
+            None,
+            documents_catalog::DocumentsCatalog::embedded(),
+        );
+        let value = serde_json::to_value(&item).unwrap();
+        assert!(!has_no_channel(&value), "{outcome:?} {value}");
+        assert_eq!(denial_code(&value, "memory"), Some("not_declared"));
+    }
+
+    let mut startup = report_with(MountOutcome::Mounted, "0.2.0", vec![]);
+    startup.granted = vec!["events".into()];
+    let stopped = documents_shown(
+        Some(&startup),
+        Some(&MountOutcome::Disabled),
+        None,
+        documents_catalog::DocumentsCatalog::embedded(),
+    );
+    let stopped = serde_json::to_value(&stopped).unwrap();
+    assert!(!has_no_channel(&stopped), "{stopped}");
+
+    let absent = documents_from(None, None, documents_catalog::DocumentsCatalog::embedded());
+    let absent = serde_json::to_value(&absent).unwrap();
+    assert_eq!(absent["declared"]["kernel"], json!(["events", "models"]));
+    assert_eq!(absent["denied"], json!([]));
+}
+
+#[test]
+fn hyphae_denials_list_each_item_once() {
+    let view = kernel_without_channel(&["events".into(), "events".into()], &[]);
+    assert_eq!(view.denied.len(), 1);
+    assert_eq!(view.denied[0].item, "events");
+    assert_eq!(view.denied[0].code, DenyReason::NoChannel);
+
+    let invalid = kernel_without_channel(&["nope".into(), "nope".into()], &[]);
+    assert_eq!(invalid.denied.len(), 1);
+    assert_eq!(invalid.denied[0].item, "nope");
+    assert_eq!(invalid.denied[0].code, DenyReason::RequiresInvalid);
+}
+
+#[tokio::test]
+async fn an_attached_module_shows_the_admission_grant() {
+    use agent24_attach::attach_registry::AttachGrantBuilder;
+    let manifest = agent24_domain::DomainOsManifest::from_yaml(
+        "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\
+         event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
+         impl_kind: attached_process\nkernel_capabilities: [events, models, memory]\n",
+    )
+    .unwrap();
+    for with_models in [false, true] {
+        let builder = admission_builder(with_models).await;
+        let held = builder.build("agentear", &manifest).kernel_grants.clone();
+        let registry = agent24_attach::attach_registry::AttachRegistry::new(
+            agent24_attach::attach_registry::AttachDeps {
+                grants: Arc::new(builder),
+            },
+        );
+        registry.on_change(&agent24_attach::attached::Change::Registered {
+            name: "agentear",
+            rotated: false,
+            manifest: &manifest,
+            manifest_digest: "sha256:deadbeef",
+            token_sha256_hex: &"ab".repeat(32),
+            token_id: "tok_agentear",
+            disabled: false,
+        });
+        let snap = registry.snapshot();
+        assert_eq!(snap[0].kernel_grants, held);
+        assert_eq!(snap[0].declared_kernel, ["events", "models", "memory"]);
+        let row = serde_json::to_value(&attach_items_from(snap)[0]).unwrap();
+        assert_eq!(row["kernel_grants"], json!(held));
+        assert_eq!(
+            row["declared"],
+            json!({"kernel": ["events", "models", "memory"], "operations": []})
+        );
+        if with_models {
+            assert_eq!(row["kernel_grants"], json!(["events", "models"]));
+            assert!(denial_code(&row, "models").is_none(), "{row}");
+        } else {
+            assert_eq!(row["kernel_grants"], json!(["events"]));
+            assert_eq!(denial_code(&row, "models"), Some("no_channel"), "{row}");
+        }
+        assert_eq!(denial_code(&row, "memory"), Some("above_ceiling"), "{row}");
+    }
+}
+
+struct NoopTrigger;
+
+#[async_trait::async_trait]
+impl agent24_scheduler::RunTrigger for NoopTrigger {
+    async fn trigger(
+        &self,
+        _invocation: &agent24_scheduler::ScheduleInvocation,
+    ) -> agent24_scheduler::FireOutcome {
+        agent24_scheduler::FireOutcome::Deferred {
+            reason: agent24_scheduler::DeferReason::MountPending,
+        }
+    }
+}
+
+async fn admission_builder(with_models: bool) -> crate::attach_grant::DaemonAttachGrantBuilder {
+    let store = agent24_store::Store::open_memory().await.unwrap();
+    let events = crate::events::EventsHub::default();
+    crate::attach_grant::DaemonAttachGrantBuilder {
+        scheduler: agent24_scheduler::Scheduler::new(
+            store.clone(),
+            Arc::new(NoopTrigger),
+            Arc::new(|_| {}),
+        ),
+        models: with_models.then(|| crate::model_callback::ModelCallbackDeps {
+            router: Arc::new(agent24_models::router::ModelRouter::with_defaults(vec![])),
+            usage: Arc::new(crate::model_callback::MemoryUsageSink::default()),
+            cancel_root: CancellationToken::new(),
+            admission: crate::model_callback::ModelAdmission::new(
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+            ),
+            events: events.clone(),
+            timings: Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
+        }),
+        approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
+            store,
+            events.clone(),
+        ),
+        events,
+    }
 }
 
 #[tokio::test]
@@ -132,6 +440,15 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "crash at /Users/x/od ws://relay.example"
     );
     assert!(find(&full, "hyphae").get("detail").is_some());
+    // Hyphae declares `events` and has no kernel channel. The host sees that
+    // denial; the grant list stays empty because nothing was mounted.
+    let hyphae = find(&full, "hyphae");
+    assert_eq!(hyphae["kernel_grants"], json!([]));
+    assert_eq!(hyphae["declared"]["kernel"], json!(["events"]));
+    assert_eq!(
+        hyphae["denied"],
+        json!([{"item": "events", "code": "no_channel"}])
+    );
 
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
@@ -145,6 +462,10 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "contract",
         "port",
         "pid",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -503,12 +824,14 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         "idoris",
     ]
     .into_iter()
-    .map(|n| crate::attach_registry::AttachSnap {
+    .map(|n| agent24_attach::attach_registry::AttachSnap {
         name: n.to_owned(),
         version: String::new(),
         disabled: false,
         drain: Some(DrainState::Running),
         mismatch: None,
+        kernel_grants: Vec::new(),
+        declared_kernel: Vec::new(),
     })
     .collect();
     let items = attach_items_from(modules);
@@ -1093,6 +1416,10 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
         "binding",
         "in_process",
         "memory",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -1135,6 +1462,40 @@ fn covered(id: &str, registered: &std::collections::BTreeSet<String>) -> bool {
     registered.contains(id) || mcp_exempt(id)
 }
 
+/// `requires` names kernel capabilities and canonical operations, never a
+/// REGISTRY capability id (C9-A). A kernel name that is also a registry id,
+/// or an operation that is only a slash alias, turns this red.
+fn assert_requires_tokens(
+    requires: &Value,
+    registered: &std::collections::BTreeSet<String>,
+    where_: &str,
+) {
+    let kernel = requires["kernel"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{where_} requires.kernel is missing"));
+    for name in kernel {
+        let name = name.as_str().unwrap();
+        assert!(
+            agent24_domain::Capability::parse(name).is_ok(),
+            "{where_} requires.kernel {name} is not a kernel capability"
+        );
+        assert!(
+            !registered.contains(name),
+            "{where_} requires.kernel {name} is a REGISTRY capability id"
+        );
+    }
+    let operations = requires["operations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{where_} requires.operations is missing"));
+    for op in operations {
+        let op = op.as_str().unwrap();
+        assert!(
+            crate::capabilities::Operation::canonical(op).is_some(),
+            "{where_} requires.operations {op} is not a canonical Operation name"
+        );
+    }
+}
+
 fn provide_ids(body: &Value) -> Vec<String> {
     body["components"]
         .as_array()
@@ -1163,6 +1524,13 @@ async fn registry_lists_every_capability_id_the_components_emit() {
         "ADR-040 should say the C7 registry exists"
     );
     let registered = registered_ids(&markdown);
+    for cap in agent24_domain::ALL_CAPABILITIES {
+        assert!(
+            !registered.contains(cap.as_str()),
+            "kernel capability {} collides with a REGISTRY capability id",
+            cap.as_str()
+        );
+    }
     for id in [
         "model-gateway",
         "nostr-dm",
@@ -1205,6 +1573,9 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     for path in &locks {
         let text = std::fs::read_to_string(path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(requires) = value.get("requires") {
+            assert_requires_tokens(requires, &registered, &path.display().to_string());
+        }
         let Some(provides) = value.get("provides").and_then(|p| p.as_array()) else {
             continue;
         };
@@ -1238,24 +1609,78 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     }
     let mut manifests = Vec::new();
     walk_manifests(&root, &mut manifests);
+    assert!(
+        manifests
+            .iter()
+            .any(|p| p.ends_with("agent24-documents/domain-os.yml")),
+        "documents domain-os.yml must be part of the requires drift check"
+    );
     for path in manifests {
         let text = std::fs::read_to_string(&path).unwrap();
-        if !text
+        let has_provides = text
             .lines()
-            .any(|line| line.trim().starts_with("provides:"))
-        {
-            continue;
-        }
+            .any(|line| line.trim().starts_with("provides:"));
         let manifest = agent24_domain::DomainOsManifest::from_yaml(&text)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for provide in manifest.provides() {
+        if has_provides {
+            for provide in manifest.provides() {
+                assert!(
+                    registered.contains(provide.id()),
+                    "{} provides {}, which REGISTRY.md does not list",
+                    path.display(),
+                    provide.id()
+                );
+            }
+        }
+        for cap in manifest.kernel_capabilities() {
             assert!(
-                registered.contains(provide.id()),
-                "{} provides {}, which REGISTRY.md does not list",
+                agent24_domain::Capability::parse(cap.as_str()).is_ok(),
+                "{} kernel capability {} is not a kernel capability",
                 path.display(),
-                provide.id()
+                cap.as_str()
+            );
+            assert!(
+                !registered.contains(cap.as_str()),
+                "{} kernel capability {} is a REGISTRY capability id",
+                path.display(),
+                cap.as_str()
             );
         }
+    }
+
+    let mut catalogs = Vec::new();
+    fn walk_catalogs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk_catalogs(&path, out);
+            } else if name == "component.json" {
+                out.push(path);
+            }
+        }
+    }
+    walk_catalogs(&root.join("rust"), &mut catalogs);
+    assert!(
+        catalogs
+            .iter()
+            .any(|p| p.ends_with("agent24-documents/component.json")),
+        "documents component.json must be part of the requires drift check"
+    );
+    for path in catalogs {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let Some(requires) = value.get("requires") else {
+            continue;
+        };
+        assert_requires_tokens(requires, &registered, &path.display().to_string());
     }
 
     let app = build_router(server_tests::state().await);
@@ -1572,8 +1997,8 @@ fn redacted_components_omit_the_health_summary() {
 // ---- Knowledge capabilities probe (ADR-038 C5) -----------------------------------------
 
 use crate::capabilities::unix_now;
-use crate::knowledge_host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
-use crate::knowledge_probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
+use agent24_knowledge::host::{Change, Credential, Endpoint, KnowledgeHostRegistry};
+use agent24_knowledge::probe::{KNOWLEDGE_PROBE_TIMEOUT, KNOWLEDGE_PROBE_TTL};
 use tokio::io::AsyncReadExt;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -2737,10 +3162,10 @@ struct Link {
 }
 
 impl Ear {
-    fn apply(&mut self, outcome: crate::attached::RegisterOutcome) {
+    fn apply(&mut self, outcome: agent24_attach::attached::RegisterOutcome) {
         let response = match outcome {
-            crate::attached::RegisterOutcome::Created(response)
-            | crate::attached::RegisterOutcome::Rotated { response, .. } => response,
+            agent24_attach::attached::RegisterOutcome::Created(response)
+            | agent24_attach::attached::RegisterOutcome::Rotated { response, .. } => response,
         };
         self.token = response.token;
         self.digest = response.manifest_digest;
@@ -2748,7 +3173,7 @@ impl Ear {
 
     fn rotate(&mut self) {
         let registry = std::sync::Arc::clone(&self.state.attach_registry);
-        let outcome = crate::attached::register(
+        let outcome = agent24_attach::attached::register(
             &self.path,
             MANIFEST,
             false,
@@ -2763,10 +3188,11 @@ impl Ear {
 
     fn set_disabled(&self, disabled: bool) {
         let registry = std::sync::Arc::clone(&self.state.attach_registry);
-        let found = crate::attached::set_disabled(&self.path, "agentear", disabled, |change| {
-            registry.on_change(change);
-        })
-        .unwrap();
+        let found =
+            agent24_attach::attached::set_disabled(&self.path, "agentear", disabled, |change| {
+                registry.on_change(change);
+            })
+            .unwrap();
         assert!(found);
     }
 }
@@ -2776,7 +3202,7 @@ async fn ear() -> Ear {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("attached.json");
     let registry = std::sync::Arc::clone(&state.attach_registry);
-    let outcome = crate::attached::register(
+    let outcome = agent24_attach::attached::register(
         &path,
         MANIFEST,
         false,
@@ -2833,8 +3259,12 @@ async fn open(ear: &Ear, versions: Option<Value>) -> Link {
     let (kernel, mut module) = UnixStream::pair().unwrap();
     let registry = std::sync::Arc::clone(&ear.state.attach_registry);
     let task = tokio::spawn(async move {
-        crate::attach_listener::handle_connection(kernel, &registry, CancellationToken::new())
-            .await;
+        agent24_attach::attach_listener::handle_connection(
+            kernel,
+            &registry,
+            CancellationToken::new(),
+        )
+        .await;
     });
     let mut params = json!({
         "module": "agentear",
@@ -3198,6 +3628,25 @@ fn documents_d9_catalog_parses_the_module_tools() {
     assert!(catalog.assurance.is_empty());
     assert_eq!(catalog.requires.kernel, ["events", "models"]);
     assert!(catalog.requires.operations.is_empty());
+    let mut with_op: Value =
+        serde_json::from_str(include_str!("../../../agent24-documents/component.json")).unwrap();
+    with_op["requires"]["operations"] = json!(["models.read"]);
+    assert!(
+        documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_ok(),
+        "a canonical Operation name is a valid requires.operations entry"
+    );
+    with_op["requires"]["operations"] = json!(["models/read"]);
+    assert!(
+        documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
+        "a slash alias is not a canonical operation name"
+    );
+    for op in ["skills.read", "skills.install", "skills.activate"] {
+        with_op["requires"]["operations"] = json!([op]);
+        assert!(
+            documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
+            "a component lock cannot grant {op}"
+        );
+    }
     // domain-os.yml is parsed, not searched: a comment or another key that
     // happens to contain the text cannot satisfy it.
     let manifest: serde_yaml::Value =
@@ -3312,10 +3761,10 @@ fn documents_d9_missing_or_broken_catalog_is_an_error() {
             v["requires"]["kernel"] = json!(["events", "events"]);
         }),
         ("operations", |v| {
-            v["requires"]["operations"] = json!(["Bad"])
+            v["requires"]["operations"] = json!(["list"])
         }),
         ("operations-unique", |v| {
-            v["requires"]["operations"] = json!(["list", "list"]);
+            v["requires"]["operations"] = json!(["models.read", "models.read"]);
         }),
         // Well formed, but not `<this component's id>.<operation>`.
         ("tool-component", |v| {
@@ -3432,6 +3881,7 @@ fn documents_d9_states_stay_in_the_resident_subset() {
             MountOutcome::Mounted,
             Some(Supervised::PackageChanged {
                 reason: "digest".into(),
+                code: None,
             }),
             ComponentState::Failed,
             Some("package_changed"),
@@ -3729,7 +4179,7 @@ async fn the_ready_probe_waits_for_a_compatible_declaration() {
 /// is not sent again: the stale answer is dropped and the snapshot retaken.
 #[tokio::test]
 async fn the_ready_probe_rechecks_the_credential_before_sending() {
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-moves-secret");
     let targets = registry.probe_targets(unix_now());
@@ -3737,7 +4187,7 @@ async fn the_ready_probe_rechecks_the_credential_before_sending() {
     // Valid for the capabilities request, revoked by the time §8 would go.
     let calls = AtomicUsize::new(0);
     let current =
-        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
+        |_: &agent24_knowledge::probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) == 0;
     let assessed = cache.assess(&targets, Instant::now(), &current).await;
     assert!(assessed.stale);
     assert_eq!(fake.hits.load(Ordering::SeqCst), 1);
@@ -3779,8 +4229,8 @@ async fn a_target_that_failed_the_recheck_is_probed_again_not_dropped() {
 
 #[tokio::test]
 async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed() {
-    use crate::knowledge_host::assess_until_fresh;
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::host::assess_until_fresh;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = configured(&fake.base);
     let targets = registry.probe_targets(unix_now());
@@ -3823,7 +4273,7 @@ async fn a_stale_answer_is_not_cached_and_bindings_that_keep_moving_fail_closed(
 
 #[tokio::test]
 async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-gate-secret");
     let url = fake.base.as_str();
@@ -3859,7 +4309,7 @@ async fn the_contract_gate_reads_the_probe_cache_and_reprobes_after_the_ttl() {
 
 #[tokio::test]
 async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let t0 = Instant::now();
     let incompatible =
         ready_body().replace("\"protocol_versions\":[1,2]", "\"protocol_versions\":[2]");
@@ -3917,7 +4367,7 @@ async fn the_contract_gate_refuses_incompatible_missing_and_unknown() {
 /// goes to another binding's good endpoint, and its own calls are still refused.
 #[tokio::test]
 async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
-    use crate::knowledge_host::ContractGate;
+    use agent24_knowledge::host::ContractGate;
     let t0 = Instant::now();
     let good = serve(Script::Reply(200, ready_body())).await;
     let down = serve(Script::Reply(500, "x".into())).await;
@@ -3959,8 +4409,8 @@ async fn the_gate_looks_only_at_the_endpoint_the_call_goes_to() {
 /// M2: a failed reading closes the gate for a few seconds, not for a whole TTL.
 #[tokio::test]
 async fn a_failed_reading_is_reprobed_after_a_short_ttl_not_the_full_one() {
-    use crate::knowledge_host::ContractGate;
-    use crate::knowledge_probe::KNOWLEDGE_PROBE_FAILED_TTL;
+    use agent24_knowledge::host::ContractGate;
+    use agent24_knowledge::probe::KNOWLEDGE_PROBE_FAILED_TTL;
     let up = Arc::new(AtomicBool::new(false));
     let fake = serve(Script::Switch(Arc::clone(&up), ready_body())).await;
     let registry = configured(&fake.base);
@@ -4367,7 +4817,7 @@ async fn a_float_at_two_to_the_53_is_not_read_as_an_integer() {
 /// L2: the key moves while the §8 request is out. Its answer must not be used.
 #[tokio::test]
 async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale() {
-    use crate::knowledge_probe::KnowledgeProbeCache;
+    use agent24_knowledge::probe::KnowledgeProbeCache;
     let fake = serve(Script::Reply(200, ready_body())).await;
     let registry = with_credential(&fake.base, "LEAK-during-secret");
     let targets = registry.probe_targets(unix_now());
@@ -4375,7 +4825,7 @@ async fn a_credential_that_moves_during_the_ready_request_makes_the_answer_stale
     // Valid before the capabilities request and before §8; revoked after it.
     let calls = AtomicUsize::new(0);
     let current =
-        |_: &crate::knowledge_probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
+        |_: &agent24_knowledge::probe::ProbeTarget| calls.fetch_add(1, Ordering::SeqCst) < 2;
     let assessed = cache.assess(&targets, Instant::now(), &current).await;
     assert_eq!(fake.ready_hits(), 1, "§8 went out");
     assert!(assessed.stale, "its answer was used although the key moved");
@@ -4404,7 +4854,7 @@ async fn an_envelope_code_that_underflows_to_zero_is_not_success() {
 
 #[test]
 fn s1_4_idoris_contract_mismatch_is_incompatible() {
-    use agent24d::idoris_host::Code;
+    use agent24_idoris::idoris_host::Code;
     assert_eq!(
         from_idoris(IdorisState::Failed, false, Some(Code::ContractMismatch)),
         (
@@ -4438,5 +4888,216 @@ fn s1_4_components_render_hyphae_lifecycle() {
             json!(reason),
             "{process}"
         );
+    }
+}
+
+fn unsealed_package(root: &std::path::Path, name: &str) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("domain-os.yml"),
+        format!(
+            "name: {name}\nversion: \"0.1.0\"\nroute_namespace: /api/v1/{name}\n\
+             event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+             kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+             spawn:\n  command: bin/mod\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// T6. A fresh scan refuses an old package that has no integrity section and
+/// keeps a sealed sibling. Restoring the optional "no integrity means pass"
+/// path puts `oldmod` in `found` and this test goes red.
+#[test]
+fn t6_old_package_is_failed_and_a_sealed_sibling_stays_available() {
+    let root = tempfile::tempdir().unwrap();
+    unsealed_package(root.path(), "oldmod");
+    let good = root.path().join("goodmod");
+    std::fs::create_dir_all(&good).unwrap();
+    std::fs::write(
+        good.join("domain-os.yml"),
+        "name: goodmod\nversion: \"0.1.0\"\nroute_namespace: /api/v1/goodmod\n\
+         event_module: goodmod\ndata_dir: ~/.agent24/os/goodmod/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/mod\n",
+    )
+    .unwrap();
+    agent24_os_packages::test_support::seal_exit_stub(&good, "bin/mod").unwrap();
+    let scan = agent24_os_packages::test_support::scan(root.path(), &CancellationToken::new());
+    assert_eq!(
+        scan.found
+            .iter()
+            .map(|d| d.manifest.name())
+            .collect::<Vec<_>>(),
+        vec!["goodmod"]
+    );
+    let old = scan.refused.iter().find(|r| r.dir.ends_with("oldmod"));
+    assert!(old.is_some(), "old package was accepted");
+    let old = old.unwrap();
+    assert_eq!(
+        old.integrity,
+        Some(agent24_components::integrity::IntegrityReason::ManifestMissing)
+    );
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].name, "oldmod");
+    let (state, reason, _) = os_mapped(&reports[0].outcome, None);
+    assert_eq!(state, ComponentState::Failed);
+    assert_eq!(reason, Some("integrity_manifest_missing"));
+    let item = Item::new("oldmod", Form::Resident, state).with(|i| {
+        i.version = Some("0.1.0".to_owned());
+        i.reason = reason.map(str::to_owned);
+        i.provides.clear();
+    });
+    let full = render(std::slice::from_ref(&item), true);
+    assert_eq!(full["components"][0]["state"], "failed");
+    assert_eq!(
+        full["components"][0]["reason"],
+        "integrity_manifest_missing"
+    );
+    let redacted = render(&[item], false);
+    assert!(redacted["components"][0].get("reason").is_none());
+    assert!(redacted["components"][0].get("detail").is_none());
+
+    agent24_os_packages::test_support::seal_exit_stub(&root.path().join("oldmod"), "bin/mod")
+        .unwrap();
+    let again = agent24_os_packages::test_support::scan(root.path(), &CancellationToken::new());
+    assert!(
+        again.refused.iter().all(|r| !r.dir.ends_with("oldmod")),
+        "reinstall left the refusal: {:?}",
+        again.refused
+    );
+    assert!(again.found.iter().any(|d| d.manifest.name() == "oldmod"));
+}
+
+/// A manifest too damaged to trust, or one that forges a builtin name, does
+/// not take that name and does not publish its provides.
+#[test]
+fn t6_a_forged_or_unreadable_name_uses_a_directory_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let forged = root.path().join("sneaky");
+    std::fs::create_dir_all(&forged).unwrap();
+    std::fs::write(
+        forged.join("domain-os.yml"),
+        "name: idoris\nversion: \"9.9.9\"\nroute_namespace: /api/v1/idoris\n\
+         event_module: idoris\ndata_dir: ~/.agent24/os/idoris/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/mod\nprovides:\n  - id: model-gateway\n    tools: []\n",
+    )
+    .unwrap();
+    let broken = root.path().join("broken");
+    std::fs::create_dir_all(&broken).unwrap();
+    std::fs::write(broken.join("domain-os.yml"), "name: [").unwrap();
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    let names: Vec<&str> = reports.iter().map(|r| r.name.as_str()).collect();
+    assert!(names.iter().all(|n| *n != "idoris"), "{names:?}");
+    assert!(reports.iter().all(|r| r.d9.is_none()));
+    assert!(
+        reports
+            .iter()
+            .all(|r| r.version.is_empty() || r.name != "idoris")
+    );
+    assert!(names.iter().any(|n| n.starts_with("dir-")));
+}
+
+fn package_yaml(name: &str, version: &str) -> String {
+    format!(
+        "name: {name}\nversion: \"{version}\"\nroute_namespace: /api/v1/{name}\n\
+         event_module: {name}\ndata_dir: ~/.agent24/os/{name}/\n\
+         kernel_capabilities: []\nimpl_kind: out_of_process_provider\n\
+         spawn:\n  command: bin/{name}\n"
+    )
+}
+
+/// The Documents package the app installs is refused on the `documents` row.
+/// Pre-claiming `documents` in `taken` renames it to `dir-*` and this row
+/// stays `absent`. A forged `name: documents` in another directory, and a
+/// forged builtin name, still use `dir-*`.
+#[tokio::test]
+async fn a_refused_documents_package_is_failed_on_the_documents_row() {
+    let root = tempfile::tempdir().unwrap();
+    let documents = root.path().join("documents");
+    std::fs::create_dir_all(&documents).unwrap();
+    std::fs::write(
+        documents.join("domain-os.yml"),
+        package_yaml("documents", "1.2.3"),
+    )
+    .unwrap();
+    let forged_documents = root.path().join("aaa");
+    std::fs::create_dir_all(&forged_documents).unwrap();
+    std::fs::write(
+        forged_documents.join("domain-os.yml"),
+        package_yaml("documents", "9.9.9"),
+    )
+    .unwrap();
+    let forged_builtin = root.path().join("sneaky");
+    std::fs::create_dir_all(&forged_builtin).unwrap();
+    std::fs::write(
+        forged_builtin.join("domain-os.yml"),
+        package_yaml("idoris", "9.9.9"),
+    )
+    .unwrap();
+
+    let scan = agent24_os_packages::discovery::scan(root.path(), &CancellationToken::new());
+    let reports = crate::domain::integrity_refusal_reports(&scan.refused, &[]);
+    let mut state = server_tests::state().await;
+    state.os_reports = Arc::new(reports);
+    let body = render(&collect(&state, std::time::Instant::now()).await, true);
+    let rows = body["components"].as_array().unwrap();
+    let documents_rows: Vec<_> = rows.iter().filter(|row| row["id"] == "documents").collect();
+    assert_eq!(documents_rows.len(), 1);
+    assert_eq!(documents_rows[0]["state"], "failed");
+    assert_eq!(documents_rows[0]["reason"], "integrity_manifest_missing");
+    assert_eq!(documents_rows[0]["version"], "1.2.3");
+    assert!(
+        rows.iter()
+            .all(|row| row["id"] != "idoris" || row["reason"] != "integrity_manifest_missing"),
+        "{body}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row["id"].as_str().is_some_and(|id| id.starts_with("dir-"))),
+        "{body}"
+    );
+}
+
+/// T8. Each integrity reason is `failed` for the host and absent from the
+/// redacted row. Dropping `reason`, or copying `detail` into the redacted
+/// view, turns this red.
+#[test]
+fn t8_each_integrity_reason_is_host_only() {
+    use crate::domain::RefusalReason;
+    use agent24_components::integrity::IntegrityReason;
+    for reason in [
+        IntegrityReason::ManifestMissing,
+        IntegrityReason::HashMismatch,
+        IntegrityReason::ManifestInvalid,
+        IntegrityReason::SignatureRejected,
+        IntegrityReason::CheckFailed,
+    ] {
+        let outcome = MountOutcome::RefusedFor(
+            RefusalReason::PackageIntegrity(reason),
+            format!("detail /tmp/secret stderr {}", reason.code()),
+        );
+        let (state, code, message) = os_mapped(&outcome, None);
+        assert_eq!(state, ComponentState::Failed);
+        assert_eq!(code, Some(reason.code()));
+        let item = Item::new("pkg", Form::Resident, state).with(|i| {
+            i.version = Some("1".to_owned());
+            i.reason = code.map(str::to_owned);
+            i.detail = message.map(|text| json!({"message": text}));
+        });
+        let full = render(std::slice::from_ref(&item), true);
+        assert_eq!(full["components"][0]["state"], "failed");
+        assert_eq!(full["components"][0]["reason"], reason.code());
+        assert_ne!(full["components"][0]["state"], "absent");
+        assert_ne!(full["components"][0]["state"], "incompatible");
+        let redacted = render(&[item], false).to_string();
+        assert!(!redacted.contains("reason"), "{redacted}");
+        assert!(!redacted.contains("detail"), "{redacted}");
+        assert!(!redacted.contains("/tmp"), "{redacted}");
+        assert!(!redacted.contains("stderr"), "{redacted}");
     }
 }
