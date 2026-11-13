@@ -2699,7 +2699,6 @@ pub(crate) mod tests {
     // those contracts land; the remaining exceptions have separate owners.
     const UNDOCUMENTED_KERNEL_ROUTES: &[&str] = &[
         "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
-        "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
         // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
         "/host/knowledge/bindings/{binding_id}",

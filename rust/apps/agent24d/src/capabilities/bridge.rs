@@ -47,11 +47,13 @@ pub enum IngestDeny {
 }
 
 impl IngestDeny {
-    pub(crate) fn reason(self) -> CapabilityDenyReason {
+    /// `Audience` has no audit arm. The denial writer ignores a
+    /// non-component bearer, and a component bearer never takes that arm.
+    pub(crate) fn audit_reason(self) -> Option<CapabilityDenyReason> {
         match self {
-            Self::Audience => CapabilityDenyReason::Audience,
-            Self::Component => CapabilityDenyReason::Component,
-            Self::Operation => CapabilityDenyReason::Operation,
+            Self::Audience => None,
+            Self::Component => Some(CapabilityDenyReason::Component),
+            Self::Operation => Some(CapabilityDenyReason::Operation),
         }
     }
 }
@@ -161,6 +163,8 @@ async fn write_component_denial_with<F, Fut>(
 /// After that write, the caller is checked again and the new token is
 /// inserted under the same store lock. A caller revoked, expired, rotated,
 /// or whose shell process has exited during the audit is not issued.
+/// That path appends `capability.token.issue_aborted` for the same id. If
+/// the compensating row cannot be written the result is [`BridgeIssueError::AuditFailed`].
 pub async fn issue_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     authorization: &Authorization,
@@ -168,7 +172,7 @@ pub async fn issue_wechat_bridge<F, Fut>(
     audit: F,
 ) -> Result<super::MintedCapability, BridgeIssueError>
 where
-    F: FnOnce(CapabilityTokenAuditEvent) -> Fut,
+    F: Fn(CapabilityTokenAuditEvent) -> Fut,
     Fut: Future<Output = Result<(), ()>>,
 {
     if authorization.claims.audience != Audience::FirstPartyShell
@@ -177,17 +181,23 @@ where
         return Err(BridgeIssueError::Rejected);
     }
     let capability_id = random_capability_id();
+    let component_id =
+        AuditRef::new(DEV_BRIDGE_COMPONENT_ID).map_err(|_| BridgeIssueError::Rejected)?;
+    let operation = AuditRef::new(DEV_BRIDGE_OPERATION).map_err(|_| BridgeIssueError::Rejected)?;
+    let capability_ref = AuditRef::new(&capability_id).map_err(|_| BridgeIssueError::Rejected)?;
+    let issuer_capability_id = AuditRef::new(&authorization.claims.capability_id)
+        .map_err(|_| BridgeIssueError::Rejected)?;
     let event = CapabilityTokenAuditEvent::Issued {
-        component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID)
-            .map_err(|_| BridgeIssueError::Rejected)?,
-        capability_id: AuditRef::new(&capability_id).map_err(|_| BridgeIssueError::Rejected)?,
-        operation: AuditRef::new(DEV_BRIDGE_OPERATION).map_err(|_| BridgeIssueError::Rejected)?,
+        component_id: component_id.clone(),
+        capability_id: capability_ref.clone(),
+        operation: operation.clone(),
         ttl_seconds: COMPONENT_RUNTIME_TTL_SECONDS,
+        issuer_capability_id: issuer_capability_id.clone(),
     };
     if audit(event).await.is_err() {
         return Err(BridgeIssueError::AuditFailed);
     }
-    insert_for_live_caller(
+    match insert_for_live_caller(
         store,
         authorization,
         now,
@@ -207,7 +217,23 @@ where
             deadline: Some(Instant::now() + Duration::from_secs(BRIDGE_TTL_SECONDS)),
             allowed_operations: BTreeSet::from([Operation::InboundIngest]),
         },
-    )
+    ) {
+        Err(err @ (BridgeIssueError::CallerInvalid | BridgeIssueError::Rejected)) => {
+            // The issued row names an id that was not inserted. Close it.
+            // `Rejected` here is only `insert_locked` failing after that row.
+            let aborted = CapabilityTokenAuditEvent::IssueAborted {
+                component_id,
+                capability_id: capability_ref,
+                operation,
+                issuer_capability_id,
+            };
+            if audit(aborted).await.is_err() {
+                return Err(BridgeIssueError::AuditFailed);
+            }
+            Err(err)
+        }
+        other => other,
+    }
 }
 
 /// Caller liveness and the insert share one lock, so a revoke or a dead
@@ -243,8 +269,21 @@ fn insert_for_live_caller(
         .map_err(|_| BridgeIssueError::Rejected)
 }
 
-/// Mark the token revoked before the audit write. A write failure must not
-/// put the old bearer back into service; the caller retries the row.
+/// Dev-bridge profile: component runtime whose component id is
+/// `wechat-bridge`. Other audiences, including another component, are not.
+pub(crate) fn is_dev_bridge(claims: &CapabilityClaims) -> bool {
+    claims.audience == Audience::ComponentRuntime
+        && claims.component_id.as_deref() == Some(DEV_BRIDGE_COMPONENT_ID)
+}
+
+/// Mark the token revoked and `pending` under one lock, then write one
+/// `Revoked` row. `pending` is set before the write (in progress). Success
+/// clears it; failure leaves it so the next call writes the row.
+///
+/// The same id takes one gate. A caller that finds the gate held returns
+/// [`BridgeRevokeError::AuditFailed`] and does not answer success. A call
+/// that returns `Ok` has either stored the row itself or observed `pending`
+/// already clear after a previous store. Two calls do not append two rows.
 pub async fn revoke_wechat_bridge<F, Fut>(
     store: &CapabilityStore,
     capability_id: &str,
@@ -257,12 +296,32 @@ where
     let Some(claims) = store.claims_by_id(capability_id) else {
         return Err(BridgeRevokeError::NotComponent);
     };
-    if claims.audience != Audience::ComponentRuntime
-        || claims.component_id.as_deref() != Some(DEV_BRIDGE_COMPONENT_ID)
-    {
+    if !is_dev_bridge(&claims) {
         return Err(BridgeRevokeError::NotComponent);
     }
-    store.revoke_by_id(capability_id);
+    let gate = {
+        let mut gates = store
+            .shared
+            .revoke_gates
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        gates
+            .entry(capability_id.to_owned())
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    // Held across the audit write. Dropping it early would let the next
+    // caller observe `pending` and write a second row.
+    let Ok(_gate_hold) = gate.try_lock() else {
+        return Err(BridgeRevokeError::AuditFailed);
+    };
+    // Already revoked and the row was written: do not append another.
+    // `pending` is set in this same lock when a row still has to be written.
+    match store.start_revoke_audit(capability_id) {
+        Some(super::revoke::RevokeAuditStart::Stored) => return Ok(()),
+        Some(super::revoke::RevokeAuditStart::Write) => {}
+        None => return Err(BridgeRevokeError::AuditFailed),
+    }
     let event = CapabilityTokenAuditEvent::Revoked {
         component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID)
             .map_err(|_| BridgeRevokeError::AuditFailed)?,
@@ -272,6 +331,7 @@ where
     if audit(event).await.is_err() {
         return Err(BridgeRevokeError::AuditFailed);
     }
+    store.set_revoke_audit_pending(capability_id, false);
     Ok(())
 }
 
@@ -465,6 +525,90 @@ mod tests {
         );
     }
 
+    /// The issued row is closed with `issue_aborted`. The id is not inserted.
+    /// Dropping the `IssueAborted` write turns the action assertion red.
+    /// Returning `CallerInvalid` when that write fails turns the second
+    /// assertion red.
+    #[tokio::test]
+    async fn recheck_failure_appends_issue_aborted_and_inserts_nothing() {
+        use agent24_store::Store;
+
+        let (store, auth) = shell_store();
+        let db = Store::open_memory().await.unwrap();
+        let caller_id = auth.claims.capability_id.clone();
+        let issuer = caller_id.clone();
+        let during = store.clone();
+        let db_audit = db.clone();
+        let failed = issue_wechat_bridge(&store, &auth, unix_now(), move |event| {
+            let during = during.clone();
+            let caller_id = caller_id.clone();
+            let db_audit = db_audit.clone();
+            async move {
+                if matches!(event, CapabilityTokenAuditEvent::Issued { .. }) {
+                    during.revoke_by_id(&caller_id);
+                }
+                let ts = audit_now().unwrap();
+                db_audit
+                    .append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await;
+        assert!(matches!(failed, Err(BridgeIssueError::CallerInvalid)));
+        let entries = db.list_audit().await.unwrap();
+        let actions: Vec<_> = entries.iter().map(|entry| entry.action.as_str()).collect();
+        assert_eq!(
+            actions,
+            ["capability.token.issued", "capability.token.issue_aborted"]
+        );
+        let issued_id = entries[0].detail["issued"]["capability_id"]
+            .as_str()
+            .unwrap();
+        assert_eq!(
+            entries[1].detail["issue_aborted"]["capability_id"].as_str(),
+            Some(issued_id)
+        );
+        assert_eq!(
+            entries[0].detail["issued"]["issuer_capability_id"].as_str(),
+            Some(issuer.as_str())
+        );
+        assert_eq!(
+            entries[1].detail["issue_aborted"]["issuer_capability_id"].as_str(),
+            Some(issuer.as_str())
+        );
+        assert!(store.claims_by_id(issued_id).is_none());
+
+        let (store, auth) = shell_store();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let during = store.clone();
+        let caller_id = auth.claims.capability_id.clone();
+        let failed = issue_wechat_bridge(&store, &auth, unix_now(), move |event| {
+            let during = during.clone();
+            let caller_id = caller_id.clone();
+            let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                if matches!(event, CapabilityTokenAuditEvent::Issued { .. }) {
+                    during.revoke_by_id(&caller_id);
+                }
+                if n == 0 { Ok(()) } else { Err(()) }
+            }
+        })
+        .await;
+        assert!(matches!(failed, Err(BridgeIssueError::AuditFailed)));
+        assert!(
+            store
+                .shared
+                .state
+                .lock()
+                .unwrap()
+                .records
+                .values()
+                .all(|record| record.claims.audience != Audience::ComponentRuntime)
+        );
+    }
+
     /// A shell whose process is already dead is not issued. Bumping the
     /// recorded start time is the same stand-in `process_live` uses.
     /// Dropping `process_live` in `insert_for_live_caller` turns this
@@ -609,6 +753,243 @@ mod tests {
             store
                 .claim_deny_audit("gate-models", CapabilityDenyReason::Route)
                 .is_some()
+        );
+    }
+
+    /// A poisoned deny-audit lock skips the write. Returning `Some` from the
+    /// `Err` arm of `claim_deny_audit` turns this red.
+    #[test]
+    fn poisoned_deny_audit_lock_does_not_claim_a_write() {
+        use agent24_store::CapabilityDenyReason;
+
+        let store = CapabilityStore::new("g");
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = store.shared.deny_audit_at.lock().unwrap();
+            panic!("poison the deny-audit lock");
+        }));
+        assert!(
+            store
+                .claim_deny_audit("gate-models", CapabilityDenyReason::Route)
+                .is_none()
+        );
+    }
+
+    /// A failed revoke audit stays pending. The next call writes one row.
+    /// A third call does not write again. Clearing the pending flag on the
+    /// failure path turns the second count into 0.
+    #[tokio::test]
+    async fn failed_revoke_audit_is_written_on_the_next_call_only() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        let writes = AtomicUsize::new(0);
+        let first = revoke_wechat_bridge(&store, &id, |_| async { Err(()) }).await;
+        assert_eq!(first, Err(BridgeRevokeError::AuditFailed));
+        assert!(store.revoke_audit_pending(&id));
+        let second = revoke_wechat_bridge(&store, &id, |_| {
+            writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(second, Ok(()));
+        assert!(!store.revoke_audit_pending(&id));
+        let third = revoke_wechat_bridge(&store, &id, |_| {
+            writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(third, Ok(()));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two overlapping revokes write one row. The call that finds the gate
+    /// held does not return success. Returning `Ok` from that path turns
+    /// the second assertion into `Ok`.
+    #[tokio::test]
+    async fn concurrent_revoke_writes_one_row_and_the_other_does_not_return_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        let db = agent24_store::Store::open_memory().await.unwrap();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = {
+            let store = store.clone();
+            let id = id.clone();
+            let db = db.clone();
+            let writes = writes.clone();
+            tokio::spawn(async move {
+                revoke_wechat_bridge(&store, &id, move |event| {
+                    let db = db.clone();
+                    let writes = writes.clone();
+                    async move {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.await;
+                        writes.fetch_add(1, Ordering::SeqCst);
+                        let ts = audit_now().unwrap();
+                        db.append_capability_token_audit(&ts, &event)
+                            .await
+                            .map(|_| ())
+                            .map_err(|_| ())
+                    }
+                })
+                .await
+            })
+        };
+        started_rx.await.unwrap();
+        let second = revoke_wechat_bridge(&store, &id, |_| async { Ok(()) }).await;
+        assert_eq!(second, Err(BridgeRevokeError::AuditFailed));
+        let _ = release_tx.send(());
+        assert_eq!(first.await.unwrap(), Ok(()));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(!store.revoke_audit_pending(&id));
+        let revoked = db
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "capability.token.revoked")
+            .count();
+        assert_eq!(revoked, 1);
+    }
+
+    /// While the first audit is still running and then fails, the overlapping
+    /// call does not return success. Answering `Ok` there turns this red.
+    #[tokio::test]
+    async fn slow_failed_revoke_audit_does_not_let_the_second_call_return_ok() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (store, auth) = shell_store();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let first = {
+            let store = store.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                revoke_wechat_bridge(&store, &id, move |_| async move {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.await;
+                    Err(())
+                })
+                .await
+            })
+        };
+        started_rx.await.unwrap();
+        let second_writes = writes.clone();
+        let second = revoke_wechat_bridge(&store, &id, |_| {
+            second_writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(second, Err(BridgeRevokeError::AuditFailed));
+        assert_eq!(writes.load(Ordering::SeqCst), 0);
+        let _ = release_tx.send(());
+        assert_eq!(first.await.unwrap(), Err(BridgeRevokeError::AuditFailed));
+        assert!(store.revoke_audit_pending(&id));
+        let third_writes = writes.clone();
+        let third = revoke_wechat_bridge(&store, &id, |_| {
+            third_writes.fetch_add(1, Ordering::SeqCst);
+            async { Ok(()) }
+        })
+        .await;
+        assert_eq!(third, Ok(()));
+        assert_eq!(writes.load(Ordering::SeqCst), 1);
+        assert!(!store.revoke_audit_pending(&id));
+    }
+
+    /// The second revoke does not append another `Revoked` row. Ignoring
+    /// `revoke_by_id`'s bool and always auditing turns the count into 2.
+    #[tokio::test]
+    async fn revoked_row_is_written_only_when_revoke_by_id_returns_true() {
+        use agent24_store::Store;
+
+        let (store, auth) = shell_store();
+        let db = Store::open_memory().await.unwrap();
+        let record = db.clone();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), move |event| {
+            let record = record.clone();
+            async move {
+                let ts = audit_now().unwrap();
+                record
+                    .append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        .unwrap();
+        let (_, id, _) = minted.into_bearer_parts();
+        for _ in 0..2 {
+            let record = db.clone();
+            revoke_wechat_bridge(&store, &id, move |event| {
+                let record = record.clone();
+                async move {
+                    let ts = audit_now().unwrap();
+                    record
+                        .append_capability_token_audit(&ts, &event)
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| ())
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let revoked = db
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "capability.token.revoked")
+            .count();
+        assert_eq!(revoked, 1);
+    }
+
+    /// Revoking the shell record does not revoke the bridge token it issued.
+    /// Cascading `revoke` onto component tokens turns the bearer check red.
+    #[tokio::test]
+    async fn revoking_the_shell_leaves_its_bridge_token_live() {
+        let store = CapabilityStore::new("g");
+        let authority = FirstPartyAuthority::new(store.clone());
+        let peer = test_peer("g");
+        let issued = authority.issue(&peer).unwrap();
+        let auth = store
+            .validate_bearer(
+                &issued.secret,
+                Operation::CapabilityMint,
+                &Resource::global(),
+                unix_now(),
+            )
+            .unwrap();
+        let minted = issue_wechat_bridge(&store, &auth, unix_now(), |_| async { Ok(()) })
+            .await
+            .unwrap();
+        let (bearer, _, _) = minted.into_bearer_parts();
+        authority.revoke(&peer, &issued.token_id);
+        assert!(
+            store
+                .validate_bearer(
+                    &bearer,
+                    Operation::InboundIngest,
+                    &Resource::global(),
+                    unix_now()
+                )
+                .is_ok()
         );
     }
 }

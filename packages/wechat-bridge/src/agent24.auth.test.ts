@@ -27,6 +27,7 @@ describe('Agent24Client without a bearer sends nothing', () => {
     expect(init.method).toBe('POST')
     expect((init.headers as Record<string, string>).Authorization).toBe('Bearer b')
     expect(JSON.parse(String(init.body))).toEqual(event)
+    expect(init.signal).toBeInstanceOf(AbortSignal)
   })
 
   // Without the status check a 5xx body would be parsed as a record with no

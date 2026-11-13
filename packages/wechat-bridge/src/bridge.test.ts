@@ -2,7 +2,8 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { Bridge, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp } from './bridge.js'
+import { Bridge, DEV_ROUTE_MISSING, FAILURE_REPLY_LIMIT, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp, classifyInboundFailure } from './bridge.js'
+import { InboundHttpError } from './agent24.js'
 import type { Agent24Client, InboundEvent, InboundRecord } from './agent24.js'
 import type { Sender } from './ilink/sender.js'
 import { splitText } from './ilink/sender.js'
@@ -16,6 +17,15 @@ describe('production sources do not post a run', () => {
     const forbidden = '/api/v1/' + 'runs'
     for (const file of files) {
       expect(readFileSync(file, 'utf8'), file).not.toContain(forbidden)
+    }
+  })
+
+  it('does not read a legacy bearer', () => {
+    const root = fileURLToPath(new URL('.', import.meta.url))
+    const banned = ['A24_TOKEN', 'requireDaemonBearer', 'daemonBearer']
+    for (const file of productionSources(root)) {
+      const text = readFileSync(file, 'utf8')
+      for (const word of banned) expect(text, `${file} ${word}`).not.toContain(word)
     }
   })
 })
@@ -114,7 +124,7 @@ describe('Bridge transport', () => {
 
   it('records a finished user message and replies only 已记录', async () => {
     const { bridge, recorded, sends } = makeBridge()
-    await bridge.handle(textMsg('alice', '查一下天气'))
+    await expect(bridge.handle(textMsg('alice', '查一下天气'))).resolves.toBe('advance')
     expect(recorded).toEqual([
       {
         id: 'wechat:42',
@@ -166,7 +176,7 @@ describe('Bridge transport', () => {
 
   it('does not post or reply to a picture or blank text', async () => {
     const { bridge, recorded, sends } = makeBridge()
-    await bridge.handle(imageMsg('alice'))
+    await expect(bridge.handle(imageMsg('alice'))).resolves.toBe('advance')
     await bridge.handle(textMsg('alice', '   '))
     await bridge.handle(textMsg('alice', '', { item_list: [] }))
     expect(recorded).toEqual([])
@@ -189,9 +199,81 @@ describe('Bridge transport', () => {
 
   it('replies with a fixed failure line and does not echo the error', async () => {
     const { bridge, sends } = makeBridge(new Error('daemon down'))
-    await bridge.handle(textMsg('alice', '做点事'))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('hold')
     expect(sends).toEqual([RECORD_FAILED_REPLY])
     expect(sends.join('')).not.toContain('daemon down')
+  })
+
+  it('stops on 401 without the failure reply', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(401))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('stop')
+    expect(sends).toEqual([])
+  })
+
+  it('advances on 400 after one failure reply', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(400))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('advance')
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+  })
+
+  it('stops on 404 without advancing or the failure reply', async () => {
+    const errors: unknown[] = []
+    const previous = console.error
+    console.error = (...args: unknown[]) => {
+      errors.push(args.join(' '))
+    }
+    try {
+      const { bridge, sends } = makeBridge(new InboundHttpError(404))
+      await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('dev_tool')
+      expect(sends).toEqual([])
+      expect(errors.join('\n')).toContain(DEV_ROUTE_MISSING)
+      expect(classifyInboundFailure(new InboundHttpError(408))).toBe('hold')
+      expect(classifyInboundFailure(new InboundHttpError(400))).toBe('advance')
+      expect(classifyInboundFailure(new InboundHttpError(418))).toBe('hold')
+    } finally {
+      console.error = previous
+    }
+  })
+
+  it('holds on 500, 429, and a timeout', async () => {
+    for (const fail of [new InboundHttpError(500), new InboundHttpError(429)]) {
+      const { bridge } = makeBridge(fail)
+      await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('hold')
+    }
+    const timeout = new Error('The operation was aborted due to timeout')
+    timeout.name = 'TimeoutError'
+    const { bridge } = makeBridge(timeout)
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('hold')
+  })
+
+  it('drops the oldest failure reply past the cap', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(400))
+    const first = textMsg('alice', '做点事', { message_id: 1 })
+    await bridge.handle(first)
+    for (let id = 2; id <= FAILURE_REPLY_LIMIT; id++) {
+      await bridge.handle(textMsg('alice', '做点事', { message_id: id }))
+    }
+    expect(sends).toHaveLength(FAILURE_REPLY_LIMIT)
+    await bridge.handle(textMsg('alice', '做点事', { message_id: FAILURE_REPLY_LIMIT }))
+    expect(sends).toHaveLength(FAILURE_REPLY_LIMIT)
+    await bridge.handle(textMsg('alice', '做点事', { message_id: FAILURE_REPLY_LIMIT + 1 }))
+    expect(sends).toHaveLength(FAILURE_REPLY_LIMIT + 1)
+    await bridge.handle(first)
+    expect(sends).toHaveLength(FAILURE_REPLY_LIMIT + 2)
+  })
+
+  it('sends 记录失败 once for the same message id', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(500))
+    const msg = textMsg('alice', '做点事')
+    await expect(bridge.handle(msg)).resolves.toBe('hold')
+    await expect(bridge.handle(msg)).resolves.toBe('hold')
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+  })
+
+  it('stops on legacy capability mode without the failure reply', async () => {
+    const { bridge, sends } = makeBridge(new InboundHttpError(409, 'capability_mode_required'))
+    await expect(bridge.handle(textMsg('alice', '做点事'))).resolves.toBe('capabilities')
+    expect(sends).toEqual([])
   })
 })
 

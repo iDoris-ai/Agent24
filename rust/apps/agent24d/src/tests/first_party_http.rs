@@ -133,6 +133,292 @@ async fn bridge_mint_uses_the_host_summary_and_writes_the_audit_before_the_token
             .any(|action| action == "capability.token.issued")
     );
     assert!(!body.to_string().contains("客户端"));
+    let issued = state
+        .store
+        .list_audit()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|entry| entry.action == "capability.token.issued")
+        .unwrap();
+    assert_eq!(
+        issued.detail["issued"]["issuer_capability_id"].as_str(),
+        Some(token.token_id.as_str())
+    );
+}
+
+/// The shell that minted the bridge token revokes it. The next use is 401.
+/// A second revoke does not write another `capability.token.revoked` row.
+/// Removing `CapabilityRevoke` from `resolve_target` makes `grant` fail.
+#[tokio::test]
+async fn shell_revokes_the_bridge_token_it_issued() {
+    let (mut state, token) = setup().await;
+    state.dev_wechat_events = true;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .set_provider(Some(Arc::new(Allow)));
+    let secret = grant(&state, &token, "POST", "/api/v1/capabilities/bridge", "").await;
+    let response = build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/bridge",
+            "",
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = body["capability_id"].as_str().unwrap();
+    let bearer = body["token"].as_str().unwrap().to_owned();
+    let path = format!("/api/v1/capabilities/{id}/revoke");
+    let blocked = build_router(state.clone())
+        .oneshot(request(&token.secret, "POST", &path, "", None))
+        .await
+        .unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(blocked).await, "presence_required");
+    for _ in 0..2 {
+        let secret = grant(&state, &token, "POST", &path, "").await;
+        let response = build_router(state.clone())
+            .oneshot(request(
+                &token.secret,
+                "POST",
+                &path,
+                "",
+                Some(secret.as_str()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let revoked = state
+        .store
+        .list_audit()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.action == "capability.token.revoked")
+        .count();
+    assert_eq!(revoked, 1);
+    let rejected = build_router(state)
+        .oneshot(request(&bearer, "GET", "/api/v1/models", "", None))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// After a restart the id is gone. The shell hears 404
+/// `bridge_token_unknown` and is not asked to elevate. Answering
+/// `presence_required` or `not_elevated_operation` turns this red.
+#[tokio::test]
+async fn shell_revoke_of_an_unknown_id_is_not_an_elevation_failure() {
+    let (state, token) = setup().await;
+    let response = build_router(state)
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/deadbeef/revoke",
+            "",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(error_code(response).await, "bridge_token_unknown");
+}
+
+/// A shell grant is refused for another shell token, a creative token, and
+/// an id that is not in the store. Those bearers stay valid. ProductHost
+/// still revokes the creative token. Dropping the bridge check in
+/// `target_summary` lets `elevate` return a grant. Dropping the shell check
+/// in `revoke_capability` turns the direct 403 into 200 and revokes the target.
+#[tokio::test]
+async fn shell_revoke_elevation_is_only_the_bridge_token() {
+    use crate::capabilities::{Operation, Resource, unix_now};
+    use crate::enroll_api::EnrollErrorCode;
+
+    let (state, host, creative) = tests::capability_state().await;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .set_provider(Some(Arc::new(Allow)));
+    let shell = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap();
+    let caps = state.capabilities.clone().unwrap();
+    let creative_id = caps
+        .validate_bearer(
+            &creative,
+            Operation::ModelsRead,
+            &Resource::global(),
+            unix_now(),
+        )
+        .unwrap()
+        .claims
+        .capability_id;
+    let shell_auth = caps
+        .validate_bearer(
+            &shell.secret,
+            Operation::CapabilityRevoke,
+            &Resource::global(),
+            unix_now(),
+        )
+        .unwrap();
+    for id in [
+        creative_id.as_str(),
+        shell.token_id.as_str(),
+        "deadbeefdeadbeefdeadbeefdeadbeef",
+    ] {
+        let path = format!("/api/v1/capabilities/{id}/revoke");
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        let err = state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .elevate(
+                &test_peer("daemon-test"),
+                &shell.token_id,
+                ElevateRequest {
+                    method: "POST".into(),
+                    path: path.clone(),
+                    body_sha256: body_digest(b""),
+                    client_summary: "ignored".into(),
+                },
+                tx,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err, EnrollErrorCode::NotElevatedOperation, "{id}");
+        let response = super::revoke_capability(
+            axum::extract::State(state.clone()),
+            Some(axum::extract::Extension(shell_auth.clone())),
+            axum::extract::Path(id.to_owned()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{id}");
+        assert_eq!(error_code(response).await, "forbidden");
+    }
+    let creative_ok = build_router(state.clone())
+        .oneshot(request(&creative, "GET", "/api/v1/models", "", None))
+        .await
+        .unwrap();
+    assert_eq!(creative_ok.status(), StatusCode::OK);
+    let shell_ok = build_router(state.clone())
+        .oneshot(request(&shell.secret, "GET", "/api/v1/models", "", None))
+        .await
+        .unwrap();
+    assert_eq!(shell_ok.status(), StatusCode::OK);
+
+    let revoked = build_router(state.clone())
+        .oneshot(request(
+            &host,
+            "POST",
+            &format!("/api/v1/capabilities/{creative_id}/revoke"),
+            "",
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(revoked.status(), StatusCode::OK);
+    let rejected = build_router(state)
+        .oneshot(request(&creative, "GET", "/api/v1/models", "", None))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The first revoke audit write fails with 503 and the bearer is dead.
+/// The retry writes one `Revoked` row. A further retry does not write again.
+/// Dropping the audit-pending flag turns the second count into 0.
+#[tokio::test]
+async fn bridge_revoke_audit_failure_is_retried_once() {
+    let (mut state, token) = setup().await;
+    state.dev_wechat_events = true;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .set_provider(Some(Arc::new(Allow)));
+    let secret = grant(&state, &token, "POST", "/api/v1/capabilities/bridge", "").await;
+    let response = build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            "/api/v1/capabilities/bridge",
+            "",
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let id = body["capability_id"].as_str().unwrap().to_owned();
+    let bearer = body["token"].as_str().unwrap().to_owned();
+    let pool = agent24_store::test_hooks::pool(&state.store);
+    sqlx::query(
+        "CREATE TRIGGER c9c_block_audit BEFORE INSERT ON audit_log \
+         BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let path = format!("/api/v1/capabilities/{id}/revoke");
+    let secret = grant(&state, &token, "POST", &path, "").await;
+    let failed = build_router(state.clone())
+        .oneshot(request(
+            &token.secret,
+            "POST",
+            &path,
+            "",
+            Some(secret.as_str()),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(failed.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(error_code(failed).await, "audit_unavailable");
+    let rejected = build_router(state.clone())
+        .oneshot(request(&bearer, "GET", "/api/v1/models", "", None))
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    sqlx::query("DROP TRIGGER c9c_block_audit")
+        .execute(pool)
+        .await
+        .unwrap();
+    for expected in [1_usize, 1] {
+        let secret = grant(&state, &token, "POST", &path, "").await;
+        let response = build_router(state.clone())
+            .oneshot(request(
+                &token.secret,
+                "POST",
+                &path,
+                "",
+                Some(secret.as_str()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let revoked = state
+            .store
+            .list_audit()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.action == "capability.token.revoked")
+            .count();
+        assert_eq!(revoked, expected);
+    }
 }
 
 /// The dev gate off is the same 404 as the wechat POST. Nothing is issued
