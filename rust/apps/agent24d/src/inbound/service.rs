@@ -327,6 +327,7 @@ impl InboundService {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         };
         let origin = InboundOrigin {
             event_id: event.id,

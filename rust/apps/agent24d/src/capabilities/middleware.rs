@@ -274,6 +274,21 @@ fn capability_token_rejected(state: &AppState, req: &Request<Body>) -> Option<To
     }
 }
 
+/// The id in a shell revoke path is not in this process. ProductHost is
+/// not this check: an unknown id there stays the idempotent 200.
+fn shell_revoke_target_missing(store: &crate::capabilities::CapabilityStore, path: &str) -> bool {
+    let Some(id) = path
+        .strip_prefix("/api/v1/capabilities/")
+        .and_then(|rest| rest.strip_suffix("/revoke"))
+    else {
+        return false;
+    };
+    if id.is_empty() || id.contains('/') {
+        return false;
+    }
+    store.claims_by_id(id).is_none()
+}
+
 /// Revoked, expired, or stale component-runtime rows are audited. An unknown
 /// bearer is not: `known_component_bearer` returns `None`.
 fn component_liveness_denial(
@@ -404,6 +419,18 @@ async fn authorize(
                 }
             }
             if authorization.claims.audience == crate::capabilities::Audience::FirstPartyShell {
+                // A restarted daemon no longer has the id. Say so before
+                // elevation, so `--revoke` is not `not_elevated_operation`.
+                if *method == Method::POST
+                    && template == "/api/v1/capabilities/{capability_id}/revoke"
+                    && shell_revoke_target_missing(store, req.uri().path())
+                {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "bridge_token_unknown",
+                        "daemon 重启后查不到该令牌",
+                    );
+                }
                 let elevated = operation.assurance_level()
                     == Some(crate::capabilities::AssuranceLevel::Elevated);
                 let grant = req

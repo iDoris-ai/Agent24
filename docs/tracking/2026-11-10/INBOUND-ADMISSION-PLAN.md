@@ -272,7 +272,7 @@ ADR-041 D10 写的是后者（默认只给 id、前 50 字，全文按 id 分页
 5. **`persist_new_run`（`lib.rs:679`）能否与 `inbound_runs` 在同一事务写入**：只读了入口，没读 `insert_run` 的事务边界；2c 开工前先读。
 6. **`execute` 对 origin 的打标签改动**对恢复、重放路径（`plan_resume` 等）的影响未读。
 7. **peer 视图与外发门**对 `Unknown` run 的现有行为：`peer_runs.rs` 有测试但本文没逐条读，2c 验收 ③④ 依赖它们。
-8. **wechat-bridge 令牌**：开发态继续用 legacy 令牌（C9 未排期）。
+8. **wechat-bridge 令牌**：ADR-038-C9 已接线（#1833）。开发态用 `agent24 dev bridge-token` 签发的组件令牌，不再用 legacy 全权令牌。capabilities 模式下种子环境变量不写入名单。
 9. **语音**：本仓库没找到「听到话就起 run」的代码，写的是「没找到」，不是「确认没有」。
 10. **§7-3 若选 (b)**：`runs.input`、`run_messages` 快照、记忆写入各处的清理方式未读。
 11. **水位最大时延、速率上限的默认值**是占位，2c 定。

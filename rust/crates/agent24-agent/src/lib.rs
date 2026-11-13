@@ -16,8 +16,10 @@ pub mod resume;
 mod retain;
 pub mod self_wake;
 mod session_memory;
+mod skill_inject;
 pub mod subagent;
 pub use session_memory::{RECALL_END_MARKER, RECALL_PREFIX, SessionMemory};
+pub use skill_inject::{SkillAdmissionError, SkillProvider, SkillProviderSource};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -66,6 +68,25 @@ pub const MAX_ITERATIONS: usize = 10;
 const SOURCE_UNPROVEN_CODE: &str = "source_unproven";
 const SOURCE_UNPROVEN_MESSAGE: &str =
     "无法证明本线程已落盘消息的来源，已停止发送。请新建会话。不要自动复制旧 recall 或待执行工具。";
+/// Refuses to run a tool for a run whose pinned skill has lost its label.
+struct SkillLabelGuard {
+    store: Store,
+    run_id: String,
+}
+
+#[async_trait::async_trait]
+impl agent24_tools::ExecutionGuard for SkillLabelGuard {
+    async fn permit(&self) -> Result<(), String> {
+        if skill_inject::label_missing(&self.store, &self.run_id).await {
+            Err("skill source label unavailable".to_owned())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+const SKILL_LABEL_MESSAGE: &str =
+    "这次运行钉了技能，但读不到它的来源标签，已停止。缺标签不会按普通来源处理。";
 const PROVIDER_ROLE_MESSAGE: &str = "模型返回的角色不是 assistant，已停止。不会执行这一轮的工具。";
 
 fn origin_allows_send(lookup: &MessageOriginLookup) -> bool {
@@ -367,6 +388,9 @@ pub enum AgentError {
     WorkspaceServiceUnavailable,
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    /// A run that names a skill was refused before any row was written.
+    #[error(transparent)]
+    Skill(#[from] SkillAdmissionError),
 }
 
 fn zero_usage() -> Usage {
@@ -654,6 +678,10 @@ enum PersistOutcome {
     Stored,
     InboundAlreadyLinked,
     InboundNotStarting,
+    /// The skill has no pointer row any more. No run was written.
+    SkillNotActive,
+    /// The pointer moved between admission and insert. No run was written.
+    SkillMoved,
 }
 
 enum ParkedCallStop {
@@ -850,7 +878,16 @@ impl RunManager {
                 authority,
             )
         };
+        // Asked again right before any tool runs, after an approval wait too.
+        let context = context.with_execution_guard(Arc::new(SkillLabelGuard {
+            store: self.store.clone(),
+            run_id: run.id.clone(),
+        }));
         let context = match self.store.run_policy_snapshot(&run.id).await {
+            // A pinned skill without its label is never read as Ordinary.
+            Ok(_) if self.skill_label_missing(&run.id).await => {
+                context.with_egress_policy_unavailable()
+            }
             Ok(snapshot) if snapshot.sources.is_empty() => context.with_egress_policy_unavailable(),
             Ok(snapshot) => {
                 let resources = snapshot
@@ -1507,7 +1544,7 @@ impl RunManager {
         schedule_id: Option<String>,
     ) -> Result<Run, AgentError> {
         self.ready_run(
-            self.start_run_inner(create, schedule_id, |_| {}, None)
+            self.start_run_inner(create, schedule_id, |_| {}, None, None)
                 .await?,
         )
     }
@@ -1520,8 +1557,20 @@ impl RunManager {
         create: RunCreate,
         before_execute: impl FnOnce(&Run),
     ) -> Result<Run, AgentError> {
+        self.start_run_then_with(create, before_execute, None).await
+    }
+
+    /// As [`start_run_then`], with the lookup used to resolve the providers of
+    /// the capabilities a skill requires (`create.skill_id`). Without one, a
+    /// skill that requires any capability is refused as missing it.
+    pub async fn start_run_then_with(
+        self: &Arc<Self>,
+        create: RunCreate,
+        before_execute: impl FnOnce(&Run),
+        providers: Option<&dyn SkillProviderSource>,
+    ) -> Result<Run, AgentError> {
         self.ready_run(
-            self.start_run_inner(create, None, before_execute, None)
+            self.start_run_inner(create, None, before_execute, None, providers)
                 .await?,
         )
     }
@@ -1545,7 +1594,7 @@ impl RunManager {
             )));
         }
         match self
-            .start_run_inner(create, None, |_| {}, Some(origin))
+            .start_run_inner(create, None, |_| {}, Some(origin), None)
             .await?
         {
             RunStart::Ready(run) => Ok(InboundRunStart::Started(run)),
@@ -1572,7 +1621,41 @@ impl RunManager {
         schedule_id: Option<String>,
         before_execute: impl FnOnce(&Run),
         inbound: Option<InboundOrigin>,
+        providers: Option<&dyn SkillProviderSource>,
     ) -> Result<RunStart, AgentError> {
+        // Skill admission comes first and writes nothing. Inbound runs,
+        // self-wake runs and workspace-bound runs cannot carry a skill.
+        let skill_pin = match create.skill_id.as_deref() {
+            None => None,
+            Some(skill_id) => {
+                let reason = if inbound.is_some() {
+                    Some("inbound runs cannot carry skill_id")
+                } else if schedule_id.is_some() {
+                    Some("scheduled runs cannot carry skill_id")
+                } else if create.workspace_id.is_some() {
+                    Some("workspace-bound runs cannot carry skill_id in v1")
+                } else if let Some(session_id) = create.session_id.as_deref()
+                    && self
+                        .store
+                        .get_session(session_id)
+                        .await?
+                        .is_some_and(|session| session.workspace_id.is_some())
+                {
+                    Some("workspace-bound sessions cannot carry skill_id in v1")
+                } else {
+                    None
+                };
+                if let Some(reason) = reason {
+                    return Err(SkillAdmissionError::NotAdmitted { reason }.into());
+                }
+                let admitted = skill_inject::admit(&self.store, providers, skill_id).await?;
+                Some(agent24_store::SkillPinRequest {
+                    skill_id: skill_id.to_owned(),
+                    expected_body_revision_id: admitted.body_revision_id,
+                    providers_json: admitted.providers_json,
+                })
+            }
+        };
         // Inbound creates the session in the same transaction as the run.
         // Checking first would always miss it.
         if inbound.is_none()
@@ -1614,7 +1697,10 @@ impl RunManager {
             .lock()
             .await
             .insert(run.id.clone(), token.clone());
-        let persisted = match self.persist_created_run(&run, inbound.as_ref()).await {
+        let persisted = match self
+            .persist_created_run(&run, inbound.as_ref(), skill_pin.as_ref())
+            .await
+        {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.cancels.lock().await.remove(&run.id);
@@ -1630,6 +1716,14 @@ impl RunManager {
             PersistOutcome::InboundNotStarting => {
                 self.cancels.lock().await.remove(&run.id);
                 return Ok(RunStart::InboundNotStarting);
+            }
+            PersistOutcome::SkillNotActive => {
+                self.cancels.lock().await.remove(&run.id);
+                return Err(SkillAdmissionError::NotActive.into());
+            }
+            PersistOutcome::SkillMoved => {
+                self.cancels.lock().await.remove(&run.id);
+                return Err(AgentError::Store(StoreError::SkillPointerConflict));
             }
         }
         if let Some(origin) = &inbound {
@@ -1690,7 +1784,19 @@ impl RunManager {
         &self,
         run: &Run,
         inbound: Option<&InboundOrigin>,
+        skill_pin: Option<&agent24_store::SkillPinRequest>,
     ) -> Result<PersistOutcome, AgentError> {
+        if let Some(pin) = skill_pin {
+            // The pin is derived from the pointer in the same transaction as
+            // the run row. Admission already refused inbound.
+            return Ok(
+                match self.store.insert_run_with_skill_pin(run, pin).await? {
+                    agent24_store::SkillPinOutcome::Pinned(_) => PersistOutcome::Stored,
+                    agent24_store::SkillPinOutcome::NotActive => PersistOutcome::SkillNotActive,
+                    agent24_store::SkillPinOutcome::PointerMoved => PersistOutcome::SkillMoved,
+                },
+            );
+        }
         let Some(origin) = inbound else {
             self.persist_new_run(run).await?;
             return Ok(PersistOutcome::Stored);
@@ -2104,6 +2210,22 @@ impl RunManager {
                 return;
             }
             self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                .await;
+            return;
+        }
+        // A pinned skill must still have its label. The pointer is not read
+        // and nothing is reclassified: a missing label ends the run.
+        if self.skill_label_missing(&run_id).await {
+            if let Err(err) = self
+                .store
+                .transition_run(&run_id, RunStatus::Running, RunPatch::default())
+                .await
+            {
+                tracing::error!("run {run_id}: skill label refusal could not enter running: {err}");
+                self.release_inbound_after_abandoned_start(&run_id).await;
+                return;
+            }
+            self.finish_failed(&run_id, "source_policy_unavailable", SKILL_LABEL_MESSAGE)
                 .await;
             return;
         }
@@ -2533,6 +2655,45 @@ impl RunManager {
             rows.push(SnapshotRunMessage::PauseNotice(pending_of(&notice)));
             snapshot.push(notice);
         }
+        // SL-5 (plan §4.7): the skill segment, from the revision pinned when
+        // the run was admitted, after the pause notice and before the session
+        // history. A run without a pin row used no skill. A pin that cannot be
+        // read or does not match its revision ends the run before the model.
+        let mut skill_tag = None;
+        match self.store.get_run_skill_pin(&run_id).await {
+            Ok(None) => {}
+            Ok(Some(pinned)) => match skill_inject::render(&pinned) {
+                Ok(injection) => {
+                    let message = Msg::system(injection.segment.clone());
+                    let seq = snapshot.len() as i64;
+                    rows.push(originated(&message, MessageOrigin::SkillText));
+                    snapshot.push(message);
+                    // The label is written with the snapshot, in one
+                    // transaction, and before the user-input label below.
+                    let tag = agent24_store::SourceRef::skill_text(
+                        &injection.skill_id,
+                        injection.origin,
+                        &injection.content_digest,
+                        now_iso8601(),
+                    );
+                    skill_tag = Some((seq, tag));
+                }
+                Err(detail) => {
+                    self.finish_failed(&run_id, "skill_pin_invalid", &detail)
+                        .await;
+                    return;
+                }
+            },
+            Err(err) => {
+                self.finish_failed(
+                    &run_id,
+                    "skill_pin_invalid",
+                    &format!("failed to read the run's skill pin: {err}"),
+                )
+                .await;
+                return;
+            }
+        }
         // M3 growth control: the seq range `prior_context` will occupy in
         // THIS run's own `run_messages`, so it can be reclaimed once the run
         // is confirmed terminal (see the cleanup call after `run_loop`
@@ -2556,17 +2717,28 @@ impl RunManager {
         // its index in `snapshot`/`rows` — the user message is pushed
         // last, so its seq is `snapshot.len() - 1`.
         let user_msg_seq = (snapshot.len() - 1) as i64;
+        let skill_tags: Vec<(i64, &agent24_store::SourceRef)> = skill_tag
+            .as_ref()
+            .map(|(seq, tag)| (*seq, tag))
+            .into_iter()
+            .collect();
         if let Err(err) = self
             .store
-            .append_snapshot_run_messages(&run_id, &rows, &now_iso8601())
+            .append_snapshot_run_messages_tagged(&run_id, &rows, &skill_tags, &now_iso8601())
             .await
         {
-            self.finish_failed(
-                &run_id,
-                "memory_snapshot_persist_failed",
-                &format!("failed to persist run input snapshot: {err}"),
-            )
-            .await;
+            // With a skill, the snapshot and the skill label are one write:
+            // a failure is a label failure as far as the run is concerned.
+            let (code, what) = if skill_tag.is_some() {
+                (
+                    "source_policy_unavailable",
+                    "run input snapshot and skill source policy",
+                )
+            } else {
+                ("memory_snapshot_persist_failed", "run input snapshot")
+            };
+            self.finish_failed(&run_id, code, &format!("failed to persist {what}: {err}"))
+                .await;
             return;
         }
         // K1-6b.1 (ADR-K1-02 §6, §2.1): tag the run's user input at entry.
@@ -2933,6 +3105,14 @@ impl RunManager {
         }
     }
 
+    /// `true` when the run has a skill pin and no usable `SkillText` label for
+    /// it, or when either cannot be read. A run without a pin has nothing to
+    /// check. Only stored rows are read: not the pointer, and nothing is
+    /// reclassified. An imported skill's label must not be `Ordinary`.
+    async fn skill_label_missing(&self, run_id: &str) -> bool {
+        skill_inject::label_missing(&self.store, run_id).await
+    }
+
     /// Stored seq order, not message text. A read error is the same refusal
     /// as a missing or unreadable row: the provider is not called.
     async fn persisted_origins_allow_send(&self, run_id: &str) -> bool {
@@ -2979,6 +3159,11 @@ impl RunManager {
         for _ in 0..MAX_ITERATIONS {
             if !self.persisted_origins_allow_send(&run_id).await {
                 self.finish_failed(&run_id, SOURCE_UNPROVEN_CODE, SOURCE_UNPROVEN_MESSAGE)
+                    .await;
+                return;
+            }
+            if self.skill_label_missing(&run_id).await {
+                self.finish_failed(&run_id, "source_policy_unavailable", SKILL_LABEL_MESSAGE)
                     .await;
                 return;
             }
@@ -3792,6 +3977,9 @@ pub(crate) mod tests {
     mod send_trim_tests {
         include!("send_trim_tests.rs");
     }
+    mod skill_inject_tests {
+        include!("skill_inject_tests.rs");
+    }
 
     use super::*;
     use agent24_memory::{KvStore, session::CompactionPolicy};
@@ -4475,6 +4663,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -4498,6 +4687,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -4515,6 +4705,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap_err();
@@ -4556,6 +4747,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -5129,6 +5321,7 @@ pub(crate) mod tests {
                     model_override: None,
                     mode: RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await,
             Err(AgentError::Workspace(WorkspaceStoreError::Database))
@@ -5246,6 +5439,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -5520,6 +5714,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -5875,6 +6070,7 @@ pub(crate) mod tests {
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 },
                 Some(schedule_id.to_owned()),
             )
@@ -6328,6 +6524,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -6350,6 +6547,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -6408,6 +6606,7 @@ pub(crate) mod tests {
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await
                 .unwrap();
@@ -6559,6 +6758,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -6635,6 +6835,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -6652,6 +6853,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -6748,6 +6950,7 @@ pub(crate) mod tests {
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 },
                 InboundOrigin {
                     event_id: event_id.to_owned(),
@@ -6858,6 +7061,7 @@ pub(crate) mod tests {
                     model_override: None,
                     mode: agent24_protocol::RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 },
                 InboundOrigin {
                     event_id: event_id.to_owned(),
@@ -7156,6 +7360,7 @@ pub(crate) mod tests {
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         }
     }
 
@@ -7482,6 +7687,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();
@@ -7697,6 +7903,7 @@ pub(crate) mod tests {
             model_override: None,
             mode: agent24_protocol::RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         }
     }
 
@@ -7766,6 +7973,7 @@ pub(crate) mod tests {
                 model_override: None,
                 mode: agent24_protocol::RunMode::Normal,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap_err();
@@ -8392,6 +8600,7 @@ mod approval_tests {
             model_override: None,
             mode: RunMode::Plan,
             knowledge_binding_id: None,
+            skill_id: None,
         }
     }
 

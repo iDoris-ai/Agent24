@@ -110,7 +110,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | worker | L3 | protocol | — |
 | comm | L3（例外：自带 REST 面） | （无） | components |
 | documents-client | L3（客户端库） | （无） | — |
-| agent | L4 | core, domain, memory, models, protocol, scheduler, store, tools, workspace | policy |
+| agent | L4 | core, domain, memory, models, protocol, scheduler, skill, store, tools, workspace | policy |
 | attach | L4½ | domain, os-proto, protocol | — |
 | os-fd | L4½ | （无） | — |
 | os-packages | L4½ | components, domain, os-proc, os-proto, protocol | — |
@@ -119,7 +119,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 | **agent24d** | L5 | agent, attach, comm, components, core, decide, domain, hw, idoris, knowledge, mcp, memory, models, os-packages, os-proc, os-proto, os-sqlite, policy, protocol, scheduler, skill, store, tools, workspace | os-sdk |
 | documents | L6 | os-sdk | domain, os-proto |
 | sidecar-host | L6 | sidecar-host-protocol | — |
-| cli | L7 | documents-client, hw, mcp, os-packages, os-proc, protocol, store | — |
+| cli | L7 | documents-client, hw, mcp, os-packages, os-proc, protocol, skill, store | — |
 
 共 34 个 crate（`cargo metadata` 的 workspace member 数）。
 <!-- END GENERATED: layer-deps -->
@@ -127,7 +127,7 @@ python3 scripts/gen-layer-deps.py --check   # 与 cargo metadata 不一致时退
 读表时的几点说明（手写，依赖表变了要回来核对）：
 
 - 依赖方向一律向下，正常依赖里没有环，也没有下层依赖上层（R1 §3.2 用 DFS 核过）。dev 依赖里有两条反向，只影响测试：`protocol` → `knowledge`、`store` → `decide`。
-- `skill` 在 L1，正常依赖为空。清单解析、`render_skill_segment`、文本一致性检查放在这里；`agent24d` 已向下引用（导入与用户目录扫描）。`agent` 仍等 SL-5 注入时再引用。
+- `skill` 在 L1，正常依赖为空。清单解析、`render_skill_segment`、文本一致性检查放在这里；`agent24d` 已向下引用（导入与用户目录扫描），`agent24-cli` 导入前用它读清单里的评测路径。`agent` 仍等 SL-5 注入时再引用。
 - `idoris` 依赖 `components`，不是反过来：`ComponentLock` 和通用下载器在 `components`，iDoris 的 `IdorisLock` 是它之上的视图（ADR-038 C1，#1539；原先 11-01 版写成「`components` 借用 `idoris`」，已不成立，`fetch_verified` 在全仓已不存在）。
 - `agent24d` 是内核运行时的组合根，没有 crate 反向依赖它。`comm` 编译进 `agent24d`，且不依赖其它内部 crate。
 - `worker` 依赖 `protocol`，但没有任何 crate 依赖它。`decide` 只被 `agent24d` 的 `GET /api/v1/decide/profile` 消费。

@@ -487,6 +487,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     // Normal.
                     mode: agent24_protocol::RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 };
                 match self
                     .runs
@@ -2698,7 +2699,6 @@ pub(crate) mod tests {
     // those contracts land; the remaining exceptions have separate owners.
     const UNDOCUMENTED_KERNEL_ROUTES: &[&str] = &[
         "/capabilities/creative", // OD-M11 (PAUSED): capability contract is out of scope.
-        "/capabilities/{capability_id}/revoke", // OD-M11 (PAUSED): capability contract is out of scope.
         "/events", // WebSocket protocol is documented by protocol/events.schema.json.
         // KB-HOST-01: the desktop host's private interface (UI-BRIDGE U1.5), not a client contract.
         "/host/knowledge/bindings/{binding_id}",
@@ -7439,6 +7439,7 @@ pub fn build_router_with_modules() {
                 mode: agent24_protocol::RunMode::Normal,
                 workspace_id: None,
                 knowledge_binding_id: None,
+                skill_id: None,
             })
             .await
             .unwrap();

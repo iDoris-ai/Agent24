@@ -29,10 +29,13 @@ pub enum CapabilityRevokeReason {
 }
 
 /// Why a presented credential was refused. Closed; not a message string.
+///
+/// There is no `Audience` arm. A non-component bearer never reaches the
+/// denial writer (that function returns first), and a component bearer
+/// cannot fail the audience check in `component_may_ingest`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CapabilityDenyReason {
-    Audience,
     Component,
     Operation,
     Route,
@@ -54,6 +57,16 @@ pub enum CapabilityTokenAuditEvent {
         capability_id: AuditRef,
         operation: AuditRef,
         ttl_seconds: u64,
+        /// The shell that asked for this token. Not the new bearer.
+        issuer_capability_id: AuditRef,
+    },
+    /// The issue row was committed, then the caller failed the live check,
+    /// so the id in that row was never inserted.
+    IssueAborted {
+        component_id: AuditRef,
+        capability_id: AuditRef,
+        operation: AuditRef,
+        issuer_capability_id: AuditRef,
     },
     Revoked {
         component_id: AuditRef,
@@ -88,6 +101,19 @@ impl CapabilityTokenAuditEvent {
                     ));
                 }
             }
+            Self::IssueAborted {
+                component_id,
+                operation,
+                ..
+            } => {
+                if component_id.as_str() != DEV_BRIDGE_COMPONENT_ID
+                    || operation.as_str() != DEV_BRIDGE_OPERATION
+                {
+                    return Err(invalid(
+                        "capability issue abort audit must be the dev-bridge profile",
+                    ));
+                }
+            }
             Self::Revoked { component_id, .. } => {
                 if component_id.as_str() != DEV_BRIDGE_COMPONENT_ID {
                     return Err(invalid(
@@ -108,6 +134,7 @@ impl CapabilityTokenAuditEvent {
     pub fn action(&self) -> &'static str {
         match self {
             Self::Issued { .. } => "capability.token.issued",
+            Self::IssueAborted { .. } => "capability.token.issue_aborted",
             Self::Revoked { .. } => "capability.token.revoked",
             Self::Denied { .. } => "capability.token.denied",
         }
@@ -154,6 +181,16 @@ mod tests {
             capability_id: AuditRef::new("aabbccddeeff00112233445566778899").unwrap(),
             operation: AuditRef::new(DEV_BRIDGE_OPERATION).unwrap(),
             ttl_seconds: COMPONENT_RUNTIME_TTL_SECONDS,
+            issuer_capability_id: AuditRef::new("11223344556677889900aabbccddeeff").unwrap(),
+        }
+    }
+
+    fn aborted() -> CapabilityTokenAuditEvent {
+        CapabilityTokenAuditEvent::IssueAborted {
+            component_id: AuditRef::new(DEV_BRIDGE_COMPONENT_ID).unwrap(),
+            capability_id: AuditRef::new("aabbccddeeff00112233445566778899").unwrap(),
+            operation: AuditRef::new(DEV_BRIDGE_OPERATION).unwrap(),
+            issuer_capability_id: AuditRef::new("11223344556677889900aabbccddeeff").unwrap(),
         }
     }
 
@@ -211,6 +248,34 @@ mod tests {
             capability_id: Some(AuditRef::new("aabbccddeeff00112233445566778899").unwrap()),
             operation: AuditRef::new(DEV_BRIDGE_OPERATION).unwrap(),
         }
+    }
+
+    /// `issue_aborted` names the same profile as `issued`. A foreign component
+    /// is not written. Deleting the component check in `validate` turns this red.
+    #[tokio::test]
+    async fn issue_aborted_round_trips_and_rejects_a_foreign_component() {
+        let store = Store::open_memory().await.unwrap();
+        let event = aborted();
+        let entry = store
+            .append_capability_token_audit(&ts(), &event)
+            .await
+            .unwrap();
+        assert_eq!(entry.action, "capability.token.issue_aborted");
+        let parsed: CapabilityTokenAuditEvent =
+            serde_json::from_value(entry.detail.clone()).unwrap();
+        assert_eq!(parsed, event);
+
+        let mut event = aborted();
+        if let CapabilityTokenAuditEvent::IssueAborted { component_id, .. } = &mut event {
+            *component_id = AuditRef::new("other-bridge").unwrap();
+        }
+        assert!(
+            store
+                .append_capability_token_audit(&ts(), &event)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.list_audit().await.unwrap().len(), 1);
     }
 
     /// Revoked rows name `wechat-bridge`. A foreign component is not written.

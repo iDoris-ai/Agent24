@@ -1054,6 +1054,55 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items
 }
 
+// ---- providers for a skill run (SL-5) -------------------------------------------------
+
+/// The components that provide a capability right now, for admitting a run that names a
+/// skill. One component view per admission; a component counts when it is `ready` and its own
+/// report has not marked that capability unavailable.
+pub(crate) struct ComponentProviders<'a> {
+    state: &'a AppState,
+    items: tokio::sync::OnceCell<Vec<Item>>,
+}
+
+impl<'a> ComponentProviders<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self {
+            state,
+            items: tokio::sync::OnceCell::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl agent24_agent::SkillProviderSource for ComponentProviders<'_> {
+    async fn providers(&self, capability: &str) -> Vec<agent24_agent::SkillProvider> {
+        let items = self
+            .items
+            .get_or_init(|| collect(self.state, Instant::now()))
+            .await;
+        items
+            .iter()
+            .filter(|item| item.state == ComponentState::Ready)
+            .filter(|item| {
+                item.provides
+                    .iter()
+                    .any(|p| p.id == capability && p.availability.is_none())
+            })
+            .map(|item| agent24_agent::SkillProvider {
+                component: item.id.clone(),
+                version: item.version.clone(),
+            })
+            .collect()
+    }
+
+    fn registered_provider(&self, capability: &str) -> Option<String> {
+        crate::component_manifest::REGISTERED_PROVIDERS
+            .iter()
+            .find(|(cap, _)| *cap == capability)
+            .map(|(_, provider)| (*provider).to_owned())
+    }
+}
+
 // ---- GET -------------------------------------------------------------------------------
 
 /// Host sees everything. In capability mode anyone else, and a request that somehow reached

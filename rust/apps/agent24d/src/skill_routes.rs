@@ -11,11 +11,15 @@
 //! counts bytes actually read. `evals/` is opened from the skill directory
 //! handle. Caps: 64 skill directories, 8 directories and depth 2 inside one
 //! skill, 32 regular files, 256 KiB. Every root dirent shares one read budget
-//! of 72. One skill directory stops at 40 entries. Validation, the manifest
+//! of 72, including a name that is not utf-8 or contains a slash or backslash.
+//! That name is one error and the scan continues. One skill directory stops
+//! at 40 entries. Validation, the manifest
 //! digest, and the stored eval bytes all come from that one snapshot.
 //!
-//! Neither path moves the skill pointer. Activation is SL-4. Provider status
-//! is SL-5 and is omitted here.
+//! Neither path moves the skill pointer. Activation is SL-4. A body revision
+//! on the detail carries the manifest `requires` list when the stored bytes
+//! still parse. An activation carries `accepted_count` when its binding's
+//! accepted list parses. Who provides a capability stays on `GET /components`.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
@@ -132,6 +136,10 @@ struct RevisionView {
     kind: String,
     content_digest: String,
     created_at: String,
+    /// Capability ids from this body revision. Absent on evals rows, and when
+    /// the stored body no longer parses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +152,10 @@ struct ActivationView {
     origin_from: Option<String>,
     origin_to: String,
     created_at: String,
+    /// How many failing cases this activation accepted. Absent when
+    /// `accepted_json` is not a JSON array. The case text stays off this view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_count: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,10 +482,12 @@ async fn store_pair(
         .await
         .map_err(Fail::from_store)?;
     let inserted = is_inserted(&body_row) || is_inserted(&evals_row);
+    // A pointer whose two sides have different origins is a corrupt read:
+    // 500 internal, not the write-path `skill_origin_mismatch`.
     let pointer = store
         .get_skill_pointer(&manifest.name)
         .await
-        .map_err(Fail::from_store)?;
+        .map_err(|_| Fail::internal("read pointer"))?;
     let generation = pointer.as_ref().map(|row| row.generation).unwrap_or(0);
     Ok(StoredSkill {
         response: InstallResponse {
@@ -584,6 +598,7 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         .map_err(|_| Fail::internal("read history"))?
         .into_iter()
         .map(|row| ActivationView {
+            accepted_count: accepted_count(&row.accepted_json),
             activation_id: row.activation_id,
             seq: row.seq,
             body_revision_id: row.body_revision_id,
@@ -594,17 +609,18 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
             created_at: row.created_at,
         })
         .collect();
-    let revisions = mine
-        .iter()
-        .map(|row| RevisionView {
+    let mut revisions = Vec::with_capacity(mine.len());
+    for row in &mine {
+        revisions.push(RevisionView {
             revision_id: row.revision_id.clone(),
             origin: row.origin.as_str().to_owned(),
             semver: row.semver.clone(),
             kind: row.kind.as_str().to_owned(),
             content_digest: row.content_digest.clone(),
             created_at: row.created_at.clone(),
-        })
-        .collect();
+            requires: body_requires(store, row).await?,
+        });
+    }
     Ok(SkillDetail {
         skill_id: skill_id.to_owned(),
         pointer: pointer.map(pointer_view),
@@ -613,6 +629,37 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         activations,
         text_consistency,
     })
+}
+
+fn accepted_count(accepted_json: &str) -> Option<usize> {
+    serde_json::from_str::<Vec<serde_json::Value>>(accepted_json)
+        .ok()
+        .map(|items| items.len())
+}
+
+/// `requires` from a body revision. Evals rows and a body that no longer
+/// parses yield `None`, so the field is omitted rather than invented.
+async fn body_requires(
+    store: &Store,
+    row: &agent24_store::SkillRevisionMeta,
+) -> Result<Option<Vec<String>>, Fail> {
+    if row.kind != SkillRevisionKind::Body {
+        return Ok(None);
+    }
+    let Some(full) = store
+        .get_skill_revision(&row.revision_id)
+        .await
+        .map_err(|_| Fail::internal("read body"))?
+    else {
+        return Ok(None);
+    };
+    let Ok(text) = String::from_utf8(full.content) else {
+        return Ok(None);
+    };
+    let Ok(manifest) = parse_for_origin(full.origin, &text) else {
+        return Ok(None);
+    };
+    Ok(Some(manifest.requires))
 }
 
 fn consistency_view(
@@ -1385,7 +1432,7 @@ async fn read_body(body: Body) -> Result<Vec<u8>, Fail> {
         Err(_) => Err(Fail::Http(
             StatusCode::PAYLOAD_TOO_LARGE,
             "skill_body_too_large",
-            "正文超过 32 KiB".to_owned(),
+            "请求体超过 1 MiB".to_owned(),
         )),
     }
 }
@@ -1496,28 +1543,46 @@ enum Walk {
     Stop,
 }
 
+/// One dirent. [`ListedName::Bad`] is not opened. The caller records it or
+/// stops that skill. It does not abort the rest of the root listing.
+#[cfg(unix)]
+enum ListedName {
+    Name(String),
+    Bad { path: String, message: String },
+}
+
 /// Read `readdir` one entry at a time. `visit` returning [`Walk::Stop`] ends
 /// the listing. Names are not collected and then sorted.
 #[cfg(unix)]
 fn for_each_entry(
     dir: &OwnedFd,
-    mut visit: impl FnMut(&str) -> Result<Walk, String>,
+    mut visit: impl FnMut(ListedName) -> Result<Walk, String>,
 ) -> Result<(), String> {
     let listed = rustix::fs::Dir::read_from(dir).map_err(io_message)?;
     for entry in listed {
         let entry = entry.map_err(io_message)?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .map_err(|_| "skill directory entry is not utf-8".to_owned())?
-            .to_owned();
-        if name.is_empty() || name == "." || name == ".." {
-            continue;
-        }
-        if name.contains('/') || name.contains('\\') {
-            return Err(format!("skill directory entry escapes: {name}"));
-        }
-        if visit(&name)? == Walk::Stop {
+        let listed_name = match entry.file_name().to_str() {
+            Ok(name) => {
+                let name = name.to_owned();
+                if name.is_empty() || name == "." || name == ".." {
+                    continue;
+                }
+                if name.contains('/') || name.contains('\\') {
+                    let message = format!("skill directory entry escapes: {name}");
+                    ListedName::Bad {
+                        path: name,
+                        message,
+                    }
+                } else {
+                    ListedName::Name(name)
+                }
+            }
+            Err(_) => ListedName::Bad {
+                path: ".".to_owned(),
+                message: "skill directory entry is not utf-8".to_owned(),
+            },
+        };
+        if visit(listed_name)? == Walk::Stop {
             break;
         }
     }
@@ -1565,13 +1630,13 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
         let mut skill_dirs = 0usize;
         let mut read = 0usize;
         let mut capped = false;
-        if let Err(message) = for_each_entry(&root_fd, |name| {
+        if let Err(message) = for_each_entry(&root_fd, |listed| {
             if capped {
                 return Ok(Walk::Stop);
             }
-            // Directories, files, symlinks, missing names, and open errors
-            // share this counter. Counting only directories leaves the rest
-            // unbounded.
+            // Directories, files, symlinks, missing names, open errors, and
+            // rejected names share this counter. Counting only directories
+            // leaves the rest unbounded.
             read += 1;
             if read > ROOT_READ_BUDGET {
                 capped = true;
@@ -1582,7 +1647,14 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
                 ));
                 return Ok(Walk::Stop);
             }
-            match open_directory(&root_fd, name) {
+            let name = match listed {
+                ListedName::Bad { path, message } => {
+                    prepared.push(failed(path, "skill_manifest_invalid", &message));
+                    return Ok(Walk::Next);
+                }
+                ListedName::Name(name) => name,
+            };
+            match open_directory(&root_fd, name.as_str()) {
                 OpenDir::Dir(fd) => {
                     skill_dirs += 1;
                     if skill_dirs > MAX_SKILL_DIRS {
@@ -1594,7 +1666,7 @@ fn prepare_root(root: &Path) -> Vec<Prepared> {
                         ));
                         return Ok(Walk::Stop);
                     }
-                    prepared.push(prepare_skill(name, fd));
+                    prepared.push(prepare_skill(&name, fd));
                 }
                 OpenDir::NotDirectory => {}
                 OpenDir::Symlink => {
@@ -1667,7 +1739,11 @@ fn walk_skill(
         return Err("skill directory exceeds 8 directories".to_owned());
     }
     let mut entries = 0usize;
-    for_each_entry(dir, |name| {
+    for_each_entry(dir, |listed| {
+        let name = match listed {
+            ListedName::Bad { message, .. } => return Err(message),
+            ListedName::Name(name) => name,
+        };
         entries += 1;
         if entries > MAX_SKILL_DIR_ENTRIES {
             return Err(format!("entries exceed {MAX_SKILL_DIR_ENTRIES}"));
@@ -1677,12 +1753,14 @@ fn walk_skill(
         } else {
             format!("{rel_dir}/{name}")
         };
-        match open_directory(dir, name) {
+        match open_directory(dir, name.as_str()) {
             OpenDir::Dir(child) => {
                 walk_skill(&child, &rel, depth + 1, quota, ingested, skipped)?;
             }
             OpenDir::Symlink => return Err(format!("symlink rejected: {rel}")),
-            OpenDir::NotDirectory => read_regular(dir, name, &rel, quota, ingested, skipped)?,
+            OpenDir::NotDirectory => {
+                read_regular(dir, name.as_str(), &rel, quota, ingested, skipped)?
+            }
             OpenDir::Missing => return Err(format!("skill directory entry is missing: {rel}")),
             OpenDir::Error(message) => return Err(message),
         }
@@ -1933,6 +2011,43 @@ mod tests {
         assert!(detail["pointer"].is_null());
         assert!(detail["text_consistency"].is_null(), "{detail}");
         assert!(detail.get("providers").is_none());
+        let body_rev = detail["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "body")
+            .unwrap();
+        assert_eq!(body_rev["requires"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn detail_lists_the_body_requires() {
+        let state = crate::server::tests::state().await;
+        let markdown = "---\nname: weekly-report\ndescription: 周报\nrequires: [documents, model-gateway]\n---\nhello\n";
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": markdown }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, detail) = call(&state, "GET", "/api/v1/skills/weekly-report", None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let body_rev = detail["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "body")
+            .unwrap();
+        assert_eq!(body_rev["requires"], json!(["documents", "model-gateway"]));
+        let evals = detail["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "evals")
+            .unwrap();
+        assert!(evals.get("requires").is_none());
     }
 
     #[tokio::test]
@@ -2044,6 +2159,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_over_one_mib_says_the_body_exceeds_one_mib() {
+        let state = crate::server::tests::state().await;
+        let markdown = format!(
+            "---\nname: weekly-report\ndescription: 周报\n---\n{}",
+            "x".repeat(REQUEST_MAX_BYTES)
+        );
+        let body = json!({ "markdown": markdown }).to_string();
+        assert!(body.len() > REQUEST_MAX_BYTES);
+        let (status, value) = call(&state, "POST", "/api/v1/skills", Some(&body)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
+        assert_eq!(value["error"]["code"], "skill_body_too_large");
+        assert_eq!(value["error"]["message"], "请求体超过 1 MiB");
+        let (status, value) = call(&state, "POST", "/api/v1/skills/scans", Some(&body)).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{value}");
+        assert_eq!(value["error"]["message"], "请求体超过 1 MiB");
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn import_does_not_become_a_user_skill_and_a_scan_does_not_write() {
         let state = crate::server::tests::state().await;
         let (status, _) = call(
@@ -2131,16 +2265,96 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let scanned =
-            tokio::time::timeout(Duration::from_secs(2), scan_root(&state.store, &skills))
-                .await
-                .expect("scan opened a fifo");
+        // `recv_timeout` fails the test when `O_NONBLOCK` is missing. A writer
+        // is opened only after that timeout, so the blocked open can finish
+        // and the process can exit.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let store = state.store.clone();
+        let skills_for_scan = skills.clone();
+        let handle = tokio::runtime::Handle::current();
+        let worker = std::thread::spawn(move || {
+            let report = handle.block_on(scan_root(&store, &skills_for_scan));
+            let _ = tx.send(report);
+        });
+        let scanned = match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(report) => {
+                worker.join().unwrap();
+                report
+            }
+            Err(_) => {
+                let _ = std::fs::OpenOptions::new().write(true).open(&fifo);
+                let _ = worker.join();
+                panic!("scan blocked on a fifo");
+            }
+        };
         assert!(
             scanned
                 .errors
                 .iter()
                 .any(|err| err.message.contains("not a regular file")),
             "{scanned:?}"
+        );
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_scan_records_one_error_for_a_bad_root_name_and_keeps_the_skill() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skills = root.path().join("skills");
+        let good = skills.join("weekly-report");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(good.join("SKILL.md"), user_md("[]", "hello\n")).unwrap();
+        std::fs::write(skills.join("notes\\old.txt"), b"nope").unwrap();
+        let report = scan_root(&state.store, &skills).await;
+        assert_eq!(report.skills.len(), 1, "{report:?}");
+        assert_eq!(report.skills[0].skill_id, "weekly-report");
+        assert_eq!(report.errors.len(), 1, "{report:?}");
+        assert!(report.errors[0].message.contains("escapes"), "{report:?}");
+        assert_eq!(state.store.list_skill_revisions().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn user_scan_rejects_when_read_bytes_sum_past_the_cap() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("skills").join("weekly-report");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), user_md("[]", "hello\n")).unwrap();
+        let chunk = vec![b'a'; 200 * 1024];
+        std::fs::write(skill.join("pad-a.bin"), &chunk).unwrap();
+        std::fs::write(skill.join("pad-b.bin"), &chunk).unwrap();
+        let report = scan_root(&state.store, &root.path().join("skills")).await;
+        assert!(report.skills.is_empty(), "{report:?}");
+        assert!(
+            report.errors.iter().any(|err| err.message.contains("256")),
+            "{report:?}"
+        );
+        assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_scan_rejects_a_sparse_file_over_the_cap_without_reading_it() {
+        let state = crate::server::tests::state().await;
+        let root = tempfile::tempdir().unwrap();
+        let skill = root.path().join("skills").join("weekly-report");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), user_md("[]", "hello\n")).unwrap();
+        let pad = std::fs::File::create(skill.join("pad.bin")).unwrap();
+        pad.set_len(4 * 1024 * 1024 * 1024).unwrap();
+        drop(pad);
+        let started = std::time::Instant::now();
+        let report = tokio::time::timeout(
+            Duration::from_secs(2),
+            scan_root(&state.store, &root.path().join("skills")),
+        )
+        .await
+        .expect("scan read a sparse file past the cap");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(report.skills.is_empty(), "{report:?}");
+        assert!(
+            report.errors.iter().any(|err| err.message.contains("256")),
+            "{report:?}"
         );
         assert!(state.store.list_skill_revisions().await.unwrap().is_empty());
     }

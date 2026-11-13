@@ -11,6 +11,7 @@ import {
 import { useT } from '../i18n'
 import { capabilitiesMessages } from './Capabilities.i18n'
 import { capabilitiesMessages as catalogMessages } from '../capabilities/capabilities.i18n'
+import SkillBar from './skills/SkillBar'
 
 /** Row that shows the pending-approval count. Matches the capability id. */
 
@@ -175,6 +176,7 @@ export default function CapabilitiesPage({ statusFor, grantsFor, onOpenSettings 
           )
         })}
       </div>
+      <SkillBar />
     </main>
   )
 }

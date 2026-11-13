@@ -60,7 +60,9 @@ r5 不改任何决策，只做三件事：把 §7（r4）的订正回写进 D2 /
 - **D10（新增）**：OS 包（domain OS 包）纳入同一完整性机制，对应 Q15，实现留给第 1 期。
 - **`docs/capabilities/REGISTRY.md`**：`documents` 行的契约来源改指 `rust/apps/agent24-documents/component.json`。
 
-2026-11-12 核对（`origin/main` `bb03081e8`）在 r5 记录之上补了三件当时还没发生的事，不改上表：S1-4（#1605）已把 iDoris 的 `ContractMismatch` 映射为 `incompatible`（`rust/apps/agent24d/src/component_routes.rs` 的 `from_idoris`）；D10 已由 S1-9 落地，见该条现状；C9 仍未开工。
+2026-11-12 核对（`origin/main` `bb03081e8`）在 r5 记录之上补了两件当时还没发生的事，不改上表：S1-4（#1605）已把 iDoris 的 `ContractMismatch` 映射为 `incompatible`（`rust/apps/agent24d/src/component_routes.rs` 的 `from_idoris`）；D10 已由 S1-9 落地，见该条现状。
+
+2026-11-13：ADR-038-C9 完成（A #1825、B #1830、C #1833、D #1831），见 D7 与 §4 的 C9 行。
 
 ## 1. 背景
 
@@ -287,14 +289,15 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 - 超时后结果算「未知」，处理方式沿用 ADR-K1-01 §2.5：会改变状态的调用不自动重试。
 - **关停时的模型调用**：daemon 关停后，模块和 attach 模块在途的模型调用在 `drain + 2 秒`（本条的取消宽限，`lifecycle::CALL_CANCEL_GRACE`）被取消，早于 D5 的 15 秒停组件宽限。所以进程外包在停止宽限期内**不能**再发起模型调用，这是有意的：宽限期只用来落盘，不用来继续推理；attach 模块不会收到 SIGTERM，更不该被 15 秒拖住。
 
-### D7 授权（**待接线**）
+### D7 授权（**已接线**）
 
-> r5 状态：`requires` 目前只被解析和校验（`lock.rs`、`documents_catalog.rs`），**没有授权路径读取它**，授权仍走 `Grants` 现有逻辑。下面是目标语义，**未排期（C9）**：接线不属于 C1–C8，也不在方案第 0–2 期的分片里，见 §4 末尾的 C9 行。
+> r5 当时：`requires` 只被解析和校验，没有授权路径读取它。2026-11-12 ADR-038-C9 已接线（A #1825、B #1830、C #1833、D #1831）：内核能力经解析器进入三处 `Grants::granting`；`GET /api/v1/components` 展示挂载后的实际授予。开发态微信桥改为组件令牌，不再持有 legacy 全权令牌。第三方同意卡仍不做。
 
-- 组件能调用的宿主接口 = 锁 / 清单里 `requires` 的声明 ∩ 宿主愿意给的（`Grants::granting` 现有逻辑）∩ 用户按 ADR-K1-03 确认的。三者任一缺失即拒绝。令牌由 CORE-2 按组件发放，组件不得持有 legacy 全权 token。
+- 组件能调用的宿主接口 = 锁 / 清单里 `requires` 的声明 ∩ 宿主愿意给的（`Grants::granting` 现有逻辑）∩ 用户按 ADR-K1-03 确认的。三者任一缺失即拒绝。令牌由 CORE-2 按组件发放，组件不得持有 legacy 全权 token。本期只有开发态微信桥拿组件令牌。
 - `provides` **不参与授权**。它只用于能力中心展示和技能依赖解析（D9）。
 - 组件暴露给 agent 的工具，走 ADR-K1-01 的模块工具契约。本 ADR 不重复规定。
 - 安装、升级走现有系统确认框。**首次启用**的同意内容与记录按 ADR-K1-03 §1（逐工具列出可读 / 可改 / 可外发 / 风险）和 §4（第一方、第三方、升级重同意），本 ADR 不另设。只读的状态查询不需要确认。
+- 订正（C9 方案 §2.3，2026-11-12）：**第一方签名、随桌面安装的模块，其内核能力（`requires.kernel` ∩ 宿主上限）以「启用」为同意，不另设确认；宿主只在能力中心与 `GET /api/v1/components` 展示实际授予了哪些。第三方与手动安装的模块不适用本句，仍按 §1、§4 逐项确认。** 本句的 §1、§4 指 ADR-K1-03。它只收窄内核能力，不取消逐工具同意。
 
 ### D8 升级与替换
 
@@ -369,9 +372,9 @@ CLI 绑定额外规定（和 `agent24-comm/src/runner.rs` 现有约定一致）�
 | C6 | Documents：补 D9 清单。**已完成**（#1570，2026-11-03）：清单是模块自带的 `rust/apps/agent24-documents/component.json`，编译进 agent24d（不写入 `domain-os.yml`，那份是握手 manifest）。`/components` 用清单的 provides 与 version；形态按 D5 为常驻。D2 的锁等独立发版再补。**D9 expected-vs-actual 已落地**：`version` 显示 mount report 的运行时版本，清单版本在 host 的 `detail.expected_version`；版本不一致**不改状态**（按需下载的包可能比本体新或旧），只在 `detail` 加 `actual_version` 和 `update_available: true`；manifest 声明了该能力却缺清单里的工具名，为 `incompatible` / `component_contract_mismatch`（`detail` 带 `expected`/`actual`/`missing`），且只覆盖实时状态为 `ready` 或 `degraded` 的读数；清单期望的能力不在 manifest 的非空 `provides` 里，该项标 `availability: unavailable`，manifest 多出的能力忽略。manifest 没声明 `provides`（Documents 现状）不做能力比对 | Agent24 |
 | C7 | 领域 OS、进程内 DomainModule、MCP：补 D9 清单（MCP 自动生成），状态接入 C3；`REGISTRY.md` 建表。**已完成**（#1575，2026-11-03）：登记表见 `docs/capabilities/REGISTRY.md` | Agent24 |
 | C8 | Open Design：桌面经 `POST /api/v1/components/{id}/report` 上报安装与运行状态；打包模式迁到 `SidecarManager`（TS）托管。**已完成**（2026-11-04，#1580 主片，#1584 e2e 跟进；jason 拍板 Q1 = (b)，设计见 [C8-SIDECAR-DESIGN](../tracking/2026-11-04/C8-SIDECAR-DESIGN.md)）。Rust 的 `agent24-sidecar-host` 这次不接：打包模式的进程由 `SidecarManager` 托管（`open-design-sidecar.ts`：launcher / health / POSIX 进程组 tree controller），上报的运行态由 manager 状态派生（`healthy` 映射为 `ready`，`degraded` 照实报）。崩溃后懒重启，自动有界重启另开一片。SIGTERM / SIGINT / SIGHUP 由 Electron 转为 app.quit，经 before-quit / will-quit 共享同一次 22 s 有界 stop，不使用 128+n 退出码（只在 macOS 打包版上实测；应用就绪前或主进程卡死时收到的信号不保证走到退出流程，遗留进程按崩溃处理）。degraded 时再次打开视图会先停止旧实例再启动新实例。运行目录记录 launcher pgid；下次启动时发现上次留下的 launcher 只记日志、不发信号（pid 文件加 ps 快照证明不了信号落地时组号还属于我们）；新实例照常启动并覆盖 pgid 记录，所以应用崩溃或被 SIGKILL 后遗留的 OD 进程在 sidecar-host 接管前只能手工清理。重复退出事件仍等待同一次有界 stop，不会因第二次信号立即退出。另一个已知风险：强杀走 POSIX 进程组，组长退出后，「组非空」探测和 SIGKILL 之间组号可能被复用，没有原子手段消除；普通桌面负载下概率很低，彻底解决要靠生命周期绑定的监督进程（sidecar-host，Linux 可用 pidfd）。SIGKILL / 崩溃无法执行退出处理；身份无法确认（含 launcher 已退出仅剩子进程）时宁可保留，绝不猜测误杀。checkout 模式仍在 `CreativeServeWeb`（可选的 PR-2）。OD 下载迁进 daemon 不在 v1 | Agent24 |
-| C9 | D7 `requires` 授权接线：令牌按 `requires` ∩ grants ∩ 同意发放，组件不再持有 legacy 全权 token。**未开工**（2026-11-12）。方案见 [C9-REQUIRES-AUTHZ-PLAN](../tracking/2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md)（在写） | Agent24 |
+| C9 | D7 `requires` 授权接线：内核能力经解析器进入三处 `Grants::granting`；`GET /api/v1/components` 展示挂载后的实际授予。开发态微信桥只拿写死的 dev-bridge 档 `ComponentRuntime` 令牌，不是从 `requires` 推出来的，不再持有 legacy 全权 token。第三方同意卡仍不做。**已完成**（ADR-038-C9：A #1825、B #1830、C #1833、D #1831）。方案见 [C9-REQUIRES-AUTHZ-PLAN](../tracking/2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md) | Agent24 |
 
-**C1–C8 全部完成**（r5，2026-11-05；C4–C7 的 PR 号于 2026-11-12 补记：#1572、#1571、#1570、#1575）。没有挂账的迁移片。仍开放的缺口：code-page 比对（§7.11 (a)）、`agent24 idoris gc`（CLI 尚无该子命令，§7.9）、D7 / C9 `requires` 授权（未开工）。iDoris 契约失配已由 S1-4（#1605）映射为 `incompatible`。D10 已由 S1-9 落地。
+**C1–C9 全部完成**（r5，2026-11-05；C4–C7 的 PR 号于 2026-11-12 补记：#1572、#1571、#1570、#1575；ADR-038-C9 为 #1825、#1830、#1833、#1831）。没有挂账的迁移片。仍开放的缺口：code-page 比对（§7.11 (a)）、`agent24 idoris gc`（CLI 尚无该子命令，§7.9）。iDoris 契约失配已由 S1-4（#1605）映射为 `incompatible`。D10 已由 S1-9 落地。D7 已接线，见该条。
 
 C1 最先做：它不改任何外部行为，而且能马上去掉 `fetch_verified` 借用 iDoris 锁的问题。C1b、C2 要和 Hyphae 一起做，排在 relay 上线并接好线之后。
 

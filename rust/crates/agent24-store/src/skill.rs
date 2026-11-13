@@ -82,7 +82,7 @@ impl SkillOrigin {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "user" => Ok(Self::User),
             "imported" => Ok(Self::Imported),
@@ -108,7 +108,7 @@ impl SkillRevisionKind {
         }
     }
 
-    fn parse(value: &str) -> Result<Self> {
+    pub(crate) fn parse(value: &str) -> Result<Self> {
         match value {
             "body" => Ok(Self::Body),
             "evals" => Ok(Self::Evals),
@@ -413,6 +413,11 @@ impl Store {
     /// not checked here; the route asserts the manifest digest.
     /// [`Store::insert_skill_revision`] still requires a byte digest for both.
     ///
+    /// A requested `revision_id` that already names a different row is
+    /// [`StoreError::Conflict`] before either side returns
+    /// [`SkillRevisionInsert::Existing`]. The same id as the adopted row is
+    /// not a conflict.
+    ///
     /// # Errors
     /// Conflict, a kind mismatch, or storage.
     pub async fn install_skill_pair(
@@ -705,8 +710,12 @@ async fn adopt_or_insert(
     if let Some(row) = by_semver {
         let digest: String = row.get("content_digest");
         if digest == rev.content_digest {
+            let stored_id: String = row.get("revision_id");
+            // Before accepting the dedupe hit: the caller's id must not already
+            // name some other revision.
+            ensure_revision_id_free_or_same(tx, &rev.revision_id, Some(&stored_id)).await?;
             return Ok(SkillRevisionInsert::Existing {
-                revision_id: row.get("revision_id"),
+                revision_id: stored_id,
             });
         }
         return Err(StoreError::SkillRevisionConflict);
@@ -722,8 +731,10 @@ async fn adopt_or_insert(
     .fetch_optional(&mut **tx)
     .await?;
     if let Some(row) = by_digest {
+        let stored_id: String = row.get("revision_id");
+        ensure_revision_id_free_or_same(tx, &rev.revision_id, Some(&stored_id)).await?;
         return Ok(SkillRevisionInsert::Existing {
-            revision_id: row.get("revision_id"),
+            revision_id: stored_id,
         });
     }
     insert_pair_row(tx, rev).await
@@ -3660,6 +3671,260 @@ mod tests {
                 .unwrap()
                 .content,
             b"B"
+        );
+    }
+
+    /// v1 known limitation, eval side. Reusing an eval row does not store the
+    /// new semver, so a later different eval at that semver inserts. It does
+    /// not return [`StoreError::SkillRevisionConflict`].
+    #[tokio::test]
+    async fn known_limitation_eval_semver_reuse_inserts_another_eval_row() {
+        let store = Store::open_memory().await.unwrap();
+        let evals_v1 = content_digest_of(b"E1");
+        let evals_v2 = content_digest_of(b"E2");
+        store
+            .install_skill_pair(
+                &pair_row(
+                    "b1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-b1",
+                    b"B1",
+                ),
+                &pair_row(
+                    "e1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals_v1,
+                    b"E1",
+                ),
+            )
+            .await
+            .unwrap();
+        let reused = store
+            .install_skill_pair(
+                &pair_row(
+                    "b2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-b2",
+                    b"B2",
+                ),
+                &pair_row(
+                    "e-reuse",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals_v1,
+                    b"E1",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reused.0,
+            SkillRevisionInsert::Inserted {
+                revision_id: "b2".to_owned()
+            }
+        );
+        assert_eq!(
+            reused.1,
+            SkillRevisionInsert::Existing {
+                revision_id: "e1".to_owned()
+            }
+        );
+        assert!(store.get_skill_revision("e-reuse").await.unwrap().is_none());
+        let inserted = store
+            .install_skill_pair(
+                &pair_row(
+                    "b2-again",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-b2",
+                    b"B2",
+                ),
+                &pair_row(
+                    "e2",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals_v2,
+                    b"E2",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inserted.0,
+            SkillRevisionInsert::Existing {
+                revision_id: "b2".to_owned()
+            }
+        );
+        assert_eq!(
+            inserted.1,
+            SkillRevisionInsert::Inserted {
+                revision_id: "e2".to_owned()
+            }
+        );
+        assert_eq!(revision_count(&store).await, 4);
+        assert_eq!(
+            store
+                .get_skill_revision("e2")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"E2"
+        );
+        assert_eq!(
+            store
+                .get_skill_revision("e1")
+                .await
+                .unwrap()
+                .unwrap()
+                .semver,
+            "1.0.0"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_pair_dedupe_rejects_a_revision_id_owned_by_another_row() {
+        let store = Store::open_memory().await.unwrap();
+        let evals = content_digest_of(b"evals");
+        store
+            .install_skill_pair(
+                &pair_row(
+                    "b1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A",
+                ),
+                &pair_row(
+                    "e1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        let again = store
+            .install_skill_pair(
+                &pair_row(
+                    "b1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A",
+                ),
+                &pair_row(
+                    "e1",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            again.0,
+            SkillRevisionInsert::Existing {
+                revision_id: "b1".to_owned()
+            }
+        );
+        assert_eq!(
+            again.1,
+            SkillRevisionInsert::Existing {
+                revision_id: "e1".to_owned()
+            }
+        );
+        put(
+            &store,
+            &revision(
+                "taken",
+                "other",
+                SkillOrigin::User,
+                "1.0.0",
+                SkillRevisionKind::Body,
+                "other",
+                b"other",
+            ),
+        )
+        .await;
+
+        let err = store
+            .install_skill_pair(
+                &pair_row(
+                    "taken",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A",
+                ),
+                &pair_row(
+                    "e-new",
+                    "notes",
+                    "1.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message.contains("revision_id")),
+            "{err:?}"
+        );
+
+        let err = store
+            .install_skill_pair(
+                &pair_row(
+                    "b-new",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Body,
+                    "digest-a",
+                    b"A-later",
+                ),
+                &pair_row(
+                    "taken",
+                    "notes",
+                    "2.0.0",
+                    SkillRevisionKind::Evals,
+                    &evals,
+                    b"evals",
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Conflict(ref message) if message.contains("revision_id")),
+            "{err:?}"
+        );
+        assert_eq!(revision_count(&store).await, 3);
+        assert!(store.get_skill_revision("e-new").await.unwrap().is_none());
+        assert!(store.get_skill_revision("b-new").await.unwrap().is_none());
+        assert_eq!(
+            store
+                .get_skill_revision("b1")
+                .await
+                .unwrap()
+                .unwrap()
+                .content,
+            b"A"
         );
     }
 
