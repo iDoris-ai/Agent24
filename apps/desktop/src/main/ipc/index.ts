@@ -68,6 +68,10 @@ let rememberKept: (k: { pid: number; port: number }) => void = () => {}
 let keptRemembered: ChildProcess | null = null
 /** Stops what earlier quits left running and recorded (omlx-kept.ts). Set by registerIpcHandlers. */
 let stopKept: () => Promise<void> = () => Promise.resolve()
+/** Its run in this process: a quit enters ensureOwnedOmlxQuit again after the
+ *  latch cleared (app.quit() fires before-quit again), and a record that could
+ *  not be read is left on file; it is looked at once per process. */
+let keptStopRun: Promise<void> | null = null
 
 /** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
  *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
@@ -95,6 +99,7 @@ export function resetOmlxProcessForTests(): void {
   ownedOmlxQuit = null
   omlxPort = null
   keptRemembered = null
+  keptStopRun = null
   omlxStopGraceMs = OMLX_STOP_GRACE_MS
   omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
 }
@@ -194,6 +199,11 @@ function keepOwnedOmlx(): Promise<boolean> {
 /** A quit that stops: what earlier quits left running goes too, inside the
  *  same budget. Never throws, never rejects. */
 function stopKeptOnQuit(): Promise<void> {
+  keptStopRun ??= runKeptStop()
+  return keptStopRun
+}
+
+function runKeptStop(): Promise<void> {
   try {
     return stopKept().catch((e: unknown) => { console.warn('[omlx] failed to stop the oMLX an earlier quit left running', e) })
   } catch (e) {

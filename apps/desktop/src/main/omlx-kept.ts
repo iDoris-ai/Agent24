@@ -63,7 +63,9 @@ export function keptOmlxPath(dataDir: string): string {
 function parseKept(value: unknown): KeptOmlx | null {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return null
   const entry = value as { pid?: unknown; port?: unknown; started?: unknown; command?: unknown }
-  if (typeof entry.pid !== 'number' || !Number.isInteger(entry.pid)) return null
+  // pid 0 and 1 and negatives are never an oMLX this app started (kill(0) and
+  // kill(-1) would even reach other processes); as processAlive in backend-manager.ts.
+  if (typeof entry.pid !== 'number' || !Number.isInteger(entry.pid) || entry.pid <= 1) return null
   if (typeof entry.port !== 'number' || !Number.isInteger(entry.port)) return null
   if (typeof entry.started !== 'string' || typeof entry.command !== 'string') return null
   return { pid: entry.pid, port: entry.port, started: entry.started, command: entry.command }
@@ -271,11 +273,15 @@ function psValue(pid: number, column: 'lstart=' | 'command='): ProbeRead<string>
   }
 }
 
-/** lsof's own "nothing matched": exit status 1, not killed, no output. */
-function lsofFoundNothing(err: unknown): boolean {
-  const e = err as { status?: unknown; signal?: unknown; stdout?: unknown }
-  const out = typeof e.stdout === 'string' ? e.stdout : Buffer.isBuffer(e.stdout) ? e.stdout.toString() : ''
-  return e.status === 1 && (e.signal === null || e.signal === undefined) && out.trim() === ''
+function text(value: unknown): string {
+  return typeof value === 'string' ? value : Buffer.isBuffer(value) ? value.toString() : ''
+}
+
+/** lsof's own "nothing matched": exit status 1, not killed, nothing on stdout
+ *  or stderr (an error also exits 1, and says so on stderr). Exported for tests. */
+export function lsofFoundNothing(err: unknown): boolean {
+  const e = err as { status?: unknown; signal?: unknown; stdout?: unknown; stderr?: unknown }
+  return e.status === 1 && (e.signal === null || e.signal === undefined) && text(e.stdout).trim() === '' && text(e.stderr).trim() === ''
 }
 
 /** The real probe: `kill(pid, 0)`, `ps` and `lsof` through execFileSync, each

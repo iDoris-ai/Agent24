@@ -8,11 +8,13 @@
 // (inode and mtime) in the data directory, and a quit treats that very plist
 // as not installed. The record is cleared, and the plist read as installed
 // again, as soon as any of these holds at a quit: the plist is gone (a later
-// stop removed it), it is another file (an install wrote it anew: service.rs
-// writes a temp file and renames it), or a service daemon is up again (launchd
-// started it from that plist at the next login).
+// stop removed it), it was written again (an install rewrites it in place,
+// service.rs write_install_files `std::fs::write`: same inode, new mtime), or
+// a service daemon is up again (launchd started it from that plist at the
+// next login).
 import fs from 'node:fs'
 import path from 'node:path'
+import type { ExternalDaemonState } from './backend-manager'
 
 export const SERVICE_LEFT_FORMAT = 'agent24.desktop.service-left'
 export const SERVICE_LEFT_VERSION = 1
@@ -50,6 +52,21 @@ function readLeft(file: string): PlistId | null {
   } catch {
     return null
   }
+}
+
+/** Whether the daemon on record can be the service's, up now: not this app's
+ * own child, either with an enrolment socket (as serviceRecordPid in
+ * resident-service.ts) or a record this app refused to parse (a newer daemon:
+ * still a daemon that may be using oMLX), and alive. A legacy record (no
+ * socket) is not the service's. */
+export function serviceDaemonUp(
+  state: Pick<ExternalDaemonState, 'pid' | 'enrollEndpoint' | 'rejected'> | null,
+  spawned: (pid: number) => boolean,
+  alive: (pid: number) => boolean,
+): boolean {
+  if (state === null || spawned(state.pid)) return false
+  if (state.enrollEndpoint === undefined && state.rejected === undefined) return false
+  return alive(state.pid)
 }
 
 function clear(file: string): void {

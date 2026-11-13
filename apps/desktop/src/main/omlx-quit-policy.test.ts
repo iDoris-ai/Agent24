@@ -26,7 +26,14 @@ describe('whether quitting stops the oMLX this app started', () => {
     const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
     expect(main).not.toMatch(/stopOwnedOmlx\(/)
     expect(main.match(/ensureOwnedOmlxQuit\(\)/g)).toHaveLength(3)
-    expect(main).toContain('keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !plistLeftByStop() }),')
+    const keep = main.slice(main.indexOf('keepOwnedOmlxOnQuit: () => {'))
+    expect(keep.indexOf('\n    },')).toBeGreaterThan(0)
+    const keepBody = keep.slice(0, keep.indexOf('\n    },'))
+    // The left-behind record is read before the plist check, so it is read (and
+    // cleared when the plist is gone) at every quit, not only when the plist exists.
+    expect(keepBody).toContain('const left = plistLeftByStop()')
+    expect(keepBody).toContain('return !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !left })')
+    expect(keepBody.indexOf('const left = plistLeftByStop()')).toBeLessThan(keepBody.indexOf('launchAgentPlistExists()'))
     const ipc = fs.readFileSync(path.join(__dirname, 'ipc', 'index.ts'), 'utf8')
     const ensure = ipc.slice(ipc.indexOf('export function ensureOwnedOmlxQuit'))
     const body = ensure.slice(0, ensure.indexOf('\n}\n'))
@@ -80,6 +87,6 @@ describe('whether quitting stops the oMLX this app started', () => {
     expect(main.match(/serviceLeftBehind\(/g)).toHaveLength(1)
     const left = main.slice(main.indexOf('function plistLeftByStop(): boolean'))
     expect(left.indexOf('\n}\n')).toBeGreaterThan(0)
-    expect(left.slice(0, left.indexOf('\n}\n'))).toContain('serviceRecordPid(readExternalDaemonState(), (p) => backendManager.spawned(p))')
+    expect(left.slice(0, left.indexOf('\n}\n'))).toContain('serviceDaemonUp(readExternalDaemonState(), (p) => backendManager.spawned(p), processAlive)')
   })
 })

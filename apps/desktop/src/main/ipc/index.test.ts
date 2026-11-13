@@ -2287,6 +2287,13 @@ describe('FU-114 OmlxStop only kills the process this app started', () => {
     }
   })
 
+  it('looks at what earlier quits left running once per process, even when a quit enters again later', async () => {
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    // app.quit() fires before-quit again after the latch cleared.
+    expect(await ensureOwnedOmlxQuit()).toBe(true)
+    expect(keptStop.calls).toBe(1)
+  })
+
   it('a quit that stops goes on when stopping what earlier quits left running throws or fails', async () => {
     vi.spyOn(console, 'warn').mockImplementation(() => {})
     keptStop.impl = () => { throw new Error('ps failed') }

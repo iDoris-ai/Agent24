@@ -5,7 +5,7 @@ import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
 import { keptOmlxPath, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx } from './omlx-kept'
-import { launchAgentPlistPath, markServiceLeft, serviceLeftBehind, serviceLeftPath } from './omlx-service-left'
+import { launchAgentPlistPath, markServiceLeft, serviceDaemonUp, serviceLeftBehind, serviceLeftPath } from './omlx-service-left'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
@@ -595,7 +595,11 @@ app.whenReady().then(async () => {
       uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
-    keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !plistLeftByStop() }),
+    keepOwnedOmlxOnQuit: () => {
+      // Read first: it also clears a record whose plist is gone.
+      const left = plistLeftByStop()
+      return !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !left })
+    },
     rememberKeptOmlx: (k) => { const dir = tryDataDir(); if (dir !== null) rememberKeptOmlx(keptOmlxPath(dir), k, realOmlxProcessProbe()) },
     // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS
     // (FU-114 terminateOwnedOmlx), inside the same OMLX_QUIT_STOP_BUDGET_MS.
@@ -802,10 +806,7 @@ function residentStop(): Promise<StopOutcome> {
 function plistLeftByStop(): boolean {
   const dir = tryDataDir()
   if (dir === null) return false
-  return serviceLeftBehind(serviceLeftPath(dir), launchAgentPlistPath(), () => {
-    const pid = serviceRecordPid(readExternalDaemonState(), (p) => backendManager.spawned(p))
-    return pid !== null && processAlive(pid)
-  })
+  return serviceLeftBehind(serviceLeftPath(dir), launchAgentPlistPath(), () => serviceDaemonUp(readExternalDaemonState(), (p) => backendManager.spawned(p), processAlive))
 }
 
 function recordConsent(answer: ConsentAnswer): void {

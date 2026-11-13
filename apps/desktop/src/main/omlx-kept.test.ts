@@ -3,7 +3,7 @@ import net, { type AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { KEPT_OMLX_FORMAT, KEPT_OMLX_VERSION, keptOmlxPath, readKeptOmlx, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx, type OmlxProcessProbe, type ProbeRead } from './omlx-kept'
+import { KEPT_OMLX_FORMAT, KEPT_OMLX_VERSION, keptOmlxPath, lsofFoundNothing, readKeptOmlx, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx, type OmlxProcessProbe, type ProbeRead } from './omlx-kept'
 
 // PR#1 F1 follow-up (rulings 2026-11-13-pr1-omlx-orphan-ownership 乙,
 // 2026-11-13-pr1-omlx-kept-deactivate A, 2026-11-13-pr1-remaining-lows-gate-f L-b).
@@ -106,7 +106,11 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
       JSON.stringify({ format: 'other', version: KEPT_OMLX_VERSION, kept: [] }),
       JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION + 1, kept: [{ pid: 1, port: 8088, started: 's', command: 'c' }] }),
       JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [{ pid: '1', port: 8088, started: 's', command: 'c' }] }),
-      JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [{ pid: 1, port: 8088, started: 's', command: 'c' }, { pid: 2 }] }),
+      JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [{ pid: 4100, port: 8088, started: 's', command: 'c' }, { pid: 2 }] }),
+      // pid 1 (launchd), 0 and negatives are never an oMLX this app started.
+      JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [{ pid: 1, port: 8088, started: 's', command: 'c' }] }),
+      JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [{ pid: 0, port: 8088, started: 's', command: 'c' }] }),
+      JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [{ pid: -1, port: 8088, started: 's', command: 'c' }] }),
     ]) {
       fs.writeFileSync(file, body)
       expect(readKeptOmlx(file), body).toEqual([])
@@ -284,6 +288,23 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     expect(fs.existsSync(file)).toBe(false)
     // No file at all.
     expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [], kept: [] })
+  })
+})
+
+describe('lsof finding nothing (lsofFoundNothing)', () => {
+  it('is exit status 1 with nothing on stdout or stderr, and nothing else', () => {
+    const cases: Array<[string, unknown, boolean]> = [
+      ['status 1, no output', { status: 1, signal: null, stdout: '', stderr: '' }, true],
+      ['status 1, buffers, whitespace only', { status: 1, signal: null, stdout: Buffer.from('\n'), stderr: Buffer.from('') }, true],
+      ['status 1, output streams absent', { status: 1 }, true],
+      ['killed by the timeout', { status: null, signal: 'SIGTERM', stdout: '', stderr: '' }, false],
+      ['status 1 yet a signal', { status: 1, signal: 'SIGTERM', stdout: '', stderr: '' }, false],
+      ['status 1 with a listing', { status: 1, signal: null, stdout: 'p4100\n', stderr: '' }, false],
+      ['status 1 with an error', { status: 1, signal: null, stdout: '', stderr: 'lsof: WARNING: can\'t stat()\n' }, false],
+      ['another status', { status: 2, signal: null, stdout: '', stderr: '' }, false],
+      ['not run at all', { code: 'ENOENT' }, false],
+    ]
+    for (const [name, err, nothing] of cases) expect(lsofFoundNothing(err), name).toBe(nothing)
   })
 })
 
