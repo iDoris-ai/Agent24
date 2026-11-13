@@ -6,6 +6,7 @@ import { ChatHistoryList } from './ChatHistoryList'
 import { resetHistoryStore } from './history'
 import { setLocale } from '../../i18n'
 import { chatHistorySummary, type ChatHistoryRecord } from '../../../shared/chat-history'
+import { aside } from './skill-list-aside'
 
 // UI-04 T2: the model titles a new conversation once, in the background.
 
@@ -73,7 +74,7 @@ beforeEach(() => {
   proxy.mockImplementation((req: Req) => isTitle(req)
     ? titleAnswer(req)
     : Promise.resolve({ ok: true, status: 200, data: { message: { content: 'ack' } } }))
-  Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy, chatHistory }, writable: true, configurable: true })
+  Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(proxy), chatHistory }, writable: true, configurable: true })
 })
 afterEach(() => { vi.restoreAllMocks() })
 
@@ -181,7 +182,7 @@ describe('model titles (UI-04 T2)', () => {
   })
 
   it('without the history bridge, never asks', async () => {
-    Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy }, writable: true, configurable: true })
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(proxy) }, writable: true, configurable: true })
     renderBoth()
     await turn('帮我写一份本周的周报', 1)
     expect(titleCalls()).toHaveLength(0)

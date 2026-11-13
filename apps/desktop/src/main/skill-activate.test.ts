@@ -68,7 +68,7 @@ describe('skills:activate main-process IPC', () => {
     await handleSkillActivate(h.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'ub', evalsRevisionId: 'ue' })
     const text = h.confirm.mock.calls[0][1]
     expect(text).toContain('changed')
-    expect(text).toContain('imported -> user')
+    expect(text).toContain('Imported -> User')
     expect(text).toContain('01234567')
     const changed = harness()
     await handleSkillActivate(changed.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'b1', evalsRevisionId: 'e2' })
@@ -178,6 +178,53 @@ describe('skills:activate main-process IPC', () => {
     }
     const missing = harness({ record: { ok: false, status: 404, data: null } })
     expect((await handleSkillActivate(missing.deps, 'activate', input)).status).toBe(404)
+  })
+
+  it('names the source on a first activation, when there is no pointer', async () => {
+    const h = harness({ record: { ok: true, status: 200, data: detail({ pointer: null, generation: 0 }) } })
+    await handleSkillActivate(h.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'ub', evalsRevisionId: 'ue' })
+    const text = h.confirm.mock.calls[0][1]
+    expect(text).toContain('Source: User')
+    expect(text).toContain('no current pointer')
+    expect(text).not.toContain('Source switch')
+  })
+
+  it('localizes the source name in the first-activation text, and keeps an unknown one plain', async () => {
+    const { setMainLocale } = await import('./main-i18n')
+    const run = async () => {
+      const h = harness({ record: { ok: true, status: 200, data: detail({ pointer: null, generation: 0 }) } })
+      await handleSkillActivate(h.deps, 'activate', { skillId: 'demo', bodyRevisionId: 'ub', evalsRevisionId: 'ue' })
+      return h.confirm.mock.calls[0][1] as string
+    }
+    setMainLocale('zh')
+    expect(await run()).toContain('来源：用户')
+    setMainLocale('th')
+    expect(await run()).toContain('แหล่งที่มา: ผู้ใช้')
+  })
+
+  it('says how many failing cases the restored pair accepted, and stays quiet when the detail has no count', async () => {
+    const withCount = harness({ record: { ok: true, status: 200, data: detail({
+      pointer: { origin: 'imported', body_revision_id: 'b2', evals_revision_id: 'e1', generation: 4 },
+      activations: [{ activation_id: 'act-1', body_revision_id: 'b1', evals_revision_id: 'e1', accepted_count: 3 }],
+    }) } })
+    await handleSkillActivate(withCount.deps, 'rollback', { skillId: 'demo', rollbackActivationId: 'act-1' })
+    expect(withCount.confirm.mock.calls[0][1]).toContain('This pair was accepted with 3 failing case(s)')
+
+    const none = harness({ record: { ok: true, status: 200, data: detail({
+      pointer: { origin: 'imported', body_revision_id: 'b2', evals_revision_id: 'e1', generation: 4 },
+      activations: [{ activation_id: 'act-1', body_revision_id: 'b1', evals_revision_id: 'e1', accepted_count: 0 }],
+    }) } })
+    await handleSkillActivate(none.deps, 'rollback', { skillId: 'demo', rollbackActivationId: 'act-1' })
+    expect(none.confirm.mock.calls[0][1]).not.toContain('failing case')
+
+    const { setMainLocale } = await import('./main-i18n')
+    setMainLocale('zh')
+    const zh = harness({ record: { ok: true, status: 200, data: detail({
+      pointer: { origin: 'imported', body_revision_id: 'b2', evals_revision_id: 'e1', generation: 4 },
+      activations: [{ activation_id: 'act-1', body_revision_id: 'b1', evals_revision_id: 'e1', accepted_json: '["a","b"]' }],
+    }) } })
+    await handleSkillActivate(zh.deps, 'rollback', { skillId: 'demo', rollbackActivationId: 'act-1' })
+    expect(zh.confirm.mock.calls[0][1]).toContain('这一对当初接受了 2 条失败用例')
   })
 
   it('shows no dialog when the pair is already active, and posts so the daemon answers unchanged', async () => {

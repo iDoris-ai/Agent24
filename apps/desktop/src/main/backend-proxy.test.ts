@@ -89,6 +89,9 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/skills/{id}/activate')).toBe(false)
     expect(findAllowedRoute('POST', '/api/v1/skills/demo/activate')).toBeNull()
     expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/activate'))).toBe(false)
+    expect(isAllowedProxyRoute('GET', '/api/v1/skills')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/skills/demo')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/skills')).toBe(false)
   })
   it('lets the renderer read the component list and keeps the host report off the proxy', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/components')).toBe(true)

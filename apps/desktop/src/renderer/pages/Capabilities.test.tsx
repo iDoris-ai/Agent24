@@ -72,9 +72,10 @@ describe('CapabilitiesPage', () => {
     renderPage({
       defs: DEFS.filter((d) => d.group !== 'tools'),
     })
-    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(
-      GROUP_TITLES.filter((title) => title !== 'Tools'),
-    )
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual([
+      ...GROUP_TITLES.filter((title) => title !== 'Tools'),
+      'Skills',
+    ])
     for (const blurb of GROUP_BLURBS.filter((text) => text !== GROUP_BLURBS[4])) {
       expect(screen.getByText(blurb)).toBeInTheDocument()
     }
