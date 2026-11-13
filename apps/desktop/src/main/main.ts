@@ -5,6 +5,7 @@ import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
 import { keptOmlxPath, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx } from './omlx-kept'
+import { launchAgentPlistPath, markServiceLeft, serviceLeftBehind, serviceLeftPath } from './omlx-service-left'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
@@ -13,7 +14,7 @@ import { registerResidentService } from './ipc/resident-service'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
 import { bundledDaemonVersion, consentPath, CrashLoopDetector, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
@@ -594,7 +595,7 @@ app.whenReady().then(async () => {
       uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
-    keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() }),
+    keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !plistLeftByStop() }),
     rememberKeptOmlx: (k) => { const dir = tryDataDir(); if (dir !== null) rememberKeptOmlx(keptOmlxPath(dir), k, realOmlxProcessProbe()) },
     // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS
     // (FU-114 terminateOwnedOmlx), inside the same OMLX_QUIT_STOP_BUDGET_MS.
@@ -791,7 +792,20 @@ function residentStop(): Promise<StopOutcome> {
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
+    leftInstalled: () => { const dir = tryDataDir(); if (dir !== null) markServiceLeft(serviceLeftPath(dir), launchAgentPlistPath()) },
   })))
+}
+
+/** The plist is the one a service stop left behind with no daemon
+ * (omlx-service-left.ts): a quit then reads the service as not installed.
+ * A service daemon up again (an enrolment socket, not our own child) ends it. */
+function plistLeftByStop(): boolean {
+  const dir = tryDataDir()
+  if (dir === null) return false
+  return serviceLeftBehind(serviceLeftPath(dir), launchAgentPlistPath(), () => {
+    const pid = serviceRecordPid(readExternalDaemonState(), (p) => backendManager.spawned(p))
+    return pid !== null && processAlive(pid)
+  })
 }
 
 function recordConsent(answer: ConsentAnswer): void {

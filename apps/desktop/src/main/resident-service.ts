@@ -512,6 +512,12 @@ export interface StopDeps {
   exited: () => Promise<boolean>
   /** `agent24 service uninstall`. */
   uninstall: () => Promise<void>
+  /** The shutdown went through (the daemon exited) and the uninstall then
+   * failed: the plist may be left with no daemon behind it
+   * (omlx-service-left.ts). Not called when there was no shutdown to send:
+   * the uninstall may then have failed before its bootout, with launchd's
+   * daemon still up. A failure here is ignored. */
+  leftInstalled?: () => void
   /** Runs `work` with this app spawning nothing (`whileServiceRestarts`). */
   hold: <T>(work: () => Promise<T>) => Promise<T>
   /** Keeps the answer as declined, so the first-launch box is not shown again. */
@@ -530,7 +536,12 @@ export function stopService(deps: StopDeps): Promise<StopOutcome> {
       if (down.status < 200 || down.status >= 300) return { ok: false, stage: 'shutdown', code: down.code ?? `http_${down.status}` }
       await deps.exited()
     }
-    try { await deps.uninstall() } catch (err) { return { ok: false, stage: 'uninstall', code: installErrorCode(err) } }
+    try { await deps.uninstall() } catch (err) {
+      if (deps.shutdown && deps.leftInstalled) {
+        try { deps.leftInstalled() } catch { /* the quit then keeps oMLX, as before */ }
+      }
+      return { ok: false, stage: 'uninstall', code: installErrorCode(err) }
+    }
     try { deps.record() } catch { /* the plist is gone already */ }
     return { ok: true }
   })
@@ -556,7 +567,7 @@ const realStopSystem = (): StopSystem => ({
 /** The real steps for the enrolled service daemon `pid` (null when not
  * enrolled), with the bundled CLI. */
 export function serviceStopDeps(
-  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void },
+  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void; leftInstalled?: () => void },
   sys: StopSystem = realStopSystem(),
 ): StopDeps {
   const pid = o.pid
@@ -570,6 +581,7 @@ export function serviceStopDeps(
     uninstall: () => sys.run(o.cli, ['service', 'uninstall'], process.env),
     hold: o.hold,
     record: o.record,
+    ...(o.leftInstalled ? { leftInstalled: o.leftInstalled } : {}),
   }
 }
 

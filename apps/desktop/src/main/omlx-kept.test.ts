@@ -3,22 +3,38 @@ import net, { type AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { KEPT_OMLX_FORMAT, KEPT_OMLX_VERSION, keptOmlxPath, readKeptOmlx, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx, type OmlxProcessProbe } from './omlx-kept'
+import { KEPT_OMLX_FORMAT, KEPT_OMLX_VERSION, keptOmlxPath, readKeptOmlx, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx, type OmlxProcessProbe, type ProbeRead } from './omlx-kept'
 
-// PR#1 F1 follow-up (ruling 2026-11-13-pr1-omlx-orphan-ownership, 乙).
-interface FakeProc { started: string; command: string; port: number | null; alive: boolean; diesOn?: NodeJS.Signals }
+// PR#1 F1 follow-up (rulings 2026-11-13-pr1-omlx-orphan-ownership 乙,
+// 2026-11-13-pr1-omlx-kept-deactivate A, 2026-11-13-pr1-remaining-lows-gate-f L-b).
+type Part = 'started' | 'command' | 'listens'
+interface FakeProc {
+  started: string
+  command: string
+  port: number | null
+  alive: boolean
+  /** A process of another user: kill(pid, 0) says EPERM. */
+  other?: boolean
+  diesOn?: NodeJS.Signals
+  /** Parts ps/lsof cannot read (timed out). */
+  unread?: Part[]
+}
+
+const read = <T,>(value: T): ProbeRead<T> => ({ ok: true, value })
+const UNREAD = { ok: false } as const
 
 function fakeProbe(procs: Map<number, FakeProc>) {
   const signals: Array<[number, NodeJS.Signals]> = []
+  const live = (pid: number) => { const p = procs.get(pid); return p?.alive ? p : undefined }
   const probe: OmlxProcessProbe = {
-    started: (pid) => (procs.get(pid)?.alive ? procs.get(pid)!.started : null),
-    command: (pid) => (procs.get(pid)?.alive ? procs.get(pid)!.command : null),
-    listensOn: (pid, port) => procs.get(pid)?.alive === true && procs.get(pid)!.port === port,
-    alive: (pid) => procs.get(pid)?.alive === true,
+    exists: (pid) => { const p = live(pid); return p === undefined ? 'gone' : p.other ? 'other' : 'yes' },
+    started: (pid) => { const p = live(pid); return p === undefined || p.unread?.includes('started') ? UNREAD : read(p.started) },
+    command: (pid) => { const p = live(pid); return p === undefined || p.unread?.includes('command') ? UNREAD : read(p.command) },
+    listensOn: (pid, port) => { const p = live(pid); return p?.unread?.includes('listens') ? UNREAD : read(p !== undefined && p.port === port) },
     signal: (pid, signal) => {
       signals.push([pid, signal])
-      const p = procs.get(pid)
-      if (!p?.alive) return false
+      const p = live(pid)
+      if (p === undefined || p.other) return false
       if (p.diesOn === signal || signal === 'SIGKILL') p.alive = false
       return true
     },
@@ -77,9 +93,7 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
 
   it('writes nothing when only one part of the identity can be read', () => {
     for (const missing of ['started', 'command'] as const) {
-      const { probe } = fakeProbe(new Map([[4100, OMLX()]]))
-      probe[missing] = () => null
-      rememberKeptOmlx(file, { pid: 4100, port: 8088 }, probe)
+      rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(new Map([[4100, OMLX({ unread: [missing] })]])).probe)
       expect(fs.existsSync(file), missing).toBe(false)
     }
   })
@@ -103,7 +117,7 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     const procs = new Map([[4100, OMLX()]])
     rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
     const { probe, signals } = fakeProbe(procs)
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4100], dropped: [] })
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4100], dropped: [], kept: [] })
     expect(signals).toEqual([[4100, 'SIGTERM']])
     expect(procs.get(4100)!.alive).toBe(false)
     expect(fs.existsSync(file)).toBe(false)
@@ -113,7 +127,7 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     const procs = new Map([[4100, OMLX({ diesOn: undefined })]])
     rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
     const { probe, signals } = fakeProbe(procs)
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4100], dropped: [] })
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4100], dropped: [], kept: [] })
     expect(signals).toEqual([[4100, 'SIGTERM'], [4100, 'SIGKILL']])
   })
 
@@ -132,12 +146,13 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     expect(signals).toEqual([[4100, 'SIGTERM']])
   })
 
-  // The four mismatches the ruling names; each stops nothing and clears the record.
+  // The mismatches the rulings name; each stops nothing and clears the record.
   const mismatches: Array<[string, Partial<FakeProc>]> = [
     ['the pid was reused (another start time)', { started: 'Sat Nov 14 10:00:00 2026' }],
     ['the record is stale (another command on that pid)', { command: '/usr/bin/python3 other.py' }],
     ['the record is stale (no longer listening on its port)', { port: 9000 }],
-    ['the process already exited on its own', { alive: false }],
+    ['the process already exited on its own (ESRCH)', { alive: false }],
+    ['the pid now belongs to another user (EPERM)', { other: true }],
   ]
   for (const [name, now] of mismatches) {
     it(`stops nothing when ${name}, and clears the record`, async () => {
@@ -145,38 +160,84 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
       rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
       procs.set(4100, OMLX(now))
       const { probe, signals } = fakeProbe(procs)
-      expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [4100] })
+      expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [4100], kept: [] })
       expect(signals).toEqual([])
       expect(fs.existsSync(file)).toBe(false)
     })
   }
 
-  it('counts a record whose SIGTERM failed (EPERM) as dropped, not stopped', async () => {
+  // Ruling L-b: a part that cannot be read (ps or lsof timed out) is not a
+  // mismatch: nothing is signalled and the record stays for the next quit.
+  for (const part of ['started', 'command', 'listens'] as const) {
+    it(`signals nothing and keeps the record when the ${part} part cannot be read`, async () => {
+      const procs = new Map([[4100, OMLX()]])
+      rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
+      procs.set(4100, OMLX({ unread: [part] }))
+      const { probe, signals } = fakeProbe(procs)
+      expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [], kept: [4100] })
+      expect(signals).toEqual([])
+      expect(readKeptOmlx(file).map((k) => k.pid)).toEqual([4100])
+      // The next quit, the system no longer busy: stopped then.
+      procs.set(4100, OMLX())
+      expect(await stopKeptOmlx(file, fakeProbe(procs).probe, TIMING)).toEqual({ stopped: [4100], dropped: [], kept: [] })
+      expect(fs.existsSync(file)).toBe(false)
+    })
+  }
+
+  it('does not kill, and keeps the record, when the start time cannot be read before the SIGKILL', async () => {
+    const procs = new Map([[4100, OMLX({ diesOn: undefined })]])
+    rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
+    const { probe, signals } = fakeProbe(procs)
+    const realSignal = probe.signal
+    probe.signal = (pid, signal) => {
+      const sent = realSignal(pid, signal)
+      if (signal === 'SIGTERM') procs.get(4100)!.unread = ['started']
+      return sent
+    }
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4100], dropped: [], kept: [4100] })
+    expect(signals).toEqual([[4100, 'SIGTERM']])
+    expect(readKeptOmlx(file).map((k) => k.pid)).toEqual([4100])
+  })
+
+  it('a probe that throws for one record keeps it unsignalled and still stops the others', async () => {
+    const procs = new Map([[4100, OMLX()], [4200, OMLX({ started: 'Fri Nov 13 09:00:00 2026', port: 8089 })]])
+    rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
+    rememberKeptOmlx(file, { pid: 4200, port: 8089 }, fakeProbe(procs).probe)
+    const { probe, signals } = fakeProbe(procs)
+    const realListens = probe.listensOn
+    probe.listensOn = (pid, port) => { if (pid === 4100) throw new Error('lsof'); return realListens(pid, port) }
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4200], dropped: [], kept: [4100] })
+    expect(signals).toEqual([[4200, 'SIGTERM']])
+    expect(readKeptOmlx(file).map((k) => k.pid)).toEqual([4100])
+  })
+
+  it('counts a record whose SIGTERM failed as dropped, not stopped', async () => {
     const procs = new Map([[4100, OMLX()]])
     rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
     const { probe, signals } = fakeProbe(procs)
     probe.signal = (pid, signal) => { signals.push([pid, signal]); return false }
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [4100] })
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [4100], kept: [] })
     expect(signals).toEqual([[4100, 'SIGTERM']])
     expect(fs.existsSync(file)).toBe(false)
   })
 
-  // Ruling 2026-11-13-pr1-omlx-kept-deactivate (A): the record is cleared
+  // Ruling 2026-11-13-pr1-omlx-kept-deactivate (A): the record is settled
   // before any signal, so a quit's budget cutting the wait short leaves it
-  // cleared; what then survives is not tried again (a known limit).
-  it('clears the record before any signal, so a stop cut short leaves it cleared', async () => {
-    const procs = new Map([[4100, OMLX({ diesOn: undefined })]])
+  // settled; what then survives is not tried again (a known limit).
+  it('settles the record before any signal, so a stop cut short leaves it settled', async () => {
+    const procs = new Map([[4100, OMLX({ diesOn: undefined })], [4200, OMLX({ started: 'Fri Nov 13 09:00:00 2026', port: 8089, unread: ['listens'] })]])
     rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
+    rememberKeptOmlx(file, { pid: 4200, port: 8089 }, fakeProbe(procs).probe)
     const { probe, signals } = fakeProbe(procs)
-    const seen: boolean[] = []
+    const seen: number[][] = []
     const realSignal = probe.signal
-    probe.signal = (pid, signal) => { seen.push(fs.existsSync(file)); return realSignal(pid, signal) }
+    probe.signal = (pid, signal) => { seen.push(readKeptOmlx(file).map((k) => k.pid)); return realSignal(pid, signal) }
     const stopping = stopKeptOmlx(file, probe, { graceMs: 200, killMs: 30 })
-    // Before the wait even starts.
-    expect(fs.existsSync(file)).toBe(false)
+    // Before the wait even starts: only the one that could not be read is left.
+    expect(readKeptOmlx(file).map((k) => k.pid)).toEqual([4200])
     expect(signals).toEqual([[4100, 'SIGTERM']])
     await stopping
-    expect(seen).toEqual([false, false])
+    expect(seen).toEqual([[4200], [4200]])
   })
 
   it('stops all matched records at once, not one after another', async () => {
@@ -197,21 +258,11 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     fs.writeFileSync(file, JSON.stringify({ format: KEPT_OMLX_FORMAT, version: KEPT_OMLX_VERSION, kept: [4100, 4200, 4300].map((pid, i) => ({ pid, port: 8088 + i, started: `Fri Nov 13 0${i}:00:00 2026`, command: 'omlx-server' })) }))
     const { probe, signals } = fakeProbe(procs)
     const looked: number[] = []
-    const realStarted = probe.started
-    probe.started = (pid) => { looked.push(pid); return realStarted(pid) }
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4200, 4300], dropped: [4100] })
+    const realExists = probe.exists
+    probe.exists = (pid) => { looked.push(pid); return realExists(pid) }
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4200, 4300], dropped: [4100], kept: [] })
     expect(looked).not.toContain(4100)
     expect(signals.map(([pid]) => pid)).not.toContain(4100)
-  })
-
-  it('a probe that throws for one record drops it and still stops the others', async () => {
-    const procs = new Map([[4100, OMLX()], [4200, OMLX({ started: 'Fri Nov 13 09:00:00 2026', port: 8089 })]])
-    rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
-    rememberKeptOmlx(file, { pid: 4200, port: 8089 }, fakeProbe(procs).probe)
-    const { probe } = fakeProbe(procs)
-    const realListens = probe.listensOn
-    probe.listensOn = (pid, port) => { if (pid === 4100) throw new Error('lsof'); return realListens(pid, port) }
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4200], dropped: [4100] })
   })
 
   it('handles each record on its own: a match is stopped, a mismatch beside it is not', async () => {
@@ -220,7 +271,7 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     rememberKeptOmlx(file, { pid: 4200, port: 8089 }, fakeProbe(procs).probe)
     procs.set(4100, OMLX({ started: 'Sat Nov 14 10:00:00 2026' }))
     const { probe, signals } = fakeProbe(procs)
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4200], dropped: [4100] })
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [4200], dropped: [4100], kept: [] })
     expect(signals).toEqual([[4200, 'SIGTERM']])
   })
 
@@ -228,34 +279,35 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     fs.mkdirSync(path.dirname(file), { recursive: true })
     fs.writeFileSync(file, '{not json')
     const { probe, signals } = fakeProbe(new Map([[4100, OMLX()]]))
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [] })
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [], kept: [] })
     expect(signals).toEqual([])
     expect(fs.existsSync(file)).toBe(false)
     // No file at all.
-    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [] })
+    expect(await stopKeptOmlx(file, probe, TIMING)).toEqual({ stopped: [], dropped: [], kept: [] })
   })
 })
 
-// The real probe (ps, lsof), against this test process and a port it listens on.
+// The real probe (kill -0, ps, lsof), against this test process and a port it listens on.
 describe.skipIf(process.platform !== 'darwin')('realOmlxProcessProbe', () => {
-  it('reads a live process, the port it listens on, and nothing for a pid that is gone', async () => {
+  it('reads a live process, the port it listens on, and tells a gone pid and a foreign one apart', async () => {
     const server = net.createServer()
     await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
     try {
       const port = (server.address() as AddressInfo).port
       const probe = realOmlxProcessProbe()
-      expect(probe.started(process.pid)).toMatch(/\d{4}$/)
-      expect(probe.command(process.pid)).toBeTruthy()
-      expect(probe.alive(process.pid)).toBe(true)
-      expect(probe.listensOn(process.pid, port)).toBe(true)
-      expect(probe.listensOn(process.pid, port === 65535 ? 65534 : port + 1)).toBe(false)
-      // The start time reads the same whatever zone and locale the app runs in.
       const started = probe.started(process.pid)
+      expect(started.ok && started.value).toMatch(/\d{4}$/)
+      expect(probe.command(process.pid).ok).toBe(true)
+      expect(probe.exists(process.pid)).toBe('yes')
+      expect(probe.listensOn(process.pid, port)).toEqual({ ok: true, value: true })
+      // lsof finding nothing is a value, not a failure to read.
+      expect(probe.listensOn(process.pid, port === 65535 ? 65534 : port + 1)).toEqual({ ok: true, value: false })
+      // The start time reads the same whatever zone and locale the app runs in.
       const saved = { TZ: process.env['TZ'], LC_ALL: process.env['LC_ALL'] }
       try {
         process.env['TZ'] = 'Asia/Tokyo'
         process.env['LC_ALL'] = 'zh_CN.UTF-8'
-        expect(realOmlxProcessProbe().started(process.pid)).toBe(started)
+        expect(realOmlxProcessProbe().started(process.pid)).toEqual(started)
       } finally {
         for (const [k, v] of Object.entries(saved)) {
           if (v === undefined) delete process.env[k]
@@ -263,10 +315,11 @@ describe.skipIf(process.platform !== 'darwin')('realOmlxProcessProbe', () => {
         }
       }
       const gone = 2 ** 22 + 12345
-      expect(probe.started(gone)).toBeNull()
-      expect(probe.command(gone)).toBeNull()
-      expect(probe.alive(gone)).toBe(false)
+      expect(probe.exists(gone)).toBe('gone')
+      expect(probe.started(gone)).toEqual({ ok: false })
       expect(probe.signal(gone, 'SIGTERM')).toBe(false)
+      // launchd (pid 1) is root's: EPERM, not ESRCH.
+      expect(probe.exists(1)).toBe('other')
     } finally {
       await new Promise<void>((r) => server.close(() => r()))
     }

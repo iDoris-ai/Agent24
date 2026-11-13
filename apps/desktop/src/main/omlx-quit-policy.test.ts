@@ -26,7 +26,7 @@ describe('whether quitting stops the oMLX this app started', () => {
     const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
     expect(main).not.toMatch(/stopOwnedOmlx\(/)
     expect(main.match(/ensureOwnedOmlxQuit\(\)/g)).toHaveLength(3)
-    expect(main).toContain('keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() }),')
+    expect(main).toContain('keepOwnedOmlxOnQuit: () => !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !plistLeftByStop() }),')
     const ipc = fs.readFileSync(path.join(__dirname, 'ipc', 'index.ts'), 'utf8')
     const ensure = ipc.slice(ipc.indexOf('export function ensureOwnedOmlxQuit'))
     const body = ensure.slice(0, ensure.indexOf('\n}\n'))
@@ -62,5 +62,24 @@ describe('whether quitting stops the oMLX this app started', () => {
     expect(body).not.toContain('afterUninstall')
     const resident = fs.readFileSync(path.join(__dirname, 'resident-service.ts'), 'utf8')
     expect(resident).not.toMatch(/[Kk]eptOmlx|afterUninstall/)
+  })
+
+  // Ruling 2026-11-13-pr1-remaining-lows-gate-f (L-a): the one service stop
+  // (「完全退出」 and the Settings switch off) marks a plist it left behind,
+  // and a quit reads that plist as not installed.
+  it('main.ts marks a plist a stop left behind from the one service stop, and reads it at a quit', () => {
+    const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
+    const stop = main.slice(main.indexOf('function residentStop(): Promise<StopOutcome>'))
+    expect(stop.indexOf('\n}\n')).toBeGreaterThan(0)
+    const body = stop.slice(0, stop.indexOf('\n}\n'))
+    expect(body).toContain('leftInstalled: () => { const dir = tryDataDir(); if (dir !== null) markServiceLeft(serviceLeftPath(dir), launchAgentPlistPath()) },')
+    // Both callers run that stop.
+    expect(main).toMatch(/stop: residentStop,/)
+    expect(main).toMatch(/const outcome = await residentStop\(\)/)
+    expect(main.match(/markServiceLeft\(/g)).toHaveLength(1)
+    expect(main.match(/serviceLeftBehind\(/g)).toHaveLength(1)
+    const left = main.slice(main.indexOf('function plistLeftByStop(): boolean'))
+    expect(left.indexOf('\n}\n')).toBeGreaterThan(0)
+    expect(left.slice(0, left.indexOf('\n}\n'))).toContain('serviceRecordPid(readExternalDaemonState(), (p) => backendManager.spawned(p))')
   })
 })
