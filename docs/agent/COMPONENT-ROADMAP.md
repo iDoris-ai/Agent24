@@ -84,7 +84,7 @@
 - **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板记录见 `ab/m1-memory` 分支的 `docs/research/MEMORY-STRATEGY.md` §7；两份文档里的 `[B]`（Mac mini 执行）标记已被 2026-10-03 裁决取代，Agent24 全部在笔记本做）
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
-  3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
+  3. **P2 本地智能**：向量召回 + RRF **已接入（向量召回 VR-1…VR-5，尚未进 main）**；本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例仍未做；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
   4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义），并与 C6 O-2b（scoped memory 回调）同批交付；F9 的其余部分（groups、企业场景）与 F10 仍等第二个真实用户；F11 按 C11 的 P0 / P1 决策门处理。
   5. **P4 企业治理** / **P5 高级记忆**（时态图、巩固 / 反思、**AgentEar 语音摄入**）。📐 → 远期。
 - **依赖**：C1 K-1 ← P0；C6 O-3（Cos72 M4）← P0（roadmap 明写「依赖 M1 全部完成」）；P1 ← P0；P2 ← P1（K-4 ⊂ P2）；P3 ← P2（MEMORY-STRATEGY 的顺序 P0 → P1 → P2 → P3，未批准并行）；P3 是组合里程碑：冻结 C11 F9 社区契约 → 共享空间核心与 C6 O-2b 并行实现 → P3 联合验收（F9 社区子集、O-2b ⊂ C3 P3）；C9 语音摄入 ← P1 的事件 schema。

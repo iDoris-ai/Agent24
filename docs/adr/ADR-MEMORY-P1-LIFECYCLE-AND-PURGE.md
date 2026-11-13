@@ -36,7 +36,7 @@ purge 不等同于撤回；暂停不等同于无痕；更正不等同于物理�
 | assertions：`assertion.rs`、`writer.rs`、migration 0004 | 清正文、evidence、修订/撤回关联中的被清除内容；不能只置 inactive。跨 owner 同名 ID 不构成授权；有效时间、录入时间、purge fence 一起约束读取。 |
 | 摘要/派生知识：`session.rs`、`condenser.rs`、`consolidator.rs`、`mem_consolidations` | 混合来源摘要无法安全按字符串抹除；使整份依赖投影失效并仅从剩余合法来源重建。旧缓存/版本不能继续服务；只有底座存在不等于每条生产链已接线。 |
 | FTS：`retriever.rs`、migration 0005/0017 | 当前文本召回；删除或重建索引并核对主账本，重建必须先应用 fence；不能只删 FTS 留正文。高分失效候选不挤走有效候选。 |
-| 向量：`vector.rs`、migration 0007 `mem_embeddings` | **个人产品向量上线 N/A（P2）**，已有可选底座/测试。未来接入必须支持逐 owner/对象、所有 model/revision 删除及重建 fence；实例若发现残留行必须处理，不能因 N/A 跳过真实数据。 |
+| 向量：`vector.rs`、migration 0007/0021 `mem_embeddings` | **已接入（向量召回 VR-1…VR-5）**。撤回/更正触发器与 `delete_owner_embeddings` 删该 owner 全部 model/revision；当前 key 完整后 `reindex` 删该 owner 其它 revision（「reindex 不丢旧版本行」已作废，原句在 SPEC-MD-ME MD-6，不在本表）。purge 本体仍未做。实例若发现残留行必须处理。 |
 | 可编辑 artifacts/偏好：`artifact.rs`、migration 0003/0008、`reconcile.rs` | 覆盖 body、历史版本及磁盘投影的来源闭包；全局 `kv` 逐 namespace/key 定义映射。用户维护的权威文件不自动删除：预览中显式选择，否则说明不在范围；无法判归属则拒绝执行该范围。 |
 | 工具正文/附件：`trace.rs`、migration 0009 `mem_trace_nodes/refs` | 已有 DB 内完整工具正文，不能当成 P1 磁盘附件已上线。拟议大输出附件按 owner 内去重；引用与 blob 分开删除，剩余合法引用保留，多 owner 共用 blob 默认禁用。 |
 | 冷归档 / JSON+Markdown 导出包 | P1 能力尚待实现；托管包登记 owner、对象 ID、来源与删除世代，包含原文、修订和状态。压缩不是删除；受控包需删除/重写并验证；用户复制出去的包见 §7。 |
