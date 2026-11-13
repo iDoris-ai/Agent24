@@ -12,7 +12,7 @@ import {
   validKnowledgeBaseIds,
 } from './knowledge-settings'
 
-vi.mock('./backend-manager', () => ({ daemonConnection: () => null }))
+vi.mock('./backend-manager', () => ({ daemonConnection: () => null, daemonElevation: () => null }))
 
 const box: SecretBox = {
   isEncryptionAvailable: () => true,

@@ -3,11 +3,14 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { KnowledgeHost, SequenceClock, validBindingId, type HostTransport, type KnowledgeCredential } from './knowledge-host'
+import { KnowledgeHost, SequenceClock, elevatingTransport, validBindingId, type HostTransport, type KnowledgeCredential } from './knowledge-host'
 import { KnowledgeLoginStore, type KnowledgeLogin, type SecretBox } from './knowledge-logins'
 import type { DaemonConnection } from './backend-manager'
+import { proxyError } from './backend-proxy'
+import { EnrolError, type ElevateRequest } from './daemon-enroll'
+import type { BackendProxyRequest, BackendProxyResponse } from '../shared/ipc-types'
 
-vi.mock('./backend-manager', () => ({ daemonConnection: () => null }))
+vi.mock('./backend-manager', () => ({ daemonConnection: () => null, daemonElevation: () => null }))
 
 const box: SecretBox = {
   isEncryptionAvailable: () => true,
@@ -615,5 +618,164 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     daemon.setConnection(null)
     results.push(await host.refresh('b1', async () => credential('C-SECRET')))
     expect(JSON.stringify(results)).not.toMatch(/SECRET/)
+  })
+})
+
+// M5 B6: in service mode every binding change is Elevated (K-B6). The host
+// sends through B3's sendElevating: a 403 presence_required is confirmed once
+// on the enrolment's turn and retried with the grant; with no enrolment it is
+// one plain request (the loopback test above).
+describe('KnowledgeHost through elevation (M5 B6)', () => {
+  const GRANT = 'grant-one-shot'
+  let dir: string
+  let store: KnowledgeLoginStore
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kh-elevate-'))
+    store = new KnowledgeLoginStore(dir, box, 'darwin')
+  })
+
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  /** A service-mode daemon: every binding change without a grant is 403
+   * presence_required; with the grant it is applied (204). */
+  async function serviceDaemon() {
+    const seen: { method?: string; url?: string; auth?: string; grant?: string; body: string }[] = []
+    const server = http.createServer((req, res) => {
+      let body = ''
+      req.on('data', (chunk: Buffer) => (body += chunk.toString()))
+      req.on('end', () => {
+        const grant = req.headers['x-agent24-elevation']
+        seen.push({ method: req.method, url: req.url, auth: req.headers.authorization, grant: typeof grant === 'string' ? grant : undefined, body })
+        if (grant === GRANT) {
+          res.writeHead(204)
+          res.end()
+          return
+        }
+        res.writeHead(403, { 'Content-Type': 'application/json' })
+        res.end(JSON.stringify({ error: { code: 'presence_required', message: 'Presence confirmation required' } }))
+      })
+    })
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve))
+    const port = (server.address() as { port: number }).port
+    return { seen, port, close: () => new Promise((resolve) => server.close(resolve)) }
+  }
+
+  /** The enrolment's turn: records each elevation, answers with the grant or
+   * with `fail`. The token is the one the connection carries. */
+  function enrolment(fail?: unknown) {
+    const asked: ElevateRequest[] = []
+    const turn = async <T>(fn: (elevate: (request: ElevateRequest) => Promise<string>, token: string) => Promise<T>): Promise<T> =>
+      fn(async (request) => {
+        asked.push(request)
+        if (fail !== undefined) throw fail
+        return GRANT
+      }, 'DAILY')
+    return { asked, turn }
+  }
+
+  it('confirms each of the four changes once and retries it with the grant, the bytes it was granted for', async () => {
+    const daemon = await serviceDaemon()
+    const { asked, turn } = enrolment()
+    try {
+      const host = new KnowledgeHost(store, {
+        connection: () => ({ port: daemon.port, authHeaders: { Authorization: 'Bearer DAILY' } }),
+        elevation: () => turn,
+        clock: new SequenceClock(() => 7),
+      })
+      host.start()
+      const endpoint = { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] }
+      expect(await host.activate('b1', endpoint)).toEqual({ ok: true })
+      expect(await host.pushCredential('b1', credential('C-SECRET'))).toEqual({ ok: true })
+      expect(await host.revokeCredential('b1')).toEqual({ ok: true })
+      expect(await host.deactivate('b1')).toEqual({ ok: true })
+      const changes = [
+        ['PUT', '/api/v1/host/knowledge/bindings/b1'],
+        ['PUT', '/api/v1/host/knowledge/bindings/b1/credential'],
+        ['DELETE', '/api/v1/host/knowledge/bindings/b1/credential'],
+        ['DELETE', '/api/v1/host/knowledge/bindings/b1'],
+      ]
+      expect(asked.map((a) => [a.method, a.path])).toEqual(changes)
+      // Per change: first try, again in the turn, then the retry with the grant.
+      expect(daemon.seen).toHaveLength(12)
+      for (const [i, [method, url]] of changes.entries()) {
+        const tries = daemon.seen.slice(3 * i, 3 * i + 3)
+        expect(tries.map((t) => [t.method, t.url, t.grant])).toEqual([
+          [method, url, undefined],
+          [method, url, undefined],
+          [method, url, GRANT],
+        ])
+        // The grant binds the body: the elevation names exactly what is sent.
+        expect(tries.every((t) => t.body === asked[i]!.body)).toBe(true)
+        expect(tries.every((t) => t.auth === 'Bearer DAILY')).toBe(true)
+      }
+      expect(JSON.parse(asked[0]!.body)).toEqual({ seq: 7, endpoint: 'https://kb.example/api/v1', knowledge_base_ids: ['kb-a'] })
+      // The daemon writes the approval text; the fallback main sends never carries C.
+      expect(asked.map((a) => a.summary).join(' ')).not.toMatch(/SECRET/)
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it('reports a change the user did not confirm as refused, and does not ask again on sync()', async () => {
+    const daemon = await serviceDaemon()
+    const { asked, turn } = enrolment(new EnrolError('presence_denied', 'denied'))
+    try {
+      const host = new KnowledgeHost(store, {
+        connection: () => ({ port: daemon.port, authHeaders: { Authorization: 'Bearer DAILY' } }),
+        elevation: () => turn,
+      })
+      host.start()
+      expect(await host.activate('b1')).toEqual({ ok: false, reason: 'refused' })
+      expect(host.isActive('b1')).toBe(false)
+      const before = daemon.seen.length
+      host.sync()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      expect(asked).toHaveLength(1)
+      expect(daemon.seen).toHaveLength(before)
+      expect(daemon.seen.some((t) => t.grant !== undefined)).toBe(false)
+    } finally {
+      await daemon.close()
+    }
+  })
+
+  it('maps only proxyRequest’s own failures to daemon_unavailable, and a daemon answer to its code', async () => {
+    const conn = () => ({ port: 1, authHeaders: { Authorization: 'Bearer HOST' } })
+    const own = [
+      proxyError('timeout', 'x'),
+      proxyError('proxy_failed', 'x'),
+      proxyError('payload_too_large', 'x'),
+      proxyError('backend_not_ready', 'x'),
+    ]
+    for (const reply of own) {
+      const transport = elevatingTransport(conn, () => null, async () => reply)
+      await expect(transport(conn(), 'PUT', '/api/v1/host/knowledge/bindings/b1', '{"seq":1}')).rejects.toThrow('Knowledge host request failed')
+    }
+    const daemonAnswers: [BackendProxyResponse, { status: number; code?: string }][] = [
+      [{ ok: true, status: 204, data: null }, { status: 204, code: undefined }],
+      [{ ok: false, status: 409, data: { error: { code: 'stale_sequence', message: 'm' } } }, { status: 409, code: 'stale_sequence' }],
+      [{ ok: false, status: 503, data: { error: { code: 'knowledge_host_unavailable', message: 'm' } } }, { status: 503, code: 'knowledge_host_unavailable' }],
+      [{ ok: false, status: 413, data: { error: { code: 'payload_too_large', message: 'm' } } }, { status: 413, code: 'payload_too_large' }],
+      [{ ok: false, status: 400, data: { error: { code: 7 } } }, { status: 400, code: undefined }],
+    ]
+    for (const [reply, mapped] of daemonAnswers) {
+      const transport = elevatingTransport(conn, () => null, async () => reply)
+      await expect(transport(conn(), 'PUT', '/api/v1/host/knowledge/bindings/b1', '{"seq":1}')).resolves.toEqual(mapped)
+    }
+  })
+
+  it('sends the body it was given, parsed once, and nothing of it in a failure', async () => {
+    const conn = () => ({ port: 1, authHeaders: {} })
+    const got: BackendProxyRequest[] = []
+    const transport = elevatingTransport(conn, () => null, async (_endpoint, req) => {
+      got.push(req)
+      return proxyError('proxy_failed', 'x')
+    })
+    const body = JSON.stringify({ seq: 3, kind: 'bearer', value: 'C-SECRET', expires_at: NOW })
+    const error = await transport(conn(), 'PUT', '/api/v1/host/knowledge/bindings/b1/credential', body).catch((e: Error) => e)
+    expect(JSON.stringify(got[0]!.body)).toBe(body)
+    expect(String(error)).not.toMatch(/SECRET/)
   })
 })

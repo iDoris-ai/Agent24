@@ -11,9 +11,16 @@
 // point. A change that did not land for a passing reason is reconciled the same
 // way on every sync() until it does. Everything for one binding runs one at a
 // time: a refresh and a destroy never overlap (decided 2026-10-25).
+//
+// In service mode the daemon requires presence confirmation. Every binding
+// change, including a replay after the daemon has changed, is confirmed once
+// through sendElevating. When the user refuses, the result is `refused` and
+// it is not retried on its own.
 
-import http from 'node:http'
-import { daemonConnection, type DaemonConnection } from './backend-manager'
+import { daemonConnection, daemonElevation, type DaemonConnection } from './backend-manager'
+import type { proxyRequest } from './backend-proxy'
+import type { EnrolSession } from './daemon-enroll'
+import { sendElevating } from './elevated-request'
 import type { KnowledgeLogin, KnowledgeLoginStore, LoadResult } from './knowledge-logins'
 
 const BINDINGS = '/api/v1/host/knowledge/bindings'
@@ -78,6 +85,8 @@ export class SequenceClock {
 
 export interface KnowledgeHostDeps {
   connection?: () => DaemonConnection | null
+  /** the enrolment's token-connection turn (backend-manager `daemonElevation`); null without an enrolment */
+  elevation?: () => EnrolSession['turn'] | null
   transport?: HostTransport
   clock?: SequenceClock
   /** Unix seconds, to tell whether a C is still worth replaying. */
@@ -102,7 +111,9 @@ export class KnowledgeHost {
 
   constructor(private readonly logins: KnowledgeLoginStore, deps: KnowledgeHostDeps = {}) {
     const nowSeconds = () => Math.floor(Date.now() / 1000)
-    this.deps = { connection: daemonConnection, transport: httpTransport, clock: new SequenceClock(), nowSeconds, ...deps }
+    const connection = deps.connection ?? daemonConnection
+    const elevation = deps.elevation ?? daemonElevation
+    this.deps = { connection, elevation, transport: elevatingTransport(connection, elevation), clock: new SequenceClock(), nowSeconds, ...deps }
   }
 
   /** Loads the logins, once, before anything may change them (G4). A load
@@ -334,32 +345,42 @@ function credentialBody(credential: KnowledgeCredential): Record<string, unknown
   return { kind: credential.kind, value: credential.value, expires_at: credential.expiresAt }
 }
 
-/** Loopback HTTP to the daemon; reads nothing from a response but its error code. */
-const httpTransport: HostTransport = (connection, method, path, body) =>
-  new Promise((resolve, reject) => {
-    const headers: Record<string, string> = { ...connection.authHeaders }
-    if (body !== undefined) {
-      headers['Content-Type'] = 'application/json'
-      headers['Content-Length'] = String(Buffer.byteLength(body))
+/** M5 B6. After K-B6 a binding change is Elevated in service mode. With an
+ * enrolment, confirm once and retry once with the grant. Without an
+ * enrolment, this is one ordinary request. */
+export function elevatingTransport(
+  connection: () => DaemonConnection | null,
+  elevation: () => EnrolSession['turn'] | null,
+  send?: typeof proxyRequest,
+): HostTransport {
+  return async (_connection, method, path, body) => {
+    // Live `connection`, not `_connection`. sendElevating reads the getter again
+    // inside the turn to check the token is still this one. send() just read
+    // that same getter before calling the transport, so the first request
+    // uses the same connection.
+    let request: { method: 'PUT' | 'DELETE'; path: string; body?: unknown }
+    try {
+      request = body === undefined ? { method, path } : { method, path, body: JSON.parse(body) }
+    } catch {
+      throw new Error('Knowledge host request failed')
     }
-    const options = { host: '127.0.0.1', port: connection.port, method, path, headers, timeout: REQUEST_TIMEOUT_MS }
-    const req = http.request(options, (res) => {
-      const chunks: Buffer[] = []
-      // A response cut short emits 'error' (ECONNRESET) and never 'end'.
-      res.on('error', () => reject(new Error('Knowledge host request failed')))
-      res.on('data', (chunk: Buffer) => chunks.push(chunk))
-      res.on('end', () => {
-        let code: string | undefined
-        try {
-          const parsed = JSON.parse(Buffer.concat(chunks).toString()) as { error?: { code?: unknown } }
-          if (typeof parsed.error?.code === 'string') code = parsed.error.code
-        } catch {
-          // No JSON body: a success, or an error without the envelope.
-        }
-        resolve({ status: res.statusCode ?? 0, code })
-      })
-    })
-    req.on('timeout', () => req.destroy(new Error('timeout')))
-    req.on('error', () => reject(new Error('Knowledge host request failed')))
-    req.end(body)
-  })
+    const res = await sendElevating(
+      request,
+      { timeoutMs: REQUEST_TIMEOUT_MS },
+      send ? { connection, elevation, send } : { connection, elevation },
+    )
+    const raw = (res.data as { error?: { code?: unknown } } | null)?.error?.code
+    const code = typeof raw === 'string' ? raw : undefined
+    // proxyRequest's own failure (cannot connect, timed out, response cut short):
+    // send() still records the throw as daemon_unavailable.
+    if (
+      (code === 'timeout' && res.status === 504)
+      || (code === 'proxy_failed' && res.status === 502)
+      || (code === 'payload_too_large' && res.status === 502)
+      || (code === 'backend_not_ready' && res.status === 503)
+    ) {
+      throw new Error('Knowledge host request failed')
+    }
+    return { status: res.status, code }
+  }
+}
