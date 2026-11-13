@@ -802,7 +802,9 @@ function residentStop(): Promise<StopOutcome> {
 
 /** The plist is the one a service stop left behind with no daemon
  * (omlx-service-left.ts): a quit then reads the service as not installed.
- * A service daemon up again (an enrolment socket, not our own child) ends it. */
+ * A service daemon up again (an enrolment socket, not our own child) ends it;
+ * a live daemon whose record this app refuses keeps it for this quit (read as
+ * installed) without ending it. */
 function plistLeftByStop(): boolean {
   const dir = tryDataDir()
   if (dir === null) return false

@@ -2,14 +2,14 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { launchAgentPlistPath, markServiceLeft, serviceDaemonUp, serviceLeftBehind, serviceLeftPath, SERVICE_LEFT_FORMAT } from './omlx-service-left'
+import { launchAgentPlistPath, markServiceLeft, serviceDaemonUp, serviceLeftBehind, serviceLeftPath, SERVICE_LEFT_FORMAT, type DaemonSeen } from './omlx-service-left'
 
 // PR#1 F1 follow-up (ruling 2026-11-13-pr1-remaining-lows-gate-f, L-a).
 describe('the plist a service stop left behind (omlx-service-left)', () => {
   let dir = ''
   let file = ''
   let plist = ''
-  const down = () => false
+  const down = (): DaemonSeen => 'none'
   beforeEach(() => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'svc-left-'))
     file = serviceLeftPath(path.join(dir, 'data'))
@@ -72,11 +72,26 @@ describe('the plist a service stop left behind (omlx-service-left)', () => {
 
   it('ends, and clears the record, once a service daemon is up again (launchd at the next login)', () => {
     markServiceLeft(file, plist)
-    expect(serviceLeftBehind(file, plist, () => true)).toBe(false)
+    expect(serviceLeftBehind(file, plist, () => 'service')).toBe(false)
     expect(fs.existsSync(file)).toBe(false)
     // A look that throws reads as up: the service keeps its oMLX.
     markServiceLeft(file, plist)
     expect(serviceLeftBehind(file, plist, () => { throw new Error('read') })).toBe(false)
+    expect(fs.existsSync(file)).toBe(false)
+  })
+
+  // Ruling 2026-11-13-pr1-hardstop-service-left (A): a live daemon whose record
+  // this app refuses may or may not be the service.
+  it('keeps oMLX for a live refused daemon at this quit, without clearing the record', () => {
+    markServiceLeft(file, plist)
+    expect(serviceLeftBehind(file, plist, () => 'refused')).toBe(false)
+    expect(fs.existsSync(file)).toBe(true)
+    // That daemon gone at a later quit: the plist is left behind again.
+    expect(serviceLeftBehind(file, plist, down)).toBe(true)
+    // The plist gone still ends it, whatever runs.
+    fs.rmSync(plist)
+    expect(serviceLeftBehind(file, plist, () => 'refused')).toBe(false)
+    expect(fs.existsSync(file)).toBe(false)
   })
 
   it('reads an unreadable or foreign record as not left behind, and clears it', () => {
@@ -95,21 +110,22 @@ describe('the plist a service stop left behind (omlx-service-left)', () => {
     expect(() => markServiceLeft(serviceLeftPath(blocked), plist)).not.toThrow()
   })
 
-  it('reads a service daemon as up only for a live, not-own daemon with a socket or a refused record', () => {
+  it('tells the service up (a socket) from a refused record, and both from nothing that can be the service', () => {
     const alive = (pid: number) => pid !== 4404
     const own = (pid: number) => pid === 4401
     const svc = { pid: 4400, enrollEndpoint: '/s.sock' }
-    expect(serviceDaemonUp(svc, own, alive)).toBe(true)
+    expect(serviceDaemonUp(svc, own, alive)).toBe('service')
     // This app's own child daemon is not the service.
-    expect(serviceDaemonUp({ ...svc, pid: 4401 }, own, alive)).toBe(false)
+    expect(serviceDaemonUp({ ...svc, pid: 4401 }, own, alive)).toBe('none')
     // A stale record: its pid is gone.
-    expect(serviceDaemonUp({ ...svc, pid: 4404 }, own, alive)).toBe(false)
+    expect(serviceDaemonUp({ ...svc, pid: 4404 }, own, alive)).toBe('none')
     // A legacy record without a socket is not the service's.
-    expect(serviceDaemonUp({ pid: 4400 }, own, alive)).toBe(false)
+    expect(serviceDaemonUp({ pid: 4400 }, own, alive)).toBe('none')
     // A record the strict parser refused (a newer daemon) still names a live daemon.
-    expect(serviceDaemonUp({ pid: 4400, rejected: 'version 9' }, own, alive)).toBe(true)
-    expect(serviceDaemonUp({ pid: 4404, rejected: 'version 9' }, own, alive)).toBe(false)
-    expect(serviceDaemonUp(null, own, alive)).toBe(false)
+    expect(serviceDaemonUp({ pid: 4400, rejected: 'version 9' }, own, alive)).toBe('refused')
+    expect(serviceDaemonUp({ pid: 4401, rejected: 'version 9' }, own, alive)).toBe('none')
+    expect(serviceDaemonUp({ pid: 4404, rejected: 'version 9' }, own, alive)).toBe('none')
+    expect(serviceDaemonUp(null, own, alive)).toBe('none')
   })
 
   it('names the same plist as backend-manager.ts launchAgentPlistExists', () => {

@@ -54,19 +54,25 @@ function readLeft(file: string): PlistId | null {
   }
 }
 
-/** Whether the daemon on record can be the service's, up now: not this app's
- * own child, either with an enrolment socket (as serviceRecordPid in
- * resident-service.ts) or a record this app refused to parse (a newer daemon:
- * still a daemon that may be using oMLX), and alive. A legacy record (no
- * socket) is not the service's. */
+/** What daemon is up now, as far as the service goes:
+ * - 'service': alive, not this app's own child, with an enrolment socket (as
+ *   serviceRecordPid in resident-service.ts): the service is back.
+ * - 'refused': alive, not this app's own child, a record this app refused to
+ *   parse. It may be the service (a newer daemon) or not (another CLI's
+ *   daemon); this app cannot tell (ruling 2026-11-13-pr1-hardstop-service-left).
+ * - 'none': nothing up that can be the service (no record, our own child, a
+ *   stale pid, a legacy record without a socket). */
+export type DaemonSeen = 'service' | 'refused' | 'none'
+
 export function serviceDaemonUp(
   state: Pick<ExternalDaemonState, 'pid' | 'enrollEndpoint' | 'rejected'> | null,
   spawned: (pid: number) => boolean,
   alive: (pid: number) => boolean,
-): boolean {
-  if (state === null || spawned(state.pid)) return false
-  if (state.enrollEndpoint === undefined && state.rejected === undefined) return false
-  return alive(state.pid)
+): DaemonSeen {
+  if (state === null || spawned(state.pid)) return 'none'
+  if (state.enrollEndpoint === undefined && state.rejected === undefined) return 'none'
+  if (!alive(state.pid)) return 'none'
+  return state.enrollEndpoint !== undefined ? 'service' : 'refused'
 }
 
 function clear(file: string): void {
@@ -100,17 +106,20 @@ export function markServiceLeft(file: string, plist: string | null): void {
 
 /** At a quit: whether `plist` is the one a stop left behind with no service
  * daemon. False (and the record cleared) when there is no record, the record
- * cannot be read, the plist is gone or is another file, or `serviceDaemonUp`
- * says a service daemon runs again. Never throws. */
-export function serviceLeftBehind(file: string, plist: string | null, serviceDaemonUp: () => boolean): boolean {
+ * cannot be read, the plist is gone or was written again, or `daemonSeen`
+ * says the service runs again (or throws). False with the record kept when it
+ * says 'refused': this quit keeps oMLX for a daemon that may be the service,
+ * and a later quit with that daemon gone reads the plist as left behind again.
+ * Never throws. */
+export function serviceLeftBehind(file: string, plist: string | null, daemonSeen: () => DaemonSeen): boolean {
   if (!fs.existsSync(file)) return false
   const left = readLeft(file)
   const now = plist === null ? null : plistId(plist)
-  let up = true
-  try { up = serviceDaemonUp() } catch { up = true }
-  if (left === null || now === null || now.ino !== left.ino || now.mtimeMs !== left.mtimeMs || up) {
+  let seen: DaemonSeen = 'service'
+  try { seen = daemonSeen() } catch { seen = 'service' }
+  if (left === null || now === null || now.ino !== left.ino || now.mtimeMs !== left.mtimeMs || seen === 'service') {
     clear(file)
     return false
   }
-  return true
+  return seen === 'none'
 }
