@@ -14,8 +14,10 @@
 //! of 72. One skill directory stops at 40 entries. Validation, the manifest
 //! digest, and the stored eval bytes all come from that one snapshot.
 //!
-//! Neither path moves the skill pointer. Activation is SL-4. Provider status
-//! is SL-5 and is omitted here.
+//! Neither path moves the skill pointer. Activation is SL-4. A body revision
+//! on the detail carries the manifest `requires` list when the stored bytes
+//! still parse. An activation carries `accepted_count` when its binding's
+//! accepted list parses. Who provides a capability stays on `GET /components`.
 
 use std::collections::{BTreeMap, BTreeSet};
 #[cfg(unix)]
@@ -132,6 +134,10 @@ struct RevisionView {
     kind: String,
     content_digest: String,
     created_at: String,
+    /// Capability ids from this body revision. Absent on evals rows, and when
+    /// the stored body no longer parses.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    requires: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -144,6 +150,10 @@ struct ActivationView {
     origin_from: Option<String>,
     origin_to: String,
     created_at: String,
+    /// How many failing cases this activation accepted. Absent when
+    /// `accepted_json` is not a JSON array. The case text stays off this view.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted_count: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -586,6 +596,7 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         .map_err(|_| Fail::internal("read history"))?
         .into_iter()
         .map(|row| ActivationView {
+            accepted_count: accepted_count(&row.accepted_json),
             activation_id: row.activation_id,
             seq: row.seq,
             body_revision_id: row.body_revision_id,
@@ -596,17 +607,18 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
             created_at: row.created_at,
         })
         .collect();
-    let revisions = mine
-        .iter()
-        .map(|row| RevisionView {
+    let mut revisions = Vec::with_capacity(mine.len());
+    for row in &mine {
+        revisions.push(RevisionView {
             revision_id: row.revision_id.clone(),
             origin: row.origin.as_str().to_owned(),
             semver: row.semver.clone(),
             kind: row.kind.as_str().to_owned(),
             content_digest: row.content_digest.clone(),
             created_at: row.created_at.clone(),
-        })
-        .collect();
+            requires: body_requires(store, row).await?,
+        });
+    }
     Ok(SkillDetail {
         skill_id: skill_id.to_owned(),
         pointer: pointer.map(pointer_view),
@@ -615,6 +627,37 @@ async fn skill_detail(store: &Store, skill_id: &str) -> Result<SkillDetail, Fail
         activations,
         text_consistency,
     })
+}
+
+fn accepted_count(accepted_json: &str) -> Option<usize> {
+    serde_json::from_str::<Vec<serde_json::Value>>(accepted_json)
+        .ok()
+        .map(|items| items.len())
+}
+
+/// `requires` from a body revision. Evals rows and a body that no longer
+/// parses yield `None`, so the field is omitted rather than invented.
+async fn body_requires(
+    store: &Store,
+    row: &agent24_store::SkillRevisionMeta,
+) -> Result<Option<Vec<String>>, Fail> {
+    if row.kind != SkillRevisionKind::Body {
+        return Ok(None);
+    }
+    let Some(full) = store
+        .get_skill_revision(&row.revision_id)
+        .await
+        .map_err(|_| Fail::internal("read body"))?
+    else {
+        return Ok(None);
+    };
+    let Ok(text) = String::from_utf8(full.content) else {
+        return Ok(None);
+    };
+    let Ok(manifest) = parse_for_origin(full.origin, &text) else {
+        return Ok(None);
+    };
+    Ok(Some(manifest.requires))
 }
 
 fn consistency_view(
@@ -1935,6 +1978,43 @@ mod tests {
         assert!(detail["pointer"].is_null());
         assert!(detail["text_consistency"].is_null(), "{detail}");
         assert!(detail.get("providers").is_none());
+        let body_rev = detail["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "body")
+            .unwrap();
+        assert_eq!(body_rev["requires"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn detail_lists_the_body_requires() {
+        let state = crate::server::tests::state().await;
+        let markdown = "---\nname: weekly-report\ndescription: 周报\nrequires: [documents, model-gateway]\n---\nhello\n";
+        let (status, _) = call(
+            &state,
+            "POST",
+            "/api/v1/skills",
+            Some(&json!({ "markdown": markdown }).to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, detail) = call(&state, "GET", "/api/v1/skills/weekly-report", None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        let body_rev = detail["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "body")
+            .unwrap();
+        assert_eq!(body_rev["requires"], json!(["documents", "model-gateway"]));
+        let evals = detail["revisions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["kind"] == "evals")
+            .unwrap();
+        assert!(evals.get("requires").is_none());
     }
 
     #[tokio::test]

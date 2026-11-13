@@ -58,6 +58,9 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // ADR-038 C3b: read-only component list. The host report POST stays in main.
   r('GET', '/api/v1/components'),
+  // Skill list and detail are Everyday reads. Activation stays on the IPC below.
+  r('GET', '/api/v1/skills'),
+  r('GET', '/api/v1/skills/{id}'),
   // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
   r('GET', '/api/v1/idoris/status'),
   r('GET', '/api/v1/idoris/omlx/candidates'),

@@ -7291,6 +7291,12 @@ components:
         kind: { type: string, enum: [body, evals] }
         content_digest: { type: string }
         created_at: { type: string }
+        requires:
+          type: array
+          items: { type: string }
+          description: >-
+            Capability ids declared by this body revision. Omitted on evals
+            revisions, and when the stored body no longer parses.
     SkillConsistency:
       type: object
       required: [consistent, total]
@@ -7317,6 +7323,12 @@ components:
         origin_from: { type: [string, "null"], enum: [imported, user, null] }
         origin_to: { type: string, enum: [imported, user] }
         created_at: { type: string }
+        accepted_count:
+          type: integer
+          minimum: 0
+          description: >-
+            How many failing cases this activation accepted. Omitted when the
+            binding's accepted list is not a JSON array. Case text is not included.
     SkillDetail:
       type: object
       required: [skill_id, pointer, generation, revisions, activations, text_consistency]

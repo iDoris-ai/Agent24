@@ -5,13 +5,17 @@ import ChatPage from './Chat'
 import { setLocale } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import { chatHistorySummary } from '../../shared/chat-history'
+import { resetConversationSkillsForTests } from './chat/session-skill'
+import { aside, resetSkillListing, skillListing } from './chat/skill-list-aside'
 
 const mockBackendProxy = vi.fn()
 
 beforeEach(() => {
   vi.clearAllMocks()
+  resetConversationSkillsForTests()
+  resetSkillListing()
   Object.defineProperty(window, 'agent24', {
-    value: { backendProxy: mockBackendProxy },
+    value: { backendProxy: aside(mockBackendProxy) },
     writable: true,
     configurable: true,
   })
@@ -367,7 +371,7 @@ describe('ChatPage with Knowledge', () => {
       .mockResolvedValueOnce({ enabled: true, active: false })
       .mockResolvedValue({ enabled: true, active: true })
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status } },
       writable: true,
       configurable: true,
     })
@@ -394,7 +398,7 @@ describe('ChatPage with Knowledge', () => {
 
   it('runs the first Knowledge turn of a new conversation in a new session', async () => {
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
       configurable: true,
     })
@@ -419,6 +423,186 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText('answer two')).toBeInTheDocument(), { timeout: 3000 })
     expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's2' } }))
   })
+
+  // Mutation: pass skill_id only while creating the run session (the first round) and the second expectation goes red.
+  it('sends the chosen skill_id on every run of the conversation, including the second round', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true }) } },
+      writable: true,
+      configurable: true,
+    })
+    skillListing.respond = () => ({ ok: true, status: 200, data: { skills: [
+      { skill_id: 'live', origin: 'user', semver: '1.0.0', generation: 1, active: true },
+      { skill_id: 'draft', origin: 'imported', semver: '0.1.0', generation: 0, active: false },
+    ] } })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      const text = req.path.endsWith('r-first') ? 'answer one' : 'answer two'
+      return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge: { searched: true, read_chunks: [] } } }
+    })
+
+    render(<ChatPage />)
+    const select = screen.getByRole('combobox', { name: '技能' })
+    fireEvent.focus(select)
+    await waitFor(() => expect(screen.getByRole('option', { name: 'live' })).toBeInTheDocument())
+    expect(screen.queryByRole('option', { name: 'draft' })).not.toBeInTheDocument()
+    fireEvent.change(select, { target: { value: 'live' } })
+
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'first' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('answer one')).toBeInTheDocument(), { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: 'second' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('answer two')).toBeInTheDocument(), { timeout: 3000 })
+
+    const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body)).toEqual([
+      { prompt: 'first', session_id: 's1', skill_id: 'live' },
+      { prompt: 'second', session_id: 's1', skill_id: 'live' },
+    ])
+  })
+
+  const skillList = (ids: string[]) => ({ ok: true, status: 200, data: { skills: ids.map((id) => ({ skill_id: id, origin: 'user', semver: '1.0.0', generation: 1, active: true })) } })
+  const noKnowledge = () => Object.defineProperty(window, 'agent24', {
+    value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: false, active: false }) } },
+    writable: true,
+    configurable: true,
+  })
+  const send = (text: string) => {
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: text } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+  }
+  const posts = () => mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST')
+
+  // Mutation: route on `knowledge?.active` alone (drop `|| skill`) and the first expectation goes red.
+  it('sends a skill turn to /runs with skill_id even when Knowledge is off, every round', async () => {
+    noKnowledge()
+    skillListing.respond = () => skillList(['live'])
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: `ans ${req.path.slice('/api/v1/runs/r-'.length)}` }, knowledge: null } }
+    })
+    render(<ChatPage />)
+    const select = screen.getByRole('combobox', { name: '技能' })
+    await waitFor(() => expect(screen.getByRole('option', { name: 'live' })).toBeInTheDocument())
+    fireEvent.change(select, { target: { value: 'live' } })
+    send('first')
+    await waitFor(() => expect(screen.getByText('ans first')).toBeInTheDocument(), { timeout: 3000 })
+    send('second')
+    await waitFor(() => expect(screen.getByText('ans second')).toBeInTheDocument(), { timeout: 3000 })
+    expect(posts().map((req) => [req.path, req.body.skill_id])).toEqual([
+      ['/api/v1/sessions', undefined],
+      ['/api/v1/runs', 'live'],
+      ['/api/v1/runs', 'live'],
+    ])
+    expect(posts().some((req) => req.path === '/api/v1/chat')).toBe(false)
+  })
+
+  it('keeps /api/v1/chat when no skill is chosen and Knowledge is off', async () => {
+    noKnowledge()
+    skillListing.respond = () => skillList(['live'])
+    mockBackendProxy.mockImplementation(async () => {
+      return { ok: true, status: 200, data: { message: { content: 'plain reply' } } }
+    })
+    render(<ChatPage />)
+    send('hello')
+    await waitFor(() => expect(screen.getByText('plain reply')).toBeInTheDocument())
+    expect(posts().map((req) => req.path)).toEqual(['/api/v1/chat'])
+  })
+
+  it('does not send a skill that left the active list: the picker drops it on refresh', async () => {
+    noKnowledge()
+    let active = ['live']
+    skillListing.respond = () => skillList(active)
+    mockBackendProxy.mockImplementation(async () => {
+      return { ok: true, status: 200, data: { message: { content: 'plain reply' } } }
+    })
+    render(<ChatPage />)
+    const select = screen.getByRole('combobox', { name: '技能' })
+    await waitFor(() => expect(screen.getByRole('option', { name: 'live' })).toBeInTheDocument())
+    fireEvent.change(select, { target: { value: 'live' } })
+    active = []
+    fireEvent.focus(select)
+    await waitFor(() => expect(select).toHaveValue(''))
+    expect(screen.getByRole('status')).toHaveTextContent('live')
+    send('hello')
+    await waitFor(() => expect(screen.getByText('plain reply')).toBeInTheDocument())
+    expect(posts().map((req) => req.path)).toEqual(['/api/v1/chat'])
+  })
+
+  it('clears the choice and says so when the run is refused with skill_not_active', async () => {
+    noKnowledge()
+    skillListing.respond = () => skillList(['live'])
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: false, status: 409, data: { error: { code: 'skill_not_active', message: 'x' } } }
+      return { ok: true, status: 200, data: { message: { content: 'plain reply' } } }
+    })
+    render(<ChatPage />)
+    const select = screen.getByRole('combobox', { name: '技能' })
+    await waitFor(() => expect(screen.getByRole('option', { name: 'live' })).toBeInTheDocument())
+    fireEvent.change(select, { target: { value: 'live' } })
+    send('first')
+    await waitFor(() => expect(screen.getByText(/技能“live”已不再生效/)).toBeInTheDocument(), { timeout: 3000 })
+    expect(select).toHaveValue('')
+    send('again')
+    await waitFor(() => expect(screen.getByText('plain reply')).toBeInTheDocument())
+  })
+
+  // Mutation: in SkillPicker, call setConversationSkill(conversation, next) even when hasMessages
+  // (attach mid-chat) and the first expectation goes red.
+  it('starts a new conversation when a skill is chosen in a chat that has turns; the old one is left as it was', async () => {
+    const save = vi.fn(async (record: { id: string }) => ({ id: record.id, archived_at: null }))
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: aside(mockBackendProxy),
+        knowledge: { status: vi.fn().mockResolvedValue({ enabled: false, active: false }) },
+        chatHistory: { list: vi.fn().mockResolvedValue([]), save, promoteRun: vi.fn(), setTitle: vi.fn().mockResolvedValue(null), get: vi.fn().mockResolvedValue(null) },
+      },
+      writable: true,
+      configurable: true,
+    })
+    skillListing.respond = () => skillList(['live'])
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.path.startsWith('/api/v1/runs/')) return { ok: true, status: 200, data: { status: 'completed', output: { text: `ans ${req.path.slice('/api/v1/runs/r-'.length)}` }, knowledge: null } }
+      return { ok: true, status: 200, data: { message: { content: 'plain reply' } } }
+    })
+    render(<ChatPage />)
+    await waitFor(() => expect(screen.getByRole('option', { name: 'live' })).toBeInTheDocument())
+    send('old topic')
+    await waitFor(() => expect(screen.getByText('plain reply')).toBeInTheDocument())
+    await waitFor(() => expect(save).toHaveBeenCalled())
+    const oldId = save.mock.calls[0][0].id
+    const oldSaved = JSON.stringify(save.mock.calls[save.mock.calls.length - 1][0])
+
+    const select = screen.getByRole('combobox', { name: '技能' })
+    expect(screen.getByText('选技能会开新对话')).toBeInTheDocument()
+    fireEvent.change(select, { target: { value: 'live' } })
+    // A new, empty conversation with the skill preselected; nothing attached to the old one.
+    await waitFor(() => expect(screen.queryByText('old topic')).not.toBeInTheDocument())
+    expect(select).toHaveValue('live')
+    expect(screen.queryByText('选技能会开新对话')).not.toBeInTheDocument()
+
+    send('one')
+    await waitFor(() => expect(screen.getByText('ans one')).toBeInTheDocument(), { timeout: 3000 })
+    send('two')
+    await waitFor(() => expect(screen.getByText('ans two')).toBeInTheDocument(), { timeout: 3000 })
+    const runs = posts().filter((req) => req.path === '/api/v1/runs')
+    expect(runs.map((req) => req.body)).toEqual([
+      { prompt: 'one', session_id: 's1', skill_id: 'live' },
+      { prompt: 'two', session_id: 's1', skill_id: 'live' },
+    ])
+    expect(posts().filter((req) => req.path === '/api/v1/chat' && req.body.session_id)).toHaveLength(1)
+    // The old conversation's last saved record is untouched by anything that followed.
+    const lastOld = [...save.mock.calls].reverse().find(([record]) => record.id === oldId)![0]
+    expect(JSON.stringify(lastOld)).toBe(oldSaved)
+  })
 })
 
 // M4 A2: a Knowledge turn whose run waits on an approval becomes a task of
@@ -431,7 +615,7 @@ describe('ChatPage promoting a Knowledge run to a task', () => {
     const save = vi.fn(async (record: { id: string }) => ({ id: record.id }))
     Object.defineProperty(window, 'agent24', {
       value: {
-        backendProxy: mockBackendProxy,
+        backendProxy: aside(mockBackendProxy),
         knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true }) },
         chatHistory: { list: vi.fn().mockResolvedValue([]), save, promoteRun },
       },
@@ -481,7 +665,7 @@ describe('ChatPage with Knowledge when the run outlasts the wait', () => {
       (recorded && saved ? chatHistorySummary({ ...saved, runs: [{ run_id: runId, kind: 'task', started_at: saved.created_at }] }) : null))
     Object.defineProperty(window, 'agent24', {
       value: {
-        backendProxy: mockBackendProxy,
+        backendProxy: aside(mockBackendProxy),
         knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true }) },
         chatHistory: { list: vi.fn().mockResolvedValue([]), save, promoteRun },
       },
@@ -558,7 +742,7 @@ describe('ChatPage with Knowledge when the answer names sources the run did not 
 
   const answerWith = async (text: string, knowledge: unknown) => {
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
       configurable: true,
     })
@@ -594,7 +778,7 @@ describe('ChatPage with Knowledge switched On but not in effect', () => {
 
   const askPlain = async (status: { enabled: boolean; active: boolean }) => {
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ ...status, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ ...status, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
       configurable: true,
     })
@@ -628,7 +812,7 @@ describe('ChatPage with Knowledge on another server', () => {
       .mockResolvedValueOnce({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] })
       .mockResolvedValue({ enabled: true, active: true, endpoint: 'https://b.example/api/v1', knowledgeBaseIds: ['kb'] })
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status } },
       writable: true,
       configurable: true,
     })
@@ -657,7 +841,7 @@ describe('ChatPage when the daemon refuses an old session', () => {
 
   it('asks again in a new session, once', async () => {
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
       configurable: true,
     })
@@ -687,7 +871,7 @@ describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
 
   it('shows the inline confirmation, then sends the turn again in the same session with the flag', async () => {
     Object.defineProperty(window, 'agent24', {
-      value: { backendProxy: mockBackendProxy, knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
       configurable: true,
     })

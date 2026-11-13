@@ -569,7 +569,9 @@ async fn the_detail_lists_activations_without_cases_or_text() {
     assert_eq!(rows[0]["result_code"], "activated");
     assert_eq!(rows[0]["origin_from"], Value::Null);
     assert_eq!(rows[0]["origin_to"], "imported");
+    assert_eq!(rows[0]["accepted_count"], 0);
     assert!(rows[0].get("cases_json").is_none());
+    assert!(rows[0].get("accepted_json").is_none());
     assert!(!detail.to_string().contains("hello world"));
 }
 
@@ -612,6 +614,14 @@ async fn the_summary_discloses_accepted_failures() {
             .await
             .is_none()
     );
+    let (status, activated) = post(&state, SKILL, request).await;
+    assert_eq!(status, StatusCode::OK, "{activated}");
+    let response = get_skill(State(state), AxumPath(SKILL.to_owned())).await;
+    let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    let detail: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(detail["activations"][0]["accepted_count"], 1);
 }
 
 /// The audit actor names the caller's audience and token id, not a constant.

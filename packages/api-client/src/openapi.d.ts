@@ -3596,6 +3596,8 @@ export interface components {
             kind: "body" | "evals";
             content_digest: string;
             created_at: string;
+            /** @description Capability ids declared by this body revision. Omitted on evals revisions, and when the stored body no longer parses. */
+            requires?: string[];
         };
         SkillConsistency: {
             consistent: number;
@@ -3613,6 +3615,8 @@ export interface components {
             /** @enum {string} */
             origin_to: "imported" | "user";
             created_at: string;
+            /** @description How many failing cases this activation accepted. Omitted when the binding's accepted list is not a JSON array. Case text is not included. */
+            accepted_count?: number;
         };
         SkillDetail: {
             skill_id: string;

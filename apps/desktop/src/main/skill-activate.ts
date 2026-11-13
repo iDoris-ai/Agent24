@@ -55,7 +55,13 @@ export function parseSkillActivateInput(raw: unknown): SkillActivateInput | null
 
 interface Revision { revision_id: string; origin: string; semver: string; kind: string; content_digest: string }
 interface Pointer { origin: string; body_revision_id: string; evals_revision_id: string; generation: number }
-interface Activation { activation_id: string; body_revision_id: string; evals_revision_id: string }
+interface Activation {
+  activation_id: string
+  body_revision_id: string
+  evals_revision_id: string
+  /** Present when the detail's binding listed the accepted failing cases. */
+  acceptedCount?: number
+}
 interface Detail {
   skill_id: string
   generation: number
@@ -65,6 +71,21 @@ interface Detail {
 }
 
 const str = (v: unknown): v is string => typeof v === 'string'
+
+/** A count from the detail, when the binding is on the activation row. Missing means do not mention it. */
+function acceptedCountOf(v: Record<string, unknown>): number | undefined {
+  if (typeof v.accepted_count === 'number' && Number.isSafeInteger(v.accepted_count) && v.accepted_count >= 0) {
+    return v.accepted_count
+  }
+  if (Array.isArray(v.accepted) && v.accepted.every(str)) return v.accepted.length
+  if (typeof v.accepted_json === 'string') {
+    try {
+      const parsed = JSON.parse(v.accepted_json) as unknown
+      if (Array.isArray(parsed)) return parsed.length
+    } catch { /* not a list: the dialog omits the line */ }
+  }
+  return undefined
+}
 
 /** The daemon's own detail record, or null when it is not the shape promised. */
 export function parseDetail(data: unknown, skillId: string): Detail | null {
@@ -83,7 +104,13 @@ export function parseDetail(data: unknown, skillId: string): Detail | null {
   for (const item of d.activations) {
     const v = item as Record<string, unknown> | null
     if (!v || !str(v.activation_id) || !str(v.body_revision_id) || !str(v.evals_revision_id)) return null
-    activations.push({ activation_id: v.activation_id, body_revision_id: v.body_revision_id, evals_revision_id: v.evals_revision_id })
+    const acceptedCount = acceptedCountOf(v)
+    activations.push({
+      activation_id: v.activation_id,
+      body_revision_id: v.body_revision_id,
+      evals_revision_id: v.evals_revision_id,
+      ...(acceptedCount === undefined ? {} : { acceptedCount }),
+    })
   }
   let pointer: Pointer | null = null
   if (d.pointer !== null) {
@@ -99,6 +126,10 @@ const plain = (text: string, max = 64): string => {
   const clean = text.replace(/[^\x20-\x7e]/g, '?')
   return clean.length > max ? `${clean.slice(0, max)}...` : clean
 }
+
+/** The origin as the user knows it; an unknown value stays plain text. */
+const originLabel = (origin: string): string =>
+  origin === 'user' ? mt('origin.user') : origin === 'imported' ? mt('origin.imported') : plain(origin, 16)
 
 export interface Confirmation { message: string; detail: string }
 
@@ -121,9 +152,11 @@ export function buildConfirmation(
   const rollback = 'rollbackActivationId' in input
   let bodyId: string
   let evalsId: string
+  let restored: Activation | undefined
   if (rollback) {
     const row = detail.activations.find((a) => a.activation_id === input.rollbackActivationId)
     if (!row) return { failure: 'activation_not_found' }
+    restored = row
     bodyId = row.body_revision_id
     evalsId = row.evals_revision_id
   } else {
@@ -149,8 +182,12 @@ export function buildConfirmation(
     mt('skill.digest', { digest: plain(body.content_digest.slice(0, 8), 8) }),
     mt('skill.evals', { state }),
   ]
-  if (pointer && pointer.origin !== body.origin) {
-    lines.push(mt('skill.switch', { from: plain(pointer.origin, 16), to: plain(body.origin, 16) }))
+  if (!pointer) lines.push(mt('skill.origin', { origin: originLabel(body.origin) }))
+  else if (pointer.origin !== body.origin) {
+    lines.push(mt('skill.switch', { from: originLabel(pointer.origin), to: originLabel(body.origin) }))
+  }
+  if (rollback && restored?.acceptedCount !== undefined && restored.acceptedCount > 0) {
+    lines.push(mt('skill.acceptedThen', { count: restored.acceptedCount }))
   }
   if (!rollback && input.accepted.length > 0) lines.push(mt('skill.accepted', { count: input.accepted.length }))
   lines.push('', mt('skill.detail'))
