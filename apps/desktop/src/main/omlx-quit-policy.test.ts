@@ -51,10 +51,12 @@ describe('whether quitting stops the oMLX this app started', () => {
     expect(main.match(/stopKeptOmlx\(/g)).toHaveLength(1)
     // Both are options of the one registerIpcHandlers call.
     const register = main.slice(main.indexOf('registerIpcHandlers({'))
+    expect(register.indexOf('\n  })\n')).toBeGreaterThan(0)
     const args = register.slice(0, register.indexOf('\n  })\n'))
     expect(args).toContain('rememberKeptOmlx: ')
     expect(args).toContain('stopKeptOmlx: ')
     const stop = main.slice(main.indexOf('function residentStop(): Promise<StopOutcome>'))
+    expect(stop.indexOf('\n}\n')).toBeGreaterThan(0)
     const body = stop.slice(0, stop.indexOf('\n}\n'))
     expect(body).not.toMatch(/[Kk]ept/)
     expect(body).not.toContain('afterUninstall')

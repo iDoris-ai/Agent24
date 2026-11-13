@@ -184,10 +184,9 @@ describe('the oMLX a quit left running (omlx-kept)', () => {
     rememberKeptOmlx(file, { pid: 4100, port: 8088 }, fakeProbe(procs).probe)
     rememberKeptOmlx(file, { pid: 4200, port: 8089 }, fakeProbe(procs).probe)
     const { probe, signals } = fakeProbe(procs)
-    const started = Date.now()
     expect((await stopKeptOmlx(file, probe, { graceMs: 150, killMs: 30 })).stopped.sort()).toEqual([4100, 4200])
-    expect(Date.now() - started).toBeLessThan(290)
-    expect(signals.slice(0, 2).map(([, s]) => s)).toEqual(['SIGTERM', 'SIGTERM'])
+    // Both TERMs before any KILL: one after another would be TERM, KILL, TERM, KILL.
+    expect(signals.map(([, s]) => s)).toEqual(['SIGTERM', 'SIGTERM', 'SIGKILL', 'SIGKILL'])
   })
 
   it('keeps at most the newest two records, and looks at no more than two', async () => {

@@ -175,7 +175,8 @@ export async function stopOwnedOmlx(): Promise<boolean> {
 }
 
 /** A quit that leaves the child running: record it once (pid and the port it
- *  was started on), so the service's stop can stop it later (omlx-kept.ts). */
+ *  was started on), so a later quit with the service not installed can stop
+ *  it (omlx-kept.ts). */
 function keepOwnedOmlx(): Promise<boolean> {
   const child = omlxProcess
   const port = omlxPort
@@ -203,7 +204,10 @@ function stopKeptOnQuit(): Promise<void> {
 
 /** before-quit entry. The first call sends SIGTERM before it returns, then
  *  waits at most {@link OMLX_QUIT_STOP_BUDGET_MS} (same shape as
- *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
+ *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. When it
+ *  stops, what earlier quits left running is stopped in the same wait; that
+ *  stop's identity checks (ps, lsof) run synchronously before the budget
+ *  starts, at most about 4 s in the worst case (omlx-kept.ts stopKeptOmlx). */
 export function ensureOwnedOmlxQuit(): Promise<boolean> {
   if (ownedOmlxQuit) return ownedOmlxQuit
   // The resident service daemon uses it after the app is gone (M5 B4).
@@ -709,7 +713,8 @@ export function registerIpcHandlers(options: {
    * service daemon uses it); default: never. */
   keepOwnedOmlxOnQuit?: () => boolean
   /** Records the pid and port of the oMLX a quit leaves running, so a later
-   * service stop can stop that process when its identity still matches.
+   * quit with the service not installed can stop that process when its
+   * identity still matches.
    * Default: do nothing. */
   rememberKeptOmlx?: (k: { pid: number; port: number }) => void
   /** At a quit that stops (the resident service not installed): stops what

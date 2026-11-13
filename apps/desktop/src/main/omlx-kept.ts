@@ -142,8 +142,10 @@ async function waitUntilGone(probe: OmlxProcessProbe, pid: number, ms: number): 
  * cut the wait short; what then survives is not tried again). Then, for all
  * matched records at once: SIGTERM; when still alive after `graceMs`, and its
  * started still matches, SIGKILL; then wait at most `killMs` more. The checks
- * are synchronous (ps, lsof): at most 2 records × 2 s in the worst case.
- * Never throws. */
+ * are synchronous (ps, lsof) and run before the caller's budget starts: at
+ * most 2 records × 2 s in the worst case (each ps 0.5 s, lsof 1 s, when they
+ * time out), plus one ps per record before a SIGKILL. A check that times out
+ * reads as a mismatch. Never throws. */
 export async function stopKeptOmlx(
   file: string,
   probe: OmlxProcessProbe,
@@ -190,13 +192,15 @@ export async function stopKeptOmlx(
 /** `ps` reads in a fixed zone and locale, so the start time recorded at one
  *  launch reads the same at a later one (a changed TZ or LC_TIME otherwise
  *  changes the text). Short timeout: it runs synchronously in before-quit. */
-const PS_ENV: NodeJS.ProcessEnv = { ...process.env, TZ: 'UTC', LC_ALL: 'C' }
+function psEnv(): NodeJS.ProcessEnv {
+  return { ...process.env, TZ: 'UTC', LC_ALL: 'C' }
+}
 const PS_TIMEOUT_MS = 500
 const LSOF_TIMEOUT_MS = 1_000
 
 function psValue(pid: number, column: 'lstart=' | 'command='): string | null {
   try {
-    const out = execFileSync('/bin/ps', ['-o', column, '-p', String(pid)], { encoding: 'utf8', timeout: PS_TIMEOUT_MS, env: PS_ENV })
+    const out = execFileSync('/bin/ps', ['-o', column, '-p', String(pid)], { encoding: 'utf8', timeout: PS_TIMEOUT_MS, env: psEnv() })
     const text = out.trim()
     return text === '' ? null : text
   } catch {
