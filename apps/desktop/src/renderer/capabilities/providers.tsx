@@ -47,7 +47,6 @@ const samePage = (a: Route, b: Route) =>
 export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   const [{ defs, moduleInventory }, setRegistry] = useState<Pick<CapabilitiesApi, 'defs' | 'moduleInventory'>>({ defs: CAPABILITIES })
   const [route, setRoute] = useState<Route>({ kind: 'page', page: 'home' })
-  const [approvalsWaiting, setApprovalsWaiting] = useState(0)
   const settingsVisit = useRef(0)
   const t = useT(capabilitiesMessages)
   const [guards] = useState(() => new Set<LeaveGuard>())
@@ -78,7 +77,6 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let disposed = false
     let modulesBusy = false
-    let approvalsBusy = false
     const poll = () => {
       if (!modulesBusy) {
         modulesBusy = true
@@ -96,13 +94,9 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
           setRegistry(prev => ({ defs, moduleInventory: { ids, disabledIds, previousIds: prev.moduleInventory?.ids } }))
         }).catch(() => { /* Keep the last successful registry while offline. */ }).finally(() => { modulesBusy = false })
       }
-      if (!approvalsBusy) {
-        approvalsBusy = true
-        void window.agent24.backendProxy({ method: 'GET', path: '/api/v1/approvals?status=pending' }).then(res => {
-          if (!disposed && res.ok && res.data && typeof res.data === 'object'
-            && 'approvals' in res.data && Array.isArray(res.data.approvals)) setApprovalsWaiting(res.data.approvals.length)
-        }).catch(() => { /* Keep the last successful count while offline. */ }).finally(() => { approvalsBusy = false })
-      }
+      // M6 C2: the assistant's badge is the list's "Needs you" now (T-1,
+      // Sidebar.tsx), no longer the daemon's pending approvals: an approval
+      // no conversation has goes to the assistant's own (M4 A6).
     }
     poll()
     const timer = setInterval(poll, 5000)
@@ -110,7 +104,7 @@ export function CapabilitiesProvider({ children }: { children: ReactNode }) {
   }, [])
 
   return <CapabilitiesContext.Provider value={{
-    defs, moduleInventory, manifestsLoaded: moduleInventory !== undefined, approvalsWaiting,
+    defs, moduleInventory, manifestsLoaded: moduleInventory !== undefined,
     open,
   }}>
     <RouteContext.Provider value={{ route, navigate }}>

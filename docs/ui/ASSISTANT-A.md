@@ -9,7 +9,7 @@
 每条对话一个文件：`<userData>/chat-history/<id>.json`。原子替换写入，文件 0600、目录 0700，这些都跟以前一样。
 
 - `format`：`agent24.desktop.chat-history`
-- `version`：**2**。版本不是 2 的文件不读。`list` 跳过它，`get` 返回 null，文件本身原样留在磁盘上。
+- `version`：**2**（M6 C1 起为 3，见 `ASSISTANT-C.md` §1）。版本不是 2 的文件不读。`list` 跳过它，`get` 返回 null，文件本身原样留在磁盘上。
 - v2 的每个字段都必须有：`title_source`、`group_id`、`archived_at`、`runs`、`pending`。缺一个就整个文件不读，不再按「v1 里后加的字段」去补默认值。
 
 新增的两个字段（类型在 `apps/desktop/src/shared/chat-history.ts`）：

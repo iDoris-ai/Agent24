@@ -152,7 +152,7 @@ it.skipIf(process.platform !== 'darwin')('startup detection prompts for the stal
     { path: '/usr/local/bin/agent24', link: 'missing', state: 'missing' },
     { path: destination, link: 'other', state: 'outdated', version: '0.4.0' },
   ] })
-  expect(buildTrayView({ status: 'running', external: false, externalPid: null, foreignPid: null, backendKind: 'rust', cliTool: status }).items)
+  expect(buildTrayView({ status: 'running', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust', cliTool: status }).items)
     .toContainEqual(expect.objectContaining({ action: 'cli-settings', label: expect.stringContaining('0.4.0') }))
   expect(await readFile(destination, 'utf8')).toBe(original)
   expect((await lstat(destination)).isFile()).toBe(true)

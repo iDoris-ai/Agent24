@@ -10,7 +10,7 @@ import { aside } from './skill-list-aside'
 
 const proxy = vi.fn()
 let saved: Map<string, ChatHistoryRecord>
-const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn(), setTitle: vi.fn() }
+const chatHistory = { list: vi.fn(), get: vi.fn(), save: vi.fn(), delete: vi.fn(), clear: vi.fn(), setTitle: vi.fn(), markSeen: vi.fn() }
 const summary = chatHistorySummary
 const RANK = { prompt: 0, model: 1, schedule: 2, assistant: 2, user: 3 } as const
 /** Saves as main does: a stronger title on file is kept (main/chat-history.ts). */
@@ -31,6 +31,13 @@ function memoryStore() {
   chatHistory.save.mockReset().mockImplementation(async (r: ChatHistoryRecord) => put(r))
   chatHistory.delete.mockReset().mockImplementation(async (id: string) => { saved.delete(id) })
   chatHistory.clear.mockReset().mockImplementation(async () => { saved.clear() })
+  // M6 C1: as main does, nothing of it unseen any more; null when not on file.
+  chatHistory.markSeen.mockReset().mockImplementation(async (id: string) => {
+    const before = saved.get(id)
+    if (!before) return null
+    saved.set(id, { ...before, unseen: [] })
+    return summary(saved.get(id)!)
+  })
   chatHistory.setTitle.mockReset().mockImplementation(async (id: string, title: string, source: 'user' | 'model') => {
     const before = saved.get(id)
     if (!before) return null
@@ -42,7 +49,7 @@ function memoryStore() {
 
 function stored(id: string, title: string, updated: string): ChatHistoryRecord {
   return {
-    format: 'agent24.desktop.chat-history', version: 2, id, title, title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [],
+    format: 'agent24.desktop.chat-history', version: 3, id, title, title_source: 'prompt', group_id: null, archived_at: null, runs: [], pending: [], initiator: 'user', unseen: [],
     created_at: '2026-11-07T10:00:00.000Z', updated_at: updated,
     messages: [
       { role: 'user', content: title, at: '2026-11-07T10:00:00.000Z', delivered: true },
@@ -127,7 +134,7 @@ describe('chat history', () => {
     const sessionId = proxy.mock.calls[0][0].body.session_id
     await waitFor(() => expect(saved.get(sessionId)?.messages).toHaveLength(2))
     const record = saved.get(sessionId)!
-    expect(record).toMatchObject({ format: 'agent24.desktop.chat-history', version: 2, id: sessionId, title: '第一个问题' })
+    expect(record).toMatchObject({ format: 'agent24.desktop.chat-history', version: 3, id: sessionId, title: '第一个问题' })
     expect(record.messages[0]).toMatchObject({ role: 'user', content: '第一个问题', delivered: true })
     expect(record.messages[1]).toMatchObject({ role: 'assistant', content: 'ack', run_id: null })
     expect(record.messages.every(m => /Z$/.test(m.at))).toBe(true)
@@ -764,5 +771,61 @@ describe('finding a conversation (UI-04 T3)', () => {
     const d = new Date(2026, 10, 8, 9, 5)
     expect(shortTime(d.toISOString())).toBe('11-08 09:05')
     expect(shortTime('不是时间')).toBe('')
+  })
+})
+
+// M6 C1: opening a conversation marks it seen (docs/ui/ASSISTANT-C.md §4).
+describe('opening a conversation marks it seen (M6 C1)', () => {
+  /** A schedule's conversation with a run not seen yet. Its run is left out
+   *  of `runs` so that no card polls the daemon here (the bridge does not
+   *  check); TaskCard.test.tsx shows the cards. */
+  const unseenOne = (id: string, title: string): ChatHistoryRecord =>
+    ({ ...stored(id, title, '2026-11-07T10:00:02.000Z'), initiator: 'schedule', unseen: ['run_1'] })
+  const listed = (id: string) => getHistoryState().items.find(item => item.id === id)
+
+  it('asks main to mark it seen and lists what main answers; opening still writes nothing', async () => {
+    saved.set('chat_sch_1', unseenOne('chat_sch_1', '日程：周报'))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '日程：周报' }))
+    await waitFor(() => expect(screen.getByText('答：日程：周报')).toBeInTheDocument())
+    await waitFor(() => expect(chatHistory.markSeen).toHaveBeenCalledWith('chat_sch_1'))
+    expect(chatHistory.markSeen).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(listed('chat_sch_1')?.unseen).toEqual([]))
+    expect(chatHistory.save).not.toHaveBeenCalled()
+  })
+
+  it('a failed mark leaves it unseen in the list, and the conversation open', async () => {
+    saved.set('chat_sch_1', unseenOne('chat_sch_1', '日程：周报'))
+    chatHistory.markSeen.mockRejectedValueOnce(new Error('EIO'))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '日程：周报' }))
+    await waitFor(() => expect(chatHistory.markSeen).toHaveBeenCalledTimes(1))
+    await waitFor(() => expect(screen.getByText('答：日程：周报')).toBeInTheDocument())
+    expect(listed('chat_sch_1')?.unseen).toEqual(['run_1'])
+  })
+
+  it('a bridge without markSeen still opens it', async () => {
+    saved.set('chat_sch_1', unseenOne('chat_sch_1', '日程：周报'))
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: proxy, chatHistory: { ...chatHistory, markSeen: undefined } }, writable: true, configurable: true,
+    })
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '日程：周报' }))
+    await waitFor(() => expect(screen.getByText('答：日程：周报')).toBeInTheDocument())
+    expect(listed('chat_sch_1')?.unseen).toEqual(['run_1'])
+  })
+
+  it('a conversation deleted while main marks it seen is not listed again', async () => {
+    saved.set('chat_sch_1', unseenOne('chat_sch_1', '日程：周报'))
+    let answer: (value: unknown) => void = () => {}
+    chatHistory.markSeen.mockImplementationOnce(() => new Promise(r => { answer = r }))
+    renderBoth()
+    fireEvent.click(await within(await findHistoryList()).findByRole('button', { name: '日程：周报' }))
+    await waitFor(() => expect(chatHistory.markSeen).toHaveBeenCalledTimes(1))
+    deleteFromMenu('日程：周报')
+    await waitFor(() => expect(listed('chat_sch_1')).toBeUndefined())
+    answer(summary({ ...unseenOne('chat_sch_1', '日程：周报'), unseen: [] }))
+    await new Promise(r => setTimeout(r, 0))
+    expect(listed('chat_sch_1')).toBeUndefined()
   })
 })

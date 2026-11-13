@@ -3,7 +3,7 @@ import { onMainLocaleChange, resetMainLocaleForTest, setMainLocale } from './mai
 import { buildTrayView, type TrayInput } from './tray-menu'
 
 const input: TrayInput = {
-  status: 'running', external: false, externalPid: null, foreignPid: null, backendKind: 'rust',
+  status: 'running', external: false, enrolled: false, externalPid: null, foreignPid: null, backendKind: 'rust',
 }
 const outdated = { ...input, cliTool: { state: 'outdated', version: '0.3.0' } } as const
 
@@ -88,9 +88,24 @@ it('refreshes missing protocol details on locale changes without a new backend s
   unsubscribe()
 })
 
-it('tells the user of a reused (LaunchAgent) daemon how to get Knowledge working', () => {
-  const reused = { ...input, external: true, externalPid: 4242 }
-  expect(buildTrayView(reused, 'darwin').tooltip).toContain('`agent24 service uninstall`')
-  expect(buildTrayView(reused, 'win32').tooltip).not.toContain('service uninstall')
-  expect(buildTrayView(input, 'darwin').tooltip).not.toContain('service uninstall')
+it('enrolled with the service daemon: says so and that Knowledge bindings ask for presence, never to uninstall (M5 B6)', () => {
+  setMainLocale('zh')
+  const enrolled = buildTrayView({ ...input, external: true, externalPid: 4242, enrolled: true }).tooltip
+  expect(enrolled).toContain('已登记到后台服务；知识库绑定变更需在场确认。')
+  expect(enrolled).not.toContain('service uninstall')
+  // A reused legacy daemon is external but not enrolled: no such line.
+  expect(buildTrayView({ ...input, external: true, externalPid: 4242 }).tooltip).not.toContain('后台服务')
+  expect(buildTrayView(input).tooltip).not.toContain('后台服务')
+})
+
+it('says the service daemon did not enrol this app, why, and offers nothing that would spawn over it (M5 B2)', () => {
+  setMainLocale('zh')
+  const view = buildTrayView({ ...input, status: 'error', detail: { kind: 'enrol_refused', code: 'identity_rejected', pid: 4242 } })
+  expect(view.items).toContainEqual({ label: '✕ daemon：未登记本应用', enabled: false })
+  expect(view.items).toContainEqual({ label: '登记被拒：此构建未签名或版本不符 · pid 4242', enabled: false })
+  expect(view.tooltip).toContain('`agent24 service uninstall`')
+  expect(view.tooltip).not.toContain('协议')
+  expect(view.items.some((i) => 'action' in i && ['start', 'restart', 'stop'].includes(i.action))).toBe(false)
+  const failed = buildTrayView({ ...input, status: 'error', detail: { kind: 'enrol_refused', code: 'timeout', pid: 4242 } })
+  expect(failed.items).toContainEqual({ label: '登记失败（timeout）· pid 4242，正在重试', enabled: false })
 })

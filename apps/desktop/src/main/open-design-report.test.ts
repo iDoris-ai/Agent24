@@ -280,9 +280,8 @@ describe('Open Design report follows daemon ready', () => {
       read,
       checkHealth: async () => true,
       fetchHealth: async () => ({ ok: true, protocolVersion: CLIENT_PROTOCOL_VERSION }),
-      // A LaunchAgent-managed daemon that accepts its recorded token, so the
-      // legacy record below is reused (not taken over) as before T1-0.
-      serviceManaged: () => true,
+      // No LaunchAgent; a port that accepts its recorded token.
+      serviceInstalled: () => false,
       acceptsToken: async () => true,
       requestShutdown: async () => 202,
       isAlive: () => true,
@@ -355,7 +354,7 @@ describe('Open Design report follows daemon ready', () => {
     })
     const manager = new BackendManager({
       external: external(() => ({ port: 4600, token: 'legacy-token', pid: 9, authMode: 'legacy' })),
-      authMode: 'capabilities',
+      authMode: 'legacy',
       spawnProcess: vi.fn(),
     })
     const stopReady = onDaemonReady(() => reporter.reportNow())

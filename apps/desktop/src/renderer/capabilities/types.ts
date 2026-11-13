@@ -89,8 +89,6 @@ export type OpenOptions = { focus?: 'slots' }
 export interface CapabilitiesApi {
   defs: readonly CapabilityDef[]
   open: (id: CapabilityId, origin: OpenOrigin, options?: OpenOptions) => void
-  /** Pending approvals count, shown as a badge on the assistant (M4 A6). */
-  approvalsWaiting: number
   /** Stays true after the first successful manifest load, including while offline. */
   manifestsLoaded?: boolean
   /** Raw module ids before display filtering, from the latest two successful reads. */
@@ -115,7 +113,6 @@ export interface NavPrefsApi {
 export const CapabilitiesContext = createContext<CapabilitiesApi>({
   defs: [],
   open: () => {},
-  approvalsWaiting: 0,
 })
 
 export const NavPrefsContext = createContext<NavPrefsApi>({

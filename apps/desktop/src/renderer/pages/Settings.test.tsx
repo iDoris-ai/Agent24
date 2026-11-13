@@ -104,7 +104,7 @@ async function renderPrefs(
 ) {
   await act(async () => {
     render(
-      <CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn(), approvalsWaiting: 0 }}>
+      <CapabilitiesContext.Provider value={{ defs: CAPABILITIES, open: vi.fn() }}>
         <PrefsHarness initial={initial} apply={apply}><SettingsPage /></PrefsHarness>
       </CapabilitiesContext.Provider>,
     )
@@ -454,7 +454,7 @@ describe('Settings sidebar prefs', () => {
     const defs = withDynamicCapabilities([{ id: 'hello', type: 'ui', name: 'Hello workspace' }])
     await act(async () => {
       render(
-        <CapabilitiesContext.Provider value={{ defs, open: vi.fn(), approvalsWaiting: 0 }}>
+        <CapabilitiesContext.Provider value={{ defs, open: vi.fn() }}>
           <PrefsHarness initial={{ pinned: ['documents', 'hello'], slotCount: 2, showOverview: true }}
             apply={next => ({ prefs: { ...next, pinned: ['documents'] }, dropped: ['hello'] })}>
             <SettingsPage />
@@ -671,7 +671,7 @@ describe('Settings voice link and previous blocks', () => {
     const voice: CapabilityDef = { id: 'agent-ear', group: 'office', nameKey: 'n', descKey: 'd', builtin: false, page: 'voice' }
     await act(async () => {
       render(
-        <CapabilitiesContext.Provider value={{ defs: [voice], open, approvalsWaiting: 0 }}>
+        <CapabilitiesContext.Provider value={{ defs: [voice], open }}>
           <SettingsPage />
         </CapabilitiesContext.Provider>,
       )
@@ -685,7 +685,7 @@ describe('Settings voice link and previous blocks', () => {
     const open = vi.fn()
     await act(async () => {
       render(
-        <CapabilitiesContext.Provider value={{ defs: [], open, approvalsWaiting: 0 }}>
+        <CapabilitiesContext.Provider value={{ defs: [], open }}>
           <SettingsPage />
         </CapabilitiesContext.Provider>,
       )

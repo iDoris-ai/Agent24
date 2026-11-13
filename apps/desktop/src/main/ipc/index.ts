@@ -10,8 +10,9 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
-import { daemonCliEndpoint, daemonConnection, getBackendEndpoint } from '../backend-manager'
-import { findAllowedRoute, proxyError, proxyRequest, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint } from '../backend-manager'
+import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
+import { approvalConfirmShown, sendElevating } from '../elevated-request'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
@@ -57,6 +58,20 @@ let omlxProcess: ChildProcess | null = null
 let omlxStopping: Promise<void> | null = null
 /** Quit latch so before-quit and the shutdown wait share one bounded stop. */
 let ownedOmlxQuit: Promise<boolean> | null = null
+/** Whether quitting leaves the oMLX this app started running; set by registerIpcHandlers. */
+let keepOwnedOmlxOnQuit: () => boolean = () => false
+/** Port of the child `OmlxStart` actually spawned; null once that child has exited. */
+let omlxPort: number | null = null
+/** Records the pid and port of an oMLX a quit leaves running. Set by registerIpcHandlers. */
+let rememberKept: (k: { pid: number; port: number }) => void = () => {}
+/** The child already handed to `rememberKept`, so a later keep-quit does not record it again. */
+let keptRemembered: ChildProcess | null = null
+/** Stops what earlier quits left running and recorded (omlx-kept.ts). Set by registerIpcHandlers. */
+let stopKept: () => Promise<void> = () => Promise.resolve()
+/** Its run in this process: a quit enters ensureOwnedOmlxQuit again after the
+ *  latch cleared (app.quit() fires before-quit again), and a record that could
+ *  not be read is left on file; it is looked at once per process. */
+let keptStopRun: Promise<void> | null = null
 
 /** SIGTERM grace before SIGKILL. Same 5s as creative-serve-web checkout
  *  (`CHECKOUT_STOP_TIMEOUT_MS`). Single PID only: a process-group kill needs
@@ -82,6 +97,9 @@ export function resetOmlxProcessForTests(): void {
   omlxProcess = null
   omlxStopping = null
   ownedOmlxQuit = null
+  omlxPort = null
+  keptRemembered = null
+  keptStopRun = null
   omlxStopGraceMs = OMLX_STOP_GRACE_MS
   omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
 }
@@ -161,13 +179,52 @@ export async function stopOwnedOmlx(): Promise<boolean> {
   return true
 }
 
+/** A quit that leaves the child running: record it once (pid and the port it
+ *  was started on), so a later quit with the service not installed can stop
+ *  it (omlx-kept.ts). */
+function keepOwnedOmlx(): Promise<boolean> {
+  const child = omlxProcess
+  const port = omlxPort
+  if (child && child.pid != null && port !== null && keptRemembered !== child) {
+    keptRemembered = child
+    try {
+      rememberKept({ pid: child.pid, port })
+    } catch (e) {
+      console.warn('[omlx] failed to record the oMLX a quit left running', e)
+    }
+  }
+  return Promise.resolve(false)
+}
+
+/** A quit that stops: what earlier quits left running goes too, inside the
+ *  same budget. Never throws, never rejects. */
+function stopKeptOnQuit(): Promise<void> {
+  keptStopRun ??= runKeptStop()
+  return keptStopRun
+}
+
+function runKeptStop(): Promise<void> {
+  try {
+    return stopKept().catch((e: unknown) => { console.warn('[omlx] failed to stop the oMLX an earlier quit left running', e) })
+  } catch (e) {
+    console.warn('[omlx] failed to stop the oMLX an earlier quit left running', e)
+    return Promise.resolve()
+  }
+}
+
 /** before-quit entry. The first call sends SIGTERM before it returns, then
  *  waits at most {@link OMLX_QUIT_STOP_BUDGET_MS} (same shape as
- *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. */
+ *  `creative-serve-web`'s `stopWithin`). Later calls share that wait. When it
+ *  stops, what earlier quits left running is stopped in the same wait; that
+ *  stop's identity checks (ps, lsof) run synchronously before the budget
+ *  starts, at most about 4 s in the worst case (omlx-kept.ts stopKeptOmlx). */
 export function ensureOwnedOmlxQuit(): Promise<boolean> {
   if (ownedOmlxQuit) return ownedOmlxQuit
+  // The resident service daemon uses it after the app is gone (M5 B4).
+  if (keepOwnedOmlxOnQuit()) return keepOwnedOmlx()
   const stopping = stopOwnedOmlx()
-  const bounded = stopWithin({ stop: () => stopping }, OMLX_QUIT_STOP_BUDGET_MS)
+  const kept = stopKeptOnQuit()
+  const bounded = stopWithin({ stop: () => Promise.all([stopping, kept]) }, OMLX_QUIT_STOP_BUDGET_MS)
   ownedOmlxQuit = bounded
   void bounded.finally(() => {
     if (ownedOmlxQuit === bounded) ownedOmlxQuit = null
@@ -347,12 +404,12 @@ async function documentsOsEntry(timeoutMs?: number): Promise<{ name?: unknown; e
 function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<BackendProxyResponse> {
   // Port and credential come from the backend's ready line (dynamic port +
   // token for agent24d; fixed 8765 and no credential for the node mock).
-  // Without a usable credential nothing is sent.
-  const conn = daemonConnection()
-  if (!conn) {
-    return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready (no announced port or credential)'))
-  }
-  return proxyRequest(conn, req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
+  // Without a usable credential nothing is sent. With the service daemon an
+  // elevated route is confirmed once and retried (M5 B3, elevated-request.ts).
+  return sendElevating(req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) }, {
+    connection: daemonConnection,
+    elevation: daemonElevation,
+  })
 }
 
 function isBackendProxyRequest(req: unknown): req is BackendProxyRequest {
@@ -662,6 +719,18 @@ export function registerIpcHandlers(options: {
    * Tests shrink `current`; production leaves it at {@link EXPORT_TIMEOUT_MS}.
    */
   exportTimeoutMs?: { current: number }
+  /** Whether quitting leaves the oMLX this app started running (the resident
+   * service daemon uses it); default: never. */
+  keepOwnedOmlxOnQuit?: () => boolean
+  /** Records the pid and port of the oMLX a quit leaves running, so a later
+   * quit with the service not installed can stop that process when its
+   * identity still matches.
+   * Default: do nothing. */
+  rememberKeptOmlx?: (k: { pid: number; port: number }) => void
+  /** At a quit that stops (the resident service not installed): stops what
+   * earlier quits left running and recorded, when its identity still matches.
+   * Default: nothing. */
+  stopKeptOmlx?: () => Promise<void>
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
@@ -672,6 +741,9 @@ export function registerIpcHandlers(options: {
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
+  keepOwnedOmlxOnQuit = options.keepOwnedOmlxOnQuit ?? (() => false)
+  rememberKept = options.rememberKeptOmlx ?? (() => {})
+  stopKept = options.stopKeptOmlx ?? (() => Promise.resolve())
   app.on('before-quit', () => {
     quitting = true
     // SIGTERM goes out before this listener returns when we own the child.
@@ -721,9 +793,13 @@ export function registerIpcHandlers(options: {
     if (typeof apiKey === 'string' && apiKey) env['OMLX_API_KEY'] = apiKey
     const child = execFile('omlx', ['serve', '--port', String(p)], { env })
     omlxProcess = child
+    omlxPort = p
     // Identity check: this child's exit must not clear a newer start (FU-114).
     child.on('exit', () => {
-      if (omlxProcess === child) omlxProcess = null
+      if (omlxProcess === child) {
+        omlxProcess = null
+        omlxPort = null
+      }
     })
     return { ok: true, url: `http://127.0.0.1:${p}` }
   })
@@ -794,6 +870,7 @@ export function registerIpcHandlers(options: {
     chatHistory().setTitle(id, title, source))
   handle(IpcChannels.ChatHistoryOrganize, (_event, id: unknown, patch: unknown) => chatHistory().organize(id, patch))
   handle(IpcChannels.ChatHistoryPromoteRun, (_event, id: unknown, runId: unknown) => chatHistory().promoteRun(id, runId))
+  handle(IpcChannels.ChatHistoryMarkSeen, (_event, id: unknown) => chatHistory().markSeen(id))
   handle(IpcChannels.ScheduleConversation, (_event, scheduleId: unknown) =>
     (typeof scheduleId === 'string' ? options.scheduleConversation?.(scheduleId) ?? null : null))
   handle(IpcChannels.ChatGroupsGet, () => chatHistory().groups())
@@ -1298,8 +1375,11 @@ export function registerIpcHandlers(options: {
         typeof d.reason === 'string' && d.reason ? mt('approval.note', { value: clip(d.reason, 200) }) : '',
         mt('approval.warning'),
       ].filter(Boolean).join('\n')
-      const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
-      if (!ok) return cancelled()
+      // In service mode the daemon's presence box asks again (M5 B3); the switch is in elevated-request.ts.
+      if (approvalConfirmShown(daemonElevation() !== null)) {
+        const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
+        if (!ok) return cancelled()
+      }
       return proxyToBackend({
         method: 'POST',
         path: `/api/v1/approvals/${id}`,

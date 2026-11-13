@@ -11,6 +11,8 @@ import {
   type CommImportPickResult,
   type CliToolStatus,
   type CliInstallResult,
+  type ResidentServiceResult,
+  type ResidentServiceStatus,
   type DocumentsEvent,
   type DocumentsModuleStatus,
   type KnowledgeConfigureInput,
@@ -65,6 +67,9 @@ const api = {
       ipcRenderer.invoke(IpcChannels.ChatHistoryOrganize, id, patch),
     promoteRun: (id: string, runId: string): Promise<ChatHistorySummary | null> =>
       ipcRenderer.invoke(IpcChannels.ChatHistoryPromoteRun, id, runId),
+    /** M6 C1: the conversation is open: nothing of it is unseen any more. */
+    markSeen: (id: string): Promise<ChatHistorySummary | null> =>
+      ipcRenderer.invoke(IpcChannels.ChatHistoryMarkSeen, id),
     /** M4 A6: the conversation a schedule's runs go to, if it has one yet. */
     ofSchedule: (scheduleId: string): Promise<string | null> =>
       ipcRenderer.invoke(IpcChannels.ScheduleConversation, scheduleId),
@@ -89,6 +94,8 @@ const api = {
   cliToolStatus: (): Promise<CliToolStatus> => ipcRenderer.invoke(IpcChannels.CliToolStatus),
   installCliTool: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolInstall),
   repairUserCli: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolRepairUser),
+  residentServiceStatus: (): Promise<ResidentServiceStatus> => ipcRenderer.invoke(IpcChannels.ResidentServiceStatus),
+  setResidentService: (on: boolean): Promise<ResidentServiceResult> => ipcRenderer.invoke(IpcChannels.ResidentServiceSet, on),
   setAppLocale: (locale: import('../shared/i18n').Locale): Promise<void> => ipcRenderer.invoke(IpcChannels.AppLocale, locale),
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
   setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),

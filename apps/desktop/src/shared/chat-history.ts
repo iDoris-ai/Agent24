@@ -2,6 +2,9 @@
 // M4 A2: version 2 adds the runs each conversation started and what in it
 // waits on the user (docs/ui/ASSISTANT-A.md). There is no version 1 data to
 // keep: a version 1 file is not read and not migrated.
+// M6 C1: version 3 adds who started each conversation and what of it the
+// user has not seen yet (docs/ui/ASSISTANT-C.md). A version 2 file is not
+// read and not migrated either.
 //
 // A stopgap until the main chat runs through daemon sessions: the file says
 // what it is (`format`, `version`) and stamps every message with a time, and a
@@ -10,7 +13,7 @@
 // purpose rather than guess.
 
 export const CHAT_HISTORY_FORMAT = 'agent24.desktop.chat-history'
-export const CHAT_HISTORY_VERSION = 2
+export const CHAT_HISTORY_VERSION = 3
 
 /** The chat's `session_id` (the daemon's memory key for the conversation)
  *  doubles as the record id. Only these characters, so an id is always a
@@ -51,6 +54,13 @@ export type ChatHistoryMessage =
 export type ChatHistoryTitleSource = 'user' | 'schedule' | 'assistant' | 'model' | 'prompt'
 export const CHAT_HISTORY_TITLE_SOURCES: readonly ChatHistoryTitleSource[] = ['user', 'schedule', 'assistant', 'model', 'prompt']
 
+/** M6 C1: who started a conversation: the user (from the page), a
+ *  schedule (M4 A5) or the assistant (A6, a run no conversation asked for).
+ *  Set when main writes it first and never changed after: a rename, a run
+ *  or a save does not change it. docs/ui/ASSISTANT-C.md §2. */
+export type ChatHistoryInitiator = 'user' | 'schedule' | 'assistant'
+export const CHAT_HISTORY_INITIATORS: readonly ChatHistoryInitiator[] = ['user', 'schedule', 'assistant']
+
 export interface ChatHistoryRecord {
   format: typeof CHAT_HISTORY_FORMAT
   version: typeof CHAT_HISTORY_VERSION
@@ -71,6 +81,13 @@ export interface ChatHistoryRecord {
   runs: ChatHistoryRun[]
   /** M4 A2: what in this conversation waits on the user. Main keeps them. */
   pending: ChatHistoryPending[]
+  /** M6 C1: who started it. Main keeps it; a save from the page never sets it. */
+  initiator: ChatHistoryInitiator
+  /** M6 C1: the runs of it the user has not seen yet, by run id, oldest
+   *  first: each one of `runs`, at most once. Only a conversation the user
+   *  did not start has any; opening it empties them. Main keeps them.
+   *  docs/ui/ASSISTANT-C.md §3. */
+  unseen: string[]
 }
 
 /** M4 A2: what a run is to its conversation. A reply's run is recorded as
@@ -156,7 +173,8 @@ export interface ChatHistoryOrganize {
 /** What the history list shows and searches: the record without its
  *  messages, plus the start of its first prompt (UI-04 T3). */
 export interface ChatHistorySummary extends Pick<ChatHistoryRecord,
-  'id' | 'title' | 'title_source' | 'group_id' | 'archived_at' | 'created_at' | 'updated_at' | 'pending'> {
+  'id' | 'title' | 'title_source' | 'group_id' | 'archived_at' | 'created_at' | 'updated_at' | 'pending'
+  | 'initiator' | 'unseen'> {
   /** The first prompt on one line, at most `FIRST_PROMPT_CHARS` characters. */
   first_prompt: string
   /** M4 A2: the conversation's tasks: its runs other than answers, which the
@@ -200,5 +218,16 @@ export function chatHistorySummary(r: ChatHistoryRecord): ChatHistorySummary {
     id: r.id, title: r.title, title_source: r.title_source, group_id: r.group_id, archived_at: r.archived_at,
     created_at: r.created_at, updated_at: r.updated_at, first_prompt: chars.join(''),
     tasks: r.runs.filter(run => run.kind !== 'answer'), pending: r.pending,
+    initiator: r.initiator, unseen: r.unseen,
   }
+}
+
+/** M6 C1: how many things the assistant has to say (the banner's n, C2):
+ *  the runs not seen yet of the given conversations the user did not
+ *  start. Which conversations to give (archived ones or not) is the
+ *  caller's. docs/ui/ASSISTANT-C.md §3. */
+export function unseenCount(items: readonly Pick<ChatHistorySummary, 'initiator' | 'unseen'>[]): number {
+  let count = 0
+  for (const item of items) if (item.initiator !== 'user') count += item.unseen.length
+  return count
 }

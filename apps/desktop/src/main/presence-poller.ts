@@ -117,6 +117,27 @@ function clip(value: string): string {
   return value.length > MAX_FIELD ? `${value.slice(0, MAX_FIELD)}…` : value
 }
 
+/** The native box for a challenge, from the daemon's own text; Deny is the
+ * default and the cancel answer. Shared with the service mode's presence
+ * connection (M5 B3). */
+export function presenceDialogOptions(challenge: PresenceChallenge, t: typeof mt): PresenceDialogOptions {
+  return {
+    type: 'question',
+    title: t('presence.title'),
+    message: t('presence.message', {
+      requester: clip(challenge.requester.identifier),
+      pid: challenge.requester.pid,
+      operation: clip(challenge.operation),
+    }),
+    detail: t('presence.detail', { summary: clip(challenge.summary) }),
+    buttons: [t('presence.allow'), t('presence.deny')],
+    // Deny is both the default and the cancel (Esc / closed) answer.
+    defaultId: 1,
+    cancelId: 1,
+    noLink: true,
+  }
+}
+
 export function parseChallenge(raw: unknown): PresenceChallenge | null {
   if (typeof raw !== 'object' || raw === null) return null
   const c = raw as Record<string, unknown>
@@ -230,25 +251,7 @@ export class PresencePoller {
     this.abort?.signal.addEventListener('abort', onStop)
     let response: number
     try {
-      const { t } = this.deps
-      const result = await this.deps.showDialog(
-        {
-          type: 'question',
-          title: t('presence.title'),
-          message: t('presence.message', {
-            requester: clip(challenge.requester.identifier),
-            pid: challenge.requester.pid,
-            operation: clip(challenge.operation),
-          }),
-          detail: t('presence.detail', { summary: clip(challenge.summary) }),
-          buttons: [t('presence.allow'), t('presence.deny')],
-          // Deny is both the default and the cancel (Esc / closed) answer.
-          defaultId: 1,
-          cancelId: 1,
-          noLink: true,
-        },
-        expiry.signal,
-      )
+      const result = await this.deps.showDialog(presenceDialogOptions(challenge, this.deps.t), expiry.signal)
       response = result.response
     } catch (err) {
       this.deps.log(`dialog error, denying: ${(err as Error).message}`)

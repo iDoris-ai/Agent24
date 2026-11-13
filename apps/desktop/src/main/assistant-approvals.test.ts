@@ -245,3 +245,46 @@ describe('assistant approvals (M4 A6)', () => {
     })
   })
 })
+
+// M6 C1: the assistant's conversation is the assistant's, and each run put
+// in it is unseen until the user opens it (docs/ui/ASSISTANT-C.md §3).
+describe('what of the assistant\'s conversation is unseen (M6 C1)', () => {
+  it('starts the conversation as the assistant\'s; each run put in it is unseen, once', async () => {
+    const m = approvals()
+    const first = await m.route('run_cli')
+    expect(first).toMatchObject({ initiator: 'assistant', unseen: ['run_cli'] })
+    expect(await m.route('run_cli2')).toMatchObject({ unseen: ['run_cli', 'run_cli2'] })
+    await m.catchUp(pending('run_cli', 'run_cli2'))
+    expect(history.get(first!.id)!.unseen).toEqual(['run_cli', 'run_cli2'])
+  })
+
+  it('a catch-up of runs already in it, once it was opened, makes none unseen again; a new one is', async () => {
+    const m = approvals()
+    const { id } = (await m.route('run_cli'))!
+    history.markSeen(id)
+    await m.catchUp(pending('run_cli'))
+    expect(history.get(id)!.unseen).toEqual([])
+    owners.run_cli3 = 'other'
+    await m.catchUp(pending('run_cli', 'run_cli3'))
+    expect(history.get(id)!.unseen).toEqual(['run_cli3'])
+  })
+
+  it('an approval that could not be routed when it came is unseen once a catch-up routes it (the known limit)', async () => {
+    const m = approvals()
+    await expect(m.route('run_late')).rejects.toThrow('backend_not_ready')
+    expect(history.list()).toEqual([])
+    owners.run_late = 'other'
+    await m.catchUp(pending('run_late'))
+    expect(history.list()).toMatchObject([{ initiator: 'assistant', unseen: ['run_late'] }])
+  })
+
+  it('a full conversation of its own: the new one is the assistant\'s too, and the run is unseen there', async () => {
+    const m = approvals()
+    const { id } = (await m.route('run_cli'))!
+    for (let i = 0; i < 999; i++) history.appendRun(id, `run_f${i}`, 'task')
+    owners.run_next = 'other'
+    const next = await m.route('run_next')
+    expect(next!.id).not.toBe(id)
+    expect(next).toMatchObject({ initiator: 'assistant', unseen: ['run_next'] })
+  })
+})

@@ -3,7 +3,9 @@
 
 import type { BackendStatusDetail } from './backend-manager'
 import { mt } from './main-i18n'
+import { REJECTED_CODES } from './daemon-enroll'
 import type { CliToolStatus } from '../shared/ipc-types'
+import type { UpgradeHint } from './resident-service'
 
 export type TrayStatus = 'running' | 'starting' | 'stopped' | 'error' | 'blocked'
 
@@ -14,19 +16,32 @@ const TITLES: Record<TrayStatus, string> = {
 export interface TrayInput {
   status: TrayStatus
   external: boolean
+  /** M5 B6: enrolled with the LaunchAgent's service daemon. */
+  enrolled: boolean
   externalPid: number | null
   foreignPid: number | null
   detail?: BackendStatusDetail | null
   backendKind: string
   cliTool?: Pick<CliToolStatus, 'state' | 'version'>
+  /** M5 B5: the service daemon is not the bundled version, or its upgrade did not finish. */
+  upgrade?: UpgradeHint
+  /** M5 B5: the LaunchAgent's daemon keeps exiting and being started again. */
+  crashLoop?: boolean
+  /** M5 B4a: `BackendManager.serviceWaitMs()`: waiting for the service daemon. */
+  serviceWaitMs?: number | null
+  /** M5 B4c: the LaunchAgent's plist is there: offer 「完全退出」. */
+  serviceInstalled?: boolean
 }
 
-export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'cli-settings'
+/** M5 B4a: after this long waiting, the tray says the service has not started. */
+export const SERVICE_WAIT_HINT_MS = 60_000
+
+export type TrayAction = 'start' | 'disconnect' | 'restart' | 'stop' | 'show' | 'quit' | 'quit-service' | 'cli-settings'
 export type TrayItem = { type: 'separator' } | { label: string; enabled: false } | { label: string; action: TrayAction }
 
 export interface TrayView { title: string; tooltip: string; items: TrayItem[] }
 
-export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = process.platform): TrayView {
+export function buildTrayView(input: TrayInput): TrayView {
   const cliItems: TrayItem[] = []
   const cli = input.cliTool
   if (cli && (cli.state === 'missing' || cli.state === 'outdated' || cli.state === 'unknown')) {
@@ -35,30 +50,45 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
       { type: 'separator' },
     )
   }
-  const base = mt(`tray.${input.status}`)
+  const detail = input.status === 'error' ? input.detail : null
+  const protocol = detail?.kind === 'protocol_mismatch' ? detail : null
+  // M5 B2: the LaunchAgent's daemon did not enrol this app.
+  const enrol = detail?.kind === 'enrol_refused' ? detail : null
+  const base = enrol ? mt('tray.enrolError') : mt(`tray.${input.status}`)
   // DEP-A5: an external daemon gets a visibly different label so the user can
   // tell it apart before hitting stop.
   const label = input.external
     ? mt('tray.external', { label: base, pid: input.externalPid ?? '?' })
     : input.foreignPid !== null ? mt('tray.foreign', { label: base, pid: input.foreignPid }) : base
   let tooltip = `Agent24 — ${label.replace(/^[●○✕]\s*/, '')} (${input.backendKind})`
-  // T1-0: on macOS a reused external daemon is one the LaunchAgent manages;
-  // Knowledge needs this app's own daemon, so say how to get there.
-  if (input.external && platform === 'darwin') tooltip += '\n' + mt('tray.externalKnowledge')
-  const detail = input.status === 'error' ? input.detail : null
-  const summary = detail ? mt('tray.protocolShort', {
-    daemonVersion: detail.daemonVersion ?? mt('tray.protocolUnknown'),
-    clientVersion: detail.clientVersion, pid: detail.pid,
-  }) : null
-  if (detail && summary) {
+  // M5 B6: Knowledge works on the service daemon; its bindings ask for presence.
+  if (input.enrolled) tooltip += '\n' + mt('tray.externalKnowledge')
+  const upgrade = input.upgrade
+  if (upgrade) tooltip += '\n' + (upgrade.kind === 'needed' ? mt('tray.serviceUpgrade') : mt('tray.serviceUpgradeFailed', { code: upgrade.code }))
+  if (input.crashLoop) tooltip += '\n' + mt('tray.serviceCrashLoop')
+  // M5 B4a: the crash loop already says it and gives the way back: one line at a time.
+  else if (input.serviceWaitMs !== undefined && input.serviceWaitMs !== null) {
+    tooltip += '\n' + mt(input.serviceWaitMs >= SERVICE_WAIT_HINT_MS ? 'tray.serviceNotStarted' : 'tray.serviceWaiting')
+  }
+  const summary = protocol
+    ? mt('tray.protocolShort', {
+      daemonVersion: protocol.daemonVersion ?? mt('tray.protocolUnknown'),
+      clientVersion: protocol.clientVersion, pid: protocol.pid,
+    })
+    : enrol
+      ? mt(REJECTED_CODES.has(enrol.code) ? 'tray.enrolRejected' : 'tray.enrolFailed', { code: enrol.code, pid: enrol.pid })
+      : null
+  const hint = enrol ? mt('tray.enrolHint') : mt('tray.errorHint')
+  if (protocol && summary) {
     tooltip += '\n' + mt('tray.protocolDetail', {
       summary,
-      recorded: detail.recordedVersion === undefined
+      recorded: protocol.recordedVersion === undefined
         ? mt('tray.protocolUnrecorded')
-        : mt('tray.protocolRecorded', { version: detail.recordedVersion }),
-      hint: mt('tray.errorHint'),
+        : mt('tray.protocolRecorded', { version: protocol.recordedVersion }),
+      hint,
     })
   }
+  if (enrol && summary) tooltip += '\n' + summary + '\n' + hint
   // DEP-A5 #2: stop/restart only ever act on a daemon this app spawned, so the
   // external case is worded "disconnect", never implying a kill. An
   // incompatible daemon is neither reused nor killed: no start/stop at all.
@@ -66,7 +96,7 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
     input.status === 'error'
       ? [
         ...(summary ? [{ label: summary, enabled: false } satisfies TrayItem] : []),
-        { label: mt('tray.errorHint'), enabled: false },
+        { label: hint, enabled: false },
       ]
       : input.status === 'stopped'
         ? [{ label: mt('tray.start'), action: 'start' }]
@@ -85,6 +115,7 @@ export function buildTrayView(input: TrayInput, platform: NodeJS.Platform = proc
       ...daemonItems,
       { type: 'separator' },
       { label: mt('tray.quit'), action: 'quit' },
+      ...(input.serviceInstalled ? [{ label: mt('tray.quitService'), action: 'quit-service' } satisfies TrayItem] : []),
     ],
   }
 }
