@@ -18,6 +18,7 @@ pub mod eval;
 #[cfg(test)]
 mod eval_m1;
 pub mod event;
+pub mod hybrid;
 pub mod knowledge;
 pub mod reconcile;
 pub mod rejections;
@@ -610,6 +611,16 @@ impl KvStore {
         embedder: E,
     ) -> vector::VectorRetriever<E> {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
+    }
+
+    /// A [`hybrid::HybridRetriever`] (FTS + vector, RRF) over the SAME database
+    /// file. The breaker state lives in the returned value, so keep one per
+    /// process/session owner rather than building one per query.
+    pub fn hybrid_retriever(
+        &self,
+        embedder: std::sync::Arc<dyn vector::Embedder>,
+    ) -> hybrid::HybridRetriever {
+        hybrid::HybridRetriever::new(self.pool.clone(), embedder)
     }
 
     /// Delete every embedding row stored for `owner`, across models and

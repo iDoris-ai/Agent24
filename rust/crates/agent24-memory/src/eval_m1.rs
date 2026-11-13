@@ -52,6 +52,8 @@ use serde_json::json;
 const OWNER: &str = "m1-eval-owner";
 const OTHER_OWNER: &str = "m1-eval-other-owner";
 const TOP_K: usize = 5;
+/// Hybrid eval must exercise the vector route on at least this many queries.
+const MIN_VECTOR_ROUTE_QUERIES: usize = 3;
 /// `forget`/supersede effective time: must be in the PAST relative to test
 /// execution — `beliefs_as_of`/`search_any`'s active-row semantics are
 /// bi-temporal, so a FUTURE timestamp would not have taken effect yet (a
@@ -291,8 +293,7 @@ fn pct(n: usize, of: usize) -> String {
     }
 }
 
-#[tokio::test]
-async fn eval_m1() {
+async fn run_eval(hybrid: bool) {
     let cases = cases();
     assert!(
         cases.len() >= 15,
@@ -307,14 +308,39 @@ async fn eval_m1() {
     let store = KvStore::open_memory().await.unwrap();
     seed(&store).await;
     let retriever = store.retriever();
-
-    let mut metrics = Metrics::default();
-    println!("—— M1-T08 + T07.2 recall eval baseline (search_any, top_{TOP_K}) ——");
-    for case in &cases {
-        let hits = retriever
-            .search_any(case.query, OWNER, TOP_K)
+    // Hybrid mode: every current fact is embedded, and the SAME cases run
+    // through `HybridRetriever` (FTS 20 + vector 20 + RRF, MIN_COSINE).
+    let hybrid_retriever = if hybrid {
+        store
+            .vector_retriever(NgramEmbedder)
+            .reindex(OWNER)
             .await
             .unwrap();
+        Some(store.hybrid_retriever(std::sync::Arc::new(NgramEmbedder)))
+    } else {
+        None
+    };
+
+    let mut metrics = Metrics::default();
+    println!(
+        "—— M1-T08 + T07.2 recall eval baseline ({}, top_{TOP_K}) ——",
+        if hybrid { "hybrid" } else { "search_any" }
+    );
+    let mut vector_route_queries = 0usize;
+    for case in &cases {
+        if let Some(h) = &hybrid_retriever {
+            // Did the vector route itself produce candidates (cosine >= MIN_COSINE)?
+            if !h.vector_route(case.query, OWNER).await.unwrap().is_empty() {
+                vector_route_queries += 1;
+            }
+        }
+        let hits = match &hybrid_retriever {
+            Some(h) => h.search(case.query, OWNER, TOP_K).await.unwrap(),
+            None => retriever
+                .search_any(case.query, OWNER, TOP_K)
+                .await
+                .unwrap(),
+        };
         let hit_ids: Vec<&str> = hits.iter().map(|h| h.assertion.id.as_str()).collect();
 
         let hit_at_1 = hit_ids
@@ -388,6 +414,16 @@ async fn eval_m1() {
     }
 
     println!("—— summary ——");
+    if hybrid {
+        println!(
+            "queries whose vector route returned candidates: {vector_route_queries}/{}",
+            cases.len()
+        );
+        assert!(
+            vector_route_queries >= MIN_VECTOR_ROUTE_QUERIES,
+            "hybrid eval silently fell back to FTS: only {vector_route_queries} queries crossed MIN_COSINE"
+        );
+    }
     println!(
         "Hit@1 (record only): {}/{} ({})",
         metrics.hit_at_1,
@@ -461,4 +497,65 @@ async fn eval_m1() {
         "every CJK safety-bigram case (a real word that merely contains a \
          pronoun/particle character) must be recalled (M1-T07.2 round 2 M2)"
     );
+}
+
+/// A stand-in for a real model with a tiny synonym table: hashed character
+/// bigrams of the OBJECT text (the fixed `user said_to_remember` prefix that
+/// reindex prepends is stripped, or it would dominate every vector) plus a
+/// concept axis per keyword, so paraphrases share a concept and cross
+/// `MIN_COSINE` while unrelated text stays far below it.
+#[derive(Clone)]
+struct NgramEmbedder;
+
+const CONCEPTS: &[&[&str]] = &[&["过敏"], &["狗"], &["工作", "公司"], &["颜色"]];
+const CONCEPT_WEIGHT: f32 = 3.0;
+const NGRAM_DIMS: usize = 512;
+#[cfg(test)]
+const FACT_PREFIX: &str = "user said_to_remember ";
+
+#[async_trait::async_trait]
+impl crate::vector::Embedder for NgramEmbedder {
+    fn model_id(&self) -> &str {
+        "ngram"
+    }
+    fn revision(&self) -> &str {
+        "v1"
+    }
+    async fn embed(&self, text: &str) -> crate::Result<crate::vector::Embedding> {
+        let text = text.strip_prefix(FACT_PREFIX).unwrap_or(text);
+        let mut vector = vec![0.0f32; NGRAM_DIMS + CONCEPTS.len()];
+        let chars: Vec<char> = text.chars().filter(|c| c.is_alphanumeric()).collect();
+        for pair in chars.windows(2) {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for c in pair {
+                h ^= u64::from(u32::from(*c));
+                h = h.wrapping_mul(0x0100_0000_01b3);
+            }
+            vector[(h as usize) % NGRAM_DIMS] += 1.0;
+        }
+        for (i, words) in CONCEPTS.iter().enumerate() {
+            if words.iter().any(|w| text.contains(w)) {
+                vector[NGRAM_DIMS + i] = CONCEPT_WEIGHT;
+            }
+        }
+        Ok(crate::vector::Embedding {
+            model_id: "ngram".into(),
+            revision: "v1".into(),
+            dims: vector.len() as u32,
+            normalized: false,
+            vector,
+        })
+    }
+}
+
+#[tokio::test]
+async fn eval_m1() {
+    run_eval(false).await;
+}
+
+/// VR-3: both hard gates (Hit@5 >= 13/14, no-answer injects nothing) and the
+/// security-leak gate hold when recall goes through the hybrid retriever.
+#[tokio::test]
+async fn eval_m1_hybrid() {
+    run_eval(true).await;
 }
