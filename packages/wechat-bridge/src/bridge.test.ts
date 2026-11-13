@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { Bridge, DEV_ROUTE_MISSING, FAILURE_REPLY_LIMIT, HOLD_GIVE_UP, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp, classifyInboundFailure, holdCountsTowardGiveUp, inboundStamp } from './bridge.js'
+import { ABANDONED_LIMIT, Bridge, DEV_ROUTE_MISSING, FAILURE_REPLY_LIMIT, HOLD_GIVE_UP, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp, classifyInboundFailure, holdCountsTowardGiveUp, inboundStamp } from './bridge.js'
 import { InboundHttpError } from './agent24.js'
 import type { Agent24Client, InboundEvent, InboundRecord } from './agent24.js'
 import type { Sender } from './ilink/sender.js'
@@ -349,6 +349,102 @@ describe('Bridge transport', () => {
       expect(sends).toEqual([RECORD_FAILED_REPLY])
       expect(errors.join('\n')).not.toContain('放弃并前进')
       expect(holdCountsTowardGiveUp(fail)).toBe(false)
+    } finally {
+      console.error = previous
+    }
+  })
+
+  it('holds on the 20th counting failure and gives up on the 21st', async () => {
+    let calls = 0
+    const sends: string[] = []
+    const agent = {
+      async recordInbound(): Promise<InboundRecord> {
+        calls += 1
+        throw new InboundHttpError(408)
+      },
+    } as unknown as Agent24Client
+    const sender = {
+      async send(_user: string, _ctx: string, text: string): Promise<void> {
+        sends.push(text)
+      },
+    } as unknown as Sender
+    const bridge = new Bridge(agent, sender)
+    const msg = textMsg('alice', '做点事')
+    for (let n = 1; n <= 20; n++) {
+      await expect(bridge.handle(msg)).resolves.toBe('hold')
+    }
+    expect(holdsOf(bridge).get('42')).toBe(20)
+    await expect(bridge.handle(msg)).resolves.toBe('advance')
+    expect(calls).toBe(21)
+    expect(holdsOf(bridge).size).toBe(0)
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+    await expect(bridge.handle(msg)).resolves.toBe('advance')
+    expect(calls).toBe(21)
+    expect(sends).toEqual([RECORD_FAILED_REPLY])
+  })
+
+  it('clears the consecutive count after a successful record', async () => {
+    const scripted: Array<Error | null> = [
+      ...Array.from({ length: 20 }, () => new InboundHttpError(408)),
+      null,
+      new InboundHttpError(408),
+    ]
+    let call = 0
+    const agent = {
+      async recordInbound(): Promise<InboundRecord> {
+        const err = scripted[call]
+        call += 1
+        if (err) throw err
+        return { id: 'wechat:42', outcome: 'started' }
+      },
+    } as unknown as Agent24Client
+    const sender = { async send() {} } as unknown as Sender
+    const bridge = new Bridge(agent, sender)
+    const msg = textMsg('alice', '做点事')
+    for (let n = 1; n <= 20; n++) {
+      await expect(bridge.handle(msg)).resolves.toBe('hold')
+    }
+    expect(holdsOf(bridge).get('42')).toBe(20)
+    await expect(bridge.handle(msg)).resolves.toBe('advance')
+    expect(holdsOf(bridge).size).toBe(0)
+    await expect(bridge.handle(msg)).resolves.toBe('hold')
+    expect(holdsOf(bridge).get('42')).toBe(1)
+  })
+
+  it('drops the oldest abandoned id past the cap and does not post one still remembered', async () => {
+    let calls = 0
+    const agent = {
+      async recordInbound(): Promise<InboundRecord> {
+        calls += 1
+        throw new InboundHttpError(418)
+      },
+    } as unknown as Agent24Client
+    const sender = { async send() {} } as unknown as Sender
+    const bridge = new Bridge(agent, sender)
+    const previous = console.error
+    console.error = () => {}
+    try {
+      for (let id = 1; id <= ABANDONED_LIMIT; id++) {
+        const msg = textMsg('alice', '做点事', { message_id: id })
+        for (let n = 0; n < 20; n++) {
+          const step = await bridge.handle(msg)
+          if (step !== 'hold') throw new Error(`id ${id} attempt ${n} ${step}`)
+        }
+        const step = await bridge.handle(msg)
+        if (step !== 'advance') throw new Error(`id ${id} give-up ${step}`)
+      }
+      const parked = calls
+      await expect(bridge.handle(textMsg('alice', '做点事', { message_id: 1 }))).resolves.toBe('advance')
+      expect(calls).toBe(parked)
+      const overflow = textMsg('alice', '做点事', { message_id: ABANDONED_LIMIT + 1 })
+      for (let n = 0; n < 20; n++) {
+        await expect(bridge.handle(overflow)).resolves.toBe('hold')
+      }
+      await expect(bridge.handle(overflow)).resolves.toBe('advance')
+      await expect(bridge.handle(textMsg('alice', '做点事', { message_id: 1 }))).resolves.toBe('hold')
+      expect(calls).toBe(parked + 22)
+      await expect(bridge.handle(textMsg('alice', '做点事', { message_id: 2 }))).resolves.toBe('advance')
+      expect(calls).toBe(parked + 22)
     } finally {
       console.error = previous
     }

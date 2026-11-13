@@ -26,9 +26,12 @@ function shouldAck(outcome: InboundRecord['outcome']): boolean {
  * The cursor stays put and the bridge backs off. Network errors, timeouts,
  * 5xx, and 429 hold with backoff and are never given up on a count: a down
  * daemon must not drop the message. One of those holds clears the consecutive
- * count. 408 and any other unlisted 4xx stop holding after {@link HOLD_GIVE_UP}
- * consecutive holds of that kind: the bridge logs, drops the hold entry, and
- * advances so one rejected event cannot block the rest. A permanent failure
+ * count. 408 and any other unlisted 4xx are not transient: after
+ * {@link HOLD_GIVE_UP} consecutive holds of that kind the next one is given
+ * up. The bridge logs, drops the hold entry, remembers the id
+ * ({@link ABANDONED_LIMIT}, oldest dropped), and advances. A later delivery
+ * of that id — including a redelivery of this batch while a later message
+ * still holds — advances without posting or replying. A permanent failure
  * drops the entry too.
  * `stop` — the bridge token was rejected (401).
  * `dev_tool` — 404: the daemon is not serving the dev inbound route. Stop.
@@ -63,7 +66,10 @@ export function holdCountsTowardGiveUp(err: unknown): boolean {
 /** Oldest ids are dropped past this, so one long run cannot grow without bound. */
 export const FAILURE_REPLY_LIMIT = 1024
 
-/** Consecutive holds of one message before the cursor moves past it. */
+/** Given-up message ids. Same bound: oldest dropped, one run cannot grow forever. */
+export const ABANDONED_LIMIT = 1024
+
+/** Consecutive counting holds before the next one gives up. The 20th still holds. */
 export const HOLD_GIVE_UP = 20
 
 /** `Date` range. Outside it, `toISOString` throws `RangeError`. */
@@ -75,6 +81,8 @@ export class Bridge {
   /** Consecutive counting holds for one WeChat message id.
    * Success, a non-counting hold, give-up, or a permanent failure removes it. */
   private readonly holds = new Map<string, number>()
+  /** Ids given up after {@link HOLD_GIVE_UP}. A redelivery must not POST them. */
+  private readonly abandoned = new Set<string>()
 
   constructor(
     private readonly agent: Agent24Client,
@@ -104,6 +112,7 @@ export class Bridge {
       return 'advance'
     }
     const key = String(msg.message_id)
+    if (this.abandoned.has(key)) return 'advance'
     try {
       const recorded = await this.agent.recordInbound({
         id: `wechat:${msg.message_id}`,
@@ -126,6 +135,7 @@ export class Bridge {
         const n = (this.holds.get(key) ?? 0) + 1
         if (n > HOLD_GIVE_UP) {
           this.holds.delete(key)
+          this.rememberAbandoned(key)
           console.error(`[wechat] 消息 ${key} 连续失败 ${n} 次，放弃并前进`)
           return 'advance'
         }
@@ -135,6 +145,15 @@ export class Bridge {
       }
       await this.failReplyOnce(msg, user, ctx)
       return step
+    }
+  }
+
+  private rememberAbandoned(key: string): void {
+    this.abandoned.add(key)
+    while (this.abandoned.size > ABANDONED_LIMIT) {
+      const oldest = this.abandoned.values().next().value
+      if (oldest === undefined) break
+      this.abandoned.delete(oldest)
     }
   }
 

@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { InboundHttpError } from '../agent24.js'
-import { Bridge, DEV_ROUTE_MISSING, HOLD_GIVE_UP } from '../bridge.js'
+import { Bridge, DEV_ROUTE_MISSING, HOLD_GIVE_UP, RECORD_FAILED_REPLY } from '../bridge.js'
 import { CONFIG } from '../config.js'
 import type { Agent24Client, InboundEvent } from '../agent24.js'
 import type { Sender } from './sender.js'
@@ -265,6 +265,75 @@ describe('monitor cursor and 404', () => {
     await finished
     expect(attempts.length).toBeGreaterThan(HOLD_GIVE_UP)
     expect(polls.filter((cursor) => cursor === '').length).toBeGreaterThan(HOLD_GIVE_UP)
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  it('stops posting a given-up message while a later one in the batch still holds', async () => {
+    const dir = privateDev()
+    const previousDelay = CONFIG.RECONNECT_DELAY_MS
+    const previousCap = CONFIG.HOLD_BACKOFF_CAP_MS
+    CONFIG.RECONNECT_DELAY_MS = 1
+    CONFIG.HOLD_BACKOFF_CAP_MS = 1
+    const posts: string[] = []
+    const sends: string[] = []
+    const polls: string[] = []
+    cleanup.push(() => {
+      CONFIG.RECONNECT_DELAY_MS = previousDelay
+      CONFIG.HOLD_BACKOFF_CAP_MS = previousCap
+    })
+    const parked = park()
+    const client = {
+      async post(_path: string, body: { get_updates_buf: string }) {
+        polls.push(body.get_updates_buf)
+        if (body.get_updates_buf !== '') {
+          await parked
+          return { get_updates_buf: body.get_updates_buf, msgs: [] }
+        }
+        return {
+          get_updates_buf: '9',
+          msgs: [userMessage(2, 'B'), userMessage(3, 'C')],
+        }
+      },
+    } as unknown as ILinkClient
+    const agent = {
+      async recordInbound(event: InboundEvent) {
+        posts.push(event.id)
+        if (event.id === 'wechat:2') throw new InboundHttpError(418)
+        throw new InboundHttpError(503)
+      },
+    } as unknown as Agent24Client
+    const sender = {
+      async send(_user: string, _ctx: string, text: string) {
+        sends.push(text)
+      },
+    } as unknown as Sender
+    const bridge = new Bridge(agent, sender)
+    const monitor = new Monitor(client, (msg) => bridge.handle(msg), '')
+    cleanup.push(() => {
+      monitor.stop()
+      releasePark()
+    })
+    const previous = console.error
+    console.error = () => {}
+    cleanup.push(() => {
+      console.error = previous
+    })
+    const finished = monitor.start()
+    const deadline = Date.now() + 3000
+    const count = (id: string) => posts.filter((posted) => posted === id).length
+    while (!(count('wechat:2') === HOLD_GIVE_UP + 1 && count('wechat:3') >= 5)) {
+      if (Date.now() > deadline) {
+        throw new Error(`posts B=${count('wechat:2')} C=${count('wechat:3')} total=${posts.length}`)
+      }
+      await new Promise((resolve) => setTimeout(resolve, 5))
+    }
+    monitor.stop()
+    releasePark()
+    await finished
+    expect(count('wechat:2')).toBe(HOLD_GIVE_UP + 1)
+    expect(count('wechat:3')).toBeGreaterThanOrEqual(5)
+    expect(polls).not.toContain('9')
+    expect(sends).toEqual([RECORD_FAILED_REPLY, RECORD_FAILED_REPLY])
     fs.rmSync(dir, { recursive: true, force: true })
   })
 })

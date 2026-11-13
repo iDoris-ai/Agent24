@@ -1251,8 +1251,9 @@ async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
 
 /// Best-effort revoke of an id captured before the new file was published.
 ///
-/// Failure is printed and does not remove the new file. The bearer is not
-/// part of the warning.
+/// A 404 `bridge_token_unknown` means the daemon restarted and that id is
+/// already gone. That is not a warning. Any other failure is printed and
+/// does not remove the new file. The bearer is not part of the warning.
 async fn revoke_previous_bridge_id(ep: &Endpoint, old_id: &str) {
     let reply = send_elevating(
         ep,
@@ -1270,10 +1271,9 @@ async fn revoke_previous_bridge_id(ep: &Endpoint, old_id: &str) {
         Ok(reply) => {
             let status = reply.status;
             let body = reply.json_value().await;
-            eprintln!(
-                "撤销上一枚桥令牌没有成功（{}）。新令牌已经写入。",
-                bridge_token::http_failure(status.as_u16(), &body)
-            );
+            if let Some(warning) = bridge_token::previous_revoke_warning(status.as_u16(), &body) {
+                eprintln!("{warning}");
+            }
         }
         Err(err) => {
             let (code, message) = err.parts();
