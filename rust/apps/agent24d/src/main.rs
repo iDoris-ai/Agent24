@@ -27,6 +27,7 @@ mod decide_routes;
 mod docked_router;
 mod docked_startup;
 mod domain;
+mod embed_backfill;
 #[allow(dead_code, reason = "frozen CORE-2 slice seam; wired by S1/S2")]
 mod enroll_api;
 mod enroll_endpoint;

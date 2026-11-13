@@ -1520,6 +1520,11 @@ pub async fn serve(
     .await?;
     let (guardian, memory_base, memory) =
         serve_steps::open_guardian_and_memory(ephemeral, &router, &cancel, &startup).await;
+    // Captured before `memory` moves into the run loop. The background task
+    // installs into this same slot, so the breaker stays on the one retriever.
+    let embed_backfill = memory
+        .as_ref()
+        .map(agent24_agent::SessionMemory::embed_backfill);
     let (state_dir, packages_root, catalogue, integrity_refusals) =
         serve_steps::discover_packages(ephemeral, &cancel).await?;
     let (
@@ -1674,6 +1679,14 @@ pub async fn serve(
     let Some(still) = still else {
         return Ok(());
     };
+    // After the ready line. Awaiting the probe here would hold startup on the
+    // embedding server (cold load, or a connection that never answers).
+    if let Some(backfill) = embed_backfill {
+        let backfill_cancel = cancel.clone();
+        tokio::spawn(async move {
+            crate::embed_backfill::drive(backfill, backfill_cancel).await;
+        });
+    }
     let serve_steps::StillUp {
         stopping,
         usage_recorder,

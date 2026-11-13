@@ -1,18 +1,21 @@
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+};
 
 use agent24_memory::{
     KvStore, MemoryError,
     assertion::{AssertionStore, BeliefQuery},
+    embedder::LocalEmbedder,
     event::{EventQuery, EventStore, Origin, Trust},
+    hybrid::HybridRetriever,
     session::{CanonicalSession, CompactionPolicy, Summarizer},
     session_log::SessionLog,
 };
 use agent24_models::Msg;
-use tokio::sync::Mutex;
-#[cfg(test)]
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 const RECENT_HARD_CEILING_FACTOR: usize = 4;
 const SCAN_PAGE: i64 = 500;
@@ -64,12 +67,55 @@ pub struct SessionMemory {
     summarizer: Arc<dyn Summarizer>,
     policy: CompactionPolicy,
     recall_budget: usize,
-    /// VR-3: hybrid (FTS + vector) recall. `None` is today's pure-FTS recall.
-    /// Held here, not rebuilt per call, because it owns the embedder breaker.
-    hybrid: Option<Arc<agent24_memory::hybrid::HybridRetriever>>,
+    /// VR-3: hybrid (FTS + vector) recall. Empty is today's pure-FTS recall.
+    /// One slot per `SessionMemory`, filled once the loopback embedder is up.
+    /// The breaker lives in the retriever, so VR-4 attaches it here instead of
+    /// building a second retriever for the same owner.
+    hybrid: Arc<RwLock<Option<Arc<HybridRetriever>>>>,
+    /// Remember succeeded: the background backfill coalesces these.
+    backfill: Arc<Notify>,
     locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     #[cfg(test)]
     commit_probe: Option<Arc<CommitAcknowledgementProbe>>,
+}
+
+/// The one hybrid slot and the remember signal for an owner.
+///
+/// The daemon keeps this after [`SessionMemory`] moves into the run loop, and
+/// installs the loopback embedder into the same slot [`SessionMemory::with_embedder`]
+/// writes. The breaker stays inside that one retriever.
+#[derive(Clone)]
+pub struct EmbedBackfill {
+    kv: KvStore,
+    owner: String,
+    hybrid: Arc<RwLock<Option<Arc<HybridRetriever>>>>,
+    notify: Arc<Notify>,
+}
+
+impl EmbedBackfill {
+    #[must_use]
+    pub fn kv(&self) -> &KvStore {
+        &self.kv
+    }
+
+    #[must_use]
+    pub fn owner(&self) -> &str {
+        &self.owner
+    }
+
+    #[must_use]
+    pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+        self.notify.notified()
+    }
+
+    /// Same write as [`SessionMemory::with_embedder`].
+    pub fn install(&self, embedder: Arc<LocalEmbedder>) {
+        let hybrid = Arc::new(self.kv.local_hybrid(embedder));
+        *self
+            .hybrid
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hybrid);
+    }
 }
 
 /// Test-only pause between a successful append and its acknowledgement to remember.
@@ -92,7 +138,8 @@ impl SessionMemory {
             summarizer,
             policy: CompactionPolicy::default(),
             recall_budget: DEFAULT_RECALL_BUDGET,
-            hybrid: None,
+            hybrid: Arc::new(RwLock::new(None)),
+            backfill: Arc::new(Notify::new()),
             locks: Mutex::new(HashMap::new()),
             #[cfg(test)]
             commit_probe: None,
@@ -136,22 +183,35 @@ impl SessionMemory {
     }
 
     /// VR-3: recall through the hybrid retriever (keyword + vector, RRF) with
-    /// this embedder. Without it recall is pure FTS. The embedder is only ever
-    /// called from [`Self::recall`], after the pause check.
+    /// the loopback embedder. Without it recall is pure FTS. Query embedding
+    /// happens in [`Self::recall`], after the pause check.
     ///
-    /// Safety contract for VR-4: pass ONLY VR-1's local (loopback-only)
-    /// embedder. Outbound safety relies on it — the prompt and the facts are
-    /// sent to the embedder, and recalled labels assume that never leaves the
-    /// machine. Never wire a remote or cloud embedder here.
+    /// Only [`LocalEmbedder`] is accepted. The prompt and the facts are sent
+    /// to it, and it refuses any non-loopback address.
     #[must_use]
-    pub fn with_embedder(mut self, embedder: Arc<dyn agent24_memory::vector::Embedder>) -> Self {
-        self.hybrid = Some(Arc::new(self.kv.hybrid_retriever(embedder)));
+    pub fn with_embedder(self, embedder: Arc<LocalEmbedder>) -> Self {
+        self.embed_backfill().install(embedder);
         self
     }
 
+    /// Shared with the daemon's post-ready backfill. Same slot as
+    /// [`Self::with_embedder`]: one retriever, one breaker, per owner.
+    #[must_use]
+    pub fn embed_backfill(&self) -> EmbedBackfill {
+        EmbedBackfill {
+            kv: self.kv.clone(),
+            owner: self.owner.clone(),
+            hybrid: Arc::clone(&self.hybrid),
+            notify: Arc::clone(&self.backfill),
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn with_hybrid(mut self, hybrid: agent24_memory::hybrid::HybridRetriever) -> Self {
-        self.hybrid = Some(Arc::new(hybrid));
+    pub(crate) fn with_hybrid(self, hybrid: HybridRetriever) -> Self {
+        *self
+            .hybrid
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(hybrid));
         self
     }
 
@@ -191,7 +251,13 @@ impl SessionMemory {
 
         // Hits are ledger rows either way: classification and `source_ref`
         // below come from the row, never from which route found it.
-        let hits = match &self.hybrid {
+        // Clone the Arc out of the lock before the search await.
+        let hybrid = self
+            .hybrid
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let hits = match hybrid {
             Some(hybrid) => {
                 hybrid
                     .search(prompt, &self.owner, DEFAULT_RECALL_TOP_K)
@@ -487,6 +553,10 @@ impl SessionMemory {
         let (append_result, retain_result, guard) = joined
             .map_err(|err| MemoryError::Io(format!("session memory append task failed: {err}")))?;
         append_result?;
+        // The fact is durable. The backfill task coalesces repeated notifies.
+        if matches!(&retain_result, Ok(crate::retain::RetainOutcome::Saved)) {
+            self.backfill.notify_one();
+        }
         // From here on the turn's messages are durable. A retain failure is
         // therefore a PARTIAL write (conversation saved, assertion not), which
         // the caller reports differently from "nothing was saved".

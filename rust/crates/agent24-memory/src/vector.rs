@@ -244,6 +244,36 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
         Ok(n)
     }
 
+    /// Current qualified facts for `owner`, and how many of them have a vector
+    /// under this embedder's key. `(embedded, total)`.
+    pub async fn coverage(&self, owner: &str) -> Result<(u64, u64)> {
+        let revision = index_revision(self.embedder.revision());
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_assertions a
+             WHERE a.scope_owner = ? AND a.recorded_to IS NULL AND a.qualified = 1",
+        )
+        .bind(owner)
+        .fetch_one(&self.pool)
+        .await?;
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_embeddings e
+             WHERE e.scope_owner = ? AND e.model_id = ? AND e.revision = ?
+               AND EXISTS (
+                 SELECT 1 FROM mem_assertions a
+                 WHERE a.id = e.assertion_id AND a.recorded_to IS NULL AND a.qualified = 1
+               )",
+        )
+        .bind(owner)
+        .bind(self.embedder.model_id())
+        .bind(revision)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            u64::try_from(embedded).unwrap_or(0),
+            u64::try_from(total).unwrap_or(0),
+        ))
+    }
+
     /// Delete this owner's embeddings outside the current key. The completeness
     /// read and the delete share one write transaction, so a fact inserted
     /// after the read cannot land in between. A key that is still missing a
