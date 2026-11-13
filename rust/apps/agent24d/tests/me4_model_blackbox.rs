@@ -200,7 +200,9 @@ while f.readline():
 /// safety net; the real bound is the Rust side's own poll deadline) counts
 /// as "not closed" — it overwrites `hang_result.json` with
 /// `{"phase":"done","closed":<bool>}`.
-/// Every request is logged (mode + body) to `requests.json`
+/// `POST /v1/embeddings` is answered 404 and not logged: VR-4 probes that
+/// path on this origin after ready, and it is not a completion.
+/// Every other request is logged (mode + body) to `requests.json`
 /// (append-atomic, same rationale as the other blackbox scripts' own
 /// `dump_atomic`: a concurrent reader must never see a torn write) — the
 /// Rust side reads its length as "how many times was this stub actually
@@ -264,6 +266,14 @@ while True:
             if not chunk:
                 break
             body_bytes += chunk
+        # VR-4 probes POST /v1/embeddings on this same origin after the ready
+        # line. That is not a completion: answer it and do not log it, so hang
+        # mode and request counts stay about chat.
+        request_line = lines[0].decode(errors="replace") if lines else ""
+        if "/v1/embeddings" in request_line:
+            out = b'{"error":{"message":"no embeddings","type":"not_found"}}'
+            conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
+            continue
         mode = read_mode()
         if mode == "hang":
             # Written BEFORE the requests.json append below (not after) —

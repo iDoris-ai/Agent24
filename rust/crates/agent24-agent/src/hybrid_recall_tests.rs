@@ -71,9 +71,11 @@ async fn memory_over(kv: &KvStore, embedder: Option<HybridWiring>) -> SessionMem
     let memory = SessionMemory::new(kv.clone(), Arc::new(UnusedSummarizer)).with_owner(OWNER.into());
     match embedder {
         None => memory,
-        Some(HybridWiring::Default(e)) => memory.with_embedder(Arc::new(e)),
+        Some(HybridWiring::Default(e)) => memory.with_hybrid(
+            agent24_memory::test_hooks::hybrid_retriever(kv, Arc::new(e)),
+        ),
         Some(HybridWiring::ShortTimeout(e)) => memory.with_hybrid(
-            kv.hybrid_retriever(Arc::new(e))
+            agent24_memory::test_hooks::hybrid_retriever(kv, Arc::new(e))
                 .with_timing(Duration::from_millis(50), Duration::from_secs(30)),
         ),
     }

@@ -18,7 +18,7 @@ pub mod self_wake;
 mod session_memory;
 mod skill_inject;
 pub mod subagent;
-pub use session_memory::{RECALL_END_MARKER, RECALL_PREFIX, SessionMemory};
+pub use session_memory::{EmbedBackfill, RECALL_END_MARKER, RECALL_PREFIX, SessionMemory};
 pub use skill_inject::{SkillAdmissionError, SkillProvider, SkillProviderSource};
 
 use std::collections::HashMap;

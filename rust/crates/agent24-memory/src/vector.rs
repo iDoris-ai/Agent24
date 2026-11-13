@@ -202,14 +202,31 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
         .await?;
 
         let mut n = 0usize;
+        // One fact that never embeds (for example text the model rejects) must
+        // not keep every later fact without a vector. Skip it and go on; only
+        // when every row fails is the error returned (embedder down).
+        let mut first_err = None;
         for r in &rows {
             let id: String = r.get("id");
             let subject: String = r.get("subject");
             let predicate: String = r.get("predicate");
             let object: String = r.get("object");
             let text = embed_input(&subject, &predicate, &object);
-            let emb = self.embedder.embed(&text).await?;
-            self.check_embedding(&emb)?;
+            let emb = match self.embedder.embed(&text).await {
+                Ok(emb) => match self.check_embedding(&emb) {
+                    Ok(()) => emb,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "skipping a fact whose embedding is invalid");
+                        first_err.get_or_insert(err);
+                        continue;
+                    }
+                },
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping a fact that failed to embed");
+                    first_err.get_or_insert(err);
+                    continue;
+                }
+            };
             // The fact can be retracted while `embed` runs. Validity is decided
             // in this statement, so a close that has already committed inserts
             // zero rows and leaves no orphan.
@@ -239,9 +256,44 @@ impl<E: Embedder + Clone> VectorRetriever<E> {
             // Count rows actually inserted, not conflicts or skipped closes.
             n += res.rows_affected() as usize;
         }
+        if let Some(err) = first_err
+            && n == 0
+        {
+            return Err(err);
+        }
         self.drop_other_revisions_if_complete(owner, &revision)
             .await?;
         Ok(n)
+    }
+
+    /// Current qualified facts for `owner`, and how many of them have a vector
+    /// under this embedder's key. `(embedded, total)`.
+    pub async fn coverage(&self, owner: &str) -> Result<(u64, u64)> {
+        let revision = index_revision(self.embedder.revision());
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_assertions a
+             WHERE a.scope_owner = ? AND a.recorded_to IS NULL AND a.qualified = 1",
+        )
+        .bind(owner)
+        .fetch_one(&self.pool)
+        .await?;
+        let embedded: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mem_embeddings e
+             WHERE e.scope_owner = ? AND e.model_id = ? AND e.revision = ?
+               AND EXISTS (
+                 SELECT 1 FROM mem_assertions a
+                 WHERE a.id = e.assertion_id AND a.recorded_to IS NULL AND a.qualified = 1
+               )",
+        )
+        .bind(owner)
+        .bind(self.embedder.model_id())
+        .bind(revision)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((
+            u64::try_from(embedded).unwrap_or(0),
+            u64::try_from(total).unwrap_or(0),
+        ))
     }
 
     /// Delete this owner's embeddings outside the current key. The completeness
@@ -886,6 +938,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows_of(&pool, "a1").await, 1);
+    }
+
+    /// A fact the embedder always rejects must not keep the facts after it
+    /// without vectors; when every fact fails, the error is returned.
+    #[tokio::test]
+    async fn one_fact_that_never_embeds_does_not_block_the_others() {
+        #[derive(Clone)]
+        struct RejectOne(HashEmbedder);
+        #[async_trait]
+        impl Embedder for RejectOne {
+            fn model_id(&self) -> &str {
+                self.0.model_id()
+            }
+            fn revision(&self) -> &str {
+                self.0.revision()
+            }
+            async fn embed(&self, text: &str) -> Result<Embedding> {
+                if text.contains("poison") {
+                    return Err(MemoryError::Embedder("too long".into()));
+                }
+                self.0.embed(text).await
+            }
+        }
+        let kv = store().await;
+        assert(&kv, "a0", "u1", "note", "poison").await;
+        assert(&kv, "a1", "u1", "color", "blue").await;
+        assert(&kv, "a2", "u1", "city", "lyon").await;
+        let v = kv.vector_retriever(RejectOne(HashEmbedder::new("m", "v1", 32)));
+        assert_eq!(v.reindex("u1").await.unwrap(), 2);
+        assert_eq!(rows_of(&v.pool, "a1").await, 1);
+        assert_eq!(rows_of(&v.pool, "a2").await, 1);
+        assert_eq!(rows_of(&v.pool, "a0").await, 0);
+
+        let only_bad = store().await;
+        assert(&only_bad, "b0", "u1", "note", "poison").await;
+        let v = only_bad.vector_retriever(RejectOne(HashEmbedder::new("m", "v1", 32)));
+        assert!(v.reindex("u1").await.is_err());
     }
 
     #[tokio::test]

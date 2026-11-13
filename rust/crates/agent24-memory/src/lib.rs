@@ -381,6 +381,15 @@ pub mod test_hooks {
     pub fn pool(store: &super::KvStore) -> &sqlx::SqlitePool {
         &store.pool
     }
+
+    /// Hybrid retriever with a test embedder. Production code uses
+    /// [`super::KvStore::local_hybrid`], which only accepts the loopback embedder.
+    pub fn hybrid_retriever(
+        store: &super::KvStore,
+        embedder: std::sync::Arc<dyn super::vector::Embedder>,
+    ) -> super::hybrid::HybridRetriever {
+        store.hybrid_retriever(embedder)
+    }
 }
 
 /// L0: a namespaced JSON key-value store over SQLite (WAL, 5s busy timeout).
@@ -621,10 +630,21 @@ impl KvStore {
         vector::VectorRetriever::new(self.pool.clone(), embedder)
     }
 
+    /// Hybrid recall bound to the loopback embedder. The breaker state lives in
+    /// the returned value, so keep one per owner rather than one per query.
+    pub fn local_hybrid(
+        &self,
+        embedder: std::sync::Arc<embedder::LocalEmbedder>,
+    ) -> hybrid::HybridRetriever {
+        use vector::Embedder;
+        let embedder: std::sync::Arc<dyn Embedder> = embedder;
+        self.hybrid_retriever(embedder)
+    }
+
     /// A [`hybrid::HybridRetriever`] (FTS + vector, RRF) over the SAME database
-    /// file. The breaker state lives in the returned value, so keep one per
-    /// process/session owner rather than building one per query.
-    pub fn hybrid_retriever(
+    /// file. Crate-private so a caller outside this crate cannot pass an
+    /// arbitrary embedder (review #1847 M1). Production uses [`Self::local_hybrid`].
+    pub(crate) fn hybrid_retriever(
         &self,
         embedder: std::sync::Arc<dyn vector::Embedder>,
     ) -> hybrid::HybridRetriever {
