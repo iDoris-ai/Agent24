@@ -108,7 +108,7 @@ export class Monitor {
 
   private async backoff(why: string): Promise<void> {
     const wait = this.holdDelay
-    this.holdDelay = nextHoldDelay(this.holdDelay)
+    this.holdDelay = nextHoldDelay(this.holdDelay, CONFIG.HOLD_BACKOFF_CAP_MS)
     console.error(`[wechat] ${why} — ${wait}ms 后重试`)
     await sleep(wait)
   }

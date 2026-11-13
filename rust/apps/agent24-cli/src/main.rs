@@ -1143,6 +1143,21 @@ async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
                 .to_owned(),
         );
     };
+    let root = match agent24_protocol::data_dir::data_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err.to_string());
+        }
+    };
+    // Remember the id before the new file replaces it. Revoke only after the
+    // new bearer is on disk, so a failed issue or write leaves the old bearer
+    // usable. A failed revoke is a warning and does not roll back the file.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let previous_id = bridge_token::live_bridge_id(&root, now);
     let reply = send_elevating(
         &ep,
         reqwest::Method::POST,
@@ -1184,13 +1199,6 @@ async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
         finish(ep).await;
         return Err("签发响应没有 expires_at 或 capability_id".to_owned());
     };
-    let root = match agent24_protocol::data_dir::data_dir() {
-        Ok(root) => root,
-        Err(err) => {
-            finish(ep).await;
-            return Err(err.to_string());
-        }
-    };
     let path = match bridge_token::write_bridge_token_at(
         &root,
         token.as_str(),
@@ -1230,9 +1238,48 @@ async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
             return Err(format!("{err}。{note}"));
         }
     };
+    if let Some(old_id) = previous_id
+        .as_deref()
+        .filter(|id| *id != capability_id.as_str())
+    {
+        revoke_previous_bridge_id(&ep, old_id).await;
+    }
     finish(ep).await;
     print!("{}", bridge_token::stdout_lines(&path, expires_at));
     Ok(())
+}
+
+/// Best-effort revoke of an id captured before the new file was published.
+///
+/// A 404 `bridge_token_unknown` means the daemon restarted and that id is
+/// already gone. That is not a warning. Any other failure is printed and
+/// does not remove the new file. The bearer is not part of the warning.
+async fn revoke_previous_bridge_id(ep: &Endpoint, old_id: &str) {
+    let reply = send_elevating(
+        ep,
+        reqwest::Method::POST,
+        &format!("/api/v1/capabilities/{old_id}/revoke"),
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await;
+    match reply {
+        Ok(reply) if reply.status.is_success() => {
+            let _ = reply.json_value().await;
+        }
+        Ok(reply) => {
+            let status = reply.status;
+            let body = reply.json_value().await;
+            if let Some(warning) = bridge_token::previous_revoke_warning(status.as_u16(), &body) {
+                eprintln!("{warning}");
+            }
+        }
+        Err(err) => {
+            let (code, message) = err.parts();
+            eprintln!("撤销上一枚桥令牌没有成功（{code}: {message}）。新令牌已经写入。");
+        }
+    }
 }
 
 /// Revoke the id stored in the token file, then delete the file.

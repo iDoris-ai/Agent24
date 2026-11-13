@@ -411,6 +411,128 @@ fn bridge_token_does_not_elevate_when_the_daemon_gate_is_off() {
     assert!(!stderr.contains("Waiting for approval"), "{stderr}");
 }
 
+/// A second issue revokes the id still in the file. The first bearer is 401.
+/// Skipping that revoke leaves the first bearer able to post.
+#[test]
+fn a_second_bridge_token_revokes_the_first() {
+    let host = Host::start_with("allow", &[("A24_DEV_TOOL", "1")]);
+    let first = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    assert!(
+        first.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let path = host.home().join(".agent24/dev/wechat-bridge.token");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let first_token = file["token"].as_str().unwrap().to_owned();
+    let second = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(second.status.success(), "{stderr}");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let second_token = file["token"].as_str().unwrap();
+    assert_ne!(first_token, second_token);
+    let (status, body) = host.request_as(
+        "POST",
+        "/api/v1/inbound/events",
+        &first_token,
+        &json!({"id": "wechat:1001", "actor": "alice", "at": stamp(0), "text": "hello"}),
+    );
+    assert_eq!(status, 401, "{body}");
+    let (status, body) = host.request_as(
+        "POST",
+        "/api/v1/inbound/events",
+        second_token,
+        &json!({"id": "wechat:1002", "actor": "alice", "at": stamp(0), "text": "hello"}),
+    );
+    assert_ne!(status, 401, "{body}");
+}
+
+/// A re-issue that cannot publish the new file must not revoke the bearer
+/// still in the file. The user-immutable flag blocks the rename. The first
+/// bearer is not 401. Clearing the flag and issuing again makes it 401.
+/// Revoking before the write turns the first assertion red.
+#[test]
+fn a_failed_reissue_leaves_the_previous_bridge_token_usable() {
+    let host = Host::start_with("allow", &[("A24_DEV_TOOL", "1")]);
+    let first = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    assert!(
+        first.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let path = host.home().join(".agent24/dev/wechat-bridge.token");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let first_token = file["token"].as_str().unwrap().to_owned();
+    set_user_immutable(&path, true);
+    let _clear = ClearUserImmutable(&path);
+    let second = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success(), "{stderr}");
+    let file: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert_eq!(file["token"].as_str().unwrap(), first_token);
+    let (status, body) = host.request_as(
+        "POST",
+        "/api/v1/inbound/events",
+        &first_token,
+        &json!({"id": "wechat:1001", "actor": "alice", "at": stamp(0), "text": "hello"}),
+    );
+    assert_ne!(status, 401, "{body}");
+    set_user_immutable(&path, false);
+    let third = host.cli_env(
+        &["dev", "bridge-token"],
+        &[("A24_DEV_TOOL", "1")],
+        Duration::from_secs(30),
+    );
+    let stderr = String::from_utf8_lossy(&third.stderr);
+    assert!(third.status.success(), "{stderr}");
+    let (status, body) = host.request_as(
+        "POST",
+        "/api/v1/inbound/events",
+        &first_token,
+        &json!({"id": "wechat:1002", "actor": "alice", "at": stamp(0), "text": "hello"}),
+    );
+    assert_eq!(status, 401, "{body}");
+}
+
+fn set_user_immutable(path: &Path, on: bool) {
+    let flag = if on { "uchg" } else { "nouchg" };
+    let out = Command::new("chflags")
+        .arg(flag)
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "chflags {flag}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `uchg` blocks deleting the temp home. Clear it even when the test panics.
+struct ClearUserImmutable<'a>(&'a Path);
+
+impl Drop for ClearUserImmutable<'_> {
+    fn drop(&mut self) {
+        let _ = Command::new("chflags").arg("nouchg").arg(self.0).status();
+    }
+}
+
 /// The shell revokes the bridge token it just wrote. The bearer is then 401
 /// and the file is gone. Skipping the delete leaves the path in place.
 #[test]

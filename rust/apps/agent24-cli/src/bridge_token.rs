@@ -163,6 +163,25 @@ fn capability_id_in(path: &Path, text: &str) -> Result<String, String> {
     Ok(id.to_owned())
 }
 
+/// A capability id still inside its recorded lifetime.
+///
+/// Missing file, unreadable file, bad id, or `expires_at` already past:
+/// nothing to revoke. A file with a well-formed id and no `expires_at` is
+/// treated as still live, so a re-issue still tries to revoke it.
+pub fn live_bridge_id(root: &Path, now: u64) -> Option<String> {
+    let path = bridge_token_path(root);
+    let text = read_token_text(&path).ok().flatten()?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let id = parsed["capability_id"].as_str().unwrap_or("");
+    if !capability_id_ok(id) {
+        return None;
+    }
+    if parsed["expires_at"].as_u64().is_some_and(|exp| exp <= now) {
+        return None;
+    }
+    Some(id.to_owned())
+}
+
 /// The id recorded when the file was written. Missing file or missing id
 /// is an error and does not contact the daemon. A symlink is not followed.
 pub fn read_bridge_capability_id(root: &Path) -> Result<String, String> {
@@ -206,6 +225,22 @@ pub const DAEMON_RESTART_REVOKED: &str = "令牌已随 daemon 重启失效，已
 /// `true` when the daemon answered that it has no such capability id.
 pub fn daemon_lost_bridge_token(status: u16, body: &serde_json::Value) -> bool {
     status == 404 && body["error"]["code"].as_str() == Some("bridge_token_unknown")
+}
+
+/// Stderr when revoking the previous id failed, after the new file is in place.
+///
+/// `None` when the daemon restarted and no longer has that id
+/// (`404` `bridge_token_unknown`). That is the same outcome as `--revoke`:
+/// the old token is already dead. It is not a revoke failure, and the new
+/// file stays.
+pub fn previous_revoke_warning(status: u16, body: &serde_json::Value) -> Option<String> {
+    if daemon_lost_bridge_token(status, body) {
+        return None;
+    }
+    Some(format!(
+        "撤销上一枚桥令牌没有成功（{}）。新令牌已经写入。",
+        http_failure(status, body)
+    ))
 }
 
 /// Delete the local file after the daemon reported the id is gone.
@@ -280,6 +315,8 @@ mod tests {
         assert_eq!(parsed["expires_at"], 1_700_000_000);
         assert_eq!(parsed["capability_id"], "abc123");
         assert_eq!(read_bridge_capability_id(root.path()).unwrap(), "abc123");
+        assert_eq!(live_bridge_id(root.path(), 1).as_deref(), Some("abc123"));
+        assert_eq!(live_bridge_id(root.path(), 1_700_000_000).as_deref(), None);
         let printed = stdout_lines(&path, 1_700_000_000);
         assert!(!printed.contains(secret));
         assert!(printed.contains(&path.display().to_string()));
@@ -381,5 +418,18 @@ mod tests {
             revoke_reply_when_daemon_lost_the_id(root.path(), "abc123", 403, &forbidden).is_none()
         );
         assert!(bridge_token_path(root.path()).exists());
+    }
+
+    /// Reissue revoke of an id the daemon lost on restart is not a warning.
+    /// Printing `http_failure` for that 404 turns the `None` assertion red.
+    #[test]
+    fn reissue_revoke_of_an_id_the_daemon_lost_is_not_a_warning() {
+        let lost = serde_json::json!({"error": {"code": "bridge_token_unknown", "message": "x"}});
+        assert!(previous_revoke_warning(404, &lost).is_none());
+        let other = serde_json::json!({"error": {"code": "not_found", "message": "no"}});
+        let warning = previous_revoke_warning(404, &other).unwrap();
+        assert!(warning.contains("撤销上一枚桥令牌没有成功"));
+        assert!(warning.contains("新令牌已经写入"));
+        assert!(warning.contains("not_found"));
     }
 }

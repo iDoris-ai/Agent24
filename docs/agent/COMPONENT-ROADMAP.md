@@ -26,8 +26,8 @@
 
 **下一步**（jason 2026-11-12 拍板顺序）：
 
-1. **C9 `requires` 授权**（ADR-038 D7）：令牌按 `requires` ∩ grants ∩ 同意发放。未开工。方案 `docs/tracking/2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md`（在写）。
-2. **ADR-040 技能加载器 v1**：ADR 已接受为设计约束，加载器、版本表、评测跑器仍是零代码（`docs/adr/ADR-040-skill-contract-v1.md:5`）。排在 C9 之后。
+1. **ADR-038-C9 `requires` 授权**（ADR-038 D7）：已接线（A #1825、B #1830、C #1833、D #1831）。内核能力经解析器进入授予；开发态微信桥用组件令牌。方案 `docs/tracking/2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md`。
+2. **ADR-040 技能加载器 v1**：ADR 已接受为设计约束，加载器、版本表、评测跑器仍是零代码（`docs/adr/ADR-040-skill-contract-v1.md:5`）。排在 ADR-038-C9 之后。
 
 **多平台锁**（另计，不插进上面的顺序）：Hyphae 的 `assets` 只有 `darwin-arm64` 与 `linux-x64`（`hyphae.lock.json:2-22`，v0.30.1）。iDoris 的 `assets` 只有 `darwin-arm64`（`idoris.lock.json:11-23`，v0.4.0）。
 
