@@ -46,10 +46,7 @@ pub fn is_user_visible_volume(
         return false;
     }
     let fs = fs_type.to_ascii_lowercase();
-    if VIRTUAL_FS_TYPES.contains(&fs.as_str()) {
-        return false;
-    }
-    true
+    !VIRTUAL_FS_TYPES.contains(&fs.as_str())
 }
 
 /// The disk whose mount point is the longest component-wise prefix of
