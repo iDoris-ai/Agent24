@@ -59,6 +59,13 @@ describe('the plist a service stop left behind (omlx-service-left)', () => {
     expect(fs.statSync(plist).ino).toBe(ino)
     expect(serviceLeftBehind(file, plist, down)).toBe(false)
     expect(fs.existsSync(file)).toBe(false)
+    // Also with a live refused daemon (ruling 2026-11-13-pr1-hardstop-service-left):
+    // the plist written again ends the record whatever runs.
+    markServiceLeft(file, plist)
+    const again = new Date(fs.statSync(plist).mtimeMs + 5_000)
+    fs.utimesSync(plist, again, again)
+    expect(serviceLeftBehind(file, plist, () => 'refused')).toBe(false)
+    expect(fs.existsSync(file)).toBe(false)
   })
 
   it('ends, and clears the record, once an install wrote the plist anew as another file', () => {
