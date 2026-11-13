@@ -741,9 +741,7 @@ pub(super) async fn assemble_app_state(
     state.idoris_unavailable = idoris_unavailable;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
-        if mode == StartupMode::HostChild {
-            state.enable_desktop_presence();
-        }
+        state.enable_presence_for(mode);
         state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
             &state_dir,
         )?);
@@ -751,7 +749,7 @@ pub(super) async fn assemble_app_state(
     // Last, so it wins over the desktop provider that HostChild mode installs
     // just above (the e2e daemon runs as a host child). Debug test builds only.
     #[cfg(feature = "test-enrollment")]
-    if crate::enroll_test_support::enabled() {
+    if crate::enroll_test_support::fixed_presence() {
         state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
     }
     // X11-2g / C9-B. `A24_DEV_TOOL=1` opens the route in either mode. The

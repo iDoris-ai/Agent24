@@ -1148,7 +1148,8 @@ mod tests {
         }
         let support = std::fs::read_to_string(root.join("tests/support/enroll.rs")).unwrap();
         assert!(names.iter().all(|n| support.contains(n.as_str())));
-        let server = include_str!("server.rs");
+        // S2-1 moved serve() into serve_steps.rs: the switches are read there.
+        let server = include_str!("serve_steps.rs");
         let server = &server[..server.find("mod tests {").unwrap()];
         let uses: Vec<usize> = server
             .match_indices("crate::enroll_test_support::")
