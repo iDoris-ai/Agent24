@@ -1,7 +1,7 @@
 # 向量召回接入对话循环——实施方案（第 1 版）
 
 - 日期：2026-11-13
-- 状态：草案，待 jason 拍板 §5 三项。只写文档，没有改代码。
+- 状态：已冻结（2026-11-13）。jason 已拍板 §5 三项，PR-Daemon 一轮评审无阻塞；评审带入分片的事项见 §4 末「评审带入」。只写文档，没有改代码。
 - 来源：用户外部反馈「跨会话记忆只有 SQLite FTS 全文检索，向量检索还没接进 loop」。组件规范化（C9、技能加载器 v1）收口后的下一条主线。
 - 依据：[ADR-MEMORY-P1-LIFECYCLE-AND-PURGE](../../adr/ADR-MEMORY-P1-LIFECYCLE-AND-PURGE.md)（下称「生命周期 ADR」）；[ADR-MEMORY-RECALL-MESSAGE-ORIGINS](../../adr/ADR-MEMORY-RECALL-MESSAGE-ORIGINS.md)；[ADR-K1-02](../../adr/ADR-K1-02-session-dataflow-security-modes.md)；[ADR-039](../../adr/ADR-039-concept-model.md) §2；[ADR-046](../../adr/ADR-046-idoris-managed-host.md)；[ADR-KB-01](../../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md)、[ADR-KB-02](../../knowledge/ADR-KB-02-HOST-AUTHORITY.md)；[SPEC-MD-ME](../../specs/SPEC-MD-ME.md) MD-6；[MEMORY-STRATEGY](../../research/MEMORY-STRATEGY.md) P2；[HW-TIERS](../../design/HW-TIERS-capability-hardware-matrix.md) §4。
 - 核对基线：`main` @ `ee5d6c360`（本工作树 `docs/vector-recall-plan`）。行号开工时按符号再对一次。
@@ -186,6 +186,12 @@
 | VR-5 评测与文档收口 | `eval_m1` 增加至少 20 条中文换说法用例（记录项）；在笔记本真模型上跑一次，记录纯 FTS 与混合的 Hit@5；校准 `MIN_COSINE`；改 `SPEC-MD-ME` MD-6 行、生命周期 ADR 第 39 行、`MEMORY-STRATEGY` P2 状态、里程碑表 | `agent24-memory/src/eval_m1.rs`、`docs/…` | ~80 + 用例 | VR-0、VR-4 | 混合 Hit@5 高于纯 FTS，数字和命令写进文档可复现；原有硬门不退。真模型评测不进 CI（CI 用测试嵌入器），文档写明。`pre-pr-check` 通过 | 用例写成只对向量有利；阈值过拟合 | Sonnet |
 
 依赖：VR-1 与 VR-2 可并行；VR-3 等 VR-2；VR-4 等 VR-1、VR-3；VR-5 收尾。VR-0 在 VR-1 开工前做完。只有 VR-2 带迁移（agent24-memory 的迁移目录，不是 agent24-store）。
+
+**评审带入（#1843 PR-Daemon，开工时照做）**
+- VR-3 / VR-4（Medium）：嵌入服务「接受连接却不回」时每轮都要等满 1.5 秒。加一个小熔断：一次超时后 N 秒内跳过向量路，直接走关键词；测试「连续两次超时只付一次约 1.5 秒」。
+- VR-1：直连 oMLX 模式只按 URL 判本机，没有 iDoris 模式那样的回包本机标头；本机代理再转发到外网也能通过。这是配置选择不是攻击面，§3.7 照实写明两种模式的保证不同。
+- VR-2：嵌入输入改成纯文本 `object` 后，旧格式向量仍挂在同一 revision 下。生产今天 0 行，无害；探针 / revision 输入里带上文本格式版本，开发库里的旧行会自动重嵌。
+- VR-2：新版本补嵌完成后删旧版本行，切回旧模型会全部重嵌。千条量级可接受，§3.6 写一句。
 
 ## 5. 已拍板（jason，2026-11-13）
 
