@@ -35,15 +35,16 @@ pub(crate) enum SkillAction {
     /// 重扫用户技能目录
     Rescan,
     /// 激活一对修订，或回滚到一条历史。指针真会移动时才请求桌面确认。
-    /// 省略 --body / --evals 时，取最新正文的来源，评测只在该来源里找。
+    /// 省略 --body / --evals 时，有指针就只换比指针新的一侧；两侧都新则拒绝。
+    /// 没有指针时，该来源恰好一条正文和一条评测才直接用。
     /// 两个来源都有修订时，用 --origin user|imported，或同时给出 --body 与 --evals
     Activate {
         /// 技能 id
         id: String,
-        /// 正文修订 id。省略则在选定来源里用最新的一条正文。须与 --evals 同时给出
+        /// 正文修订 id。省略则按指针或唯一修订选择。须与 --evals 同时给出
         #[arg(long)]
         body: Option<String>,
-        /// 评测修订 id。省略则在选定来源里用最新的一条评测。须与 --body 同时给出
+        /// 评测修订 id。省略则按指针或唯一修订选择。须与 --body 同时给出
         #[arg(long)]
         evals: Option<String>,
         /// 接受的失败用例 id，可重复。须正好是服务端这一次评测的失败用例
@@ -52,7 +53,7 @@ pub(crate) enum SkillAction {
         /// 回滚到这条激活历史。不能和 --body / --evals / --accept / --origin 一起用
         #[arg(long)]
         rollback: Option<String>,
-        /// 省略修订 id 时只在这个来源里取最新正文和评测。取值 user 或 imported
+        /// 省略修订 id 时只在这个来源里选择。取值 user 或 imported
         #[arg(long, value_parser = ["user", "imported"])]
         origin: Option<String>,
     },
@@ -318,6 +319,10 @@ async fn activate(
         let (body, evals) = default_pair(&detail, origin)?;
         (Some(body), Some(evals))
     };
+    if let (Some(body), Some(evals)) = (&body_rev, &evals_rev) {
+        // 请求之前打出这一对。桌面确认看的是服务端摘要，这里先让命令行对上号。
+        eprintln!("{}", activation_pair_line(&detail, body, evals));
+    }
     let bytes = encode_activate(ActivateSpec {
         expected_generation: generation,
         body_revision_id: body_rev,
@@ -365,8 +370,13 @@ fn encode_activate(spec: ActivateSpec) -> Result<Vec<u8>, String> {
     serde_json::to_vec(&Value::Object(payload)).map_err(|err| err.to_string())
 }
 
-/// 不带 `--body` / `--evals` 时的那一对。来源是最新正文的来源；两个来源都有
-/// 修订且没有 `--origin` 时不拼一对。评测只在选定来源里找。
+/// 不带 `--body` / `--evals` 时的那一对。来源仍是最新正文的来源；两个来源都有
+/// 修订且没有 `--origin` 时不拼一对。
+///
+/// 有这个来源的指针时只换一侧：比指针新的正文配指针上的评测，否则比指针新的评测
+/// 配指针上的正文。两侧都比指针新就拒绝，因为 daemon 同一次激活也只许换一侧。
+/// 没有指针时，这个来源恰好一条正文和一条评测才直接用。分别取两侧最新会在
+/// 重装复用旧 `created_at` 时拼出从未一起装过的一对，这里不这么做。
 fn default_pair(detail: &Value, origin: Option<&str>) -> Result<(String, String), String> {
     let rows = detail["revisions"]
         .as_array()
@@ -391,10 +401,121 @@ fn default_pair(detail: &Value, origin: Option<&str>) -> Result<(String, String)
             latest_body_origin(rows)?
         }
     };
-    Ok((
-        latest_revision(detail, "body", &chosen)?,
-        latest_revision(detail, "evals", &chosen)?,
-    ))
+    let bodies = kind_rows(detail, "body", &chosen)?;
+    let evals = kind_rows(detail, "evals", &chosen)?;
+    if bodies.is_empty() {
+        return Err("invalid_request: 详情里没有正文修订".to_owned());
+    }
+    if evals.is_empty() {
+        return Err("invalid_request: 详情里没有评测修订".to_owned());
+    }
+    if let Some((body_id, evals_id)) = pointer_ids(detail, &chosen) {
+        let newer_body = newer_than(&bodies, body_id)?;
+        let newer_evals = newer_than(&evals, evals_id)?;
+        return match (newer_body, newer_evals) {
+            (Some(_), Some(_)) => Err(
+                "invalid_request: 正文和评测都比当前指针新。请分两次激活，每次用 --body 与 --evals 只换一侧"
+                    .to_owned(),
+            ),
+            (Some(body), None) => Ok((body, evals_id.to_owned())),
+            (None, Some(evals)) => Ok((body_id.to_owned(), evals)),
+            (None, None) => Ok((body_id.to_owned(), evals_id.to_owned())),
+        };
+    }
+    if bodies.len() == 1 && evals.len() == 1 {
+        return Ok((bodies[0].1.clone(), evals[0].1.clone()));
+    }
+    Err(
+        "invalid_request: 没有激活指针，且这个来源有多条正文或评测。请用 --body 与 --evals 指定"
+            .to_owned(),
+    )
+}
+
+/// 这个来源的指针。别的来源、空 id、或还没有指针，都当没有。
+fn pointer_ids<'a>(detail: &'a Value, origin: &str) -> Option<(&'a str, &'a str)> {
+    let pointer = detail.get("pointer")?;
+    if !pointer.is_object() || pointer["origin"].as_str() != Some(origin) {
+        return None;
+    }
+    let body = pointer["body_revision_id"].as_str()?;
+    let evals = pointer["evals_revision_id"].as_str()?;
+    if body.is_empty() || evals.is_empty() {
+        return None;
+    }
+    Some((body, evals))
+}
+
+/// `(created_at, revision_id)`，只留选定来源、选定种类、id 非空的行。
+fn kind_rows(detail: &Value, kind: &str, origin: &str) -> Result<Vec<(String, String)>, String> {
+    let rows = detail["revisions"]
+        .as_array()
+        .ok_or_else(|| "invalid_response: 详情没有修订".to_owned())?;
+    let mut out = Vec::new();
+    for row in rows {
+        if row["kind"].as_str() != Some(kind) || row["origin"].as_str() != Some(origin) {
+            continue;
+        }
+        let Some(id) = row["revision_id"].as_str().filter(|id| !id.is_empty()) else {
+            continue;
+        };
+        out.push((
+            row["created_at"].as_str().unwrap_or("").to_owned(),
+            id.to_owned(),
+        ));
+    }
+    Ok(out)
+}
+
+/// 比指针这一行更新的那条。比较键与库的列表顺序一样：`created_at`，再 `revision_id`。
+/// 重装复用的旧行不会因此变成新的。
+fn newer_than(rows: &[(String, String)], current_id: &str) -> Result<Option<String>, String> {
+    let current = rows
+        .iter()
+        .find(|(_, id)| id == current_id)
+        .ok_or_else(|| "invalid_response: 指针上的修订不在这个来源里".to_owned())?;
+    let mut best: Option<&(String, String)> = None;
+    for row in rows {
+        if (row.0.as_str(), row.1.as_str()) <= (current.0.as_str(), current.1.as_str()) {
+            continue;
+        }
+        let replace = best.is_none_or(|prev| {
+            (row.0.as_str(), row.1.as_str()) >= (prev.0.as_str(), prev.1.as_str())
+        });
+        if replace {
+            best = Some(row);
+        }
+    }
+    Ok(best.map(|(_, id)| id.clone()))
+}
+
+/// 发请求前打出的那一对：修订 id 和摘要各前 8 位，semver 原样。
+fn activation_pair_line(detail: &Value, body_id: &str, evals_id: &str) -> String {
+    let (body_ver, body_digest) = revision_brief(detail, body_id);
+    let (evals_ver, evals_digest) = revision_brief(detail, evals_id);
+    format!(
+        "将激活 正文 {} {} {}  评测 {} {} {}",
+        prefix8(body_id),
+        body_ver,
+        prefix8(&body_digest),
+        prefix8(evals_id),
+        evals_ver,
+        prefix8(&evals_digest)
+    )
+}
+
+fn revision_brief(detail: &Value, id: &str) -> (String, String) {
+    let Some(rows) = detail["revisions"].as_array() else {
+        return ("—".to_owned(), String::new());
+    };
+    for row in rows {
+        if row["revision_id"].as_str() == Some(id) {
+            return (
+                row["semver"].as_str().unwrap_or("—").to_owned(),
+                row["content_digest"].as_str().unwrap_or("").to_owned(),
+            );
+        }
+    }
+    ("—".to_owned(), String::new())
 }
 
 fn latest_body_origin(rows: &[Value]) -> Result<String, String> {
@@ -416,31 +537,6 @@ fn latest_body_origin(rows: &[Value]) -> Result<String, String> {
         Some(_) => Err("invalid_response: 最新正文没有来源".to_owned()),
         None => Err("invalid_request: 详情里没有正文修订".to_owned()),
     }
-}
-
-fn latest_revision(detail: &Value, kind: &str, origin: &str) -> Result<String, String> {
-    let mut best: Option<(&str, &str)> = None;
-    let rows = detail["revisions"]
-        .as_array()
-        .ok_or_else(|| "invalid_response: 详情没有修订".to_owned())?;
-    for row in rows {
-        if row["kind"].as_str() != Some(kind) || row["origin"].as_str() != Some(origin) {
-            continue;
-        }
-        let created = row["created_at"].as_str().unwrap_or("");
-        let id = row["revision_id"].as_str().unwrap_or("");
-        let replace = best.is_none_or(|(at, prev)| (created, id) >= (at, prev));
-        if replace {
-            best = Some((created, id));
-        }
-    }
-    best.map(|(_, id)| id.to_owned())
-        .filter(|id| !id.is_empty())
-        .ok_or_else(|| format!("invalid_request: 详情里没有{}修订", kind_label(kind)))
-}
-
-fn kind_label(kind: &str) -> &'static str {
-    if kind == "body" { "正文" } else { "评测" }
 }
 
 async fn exchange(
@@ -487,6 +583,7 @@ fn finish_json(
 }
 
 fn fail(json_output: bool, raw: Option<&str>, message: String) -> Result<(), String> {
+    let message = terminal_text(&message);
     if json_output {
         match raw.map(str::trim).filter(|text| !text.is_empty()) {
             Some(text) => println!("{text}"),
@@ -507,23 +604,26 @@ fn parse_json(text: &str) -> Result<Value, String> {
 
 fn explain_failure(text: &str) -> String {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
-        return format!("invalid_response: {text}");
+        return format!("invalid_response: {}", terminal_text(text));
     };
-    let code = value["error"]["code"]
-        .as_str()
-        .unwrap_or("invalid_response");
-    let message = value["error"]["message"].as_str().unwrap_or("");
+    let code = terminal_text(
+        value["error"]["code"]
+            .as_str()
+            .unwrap_or("invalid_response"),
+    );
+    let message = terminal_text(value["error"]["message"].as_str().unwrap_or(""));
     let mut out = format!("{code}: {message}");
     if let Some(cases) = value["error"]["details"]["cases"].as_array() {
         out.push_str("\n用例:");
         for case in cases {
             let passed = case["passed"].as_bool().unwrap_or(false);
+            let digest = terminal_text(case["expect_digest"].as_str().unwrap_or(""));
             out.push_str(&format!(
                 "\n  {} 行 {} {} passed={passed} 摘要 {}",
-                case["id"].as_str().unwrap_or(""),
+                terminal_text(case["id"].as_str().unwrap_or("")),
                 case["line"].as_i64().unwrap_or(0),
-                case["judge"].as_str().unwrap_or(""),
-                prefix8(case["expect_digest"].as_str().unwrap_or(""))
+                terminal_text(case["judge"].as_str().unwrap_or("")),
+                prefix8(&digest)
             ));
         }
     }
@@ -531,7 +631,7 @@ fn explain_failure(text: &str) -> String {
         let flags = failed
             .iter()
             .filter_map(Value::as_str)
-            .map(|id| format!("--accept {id}"))
+            .map(|id| format!("--accept {}", terminal_text(id)))
             .collect::<Vec<_>>()
             .join(" ");
         if !flags.is_empty() {
@@ -539,6 +639,14 @@ fn explain_failure(text: &str) -> String {
         }
     }
     out
+}
+
+/// 打到终端之前去掉 C0/C1（ESC、BEL、DEL 等）。换行留着，多行用例摘要还要它。
+fn terminal_text(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| *ch == '\n' || !ch.is_control())
+        .collect()
 }
 
 fn read_text(path: &Path) -> Result<String, String> {
@@ -768,25 +876,11 @@ mod tests {
                 .unwrap()
                 .contains("--origin")
         );
-    }
-
-    #[test]
-    fn latest_revision_is_the_newest_of_that_kind() {
-        let detail = json!({
-            "revisions": [
-                {"kind": "body", "origin": "user", "created_at": "t1", "revision_id": "body-old"},
-                {"kind": "evals", "origin": "user", "created_at": "t2", "revision_id": "evals-new"},
-                {"kind": "body", "origin": "user", "created_at": "t2", "revision_id": "body-new"},
-                {"kind": "evals", "origin": "user", "created_at": "t1", "revision_id": "evals-old"}
-            ]
-        });
-        assert_eq!(
-            latest_revision(&detail, "body", "user").unwrap(),
-            "body-new"
-        );
-        assert_eq!(
-            latest_revision(&detail, "evals", "user").unwrap(),
-            "evals-new"
+        // 去掉上面的 `pair ||` 后，回滚加 `--body`/`--evals` 会漏下去，断言变红。
+        assert!(
+            activate_flags(Some("b"), Some("e"), &[], Some("act"), None)
+                .unwrap()
+                .contains("回滚")
         );
     }
 
@@ -821,10 +915,117 @@ mod tests {
                 {"kind": "evals", "origin": "imported", "created_at": "t1", "revision_id": "e1"}
             ]
         });
-        assert_eq!(
-            default_pair(&only, None).unwrap(),
-            ("b2".to_owned(), "e2".to_owned())
+        let err = default_pair(&only, None).unwrap_err();
+        assert!(err.contains("--body"), "{err}");
+        assert!(err.contains("--evals"), "{err}");
+    }
+
+    /// (A,E1) → (B,E2) → 重装 A 得到 E3。A 的 `created_at` 仍是 t1，分别取两侧
+    /// 最新会得到从未一起装过的 (B,E3)。改回那种选择，下面的断言变红。
+    #[test]
+    fn default_pair_does_not_assemble_the_reinstall_with_the_newest_evals() {
+        let detail = reinstall_detail(json!({
+            "origin": "user",
+            "body_revision_id": "A",
+            "evals_revision_id": "E1"
+        }));
+        let err = default_pair(&detail, None).unwrap_err();
+        assert_ne!(
+            default_pair(&detail, None).ok(),
+            Some(("B".to_owned(), "E3".to_owned()))
         );
+        assert!(err.contains("分两次"), "{err}");
+        assert!(err.contains("--body") && err.contains("--evals"), "{err}");
+
+        let bare = reinstall_detail(Value::Null);
+        assert_ne!(
+            default_pair(&bare, None).ok(),
+            Some(("B".to_owned(), "E3".to_owned()))
+        );
+        let err = default_pair(&bare, None).unwrap_err();
+        assert!(err.contains("没有激活指针"), "{err}");
+        assert!(err.contains("--body") && err.contains("--evals"), "{err}");
+    }
+
+    #[test]
+    fn default_pair_moves_only_the_newer_side() {
+        let body_only = json!({
+            "pointer": {"origin": "user", "body_revision_id": "A", "evals_revision_id": "E1"},
+            "revisions": [
+                {"kind": "body", "origin": "user", "created_at": "t1", "revision_id": "A"},
+                {"kind": "evals", "origin": "user", "created_at": "t1", "revision_id": "E1"},
+                {"kind": "body", "origin": "user", "created_at": "t2", "revision_id": "B"},
+                {"kind": "body", "origin": "user", "created_at": "t3", "revision_id": "C"}
+            ]
+        });
+        assert_eq!(
+            default_pair(&body_only, None).unwrap(),
+            ("C".to_owned(), "E1".to_owned())
+        );
+
+        let evals_only = json!({
+            "pointer": {"origin": "user", "body_revision_id": "A", "evals_revision_id": "E1"},
+            "revisions": [
+                {"kind": "body", "origin": "user", "created_at": "t1", "revision_id": "A"},
+                {"kind": "evals", "origin": "user", "created_at": "t1", "revision_id": "E1"},
+                {"kind": "evals", "origin": "user", "created_at": "t2", "revision_id": "E2"}
+            ]
+        });
+        assert_eq!(
+            default_pair(&evals_only, None).unwrap(),
+            ("A".to_owned(), "E2".to_owned())
+        );
+
+        let same = json!({
+            "pointer": {"origin": "user", "body_revision_id": "A", "evals_revision_id": "E1"},
+            "revisions": [
+                {"kind": "body", "origin": "user", "created_at": "t1", "revision_id": "A"},
+                {"kind": "evals", "origin": "user", "created_at": "t1", "revision_id": "E1"}
+            ]
+        });
+        assert_eq!(
+            default_pair(&same, None).unwrap(),
+            ("A".to_owned(), "E1".to_owned())
+        );
+
+        let alone = json!({
+            "pointer": null,
+            "revisions": [
+                {"kind": "body", "origin": "user", "created_at": "t1", "revision_id": "A"},
+                {"kind": "evals", "origin": "user", "created_at": "t1", "revision_id": "E1"}
+            ]
+        });
+        assert_eq!(
+            default_pair(&alone, None).unwrap(),
+            ("A".to_owned(), "E1".to_owned())
+        );
+    }
+
+    #[test]
+    fn activation_pair_line_shows_ids_semver_and_digest() {
+        let detail = json!({
+            "revisions": [
+                {"revision_id": "bodyrev-aaaa", "semver": "1.2.0", "content_digest": "deadbeef0011"},
+                {"revision_id": "evalsrev-bbbb", "semver": "1.2.1", "content_digest": "cafebabe2233"}
+            ]
+        });
+        assert_eq!(
+            activation_pair_line(&detail, "bodyrev-aaaa", "evalsrev-bbbb"),
+            "将激活 正文 bodyrev- 1.2.0 deadbeef  评测 evalsrev 1.2.1 cafebabe"
+        );
+    }
+
+    fn reinstall_detail(pointer: Value) -> Value {
+        json!({
+            "pointer": pointer,
+            "revisions": [
+                {"kind": "body", "origin": "user", "created_at": "t1", "revision_id": "A", "semver": "1.0.0", "content_digest": "aaaaaaaa11"},
+                {"kind": "evals", "origin": "user", "created_at": "t1", "revision_id": "E1", "semver": "1.0.0", "content_digest": "11111111aa"},
+                {"kind": "body", "origin": "user", "created_at": "t2", "revision_id": "B", "semver": "1.1.0", "content_digest": "bbbbbbbb22"},
+                {"kind": "evals", "origin": "user", "created_at": "t2", "revision_id": "E2", "semver": "1.1.0", "content_digest": "22222222bb"},
+                {"kind": "evals", "origin": "user", "created_at": "t3", "revision_id": "E3", "semver": "1.0.1", "content_digest": "33333333cc"}
+            ]
+        })
     }
 
     #[test]
@@ -894,6 +1095,38 @@ mod tests {
         let two = r#"{"error":{"code":"skill_eval_failed","message":"有失败用例未被接受","details":{"failed":["a","b"]}}}"#;
         assert!(explain_failure(two).contains("失败: --accept a --accept b"));
         assert!(!explained.contains("secret expect"));
+    }
+
+    #[test]
+    fn daemon_error_strips_osc_from_the_unknown_eval_field() {
+        let key = "\u{1b}]0;pwned\u{7}\u{9b}";
+        let text = serde_json::json!({
+            "error": {
+                "code": "invalid_request",
+                "message": format!("unknown eval field {key}"),
+                "details": {
+                    "cases": [{
+                        "id": key,
+                        "line": 1,
+                        "judge": "contains",
+                        "passed": false,
+                        "expect_digest": "abcd"
+                    }],
+                    "failed": [key]
+                }
+            }
+        })
+        .to_string();
+        let explained = explain_failure(&text);
+        assert!(explained.contains("unknown eval field ]0;pwned"));
+        assert!(explained.contains("--accept ]0;pwned"));
+        assert!(
+            !explained.chars().any(|ch| ch.is_control() && ch != '\n'),
+            "{explained:?}"
+        );
+        assert!(!explained.contains('\u{1b}'));
+        assert!(!explained.contains('\u{7}'));
+        assert!(!explained.contains('\u{9b}'));
     }
 
     #[test]

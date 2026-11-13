@@ -626,6 +626,11 @@ fn real_skill_activate_without_confirmation_does_not_move_the_pointer() {
     let (stdout, stderr) = cli_text(&out);
     assert!(!out.status.success(), "stdout={stdout} stderr={stderr}");
     assert!(
+        stderr.contains("将激活"),
+        "发请求前应打出正文和评测那一对: {stderr}"
+    );
+    assert!(stderr.contains("1.2.0"), "{stderr}");
+    assert!(
         stderr.contains("Waiting for approval"),
         "跳过预检直接请求提升以外的失败不会停在桌面确认: {stderr}"
     );
