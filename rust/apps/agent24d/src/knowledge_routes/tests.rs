@@ -1615,3 +1615,83 @@ async fn an_endpoint_the_registry_would_refuse_is_not_an_elevated_operation() {
     assert_eq!(refused.unwrap_err(), EnrollErrorCode::NotElevatedOperation);
     assert_eq!(capture.0.lock().unwrap().len(), before);
 }
+
+/// F1 (ruling 2026-11-14-f1-endpoint-canonical, C): the endpoint is stored,
+/// and shown in the approval, as the transport connects to it, that is as
+/// `validate_base_url` normalises it. Five spellings the parser accepts and
+/// the transport rewrites: `\` read as `/` (the host is the part before it),
+/// an IDN host, an upper-case host, the default port, a trailing `/`.
+const F1_SPELLINGS: [(&str, &str); 5] = [
+    (
+        "https://evil.example\\@good.example",
+        "https://evil.example/@good.example",
+    ),
+    (
+        "https://b\u{fc}cher.example/api",
+        "https://xn--bcher-kva.example/api",
+    ),
+    ("https://KB.Example/api/v1", "https://kb.example/api/v1"),
+    ("https://kb.example:443/api/v1", "https://kb.example/api/v1"),
+    ("https://kb.example/api/v1/", "https://kb.example/api/v1"),
+];
+
+#[tokio::test]
+async fn an_endpoint_is_stored_as_the_transport_connects_to_it() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    for (i, (raw, canonical)) in F1_SPELLINGS.into_iter().enumerate() {
+        // The string the HTTP transport connects to.
+        assert_eq!(
+            agent24_knowledge::validate_base_url(raw).as_deref(),
+            Ok(canonical),
+            "{raw}"
+        );
+        let body = serde_json::json!({ "seq": 1 + i as u64, "endpoint": raw,
+                                       "knowledge_base_ids": ["kb-a"] });
+        let (status, _) = send(
+            &router,
+            with_body(Method::PUT, BINDING, &host, &body.to_string()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{raw}");
+        let host_id = registry.only_host();
+        let now = registry.binding_now(&host_id, "b1", unix_now()).unwrap();
+        assert_eq!(
+            now.endpoint.map(|endpoint| endpoint.base_url).as_deref(),
+            Some(canonical),
+            "{raw}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_approval_shows_the_endpoint_the_transport_connects_to() {
+    for (i, (raw, canonical)) in F1_SPELLINGS.into_iter().enumerate() {
+        let (state, peer, token, capture) = captured_shell().await;
+        let seq = 1 + i as u64;
+        let body = serde_json::json!({ "seq": seq, "endpoint": raw,
+                                       "knowledge_base_ids": ["kb-a"] })
+        .to_string();
+        state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .remember_knowledge_request(
+                &token.token_id,
+                "PUT",
+                BINDING_TEMPLATE,
+                BINDING,
+                body.as_bytes(),
+            );
+        let _grant = approve(&state, &peer, &token.token_id, "PUT", BINDING, &body).await;
+        let shown = capture.0.lock().unwrap();
+        assert_eq!(
+            approval_details(shown.last().unwrap()),
+            format!(
+                "activate Knowledge binding \"b1\" for \"{canonical}\"; knowledge bases: [\"kb-a\"]; sequence {seq}"
+            ),
+            "{raw}"
+        );
+    }
+}
