@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { KnowledgeHost, SequenceClock, elevatingTransport, validBindingId, type HostTransport, type KnowledgeCredential } from './knowledge-host'
+import { KnowledgeHost, SequenceClock, elevatingTransport, unansweredRetryDelayMs, validBindingId, type HostTransport, type KnowledgeCredential } from './knowledge-host'
 import { KnowledgeLoginStore, type KnowledgeLogin, type SecretBox } from './knowledge-logins'
 import type { DaemonConnection } from './backend-manager'
 import { proxyError } from './backend-proxy'
@@ -777,5 +777,681 @@ describe('KnowledgeHost through elevation (M5 B6)', () => {
     const error = await transport(conn(), 'PUT', '/api/v1/host/knowledge/bindings/b1/credential', body).catch((e: Error) => e)
     expect(JSON.stringify(got[0]!.body)).toBe(body)
     expect(String(error)).not.toMatch(/SECRET/)
+  })
+})
+
+// (c2) F2 and F3 (ruling 2026-11-13-c-fix-f1-f3): which daemon the host talks
+// to is told by the enrolled service daemon's pid:generation, by value, so a
+// renewal replays nothing; and what a confirmation that did not happen means.
+describe('KnowledgeHost: daemon identity and confirmation outcomes (M5 B6 c2)', () => {
+  let dir = ''
+  let store: KnowledgeLoginStore
+  let daemon: ReturnType<typeof fakeDaemon>
+  let identity: string | null
+  let nowMs = 1_000_000
+
+  const make = () => new KnowledgeHost(store, {
+    connection: daemon.connection,
+    transport: daemon.transport,
+    daemonIdentity: () => identity,
+    nowMs: () => nowMs,
+    nowSeconds: () => NOW,
+  })
+  const lines = () => daemon.sent.map((r) => `${r.method} ${r.path}`)
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 20))
+  const MIN = 60_000
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-host-c2-'))
+    store = new KnowledgeLoginStore(dir, box, 'darwin')
+    daemon = fakeDaemon()
+    identity = '100:g1'
+    nowMs = 1_000_000
+  })
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  async function activeWithC(host: KnowledgeHost) {
+    host.start()
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    expect(await host.pushCredential('b1', credential('C1'))).toEqual({ ok: true })
+    daemon.sent.length = 0
+  }
+
+  it('replays nothing on a renewal: a new token from the same service daemon', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.setConnection({ port: 1, authHeaders: { Authorization: 'Bearer renewed' } })
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([])
+    expect(host.isActive('b1')).toBe(true)
+  })
+
+  it('replays nothing when the token connection ends and enrols again with the same daemon', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.setConnection(null)
+    host.sync()
+    daemon.setConnection({ port: 1, authHeaders: { Authorization: 'Bearer enrolled-again' } })
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([])
+    expect(host.isActive('b1')).toBe(true)
+  })
+
+  it('replays on a restarted service daemon (another generation, or another pid)', async () => {
+    for (const next of ['100:g2', '101:g1']) {
+      daemon = fakeDaemon()
+      identity = '100:g1'
+      const host = make()
+      await activeWithC(host)
+      identity = next
+      daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer new-daemon' } })
+      host.sync()
+      await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+    }
+  })
+
+  it('replays when the service daemon gives way to our own child, and back', async () => {
+    const host = make()
+    await activeWithC(host)
+    // Our own child: no enrolment, so the connection itself is the identity.
+    identity = null
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer host-token' } })
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+    daemon.sent.length = 0
+    // And the service daemon again.
+    identity = '200:g9'
+    daemon.setConnection({ port: 3, authHeaders: { Authorization: 'Bearer daily' } })
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+  })
+
+  it('without an enrolment, keeps telling daemons apart by the connection, as before', async () => {
+    identity = null
+    const host = make()
+    await activeWithC(host)
+    daemon.setConnection({ port: 1, authHeaders: { Authorization: 'Bearer t2' } })
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+  })
+
+  it('tells a refusal, an unanswered confirmation and one that could not be asked apart', async () => {
+    const outcomes: [string, string][] = [
+      ['presence_denied', 'refused'],
+      ['presence_timeout', 'unanswered'],
+      ['presence_unavailable', 'daemon_unavailable'],
+      ['closed', 'daemon_unavailable'],
+      ['busy', 'daemon_unavailable'],
+      ['timeout', 'daemon_unavailable'],
+      ['daemon_unavailable', 'daemon_unavailable'],
+      ['bad_frame', 'daemon_unavailable'],
+      // Any other 403 is still the daemon's refusal.
+      ['host_authority_required', 'refused'],
+      ['endpoint_mismatch', 'refused'],
+    ]
+    for (const [code, reason] of outcomes) {
+      daemon = fakeDaemon()
+      const host = make()
+      host.start()
+      daemon.respondWith(() => ({ status: 403, code }))
+      expect(await host.activate('b1'), code).toEqual({ ok: false, reason })
+    }
+  })
+
+  it('never asks again on its own after the user refused, however late; the user changing it asks again', async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'refused' })
+    for (const later of [0, 4_000, 2 * 3600_000, 365 * 24 * 3600_000]) {
+      nowMs += later
+      host.sync()
+      await settle()
+    }
+    expect(lines()).toEqual([`PUT ${B1}`])
+    daemon.respondWith(() => ({ status: 204 }))
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`])
+  })
+
+  it('backs off an unanswered confirmation: 10 min, doubling, at most 1 h', () => {
+    expect([1, 2, 3, 4, 5, 9].map(unansweredRetryDelayMs)).toEqual([10 * MIN, 20 * MIN, 40 * MIN, 60 * MIN, 60 * MIN, 60 * MIN])
+  })
+
+  it('replays an unanswered activation only when its backoff is over, never on the 4 s sync, and backs off further', async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    let asked = 1
+    for (const step of [10, 20, 40, 60, 60]) {
+      nowMs += step * MIN - 1
+      for (let i = 0; i < 3; i++) host.sync()
+      await settle()
+      expect(daemon.sent.length, `before ${step} min`).toBe(asked)
+      nowMs += 1
+      host.sync()
+      await vi.waitFor(() => expect(daemon.sent.length).toBe(asked + 1))
+      asked += 1
+      await settle()
+    }
+    expect(new Set(lines())).toEqual(new Set([`PUT ${B1}`]))
+    // Answered at last: active, and nothing more is asked.
+    daemon.respondWith(() => ({ status: 204 }))
+    nowMs += 60 * MIN
+    host.sync()
+    await vi.waitFor(() => expect(host.isActive('b1')).toBe(true))
+    nowMs += 24 * 3600_000
+    host.sync()
+    await settle()
+    expect(daemon.sent.length).toBe(asked + 1)
+  })
+
+  it('starts the backoff again from 10 min after a success, the user changing the binding, or another daemon', async () => {
+    const timeoutThenAsk = async (host: KnowledgeHost) => {
+      daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+      // Three unanswered in a row: the next wait would be 40 min.
+      expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+      for (const step of [10, 20]) {
+        nowMs += step * MIN
+        host.sync()
+        const before = daemon.sent.length
+        await vi.waitFor(() => expect(daemon.sent.length).toBe(before + 1))
+        await settle()
+      }
+    }
+    const waitsTenMinutes = async (host: KnowledgeHost) => {
+      const before = daemon.sent.length
+      nowMs += 10 * MIN - 1
+      host.sync()
+      await settle()
+      expect(daemon.sent.length).toBe(before)
+      nowMs += 1
+      host.sync()
+      await vi.waitFor(() => expect(daemon.sent.length).toBe(before + 1))
+      await settle()
+    }
+
+    // The user changes the binding: its own activation is asked at once, and a
+    // timeout of that starts from the first step.
+    let host = make()
+    host.start()
+    await timeoutThenAsk(host)
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    await waitsTenMinutes(host)
+
+    // Another daemon: everything is replayed at once, the backoff from the first step.
+    daemon = fakeDaemon()
+    host = make()
+    host.start()
+    await timeoutThenAsk(host)
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer new-daemon' } })
+    const before = daemon.sent.length
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent.length).toBe(before + 1))
+    await settle()
+    await waitsTenMinutes(host)
+
+    // A success clears it: the next timeout starts from the first step.
+    daemon = fakeDaemon()
+    identity = '100:g1'
+    host = make()
+    host.start()
+    await timeoutThenAsk(host)
+    daemon.respondWith(() => ({ status: 204 }))
+    nowMs += 40 * MIN
+    host.sync()
+    await vi.waitFor(() => expect(host.isActive('b1')).toBe(true))
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.pushCredential('b1', credential('C2'))).toEqual({ ok: false, reason: 'unanswered' })
+    await waitsTenMinutes(host)
+  })
+
+  it("the user's own change of a binding waiting out its backoff is asked once, and the next sync asks nothing more", async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    daemon.respondWith(() => ({ status: 204 }))
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`])
+    nowMs += 24 * 3600_000
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`])
+    // The same for an Off.
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.deactivate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    daemon.respondWith(() => ({ status: 204 }))
+    expect(await host.deactivate('b1')).toEqual({ ok: true })
+    nowMs += 24 * 3600_000
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`, `DELETE ${B1}`, `DELETE ${B1}`])
+  })
+
+  it('a C push not answered in time comes back with the activation once its backoff is over', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.pushCredential('b1', credential('C2'))).toEqual({ ok: false, reason: 'unanswered' })
+    daemon.sent.length = 0
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([])
+    nowMs += 10 * MIN
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+    expect(JSON.parse(daemon.sent[1].body ?? '{}').value).toBe('C2')
+  })
+
+  it('a refused binding is not asked again by a replay on another daemon; the user activating it asks again (ruling c2-refused-scope)', async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'refused' })
+    for (const next of ['100:g2', null]) {
+      identity = next
+      daemon.setConnection({ port: 9, authHeaders: { Authorization: `Bearer ${next ?? 'host'}` } })
+      host.sync()
+      await settle()
+    }
+    expect(lines()).toEqual([`PUT ${B1}`])
+    expect(host.isActive('b1')).toBe(false)
+    daemon.respondWith(() => ({ status: 204 }))
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`])
+    // Taken again, it is replayed on the next daemon as before.
+    identity = '100:g3'
+    daemon.setConnection({ port: 10, authHeaders: { Authorization: 'Bearer g3' } })
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`, `PUT ${B1}`]))
+  })
+
+  it('a refused C push of a binding active before is not replayed on another daemon, and the binding is not active there', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    expect(await host.pushCredential('b1', credential('C2'))).toEqual({ ok: false, reason: 'refused' })
+    // Not in effect at once, though the old C may run for up to an hour more (fail-closed).
+    expect(host.isActive('b1')).toBe(false)
+    daemon.respondWith(() => ({ status: 204 }))
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer new-daemon' } })
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}/credential`])
+    expect(host.isActive('b1')).toBe(false)
+    // The user activating it again: in effect again.
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    expect(host.isActive('b1')).toBe(true)
+  })
+
+  it('a replay refused on one daemon is not asked again on the next (activation, or its C)', async () => {
+    for (const refuse of ['activation', 'credential']) {
+      daemon = fakeDaemon()
+      identity = '100:g1'
+      const host = make()
+      await activeWithC(host)
+      daemon.respondWith((req) => {
+        const isC = req.path.endsWith('/credential')
+        return (refuse === 'credential') === isC ? { status: 403, code: 'presence_denied' } : { status: 204 }
+      })
+      identity = '100:g2'
+      daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+      host.sync()
+      const replay = refuse === 'credential' ? [`PUT ${B1}`, `PUT ${B1}/credential`] : [`PUT ${B1}`]
+      await vi.waitFor(() => expect(lines(), refuse).toEqual(replay))
+      await settle()
+      daemon.respondWith(() => ({ status: 204 }))
+      identity = '100:g3'
+      daemon.setConnection({ port: 10, authHeaders: { Authorization: 'Bearer g3' } })
+      host.sync()
+      await settle()
+      expect(lines(), refuse).toEqual(replay)
+    }
+  })
+
+  it('an Off the user gives again after a refused one is retried as before when the daemon is not up', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    expect(await host.deactivate('b1')).toEqual({ ok: false, reason: 'refused' })
+    daemon.respondWith(() => ({ status: 503 }))
+    expect(await host.deactivate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`DELETE ${B1}`, `DELETE ${B1}`, `DELETE ${B1}`]))
+  })
+
+  it('a replay queued behind a change the user then refuses is not sent', async () => {
+    let release = () => {}
+    const asked = new Promise<void>((resolve) => { release = resolve })
+    const realTransport = daemon.transport
+    let gate = false
+    const host = new KnowledgeHost(store, {
+      connection: daemon.connection,
+      transport: async (conn, method, requestPath, body) => {
+        const result = await realTransport(conn, method, requestPath, body)
+        if (gate && requestPath.endsWith('/credential')) {
+          gate = false
+          await asked
+          return { status: 403, code: 'presence_denied' }
+        }
+        return result
+      },
+      daemonIdentity: () => identity,
+      nowMs: () => nowMs,
+      nowSeconds: () => NOW,
+    })
+    await activeWithC(host)
+    // A C push waits for its confirmation; meanwhile the daemon changes, and its replay queues behind.
+    gate = true
+    const push = host.pushCredential('b1', credential('C2'))
+    await settle()
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+    host.sync()
+    release()
+    expect(await push).toEqual({ ok: false, reason: 'refused' })
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}/credential`])
+  })
+
+  // A host whose next matching request waits for `answer` before the daemon replies.
+  function gatedHost(match: (method: string, requestPath: string) => boolean) {
+    let answer: (reply: { status: number; code?: string }) => void = () => {}
+    let armed = false
+    const realTransport = daemon.transport
+    const host = new KnowledgeHost(store, {
+      connection: daemon.connection,
+      transport: async (conn, method, requestPath, body) => {
+        const result = await realTransport(conn, method, requestPath, body)
+        if (armed && match(method, requestPath)) {
+          armed = false
+          return new Promise((resolve) => { answer = resolve })
+        }
+        return result
+      },
+      daemonIdentity: () => identity,
+      nowMs: () => nowMs,
+      nowSeconds: () => NOW,
+    })
+    return { host, arm: () => { armed = true }, answer: (reply: { status: number; code?: string }) => answer(reply) }
+  }
+
+  for (const op of ['activate', 'deactivate'] as const) {
+    for (const [code, status] of [['presence_denied', 403], ['presence_timeout', 403], ['', 204]] as const) {
+      it(`the user's own ${op} of a binding waiting out a backoff is asked once, though a sync runs while it waits (${code || 'confirmed'})`, async () => {
+        const method = op === 'activate' ? 'PUT' : 'DELETE'
+        const g = gatedHost((m, requestPath) => m === method && !requestPath.endsWith('/credential'))
+        g.host.start()
+        if (op === 'deactivate') expect(await g.host.activate('b1')).toEqual({ ok: true })
+        // Unanswered once: in unsynced, with a backoff.
+        daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+        expect(await g.host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+        daemon.respondWith(() => ({ status: 204 }))
+        daemon.sent.length = 0
+        g.arm()
+        const change = op === 'activate' ? g.host.activate('b1') : g.host.deactivate('b1')
+        await settle()
+        // The 4 s sync while the user's dialog is open.
+        g.host.sync()
+        await settle()
+        g.answer(code ? { status, code } : { status })
+        await change
+        await settle()
+        g.host.sync()
+        await settle()
+        expect(lines()).toEqual([`${method} ${B1}`])
+      })
+    }
+  }
+
+  it("the user's own Off during a backoff starts it again from 10 min when it goes unanswered too", async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    nowMs += 10 * MIN
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent.length).toBe(2))
+    await settle()
+    // Two unanswered: the next wait would be 20 min. The user turns it off, unanswered again.
+    expect(await host.deactivate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    const after = daemon.sent.length
+    nowMs += 10 * MIN - 1
+    host.sync()
+    await settle()
+    expect(daemon.sent.length).toBe(after)
+    nowMs += 1
+    host.sync()
+    await vi.waitFor(() => expect(lines().slice(after)).toEqual([`DELETE ${B1}`]))
+  })
+
+  it("the user's own activate right after a new daemon is asked once: no replay is queued ahead of it", async () => {
+    const host = make()
+    await activeWithC(host)
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+    // No sync has noticed the new daemon yet; the user's change is the first call.
+    expect(await host.activate('b1')).toEqual({ ok: true })
+    await settle()
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}`])
+  })
+
+  it('a C push confirmed while a backoff of its replay is pending ends it: nothing more is replayed', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.pushCredential('b1', credential('C2'))).toEqual({ ok: false, reason: 'unanswered' })
+    daemon.respondWith(() => ({ status: 204 }))
+    // The user is back for the next push, before the backoff is over.
+    expect(await host.pushCredential('b1', credential('C3'))).toEqual({ ok: true })
+    nowMs += 24 * 3600_000
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}/credential`, `PUT ${B1}/credential`])
+    expect(host.isActive('b1')).toBe(true)
+  })
+
+  for (const code of ['presence_timeout', 'presence_denied']) {
+    it(`an Off while a replay waits for its answer is not held back by that replay's outcome (${code})`, async () => {
+      const g = gatedHost((m, requestPath) => m === 'PUT' && !requestPath.endsWith('/credential'))
+      await activeWithC(g.host)
+      identity = '100:g2'
+      daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+      g.arm()
+      g.host.sync()
+      await settle()
+      expect(lines()).toEqual([`PUT ${B1}`])
+      // The user turns it off while the replay's dialog is open; that Off does not land yet.
+      daemon.respondWith(() => ({ status: 503 }))
+      expect(await g.host.deactivate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+      g.answer({ status: 403, code })
+      await settle()
+      // The Off is retried on the next sync, not after a backoff, nor held as refused.
+      daemon.respondWith(() => ({ status: 204 }))
+      g.host.sync()
+      await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `DELETE ${B1}`, `DELETE ${B1}`]))
+    })
+  }
+
+  it("the user's own activate queued behind a push is the replay on a daemon that changes meanwhile", async () => {
+    const g = gatedHost((m, requestPath) => requestPath.endsWith('/credential'))
+    await activeWithC(g.host)
+    g.arm()
+    const push = g.host.pushCredential('b1', credential('C2'))
+    await settle()
+    const change = g.host.activate('b1')
+    // The daemon changes while the user's change waits behind the push.
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+    g.host.sync()
+    g.answer({ status: 503 })
+    await push
+    expect(await change).toEqual({ ok: true })
+    await settle()
+    g.host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}/credential`, `PUT ${B1}`])
+  })
+
+  it('a C push confirmed during a backoff clears it: a later passing failure is retried on the next sync', async () => {
+    const host = make()
+    await activeWithC(host)
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.pushCredential('b1', credential('C2'))).toEqual({ ok: false, reason: 'unanswered' })
+    daemon.respondWith(() => ({ status: 204 }))
+    expect(await host.pushCredential('b1', credential('C3'))).toEqual({ ok: true })
+    daemon.respondWith(() => ({ status: 503 }))
+    expect(await host.pushCredential('b1', credential('C4'))).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    daemon.respondWith(() => ({ status: 204 }))
+    const before = daemon.sent.length
+    host.sync()
+    await vi.waitFor(() => expect(lines().slice(before)).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+  })
+
+  it("an Off while a replay's C waits for its answer is not held back by that answer", async () => {
+    const g = gatedHost((m, requestPath) => requestPath.endsWith('/credential'))
+    await activeWithC(g.host)
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+    g.arm()
+    g.host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`])
+    daemon.respondWith(() => ({ status: 503 }))
+    expect(await g.host.deactivate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    g.answer({ status: 403, code: 'presence_timeout' })
+    await settle()
+    daemon.respondWith(() => ({ status: 204 }))
+    g.host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`, `DELETE ${B1}`, `DELETE ${B1}`]))
+  })
+
+  it('a replay queued behind a change that then goes unanswered waits out the backoff', async () => {
+    const g = gatedHost((m, requestPath) => requestPath.endsWith('/credential'))
+    await activeWithC(g.host)
+    g.arm()
+    const push = g.host.pushCredential('b1', credential('C2'))
+    await settle()
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+    g.host.sync()
+    g.answer({ status: 403, code: 'presence_timeout' })
+    expect(await push).toEqual({ ok: false, reason: 'unanswered' })
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}/credential`])
+    nowMs += 10 * MIN
+    g.host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}/credential`, `PUT ${B1}`, `PUT ${B1}/credential`]))
+  })
+
+  it('a binding refused while it waits out a backoff is not asked again when the backoff is over', async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_timeout' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    expect(await host.pushCredential('b1', credential('C2'))).toEqual({ ok: false, reason: 'refused' })
+    nowMs += 24 * 3600_000
+    host.sync()
+    await settle()
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`])
+  })
+
+  it('a C push not answered in time while the activation was taken comes back with the activation', async () => {
+    // reconcile: the activation lands, the C push in it goes unanswered.
+    const host = make()
+    await activeWithC(host)
+    identity = '100:g2'
+    daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer new-daemon' } })
+    daemon.respondWith((req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_timeout' } : { status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`]))
+    await settle()
+    daemon.respondWith(() => ({ status: 204 }))
+    nowMs += 10 * MIN - 1
+    host.sync()
+    await settle()
+    expect(daemon.sent.length).toBe(2)
+    nowMs += 1
+    host.sync()
+    await vi.waitFor(() => expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`, `PUT ${B1}`, `PUT ${B1}/credential`]))
+  })
+
+  it('an unanswered reply from the old daemon makes the replay on the new one wait out a first backoff, not a second', async () => {
+    for (const late of ['activation', 'credential']) {
+      daemon = fakeDaemon()
+      identity = '100:g1'
+      let gate: Promise<void> | null = null
+      let release = () => {}
+      const realTransport = daemon.transport
+      // The replay on the old daemon waits for its answer while the daemon changes.
+      const host = new KnowledgeHost(store, {
+        connection: daemon.connection,
+        transport: async (conn, method, requestPath, body) => {
+          const isC = requestPath.endsWith('/credential')
+          if (gate && (late === 'credential') === isC) {
+            const wait = gate
+            gate = null
+            await wait
+          }
+          return realTransport(conn, method, requestPath, body)
+        },
+        daemonIdentity: () => identity,
+        nowMs: () => nowMs,
+        nowSeconds: () => NOW,
+      })
+      host.start()
+      expect(await host.activate('b1')).toEqual({ ok: true })
+      daemon.respondWith((req) => (late === 'credential' || !req.path.endsWith('/credential') ? { status: 403, code: 'presence_timeout' } : { status: 204 }))
+      if (late === 'credential') {
+        expect(await host.pushCredential('b1', credential('C1'))).toEqual({ ok: false, reason: 'unanswered' })
+        daemon.respondWith((req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_timeout' } : { status: 204 }))
+      } else {
+        expect(await host.activate('b1')).toEqual({ ok: false, reason: 'unanswered' })
+      }
+      gate = new Promise<void>((resolve) => { release = resolve })
+      nowMs += 10 * MIN
+      host.sync()
+      await settle()
+      identity = '100:g2'
+      daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+      host.sync()
+      release()
+      await settle()
+      await settle()
+      // Not answered: the user is away, so the new daemon is not asked at once either.
+      const after = daemon.sent.length
+      nowMs += 10 * MIN - 1
+      host.sync()
+      await settle()
+      expect(daemon.sent.length, late).toBe(after)
+      // The backoff the old daemon set is its first step (10 min, not 20).
+      nowMs += 1
+      host.sync()
+      await vi.waitFor(() => expect(daemon.sent.length, late).toBeGreaterThan(after))
+    }
+  })
+
+  it('tries a change that could not be asked on the next sync, as a daemon not up', async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_unavailable' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'daemon_unavailable' })
+    daemon.respondWith(() => ({ status: 204 }))
+    host.sync()
+    await vi.waitFor(() => expect(host.isActive('b1')).toBe(true))
+    expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`])
   })
 })

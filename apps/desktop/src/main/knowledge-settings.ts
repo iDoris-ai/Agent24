@@ -116,6 +116,8 @@ export class KnowledgeController {
   private settings: KnowledgeSettings
   /** When the C last pushed for the binding expires, or 0 when none is. */
   private pushedUntil = 0
+  /** The push under way, if any: the tick never starts a second one beside it. */
+  private pushing: Promise<HostResult> | null = null
   /** Bumped by every change; a change whose save finishes under a later
    * number was overtaken and takes no effect. */
   private version = 0
@@ -264,6 +266,9 @@ export class KnowledgeController {
 
   /** Called on the main process's sync tick: pushes C again before it runs out. */
   async tick(): Promise<void> {
+    // A binding whose last change was refused is not in effect (the host's
+    // isActive): the tick does not ask again until the user changes something
+    // or the app restarts.
     if (this.bindingForRun() === null) return
     if (this.pushedUntil - this.nowSeconds() > REFRESH_BEFORE_S) return
     await this.push()
@@ -281,14 +286,25 @@ export class KnowledgeController {
   }
 
   private async push(): Promise<HostResult> {
+    if (this.pushing) return this.pushing
+    this.pushing = this.pushOnce()
+    try {
+      return await this.pushing
+    } finally {
+      this.pushing = null
+    }
+  }
+
+  private async pushOnce(): Promise<HostResult> {
     const expiresAt = this.nowSeconds() + CREDENTIAL_LIFETIME_S
     const endpoint = this.settings.endpoint
     const result = await this.host.refresh(KNOWLEDGE_BINDING, async (login) => {
       if (login.profileId !== endpoint || this.settings.endpoint !== endpoint) throw new Error('key is for another endpoint')
       return { kind: 'api_key', value: login.material, expiresAt }
     })
-    // Replayed by the host on a daemon not up yet.
-    if (result.ok || result.reason === 'daemon_unavailable') this.pushedUntil = expiresAt
+    // Replayed by the host on a daemon not up yet, or after the backoff of a
+    // confirmation not answered in time.
+    if (result.ok || result.reason === 'daemon_unavailable' || result.reason === 'unanswered') this.pushedUntil = expiresAt
     return result
   }
 

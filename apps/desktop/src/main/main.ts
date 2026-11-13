@@ -50,6 +50,7 @@ import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
+import { serviceDaemonOf } from './service-daemon'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 import { knowledgeAppInstanceId } from './knowledge-app-instance'
@@ -81,7 +82,7 @@ const serviceUpgrader = new ServiceUpgrader({
   bundled: () => bundledVersion,
   running: () => backendManager.serviceDaemonVersion(),
   installed: launchAgentPlistExists,
-  pid: () => (backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null),
+  pid: () => serviceDaemonOf(backendManager)?.pid ?? null,
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
@@ -558,7 +559,12 @@ app.whenReady().then(async () => {
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
   const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
-  knowledgeHost = new KnowledgeHost(loginStore)
+  knowledgeHost = new KnowledgeHost(loginStore, {
+    daemonIdentity: () => {
+      const daemon = serviceDaemonOf(backendManager)
+      return daemon ? `${daemon.pid}:${daemon.generation}` : null
+    },
+  })
   const knowledgeLogins = knowledgeHost.start()
   if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
   // The user's Knowledge settings drive the one binding; Off keeps it inactive.
@@ -830,7 +836,7 @@ function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutco
 function residentStop(): Promise<StopOutcome> {
   return residentOp('stop', () => stopService(serviceStopDeps({
     cli: resolveBundledRustBinary('agent24', app.isPackaged),
-    pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
+    pid: serviceDaemonOf(backendManager)?.pid ?? null,
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
