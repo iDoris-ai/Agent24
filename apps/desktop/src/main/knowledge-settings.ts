@@ -303,8 +303,8 @@ export class KnowledgeController {
       return { kind: 'api_key', value: login.material, expiresAt }
     })
     // Replayed by the host on a daemon not up yet, or after the backoff of a
-    // confirmation not answered in time.
-    if (result.ok || result.reason === 'daemon_unavailable' || result.reason === 'unanswered') this.pushedUntil = expiresAt
+    // confirmation not answered in time or not asked at all (#1852 B1).
+    if (result.ok || result.reason === 'daemon_unavailable' || result.reason === 'unanswered' || result.reason === 'not_asked') this.pushedUntil = expiresAt
     return result
   }
 

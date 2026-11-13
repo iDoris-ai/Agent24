@@ -21,7 +21,9 @@
 // One not answered in time is `unanswered`: asked again on its own only after
 // a backoff (10 min, doubling, at most 1 h), which the user's own change or
 // another daemon resets. One that could not be asked at all is retried like
-// a daemon that is not up.
+// a daemon that is not up. One the daemon itself would not ask about (no
+// summary it could show, say one too long; nothing was shown) is `not_asked`:
+// no refusal, it waits out the same backoff (#1852 B1).
 
 import { daemonConnection, daemonElevation, type DaemonConnection } from './backend-manager'
 import type { proxyRequest } from './backend-proxy'
@@ -38,6 +40,11 @@ const PASSING: readonly Failure[] = ['daemon_unavailable', 'binding_inactive', '
 // Not asked at all, or the connection went: nothing was shown; tried again
 // on the next sync() like a daemon that is not up.
 const PRESENCE_PASSING: readonly string[] = ['presence_unavailable', 'closed', 'busy', 'timeout', 'daemon_unavailable', 'bad_frame']
+// The daemon would not ask (sendElevating's own failure is `internal`):
+// nothing was shown, so no refusal; it may well not change, so backed off.
+const NOT_ASKED: readonly string[] = ['not_elevated_operation', 'unknown_route', 'internal']
+// Failures held for a backoff, then replayed.
+const HELD: readonly Failure[] = ['unanswered', 'not_asked']
 
 const UNANSWERED_FIRST_MS = 10 * 60_000
 const UNANSWERED_MAX_MS = 60 * 60_000
@@ -57,7 +64,7 @@ export interface KnowledgeCredential {
 }
 
 type Failure = 'not_started' | 'invalid_binding' | 'login_unavailable' | 'credential_unavailable' | 'not_saved'
-  | 'daemon_unavailable' | 'binding_inactive' | 'stale_sequence' | 'refused' | 'unanswered'
+  | 'daemon_unavailable' | 'binding_inactive' | 'stale_sequence' | 'refused' | 'unanswered' | 'not_asked'
 
 export type HostResult = { ok: true } | { ok: false; reason: Failure }
 
@@ -333,7 +340,7 @@ export class KnowledgeHost {
     if (result.ok) return result
     if (result.reason === 'refused') {
       this.refused.add(bindingId)
-    } else if (result.reason === 'unanswered') {
+    } else if (HELD.includes(result.reason)) {
       // Back into unsynced, so the activation is replayed when the backoff is over.
       const attempt = (this.held.get(bindingId)?.attempt ?? 0) + 1
       this.held.set(bindingId, { until: this.deps.nowMs() + unansweredRetryDelayMs(attempt), attempt })
@@ -363,8 +370,8 @@ export class KnowledgeHost {
     if (superseded()) return
     if (!result.ok) {
       // Not answered, on whichever daemon it was asked: the user is away, so
-      // the replay waits out the backoff.
-      if (result.reason === 'unanswered') {
+      // the replay waits out the backoff. So does one the daemon would not ask about.
+      if (HELD.includes(result.reason)) {
         this.track(bindingId, result)
         return
       }
@@ -377,7 +384,7 @@ export class KnowledgeHost {
     if (credential && credential.expiresAt > this.deps.nowSeconds()) {
       const pushed = await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
       if (superseded()) return
-      if (!pushed.ok && pushed.reason === 'unanswered') {
+      if (!pushed.ok && HELD.includes(pushed.reason)) {
         this.track(bindingId, pushed)
         return
       }
@@ -432,6 +439,7 @@ function classify(response: { status: number; code?: string }): Failure {
   if (response.status === 403 && response.code !== undefined) {
     if (response.code === 'presence_timeout') return 'unanswered'
     if (PRESENCE_PASSING.includes(response.code)) return 'daemon_unavailable'
+    if (NOT_ASKED.includes(response.code)) return 'not_asked'
   }
   if (response.code === 'stale_sequence') return 'stale_sequence'
   if (response.code === 'binding_inactive') return 'binding_inactive'

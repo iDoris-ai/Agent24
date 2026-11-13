@@ -889,9 +889,15 @@ describe('KnowledgeHost: daemon identity and confirmation outcomes (M5 B6 c2)', 
       ['timeout', 'daemon_unavailable'],
       ['daemon_unavailable', 'daemon_unavailable'],
       ['bad_frame', 'daemon_unavailable'],
-      // Any other 403 is still the daemon's refusal.
+      // The daemon could not ask: nothing was shown (#1852 B1).
+      ['not_elevated_operation', 'not_asked'],
+      ['unknown_route', 'not_asked'],
+      ['internal', 'not_asked'],
+      // Any other 403 is still the daemon's refusal, also one after a
+      // confirmation the user gave (ruling c2-refused-scope question 1).
       ['host_authority_required', 'refused'],
       ['endpoint_mismatch', 'refused'],
+      ['elevation_invalid', 'refused'],
     ]
     for (const [code, reason] of outcomes) {
       daemon = fakeDaemon()
@@ -916,6 +922,40 @@ describe('KnowledgeHost: daemon identity and confirmation outcomes (M5 B6 c2)', 
     daemon.respondWith(() => ({ status: 204 }))
     expect(await host.activate('b1')).toEqual({ ok: true })
     expect(lines()).toEqual([`PUT ${B1}`, `PUT ${B1}`])
+  })
+
+  it('one the daemon could not ask about at all (say, a summary too long to show) is no refusal: asked again after the backoff, never on the 4 s sync (#1852 B1)', async () => {
+    for (const code of ['not_elevated_operation', 'internal']) {
+      daemon = fakeDaemon()
+      const host = make()
+      host.start()
+      daemon.respondWith(() => ({ status: 403, code }))
+      expect(await host.activate('b1'), code).toEqual({ ok: false, reason: 'not_asked' })
+      nowMs += 10 * MIN - 1
+      for (let i = 0; i < 3; i++) host.sync()
+      await settle()
+      expect(daemon.sent.length, code).toBe(1)
+      nowMs += 1
+      daemon.respondWith(() => ({ status: 204 }))
+      host.sync()
+      await vi.waitFor(() => expect(host.isActive('b1'), code).toBe(true))
+      expect(lines(), code).toEqual([`PUT ${B1}`, `PUT ${B1}`])
+    }
+  })
+
+  it('a refusal by the user stays one: not asked again when a backoff would be over (#1852 B1)', async () => {
+    const host = make()
+    host.start()
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    expect(await host.activate('b1')).toEqual({ ok: false, reason: 'refused' })
+    daemon.respondWith(() => ({ status: 204 }))
+    for (const later of [10 * MIN, 60 * MIN]) {
+      nowMs += later
+      host.sync()
+      await settle()
+    }
+    expect(lines()).toEqual([`PUT ${B1}`])
+    expect(host.isActive('b1')).toBe(false)
   })
 
   it('backs off an unanswered confirmation: 10 min, doubling, at most 1 h', () => {
@@ -1115,6 +1155,33 @@ describe('KnowledgeHost: daemon identity and confirmation outcomes (M5 B6 c2)', 
       host.sync()
       await settle()
       expect(lines(), refuse).toEqual(replay)
+    }
+  })
+
+  it('a replay the daemon would not ask about (activation, or its C) waits out the backoff, then comes back (#1852 B1)', async () => {
+    for (const fail of ['activation', 'credential']) {
+      daemon = fakeDaemon()
+      identity = '100:g1'
+      const host = make()
+      await activeWithC(host)
+      daemon.respondWith((req) => {
+        const isC = req.path.endsWith('/credential')
+        return (fail === 'credential') === isC ? { status: 403, code: 'not_elevated_operation' } : { status: 204 }
+      })
+      identity = '100:g2'
+      daemon.setConnection({ port: 9, authHeaders: { Authorization: 'Bearer g2' } })
+      host.sync()
+      const replay = fail === 'credential' ? [`PUT ${B1}`, `PUT ${B1}/credential`] : [`PUT ${B1}`]
+      await vi.waitFor(() => expect(lines(), fail).toEqual(replay))
+      await settle()
+      daemon.respondWith(() => ({ status: 204 }))
+      nowMs += 10 * MIN - 1
+      host.sync()
+      await settle()
+      expect(lines(), fail).toEqual(replay)
+      nowMs += 1
+      host.sync()
+      await vi.waitFor(() => expect(lines(), fail).toEqual([...replay, `PUT ${B1}`, `PUT ${B1}/credential`]))
     }
   })
 

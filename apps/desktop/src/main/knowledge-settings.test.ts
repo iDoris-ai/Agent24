@@ -468,9 +468,11 @@ describe('KnowledgeController and confirmation (M5 B6 c2)', () => {
     expect(c.status().active).toBe(true)
   })
 
-  it('a push not answered in time is not asked again by the tick: the host replays it after its backoff', async () => {
+  // presence_timeout: not answered in time; not_elevated_operation: the daemon
+  // would not ask (#1852 B1).
+  it.each(['presence_timeout', 'not_elevated_operation'])('a push %s is not asked again by the tick: the host replays it after its backoff', async (code) => {
     const c = await onAndDue()
-    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_timeout' } : { status: 204 })
+    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code } : { status: 204 })
     await c.tick()
     expect(pushes()).toBe(1)
     respond = async () => ({ status: 204 })
