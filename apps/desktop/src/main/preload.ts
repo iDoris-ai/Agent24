@@ -26,6 +26,7 @@ import {
   type KnowledgeEntryAdmitAnswer,
   type KnowledgeEntryDraftCreated,
   type KnowledgeEntryDraftSaved,
+  type KnowledgeEntrySubmitAnswer,
   type KnowledgeEntryDraftSummary,
   type KnowledgeEntryDraftView,
   type KnowledgeEntryKind,
@@ -247,6 +248,9 @@ const api = {
     },
     answer: (id: string, confirmed: boolean): Promise<void> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeViewAnswer, id, confirmed),
+    /** M4 A7: dialog `id` is up; `activeId` is the conversation open in the main window, or null. */
+    shown: (id: string, activeId: string | null): Promise<void> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewShown, id, activeId),
   },
   // KB-C2-04b-2 (U7.2): draft attachments the user confirmed into this chat.
   knowledgeDraft: {
@@ -275,6 +279,12 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftRedact, id),
     withdrawDraft: (id: string): Promise<boolean> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftWithdraw, id),
+    submit: (id: string, knowledgeBaseId: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmit, id, knowledgeBaseId),
+    submitStatus: (id: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmitStatus, id),
+    retractSubmission: (id: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmitRetract, id),
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {

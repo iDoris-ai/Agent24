@@ -1,17 +1,22 @@
 #!/usr/bin/env python3
 """Knowledge (ab/weknora) first release: acceptance on a real machine.
 
-    python3 -I scripts/kb-r1-accept.py --old <main bin dir> --new <release bin dir> [--work <dir>]
+    python3 -I scripts/kb-r1-accept.py --old <main bin dir> --new <release bin dir> \
+        --enroll-new <release bin dir built with --features test-enrollment> [--work <dir>]
 
 Cases: docs/agent/KB-R1-ACCEPTANCE.md. Each bin dir holds `agent24d`,
 `agent24` and `agent24-documents` (`cargo build -p agent24d -p agent24-cli
--p agent24-documents`). Every daemon and CLI call
+-p agent24-documents`); --enroll-new holds the release head's `agent24d`
+built with `--features test-enrollment` (W7, service mode: the test build
+takes an unsigned peer as the identity AGENT24_TEST_ENROLL_IDENTIFIER names
+and answers presence with AGENT24_TEST_PRESENCE). Every daemon and CLI call
 runs with its own AGENT24_DATA_DIR and a HOME under --work; ~/.agent24 must
 stay untouched (Z1). No model is needed. Prints PASS/FAIL per check, writes
 report.md in the work directory and exits non-zero on any FAIL.
 """
 
 import argparse
+import hashlib
 import http.client
 import json
 import os
@@ -19,6 +24,7 @@ import secrets
 import select
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -36,6 +42,7 @@ def parse_args():
     p = argparse.ArgumentParser(add_help=True)
     p.add_argument("--old", required=True)
     p.add_argument("--new", required=True)
+    p.add_argument("--enroll-new", required=True)
     p.add_argument("--work")
     return p.parse_args()
 
@@ -43,10 +50,13 @@ def parse_args():
 ARGS = parse_args()
 OLD = os.path.realpath(ARGS.old)
 NEW = os.path.realpath(ARGS.new)
+ENROLL_NEW = os.path.realpath(ARGS.enroll_new)
 for d in (OLD, NEW):
     for b in ("agent24d", "agent24"):
         if not os.access(os.path.join(d, b), os.X_OK):
             sys.exit(f"missing binary: {os.path.join(d, b)}")
+if not os.access(os.path.join(ENROLL_NEW, "agent24d"), os.X_OK):
+    sys.exit(f"missing binary: {os.path.join(ENROLL_NEW, 'agent24d')}")
 REAL = os.path.realpath(os.path.join(os.environ.get("HOME", "/nonexistent"), ".agent24"))
 WORK = os.path.realpath(ARGS.work or os.path.join(os.environ.get("TMPDIR", "/tmp"), f"kb-r1-accept.{os.getpid()}"))
 if WORK == REAL or WORK.startswith(REAL + os.sep):
@@ -114,12 +124,13 @@ def snapshot(top):
 
 
 def daemons():
-    """Pids of `agent24d serve` processes from either bin dir."""
+    """Pids of `agent24d serve` processes from any of the bin dirs (W7's come
+    from --enroll-new)."""
     out = subprocess.run(["ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
     found = set()
     for line in out.splitlines():
         pid, _, cmd = line.strip().partition(" ")
-        if any(cmd.startswith(os.path.join(d, "agent24d") + " serve") for d in (OLD, NEW)):
+        if any(cmd.startswith(os.path.join(d, "agent24d") + " serve") for d in (OLD, NEW, ENROLL_NEW)):
             found.add(int(pid))
     return found
 
@@ -188,15 +199,22 @@ def env_for(data):
     return env
 
 
-def call(port, method, path, token=None, body=None):
+def body_bytes(body):
+    """The exact bytes call() sends for BODY: an elevation grant is bound to them."""
+    return json.dumps(body).encode()
+
+
+def call(port, method, path, token=None, body=None, grant=None):
     """(status, json or None, raw text). Host is 127.0.0.1:port, as the daemon's
     Host guard expects. Never raises: no answer, or a broken one, is status 0."""
     headers = {}
     data = None
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
+    if grant is not None:
+        headers["X-Agent24-Elevation"] = grant
     if body is not None:
-        data = json.dumps(body).encode()
+        data = body_bytes(body)
         headers["Content-Type"] = "application/json"
     try:
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
@@ -311,6 +329,125 @@ class CliDaemon:
         cli(self.bin, self.data, "daemon", "stop")
 
 
+class ServiceDaemon:
+    """M5 service mode, the way the LaunchAgent starts it (`agent24 service
+    install`, rust/apps/agent24-cli/src/service.rs): `serve --port 0
+    --auth-mode capabilities --enroll-endpoint`, no host pipe. Shells get
+    their tokens by enrolling on <data>/enroll.sock. The test build stands in
+    for the signature check (IDENTIFIER) and for the person at the desk
+    (PRESENCE: allow or deny)."""
+
+    def __init__(self, data, presence, identifier="ai.auraai.agent24"):
+        os.makedirs(data, exist_ok=True)
+        self.data = data
+        self.log_path = data + ".serve.log"
+        self.log = open(self.log_path, "wb")
+        env = env_for(data)
+        env["AGENT24_TEST_PRESENCE"] = presence
+        env["AGENT24_TEST_ENROLL_IDENTIFIER"] = identifier
+        args = [os.path.join(ENROLL_NEW, "agent24d"), "serve", "--port", "0",
+                "--auth-mode", "capabilities", "--enroll-endpoint"]
+        self.proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                     stderr=self.log, env=env, cwd=data)
+        # No parent lease here: a service daemon outlives this script, so one
+        # interrupted before the caller holds it is stopped on the spot.
+        try:
+            self.ready = read_line(self.proc, READY_TIMEOUT)
+        except BaseException:
+            self.stop()
+            raise
+        r = self.ready if isinstance(self.ready, dict) else {}
+        self.port = r.get("port")
+        self.generation = r.get("generation")
+        self.endpoint = r.get("enroll_endpoint")
+
+    def stop(self):
+        try:
+            self.proc.terminate()
+            self.proc.wait(timeout=15)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        self.log.close()
+
+
+class EnrolError(Exception):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+class Shell:
+    """A first-party shell's enrolment connection, as apps/desktop's
+    daemon-enroll.ts and the CLI's enroll.rs speak it: one JSON line per
+    frame; the daemon speaks first (challenge), the shell answers `hello`
+    with the nonce and the generation, and gets `enrolled` with its token.
+    `elevate` is only taken on this connection, so it stays open."""
+
+    def __init__(self, daemon):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(10)
+        self.sock.connect(daemon.endpoint)
+        self.file = self.sock.makefile("rwb")
+        challenge = self.read()
+        if challenge.get("op") != "challenge" or not isinstance(challenge.get("nonce"), str):
+            raise EnrolError(challenge.get("code") or "bad_frame")
+        self.write({"v": 1, "op": "hello", "generation": daemon.generation, "nonce": challenge["nonce"]})
+        enrolled = self.read()
+        if enrolled.get("op") != "enrolled":
+            raise EnrolError(enrolled.get("code") or "bad_frame")
+        if enrolled.get("http_port") != daemon.port:
+            raise EnrolError("endpoint_mismatch")
+        self.token = enrolled.get("token")
+
+    def read(self, timeout=10):
+        self.sock.settimeout(timeout)
+        line = self.file.readline(16 * 1024 + 1)
+        if not line:
+            raise EnrolError("closed")
+        try:
+            frame = json.loads(line)
+        except ValueError:
+            raise EnrolError("bad_frame") from None
+        return frame if isinstance(frame, dict) else {}
+
+    def write(self, frame):
+        self.file.write(json.dumps(frame).encode() + b"\n")
+        self.file.flush()
+
+    def elevate(self, method, path, body):
+        """A one-shot grant for exactly METHOD PATH BODY, or EnrolError(code).
+        The daemon shows its own text; the summary sent here is not shown."""
+        self.write({"v": 1, "op": "elevate", "method": method, "path": path,
+                    "body_sha256": hashlib.sha256(body_bytes(body)).hexdigest(),
+                    "summary": "kb-r1 accept"})
+        pending = None
+        deadline = time.monotonic() + 70
+        while True:
+            frame = self.read(max(1, deadline - time.monotonic()))
+            op = frame.get("op")
+            if op == "elevation_pending" and pending is None:
+                pending = frame.get("challenge_id")
+            elif op == "elevated" and pending is not None and frame.get("challenge_id") == pending:
+                grant = frame.get("grant")
+                # As enroll.rs: an `elevated` frame without a grant is a bad frame,
+                # so W7d never reports "got a grant" it did not get (PR-Daemon N2).
+                if not isinstance(grant, str) or not grant:
+                    raise EnrolError("bad_frame")
+                return grant
+            elif op == "error":
+                raise EnrolError(frame.get("code"))
+            else:
+                raise EnrolError("bad_frame")
+
+    def close(self):
+        try:
+            self.file.close()
+            self.sock.close()
+        except OSError:
+            pass
+
+
 def install_documents(bin_dir, data):
     """The documents package assembled as its README says (domain-os.yml and
     the module binary; W6 needs no read engine), installed with `agent24 os
@@ -372,8 +509,18 @@ def start_run(port, token, binding=None):
     return call(port, "POST", "/api/v1/runs", token, body)
 
 
-def host_change(port, token, method, seq, suffix="", body=None):
-    return call(port, method, f"/api/v1/host/knowledge/bindings/{BINDING}{suffix}?seq={seq}", token, body)
+def host_payload(seq, body=None):
+    payload = {"seq": seq}
+    if body:
+        payload.update(body)
+    return payload
+
+
+BINDING_PATH = f"/api/v1/host/knowledge/bindings/{BINDING}"
+
+
+def host_change(port, token, method, seq, suffix="", body=None, grant=None):
+    return call(port, method, BINDING_PATH + suffix, token, host_payload(seq, body), grant)
 
 
 def attach(port, token, name):
@@ -569,11 +716,15 @@ def case_w4():
               code == 0 and f"pid {host.proc.pid}" in said and "host authority unavailable" in said,
               f"退出 {code}：{said.splitlines()[0] if said else ''} …")
         code, said = cli(NEW, data, "models")
-        check("W4b", "`agent24 models` 不能借用桌面的 daemon", code not in (0, None)
-              and "host authority unavailable" in said and host.alive(), f"退出 {code}：{said[-80:]}")
+        # Since the CLI enrols on a daemon that offers an endpoint, an unsigned
+        # build is told its identity was rejected; either way it gets nothing.
+        refused = "host authority unavailable" in said or "rejected this agent24 binary's identity" in said
+        # A signed CLI would enrol and get the daily tier (W4b′, real machine only).
+        check("W4b", "未签名构建：`agent24 models` 不能借用桌面的 daemon", code not in (0, None)
+              and refused and host.alive(), f"退出 {code}：{said[-80:]}")
         code, said = cli(NEW, data, "daemon", "stop")
         s, _, _ = call(host.port, "GET", "/api/v1/models", host.token)
-        check("W4c", "`agent24 daemon stop` 停不掉桌面的 daemon", code not in (0, None)
+        check("W4c", "未签名构建：`agent24 daemon stop` 停不掉桌面的 daemon", code not in (0, None)
               and "host authority unavailable" in said and host.alive() and s == 200,
               f"退出 {code}：{said[-80:]}；daemon 仍应答 {s}")
     finally:
@@ -657,8 +808,126 @@ def case_w6():
             old.stop()
 
 
+def case_w7():
+    """M5 B6: Knowledge on the service-mode daemon. Who may change a binding is
+    now told by enrolment and elevation: no token is refused, an enrolled
+    desktop shell needs a presence-confirmed one-shot grant, a CLI shell is
+    not the host at all."""
+    allow = None
+    shell = None
+    try:
+        allow = ServiceDaemon(os.path.join(WORK, "w7"), "allow")
+        r = allow.ready if isinstance(allow.ready, dict) else {}
+        ok = (r.get("auth_mode") == "capabilities" and isinstance(allow.port, int)
+              and "product_host_token" not in r and "token" not in r
+              and isinstance(allow.generation, str) and isinstance(allow.endpoint, str)
+              and os.path.exists(allow.endpoint))
+        check("W7a", "服务模式拉起：ready 行不带任何令牌，带登记端点", ok,
+              f"auth_mode={r.get('auth_mode')!r}，port={allow.port!r}，"
+              f"令牌字段 {'有' if ('product_host_token' in r or 'token' in r) else '无'}，"
+              f"enroll_endpoint {'在' if allow.endpoint and os.path.exists(allow.endpoint) else '不在'}")
+        if not ok:
+            return
+        p = allow.port
+        s, body, _ = host_change(p, None, "PUT", 1)
+        check("W7b", "未登记（不带令牌）改 binding 被拒", s == 401, f"{s} {code_of(body)}")
+        shell = Shell(allow)
+        t = shell.token
+        s, body, _ = host_change(p, t, "PUT", 1)
+        check("W7c", "登记了但没提升，改 binding 被拒，要在场确认",
+              s == 403 and code_of(body) == "presence_required", f"{s} {code_of(body)}")
+        try:
+            grant, refused = shell.elevate("PUT", BINDING_PATH, host_payload(1)), None
+        except EnrolError as err:
+            # Before K-B6 the daemon had no text for this route: nothing to approve.
+            grant, refused = None, err.code
+        s1, _, _ = host_change(p, t, "PUT", 1, grant=grant)
+        s2, b2, _ = start_run(p, t, BINDING)
+        run_id = b2.get("id") if isinstance(b2, dict) else None
+        s3, b3, _ = call(p, "GET", f"/api/v1/runs/{run_id}", t) if run_id else (0, None, "")
+        check("W7d", "在场确认后凭一次性 grant 激活；桌面外壳就是宿主，指名 binding 的 run 照常建立",
+              refused is None and s1 == 204 and s2 == 202 and binding_of(b3) == (True, BINDING),
+              f"elevate {refused or '得到 grant'}，激活 {s1}，建 run {s2} {code_of(b2) or ''}，读回 {binding_of(b3)[1]!r}")
+        s, body, _ = host_change(p, t, "PUT", 1, grant=grant)
+        check("W7e", "同一个 grant 不能再用", grant is not None and s == 403 and code_of(body) == "elevation_invalid",
+              f"{s} {code_of(body)}" if grant is not None else "没有拿到 grant（见 W7d）")
+        # W7h (B6): the other three binding routes go through elevation the
+        # same way: refused without a grant, applied with their own one-shot
+        # grant. A deactivated binding then names no run.
+        cred = {"kind": "bearer", "value": "kb-r1-accept-c", "expires_at": int(time.time()) + 3600}
+        seen = []
+        for method, suffix, seq, extra in (("PUT", "/credential", 2, cred),
+                                           ("DELETE", "/credential", 3, None),
+                                           ("DELETE", "", 4, None)):
+            s0, b0, _ = host_change(p, t, method, seq, suffix, extra)
+            try:
+                g, why = shell.elevate(method, BINDING_PATH + suffix, host_payload(seq, extra)), None
+            except EnrolError as err:
+                g, why = None, err.code
+            s1, b1, _ = host_change(p, t, method, seq, suffix, extra, grant=g)
+            seen.append((f"{method} …{suffix or '/{id}'}", s0, code_of(b0), why, s1, code_of(b1)))
+        s, body, _ = start_run(p, t, BINDING)
+        ok = (grant is not None
+              and all(s0 == 403 and c0 == "presence_required" and why is None and s1 == 204
+                      for _, s0, c0, why, s1, _ in seen)
+              and s == 409 and code_of(body) == "knowledge_binding_inactive")
+        check("W7h", "推凭据、撤凭据、停用也各要一次在场确认：没有 grant 时 403，凭 grant 204；停用后指名 binding 建 run 409",
+              ok, "；".join(f"{r} 先 {s0} {c0}，elevate {why or '得到 grant'}，再 {s1} {c1 or ''}"
+                           for r, s0, c0, why, s1, c1 in seen) + f"；建 run {s} {code_of(body)}")
+    finally:
+        if shell:
+            shell.close()
+        if allow:
+            allow.stop()
+    deny = None
+    shell = None
+    try:
+        deny = ServiceDaemon(os.path.join(WORK, "w7-deny"), "deny")
+        if not deny.port:
+            check("W7f", "服务模式 daemon（在场确认答「拒绝」）就绪", False, "没有 ready 行")
+            return
+        shell = Shell(deny)
+        p, t = deny.port, shell.token
+        s0, _, _ = host_change(p, t, "PUT", 1)
+        try:
+            shell.elevate("PUT", BINDING_PATH, host_payload(1))
+            refused = None
+        except EnrolError as err:
+            refused = err.code
+        s, body, _ = start_run(p, t, BINDING)
+        check("W7f", "在场确认被拒：拿不到 grant，binding 没有激活",
+              s0 == 403 and refused == "presence_denied" and s == 409
+              and code_of(body) == "knowledge_binding_inactive",
+              f"先 {s0}，elevate {refused}，指名 binding 建 run {s} {code_of(body)}")
+    finally:
+        if shell:
+            shell.close()
+        if deny:
+            deny.stop()
+    cli_shell = None
+    shell = None
+    try:
+        cli_shell = ServiceDaemon(os.path.join(WORK, "w7-cli"), "allow", identifier="agent24")
+        if not cli_shell.port:
+            check("W7g", "服务模式 daemon（CLI 身份登记）就绪", False, "没有 ready 行")
+            return
+        shell = Shell(cli_shell)
+        p, t = cli_shell.port, shell.token
+        s1, b1, _ = host_change(p, t, "PUT", 1)
+        s2, b2, _ = start_run(p, t, BINDING)
+        check("W7g", "CLI 登记的外壳不是宿主：改 binding、指名 binding 都直接 403，不弹在场确认",
+              s1 == 403 and code_of(b1) == "host_authority_required"
+              and s2 == 403 and code_of(b2) == "host_authority_required",
+              f"改 binding {s1} {code_of(b1)}，建 run {s2} {code_of(b2)}")
+    finally:
+        if shell:
+            shell.close()
+        if cli_shell:
+            cli_shell.stop()
+
+
 try:
-    for case in (case_w1, case_w2, case_w3_w5, case_w4, case_w6):
+    for case in (case_w1, case_w2, case_w3_w5, case_w4, case_w6, case_w7):
         try:
             case()
         except Exception as err:  # a case that blows up is a FAIL, the rest still run

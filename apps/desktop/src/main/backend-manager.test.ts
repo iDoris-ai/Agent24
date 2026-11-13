@@ -30,6 +30,7 @@ import {
   type ExternalDaemonSource,
   type ExternalDaemonState,
 } from './backend-manager'
+import { serviceDaemonOf } from './service-daemon'
 import { CLIENT_PROTOCOL_VERSION } from './protocol-compatibility'
 import { EnrolError } from './daemon-enroll'
 
@@ -2262,6 +2263,33 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     }
   })
 
+  it('the service daemon identity is gone before our own child is spawned (M5 B6 c2)', async () => {
+    // The reverse of enrolment: knowledge-host.ts must not take our own
+    // child's connection for the service daemon's.
+    vi.useFakeTimers()
+    let alive = true
+    const s = session()
+    let manager: BackendManager | null = null
+    const atSpawn: Array<ReturnType<typeof serviceDaemonOf>> = []
+    const spawnProcess = vi.fn(() => {
+      atSpawn.push(serviceDaemonOf(manager!))
+      return child()
+    })
+    manager = new BackendManager({
+      external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s), isAlive: () => alive, checkHealth: vi.fn(async () => alive), serviceInstalled: () => false }),
+      spawnProcess, authMode: 'capabilities',
+    })
+    await manager.start()
+    try {
+      expect(serviceDaemonOf(manager)).toEqual({ pid: 4242, generation: 'gen-1' })
+      alive = false
+      await vi.advanceTimersByTimeAsync(15_000)
+      expect(atSpawn).toEqual([null])
+    } finally {
+      manager.stop()
+    }
+  })
+
   it('once the refusing daemon is gone, the app spawns its own', async () => {
     vi.useFakeTimers()
     let alive = true
@@ -2429,6 +2457,29 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
       manager.stopDaemon()
       expect(manager.presenceTarget()).toBeNull()
     } finally {
+      manager.stop()
+    }
+  })
+
+  it('the service daemon identity is set before each connection is published, and a renewal leaves it alone (M5 B6 c2)', async () => {
+    // knowledge-host.ts tells daemons apart by serviceDaemonOf(): a listener
+    // that already sees the new connection must see the new identity too.
+    vi.useFakeTimers()
+    const s = session()
+    const seen: Array<{ token: string | undefined; daemon: ReturnType<typeof serviceDaemonOf> }> = []
+    const manager = new BackendManager({ external: serviceDaemon({ enrol: vi.fn().mockResolvedValue(s) }), spawnProcess: vi.fn(child), authMode: 'capabilities' })
+    const off = onDaemonReady(() => {
+      seen.push({ token: daemonConnection()?.authHeaders.Authorization, daemon: serviceDaemonOf(manager) })
+    })
+    await manager.start()
+    try {
+      await vi.advanceTimersByTimeAsync(5 * 60_000)
+      expect(seen).toEqual([
+        { token: 'Bearer daily-1', daemon: { pid: 4242, generation: 'gen-1' } },
+        { token: 'Bearer daily-2', daemon: { pid: 4242, generation: 'gen-1' } },
+      ])
+    } finally {
+      off()
       manager.stop()
     }
   })

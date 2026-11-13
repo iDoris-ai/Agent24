@@ -90,6 +90,81 @@ pub enum PresenceOutcome { Allowed, Denied, Unavailable, TimedOut }
 - 与冻结稿 D7 的差异：子进程模式下桌面是 ProductHost 父进程，不经登记；以 ProductHost 令牌鉴权的主进程通道等价于「已登记桌面主进程的通道」。2f 桌面改走登记后改为 FirstPartyShell + 桌面身份。
 - 同一挑战只接受一次决定；过期挑战决定返回 `410`。
 
+### 3.4b 在场连接（服务模式，K-B3 #1715）
+
+服务模式下 daemon 由 launchd 拉起，桌面不是它的父进程，3.4 的 HTTP 通道（只认 ProductHost）没人轮询。改由桌面主进程在 `enroll.sock` 上另开一条**在场连接**。帧形状在 #1715 评论 6732349252 定稿，实现在 `enroll_endpoint.rs` 的 `serve_presence` 和 `presence_service.rs`。
+
+- **哪种模式用哪条通道**：
+  - 服务模式只用在场连接，`ServicePresence` 就是提供者。
+  - 子进程模式保持 3.4 不变。在场连接会被拒，错误码 `wrong_role`。
+  - legacy 模式不绑定 `enroll.sock`。
+- **握手**：
+  - daemon 照常先发 `challenge`。桌面回 `hello`，比令牌连接多一个 `"role":"presence"`。不带 `role` 的是令牌连接；`role` 取其他值得 `bad_frame`。
+  - daemon 照令牌连接的办法核对代码签名和 audit token，另外要求 identifier **恰好**是 `ai.auraai.agent24`。CLI 的 `agent24`、`agent24d` 都会得到 `identity_rejected`。
+  - 通过后 daemon 回 `{"v":1,"op":"presence_ready","identity":{"kind":"macos_seccode","identifier":"ai.auraai.agent24"}}`。**不签发令牌**，帧里没有 `token`、`http_port`、`expires_in`。
+- **同一时刻只有一条**：
+  - 已有在场连接、而且它的对端进程还活着（audit token 仍然有效），新连接得到 `presence_conflict`。
+  - 对端已经退出、但 daemon 还没读到 EOF 时，新连接直接接替。旧连接的挑战结算为 `Unavailable`，旧连接随后关闭。
+- **挑战**（daemon→桌面）：
+  ```json
+  {"v":1,"op":"presence_challenge","challenge_id":"…","nonce":"<hex32>","operation":"<Operation::action()>","method":"…","path":"…","summary":"<daemon 写的批准文字>","requester":{"identifier":"…","pid":0},"expires_at":0}
+  ```
+  - 同一条连接上最多一个已下发、还没应答的挑战，其余排队。
+  - 排队中过期的挑战直接结算为 `TimedOut`，不会下发。
+  - `summary` 由 daemon 生成，桌面原样显示。elevate 帧里客户端自带的 `summary` 不进这个框。
+- **应答**（桌面→daemon）：
+  - 帧：`{"v":1,"op":"presence_answer","challenge_id":"…","nonce":"<回显>","decision":"allow"|"deny"}`。
+  - daemon 每条都回 `{"v":1,"op":"presence_answered","challenge_id":"…","accepted":true|false}`。
+  - 以下情况回 `accepted:false`，**连接不断**：未知 id、已结算、还在排队没下发、nonce 不符，以及挂钟已过 `expires_at`。挂钟已过时，daemon 当场把这条挑战结算为超时并发 `presence_cancel`，不等自己的计时器；之后即使挂钟被调回，也不能再应答。这和 3.4 的 HTTP 通道一致。排队中过期的挑战同样当场结算，不会下发。
+  - `decision` 取其他值得 `bad_frame`，连接关闭。
+  - 每条应答生效前，daemon 都重新核对对端身份（pid 启动时间、代码签名、audit token）。对端 exec 过就得到 `identity_rejected`，连接关闭。
+- **取消**（daemon→桌面）：已下发的挑战在应答前就结算了（发起方的 elevate 连接断开、过期），daemon 发 `{"v":1,"op":"presence_cancel","challenge_id":"…"}`。之后再对它应答，得到 `accepted:false`。
+- **心跳**：
+  - 在场连接不受 10 分钟空闲上限约束。daemon 每 60 秒发一次 `{"v":1,"op":"presence_ping","nonce":"<hex32>"}`，桌面须在 10 秒内回 `{"v":1,"op":"presence_pong","nonce":"<回显>"}`。
+  - 超时、nonce 不符或主动发的 pong，daemon 直接关闭连接。截止时间按整帧收齐的时刻算：开头在截止前到、换行在截止后才到的 pong 也算超时。
+- **错误**：
+  - 在场连接上发 `renew`、`elevate`、第二个 `hello`，得到 `wrong_role`。
+  - 令牌连接上发 `presence_answer`、`presence_pong`，也得到 `wrong_role`。
+  - daemon 发出错误帧后关闭连接。
+- **断开**：在场连接断开（包括 daemon 退出）时，已下发的和排队中的挑战都结算为 `Unavailable`，发起方得到 `presence_unavailable`。服务模式下没有在场连接时，elevate 立即得到 `presence_unavailable`，不会排队等桌面连上来。
+- **并发**：在场连接和令牌连接共用 8 条的并发上限。在场连接长期占其中 1 条，令牌连接还剩 7 条。
+- **已知局限**：
+  - 同 UID 的恶意进程占满 7 条令牌连接时，在场连接连不上，提升请求得到 `presence_unavailable`。这在 ADR-031 的威胁边界之内。
+  - 这是桌面替自己作证：能挡住 renderer 和 CLI，挡不住已经被攻破的桌面主进程。强度不如 D7 的 LocalAuthentication helper，是 helper 落地之前的过渡方案。
+  - daemon 读一帧时，同一条连接上不会同时下发挑战或取消。桌面只发了半帧时，挑战要等这一帧收齐才下发。5 秒（单帧读超时）内收不齐，daemon 回 `timeout` 并关闭连接，挑战结算为 `Unavailable`。这和令牌连接的单帧超时一致。
+
+### 3.4c 三类操作的批准文字（K-B3b #1715）
+
+服务模式下桌面只留 presence 框（#1738），这些文字就是用户批准前看到的全部内容。口径见 #1715 评论 6732504621、6732795187 和修订 6732823397，实现在 `elevation_summaries.rs`。
+
+- **哪些路由**：`DERIVED_ROUTES` 里 10 条，正是 ApprovalDecision、ScheduleManage、Shutdown 在路由策略里的全部 Elevated 行（测试 `derived_routes_are_the_elevated_rows_of_the_three_operations` 锁住）。**等级表不动**。
+- **怎么生成**：第一次请求在 `presence_required` 分支里被拒时，daemon 先缓冲 body，用和 handler 同一种解析方式解析，再用自己库里的记录拼文字，按「令牌 + method + path + body 哈希」记下。elevate 只认这份文字，客户端自带的 `summary` 不进框。
+- **工具审批** `POST /approvals/{id}`：
+  - `{决定及范围}: approval {id} of run {run_id}, conversation {会话标题}; tool {工具名}; arguments: {参数预览}`。
+  - 决定及范围：`approve once`、`approve for the rest of this session`、`approve always for target {standing_target}`、`deny (with your reason)`、`abort the whole run`。
+  - 工具名按 `tool_call_id` 取 `ToolCall.tool`；标题取 run 所属会话的标题，没有或为空时写 `untitled`。
+  - 参数预览：取 `Approval.payload`，凭据类键（token、secret、password、passwd、api_key、apikey、authorization、credential、cookie、private_key，以及以 `_token`、`_secret`、`_key` 结尾的键，不分大小写）的值逐层换成 `"***"`，序列化成单行 JSON，`shown()` 会拒的字符写成 `\u{XXXX}`，再在字符（和转义）边界上截到 200 字节，截断标记和 `summarize_input` 相同。没有凭据、没有隐藏字符时，预览和 `Approval.summary` 里「`{tool}: `」之后的部分逐字节相同。
+  - 总长超出时先缩短标题（标题最多 120 字），预览不再缩。
+- **模块审批** `POST /module-approvals/{id}`：`{approve|deny} module approval {id}: module {module}, action {action}; target {target}; arguments: {参数预览}`。
+- **模块授权** `POST /module-consents/modules/{module}/tools/{tool}`：`{grant|deny} consent for module {module} tool {tool} until {expires_at}; {N} resource(s) of kind {类别}`，只写资源类别，不写资源内容。
+- **日程**：`create schedule {name} ({cron … in tz | every N s | once at ts}; enabled|disabled)`、`change schedule {name} ({id}): {改动的字段名}`、`delete`、`run … now`、`suspend`、`resume schedule {name} ({id})`。日程的 prompt 和 delivery 不显示。
+- **Shutdown**：固定文案 `stop the Agent24 background service (running work stops)`。
+- **不显示**：run 的输入正文、deny 的 `reason`、日程 prompt、任何凭据类键的值。
+- **fail closed**：以下情况都不存文字，elevate 得到 `not_elevated_operation`，handler 本来也会拒：
+  - 记录查不到或已结算；
+  - 模块授权：本机没开授权，或这个工具没有卡片、卡片不走 grants 协议；
+  - 决定类型未知，或不在 `available_decisions` 里；
+  - `approve_for_target` 没有 `standing_target`；
+  - 查不到 tool call；
+  - 请求带 query；
+  - 路径段带百分号编码；
+  - id、名字等经 `shown()` 被拒；
+  - 整条超出预算（`SUMMARY_MAX_UTF16` 减去 64，留给 `{identifier} (pid N) wants to: ` 前缀）。
+- **已知局限**：文字按第一次被拒时 daemon 查到的数据生成。到批准执行之前，审批或日程如果在别处被改了，grant 仍按 method、path、body 绑定，handler 照常复验状态，但框里的文字可能略旧。
+- **测试开关**（只在 `--features test-enrollment` 下编译，release 构建是 `compile_error`）：
+  - `AGENT24_TEST_PRESENCE=allow|deny`：放行未签名身份，**并且**把提供者换成固定答复。
+  - `AGENT24_TEST_UNSIGNED=1`：只放行未签名身份，提供者不换，挑战照常经在场连接下发。配合 `AGENT24_TEST_ENROLL_IDENTIFIER=ai.auraai.agent24`，构建机上未签名的桌面也能走完「挑战 → 原生框 → 应答」。
+
 ### 3.5 路由等级
 
 沿用冻结稿 §3。`POST /api/v1/attached` = ModuleAdmin = 提升。新增两条 presence 路由进 2a 的路由覆盖门（T1）。

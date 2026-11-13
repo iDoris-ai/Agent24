@@ -548,6 +548,126 @@
       }
     },
     {
+      "name": "get request",
+      "schema": "candidate.get_request",
+      "valid": true,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "generation": 3,
+        "candidate_id": "cand-1"
+      }
+    },
+    {
+      "name": "get request without generation",
+      "schema": "candidate.get_request",
+      "valid": false,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "candidate_id": "cand-1"
+      }
+    },
+    {
+      "name": "get request with an extra field",
+      "schema": "candidate.get_request",
+      "valid": false,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "generation": 3,
+        "candidate_id": "cand-1",
+        "approved": true
+      }
+    },
+    {
+      "name": "get response",
+      "schema": "candidate.get_response",
+      "valid": true,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "generation": 3,
+        "authz_version": "az-7",
+        "candidate": {
+          "candidate_id": "cand-1",
+          "status": "submitted",
+          "kind": "sop",
+          "title": "请假流程 🌿",
+          "body": "正文",
+          "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+          "target_knowledge_base_id": "kb-ops-1",
+          "mode": "create",
+          "submitted_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-09T12:00:00Z"
+        }
+      }
+    },
+    {
+      "name": "get response without authz_version",
+      "schema": "candidate.get_response",
+      "valid": false,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "generation": 3,
+        "candidate": {
+          "candidate_id": "cand-1",
+          "status": "submitted",
+          "kind": "sop",
+          "title": "请假流程 🌿",
+          "body": "正文",
+          "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+          "target_knowledge_base_id": "kb-ops-1",
+          "mode": "create",
+          "submitted_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-09T12:00:00Z"
+        }
+      }
+    },
+    {
+      "name": "get response with details",
+      "schema": "candidate.get_response",
+      "valid": false,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "generation": 3,
+        "authz_version": "az-7",
+        "candidate": {
+          "candidate_id": "cand-1",
+          "status": "submitted",
+          "kind": "sop",
+          "title": "请假流程 🌿",
+          "body": "正文",
+          "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+          "target_knowledge_base_id": "kb-ops-1",
+          "mode": "create",
+          "submitted_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-09T12:00:00Z"
+        },
+        "details": {
+          "replayed": true
+        }
+      }
+    },
+    {
+      "name": "get response with a view breaking its rules",
+      "schema": "candidate.get_response",
+      "valid": false,
+      "doc": {
+        "request_id": "req_01HZX3",
+        "generation": 3,
+        "authz_version": "az-7",
+        "candidate": {
+          "candidate_id": "cand-1",
+          "status": "returned",
+          "kind": "sop",
+          "title": "请假流程 🌿",
+          "body": "正文",
+          "content_sha256": "cd192d152a12cfe33ea1ae7687e0653d911e24971edfc4bca2146cf8bbfbf30f",
+          "target_knowledge_base_id": "kb-ops-1",
+          "mode": "create",
+          "submitted_at": "2026-11-09T12:00:00Z",
+          "updated_at": "2026-11-09T12:00:00Z"
+        }
+      }
+    },
+    {
       "name": "return request with note",
       "schema": "candidate.return_request",
       "valid": true,

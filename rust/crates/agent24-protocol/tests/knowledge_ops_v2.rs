@@ -22,7 +22,7 @@ const FIXTURE_SHA256: [(&str, &str); 2] = [
     ),
     (
         "schema-cases.json",
-        "cc2f9acf9715fd64524cc32e20c27e738e1d81ed9f4cea940251a1379801db29",
+        "8ec64a631b6550a3dc1a123a7ea92bcab5f0f581c4f9df09d266b682f96e81f4",
     ),
 ];
 const DEFS: [(&str, &[&str]); 2] = [
@@ -33,6 +33,8 @@ const DEFS: [(&str, &[&str]); 2] = [
             "submit_response",
             "withdraw_request",
             "withdraw_response",
+            "get_request",
+            "get_response",
             "return_request",
             "return_response",
             "approve_request",

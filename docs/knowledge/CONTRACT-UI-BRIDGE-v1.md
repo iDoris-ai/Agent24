@@ -1,6 +1,6 @@
 # Knowledge UI 身份交换与消息桥契约 v1（CONTRACT-UI-BRIDGE-v1）
 
-> **状态**：规范核心 v1，已评审合入；已实施：长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4，KB-R1/R2）；KnowledgeView 容器、分区隔离与死代理（U4.1–U4.4、U4.6–U4.8 中与会话无关的部分，KB-C2-03 #1622 与决定 #30）。一次性票据、session JWT 与注入已实施（KB-C2-04a-1，#1657）；消息桥的宿主侧在 KB-C2-04a-2（#1623）实施中，页面侧在 KB-C2-02（WeKnora#134）。条款按 READONLY r8 写成，现行 READONLY 为 r11（r11 定了决定 #25，见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）；U3.4、U3.8 补服务端重启信号（决定 #36）；决定 #30（WebRTC 的 TCP）按真机读数定案；信封加每文档 `document_id`（决定 #37）。· **日期**：2026-10-20，修订 2026-11-09 · **桥报文** `v: 3`（决定 #35、#37 各按 §0 变更规则递增一次；`v: 1`、`v: 2` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
+> **状态**：规范核心 v1，已评审合入；已实施：长期登录态的本机存储（`knowledge-logins.ts`）和 C 不进 renderer（U1.4，KB-R1/R2）；KnowledgeView 容器、分区隔离与死代理（U4.1–U4.4、U4.6–U4.8 中与会话无关的部分，KB-C2-03 #1622 与决定 #30）。一次性票据、session JWT 与注入已实施（KB-C2-04a-1，#1657）；消息桥的宿主侧在 KB-C2-04a-2（#1623）实施中，页面侧在 KB-C2-02（WeKnora#134）。条款按 READONLY r8 写成，现行 READONLY 为 r13（r11 定了决定 #25，r13 定了 UI 会话的三类写操作，均见 U1.3）；U7 的引用字段按 READONLY r9 起的 `content_tag` 修订（决定 #35）；U3.4、U3.8 补服务端重启信号（决定 #36）；决定 #30（WebRTC 的 TCP）按真机读数定案；信封加每文档 `document_id`（决定 #37）。· **日期**：2026-10-20，修订 2026-11-09 · **桥报文** `v: 3`（决定 #35、#37 各按 §0 变更规则递增一次；`v: 1`、`v: 2` 从未实施，宿主不支持；文中其余「v1」指本契约文档版本）
 > **依据**：`docs/knowledge/CONTRACT-READONLY-v1.md`（下称 READONLY，按 r8；例外：引用 read、分块分页与 `content_tag` 的日志规则按现行 r11 的 R4.1、R4.3、R4.5、R4.7、R10.3，决定 #35）；`docs/knowledge/CONTRACT-STATE-v1.md`（下称 STATE，规范核心 v1，PR #1113；本文依赖它的规则汇总在 §8.2）。
 > 由完整版 `ab/weknora-03b-ui-bridge`（#1077 的分支）压缩而来。本文只写对外行为与不变式；实现机制由各实现任务以代码和测试证明。
 > 编号：`R*` 为 READONLY 规则，`S*` 为 STATE 规范核心 v1（同批）的条款，`U*` 为本文规则（沿用完整版编号，空号即已移出规范），`决定 #n` 见 §9.1（已定）与 §9.5（待决）。
@@ -33,7 +33,12 @@
 
 - **U1.1** 票据与 session JWT 只由服务端签发；宿主即使按 R1.4 持有实例秘密也不得自签。
 - **U1.2** 页面不可信。页面始终拿不到 C、长期登录态、票据、JWT、`view_secret` 与本地路径；它只知道 generation、不透明的 view 实例 ID 与 `state` 消息里的非秘密信息。
-- **U1.3** 受众隔离：C 与 session JWT（`aud: "agent24-knowledge-view"`）在服务端互不接受。JWT 的范围是 C 的子集，`ops` 只含只读 UI 操作，不含下载原件与 preview（R2.7），不能换票据、签凭据或调用写入与管理接口。UI 操作与 C 的关系按 READONLY R1.8、R2.8（r11，决定 #25）：JWT 的数据范围（知识库集合）是 C 的子集；`ops` 是 R2.8 列出的独立只读展示清单（以五类为上限，不含 preview 与下载原件），服务端对每个 UI 入口自己计算 E，首版只放行页面实际调用的入口。
+- **U1.3** 受众隔离：C 与 session JWT（`aud: "agent24-knowledge-view"`）在服务端互不接受。JWT 的范围是 C 的子集，不含下载原件与 preview（R2.7），不能换票据、签凭据或调用管理接口。UI 操作与 C 的关系按 READONLY R1.8、R2.8（r11 决定 #25，r13 定稿写操作）：JWT 的数据范围（知识库集合）是 C 的子集；`ops` 由两部分组成：R2.8 列出的独立只读展示清单（以五类为上限，不含 preview 与下载原件），以及 C 持有对应能力值时的三类写操作类 `candidate.review`、`candidate.approve`、`entry.withdraw`（READONLY R1.8，CONTRACT-OPS-v2 W1.6、I3）。服务端对每个 UI 入口自己计算 E，首版只放行页面实际调用的入口。写操作类只经集成闸门精确表与宿主 UI 路由表（`knowledge-ui-routes.json`）里为它列出的入口执行，入口如下（前缀 `/api/v1/agent24/knowledge`）：
+  - `candidate.review`：`GET /ui/candidates`、`GET /ui/candidates/:id`、`POST /ui/candidates/:id/return`；
+  - `candidate.approve`：`POST /ui/candidates/:id/approve`；
+  - `entry.withdraw`：`POST /ui/documents/:knowledge_id/withdraw`。
+
+  宿主路由表只对这里的三个 POST 入口放行 POST，其余 UI 入口仍只放行 GET；宿主表必须是 WeKnora `docs/agent24/ui-routes.json` 在钉定提交上的子集。服务端每次执行写操作都按 OPS-v2 W1.6 复验；`candidate.propose` 与其余写操作用 session JWT 调用得 `unauthorized/credential_invalid`。UI 会话的写请求只带 `request_id`，不带 `generation`（READONLY R6.1）。桥仍然不是写入口，桥消息闭集与禁止键不变（U6.2、OPS-v2 W1.6）。
 - **U1.4** C 不进任何 renderer；票据只在 Provider、main 内存及两者的私有接口里；JWT 只在服务端与 main 内存里。
 - **U1.5** Agent24 自身的 renderer 不参与身份交换：铸票、撤销、作废通知所用的私有接口，经 renderer 可用的任何通用代理（如 `backendProxy`）都到不了；该通道双向认证。
 
