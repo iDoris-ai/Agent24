@@ -75,6 +75,20 @@ describe('the plist a service stop left behind (omlx-service-left)', () => {
     fs.renameSync(temp, plist)
     expect(serviceLeftBehind(file, plist, down)).toBe(false)
     expect(fs.existsSync(file)).toBe(false)
+    // Also with a live refused daemon, and another file with the very same
+    // mtime (ruling 2026-11-13-pr1-hardstop-service-left): the inode alone ends it.
+    const at = new Date(Math.floor(fs.statSync(plist).mtimeMs / 1000) * 1000 - 60_000)
+    fs.utimesSync(plist, at, at)
+    markServiceLeft(file, plist)
+    const recorded = (JSON.parse(fs.readFileSync(file, 'utf8')) as { plist: { ino: number; mtimeMs: number } }).plist
+    const other = `${plist}.other`
+    fs.writeFileSync(other, '<plist>other</plist>')
+    fs.utimesSync(other, at, at)
+    fs.renameSync(other, plist)
+    expect(fs.statSync(plist).ino).not.toBe(recorded.ino)
+    expect(fs.statSync(plist).mtimeMs).toBe(recorded.mtimeMs)
+    expect(serviceLeftBehind(file, plist, () => 'refused')).toBe(false)
+    expect(fs.existsSync(file)).toBe(false)
   })
 
   it('ends, and clears the record, once a service daemon is up again (launchd at the next login)', () => {
@@ -103,10 +117,13 @@ describe('the plist a service stop left behind (omlx-service-left)', () => {
 
   it('reads an unreadable or foreign record as not left behind, and clears it', () => {
     fs.mkdirSync(path.dirname(file), { recursive: true })
-    for (const body of ['{not json', JSON.stringify({ format: 'other', version: 1, plist: { ino: 1, mtimeMs: 1 } })]) {
-      fs.writeFileSync(file, body)
-      expect(serviceLeftBehind(file, plist, down), body).toBe(false)
-      expect(fs.existsSync(file)).toBe(false)
+    // Whatever runs, a live refused daemon included.
+    for (const seen of [down, (): DaemonSeen => 'refused']) {
+      for (const body of ['{not json', JSON.stringify({ format: 'other', version: 1, plist: { ino: 1, mtimeMs: 1 } })]) {
+        fs.writeFileSync(file, body)
+        expect(serviceLeftBehind(file, plist, seen), body).toBe(false)
+        expect(fs.existsSync(file)).toBe(false)
+      }
     }
   })
 
