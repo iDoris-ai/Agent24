@@ -23,10 +23,10 @@
 //!   is already complete inserts nothing, and still deletes the other keys.
 //!
 //! The production embedder is [`crate::embedder::LocalEmbedder`] (loopback oMLX
-//! or iDoris). Daemon startup wiring is a later slice. This module is the trait,
-//! the storage, and the cosine / reindex mechanics, exercised with deterministic
-//! test embedders. The "semantic recall beats pure FTS" benchmark needs a real
-//! model and stays deferred.
+//! or iDoris). Daemon startup attaches it from `agent24d`'s embed backfill.
+//! This module is the trait, the storage, and the cosine / reindex mechanics.
+//! CI exercises them with deterministic test embedders. The real-model Hit@5
+//! comparison is the ignored `eval_m1_omlx` test, not part of CI.
 
 use async_trait::async_trait;
 use sqlx::{Row, SqlitePool};

@@ -39,6 +39,22 @@
 //! Everything else (Hit@1, All-evidence@5, distractor precision, the
 //! original Chinese no-answer injection rate) stays record-only per the base
 //! spec. Run: `cargo test -p agent24-memory eval_m1 -- --nocapture`.
+//!
+//! VR-5 adds 20 Chinese paraphrase cases (a remembered sentence, then a
+//! question that does not share a content bigram with it) and 4 no-answer
+//! prompts. CI still embeds with [`NgramEmbedder`]. On that path the Hit@5
+//! gate is the original 13/14 ratio applied to the answerable set **including
+//! the paraphrases**, and the new no-answer prompts must inject nothing.
+//! Pure FTS cannot see those paraphrases, so `eval_m1` (keyword only) keeps
+//! them out of the 13/14 denominator and only records the miss. The real
+//! bge-m3 run is `eval_m1_omlx` (`#[ignore]`, not CI):
+//!
+//! ```text
+//! export PATH="$HOME/Library/Application Support/mbx/bin:$PATH"
+//! export OMLX_URL=http://127.0.0.1:8088
+//! export OMLX_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.omlx/settings.json")))["auth"]["api_key"])')"
+//! cd rust && cargo test -j 4 -p agent24-memory eval_m1::eval_m1_omlx -- --ignored --exact --nocapture
+//! ```
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -54,6 +70,8 @@ const OTHER_OWNER: &str = "m1-eval-other-owner";
 const TOP_K: usize = 5;
 /// Hybrid eval must exercise the vector route on at least this many queries.
 const MIN_VECTOR_ROUTE_QUERIES: usize = 3;
+const PARAPHRASE: &str = "paraphrase";
+const PARAPHRASE_NO_ANSWER: &str = "paraphrase_no_answer";
 /// `forget`/supersede effective time: must be in the PAST relative to test
 /// execution — `beliefs_as_of`/`search_any`'s active-row semantics are
 /// bi-temporal, so a FUTURE timestamp would not have taken effect yet (a
@@ -170,6 +188,28 @@ const FIXTURES: &[Fixture] = &[
     // syllable — must still be recalled.
     f("safety-morphine", OWNER, "我对吗啡过敏"),
     f("safety-bar", OWNER, "附近那家酒吧很吵"),
+    // VR-5: one fact per paraphrase case. The question uses different words
+    // (no shared content bigram); the test embedder links them by CONCEPTS.
+    f("p01-piano", OWNER, "每周三晚上练钢琴"),
+    f("p02-alarm", OWNER, "闹钟设在清晨六点"),
+    f("p03-neuter", OWNER, "宠物猫已做绝育"),
+    f("p04-swim", OWNER, "每周五下班去游泳"),
+    f("p05-neck", OWNER, "颈椎病好多年"),
+    f("p06-loan", OWNER, "每月还房贷八千"),
+    f("p07-hike", OWNER, "周末固定去爬山"),
+    f("p08-uncle", OWNER, "紧急联系人是舅舅"),
+    f("p09-glasses", OWNER, "眼镜度数是三百"),
+    f("p10-license", OWNER, "驾照档案号尾段是庚寅"),
+    f("p11-desk", OWNER, "工位在靠窗第三排"),
+    f("p12-soy", OWNER, "早餐只喝豆浆"),
+    f("p13-south", OWNER, "租的房子朝南"),
+    f("p14-school", OWNER, "孩子就读于育才小学"),
+    f("p15-mail", OWNER, "常用邮箱前缀是青石"),
+    f("p16-checkup", OWNER, "每年体检安排在三月"),
+    f("p17-screen", OWNER, "屏幕贴的是磨砂膜"),
+    f("p18-metro", OWNER, "地铁通勤四十分钟"),
+    f("p19-pen", OWNER, "惯用左手执笔"),
+    f("p20-rent", OWNER, "每年四月交房租"),
 ];
 
 fn candidate(id: &str, owner: &str, object: &str) -> Candidate {
@@ -263,6 +303,34 @@ fn cases() -> Vec<EvalCase> {
         // cases for the "contains a function character" over-filtering bug.
         EvalCase { id: "safety-morphine", category: "cjk_safety_bigram", query: "我对吗啡过敏吗？", expected_ids: &["safety-morphine"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
         EvalCase { id: "safety-bar", category: "cjk_safety_bigram", query: "附近有什么酒吧？", expected_ids: &["safety-bar"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        // VR-5 paraphrases. Each query is a different wording of the fixture
+        // above and shares no content bigram with that fixture.
+        EvalCase { id: "p01-piano", category: PARAPHRASE, query: "练琴固定哪一天", expected_ids: &["p01-piano"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p02-alarm", category: PARAPHRASE, query: "每天几点被叫醒", expected_ids: &["p02-alarm"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p03-neuter", category: PARAPHRASE, query: "猫咪做了节育没有", expected_ids: &["p03-neuter"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p04-swim", category: PARAPHRASE, query: "周末前有固定的泳程吗", expected_ids: &["p04-swim"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p05-neck", category: PARAPHRASE, query: "脖子的老毛病几年了", expected_ids: &["p05-neck"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p06-loan", category: PARAPHRASE, query: "月供大概是多少钱", expected_ids: &["p06-loan"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p07-hike", category: PARAPHRASE, query: "假日专门去登山吗", expected_ids: &["p07-hike"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p08-uncle", category: PARAPHRASE, query: "出事最先找哪位亲戚", expected_ids: &["p08-uncle"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p09-glasses", category: PARAPHRASE, query: "近视多少度", expected_ids: &["p09-glasses"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p10-license", category: PARAPHRASE, query: "驾驶证编号末尾是什么", expected_ids: &["p10-license"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p11-desk", category: PARAPHRASE, query: "座位是不是挨着窗", expected_ids: &["p11-desk"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p12-soy", category: PARAPHRASE, query: "早起那一顿喝什么", expected_ids: &["p12-soy"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p13-south", category: PARAPHRASE, query: "住房朝向是哪边", expected_ids: &["p13-south"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p14-school", category: PARAPHRASE, query: "小朋友在哪所学校上学", expected_ids: &["p14-school"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p15-mail", category: PARAPHRASE, query: "邮件地址怎么开头", expected_ids: &["p15-mail"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p16-checkup", category: PARAPHRASE, query: "健康检查固定哪个月", expected_ids: &["p16-checkup"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p17-screen", category: PARAPHRASE, query: "显示器蒙了哪种膜", expected_ids: &["p17-screen"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p18-metro", category: PARAPHRASE, query: "坐轨道上下班要多久", expected_ids: &["p18-metro"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p19-pen", category: PARAPHRASE, query: "写字用哪一侧的手", expected_ids: &["p19-pen"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "p20-rent", category: PARAPHRASE, query: "租约费用哪个月付", expected_ids: &["p20-rent"], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        // No lexical overlap with the corpus, and no CONCEPTS word, so neither
+        // FTS nor the test embedder may inject a fact.
+        EvalCase { id: "pn1-quantum", category: PARAPHRASE_NO_ANSWER, query: "量子纠缠怎么推导", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "pn2-stew", category: PARAPHRASE_NO_ANSWER, query: "红烧肉要炖到软烂", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "pn3-wallet", category: PARAPHRASE_NO_ANSWER, query: "比特币钱包助记词放哪", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
+        EvalCase { id: "pn4-poem", category: PARAPHRASE_NO_ANSWER, query: "这首古诗的下一句", expected_ids: &[], security_forbidden_ids: &[], distractor_forbidden_ids: &[] },
     ]
 }
 
@@ -283,6 +351,23 @@ struct Metrics {
     security_leaks: usize,
     cjk_safety_total: usize,
     cjk_safety_hits: usize,
+    paraphrase_total: usize,
+    paraphrase_hits: usize,
+    /// Same paraphrase queries scored with keyword search, when the run is
+    /// also scoring the hybrid path (the real-model comparison).
+    paraphrase_fts_hits: usize,
+    paraphrase_no_answer: usize,
+    paraphrase_no_answer_injected: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Keyword search only. Paraphrases stay out of the Hit@5 denominator.
+    Fts,
+    /// CI hybrid: [`NgramEmbedder`]. Paraphrases join the 13/14 denominator.
+    Hybrid,
+    /// Real bge-m3. Same gates as [`Mode::Hybrid`], plus the FTS comparison.
+    Real,
 }
 
 fn pct(n: usize, of: usize) -> String {
@@ -293,12 +378,28 @@ fn pct(n: usize, of: usize) -> String {
     }
 }
 
-async fn run_eval(hybrid: bool) {
+async fn run_eval(mode: Mode) {
     let cases = cases();
+    let paraphrase_cases = cases
+        .iter()
+        .filter(|case| case.category == PARAPHRASE)
+        .count();
+    let paraphrase_negatives = cases
+        .iter()
+        .filter(|case| case.category == PARAPHRASE_NO_ANSWER)
+        .count();
     assert!(
         cases.len() >= 15,
         "M1-T08 asks for >=15 hand-written cases: got {}",
         cases.len()
+    );
+    assert!(
+        paraphrase_cases >= 20,
+        "VR-5 asks for >=20 Chinese paraphrase cases: got {paraphrase_cases}"
+    );
+    assert!(
+        paraphrase_negatives >= 4,
+        "VR-5 asks for a few no-answer prompts: got {paraphrase_negatives}"
     );
     assert!(
         DISTRACTOR_IDS.len() >= 5,
@@ -310,21 +411,48 @@ async fn run_eval(hybrid: bool) {
     let retriever = store.retriever();
     // Hybrid mode: every current fact is embedded, and the SAME cases run
     // through `HybridRetriever` (FTS 20 + vector 20 + RRF, MIN_COSINE).
-    let hybrid_retriever = if hybrid {
-        store
-            .vector_retriever(NgramEmbedder)
-            .reindex(OWNER)
-            .await
-            .unwrap();
-        Some(store.hybrid_retriever(std::sync::Arc::new(NgramEmbedder)))
-    } else {
-        None
+    let hybrid_retriever = match mode {
+        Mode::Fts => None,
+        Mode::Hybrid => {
+            store
+                .vector_retriever(NgramEmbedder)
+                .reindex(OWNER)
+                .await
+                .unwrap();
+            Some(store.hybrid_retriever(std::sync::Arc::new(NgramEmbedder)))
+        }
+        Mode::Real => {
+            let embedder = crate::embedder::LocalEmbedder::open(&store, omlx_client())
+                .await
+                .expect("oMLX embedder did not open; is bge-m3 listening?");
+            store
+                .vector_retriever(embedder.clone())
+                .reindex(OWNER)
+                .await
+                .unwrap();
+            // A cold embed is slower than the production 1.5s budget. The
+            // ignored run only records quality, so give the request room and
+            // keep the breaker from dropping the rest of the set.
+            Some(
+                store
+                    .hybrid_retriever(std::sync::Arc::new(embedder))
+                    .with_timing(
+                        std::time::Duration::from_secs(60),
+                        std::time::Duration::from_secs(30),
+                    ),
+            )
+        }
     };
+    let hybrid = hybrid_retriever.is_some();
 
     let mut metrics = Metrics::default();
     println!(
         "—— M1-T08 + T07.2 recall eval baseline ({}, top_{TOP_K}) ——",
-        if hybrid { "hybrid" } else { "search_any" }
+        match mode {
+            Mode::Fts => "search_any",
+            Mode::Hybrid => "hybrid",
+            Mode::Real => "hybrid-omlx",
+        }
     );
     let mut vector_route_queries = 0usize;
     for case in &cases {
@@ -334,6 +462,17 @@ async fn run_eval(hybrid: bool) {
                 vector_route_queries += 1;
             }
         }
+        let fts_ids: Vec<String> = if mode == Mode::Real {
+            retriever
+                .search_any(case.query, OWNER, TOP_K)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.assertion.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let hits = match &hybrid_retriever {
             Some(h) => h.search(case.query, OWNER, TOP_K).await.unwrap(),
             None => retriever
@@ -363,7 +502,12 @@ async fn run_eval(hybrid: bool) {
             .filter(|forbidden| hit_ids.contains(&**forbidden))
             .collect();
 
-        if case.expected_ids.is_empty() {
+        if case.category == PARAPHRASE_NO_ANSWER {
+            // Before the empty-expected bucket: these are a hard gate, not
+            // the record-only Chinese no-answer rate.
+            metrics.paraphrase_no_answer += 1;
+            metrics.paraphrase_no_answer_injected += usize::from(!hit_ids.is_empty());
+        } else if case.expected_ids.is_empty() {
             if case.category == "no_answer_english_neutral" {
                 metrics.no_answer_en += 1;
                 if !hit_ids.is_empty() {
@@ -381,6 +525,22 @@ async fn run_eval(hybrid: bool) {
             // gate instead (both must hit, see below).
             metrics.cjk_safety_total += 1;
             metrics.cjk_safety_hits += usize::from(hit_at_5);
+        } else if case.category == PARAPHRASE {
+            // Keyword search misses these on purpose. Only the hybrid runs
+            // fold them into the 13/14 Hit@5 denominator.
+            metrics.paraphrase_total += 1;
+            metrics.paraphrase_hits += usize::from(hit_at_5);
+            if mode == Mode::Real {
+                let fts_hit = fts_ids
+                    .iter()
+                    .any(|id| case.expected_ids.contains(&id.as_str()));
+                metrics.paraphrase_fts_hits += usize::from(fts_hit);
+            }
+            if hybrid {
+                metrics.answerable += 1;
+                metrics.hit_at_1 += usize::from(hit_at_1);
+                metrics.hit_at_5 += usize::from(hit_at_5);
+            }
         } else {
             metrics.answerable += 1;
             metrics.hit_at_1 += usize::from(hit_at_1);
@@ -476,6 +636,38 @@ async fn run_eval(hybrid: bool) {
         metrics.cjk_safety_total,
         pct(metrics.cjk_safety_hits, metrics.cjk_safety_total)
     );
+    println!(
+        "paraphrase Hit@5 ({}): {}/{} ({})",
+        if hybrid {
+            "in the 13/14 denominator"
+        } else {
+            "FTS record only; not in the 13/14 denominator"
+        },
+        metrics.paraphrase_hits,
+        metrics.paraphrase_total,
+        pct(metrics.paraphrase_hits, metrics.paraphrase_total)
+    );
+    if mode == Mode::Real {
+        println!(
+            "paraphrase Hit@5 pure FTS (comparison): {}/{} ({})",
+            metrics.paraphrase_fts_hits,
+            metrics.paraphrase_total,
+            pct(metrics.paraphrase_fts_hits, metrics.paraphrase_total)
+        );
+    }
+    println!(
+        "paraphrase no-answer injection (HARD GATE = 0): {}/{} ({})",
+        metrics.paraphrase_no_answer_injected,
+        metrics.paraphrase_no_answer,
+        pct(
+            metrics.paraphrase_no_answer_injected,
+            metrics.paraphrase_no_answer
+        )
+    );
+
+    if mode == Mode::Real {
+        print_real_margins(&store).await;
+    }
 
     assert_eq!(
         metrics.security_leaks, 0,
@@ -486,17 +678,41 @@ async fn run_eval(hybrid: bool) {
         "an English/neutral no-answer prompt must never inject a memory (M1-T07.2)"
     );
     assert!(
+        metrics.paraphrase_no_answer >= 4,
+        "VR-5 no-answer prompts were not scored"
+    );
+    assert_eq!(
+        metrics.paraphrase_no_answer_injected, 0,
+        "a VR-5 no-answer prompt must not inject a memory"
+    );
+    assert!(
         metrics.hit_at_5 * 14 >= 13 * metrics.answerable,
         "Hit@5 must be >= 13/14 of the {} answerable cases: got {}/{}",
         metrics.answerable,
         metrics.hit_at_5,
         metrics.answerable
     );
+    if hybrid {
+        assert!(
+            metrics.paraphrase_hits * 14 >= 13 * metrics.paraphrase_total,
+            "paraphrase Hit@5 must be >= 13/14: got {}/{}",
+            metrics.paraphrase_hits,
+            metrics.paraphrase_total
+        );
+    }
     assert_eq!(
         metrics.cjk_safety_hits, metrics.cjk_safety_total,
         "every CJK safety-bigram case (a real word that merely contains a \
          pronoun/particle character) must be recalled (M1-T07.2 round 2 M2)"
     );
+    if mode == Mode::Real {
+        assert!(
+            metrics.paraphrase_hits > metrics.paraphrase_fts_hits,
+            "hybrid paraphrase Hit@5 ({}) must beat pure FTS ({})",
+            metrics.paraphrase_hits,
+            metrics.paraphrase_fts_hits
+        );
+    }
 }
 
 /// A stand-in for a real model with a tiny synonym table: hashed character
@@ -507,8 +723,37 @@ async fn run_eval(hybrid: bool) {
 #[derive(Clone)]
 struct NgramEmbedder;
 
-const CONCEPTS: &[&[&str]] = &[&["过敏"], &["狗"], &["工作", "公司"], &["颜色"]];
-const CONCEPT_WEIGHT: f32 = 3.0;
+const CONCEPTS: &[&[&str]] = &[
+    &["过敏"],
+    &["狗"],
+    &["工作", "公司"],
+    &["颜色"],
+    // VR-5: fact wording, then the question's wording. They share no content
+    // bigram, so the axis is the only reason the pair clears MIN_COSINE.
+    &["钢琴", "练琴"],
+    &["闹钟", "叫醒"],
+    &["绝育", "节育"],
+    &["游泳", "泳程"],
+    &["颈椎", "脖子"],
+    &["房贷", "月供"],
+    &["爬山", "登山"],
+    &["舅舅", "亲戚"],
+    &["眼镜", "近视"],
+    &["驾照", "驾驶证"],
+    &["工位", "挨着"],
+    &["豆浆", "早起"],
+    &["朝南", "朝向"],
+    &["育才", "小朋友"],
+    &["邮箱", "邮件"],
+    &["体检", "健康"],
+    &["磨砂", "显示器"],
+    &["地铁", "轨道"],
+    &["执笔", "写字"],
+    &["房租", "租约"],
+];
+/// Heavy enough that one shared axis clears 0.62 with no shared bigram.
+/// A query that matches no axis stays far below that line.
+const CONCEPT_WEIGHT: f32 = 6.0;
 const NGRAM_DIMS: usize = 512;
 #[cfg(test)]
 const FACT_PREFIX: &str = "user said_to_remember ";
@@ -548,14 +793,114 @@ impl crate::vector::Embedder for NgramEmbedder {
     }
 }
 
-#[tokio::test]
-async fn eval_m1() {
-    run_eval(false).await;
+/// Same URL and key read as chat (`OMLX_URL` / `OMLX_API_KEY`, loopback only).
+/// Ignores `IDORIS_URL` so this run always hits the local oMLX named above.
+fn omlx_client() -> agent24_models::EmbeddingClient {
+    let url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
+    let key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
+    agent24_models::EmbeddingClient::direct(url, key, agent24_models::DEFAULT_EMBED_MODEL)
+        .expect("OMLX_URL must be a loopback embeddings endpoint")
 }
 
-/// VR-3: both hard gates (Hit@5 >= 13/14, no-answer injects nothing) and the
-/// security-leak gate hold when recall goes through the hybrid retriever.
+/// Min cosine of each paraphrase against its own fact, and max cosine of each
+/// no-answer prompt against the owner's vectors. Printed so VR-5 can see
+/// whether [`crate::hybrid::MIN_COSINE`] still sits between the two.
+async fn print_real_margins(store: &KvStore) {
+    use crate::vector::Embedder;
+    let embedder = omlx_embedder(store).await;
+    let rows = stored_vectors(store, &embedder).await;
+    let mut paraphrase_min = f32::MAX;
+    let mut paraphrase_min_id = "";
+    let mut no_answer_max = f32::MIN;
+    let mut no_answer_max_query = "";
+    for case in cases() {
+        let query_vec = embedder.embed(case.query).await.unwrap().vector;
+        if case.category == PARAPHRASE {
+            let expected = case.expected_ids[0];
+            let stored = rows
+                .iter()
+                .find(|(id, _)| id == expected)
+                .map(|(_, vector)| vector.as_slice())
+                .unwrap_or(&[]);
+            let score = crate::vector::cosine(&query_vec, stored);
+            if score < paraphrase_min {
+                paraphrase_min = score;
+                paraphrase_min_id = case.id;
+            }
+            println!(
+                "calibration paraphrase {id} cosine={score:.3}",
+                id = case.id
+            );
+        } else if case.category == PARAPHRASE_NO_ANSWER {
+            let score = rows
+                .iter()
+                .map(|(_, vector)| crate::vector::cosine(&query_vec, vector))
+                .fold(f32::MIN, f32::max);
+            if score > no_answer_max {
+                no_answer_max = score;
+                no_answer_max_query = case.query;
+            }
+            println!(
+                "calibration no-answer {id} max_cosine={score:.3}",
+                id = case.id
+            );
+        }
+    }
+    println!(
+        "calibration summary: paraphrase min={paraphrase_min:.3} ({paraphrase_min_id}), no-answer max={no_answer_max:.3} ({no_answer_max_query}), MIN_COSINE={}",
+        crate::hybrid::MIN_COSINE
+    );
+}
+
+async fn omlx_embedder(store: &KvStore) -> crate::embedder::LocalEmbedder {
+    crate::embedder::LocalEmbedder::open(store, omlx_client())
+        .await
+        .unwrap()
+}
+
+async fn stored_vectors(
+    store: &KvStore,
+    embedder: &crate::embedder::LocalEmbedder,
+) -> Vec<(String, Vec<f32>)> {
+    use crate::vector::Embedder;
+    use sqlx::Row;
+    let revision = crate::vector::index_revision(embedder.revision());
+    let rows = sqlx::query(
+        "SELECT e.assertion_id, e.vec FROM mem_embeddings e
+         JOIN mem_assertions a ON a.id = e.assertion_id
+         WHERE a.scope_owner = ? AND e.model_id = ? AND e.revision = ?
+           AND a.recorded_to IS NULL AND a.qualified = 1",
+    )
+    .bind(OWNER)
+    .bind(embedder.model_id())
+    .bind(&revision)
+    .fetch_all(crate::test_hooks::pool(store))
+    .await
+    .unwrap();
+    rows.into_iter()
+        .map(|row| {
+            let id: String = row.get("assertion_id");
+            let vector = crate::vector::blob_to_vec(&row.get::<Vec<u8>, _>("vec"));
+            (id, vector)
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn eval_m1() {
+    run_eval(Mode::Fts).await;
+}
+
+/// VR-3 / VR-5: both hard gates (Hit@5 >= 13/14 of the set that now includes
+/// the paraphrases, no-answer injects nothing) hold on the test embedder.
 #[tokio::test]
 async fn eval_m1_hybrid() {
-    run_eval(true).await;
+    run_eval(Mode::Hybrid).await;
+}
+
+/// Real bge-m3 on the local oMLX. Not part of CI. Command in the module docs.
+#[tokio::test]
+#[ignore = "real oMLX bge-m3-mlx-fp16; set OMLX_URL and OMLX_API_KEY, then --ignored --exact"]
+async fn eval_m1_omlx() {
+    run_eval(Mode::Real).await;
 }

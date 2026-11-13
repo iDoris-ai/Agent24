@@ -39,9 +39,11 @@ use crate::vector::{Embedder, blob_to_vec, cosine, index_revision, validate_embe
 pub const ROUTE_TOP_N: usize = 20;
 /// RRF constant: `score = Σ 1 / (RRF_K + rank)`, rank starting at 1.
 pub const RRF_K: f32 = 60.0;
-/// Vector hits whose cosine is below this are dropped before fusion. Initial
-/// value from the VR-0 measurements (paraphrases >= 0.86, unrelated <= 0.53);
-/// VR-5 calibrates it on the eval set.
+/// Vector hits whose cosine is below this are dropped before fusion.
+/// VR-0 close paraphrases sit near 0.8 after the fact prefix, and unrelated
+/// text near 0.4. VR-5 kept 0.62: on bge-m3 the zero-overlap paraphrase floor
+/// is 0.648 and the no-answer ceiling is 0.516, so the line stays in that gap.
+/// Exact figures are in VECTOR-RECALL-PLAN §7.
 pub const MIN_COSINE: f32 = 0.62;
 /// The query is cut to this many characters before it is embedded.
 pub const MAX_QUERY_CHARS: usize = 2000;
