@@ -2,7 +2,7 @@ import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { Bridge, DEV_ROUTE_MISSING, FAILURE_REPLY_LIMIT, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp, classifyInboundFailure } from './bridge.js'
+import { Bridge, DEV_ROUTE_MISSING, FAILURE_REPLY_LIMIT, HOLD_GIVE_UP, RECORD_FAILED_REPLY, RECORDED_REPLY, canonicalStamp, classifyInboundFailure, holdCountsTowardGiveUp, inboundStamp } from './bridge.js'
 import { InboundHttpError } from './agent24.js'
 import type { Agent24Client, InboundEvent, InboundRecord } from './agent24.js'
 import type { Sender } from './ilink/sender.js'
@@ -74,6 +74,19 @@ describe('canonicalStamp', () => {
   })
 })
 
+describe('inboundStamp', () => {
+  it('rejects a missing, non-finite, or out-of-range time', () => {
+    expect(inboundStamp(undefined)).toBeNull()
+    expect(inboundStamp(Number.NaN)).toBeNull()
+    expect(inboundStamp(Number.POSITIVE_INFINITY)).toBeNull()
+    expect(inboundStamp(1e20)).toBeNull()
+    expect(inboundStamp(8.64e15 + 1)).toBeNull()
+    expect(inboundStamp(-8.64e15 - 1)).toBeNull()
+    expect(inboundStamp(0)).toBe('1970-01-01T00:00:00Z')
+    expect(inboundStamp(8.64e15)).toBe(canonicalStamp(8.64e15))
+  })
+})
+
 describe('Bridge transport', () => {
   function textMsg(
     from: string,
@@ -120,6 +133,10 @@ describe('Bridge transport', () => {
       },
     } as unknown as Sender
     return { bridge: new Bridge(agent, sender), recorded, sends }
+  }
+
+  function holdsOf(bridge: Bridge): Map<string, number> {
+    return (bridge as unknown as { holds: Map<string, number> }).holds
   }
 
   it('records a finished user message and replies only 已记录', async () => {
@@ -261,6 +278,186 @@ describe('Bridge transport', () => {
     await bridge.handle(first)
     expect(sends).toHaveLength(FAILURE_REPLY_LIMIT + 2)
   })
+
+  it.each([Number.NaN, undefined, 1e20, 8.64e15 + 1])(
+    'advances a bad create_time_ms (%s) without posting or the failure reply',
+    async (create_time_ms) => {
+      const errors: unknown[] = []
+      const previous = console.error
+      console.error = (...args: unknown[]) => {
+        errors.push(args.join(' '))
+      }
+      try {
+        const { bridge, recorded, sends } = makeBridge()
+        await expect(
+          bridge.handle(textMsg('alice', '坏时间', { create_time_ms: create_time_ms as number })),
+        ).resolves.toBe('advance')
+        expect(recorded).toEqual([])
+        expect(sends).toEqual([])
+        expect(errors.join('\n')).toContain('create_time_ms 不合法')
+      } finally {
+        console.error = previous
+      }
+    },
+  )
+
+  it.each([408, 418])(
+    'advances after status %s passes the hold ceiling and does not post another failure reply',
+    async (status) => {
+      const errors: unknown[] = []
+      const previous = console.error
+      console.error = (...args: unknown[]) => {
+        errors.push(args.join(' '))
+      }
+      try {
+        const { bridge, sends } = makeBridge(new InboundHttpError(status))
+        const msg = textMsg('alice', '做点事')
+        for (let n = 0; n < HOLD_GIVE_UP; n++) {
+          await expect(bridge.handle(msg)).resolves.toBe('hold')
+        }
+        await expect(bridge.handle(msg)).resolves.toBe('advance')
+        expect(sends).toEqual([RECORD_FAILED_REPLY])
+        expect(holdsOf(bridge).size).toBe(0)
+        expect(errors.join('\n')).toContain('放弃并前进')
+        expect(holdCountsTowardGiveUp(new InboundHttpError(status))).toBe(true)
+      } finally {
+        console.error = previous
+      }
+    },
+  )
+
+  it.each([
+    ['503', new InboundHttpError(503)],
+    ['429', new InboundHttpError(429)],
+    ['network', new Error('connect ECONNREFUSED')],
+    [
+      'timeout',
+      Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }),
+    ],
+  ])('keeps holding %s past the ceiling', async (_label, fail) => {
+    const errors: unknown[] = []
+    const previous = console.error
+    console.error = (...args: unknown[]) => {
+      errors.push(args.join(' '))
+    }
+    try {
+      const { bridge, sends } = makeBridge(fail)
+      const msg = textMsg('alice', '做点事')
+      for (let n = 0; n <= HOLD_GIVE_UP; n++) {
+        await expect(bridge.handle(msg)).resolves.toBe('hold')
+      }
+      expect(sends).toEqual([RECORD_FAILED_REPLY])
+      expect(errors.join('\n')).not.toContain('放弃并前进')
+      expect(holdCountsTowardGiveUp(fail)).toBe(false)
+    } finally {
+      console.error = previous
+    }
+  })
+
+  it('clears the consecutive count when a 503 lands between 408s', async () => {
+    const errors: unknown[] = []
+    const previous = console.error
+    console.error = (...args: unknown[]) => {
+      errors.push(args.join(' '))
+    }
+    const scripted = [
+      ...Array.from({ length: 10 }, () => new InboundHttpError(408)),
+      ...Array.from({ length: 3 }, () => new InboundHttpError(503)),
+      ...Array.from({ length: 11 }, () => new InboundHttpError(408)),
+    ]
+    let call = 0
+    const sends: string[] = []
+    const agent = {
+      async recordInbound(): Promise<InboundRecord> {
+        const err = scripted[call]
+        call += 1
+        if (err) throw err
+        return { id: 'wechat:42', outcome: 'started' }
+      },
+    } as unknown as Agent24Client
+    const sender = {
+      async send(_user: string, _ctx: string, text: string): Promise<void> {
+        sends.push(text)
+      },
+    } as unknown as Sender
+    const bridge = new Bridge(agent, sender)
+    const msg = textMsg('alice', '做点事')
+    try {
+      for (let n = 0; n < 10; n++) {
+        await expect(bridge.handle(msg)).resolves.toBe('hold')
+      }
+      expect(holdsOf(bridge).get('42')).toBe(10)
+      for (let n = 0; n < 3; n++) {
+        await expect(bridge.handle(msg)).resolves.toBe('hold')
+      }
+      const sizeAfter503 = holdsOf(bridge).size
+      for (let n = 0; n < 11; n++) {
+        await expect(bridge.handle(msg)).resolves.toBe('hold')
+      }
+      expect(holdsOf(bridge).get('42')).toBe(11)
+      expect(sizeAfter503).toBe(0)
+      expect(errors.join('\n')).not.toContain('放弃并前进')
+      expect(sends).toEqual([RECORD_FAILED_REPLY])
+    } finally {
+      console.error = previous
+    }
+  })
+
+  it.each([400, 403, 413, 422])(
+    'drops the hold entry when status %s advances',
+    async (status) => {
+      let calls = 0
+      const sends: string[] = []
+      const agent = {
+        async recordInbound(): Promise<InboundRecord> {
+          calls += 1
+          if (calls <= 2) throw new InboundHttpError(408)
+          throw new InboundHttpError(status)
+        },
+      } as unknown as Agent24Client
+      const sender = {
+        async send(_user: string, _ctx: string, text: string): Promise<void> {
+          sends.push(text)
+        },
+      } as unknown as Sender
+      const bridge = new Bridge(agent, sender)
+      const msg = textMsg('alice', '做点事', { message_id: status })
+      await expect(bridge.handle(msg)).resolves.toBe('hold')
+      await expect(bridge.handle(msg)).resolves.toBe('hold')
+      expect(holdsOf(bridge).size).toBe(1)
+      await expect(bridge.handle(msg)).resolves.toBe('advance')
+      expect(holdsOf(bridge).size).toBe(0)
+      expect(sends).toEqual([RECORD_FAILED_REPLY])
+    },
+  )
+
+  it.each([undefined, null])(
+    'advances a message with no message_id (%s) without posting or sharing a key',
+    async (message_id) => {
+      const errors: unknown[] = []
+      const previous = console.error
+      console.error = (...args: unknown[]) => {
+        errors.push(args.join(' '))
+      }
+      try {
+        const { bridge, recorded, sends } = makeBridge()
+        const missing = textMsg('alice', '没 id', {
+          message_id: message_id as unknown as number,
+        })
+        await expect(bridge.handle(missing)).resolves.toBe('advance')
+        await expect(bridge.handle(missing)).resolves.toBe('advance')
+        expect(recorded).toEqual([])
+        expect(sends).toEqual([])
+        expect(holdsOf(bridge).size).toBe(0)
+        expect(errors.join('\n')).toContain('缺少 message_id')
+        expect(errors.join('\n')).not.toContain('undefined')
+        await expect(bridge.handle(textMsg('alice', '有 id'))).resolves.toBe('advance')
+        expect(recorded.map((event) => event.id)).toEqual(['wechat:42'])
+      } finally {
+        console.error = previous
+      }
+    },
+  )
 
   it('sends 记录失败 once for the same message id', async () => {
     const { bridge, sends } = makeBridge(new InboundHttpError(500))

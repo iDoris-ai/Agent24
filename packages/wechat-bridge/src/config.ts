@@ -25,6 +25,8 @@ export const CONFIG = {
   },
   POLL_TIMEOUT_MS: 40_000,
   RECONNECT_DELAY_MS: 3_000,
+  /** Ceiling for the hold backoff. Tests lower it; production stays at 60s. */
+  HOLD_BACKOFF_CAP_MS: 60_000,
   MAX_MSG_LEN: 1800,
 
   // ── agent24d (the local daemon this bridge posts events to) ──────────────

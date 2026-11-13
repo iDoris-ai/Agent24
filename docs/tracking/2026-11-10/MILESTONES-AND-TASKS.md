@@ -38,7 +38,7 @@
 | 架构优化（总纲） | 第 0 期：文档与 ADR 收口 | `docs/p0-*`（已合并） | 订正文档与 ADR，补通讯 ADR、路由约定、跟踪文档 | S0-1～S0-7 DONE；S0-8 BACKLOG | 无 | [方案 §4.1](../2026-11-04/ARCH-OPTIMIZATION-PLAN.md) |
 | 架构优化 | 第 1 期：低风险结构调整 | `main`（逐片分支，已合并） | OpenAPI、签名单源、`daemon.json`、状态映射、OD pin、休眠代码、OS 包完整性 | **全部 DONE**（S1-6、S1-8 CANCELLED） | 无 | 方案 §4.2、S1-9 设计 |
 | 架构优化 | 第 2 期：agent24d 瘦身 | 待定 | 拆 `server.rs`，下沉 iDoris / Knowledge / attach，进程组终止原语，CLI 补齐 | 2026-11-10 推进：S2-1/2/3/4a 已合，S2-6/S2-7 按拍板降级为文档已合，S2-4b #1794 已合；agent24d 96,032 → 82,276 行（含已合的 #1794） | S0-5 已合 | 方案 §4.3 |
-| 组件统一 | ADR-038 / ADR-039 收尾 | `main` | 组件契约、清单、统一状态面 | C1–C8 DONE（含 C2，见 §2.2）；C9 未排期 | — | [ADR-038](../../adr/ADR-038-component-contract-v1.md) |
+| 组件统一 | ADR-038 / ADR-039 收尾 | `main` | 组件契约、清单、统一状态面 | C1–C9 DONE（含 C2，见 §2.2；ADR-038-C9：#1825、#1830、#1833、#1831） | — | [ADR-038](../../adr/ADR-038-component-contract-v1.md) |
 | 通讯（Hyphae） | COMM 系列、X11、X7、好友机制 | `ab/comm`（**2939 落后**（2487），该分支领先 11（11）；最后一次提交 2026-10-21） | 尾巴：X11、X7；好友机制之后 | `ab/comm` 盘点存档：未做（尾巴 2）；ADR-044 DONE | Q12 已定 | [ADR-044](../../adr/ADR-044-communication.md)、[COMM-HYPHAE](../../design/COMM-HYPHAE.md) |
 | 决策模型 | D0–D3 | `ab/decide`（**2914 落后**（2462），分支领先 25（25）） | D0 契约 / 规则后端已有，D1 接线未排期 | `ab/decide` 盘点存档：未做（尾巴 2）；当前排期未核实 | — | [PLAN-DECIDE](../../agent/PLAN-DECIDE.md) |
 | 记忆 | P1 | `ab/memory-p1`：本期远端**无此分支**（首期同样未列出），**未核实**是否已合并删除 | 个人记忆生命周期与清除权 | 未核实 | — | [PLAN-MEMORY-P1](../../agent/PLAN-MEMORY-P1.md) |
@@ -123,7 +123,7 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 | C3a / C3b | `/api/v1/components` 统一状态面；OD 状态由桌面上报 | DONE | #1545、#1549 | |
 | C4–C7 | AgentEar、Knowledge、Documents、领域 OS / MCP 清单 | DONE | #1572、#1571、#1570、#1575 | |
 | C8 | Open Design 改由 `SidecarManager` 托管 | DONE | #1580、#1584 | Q1 = (b) |
-| C9 | `requires` 接入授权 | BACKLOG（未排期，不在第 0–2 期） | — | jason 2026-11-10；2026-11-12 起排为主线，实施方案见 [C9-REQUIRES-AUTHZ-PLAN](../2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md) |
+| C9 | `requires` 接入授权（ADR-038-C9） | DONE | #1825、#1830、#1833、#1831 | 2026-11-12 收口。方案 [C9-REQUIRES-AUTHZ-PLAN](../2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md)。2026-11-10 曾记未排期，见 §0 |
 | — | Hyphae 锁只有 darwin-arm64、linux-x64 两个平台 | BACKLOG | — | `rust/crates/agent24-comm/hyphae.lock.json`，本期核对仍是这两个 |
 
 ### 2.3 内核（CORE-2 / CORE-5）
@@ -164,7 +164,8 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 | Open Design 线 OD-M11 / OD-M12 / TPI-W / OC | 2026-10-03 jason（`PAUSED`） | 路由级资源授权等遗留缺口有人排期时，从 OD-M11 起步 |
 | `agent24-sidecar-host`（Rust） | 2026-11-04 Q1 = (b)，冻结 | Windows 支持被排上日程 |
 | S1-6、S1-8、S2-5 | 2026-11-04（Q1 = (b)；Q7 = (c)；Q3 = (B)） | 见各行 |
-| 好友机制、C9 | 2026-11-10 jason：之后 / 未排期 | 尾巴清完、第 2 期之后再议 |
+| 好友机制 | 2026-11-10 jason：之后 | 尾巴清完、第 2 期之后再议 |
+| C9（`requires` 接入授权） | 2026-11-10 曾未排期；2026-11-12 已完成（ADR-038-C9：#1825、#1830、#1833、#1831） | 不再暂停，见 §2.2 |
 | 移动端 | 暂不做，将来仅遥控 | ADR-037 决策 6 的遥控设计 |
 
 ## 4. 跟进项汇总
