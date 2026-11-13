@@ -316,9 +316,11 @@ struct ActivateBody {
 /// HTTP transport accepts (`https`, or `http` to a loopback IP) and 1 to
 /// [`MAX_KNOWLEDGE_BASES`] distinct, non-blank ids.
 /// Same rules as the registry's own check; a test pins the two together.
+/// The endpoint is kept as `validate_base_url` normalises it, which is the
+/// string the HTTP transport connects to (ruling 2026-11-14-f1-endpoint-canonical).
 fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
     let body: ActivateBody = serde_json::from_slice(body).ok()?;
-    agent24_knowledge::validate_base_url(&body.endpoint).ok()?;
+    let base_url = agent24_knowledge::validate_base_url(&body.endpoint).ok()?;
     let ids = &body.knowledge_base_ids;
     let id_ok =
         |id: &String| !id.trim().is_empty() && id.chars().count() <= MAX_KNOWLEDGE_BASE_ID_CHARS;
@@ -326,7 +328,7 @@ fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
     let ids_ok = !ids.is_empty() && ids.len() <= MAX_KNOWLEDGE_BASES && distinct;
     let ok = ids_ok && ids.iter().all(id_ok);
     ok.then_some(Endpoint {
-        base_url: body.endpoint,
+        base_url,
         knowledge_base_ids: body.knowledge_base_ids,
     })
 }
