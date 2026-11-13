@@ -8,7 +8,7 @@ mod signature_command;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -345,17 +345,17 @@ fn http(port: u16, token: &str, method: &str, path: &str, body: &str) -> (u16, S
     (status, resp.to_owned())
 }
 
-fn tmp_home() -> PathBuf {
-    let path = std::env::temp_dir().join(format!(
-        "a24-vr4-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    std::fs::create_dir_all(&path).unwrap();
-    path
+static HOME_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+/// A fresh home per test. The counter keeps parallel tests apart (macOS clock
+/// is microsecond-grained) and `TempDir` removes the directory afterwards.
+fn tmp_home() -> tempfile::TempDir {
+    let n = HOME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    tempfile::Builder::new()
+        .prefix(&format!("a24vr4-{n}-"))
+        .rand_bytes(4)
+        .tempdir_in("/tmp")
+        .unwrap()
 }
 
 fn embedding_rows(home: &Path) -> i64 {
@@ -458,7 +458,8 @@ fn chat_containing(stub: &Stub, needle: &str) -> String {
 
 #[test]
 fn a_remembered_fact_is_embedded_and_a_paraphrase_recalls_it() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let stub = Stub::start(EmbedMode::Semantic);
     let daemon = start_daemon(&home, stub.port, Duration::from_secs(30));
     finish_run(&daemon, &session(&daemon), REMEMBER);
@@ -487,7 +488,8 @@ fn a_remembered_fact_is_embedded_and_a_paraphrase_recalls_it() {
 
 #[test]
 fn daemon_is_ready_while_the_embedding_server_never_answers() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let stub = Stub::start(EmbedMode::Hang);
     let started = Instant::now();
     let daemon = start_daemon(&home, stub.port, Duration::from_secs(20));
@@ -500,7 +502,8 @@ fn daemon_is_ready_while_the_embedding_server_never_answers() {
 
 #[test]
 fn without_an_embedding_service_recall_stays_on_keywords() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let stub = Stub::start(EmbedMode::Reject);
     let daemon = start_daemon(&home, stub.port, Duration::from_secs(30));
     wait_stderr(&daemon, "vector recall off", Duration::from_secs(10));
@@ -527,7 +530,8 @@ fn without_an_embedding_service_recall_stays_on_keywords() {
 
 #[test]
 fn paused_personal_memory_is_not_backfilled() {
-    let home = tmp_home();
+    let home_dir = tmp_home();
+    let home = home_dir.path().to_path_buf();
     let stub = Stub::start(EmbedMode::Hold);
     let daemon = start_daemon(&home, stub.port, Duration::from_secs(30));
     finish_run(&daemon, &session(&daemon), REMEMBER);
