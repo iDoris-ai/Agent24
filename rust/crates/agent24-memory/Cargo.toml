@@ -38,6 +38,7 @@ rustix = { version = "0.38", features = ["fs"] }
 [dev-dependencies]
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tokio-util = "0.7"
 
 [lints]
 workspace = true

@@ -55,6 +55,13 @@
 //! export OMLX_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.omlx/settings.json")))["auth"]["api_key"])')"
 //! cd rust && cargo test -j 4 -p agent24-memory eval_m1::eval_m1_omlx -- --ignored --exact --nocapture
 //! ```
+//!
+//! VR-6 adds three indirect food questions. Two sit in the rewrite band and
+//! must recall the peanut allergy. 「我有什么东西不能吃」already clears `MIN_COSINE`
+//! on 「我不吃辣」, so the rewriter stays off and that case expects the spicy
+//! fact. Set `REWRITE_MODEL` to a local chat model id to score them; leave it
+//! unset and those three are skipped. The original 20 paraphrases and the
+//! no-answer gate do not depend on it.
 
 #![cfg(test)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -63,6 +70,7 @@ use crate::KvStore;
 use crate::assertion::{Assertion, AssertionStore};
 use crate::event::{Origin, Scope, Trust};
 use crate::writer::{Candidate, MemoryWriter};
+use agent24_models::ModelProvider;
 use serde_json::json;
 
 const OWNER: &str = "m1-eval-owner";
@@ -72,6 +80,7 @@ const TOP_K: usize = 5;
 const MIN_VECTOR_ROUTE_QUERIES: usize = 3;
 const PARAPHRASE: &str = "paraphrase";
 const PARAPHRASE_NO_ANSWER: &str = "paraphrase_no_answer";
+const QUERY_REWRITE: &str = "query_rewrite";
 /// `forget`/supersede effective time: must be in the PAST relative to test
 /// execution — `beliefs_as_of`/`search_any`'s active-row semantics are
 /// bi-temporal, so a FUTURE timestamp would not have taken effect yet (a
@@ -358,6 +367,8 @@ struct Metrics {
     paraphrase_fts_hits: usize,
     paraphrase_no_answer: usize,
     paraphrase_no_answer_injected: usize,
+    rewrite_total: usize,
+    rewrite_hits: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -378,8 +389,50 @@ fn pct(n: usize, of: usize) -> String {
     }
 }
 
+fn rewrite_model() -> Option<String> {
+    let model = std::env::var("REWRITE_MODEL").ok()?;
+    let model = model.trim().to_owned();
+    if model.is_empty() { None } else { Some(model) }
+}
+
+fn rewrite_cases() -> Vec<EvalCase> {
+    vec![
+        EvalCase {
+            id: "rw-eat",
+            category: QUERY_REWRITE,
+            query: "我吃东西有什么要注意的",
+            expected_ids: &["f1-peanut"],
+            security_forbidden_ids: &[],
+            distractor_forbidden_ids: &[],
+        },
+        EvalCase {
+            id: "rw-cannot",
+            category: QUERY_REWRITE,
+            // Best cosine is 「我不吃辣」 above MIN_COSINE, so this is a vector
+            // hit, not a near miss. Peanut stays under the cut.
+            query: "我有什么东西不能吃",
+            expected_ids: &["st2-spicy-qualified"],
+            security_forbidden_ids: &[],
+            distractor_forbidden_ids: &[],
+        },
+        EvalCase {
+            id: "rw-takeout",
+            category: QUERY_REWRITE,
+            query: "点外卖要注意什么忌口",
+            expected_ids: &["f1-peanut"],
+            security_forbidden_ids: &[],
+            distractor_forbidden_ids: &[],
+        },
+    ]
+}
+
 async fn run_eval(mode: Mode) {
-    let cases = cases();
+    let rewrite_model = if mode == Mode::Real {
+        rewrite_model()
+    } else {
+        None
+    };
+    let mut cases = cases();
     let paraphrase_cases = cases
         .iter()
         .filter(|case| case.category == PARAPHRASE)
@@ -405,6 +458,11 @@ async fn run_eval(mode: Mode) {
         DISTRACTOR_IDS.len() >= 5,
         "M1-T08 asks for >=5 distractor assertions"
     );
+    if rewrite_model.is_some() {
+        cases.extend(rewrite_cases());
+    } else if mode == Mode::Real {
+        println!("REWRITE_MODEL unset; skipped 3 indirect queries");
+    }
 
     let store = KvStore::open_memory().await.unwrap();
     seed(&store).await;
@@ -433,14 +491,22 @@ async fn run_eval(mode: Mode) {
             // A cold embed is slower than the production 1.5s budget. The
             // ignored run only records quality, so give the request room and
             // keep the breaker from dropping the rest of the set.
-            Some(
-                store
-                    .hybrid_retriever(std::sync::Arc::new(embedder))
-                    .with_timing(
-                        std::time::Duration::from_secs(60),
-                        std::time::Duration::from_secs(30),
-                    ),
-            )
+            let mut hybrid = store
+                .hybrid_retriever(std::sync::Arc::new(embedder))
+                .with_timing(
+                    std::time::Duration::from_secs(60),
+                    std::time::Duration::from_secs(30),
+                );
+            if let Some(model) = &rewrite_model {
+                let rewriter = std::sync::Arc::new(OmlxRewriter::new(model));
+                let sample = rewriter
+                    .complete("我对什么食物过敏")
+                    .await
+                    .expect("rewrite model did not answer the warmup");
+                println!("rewrite warmup ({model}): {sample}");
+                hybrid = hybrid.with_rewriter(rewriter);
+            }
+            Some(hybrid)
         }
     };
     let hybrid = hybrid_retriever.is_some();
@@ -525,6 +591,9 @@ async fn run_eval(mode: Mode) {
             // gate instead (both must hit, see below).
             metrics.cjk_safety_total += 1;
             metrics.cjk_safety_hits += usize::from(hit_at_5);
+        } else if case.category == QUERY_REWRITE {
+            metrics.rewrite_total += 1;
+            metrics.rewrite_hits += usize::from(hit_at_5);
         } else if case.category == PARAPHRASE {
             // Keyword search misses these on purpose. Only the hybrid runs
             // fold them into the 13/14 Hit@5 denominator.
@@ -656,6 +725,12 @@ async fn run_eval(mode: Mode) {
         );
     }
     println!(
+        "query-rewrite Hit@5: {}/{} ({})",
+        metrics.rewrite_hits,
+        metrics.rewrite_total,
+        pct(metrics.rewrite_hits, metrics.rewrite_total)
+    );
+    println!(
         "paraphrase no-answer injection (HARD GATE = 0): {}/{} ({})",
         metrics.paraphrase_no_answer_injected,
         metrics.paraphrase_no_answer,
@@ -712,6 +787,20 @@ async fn run_eval(mode: Mode) {
             metrics.paraphrase_hits,
             metrics.paraphrase_fts_hits
         );
+        assert_eq!(
+            metrics.paraphrase_hits, metrics.paraphrase_total,
+            "the original paraphrase questions must all be recalled"
+        );
+        if rewrite_model.is_some() {
+            assert_eq!(
+                metrics.rewrite_total, 3,
+                "the three indirect questions were not scored"
+            );
+            assert_eq!(
+                metrics.rewrite_hits, metrics.rewrite_total,
+                "indirect questions must all be recalled"
+            );
+        }
     }
 }
 
@@ -850,6 +939,83 @@ async fn print_real_margins(store: &KvStore) {
         "calibration summary: paraphrase min={paraphrase_min:.3} ({paraphrase_min_id}), no-answer max={no_answer_max:.3} ({no_answer_max_query}), MIN_COSINE={}",
         crate::hybrid::MIN_COSINE
     );
+    for case in rewrite_cases() {
+        let query_vec = embedder.embed(case.query).await.unwrap().vector;
+        let peanut = rows
+            .iter()
+            .find(|(id, _)| id == "f1-peanut")
+            .map(|(_, vector)| vector.as_slice())
+            .unwrap_or(&[]);
+        let peanut_cosine = crate::vector::cosine(&query_vec, peanut);
+        let max_cosine = rows
+            .iter()
+            .map(|(_, vector)| crate::vector::cosine(&query_vec, vector))
+            .fold(f32::MIN, f32::max);
+        println!(
+            "calibration rewrite {id} query={q:?} peanut={peanut_cosine:.3} max={max_cosine:.3}",
+            id = case.id,
+            q = case.query
+        );
+    }
+}
+
+/// Local chat model for the three indirect questions. Same prompt as
+/// [`crate::hybrid::rewrite_prompt`]. `REWRITE_MODEL` is the model id.
+struct OmlxRewriter {
+    provider: agent24_models::OpenAiCompatProvider,
+    model: String,
+}
+
+impl OmlxRewriter {
+    fn new(model: &str) -> Self {
+        let url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
+        let key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
+        let provider = agent24_models::OpenAiCompatProvider::new(
+            "omlx",
+            url,
+            Some(key),
+            "local",
+            model.to_owned(),
+        )
+        .loopback_only()
+        .supports_chat_template_kwargs();
+        Self {
+            provider,
+            model: model.to_owned(),
+        }
+    }
+
+    async fn complete(&self, query: &str) -> std::result::Result<String, String> {
+        let req = agent24_models::CompletionRequest {
+            messages: vec![agent24_models::Msg::user(crate::hybrid::rewrite_prompt(
+                query,
+            ))],
+            model: Some(self.model.clone()),
+            tools: vec![],
+            response_format: None,
+            max_tokens: std::num::NonZeroU32::new(64),
+            disable_thinking: true,
+            idoris_headroom_confirmed: false,
+            temperature: Some(0.0),
+            progress: None,
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let response = self
+            .provider
+            .complete(&req, &cancel)
+            .await
+            .map_err(|err| err.to_string())?;
+        Ok(response.message.content.unwrap_or_default())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::hybrid::QueryRewriter for OmlxRewriter {
+    async fn rewrite(&self, query: &str) -> std::result::Result<Vec<String>, String> {
+        let text = self.complete(query).await?;
+        println!("rewrite {query:?} -> {text:?}");
+        Ok(crate::hybrid::normalize_rewrites(&text))
+    }
 }
 
 async fn omlx_embedder(store: &KvStore) -> crate::embedder::LocalEmbedder {
