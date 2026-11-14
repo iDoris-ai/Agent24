@@ -25,8 +25,12 @@ import type {
 // resourceSafeBase; the ready payload's pinVersion must match the host's pin.
 export const AGENT24_HEADLESS_PROTOCOL = 2
 
-/** Each readiness phase (ready line, /api/ready); the total budget is two phases plus 2 s. */
-export const OPEN_DESIGN_READY_PHASE_TIMEOUT_MS = 14_000
+/**
+ * Each readiness phase (ready line, then /api/ready). 60 s covers a first
+ * launch after unpack, when Gatekeeper checks the native modules. The manager
+ * budget stays two phases plus 2 s, so this process's own error still wins.
+ */
+export const OPEN_DESIGN_READY_PHASE_TIMEOUT_MS = 60_000
 export const OPEN_DESIGN_HEALTH_INTERVAL_MS = 10_000
 export const OPEN_DESIGN_HEALTH_TIMEOUT_MS = 3_000
 export const OPEN_DESIGN_MAX_HEALTH_FAILURES = 3
