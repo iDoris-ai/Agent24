@@ -69,7 +69,7 @@
         // `build_router_with_modules` scan below: find the function, cut at
         // the first column-zero `}` (every brace inside a rustfmt'd function
         // body is indented).
-        let server = include_str!("../../server.rs");
+        let server = include_str!("../serve.rs");
         let steps = include_str!("../../serve_steps.rs");
         let serve = &server[server
             .find("pub async fn serve(")
@@ -102,7 +102,7 @@
     /// `stop_usage_writer_is_called_after_the_supervisors_have_stopped`.
     #[test]
     fn serve_authorizes_module_tools_by_protocol() {
-        let server = include_str!("../../server.rs");
+        let server = include_str!("../serve.rs");
         let steps = include_str!("../../serve_steps.rs");
         let serve = &server[server
             .find("pub async fn serve(")
@@ -185,7 +185,7 @@
     /// turns it green again.
     #[test]
     fn stop_usage_writer_is_called_after_the_supervisors_have_stopped() {
-        let src = include_str!("../../server.rs");
+        let src = include_str!("../serve.rs");
         let start = src.find("pub async fn serve(").expect("serve must exist");
         let body = &src[start..];
         let end = body
