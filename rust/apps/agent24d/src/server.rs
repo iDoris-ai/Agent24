@@ -1681,6 +1681,7 @@ pub async fn serve(
     // The user-directory scan runs after the listener is accepting. It must
     // not sit on the path that publishes the ready line.
     let skill_scan_store = state.store.clone();
+    let model_router = embed_backfill.as_ref().map(|_| Arc::clone(&state.router));
     let router = build_router_with_modules(state, module_routes.merge(comm_router));
 
     let still = serve_steps::advertise_readiness(
@@ -1708,10 +1709,10 @@ pub async fn serve(
     };
     // After the ready line. Awaiting the probe here would hold startup on the
     // embedding server (cold load, or a connection that never answers).
-    if let Some(backfill) = embed_backfill {
+    if let (Some(backfill), Some(model_router)) = (embed_backfill, model_router) {
         let backfill_cancel = cancel.clone();
         tokio::spawn(async move {
-            crate::embed_backfill::drive(backfill, backfill_cancel).await;
+            crate::embed_backfill::drive(backfill, model_router, backfill_cancel).await;
         });
     }
     let serve_steps::StillUp {

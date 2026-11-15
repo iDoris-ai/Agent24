@@ -10,7 +10,7 @@ use agent24_memory::{
     assertion::{AssertionStore, BeliefQuery},
     embedder::LocalEmbedder,
     event::{EventQuery, EventStore, Origin, Trust},
-    hybrid::HybridRetriever,
+    hybrid::{HybridRetriever, QueryRewriter},
     session::{CanonicalSession, CompactionPolicy, Summarizer},
     session_log::SessionLog,
 };
@@ -108,13 +108,26 @@ impl EmbedBackfill {
         self.notify.notified()
     }
 
-    /// Same write as [`SessionMemory::with_embedder`].
+    /// Same write as [`SessionMemory::with_embedder`]. No rewriter.
     pub fn install(&self, embedder: Arc<LocalEmbedder>) {
-        let hybrid = Arc::new(self.kv.local_hybrid(embedder));
+        self.install_retriever(embedder, None);
+    }
+
+    /// Install the loopback embedder and, when a local chat model exists, the
+    /// near-miss rewriter. `None` keeps today's keyword-plus-vector recall.
+    pub fn install_retriever(
+        &self,
+        embedder: Arc<LocalEmbedder>,
+        rewriter: Option<Arc<dyn QueryRewriter>>,
+    ) {
+        let mut hybrid = self.kv.local_hybrid(embedder);
+        if let Some(rewriter) = rewriter {
+            hybrid = hybrid.with_rewriter(rewriter);
+        }
         *self
             .hybrid
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hybrid);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(hybrid));
     }
 }
 

@@ -30,6 +30,7 @@ use tokio::sync::Mutex;
 
 use agent24_core::util::{now_iso8601, ulid};
 use agent24_memory::event::{Origin, Trust};
+use agent24_memory::hybrid::{QueryRewriter, normalize_rewrites, rewrite_prompt};
 use agent24_memory::session::Summarizer;
 use agent24_models::router::{ModelRouter, TaskProfile};
 use agent24_models::{CompletionRequest, ModelError, Msg, ToolCallRequest, ToolSpec};
@@ -371,6 +372,58 @@ impl Summarizer for RouterSummarizer {
             return Err("summarizer returned an empty summary".to_owned());
         }
         Ok(summary)
+    }
+}
+
+/// VR-6: rewrite a near-miss question into short retrieval phrases.
+///
+/// Same local-only router path as [`RouterSummarizer`]. The retriever applies
+/// the 2s timeout and falls back to keyword search when this errors.
+pub struct RouterRewriter {
+    router: Arc<ModelRouter>,
+    shutdown: CancellationToken,
+    model: String,
+}
+
+impl RouterRewriter {
+    #[must_use]
+    pub fn new(
+        router: Arc<ModelRouter>,
+        shutdown: CancellationToken,
+        model: impl Into<String>,
+    ) -> Self {
+        Self {
+            router,
+            shutdown,
+            model: model.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl QueryRewriter for RouterRewriter {
+    async fn rewrite(&self, query: &str) -> Result<Vec<String>, String> {
+        let req = CompletionRequest {
+            messages: vec![Msg::user(rewrite_prompt(query))],
+            model: Some(self.model.clone()),
+            tools: vec![],
+            response_format: None,
+            max_tokens: std::num::NonZeroU32::new(64),
+            disable_thinking: true,
+            idoris_headroom_confirmed: false,
+            temperature: Some(0.0),
+            progress: None,
+        };
+        let profile =
+            merge_source_policy(TaskProfile::default(), agent24_store::SourceMode::LocalOnly);
+        let (_provider, res) = self
+            .router
+            .complete(profile, &req, &self.shutdown)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(normalize_rewrites(
+            res.message.content.unwrap_or_default().as_str(),
+        ))
     }
 }
 
