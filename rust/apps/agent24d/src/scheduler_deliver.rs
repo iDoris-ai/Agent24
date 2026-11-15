@@ -575,7 +575,7 @@ mod tests {
     /// function.
     #[test]
     fn the_tick_loop_and_delivery_pump_are_spawned_after_mount_all() {
-        let server = include_str!("server.rs");
+        let server = include_str!("server/serve.rs");
         let steps = include_str!("serve_steps.rs");
         let serve_start = server
             .find("pub async fn serve(")

@@ -57,6 +57,31 @@ describe('parseComponentList', () => {
     expect(code(() => parseComponentList(payload))).toBe('invalid_response')
   })
 
+  it('keeps a legal isolation value and drops a missing or illegal one', () => {
+    const rows = parseComponentList({
+      components: [
+        { ...ROW, isolation: { state: 'isolated', mechanism: 'seatbelt' } },
+        { ...ROW, id: 'documents', isolation: { state: 'not_isolated', reason: 'platform_unsupported' } },
+        { ...ROW, id: 'hyphae', isolation: { state: 'not_isolated', reason: 'form_not_covered' } },
+        { ...ROW, id: 'knowledge' },
+        { ...ROW, id: 'open-design', isolation: null },
+        { ...ROW, id: 'mcp-files', isolation: { state: 'isolated' } },
+        { ...ROW, id: 'sin90', isolation: { state: 'not_isolated', reason: 'maybe' } },
+        { ...ROW, id: 'cos72', isolation: 'seatbelt' },
+      ],
+    })
+    expect(rows.map((row) => row.isolation)).toEqual([
+      { state: 'isolated', mechanism: 'seatbelt' },
+      { state: 'not_isolated', reason: 'platform_unsupported' },
+      { state: 'not_isolated', reason: 'form_not_covered' },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+    ])
+  })
+
   it('drops a malformed kernel field and keeps the rest of the row', () => {
     const rows = parseComponentList({
       components: [{

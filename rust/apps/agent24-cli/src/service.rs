@@ -974,6 +974,9 @@ mod tests {
                                 // opt-in #[ignore] real-filesystem test switch
                                 // (agent24-comm export.rs); the daemon never reads it
                                     | "A24_FS_TEST_DIRS"
+                                // opt-in #[ignore] real-oMLX eval switch
+                                // (agent24-memory eval_m1.rs, VR-6); the daemon never reads it
+                                    | "REWRITE_MODEL"
                                 // debug-only seam behind `--features test-enrollment`
                                 // (a compile_error in release); never set in a LaunchAgent
                                     | "AGENT24_TEST_MIGRATION_GUARD"

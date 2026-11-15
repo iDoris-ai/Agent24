@@ -68,6 +68,83 @@ fn find<'a>(body: &'a Value, id: &str) -> &'a Value {
 const GET: &str = "/api/v1/components";
 const OD: &str = "/api/v1/components/open-design/report";
 
+const REDACTED_KEYS: &[&str] = &["id", "isolation", "provides", "state", "version"];
+
+/// `isolation` is on the redacted view, and its `reason` / `form_not_covered`
+/// would trip a raw substring scan for the host-only `reason` and `form`.
+fn without_isolation(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(without_isolation).collect()),
+        Value::Object(map) => {
+            let mut next = serde_json::Map::new();
+            for (key, child) in map {
+                if key == "isolation" {
+                    continue;
+                }
+                next.insert(key.clone(), without_isolation(child));
+            }
+            Value::Object(next)
+        }
+        other => other.clone(),
+    }
+}
+
+fn isolation_json(os_module: bool) -> Value {
+    if os_module && cfg!(target_os = "macos") {
+        json!({"state": "isolated", "mechanism": "seatbelt"})
+    } else if os_module {
+        json!({"state": "not_isolated", "reason": "platform_unsupported"})
+    } else {
+        json!({"state": "not_isolated", "reason": "form_not_covered"})
+    }
+}
+
+#[test]
+fn isolation_follows_class_and_platform() {
+    assert_eq!(
+        component_isolation(ComponentClass::OsModule, true),
+        Isolation::Isolated {
+            mechanism: IsolationMechanism::Seatbelt,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(component_isolation(ComponentClass::OsModule, true)).unwrap(),
+        json!({"state": "isolated", "mechanism": "seatbelt"})
+    );
+    assert_eq!(
+        component_isolation(ComponentClass::OsModule, false),
+        Isolation::NotIsolated {
+            reason: NotIsolatedReason::PlatformUnsupported,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(component_isolation(ComponentClass::OsModule, false)).unwrap(),
+        json!({"state": "not_isolated", "reason": "platform_unsupported"})
+    );
+    for class in [
+        ComponentClass::Resident,
+        ComponentClass::Sidecar,
+        ComponentClass::Cli,
+        ComponentClass::Attach,
+        ComponentClass::Remote,
+        ComponentClass::Mcp,
+    ] {
+        for macos in [false, true] {
+            assert_eq!(
+                component_isolation(class, macos),
+                Isolation::NotIsolated {
+                    reason: NotIsolatedReason::FormNotCovered,
+                },
+                "{class:?} macos={macos}"
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(component_isolation(ComponentClass::Mcp, true)).unwrap(),
+        json!({"state": "not_isolated", "reason": "form_not_covered"})
+    );
+}
+
 #[tokio::test]
 async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     let (app, host, ..) = app().await;
@@ -115,6 +192,10 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     );
     assert_eq!(find(&body, "knowledge")["state"], "stopped");
     assert_eq!(find(&body, "documents")["state"], "absent");
+    assert_eq!(find(&body, "documents")["isolation"], isolation_json(true));
+    for id in ["idoris", "hyphae", "knowledge", "open-design"] {
+        assert_eq!(find(&body, id)["isolation"], isolation_json(false), "{id}");
+    }
     // Rows with no `requires` lock leave the declaration unknown, not empty.
     for id in ["knowledge", "open-design", "idoris"] {
         assert!(find(&body, id)["declared"].is_null(), "{id}");
@@ -166,6 +247,7 @@ async fn components_show_the_mount_grant_not_the_resolver() {
     let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
     let row = find(&full, "modelnodeps");
     assert_eq!(row["kernel_grants"], json!(["events"]));
+    assert_eq!(row["isolation"], isolation_json(true));
     assert_eq!(
         row["declared"],
         json!({"kernel": ["events", "models"], "operations": []})
@@ -186,6 +268,11 @@ async fn components_show_the_mount_grant_not_the_resolver() {
     let row = find(&redacted, "modelnodeps");
     assert!(row.get("denied").is_none());
     assert!(row.get("kernel_grants").is_none());
+    assert_eq!(row["isolation"], isolation_json(true));
+    assert_eq!(
+        find(&redacted, "hyphae")["isolation"],
+        isolation_json(false)
+    );
     assert!(!redacted.to_string().contains("no_channel"));
 }
 
@@ -282,6 +369,11 @@ async fn no_channel_tracks_the_effective_outcome_not_the_startup_report() {
     assert!(unread["declared"].is_null(), "{unread}");
     assert_eq!(unread["denied"], json!([]));
     assert_eq!(unread["kernel_grants"], json!(["events"]));
+    assert_eq!(
+        unread["isolation"],
+        isolation_json(false),
+        "a row with no manifest is not classified as an OS module"
+    );
     assert!(
         !unread.to_string().contains("not_declared"),
         "an unread manifest does not take the out-of-process ceiling: {unread}"
@@ -452,7 +544,7 @@ async fn other_audiences_get_only_id_version_state_provides() {
 
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
-    let text = redacted.to_string();
+    let text = without_isolation(&redacted).to_string();
     for leaked in [
         "detail",
         "reason",
@@ -472,7 +564,7 @@ async fn other_audiences_get_only_id_version_state_provides() {
     for item in redacted["components"].as_array().unwrap() {
         let mut keys: Vec<_> = item.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["id", "provides", "state", "version"], "{item}");
+        assert_eq!(keys, REDACTED_KEYS, "{item}");
     }
     let od = find(&redacted, "open-design");
     assert_eq!(
@@ -1076,6 +1168,20 @@ async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
         bad["provides"].as_array().unwrap().is_empty(),
         "tools on the record are not provides without a capability id"
     );
+
+    for id in ["documents", "sin90", "cos72", "broken"] {
+        assert_eq!(find(&body, id)["isolation"], isolation_json(true), "{id}");
+    }
+    for id in [
+        "demo",
+        "idoris",
+        "hyphae",
+        "knowledge",
+        "open-design",
+        "mcp-files",
+    ] {
+        assert_eq!(find(&body, id)["isolation"], isolation_json(false), "{id}");
+    }
 }
 
 /// A domain package named `mcp-files` and the MCP server `files` would both
@@ -1403,7 +1509,7 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
     );
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
-    let text = redacted.to_string();
+    let text = without_isolation(&redacted).to_string();
     for leaked in [
         "detail",
         "reason",
@@ -1435,7 +1541,7 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
     for item in redacted["components"].as_array().unwrap() {
         let mut keys: Vec<_> = item.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["id", "provides", "state", "version"]);
+        assert_eq!(keys, REDACTED_KEYS);
     }
 }
 
@@ -1970,9 +2076,9 @@ fn redacted_components_omit_the_health_summary() {
     );
     let full = render(std::slice::from_ref(&item), true);
     let redacted = render(&[item], false);
-    let text = redacted.to_string();
+    let text = without_isolation(&redacted).to_string();
     assert_eq!(redacted["components"][0]["state"], "degraded");
-    assert!(text.contains("nostr-relay"));
+    assert!(redacted.to_string().contains("nostr-relay"));
     for forbidden in [
         "consecutive_failures",
         "relays",
@@ -2008,7 +2114,9 @@ fn shown(item: &Item) -> Value {
 
 fn assert_no_canary(item: &Item, canaries: &[&str]) {
     let host = render(std::slice::from_ref(item), true).to_string();
-    let redacted = render(std::slice::from_ref(item), false).to_string();
+    let redacted_value = render(std::slice::from_ref(item), false);
+    let redacted = redacted_value.to_string();
+    let visible = without_isolation(&redacted_value).to_string();
     for canary in canaries {
         assert!(!host.contains(canary), "{canary} in host view {host}");
         assert!(
@@ -2026,7 +2134,7 @@ fn assert_no_canary(item: &Item, canaries: &[&str]) {
         "basis",
     ] {
         assert!(
-            !redacted.contains(leaked),
+            !visible.contains(leaked),
             "{leaked} in redacted view {redacted}"
         );
     }
@@ -3981,7 +4089,7 @@ async fn documents_d9_entry_lists_provides_and_redacts() {
     let doc = find(&redacted, "documents");
     let mut keys: Vec<_> = doc.as_object().unwrap().keys().cloned().collect();
     keys.sort();
-    assert_eq!(keys, ["id", "provides", "state", "version"]);
+    assert_eq!(keys, REDACTED_KEYS);
     assert_eq!(doc["provides"][0]["id"], "documents");
     assert_eq!(
         sorted_tools(
@@ -3993,7 +4101,7 @@ async fn documents_d9_entry_lists_provides_and_redacts() {
         ),
         DOC_TOOLS
     );
-    let text = doc.to_string();
+    let text = without_isolation(doc).to_string();
     for leaked in ["reason", "form", "detail", "catalog_invalid", "port", "pid"] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -4744,7 +4852,7 @@ async fn documents_expected_vs_actual_reaches_the_list_and_hides_detail_from_oth
     let doc = find(&redacted, "documents");
     assert_eq!(doc["state"], "ready");
     assert_eq!(doc["version"], "9.9.9");
-    let text = doc.to_string();
+    let text = without_isolation(doc).to_string();
     for leaked in [
         "expected_version",
         "actual_version",
@@ -5094,10 +5202,11 @@ fn t8_each_integrity_reason_is_host_only() {
         assert_eq!(full["components"][0]["reason"], reason.code());
         assert_ne!(full["components"][0]["state"], "absent");
         assert_ne!(full["components"][0]["state"], "incompatible");
-        let redacted = render(&[item], false).to_string();
-        assert!(!redacted.contains("reason"), "{redacted}");
-        assert!(!redacted.contains("detail"), "{redacted}");
-        assert!(!redacted.contains("/tmp"), "{redacted}");
-        assert!(!redacted.contains("stderr"), "{redacted}");
+        let redacted = render(&[item], false);
+        let text = without_isolation(&redacted).to_string();
+        assert!(!text.contains("reason"), "{redacted}");
+        assert!(!text.contains("detail"), "{redacted}");
+        assert!(!text.contains("/tmp"), "{redacted}");
+        assert!(!text.contains("stderr"), "{redacted}");
     }
 }

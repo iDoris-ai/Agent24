@@ -8,8 +8,8 @@
 //! 2. [`mint_token`] — a fresh secret for this one handshake.
 //! 3. [`spawn`] — start it, in its own process group, with a cleared
 //!    environment, the proxy's listening socket as fd 3, and its output drained
-//!    into the log. What comes back is a [`ModuleProcess`], the only holder of
-//!    the child.
+//!    into the log. On macOS the trampoline execs it under `sandbox-exec`.
+//!    What comes back is a [`ModuleProcess`], the only holder of the child.
 //!
 //! Supervision (backoff, circuit breaker, startup timeout) is not here: what
 //! "ready" means depends on the handshake (ME3-SUP's second and third slices).
@@ -79,6 +79,9 @@ pub enum LaunchError {
     /// The package tree has more than [`MAX_PACKAGE_ENTRIES`] entries — too
     /// many to check at every start.
     TooLarge { package: PathBuf },
+    /// macOS could not confine the module (no `sandbox-exec`, or the profile
+    /// could not be built). The module is not started.
+    SandboxUnavailable(String),
 }
 
 impl std::fmt::Display for LaunchError {
@@ -108,7 +111,91 @@ impl std::fmt::Display for LaunchError {
                  refusing to run a module from it",
                 p.display()
             ),
+            Self::SandboxUnavailable(why) => write!(
+                f,
+                "refusing to start the module without seatbelt isolation: {why}"
+            ),
         }
+    }
+}
+
+/// Seatbelt profile text. Set on the trampoline only, and removed before the
+/// module's program starts. Not a variable a service manager passes in — the
+/// daemon mints it per spawn. Looked up by walking the environment, same as
+/// [`ENV_TRAMPOLINE`], so a scan for `env::var("…")` does not treat it as one.
+const ENV_SEATBELT_PROFILE: &str = "A24_SEATBELT_PROFILE";
+
+/// Canonical program path plus the profile, on macOS. The profile is built
+/// from the path `resolve` returned (so a symlink's own directory is allowed)
+/// and the process is exec'd at the canonical path (seatbelt refused the
+/// symlink spelling even when that directory was allowed — measured, SBX-0).
+#[cfg(target_os = "macos")]
+fn prepare_seatbelt(
+    package_dir: &Path,
+    data_dir: &Path,
+    callback_sock: &Path,
+    program: &Path,
+) -> Result<(PathBuf, String), LaunchError> {
+    ensure_seatbelt_available(Path::new("/usr/bin/sandbox-exec"))?;
+    let exec_program = crate::sandbox::canonical(program).map_err(|error| {
+        LaunchError::SandboxUnavailable(format!(
+            "could not canonicalise the module program {}: {error}",
+            program.display()
+        ))
+    })?;
+    let home = std::env::vars_os().find_map(|(k, v)| (k == "HOME").then(|| PathBuf::from(v)));
+    let data_dir = crate::sandbox::check_data_dir(data_dir, home.as_deref())
+        .map_err(|error| LaunchError::SandboxUnavailable(error.0))?;
+    let temp = std::env::temp_dir();
+    // A test launcher is a tiny binary that `execv`s an absolute interpreter
+    // path compiled into it. The profile's program is the launcher, so that
+    // interpreter would otherwise be unreadable. Production binaries are not
+    // scanned (the cap) and do not gain the interpreter's prefix.
+    let embedded = embedded_interpreter(program);
+    let also: Vec<&Path> = embedded.iter().map(PathBuf::as_path).collect();
+    let profile = crate::sandbox::seatbelt_profile(&crate::sandbox::SeatbeltInputs {
+        package_dir,
+        data_dir: &data_dir,
+        callback_sock,
+        program,
+        also_programs: &also,
+        temp_dir: &temp,
+        home_dir: home.as_deref(),
+    })
+    .map_err(|error| LaunchError::SandboxUnavailable(error.0))?;
+    Ok((exec_program, profile))
+}
+
+/// `python3`'s absolute path, when `program` is a small file that contains
+/// that path as bytes — the shape of the test launcher in
+/// `agent24-os-packages`. Anything bigger than a launcher is left alone.
+#[cfg(target_os = "macos")]
+fn embedded_interpreter(program: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let meta = std::fs::metadata(program).ok()?;
+    if !meta.is_file() || meta.len() > 1024 * 1024 {
+        return None;
+    }
+    let bytes = std::fs::read(program).ok()?;
+    let python = which("python3")?;
+    let needle = python.as_os_str().as_bytes();
+    bytes
+        .windows(needle.len())
+        .any(|window| window == needle)
+        .then_some(python)
+}
+
+/// `/usr/bin/sandbox-exec` must be a real file. A missing one is a machine
+/// that cannot confine a module, and on macOS that refuses the start.
+#[cfg(target_os = "macos")]
+pub(crate) fn ensure_seatbelt_available(sandbox_exec: &Path) -> Result<(), LaunchError> {
+    if sandbox_exec.is_file() {
+        Ok(())
+    } else {
+        Err(LaunchError::SandboxUnavailable(format!(
+            "{p} is not available",
+            p = sandbox_exec.display()
+        )))
     }
 }
 
@@ -396,6 +483,9 @@ pub fn run_as_trampoline_if_asked() {
         eprintln!("agent24: the module trampoline was started without a program");
         std::process::exit(127);
     };
+    // Walked, not `env::var`: see [`ENV_SEATBELT_PROFILE`]. Removed below, so
+    // the module does not see the profile text.
+    let seatbelt = std::env::vars_os().find_map(|(k, v)| (k == ENV_SEATBELT_PROFILE).then_some(v));
     close_fds::set_fds_cloexec_threadsafe(LISTEN_FD + 1, &[]);
     // `close_fds` covers the whole range when `close_range` works (Linux) or
     // when it can walk FD_DIR; otherwise — and silently, even part-way through
@@ -422,9 +512,35 @@ pub fn run_as_trampoline_if_asked() {
             std::process::exit(127);
         }
     }
-    let error = std::process::Command::new(&program)
+    // macOS: `sandbox-exec` applies the profile and execs the module in this
+    // same process, so the pid and the process group stay the ones `start`
+    // recorded. No profile means no isolation — refuse, do not exec the module.
+    // Other platforms ignore the variable and exec the module directly (SBX-2
+    // is what will say "not isolated" on Linux).
+    #[cfg(target_os = "macos")]
+    let mut cmd = match seatbelt {
+        Some(profile) => {
+            let mut cmd = std::process::Command::new("/usr/bin/sandbox-exec");
+            cmd.arg("-p").arg(profile).arg(&program);
+            cmd
+        }
+        None => {
+            eprintln!(
+                "agent24: refusing to start a module without a seatbelt profile \
+                 ({ENV_SEATBELT_PROFILE} was not set)"
+            );
+            std::process::exit(127);
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut cmd = {
+        let _ = seatbelt;
+        std::process::Command::new(&program)
+    };
+    let error = cmd
         .args(argv)
         .env_remove(ENV_TRAMPOLINE)
+        .env_remove(ENV_SEATBELT_PROFILE)
         // macOS CoreFoundation writes this into the environment of a process
         // that initializes it. Where it came from in the one run that showed it
         // is not settled — the test binary links no CoreFoundation (`otool -L`:
@@ -564,6 +680,17 @@ fn start(
     use command_fds::{CommandFdExt, FdMapping};
 
     let token = mint_token()?;
+    // The module can only write its data directory. Create it here, after the
+    // package identity was taken, so the directory exists before the profile
+    // confines the process (creating it is a write to the parent).
+    if let Err(error) = std::fs::create_dir_all(spec.data_dir) {
+        return Err(LaunchError::Spawn(error));
+    }
+    #[cfg(target_os = "macos")]
+    let (exec_program, seatbelt) =
+        prepare_seatbelt(spec.package_dir, spec.data_dir, spec.callback_sock, program)?;
+    #[cfg(not(target_os = "macos"))]
+    let exec_program = program.to_path_buf();
     // The generation's address is the path its listener is bound at (D4,
     // FU-60): read now, before the listener moves into the command. Cloned,
     // not borrowed from `spec.http_path` — that value moves into the
@@ -575,7 +702,7 @@ fn start(
     let mut cmd = tokio::process::Command::new(&spec.trampoline.program);
     cmd.args(&spec.trampoline.args)
         .arg(TRAMPOLINE_ARG)
-        .arg(program)
+        .arg(&exec_program)
         .args(&spec.command.args)
         .current_dir(spec.package_dir)
         .env_clear()
@@ -591,6 +718,10 @@ fn start(
         // 0 means "a new group whose id is this child's pid". The trampoline
         // execs in place, so the module keeps that pid and that group.
         .process_group(0);
+    // Only the trampoline reads this. It strips the variable before the
+    // module's program is executed. Other platforms do not set it.
+    #[cfg(target_os = "macos")]
+    cmd.env(ENV_SEATBELT_PROFILE, seatbelt);
     cmd.fd_mappings(vec![FdMapping {
         parent_fd: spec.listener.into(),
         child_fd: LISTEN_FD,
@@ -1076,6 +1207,12 @@ mod tests {
         std::fs::read_to_string(t.join(name)).unwrap_or_default()
     }
 
+    /// Where a sandboxed module is allowed to write. The package directory is
+    /// read-only once seatbelt is on, so probes go here.
+    fn data_out(t: &Path) -> String {
+        read(&t.join("data"), "out")
+    }
+
     /// The child must be in its OWN process group, so a stop can signal the
     /// whole tree. A module that starts helpers and is killed by pid alone
     /// leaves them running — holding ports, holding the package directory, and
@@ -1084,13 +1221,18 @@ mod tests {
     async fn the_child_gets_its_own_process_group() {
         let t = pkg();
         // Output goes to a file: the child's stdout is drained into the log.
-        exe(
-            &t.path().join("bin/mod"),
-            "#!/bin/sh\nps -o pgid= -p $$ | tr -d ' ' > out\n",
-        );
-        let mut p = start(t.path(), &cmd("bin/mod", &[])).await;
+        // `getpgrp` is the child's own group. `ps` asks seatbelt for other
+        // processes, which this profile does not allow.
+        let mut p = start(
+            t.path(),
+            &python(
+                "import os\n\
+                 open(os.environ['A24_DATA_DIR']+'/out','w').write(str(os.getpgrp()))\n",
+            ),
+        )
+        .await;
         exited(&mut p).await;
-        let child_pgid: i32 = read(t.path(), "out").trim().parse().unwrap();
+        let child_pgid: i32 = data_out(t.path()).trim().parse().unwrap();
 
         assert_eq!(
             child_pgid,
@@ -1108,9 +1250,13 @@ mod tests {
     #[tokio::test]
     async fn a_run_carries_its_package_identity() {
         let t = pkg();
-        exe(&t.path().join("bin/mod"), "#!/bin/sh\necho changed > out\n");
+        exe(&t.path().join("bin/mod"), "#!/bin/sh\nexit 0\n");
         let before = crate::artifact::identity(t.path()).unwrap();
         let mut p = start(t.path(), &cmd("bin/mod", &[])).await;
+        // The snapshot is taken before the child exists. Under seatbelt the
+        // child cannot write the package, so the parent writes afterwards:
+        // the run keeps the identity from before that write.
+        std::fs::write(t.path().join("changed"), b"changed\n").unwrap();
         exited(&mut p).await;
         assert_eq!(p.generation().artifact(), Some(before.as_str()));
         assert_ne!(
@@ -1146,12 +1292,12 @@ mod tests {
         // mutation that ALSO put the token in argv left that version green.)
         exe(
             &t.path().join("bin/mod"),
-            "#!/bin/sh\n{ echo \"$A24_HANDSHAKE_TOKEN\"; echo \"$@\"; } > out\n",
+            "#!/bin/sh\n{ echo \"$A24_HANDSHAKE_TOKEN\"; echo \"$@\"; } > \"$A24_DATA_DIR/out\"\n",
         );
         let mut p = start(t.path(), &cmd("bin/mod", &["--flag"])).await;
         let token = p.token().to_owned();
         exited(&mut p).await;
-        let out = read(t.path(), "out");
+        let out = data_out(t.path());
         let mut lines = out.lines();
 
         assert_eq!(lines.next().unwrap_or_default().trim(), token, "env var");
@@ -1198,9 +1344,9 @@ mod tests {
             "precondition: the parent has a variable the child must not inherit"
         );
         let t = pkg();
-        let mut p = start(t.path(), &cmd("sh", &["-c", "env > out"])).await;
+        let mut p = start(t.path(), &cmd("sh", &["-c", "env > \"$A24_DATA_DIR/out\""])).await;
         exited(&mut p).await;
-        let out = read(t.path(), "out");
+        let out = data_out(t.path());
         let env: std::collections::BTreeMap<&str, &str> =
             out.lines().filter_map(|l| l.split_once('=')).collect();
 
@@ -1378,13 +1524,13 @@ mod tests {
                  \x20   except OSError:\n\
                  \x20       return False\n\
                  fds = [fd for fd in range(0, 1024) if is_open(fd)]\n\
-                 open('out','w').write(' '.join(map(str, fds)))",
+                 open(os.environ['A24_DATA_DIR']+'/out','w').write(' '.join(map(str, fds)))",
             ),
         )
         .await;
         exited(&mut p).await;
         // 0–3 open is also the control: the probe sees open fds.
-        assert_eq!(read(t.path(), "out"), "0 1 2 3");
+        assert_eq!(data_out(t.path()), "0 1 2 3");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
         drop(high);
     }
@@ -1399,12 +1545,15 @@ mod tests {
             t.path(),
             &cmd(
                 "sh",
-                &["-c", "head -c 2097152 /dev/zero >&2; echo done > out"],
+                &[
+                    "-c",
+                    "head -c 2097152 /dev/zero >&2; echo done > \"$A24_DATA_DIR/out\"",
+                ],
             ),
         )
         .await;
         exited(&mut p).await;
-        assert_eq!(read(t.path(), "out").trim(), "done");
+        assert_eq!(data_out(t.path()).trim(), "done");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
@@ -1536,7 +1685,7 @@ mod tests {
              \x20   except OSError:\n\
              \x20       return False\n\
              fds = [fd for fd in range(0, 1024) if is_open(fd)]\n\
-             open('out','w').write(' '.join(map(str, fds)))";
+             open(os.environ['A24_DATA_DIR']+'/out','w').write(' '.join(map(str, fds)))";
         let dirs: Vec<tempfile::TempDir> = (0..12).map(|_| pkg()).collect();
         let command = python(report);
         let mut starting = tokio::task::JoinSet::new();
@@ -1554,7 +1703,7 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         churn.join().unwrap();
         for d in &dirs {
-            assert_eq!(read(d.path(), "out"), "0 1 2 3", "{}", d.path().display());
+            assert_eq!(data_out(d.path()), "0 1 2 3", "{}", d.path().display());
         }
         for p in procs {
             let _ = p.stop(std::time::Duration::from_millis(100)).await;
@@ -1570,12 +1719,12 @@ mod tests {
     async fn a_long_argument_list_reaches_the_module_whole() {
         let t = pkg();
         let arg = "a".repeat(100);
-        let mut args = vec!["-c", "echo $# > out", "sh"];
+        let mut args = vec!["-c", "echo $# > \"$A24_DATA_DIR/out\"", "sh"];
         args.extend(std::iter::repeat_n(arg.as_str(), 2000));
         let mut p = start(t.path(), &cmd("sh", &args)).await;
         let exit = exited(&mut p).await;
         assert_eq!(exit.code, Some(0), "{exit}");
-        assert_eq!(read(t.path(), "out").trim(), "2000");
+        assert_eq!(data_out(t.path()).trim(), "2000");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 
@@ -1644,5 +1793,181 @@ mod tests {
         );
         // Control: readable again, and it passes.
         resolve(&cmd("bin/mod", &[]), t.path()).expect("readable");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_missing_sandbox_exec_is_a_refusal() {
+        let err = ensure_seatbelt_available(Path::new("/no/such/sandbox-exec")).unwrap_err();
+        let text = err.to_string();
+        assert!(
+            text.contains("refusing to start the module without seatbelt isolation"),
+            "{text}"
+        );
+        assert!(text.contains("is not available"), "{text}");
+    }
+
+    /// SBX-1: seatbelt lets the module write its data directory (including a
+    /// SQLite WAL), refuses a file in `$HOME` and a TCP connect, and still
+    /// passes the handshake plus one HTTP call on the inherited listener.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_confines_files_and_tcp_and_the_handshake_still_works() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let home = std::env::vars_os()
+            .find_map(|(k, v)| (k == "HOME").then_some(v))
+            .expect("HOME");
+        let secret = Path::new(&home).join(".agent24-sbx1-denied");
+        std::fs::write(&secret, b"deny-me").unwrap();
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _remove = RemoveOnDrop(secret.clone());
+
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        let home_json = serde_json::to_string(&secret.display().to_string()).unwrap();
+        let script = format!(
+            r#"
+import json, os, socket, sqlite3
+data = os.environ["A24_DATA_DIR"]
+home_path = {home_json}
+port = {port}
+report = {{}}
+db = os.path.join(data, "probe.db")
+con = sqlite3.connect(db)
+report["journal"] = con.execute("pragma journal_mode=wal").fetchone()[0]
+con.execute("create table t(x)")
+con.execute("insert into t values (1)")
+con.commit()
+report["wal"] = sorted(n for n in os.listdir(data) if n.startswith("probe.db"))
+con.close()
+with open(os.path.join(data, "marker"), "w") as fh:
+    fh.write("ok")
+report["write"] = "ok"
+try:
+    open(home_path, "rb").read()
+    report["home"] = 0
+except OSError as e:
+    report["home"] = e.errno if e.errno is not None else -1
+sock = socket.socket()
+sock.settimeout(2)
+try:
+    sock.connect(("127.0.0.1", port))
+    report["tcp"] = 0
+except OSError as e:
+    report["tcp"] = e.errno if e.errno is not None else -1
+sock.close()
+def dump():
+    with open(os.path.join(data, "report.json"), "w") as fh:
+        json.dump(report, fh)
+dump()
+cb = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+frame = {{"jsonrpc":"2.0","method":"initialize","id":"1","params":{{"protocol_versions":{{"min":1,"max":1}},"module":"cos72","manifest_digest":"sha256:abc","auth_token":os.environ["A24_HANDSHAKE_TOKEN"],"capabilities":[]}}}}
+cb.sendall((json.dumps(frame) + "\n").encode())
+buf = b""
+while b"\n" not in buf:
+    chunk = cb.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+report["handshake"] = "ok" if b'"result"' in buf else "bad"
+dump()
+http = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+conn, _addr = http.accept()
+req = b""
+while b"\r\n\r\n" not in req:
+    chunk = conn.recv(4096)
+    if not chunk:
+        break
+    req += chunk
+conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ntool-ok")
+conn.close()
+report["tool"] = "ok"
+dump()
+"#
+        );
+
+        let state = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let callbacks = crate::endpoint::CallbackDir::create(state.path()).unwrap();
+        let cb = callbacks.listen_next().unwrap();
+        let cb_path = cb.path().to_owned();
+        let (http_listener, http_path) = listener();
+        let http_path_buf = http_path.path().to_owned();
+        let t = pkg();
+        let trampoline = test_trampoline();
+        let command = python(&script);
+        let mut p = spawn(LaunchSpec {
+            name: "t",
+            command: &command,
+            package_dir: t.path(),
+            data_dir: &t.path().join("data"),
+            callback_sock: &cb_path,
+            trampoline: &trampoline,
+            listener: http_listener,
+            http_path,
+        })
+        .await
+        .expect("spawn");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let stream = cb.accept_one(deadline).await.expect("callback connect");
+        let expect = crate::initialize::Expectation {
+            module: "cos72".to_owned(),
+            manifest_digest: "sha256:abc".to_owned(),
+            auth_token: p.token().to_owned(),
+            kernel_versions: crate::version::VersionRange::new(1, 1).unwrap(),
+            offer: crate::initialize::Offer::none(),
+        };
+        crate::endpoint::handshake(stream, &expect, deadline)
+            .await
+            .expect("handshake");
+
+        let mut conn = tokio::net::UnixStream::connect(&http_path_buf)
+            .await
+            .unwrap();
+        conn.write_all(b"POST /tool HTTP/1.1\r\nHost: module\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            conn.read_to_end(&mut body),
+        )
+        .await
+        .expect("no tool answer within 30s")
+        .unwrap();
+        assert!(
+            body.windows(7).any(|window| window == b"tool-ok"),
+            "{body:?}"
+        );
+        let exit = exited(&mut p).await;
+        assert_eq!(exit.code, Some(0), "{exit}");
+        let report: serde_json::Value =
+            serde_json::from_str(&read(&t.path().join("data"), "report.json")).unwrap();
+        assert_eq!(report["write"], "ok", "{report}");
+        assert_eq!(report["journal"], "wal", "{report}");
+        assert!(
+            report["wal"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|name| name == "probe.db-wal"),
+            "{report}"
+        );
+        assert_eq!(report["home"], 1, "{report}");
+        assert_eq!(report["tcp"], 1, "{report}");
+        assert_eq!(report["handshake"], "ok", "{report}");
+        assert_eq!(report["tool"], "ok", "{report}");
+        drop(tcp);
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 }

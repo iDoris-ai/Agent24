@@ -98,7 +98,8 @@ type FetchFn = typeof fetch
 type CreativeChild = ChildProcess & { stdout: Readable; stderr: Readable }
 
 const DEFAULT_PORT = 7456
-const DEFAULT_READY_TIMEOUT_MS = 15_000
+/** Checkout path, per phase (origin line, then /api/ready). Same 60 s as the packaged phases. */
+const DEFAULT_READY_TIMEOUT_MS = 60_000
 const CHECKOUT_STOP_TIMEOUT_MS = 5_000
 /** before-quit waits at most this long for Creative to stop: 15 s grace + 5 s kill + slack. */
 export const CREATIVE_QUIT_STOP_BUDGET_MS = 22_000

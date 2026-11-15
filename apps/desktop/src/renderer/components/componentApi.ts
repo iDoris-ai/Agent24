@@ -32,12 +32,19 @@ export interface ComponentView {
   declared?: ComponentDeclared
   /** Present on the host view when the denial list parsed. */
   denied?: ComponentDenial[]
+  /** Both views. Omitted when missing or not one of the two known shapes. */
+  isolation?: ComponentIsolation
 }
 
 export interface ComponentDenial {
   item: string
   code: string
 }
+
+/** SBX-2. Absent when the daemon is older, or when the field is malformed. */
+export type ComponentIsolation =
+  | { state: 'isolated'; mechanism: 'seatbelt' }
+  | { state: 'not_isolated'; reason: 'platform_unsupported' | 'form_not_covered' }
 
 export class ComponentApiError extends Error {
   constructor(readonly code: 'backend_not_ready' | 'request_failed' | 'invalid_response') {
@@ -70,6 +77,21 @@ function parseDeclared(value: unknown): ComponentDeclared | undefined {
   const operations = parseStringList(declared.operations)
   if (kernel === undefined || operations === undefined) return undefined
   return { kernel, operations }
+}
+
+function parseIsolation(value: unknown): ComponentIsolation | undefined {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined
+  const row = value as Record<string, unknown>
+  if (row.state === 'isolated' && row.mechanism === 'seatbelt') {
+    return { state: 'isolated', mechanism: 'seatbelt' }
+  }
+  if (
+    row.state === 'not_isolated' &&
+    (row.reason === 'platform_unsupported' || row.reason === 'form_not_covered')
+  ) {
+    return { state: 'not_isolated', reason: row.reason }
+  }
+  return undefined
 }
 
 function parseDenied(value: unknown): ComponentDenial[] | undefined {
@@ -118,6 +140,10 @@ export function parseComponentView(value: unknown): ComponentView {
   if (row.denied !== undefined) {
     const denied = parseDenied(row.denied)
     if (denied !== undefined) view.denied = denied
+  }
+  if (row.isolation !== undefined) {
+    const isolation = parseIsolation(row.isolation)
+    if (isolation !== undefined) view.isolation = isolation
   }
   return view
 }

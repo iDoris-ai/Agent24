@@ -1,17 +1,22 @@
 //! VR-4: after the ready line, attach the loopback embedder and keep the
-//! owner's vectors caught up. Nothing here runs on the startup path.
+//! owner's vectors caught up. VR-6 attaches the near-miss rewriter in the
+//! same place when the router already has a local chat model. Nothing here
+//! runs on the startup path.
 
 use std::sync::Arc;
 
-use agent24_agent::EmbedBackfill;
+use agent24_agent::{EmbedBackfill, RouterRewriter};
 use agent24_memory::embedder::LocalEmbedder;
+use agent24_memory::hybrid::QueryRewriter;
 use agent24_memory::vector::Embedder;
 use agent24_models::EmbeddingClient;
+use agent24_models::router::ModelRouter;
+use agent24_protocol::Model;
 use tokio_util::sync::CancellationToken;
 
 /// Probe, attach, reindex, then wait for remembers. Returns when `cancel` fires
 /// or the embedder cannot be built (keyword search stays on).
-pub async fn drive(link: EmbedBackfill, cancel: CancellationToken) {
+pub async fn drive(link: EmbedBackfill, router: Arc<ModelRouter>, cancel: CancellationToken) {
     if cancel.is_cancelled() {
         return;
     }
@@ -39,7 +44,8 @@ pub async fn drive(link: EmbedBackfill, cancel: CancellationToken) {
             return;
         }
     };
-    link.install(Arc::clone(&embedder));
+    let rewriter = local_rewriter(&router, &cancel).await;
+    link.install_retriever(Arc::clone(&embedder), rewriter);
     let model = embedder.model_id().to_owned();
     backfill_once(&link, &embedder, &cancel).await;
     match link
@@ -99,6 +105,49 @@ async fn backfill_once(link: &EmbedBackfill, embedder: &LocalEmbedder, cancel: &
         // text or an embeddings response body.
         tracing::warn!(reason = %log_reason(&err), "embedding backfill failed");
     }
+}
+
+/// The router's default model, when a local provider is actually serving it
+/// and it is not the embedding model. Anything else (OCR, speech, image)
+/// stays off: recall then behaves as it did before VR-6.
+async fn local_rewriter(
+    router: &Arc<ModelRouter>,
+    cancel: &CancellationToken,
+) -> Option<Arc<dyn QueryRewriter>> {
+    let Some(preferred) = router.default_model() else {
+        tracing::info!("query rewrite off; no local chat model");
+        return None;
+    };
+    let preferred = preferred.to_owned();
+    if !is_chat_model(&preferred) {
+        tracing::info!("query rewrite off; no local chat model");
+        return None;
+    }
+    let models = router.models(cancel).await;
+    let served = models
+        .iter()
+        .any(|model| model.id == preferred && is_local(model));
+    if !served {
+        tracing::info!("query rewrite off; no local chat model");
+        return None;
+    }
+    tracing::info!(model = %preferred, "query rewrite on");
+    Some(Arc::new(RouterRewriter::new(
+        Arc::clone(router),
+        cancel.clone(),
+        preferred,
+    )))
+}
+
+fn is_local(model: &Model) -> bool {
+    model.tier.eq_ignore_ascii_case("local") || model.tier.eq_ignore_ascii_case("lora")
+}
+
+fn is_chat_model(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id != agent24_models::DEFAULT_EMBED_MODEL.to_ascii_lowercase()
+        && !id.contains("embed")
+        && !id.contains("bge")
 }
 
 /// One short line. Embedding failures already omit the response body (VR-1);
