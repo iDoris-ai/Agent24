@@ -1703,3 +1703,47 @@ async fn the_approval_shows_the_endpoint_the_transport_connects_to() {
         );
     }
 }
+
+/// #1854 I-1: raw endpoints that `shown` itself would refuse (a newline in
+/// the host, a bidi override in the path) are approved, because the dialog
+/// shows the normalised connect target, in which neither character survives.
+#[tokio::test]
+async fn the_approval_accepts_a_raw_endpoint_whose_hidden_characters_normalise_away() {
+    for (raw, canonical) in [
+        ("https://kb.exa\nmple/x", "https://kb.example/x"),
+        (
+            "https://kb.example/\u{202e}x",
+            "https://kb.example/%E2%80%AEx",
+        ),
+    ] {
+        assert_eq!(
+            crate::capabilities::first_party::shown(raw),
+            None,
+            "{raw:?}"
+        );
+        let (state, peer, token, capture) = captured_shell().await;
+        let body = serde_json::json!({ "seq": 1, "endpoint": raw,
+                                       "knowledge_base_ids": ["kb-a"] })
+        .to_string();
+        state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .remember_knowledge_request(
+                &token.token_id,
+                "PUT",
+                BINDING_TEMPLATE,
+                BINDING,
+                body.as_bytes(),
+            );
+        let _grant = approve(&state, &peer, &token.token_id, "PUT", BINDING, &body).await;
+        let shown = capture.0.lock().unwrap();
+        assert_eq!(
+            approval_details(shown.last().unwrap()),
+            format!(
+                "activate Knowledge binding \"b1\" for \"{canonical}\"; knowledge bases: [\"kb-a\"]; sequence 1"
+            ),
+            "{raw:?}"
+        );
+    }
+}
