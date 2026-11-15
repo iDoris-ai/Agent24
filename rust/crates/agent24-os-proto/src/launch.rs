@@ -86,8 +86,8 @@ pub enum LaunchError {
     /// macOS could not confine the module (no `sandbox-exec`, or the profile
     /// could not be built). The module is not started.
     SandboxUnavailable(String),
-    /// The module temp directory is a symlink, or not a directory. Following
-    /// it to clear it would delete somewhere else. The module is not started.
+    /// The module temp directory could not be inspected, replaced, cleared or
+    /// created. The module is not started.
     UnsafeTemp(String),
 }
 
@@ -1419,43 +1419,41 @@ mod tests {
 
     /// A symlink where `<data>/tmp` should be is not followed and not cleared.
     /// Starting would otherwise delete whatever the link points at.
-    #[tokio::test]
-    async fn a_symlink_module_temp_dir_refuses_to_start() {
+    #[test]
+    fn an_odd_module_temp_entry_is_replaced_and_its_target_kept() {
         let t = pkg();
         let data = t.path().join("data");
         std::fs::create_dir_all(&data).unwrap();
         let elsewhere = t.path().join("elsewhere");
         std::fs::create_dir_all(&elsewhere).unwrap();
         std::fs::write(elsewhere.join("keep"), b"keep").unwrap();
+        // A symlink leaf: unlinked, not followed.
         std::os::unix::fs::symlink(&elsewhere, data.join("tmp")).unwrap();
-        let (listener, http_path) = listener();
-        let trampoline = test_trampoline();
-        let command = cmd("sh", &["-c", "exit 0"]);
-        let err = spawn(LaunchSpec {
-            name: "t",
-            command: &command,
-            package_dir: t.path(),
-            data_dir: &data,
-            callback_sock: &t.path().join("cb.sock"),
-            trampoline: &trampoline,
-            listener,
-            http_path,
-        })
-        .await
-        .expect_err("a symlink temp directory must refuse the start");
-        let text = err.to_string();
-        assert!(
-            text.contains("is a symlink") && text.contains("refusing to start"),
-            "{text}"
-        );
-        assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
+        crate::sandbox::reset_module_temp(&data).expect("a symlink leaf is replaced");
         assert!(
             data.join("tmp")
                 .symlink_metadata()
                 .unwrap()
                 .file_type()
-                .is_symlink()
+                .is_dir()
         );
+        assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
+        // A plain file leaf.
+        std::fs::remove_dir(data.join("tmp")).unwrap();
+        std::fs::write(data.join("tmp"), b"x").unwrap();
+        crate::sandbox::reset_module_temp(&data).expect("a file leaf is replaced");
+        assert!(
+            data.join("tmp")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+        // A symlink inside tmp: unlinked, its target kept.
+        std::os::unix::fs::symlink(&elsewhere, data.join("tmp/link")).unwrap();
+        crate::sandbox::reset_module_temp(&data).unwrap();
+        assert!(data.join("tmp/link").symlink_metadata().is_err());
+        assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
     }
 
     /// SPEC-ME3 §1: the kernel opens the listening socket and hands it over as

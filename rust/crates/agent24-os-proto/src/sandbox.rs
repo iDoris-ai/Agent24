@@ -192,42 +192,32 @@ pub fn check_data_dir(data_dir: &Path, home: Option<&Path>) -> Result<PathBuf, P
 /// `TMPDIR`, `TMP` and `TEMP`.
 ///
 /// The leaf is inspected with `symlink_metadata` before anything is removed.
-/// A symlink (or anything that is not a plain directory) refuses the start:
-/// clearing through it would delete another tree. Only entries inside a real
-/// directory are removed. The returned path is canonical and ends with `/`,
+/// A symlink (or anything that is not a plain directory) is unlinked, never
+/// followed, and a fresh directory made in its place. Only entries inside a
+/// real directory are removed. The returned path is canonical and ends with `/`,
 /// which is how macOS spells `TMPDIR`.
 ///
 /// # Errors
 ///
-/// [`ProfileError`] when the leaf is not a plain directory, or it cannot be
-/// created, cleared or canonicalised.
+/// [`ProfileError`] when the leaf cannot be inspected, removed, created,
+/// cleared or canonicalised.
 pub fn reset_module_temp(data_dir: &Path) -> Result<PathBuf, ProfileError> {
     let temp = data_dir.join("tmp");
     match std::fs::symlink_metadata(&temp) {
-        Ok(meta) => {
-            let kind = meta.file_type();
-            if kind.is_symlink() {
-                return Err(ProfileError(format!(
-                    "the module temp directory {} is a symlink; refusing to start",
-                    temp.display()
-                )));
-            }
-            if !kind.is_dir() {
-                return Err(ProfileError(format!(
-                    "the module temp directory {} is not a plain directory; refusing to start",
-                    temp.display()
-                )));
-            }
-            clear_dir_contents(&temp)?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::create_dir(&temp).map_err(|error| {
+        Ok(meta) if meta.file_type().is_dir() => clear_dir_contents(&temp)?,
+        Ok(_) => {
+            // A symlink or file left by the module itself: unlink the leaf (a
+            // symlink is not followed) and start over, so a module cannot
+            // switch off its own restarts.
+            std::fs::remove_file(&temp).map_err(|error| {
                 ProfileError(format!(
-                    "could not create the module temp directory {}: {error}",
+                    "could not remove the odd module temp entry {}: {error}",
                     temp.display()
                 ))
             })?;
+            create_temp(&temp)?;
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_temp(&temp)?,
         Err(error) => {
             return Err(ProfileError(format!(
                 "could not inspect the module temp directory {}: {error}",
@@ -238,6 +228,15 @@ pub fn reset_module_temp(data_dir: &Path) -> Result<PathBuf, ProfileError> {
     let mut canon = canonical(&temp)?.into_os_string();
     canon.push("/");
     Ok(PathBuf::from(canon))
+}
+
+fn create_temp(temp: &Path) -> Result<(), ProfileError> {
+    std::fs::create_dir(temp).map_err(|error| {
+        ProfileError(format!(
+            "could not create the module temp directory {}: {error}",
+            temp.display()
+        ))
+    })
 }
 
 /// Remove entries in `dir` and nothing outside it. A symlink entry is unlinked,
