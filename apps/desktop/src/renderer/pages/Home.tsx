@@ -3,6 +3,7 @@ import { MachineFigure } from './home/MachineFigure'
 import './home/home.css'
 import { useT, type T } from '../i18n'
 import { homeMessages } from './home/home.i18n'
+import { appMessages } from '../App.i18n'
 import {
   STAGES, STATIONS, STATION_BY_ID, machineAt, stepTo, type MachineState, type StationId,
 } from './home/machine-model'
@@ -18,6 +19,8 @@ function captionOf(s: MachineState, t: T<HomeKey>): string {
 export interface HomePageProps {
   backendOk: boolean | null
   backendPort: number | null
+  /** QA 0.6.1 §3c: the service daemon did not enrol this app (said instead of 「not answering」). */
+  refusal?: { code: string; permanent: boolean } | null
   moduleCount: number
   onNavigate: (page: string) => void
 }
@@ -32,7 +35,7 @@ function prefersReducedMotion(): boolean {
  * online — a dead daemon means a stopped machine, so the figure itself is a
  * health signal, not decoration.
  */
-export default function HomePage({ backendOk, backendPort, moduleCount, onNavigate }: HomePageProps) {
+export default function HomePage({ backendOk, backendPort, refusal = null, moduleCount, onNavigate }: HomePageProps) {
   const [time, setTime] = useState(0)
   const [playing, setPlaying] = useState(() => !prefersReducedMotion())
   const [focus, setFocus] = useState<StationId | null>(null)
@@ -41,6 +44,11 @@ export default function HomePage({ backendOk, backendPort, moduleCount, onNaviga
   const running = playing && status === 'online'
   const last = useRef<number | null>(null)
   const t = useT(homeMessages)
+  // The sidebar's words for a refusal (App.i18n), so the two places read the same.
+  const ta = useT(appMessages)
+  const refused = status === 'offline' && refusal
+    ? ta(refusal.permanent ? 'backend.refused' : 'backend.enrolRetrying', { code: refusal.code })
+    : null
 
   // Turning on reduced motion while the page is open stops the machine too.
   useEffect(() => {
@@ -82,7 +90,8 @@ export default function HomePage({ backendOk, backendPort, moduleCount, onNaviga
   const shown = STATION_BY_ID[focus ?? picked]
   const caption = status === 'online'
     ? captionOf(s, t)
-    : status === 'offline' ? t('readout.offline') : t('readout.checking')
+    : refused !== null ? (refusal?.permanent ? `${refused} — ${ta('backend.refusedHint')}` : refused)
+      : status === 'offline' ? t('readout.offline') : t('readout.checking')
 
   return (
     <div className="content home-page">
@@ -128,7 +137,7 @@ export default function HomePage({ backendOk, backendPort, moduleCount, onNaviga
           </div>
 
           <dl className="home-live">
-            <div><dt>{t('live.daemon')}</dt><dd>{status === 'online' ? `${t('live.running')}${backendPort !== null ? ` :${backendPort}` : ''}` : status === 'offline' ? t('live.offline') : t('live.checking')}</dd></div>
+            <div><dt>{t('live.daemon')}</dt><dd>{status === 'online' ? `${t('live.running')}${backendPort !== null ? ` :${backendPort}` : ''}` : refused ?? (status === 'offline' ? t('live.offline') : t('live.checking'))}</dd></div>
             <div><dt>{t('live.modules')}</dt><dd>{moduleCount}</dd></div>
             <div><dt>{t('live.ledger')}</dt><dd>{t('live.illustrative', { n: s.ledger })}</dd></div>
           </dl>

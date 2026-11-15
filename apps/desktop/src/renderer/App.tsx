@@ -277,6 +277,7 @@ function AppShell(): JSX.Element {
           <HomePage
             backendOk={backendOk}
             backendPort={backendPort}
+            refusal={refusal}
             moduleCount={osModuleCount}
             onNavigate={(target) => {
               const def = defs.find(d => d.page === target || d.id === target)
