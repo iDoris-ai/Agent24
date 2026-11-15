@@ -104,6 +104,29 @@ describe('App', () => {
     })
   })
 
+  // QA 0.6.1 §3c: the service daemon refused this unsigned build; the
+  // sidebar said only 「离线」. It now names the refusal and the way out.
+  it('names an enrolment refusal and the way out instead of plain offline', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
+    const backendRefusal = vi.fn().mockResolvedValue({ code: 'identity_rejected', permanent: true })
+    Object.assign(window.agent24, { backendRefusal })
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText('后台服务拒绝了本应用（identity_rejected）')).toBeInTheDocument()
+    })
+    expect(screen.getByText(/设置 → 通用/)).toBeInTheDocument()
+    expect(screen.queryByText('后端服务离线')).not.toBeInTheDocument()
+  })
+
+  it('a refusal that is retried says so', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 503, data: null })
+    Object.assign(window.agent24, { backendRefusal: vi.fn().mockResolvedValue({ code: 'timeout', permanent: false }) })
+    await act(async () => { render(<App />) })
+    await waitFor(() => {
+      expect(screen.getByText('后台服务登记失败（timeout），正在重试')).toBeInTheDocument()
+    })
+  })
+
   it('shows oMLX model label after detection', async () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
