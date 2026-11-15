@@ -66,8 +66,18 @@ fn the_daemon_binary_becomes_the_module_and_keeps_its_own_fds_from_it() {
     let high = rustix::io::fcntl_dupfd_cloexec(&file, 700).unwrap();
     rustix::io::fcntl_setfd(&high, rustix::io::FdFlags::empty()).unwrap();
 
+    // macOS refuses to exec a module with no seatbelt profile. This test is
+    // about fds, not about the profile, so it hands the trampoline one that
+    // allows the probe. `start` is what builds the real per-module profile.
+    #[cfg(target_os = "macos")]
+    let env = vec![
+        ("A24_TRAMPOLINE", "1"),
+        ("A24_SEATBELT_PROFILE", "(version 1)\n(allow default)\n"),
+    ];
+    #[cfg(not(target_os = "macos"))]
+    let env = vec![("A24_TRAMPOLINE", "1")];
     let (status, out) = run(
-        &[("A24_TRAMPOLINE", "1")],
+        &env,
         &[
             "--a24-exec-module",
             "/usr/bin/env",
@@ -82,8 +92,11 @@ fn the_daemon_binary_becomes_the_module_and_keeps_its_own_fds_from_it() {
     let mut lines = out.lines();
     // stdin, stdout, stderr — and not the inherited fd.
     assert_eq!(lines.next(), Some("0 1 2"), "{out}");
-    // The trampoline's marker did not follow it.
-    assert!(!lines.any(|v| v == "A24_TRAMPOLINE"), "{out}");
+    // The trampoline's marker, and the profile it was given, did not follow it.
+    assert!(
+        !lines.any(|v| v == "A24_TRAMPOLINE" || v == "A24_SEATBELT_PROFILE"),
+        "{out}"
+    );
     drop(high);
 }
 
