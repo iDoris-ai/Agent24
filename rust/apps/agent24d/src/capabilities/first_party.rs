@@ -879,10 +879,14 @@ fn expires_rfc3339(secs: u64) -> Option<String> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).map(|stamp| stamp.to_rfc3339())
 }
 
-/// The approval text for `parsed`. Every request-supplied string it shows
-/// goes through [`shown`]; `None` leaves nothing to approve. The credential
-/// value is not one of them: the text has neither the value, nor a fragment
-/// of it, nor its length.
+/// The approval text for `parsed`. Every string it shows goes through
+/// [`shown`]; `None` leaves nothing to approve. For the endpoint that string
+/// is the one `parsed` holds, i.e. the raw value as `validate_base_url`
+/// normalised it (F1), not the raw value itself: a raw endpoint whose hidden
+/// characters the URL parser drops or percent-encodes (a newline in the host,
+/// a bidi override in the path) is shown, as the target it really connects
+/// to. The credential value is not shown at all: the text has neither the
+/// value, nor a fragment of it, nor its length.
 fn knowledge_summary(
     path: &str,
     credential_route: bool,
