@@ -78,9 +78,8 @@ pub struct ConnectionCheck {
 /// Implemented for `ModelRouter` in `agent24-models`.
 #[async_trait]
 pub trait IdorisSlot: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
     fn block_idoris(&self, reason: &str);
-    fn replace_idoris(&self, gateway: PreparedGateway);
+    fn replace_idoris(&self, gateway: PreparedGateway) -> Result<(), ModelError>;
     fn published_lease(&self) -> Option<GatewayLease>;
     async fn open_gateway(
         &self,
@@ -94,6 +93,12 @@ pub trait IdorisSlot: Send + Sync {
         headroom_confirmed: bool,
         cancel: &CancellationToken,
     ) -> Result<ConnectionCheck, ModelError>;
+}
+
+/// Test-only downcast. Production code never needs the concrete router.
+#[cfg(test)]
+pub trait IdorisSlotExt {
+    fn as_any(&self) -> &dyn Any;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,7 +188,7 @@ impl ManagedIdoris {
         if cancel.is_cancelled() {
             return Err(ModelError::Cancelled);
         }
-        self.router.replace_idoris(gateway);
+        self.router.replace_idoris(gateway)?;
         Ok(true)
     }
 
@@ -205,7 +210,7 @@ impl ManagedIdoris {
             return Err(ModelError::Cancelled);
         }
         self.persist(&config)?;
-        self.router.replace_idoris(gateway);
+        self.router.replace_idoris(gateway)?;
         Ok(())
     }
 

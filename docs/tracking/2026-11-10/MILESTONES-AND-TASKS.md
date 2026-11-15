@@ -18,7 +18,7 @@
 
 | 日期 | 裁决 | 出处 |
 |---|---|---|
-| 2026-11-10 | **次序**：先清尾巴再开第 2 期。尾巴三件：(1) 本跟踪文档第二期；(2) 两条旧集成分支 `ab/comm`、`ab/decide` 盘点存档；(3) 通讯 X11（外部入口统一走 ADR-041a 准入）与 X7（nostr-bridge 并入 comm，不再是身份来源）。然后第 2 期从 S2-1 拆 `server.rs` 开始 | jason 2026-11-10 |
+| 2026-11-10 | **次序**：先清尾巴再开第 2 期。尾巴三件：(1) 本跟踪文档第二期；(2) 两条旧集成分支 `ab/comm`、`ab/decide` 盘点存档；(3) 通讯 X11（外部入口统一走 ADR-041a 准入）与 X7（身份归 comm（已定），入站适配不并入 comm（落在 agent24d inbound 模块））。然后第 2 期从 S2-1 拆 `server.rs` 开始 | jason 2026-11-10；X7 归宿 2026-11-12 回写 |
 | 2026-11-10 | **不在本轮**：好友机制（定为之后）、C9（`requires` 接入授权）；`docs/agent/followups.md` 的 82 条只做分类，不逐条修 | jason 2026-11-10 |
 | 2026-11-10 | 闭环计划不再逐项问 jason | jason 2026-11-10 |
 | 2026-11-10 | **macOS 签名信任**：默认只信任本方 Team，可 `trust-team` 增加；`os install` 离线验签，**不在线查公证**（公证不由 Agent24 检查）。落地为 S1-9 PR-3d（#1780） | jason 2026-11-10；#1780；S1-9 设计 §5 r3 |
@@ -37,8 +37,8 @@
 |---|---|---|---|---|---|---|
 | 架构优化（总纲） | 第 0 期：文档与 ADR 收口 | `docs/p0-*`（已合并） | 订正文档与 ADR，补通讯 ADR、路由约定、跟踪文档 | S0-1～S0-7 DONE；S0-8 BACKLOG | 无 | [方案 §4.1](../2026-11-04/ARCH-OPTIMIZATION-PLAN.md) |
 | 架构优化 | 第 1 期：低风险结构调整 | `main`（逐片分支，已合并） | OpenAPI、签名单源、`daemon.json`、状态映射、OD pin、休眠代码、OS 包完整性 | **全部 DONE**（S1-6、S1-8 CANCELLED） | 无 | 方案 §4.2、S1-9 设计 |
-| 架构优化 | 第 2 期：agent24d 瘦身 | 待定 | 拆 `server.rs`，下沉 iDoris / Knowledge / attach，进程组终止原语，CLI 补齐 | 2026-11-10 推进：S2-1/2/3/4a 已合，S2-6/S2-7 按拍板降级为文档已合，S2-4b #1794 在审；agent24d 96,032 → 82,276 行（含在审的 #1794） | S0-5 已合 | 方案 §4.3 |
-| 组件统一 | ADR-038 / ADR-039 收尾 | `main` | 组件契约、清单、统一状态面 | C1–C8 DONE（含 C2，见 §2.2）；C9 未排期 | — | [ADR-038](../../adr/ADR-038-component-contract-v1.md) |
+| 架构优化 | 第 2 期：agent24d 瘦身 | 待定 | 拆 `server.rs`，下沉 iDoris / Knowledge / attach，进程组终止原语，CLI 补齐 | 2026-11-10 推进：S2-1/2/3/4a 已合，S2-6/S2-7 按拍板降级为文档已合，S2-4b #1794 已合；agent24d 96,032 → 82,276 行（含已合的 #1794） | S0-5 已合 | 方案 §4.3 |
+| 组件统一 | ADR-038 / ADR-039 收尾 | `main` | 组件契约、清单、统一状态面 | C1–C9 DONE（含 C2，见 §2.2；ADR-038-C9：#1825、#1830、#1833、#1831） | — | [ADR-038](../../adr/ADR-038-component-contract-v1.md) |
 | 通讯（Hyphae） | COMM 系列、X11、X7、好友机制 | `ab/comm`（**2939 落后**（2487），该分支领先 11（11）；最后一次提交 2026-10-21） | 尾巴：X11、X7；好友机制之后 | `ab/comm` 盘点存档：未做（尾巴 2）；ADR-044 DONE | Q12 已定 | [ADR-044](../../adr/ADR-044-communication.md)、[COMM-HYPHAE](../../design/COMM-HYPHAE.md) |
 | 决策模型 | D0–D3 | `ab/decide`（**2914 落后**（2462），分支领先 25（25）） | D0 契约 / 规则后端已有，D1 接线未排期 | `ab/decide` 盘点存档：未做（尾巴 2）；当前排期未核实 | — | [PLAN-DECIDE](../../agent/PLAN-DECIDE.md) |
 | 记忆 | P1 | `ab/memory-p1`：本期远端**无此分支**（首期同样未列出），**未核实**是否已合并删除 | 个人记忆生命周期与清除权 | 未核实 | — | [PLAN-MEMORY-P1](../../agent/PLAN-MEMORY-P1.md) |
@@ -102,14 +102,14 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 
 #### 第 2 期：agent24d 瘦身（Q3 = (B)）
 
-前置：S0-5 已合。每片先移动、后修行为，同一 PR 不混。**S2-4 排在 S2-1、S2-2 之后**。**2026-11-10 状态**：S2-1 #1791、S2-2 #1790、S2-3 #1792、S2-4a #1793 已合；S2-4b #1794 在审；S2-6 #1788、S2-7 #1789 按 jason 拍板改为文档。本机 Codex 额度到 11-15，这几片只有独立 Opus 本地评审 + PR-Daemon，Codex 补审记为 FU-113。实测基线（`c396478c`）：`server.rs` 9,345 行，`serve()` 起于 1978 行、止于 3513 行（约 1,536 行），agent24d 全部 `.rs` 共 96,032 行（含内联测试）。S2-2 / S2-3 / S2-4 验收里「减约 N 行」是方案 §4.3 的估计，口径与上面不同，开工时重新量。
+前置：S0-5 已合。每片先移动、后修行为，同一 PR 不混。**S2-4 排在 S2-1、S2-2 之后**。**2026-11-10 状态**：S2-1 #1791、S2-2 #1790、S2-3 #1792、S2-4a #1793 已合；S2-4b #1794 已合；S2-6 #1788、S2-7 #1789 按 jason 拍板改为文档。本机 Codex 额度到 11-15，这几片只有独立 Opus 本地评审 + PR-Daemon，Codex 补审记为 FU-113。实测基线（`c396478c`）：`server.rs` 9,345 行，`serve()` 起于 1978 行、止于 3513 行（约 1,536 行），agent24d 全部 `.rs` 共 96,032 行（含内联测试）。S2-2 / S2-3 / S2-4 验收里「减约 N 行」是方案 §4.3 的估计，口径与上面不同，开工时重新量。
 
 | 任务 id | 标题 | 状态 | 负责 | 验收 |
 |---|---|---|---|---|
 | S2-1 | 拆 `server.rs` | DONE（#1791，`d76189a6`） | Grok + Opus 收尾 | `serve()` 1,536 → 267 行；启动黑盒测试全绿（含 `test-enrollment` 的 docked_startup）；源码断言测试收紧到等价或更严，带变异对照 |
 | S2-2 | iDoris 托管下沉 `agent24-idoris` | DONE（#1790，`a5096360`） | Grok + Opus 收尾 | agent24d 减 6,056 行（含测试）；77 条用例随迁；用 `IdorisSlot` 打断 models↔idoris 依赖环。R1 C5 未做 → FU-115；可见性收窄 → FU-116 |
 | S2-3 | Knowledge 宿主下沉 `agent24-knowledge` | DONE（#1792，`a8a749bd`） | Grok + Opus 收尾（凭据类，PR-Daemon 已 APPROVE） | agent24d 减 4,447 行；C5 探测测试原样通过；`provider/` 按 jason 拍板冻结；凭据与 endpoint 校验下沉进 registry；knowledge-store CI 改在新 crate 上跑 20 条 |
-| S2-4 | attach 新建 `agent24-attach`（排在 S2-1、S2-2 之后） | S2-4a DONE（#1793，`3e07baf3`）；S2-4b IN REVIEW（#1794） | Grok + Opus 收尾 | 拆两片：4a 在 agent24d 内抽 `AttachGrantBuilder` 等接口，4b 新建 crate 原样搬入；agent24d 减约 4,400 行；C4 用例与 a3_2b/a3_3 黑盒原样通过。过滤未被测试锁住 → FU-118 |
+| S2-4 | attach 新建 `agent24-attach`（排在 S2-1、S2-2 之后） | S2-4a DONE（#1793，`3e07baf3`）；S2-4b DONE（#1794，`378dbca6`） | Grok + Opus 收尾 | 拆两片：4a 在 agent24d 内抽 `AttachGrantBuilder` 等接口，4b 新建 crate 原样搬入；agent24d 减约 4,400 行；C4 用例与 a3_2b/a3_3 黑盒原样通过。过滤未被测试锁住 → FU-118 |
 | S2-5 | 鉴权抽 `agent24-auth` | CANCELLED：Q3 = (B) | — | — |
 | S2-6 | 进程组终止原语统一 → **降级为停止语义盘点**（jason 2026-11-10 (a)） | DONE（#1788） | Codex 盘点 + Opus 成文 | [S2-6-STOP-SEMANTICS.md](S2-6-STOP-SEMANTICS.md) 覆盖 Rust 的进程组停止调用点与桌面侧计划范围内的现状；不做统一实现 |
 | S2-7 | CLI 补齐（Q5 = (b)）→ **改为写明桌面专属例外**（jason 2026-11-10 (a)） | DONE（#1789） | Opus | Comm 私钥备份恢复、Knowledge 绑定/凭据在 daemon 上只允许桌面（ProductHost）调用，CLI 入口调不通，所以不补；连同 OD 下载、presence 一起写进 `AGENTS.md` 例外。CLI 试做存档在本地分支 `feat/s2-7-cli-parity` |
@@ -123,7 +123,7 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 | C3a / C3b | `/api/v1/components` 统一状态面；OD 状态由桌面上报 | DONE | #1545、#1549 | |
 | C4–C7 | AgentEar、Knowledge、Documents、领域 OS / MCP 清单 | DONE | #1572、#1571、#1570、#1575 | |
 | C8 | Open Design 改由 `SidecarManager` 托管 | DONE | #1580、#1584 | Q1 = (b) |
-| C9 | `requires` 接入授权 | BACKLOG（未排期，不在第 0–2 期） | — | jason 2026-11-10 |
+| C9 | `requires` 接入授权（ADR-038-C9） | DONE | #1825、#1830、#1833、#1831 | 2026-11-12 收口。方案 [C9-REQUIRES-AUTHZ-PLAN](../2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md)。2026-11-10 曾记未排期，见 §0 |
 | — | Hyphae 锁只有 darwin-arm64、linux-x64 两个平台 | BACKLOG | — | `rust/crates/agent24-comm/hyphae.lock.json`，本期核对仍是这两个 |
 
 ### 2.3 内核（CORE-2 / CORE-5）
@@ -142,8 +142,8 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 |---|---|---|---|---|
 | ADR-044 | 通讯 ADR | DONE（已接受） | #1593、#1601 | |
 | 尾巴 2 | 旧集成分支 `ab/comm`、`ab/decide` 盘点存档 | READY（jason 2026-11-10 列为开第 2 期前要清的尾巴） | — | 首期记「需先吸收 main 或归档」；现落后 2939 / 2914 提交；只盘点存档，是否吸收未定 |
-| 尾巴 3a：X11 | 外部入口统一走 ADR-041a 准入 | READY（前置 ADR-041a 已接受） | — | 含 Nostr 入站、语音输入、远程 @agent、手机遥控。①（产品隔离）已合入 #1785；②③④ 实施方案见 [INBOUND-ADMISSION-PLAN](INBOUND-ADMISSION-PLAN.md) |
-| 尾巴 3b：X7 | nostr-bridge 不再是身份来源，并入 comm | READY | — | Q6 = (c)；在此之前产品构建禁止 bridge 用 legacy 全权 token |
+| 尾巴 3a：X11 | 外部入口统一走 ADR-041a 准入 | DONE | #1785、#1797、#1805、#1806、#1803、#1810、#1813、#1816、#1808、#1812、#1820、#1821、#1809、#1811、#1818、#1819 | ① 产品隔离 #1785。②③④ 见 [INBOUND-ADMISSION-PLAN](INBOUND-ADMISSION-PLAN.md) §4.1。2e 迁移 #1820 已合（bb03081e）；2e 第 2 部分 Hyphae 轮询走 #1821，已合（a93f5df3）。手机遥控、041b 工单、自动回发本里程碑不做 |
+| 尾巴 3b：X7 | 身份归 comm（已定），入站适配不并入 comm（落在 agent24d inbound 模块） | DONE（身份：#1785 删 nostr-bridge；入站适配在 agent24d，见尾巴 3a，不并入 comm） | #1785 | 旧说法「并入 comm」已由 2026-11-12 回写取代。产品构建不启动 wechat-bridge |
 | COMM-FRIENDS | 好友机制 | BACKLOG（jason 定为之后，本轮不做） | — | 好友不等于能指挥 agent |
 
 ### 2.5 记忆与决策
@@ -164,7 +164,8 @@ S1-9 期间的 CI 与测试稳定性：#1749（Linux Rust 作业超时 20 → 30
 | Open Design 线 OD-M11 / OD-M12 / TPI-W / OC | 2026-10-03 jason（`PAUSED`） | 路由级资源授权等遗留缺口有人排期时，从 OD-M11 起步 |
 | `agent24-sidecar-host`（Rust） | 2026-11-04 Q1 = (b)，冻结 | Windows 支持被排上日程 |
 | S1-6、S1-8、S2-5 | 2026-11-04（Q1 = (b)；Q7 = (c)；Q3 = (B)） | 见各行 |
-| 好友机制、C9 | 2026-11-10 jason：之后 / 未排期 | 尾巴清完、第 2 期之后再议 |
+| 好友机制 | 2026-11-10 jason：之后 | 尾巴清完、第 2 期之后再议 |
+| C9（`requires` 接入授权） | 2026-11-10 曾未排期；2026-11-12 已完成（ADR-038-C9：#1825、#1830、#1833、#1831） | 不再暂停，见 §2.2 |
 | 移动端 | 暂不做，将来仅遥控 | ADR-037 决策 6 的遥控设计 |
 
 ## 4. 跟进项汇总

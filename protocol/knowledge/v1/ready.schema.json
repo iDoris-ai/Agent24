@@ -45,7 +45,8 @@
           "properties": {
             "search": { "$ref": "#/$defs/operation_state" },
             "read": { "$ref": "#/$defs/operation_state" },
-            "ingest": { "description": "Read-only v1: always disabled.", "allOf": [{ "$ref": "#/$defs/operation_state" }, { "properties": { "state": { "const": "disabled" } } }] }
+            "ingest": { "description": "Read-only v1: always disabled.", "allOf": [{ "$ref": "#/$defs/operation_state" }, { "properties": { "state": { "const": "disabled" } } }] },
+            "candidate": { "description": "R8.2 (r12, schema r13): candidate.* and entry.withdraw (CONTRACT-OPS-v2 W1.4). Whether the server has the candidate feature on and its dependencies healthy, never whether the credential holds the capability. Absent until the server enables it (WeKnora#146).", "$ref": "#/$defs/operation_state" }
           }
         },
         "knowledge_bases": { "description": "Present only when the request carried scope; lists only KBs in E, which is never empty.", "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/knowledge_base" } }

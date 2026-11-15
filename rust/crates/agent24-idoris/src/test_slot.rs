@@ -23,32 +23,31 @@ fn host_error(error: agent24_models::ModelError) -> HostError {
     }
 }
 
-fn built_gateway(gateway: PreparedGateway) -> IdorisGateway {
-    match gateway.downcast::<IdorisGateway>() {
-        Ok(gateway) => gateway,
-        Err(_) => panic!("iDoris slot received a gateway it did not build"),
-    }
+fn not_our_gateway() -> HostError {
+    HostError::Provider("iDoris slot received a gateway it did not build".into())
 }
 
-fn built_gateway_ref(gateway: &PreparedGateway) -> &IdorisGateway {
-    match gateway.downcast_ref::<IdorisGateway>() {
-        Some(gateway) => gateway,
-        None => panic!("iDoris slot received a gateway it did not build"),
-    }
+fn built_gateway(gateway: PreparedGateway) -> Result<IdorisGateway, HostError> {
+    gateway
+        .downcast::<IdorisGateway>()
+        .map_err(|_| not_our_gateway())
+}
+
+fn built_gateway_ref(gateway: &PreparedGateway) -> Result<&IdorisGateway, HostError> {
+    gateway
+        .downcast_ref::<IdorisGateway>()
+        .ok_or_else(not_our_gateway)
 }
 
 #[async_trait]
 impl IdorisSlot for ModelRouter {
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
     fn block_idoris(&self, reason: &str) {
         ModelRouter::block_idoris(self, reason);
     }
 
-    fn replace_idoris(&self, gateway: PreparedGateway) {
-        ModelRouter::replace_idoris(self, built_gateway(gateway));
+    fn replace_idoris(&self, gateway: PreparedGateway) -> Result<(), HostError> {
+        ModelRouter::replace_idoris(self, built_gateway(gateway)?);
+        Ok(())
     }
 
     fn published_lease(&self) -> Option<GatewayLease> {
@@ -75,7 +74,7 @@ impl IdorisSlot for ModelRouter {
         headroom_confirmed: bool,
         cancel: &CancellationToken,
     ) -> Result<ConnectionCheck, HostError> {
-        let verification = built_gateway_ref(gateway)
+        let verification = built_gateway_ref(gateway)?
             .verify_connection(headroom_confirmed, cancel)
             .await
             .map_err(host_error)?;
@@ -84,6 +83,13 @@ impl IdorisSlot for ModelRouter {
             record_id: verification.record_id,
             locality: verification.locality,
         })
+    }
+}
+
+#[cfg(test)]
+impl crate::managed_idoris::IdorisSlotExt for ModelRouter {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

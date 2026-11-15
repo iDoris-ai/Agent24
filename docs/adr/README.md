@@ -4,8 +4,8 @@
 
 本页列出仓库里**所有** ADR（架构决策记录）。ADR 记录「为什么这样定」，一份一个决策；「现在是什么样、往哪走」看 [架构总入口](../architecture/README.md)。
 
-- **唯一发号处**：新 ADR 的编号只在本页领取，不要自己挑号。**下一个可用编号是 ADR-046**；ADR-044（通讯）和 ADR-045（路由命名约定）已在第 0 期起草并于 2026-11-05 接受，见末尾「发号规则」。
-- 共 **64** 条 ADR：`docs/adr/` 下 14 个文件、15 条（ADR-041 拆成 041a、041b 两条），仓库其他位置 49 条（ADR-KB-01 拆成 01a、01b 两条）；见各表「位置」，文件均未移动。另有 5 份已被取代的初稿，单列在末尾，不计入总数。
+- **唯一发号处**：新 ADR 的编号只在本页领取，不要自己挑号。**下一个可用编号是 ADR-047**；ADR-044（通讯）、ADR-045（路由命名约定）和 ADR-046（iDoris 托管）已接受，见末尾「发号规则」。
+- 共 **66** 条 ADR：`docs/adr/` 下 15 个文件、16 条（ADR-041 拆成 041a、041b 两条），仓库其他位置 50 条（ADR-KB-01 拆成 01a、01b 两条，另有 ADR-KB-02）；见各表「位置」，文件均未移动。另有 5 份已被取代的初稿，单列在末尾，不计入总数。
 - 状态分八档：已接受 / 部分接受 / 提议 / 草案 / **被替代**（含事实取代，写明取代者）/ **部分被替代**（范围收缩，或实现路线被替换但没有正式取代者）/ **废弃**（从未实现，或方向被放弃）/ **搁置**（等外部条件再评估）；索引与文件头用词一致；文件里读不到就写「未标」。「原文」列出的是文件原话，供核对；2026-11-04 订正过的行，文件首的状态行已同步改过，两处一致。
 - `docs/decision.md` 是一份**合订的决策日志**，ADR-001 至 ADR-037（缺 ADR-026）都在里面，没有单独文件，所以这些行都链到同一个文件，用编号在文内查找。
 - 关联列里，ADR-xxx 指同一编号体系里的 ADR；有重号的编号会带上位置，详见末尾「编号与冲突」。
@@ -40,8 +40,9 @@
 | ADR-029 | [内核 ↔ 领域 OS 边界与 DomainModule 挂载缝](../decision.md) | 已接受（原文：采纳（边界原则）；挂载缝已实现） | 日志 | 领域系统可换且不改内核；原进程内编译方案已推翻，改走进程外 | ADR-030、ADR-031、ADR-039；ADR-026、ADR-028 |
 | ADR-031 | [ME-3 进程外模块的协议，按「缝」分别裁决](../decision.md) | 已接受（原文：采纳（裁决 FU-14，解除 ME-3 的开工前置）） | 日志 | 模块挂载缝不用会话协议，只定义出站回调；外壳那条缝本篇不裁 | ADR-029、ADR-K1-01；ADR-030 |
 | ADR-032 | [AgentEar（语音）与 iDoris（模型网关）接入 Agent24](../decision.md) | 已接受（原文：已接受） | 日志 | 语音端自启后附着接入；模型网关作兼容接口，不做成进程外模块 | [A3 设计](../design/A3-ATTACHED-MODULE.md)、[接入设计](../design/INTEGRATION-AGENTEAR-IDORIS.md) |
-| ADR-035 | [iDoris Admin session token 由可信 launcher 通过匿名 FD/HANDLE 一次性交付](../decision.md) | 已接受（原文：采纳（jason 明确拍板）） | 日志 | token 经继承的匿名句柄交付，不落盘不走环境变量 | ADR-032；[launcher 设计](../agent/IDORIS-LAUNCHER-DESIGN.md) |
+| ADR-035 | [iDoris Admin session token 由可信 launcher 通过匿名 FD/HANDLE 一次性交付](../decision.md) | 部分取代（ADR-046 取代交给 Electron main 的条款；stdin 交给 iDoris 仍有效。原文：采纳（jason 明确拍板）） | 日志 | token 经继承的匿名句柄交给 iDoris，不落盘不走环境变量；桌面不再持有 | ADR-032、ADR-046；[launcher 设计](../agent/IDORIS-LAUNCHER-DESIGN.md) |
 | ADR-036 | [硬件探测与整机内存账归 Agent24，模型选型归 iDoris](../decision.md) | 已接受（原文：采纳（jason 2026-10-14 拍板）） | 日志 | Agent24 管硬件探测和内存账（`agent24-hw`），iDoris 管选模型 | ADR-032；[HW-TIERS 设计](../design/HW-TIERS-capability-hardware-matrix.md)；ADR-033 |
+| ADR-046 | [iDoris 由 agent24d 托管](ADR-046-idoris-managed-host.md) | 已接受（2026-11-12，S0-8；S2-2 #1790） | adr/ | daemon 监督 iDoris；Admin token 只经 stdin 交给子进程；数据 key 在钥匙串；上游密钥走注入的 Provisioner | ADR-032、ADR-035、ADR-036、ADR-037 |
 | ADR-033 | [`agent24-decide` 位于 L3，D0-1 只定契约](../decision.md) | 已接受（原文：采纳（D0-1）；D0-3 起 agent24d 已接入） | 日志 | 决策服务放在第三层，这一片不接到任何现有调用，也不能放宽权限 | ADR-034 |
 | ADR-034 | [`agent24-decide` 决策日志契约由 `agent24d` 实现](../decision.md) | 已接受（原文：采纳（D0-2）） | 日志 | 日志落库放在组合根进程，存储层与决策层互不依赖 | ADR-033 |
 | ADR-DOC-01 | [Documenting 的定位、进程形态与对外暴露](../documenting/adr/ADR-DOC-01-placement-and-integration.md) | 已接受（原文：Accepted） | DOC/ | Documenting 作为进程外 OS `documents`，工具由模块声明、内核执行资料政策 | ADR-DOC-02、ADR-K1-01；ADR-029、ADR-031、ADR-K1-02 |
@@ -49,6 +50,7 @@
 | ADR-DOC-03 | [DOCX 编辑引擎与转换 worker](../documenting/adr/ADR-DOC-03-docx-engine-and-conversion.md) | 搁置（待 #692 格式矩阵冻结；原为 Accepted 2026-10-08，但引擎只有 PDFKit，从未实现） | DOC/ | 文档引擎只用 SuperDoc 无头组件并按需下载；转换走 LibreOffice，同样按需 | ADR-DOC-01、ADR-DOC-02 |
 | ADR-KB-01a | [知识能力进入 Agent24 唯一主对话：单一主对话 + 只读检索证据](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) | 已接受（拆分后的 KB-01a；#1503–#1511、#1515、#1524） | KB/ | 迁移入口与编排权，复用 WeKnora 流程；只有一个主对话，检索只读、带出处 | [知识契约](../knowledge/CONTRACT-OPS-v2.md) |
 | ADR-KB-01b | [知识能力进入 Agent24 唯一主对话：KnowledgeView 管理页、深度子任务、写操作](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) | 提议（拆分后的 KB-01b；挂 KB-C2 至 KB-C4） | KB/ | 管理页、深度知识子任务、写操作 / ContextPack / SOP 另行评审；尚未开工 | [知识契约](../knowledge/CONTRACT-OPS-v2.md) |
+| ADR-KB-02 | [知识库宿主的凭据交接与授权归属](../knowledge/ADR-KB-02-HOST-AUTHORITY.md) | 已接受（2026-11-12，S0-8；记录 KB-HOST-01） | KB/ | 长期登录态在桌面 safeStorage；短期凭据只在 daemon 内存；只有 ProductHost 能交接；Knowledge 工具保持 builtin | ADR-KB-01a、ADR-039、ADR-K1-03 |
 | ADR-OD-001 | [Agent24 × Open Design 集成边界](../open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md) | 已接受（原文：Accepted / P0 frozen） | OD/ | Agent24 是唯一 AI 控制面，Open Design 是创作工作区且不取得工具权限 | ADR-OD-002/003/004/005 |
 | ADR-OD-002 | [`a24.workspace.v1`](../open-design-workspace/design/ADR-002-WORKSPACE-CONTRACT.md) | 已接受（原文：Accepted / P0 frozen） | OD/ | workspace 注册表是身份、根目录和 run 绑定的唯一来源 | ADR-OD-001、ADR-OD-006；ADR-OD-005 |
 | ADR-OD-003 | [`agent24.open-design.v1` ACP bridge](../open-design-workspace/design/ADR-003-ACP-BRIDGE.md) | 已接受（原文：Accepted / P0 frozen） | OD/ | Open Design 经 stdio ACP 调 bundled `agent24 acp` | ADR-OD-002 |
@@ -159,13 +161,13 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 | ADR-001 至 ADR-006 | [日志](../decision.md) 的 ADR-001 至 ADR-006 | `docs/open-design-workspace/design/ADR-001` 至 `ADR-006` | OD 目录自成一套编号，**规范写法是 ADR-OD-001 至 ADR-OD-006**（6 份文件开头已加规范编号说明）；文件名和标题里仍是 ADR-00x，不改文件名，23 处带文件名的链接不受影响。其中 ADR-004 两边内容无关（cos72 子模块 vs 桌面宿主） |
 | ADR-040 至 ADR-044 | `docs/adr/` 最终版（040 至 043） | 初稿 `DRAFT-F040` 至 `DRAFT-F044`；Codex 稿 `DRAFT-C040` 至 `DRAFT-C044` | 初稿的 041 至 044 与最终版的 041 至 043 编号错位（初稿 042 并入 041，之后依次前移一位），对照见上面「初稿」表。初稿和 Codex 稿一律用 DRAFT- 前缀，ADR-044 留给通讯 |
 
-**独立编号体系**（不算冲突，但容易混淆）：`ADR-K1-xx`（Kernel K1）、`ADR-DOC-xx`（Documenting）、`ADR-KB-01`（知识）、`ADR-MEMORY-*`（记忆，无数字编号）。
+**独立编号体系**（不算冲突，但容易混淆）：`ADR-K1-xx`（Kernel K1）、`ADR-DOC-xx`（Documenting）、`ADR-KB-01`、`ADR-KB-02`（知识）、`ADR-MEMORY-*`（记忆，无数字编号）。
 
 **缺号**
 
 - ADR-026 不在 [日志](../decision.md) 里（日志从 ADR-025 直接跳到 ADR-027），它是单独的 [docs/ADR-026](../ADR-026-rust-core-polyglot.md)。
 - 日志里 ADR-001 至 ADR-037 除 ADR-026 外齐全；ADR-038 起在 `docs/adr/`。
-- ADR-044、ADR-045 已有文件（通讯、路由命名约定），见下面「发号规则」；初稿里的「ADR-044」是 `DRAFT-F044`，与它们无关。
+- ADR-044、ADR-045、ADR-046 已有文件（通讯、路由命名约定、iDoris 托管），见下面「发号规则」；初稿里的「ADR-044」是 `DRAFT-F044`，与它们无关。
 - ADR-K1-04 在 ADR-K1-02 写作时标为「计划中」，现已存在。
 - 记忆两份 ADR 没有数字编号，文件名即标识；R05 的标题第一行是「R05」。
 
@@ -179,18 +181,21 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 ## 发号规则
 
 - **本页是唯一发号处。** 新 ADR 先在本页登记领号（在 PR 里加一行），再写文件；不要在别处自己挑号，不要沿用 `docs/decision.md` 的 ADR-001 至 ADR-037 做新条目。
-- **下一个可用编号：ADR-046。**
-- 已分配、未必已有文件：
+- **下一个可用编号：ADR-047。**
+- 已分配：
 
 | 编号 | 用途 | 状态 |
 |---|---|---|
 | ADR-044 | 通讯（Hyphae / Nostr） | 已有文件：[ADR-044-communication.md](ADR-044-communication.md) |
 | ADR-045 | 路由命名约定 | 已有文件：[ADR-045-route-naming.md](ADR-045-route-naming.md) |
+| ADR-046 | iDoris 由 agent24d 托管 | 已有文件：[ADR-046-idoris-managed-host.md](ADR-046-idoris-managed-host.md) |
 
 - 别名只加不改：已有文件名一个都不改，规范名只用在新写的文字里，旧文字下次修改时顺手改。别名一览：ADR-OD-001 至 ADR-OD-006（Open Design 目录里的 ADR-001 至 ADR-006）、ADR-016P（docs/ 下的消费 @auraaihq 包）、DRAFT-F04x、DRAFT-C04x（研究初稿）。
 - 新文字里裸写 `ADR-001` 至 `ADR-006` 时，必须带路径或写成 `ADR-OD-00x`；不带前缀的 ADR-00x 只指 `docs/decision.md`。
 
 ## 核对记录
+
+2026-11-12（S0-8）：新增 ADR-KB-02、ADR-046；ADR-035 改为部分取代，被取代条款写在日志文首和 ADR-046 D3。下一号改为 ADR-047。未改 `docs/tracking/2026-11-10/`。
 
 2026-11-04（第 0 期 S0-1、S0-3）按 R3 报告（分支 `docs/arch-review-r3-adr-docs` 上的 R3-ADR-AND-DOCS.md，§1.1、§1.B.6）与 jason 对 Q8、Q9、Q10 的拍板一次性订正状态和编号：
 - 037、028、MEMORY-P1、R05 改已接受；KB-01、041 各拆两条；040 接受为设计约束；042、043 部分接受（Q9）。

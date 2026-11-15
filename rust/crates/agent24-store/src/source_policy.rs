@@ -78,6 +78,9 @@ pub enum SourceKind {
     /// classification is the host's for that kind of tool, never the tool's
     /// or module's own claim.
     ToolResult,
+    /// Skill text injected from a pinned revision (SL-5). The classification
+    /// follows the revision's stored origin, never the text.
+    SkillText,
 }
 
 /// Sensitivity classification is independent from processing mode and source
@@ -269,6 +272,48 @@ impl SourceRef {
             kind: SourceKind::UserInput,
             classification: SourceClassification::Ordinary,
             revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// External inbound text (X11-2c). The whole prompt is one `Unknown`
+    /// block. Only `RunManager::start_run_inbound` mints this; HTTP `RunCreate`
+    /// cannot. Mode stays `LocalOnly`, same as [`Self::user_input`].
+    pub fn inbound_external(run_id: &str, created_at: impl Into<String>) -> Self {
+        SourceRef {
+            source_id: format!("inbound_external:{run_id}"),
+            kind: SourceKind::UserInput,
+            classification: SourceClassification::Unknown,
+            revision_digest: None,
+            mode: SourceMode::LocalOnly,
+            policy_version: 0,
+            authorization_ref: None,
+            created_at: created_at.into(),
+        }
+    }
+
+    /// Skill text injected into a run (SL-5, plan §4.7). `origin` is the
+    /// pinned revision's stored origin. Imported text is `Unknown`, text the
+    /// user wrote is `Ordinary`. The mode is always `LocalOnly`. The digest is
+    /// the pinned revision's content digest and is never empty.
+    pub fn skill_text(
+        skill_id: &str,
+        origin: crate::SkillOrigin,
+        revision_digest: &str,
+        created_at: impl Into<String>,
+    ) -> Self {
+        let classification = match origin {
+            crate::SkillOrigin::Imported => SourceClassification::Unknown,
+            crate::SkillOrigin::User => SourceClassification::Ordinary,
+        };
+        SourceRef {
+            source_id: format!("skill_text:{skill_id}"),
+            kind: SourceKind::SkillText,
+            classification,
+            revision_digest: Some(revision_digest.to_owned()),
             mode: SourceMode::LocalOnly,
             policy_version: 0,
             authorization_ref: None,
@@ -707,7 +752,7 @@ impl Store {
     }
 }
 
-async fn insert_run_source_tag(
+pub(crate) async fn insert_run_source_tag(
     conn: &mut sqlx::SqliteConnection,
     run_id: &str,
     seq: i64,

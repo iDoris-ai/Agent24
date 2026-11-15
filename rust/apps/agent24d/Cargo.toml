@@ -38,6 +38,7 @@ agent24-memory = { path = "../../crates/agent24-memory" }
 agent24-models = { path = "../../crates/agent24-models" }
 agent24-policy = { path = "../../crates/agent24-policy" }
 agent24-scheduler = { path = "../../crates/agent24-scheduler" }
+agent24-skill = { path = "../../crates/agent24-skill" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 async-trait = "0.1"
 # T8.5c-P: cursor tokens are `base64(v2:<seq>:<fingerprint>)` (design §7.1).
@@ -63,11 +64,16 @@ serde_json = { workspace = true, features = ["raw_value"] }
 # one malformed key/value pair to hide an unrelated, well-formed `module=`
 # key elsewhere in the same query string.
 form_urlencoded = "1"
+# K-B6: a presence summary shows the binding id as axum's `Path` decodes it.
+percent-encoding = "2"
 # Capability and attached-module token hashing are both production daemon
 # responsibilities; one shared dependency serves both paths.
 sha2 = "0.10"
 # I-1 L1: presence summaries refuse format/separator characters.
 unicode-general-category = "1.1"
+# X11-2f: allowlist `(source, actor)` is NFC-normalized before dedup.
+# Same crate agent24-comm already depends on; not a new workspace dependency.
+unicode-normalization = "0.1"
 # T8.5c-P: `EventLog::scan_stream`'s consumer (`os_memory_page.rs`) drives it
 # with `StreamExt::next()`/`Pin<&mut S>` directly, not through sqlx.
 futures = { version = "0.3", default-features = false, features = ["std"] }
@@ -113,6 +119,10 @@ agent24-os-sqlite = { path = "../../crates/agent24-os-sqlite" }
 tempfile = "3"
 
 [dev-dependencies]
+# `RunManager::fail_next_inbound_start` is cfg'd out unless this feature is
+# on. Unit tests in this binary call it; `cargo build --release` does not
+# enable it.
+agent24-agent = { path = "../../crates/agent24-agent", features = ["test-support"] }
 # The hash-pause hook is cfg'd out unless this feature is on. Unit tests in
 # this binary call it; `cargo build --release` does not enable it.
 agent24-components = { path = "../../crates/agent24-components", features = ["test-support"] }

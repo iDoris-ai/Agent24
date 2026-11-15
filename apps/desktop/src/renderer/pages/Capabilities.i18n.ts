@@ -27,6 +27,9 @@ export const capabilitiesMessages = defineMessages({
     'group.tools.blurb': 'Small actions Assistant and Documents can use',
     'group.services': 'Services',
     'group.services.blurb': 'Background parts of Agent24',
+    'grants.line': 'Kernel capabilities: {grants}',
+    'grants.none': 'none',
+    'grants.sep': ', ',
   },
   zh: {
     'page.title': '能力中心',
@@ -54,6 +57,9 @@ export const capabilitiesMessages = defineMessages({
     'group.tools.blurb': '助理和文档可以使用的小操作',
     'group.services': '服务',
     'group.services.blurb': 'Agent24 的后台部分',
+    'grants.line': '内核能力：{grants}',
+    'grants.none': '无',
+    'grants.sep': '、',
   },
   th: {
     'page.title': 'ความสามารถ',
@@ -81,5 +87,8 @@ export const capabilitiesMessages = defineMessages({
     'group.tools.blurb': 'การทำงานเล็กๆ ที่ผู้ช่วยและเอกสารใช้ได้',
     'group.services': 'บริการ',
     'group.services.blurb': 'ส่วนเบื้องหลังของ Agent24',
+    'grants.line': 'ความสามารถเคอร์เนล: {grants}',
+    'grants.none': 'ไม่มี',
+    'grants.sep': ', ',
   },
 })

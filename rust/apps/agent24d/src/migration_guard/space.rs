@@ -33,6 +33,7 @@ pub const G_DECLARATIONS: &[(&str, i64, GDecl)] = &[
     // K1-6b); the table holds one row per run message, so 2*S is ample.
     ("agent24.db", 28, GDecl::MultipleOfS(2)), // table rewrite (run_message_origins)
     ("agent24.db", 29, GDecl::MultipleOfS(2)), // table rewrite (run_message_origins)
+    ("agent24.db", 37, GDecl::MultipleOfS(2)), // table rewrite (run_message_origins, SL-5)
     ("memory.db", 5, GDecl::MultipleOfS(2)),   // FTS backfill from mem_assertions
     ("memory.db", 10, GDecl::MultipleOfS(2)),  // table rewrite
     ("memory.db", 11, GDecl::MultipleOfS(2)),  // table rewrite (mem_events)

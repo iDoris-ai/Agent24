@@ -45,6 +45,9 @@ struct RequestSummary {
 pub struct FirstPartyAuthority {
     store: CapabilityStore,
     provider: Mutex<Option<Arc<dyn PresenceProvider>>>,
+    /// K-B3 #1715: service mode's presence queue, handed to the enrolment
+    /// endpoint for `role:"presence"` connections.
+    presence_connection: Mutex<Option<Arc<crate::presence_service::ServicePresence>>>,
     grants: Mutex<HashMap<[u8; 32], Grant>>,
     request_summaries: Mutex<HashMap<String, RequestSummary>>,
     module_surfaces: Mutex<Arc<Vec<super::delegation::ModuleSurface>>>,
@@ -66,6 +69,7 @@ impl FirstPartyAuthority {
             docked: false,
             store,
             provider: Mutex::new(None),
+            presence_connection: Mutex::new(None),
             grants: Mutex::new(HashMap::new()),
             request_summaries: Mutex::new(HashMap::new()),
             module_surfaces: Mutex::new(Arc::new(Vec::new())),
@@ -169,6 +173,100 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// SL-4: the summary the daemon built from stored revisions for a rejected
+    /// `POST /api/v1/skills/{id}/activate`. The body hash binds it to this
+    /// exact request; a different body finds nothing to approve.
+    pub fn remember_skill_activation(
+        &self,
+        token_id: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::SkillsActivate,
+                method: "POST".into(),
+                template: "/api/v1/skills/{id}/activate".into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
+    /// K-B6: derive the presence summary for a Knowledge host change from the
+    /// rejected request's body. A body the handler would refuse, or a binding
+    /// id that cannot be shown, leaves nothing to approve. The summary never
+    /// carries the credential value.
+    pub fn remember_knowledge_request(
+        &self,
+        token_id: &str,
+        method: &str,
+        template: &str,
+        path: &str,
+        bytes: &[u8],
+    ) {
+        let is_credential = match (method, template) {
+            ("PUT" | "DELETE", "/api/v1/host/knowledge/bindings/{binding_id}") => false,
+            ("PUT" | "DELETE", "/api/v1/host/knowledge/bindings/{binding_id}/credential") => true,
+            _ => return,
+        };
+        let Some(parsed) = crate::knowledge_routes::parse_change_body(method, is_credential, bytes)
+        else {
+            return;
+        };
+        let Some(summary) = knowledge_summary(path, is_credential, &parsed) else {
+            return;
+        };
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::KnowledgeHost,
+                method: method.into(),
+                template: template.into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
+    /// K-B3b: keep a summary the daemon derived (`crate::elevation_summaries`)
+    /// for an approval decision, a schedule change or shutdown, bound to this
+    /// token and to the exact method, path and body it was derived from.
+    pub fn remember_derived(
+        &self,
+        token_id: &str,
+        method: &str,
+        template: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        // The operation is the route policy's own, never the caller's.
+        let Some(operation) = derived_route(method, template)
+            .then(|| {
+                policies()
+                    .iter()
+                    .find(|p| p.method == method && p.template == template)
+                    .map(|p| p.operation)
+            })
+            .flatten()
+        else {
+            return;
+        };
+        self.remember(
+            token_id,
+            Target {
+                operation,
+                method: method.into(),
+                template: template.into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
@@ -206,8 +304,14 @@ impl FirstPartyAuthority {
     fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
         if matches!(
             target.template.as_str(),
-            "/api/v1/attached" | "/api/v1/idoris/install" | "/api/v1/idoris/connect"
-        ) {
+            "/api/v1/attached"
+                | "/api/v1/idoris/install"
+                | "/api/v1/idoris/connect"
+                | "/api/v1/skills/{id}/activate"
+                | "/api/v1/host/knowledge/bindings/{binding_id}"
+                | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+        ) || derived_route(&target.method, &target.template)
+        {
             return self
                 .request_summaries
                 .lock()
@@ -227,6 +331,27 @@ impl FirstPartyAuthority {
                     "list local oMLX endpoints, their identity, authentication and model IDs"
                         .to_owned(),
                 );
+            }
+            "/api/v1/capabilities/bridge" => {
+                return Some("签发 8 小时微信桥开发令牌，只能写入入站事件".to_owned());
+            }
+            "/api/v1/capabilities/{capability_id}/revoke" => {
+                // Elevation is only for a live or already-revoked dev-bridge
+                // token. A shell token, a creative token, or a missing id
+                // has no summary, so the grant is refused.
+                let id = target
+                    .path
+                    .strip_prefix("/api/v1/capabilities/")?
+                    .strip_suffix("/revoke")?;
+                if id.is_empty() || id.contains('/') {
+                    return None;
+                }
+                let claims = self.store.claims_by_id(id)?;
+                if !super::bridge::is_dev_bridge(&claims) {
+                    return None;
+                }
+                let prefix = id.get(..8).unwrap_or(id);
+                return Some(format!("撤销微信桥开发令牌 {prefix}"));
             }
             "/api/v1/idoris/operations/{id}/cancel" => {
                 let id = target
@@ -271,6 +396,14 @@ impl FirstPartyAuthority {
     pub fn set_provider(&self, provider: Option<Arc<dyn PresenceProvider>>) {
         if let Ok(mut slot) = self.provider.lock() {
             *slot = provider;
+        }
+    }
+    pub fn set_presence_connection(
+        &self,
+        presence: Option<Arc<crate::presence_service::ServicePresence>>,
+    ) {
+        if let Ok(mut slot) = self.presence_connection.lock() {
+            *slot = presence;
         }
     }
     fn live_peer(&self, peer: &EnrolledPeer, id: &str) -> Result<(), EnrollErrorCode> {
@@ -350,6 +483,7 @@ impl FirstPartyAuthority {
                 CapabilityClaims {
                     capability_id: random_capability_id(),
                     audience: Audience::FirstPartyShell,
+                    component_id: None,
                     first_party: Some(FirstPartyClaims {
                         peer: peer.clone(),
                         tier: FirstPartyTier::Daily,
@@ -363,17 +497,26 @@ impl FirstPartyAuthority {
                     sidecar_generation: None,
                     created_at: now,
                     expires_at: now + TOKEN_TTL,
+                    deadline: None,
                     // The presence channel answers this token's own elevation
                     // challenges: a first-party shell must never reach it,
                     // or an enrolled CLI could approve itself (#1447 F1).
                     // `presence_desktop::gate` is the second, independent layer.
+                    // `InboundWrite` is ProductHost-only the same way.
+                    // `InboundIngest` is the dev-bridge component token only.
+                    // Leaving both off this token means a later route that
+                    // forgets its gate still stays closed to a shell.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
                     } else {
                         policies()
                             .iter()
                             .map(|p| p.operation)
-                            .filter(|op| !op.is_presence_channel())
+                            .filter(|op| {
+                                !op.is_presence_channel()
+                                    && *op != Operation::InboundWrite
+                                    && *op != Operation::InboundIngest
+                            })
                             .chain([Operation::ModuleRoute])
                             .collect()
                     },
@@ -509,7 +652,40 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                     | ("POST", "/api/v1/idoris/stop")
                     | ("POST", "/api/v1/idoris/operations/{id}/cancel")
                     | ("GET", "/api/v1/idoris/omlx/candidates")
-            ));
+            ))
+        || (policy.operation == Operation::CapabilityMint
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/bridge")
+            ))
+        || (policy.operation == Operation::CapabilityRevoke
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/capabilities/{capability_id}/revoke")
+            ))
+        // SL-4: skill activation and rollback, summarised from stored rows.
+        || (policy.operation == Operation::SkillsActivate
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/skills/{id}/activate")
+            ))
+        || (policy.operation == Operation::KnowledgeHost
+            && matches!(
+                (method.as_str(), policy.template),
+                ("PUT", "/api/v1/host/knowledge/bindings/{binding_id}")
+                    | ("DELETE", "/api/v1/host/knowledge/bindings/{binding_id}")
+                    | ("PUT", "/api/v1/host/knowledge/bindings/{binding_id}/credential")
+                    | (
+                        "DELETE",
+                        "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+                    )
+            ))
+        // K-B3b: approval decisions, schedule changes and shutdown, each with
+        // a summary the daemon derived from its own records.
+        || (matches!(
+            policy.operation,
+            Operation::ApprovalDecision | Operation::ScheduleManage | Operation::Shutdown
+        ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
     }
@@ -632,10 +808,13 @@ impl EnrollAuthority for FirstPartyAuthority {
             expires_in: GRANT_TTL,
         })
     }
+    fn presence_connection(&self) -> Option<Arc<crate::presence_service::ServicePresence>> {
+        self.presence_connection.lock().ok()?.clone()
+    }
 }
 
 /// The longest request-supplied value a presence summary shows.
-const SHOWN_MAX_CHARS: usize = 120;
+pub(crate) const SHOWN_MAX_CHARS: usize = 120;
 
 /// The longest whole dialog summary, in UTF-16 code units. MUST match the
 /// desktop `clip()` limit in `apps/desktop/src/main/presence-poller.ts`: a
@@ -644,7 +823,120 @@ const SHOWN_MAX_CHARS: usize = 120;
 /// the "{identifier} (pid {pid}) wants to: " prefix and for every summary
 /// source (including delegation); `remember()` repeats it on the details
 /// alone as redundancy.
-const SUMMARY_MAX_UTF16: usize = 500;
+pub(crate) const SUMMARY_MAX_UTF16: usize = 500;
+
+/// K-B3b: the routes whose summary `crate::elevation_summaries` derives.
+/// Every one is an Elevated row of the route policy; the level table itself
+/// is unchanged (`derived_routes_are_elevated_rows`).
+pub(crate) const DERIVED_ROUTES: [(&str, &str); 10] = [
+    ("POST", "/api/v1/approvals/{id}"),
+    ("POST", "/api/v1/module-approvals/{id}"),
+    (
+        "POST",
+        "/api/v1/module-consents/modules/{module}/tools/{tool}",
+    ),
+    ("POST", "/api/v1/schedules"),
+    ("PATCH", "/api/v1/schedules/{id}"),
+    ("DELETE", "/api/v1/schedules/{id}"),
+    ("POST", "/api/v1/schedules/{id}/run_now"),
+    ("POST", "/api/v1/schedules/{id}/suspend"),
+    ("POST", "/api/v1/schedules/{id}/resume"),
+    ("POST", "/api/v1/shutdown"),
+];
+
+pub(crate) fn derived_route(method: &str, template: &str) -> bool {
+    DERIVED_ROUTES.contains(&(method, template))
+}
+
+/// Binding id from the request path: the last segment, or the one before
+/// `credential` on a credential route. Empty segments from a leading or
+/// trailing slash are not an id.
+fn binding_segment(path: &str, credential_route: bool) -> Option<&str> {
+    let segments: Vec<&str> = path
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    let index = segments
+        .len()
+        .checked_sub(if credential_route { 2 } else { 1 })?;
+    segments.get(index).copied()
+}
+
+/// The binding id as the handler sees it: the path segment percent-decoded
+/// like axum's `Path`, refused when that is not UTF-8 or the handler would
+/// refuse the id, so `b1` and `%62%31` show the same text.
+fn binding_id_of(path: &str, credential_route: bool) -> Option<String> {
+    let raw = binding_segment(path, credential_route)?;
+    let id = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?
+        .into_owned();
+    crate::knowledge_routes::valid_binding_id(&id).then_some(id)
+}
+
+fn expires_rfc3339(secs: u64) -> Option<String> {
+    let secs = i64::try_from(secs).ok()?;
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).map(|stamp| stamp.to_rfc3339())
+}
+
+/// The approval text for `parsed`. Every request-supplied string it shows
+/// goes through [`shown`]; `None` leaves nothing to approve. The credential
+/// value is not one of them: the text has neither the value, nor a fragment
+/// of it, nor its length.
+fn knowledge_summary(
+    path: &str,
+    credential_route: bool,
+    parsed: &crate::knowledge_routes::ParsedChange,
+) -> Option<String> {
+    use crate::knowledge_routes::ParsedChange;
+    use agent24_knowledge::host::Credential;
+    let id = shown(&binding_id_of(path, credential_route)?)?;
+    match parsed {
+        ParsedChange::Activate {
+            seq,
+            endpoint: None,
+        } => Some(format!(
+            "activate Knowledge binding {id} with no Knowledge service (every call refused); sequence {seq}"
+        )),
+        ParsedChange::Activate {
+            seq,
+            endpoint: Some(endpoint),
+        } => {
+            let base = shown(&endpoint.base_url)?;
+            let bases = endpoint
+                .knowledge_base_ids
+                .iter()
+                .map(|base_id| shown(base_id))
+                .collect::<Option<Vec<_>>>()?
+                .join(", ");
+            Some(format!(
+                "activate Knowledge binding {id} for {base}; knowledge bases: [{bases}]; sequence {seq}"
+            ))
+        }
+        ParsedChange::Deactivate { seq } => {
+            Some(format!("deactivate Knowledge binding {id}; sequence {seq}"))
+        }
+        ParsedChange::PushCredential {
+            seq,
+            credential,
+            expires_at,
+        } => {
+            // The value is never read here: the parser has already limited
+            // it to visible ASCII, and the text names only its kind.
+            let kind = shown(match credential {
+                Credential::Bearer(_) => "bearer",
+                Credential::ApiKey(_) => "api_key",
+            })?;
+            let expires_at = expires_rfc3339(*expires_at)?;
+            Some(format!(
+                "replace the Knowledge credential of binding {id} ({kind}, valid until {expires_at}); sequence {seq}"
+            ))
+        }
+        ParsedChange::RevokeCredential { seq } => Some(format!(
+            "revoke the Knowledge credential of binding {id}; sequence {seq}"
+        )),
+    }
+}
 
 /// A request-supplied string as a presence summary shows it, or `None` when
 /// it cannot be shown faithfully, which leaves nothing to approve. The value
@@ -652,28 +944,54 @@ const SUMMARY_MAX_UTF16: usize = 500;
 /// unambiguous even if it contains `; ` or other summary punctuation.
 /// Refused rather than dropped or cut: control, format (bidi overrides,
 /// zero-width), line and paragraph separator characters; any whitespace other
-/// than a plain ASCII space; variation selectors; and the invisible filler
-/// letters (U+3164, U+2800, U+115F, U+1160, U+FFA0). A value over
+/// than a plain ASCII space; every `Default_Ignorable_Code_Point` (variation
+/// selectors of both blocks, the Hangul and Mongolian fillers, U+034F, tags,
+/// see [`default_ignorable`]); and U+2800. A value over
 /// `SHOWN_MAX_CHARS` is refused. The length of the *whole* summary is capped
 /// separately (`SUMMARY_MAX_UTF16`, enforced in `elevate`); this function
 /// alone does not stop a long summary from being clipped by the dialog.
-fn shown(value: &str) -> Option<String> {
-    use unicode_general_category::{GeneralCategory as G, get_general_category};
-    let hidden = |c: char| {
-        matches!(
-            get_general_category(c),
-            G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
-        ) || (c.is_whitespace() && c != ' ')
-            || matches!(
-                c,
-                '\u{3164}' | '\u{2800}' | '\u{115F}' | '\u{1160}' | '\u{FFA0}' | '\u{FE00}'
-                    ..='\u{FE0F}'
-            )
-    };
+pub(crate) fn shown(value: &str) -> Option<String> {
     if value.chars().count() > SHOWN_MAX_CHARS || value.chars().any(hidden) {
         return None;
     }
     serde_json::to_string(value).ok()
+}
+/// A character [`shown`] refuses: it could be drawn as nothing, or move or
+/// break the text around it.
+pub(crate) fn hidden(c: char) -> bool {
+    use unicode_general_category::{GeneralCategory as G, get_general_category};
+    matches!(
+        get_general_category(c),
+        G::Control | G::Format | G::LineSeparator | G::ParagraphSeparator
+    ) || (c.is_whitespace() && c != ' ')
+        || c == '\u{2800}'
+        || default_ignorable(c)
+}
+/// Unicode `Default_Ignorable_Code_Point` (DerivedCoreProperties.txt):
+/// characters a renderer may draw as nothing, so two different ids could
+/// look the same in the dialog. Many are also `Format`, but not all (U+034F,
+/// U+17B4, the variation selectors, the Hangul fillers, unassigned ones).
+fn default_ignorable(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{034F}'
+            | '\u{061C}'
+            | '\u{115F}'..='\u{1160}'
+            | '\u{17B4}'..='\u{17B5}'
+            | '\u{180B}'..='\u{180F}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{206F}'
+            | '\u{3164}'
+            | '\u{FE00}'..='\u{FE0F}'
+            | '\u{FEFF}'
+            | '\u{FFA0}'
+            | '\u{FFF0}'..='\u{FFF8}'
+            | '\u{1BCA0}'..='\u{1BCA3}'
+            | '\u{1D173}'..='\u{1D17A}'
+            | '\u{E0000}'..='\u{E0FFF}'
+    )
 }
 pub fn body_digest(body: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -684,7 +1002,7 @@ pub fn body_digest(body: &[u8]) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
+pub(crate) fn test_peer_as(generation: &str, identifier: &str) -> EnrolledPeer {
     let pid = std::process::id() as i32;
     let start =
         agent24_os_proc::start_time(pid).unwrap_or(agent24_os_proc::ProcStart { sec: 0, usec: 0 });
@@ -698,13 +1016,18 @@ pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
         },
         identity: VerifiedIdentity {
             kind: IdentityKind::MacosSecCode,
-            identifier: "agent24".into(),
+            identifier: identifier.into(),
             team_id: "HYAP444FN9".into(),
             executable: std::env::current_exe().unwrap_or_default(),
             audit_token: None,
         },
         generation: generation.into(),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_peer(generation: &str) -> EnrolledPeer {
+    test_peer_as(generation, "agent24")
 }
 
 #[cfg(test)]
@@ -785,6 +1108,201 @@ mod tests {
             "control: a normal token still reaches more"
         );
     }
+
+    /// Dropping `InboundWrite` from the filter in `issue` turns the first
+    /// assertion red. `InboundRead` is the control: this is a normal shell
+    /// grant, not an empty one.
+    #[test]
+    fn shell_token_is_not_granted_inbound_write() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let parsed = CapabilityToken::parse_bearer(&token.secret).unwrap();
+        let allowed = store.shared.state.lock().unwrap().records[&digest(&parsed)]
+            .claims
+            .allowed_operations
+            .clone();
+        assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
+        assert!(!allowed.contains(&Operation::InboundIngest), "{allowed:?}");
+        assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
+        assert!(
+            store
+                .validate_bearer(
+                    &token.secret,
+                    Operation::InboundWrite,
+                    &Resource::global(),
+                    unix_now(),
+                )
+                .is_err()
+        );
+    }
+
+    /// `mint` copies route-table operations except presence and `InboundWrite`.
+    /// Skill list / show / install use this daily token (skill-loader §4.9).
+    /// Filtering `skills.*` out of `issue` turns the assertions red.
+    #[test]
+    fn shell_token_keeps_skill_read_and_install() {
+        let store = CapabilityStore::new("g");
+        let token = FirstPartyAuthority::new(store.clone())
+            .issue(&test_peer("g"))
+            .unwrap();
+        let parsed = CapabilityToken::parse_bearer(&token.secret).unwrap();
+        let allowed = store.shared.state.lock().unwrap().records[&digest(&parsed)]
+            .claims
+            .allowed_operations
+            .clone();
+        assert!(allowed.contains(&Operation::SkillsRead), "{allowed:?}");
+        assert!(allowed.contains(&Operation::SkillsInstall), "{allowed:?}");
+    }
+
+    /// SL-4. Removing the activate row from `resolve_target`'s supported set
+    /// turns the first assertion into `NotElevatedOperation`, which is how a
+    /// CLI elevation would fail. The summary needs the remembered request.
+    #[test]
+    fn skill_activate_is_elevatable_with_a_remembered_summary_only() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let path = "/api/v1/skills/demo/activate";
+        let body = br#"{"expected_generation":0}"#;
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: path.into(),
+            body_sha256: body_digest(body),
+            client_summary: "CLIENT SECRET".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        assert_eq!(target.operation, Operation::SkillsActivate);
+        assert!(authority.target_summary("id", &target).is_none());
+        authority.remember_skill_activation("id", path, body, "激活技能 \"demo\"".to_owned());
+        assert_eq!(
+            authority.target_summary("id", &target).unwrap(),
+            "激活技能 \"demo\""
+        );
+        // Another body, or another skill's path, finds nothing to approve.
+        let other_body = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let other = resolve_target(&other_body).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        let elsewhere = ElevateRequest {
+            path: "/api/v1/skills/other/activate".into(),
+            body_sha256: body_digest(body),
+            ..other_body
+        };
+        let other = resolve_target(&elsewhere).unwrap();
+        assert!(authority.target_summary("id", &other).is_none());
+        // Reading a skill is Everyday, not elevatable.
+        let read = ElevateRequest {
+            method: "GET".into(),
+            path: "/api/v1/skills/demo".into(),
+            body_sha256: body_digest(b""),
+            client_summary: String::new(),
+        };
+        assert_eq!(
+            resolve_target(&read).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
+    }
+
+    #[test]
+    fn bridge_summary_is_fixed_and_ignores_client_text() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let request = ElevateRequest {
+            method: "POST".into(),
+            path: "/api/v1/capabilities/bridge".into(),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "签发 8 小时微信桥开发令牌，只能写入入站事件");
+        assert!(!details.contains("客户端"));
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+    }
+
+    /// Dropping `CapabilityRevoke` from `resolve_target` turns the first
+    /// `unwrap` red. Dropping the summary arm, or the `claims_by_id` bridge
+    /// check, turns the details `unwrap` red or lets a non-bridge id through.
+    #[test]
+    fn bridge_revoke_summary_names_the_bridge_id_prefix() {
+        use std::collections::BTreeSet;
+
+        let store = CapabilityStore::new("g");
+        let authority = FirstPartyAuthority::new(store.clone());
+        let bridge_id = "aabbccddeeff00112233445566778899";
+        let now = unix_now();
+        store
+            .insert(CapabilityClaims {
+                first_party: None,
+                capability_id: bridge_id.to_owned(),
+                audience: Audience::ComponentRuntime,
+                component_id: Some("wechat-bridge".into()),
+                workspace_id: None,
+                attachment_id: None,
+                principal_id: None,
+                daemon_generation: "g".into(),
+                host_generation: None,
+                sidecar_generation: None,
+                created_at: now,
+                expires_at: now + 3600,
+                deadline: None,
+                allowed_operations: BTreeSet::from([Operation::InboundIngest]),
+            })
+            .unwrap();
+        let shell = authority.issue(&test_peer("g")).unwrap();
+        let mut creative = store.claims_by_id(bridge_id).unwrap();
+        creative.capability_id = "cc11223344556677889900aabbccddee".into();
+        creative.audience = Audience::CreativeRuntime;
+        creative.component_id = None;
+        creative.allowed_operations = BTreeSet::from([Operation::ModelsRead]);
+        store.insert(creative).unwrap();
+
+        let request = |id: &str| ElevateRequest {
+            method: "POST".into(),
+            path: format!("/api/v1/capabilities/{id}/revoke"),
+            body_sha256: body_digest(b""),
+            client_summary: "客户端自述".into(),
+        };
+        let target = resolve_target(&request(bridge_id)).unwrap();
+        let details = authority.target_summary("absent", &target).unwrap();
+        assert_eq!(details, "撤销微信桥开发令牌 aabbccdd");
+        assert!(!details.contains("客户端"));
+        assert!(details.contains(&bridge_id[..8]));
+        for id in [
+            shell.token_id.as_str(),
+            "cc11223344556677889900aabbccddee",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        ] {
+            let target = resolve_target(&request(id)).unwrap();
+            assert!(
+                authority.target_summary("absent", &target).is_none(),
+                "{id}"
+            );
+        }
+        let dirty = ElevateRequest {
+            body_sha256: body_digest(b"{}"),
+            ..request(bridge_id)
+        };
+        let target = resolve_target(&dirty).unwrap();
+        assert!(authority.target_summary("absent", &target).is_none());
+        assert!(
+            store
+                .validate_bearer(
+                    &shell.secret,
+                    Operation::ModelsRead,
+                    &Resource::global(),
+                    unix_now(),
+                )
+                .is_ok()
+        );
+    }
+
     #[tokio::test(start_paused = true)]
     async fn daily_token_ttl_ignores_wall_clock_jumps() {
         let store = CapabilityStore::new("g");
@@ -1392,6 +1910,39 @@ mod tests {
             '\u{1160}', '\u{FFA0}', '\t',
         ]) {
             assert_eq!(summary(&format!("a{c}b")), None, "{label}");
+        }
+        // K-B6 (PR-Daemon #1722): every Default_Ignorable_Code_Point, not
+        // only the U+FE00 block; some are not `Format` (U+034F, U+17B4, the
+        // supplementary variation selectors, unassigned U+2065 and U+FFF0).
+        for c in [
+            '\u{034F}',
+            '\u{17B4}',
+            '\u{17B5}',
+            '\u{180B}',
+            '\u{180F}',
+            '\u{2065}',
+            '\u{FFF0}',
+            '\u{FFF8}',
+            '\u{1BCA0}',
+            '\u{1D173}',
+            '\u{E0000}',
+            '\u{E0100}',
+            '\u{E01EF}',
+            '\u{E0FFF}',
+        ] {
+            assert!(default_ignorable(c), "U+{:04X}", c as u32);
+            assert_eq!(summary(&format!("a{c}b")), None, "U+{:04X}", c as u32);
+        }
+        // Visible neighbours of those ranges still show.
+        for c in [
+            '\u{034E}',
+            '\u{17B6}',
+            '\u{1810}',
+            '\u{FFF9}',
+            '\u{E1000}',
+            'é',
+        ] {
+            assert!(!default_ignorable(c), "U+{:04X}", c as u32);
         }
         for (label, daily) in [
             (

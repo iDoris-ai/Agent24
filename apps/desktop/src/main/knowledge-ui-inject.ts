@@ -12,6 +12,9 @@
 //   ⑤ injection is not paused and the session has a JWT.
 // ①–④ holding and only ⑤ failing cancels the request, so it never leaves
 // without the session it needs. Anything that cannot be judged is not injected.
+// Write entries (#1670 c2) go through the same ①–⑤ and never look at the
+// session's `ops`: the server checks every write against the JWT and answers
+// 403 operation_not_allowed (OPS-v2 W1.9 ③(a)). Evidence ruling 2026-11-11.
 
 import { matchUiRoute, type UiRoute } from './knowledge-ui-routes'
 

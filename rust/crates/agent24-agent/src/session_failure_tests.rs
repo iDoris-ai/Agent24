@@ -106,6 +106,7 @@ async fn assert_quota_rejection(rows: i64) {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -147,6 +148,7 @@ async fn assert_quota_rejection(rows: i64) {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -230,6 +232,7 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -298,6 +301,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -367,6 +371,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -435,6 +440,7 @@ async fn summarizer_timeout_keeps_durable_originals_without_write_failed_event()
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -597,6 +603,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -614,6 +621,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -731,4 +739,60 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
         .collect::<Vec<_>>();
     assert!(failures.is_empty(), "memory write failures: {failures:?}");
     pool.close().await;
+}
+
+struct NoSummary;
+
+#[async_trait]
+impl agent24_memory::session::Summarizer for NoSummary {
+    async fn summarize(&self, _prior: Option<&str>, _messages: &[Msg]) -> Result<String, String> {
+        Err("unused".to_owned())
+    }
+}
+
+#[tokio::test]
+async fn purge_session_waits_for_the_session_lock_then_deletes() {
+    // A turn write that outlives its cancelled caller keeps the session lock
+    // until its commit is confirmed (see the test above). The inbound-text
+    // purge must queue behind it, or it could run first and leave that write.
+    let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+    let origin = |trust| agent24_memory::event::Origin {
+        source: "test".into(),
+        trust,
+    };
+    kv.session_log()
+        .append_turn(
+            "o",
+            "s",
+            0,
+            &Msg::user("q"),
+            origin(agent24_memory::event::Trust::UserSaid),
+            &Msg::assistant(Some("a".into()), vec![]),
+            origin(agent24_memory::event::Trust::Model),
+        )
+        .await
+        .unwrap();
+    let memory = Arc::new(
+        crate::SessionMemory::new(kv.clone(), Arc::new(NoSummary)).with_owner("o".to_owned()),
+    );
+
+    let lock = memory.session_lock("s").await;
+    let guard = lock.lock().await;
+    let purge = tokio::spawn({
+        let memory = Arc::clone(&memory);
+        async move { memory.purge_session("s", "9999-01-01T00:00:00Z").await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    assert!(!purge.is_finished(), "the purge ran without the lock");
+    use agent24_memory::event::EventStore as _;
+    let still: Vec<_> = kv
+        .events()
+        .scan(&agent24_memory::event::EventQuery::owner("o").session("s"))
+        .await
+        .unwrap();
+    assert_eq!(still.len(), 2);
+
+    drop(guard);
+    let report = purge.await.unwrap().unwrap();
+    assert_eq!(report.events, 2);
 }

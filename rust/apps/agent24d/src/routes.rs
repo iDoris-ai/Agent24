@@ -659,7 +659,7 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 {
                     let outcome = state
                         .runs
-                        .chat_remember_turn(sid, prompt, &text, memory_source_ref)
+                        .chat_remember_turn(&run_id, sid, prompt, &text, memory_source_ref)
                         .await;
                     let explicit = explicit_remember_state.is_some();
                     let (receipt, failure) = match outcome {

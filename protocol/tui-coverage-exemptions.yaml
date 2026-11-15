@@ -146,3 +146,21 @@ exemptions:
   - operationId: getSessionSourceFloor
     category: planned-tui-2
     fallback: "raw-http，桌面壳在知识条目准入时使用（KB-SOP-01a #1669）；TUI-2 增加对应 agent24 子命令"
+  - operationId: getInboundAllowlist
+    category: planned-tui-2
+    fallback: "raw-http，X11-2f 入站名单只给 API；TUI-2 增加对应 agent24 子命令"
+  - operationId: putInboundAllowlist
+    category: planned-tui-2
+    fallback: "仅桌面（host-only），CLI 不可写"
+  - operationId: getInboundPolicy
+    category: planned-tui-2
+    fallback: "raw-http，X11-2f 接受模式只给 API；TUI-2 增加对应 agent24 子命令"
+  - operationId: putInboundPolicy
+    category: planned-tui-2
+    fallback: "仅桌面（host-only），CLI 不可写"
+  - operationId: listInboundEvents
+    category: planned-tui-2
+    fallback: "raw-http，入站事件列表只给 API（正文前 50 字）；TUI-2 增加对应 agent24 子命令"
+  - operationId: postWechatInboundEvent
+    category: visual
+    fallback: "开发态微信桥专用（A24_DEV_TOOL=1）。capabilities 只收 ComponentRuntime 桥令牌。终端不做，TUI 不提供入口"

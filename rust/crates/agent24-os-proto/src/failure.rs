@@ -134,7 +134,8 @@ pub fn launch(e: &LaunchError) -> RunFailure {
         | LaunchError::NoEntropy(_)
         | LaunchError::UnsafeOwnership(_)
         | LaunchError::Inspect { .. }
-        | LaunchError::TooLarge { .. } => FailureKind::Setup,
+        | LaunchError::TooLarge { .. }
+        | LaunchError::SandboxUnavailable(_) => FailureKind::Setup,
     };
     RunFailure::new(kind, format!("could not start the module: {e}"))
 }
@@ -300,6 +301,7 @@ mod tests {
             LaunchError::TooLarge {
                 package: "/a".into(),
             },
+            LaunchError::SandboxUnavailable("sandbox-exec is not available".into()),
         ];
         for e in &all {
             assert_eq!(launch(e).kind, Setup, "{e}");

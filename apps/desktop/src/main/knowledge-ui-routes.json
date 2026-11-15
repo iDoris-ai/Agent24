@@ -2,8 +2,8 @@
   "source": {
     "repo": "iDoris-ai/WeKnora",
     "path": "docs/agent24/ui-routes.json",
-    "commit": "5c914a51e6582f35800fb163355dae6dd147b80f",
-    "note": "The host's copy: a subset of the pinned server list at this commit (knowledge-ui-routes.test.ts). C2-01c1/c2/c3 (WeKnora#141, #142, #143)."
+    "commit": "c0992c50b986be50950994502048f616c18abb49",
+    "note": "The host's copy: a subset of the pinned server list at this commit (knowledge-ui-routes.test.ts). C2-01c1/c2/c3 (WeKnora#141, #142, #143); write entries from S5 (#1670 c2)."
   },
   "routes": [
     {
@@ -45,6 +45,31 @@
       "method": "GET",
       "path": "/api/v1/agent24/knowledge/ui/knowledge-bases/:kb_id/wiki/pages/*slug",
       "op": "wiki.get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/candidates",
+      "op": "candidate.review"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agent24/knowledge/ui/candidates/:candidate_id",
+      "op": "candidate.review"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent24/knowledge/ui/candidates/:candidate_id/return",
+      "op": "candidate.review"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent24/knowledge/ui/candidates/:candidate_id/approve",
+      "op": "candidate.approve"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agent24/knowledge/ui/documents/:knowledge_id/withdraw",
+      "op": "entry.withdraw"
     }
   ]
 }

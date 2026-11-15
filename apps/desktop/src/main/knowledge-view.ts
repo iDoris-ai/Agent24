@@ -38,6 +38,9 @@ import { KnowledgeDraft, type DraftEntry } from './knowledge-draft'
 import { KnowledgeBridgeChannel, reservedRequest, type BridgeRequestDetails } from './knowledge-bridge-channel'
 import type { ChunkRead, CitationRef } from './knowledge-readonly'
 import { IpcChannels, type KnowledgeViewConfirmAsk } from '../shared/ipc-types'
+import { CHAT_HISTORY_ID } from '../shared/chat-history'
+import { mt } from './main-i18n'
+import type { KnowledgePending } from './knowledge-pending'
 import type {
   KnowledgeViewBounds,
   KnowledgeViewClosedCode,
@@ -286,6 +289,8 @@ export interface KnowledgeViewHostDeps {
   ui?: (context: KnowledgeViewUiContext) => KnowledgeViewUi
   /** BCP 47 locale for the bridge's `state` (U7.3); 'en' without it. */
   locale?: () => string
+  /** M4 A7: an open dialog goes into its conversation's pending[]; none without it. */
+  pending?: KnowledgePending
 }
 
 /** What the host hands the UI session of a new instance. */
@@ -505,6 +510,8 @@ export class KnowledgeViewHost {
     id: string
     ask: Exclude<KnowledgeViewConfirmAsk, null>
     settle: (value: 'confirmed' | 'declined' | 'aborted') => void
+    /** M4 A7: the conversation whose pending[] holds this dialog, once the renderer said which. */
+    conversation: string | null
   } | null = null
   private instance: Instance | null = null
   private partitions = 0
@@ -758,6 +765,17 @@ export class KnowledgeViewHost {
     pending.settle(confirmed ? 'confirmed' : 'declined')
   }
 
+  /** M4 A7: the renderer put dialog `id` up while `activeId` was the open
+   * conversation; it goes into that conversation's pending[] until the dialog
+   * ends (answered, timed out, aborted, the view gone). No conversation open
+   * yet (`activeId` null): nothing is written, the dialog works the same. */
+  confirmShown(id: string, activeId: string | null): void {
+    const pending = this.pendingConfirm
+    if (!pending || pending.id !== id || pending.conversation !== null || activeId === null || !this.deps.pending) return
+    pending.conversation = activeId
+    this.deps.pending.set(activeId, id, confirmLabel(pending.ask.titles))
+  }
+
   draftList(): readonly DraftEntry[] {
     return this.draft.list()
   }
@@ -916,6 +934,11 @@ export class KnowledgeViewHost {
       } else if (instance.navigating) {
         instance.reloadPending = true
       }
+      return
+    }
+    if (event.kind === 'ops_dropped') {
+      // #1670 c2: the server listed ops this host does not know; the session goes on.
+      this.log(`[knowledge-view] UI exchange dropped ${event.count} op(s) outside the host's closed set`)
       return
     }
     if (event.kind === 'rebuild') {
@@ -1137,7 +1160,11 @@ export class KnowledgeViewHost {
         if (settled) return
         settled = true
         signal.removeEventListener('abort', onAbort)
-        if (this.pendingConfirm?.id === id) this.pendingConfirm = null
+        if (this.pendingConfirm?.id === id) {
+          const conversation = this.pendingConfirm.conversation
+          this.pendingConfirm = null
+          if (conversation !== null) this.deps.pending?.clear(conversation, id)
+        }
         if (kind === 'aborted') reject(new DOMException('The operation was aborted.', 'AbortError'))
         else resolve(kind)
       }
@@ -1147,7 +1174,7 @@ export class KnowledgeViewHost {
       }
       signal.addEventListener('abort', onAbort)
       const payload = { id, count: ask.count, titles: [...ask.titles] }
-      this.pendingConfirm = { id, ask: payload, settle: finish }
+      this.pendingConfirm = { id, ask: payload, settle: finish, conversation: null }
       if (!this.sendMain(IpcChannels.KnowledgeViewConfirm, payload)) finish('unavailable')
     })
   }
@@ -1187,6 +1214,15 @@ export class KnowledgeViewHost {
  * The draft and confirm channels are registered from {@link IpcChannels} so
  * main.ts does not grow a new argument. */
 const DRAFT_ID = /^[A-Za-z0-9_-]{22}$/
+/** Units of the cited titles a pending label keeps. */
+const CONFIRM_LABEL_UNITS = 200
+
+/** The cited titles, or the generic words when none has one. */
+function confirmLabel(titles: readonly (string | null)[]): string {
+  const named = titles.map((title) => title?.replace(/\s+/g, ' ').trim() ?? '').filter((title) => title.length > 0).join(', ')
+  if (named.length === 0) return mt('knowledge.confirmPending')
+  return named.length > CONFIRM_LABEL_UNITS ? `${named.slice(0, CONFIRM_LABEL_UNITS - 1)}…` : named
+}
 
 function draftId(value: unknown): value is string {
   return typeof value === 'string' && DRAFT_ID.test(value)
@@ -1206,6 +1242,10 @@ export function registerKnowledgeViewIpc(
   ipc.handle(IpcChannels.KnowledgeViewAnswer, guard((_event: IpcMainInvokeEvent, id: unknown, confirmed: unknown) => {
     if (!draftId(id) || typeof confirmed !== 'boolean') return
     host()?.answerConfirm(id, confirmed)
+  }))
+  ipc.handle(IpcChannels.KnowledgeViewShown, guard((_event: IpcMainInvokeEvent, id: unknown, activeId: unknown) => {
+    if (!draftId(id) || (activeId !== null && (typeof activeId !== 'string' || !CHAT_HISTORY_ID.test(activeId)))) return
+    host()?.confirmShown(id, activeId)
   }))
   ipc.handle(IpcChannels.KnowledgeDraftList, guard(() => host()?.draftList() ?? []))
   ipc.handle(IpcChannels.KnowledgeDraftRemove, guard((_event: IpcMainInvokeEvent, id: unknown) => {

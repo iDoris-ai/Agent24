@@ -1,6 +1,14 @@
 use super::store::CapabilityStore;
 use super::token::CapabilityToken;
 
+/// What the single state-lock step of a bridge revoke decided.
+pub(crate) enum RevokeAuditStart {
+    /// Already revoked and the `Revoked` row was stored.
+    Stored,
+    /// Revoked in memory, `pending` set. The caller writes one row.
+    Write,
+}
+
 impl CapabilityStore {
     pub fn epoch(&self) -> u64 {
         self.shared
@@ -43,6 +51,55 @@ impl CapabilityStore {
         state.epoch = state.epoch.wrapping_add(1);
         let _ = self.shared.changed.send(state.epoch);
         true
+    }
+
+    /// Under the state lock: a revoked id whose audit row is already stored
+    /// (`pending` clear) is [`RevokeAuditStart::Stored`]. Otherwise the id is
+    /// marked revoked and `pending` is set before the caller writes the row.
+    /// `None` is a missing id or a poisoned lock — not a stored row.
+    pub(crate) fn start_revoke_audit(&self, capability_id: &str) -> Option<RevokeAuditStart> {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return None;
+        };
+        let digest = state.ids.get(capability_id).copied()?;
+        let fresh = {
+            let record = state.records.get_mut(&digest)?;
+            if record.revoked && !record.revoke_audit_pending {
+                return Some(RevokeAuditStart::Stored);
+            }
+            let fresh = !record.revoked;
+            record.revoked = true;
+            record.revoke_audit_pending = true;
+            fresh
+        };
+        if fresh {
+            state.epoch = state.epoch.wrapping_add(1);
+            let _ = self.shared.changed.send(state.epoch);
+        }
+        Some(RevokeAuditStart::Write)
+    }
+
+    pub(crate) fn revoke_audit_pending(&self, capability_id: &str) -> bool {
+        let Ok(state) = self.shared.state.lock() else {
+            return false;
+        };
+        state
+            .ids
+            .get(capability_id)
+            .and_then(|digest| state.records.get(digest))
+            .is_some_and(|record| record.revoke_audit_pending)
+    }
+
+    pub(crate) fn set_revoke_audit_pending(&self, capability_id: &str, pending: bool) {
+        let Ok(mut state) = self.shared.state.lock() else {
+            return;
+        };
+        let Some(digest) = state.ids.get(capability_id).copied() else {
+            return;
+        };
+        if let Some(record) = state.records.get_mut(&digest) {
+            record.revoke_audit_pending = pending;
+        }
     }
 
     pub fn revoke_by_generation(&self, generation: &str) -> usize {

@@ -40,6 +40,8 @@ function renderPage(opts: {
   defs?: readonly CapabilityDef[]
   prefs?: NavPrefs
   statusFor?: (id: string) => string | undefined
+  grantsFor?: (id: string) => readonly string[] | undefined
+  isolationFor?: (id: string) => { state: 'isolated'; mechanism: 'seatbelt' } | { state: 'not_isolated'; reason: 'platform_unsupported' | 'form_not_covered' } | undefined
   onOpenSettings?: () => void
 } = {}) {
   cleanup()
@@ -50,7 +52,7 @@ function renderPage(opts: {
   render(
     <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open }}>
       <NavPrefsContext.Provider value={{ prefs, setPrefs: next => setPrefs(typeof next === 'function' ? next(prefs) : next) }}>
-        <CapabilitiesPage statusFor={opts.statusFor} onOpenSettings={onOpenSettings} />
+        <CapabilitiesPage statusFor={opts.statusFor} grantsFor={opts.grantsFor} isolationFor={opts.isolationFor} onOpenSettings={onOpenSettings} />
       </NavPrefsContext.Provider>
     </CapabilitiesContext.Provider>,
   )
@@ -70,9 +72,10 @@ describe('CapabilitiesPage', () => {
     renderPage({
       defs: DEFS.filter((d) => d.group !== 'tools'),
     })
-    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual(
-      GROUP_TITLES.filter((title) => title !== 'Tools'),
-    )
+    expect(screen.getAllByRole('heading', { level: 2 }).map((h) => h.textContent)).toEqual([
+      ...GROUP_TITLES.filter((title) => title !== 'Tools'),
+      'Skills',
+    ])
     for (const blurb of GROUP_BLURBS.filter((text) => text !== GROUP_BLURBS[4])) {
       expect(screen.getByText(blurb)).toBeInTheDocument()
     }
@@ -162,6 +165,49 @@ describe('CapabilitiesPage', () => {
     renderPage()
     expect(screen.queryByRole('status', { name: /waiting/ })).not.toBeInTheDocument()
     expect(screen.queryByText('Approvals')).not.toBeInTheDocument()
+  })
+
+  it('shows the kernel capabilities a component was actually granted, read-only', () => {
+    renderPage({
+      grantsFor: (id) => id === 'documents' ? ['events'] : id === 'sin90' ? [] : undefined,
+    })
+    expect(within(row('Documents')).getByText('Kernel capabilities: events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('Kernel capabilities: none')).toBeInTheDocument()
+    expect(within(row('Assistant')).queryByText(/Kernel capabilities/)).not.toBeInTheDocument()
+    expect(within(row('Documents')).queryByRole('textbox')).not.toBeInTheDocument()
+
+    act(() => setLocale('zh'))
+    expect(within(row('文档')).getByText('内核能力：events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('内核能力：无')).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(within(row('เอกสาร')).getByText('ความสามารถเคอร์เนล: events')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('ความสามารถเคอร์เนล: ไม่มี')).toBeInTheDocument()
+    act(() => setLocale('en'))
+  })
+
+  it('shows an isolation tag on the component row and hides it when the card has none', () => {
+    renderPage({
+      isolationFor: (id) => {
+        if (id === 'documents') return { state: 'isolated', mechanism: 'seatbelt' }
+        if (id === 'sin90') return { state: 'not_isolated', reason: 'form_not_covered' }
+        if (id === 'knowledgeBase') return { state: 'not_isolated', reason: 'platform_unsupported' }
+        return undefined
+      },
+    })
+    expect(within(row('Documents')).getByText('Isolated')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('Not isolated · This kind of component is not isolated')).toBeInTheDocument()
+    expect(within(row('Knowledge Base')).getByText('Not isolated · Isolation is not available on this platform')).toBeInTheDocument()
+    expect(within(row('Assistant')).queryByText(/Isolated|Not isolated/)).not.toBeInTheDocument()
+
+    act(() => setLocale('zh'))
+    expect(within(row('文档')).getByText('已隔离')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('未隔离 · 此类组件暂不隔离')).toBeInTheDocument()
+    expect(within(row('知识库')).getByText('未隔离 · 此平台暂不支持隔离')).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(within(row('เอกสาร')).getByText('แยกส่วนแล้ว')).toBeInTheDocument()
+    expect(within(row('Sin90')).getByText('ยังไม่แยกส่วน · ส่วนประกอบประเภทนี้ยังไม่ถูกแยกส่วน')).toBeInTheDocument()
+    expect(within(row('คลังความรู้')).getByText('ยังไม่แยกส่วน · แพลตฟอร์มนี้ยังไม่รองรับการแยกส่วน')).toBeInTheDocument()
+    act(() => setLocale('en'))
   })
 
   it('labels builtin rows Built-in, other rows Open, and lets statusFor replace either', () => {

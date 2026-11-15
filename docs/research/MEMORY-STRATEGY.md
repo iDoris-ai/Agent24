@@ -98,7 +98,7 @@ sensitivity?, retention_policy_id?   # P4
 可信身份 → Authorizer 算出可见 space 集合
         → 候选生成（每一路都带 space / qualified / active 过滤）
              ├─ FTS（unicode61 + CJK 二元组，search_any 用 OR 候选）  ← M1 已有
-             ├─ 向量（oMLX embedding，按 owner 分区，可重建）           ← P2
+             ├─ 向量（oMLX embedding，按 owner 分区，可重建）           ← P2 已接入（向量召回 VR-1…VR-5）
              └─ 时间 / 实体扩展                                       ← P5
         → RRF 名次融合（k≈60） →（可选）本地 reranker，有收益才开
         → 注入前再核状态（撤回、Held、授权版本）
@@ -189,7 +189,7 @@ sensitivity?, retention_policy_id?   # P4
 
 **目标**：不牺牲可控性的前提下，提高召回质量和写入的自动化程度。
 **交付**：
-- T07b：oMLX embedding，按 owner 分区，可从账本重建，模型或维度变化时有重建契约；FTS 和向量各自先过滤，再用 RRF 合并。reranker 只有在评测显示有收益时才开启。
+- T07b：**已接入（向量召回 VR-1…VR-5）**。oMLX embedding（`bge-m3-mlx-fp16`），按 owner 分区，可从账本重建，模型或维度变化时有重建契约；FTS 和向量各自先过滤，再用 RRF 合并。`MIN_COSINE` = 0.62。reranker 未开。T06b 与下面的 ≥100 例评测台仍未做，P2 整体未完成。
 - T06b：本地 LLM 只提出候选（ADD/UPDATE/RETRACT 提议 + 证据 EventId），一律进 Held，用户在「待确认」列表里确认后才生效。任务以 `source_event_id + extractor_revision` 作为幂等键。
 - 评测台：在 T08 用例集的基础上加入 LongMemEval 形状的中文集（≥100 例，数据结构参照官方 schema），检索、注入、回答三层分开出指标，记录模型、embedding、预算配置。评测框架与本地模型都在笔记本上（2026-10-03 起 B 机不再构建 Agent24）。
 

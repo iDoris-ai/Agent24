@@ -24,6 +24,7 @@ use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::capabilities::requires::{self, Consent, DenyReason, GrantForm};
 use crate::capabilities::{Audience, Authorization};
 use crate::comm_routes::BuildMark;
 use crate::domain::{MountOutcome, MountReport};
@@ -59,6 +60,102 @@ pub struct Provide {
     availability: Option<&'static str>,
 }
 
+/// `requires` as declared. Not what the mount handed out.
+#[derive(Serialize, Clone, PartialEq, Eq, Default)]
+struct Declared {
+    kernel: Vec<String>,
+    operations: Vec<String>,
+}
+
+/// One closed denial. `code` serializes as the snake_case [`DenyReason`].
+#[derive(Serialize, Clone, PartialEq, Eq)]
+struct Denial {
+    item: String,
+    code: DenyReason,
+}
+
+/// What SBX-2 classifies. Not D5 [`Form`]: `resident` covers both in-process
+/// daemons and out-of-process OS packages, and only the latter is started by
+/// `agent24-os-proto` launch (seatbelt on macOS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentClass {
+    /// `impl_kind: out_of_process_provider`, including Documents.
+    OsModule,
+    Resident,
+    Sidecar,
+    Cli,
+    Attach,
+    Remote,
+    Mcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IsolationMechanism {
+    Seatbelt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NotIsolatedReason {
+    PlatformUnsupported,
+    FormNotCovered,
+}
+
+/// Wire `isolation` on both the host view and the redacted view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Isolation {
+    Isolated { mechanism: IsolationMechanism },
+    NotIsolated { reason: NotIsolatedReason },
+}
+
+/// OS module on macOS is isolated. An OS module anywhere else is
+/// `platform_unsupported` (Linux is SBX-4). Every other class is
+/// `form_not_covered`. `macos` is `cfg!(target_os = "macos")` in production
+/// and a parameter here so tests do not depend on the host.
+fn component_isolation(class: ComponentClass, macos: bool) -> Isolation {
+    match class {
+        ComponentClass::OsModule if macos => Isolation::Isolated {
+            mechanism: IsolationMechanism::Seatbelt,
+        },
+        ComponentClass::OsModule => Isolation::NotIsolated {
+            reason: NotIsolatedReason::PlatformUnsupported,
+        },
+        ComponentClass::Resident
+        | ComponentClass::Sidecar
+        | ComponentClass::Cli
+        | ComponentClass::Attach
+        | ComponentClass::Remote
+        | ComponentClass::Mcp => Isolation::NotIsolated {
+            reason: NotIsolatedReason::FormNotCovered,
+        },
+    }
+}
+
+fn class_of(form: Form) -> ComponentClass {
+    match form {
+        Form::Resident => ComponentClass::Resident,
+        Form::Sidecar => ComponentClass::Sidecar,
+        Form::Cli => ComponentClass::Cli,
+        Form::Attach => ComponentClass::Attach,
+        Form::Remote => ComponentClass::Remote,
+        Form::Mcp => ComponentClass::Mcp,
+    }
+}
+
+fn isolation_here(class: ComponentClass) -> Isolation {
+    component_isolation(class, cfg!(target_os = "macos"))
+}
+
+/// Host-only kernel picture. `kernel_grants` is the mount's list.
+/// `declared` is `None` when the manifest was not read.
+struct KernelView {
+    kernel_grants: Vec<String>,
+    declared: Option<Declared>,
+    denied: Vec<Denial>,
+}
+
 /// The host view of one component.
 #[derive(Serialize, Clone)]
 pub struct Item {
@@ -73,6 +170,18 @@ pub struct Item {
     /// Ports, contract expectations, counters. Host-only.
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<Value>,
+    /// Capabilities the mount actually handed out (`MountReport.granted`).
+    /// Host-only. Empty when nothing is mounted. Not the resolver's grant set:
+    /// a missing model callback leaves `models` out of this list.
+    kernel_grants: Vec<String>,
+    /// The component's `requires` declaration. Host-only. Null when the
+    /// manifest was not read (unknown; denials are not computed).
+    declared: Option<Declared>,
+    /// Why a declared or ceiling item is not in [`Self::kernel_grants`].
+    /// Host-only; the redacted view omits it.
+    denied: Vec<Denial>,
+    /// Seatbelt or why this row is not isolated. Both audiences.
+    isolation: Isolation,
 }
 
 /// What a non-host audience sees in capability mode (see [`sees_everything`]): the fields are
@@ -83,6 +192,7 @@ struct Redacted<'a> {
     version: Option<&'a str>,
     state: ComponentState,
     provides: &'a [Provide],
+    isolation: Isolation,
 }
 
 impl Item {
@@ -95,6 +205,11 @@ impl Item {
             provides: Vec::new(),
             reason: None,
             detail: None,
+            kernel_grants: Vec::new(),
+            // Unknown until a row reads a declaration (`set_kernel` or a lock).
+            declared: None,
+            denied: Vec::new(),
+            isolation: isolation_here(class_of(form)),
         }
     }
     fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
@@ -123,7 +238,106 @@ impl Item {
             version: self.version.as_deref(),
             state: self.state,
             provides: &self.provides,
+            isolation: self.isolation,
         }
+    }
+
+    fn set_kernel(&mut self, view: KernelView) {
+        self.kernel_grants = view.kernel_grants;
+        self.declared = view.declared;
+        self.denied = view.denied;
+    }
+}
+
+fn declared_of(kernel: &[String], operations: &[String]) -> Declared {
+    Declared {
+        kernel: kernel.to_vec(),
+        operations: operations.to_vec(),
+    }
+}
+
+fn denials_of(denied: &[requires::Denial]) -> Vec<Denial> {
+    denied
+        .iter()
+        .map(|denial| Denial {
+            item: denial.item.clone(),
+            code: denial.reason,
+        })
+        .collect()
+}
+
+/// First denial wins. A declaration can repeat a token that sits in both
+/// `kernel` and `operations`, or twice in one of them.
+fn unique_by_item(denied: Vec<Denial>) -> Vec<Denial> {
+    let mut seen = BTreeSet::new();
+    denied
+        .into_iter()
+        .filter(|denial| seen.insert(denial.item.clone()))
+        .collect()
+}
+
+/// A resident with no kernel callback (Hyphae). Declared tokens are
+/// `no_channel`; an invalid declaration is `requires_invalid` and grants nothing.
+fn kernel_without_channel(kernel: &[String], operations: &[String]) -> KernelView {
+    let spec = requires::RequiresSpec::parse(kernel, operations);
+    let declared = declared_of(kernel, operations);
+    if !spec.is_valid() {
+        let resolution = requires::resolve(
+            &spec,
+            GrantForm::InProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        );
+        return KernelView {
+            kernel_grants: Vec::new(),
+            declared: Some(declared),
+            denied: unique_by_item(denials_of(&resolution.denied)),
+        };
+    }
+    let denied = kernel
+        .iter()
+        .chain(operations.iter())
+        .map(|item| Denial {
+            item: item.clone(),
+            code: DenyReason::NoChannel,
+        })
+        .collect();
+    KernelView {
+        kernel_grants: Vec::new(),
+        declared: Some(declared),
+        denied: unique_by_item(denied),
+    }
+}
+
+/// `kernel_grants` copies `actual` (the mount's or the admission's list).
+/// `no_channel` is only for a live mount: a capability the resolver would
+/// grant and this form's ceiling allows, but `actual` does not hold. A
+/// module that is not [`MountOutcome::Mounted`] keeps the resolver's static
+/// denials and does not gain `no_channel`.
+fn kernel_from_mount(
+    form: GrantForm,
+    kernel: &[String],
+    operations: &[String],
+    actual: &[String],
+    mounted: bool,
+) -> KernelView {
+    let spec = requires::RequiresSpec::parse(kernel, operations);
+    let resolution = requires::resolve(&spec, form.host_cap(), Consent::FirstPartyEnabled);
+    let mut denied = denials_of(&resolution.denied);
+    if mounted {
+        let held: BTreeSet<&str> = actual.iter().map(String::as_str).collect();
+        for cap in resolution.granted.iter() {
+            if !held.contains(cap.as_str()) {
+                denied.push(Denial {
+                    item: cap.as_str().to_owned(),
+                    code: DenyReason::NoChannel,
+                });
+            }
+        }
+    }
+    KernelView {
+        kernel_grants: actual.to_vec(),
+        declared: Some(declared_of(kernel, operations)),
+        denied: unique_by_item(denied),
     }
 }
 
@@ -362,12 +576,14 @@ fn hyphae_item(state: &AppState) -> Item {
         }
     };
     let lock = lock.component();
+    let kernel = kernel_without_channel(&lock.requires.kernel, &lock.requires.operations);
     let item = Item::new("hyphae", Form::Resident, ComponentState::Absent).with(|i| {
         i.provides = Item::provides_of(lock);
         i.detail = Some(json!({"contract": {
             "name": lock.contract.name, "major": lock.contract.major,
             "min_minor": lock.contract.min_minor,
         }}));
+        i.set_kernel(kernel);
     });
     // A binary the last start (or install rebuild) refused is `failed` with the stable
     // code, ahead of any supervisor left registered from before. Host view only: the
@@ -453,6 +669,16 @@ fn attach_items_from(mut modules: Vec<agent24_attach::attach_registry::AttachSna
                 } else {
                     item.reason = reason.map(str::to_owned);
                 }
+                // The admission already decided the channel. `mounted` stays
+                // true so a missing model callback is `no_channel` against
+                // the attach ceiling even while the module is stopped.
+                item.set_kernel(kernel_from_mount(
+                    GrantForm::Attach,
+                    &module.declared_kernel,
+                    &[],
+                    &module.kernel_grants,
+                    true,
+                ));
             })
         })
         .collect()
@@ -575,15 +801,60 @@ fn documents_shown(
     catalog: Result<documents_catalog::DocumentsCatalog, documents_catalog::CatalogError>,
 ) -> Item {
     let mut item = Item::new("documents", documents_form(), ComponentState::Absent);
+    let effective = outcome.or(report.map(|report| &report.outcome));
     if let Some(report) = report {
-        let outcome = outcome.unwrap_or(&report.outcome);
+        let outcome = effective.unwrap_or(&report.outcome);
         let (mapped, reason, detail) = documents_mapped(outcome, live);
         item.state = mapped;
         item.version = Some(report.version.clone());
         item.reason = reason.map(str::to_owned);
         item.detail = detail.map(|why| json!({"message": why}));
     }
+    let operations = match &catalog {
+        Ok(catalog) => catalog.requires.operations.clone(),
+        Err(_) => Vec::new(),
+    };
+    let catalog_kernel = match &catalog {
+        Ok(catalog) => catalog.requires.kernel.clone(),
+        Err(_) => Vec::new(),
+    };
+    let d9 = report.and_then(|report| report.d9.as_ref());
+    let actual = report
+        .map(|report| report.granted.clone())
+        .unwrap_or_default();
+    let mounted = effective.is_some_and(|outcome| matches!(outcome, MountOutcome::Mounted));
     apply_documents_catalog(&mut item, catalog, report);
+    // D9 missing: keep the catalog as `declared` (the two sources stay).
+    // Do not run a ceiling and do not invent denials — the manifest was
+    // not read. A present D9 uses the mount outcome, and `no_channel` only
+    // when that outcome is Mounted.
+    match d9 {
+        Some(d9) => {
+            let form = if d9.in_process {
+                GrantForm::InProcess
+            } else {
+                GrantForm::OutOfProcess
+            };
+            item.set_kernel(kernel_from_mount(
+                form,
+                &d9.requires_kernel,
+                &operations,
+                &actual,
+                mounted,
+            ));
+        }
+        None if report.is_some() || !catalog_kernel.is_empty() || !operations.is_empty() => {
+            item.set_kernel(KernelView {
+                kernel_grants: actual,
+                declared: Some(declared_of(&catalog_kernel, &operations)),
+                denied: Vec::new(),
+            });
+        }
+        None => {}
+    }
+    // Documents is the out-of-process package (`domain-os.yml` spawn), including
+    // the row shown when nothing is mounted.
+    item.isolation = isolation_here(ComponentClass::OsModule);
     item
 }
 
@@ -713,9 +984,34 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                     "package"
                 }
             });
+            let mounted = matches!(outcome, MountOutcome::Mounted);
+            // No D9: the manifest was not read. `declared` is unknown, so
+            // there is no denial list and no out-of-process ceiling.
+            let kernel = match d9 {
+                Some(d9) => {
+                    let form = if d9.in_process {
+                        GrantForm::InProcess
+                    } else {
+                        GrantForm::OutOfProcess
+                    };
+                    kernel_from_mount(form, &d9.requires_kernel, &[], &report.granted, mounted)
+                }
+                None => KernelView {
+                    kernel_grants: report.granted.clone(),
+                    declared: None,
+                    denied: Vec::new(),
+                },
+            };
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
                 // An integrity refusal with no trusted version is unknown,
                 // not the empty string.
+                // A package (`!in_process`) is started by os-proto launch.
+                // No D9 means the manifest was not read: not classified as an
+                // OS module (FU). In-process stays `form_not_covered`.
+                if d9.is_some_and(|d| !d.in_process) {
+                    i.isolation = isolation_here(ComponentClass::OsModule);
+                }
+                i.set_kernel(kernel);
                 i.version = if report.version.is_empty() {
                     None
                 } else {
@@ -844,6 +1140,55 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items.extend(mcp_items(state));
     dedupe_component_ids(&mut items);
     items
+}
+
+// ---- providers for a skill run (SL-5) -------------------------------------------------
+
+/// The components that provide a capability right now, for admitting a run that names a
+/// skill. One component view per admission; a component counts when it is `ready` and its own
+/// report has not marked that capability unavailable.
+pub(crate) struct ComponentProviders<'a> {
+    state: &'a AppState,
+    items: tokio::sync::OnceCell<Vec<Item>>,
+}
+
+impl<'a> ComponentProviders<'a> {
+    pub(crate) fn new(state: &'a AppState) -> Self {
+        Self {
+            state,
+            items: tokio::sync::OnceCell::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl agent24_agent::SkillProviderSource for ComponentProviders<'_> {
+    async fn providers(&self, capability: &str) -> Vec<agent24_agent::SkillProvider> {
+        let items = self
+            .items
+            .get_or_init(|| collect(self.state, Instant::now()))
+            .await;
+        items
+            .iter()
+            .filter(|item| item.state == ComponentState::Ready)
+            .filter(|item| {
+                item.provides
+                    .iter()
+                    .any(|p| p.id == capability && p.availability.is_none())
+            })
+            .map(|item| agent24_agent::SkillProvider {
+                component: item.id.clone(),
+                version: item.version.clone(),
+            })
+            .collect()
+    }
+
+    fn registered_provider(&self, capability: &str) -> Option<String> {
+        crate::component_manifest::REGISTERED_PROVIDERS
+            .iter()
+            .find(|(cap, _)| *cap == capability)
+            .map(|(_, provider)| (*provider).to_owned())
+    }
 }
 
 // ---- GET -------------------------------------------------------------------------------

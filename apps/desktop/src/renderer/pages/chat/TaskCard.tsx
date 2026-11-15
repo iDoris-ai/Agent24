@@ -14,6 +14,7 @@ import { createChatSession } from '../chat-knowledge'
 import { cancelRun, createRun, decideApproval, listPendingApprovals, type Approval, type Decision } from '../agent/api'
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
+import { skillForConversation } from './session-skill'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
 
@@ -196,7 +197,8 @@ export function HandOver({ conversation, prompt }: { conversation: string; promp
     try {
       const session = await createChatSession(window.agent24.backendProxy)
       if (session === null) throw new Error('session_unavailable')
-      const run = await createRun({ prompt, session_id: session })
+      const skillId = skillForConversation(conversation)
+      const run = await createRun({ prompt, session_id: session, ...(skillId ? { skill_id: skillId } : {}) })
       // Recorded once main has it; the card shows from then on. One that
       // could not be recorded is not left running unseen.
       if (!(await promoteRun(conversation, run.id))) {

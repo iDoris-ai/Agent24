@@ -17,6 +17,13 @@ let stateListener: ((s: KnowledgeViewState) => void) | null = null
 let citationListener: ((c: KnowledgeViewCitation) => void) | null = null
 let confirmListener: ((ask: KnowledgeViewConfirmAsk) => void) | null = null
 const answer = vi.fn()
+const shownAsk = vi.fn()
+// M4 A7: the conversation open in the main window, as the history list keeps it.
+let activeId: string | null = null
+vi.mock('./chat/history', async (original) => ({
+  ...(await original<typeof import('./chat/history')>()),
+  getHistoryState: () => ({ items: [], activeId, busy: false, groups: { groups: [] }, archiving: [] }),
+}))
 let resizeCallback: ResizeObserverCallback | null = null
 
 beforeEach(() => {
@@ -24,6 +31,7 @@ beforeEach(() => {
   stateListener = null
   citationListener = null
   confirmListener = null
+  activeId = null
   setLocale('en')
   show.mockResolvedValue({ ok: true })
   reload.mockResolvedValue({ ok: true })
@@ -37,6 +45,7 @@ beforeEach(() => {
         onCitation: (cb: (c: KnowledgeViewCitation) => void) => { citationListener = cb; return () => { citationListener = null } },
         onConfirm: (cb: (ask: KnowledgeViewConfirmAsk) => void) => { confirmListener = cb; return () => { confirmListener = null } },
         answer,
+        shown: shownAsk,
       },
     },
     configurable: true,
@@ -68,6 +77,65 @@ describe('KnowledgePage', () => {
     await waitFor(() => expect(show).toHaveBeenCalled())
     expect(show.mock.calls[0]).toHaveLength(2)
     expect(show.mock.calls[0][1]).toBe('dark')
+  })
+
+  it('reports the shell theme again whenever it changes while the page is open, and not after unmount (M2 B1)', async () => {
+    const { container, unmount } = render(<div className="app light"><KnowledgePage /></div>)
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(1))
+    act(() => stateListener?.({ state: 'ready' }))
+    const shell = container.firstElementChild as HTMLElement
+    await act(async () => { shell.className = 'app' })
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(2))
+    expect(show.mock.calls[1][1]).toBe('dark')
+    expect(Object.keys(show.mock.calls[1][0]).sort()).toEqual(['height', 'width', 'x', 'y'])
+    await act(async () => { shell.className = 'app light' })
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(3))
+    expect(show.mock.calls[2][1]).toBe('light')
+    // A class change that leaves the theme as it was reports nothing.
+    await act(async () => { shell.className = 'app light focused' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(show).toHaveBeenCalledTimes(3)
+    unmount()
+    shell.className = 'app'
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(show).toHaveBeenCalledTimes(3)
+  })
+
+  it.each([
+    [{ state: 'loading' }],
+    [{ state: 'degraded', code: 'crashed' }],
+    [{ state: 'degraded', code: 'load_failed' }],
+  ] as const)('holds a theme change while the view is %j, so show() neither rebuilds nor reloads it, and reports it once ready (M2 B1, Codex r1 C1)', async (notReady) => {
+    const { container } = render(<div className="app light"><KnowledgePage /></div>)
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(1))
+    act(() => stateListener?.(notReady as KnowledgeViewState))
+    const shell = container.firstElementChild as HTMLElement
+    await act(async () => { shell.className = 'app' })
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(show).toHaveBeenCalledTimes(1)
+    act(() => stateListener?.({ state: 'ready' }))
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(2))
+    expect(show.mock.calls[1][1]).toBe('dark')
+    // Ready again with nothing new: no further report.
+    act(() => stateListener?.({ state: 'ready' }))
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(show).toHaveBeenCalledTimes(2)
+  })
+
+  it('counts the theme Reload sends as sent: a change back during that load still goes out once ready (M2 B1, Codex r2 C1)', async () => {
+    const { container } = render(<div className="app light"><KnowledgePage /></div>)
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(1))
+    act(() => stateListener?.({ state: 'degraded', code: 'load_failed' }))
+    const shell = container.firstElementChild as HTMLElement
+    await act(async () => { shell.className = 'app' })
+    fireEvent.click(screen.getByRole('button', { name: 'Reload' }))
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1))
+    expect(reload.mock.calls[0][1]).toBe('dark')
+    act(() => stateListener?.({ state: 'loading' }))
+    await act(async () => { shell.className = 'app light' })
+    act(() => stateListener?.({ state: 'ready' }))
+    await waitFor(() => expect(show).toHaveBeenCalledTimes(2))
+    expect(show.mock.calls[1][1]).toBe('light')
   })
 
   it('not connected: says so in plain words and offers Settings, not Reload', async () => {
@@ -159,6 +227,20 @@ describe('KnowledgePage', () => {
     expect(screen.getByText('Untitled')).toBeTruthy()
     expect(container.querySelector('.knowledge-page > .knowledge-confirm')).toBeTruthy()
     expect(container.querySelector('.knowledge-host .knowledge-confirm')).toBeNull()
+  })
+
+  it('M4 A7: a dialog that comes up tells main which conversation is open; a null one does not', async () => {
+    activeId = 'chat_open1'
+    render(<KnowledgePage />)
+    await waitFor(() => expect(show).toHaveBeenCalled())
+    act(() => confirmListener?.(ASK))
+    expect(shownAsk).toHaveBeenCalledTimes(1)
+    expect(shownAsk).toHaveBeenCalledWith(ASK.id, 'chat_open1')
+    act(() => confirmListener?.(null))
+    expect(shownAsk).toHaveBeenCalledTimes(1)
+    activeId = null
+    act(() => confirmListener?.(ASK))
+    expect(shownAsk).toHaveBeenLastCalledWith(ASK.id, null)
   })
 
   it('accept answers true and opens the main chat, in that order', async () => {
@@ -293,7 +375,7 @@ describe('knowledge entry drafts on the page', () => {
   })
 
   it('keeps unsaved edits in a draft while a citation covers it (Codex C2)', async () => {
-    const draft = { ...ONE, body: 'original', message_from: 0, message_to: 1, conversation_id: 'chat_abc', created_at: ONE.updated_at, content_sha256: 'a'.repeat(64) }
+    const draft = { ...ONE, body: 'original', message_from: 0, message_to: 1, conversation_id: 'chat_abc', created_at: ONE.updated_at, content_sha256: 'a'.repeat(64), format: null, submission: { pending: false, stuck: false, candidate: null }, knowledge_base_ids: [] }
     withEntry({ listDrafts: vi.fn(async () => [ONE]), getDraft: vi.fn(async () => draft) })
     act(() => openDraft(ONE.id))
     render(<KnowledgePage />)

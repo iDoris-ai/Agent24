@@ -26,6 +26,7 @@ import {
   type KnowledgeEntryAdmitAnswer,
   type KnowledgeEntryDraftCreated,
   type KnowledgeEntryDraftSaved,
+  type KnowledgeEntrySubmitAnswer,
   type KnowledgeEntryDraftSummary,
   type KnowledgeEntryDraftView,
   type KnowledgeEntryKind,
@@ -131,6 +132,12 @@ const api = {
   commHomeImport: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommHomeImport),
   /** Elevated: replaces the relay list. Main validates the URLs and confirms natively when the list changes. */
   commRelaySet: (relays: string[]): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommRelaySet, relays),
+  /** Elevated: activates one body/evals pair. The page names the skill, the two revision ids and the failing case ids it accepts; main builds the confirmation from the daemon's record and ignores any summary or generation the page adds. */
+  skillsActivate: (input: { skillId: string; bodyRevisionId: string; evalsRevisionId: string; accepted?: string[] }): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.SkillsActivate, input),
+  /** Elevated: moves the pointer back to one recorded activation. */
+  skillsRollback: (input: { skillId: string; rollbackActivationId: string }): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.SkillsRollback, input),
   /** Elevated: main asks for the keystore password in its own window; the page only says whether to remember it. */
   commUnlock: (remember: boolean): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.CommUnlock, remember),
 
@@ -241,6 +248,9 @@ const api = {
     },
     answer: (id: string, confirmed: boolean): Promise<void> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeViewAnswer, id, confirmed),
+    /** M4 A7: dialog `id` is up; `activeId` is the conversation open in the main window, or null. */
+    shown: (id: string, activeId: string | null): Promise<void> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeViewShown, id, activeId),
   },
   // KB-C2-04b-2 (U7.2): draft attachments the user confirmed into this chat.
   knowledgeDraft: {
@@ -269,6 +279,12 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftRedact, id),
     withdrawDraft: (id: string): Promise<boolean> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeEntryDraftWithdraw, id),
+    submit: (id: string, knowledgeBaseId: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmit, id, knowledgeBaseId),
+    submitStatus: (id: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmitStatus, id),
+    retractSubmission: (id: string): Promise<KnowledgeEntrySubmitAnswer> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeEntrySubmitRetract, id),
   },
   // ADR-DOC-01 D5: the Documenting OS, by operation, never by path.
   documents: {

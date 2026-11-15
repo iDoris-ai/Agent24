@@ -13,6 +13,7 @@ function fakeStop(o: {
   uninstall?: () => Promise<void>
   record?: () => void
   unreachable?: boolean
+  leftInstalled?: () => void
 } = {}) {
   const calls: string[] = []
   let held = false
@@ -30,6 +31,7 @@ function fakeStop(o: {
       try { return await work() } finally { held = false; calls.push('release') }
     },
     record: () => { calls.push(`record held=${held}`); o.record?.() },
+    ...(o.leftInstalled ? { leftInstalled: () => { calls.push(`leftInstalled held=${held}`); o.leftInstalled!() } } : {}),
   }
   return { deps, calls }
 }
@@ -106,6 +108,36 @@ describe('stopService', () => {
     const { deps } = fakeStop({ record: () => { throw new Error('disk full') } })
     expect(await stopService(deps)).toEqual({ ok: true })
   })
+
+  // PR#1 F1 follow-up (ruling 2026-11-13-pr1-remaining-lows-gate-f, L-a): the
+  // plist a stop may leave with no daemon behind it is marked only when the
+  // shutdown went through and the uninstall then failed. 「完全退出」 and the
+  // Settings switch off both run this stop (main.ts residentStop).
+  const uninstallFails = () => Promise.reject(Object.assign(new Error('rm'), { code: 'EACCES' }))
+  it('marks the plist left behind when the shutdown went through and the uninstall failed', async () => {
+    const { deps, calls } = fakeStop({ uninstall: uninstallFails, leftInstalled: () => {} })
+    expect(await stopService(deps)).toEqual({ ok: false, stage: 'uninstall', code: 'EACCES' })
+    expect(calls).toEqual(['hold', 'shutdown held=true', 'exited held=true', 'uninstall held=true', 'leftInstalled held=true', 'release'])
+  })
+
+  it('does not mark it when there was no shutdown to send (the bootout may not have run)', async () => {
+    const { deps, calls } = fakeStop({ enrolled: false, uninstall: uninstallFails, leftInstalled: () => {} })
+    expect((await stopService(deps)).ok).toBe(false)
+    expect(calls).not.toContain('leftInstalled held=true')
+  })
+
+  it('does not mark it when the stop went through, or stopped at the shutdown', async () => {
+    for (const o of [{}, { shutdown: async () => ({ status: 403, code: 'presence_denied' }) }, { shutdown: () => Promise.reject(new Error('timeout')) }]) {
+      const { deps, calls } = fakeStop({ leftInstalled: () => {}, ...o })
+      await stopService(deps)
+      expect(calls).not.toContain('leftInstalled held=true')
+    }
+  })
+
+  it('a failing mark is ignored: the uninstall failure is reported as before', async () => {
+    const { deps } = fakeStop({ uninstall: uninstallFails, leftInstalled: () => { throw new Error('disk full') } })
+    expect(await stopService(deps)).toEqual({ ok: false, stage: 'uninstall', code: 'EACCES' })
+  })
 })
 
 describe('serviceStopDeps (the real steps over a fake system)', () => {
@@ -125,6 +157,13 @@ describe('serviceStopDeps (the real steps over a fake system)', () => {
     const deps = serviceStopDeps({ cli: '/App/backend/agent24', pid, spawned, hold, record }, sys)
     return { deps, runs, hold, record, shutdowns: () => shutdowns }
   }
+
+  it('passes leftInstalled through only when given', () => {
+    const sys: StopSystem = { run: async () => {}, record: () => null, alive: () => false, shutdown: async () => ({ status: 202 }), exitWaitMs: 0 }
+    const leftInstalled = () => {}
+    expect(serviceStopDeps({ cli: 'x', pid: 1, spawned: () => false, hold: (w) => w(), record: () => {}, leftInstalled }, sys).leftInstalled).toBe(leftInstalled)
+    expect(serviceStopDeps({ cli: 'x', pid: 1, spawned: () => false, hold: (w) => w(), record: () => {} }, sys).leftInstalled).toBeUndefined()
+  })
 
   it('not enrolled: no shutdown to send', () => {
     expect(system(null).deps.shutdown).toBeNull()

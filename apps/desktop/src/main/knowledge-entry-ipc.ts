@@ -28,6 +28,7 @@ import {
   type KnowledgeEntryDraftSaved,
   type KnowledgeEntryDraftSummary,
   type KnowledgeEntryDraftView,
+  type KnowledgeEntrySubmission,
   type KnowledgeEntryMessagePreview,
   type KnowledgeEntryTarget,
 } from '../shared/ipc-types'
@@ -35,9 +36,12 @@ import type { IpcGuard } from './ipc/guard'
 import { admit, classify, type AdmissionReader } from './knowledge-entry-admission'
 import { MAX_ENTRY_BODY, MAX_ENTRY_DRAFTS, MAX_ENTRY_TITLE, type EntryDraft, type createEntryDraftStore } from './knowledge-entry-draft'
 import { clearFindings, extractEntry, fallbackTitle, findings, SourceTooLong, sourceMessages, type ChatCall } from './knowledge-entry-extract'
+import { restrictedMarkdownProblem } from './knowledge-entry-markdown'
 import { REDACTION_RULES_VERSION } from './knowledge-entry-redact'
+import type { knowledgeEntrySubmission } from './knowledge-entry-submit'
 import { clipUnits, ENTRY_SKILL_VERSION } from './knowledge-entry-skill'
 import type { MainLocale } from './main-i18n'
+import type { KnowledgePending } from './knowledge-pending'
 
 /** The longest title the dialog shows before cutting it short. */
 const TITLE_CHARS = 60
@@ -149,7 +153,15 @@ export interface KnowledgeEntryDraftDeps {
   target: () => string | null
   locale: () => MainLocale
   now?: () => number
+  /** M4 A7: a draft waits in the conversation it came from until it is withdrawn; none without it. */
+  pending?: KnowledgePending
+  /** KB-SOP-01b: the knowledge bases of the binding in effect (a submit picks one). */
+  knowledgeBaseIds?: () => readonly string[]
+  /** KB-SOP-01b: each draft's submission as the candidate store has it. */
+  submission?: (draftId: string, draft: EntryDraft) => KnowledgeEntrySubmission
 }
+
+const NOT_SUBMITTED: KnowledgeEntrySubmission = { pending: false, stuck: false, candidate: null }
 
 /** How long a ticket stays good: long enough to choose a range. */
 export const TICKET_TTL_MS = 15 * 60 * 1000
@@ -203,15 +215,23 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
     findings: findings(draft.title, draft.body),
   })
 
-  const view = (draft: EntryDraft): KnowledgeEntryDraftView => ({
-    ...summary(draft),
-    body: draft.body,
-    conversation_id: draft.source.conversation_id,
-    message_from: draft.source.message_from,
-    message_to: draft.source.message_to,
-    created_at: draft.created_at,
-    content_sha256: draft.content_sha256,
-  })
+  const view = (draft: EntryDraft): KnowledgeEntryDraftView => {
+    const problem = restrictedMarkdownProblem(draft.body)
+    let submission = NOT_SUBMITTED
+    try { submission = deps.submission?.(draft.id, draft) ?? NOT_SUBMITTED } catch { /* shown as not submitted; submitting judges it again */ }
+    return {
+      ...summary(draft),
+      body: draft.body,
+      conversation_id: draft.source.conversation_id,
+      message_from: draft.source.message_from,
+      message_to: draft.source.message_to,
+      created_at: draft.created_at,
+      content_sha256: draft.content_sha256,
+      format: problem ? { kind: problem.problem, line: problem.line } : null,
+      submission,
+      knowledge_base_ids: targetOf(draft.binding) === 'same' ? [...(deps.knowledgeBaseIds?.() ?? [])] : [],
+    }
+  }
 
   const issue = (record: ChatHistoryRecord, sender: number): string => {
     const at = now()
@@ -223,11 +243,15 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
   }
 
   const saved = (run: () => EntryDraft): KnowledgeEntryDraftSaved => {
+    let draft: EntryDraft
     try {
-      return { ok: true, draft: view(run()) }
+      draft = run()
     } catch {
       return { ok: false, reason: 'invalid' }
     }
+    // M4 A7: the waiting item shows the title as it now is (an edit, or one-click redaction).
+    deps.pending?.set(draft.source.conversation_id, draft.id, draft.title)
+    return { ok: true, draft: view(draft) }
   }
 
   const changeable = (id: unknown): EntryDraft | 'not_found' | 'not_saved' => {
@@ -285,6 +309,7 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
         } catch {
           return { ok: false, reason: 'not_saved' }
         }
+        deps.pending?.set(draft.source.conversation_id, draft.id, draft.title)
         // Hints are only words of the body already (parseModelDraft), and the store keeps the body as given.
         return { ok: true, draft: view(draft), model: extraction.model, hints: extraction.hints }
       } finally {
@@ -331,8 +356,17 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
     },
 
     withdraw(id: unknown): boolean {
+      // A draft that cannot be read is still withdrawn; only its pending item is left.
+      let draft: EntryDraft | null = null
       try {
-        return deps.store.withdraw(id)
+        draft = deps.store.get(id)
+      } catch {
+        draft = null
+      }
+      try {
+        const withdrawn = deps.store.withdraw(id)
+        if (withdrawn && draft) deps.pending?.clear(draft.source.conversation_id, draft.id)
+        return withdrawn
       } catch {
         return false
       }
@@ -340,7 +374,13 @@ export function knowledgeEntryDrafts(deps: KnowledgeEntryDraftDeps) {
   }
 }
 
-export function registerKnowledgeEntryIpc(ipc: Pick<IpcMain, 'handle'>, guard: IpcGuard, deps: KnowledgeEntryDeps, drafting: KnowledgeEntryDraftDeps): void {
+export function registerKnowledgeEntryIpc(
+  ipc: Pick<IpcMain, 'handle'>,
+  guard: IpcGuard,
+  deps: KnowledgeEntryDeps,
+  drafting: KnowledgeEntryDraftDeps,
+  submitting?: ReturnType<typeof knowledgeEntrySubmission>,
+): void {
   const admitter = knowledgeEntryAdmitter(deps)
   const drafts = knowledgeEntryDrafts(drafting)
   ipc.handle(IpcChannels.KnowledgeEntryAdmit, guard(async (event: IpcMainInvokeEvent, id: unknown): Promise<KnowledgeEntryAdmitAnswer> => {
@@ -355,4 +395,9 @@ export function registerKnowledgeEntryIpc(ipc: Pick<IpcMain, 'handle'>, guard: I
   ipc.handle(IpcChannels.KnowledgeEntryDraftUpdate, guard((_event: IpcMainInvokeEvent, id: unknown, patch: unknown) => drafts.update(id, patch)))
   ipc.handle(IpcChannels.KnowledgeEntryDraftRedact, guard((_event: IpcMainInvokeEvent, id: unknown) => drafts.redact(id)))
   ipc.handle(IpcChannels.KnowledgeEntryDraftWithdraw, guard((_event: IpcMainInvokeEvent, id: unknown) => drafts.withdraw(id)))
+  if (!submitting) return
+  // KB-SOP-01b: the renderer names the draft and one of the binding's knowledge bases; main builds the rest.
+  ipc.handle(IpcChannels.KnowledgeEntrySubmit, guard((_event: IpcMainInvokeEvent, id: unknown, knowledgeBaseId: unknown) => submitting.submit(id, knowledgeBaseId)))
+  ipc.handle(IpcChannels.KnowledgeEntrySubmitStatus, guard((_event: IpcMainInvokeEvent, id: unknown) => submitting.status(id)))
+  ipc.handle(IpcChannels.KnowledgeEntrySubmitRetract, guard((_event: IpcMainInvokeEvent, id: unknown) => submitting.retract(id)))
 }

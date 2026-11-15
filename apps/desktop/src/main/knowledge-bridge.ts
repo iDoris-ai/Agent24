@@ -317,6 +317,8 @@ export class KnowledgeBridge {
       if (this.helloRequests < BRIDGE_HELLO_REQUESTS) {
         this.helloRequests++
         this.queueHello()
+        // M2 B1: a hello request is followed by the newest state when one is known.
+        if (this.lastState) this.queueState(this.lastState)
         return
       }
       // U6.3: past three, a generation-0 status is a stale one.

@@ -14,17 +14,19 @@ describe('wechat data dir', () => {
     process.env.AGENT24_DATA_DIR = '/a/link/../x'
     expect(CONFIG.DAEMON_STATE_FILE).toBe('/a/link/../x/daemon.json')
     expect(CONFIG.TOKEN_FILE).toBe('/a/link/../x/wechat-token.json')
+    expect(CONFIG.BRIDGE_TOKEN_FILE).toBe('/a/link/../x/dev/wechat-bridge.token')
+    expect(CONFIG.BRIDGE_CURSOR_FILE).toBe('/a/link/../x/dev/wechat-bridge.cursor')
     delete process.env.AGENT24_DATA_DIR
     process.env.HOME = '/a/link/..'
     expect(CONFIG.DAEMON_STATE_FILE).toBe('/a/link/../.agent24/daemon.json')
     expect(CONFIG.TOKEN_FILE).toBe('/a/link/../.agent24/wechat-token.json')
   })
 
-  it('keeps /../ in both the session path and the token path when AGENT24_DATA_DIR is /a/link/..', () => {
+  it('keeps /../ in the token path and the daemon state path when AGENT24_DATA_DIR is /a/link/..', () => {
     process.env.AGENT24_DATA_DIR = '/a/link/..'
     expect(CONFIG.TOKEN_FILE).toBe('/a/link/../wechat-token.json')
-    expect(CONFIG.SESSION_FILE).toBe('/a/link/../wechat-sessions.json')
+    expect(CONFIG.DAEMON_STATE_FILE).toBe('/a/link/../daemon.json')
     expect(CONFIG.TOKEN_FILE).toContain('/../')
-    expect(CONFIG.SESSION_FILE).toContain('/../')
+    expect(CONFIG.DAEMON_STATE_FILE).toContain('/../')
   })
 })

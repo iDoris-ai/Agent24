@@ -6,6 +6,7 @@ import { ChatHistoryList, shortTime } from './ChatHistoryList'
 import { getHistoryState, resetHistoryStore, setRetrySleepForTests } from './history'
 import { setLocale } from '../../i18n'
 import { chatHistorySummary, type ChatHistoryRecord } from '../../../shared/chat-history'
+import { aside } from './skill-list-aside'
 
 const proxy = vi.fn()
 let saved: Map<string, ChatHistoryRecord>
@@ -120,7 +121,7 @@ beforeEach(() => {
     req.body?.messages?.[0]?.role === 'system'
       ? { ok: false, status: 503, data: { error: { code: 'provider_unavailable', message: 'no local model' } } }
       : { ok: true, status: 200, data: { message: { content: 'ack' } } })
-  Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy, chatHistory }, writable: true, configurable: true })
+  Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(proxy), chatHistory }, writable: true, configurable: true })
 })
 afterEach(() => { vi.restoreAllMocks() })
 
@@ -441,7 +442,7 @@ describe('chat history', () => {
   })
 
   it('works without the history bridge: the chat goes on, nothing is listed', async () => {
-    Object.defineProperty(window, 'agent24', { value: { backendProxy: proxy }, writable: true, configurable: true })
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(proxy) }, writable: true, configurable: true })
     renderBoth()
     send('你好')
     await waitFor(() => expect(screen.getByText('ack')).toBeInTheDocument())

@@ -7,6 +7,9 @@ const ROUTES = parseUiRoutes({
   routes: [
     { method: 'GET', path: '/api/v1/knowledge-bases', op: 'kb.list' },
     { method: 'GET', path: '/api/v1/knowledge-bases/:id', op: 'kb.get' },
+    { method: 'GET', path: '/ui/candidates/:candidate_id', op: 'candidate.review' },
+    { method: 'POST', path: '/ui/candidates/:candidate_id/approve', op: 'candidate.approve' },
+    { method: 'POST', path: '/ui/documents/:knowledge_id/withdraw', op: 'entry.withdraw' },
   ],
 })
 const TOKEN = 'jwt-secret-value'
@@ -97,6 +100,32 @@ describe('decideInjection (U4.5 ①–⑤)', () => {
     expect(decideInjection(request(), old)).toEqual({ cancel: true })
     const fresh = target({ webContentsId: 9 })
     expect(decideInjection(request(), fresh)).toEqual(plain)
+  })
+})
+
+describe('decideInjection: write entries (#1670 c2)', () => {
+  const approve = request({ method: 'POST', url: `${ORIGIN}/ui/candidates/c-1/approve` })
+  const withdraw = request({ method: 'POST', url: `${ORIGIN}/ui/documents/k-1/withdraw` })
+  const reviewGet = request({ url: `${ORIGIN}/ui/candidates/c-1` })
+
+  it('injects every listed write entry like a read entry: the server, not the host, checks the op (W1.9 ③(a))', () => {
+    expect(decideInjection(approve, target())).toEqual(injected)
+    expect(decideInjection(withdraw, target())).toEqual(injected)
+    expect(decideInjection(reviewGet, target())).toEqual(injected)
+    // A page-supplied session header is replaced, never passed on.
+    const forged = request({ method: 'POST', url: `${ORIGIN}/ui/candidates/c-1/approve`, requestHeaders: { Accept: 'application/json', Authorization: 'Bearer forged', 'x-agent24-view-proof': 'forged' } })
+    expect(decideInjection(forged, target())).toEqual(injected)
+  })
+
+  it('⑤ still cancels a write entry while there is no session', () => {
+    expect(decideInjection(approve, target({ credentials: () => null }))).toEqual({ cancel: true })
+  })
+
+  it('a write entry needs its own method: GET on a POST entry and POST on a GET entry get nothing', () => {
+    const all = target()
+    expect(decideInjection(request({ url: `${ORIGIN}/ui/candidates/c-1/approve` }), all)).toEqual(plain)
+    expect(decideInjection(request({ method: 'POST', url: `${ORIGIN}/ui/candidates/c-1` }), all)).toEqual(plain)
+    expect(decideInjection(request({ method: 'POST', url: `${ORIGIN}/api/v1/knowledge-bases` }), all)).toEqual(plain)
   })
 })
 

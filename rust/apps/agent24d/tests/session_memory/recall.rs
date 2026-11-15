@@ -343,6 +343,7 @@ fn recalled_context_survives_approval_wait_and_daemon_restart() {
                     model_override: None,
                     mode: RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await
                 .unwrap();
@@ -486,6 +487,7 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
                     model_override: None,
                     mode: RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await
                 .unwrap();
@@ -540,6 +542,7 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
                     model_override: None,
                     mode: RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await
                 .unwrap();
@@ -753,6 +756,7 @@ async fn malicious_recall_content_does_not_alter_system_rules_or_tool_authorizat
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -871,6 +875,7 @@ fn resume_reconstructs_the_prior_turns_history_not_only_the_recall_and_prompt() 
                     model_override: None,
                     mode: RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await
                 .unwrap();
@@ -1014,6 +1019,7 @@ fn forgotten_memory_is_not_resurrected_by_resume_after_an_approval_pends() {
                     model_override: None,
                     mode: RunMode::Normal,
                     knowledge_binding_id: None,
+                    skill_id: None,
                 })
                 .await
                 .unwrap();
@@ -1148,6 +1154,7 @@ async fn forgetting_memory_while_still_parked_in_process_prunes_on_the_next_mode
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

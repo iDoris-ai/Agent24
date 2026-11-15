@@ -73,6 +73,17 @@ struct DecideBody {
     decision: ModuleApprovalDecision,
 }
 
+/// K-B3b: the decision a body asks for, parsed and checked exactly as
+/// [`decide_module_approval`] does, or `None` when the handler would refuse it.
+pub(crate) fn parse_decide_body(body: &[u8]) -> Option<ModuleApprovalDecision> {
+    let decide: DecideBody = serde_json::from_slice(body).ok()?;
+    matches!(
+        decide.decision,
+        ModuleApprovalDecision::Approved | ModuleApprovalDecision::Denied
+    )
+    .then_some(decide.decision)
+}
+
 pub async fn decide_module_approval(State(state): State<AppState>, req: Request<Body>) -> Response {
     // Path parsed manually off the URI, same as `crate::approvals::decide_approval`:
     // URI shape is /api/v1/module-approvals/{id}.

@@ -2,6 +2,15 @@
 
 > 2026-10-03 起 Agent24 的全部任务（派发、编译、测试、验收）都在**笔记本**上执行；B 机（Mac mini ab-codex）因磁盘不足不再构建 Agent24，下文已去掉 B 端专属约定。
 
+## 最高原则：只推主干（jason 2026-11-13）
+
+这一条优先于下文所有约定。
+
+- **只做主干流程和核心功能。** 边缘案例、低概率事件一律先不做：并发竞态的极端交错、有人篡改数据库或文件、恶意本机进程、磁盘或网络的极端故障、罕见输入组合等。需要记的写成一行 FU，以后再说。
+- **评审只修影响主流程的问题。** 只修会让主流程错、不可用或越过安全底线的问题（Critical / High，以及直接打断主流程的 Medium）。Low 和边缘 Medium 不修，挂账。
+- **不反复磨。** 设计文档一轮评审即冻结；每个分片默认一轮评审、一轮修复就合，不为边缘问题开第二、三轮。
+- **分工。** 写码派 Grok（订阅额度）；主会话负责分析、出方案、分派任务和验收，少开 Claude 子代理。
+
 ## 分支规则
 - 集成分支：`ab/<里程碑或方向>`（例如 `ab/m1-memory`、`ab/decide`），规则见下节「里程碑方向分支工作流」。**每个 task PR 的 base 必须是对应的 `ab/*` 集成分支**，绝不能是 `main`。
 - task 分支：`ab/<里程碑>-NN-<短名>`，每个 task 一个 git worktree，放在 `~/Dev/auraai/` 下（笔记本 Agent24 主 checkout 是 `~/Dev/auraai/Agent24`）。
@@ -65,7 +74,7 @@ pnpm typecheck && pnpm lint && pnpm test
 ## 提交与 PR
 - commit author：
   - jason 派发给编码代理的任务，author 用 `jhfnetboy <firsttorch66@gmail.com>`（CLA 检查）；
-  - 已自行签署 CLA 的协作者，用**本人身份**提交本人负责的工作（例如 David：`stoptheworld-java <183781976+stoptheworld-java@users.noreply.github.com>`，负责 Documenting），不改用 jason 的身份；
+  - 已自行签署 CLA 的协作者，用**本人身份**提交本人负责的工作（例如 David：`David <david@idoris.ai>`（GitHub 账号 `davidxuxuxu`），负责 Documenting），不改用 jason 的身份；
   - 任何情况下都不要把 Codex/AI 写成 author，AI 协作只写在 `Co-Authored-By` 尾注里。
 - commit message、PR 标题与正文用中文；标题格式 `<type>(<scope>): <任务ID> —— <摘要>`。
 - 测试先行：验收判据先写成测试并确认它在修复前失败（反面对照），PR body 说明怎么证的。

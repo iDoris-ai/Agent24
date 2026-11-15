@@ -52,10 +52,15 @@ const r = (method: HttpMethod, template: string, timeoutMs?: number): ProxyRoute
  *   PUT    /api/v1/comm/relay                -> IpcChannels.CommRelaySet
  *   POST   /api/v1/comm/unlock               -> IpcChannels.CommUnlock
  *   POST   /api/v1/components/{id}/report    -> main only (open-design-report.ts)
+ *   POST   /api/v1/skills/{id}/activate      -> IpcChannels.SkillsActivate / SkillsRollback (skill-loader §4.9):
+ *                                                主进程读 daemon 自己的修订记录、自己出确认摘要，渲染进程不经代理调用。
  */
 export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // ADR-038 C3b: read-only component list. The host report POST stays in main.
   r('GET', '/api/v1/components'),
+  // Skill list and detail are Everyday reads. Activation stays on the IPC below.
+  r('GET', '/api/v1/skills'),
+  r('GET', '/api/v1/skills/{id}'),
   // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
   r('GET', '/api/v1/idoris/status'),
   r('GET', '/api/v1/idoris/omlx/candidates'),

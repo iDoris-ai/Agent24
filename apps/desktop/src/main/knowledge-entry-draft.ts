@@ -3,7 +3,8 @@
 // Hash: CONTRACT-OPS-v2 W8.13 scheme 1, frozen in #1668. The server does not
 // normalize anything; it hashes the bytes it gets. So the text is put in its
 // canonical form here, when a draft is saved (NFC, every line break as LF,
-// the title trimmed, no lone surrogate), and the hash is
+// the title trimmed, no lone surrogate, no U+0000, `[ ] ( )` inside an https
+// link destination percent-encoded), and the hash is
 // sha256(JSON.stringify([1, kind, title, body])) of exactly the stored text.
 // A stored draft whose text is not canonical, or whose hash does not match,
 // reads as missing.
@@ -12,6 +13,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { CHAT_HISTORY_ID } from '../shared/chat-history'
+import { encodeLinkBrackets } from './knowledge-entry-markdown'
 
 export const ENTRY_KINDS = ['sop', 'faq', 'note'] as const
 export type EntryKind = typeof ENTRY_KINDS[number]
@@ -59,9 +61,13 @@ export function entryHash(entry: { kind: EntryKind; title: string; body: string 
 
 const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/
 
-/** The canonical form W8.13 asks the client for: NFC, LF line breaks, the title trimmed. */
+/**
+ * The canonical form W8.13 asks the client for: NFC, LF line breaks, the title
+ * trimmed. Refused before any hash: a lone surrogate, and U+0000 (OPS-v2 r3:
+ * the server cannot store a NUL and refuses it in any field).
+ */
 export function canonicalText(value: string, trim: boolean): string {
-  if (LONE_SURROGATE.test(value)) fail()
+  if (LONE_SURROGATE.test(value) || value.includes('\u0000')) fail()
   const normalized = value.normalize('NFC').replace(/\r\n?/g, '\n')
   return trim ? normalized.trim() : normalized
 }
@@ -95,7 +101,15 @@ function checkedContent(kind: unknown, title: unknown, body: unknown): { kind: E
   if (!isKind(kind)) fail()
   if (typeof title !== 'string' || typeof body !== 'string') fail()
   const canonTitle = canonicalText(title, true)
-  const canonBody = canonicalText(body, false)
+  // S2 (WeKnora#157 B1): brackets and parentheses inside an https link
+  // destination are percent-encoded at save time, so the stored body is the
+  // body sent and its hash is the one the server computes.
+  const canonBody = encodeLinkBrackets(canonicalText(body, false))
+  // A combining mark right after an encoded `[` or `]` composes with the B or D
+  // of `%5B`/`%5D` under NFC (B + U+0307 is U+1E02). Such a body cannot be both
+  // NFC (W8.13) and encoded, and a stored one would fail isCanonical on read and
+  // vanish, so it is refused here, before anything is written.
+  if (canonBody.normalize('NFC') !== canonBody) fail()
   if (canonTitle.length < 1 || canonTitle.length > MAX_ENTRY_TITLE) fail()
   if (Buffer.byteLength(canonBody, 'utf8') > MAX_ENTRY_BODY) fail()
   return { kind, title: canonTitle, body: canonBody }

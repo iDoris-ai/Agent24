@@ -1,7 +1,7 @@
 # 入站准入里程碑实施方案（X11 ②③④）
 
 - 日期：2026-11-10（基线：`origin/main` @ `2fa86db3b`；第 2 版吸收 Opus 独立评审）
-- 状态：方案草案，待评审。只写文档，没有改代码。
+- 状态：已实施。2a–2d、2f、2g 已合入 main；2e 迁移 #1820 已合（bb03081e）；2e 第 2 部分（Hyphae 轮询）#1821 已合（a93f5df3）；2h 为本收口。对照见 §4.1。
 - 依据：[ADR-041](../../adr/ADR-041-inbound-events-admission-and-work-items.md) 的 041a（D1–D4、D10，已接受）；[ADR-044](../../adr/ADR-044-communication.md) D5（X11 结论）；[MILESTONES-AND-TASKS §2.4](MILESTONES-AND-TASKS.md)「尾巴 3a：X11」。
 - 不实现 ADR-041b（工单，D5–D9）。
 - §7 四条取舍 jason 2026-11-11 已拍板，均按推荐。
@@ -126,18 +126,28 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 );
 ```
 
-外键方向说明：`inbound_runs.run_id → runs(id) ON DELETE CASCADE`（run 被清则关联行跟着清，事件行保留）；事件表自己不引用 `runs`，所以 run 删除不会破坏入站记录（评审 L：`ON DELETE SET NULL` 的诉求用关联表实现）。读位置若 Hyphae 自带游标则不另建表，否则 2e 加 `inbound_cursor`。
+外键方向说明：`inbound_runs.run_id → runs(id) ON DELETE CASCADE`（run 被清则关联行跟着清，事件行保留）；事件表自己不引用 `runs`，所以 run 删除不会破坏入站记录（评审 L：`ON DELETE SET NULL` 的诉求用关联表实现）。`inbound_cursor` 表保留，主键仍是 `(source, recipient_identity, thread_key)`（Hyphae 群消息按本机身份分开存，两个身份同群不能共用一行）。当前群拉取**不读写这张表**。Hyphae `groupchat history --after-id` 比的是 `(created_at, logical_id)`，不是本地接收顺序：晚到但 `created_at` 更早的消息会被游标永久漏掉，未来时间会把游标推到未来。2e 每轮对每个 active 群取无游标的最新一页（最多 200 条，从旧到新），已入库的 `inbound_events.id` 跳过（`start_failed` 且 `received_at` 仍在 600 秒内的例外：转回 `starting` 再派，不新插一行；同 actor 已有在途则留下 `start_failed`，下一轮再试），其余入库。Hyphae 若提供按本地接收序的游标再启用这张表。
+
+2026-11-12 jason：Hyphae 入站**默认不拉取**。只有 `inbound_allowlist` 里至少有一条 `source=hyphae`，或 `inbound_policy` 行存在且 `accept_mode` 是用户明确设置过的 `observe` / `auto`，才轮询。策略行不存在且名单为空则不拉。用户设为 `accept_mode=off` 时一律不拉，名单里有 hyphae 条目也不拉（关就是关）。这个开关在每次 CLI 调用前、每条消息入库前从 store 重读，不在进程启动时定死，也不在一轮开始时定死。读到 `off` 立刻停下本轮剩下的拉取和入库。
 
 策略版本 = `sha256(排序后的名单 + accept_mode + 准入表版本号)`，判定时现算，写进该行。
 
 ### 3.2 正文清理
 
 - **保留什么**：整行保留（发送者、时间、类别、准入结果、策略版本）；清 `text`、`meta`，写 `text_scrubbed_at`。
-- **放哪**：`agent24-store` 新增 `scrub_expired_inbound_text(cutoff, now)`，同构于 `decision_log.rs:307` 的 `scrub_expired_decision_log`，幂等。
+- **放哪**：`agent24-store` 新增 `scrub_expired_inbound(cutoff, now, batch, memory_handled)`（2a 的 `scrub_expired_inbound_text` 只留作测试），同构于 `decision_log.rs:307` 的 `scrub_expired_decision_log`，幂等。
 - **谁定时**：`agent24d` 后台任务，形态照 `memory_maintenance.rs`，在 `serve_steps.rs` 启动（参照 `:409-414`）；启动先扫一次，之后每 6 小时。
 - **为什么要真调用方**：`decision_log` 的清理函数目前只有测试调用（`decision_log.rs:306` 注释自述无人调用）。
 - 按 `received_at` 算 180 天。
 - **范围（已拍板 §7-3，jason 2026-11-11）**：按推荐，同一任务里一并清掉这些事件对应 run 的 `runs.input`、run 消息快照、会话记忆里来自该事件的内容，否则「180 天删正文」名不副实。**这会碰旧表**，2d 的规模和风险按此重估；落地方式（置空 vs 级联删）开片前读 `run_messages`、记忆写入路径再定。
+- **已知限制（2d 落地时如实记录）**：
+  - 会话记忆按会话整体清理，且只在该会话里的 run 全部是到期入站 run 时才清。会话混入了非入站 run（用户在 UI 里接着聊）时，该会话的记忆按设计不清（记忆里无法区分哪些来自入站），入站原文留在记忆里；run 与消息快照等副本仍照清。
+  - `/chat` 不写 run，却把轮次写进调用方给的会话。清理时记忆层检查会话里是否有晚于入站 run 终态（加 1 秒宽限）的事件，有就整段保留，与上一条同一结局。
+  - 「记住」类断言不由 2d 清理，依赖 X11-2c 在源头禁止入站 run 写断言。
+  - 审计链（`audit_log`）里的 `approval.required` 条目带审批摘要与负载，哈希链不可改，不清。
+  - 入站 run 创建的自唤醒日程：其 prompt（`schedules.action`）不清，唤醒 run 没有 `inbound_runs` 关联，会让该会话变成非独占，会话记忆也留下。
+  - 不覆盖：`tool_calls.tool` 名称、记忆派生表（`mem_consolidations`、向量、trace）、非对象形态的 `runs.input`；写入缺口与遗留 kv 快照按会话 id 删除。
+  - **每轮最多 200 条（2e，可用性缺口，不只是安全方向）**：私信 `history inbox` 与群 `groupchat history` 每轮只读最新一页，最多 200 条。更早的消息本轮看不见，所以不会把积压起成 run。同一次窗口里，陌生人可以刷满这 200 条，把名单内的人的消息挤出本轮。X11-2h 收口时写进限制说明。
 
 ### 3.3 准入判定（确定性，优先级自上而下，第一条命中即结果）
 
@@ -152,6 +162,8 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 | 7 | 名单内但未 @ | `ignore(no_rule)`（`inferred` 本里程碑统一为这条，ADR-041 D3：无主动技能时记 `ignore(no_rule)`） |
 
 `human` 的确定性规则：来源适配器按固定规则给——Hyphae 消息的 `kind`/内容不是协议信封、且不匹配 canary 前缀才算 `human=true`；微信 `message_type=USER` 才算。规则写进 2e/2g 的单测，不让模型判。
+
+群 @ 没有 mention 数组。只认正文里的本机 npub，或两侧有边界的 `@nickname`。句末的 `.`（后面是空白或结尾，如 `@ann.`）算边界；`@ann.x` 仍是同一个记号，不算。`@ann你好` 这种 CJK 紧贴不算：中文昵称有歧义，这是有意的保守判断，宁可漏判。
 
 好友表不写进名单；本轮没有好友机制。
 
@@ -175,10 +187,35 @@ CREATE TABLE inbound_source_watermark (            -- 每来源激活水位（�
 | X11-2b | 准入纯函数 `admit(...)` + 策略版本哈希，覆盖 §3.3 全部 7 行与水位 / 速率入参 | `agent24d/src/inbound/admit.rs`（新） | S | 2a（类型） | 表驱动：每行至少一条命中用例 + 一条不命中的正对照；优先级用例（协议消息即使名单内也是 `ignore(protocol)`）；变异：反转「名单内」判断，至少 3 条变红；同输入同哈希、名单顺序无关 | 与 ADR-041 D3 不一致 | Grok |
 | X11-2c | `RunManager.start_run_inbound` 与 `InboundService.ingest`：INSERT 一次写结果 → 起 run → 同事务 `inbound_runs` → 打 Unknown 标签；启动对账 | `agent24-agent/src/lib.rs`（新内部入口、`execute` 按 origin 打标签）、`agent24-store/src/source_policy.rs`（新增构造 `SourceRef::inbound_external` 或等价）、`agent24d/src/inbound/service.rs`（新）、`serve_steps.rs` | L | 2a、2b | ① explicit：恰好 1 个 run，`inbound_runs` 有行。② 该 run 的 `run_source_tags` 为 **Unknown**（变异：把 execute 改回 `user_input`，测试变红）。③ `/api/v1/peer/runs` 对该 run 隐藏内容（peer 视图见 `peer_runs.rs`）。④ 该 run 的外发被限制（沿用现有 source policy 外发门，用一个会外发的工具调用验证被拦）。⑤ **对同一行直接调用两次派发**（绕开插入去重，直接调 `dispatch(event_id)`）：run 恰好 1 个（变异：去掉 `inbound_runs.event_id UNIQUE` 或事务，测试变红）。⑥ 在「run 已落库、`run_state` 仍 `starting`」时重启：对账补成 `started`，不起第二个 run。⑦ 在「`starting`、无 `inbound_runs`」时重启：`interrupted`，不起 run。⑧ 名单外：0 个 run。⑨ 旧消息（早于水位）：0 个 run（H5）；**用真并发**（两个 future 同时 `await` 同一 actor 的两条不同消息，如 `tokio::join!`）：恰好 1 个 run、另一条为 `ignore(rate_limited)`；变异对照：删掉部分唯一索引，测试变红。run 终结后同一 actor 的下一条可以起 run（正对照） | `execute` 改动面是内核热路径，需确认不影响普通 run；`persist_new_run`（`lib.rs:679`）是否能与关联表同事务写入**未核实**（§8） | Grok，Opus 验收 |
 | X11-2d | 180 天清理后台任务 + 接线（范围按 §7-3） | `agent24d/src/inbound/maintenance.rs`（新）、`serve_steps.rs`；若扩范围，`agent24-store` 的 runs/消息清理 | S（仅入站表）/ M（含 runs 与记忆） | 2a | 可注入时钟：179 天与 181 天两行，只有 181 天的正文被清（正对照 179 天不变）；若含 runs：对应 `runs.input` 与消息快照也被清，且非入站 run 不受影响；停止信号下任务退出；启动即扫一次 | 清 run 数据会影响审计与恢复，开片前读恢复路径 | Sonnet |
-| X11-2e | Hyphae 入站适配：私信经 `history inbox --as`（拉取）；群消息经 `groupchat history`（有游标参数，`groupchat.rs:25-28`）；先滤自己发的；分类并写 `category/addressed/human`；调用 `ingest`；Hyphae 来源激活水位 | `agent24d/src/inbound/hyphae_source.rs`（新）、`agent24d/src/comm_routes.rs`（只读复用，不改 comm 依赖） | L | 2c | ① 用 `agent24-comm/tests/fixtures/comm_inbound_six.json` 的六类样本：plain → 按 human 规则；kind-30078 的 f4/1 信封、receipt（ack）、query、response、canary 全部 `ignore(protocol)` 且 0 个 run（变异：把协议判断删掉，至少 3 条变红）。② 好友协议消息 zero-run。③ 群消息：@ 本机身份 → `group_mention`，未 @ → `group`；私信 → `direct`；陌生人 → `stranger`。④ 自己发的消息不入表。⑤ 重启不重放（游标持久）；daemon 离线期间积压的旧消息 → `stale`，0 个 run | Hyphae 入站 JSON 字段未核实；游标语义未核实；keystore 未解锁时的行为 | Grok，Opus 验收 |
+| X11-2e | Hyphae 入站适配：私信经 `history inbox --as`（拉取）；群消息经 `groupchat history` 的无游标最新一页（不用 `--after-id`；`inbound_cursor` 表留着不读不写）；先滤自己发的；分类并写 `category/addressed/human`；调用 `ingest`；Hyphae 来源激活水位 | `agent24d/src/inbound/hyphae_source.rs`（新）、`agent24d/src/comm_routes.rs`（只读复用，不改 comm 依赖） | L | 2c | ① 用 `agent24-comm/tests/fixtures/comm_inbound_six.json` 的六类样本：plain → 按 human 规则；kind-30078 的 f4/1 信封、receipt（ack）、query、response、canary 全部 `ignore(protocol)` 且 0 个 run（变异：把协议判断删掉，至少 3 条变红）。② 好友协议消息 zero-run。③ 群消息：@ 本机身份 → `group_mention`，未 @ → `group`；私信 → `direct`；陌生人 → `stranger`。④ 自己发的消息不入表。⑤ 重启不重放（同一 event id 已入库则跳过）；daemon 离线期间积压的旧消息 → `stale`，0 个 run。超过最新 200 条的更早消息本轮不看。这是可用性缺口，不只是安全方向：陌生人可以刷满 200 条窗口，把名单内的人的消息挤出去（§3.2 已知限制） | keystore 未解锁时的行为 | Grok，Opus 验收 |
 | X11-2f | 名单、接受模式、事件列表 API。写接口（`PUT /api/v1/inbound/allowlist`、`PUT /api/v1/inbound/policy`）加入 `host_only_route`（`capabilities/middleware.rs:49`），只许 ProductHost；读接口 `GET .../allowlist`、`GET .../policy`、`GET .../events`（只回元数据 + 前 50 字，不进 WS `/events`）。CORE-2 `Operation` **拆成读、写两个** | `agent24d/src/inbound/routes.rs`（新）、`capabilities/middleware.rs`、`capabilities/operations.rs`、OpenAPI 与 `packages/api-client` 生成物 | M | 2a | 在 capabilities 模式下：FirstPartyShell 令牌（无提升头）写名单 → 拒；legacy 单令牌写名单 → 拒（`host_only_route` 的 legacy 分支，`middleware.rs:75`）；ProductHost → 通过；读接口 FirstPartyShell 可读。列表不含全文；WS `/events` 抓包无入站内容。contract-tests 覆盖 | 生成物体量大 | Grok |
 | X11-2g | wechat-bridge 改只传输，并实现开发态名单种子（§3.4）。daemon 侧 `POST /api/v1/inbound/events`：**`source` 由路由固定为 `wechat`，请求体里写别的来源一律 400**；只在 legacy / 开发态挂载，产品（capabilities）模式不挂。桥：id 用 `wechat:<message_id>`，只处理 `message_state=FINISH` 且 `message_type=USER` 的消息（过滤未完成与自己发的）；**删桥内名单与 y/n 审批**；回一句「已记录」，不回发结果 | `packages/wechat-bridge/src/{bridge,agent24,config,main}.ts` 及测试；`agent24d/src/inbound/routes.rs` | M | 2c、2f | ① 桥源码无 `/api/v1/runs` 的 POST。② 名单外微信用户：daemon 记 `ignore`，0 个 run。③ 同一 `message_id` 重投：1 个 run。④ `message_state=GENERATING` 与 `BOT` 消息：不入表。⑤ 请求体带 `source:"hyphae"`：400（变异：去掉固定来源，变红）。⑥ capabilities 模式下该路由 404。⑦ 仍需 `A24_DEV_TOOL=1`。⑧ **正向格**：`A24_DEV_TOOL=1` 且种子名单含该微信 uid → 该用户 FINISH 的 USER 消息恰好 1 个 run，`run_source_tags` 为 Unknown；同条件去掉种子 → 0 个 run；capabilities 模式下种子环境变量不生效（变异：让种子在 capabilities 下也生效，变红）。⑨ **行为变化**：微信里不再能回 y/n 批准，审批只在桌面做；桥回复只有「已记录」，用例钉住 | 桥现有测试大改；行为变化需在 README 和 PR 里写明 | Sonnet + Opus 验收 |
-| X11-2h | 防绕过测试与文档收口 | `agent24d/tests/inbound_*.rs`；`docs/adr/ADR-044-communication.md`（回写 T2/T3 与 X11 状态）；`COMM-HYPHAE.md`；ADR-041 D10 修订（若 §7-4 采纳推荐），**并在 ADR-041 §4「后果」把「所有新表都在 CORE-5 5f–5g 接线之后才进 main」改写为：入站表（`inbound_events` 等）经 jason 2026-11-11 豁免，因为是只新增、不改旧表的独立表，其余新表（工单等，041b）仍按原约束** | S | 2a–2g | ① 静态断言：`packages/*` 与 `agent24-comm` 源码里没有对 `/api/v1/runs` 的 POST；`/runs` 的调用方白名单仅为桌面、ACP（`acp.rs`）、MCP（`agent24-mcp`）、CLI、`wechat-bridge` 已移除（变异：在 comm 里加一处 POST，变红）。② `agent24d/src` 内 `start_run*` 的外部调用点只有 `runs.rs`、`inbound/service.rs`、调度投递。③ 桌面聊天 / ACP / MCP 起 run 后 `inbound_events` 行数不变（正对照）。④ 文档里的待办状态与代码一致，ADR-041 §4 已写入豁免与 D10 修订 | 源码扫描类测试易误报，需白名单与说明 | Sonnet |
+| X11-2h | 防绕过测试与文档收口。**FU（2e）**：私信 `history inbox` 与群 `groupchat history` 每轮最多 200 条（最新一页）。更早的消息本轮看不见。不把积压起成 run 是安全方向，同时是可用性缺口：陌生人可以刷满这 200 条，把名单内的人的消息挤出本轮。收口时写进限制说明 | `agent24d/tests/inbound_*.rs`；`docs/adr/ADR-044-communication.md`（回写 T2/T3 与 X11 状态）；`COMM-HYPHAE.md`；ADR-041 D10 修订（若 §7-4 采纳推荐），**并在 ADR-041 §4「后果」把「所有新表都在 CORE-5 5f–5g 接线之后才进 main」改写为：入站表（`inbound_events` 等）经 jason 2026-11-11 豁免，因为是只新增、不改旧表的独立表，其余新表（工单等，041b）仍按原约束** | S | 2a–2g | ① 静态断言：`packages/*` 与 `agent24-comm` 源码里没有对 `/api/v1/runs` 的 POST；`/runs` 的调用方白名单仅为桌面、ACP（`acp.rs`）、MCP（`agent24-mcp`）、CLI、`wechat-bridge` 已移除（变异：在 comm 里加一处 POST，变红）。② `agent24d/src` 内 `start_run*` 的外部调用点只有 `runs.rs`、`inbound/service.rs`、调度投递。③ 桌面聊天 / ACP / MCP 起 run 后 `inbound_events` 行数不变（正对照）。④ 文档里的待办状态与代码一致，ADR-041 §4 已写入豁免与 D10 修订 | 源码扫描类测试易误报，需白名单与说明 | Sonnet |
+
+### 4.1 实施状态（2026-11-12，X11-2h）
+
+上表是开工时的计划，不改写。实际合入与偏差记在这里。
+
+| 片 | 状态 | PR |
+|---|---|---|
+| X11-2a | 已合入 main | #1805、#1806 |
+| X11-2b | 已合入 main | #1803 |
+| X11-2c | 已合入 main | #1810、#1813、#1816 |
+| X11-2d | 已合入 main | #1808、#1812 |
+| X11-2e | 迁移 #1820 已合（bb03081e）；第 2 部分 Hyphae 轮询 #1821 已合（a93f5df3）。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用 | #1820、#1821 |
+| X11-2f | 已合入 main | #1809、#1811 |
+| X11-2g | 已合入 main | #1818、#1819 |
+| X11-2h | 本收口，尚未开 PR | — |
+
+X11 ① 产品隔离是 #1785。方案文档是 #1797。
+
+和原方案的偏差：
+
+- **拆分**：2a、2c、2d、2e、2f、2g 都不是一片一个 PR。2e 拆成迁移与 Hyphae 轮询两段，轮询还没自己的已合并 PR。
+- **默认不拉取**（jason 2026-11-12）：有 CLI，且名单里有 hyphae 或 `accept_mode` 明确为 `observe` / `auto`，才拉。`accept_mode=off` 一律停。这和 §3.4「接受模式本轮只存不判」不完全一样：模式仍不进 `admit()`，但已经是拉不拉的开关。
+- **名单外不回复，含 duplicate**：微信桥只在 daemon 报告这次真的起了 run 时回「已记录」。`ignored`、`duplicate`、`already_linked` 都不回。原 2g 验收写的是桥回复只有「已记录」，没有把 duplicate 排除在外。
+- **群聊与私信每轮各最多取最新 200 条**，更早的漏看（安全方向，见 followups）。群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用。只轮询 `state=active` 的群。见 `COMM-HYPHAE.md` §7.1。
+- **`INBOUND_RATE_LIMIT` / `INBOUND_MAX_AGE_SECS` 仍是占位**（每分钟 3 条、10 分钟），正式上线前确认。见 followups。代码里的名字是 `INBOUND_MAX_AGE_SECS`（`inbound/service.rs`）。
 
 推荐顺序：2a → 2b → 2c → 2d →（2e、2f 并行）→ 2g → 2h。2a–2d 合入后 daemon 已有可测试的完整「记录 → 准入 → 起 run」闭环，只是还没有真实来源。
 
@@ -230,12 +267,12 @@ ADR-041 D10 写的是后者（默认只给 id、前 50 字，全文按 id 分页
 
 1. **②③④ 的划分**是否与 jason 一致。
 2. **MCP 服务按内部输入处理**：是我按 jason 对 ACP 的口径类推，待确认。
-3. **Hyphae 入站 JSON 字段**（发送者、是否 @、群 id、`event_id`）：没找到 `agent inbox` / `history inbox` 的输出契约；`COMM-HYPHAE.md`、`docs/comm/JOINT-ROUND1.md` 未读；`groupchat history` 游标的具体语义只看到文件头的错误映射描述。
-4. **读位置**是否由 Hyphae 自带；没有则需 `inbound_cursor` 表。
+3. **Hyphae 入站 JSON 字段**（发送者、是否 @、群 id、`event_id`）：已对照本地 Hyphae `v0.30.1` 的 `StoredMessage` / `GroupMessage`（见 `hyphae_source.rs` 文件头）。群 @ 仍无 mention 数组，只认正文里的 npub 或带边界的 `@nickname`。句末 `.`（后面是空白或结尾）算边界（`@ann.`）；`@ann.x` 不算。`@ann你好`（CJK 紧贴）不算，有意保守：中文昵称有歧义，宁可漏判。
+4. **读位置**：Hyphae `--after-id` 已核实为 `(created_at, logical_id)`，不是本地接收序。`inbound_cursor` 表保留，当前群拉取不读写；每轮取最新一页再按事件 id 去重。
 5. **`persist_new_run`（`lib.rs:679`）能否与 `inbound_runs` 在同一事务写入**：只读了入口，没读 `insert_run` 的事务边界；2c 开工前先读。
 6. **`execute` 对 origin 的打标签改动**对恢复、重放路径（`plan_resume` 等）的影响未读。
 7. **peer 视图与外发门**对 `Unknown` run 的现有行为：`peer_runs.rs` 有测试但本文没逐条读，2c 验收 ③④ 依赖它们。
-8. **wechat-bridge 令牌**：开发态继续用 legacy 令牌（C9 未排期）。
+8. **wechat-bridge 令牌**：ADR-038-C9 已接线（#1833）。开发态用 `agent24 dev bridge-token` 签发的组件令牌，不再用 legacy 全权令牌。capabilities 模式下种子环境变量不写入名单。
 9. **语音**：本仓库没找到「听到话就起 run」的代码，写的是「没找到」，不是「确认没有」。
 10. **§7-3 若选 (b)**：`runs.input`、`run_messages` 快照、记忆写入各处的清理方式未读。
 11. **水位最大时延、速率上限的默认值**是占位，2c 定。

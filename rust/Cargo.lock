@@ -40,6 +40,7 @@ dependencies = [
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",
+ "agent24-skill",
  "agent24-store",
  "agent24-tools",
  "agent24-workspace",
@@ -83,6 +84,7 @@ dependencies = [
  "agent24-os-packages",
  "agent24-os-proc",
  "agent24-protocol",
+ "agent24-skill",
  "agent24-store",
  "base64",
  "clap",
@@ -326,6 +328,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -531,6 +534,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "agent24-skill"
+version = "0.6.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "agent24-store"
 version = "0.6.0"
 dependencies = [
@@ -629,6 +643,7 @@ dependencies = [
  "agent24-policy",
  "agent24-protocol",
  "agent24-scheduler",
+ "agent24-skill",
  "agent24-store",
  "agent24-tools",
  "agent24-workspace",
@@ -645,6 +660,7 @@ dependencies = [
  "jsonschema",
  "libc",
  "libproc",
+ "percent-encoding",
  "rand 0.9.5",
  "rustix 0.38.44",
  "serde",
@@ -662,6 +678,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-general-category",
+ "unicode-normalization",
  "uuid",
  "zeroize",
 ]

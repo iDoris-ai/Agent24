@@ -246,6 +246,7 @@ async fn send_copy_keeps_user_prompt_shaped_like_recall() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -292,6 +293,7 @@ async fn send_copy_keeps_session_history_shaped_like_recall() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -325,6 +327,7 @@ async fn send_copy_trims_revoked_ids_from_real_host_recall() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

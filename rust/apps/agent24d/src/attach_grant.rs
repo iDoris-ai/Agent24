@@ -13,22 +13,11 @@
 
 use std::sync::Arc;
 
-use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink, Grants};
+use agent24_domain::{Capability, DomainOsManifest, EventBroadcast, EventSink};
 
 use agent24_attach::attach_registry::{AttachGrant, AttachGrantBuilder};
 
-/// A3 P2 (design §1 "本期只用 `events`、`models`"): the only two capabilities
-/// an attached module may be granted. Deliberately narrower than
-/// `domain::KERNEL_OOP_GRANTS` — `memory`/`scheduler`/`approval` have no
-/// attach-side story yet (no partition-allocation pass runs for an attached
-/// module, and `host_commands` — A3's own reverse channel — is not one of
-/// `agent24_domain::Capability`'s variants), so granting them here would be
-/// scope no judgement or design section asks for. A manifest MAY still
-/// declare them (`kernel_capabilities` is an open list at the manifest
-/// layer); `Grants::granting`'s intersection with this list is what refuses
-/// them, the same "asking gains nothing" rule every other grant list in this
-/// daemon already documents.
-const ATTACH_OOP_GRANTS: &[Capability] = &[Capability::Events, Capability::Models];
+use crate::capabilities::requires::{self, Consent, GrantForm, RequiresSpec};
 
 /// Daemon handles one admission needs. Dropping the registry's `AttachDeps`
 /// drops this value, and with it the `ModelCallbackDeps` it owns — the same
@@ -46,7 +35,12 @@ pub(crate) struct DaemonAttachGrantBuilder {
 
 impl AttachGrantBuilder for DaemonAttachGrantBuilder {
     fn build(&self, name: &str, manifest: &DomainOsManifest) -> AttachGrant {
-        let granted = Grants::granting(manifest.kernel_capabilities(), ATTACH_OOP_GRANTS);
+        let granted = requires::resolve(
+            &RequiresSpec::from_manifest(manifest),
+            GrantForm::Attach.host_cap(),
+            Consent::FirstPartyEnabled,
+        )
+        .granted;
         let broadcast: Arc<dyn EventBroadcast> =
             Arc::new(crate::domain::HubBroadcast(self.events.clone()));
         let event_sink = granted
@@ -61,11 +55,14 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
             &granted,
             self.models.as_ref(),
         );
+        let mut kernel_grants = Vec::new();
         let mut provides = Vec::new();
         if granted.has(Capability::Events) {
+            kernel_grants.push(Capability::Events.as_str().to_owned());
             provides.push("_a24/events/".to_owned());
         }
         if model_grant.is_some() {
+            kernel_grants.push(Capability::Models.as_str().to_owned());
             provides.push("_a24/model/".to_owned());
         }
         let methods_for = crate::domain::build_methods_for(
@@ -83,6 +80,7 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
         AttachGrant {
             provides,
             methods_for,
+            kernel_grants,
         }
     }
 }
@@ -255,10 +253,15 @@ mod tests {
 
         let bare_both = bare.build("agentear", &events_and_models);
         assert_eq!(bare_both.provides, vec!["_a24/events/".to_owned()]);
+        assert_eq!(bare_both.kernel_grants, vec!["events".to_owned()]);
         let wired_both = wired.build("agentear", &events_and_models);
         assert_eq!(
             wired_both.provides,
             vec!["_a24/events/".to_owned(), "_a24/model/".to_owned()]
+        );
+        assert_eq!(
+            wired_both.kernel_grants,
+            vec!["events".to_owned(), "models".to_owned()]
         );
 
         assert_eq!(
@@ -331,6 +334,52 @@ mod tests {
                 let err = call_granted(&grant, "mem", method, params.clone())
                     .await
                     .expect_err("MemoryEntitlement::NONE");
+                assert_forbidden(&format!("{label} {method}"), &err);
+            }
+        }
+    }
+
+    /// FU-118: `build` never writes `_a24/scheduler/` or `_a24/approval/` into
+    /// `provides`, so deleting the `ATTACH_OOP_GRANTS` intersection leaves the
+    /// `provides` equality in
+    /// `both_construction_paths_lock_this_implementations_authorization` green.
+    /// The refusal is the handler `methods_for` actually runs. A manifest that
+    /// declares `scheduler` and `approval` must still get `forbidden` here.
+    /// Granting the requested set with no intersection makes this red: the
+    /// handler then gets past the capability check.
+    #[tokio::test]
+    async fn declared_scheduler_and_approval_are_refused_through_methods_for() {
+        let declared = manifest("events, models, memory, scheduler, approval");
+        let calls = [
+            ("_a24/scheduler/list", serde_json::json!({})),
+            (
+                "_a24/scheduler/delete",
+                serde_json::json!({"key": "probe.key"}),
+            ),
+            (
+                "_a24/scheduler/upsert",
+                serde_json::json!({"key": "probe.key", "spec": {"type": "every", "secs": 3600}}),
+            ),
+            (
+                "_a24/approval/status",
+                serde_json::json!({"approval_id": "appr_missing"}),
+            ),
+            (
+                "_a24/approval/advise",
+                serde_json::json!({
+                    "action": "note",
+                    "payload": {},
+                    "request_id": "req-1",
+                    "approval_token": "tok",
+                }),
+            ),
+        ];
+        for (label, with_models) in [("bare", false), ("wired", true)] {
+            let grant = builder(with_models).await.build("agentear", &declared);
+            for (method, params) in &calls {
+                let err = call_granted(&grant, "fu118", method, params.clone())
+                    .await
+                    .expect_err("ATTACH_OOP_GRANTS drops scheduler and approval");
                 assert_forbidden(&format!("{label} {method}"), &err);
             }
         }

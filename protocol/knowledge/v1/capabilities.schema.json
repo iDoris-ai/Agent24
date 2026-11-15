@@ -15,7 +15,7 @@
           "properties": {
             "protocol_versions": { "description": "Supported contract major versions (R9.4).", "type": "array", "minItems": 1, "uniqueItems": true, "items": { "$ref": "common.schema.json#/$defs/positive_int" } },
             "mode": { "description": "Only integration is compatible (R9.4).", "enum": ["integration", "standalone"] },
-            "supported_operations": { "type": "array", "uniqueItems": true, "items": { "enum": ["search", "read"] } },
+            "supported_operations": { "description": "R9.2: the operations the server supports; the write operation classes of R2.7 once the server enables them (r13).", "type": "array", "uniqueItems": true, "items": { "enum": ["search", "read", "candidate.propose", "candidate.review", "candidate.approve", "entry.withdraw"] } },
             "server_version": { "type": "string", "minLength": 1, "maxLength": 128 },
             "limits": {
               "description": "Server upper bounds that requests are clamped to (R3.3, R4.5).",

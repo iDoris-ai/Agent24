@@ -1,10 +1,35 @@
 # Agent24 结构组件路线图（Component × Milestone）
 
 > 立于 2026-10-03。本文回答：**每个核心结构组件现在到哪了、下一步做什么、在哪个里程碑完成、彼此怎么依赖。**
+> 2026-11-12 回写了 §0 与下文点名组件的现状句（核对 sha `bb03081e8`）。§2 的里程碑顺序与 §3 的波次仍是 2026-10-03 的裁决，这次不改。
 > - 架构现状（各层是什么、状态标记 ✅ / 🟡 / 📐 的含义）见 [`../ARCHITECTURE-LAYERS.md`](../ARCHITECTURE-LAYERS.md)。
 > - 执行状态以 [`tasks.md`](tasks.md) 为准；各里程碑的详细定义在各自的计划文档（文中逐条链接）。
 > - **编号原则**：里程碑的**权威编号**沿用各计划文档（记忆的 P0–P5、Open Design 的 OD-M11 / F11.*、ADR-032 的 P3–P5、iDoris 的 ID-*、通信的 COMM-*、部署的 DEP-*、SPEC-002/B4 等）。本文另有的 K-* / W-* / A-* / O-* / W3-0 只是**组件视图别名**（便于按组件阅读），每个别名都写明它对应的源编号；**依赖关系一律以源编号表达**，别名不单独作为排序节点。跨组件的排期以 §3 的「波次」表达，**以 2026-10-03 jason 裁决为准**，其中列出的个别开放项仍待拍板。
 > - 与 iDoris-Components（internal-AI）仓库的规划对齐情况见 §4。
+
+---
+
+## 0. 2026-11-12 核对
+
+核对日 **2026-11-12**。核对 sha：`bb03081e8`（`git rev-parse --short origin/main`；全长 `bb03081e860e55f81466aee2e3e84da5e0d52073`）。下表只记代码里已经成立的事实。与 §1–§2 里 2026-10-03 的「现状」冲突时，以本表为准。
+
+| 组件 | 现状 | 证据 |
+|---|---|---|
+| AgentEar | 附着模块登记进 `GET /api/v1/components`（`form=attach`，`provides` 留空）。协议区间失配为 `incompatible`。D2/D2a 仍不适用。宿主侧 attach 在 `agent24-attach` | #1572；登记逻辑 `rust/apps/agent24d/src/component_routes.rs:427-430`；crate 拆出 #1793、#1794 |
+| iDoris | 常驻组件，锁 schema 2、契约 `idoris-http`、版本 v0.4.0。`IDORIS_URL` 存在时 `ModelRouter::from_env` 只挂 iDoris 网关，否则仍是 oMLX 与 Ollama。`ContractMismatch` 映射为 `incompatible`。托管实现在 `agent24-idoris` | 锁 `rust/crates/agent24-idoris/idoris.lock.json:3-23`；`router.rs:358-364`；`component_routes.rs:159-166`（#1605）；托管下沉 #1790 |
+| Hyphae / comm | 锁 schema 2、版本 v0.30.1，契约 `hyphae-cli` 1.0。启动握手与 `hyphae health` 探测在 main。桌面有通信页。`stop_grace_ms` 已接入 Hyphae | 锁 `rust/crates/agent24-comm/hyphae.lock.json:25-71`（#1582）；握手与 health #1574；`comm_routes.rs:596`；页面 `apps/desktop/src/renderer/pages/comm/Communication.tsx` |
+| Knowledge | 远端子集：已配置 binding 探测 `/system/capabilities`，映射到 D3/D5。宿主在 `agent24-knowledge` | #1571；`component_routes.rs:808-819`；宿主下沉 #1792；登记表 `docs/capabilities/REGISTRY.md` |
+| Documents | D9 清单是 `component.json`，编译进 agent24d。`/components` 用它的 provides。免锁 | #1570；`rust/apps/agent24-documents/component.json`；`component_routes.rs:600`；`documents_catalog.rs:5` |
+| Open Design | 打包模式由 `SidecarManager` 托管，状态经 `POST /api/v1/components/{id}/report` 上报。下载仍在桌面 | #1580、#1584；`apps/desktop/src/main/open-design-sidecar.ts:46`；`component_routes.rs:822-834` |
+| 领域 OS | 文件清单 `files.json` 与逐文件哈希在加载前校验，哈希不对即拒绝。五类拒绝原因。macOS 验签可 `trust-team`。os-sdk 0.2.0 握手前对磁盘清单自检 | #1614、#1730（tag `agent24-os-sdk-v0.2.0`）、#1756、#1780；`integrity.rs:92-110`；`agent24-os-sdk/src/module.rs:132-147`；`package_integrity.rs:103` |
+| MCP | 来自 `~/.agent24/mcp.json`，无锁。每个 server 一条组件，能力 id `mcp-<server>`，D5 只用 installed / starting / ready / failed / stopped | #1575；`docs/capabilities/REGISTRY.md`「MCP」节；`rust/apps/agent24d/src/mcp.rs:284`；`component_routes.rs:844` |
+
+**下一步**（jason 2026-11-12 拍板顺序）：
+
+1. **ADR-038-C9 `requires` 授权**（ADR-038 D7）：已接线（A #1825、B #1830、C #1833、D #1831）。内核能力经解析器进入授予；开发态微信桥用组件令牌。方案 `docs/tracking/2026-11-12/C9-REQUIRES-AUTHZ-PLAN.md`。
+2. **ADR-040 技能加载器 v1**：ADR 已接受为设计约束，加载器、版本表、评测跑器仍是零代码（`docs/adr/ADR-040-skill-contract-v1.md:5`）。排在 ADR-038-C9 之后。
+
+**多平台锁**（另计，不插进上面的顺序）：Hyphae 的 `assets` 只有 `darwin-arm64` 与 `linux-x64`（`hyphae.lock.json:2-22`，v0.30.1）。iDoris 的 `assets` 只有 `darwin-arm64`（`idoris.lock.json:11-23`，v0.4.0）。
 
 ---
 
@@ -13,14 +38,14 @@
 | # | 结构组件 | 主要 crate / 位置 | 现状一句话 |
 |---|---|---|---|
 | C1 | 内核与运行时 | `agent24-core` / `store` / `agent` / `protocol` / `agent24d` | ✅ 稳定；run、审批、审计、调度、领域 OS 挂载都在默认路径上 |
-| C2 | 模型网关与路由 | `agent24-models`（`ModelRouter`） | 🟡 路由机制已实现，但主对话路径传默认 `TaskProfile`；只接了 oMLX / Ollama；iDoris 未接 |
+| C2 | 模型网关与路由 | `agent24-models`（`ModelRouter`） | 🟡 路由机制已实现。有 `IDORIS_URL` 时 `from_env` 只挂 iDoris，否则 oMLX / Ollama（`router.rs:358-364`，2026-11-12，`bb03081e8`）。主对话仍传 `TaskProfile::default()`（`routes.rs:592`）。详见 §0 |
 | C3 | 记忆 | `agent24-memory`、`ab/m1-memory` 分支 | 🟡 main 上 agent loop 只用 D1（KV + CanonicalSession）；M1 在分支上已完成大半 |
 | C4 | Workspace（文件系统工作区） | `agent24-workspace` / `store` / `os-cwd` | 🟡 仅 Unix、无对外路由、Open Design 未绑定 |
 | C5 | 权限、能力与法律 | `agent24-policy`、`agent24d/capabilities`、`docs/laws/` | 审批 ✅、Guardian ✅（可选）；capability 🟡；法律三部 |
-| C6 | 领域 OS 生态 | `os-proto` / `os-fd` / `os-packages` / `os-sdk`；Sin90、Cos72 外仓 | ✅ ME-3 / ME-4 已交付（v0.5.0）；进程内模块缝 🟡 无实例 |
-| C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`agent24-sidecar-host`、`agent24-mcp` | Open Design 现行路径 ✅；按需下载组件（不再打进安装包，见 `open-design-component.ts`）✅；目标形态 🟡/📐；MCP ✅ |
-| C8 | 通信（Hyphae） | `agent24-comm` | ✅ COMM-1a…4b、COMM-5a 已交付；UI 与联调未做 |
-| C9 | 语音（AgentEar） | 附着模块（A3） | ✅ P0–P2（非流式单轮） |
+| C6 | 领域 OS 生态 | `os-proto` / `os-fd` / `os-packages` / `os-sdk`；Sin90、Cos72 外仓 | ✅ ME-3 / ME-4 已交付；S1-9 文件级完整性已落地（#1614–#1780，2026-11-12，`bb03081e8`）。进程内模块缝仍无生产实例。详见 §0 |
+| C7 | 第三方工具集成 | Desktop `CreativeServeWeb`、`agent24 acp`、`SidecarManager`、`agent24-mcp` | Open Design 打包模式由 `SidecarManager` 托管（#1580、#1584）；按需下载仍在桌面。MCP 已进 `/api/v1/components`（#1575）。2026-11-12，`bb03081e8`。详见 §0 |
+| C8 | 通信（Hyphae） | `agent24-comm` | ✅ 锁 v0.30.1（#1582）与契约握手（#1574）在 main；桌面有通信页（`pages/comm/Communication.tsx`）。2026-11-12，`bb03081e8`。详见 §0 |
+| C9 | 语音（AgentEar） | 附着模块（A3），`agent24-attach` | ✅ 已登记进 `/api/v1/components`（#1572，2026-11-12，`bb03081e8`）。非流式单轮仍是产品范围。详见 §0 |
 | C10 | 桌面、CLI 与发布 | `apps/desktop`、`agent24-cli`、`docs/Deployment/` | ✅ v0.5.1：CLI macOS + Linux，Desktop 仅 Linux；macOS 签名包被 Apple 账号阻塞 |
 | C11 | 组织化 | ADR-030、SPEC-ORG-SPACE | F8 ✅；F9 社区子集随 C3 P3；F9 其余与 F10 等第二个真实用户；F11 随 C3 P1（2026-10-03 裁决） |
 | C12 | Web3 身份与结算（AAStar） | — | 📐 Agent24 代码中**尚无接线**，只在生态规划中 |
@@ -43,7 +68,7 @@
 
 ### C2 模型网关与路由
 
-- **现状**：`ModelRouter` 按 `TaskProfile`（`Privacy × Complexity` → `Tier`）选 provider，`LocalOnly` 对远端 fail-closed ✅。但主对话、子 agent、REST 聊天都传 `TaskProfile::default()`，只有 Guardian 与模块推理回调会设置 `LocalOnly` 🟡。`from_env` 只构造 oMLX / Ollama；Agent24 内**没有出境脱敏代码**（已定由 iDoris 出口网关负责）。
+- **现状**（2026-11-12，`bb03081e8`）：`ModelRouter` 按 `TaskProfile`（`Privacy × Complexity` → `Tier`）选 provider，`LocalOnly` 对远端 fail-closed ✅。主对话仍传 `TaskProfile::default()`（`rust/apps/agent24d/src/routes.rs:592`）🟡。`from_env`：有 `IDORIS_URL` 时只挂 iDoris 网关，否则构造 oMLX / Ollama（`rust/crates/agent24-models/src/router.rs:358-364`）。iDoris 组件锁与契约见 §0。Agent24 内**没有出境脱敏代码**（已定由 iDoris 出口网关负责）。
 - **里程碑**（ID-* 见 [iDoris-integration-and-entry-router.md](../iDoris-integration-and-entry-router.md)，其建议顺序为 ID-1 → ID-2；P3–P5 见 [decision.md ADR-032](../decision.md)，冻结顺序为 P3 → P4 → P5）
   1. **ID-1 任务画像生成**（无技术依赖；但整组 ID-* 仍受源计划的「P4 门后、需用户批准开工」约束，波次 A 以门开启为条件）：由入口路由（先规则版，再 Semantic Router 级小模型）为每个 run 生成 `TaskProfile`，替换主路径上的 `TaskProfile::default()`。📐 → 波次 A。需拍板：画像在 Agent24 侧生成，还是交给 iDoris 网关兜底（internal-AI docs/11 里程碑 1.2 的同一决断点）。
   2. **ADR-032 P3 — 推理回调流式**（`_a24/model/stream`，目标首字 ≤ 3s）。📐 → 波次 A / B。
@@ -59,7 +84,7 @@
 - **里程碑**（定义见 `ab/m1-memory` 分支的 `docs/agent/M1-PLAN-v2.md` 与 `docs/research/MEMORY-STRATEGY.md`；拍板记录见 `ab/m1-memory` 分支的 `docs/research/MEMORY-STRATEGY.md` §7；两份文档里的 `[B]`（Mac mini 执行）标记已被 2026-10-03 裁决取代，Agent24 全部在笔记本做）
   1. **P0 = M1 收尾**：T07.1（召回注入改为带标注的数据块）、T08（召回评测基线）、T10（记忆 REST + 总开关 + 来源展示）、T11（桌面「记忆」页）。然后**先把 main（含 M10 的 633 个提交）合进 `ab/m1-memory` 并重跑全部 gate，再以 merge 方式落 main**，吸取 M10「分支漂太久」的教训。📐 → 波次 A。
   2. **P1 个人记忆可控（M1.5）**：先出 ADR「原文生命周期内不丢 vs 用户清除权」；回执事件、双时态与用户 supersede、程序性偏好、导出、purge、无痕会话。📐 → 波次 B。
-  3. **P2 本地智能**：向量召回 + RRF、本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
+  3. **P2 本地智能**：向量召回 + RRF **已接入（向量召回 VR-1…VR-5，尚未进 main）**；本地 LLM 候选抽取（进待确认区）、中文评测集 ≥100 例仍未做；**包含 K-4（ML Worker 服务端与首个消费者）**。📐 → 波次 B / C（依赖 C2 本地模型可用）。
   4. **P3 共享空间**：先做社区（Cos72），`team / prj / com` SpaceId、按操作判定、`policy_epoch`、显式 publish / grant。📐 → 波次 C。与 C6 O-3（Cos72 M4）**协同设计**。授权模型归 C11：**P3 触发并交付 F9 的社区子集**（spaces + grants + 交集判定 + 审计事件，契约由 C11 定义），并与 C6 O-2b（scoped memory 回调）同批交付；F9 的其余部分（groups、企业场景）与 F10 仍等第二个真实用户；F11 按 C11 的 P0 / P1 决策门处理。
   5. **P4 企业治理** / **P5 高级记忆**（时态图、巩固 / 反思、**AgentEar 语音摄入**）。📐 → 远期。
 - **依赖**：C1 K-1 ← P0；C6 O-3（Cos72 M4）← P0（roadmap 明写「依赖 M1 全部完成」）；P1 ← P0；P2 ← P1（K-4 ⊂ P2）；P3 ← P2（MEMORY-STRATEGY 的顺序 P0 → P1 → P2 → P3，未批准并行）；P3 是组合里程碑：冻结 C11 F9 社区契约 → 共享空间核心与 C6 O-2b 并行实现 → P3 联合验收（F9 社区子集、O-2b ⊂ C3 P3）；C9 语音摄入 ← P1 的事件 schema。
@@ -95,7 +120,7 @@
 
 ### C6 领域 OS 生态
 
-- **现状**：进程外模块协议、包管理、监管、SDK 原型、调度 / 推理 / 记忆 / 审批回调 ✅（ME-3、ME-4，v0.5.0）；Sin90、Cos72（mytask 最小样例）已在独立仓库发布。进程内模块缝 🟡（无生产实例）。
+- **现状**（2026-11-12，`bb03081e8`）：进程外模块协议、包管理、监管、SDK、调度 / 推理 / 记忆 / 审批回调 ✅（ME-3、ME-4）。S1-9 文件级完整性已落地：`files.json`、哈希不对即拒绝、五类拒绝原因、macOS 可 `trust-team`、os-sdk 0.2.0 握手前清单自检（#1614–#1780，详见 §0）。Sin90、Cos72 的对齐发布在外仓。进程内模块缝 🟡（无生产实例）。
 - **里程碑**（[PLAN-ME4](PLAN-ME4-OS-CAPABILITIES.md)「不在本轮」、[roadmap.md](roadmap.md) M4 / M5）
   1. **O-1 ME-4 收尾债**：Codex 补审债（ME4-CODEX-DEBT）、FU-104（Node 参考模块补 scheduler / model / approval 演示）。📐 → 波次 A。
   2. **O-2a 模块受众与挂载策略**：manifest 加 `audience` 字段，解决「哪些模块互为替代」今天说不出来的问题（PLAN-OOP §七 的角色场景 OS 决策）。📐 → 波次 B。
@@ -107,7 +132,7 @@
 
 ### C7 第三方工具集成
 
-- **现状**：Open Design 现行路径 ✅（`CreativeServeWeb` + `agent24 acp`，legacy token，无 workspace 绑定）；目标形态组件 🟡；MCP ✅。M10 已完成（[落地指南](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md)保留为历史审计记录）。
+- **现状**（2026-11-12，`bb03081e8`）：Open Design 打包模式由 `SidecarManager` 托管（#1580、#1584；`open-design-sidecar.ts`），状态由桌面上报。按需下载仍在桌面（`open-design-component.ts`）。checkout 模式仍可走 `CreativeServeWeb`。MCP 已接入 `/api/v1/components`（#1575，详见 §0）。目标形态里的 workspace 绑定与路由级授权仍在暂停的 OD-M11。M10 已完成（[落地指南](../design/OPEN-DESIGN-M10-MAIN-LANDING-GUIDE.md)保留为历史审计记录）。
 - **里程碑**（定义见 [PLAN-OD-NEXT](PLAN-OD-NEXT.md)）
   1. **OD-M11 产品路径生效** → ⏸️ 暂停（Open Design 线，原排波次 A）。
   2. **TPI-W 第三方工具接入 Workflow**（Playbook、去 Creative 专名、harness 模板、评估清单）→ ⏸️ 暂停（Open Design 线，原排波次 B）；**OD-M12 收尾**并行。
@@ -117,7 +142,7 @@
 
 ### C8 通信（Hyphae）
 
-- **现状**：`agent24-comm` 的身份、联系人、relay、导入、daemon 监管、send / history / outbox、状态探针 ✅（COMM-1a…4b），F4b 冻结 COMM-5a ✅。
+- **现状**（2026-11-12，`bb03081e8`）：`agent24-comm` 的身份、联系人、relay、导入、daemon 监管、send / history / outbox、状态探针 ✅（COMM-1a…4b），F4b 冻结 COMM-5a ✅。锁已是 schema 2 的 v0.30.1（#1582），契约握手与 `hyphae health` 在 main（#1574）。桌面通信页在 `apps/desktop/src/renderer/pages/comm/Communication.tsx`。平台键只有 `darwin-arm64` 与 `linux-x64`，见 §0。
 - **里程碑**（[COMM-HYPHAE](../design/COMM-HYPHAE.md) §8）
   1. **COMM-5b** 结构约束测试（依赖 allowlist 等）→ 波次 A。
   2. **COMM-6** UI：身份 / 联系人 / relay / daemon 状态 / 导入向导 → 波次 A。
@@ -130,7 +155,7 @@
 
 ### C9 语音（AgentEar）
 
-- **现状**：A3 附着模块 P0–P2 ✅（非流式、单轮）。
+- **现状**（2026-11-12，`bb03081e8`）：A3 附着模块已登记进 `/api/v1/components`（#1572；`agent24-attach`，#1794）。产品范围仍是非流式、单轮。D2/D2a 不适用。
 - **里程碑**（[ADR-032](../decision.md)、[A3 设计 §12](../design/A3-ATTACHED-MODULE.md)）
   1. **A3 P4 流式（= ADR-032 P3）**：`_a24/model/stream`，见 C2。→ 波次 A / B。
   2. **A3 P3 交互闭环（= ADR-032 P5）**：proposal → 宿主确认 UI → gate 可执行集合 → 回执留档；回复文本展示。→ 波次 B，串行在 ADR-032 P4（= C2 ID-2）之后（与 C5 A-5 同一件事）。

@@ -23,6 +23,7 @@ use zeroize::{Zeroize, Zeroizing};
 compile_error!("test-support must not be enabled in release builds");
 
 mod acp;
+mod bridge_token;
 mod comm_groups;
 mod documents;
 mod enroll;
@@ -34,6 +35,7 @@ mod query;
 mod runs;
 mod schedules;
 mod service;
+mod skills;
 mod tui;
 
 #[derive(Parser)]
@@ -206,6 +208,31 @@ enum Command {
     Tools {
         #[command(subcommand)]
         action: query::ToolsAction,
+    },
+    /// 技能：列出、查看、导入、重扫，以及经桌面确认的激活
+    Skill {
+        #[command(subcommand)]
+        action: skills::SkillAction,
+        /// 原样输出 JSON 响应
+        #[arg(long, global = true)]
+        json: bool,
+    },
+    /// 开发工具。`A24_DEV_TOOL=1` 才可用。
+    Dev {
+        #[command(subcommand)]
+        action: DevAction,
+    },
+}
+
+/// `agent24 dev …`
+#[derive(Subcommand)]
+enum DevAction {
+    /// 经桌面确认签发 8 小时微信桥令牌，写入状态目录 dev/wechat-bridge.token。
+    /// `--revoke` 撤销该文件里的令牌并删除文件。
+    BridgeToken {
+        /// 撤销令牌文件中的 capability id，成功后删除文件
+        #[arg(long)]
+        revoke: bool,
     },
 }
 
@@ -1097,6 +1124,235 @@ async fn cmd_acp() -> Result<(), String> {
     let result = acp::serve(&ep).await;
     finish(ep).await;
     result
+}
+
+async fn cmd_dev(action: DevAction) -> Result<(), String> {
+    match action {
+        DevAction::BridgeToken { revoke } => cmd_bridge_token(revoke).await,
+    }
+}
+
+/// Enrol, ask the desktop to confirm, and write the dev-bridge file.
+///
+/// Stdout is the path and `expires_at` only. The bearer stays in the file.
+/// The development switch is checked before any daemon request, so a closed
+/// CLI gate never asks for elevation. A daemon that was not started with
+/// `A24_DEV_TOOL=1` answers 404 on the first POST; that is not
+/// `presence_required`, so this command does not ask the desktop either.
+async fn cmd_bridge_token(revoke: bool) -> Result<(), String> {
+    if !bridge_token::dev_tool_enabled() {
+        return Err(bridge_token::DEV_TOOL_REQUIRED.to_owned());
+    }
+    if revoke {
+        return cmd_bridge_token_revoke().await;
+    }
+    let Some(ep) = attach_only_with_enrollment(true).await? else {
+        return Err(
+            "找不到运行中的 agent24d。先以 capabilities 模式启动它（A24_DEV_TOOL=1），再运行 agent24 dev bridge-token。"
+                .to_owned(),
+        );
+    };
+    let root = match agent24_protocol::data_dir::data_dir() {
+        Ok(root) => root,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err.to_string());
+        }
+    };
+    // Remember the id before the new file replaces it. Revoke only after the
+    // new bearer is on disk, so a failed issue or write leaves the old bearer
+    // usable. A failed revoke is a warning and does not roll back the file.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let previous_id = bridge_token::live_bridge_id(&root, now);
+    let reply = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        "/api/v1/capabilities/bridge",
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await
+    .map_err(|err| {
+        let (code, message) = err.parts();
+        format!("{code}: {message}")
+    });
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err);
+        }
+    };
+    if !reply.status.is_success() {
+        let status = reply.status;
+        let body = reply.json_value().await;
+        finish(ep).await;
+        return Err(bridge_http_error(status, &body));
+    }
+    let body = reply.json_value().await;
+    let Some(token_text) = body["token"].as_str().filter(|token| !token.is_empty()) else {
+        finish(ep).await;
+        return Err("签发响应没有令牌".to_owned());
+    };
+    let token = Zeroizing::new(token_text.to_owned());
+    let expires_at = body["expires_at"].as_u64();
+    let capability_id = body["capability_id"]
+        .as_str()
+        .filter(|id| bridge_token::capability_id_ok(id))
+        .map(str::to_owned);
+    let (Some(expires_at), Some(capability_id)) = (expires_at, capability_id) else {
+        finish(ep).await;
+        return Err("签发响应没有 expires_at 或 capability_id".to_owned());
+    };
+    let path = match bridge_token::write_bridge_token_at(
+        &root,
+        token.as_str(),
+        expires_at,
+        capability_id.as_str(),
+    ) {
+        Ok(path) => path,
+        Err(err) => {
+            let note = match send_elevating(
+                &ep,
+                reqwest::Method::POST,
+                &format!("/api/v1/capabilities/{capability_id}/revoke"),
+                None,
+                Duration::from_secs(30),
+                false,
+            )
+            .await
+            {
+                Ok(reply) if reply.status.is_success() => {
+                    let _ = reply.json_value().await;
+                    "已撤销刚签发的令牌。".to_owned()
+                }
+                Ok(reply) => {
+                    let status = reply.status;
+                    let body = reply.json_value().await;
+                    format!(
+                        "撤销刚签发的令牌没有成功（{}）。",
+                        bridge_token::http_failure(status.as_u16(), &body)
+                    )
+                }
+                Err(err) => {
+                    let (code, message) = err.parts();
+                    format!("撤销刚签发的令牌没有成功（{code}: {message}）。")
+                }
+            };
+            finish(ep).await;
+            return Err(format!("{err}。{note}"));
+        }
+    };
+    if let Some(old_id) = previous_id
+        .as_deref()
+        .filter(|id| *id != capability_id.as_str())
+    {
+        revoke_previous_bridge_id(&ep, old_id).await;
+    }
+    finish(ep).await;
+    print!("{}", bridge_token::stdout_lines(&path, expires_at));
+    Ok(())
+}
+
+/// Best-effort revoke of an id captured before the new file was published.
+///
+/// A 404 `bridge_token_unknown` means the daemon restarted and that id is
+/// already gone. That is not a warning. Any other failure is printed and
+/// does not remove the new file. The bearer is not part of the warning.
+async fn revoke_previous_bridge_id(ep: &Endpoint, old_id: &str) {
+    let reply = send_elevating(
+        ep,
+        reqwest::Method::POST,
+        &format!("/api/v1/capabilities/{old_id}/revoke"),
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await;
+    match reply {
+        Ok(reply) if reply.status.is_success() => {
+            let _ = reply.json_value().await;
+        }
+        Ok(reply) => {
+            let status = reply.status;
+            let body = reply.json_value().await;
+            if let Some(warning) = bridge_token::previous_revoke_warning(status.as_u16(), &body) {
+                eprintln!("{warning}");
+            }
+        }
+        Err(err) => {
+            let (code, message) = err.parts();
+            eprintln!("撤销上一枚桥令牌没有成功（{code}: {message}）。新令牌已经写入。");
+        }
+    }
+}
+
+/// Revoke the id stored in the token file, then delete the file.
+///
+/// The id is read before the daemon is contacted. A missing file does not
+/// request elevation.
+async fn cmd_bridge_token_revoke() -> Result<(), String> {
+    let root = agent24_protocol::data_dir::data_dir().map_err(|err| err.to_string())?;
+    let capability_id = bridge_token::read_bridge_capability_id(&root)?;
+    let Some(ep) = attach_only_with_enrollment(true).await? else {
+        return Err(
+            "找不到运行中的 agent24d。先以 capabilities 模式启动它（A24_DEV_TOOL=1），再运行 agent24 dev bridge-token --revoke。"
+                .to_owned(),
+        );
+    };
+    let reply = send_elevating(
+        &ep,
+        reqwest::Method::POST,
+        &format!("/api/v1/capabilities/{capability_id}/revoke"),
+        None,
+        Duration::from_secs(30),
+        false,
+    )
+    .await
+    .map_err(|err| {
+        let (code, message) = err.parts();
+        format!("{code}: {message}")
+    });
+    let reply = match reply {
+        Ok(reply) => reply,
+        Err(err) => {
+            finish(ep).await;
+            return Err(err);
+        }
+    };
+    if !reply.status.is_success() {
+        let status = reply.status;
+        let body = reply.json_value().await;
+        finish(ep).await;
+        if let Some(outcome) = bridge_token::revoke_reply_when_daemon_lost_the_id(
+            &root,
+            &capability_id,
+            status.as_u16(),
+            &body,
+        ) {
+            return outcome;
+        }
+        return Err(bridge_token::http_failure(status.as_u16(), &body));
+    }
+    finish(ep).await;
+    let path = bridge_token::bridge_token_path(&root);
+    // Only a 2xx reply reaches here. A different id in the file is kept.
+    bridge_token::remove_bridge_token_if_id(&root, &capability_id)?;
+    print!("{}\nrevoked\n", path.display());
+    Ok(())
+}
+
+fn bridge_http_error(status: reqwest::StatusCode, body: &serde_json::Value) -> String {
+    if status == reqwest::StatusCode::NOT_FOUND
+        && body["error"]["code"].as_str() == Some("not_found")
+    {
+        return bridge_token::DAEMON_DEV_TOOL_REQUIRED.to_owned();
+    }
+    bridge_token::http_failure(status.as_u16(), body)
 }
 
 fn bearer(ep: &Endpoint, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -3262,6 +3518,8 @@ async fn main() -> std::process::ExitCode {
         Command::Consent { action } => query::consent(action).await,
         Command::Approval { action } => query::approval(action).await,
         Command::Tools { action } => query::tools(action).await,
+        Command::Skill { action, json } => skills::run(action, json).await,
+        Command::Dev { action } => cmd_dev(action).await,
     };
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,

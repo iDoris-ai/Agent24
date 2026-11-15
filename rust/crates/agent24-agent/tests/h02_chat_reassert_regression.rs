@@ -85,8 +85,14 @@ async fn remember_with(
     answer: &str,
     class: SourceClassification,
 ) -> MemoryWriteOutcome {
-    m.chat_remember_turn(SESSION, "remember espresso", answer, source(class))
-        .await
+    m.chat_remember_turn(
+        "run_h02",
+        SESSION,
+        "remember espresso",
+        answer,
+        source(class),
+    )
+    .await
 }
 
 async fn remember(m: &RunManager, answer: &str) -> MemoryWriteOutcome {

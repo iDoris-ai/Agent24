@@ -30,6 +30,10 @@ pub enum MessageOrigin {
     ToolResult,
     /// Host-generated system notice (the memory pause notice). `recall_ref` is NULL.
     HostSystem,
+    /// The skill segment injected from a pinned revision (SL-5). `recall_ref` is NULL.
+    /// Only the kind of the message: whether its text may leave the device is
+    /// the K1 source label, not this row.
+    SkillText,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -102,6 +106,7 @@ fn origin_columns(origin: &MessageOrigin) -> Result<(&'static str, Option<&str>)
         MessageOrigin::Assistant => Ok(("Assistant", None)),
         MessageOrigin::ToolResult => Ok(("ToolResult", None)),
         MessageOrigin::HostSystem => Ok(("HostSystem", None)),
+        MessageOrigin::SkillText => Ok(("SkillText", None)),
     }
 }
 
@@ -115,6 +120,7 @@ fn origin_from_row(kind: &str, recall_ref: Option<String>) -> Option<MessageOrig
         "Assistant" if recall_ref.is_none() => Some(MessageOrigin::Assistant),
         "ToolResult" if recall_ref.is_none() => Some(MessageOrigin::ToolResult),
         "HostSystem" if recall_ref.is_none() => Some(MessageOrigin::HostSystem),
+        "SkillText" if recall_ref.is_none() => Some(MessageOrigin::SkillText),
         _ => None,
     }
 }
@@ -231,6 +237,21 @@ impl Store {
         messages: &[SnapshotRunMessage],
         now: &str,
     ) -> Result<()> {
+        self.append_snapshot_run_messages_tagged(run_id, messages, &[], now)
+            .await
+    }
+
+    /// As [`Self::append_snapshot_run_messages`], and the `(seq, tag)` source
+    /// tags commit in the same transaction. A tag that cannot be written
+    /// rolls the messages back too, so text is never stored without the
+    /// label that restricts it (SL-5: the skill segment).
+    pub async fn append_snapshot_run_messages_tagged(
+        &self,
+        run_id: &str,
+        messages: &[SnapshotRunMessage],
+        tags: &[(i64, &crate::SourceRef)],
+        now: &str,
+    ) -> Result<()> {
         if messages.is_empty() {
             return Ok(());
         }
@@ -267,6 +288,9 @@ impl Store {
                 .bind(recall_ref)
                 .execute(&mut *tx)
                 .await?;
+        }
+        for (seq, tag) in tags {
+            crate::source_policy::insert_run_source_tag(&mut tx, run_id, *seq, tag, now).await?;
         }
         tx.commit().await?;
         Ok(())

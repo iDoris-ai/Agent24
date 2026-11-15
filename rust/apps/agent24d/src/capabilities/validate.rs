@@ -52,13 +52,12 @@ impl CapabilityStore {
     }
 
     /// Bearer is known, unrevoked, unexpired, and for this daemon.
-    /// Operation and resource are not checked: 404 and 405 must not reveal the
-    /// route table to a missing, unknown, or revoked token.
-    pub fn require_live_bearer(
+    /// Operation and resource are not checked.
+    pub fn authenticate_bearer(
         &self,
         bearer: &str,
         now: UnixSeconds,
-    ) -> Result<(), CapabilityError> {
+    ) -> Result<Authorization, CapabilityError> {
         let token = CapabilityToken::parse_bearer(bearer)?;
         let digest = digest(&token);
         let mut state = self
@@ -91,7 +90,37 @@ impl CapabilityStore {
         if record.expired(now) {
             return Err(CapabilityError::Expired);
         }
-        Ok(())
+        Ok(Authorization {
+            claims: record.claims.clone(),
+            epoch: state.epoch,
+        })
+    }
+
+    /// Claims when this bearer is a `ComponentRuntime` row already in the store.
+    /// Revoked, expired, and stale rows are included. An unknown bearer is
+    /// `None`, so a rejection audit cannot be filled by guessing tokens.
+    pub(crate) fn known_component_bearer(&self, bearer: &str) -> Option<Authorization> {
+        let token = CapabilityToken::parse_bearer(bearer).ok()?;
+        let digest = digest(&token);
+        let state = self.shared.state.lock().ok()?;
+        let record = state.records.get(&digest)?;
+        if record.claims.audience != super::Audience::ComponentRuntime {
+            return None;
+        }
+        Some(Authorization {
+            claims: record.claims.clone(),
+            epoch: state.epoch,
+        })
+    }
+
+    /// 404 and 405 must not reveal the route table to a missing, unknown, or
+    /// revoked token. This is [`Self::authenticate_bearer`] without the claims.
+    pub fn require_live_bearer(
+        &self,
+        bearer: &str,
+        now: UnixSeconds,
+    ) -> Result<(), CapabilityError> {
+        self.authenticate_bearer(bearer, now).map(|_| ())
     }
 
     pub fn validate_action(
@@ -165,7 +194,7 @@ impl CapabilityStore {
     }
 }
 
-fn process_live(record: &Record) -> bool {
+pub(crate) fn process_live(record: &Record) -> bool {
     record
         .claims
         .first_party

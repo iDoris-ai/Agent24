@@ -11,6 +11,7 @@ import {
   OpenDesignHealth,
   OpenDesignLauncher,
   PosixProcessGroupTree,
+  OPEN_DESIGN_READY_PHASE_TIMEOUT_MS,
   openDesignSidecarSpec,
   type KillFn,
   type OpenDesignLaunchPlan,
@@ -67,10 +68,11 @@ function launcherFor(child: FakeChild, current: OpenDesignLaunchPlan, fetchFn = 
 }
 
 describe('openDesignSidecarSpec', () => {
-  it('uses the designed bounds: ready 30 s, health 10 s / 3 s / 3 failures, TERM grace 15 s, kill 5 s', () => {
+  it('uses the designed bounds: ready 122 s (2×60 s + 2 s), health 10 s / 3 s / 3 failures, TERM grace 15 s, kill 5 s', () => {
+    expect(OPEN_DESIGN_READY_PHASE_TIMEOUT_MS).toBe(60_000)
     expect(openDesignSidecarSpec()).toEqual({
       sidecarId: 'open-design',
-      readyTimeoutMs: 30_000,
+      readyTimeoutMs: 122_000,
       healthIntervalMs: 10_000,
       healthTimeoutMs: 3_000,
       maxHealthFailures: 3,

@@ -11,6 +11,7 @@ import { ChatHistoryList } from './ChatHistoryList'
 import { DRAG_TYPE } from './drop'
 import { archiveConversation, getHistoryState, resetHistoryStore, setChatBusy, setActiveConversation } from './history'
 import { setLocale } from '../../i18n'
+import { aside } from './skill-list-aside'
 
 // UI-06 G3: the archive in the sidebar list and an archived conversation on
 // the chat page, against main's real store behind a bridge that calls it as
@@ -53,7 +54,7 @@ beforeEach(() => {
       ? { ok: false, status: 503, data: { error: { code: 'provider_unavailable', message: 'no local model' } } }
       : { ok: true, status: 200, data: { message: { content: 'ack' } } })
   Object.defineProperty(window, 'agent24', {
-    value: { chatHistory: bridge, chatGroups, backendProxy: proxy }, writable: true, configurable: true,
+    value: { chatHistory: bridge, chatGroups, backendProxy: aside(proxy) }, writable: true, configurable: true,
   })
   resetHistoryStore()
 })

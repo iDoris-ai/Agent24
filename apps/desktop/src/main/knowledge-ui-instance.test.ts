@@ -1,6 +1,6 @@
 import { readdirSync, readFileSync } from 'node:fs'
 import path from 'node:path'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import type { KnowledgeUiClient, UiCallResult } from './knowledge-ui-client'
 import type { InjectRequest } from './knowledge-ui-inject'
 import { KnowledgeUiInstance, type UiInstanceEvent } from './knowledge-ui-instance'
@@ -142,6 +142,45 @@ describe('KnowledgeUiInstance', () => {
     expect(t.log.filter((l) => l === 'probe')).toHaveLength(1)
     expect(t.events).toEqual([])
     expect(t.ui.inject(fetchReq(), WC)).toMatchObject({ injected: true })
+  })
+
+  it('reports a dropped-ops count from the exchange and goes on injecting; none when nothing is dropped (#1670 c2)', async () => {
+    const dropped = { kind: 'ok', value: { sessionToken: 'jwt-d', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'], droppedOps: 2 } } as never
+    const t = setup({ exchanges: [dropped] })
+    expect(await t.ui.start()).toBe(true)
+    expect(t.events).toEqual([{ kind: 'ops_dropped', count: 2 }])
+    expect(t.ui.inject(fetchReq(), WC)).toMatchObject({ injected: true })
+    const clean = setup({ exchanges: [{ kind: 'ok', value: { sessionToken: 'jwt-c', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'], droppedOps: 0 } } as never] })
+    expect(await clean.ui.start()).toBe(true)
+    expect(clean.events).toEqual([])
+  })
+
+  it('reports no dropped ops for an exchange that comes back after destroy (#1670 c2, Codex r3 C1)', async () => {
+    let answer: (v: unknown) => void = () => {}
+    const late = new Promise((resolve) => { answer = resolve }) as never
+    const t = setup({ exchanges: [late] })
+    const started = t.ui.start()
+    await vi.waitFor(() => expect(t.log).toContain('exchange'))
+    t.ui.destroy()
+    answer({ kind: 'ok', value: { sessionToken: 'jwt-late', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'], droppedOps: 2 } })
+    expect(await started).toBe(false)
+    expect(t.events.filter((e) => e.kind === 'ops_dropped')).toEqual([])
+  })
+
+  it('reports no dropped ops for a renewal that comes back after the instance stopped without being destroyed (#1670 c2, Codex r3 C1)', async () => {
+    let answer: (v: unknown) => void = () => {}
+    const late = new Promise((resolve) => { answer = resolve }) as never
+    const t = setup({ exchanges: [exchanged('jwt1'), late], probes: [refused('unauthorized', 'credential_invalid')] })
+    expect(await t.ui.start()).toBe(true)
+    t.timers[0].fn() // the renewal starts; its exchange stays in flight
+    await vi.waitFor(() => expect(t.log.filter((l) => l === 'exchange')).toHaveLength(2))
+    const r = fetchReq()
+    t.ui.inject(r, WC)
+    t.ui.responded(r.id, 401) // the self-check finds the JWT dead: end(rebuild), the view session lives on
+    await vi.waitFor(() => expect(t.events).toEqual([{ kind: 'rebuild' }]))
+    answer({ kind: 'ok', value: { sessionToken: 'jwt-late', expiresInS: 600, ops: ['kb.list'], knowledgeBaseIds: ['kb-a'], droppedOps: 2 } })
+    await flush()
+    expect(t.events).toEqual([{ kind: 'rebuild' }])
   })
 
   it('asks the host to reload once injection is back from a pause (U4.5)', async () => {

@@ -1,7 +1,7 @@
 import { capabilitiesMessages } from './capabilities.i18n'
 import { useT } from '../i18n'
 import { useComponentList } from '../components/useComponentList'
-import type { ComponentView } from '../components/componentApi'
+import type { ComponentIsolation, ComponentView } from '../components/componentApi'
 import { packageIntegrityHint } from '../components/packageIntegrity'
 import { idorisMessages } from '../components/idoris/IdorisPanel.i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
@@ -14,12 +14,29 @@ function findComponent(components: readonly ComponentView[], id: string): Compon
   return components.find((item) => item.id === id)
 }
 
+/** Capability card id → the component row that carries its kernel grants. */
+function componentId(id: string): string {
+  switch (id) {
+    case 'localModels': return 'idoris'
+    case 'communication': return 'hyphae'
+    case 'voice': return 'agentear'
+    case 'design': return 'open-design'
+    case 'knowledgeBase': return 'knowledge'
+    default: return id
+  }
+}
+
+export type CapabilityStatusFn = ((id: string) => string | undefined) & {
+  grantsFor: (id: string) => readonly string[] | undefined
+  isolationFor: (id: string) => ComponentIsolation | undefined
+}
+
 /**
  * Capability-card lifecycle. Installed / running comes from GET /api/v1/components.
  * Loading and failure are explicit so a missing read cannot fall through to
  * Built-in / Open.
  */
-export function useCapabilityStatus(active: boolean) {
+export function useCapabilityStatus(active: boolean): CapabilityStatusFn {
   const list = useComponentList(active)
   const cap = useT(capabilitiesMessages)
   const idorisText = useT(idorisMessages)
@@ -101,7 +118,7 @@ export function useCapabilityStatus(active: boolean) {
     return packageIntegrityHint(component.reason)
   }
 
-  return (id: string): string | undefined => {
+  const status = (id: string): string | undefined => {
     if (!active) return undefined
     if (!TRACKED.has(id)) return osPackage(id)
     if (list.status === 'idle' || list.status === 'loading') return cap('status.loading')
@@ -110,4 +127,22 @@ export function useCapabilityStatus(active: boolean) {
     if (id === 'communication') return communication(findComponent(list.components, 'hyphae'))
     return voice(findComponent(list.components, 'agentear'))
   }
+
+  // Read-only. Empty when the component declared a kernel capability and the
+  // mount handed nothing out (Hyphae). Hidden when the row says nothing.
+  const grantsFor = (id: string): readonly string[] | undefined => {
+    if (!active || list.status !== 'ready') return undefined
+    const component = findComponent(list.components, componentId(id))
+    if (!component || component.kernel_grants === undefined) return undefined
+    const declared = component.declared?.kernel ?? []
+    if (component.kernel_grants.length === 0 && declared.length === 0) return undefined
+    return component.kernel_grants
+  }
+
+  const isolationFor = (id: string): ComponentIsolation | undefined => {
+    if (!active || list.status !== 'ready') return undefined
+    return findComponent(list.components, componentId(id))?.isolation
+  }
+
+  return Object.assign(status, { grantsFor, isolationFor })
 }

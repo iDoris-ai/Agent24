@@ -188,8 +188,116 @@ pub(super) async fn mint_creative_capability(
         .into_response()
 }
 
+pub(super) async fn mint_bridge_capability(
+    State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
+) -> Response {
+    // Dark unless `A24_DEV_TOOL=1`, including legacy mode. 409 remains the
+    // answer when the gate is on and this process has no capability store.
+    // Checked before issue so a closed gate writes no `capability.token.issued`.
+    if !state.dev_wechat_events {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "No v1 route");
+    }
+    let Some(store) = state.capabilities.clone() else {
+        return error_response(
+            StatusCode::CONFLICT,
+            "capability_mode_required",
+            "Bridge capabilities require capability auth mode",
+        );
+    };
+    let Some(Extension(authorization)) = authorization else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Shell authority required",
+        );
+    };
+    let db = state.store.clone();
+    let minted = match crate::capabilities::bridge::issue_wechat_bridge(
+        &store,
+        &authorization,
+        crate::capabilities::unix_now(),
+        |event| {
+            let db = db.clone();
+            async move {
+                let ts = crate::capabilities::bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        },
+    )
+    .await
+    {
+        Ok(minted) => minted,
+        Err(crate::capabilities::bridge::BridgeIssueError::AuditFailed) => {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "audit_unavailable",
+                "Capability audit could not be written",
+            );
+        }
+        Err(crate::capabilities::bridge::BridgeIssueError::Rejected) => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Shell authority required",
+            );
+        }
+        Err(crate::capabilities::bridge::BridgeIssueError::CallerInvalid) => {
+            return error_response(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid bearer token",
+            );
+        }
+    };
+    let (token, capability_id, claims) = minted.into_bearer_parts();
+    (
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "capability_id": capability_id,
+            "token": token,
+            "audience": "component_runtime",
+            "component_id": claims.component_id,
+            "daemon_generation": claims.daemon_generation,
+            "created_at": claims.created_at,
+            "expires_at": claims.expires_at,
+            "ttl_seconds": crate::capabilities::bridge::BRIDGE_TTL_SECONDS,
+            "allowed_operations": claims.allowed_operations.iter().copied().map(operation_name).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
+/// Revoke one capability by id.
+///
+/// A live dev-bridge token is revoked in memory first, and `pending` is set
+/// in that same lock before the audit write. The `capability.token.revoked`
+/// row is written once. If the write fails the response is 503
+/// `audit_unavailable`, `pending` stays set, and the bearer stays unusable.
+/// A second call that arrives while that write is still in progress also
+/// gets 503 and does not answer 200. The next call after a failed write
+/// stores the missing row and then answers 200. A later call, once the row
+/// exists, answers 200 and does not append another. Any 200 means the row
+/// is already stored.
+///
+/// 503 is only returned for a bridge id whose revoke audit is still
+/// outstanding. The body contains no bearer. Unknown ids and tokens
+/// outside the dev-bridge profile answer 200 `revoked` when the caller is
+/// not a first-party shell, including while the audit store is down.
+///
+/// A first-party shell may revoke only the wechat-bridge token, after
+/// desktop confirmation. Any other id, including another shell token, a
+/// creative token, or an id that is not in the store, is refused here even
+/// if an elevation grant was presented. ProductHost keeps the previous
+/// revoke for every audience. Revoking the shell does not revoke the
+/// bridge token. The token still dies at its 8-hour TTL, or when this
+/// daemon process is gone and the generation no longer matches.
 pub(super) async fn revoke_capability(
     State(state): State<AppState>,
+    authorization: Option<Extension<crate::capabilities::Authorization>>,
     Path(capability_id): Path<String>,
 ) -> Response {
     let Some(store) = state.capabilities.as_ref() else {
@@ -206,9 +314,58 @@ pub(super) async fn revoke_capability(
             "Invalid capability id",
         );
     }
-    // Deliberately do not expose whether the ID existed or was already
-    // revoked. The endpoint is idempotent and is not a capability oracle.
-    let _ = store.revoke_by_id(&capability_id);
+    let shell = authorization.as_ref().is_some_and(|Extension(auth)| {
+        auth.claims.audience == crate::capabilities::Audience::FirstPartyShell
+    });
+    if shell
+        && !store
+            .claims_by_id(&capability_id)
+            .is_some_and(|claims| crate::capabilities::bridge::is_dev_bridge(&claims))
+    {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Shell may revoke only the wechat-bridge token",
+        );
+    }
+    // A dev-bridge token is revoked in memory before the audit row. A failed
+    // write leaves the bearer unusable and the record audit-pending. The
+    // next call writes that one row. Other audiences keep the previous
+    // idempotent revoke, with no audit. ProductHost still reaches them.
+    if store
+        .claims_by_id(&capability_id)
+        .is_some_and(|claims| claims.audience == crate::capabilities::Audience::ComponentRuntime)
+    {
+        let db = state.store.clone();
+        match crate::capabilities::bridge::revoke_wechat_bridge(store, &capability_id, |event| {
+            let db = db.clone();
+            async move {
+                let ts = crate::capabilities::bridge::audit_now()?;
+                db.append_capability_token_audit(&ts, &event)
+                    .await
+                    .map(|_| ())
+                    .map_err(|_| ())
+            }
+        })
+        .await
+        {
+            Ok(()) => {}
+            Err(crate::capabilities::bridge::BridgeRevokeError::AuditFailed) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "audit_unavailable",
+                    "Capability audit could not be written",
+                );
+            }
+            // A component token outside the dev-bridge profile cannot carry
+            // the closed audit row. It is still revoked in memory.
+            Err(crate::capabilities::bridge::BridgeRevokeError::NotComponent) => {
+                let _ = store.revoke_by_id(&capability_id);
+            }
+        }
+    } else {
+        let _ = store.revoke_by_id(&capability_id);
+    }
     Json(serde_json::json!({
         "capability_id": capability_id,
         "state": "revoked",

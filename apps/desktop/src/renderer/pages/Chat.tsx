@@ -16,6 +16,8 @@ import {
   forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
 } from './chat/history'
+import { SkillPicker } from './chat/SkillPicker'
+import { setConversationSkill, skillForConversation } from './chat/session-skill'
 
 /** M1-T14: what `/api/v1/chat` ACTUALLY did with an explicit "记住…" turn —
  *  read off the response field, never off the model's own reply text (the
@@ -205,12 +207,16 @@ export default function ChatPage() {
   // flight (the chat call is a single blocking IPC with no abort handle, so
   // the button is disabled rather than aborting) — hence no stale reply can
   // land in the new conversation.
-  const newChat = () => {
+  // A skill is chosen only for a conversation that has no turns yet, so
+  // every turn of a skill conversation goes to /runs from the first one.
+  const startNewChat = (skill: string | null) => {
     if (requestInFlight.current) return
     switchGen.current += 1
     setMessages([])
     setInput('')
-    setSessionId(genChatSessionId())
+    const fresh = genChatSessionId()
+    if (skill) setConversationSkill(fresh, skill)
+    setSessionId(fresh)
     setCurrentTurn(0)
     stamps.current = []
     lastSaved.current = ''
@@ -219,6 +225,7 @@ export default function ChatPage() {
     // conversation must not carry the old one's turns into its runs.
     runSession.current = null
   }
+  const newChat = () => startNewChat(null)
 
   // UI-03: open a saved conversation from the history list. Not while a reply
   // is in flight, for the same reason as `newChat`. It continues under its
@@ -245,6 +252,10 @@ export default function ChatPage() {
     setInput('')
     setSessionId(record.id)
     runSession.current = null
+    // A reopened conversation continues without a skill: its earlier turns
+    // are not in a run session, so a skill run could not see them. To use a
+    // skill, start a new conversation.
+    setConversationSkill(record.id, null)
     setActiveConversation(record.id)
     // M6 C1: opened, so nothing of it is unseen any more.
     void markConversationSeen(record.id)
@@ -272,13 +283,16 @@ export default function ChatPage() {
 
     // Asked of main on every turn: it may have turned On since the page opened.
     const knowledge = await window.agent24.knowledge?.status().then((status) => status, () => null)
-    if (knowledge?.active === true) {
-      const scope = JSON.stringify([knowledge.endpoint, knowledge.knowledgeBaseIds])
+    // A chosen skill rides on RunCreate, which `/api/v1/chat` does not have:
+    // such a turn goes to the run path with Knowledge on or off.
+    const skill = skillForConversation(sessionId)
+    if (knowledge?.active === true || skill) {
+      const scope = knowledge?.active === true ? JSON.stringify([knowledge.endpoint, knowledge.knowledgeBaseIds]) : 'no-knowledge'
       if (runScope.current !== scope) {
         runSession.current = null
         runScope.current = scope
       }
-      await replyWithKnowledge(index, request)
+      await replyWithKnowledge(index, request, knowledge?.active === true)
       return
     }
     // On but not in effect (no binding, e.g. a daemon started from the CLI):
@@ -354,7 +368,7 @@ export default function ChatPage() {
   // The turn as a run: only the new prompt goes. The run sees earlier turns
   // only through its session's memory (agent24-agent `session_context`): none
   // while memory is off, and never the turns that went to /api/v1/chat.
-  const replyWithKnowledge = async (index: number, request: ChatRequest) => {
+  const replyWithKnowledge = async (index: number, request: ChatRequest, withKnowledge: boolean) => {
     const prompt = request.messages[request.messages.length - 1]?.content ?? ''
     const sentAt = performance.now()
     const conversation = sessionId
@@ -374,7 +388,7 @@ export default function ChatPage() {
               setAwaitingApproval(waiting)
               if (runId && promotionDue({ status: waiting ? 'awaiting_approval' : 'running', replyEnded: false })) void promoteRun(conversation, runId)
             },
-          }, request.idoris_headroom_confirmed === true)
+          }, request.idoris_headroom_confirmed === true, skillForConversation(conversation))
       }
       let turn = await ask()
       // The daemon ties a session to one activation of the binding; after a
@@ -389,10 +403,18 @@ export default function ChatPage() {
         setDelivery(index, { kind: 'headroom', request })
         return
       }
+      // The skill left the active list under the user: stop naming it.
+      if (turn.kind === 'failed' && turn.code === 'skill_not_active') {
+        const gone = skillForConversation(conversation)
+        setConversationSkill(conversation, null)
+        setDelivery(index, { kind: 'notSent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: t('skill.notActive', { name: gone ?? '' }) }])
+        return
+      }
       if (turn.kind === 'answer') {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })
-        const knowledge = grounding(turn.text, turn.knowledge)
+        const knowledge = withKnowledge ? grounding(turn.text, turn.knowledge) : undefined
         setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
@@ -403,7 +425,7 @@ export default function ChatPage() {
           forgetPromotion(conversation, turn.runId)
           await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(turn.runId)}/cancel` }).catch(() => {})
           setDelivery(index, { kind: 'notSent' })
-          setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: 'run_timeout' }) }])
+          setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: 'run_timeout' }) }])
           return
         }
         setDelivery(index, { kind: 'sent' })
@@ -413,11 +435,11 @@ export default function ChatPage() {
         setMessages(prev => [...prev, { role: 'assistant', content: t('task.ongoing') }])
       } else {
         setDelivery(index, { kind: 'notSent' })
-        setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: turn.message }) }])
+        setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: turn.message }) }])
       }
     } catch (e) {
       setDelivery(index, { kind: 'notSent' })
-      setMessages(prev => [...prev, { role: 'assistant', content: t('knowledge.failed', { error: String(e) }) }])
+      setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: String(e) }) }])
     } finally {
       setAwaitingApproval(false)
       requestInFlight.current = false
@@ -450,6 +472,7 @@ export default function ChatPage() {
     <div className="chat-layout">
       <div className="chat-toolbar">
         <button className="btn" disabled={loading} onClick={newChat}>{t('newChat')}</button>
+        <SkillPicker conversation={sessionId} hasMessages={messages.length > 0} busy={loading} onStartWithSkill={startNewChat} />
       </div>
       {turns.length >= 2 && <TurnRail turns={turns} active={currentTurn} onSelect={jumpToTurn} />}
       <div className="chat-messages" ref={messagesRef} onScroll={followScroll}>

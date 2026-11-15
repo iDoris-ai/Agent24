@@ -365,6 +365,7 @@ mod tests {
                 first_party: None,
                 capability_id: "scoped-health-only".into(),
                 audience: Audience::FirstPartyShell,
+                component_id: None,
                 workspace_id: None,
                 attachment_id: None,
                 principal_id: None,
@@ -373,6 +374,7 @@ mod tests {
                 sidecar_generation: None,
                 created_at: now,
                 expires_at: now + 600,
+                deadline: None,
                 allowed_operations: BTreeSet::from([Operation::HealthRead]),
             })
             .unwrap()

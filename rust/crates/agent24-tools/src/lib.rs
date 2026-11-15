@@ -79,6 +79,17 @@ pub struct ToolContext {
     authorization_generation: u64,
     confirmed_write_root: Option<std::path::PathBuf>,
     approved_outside_directory: Option<std::sync::Arc<PinnedOutsideDir>>,
+    /// Asked again right before the tool runs, after any approval wait.
+    execution_guard: Option<Arc<dyn ExecutionGuard>>,
+}
+
+/// A last check the host runs right before a tool executes, after any wait
+/// for approval, so a context built before the wait cannot carry a stale
+/// answer into the call (SL-5: a pinned skill whose source label is gone).
+#[async_trait::async_trait]
+pub trait ExecutionGuard: Send + Sync {
+    /// `Err(reason)` stops the call: it is not executed.
+    async fn permit(&self) -> Result<(), String>;
 }
 
 /// What the approval gate bound this call to (K1-6a-G §2.3). It travels on
@@ -121,6 +132,7 @@ impl ToolContext {
             authorization_generation: 0,
             confirmed_write_root: None,
             approved_outside_directory: None,
+            execution_guard: None,
         }
     }
 
@@ -143,6 +155,13 @@ impl ToolContext {
     #[must_use]
     pub fn with_egress_resources(mut self, resources: Vec<EgressResource>) -> Self {
         self.egress_resources = resources;
+        self
+    }
+
+    /// Ask `guard` right before this call executes, every time.
+    #[must_use]
+    pub fn with_execution_guard(mut self, guard: Arc<dyn ExecutionGuard>) -> Self {
+        self.execution_guard = Some(guard);
         self
     }
 
@@ -246,6 +265,7 @@ impl ToolContext {
             authorization_generation: 0,
             confirmed_write_root: None,
             approved_outside_directory: None,
+            execution_guard: None,
         }
     }
 
@@ -329,6 +349,7 @@ impl ToolContext {
             authorization_generation: self.authorization_generation,
             confirmed_write_root: self.confirmed_write_root.clone(),
             approved_outside_directory: self.approved_outside_directory.clone(),
+            execution_guard: self.execution_guard.clone(),
         }
     }
 }
@@ -2273,6 +2294,9 @@ impl ToolRegistry {
         cancel: &CancellationToken,
         approval: ApprovalBinding,
     ) -> Result<String, ToolError> {
+        if let Some(guard) = &ctx.execution_guard {
+            guard.permit().await.map_err(ToolError::Denied)?;
+        }
         // Mint opaque settlement authority before constructing the call future.
         // Authorization receives only the reusable ToolContext.
         let mut invocation = tool.prepare_invocation(ctx)?;

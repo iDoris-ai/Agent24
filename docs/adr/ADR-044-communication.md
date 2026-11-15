@@ -39,15 +39,15 @@
 - 因此 `docs/Deployment/HYPHAE-NETWORK-DELIVERY.md` 的「随包交付」「标准包含 hyphae」「client 不依赖首次联网下载」（`:10,25,31`）作废，该文要改（待办 T1）。
 - 发布信息只有一个来源：逐字节复制上游 schema 2 的 `ComponentLock`（`rust/crates/agent24-comm/hyphae.lock.json`，当前 `v0.30.1`）。版本不写死，靠 sha256 校验，不靠 `--version`；改锁的 PR 要写明原因。CI：`.github/workflows/hyphae-lock-verify.yml`。
 - 信任：macOS 安装时全量验签并检查公证，每次启动做离线 codesign；Linux 只靠 sha256 加可复现构建（ADR-038 D2a、§7.5、§7.11；`hyphae_install.rs`）。
-- 二进制查找顺序：`A24_HYPHAE_BIN` → `A24_SPEAKER_BIN`（兼容，打 warn）→ 组件目录（每次按锁重验 hash）→ agent24d 同目录；不查 PATH（`COMM-HYPHAE.md` 路径规则；`comm_routes.rs`）。nostr-bridge 目前只读 `A24_SPEAKER_BIN`，默认 `agent-speaker`（`packages/nostr-bridge/src/config.ts:45` **（main 已核）**）。这一点在 Q6 (c) 下不再另修：桥并入 comm 后查找由 comm 统一做（见 D5），并入之前不扩展桥的查找逻辑。
+- 二进制查找顺序：`A24_HYPHAE_BIN` → `A24_SPEAKER_BIN`（兼容，打 warn）→ 组件目录（每次按锁重验 hash）→ agent24d 同目录；不查 PATH（`COMM-HYPHAE.md` 路径规则；`comm_routes.rs`）。nostr-bridge 已删除（#1785），查找由 comm 做。旧说法「桥并入 comm 后查找由 comm 统一做，并入之前不扩展桥的查找逻辑」（已被 2026-11-12 回写取代）：入站适配不并入 comm，见 D5。
 
 ### D3 数据归属与身份（C03、C21）——X7 的结论
 
-**X7 结论（jason 2026-11-04）：agent 的 Nostr 身份，以通讯专用目录 `<data>/comm/hyphae-home` 里的钥匙库为准。旧的 nostr-bridge 不再是身份来源，以后并入 comm。**
+**X7 结论（jason 2026-11-04，2026-11-12 回写）：agent 的 Nostr 身份，以通讯专用目录 `<data>/comm/hyphae-home` 里的钥匙库为准。身份归 comm（已定）。旧的 nostr-bridge 已删除（#1785），不再是身份来源。入站适配不并入 comm，落在 `agent24d` 的 inbound 模块（见 D5）。**
 
 - 专用 HOME `<state_dir>/comm/hyphae-home/`。旧 `~/.hyphae` 只能经 `agent24 comm import --from` 显式导入，用户确认后**复制**（`daemon.rs` 设 HOME 和 cwd；`import.rs`）。
 - 默认身份只有一个来源：`identity list` 里 `default:true` 的一项（`daemon.rs:698`、`router.rs:829` **（main 已核）**）。Hyphae 的文件是消息的唯一来源，comm 不另存消息；Agent24 只存关系状态。
-- nostr-bridge 过去不覆盖 HOME（`speaker.ts` 里 grep `HOME` 零命中 **（main 已核）**），实际用哪份 HOME 取决于运行环境。决定之后：**身份只认 comm 的钥匙库**；桥在并入之前不得自己生成或持有另一套身份，需要身份时只能从 comm 取（实现见 §3 待办 T2）。
+- nostr-bridge 过去不覆盖 HOME（`speaker.ts` 里 grep `HOME` 零命中 **（main 已核）**），实际用哪份 HOME 取决于运行环境。决定之后：**身份只认 comm 的钥匙库**。桥已删除（#1785）。旧说法「桥在并入之前不得自己生成或持有另一套身份」（已被 2026-11-12 回写取代）：没有第二套桥身份；入站适配在 `agent24d`，见 D5 与 T2。
 - 私钥备份和恢复用 NIP-49 `ncryptsec`；备份文件由 daemon 自己写（`O_EXCL|O_NOFOLLOW`，0600）（`export.rs`，#1535）。这条原先只在 PR 里，现在补进决策。
 
 ### D4 凭据与授权等级（C04、C10、C20）
@@ -65,19 +65,19 @@
 
 | 入口 | 现状 | 决定 |
 |---|---|---|
-| Nostr 入站消息（Hyphae 收件箱、nostr-bridge） | Hyphae 收件箱无准入；桥在桥内判名单，F4b 默认冻结 | 经 ADR-041 D1 写入 `inbound_events`，由 D3 准入决定 |
+| Nostr 入站消息（Hyphae 收件箱；nostr-bridge 已删除，#1785） | 收件箱由 `agent24d` inbound 轮询写入。旧说法「桥在桥内判名单，F4b 默认冻结」（已被 2026-11-12 回写取代） | 经 ADR-041 D1 写入 `inbound_events`，由 D3 准入决定。适配器在 `agent24d` inbound，不在 comm |
 | 语音输入（AgentEar） | ADR-041 已列为第六条路径 | 同上 |
 | 远程 @agent 消息 | 尚无实现 | 同上；没有单独的旁路 |
-| 微信桥（wechat-bridge） | 桥内判 uid 名单；微信里回 y/n 解决审批（ADR-041 §1） | **开发工具，不进产品构建，产品构建里不得启动。** 开发态下也不得绕过准入：它要触发 agent 干活，目标写法是和 nostr-bridge 一样只做传输，把消息作为 `source = wechat` 的事件交给 ADR-041 的准入，名单与去重由 daemon 持有。在它改成这样之前，开发态的桥内名单只算开发便利，不算产品行为 |
+| 微信桥（wechat-bridge） | 开发工具。X11-2g（#1818、#1819）起只做传输，不再 `POST /api/v1/runs`，不再自持名单，也不在微信里回 y/n。旧说法「桥内判 uid 名单」（已被 2026-11-12 回写取代） | **开发工具，不进产品构建，产品构建里不得启动。** 开发态把消息作为 `source = wechat` 的事件交给 ADR-041 的准入，名单与去重由 daemon 持有 |
 | 手机遥控（ADR-037 决策 6） | 设计文档不存在（C29） | 遥控只是准入的**一种来源**，配对设备身份由准入表的名单承载；ADR-037 决策 6 里「独立的授权入口」按本条理解为「准入的一个来源」，不是绕过准入的第二条路 |
 
 - **基础通信保持 zero-run**：收发消息、联系人、relay 管理不触发任何 run。结构约束保留：comm 依赖图有白名单，禁止 HTTP 客户端 crate，`CommState` 不含 Store、ModelRouter（`agent24-comm/tests/comm_dependency_allowlist.rs`、`tests/comm_zero_run.rs`；C06）。
-- **F4b 冻结**：`A24_NOSTR_F4B_INBOUND=1` 才恢复桥内的入站执行，只拦截分派，轮询和 canary 照常，解冻后只分派启动之后到达的消息（`packages/nostr-bridge/src/config.ts`、`inbound.ts`；C05）。拦截点在 `pollOnce`（`inbound.ts:200-245` **（main 已核）**），不在 `InboundBridge.handle`，见待办 X5。**F4b 是过渡开关**：ADR-041 的准入落地后，入站执行以准入为准，F4b 开关随桥的迁移删除。
+- **F4b 冻结**（已被 2026-11-12 回写取代）：旧 nostr-bridge 与 `A24_NOSTR_F4B_INBOUND` 已随 X11 ① 删除（#1785）。入站执行以 ADR-041 准入为准，适配器在 `agent24d` inbound，不在 comm。待办 X5 里的 `inbound.ts` 路径是删除前的记录。
 - **好友不等于可以指挥 agent**：好友表不写进 `A24_NOSTR_ALLOWED_NPUBS`，好友协议消息也 zero-run（C24）。能否让 agent 干活只看 ADR-041 的准入表。
-- **Q6 (c) 桥的归宿**：
-  - nostr-bridge **并入 comm**（成为 comm 的入站适配器，写 `inbound_events`，对应 ADR-041 D1、C30）。
-  - wechat-bridge **维持开发工具**，不进产品路径。
-  - **在并入之前，产品构建禁止桥使用 legacy 全权 token。** 现状：桥从 `daemon.json` 读 `port` 和 `token`（`packages/nostr-bridge/src/config.ts:125-140` 的 `discoverDaemon` **（main 已核）**），在 `AuthMode::LegacySingleToken`（`rust/apps/agent24d/src/server.rs:720` **（main 已核）**）下这个 token 是全权的。产品构建要么不启动桥，要么给桥发 CORE-2 按组件的受限令牌（ADR-038 D7：组件不得持有 legacy 全权 token）。这条是约束，代码尚未实现，见待办 T3。
+- **Q6 (c) 桥的归宿**（2026-11-12 回写：入站适配不进 comm）：
+  - nostr-bridge 已删除（X11 ①，#1785）。入站适配在 `agent24d` 的 `inbound` 模块（Hyphae 轮询写 `inbound_events`），**不是** `agent24-comm`。理由：comm 的依赖白名单与 zero-run 约束（本节上文；`comm_dependency_allowlist.rs`、`comm_zero_run.rs`）不允许持有 Store 或起 run。身份仍由 comm 管。
+  - wechat-bridge **维持开发工具**，不进产品路径。开发态也不得绕过准入（X11-2g，#1818、#1819）：它不再 `POST /api/v1/runs`。
+  - **产品构建不启动桥**（已被 2026-11-12 回写取代）。旧 nostr-bridge 已删除（#1785）。wechat-bridge 维持开发工具，且不再 `POST /api/v1/runs`（T3，#1818、#1819）。旧说法「在并入之前禁止桥使用 legacy 全权 token，代码尚未实现」不再成立：入站适配不并入 comm。按组件发受限令牌仍依赖 ADR-038 C9（未排期）。
 
 ### D6 消息状态语义与可靠性（C11、C12、C13、C19）
 
@@ -127,8 +127,8 @@
 | # | 内容 | 类别 |
 |---|---|---|
 | T1 | `HYPHAE-NETWORK-DELIVERY.md:10,25,31` 的「随包交付」改成按需下载（X1 结论） | 文档 |
-| T2 | **已完成（2026-11-10，X11① / X7）**：删除旧 nostr-bridge 及 F4b 入站执行；身份统一由 comm 管理，入站适配将在 ADR-041a 准入里程碑重做。原待办：桥并入 comm 前，桥不得持有独立身份；并入后删除桥里的 `SPEAKER_BIN` 查找（X6 随之消失）、桥内名单与内存去重（ADR-041 D1） | 代码 |
-| T3 | **已完成（2026-11-10，X11①）**：删除 Nostr 桥；微信桥启动必须显式设置 `A24_DEV_TOOL=1`，桌面打包测试禁止引用 bridge。原待办：产品构建禁止桥用 legacy 全权 token。**眼下唯一能落地的做法是产品构建不启动桥**；「按组件发受限令牌」依赖 ADR-038 的 C9（D7 `requires` 授权接线，待排、未定期），在 C9 之前做不了。同样地，**F4b（`A24_NOSTR_F4B_INBOUND=1`）仅限开发态，产品构建不得开启**，否则桥会在准入之外直接触发 run。需要测试钉住：产品构建下桥不启动、F4b 开关不生效 | 代码 |
+| T2 | **已完成（2026-11-12，X11 ②③④）**：入站适配并入 `agent24d` 的 `inbound` 模块，不并入 `agent24-comm`（依赖白名单与 zero-run，见 D5）。X11 ①（2026-11-10，#1785）已删除旧 nostr-bridge 及 F4b；身份仍由 comm 管理。②③④ 的 PR：#1797 方案，#1805 / #1806（2a），#1803（2b），#1810 / #1813 / #1816（2c），#1808 / #1812（2d），#1820（迁移已合，bb03081e）及 #1821（2e 第 2 部分 Hyphae 轮询，已合 a93f5df3；群聊每轮取最新一页、已入库跳过，`inbound_cursor` 表保留暂不使用），#1809 / #1811（2f），#1818 / #1819（2g）。原待办里「并入 comm 后删除桥内名单」已改为 daemon 持有名单与去重 | 代码 |
+| T3 | **已完成（2026-11-12，X11 ① 与 2g）**：旧 Nostr 桥已删。wechat-bridge 维持开发工具，启动必须 `A24_DEV_TOOL=1`，且不再 `POST /api/v1/runs`，只把消息交给 daemon 入站准入（#1818、#1819）。产品构建不启动桥。原待办里的「按组件发受限令牌」仍依赖 ADR-038 的 C9（未排期）。F4b 已随旧桥删除，不再是入站执行路径 | 代码 |
 | T4 | 定义 CLI 与 headless 场景的默认 relay（X12） | 决策 |
 | T5 | ADR-037 决策 6 的措辞与 D5 对齐（遥控是准入的一种来源）；`decision.md` 的订正归 S0-1 | 文档 |
 
@@ -136,7 +136,7 @@
 
 ## 4. 与 ADR-041 的边界
 
-**ADR-041 D1 写的「nostr-bridge 与 wechat-bridge 改为只做传输，名单与去重搬进 daemon」，其中 wechat-bridge 的部分以本篇为准**：wechat-bridge 维持开发工具，不进产品路径（Q6 (c)），不是产品里要迁移的适配器。ADR-041 待回写。ADR-041 的开放问题 Q4（`:133`，桥的名单搬进 daemon 的行为差异）与 X7（身份来源）同题，待回写；回写前以本篇 D3、D5 为准。
+**ADR-041 D1 写的「nostr-bridge 与 wechat-bridge 改为只做传输，名单与去重搬进 daemon」，其中 wechat-bridge 的部分以本篇为准**：wechat-bridge 维持开发工具，不进产品路径（Q6 (c)），不是产品里要迁移的适配器。入站适配在 `agent24d` 的 inbound 模块（T2），不在 comm。ADR-041 的开放问题 Q4（桥的名单搬进 daemon 的行为差异）已由 X11-2f / 2g 落地：名单在 daemon，微信桥不再自持名单。
 
 两份 ADR 管不同的东西，不重叠：
 
@@ -144,9 +144,9 @@
 |---|---|---|
 | 管什么 | 通信这项能力**怎么交付、怎么运行、怎么收发**：Hyphae 的分发与信任、身份与数据、凭据、消息状态、relay、应用层协议 | 入站事件**进入本体之后怎么处理**：`inbound_events` 表、准入表、接受模式、工单 |
 | 入站消息 | comm 负责**拿到**消息（拉取、去重、标 `actor` / `human` / `addressed`），不判断谁有权让 agent 干活 | 负责**准入**（名单 × 是否 @ × 接收范围）和之后的一切 |
-| 名单与去重 | 不再保留（桥并入 comm 后搬走） | 持有（D1：名单与去重搬进 daemon） |
-| 遥控、语音、远程 @agent | 只声明它们走准入（D5） | 定义准入表如何容纳这些来源 |
-| 状态 | 提议 | 提议（C30 的适配器迁移尚未实现） |
+| 名单与去重 | 不再保留在桥或 comm 里 | 持有（D1：名单与去重在 daemon 的 inbound 模块） |
+| 遥控、语音、远程 @agent | 只声明它们走准入（D5） | 定义准入表如何容纳这些来源。手机遥控本里程碑只预留来源名 |
+| 状态 | 已接受（#1593、#1601）。X11 ②③④ 已落地，见 T2 | 041a（D1–D4、D10）已接受并已实现；041b（D5–D9 工单）仍是提议 |
 
 具体接口：comm 作为事件源，在 ADR-038 D9 清单里加 ADR-041 D2 的可选块 `events`；comm 保证来源侧职责（持读位置、先过滤自己发的消息、标明 `actor` 与 `human`）；准入判定不在 comm。若 ADR-041 被修改或被拒绝，D5 里「统一走准入」的结论仍然成立，只是准入关卡的实现换一个载体，不回到桥内判定。
 
@@ -161,15 +161,15 @@ Windows 在 DEP-A7 之前不支持，放开时要补 env 白名单（`COMM-HYPHA
 ## 7. 后果
 
 - **好处**：三处矛盾有了结论；ADR-041、COMM-FRIENDS、遥控设计有上位依据；「谁能让 agent 干活」只有准入这一个答案，权限和审计只做一套。
-- **代价**：nostr-bridge 要并入 comm，这是一次迁移（T2）；并入前产品构建不能用桥（T3），F4b 之外没有别的入站执行路径；遥控设计要按「准入来源」重写措辞（T5）。
-- **风险**：ADR-041 仍是「提议」。准入关卡没落地之前，入站执行只有 F4b 一个冻结的开关，没有别的路；这是有意的保守。
+- **代价**：入站适配在 `agent24d` 的 inbound 模块，不在 comm（T2）；产品构建不启动 wechat-bridge（T3）；遥控设计要按「准入来源」重写措辞（T5）。
+- **风险**：041b 工单仍是提议。041a 准入已经落地（T2）；入站执行以准入为准，不再依赖已删除的 F4b。
 
 ## 8. 已拍板（jason，2026-11-04）
 
 1. X1：Hyphae 按需下载，不随安装包发。
-2. X7：Nostr 身份以 `<data>/comm/hyphae-home` 的钥匙库为准；nostr-bridge 不再是身份来源，以后并入 comm。
-3. X11：Nostr 入站、语音输入、远程 @agent、手机遥控，一律经 ADR-041 准入。
-4. Q6 (c)：nostr-bridge 并入 comm；wechat-bridge 维持开发工具。
+2. X7：Nostr 身份以 `<data>/comm/hyphae-home` 的钥匙库为准；nostr-bridge 不再是身份来源。入站适配不并入 comm，在 `agent24d` 的 inbound 模块（2026-11-12 回写，见 D5、T2）。
+3. X11：Nostr 入站、语音输入、远程 @agent、手机遥控，一律经 ADR-041 准入。②③④ 已落地（T2）；手机遥控本里程碑只预留来源名。
+4. Q6 (c)：nostr 入站适配在 `agent24d` inbound；wechat-bridge 维持开发工具。
 5. 预览版停发，主线是组件整合与统一。
 
 ## 9. 关联与取代

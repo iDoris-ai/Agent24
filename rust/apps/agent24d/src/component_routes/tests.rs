@@ -68,6 +68,83 @@ fn find<'a>(body: &'a Value, id: &str) -> &'a Value {
 const GET: &str = "/api/v1/components";
 const OD: &str = "/api/v1/components/open-design/report";
 
+const REDACTED_KEYS: &[&str] = &["id", "isolation", "provides", "state", "version"];
+
+/// `isolation` is on the redacted view, and its `reason` / `form_not_covered`
+/// would trip a raw substring scan for the host-only `reason` and `form`.
+fn without_isolation(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(without_isolation).collect()),
+        Value::Object(map) => {
+            let mut next = serde_json::Map::new();
+            for (key, child) in map {
+                if key == "isolation" {
+                    continue;
+                }
+                next.insert(key.clone(), without_isolation(child));
+            }
+            Value::Object(next)
+        }
+        other => other.clone(),
+    }
+}
+
+fn isolation_json(os_module: bool) -> Value {
+    if os_module && cfg!(target_os = "macos") {
+        json!({"state": "isolated", "mechanism": "seatbelt"})
+    } else if os_module {
+        json!({"state": "not_isolated", "reason": "platform_unsupported"})
+    } else {
+        json!({"state": "not_isolated", "reason": "form_not_covered"})
+    }
+}
+
+#[test]
+fn isolation_follows_class_and_platform() {
+    assert_eq!(
+        component_isolation(ComponentClass::OsModule, true),
+        Isolation::Isolated {
+            mechanism: IsolationMechanism::Seatbelt,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(component_isolation(ComponentClass::OsModule, true)).unwrap(),
+        json!({"state": "isolated", "mechanism": "seatbelt"})
+    );
+    assert_eq!(
+        component_isolation(ComponentClass::OsModule, false),
+        Isolation::NotIsolated {
+            reason: NotIsolatedReason::PlatformUnsupported,
+        }
+    );
+    assert_eq!(
+        serde_json::to_value(component_isolation(ComponentClass::OsModule, false)).unwrap(),
+        json!({"state": "not_isolated", "reason": "platform_unsupported"})
+    );
+    for class in [
+        ComponentClass::Resident,
+        ComponentClass::Sidecar,
+        ComponentClass::Cli,
+        ComponentClass::Attach,
+        ComponentClass::Remote,
+        ComponentClass::Mcp,
+    ] {
+        for macos in [false, true] {
+            assert_eq!(
+                component_isolation(class, macos),
+                Isolation::NotIsolated {
+                    reason: NotIsolatedReason::FormNotCovered,
+                },
+                "{class:?} macos={macos}"
+            );
+        }
+    }
+    assert_eq!(
+        serde_json::to_value(component_isolation(ComponentClass::Mcp, true)).unwrap(),
+        json!({"state": "not_isolated", "reason": "form_not_covered"})
+    );
+}
+
 #[tokio::test]
 async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     let (app, host, ..) = app().await;
@@ -115,6 +192,329 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
     );
     assert_eq!(find(&body, "knowledge")["state"], "stopped");
     assert_eq!(find(&body, "documents")["state"], "absent");
+    assert_eq!(find(&body, "documents")["isolation"], isolation_json(true));
+    for id in ["idoris", "hyphae", "knowledge", "open-design"] {
+        assert_eq!(find(&body, id)["isolation"], isolation_json(false), "{id}");
+    }
+    // Rows with no `requires` lock leave the declaration unknown, not empty.
+    for id in ["knowledge", "open-design", "idoris"] {
+        assert!(find(&body, id)["declared"].is_null(), "{id}");
+    }
+}
+
+/// The row copies `MountReport.granted`. The resolver would also grant
+/// `models` (it is in the out-of-process ceiling and `no_channel` is empty
+/// there); a mount with no model callback leaves it out of `granted`. Reading
+/// `resolution.granted` instead of `report.granted` makes `kernel_grants`
+/// include `models` and this test fails.
+#[tokio::test]
+async fn components_show_the_mount_grant_not_the_resolver() {
+    use crate::capabilities::requires::{self, Consent, GrantForm};
+
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let mut report = os_report(
+        "modelnodeps",
+        MountOutcome::Mounted,
+        d9(
+            "modelnodeps",
+            false,
+            "modelnodeps-tasks",
+            &["events", "models"],
+        ),
+    );
+    report.granted = vec!["events".into()];
+    let spec = requires::RequiresSpec::parse(&["events", "models"], &[] as &[&str]);
+    let resolution = requires::resolve(
+        &spec,
+        GrantForm::OutOfProcess.host_cap(),
+        Consent::FirstPartyEnabled,
+    );
+    assert!(
+        resolution.granted.has(agent24_domain::Capability::Models),
+        "the resolver grants models; the row must not copy that"
+    );
+    assert!(resolution.granted.has(agent24_domain::Capability::Events));
+    state.os_reports = Arc::new(vec![report]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    let row = find(&full, "modelnodeps");
+    assert_eq!(row["kernel_grants"], json!(["events"]));
+    assert_eq!(row["isolation"], isolation_json(true));
+    assert_eq!(
+        row["declared"],
+        json!({"kernel": ["events", "models"], "operations": []})
+    );
+    let denied = row["denied"].as_array().unwrap();
+    assert!(
+        denied.iter().all(|item| item["item"] != "events"),
+        "events was mounted: {denied:?}"
+    );
+    assert!(
+        denied
+            .iter()
+            .any(|item| item["item"] == "models" && item["code"] == "no_channel"),
+        "withheld models is no_channel: {denied:?}"
+    );
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let row = find(&redacted, "modelnodeps");
+    assert!(row.get("denied").is_none());
+    assert!(row.get("kernel_grants").is_none());
+    assert_eq!(row["isolation"], isolation_json(true));
+    assert_eq!(
+        find(&redacted, "hyphae")["isolation"],
+        isolation_json(false)
+    );
+    assert!(!redacted.to_string().contains("no_channel"));
+}
+
+fn denial_code<'a>(row: &'a Value, item: &str) -> Option<&'a str> {
+    row["denied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|denial| denial["item"] == item)
+        .and_then(|denial| denial["code"].as_str())
+}
+
+fn has_no_channel(row: &Value) -> bool {
+    row["denied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|denial| denial["code"] == "no_channel")
+}
+
+/// `no_channel` is a mounted-channel fact. Disabled, refused, degraded, and
+/// an uninstalled Documents row keep it out. An unread manifest (no D9) does
+/// not grow an out-of-process denial list, and `declared` is null.
+#[tokio::test]
+async fn no_channel_tracks_the_effective_outcome_not_the_startup_report() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let mut was_mounted = os_report(
+        "wasmounted",
+        MountOutcome::Mounted,
+        d9(
+            "wasmounted",
+            false,
+            "wasmounted-tasks",
+            &["events", "models"],
+        ),
+    );
+    was_mounted.granted = vec!["events".into()];
+    let now_mounted = os_report(
+        "nowmounted",
+        MountOutcome::Disabled,
+        d9("nowmounted", false, "nowmounted-tasks", &["events"]),
+    );
+    let refused = os_report(
+        "refusedmod",
+        MountOutcome::Refused("dup".into()),
+        d9("refusedmod", false, "refusedmod-tasks", &["events"]),
+    );
+    let degraded = os_report(
+        "degradedmod",
+        MountOutcome::Degraded("disk".into()),
+        d9("degradedmod", false, "degradedmod-tasks", &["memory"]),
+    );
+    let mut unread = os_report(
+        "unread",
+        MountOutcome::Mounted,
+        d9("unread", false, "unread-tasks", &["events", "models"]),
+    );
+    unread.d9 = None;
+    unread.granted = vec!["events".into()];
+    state.set_os_outcome("wasmounted", MountOutcome::Disabled);
+    state.set_os_outcome("nowmounted", MountOutcome::Mounted);
+    state.os_reports = Arc::new(vec![was_mounted, now_mounted, refused, degraded, unread]);
+    let app = build_router(state);
+    let (_, body) = call(&app, Method::GET, GET, Some(&host), "").await;
+
+    let was = find(&body, "wasmounted");
+    assert_eq!(was["state"], "stopped");
+    assert_eq!(was["kernel_grants"], json!(["events"]));
+    assert!(!has_no_channel(was), "startup Mounted must not win: {was}");
+    assert_eq!(denial_code(was, "memory"), Some("not_declared"));
+
+    let now = find(&body, "nowmounted");
+    assert_eq!(now["kernel_grants"], json!([]));
+    assert_eq!(
+        denial_code(now, "events"),
+        Some("no_channel"),
+        "the override is Mounted, so the empty grant is no_channel: {now}"
+    );
+
+    for id in ["refusedmod", "degradedmod", "documents"] {
+        let row = find(&body, id);
+        assert!(!has_no_channel(row), "{id} is not mounted: {row}");
+    }
+    assert_eq!(find(&body, "documents")["state"], "absent");
+    assert!(
+        find(&body, "documents")["denied"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "uninstalled Documents does not invent denials"
+    );
+
+    let unread = find(&body, "unread");
+    assert!(unread["declared"].is_null(), "{unread}");
+    assert_eq!(unread["denied"], json!([]));
+    assert_eq!(unread["kernel_grants"], json!(["events"]));
+    assert_eq!(
+        unread["isolation"],
+        isolation_json(false),
+        "a row with no manifest is not classified as an OS module"
+    );
+    assert!(
+        !unread.to_string().contains("not_declared"),
+        "an unread manifest does not take the out-of-process ceiling: {unread}"
+    );
+}
+
+#[test]
+fn documents_that_are_not_mounted_keep_static_denials_only() {
+    for outcome in [
+        MountOutcome::Disabled,
+        MountOutcome::Refused("dup".into()),
+        MountOutcome::Degraded("disk".into()),
+    ] {
+        let report = report_with(outcome.clone(), "0.2.0", vec![]);
+        let item = documents_shown(
+            Some(&report),
+            Some(&outcome),
+            None,
+            documents_catalog::DocumentsCatalog::embedded(),
+        );
+        let value = serde_json::to_value(&item).unwrap();
+        assert!(!has_no_channel(&value), "{outcome:?} {value}");
+        assert_eq!(denial_code(&value, "memory"), Some("not_declared"));
+    }
+
+    let mut startup = report_with(MountOutcome::Mounted, "0.2.0", vec![]);
+    startup.granted = vec!["events".into()];
+    let stopped = documents_shown(
+        Some(&startup),
+        Some(&MountOutcome::Disabled),
+        None,
+        documents_catalog::DocumentsCatalog::embedded(),
+    );
+    let stopped = serde_json::to_value(&stopped).unwrap();
+    assert!(!has_no_channel(&stopped), "{stopped}");
+
+    let absent = documents_from(None, None, documents_catalog::DocumentsCatalog::embedded());
+    let absent = serde_json::to_value(&absent).unwrap();
+    assert_eq!(absent["declared"]["kernel"], json!(["events", "models"]));
+    assert_eq!(absent["denied"], json!([]));
+}
+
+#[test]
+fn hyphae_denials_list_each_item_once() {
+    let view = kernel_without_channel(&["events".into(), "events".into()], &[]);
+    assert_eq!(view.denied.len(), 1);
+    assert_eq!(view.denied[0].item, "events");
+    assert_eq!(view.denied[0].code, DenyReason::NoChannel);
+
+    let invalid = kernel_without_channel(&["nope".into(), "nope".into()], &[]);
+    assert_eq!(invalid.denied.len(), 1);
+    assert_eq!(invalid.denied[0].item, "nope");
+    assert_eq!(invalid.denied[0].code, DenyReason::RequiresInvalid);
+}
+
+#[tokio::test]
+async fn an_attached_module_shows_the_admission_grant() {
+    use agent24_attach::attach_registry::AttachGrantBuilder;
+    let manifest = agent24_domain::DomainOsManifest::from_yaml(
+        "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\
+         event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
+         impl_kind: attached_process\nkernel_capabilities: [events, models, memory]\n",
+    )
+    .unwrap();
+    for with_models in [false, true] {
+        let builder = admission_builder(with_models).await;
+        let held = builder.build("agentear", &manifest).kernel_grants.clone();
+        let registry = agent24_attach::attach_registry::AttachRegistry::new(
+            agent24_attach::attach_registry::AttachDeps {
+                grants: Arc::new(builder),
+            },
+        );
+        registry.on_change(&agent24_attach::attached::Change::Registered {
+            name: "agentear",
+            rotated: false,
+            manifest: &manifest,
+            manifest_digest: "sha256:deadbeef",
+            token_sha256_hex: &"ab".repeat(32),
+            token_id: "tok_agentear",
+            disabled: false,
+        });
+        let snap = registry.snapshot();
+        assert_eq!(snap[0].kernel_grants, held);
+        assert_eq!(snap[0].declared_kernel, ["events", "models", "memory"]);
+        let row = serde_json::to_value(&attach_items_from(snap)[0]).unwrap();
+        assert_eq!(row["kernel_grants"], json!(held));
+        assert_eq!(
+            row["declared"],
+            json!({"kernel": ["events", "models", "memory"], "operations": []})
+        );
+        if with_models {
+            assert_eq!(row["kernel_grants"], json!(["events", "models"]));
+            assert!(denial_code(&row, "models").is_none(), "{row}");
+        } else {
+            assert_eq!(row["kernel_grants"], json!(["events"]));
+            assert_eq!(denial_code(&row, "models"), Some("no_channel"), "{row}");
+        }
+        assert_eq!(denial_code(&row, "memory"), Some("above_ceiling"), "{row}");
+    }
+}
+
+struct NoopTrigger;
+
+#[async_trait::async_trait]
+impl agent24_scheduler::RunTrigger for NoopTrigger {
+    async fn trigger(
+        &self,
+        _invocation: &agent24_scheduler::ScheduleInvocation,
+    ) -> agent24_scheduler::FireOutcome {
+        agent24_scheduler::FireOutcome::Deferred {
+            reason: agent24_scheduler::DeferReason::MountPending,
+        }
+    }
+}
+
+async fn admission_builder(with_models: bool) -> crate::attach_grant::DaemonAttachGrantBuilder {
+    let store = agent24_store::Store::open_memory().await.unwrap();
+    let events = crate::events::EventsHub::default();
+    crate::attach_grant::DaemonAttachGrantBuilder {
+        scheduler: agent24_scheduler::Scheduler::new(
+            store.clone(),
+            Arc::new(NoopTrigger),
+            Arc::new(|_| {}),
+        ),
+        models: with_models.then(|| crate::model_callback::ModelCallbackDeps {
+            router: Arc::new(agent24_models::router::ModelRouter::with_defaults(vec![])),
+            usage: Arc::new(crate::model_callback::MemoryUsageSink::default()),
+            cancel_root: CancellationToken::new(),
+            admission: crate::model_callback::ModelAdmission::new(
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_GLOBAL,
+                crate::model_callback::MODEL_MAX_IN_FLIGHT_PER_MODULE,
+            ),
+            events: events.clone(),
+            timings: Arc::new(crate::timing_recorder::MemoryTimingSink::default()),
+        }),
+        approval_broker: crate::module_approval_broker::ModuleApprovalBroker::new(
+            store,
+            events.clone(),
+        ),
+        events,
+    }
 }
 
 #[tokio::test]
@@ -132,10 +532,19 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "crash at /Users/x/od ws://relay.example"
     );
     assert!(find(&full, "hyphae").get("detail").is_some());
+    // Hyphae declares `events` and has no kernel channel. The host sees that
+    // denial; the grant list stays empty because nothing was mounted.
+    let hyphae = find(&full, "hyphae");
+    assert_eq!(hyphae["kernel_grants"], json!([]));
+    assert_eq!(hyphae["declared"]["kernel"], json!(["events"]));
+    assert_eq!(
+        hyphae["denied"],
+        json!([{"item": "events", "code": "no_channel"}])
+    );
 
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
-    let text = redacted.to_string();
+    let text = without_isolation(&redacted).to_string();
     for leaked in [
         "detail",
         "reason",
@@ -145,13 +554,17 @@ async fn other_audiences_get_only_id_version_state_provides() {
         "contract",
         "port",
         "pid",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
     for item in redacted["components"].as_array().unwrap() {
         let mut keys: Vec<_> = item.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["id", "provides", "state", "version"], "{item}");
+        assert_eq!(keys, REDACTED_KEYS, "{item}");
     }
     let od = find(&redacted, "open-design");
     assert_eq!(
@@ -509,6 +922,8 @@ fn attached_entries_named_like_a_builtin_component_are_not_listed() {
         disabled: false,
         drain: Some(DrainState::Running),
         mismatch: None,
+        kernel_grants: Vec::new(),
+        declared_kernel: Vec::new(),
     })
     .collect();
     let items = attach_items_from(modules);
@@ -753,6 +1168,20 @@ async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
         bad["provides"].as_array().unwrap().is_empty(),
         "tools on the record are not provides without a capability id"
     );
+
+    for id in ["documents", "sin90", "cos72", "broken"] {
+        assert_eq!(find(&body, id)["isolation"], isolation_json(true), "{id}");
+    }
+    for id in [
+        "demo",
+        "idoris",
+        "hyphae",
+        "knowledge",
+        "open-design",
+        "mcp-files",
+    ] {
+        assert_eq!(find(&body, id)["isolation"], isolation_json(false), "{id}");
+    }
 }
 
 /// A domain package named `mcp-files` and the MCP server `files` would both
@@ -1080,7 +1509,7 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
     );
     let (status, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
     assert_eq!(status, StatusCode::OK);
-    let text = redacted.to_string();
+    let text = without_isolation(&redacted).to_string();
     for leaked in [
         "detail",
         "reason",
@@ -1093,6 +1522,10 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
         "binding",
         "in_process",
         "memory",
+        "denied",
+        "no_channel",
+        "kernel_grants",
+        "declared",
     ] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -1108,7 +1541,7 @@ async fn os_and_mcp_detail_stays_off_the_redacted_view() {
     for item in redacted["components"].as_array().unwrap() {
         let mut keys: Vec<_> = item.as_object().unwrap().keys().cloned().collect();
         keys.sort();
-        assert_eq!(keys, ["id", "provides", "state", "version"]);
+        assert_eq!(keys, REDACTED_KEYS);
     }
 }
 
@@ -1133,6 +1566,40 @@ fn mcp_exempt(id: &str) -> bool {
 
 fn covered(id: &str, registered: &std::collections::BTreeSet<String>) -> bool {
     registered.contains(id) || mcp_exempt(id)
+}
+
+/// `requires` names kernel capabilities and canonical operations, never a
+/// REGISTRY capability id (C9-A). A kernel name that is also a registry id,
+/// or an operation that is only a slash alias, turns this red.
+fn assert_requires_tokens(
+    requires: &Value,
+    registered: &std::collections::BTreeSet<String>,
+    where_: &str,
+) {
+    let kernel = requires["kernel"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{where_} requires.kernel is missing"));
+    for name in kernel {
+        let name = name.as_str().unwrap();
+        assert!(
+            agent24_domain::Capability::parse(name).is_ok(),
+            "{where_} requires.kernel {name} is not a kernel capability"
+        );
+        assert!(
+            !registered.contains(name),
+            "{where_} requires.kernel {name} is a REGISTRY capability id"
+        );
+    }
+    let operations = requires["operations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{where_} requires.operations is missing"));
+    for op in operations {
+        let op = op.as_str().unwrap();
+        assert!(
+            crate::capabilities::Operation::canonical(op).is_some(),
+            "{where_} requires.operations {op} is not a canonical Operation name"
+        );
+    }
 }
 
 fn provide_ids(body: &Value) -> Vec<String> {
@@ -1163,6 +1630,13 @@ async fn registry_lists_every_capability_id_the_components_emit() {
         "ADR-040 should say the C7 registry exists"
     );
     let registered = registered_ids(&markdown);
+    for cap in agent24_domain::ALL_CAPABILITIES {
+        assert!(
+            !registered.contains(cap.as_str()),
+            "kernel capability {} collides with a REGISTRY capability id",
+            cap.as_str()
+        );
+    }
     for id in [
         "model-gateway",
         "nostr-dm",
@@ -1205,6 +1679,9 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     for path in &locks {
         let text = std::fs::read_to_string(path).unwrap();
         let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        if let Some(requires) = value.get("requires") {
+            assert_requires_tokens(requires, &registered, &path.display().to_string());
+        }
         let Some(provides) = value.get("provides").and_then(|p| p.as_array()) else {
             continue;
         };
@@ -1238,24 +1715,78 @@ async fn registry_lists_every_capability_id_the_components_emit() {
     }
     let mut manifests = Vec::new();
     walk_manifests(&root, &mut manifests);
+    assert!(
+        manifests
+            .iter()
+            .any(|p| p.ends_with("agent24-documents/domain-os.yml")),
+        "documents domain-os.yml must be part of the requires drift check"
+    );
     for path in manifests {
         let text = std::fs::read_to_string(&path).unwrap();
-        if !text
+        let has_provides = text
             .lines()
-            .any(|line| line.trim().starts_with("provides:"))
-        {
-            continue;
-        }
+            .any(|line| line.trim().starts_with("provides:"));
         let manifest = agent24_domain::DomainOsManifest::from_yaml(&text)
             .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        for provide in manifest.provides() {
+        if has_provides {
+            for provide in manifest.provides() {
+                assert!(
+                    registered.contains(provide.id()),
+                    "{} provides {}, which REGISTRY.md does not list",
+                    path.display(),
+                    provide.id()
+                );
+            }
+        }
+        for cap in manifest.kernel_capabilities() {
             assert!(
-                registered.contains(provide.id()),
-                "{} provides {}, which REGISTRY.md does not list",
+                agent24_domain::Capability::parse(cap.as_str()).is_ok(),
+                "{} kernel capability {} is not a kernel capability",
                 path.display(),
-                provide.id()
+                cap.as_str()
+            );
+            assert!(
+                !registered.contains(cap.as_str()),
+                "{} kernel capability {} is a REGISTRY capability id",
+                path.display(),
+                cap.as_str()
             );
         }
+    }
+
+    let mut catalogs = Vec::new();
+    fn walk_catalogs(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == "target" || name.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk_catalogs(&path, out);
+            } else if name == "component.json" {
+                out.push(path);
+            }
+        }
+    }
+    walk_catalogs(&root.join("rust"), &mut catalogs);
+    assert!(
+        catalogs
+            .iter()
+            .any(|p| p.ends_with("agent24-documents/component.json")),
+        "documents component.json must be part of the requires drift check"
+    );
+    for path in catalogs {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+        let Some(requires) = value.get("requires") else {
+            continue;
+        };
+        assert_requires_tokens(requires, &registered, &path.display().to_string());
     }
 
     let app = build_router(server_tests::state().await);
@@ -1545,9 +2076,9 @@ fn redacted_components_omit_the_health_summary() {
     );
     let full = render(std::slice::from_ref(&item), true);
     let redacted = render(&[item], false);
-    let text = redacted.to_string();
+    let text = without_isolation(&redacted).to_string();
     assert_eq!(redacted["components"][0]["state"], "degraded");
-    assert!(text.contains("nostr-relay"));
+    assert!(redacted.to_string().contains("nostr-relay"));
     for forbidden in [
         "consecutive_failures",
         "relays",
@@ -1583,7 +2114,9 @@ fn shown(item: &Item) -> Value {
 
 fn assert_no_canary(item: &Item, canaries: &[&str]) {
     let host = render(std::slice::from_ref(item), true).to_string();
-    let redacted = render(std::slice::from_ref(item), false).to_string();
+    let redacted_value = render(std::slice::from_ref(item), false);
+    let redacted = redacted_value.to_string();
+    let visible = without_isolation(&redacted_value).to_string();
     for canary in canaries {
         assert!(!host.contains(canary), "{canary} in host view {host}");
         assert!(
@@ -1601,7 +2134,7 @@ fn assert_no_canary(item: &Item, canaries: &[&str]) {
         "basis",
     ] {
         assert!(
-            !redacted.contains(leaked),
+            !visible.contains(leaked),
             "{leaked} in redacted view {redacted}"
         );
     }
@@ -3203,6 +3736,25 @@ fn documents_d9_catalog_parses_the_module_tools() {
     assert!(catalog.assurance.is_empty());
     assert_eq!(catalog.requires.kernel, ["events", "models"]);
     assert!(catalog.requires.operations.is_empty());
+    let mut with_op: Value =
+        serde_json::from_str(include_str!("../../../agent24-documents/component.json")).unwrap();
+    with_op["requires"]["operations"] = json!(["models.read"]);
+    assert!(
+        documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_ok(),
+        "a canonical Operation name is a valid requires.operations entry"
+    );
+    with_op["requires"]["operations"] = json!(["models/read"]);
+    assert!(
+        documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
+        "a slash alias is not a canonical operation name"
+    );
+    for op in ["skills.read", "skills.install", "skills.activate"] {
+        with_op["requires"]["operations"] = json!([op]);
+        assert!(
+            documents_catalog::DocumentsCatalog::load(Some(&with_op.to_string())).is_err(),
+            "a component lock cannot grant {op}"
+        );
+    }
     // domain-os.yml is parsed, not searched: a comment or another key that
     // happens to contain the text cannot satisfy it.
     let manifest: serde_yaml::Value =
@@ -3317,10 +3869,10 @@ fn documents_d9_missing_or_broken_catalog_is_an_error() {
             v["requires"]["kernel"] = json!(["events", "events"]);
         }),
         ("operations", |v| {
-            v["requires"]["operations"] = json!(["Bad"])
+            v["requires"]["operations"] = json!(["list"])
         }),
         ("operations-unique", |v| {
-            v["requires"]["operations"] = json!(["list", "list"]);
+            v["requires"]["operations"] = json!(["models.read", "models.read"]);
         }),
         // Well formed, but not `<this component's id>.<operation>`.
         ("tool-component", |v| {
@@ -3537,7 +4089,7 @@ async fn documents_d9_entry_lists_provides_and_redacts() {
     let doc = find(&redacted, "documents");
     let mut keys: Vec<_> = doc.as_object().unwrap().keys().cloned().collect();
     keys.sort();
-    assert_eq!(keys, ["id", "provides", "state", "version"]);
+    assert_eq!(keys, REDACTED_KEYS);
     assert_eq!(doc["provides"][0]["id"], "documents");
     assert_eq!(
         sorted_tools(
@@ -3549,7 +4101,7 @@ async fn documents_d9_entry_lists_provides_and_redacts() {
         ),
         DOC_TOOLS
     );
-    let text = doc.to_string();
+    let text = without_isolation(doc).to_string();
     for leaked in ["reason", "form", "detail", "catalog_invalid", "port", "pid"] {
         assert!(!text.contains(leaked), "{leaked} leaked: {text}");
     }
@@ -4300,7 +4852,7 @@ async fn documents_expected_vs_actual_reaches_the_list_and_hides_detail_from_oth
     let doc = find(&redacted, "documents");
     assert_eq!(doc["state"], "ready");
     assert_eq!(doc["version"], "9.9.9");
-    let text = doc.to_string();
+    let text = without_isolation(doc).to_string();
     for leaked in [
         "expected_version",
         "actual_version",
@@ -4650,10 +5202,11 @@ fn t8_each_integrity_reason_is_host_only() {
         assert_eq!(full["components"][0]["reason"], reason.code());
         assert_ne!(full["components"][0]["state"], "absent");
         assert_ne!(full["components"][0]["state"], "incompatible");
-        let redacted = render(&[item], false).to_string();
-        assert!(!redacted.contains("reason"), "{redacted}");
-        assert!(!redacted.contains("detail"), "{redacted}");
-        assert!(!redacted.contains("/tmp"), "{redacted}");
-        assert!(!redacted.contains("stderr"), "{redacted}");
+        let redacted = render(&[item], false);
+        let text = without_isolation(&redacted).to_string();
+        assert!(!text.contains("reason"), "{redacted}");
+        assert!(!text.contains("detail"), "{redacted}");
+        assert!(!text.contains("/tmp"), "{redacted}");
+        assert!(!text.contains("stderr"), "{redacted}");
     }
 }

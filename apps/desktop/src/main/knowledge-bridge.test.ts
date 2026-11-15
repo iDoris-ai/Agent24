@@ -100,6 +100,24 @@ describe('hello (U6.3, U7.3)', () => {
     expect(t.replies()).toHaveLength(1)
   })
 
+  it('answers a hello request with hello and then the newest state: a page that missed the first pair still gets it (M2 B1)', () => {
+    const t = setup()
+    t.bridge.setState({ profile_state: 'ready', theme: 'light', locale: 'en' })
+    t.bridge.setState({ profile_state: 'ready', theme: 'dark', locale: 'zh' })
+    const before = t.sent.length
+    t.arrive(t.msg('status', { state: 'loading' }, { generation: 0 }))
+    const after = t.sent.slice(before)
+    expect(after.map((s) => [s.msg.type, s.document])).toEqual([['hello', 1], ['state', 1]])
+    expect(after[1].msg).toMatchObject({ direction: 'host_to_page', generation: 5, document_id: t.bridge.currentDocumentId(), payload: { profile_state: 'ready', theme: 'dark', locale: 'zh' } })
+    expect(t.replies()).toEqual([])
+  })
+
+  it('answers a hello request with hello alone while there is no state yet (M2 B1)', () => {
+    const t = setup()
+    t.arrive(t.msg('status', { state: 'loading' }, { generation: 0 }))
+    expect(t.sent.map((s) => s.msg.type)).toEqual(['hello', 'hello'])
+  })
+
   it('keeps hello and state within 5 a second, holding only the newest state', () => {
     const t = setup()
     for (let i = 0; i < 6; i++) t.bridge.setState({ profile_state: 'ready', theme: i % 2 ? 'light' : 'dark', locale: `l${i}` })

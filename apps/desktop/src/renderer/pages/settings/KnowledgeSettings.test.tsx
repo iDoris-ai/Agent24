@@ -48,7 +48,7 @@ describe('KnowledgeSettings', () => {
     configure.mockResolvedValue({ ok: false, reason: 'invalid' })
     render(<KnowledgeSettings />)
     await screen.findByDisplayValue('https://kb.example/api/v1')
-    fireEvent.click(screen.getByLabelText('Use Knowledge in the main chat'))
+    fireEvent.click(screen.getByLabelText('Let the assistant use Knowledge'))
     await waitFor(() => expect(setEnabled).toHaveBeenCalledWith(true))
     fireEvent.click(screen.getByRole('button', { name: 'Save' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Check the address')

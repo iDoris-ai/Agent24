@@ -73,6 +73,7 @@ async fn paused_snapshot_notice_is_host_system_and_neighbors_are_present() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();
@@ -172,6 +173,7 @@ async fn recall_snapshot_stores_sorted_assertion_id_array() {
             model_override: None,
             mode: RunMode::Normal,
             knowledge_binding_id: None,
+            skill_id: None,
         })
         .await
         .unwrap();

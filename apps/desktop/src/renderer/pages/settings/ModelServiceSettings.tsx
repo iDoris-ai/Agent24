@@ -179,10 +179,16 @@ export function ModelServiceSettings() {
 
   async function stopServer() {
     setOmlxStatus('stopping')
-    await window.agent24.omlxStop()
+    const result = await window.agent24.omlxStop()
+    if (!result.stopped) {
+      setOmlxStatus('connected')
+      setDetectError({ key: 'error.externalOmlx' })
+      return
+    }
     setOmlxModels([])
     setOmlxActiveModel('')
     setWarmingUp({})
+    setDetectError(null)
     setOmlxStatus('disconnected')
   }
 

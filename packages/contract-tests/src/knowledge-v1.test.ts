@@ -1,6 +1,6 @@
 // KB-CT-02b (#1012): the Knowledge v1 fixtures (protocol/knowledge/fixtures/v1)
 // must match the digests pinned in their manifest and the schemas in
-// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r12). The Rust
+// protocol/knowledge/v1 (docs/knowledge/CONTRACT-READONLY-v1.md r13). The Rust
 // side (agent24-protocol tests/knowledge_fixtures.rs) checks the same manifest,
 // so changing any fixture byte turns both red. Pure schema test, no daemon.
 
@@ -24,7 +24,7 @@ const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf
 // Pins the whole fixture set (every file digest and version). Changing a fixture
 // means bumping its version, re-pinning its sha256 and updating this constant
 // together with MANIFEST_SHA256 in rust/crates/agent24-protocol/tests/knowledge_fixtures.rs.
-const MANIFEST_SHA256 = 'd3802ec7d907443396522c1c0b0a81302e2be719a53b66a749a893895f61c89a'
+const MANIFEST_SHA256 = '53f445ef9d0f3cce56a93d2321eae4f87b899d7b545f79ada1f8b129736071b0'
 // Cases the contract names (#1012; §11.3, §11.7; §12 #11, #18, #19; r6, r8); same list as the Rust test.
 const REQUIRED = [
   'search.empty-scope.json', 'search.scope-empty-array.json', 'search.partial.json', 'search.partial-overloaded.json',
@@ -35,6 +35,8 @@ const REQUIRED = [
   'search.operation-disabled.json', 'search.unauthorized-before-parse.json',
   'read.policy-denied.json', 'read.timeout.json', 'read.index-failed.json', 'read.expected-revision-partial.json',
   'read.stale-page.json', 'ready.operation-disabled.json', 'read.operation-disabled.json',
+  // r13: the candidate readiness key and the write operation classes (WeKnora#146).
+  'ready.candidate.json', 'capabilities.write-operations.json',
 ]
 const load = (file: string): any => JSON.parse(readFileSync(join(fixtureDir, file), 'utf8'))
 const clone = <T>(x: T): T => JSON.parse(JSON.stringify(x))
@@ -63,7 +65,7 @@ const responseSchema = (op: string) => (op === 'system.capabilities' ? 'capabili
 
 describe('knowledge v1 fixtures — manifest', () => {
   it('pins exactly the files in the directory, by version and sha256', () => {
-    expect(manifest.contract_revision).toBe('r12')
+    expect(manifest.contract_revision).toBe('r13')
     // The manifest pins the revision named in the contract's own header.
     const contract = readFileSync(join(repoRoot, 'docs', 'knowledge', 'CONTRACT-READONLY-v1.md'), 'utf8')
     expect(contract.match(/文档修订 (r\d+)/)?.[1]).toBe(manifest.contract_revision)
@@ -371,6 +373,26 @@ describe('knowledge v1 schemas — canonical negatives', () => {
     ok('ready.response', read, false)
     read.knowledge_bases.forEach((kb: any) => { kb.read = { state: 'not_ready', reason: 'dependency' } })
     ok('ready.response', read)
+  })
+
+  it('ready: operations.candidate is optional and has the infrastructure state shape (R8.2, r13)', () => {
+    const res = clone(load('ready.candidate.json').response.body)
+    ok('ready.response', res)
+    for (const state of ['not_ready', 'disabled']) ok('ready.response', { ...res, operations: { ...res.operations, candidate: { state, reason: 'dependency' } } })
+    ok('ready.response', { ...res, operations: { ...res.operations, candidate: { state: 'unknown' } } }, false)
+    ok('ready.response', { ...res, operations: { ...res.operations, candidate: { state: 'ready', extra: 1 } } }, false)
+    ok('ready.response', { ...res, operations: { ...res.operations, candidate: null } }, false)
+    const { candidate: _absent, ...without } = res.operations
+    ok('ready.response', { ...res, operations: without })
+  })
+
+  it('capabilities: supported_operations takes the R2.7 write operation classes, not capability values (R9.2, r13)', () => {
+    const body = clone(load('capabilities.write-operations.json').response.body)
+    const ops = (list: string[]) => ({ ...body, integration: { agent24_knowledge: { ...body.integration.agent24_knowledge, supported_operations: list } } })
+    ok('capabilities', body)
+    ok('capabilities', ops(['search', 'read']))
+    for (const bad of ['kb_candidate_propose', 'kb_entry_withdraw', 'retrieve', 'ingest', 'candidate.list']) ok('capabilities', ops(['search', bad]), false)
+    ok('capabilities', ops(['search', 'search']), false)
   })
 
   it('ready: KB-level reasons are the closed R8.4 set; operation_disabled exactly when the operation is disabled (§12 #19)', () => {

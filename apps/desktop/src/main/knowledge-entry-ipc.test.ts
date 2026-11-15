@@ -183,6 +183,24 @@ describe('registerKnowledgeEntryIpc', () => {
     expect(guard).toHaveBeenCalledTimes(7)
   })
 
+  it('KB-SOP-01b: with submitting, also the three submit channels; only the draft id and one KB id reach it (HS-N1)', async () => {
+    const handlers = new Map<string, (...args: unknown[]) => unknown>()
+    const handle = (channel: string, f: (...args: unknown[]) => unknown) => { handlers.set(channel, f) }
+    const submit = vi.fn(async () => ({ ok: false, reason: 'not_found' }) as const)
+    const status = vi.fn(async () => ({ ok: false, reason: 'not_found' }) as const)
+    const retract = vi.fn(async () => ({ ok: false, reason: 'not_found' }) as const)
+    const guard = vi.fn(<F,>(f: F) => f)
+    registerKnowledgeEntryIpc({ handle } as never, guard as never, admitDeps, draftDeps(), { submit, status, retract, view: vi.fn() } as never)
+    expect([...handlers.keys()].slice(-3)).toEqual([IpcChannels.KnowledgeEntrySubmit, IpcChannels.KnowledgeEntrySubmitStatus, IpcChannels.KnowledgeEntrySubmitRetract])
+    expect(guard).toHaveBeenCalledTimes(10)
+    await handlers.get(IpcChannels.KnowledgeEntrySubmit)!(sender(1), 'ked_x', 'kb1', { approved: true, author: 'mallory', session_ref: 'f'.repeat(64) })
+    expect(submit).toHaveBeenCalledWith('ked_x', 'kb1')
+    await handlers.get(IpcChannels.KnowledgeEntrySubmitStatus)!(sender(1), 'ked_x', { approved: true })
+    expect(status).toHaveBeenCalledWith('ked_x')
+    await handlers.get(IpcChannels.KnowledgeEntrySubmitRetract)!(sender(1), 'ked_x', { approved: true })
+    expect(retract).toHaveBeenCalledWith('ked_x')
+  })
+
   it('answers an admission with a ticket and the judged record’s messages, and a refusal as it was', async () => {
     const handlers = new Map<string, (...args: unknown[]) => unknown>()
     const handle = (channel: string, f: (...args: unknown[]) => unknown) => { handlers.set(channel, f) }
@@ -451,6 +469,76 @@ describe('the drafts as the Knowledge page sees them', () => {
     const broken = knowledgeEntryDrafts({ store: { ...s.store, withdraw: () => { throw new Error('io') }, list: () => { throw new Error('io') } }, chat: vi.fn(), target: () => TARGET, locale: () => 'zh' })
     expect(broken.withdraw(d.id)).toBe(false)
     expect(broken.list()).toEqual([])
+  })
+
+  it('M4 A7: a created draft waits in its conversation, and withdrawing it clears that', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    const d = await one(s)
+    expect(pending.set).toHaveBeenCalledTimes(1)
+    expect(pending.set).toHaveBeenCalledWith('chat_abc', d.id, d.title)
+    expect(pending.clear).not.toHaveBeenCalled()
+    expect(s.drafts.withdraw(d.id)).toBe(true)
+    expect(pending.clear).toHaveBeenCalledTimes(1)
+    expect(pending.clear).toHaveBeenCalledWith('chat_abc', d.id)
+    // Nothing withdrawn: nothing cleared.
+    expect(s.drafts.withdraw(d.id)).toBe(false)
+    expect(pending.clear).toHaveBeenCalledTimes(1)
+  })
+
+  it('M4 A7: a withdraw that fails leaves the draft waiting', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    const d = await one(s)
+    for (const withdraw of [() => false, () => { throw new Error('io') }]) {
+      const stuck = knowledgeEntryDrafts({ store: { ...s.store, get: s.store.get, withdraw }, chat: vi.fn(), target: () => TARGET, locale: () => 'zh', pending })
+      expect(stuck.withdraw(d.id)).toBe(false)
+    }
+    expect(s.drafts.get(d.id)).not.toBeNull()
+    expect(pending.clear).not.toHaveBeenCalled()
+  })
+
+  it('M4 A7: an edited or redacted title replaces the waiting item\'s label (Codex C1)', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending, chat: async () => modelDraft({ kind: 'faq', title: '找 dave@example.com', body: '打开人事系统提交。', hints: [] }) })
+    const d = await one(s)
+    expect(pending.set).toHaveBeenLastCalledWith('chat_abc', d.id, '找 dave@example.com')
+    const redacted = s.drafts.redact(d.id)
+    expect(redacted.ok).toBe(true)
+    const [, , label] = pending.set.mock.calls.at(-1)!
+    expect(label).not.toContain('dave@example.com')
+    expect(label).toBe(redacted.ok ? redacted.draft.title : '')
+    expect(s.drafts.update(d.id, { kind: 'faq', title: '请假流程', body: '打开人事系统提交。' }).ok).toBe(true)
+    expect(pending.set).toHaveBeenLastCalledWith('chat_abc', d.id, '请假流程')
+    // A refused edit leaves the label alone.
+    const calls = pending.set.mock.calls.length
+    expect(s.drafts.update(d.id, { kind: 'nope', title: '', body: '' }).ok).toBe(false)
+    expect(pending.set).toHaveBeenCalledTimes(calls)
+  })
+
+  it('M4 A7: a create that fails writes no pending item', async () => {
+    const pending = { set: vi.fn(), clear: vi.fn() }
+    const s = drafting({ pending })
+    s.retarget(null)
+    const out = await s.drafts.create(sender(1), s.drafts.issue(secretive(), 1), { from: 0, to: 1 })
+    expect(out).toEqual({ ok: false, reason: 'knowledge_off' })
+    expect(pending.set).not.toHaveBeenCalled()
+  })
+
+  it('KB-SOP-01b: the view lists the binding’s KBs only for the same target, says what the format check finds, and the submission', async () => {
+    const seen: string[] = []
+    const s = drafting({ knowledgeBaseIds: () => ['kb1'], submission: (id) => { seen.push(id); return { pending: true, stuck: false, candidate: null } } })
+    const d = await one(s)
+    const v = s.drafts.get(d.id)
+    expect(v).toMatchObject({ knowledge_base_ids: ['kb1'], format: null, submission: { pending: true, stuck: false, candidate: null } })
+    expect(seen).toContain(d.id)
+    expect(s.drafts.update(d.id, { kind: 'faq', title: '请假', body: '点 <b>这里</b>' })).toMatchObject({ ok: true })
+    expect(s.drafts.get(d.id)?.format).toMatchObject({ line: 1 })
+    s.retarget(entryTarget('https://kb.example', ['kb2']))
+    expect(s.drafts.get(d.id)?.knowledge_base_ids).toEqual([])
+    const broken = drafting({ submission: () => { throw new Error('io') } })
+    const b = await one(broken)
+    expect(broken.drafts.get(b.id)?.submission).toEqual({ pending: false, stuck: false, candidate: null })
   })
 
   it('never hands the renderer a draft’s binding', async () => {

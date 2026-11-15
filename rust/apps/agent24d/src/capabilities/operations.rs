@@ -53,6 +53,20 @@ pub enum Operation {
     // allowlist; report is the desktop's (ProductHost only, enforced at the route).
     ComponentsRead,
     ComponentsReport,
+    // X11-2f: inbound allowlist / policy / event list. Read and write are
+    // separate so `assurance_level()` stays a single level. One operation
+    // used at both Everyday and Elevated returns None and the elevation
+    // check never fires.
+    InboundRead,
+    InboundWrite,
+    // Skill loader SL-3. Read and install are Everyday routes. Activate is
+    // Elevated and has no route until SL-4, so its assurance level stays None.
+    SkillsRead,
+    SkillsInstall,
+    SkillsActivate,
+    /// C9-B dev-bridge ingest. Everyday, and not on a shell or creative token.
+    /// Route admission is [`super::component_route_permitted`], not this variant.
+    InboundIngest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,12 +154,34 @@ impl Operation {
             Self::DiagnosticRead => "diagnostic.read",
             Self::ComponentsRead => "components.read",
             Self::ComponentsReport => "components.report",
+            Self::InboundRead => "inbound.read",
+            Self::InboundWrite => "inbound.write",
+            Self::SkillsRead => "skills.read",
+            Self::SkillsInstall => "skills.install",
+            Self::SkillsActivate => "skills.activate",
+            Self::InboundIngest => "inbound.ingest",
         }
+    }
+
+    /// Component locks may not grant skill operations (skill-loader §4.9).
+    pub fn component_may_require(self) -> bool {
+        !matches!(
+            self,
+            Self::SkillsRead | Self::SkillsInstall | Self::SkillsActivate
+        )
     }
 
     /// Catalog level for this operation. `None` when no route assigns one.
     pub fn assurance_level(self) -> Option<super::route_policy::AssuranceLevel> {
         super::route_policy::assurance_level(self)
+    }
+
+    /// `action` is a canonical [`Self::action`] name. [`Self::from_action`]'s
+    /// slash aliases (`models/read`, `session/new`, …) are not canonical:
+    /// `requires.operations` accepts only the dotted form.
+    pub fn canonical(action: &str) -> Option<Self> {
+        let parsed = Self::from_action(action)?;
+        (parsed.action() == action).then_some(parsed)
     }
 
     pub fn from_action(action: &str) -> Option<Self> {
@@ -190,6 +226,12 @@ impl Operation {
             "diagnostic.read" => Self::DiagnosticRead,
             "components.read" => Self::ComponentsRead,
             "components.report" => Self::ComponentsReport,
+            "inbound.read" => Self::InboundRead,
+            "inbound.write" => Self::InboundWrite,
+            "skills.read" => Self::SkillsRead,
+            "skills.install" => Self::SkillsInstall,
+            "skills.activate" => Self::SkillsActivate,
+            "inbound.ingest" => Self::InboundIngest,
             "schedule.read" => Self::ScheduleRead,
             "usage.read" => Self::UsageRead,
             "config.read" => Self::ConfigRead,

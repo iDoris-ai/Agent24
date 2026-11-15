@@ -709,6 +709,7 @@ pub(super) async fn assemble_app_state(
     };
     #[cfg(not(unix))]
     let workspace_service = None;
+    let has_memory = memory.is_some();
     let mut state = AppState::new(AppDeps {
         token: token.clone(),
         router,
@@ -722,6 +723,15 @@ pub(super) async fn assemble_app_state(
         mcp_servers,
         packages_root: Arc::clone(&packages_root),
     });
+    // X11-2d: expire inbound message text (and its run/memory copies) after
+    // 180 days. The purge goes through the run manager (it owns the session
+    // memory and its locks). Detached on purpose: it ends on the shutdown token.
+    drop(crate::inbound::spawn_text_expiry(
+        &state.store,
+        has_memory.then(|| state.runs.clone()),
+        ephemeral,
+        shutdown.child_token(),
+    ));
     // Before any clone into the router. `AppState::new` starts this empty so
     // tests that never mount MCP keep an empty roster.
     state.mcp_roster = mcp_roster;
@@ -731,9 +741,7 @@ pub(super) async fn assemble_app_state(
     state.idoris_unavailable = idoris_unavailable;
     if let Some(capability_store) = capability_store {
         state.enable_capability_auth(capability_store);
-        if mode == StartupMode::HostChild {
-            state.enable_desktop_presence();
-        }
+        state.enable_presence_for(mode);
         state.delegations = Arc::new(crate::capabilities::delegation::Delegations::open(
             &state_dir,
         )?);
@@ -741,8 +749,28 @@ pub(super) async fn assemble_app_state(
     // Last, so it wins over the desktop provider that HostChild mode installs
     // just above (the e2e daemon runs as a host child). Debug test builds only.
     #[cfg(feature = "test-enrollment")]
-    if crate::enroll_test_support::enabled() {
+    if crate::enroll_test_support::fixed_presence() {
         state.presence_provider = Some(Arc::new(crate::enroll_test_support::TestPresence));
+    }
+    // X11-2g / C9-B. `A24_DEV_TOOL=1` opens the route in either mode. The
+    // seed string stays empty in capabilities mode, so
+    // `A24_INBOUND_DEV_ALLOWLIST` is not applied there. `seed_dev_allowlist`
+    // still deletes leftover `dev-seed` wechat rows when that gate is on.
+    let dev_tool = std::env::var("A24_DEV_TOOL").ok();
+    let allowlist = std::env::var("A24_INBOUND_DEV_ALLOWLIST").ok();
+    let (enabled, seed) =
+        dev_wechat_seed(state.auth_mode, dev_tool.as_deref(), allowlist.as_deref());
+    state.dev_wechat_events = enabled;
+    let seeded = crate::inbound::seed_dev_allowlist(
+        &state.store,
+        state.auth_mode,
+        dev_tool.as_deref() == Some("1"),
+        &seed,
+    )
+    .await
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+    if seeded > 0 {
+        tracing::info!(seeded, "seeded the development wechat inbound allowlist");
     }
     Ok((report, state))
 }
@@ -812,6 +840,19 @@ pub(super) async fn recover_durable_runs(
         tracing::warn!(
             "cancelled {} workspace-bound orphan run(s) from a previous process",
             workspace_orphans.released_leases
+        );
+    }
+    // After both orphan sweeps, so a cancelled inbound run is already terminal
+    // and its row can leave the in-flight index (`started` → `done`).
+    let inbound = crate::inbound::reconcile_inbound_runs(&state.store)
+        .await
+        .map_err(std::io::Error::other)?;
+    if inbound.started > 0 || inbound.done > 0 || inbound.interrupted > 0 {
+        tracing::warn!(
+            started = inbound.started,
+            done = inbound.done,
+            interrupted = inbound.interrupted,
+            "reconciled inbound runs from a previous process"
         );
     }
 
@@ -965,6 +1006,17 @@ pub(super) fn start_process_host(
         tracing::error!("out-of-process domain OS modules cannot be started: {why}");
     }
     host
+}
+
+/// X11-2e: poll Hyphae into inbound. The task is detached and ends on
+/// `cancel`. `cli` is read every round (the comm slot), not once here.
+/// Pulling also waits for an opt-in read from the store each round.
+pub(super) async fn start_hyphae_inbound(
+    state: &AppState,
+    cli: impl Fn() -> Option<Arc<dyn crate::inbound::HyphaeCli>> + Send + Sync + 'static,
+    cancel: CancellationToken,
+) {
+    crate::inbound::start_hyphae_inbound(&state.store, Arc::clone(&state.runs), cli, cancel).await;
 }
 
 pub(super) fn spawn_ordered_shutdown(
@@ -1807,4 +1859,228 @@ pub(super) async fn advertise_readiness(
         enroll,
         daemon_pid,
     }))
+}
+
+/// Development wechat route switch, separate from the legacy allowlist seed.
+///
+/// `A24_DEV_TOOL=1` opens `POST /api/v1/inbound/events` in either auth mode.
+/// The returned seed is imported only for legacy mode. Capabilities mode
+/// leaves it empty, so `A24_INBOUND_DEV_ALLOWLIST` is not applied there.
+/// The caller still runs `seed_dev_allowlist`, which drops leftover
+/// `dev-seed` rows in that mode when the gate is on.
+pub(crate) fn dev_wechat_seed(
+    auth_mode: AuthMode,
+    dev_tool: Option<&str>,
+    allowlist: Option<&str>,
+) -> (bool, String) {
+    let enabled = dev_tool == Some("1");
+    let seed = if enabled && auth_mode == AuthMode::LegacySingleToken {
+        allowlist.unwrap_or_default().to_owned()
+    } else {
+        String::new()
+    };
+    (enabled, seed)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::sync::Arc;
+
+    use agent24_store::NewInboundEvent;
+    use agent24_tools::HttpFetchTool;
+
+    use agent24_protocol::state_file::AuthMode;
+
+    use super::*;
+
+    #[test]
+    fn dev_wechat_seed_follows_auth_mode_and_the_dev_tool_flag() {
+        let (on, seed) =
+            dev_wechat_seed(AuthMode::LegacySingleToken, Some("1"), Some("wechat:alice"));
+        assert!(on);
+        assert_eq!(seed, "wechat:alice");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::LegacySingleToken, Some("1"), None);
+        assert!(on);
+        assert_eq!(seed, "");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::LegacySingleToken, None, Some("wechat:alice"));
+        assert!(!on);
+        assert_eq!(seed, "");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::Capabilities, Some("1"), Some("wechat:alice"));
+        assert!(on);
+        assert_eq!(seed, "");
+
+        let (on, seed) = dev_wechat_seed(AuthMode::Capabilities, None, Some("wechat:alice"));
+        assert!(!on);
+        assert_eq!(seed, "");
+    }
+
+    fn event(id: &str, actor: &str, run_state: &str) -> NewInboundEvent {
+        NewInboundEvent {
+            id: id.to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some(actor.to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: "2026-11-11T00:00:00Z".to_owned(),
+            received_at: "2026-11-11T00:00:01Z".to_owned(),
+            text: Some("t".to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some(run_state.to_owned()),
+        }
+    }
+
+    async fn insert_run(store: &Store, id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO runs (id, status, input, usage, created_at) \
+             VALUES (?, ?, \
+             '{\"prompt\":\"x\",\"workspace_id\":null,\"knowledge_binding_id\":null}', \
+             '{\"prompt_tokens\":0,\"completion_tokens\":0,\"total_tokens\":0,\"cost_usd\":0.0}', \
+             ?)",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(agent24_core::util::now_iso8601())
+        .execute(agent24_store::test_hooks::pool(store))
+        .await
+        .unwrap();
+    }
+
+    async fn run_state(store: &Store, id: &str) -> String {
+        store
+            .get_inbound_event(id)
+            .await
+            .unwrap()
+            .unwrap()
+            .run_state
+            .unwrap()
+    }
+
+    /// Restart through `recover_durable_runs`, which is the production call
+    /// after the orphan sweeps. Mutation: drop `reconcile_inbound_runs` from
+    /// that function and every row below stays at its seeded `run_state`.
+    /// Moving that call to before the orphan sweeps leaves `hyphae:running`
+    /// at `started`: the run is still `running` then, so reconcile does not
+    /// mark it `done`.
+    #[tokio::test]
+    async fn startup_reconcile_converges_the_four_restart_shapes() {
+        let store = Store::open_memory().await.unwrap();
+        for (id, actor, state) in [
+            ("hyphae:live", "a-live", "starting"),
+            ("hyphae:none", "a-none", "starting"),
+            ("hyphae:ended", "a-ended", "started"),
+            ("hyphae:gone", "a-gone", "started"),
+            ("hyphae:running", "a-running", "started"),
+        ] {
+            assert_eq!(
+                store
+                    .insert_inbound_event(&event(id, actor, state))
+                    .await
+                    .unwrap(),
+                agent24_store::InboundInsert::Inserted
+            );
+        }
+        insert_run(&store, "run_live", "awaiting_approval").await;
+        insert_run(&store, "run_ended", "completed").await;
+        insert_run(&store, "run_gone", "completed").await;
+        insert_run(&store, "run_running", "running").await;
+        store
+            .insert_inbound_run("run_live", "hyphae:live")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_ended", "hyphae:ended")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_gone", "hyphae:gone")
+            .await
+            .unwrap();
+        store
+            .insert_inbound_run("run_running", "hyphae:running")
+            .await
+            .unwrap();
+        let now = agent24_core::util::now_iso8601();
+        sqlx::query(
+            "INSERT INTO run_messages (run_id, seq, role, content, tool_calls, created_at) \
+             VALUES ('run_live', 0, 'assistant', NULL, ?, ?)",
+        )
+        .bind(r#"[{"id":"call_1","name":"http_fetch","arguments":"{}"}]"#)
+        .bind(&now)
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO approvals (id, run_id, tool_call_id, kind, summary, payload, \
+             available_decisions, status, expires_at, created_at) \
+             VALUES ('apr_live', 'run_live', 'call_1', 'exec', 'fetch', '{}', \
+             '[\"approve\",\"deny\"]', 'pending', '2099-01-01T00:00:00Z', ?)",
+        )
+        .bind(&now)
+        .execute(agent24_store::test_hooks::pool(&store))
+        .await
+        .unwrap();
+        sqlx::query("DELETE FROM runs WHERE id = 'run_gone'")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+
+        let tools = agent24_tools::ToolRegistry::new().with(Arc::new(HttpFetchTool::new(false)));
+        let state = AppState::new(AppDeps {
+            token: "testtoken".to_owned(),
+            router: Arc::new(ModelRouter::with_defaults(vec![])),
+            tools,
+            store: store.clone(),
+            shutdown: Shutdown::new(CancellationToken::new()),
+            guardian: None,
+            memory: None,
+            workspace_service: None,
+            mcp_servers: Vec::new(),
+            risk_overrides: StdArc::new(agent24_policy::overrides::RiskOverrideStore::from_rows(
+                Vec::new(),
+            )),
+            packages_root: Arc::new(tempfile::tempdir().expect("tempdir").path().to_path_buf()),
+        });
+        let cancel = CancellationToken::new();
+        let runtime = crate::module_tool_runtime::AgentModuleToolRuntime::new(
+            std::collections::HashSet::new(),
+        );
+        let registry = agent24_domain::tool::ModuleToolRegistry::new();
+        recover_durable_runs(&state, true, &cancel, &runtime, &registry)
+            .await
+            .unwrap()
+            .expect("os config");
+        cancel.cancel();
+
+        assert_eq!(run_state(&store, "hyphae:live").await, "started");
+        assert_eq!(
+            store.get_run("run_live").await.unwrap().unwrap().status,
+            agent24_protocol::RunStatus::AwaitingApproval
+        );
+        assert_eq!(run_state(&store, "hyphae:none").await, "interrupted");
+        assert_eq!(run_state(&store, "hyphae:ended").await, "done");
+        assert_eq!(run_state(&store, "hyphae:gone").await, "done");
+        assert_eq!(run_state(&store, "hyphae:running").await, "done");
+        assert_eq!(
+            store.get_run("run_running").await.unwrap().unwrap().status,
+            agent24_protocol::RunStatus::Cancelled
+        );
+        assert!(
+            store
+                .inbound_run_id_for_event("hyphae:gone")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

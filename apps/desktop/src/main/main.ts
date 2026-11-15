@@ -2,7 +2,10 @@
 
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
 import path from 'node:path'
-import { registerIpcHandlers } from './ipc/index'
+import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
+import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
+import { keptOmlxPath, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx } from './omlx-kept'
+import { launchAgentPlistPath, markServiceLeft, serviceDaemonUp, serviceLeftBehind, serviceLeftPath } from './omlx-service-left'
 import { onChatHistoryChange } from './chat-history'
 import { createScheduleConversations, type ScheduleConversations } from './schedule-conversations'
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
@@ -11,7 +14,7 @@ import { registerResidentService } from './ipc/resident-service'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
 import { bundledDaemonVersion, consentPath, CrashLoopDetector, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
@@ -47,6 +50,7 @@ import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
+import { serviceDaemonOf } from './service-daemon'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 import { knowledgeAppInstanceId } from './knowledge-app-instance'
@@ -55,12 +59,16 @@ import { KnowledgeUiInstance } from './knowledge-ui-instance'
 import { KNOWLEDGE_UI_ROUTES } from './knowledge-ui-routes'
 // KB-C2-03: the KnowledgeView lives in its own module; the lines that wire it
 // in below are additions only and leave the Creative view's paths untouched.
-import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget } from './knowledge-view'
+import { KnowledgeViewHost, registerKnowledgeViewIpc, resolveKnowledgeViewTarget, settingsKnowledgeViewTarget } from './knowledge-view'
 // KB-SOP-01a (#1669): the knowledge entry admission, additions only.
 import { createChatHistoryStore } from './chat-history'
 import { daemonFloorReader } from './knowledge-entry-floor'
 import { registerKnowledgeEntryIpc } from './knowledge-entry-ipc'
+import { knowledgePending } from './knowledge-pending'
 import { createEntryDraftStore } from './knowledge-entry-draft'
+import { createCandidateStore } from './knowledge-candidate-store'
+import { knowledgeEntrySubmission } from './knowledge-entry-submit'
+import { newUlid } from './knowledge-bridge'
 import { entryTarget } from './knowledge-entry-extract'
 import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 
@@ -74,7 +82,7 @@ const serviceUpgrader = new ServiceUpgrader({
   bundled: () => bundledVersion,
   running: () => backendManager.serviceDaemonVersion(),
   installed: launchAgentPlistExists,
-  pid: () => (backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null),
+  pid: () => serviceDaemonOf(backendManager)?.pid ?? null,
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
@@ -551,7 +559,12 @@ app.whenReady().then(async () => {
   // safeStorage needs the app ready. The logins load once, here, before
   // anything can change them; the reason is logged, never the contents.
   const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
-  knowledgeHost = new KnowledgeHost(loginStore)
+  knowledgeHost = new KnowledgeHost(loginStore, {
+    daemonIdentity: () => {
+      const daemon = serviceDaemonOf(backendManager)
+      return daemon ? `${daemon.pid}:${daemon.generation}` : null
+    },
+  })
   const knowledgeLogins = knowledgeHost.start()
   if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
   // The user's Knowledge settings drive the one binding; Off keeps it inactive.
@@ -592,6 +605,15 @@ app.whenReady().then(async () => {
       uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
+    keepOwnedOmlxOnQuit: () => {
+      // Read first: it also clears a record whose plist is gone.
+      const left = plistLeftByStop()
+      return !stopsOwnedOmlxOnQuit({ platform: process.platform, serviceInstalled: launchAgentPlistExists() && !left })
+    },
+    rememberKeptOmlx: (k) => { const dir = tryDataDir(); if (dir !== null) rememberKeptOmlx(keptOmlxPath(dir), k, realOmlxProcessProbe()) },
+    // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS
+    // (FU-114 terminateOwnedOmlx), inside the same OMLX_QUIT_STOP_BUDGET_MS.
+    stopKeptOmlx: async () => { const dir = tryDataDir(); if (dir !== null) await stopKeptOmlx(keptOmlxPath(dir), realOmlxProcessProbe(), { graceMs: 5_000, killMs: 2_000 }) },
   })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
@@ -625,7 +647,10 @@ app.whenReady().then(async () => {
   void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
+  // M4 A7: Knowledge's dialogs and drafts in their conversations' pending[].
+  const knowledgeWaiting = knowledgePending(() => createChatHistoryStore(app.getPath('userData')))
   knowledgeView = new KnowledgeViewHost({
+    pending: knowledgeWaiting,
     window: () => mainWin,
     createView: (webPreferences) => new WebContentsView({ webPreferences }),
     sessionFor: (partition) => session.fromPartition(partition, { cache: false }),
@@ -665,6 +690,38 @@ app.whenReady().then(async () => {
     hide: IpcChannels.KnowledgeViewHide,
     reload: IpcChannels.KnowledgeViewReload,
   }, () => knowledgeView)
+  const entryDrafts = createEntryDraftStore(app.getPath('userData'))
+  const entryTargetNow = (): string | null => {
+    if (!knowledge || knowledge.bindingForRun() === null) return null
+    const s = knowledge.status()
+    return entryTarget(s.endpoint, s.knowledgeBaseIds)
+  }
+  // KB-SOP-01b (#1670): the Provider's candidate.propose, with C and the
+  // generation of the binding in effect (the same ones the UI session uses).
+  const entryCandidates = createCandidateStore(app.getPath('userData'))
+  const entrySubmission = knowledgeEntrySubmission({
+    drafts: entryDrafts,
+    candidates: entryCandidates,
+    target: entryTargetNow,
+    knowledgeBaseIds: () => knowledge?.status().knowledgeBaseIds ?? [],
+    provider: () => {
+      if (!knowledge) return null
+      const binding = knowledge.viewBinding()
+      const inputs = binding === null ? null : knowledge.uiSessionInputs(binding)
+      const origin = settingsKnowledgeViewTarget(knowledge.status().endpoint)?.origin
+      if (!inputs || !origin) return null
+      return {
+        generation: inputs.generation,
+        deps: {
+          origin,
+          // Asked again at each request: a key changed meanwhile is not used for the old binding.
+          credential: () => (knowledge?.uiSessionInputs(binding as string)?.credential ?? null),
+          fetch: (url, init) => net.fetch(url, init),
+          newRequestId: () => newUlid(),
+        },
+      }
+    },
+  })
   registerKnowledgeEntryIpc(ipcMain, guard, {
     conversation: (id) => createChatHistoryStore(app.getPath('userData')).get(id),
     reader: daemonFloorReader(),
@@ -680,19 +737,18 @@ app.whenReady().then(async () => {
     bound: () => knowledge?.status().active === true,
   }, {
     // KB-SOP-01b-2: local drafts, drafted by the local model (no session_id: LocalOnly, no memory, no tools).
-    store: createEntryDraftStore(app.getPath('userData')),
+    store: entryDrafts,
     chat: (body) => {
       const conn = daemonConnection()
       if (!conn) return Promise.resolve(proxyError('backend_not_ready', 'Backend daemon is not ready'))
       return proxyRequest(conn, { method: 'POST', path: '/api/v1/chat', body }, { host: '127.0.0.1', timeoutMs: CHAT_TIMEOUT_MS })
     },
-    target: () => {
-      if (!knowledge || knowledge.bindingForRun() === null) return null
-      const s = knowledge.status()
-      return entryTarget(s.endpoint, s.knowledgeBaseIds)
-    },
+    target: entryTargetNow,
     locale: getMainLocale,
-  })
+    pending: knowledgeWaiting,
+    knowledgeBaseIds: () => knowledge?.status().knowledgeBaseIds ?? [],
+    submission: (id, draft) => entrySubmission.view(id, draft),
+  }, entrySubmission)
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeRestart, guard((_event, bounds: CreativeViewBounds) => restartCreativeView(bounds)))
   ipcMain.handle(IpcChannels.CreativeBounds, guard((_event, bounds: CreativeViewBounds) => {
@@ -780,11 +836,23 @@ function residentInstall(documentsReady: Promise<unknown>): Promise<InstallOutco
 function residentStop(): Promise<StopOutcome> {
   return residentOp('stop', () => stopService(serviceStopDeps({
     cli: resolveBundledRustBinary('agent24', app.isPackaged),
-    pid: backendManager.presenceTarget() ? backendManager.externalDaemonPid() ?? null : null,
+    pid: serviceDaemonOf(backendManager)?.pid ?? null,
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
+    leftInstalled: () => { const dir = tryDataDir(); if (dir !== null) markServiceLeft(serviceLeftPath(dir), launchAgentPlistPath()) },
   })))
+}
+
+/** The plist is the one a service stop left behind with no daemon
+ * (omlx-service-left.ts): a quit then reads the service as not installed.
+ * A service daemon up again (an enrolment socket, not our own child) ends it;
+ * a live daemon whose record this app refuses keeps it for this quit (read as
+ * installed) without ending it. */
+function plistLeftByStop(): boolean {
+  const dir = tryDataDir()
+  if (dir === null) return false
+  return serviceLeftBehind(serviceLeftPath(dir), launchAgentPlistPath(), () => serviceDaemonUp(readExternalDaemonState(), (p) => backendManager.spawned(p), processAlive))
 }
 
 function recordConsent(answer: ConsentAnswer): void {
@@ -894,6 +962,9 @@ function refreshTray(): void {
 const shutdown = createCreativeShutdown({
   prepare: () => {
     isQuitting = true
+    // before-quit below already started this (SIGTERM is synchronous there).
+    // stop() awaits the same promise, capped by OMLX_QUIT_STOP_BUDGET_MS.
+    void ensureOwnedOmlxQuit()
     openDesignComponent?.abort('Agent24 is quitting')
     void presencePoller?.stop()
     void presenceConnection?.stop()
@@ -909,7 +980,12 @@ const shutdown = createCreativeShutdown({
       console.error('[main] failed to tear down the Creative view before quit', error)
     }
   },
-  stop: async () => { await creativeServeWeb?.shutdown() },
+  stop: async () => {
+    await Promise.all([
+      creativeServeWeb?.shutdown(),
+      ensureOwnedOmlxQuit(),
+    ])
+  },
   cleanup: () => {
     if (trayTimer) { clearInterval(trayTimer); trayTimer = null }
     stopOpenDesignReady?.()
@@ -921,6 +997,9 @@ const shutdown = createCreativeShutdown({
   },
   quit: () => app.quit(),
 })
+// SIGTERM for an oMLX this process spawned, before shutdown's microtask.
+// ensureOwnedOmlxQuit sends the signal before it returns; stop() waits.
+app.on('before-quit', () => { void ensureOwnedOmlxQuit() })
 app.on('before-quit', shutdown.beforeQuit)
 // KB-C2-03: app quit is binding-level destruction for the KnowledgeView (U4.8);
 // from here on it refuses to open again (ADR §4: stop new calls, then destroy).

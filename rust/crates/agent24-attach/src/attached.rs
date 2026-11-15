@@ -115,6 +115,8 @@ pub const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "health",
     // KB-HOST-01: `/api/v1/host/knowledge/*`, the desktop host's private interface.
     "host",
+    // X11-2f: `/api/v1/inbound/allowlist`, `/policy`, `/events`.
+    "inbound",
     // M1-T10: `/api/v1/memory/assertions`, `/api/v1/memory/assertions/{id}`,
     // `/api/v1/memory/settings` — the personal-memory REST surface.
     "memory",
@@ -137,6 +139,8 @@ pub const RESERVED_KERNEL_SEGMENTS: &[&str] = &[
     "schedules",
     "sessions",
     "shutdown",
+    // Skill loader SL-3: `/api/v1/skills` and `/api/v1/skills/{id}`.
+    "skills",
     "standing-grants",
     // ME4-desktop-model-ui: `/api/v1/timings` + `/api/v1/timings/summary`.
     "timings",

@@ -61,6 +61,7 @@ impl CapabilityStore {
             first_party: None,
             capability_id: random_capability_id(),
             audience: Audience::ProductHost,
+            component_id: None,
             workspace_id: None,
             attachment_id: None,
             principal_id: None,
@@ -69,6 +70,7 @@ impl CapabilityStore {
             sidecar_generation: None,
             created_at,
             expires_at: created_at.saturating_add(ttl.as_secs()),
+            deadline: None,
             allowed_operations: BTreeSet::new(),
         })
     }
@@ -132,6 +134,7 @@ impl CapabilityStore {
                 first_party: None,
                 capability_id: random_capability_id(),
                 audience: Audience::CreativeRuntime,
+                component_id: None,
                 workspace_id: Some(request.workspace_id),
                 attachment_id: Some(request.attachment_id),
                 principal_id: Some(request.principal_id),
@@ -140,6 +143,7 @@ impl CapabilityStore {
                 sidecar_generation: Some(request.sidecar_generation),
                 created_at: request.created_at,
                 expires_at: request.created_at.saturating_add(request.ttl.as_secs()),
+                deadline: None,
                 allowed_operations,
             },
         )

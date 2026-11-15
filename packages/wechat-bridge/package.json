@@ -2,7 +2,7 @@
   "name": "@agent24/wechat-bridge",
   "version": "0.6.0",
   "private": true,
-  "description": "F3: WeChat channel for agent24d over WeChat's official iLink Bot API. Inbound WeChat message -> agent24d run; run output + approvals delivered back to WeChat. Ported iLink protocol layer from heinu1 (bot/src/ilink), wired to the daemon's v1 HTTP API instead of spawning claude.",
+  "description": "F3: development WeChat transport for agent24d over the official iLink Bot API. A finished user message is posted to POST /api/v1/inbound/events. The chat reply is only 已记录. Ported iLink protocol layer from heinu1 (bot/src/ilink).",
   "type": "module",
   "scripts": {
     "bridge": "pnpm --filter @agent24/data-dir build && tsx src/main.ts",
