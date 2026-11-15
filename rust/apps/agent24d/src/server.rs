@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 // Child test modules resolve these through `use super::*`, the same names
 // `server.rs` imported before the split.
 #[cfg(test)]
@@ -253,6 +253,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         )
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
+        .route(
+            "/api/v1/models/default",
+            put(crate::routes::put_default_model),
+        )
         .route(
             "/api/v1/decide/profile",
             get(crate::decide_routes::get_decide_profile),

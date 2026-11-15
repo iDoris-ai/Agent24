@@ -1115,9 +1115,10 @@ fn model_complete_blackbox_round_trip() {
 /// (`http://127.0.0.1:8088` by default) with a model actually loaded. L5:
 /// `OMLX_API_KEY`/`DEFAULT_MODEL`, if this test process itself has them set,
 /// are passed through to the spawned daemon (`start`'s `extra_env`) — the
-/// daemon's own `env_clear()` would otherwise silently fall back to the
-/// built-in defaults (`xiaobao8088`/`Qwen3-8B-4bit`), which is not what a
-/// real oMLX server configured with a different key or model wants.
+/// daemon's own `env_clear()` would otherwise drop them. With no key in the
+/// environment or in `~/.omlx/settings.json`, chat goes out with no
+/// `Authorization` header. Unset `DEFAULT_MODEL` still falls back to
+/// `Qwen3-8B-4bit`. Pass both through when the real server expects them.
 #[test]
 #[ignore = "requires a real oMLX server listening on OMLX_URL; run with --exact --ignored"]
 fn real_omlx_smoke() {

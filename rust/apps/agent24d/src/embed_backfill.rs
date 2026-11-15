@@ -118,7 +118,6 @@ async fn local_rewriter(
         tracing::info!("query rewrite off; no local chat model");
         return None;
     };
-    let preferred = preferred.to_owned();
     if !is_chat_model(&preferred) {
         tracing::info!("query rewrite off; no local chat model");
         return None;

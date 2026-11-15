@@ -622,6 +622,57 @@ paths:
                     type: array
                     items:
                       $ref: "#/components/schemas/Model"
+                  default_model:
+                    type: [string, "null"]
+                    description: >
+                      The daemon's current default chat model. A saved value
+                      wins over DEFAULT_MODEL, which wins over Qwen3-8B-4bit.
+                      Null only when this router was built without one.
+
+  /models/default:
+    put:
+      operationId: putDefaultModel
+      x-milestone: MS-1
+      tags: [system]
+      summary: Save the default chat model
+      description: >
+        ProductHost only. The id is stored in the daemon's existing settings
+        kv and used on the next local completion that does not name a model.
+        Empty, longer than 128 characters, or containing a control character
+        is 400. The memory base missing is 503.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model:
+                  type: string
+      responses:
+        "200":
+          description: The stored model id
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [model]
+                properties:
+                  model:
+                    type: string
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "503":
+          description: The settings store is not available on this daemon
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /os:
     get:

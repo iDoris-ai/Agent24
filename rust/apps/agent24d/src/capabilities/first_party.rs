@@ -504,7 +504,9 @@ impl FirstPartyAuthority {
                     // `presence_desktop::gate` is the second, independent layer.
                     // `InboundWrite` is ProductHost-only the same way.
                     // `InboundIngest` is the dev-bridge component token only.
-                    // Leaving both off this token means a later route that
+                    // `ModelsAdmin` changes the daemon's default chat model
+                    // and is ProductHost-only the same way.
+                    // Leaving them off this token means a later route that
                     // forgets its gate still stays closed to a shell.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
@@ -516,6 +518,7 @@ impl FirstPartyAuthority {
                                 !op.is_presence_channel()
                                     && *op != Operation::InboundWrite
                                     && *op != Operation::InboundIngest
+                                    && *op != Operation::ModelsAdmin
                             })
                             .chain([Operation::ModuleRoute])
                             .collect()
@@ -1125,6 +1128,7 @@ mod tests {
             .clone();
         assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
         assert!(!allowed.contains(&Operation::InboundIngest), "{allowed:?}");
+        assert!(!allowed.contains(&Operation::ModelsAdmin), "{allowed:?}");
         assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
         assert!(
             store
