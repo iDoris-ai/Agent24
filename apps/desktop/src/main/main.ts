@@ -15,7 +15,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -591,6 +591,7 @@ app.whenReady().then(async () => {
     guard,
     knowledge: () => knowledge,
     scheduleConversation: (scheduleId) => scheduleConversations().conversationOf(scheduleId),
+    backendRefusal: () => enrolRefusal(backendManager.statusDetail()),
     // T1-1/T1-2: what is on disk now. A daemon reads installed packages only
     // when it starts, so the pages compare this with what it serves (§9 Q2).
     documentsModule: () => ({
@@ -840,6 +841,7 @@ function residentStop(): Promise<StopOutcome> {
     spawned: (pid) => backendManager.spawned(pid),
     hold: (work) => backendManager.whileServiceRestarts(work),
     record: () => recordConsent('declined'),
+    refused: (pid) => refusedThisApp(backendManager.statusDetail(), pid),
     leftInstalled: () => { const dir = tryDataDir(); if (dir !== null) markServiceLeft(serviceLeftPath(dir), launchAgentPlistPath()) },
   })))
 }

@@ -8,6 +8,7 @@ import type { ChatGroupsState, ChatHistoryOrganize, ChatHistoryRecord, ChatHisto
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type BackendRefusalResult,
   type CommImportPickResult,
   type CliToolStatus,
   type CliInstallResult,
@@ -156,6 +157,8 @@ const api = {
     ipcRenderer.invoke(IpcChannels.AgentEarUnpair),
   backendEndpoint: (): Promise<BackendEndpointResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendEndpoint),
+  backendRefusal: (): Promise<BackendRefusalResult | null> =>
+    ipcRenderer.invoke(IpcChannels.BackendRefusal),
   creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>
     ipcRenderer.invoke(IpcChannels.CreativeShow, bounds),
   creativeRestart: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>
