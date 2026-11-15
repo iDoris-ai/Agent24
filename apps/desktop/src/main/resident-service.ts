@@ -508,7 +508,10 @@ export interface StopDeps {
    * box (Codex B4c1 C1), so nothing changes until this app is enrolled again.
    * Not enrolled and none on record (a crash loop, waiting), or the one on
    * record refused this app for good (QA 0.6.1 §3c: no presence connection
-   * to ask through): the uninstall's bootout stops whatever launchd runs. */
+   * to ask through): the uninstall's bootout stops whatever launchd runs.
+   * That last case is a deliberate exception to Codex B4c1 C1: there the
+   * daemon would enrol this app, so its box is asked; a refused one never
+   * will, and the stop is what `agent24 service uninstall` does anyway. */
   unreachable: () => boolean
   /** Resolves true once the daemon that was shut down has exited; false when
    * the wait ran out (the bootout then stops it). */
