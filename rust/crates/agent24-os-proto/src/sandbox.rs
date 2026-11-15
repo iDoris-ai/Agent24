@@ -102,7 +102,7 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
          (deny default)\n\
          (allow process-exec)\n\
          (allow process-fork)\n\
-         (allow signal)\n\
+         (allow signal (target same-sandbox))\n\
          (allow sysctl-read)\n\
          (allow mach-lookup)\n\
          (allow file-ioctl)\n\
@@ -146,6 +146,37 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
     }
     profile.push_str(")\n");
     Ok(profile)
+}
+
+/// Refuse a data directory the module could have redirected (#1863 B2). The
+/// module can write its data directory, including replacing the directory
+/// itself with a symlink between two runs; the next profile would then follow
+/// that link and grant writes wherever it points. Checked on every start,
+/// right before the profile is built: the leaf must be a real directory, and
+/// its canonical path must not be `/`, the home, or an ancestor of the home.
+pub fn check_data_dir(data_dir: &Path, home: Option<&Path>) -> Result<(), ProfileError> {
+    let meta = std::fs::symlink_metadata(data_dir).map_err(|e| {
+        ProfileError(format!(
+            "cannot inspect the data directory {}: {e}",
+            data_dir.display()
+        ))
+    })?;
+    if !meta.file_type().is_dir() {
+        return Err(ProfileError(format!(
+            "the data directory {} is not a plain directory (a symlink?)",
+            data_dir.display()
+        )));
+    }
+    let data = canonical(data_dir)?;
+    let home = home.map(canonical).transpose()?;
+    if data == Path::new("/") || home.is_some_and(|home| home.starts_with(&data)) {
+        return Err(ProfileError(format!(
+            "the data directory {} resolves to {}, which would expose the home",
+            data_dir.display(),
+            data.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Canonicalise `path`, keeping a trailing component that does not exist yet
@@ -301,6 +332,26 @@ mod tests {
             temp_dir: temp,
             home_dir: home,
         }
+    }
+
+    #[test]
+    fn a_data_dir_swapped_for_a_symlink_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let data = t.path().join("data");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        check_data_dir(&data, Some(&home)).unwrap();
+
+        std::fs::remove_dir(&data).unwrap();
+        std::os::unix::fs::symlink(&home, &data).unwrap();
+        let err = check_data_dir(&data, Some(&home)).unwrap_err();
+        assert!(err.0.contains("not a plain directory"), "{err}");
+
+        let err = check_data_dir(&home, Some(&home)).unwrap_err();
+        assert!(err.0.contains("expose the home"), "{err}");
+        let err = check_data_dir(t.path(), Some(&home)).unwrap_err();
+        assert!(err.0.contains("expose the home"), "{err}");
     }
 
     #[test]

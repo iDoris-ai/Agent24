@@ -144,6 +144,8 @@ fn prepare_seatbelt(
         ))
     })?;
     let home = std::env::vars_os().find_map(|(k, v)| (k == "HOME").then(|| PathBuf::from(v)));
+    crate::sandbox::check_data_dir(data_dir, home.as_deref())
+        .map_err(|error| LaunchError::SandboxUnavailable(error.0))?;
     let temp = std::env::temp_dir();
     // A test launcher is a tiny binary that `execv`s an absolute interpreter
     // path compiled into it. The profile's program is the launcher, so that
