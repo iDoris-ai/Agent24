@@ -1963,9 +1963,11 @@ mod hy1_regression_tests {
         let (host, redacted) = components(&runtime).await;
         assert_eq!(host["state"], "failed");
         assert_eq!(host["reason"], "signature_rejected");
-        // Redacted keeps only {id, version, state, provides}: no reason.
-        let keys: Vec<_> = redacted.as_object().unwrap().keys().cloned().collect();
-        assert_eq!(keys, ["id", "provides", "state", "version"]);
+        // Redacted keeps id, version, state, provides, and isolation. No host reason.
+        let mut keys: Vec<_> = redacted.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["id", "isolation", "provides", "state", "version"]);
+        assert!(redacted.get("reason").is_none());
         assert_eq!(redacted["state"], "failed");
 
         let app = runtime_router(runtime.clone());
