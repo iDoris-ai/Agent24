@@ -533,8 +533,7 @@ pub fn run_as_trampoline_if_asked() {
     #[cfg(not(target_os = "macos"))]
     let mut cmd = {
         let _ = seatbelt;
-        let mut cmd = std::process::Command::new(&program);
-        cmd
+        std::process::Command::new(&program)
     };
     let error = cmd
         .args(argv)

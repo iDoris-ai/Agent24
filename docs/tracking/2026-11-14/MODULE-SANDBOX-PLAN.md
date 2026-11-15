@@ -69,3 +69,6 @@ ADR-K1-01 §113、ADR-K1-02 §114 都写明「OS 进程分离不等于文件系�
 - 本机这个会话继承了 fd 3 时，跳板测试可能失败；不为此改代码。
 - `agent24-documents` 二进制没有在 SBX-0 里单独跑过。
 - node 探针用错了 adopt-fd 的 API，fd 3 的 accept 是用 python 证明的，不是用 node。
+- 临时目录放行的是整个用户 `TMPDIR`（同一用户所有 app 共用），模块能读写别的进程和别的模块留在里面的文件，是模块之间的一条旁路。以后改为每个模块专属临时目录（如 `<data>/tmp` 并设 `TMPDIR`），需先实测 macOS `python3` 桩的 xcrun 缓存能否改指（#1863 评审建议 1）。
+- `(allow mach-lookup)`、`(allow process-exec)` 不带过滤。直连 TCP 与 NSURLSession 已实测被拒，但 mach 服务面（LaunchServices、AppleEvents 等）没测。在收紧之前，不对外宣称「模块无法影响沙箱外」（#1863 评审建议 2）。
+- 读白名单包含整个 `/opt/homebrew`、`/usr/local`、`/Library`、`/private/etc`，其中配置文件的**内容**可读（可能含凭据），比「元数据可见」更强（#1863 评审建议 3）。
