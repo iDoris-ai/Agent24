@@ -526,7 +526,7 @@
             reason: "模块路由 merge 入口：auth layer 之前折入 domain OS",
         },
         AllowedRegistration {
-            file: "apps/agent24d/src/server.rs",
+            file: "apps/agent24d/src/server/serve.rs",
             form: "merge",
             call: "module_routes.merge(comm_router)",
             reason: "comm 路由 merge 入口：并入 module_routes，使 /api/v1/comm 走 kernel auth",

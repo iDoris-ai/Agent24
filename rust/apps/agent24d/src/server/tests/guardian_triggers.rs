@@ -106,7 +106,7 @@
 
     #[test]
     fn startup_recovers_timed_out_runs_before_strict_workspace_orphan_sweep() {
-        let server = include_str!("../../server.rs");
+        let server = include_str!("../serve.rs");
         let steps = include_str!("../../serve_steps.rs");
         let serve = &server[server
             .find("pub async fn serve(")

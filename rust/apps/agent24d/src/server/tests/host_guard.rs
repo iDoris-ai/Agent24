@@ -99,7 +99,7 @@
 
     #[test]
     fn serve_layers_the_host_guard_on_the_router_it_serves() {
-        let src = include_str!("../../server.rs");
+        let src = include_str!("../serve.rs");
         let start = src.find("pub async fn serve(").expect("serve must exist");
         assert!(src[start..].contains("guard_host_origin(router, local.port())"));
     }
