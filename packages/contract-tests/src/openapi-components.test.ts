@@ -1,5 +1,5 @@
 // C9-D: GET /components host view carries the mount's kernel grants. The redacted
-// view stays id, version, state and provides. Denial codes are a closed enum.
+// view is id, version, state, provides and isolation. Denial codes are a closed enum.
 
 import { beforeAll, describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
@@ -25,6 +25,7 @@ const hostRow = {
   kernel_grants: [] as string[],
   declared: { kernel: ['events'], operations: [] as string[] },
   denied: [{ item: 'events', code: 'no_channel' }],
+  isolation: { state: 'not_isolated', reason: 'form_not_covered' },
 }
 
 const redactedRow = {
@@ -32,6 +33,7 @@ const redactedRow = {
   version: null,
   state: 'absent',
   provides: [{ id: 'nostr-dm' }],
+  isolation: { state: 'isolated', mechanism: 'seatbelt' },
 }
 
 beforeAll(() => {
@@ -68,8 +70,13 @@ describe('ComponentList kernel grants', () => {
     expect(openapi.components.schemas.ComponentDenial.properties.code.enum).toEqual(CODES)
     expect(openapi.components.schemas.ComponentRedactedView.additionalProperties).toBe(false)
     const redactedProps = Object.keys(openapi.components.schemas.ComponentRedactedView.properties)
+    expect(redactedProps).toContain('isolation')
     expect(redactedProps).not.toContain('denied')
     expect(redactedProps).not.toContain('kernel_grants')
+    const { isolation: _hostIsolation, ...withoutIsolation } = hostRow
+    expect(validateView(withoutIsolation)).toBe(false)
+    const { isolation: _redactedIsolation, ...redactedWithout } = redactedRow
+    expect(validateRedacted(redactedWithout)).toBe(false)
   })
 
   it('rejects an illegal code, a host row missing a field, and a redacted row that carries denied', () => {

@@ -534,7 +534,7 @@ mod tests {
     /// start the original `serve` scan required to sit after the hook.
     #[test]
     fn serve_hook_precedes_every_business_start() {
-        let server = include_str!("server.rs");
+        let server = include_str!("server/serve.rs");
         let steps = include_str!("serve_steps.rs");
         let serve = &server[server.find("pub async fn serve(").unwrap()..];
         let serve = &serve[..serve.find("\n}\n").unwrap()];

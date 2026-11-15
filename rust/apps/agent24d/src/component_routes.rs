@@ -74,6 +74,80 @@ struct Denial {
     code: DenyReason,
 }
 
+/// What SBX-2 classifies. Not D5 [`Form`]: `resident` covers both in-process
+/// daemons and out-of-process OS packages, and only the latter is started by
+/// `agent24-os-proto` launch (seatbelt on macOS).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComponentClass {
+    /// `impl_kind: out_of_process_provider`, including Documents.
+    OsModule,
+    Resident,
+    Sidecar,
+    Cli,
+    Attach,
+    Remote,
+    Mcp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum IsolationMechanism {
+    Seatbelt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NotIsolatedReason {
+    PlatformUnsupported,
+    FormNotCovered,
+}
+
+/// Wire `isolation` on both the host view and the redacted view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum Isolation {
+    Isolated { mechanism: IsolationMechanism },
+    NotIsolated { reason: NotIsolatedReason },
+}
+
+/// OS module on macOS is isolated. An OS module anywhere else is
+/// `platform_unsupported` (Linux is SBX-4). Every other class is
+/// `form_not_covered`. `macos` is `cfg!(target_os = "macos")` in production
+/// and a parameter here so tests do not depend on the host.
+fn component_isolation(class: ComponentClass, macos: bool) -> Isolation {
+    match class {
+        ComponentClass::OsModule if macos => Isolation::Isolated {
+            mechanism: IsolationMechanism::Seatbelt,
+        },
+        ComponentClass::OsModule => Isolation::NotIsolated {
+            reason: NotIsolatedReason::PlatformUnsupported,
+        },
+        ComponentClass::Resident
+        | ComponentClass::Sidecar
+        | ComponentClass::Cli
+        | ComponentClass::Attach
+        | ComponentClass::Remote
+        | ComponentClass::Mcp => Isolation::NotIsolated {
+            reason: NotIsolatedReason::FormNotCovered,
+        },
+    }
+}
+
+fn class_of(form: Form) -> ComponentClass {
+    match form {
+        Form::Resident => ComponentClass::Resident,
+        Form::Sidecar => ComponentClass::Sidecar,
+        Form::Cli => ComponentClass::Cli,
+        Form::Attach => ComponentClass::Attach,
+        Form::Remote => ComponentClass::Remote,
+        Form::Mcp => ComponentClass::Mcp,
+    }
+}
+
+fn isolation_here(class: ComponentClass) -> Isolation {
+    component_isolation(class, cfg!(target_os = "macos"))
+}
+
 /// Host-only kernel picture. `kernel_grants` is the mount's list.
 /// `declared` is `None` when the manifest was not read.
 struct KernelView {
@@ -106,6 +180,8 @@ pub struct Item {
     /// Why a declared or ceiling item is not in [`Self::kernel_grants`].
     /// Host-only; the redacted view omits it.
     denied: Vec<Denial>,
+    /// Seatbelt or why this row is not isolated. Both audiences.
+    isolation: Isolation,
 }
 
 /// What a non-host audience sees in capability mode (see [`sees_everything`]): the fields are
@@ -116,6 +192,7 @@ struct Redacted<'a> {
     version: Option<&'a str>,
     state: ComponentState,
     provides: &'a [Provide],
+    isolation: Isolation,
 }
 
 impl Item {
@@ -132,6 +209,7 @@ impl Item {
             // Unknown until a row reads a declaration (`set_kernel` or a lock).
             declared: None,
             denied: Vec::new(),
+            isolation: isolation_here(class_of(form)),
         }
     }
     fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
@@ -160,6 +238,7 @@ impl Item {
             version: self.version.as_deref(),
             state: self.state,
             provides: &self.provides,
+            isolation: self.isolation,
         }
     }
 
@@ -773,6 +852,9 @@ fn documents_shown(
         }
         None => {}
     }
+    // Documents is the out-of-process package (`domain-os.yml` spawn), including
+    // the row shown when nothing is mounted.
+    item.isolation = isolation_here(ComponentClass::OsModule);
     item
 }
 
@@ -923,6 +1005,12 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
             Item::new(&report.name, Form::Resident, mapped).with(|i| {
                 // An integrity refusal with no trusted version is unknown,
                 // not the empty string.
+                // A package (`!in_process`) is started by os-proto launch.
+                // No D9 means the manifest was not read: not classified as an
+                // OS module (FU). In-process stays `form_not_covered`.
+                if d9.is_some_and(|d| !d.in_process) {
+                    i.isolation = isolation_here(ComponentClass::OsModule);
+                }
                 i.set_kernel(kernel);
                 i.version = if report.version.is_empty() {
                     None

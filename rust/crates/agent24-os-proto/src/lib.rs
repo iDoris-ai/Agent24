@@ -33,6 +33,7 @@ pub mod model_budget;
 pub mod module;
 pub mod proxy;
 pub mod rpc;
+pub mod sandbox;
 pub mod stop_record;
 pub mod supervise;
 pub mod supervisor;

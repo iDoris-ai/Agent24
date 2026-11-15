@@ -1,7 +1,7 @@
 import { capabilitiesMessages } from './capabilities.i18n'
 import { useT } from '../i18n'
 import { useComponentList } from '../components/useComponentList'
-import type { ComponentView } from '../components/componentApi'
+import type { ComponentIsolation, ComponentView } from '../components/componentApi'
 import { packageIntegrityHint } from '../components/packageIntegrity'
 import { idorisMessages } from '../components/idoris/IdorisPanel.i18n'
 import { settingsMessages } from '../pages/Settings.i18n'
@@ -28,6 +28,7 @@ function componentId(id: string): string {
 
 export type CapabilityStatusFn = ((id: string) => string | undefined) & {
   grantsFor: (id: string) => readonly string[] | undefined
+  isolationFor: (id: string) => ComponentIsolation | undefined
 }
 
 /**
@@ -138,5 +139,10 @@ export function useCapabilityStatus(active: boolean): CapabilityStatusFn {
     return component.kernel_grants
   }
 
-  return Object.assign(status, { grantsFor })
+  const isolationFor = (id: string): ComponentIsolation | undefined => {
+    if (!active || list.status !== 'ready') return undefined
+    return findComponent(list.components, componentId(id))?.isolation
+  }
+
+  return Object.assign(status, { grantsFor, isolationFor })
 }

@@ -12,6 +12,8 @@ import { useT } from '../i18n'
 import { capabilitiesMessages } from './Capabilities.i18n'
 import { capabilitiesMessages as catalogMessages } from '../capabilities/capabilities.i18n'
 import SkillBar from './skills/SkillBar'
+import { IsolationTag } from '../components/IsolationTag'
+import type { ComponentIsolation } from '../components/componentApi'
 
 /** Row that shows the pending-approval count. Matches the capability id. */
 
@@ -39,13 +41,18 @@ export interface CapabilitiesPageProps {
    */
   grantsFor?: (id: CapabilityId) => readonly string[] | undefined
   /**
+   * Sandbox status of the component behind this card. `undefined` hides the tag
+   * (no matching component, or an older daemon that omits `isolation`).
+   */
+  isolationFor?: (id: CapabilityId) => ComponentIsolation | undefined
+  /**
    * Slots-full note. Settings is not a capability id, so the link cannot go
    * through `open`.
    */
   onOpenSettings?: () => void
 }
 
-export default function CapabilitiesPage({ statusFor, grantsFor, onOpenSettings }: CapabilitiesPageProps) {
+export default function CapabilitiesPage({ statusFor, grantsFor, isolationFor, onOpenSettings }: CapabilitiesPageProps) {
   const { defs, open } = useContext(CapabilitiesContext)
   const { prefs, pinnedCount = prefs.pinned.length, setPrefs } = useContext(NavPrefsContext)
   const t = useT(capabilitiesMessages)
@@ -150,6 +157,7 @@ export default function CapabilitiesPage({ statusFor, grantsFor, onOpenSettings 
                         {grantText !== undefined && <p className="cap-grants">{grantText}</p>}
                       </div>
                       <div className="cap-actions">
+                        <IsolationTag isolation={isolationFor?.(def.id)} />
                         <span className="tag cap-status">{statusText(def)}</span>
                         <button type="button" className="btn btn-primary" onClick={() => open(def.id, 'capabilities')}>
                           {t('action.open')}

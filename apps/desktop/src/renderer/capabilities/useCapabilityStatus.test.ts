@@ -14,6 +14,7 @@ interface Row {
   provides: []
   kernel_grants?: string[]
   declared?: { kernel: string[]; operations: string[] }
+  isolation?: unknown
 }
 
 let rows: Row[]
@@ -177,6 +178,19 @@ describe('communication capability status', () => {
     expect(result.current.grantsFor('documents')).toEqual(['events'])
     expect(result.current.grantsFor('communication')).toEqual([])
     expect(result.current.grantsFor('localModels')).toBeUndefined()
+  })
+
+  it('passes a parsed isolation through and drops a missing or illegal one', async () => {
+    rows = [
+      { ...row('documents', 'ready'), isolation: { state: 'isolated', mechanism: 'seatbelt' } },
+      { ...row('hyphae', 'absent'), isolation: { state: 'isolated', mechanism: 'none' } },
+      row('idoris', 'absent'),
+    ]
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    expect(result.current.isolationFor('documents')).toEqual({ state: 'isolated', mechanism: 'seatbelt' })
+    expect(result.current.isolationFor('communication')).toBeUndefined()
+    expect(result.current.isolationFor('localModels')).toBeUndefined()
   })
 
   it('shows missing when hyphae is absent from the list', async () => {
