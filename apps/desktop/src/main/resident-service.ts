@@ -394,12 +394,35 @@ export interface InstallDeps {
   installed?: () => boolean
 }
 
+const INSTALL_REASON_MAX = 200
+
+/** First stderr line, with KEY/TOKEN/SECRET/PASSWORD assignments and Bearer
+ * tokens removed. Paths stay: the launchctl line names the plist. FU: other
+ * secret shapes are not detected. */
+export function publicInstallReason(stderr: string): string {
+  const line = stderr.split(/\r?\n/).map((s) => s.trim()).find((s) => s.length > 0) ?? ''
+  return line
+    .replace(/\bBearer\s+\S+/gi, 'Bearer [redacted]')
+    .replace(/\b([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Za-z0-9_]*)\s*=\s*\S+/gi, '$1=[redacted]')
+    .slice(0, INSTALL_REASON_MAX)
+}
+
+function stderrText(err: unknown): string {
+  if (typeof err !== 'object' || err === null || !('stderr' in err)) return ''
+  const raw = (err as { stderr?: unknown }).stderr
+  if (typeof raw === 'string') return raw
+  if (raw instanceof Uint8Array) return Buffer.from(raw).toString('utf8')
+  return ''
+}
+
 function installErrorCode(err: unknown): string {
+  let base = 'install_failed'
   if (typeof err === 'object' && err !== null && 'code' in err) {
-    if (typeof err.code === 'string') return err.code
-    if (typeof err.code === 'number') return `exit_${err.code}`
+    if (typeof err.code === 'string') base = err.code
+    else if (typeof err.code === 'number') base = `exit_${err.code}`
   }
-  return 'install_failed'
+  const reason = publicInstallReason(stderrText(err))
+  return reason ? `${base}: ${reason}` : base
 }
 
 /** Inside one hold: install, then wait for the service daemon. Any failure

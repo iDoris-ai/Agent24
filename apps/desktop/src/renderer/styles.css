@@ -216,9 +216,22 @@ button { cursor: pointer; font-family: var(--font); }
 .backend-status {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   font-size: 11px;
   color: var(--muted);
+}
+.backend-failure { display: contents; }
+.backend-failure-hint { flex-basis: 100%; }
+.backend-failure-raw { flex-basis: 100%; white-space: pre-wrap; word-break: break-word; }
+.backend-retry, .backend-failure-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 11px;
+  border-radius: 4px;
+  padding: 1px 6px;
+  cursor: pointer;
 }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #555; flex-shrink: 0; }
 .status-dot.online { background: #4caf50; box-shadow: 0 0 4px #4caf5066; }

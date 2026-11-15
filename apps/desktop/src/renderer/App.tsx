@@ -1,5 +1,6 @@
 import { useContext, useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
+import type { DaemonStartupFailure } from '../shared/ipc-types'
 
 declare global {
   interface Window { agent24: Agent24API }
@@ -68,11 +69,45 @@ const LLM_NEEDS_KEY = '\u0000needs-key'
  * (`agent24-models::router::ModelRouter::from_env`), not a client-side guess.
  * `null`/missing/non-string all mean "the daemon has none to report" —
  * exported for its unit test. */
+/** A database newer than this binary (migration applied, then missing here). */
+export function daemonStartupHint(failure: { error: string } | null | undefined): 'migration_newer' | null {
+  if (!failure) return null
+  const error = failure.error
+  if (/migration/i.test(error) && /previously applied/i.test(error) && /missing/i.test(error)) return 'migration_newer'
+  return null
+}
+
 export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): string | null {
   if (!res.ok) return null
   const data = res.data as { default_model?: unknown } | null
   const dm = data?.default_model
   return typeof dm === 'string' && dm.trim() !== '' ? dm : null
+}
+
+function BackendOffline({ failure, reasonOpen, onToggleReason, onRetry }: {
+  failure: DaemonStartupFailure | null
+  reasonOpen: boolean
+  onToggleReason: () => void
+  onRetry: () => void
+}): JSX.Element {
+  const t = useT(appMessages)
+  const hint = daemonStartupHint(failure)
+  const raw = failure ? (failure.error || failure.code) : ''
+  return (
+    <>
+      <span title={failure ? raw : undefined}>{failure ? t('backend.startFailed') : t('backend.offline')}</span>
+      {failure && (
+        <span className="backend-failure">
+          {hint === 'migration_newer' && <span className="backend-failure-hint" title={raw}>{t('backend.migrationNewer')}</span>}
+          <button type="button" className="backend-failure-toggle" aria-expanded={reasonOpen} title={raw} onClick={onToggleReason}>
+            {t('backend.reason')}
+          </button>
+          {reasonOpen && <span className="backend-failure-raw">{raw}</span>}
+        </span>
+      )}
+      <button type="button" className="backend-retry" onClick={onRetry}>{t('backend.retry')}</button>
+    </>
+  )
 }
 
 export function App(): JSX.Element {
@@ -95,6 +130,8 @@ function AppShell(): JSX.Element {
     if (!prefs.showOverview && route.kind === 'page' && route.page === 'home') open('assistant', 'other')
   }, [prefs.showOverview, route, open])
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
+  const [startupFailure, setStartupFailure] = useState<DaemonStartupFailure | null>(null)
+  const [reasonOpen, setReasonOpen] = useState(false)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
@@ -128,11 +165,17 @@ function AppShell(): JSX.Element {
     void window.agent24.getAppVersion().then(setVersion)
 
     // Backend health + domain-OS module count polling
+    const readStartupFailure = () => {
+      void window.agent24.backendEndpoint()
+        .then((e) => setStartupFailure(e?.startupFailure ?? null))
+        .catch(() => { /* keep the last reason */ })
+    }
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
           if (res.ok) {
+            setStartupFailure(null)
             void listOsModules()
               .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
               .catch(() => { /* keep the last count */ })
@@ -147,9 +190,11 @@ function AppShell(): JSX.Element {
                 if (dm) setDaemonDefaultModel(dm)
               })
               .catch(() => { /* fall back to the oMLX-derived label */ })
+          } else {
+            readStartupFailure()
           }
         })
-        .catch(() => setBackendOk(false))
+        .catch(() => { setBackendOk(false); readStartupFailure() })
     }
     checkBackend()
     const backendTimer = setInterval(checkBackend, 5000)
@@ -221,7 +266,10 @@ function AppShell(): JSX.Element {
             {backendOk === true && (
               <span>{t('backend.online')}{backendPort !== null ? ` :${backendPort}` : ''}</span>
             )}
-            {backendOk === false && <span>{t('backend.offline')}</span>}
+            {backendOk === false && (
+              <BackendOffline failure={startupFailure} reasonOpen={reasonOpen} onToggleReason={() => setReasonOpen((open) => !open)}
+                onRetry={() => { void window.agent24.retryBackend() }} />
+            )}
             {backendOk === null && <span>{t('backend.checking')}</span>}
           </div>
         </div>

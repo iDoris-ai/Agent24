@@ -614,6 +614,7 @@ app.whenReady().then(async () => {
     // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS
     // (FU-114 terminateOwnedOmlx), inside the same OMLX_QUIT_STOP_BUDGET_MS.
     stopKeptOmlx: async () => { const dir = tryDataDir(); if (dir !== null) await stopKeptOmlx(keptOmlxPath(dir), realOmlxProcessProbe(), { graceMs: 5_000, killMs: 2_000 }) },
+    retryDaemon: () => { backendManager.restart(); refreshTray() },
   })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,

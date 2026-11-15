@@ -10,7 +10,7 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
-import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint } from '../backend-manager'
+import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint, getDaemonStartupFailure } from '../backend-manager'
 import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import { approvalConfirmShown, sendElevating } from '../elevated-request'
 import type { KnowledgeController } from '../knowledge-settings'
@@ -731,6 +731,8 @@ export function registerIpcHandlers(options: {
    * earlier quits left running and recorded, when its identity still matches.
    * Default: nothing. */
   stopKeptOmlx?: () => Promise<void>
+  /** Sidebar "retry start": the same restart the tray uses. */
+  retryDaemon?: () => void
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
@@ -892,9 +894,13 @@ export function registerIpcHandlers(options: {
   // backend:endpoint — the daemon's actual port (FU-93: the sidebar used to
   // show a hardcoded `:8765`, but agent24d is spawned with `--port 0` and
   // gets whatever the OS hands it).
-  handle(IpcChannels.BackendEndpoint, (): BackendEndpointResult | null => {
+  handle(IpcChannels.BackendEndpoint, (_event, action: unknown): BackendEndpointResult | null => {
+    if (action === 'retry') options.retryDaemon?.()
     const endpoint = getBackendEndpoint()
-    return endpoint ? { port: endpoint.port } : null
+    const startupFailure = getDaemonStartupFailure()
+    if (!endpoint && !startupFailure) return null
+    const port = endpoint?.port ?? null
+    return startupFailure ? { port, startupFailure } : { port }
   })
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, daemonCliEndpoint),

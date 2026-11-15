@@ -360,11 +360,20 @@ export interface ApprovalDecisionInput {
   reason?: string
 }
 
+/** Why the daemon this app spawned last failed to start. `error` is the
+ * daemon's own text (the `failed` line, or the last stderr line). */
+export interface DaemonStartupFailure {
+  code: string
+  error: string
+}
+
 /** FU-93: the backend daemon's actual (dynamic) port, so the sidebar can show
- * it instead of a hardcoded guess. `null` while the daemon has not announced
- * its ready line yet. */
+ * it instead of a hardcoded guess. `port` is null while the daemon has not
+ * announced its ready line. `startupFailure` is the last start failure, when
+ * there is one. */
 export interface BackendEndpointResult {
-  port: number
+  port: number | null
+  startupFailure?: DaemonStartupFailure
 }
 
 export interface CreativeViewBounds {

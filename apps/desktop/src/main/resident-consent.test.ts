@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  CONSENT_VERSION, consentPath, installService, readConsent, runConsent, serviceInstallDeps, shouldAskConsent, writeConsent,
+  CONSENT_VERSION, consentPath, installService, publicInstallReason, readConsent, runConsent, serviceInstallDeps, shouldAskConsent, writeConsent,
   type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem,
 } from './resident-service'
 import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
@@ -112,6 +112,8 @@ describe('installService', () => {
     ['an exit status', Object.assign(new Error('exit'), { code: 1 }), 'exit_1'],
     ['no code (a timeout kill)', Object.assign(new Error('killed'), { code: null, killed: true }), 'install_failed'],
     ['not an Error', 'boom', 'install_failed'],
+    ['stderr first line', Object.assign(new Error('exit'), { code: 1, stderr: 'Bootstrap failed: 5: Input/output error\nTry again: 1\n' }), 'exit_1: Bootstrap failed: 5: Input/output error'],
+    ['stderr as a buffer', Object.assign(new Error('exit'), { code: 1, stderr: Buffer.from('/Users/tester/Library/LaunchAgents/ai.auraai.agent24.plist: Operation not permitted\n') }), 'exit_1: /Users/tester/Library/LaunchAgents/ai.auraai.agent24.plist: Operation not permitted'],
   ])('an install failing with %s is named by it', async (_name, err, code) => {
     const { deps } = fakeInstall({ install: () => Promise.reject(err) })
     expect(await installService(deps)).toEqual({ ok: false, stage: 'install', code })
@@ -272,6 +274,14 @@ describe('the consent box copy', () => {
     setMainLocale(locale)
     for (const key of ['consent.message', 'consent.detail', 'consent.allow', 'consent.deny'] as const) expect(mt(key)).not.toBe('')
     expect(mt('consent.failed', { code: 'not_started' })).toContain('not_started')
+    const reason = publicInstallReason(`${'x'.repeat(250)}\nsecond line`)
+    expect(reason).toHaveLength(200)
+    expect(reason).not.toContain('second')
+    const secret = publicInstallReason('launchctl: OMLX_API_KEY=supersecret Bearer abcdefghijklmnop')
+    expect(secret).not.toContain('supersecret')
+    expect(secret).not.toContain('abcdefghijklmnop')
+    expect(secret).toContain('OMLX_API_KEY=[redacted]')
+    expect(mt('consent.failed', { code: `exit_1: ${publicInstallReason('Bootstrap failed: 5: Input/output error')}` })).toContain('Bootstrap failed: 5: Input/output error')
     // What the box says matches what there is (QA on B4b), and a no is not asked again.
     // M5 B4c2: the way back is the Settings switch, named as Settings names it.
     expect(mt('consent.detail')).toContain(residentServiceMessages[locale].label)
