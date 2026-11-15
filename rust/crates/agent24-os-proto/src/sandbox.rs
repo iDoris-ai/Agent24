@@ -87,6 +87,7 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
         add_program(&mut reads, path, home.as_deref())?;
     }
 
+    let data_dir = data.clone();
     let mut writes = vec![data, temp];
     for dev in WRITE_DEVICES {
         push_unique(&mut writes, PathBuf::from(*dev));
@@ -133,6 +134,11 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
         profile.push_str(&quote(path)?);
         profile.push_str(")\n");
     }
+    // Writes inside the data directory stay allowed; the directory node itself
+    // cannot be renamed, removed or replaced (#1863 B2). Later rules win.
+    profile.push_str(")\n(deny file-write*\n    (literal ");
+    profile.push_str(&quote(&data_dir)?);
+    profile.push_str(")\n");
     profile.push_str(
         ")\n\
          (allow network-inbound\n    (local unix-socket)\n)\n\
@@ -154,7 +160,10 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
 /// that link and grant writes wherever it points. Checked on every start,
 /// right before the profile is built: the leaf must be a real directory, and
 /// its canonical path must not be `/`, the home, or an ancestor of the home.
-pub fn check_data_dir(data_dir: &Path, home: Option<&Path>) -> Result<(), ProfileError> {
+/// Returns that canonical path, for the profile to use as is. The profile also
+/// denies writes to the directory node itself, so a module (or a process left
+/// from an earlier run) cannot rename or replace it at all.
+pub fn check_data_dir(data_dir: &Path, home: Option<&Path>) -> Result<PathBuf, ProfileError> {
     let meta = std::fs::symlink_metadata(data_dir).map_err(|e| {
         ProfileError(format!(
             "cannot inspect the data directory {}: {e}",
@@ -176,7 +185,7 @@ pub fn check_data_dir(data_dir: &Path, home: Option<&Path>) -> Result<(), Profil
             data.display()
         )));
     }
-    Ok(())
+    Ok(data)
 }
 
 /// Canonicalise `path`, keeping a trailing component that does not exist yet
@@ -332,6 +341,45 @@ mod tests {
             temp_dir: temp,
             home_dir: home,
         }
+    }
+
+    /// #1863 B2: under the generated profile the module writes inside its
+    /// data directory but cannot move the directory itself out of the way.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_data_dir_itself_cannot_be_moved_under_the_profile() {
+        let t = tempfile::tempdir().unwrap();
+        let root = canonical(t.path()).unwrap();
+        let package = root.join("pkg");
+        let data = root.join("data");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let sh = Path::new("/bin/sh");
+        let profile = seatbelt_profile(&inputs(
+            &package,
+            &data,
+            &root.join("cb.sock"),
+            sh,
+            &std::env::temp_dir(),
+            None,
+        ))
+        .unwrap();
+        let run = |script: &str| {
+            std::process::Command::new("/usr/bin/sandbox-exec")
+                .arg("-p")
+                .arg(&profile)
+                .arg(sh)
+                .arg("-c")
+                .arg(script)
+                .current_dir(&data)
+                .status()
+                .unwrap()
+                .success()
+        };
+        let d = data.display();
+        assert!(run(&format!("echo x > '{d}/f' && rm '{d}/f'")));
+        assert!(!run(&format!("/bin/mv '{d}' '{d}.old'")));
+        assert!(data.is_dir() && !root.join("data.old").exists());
     }
 
     #[test]
