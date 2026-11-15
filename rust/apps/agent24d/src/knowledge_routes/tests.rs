@@ -1618,10 +1618,11 @@ async fn an_endpoint_the_registry_would_refuse_is_not_an_elevated_operation() {
 
 /// F1 (ruling 2026-11-14-f1-endpoint-canonical, C): the endpoint is stored,
 /// and shown in the approval, as the transport connects to it, that is as
-/// `validate_base_url` normalises it. Five spellings the parser accepts and
+/// `validate_base_url` normalises it. Six spellings the parser accepts and
 /// the transport rewrites: `\` read as `/` (the host is the part before it),
-/// an IDN host, an upper-case host, the default port, a trailing `/`.
-const F1_SPELLINGS: [(&str, &str); 5] = [
+/// an IDN host, an upper-case host, the default port, a trailing `/`, and a
+/// non-dotted loopback (`0x7f000001`, allowed over `http`) (#1854 N2).
+const F1_SPELLINGS: [(&str, &str); 6] = [
     (
         "https://evil.example\\@good.example",
         "https://evil.example/@good.example",
@@ -1633,6 +1634,7 @@ const F1_SPELLINGS: [(&str, &str); 5] = [
     ("https://KB.Example/api/v1", "https://kb.example/api/v1"),
     ("https://kb.example:443/api/v1", "https://kb.example/api/v1"),
     ("https://kb.example/api/v1/", "https://kb.example/api/v1"),
+    ("http://0x7f000001:8080/api", "http://127.0.0.1:8080/api"),
 ];
 
 #[tokio::test]
@@ -1646,6 +1648,12 @@ async fn an_endpoint_is_stored_as_the_transport_connects_to_it() {
             agent24_knowledge::validate_base_url(raw).as_deref(),
             Ok(canonical),
             "{raw}"
+        );
+        // Idempotent: the stored string normalises to itself (#1854 N2).
+        assert_eq!(
+            agent24_knowledge::validate_base_url(canonical).as_deref(),
+            Ok(canonical),
+            "{canonical}"
         );
         let body = serde_json::json!({ "seq": 1 + i as u64, "endpoint": raw,
                                        "knowledge_base_ids": ["kb-a"] });
