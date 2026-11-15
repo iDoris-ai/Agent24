@@ -228,8 +228,11 @@ export interface paths {
          *     mount actually handed out, `MountReport.granted`), `declared` (the `requires` declaration)
          *     and `denied` (`{item, code}` with a closed code). Hyphae's declared kernel items are
          *     `no_channel`: it has no kernel callback. Every other audience gets
-         *     `ComponentRedactedView`: id, version, state and provides only, with no install path, pid,
-         *     port, error message, team id, commit, denial, or Hyphae health probes. While the Hyphae daemon is
+         *     `ComponentRedactedView`: id, version, state, provides and `isolation` only, with no install path, pid,
+         *     port, error message, team id, commit, denial, or Hyphae health probes. `isolation` is on both
+         *     views: an OS module (`out_of_process_provider`, started by agent24-os-proto) on macOS is
+         *     `isolated` / `seatbelt`; the same module on another platform is `not_isolated` /
+         *     `platform_unsupported`; every other form is `not_isolated` / `form_not_covered`. While the Hyphae daemon is
          *     running, the host view's `detail.health` lists each probe (`relays`, `keystore`, `daemon`,
          *     or `health` when the command itself did not finish) with `ok` and `consecutive_failures`.
          *     Three consecutive failures set state `degraded` and `reason` to those probe names; one
@@ -2629,6 +2632,24 @@ export interface components {
              */
             code: "not_declared" | "above_ceiling" | "no_channel" | "requires_invalid";
         };
+        /** @description Whether this component is covered by the module sandbox. Present on both the host view and the redacted view. Not a probe of a live process: an OS module on macOS is isolated because the daemon refuses to start it without seatbelt (SBX-1). */
+        ComponentIsolation: {
+            /** @constant */
+            state: "isolated";
+            /**
+             * @description macOS seatbelt via /usr/bin/sandbox-exec.
+             * @constant
+             */
+            mechanism: "seatbelt";
+        } | {
+            /** @constant */
+            state: "not_isolated";
+            /**
+             * @description platform_unsupported: OS module on a platform other than macOS (Linux is SBX-4). form_not_covered: not an OS module (resident in-process, sidecar, cli, attach, remote, mcp).
+             * @enum {string}
+             */
+            reason: "platform_unsupported" | "form_not_covered";
+        };
         /** @description Host view of one component. */
         ComponentView: {
             id: string;
@@ -2645,17 +2666,19 @@ export interface components {
             declared: components["schemas"]["ComponentRequires"] | null;
             /** @description Host only. Closed reasons an item is not in `kernel_grants`. */
             denied: components["schemas"]["ComponentDenial"][];
+            isolation: components["schemas"]["ComponentIsolation"];
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
                 [key: string]: unknown;
             };
         };
-        /** @description What every audience other than the host sees. No path, pid, port, message, team id, commit, kernel grant, denial, or Hyphae health probes. */
+        /** @description What every audience other than the host sees. No path, pid, port, message, team id, commit, kernel grant, denial, or Hyphae health probes. `isolation` is included: it is not sensitive. */
         ComponentRedactedView: {
             id: string;
             version: string | null;
             state: components["schemas"]["ComponentState"];
             provides: components["schemas"]["ComponentProvide"][];
+            isolation: components["schemas"]["ComponentIsolation"];
         };
         ComponentList: {
             components: (components["schemas"]["ComponentView"] | components["schemas"]["ComponentRedactedView"])[];

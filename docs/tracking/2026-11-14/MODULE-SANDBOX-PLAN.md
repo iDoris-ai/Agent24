@@ -49,7 +49,7 @@ ADR-K1-01 §113、ADR-K1-02 §114 都写明「OS 进程分离不等于文件系�
 |---|---|---|
 | SBX-0 | 探针，不出 PR：用 examples 里的 sin90 / 测试模块在沙箱下跑完握手 + 一次工具调用。重点确认继承的 fd 3 监听 socket 和回调 unix socket 能用，SQLite（sin90.db 的 WAL）能写 | 记录最小 profile |
 | SBX-1 | `agent24-os-proto`：按模块生成 profile（纯函数 + 单测）；跳板在 macOS 上经 `sandbox-exec` 启动模块 | 测试模块：写数据目录成功；读 `$HOME` 下一个文件失败；连 127.0.0.1 一个 TCP 端口失败；握手和工具调用照常通过 |
-| SBX-2 | `/components` 和桌面的组件页显示每个模块的隔离状态（已隔离 / 未隔离及原因） | 有一个页面能看到状态 |
+| SBX-2 | `/components` 和桌面的组件页显示每个模块的隔离状态（已隔离 / 未隔离及原因）。**已完成**（2026-11-15） | 有一个页面能看到状态 |
 | SBX-3 | 模块要更多权限时的出口 | **暂不做**（§5 问题 2 选了 A） |
 | SBX-4（之后） | Linux Landlock | — |
 
@@ -72,3 +72,6 @@ ADR-K1-01 §113、ADR-K1-02 §114 都写明「OS 进程分离不等于文件系�
 - 临时目录放行的是整个用户 `TMPDIR`（同一用户所有 app 共用），模块能读写别的进程和别的模块留在里面的文件，是模块之间的一条旁路。以后改为每个模块专属临时目录（如 `<data>/tmp` 并设 `TMPDIR`），需先实测 macOS `python3` 桩的 xcrun 缓存能否改指（#1863 评审建议 1）。
 - `(allow mach-lookup)`、`(allow process-exec)` 不带过滤。直连 TCP 与 NSURLSession 已实测被拒，但 mach 服务面（LaunchServices、AppleEvents 等）没测。在收紧之前，不对外宣称「模块无法影响沙箱外」（#1863 评审建议 2）。
 - 读白名单包含整个 `/opt/homebrew`、`/usr/local`、`/Library`、`/private/etc`，其中配置文件的**内容**可读（可能含凭据），比「元数据可见」更强（#1863 评审建议 3）。
+- SBX-2 不探测进程是否真在沙箱里。macOS 上 OS 模块即使 stopped、failed 或还没装上（Documents 空行），也标 `isolated`。
+- SBX-2 对读不到 manifest（`d9` 缺失）的域模块行标 `form_not_covered`，不猜它是不是包。
+- SBX-2 能力中心只给能对上组件 id 的卡片挂标签；对不上的能力行不显示。未知 `isolation` 短码当没有该字段，不让整行失败。
