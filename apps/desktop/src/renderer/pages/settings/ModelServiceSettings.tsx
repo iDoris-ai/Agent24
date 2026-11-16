@@ -26,7 +26,7 @@ function saveCategories(c: Record<string, ModelCategory>) {
 /** AI model service block. Mounted by the Models tab and kept alive (hidden)
  *  after the first visit so a typed key and the detection result survive
  *  switching sections. */
-export function ModelServiceSettings() {
+export function ModelServiceSettings({ customInUse = false }: { customInUse?: boolean } = {}) {
   const [omlxStatus, setOmlxStatus] = useState<OmlxStatus>('detecting')
   const [omlxUrl, setOmlxUrl] = useState(`http://127.0.0.1:${AUTO_START_PORT}`)
   const [omlxApiKey, setOmlxApiKey] = useState(AUTO_START_KEY)
@@ -206,6 +206,8 @@ export function ModelServiceSettings() {
   }
 
   const isConnected = omlxStatus === 'connected'
+  // A custom local model service is in use: oMLX not running is expected, not an error.
+  const idleForCustom = customInUse && omlxStatus === 'disconnected'
   const isBusy = omlxStatus === 'detecting' || omlxStatus === 'starting' || omlxStatus === 'stopping'
 
   const statusLabel: Record<OmlxStatus, string> = {
@@ -226,10 +228,10 @@ export function ModelServiceSettings() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{
             width: 8, height: 8, borderRadius: '50%', flexShrink: 0,
-            background: statusDotColor[omlxStatus],
+            background: idleForCustom ? '#888' : statusDotColor[omlxStatus],
             boxShadow: isConnected ? `0 0 6px ${statusDotColor[omlxStatus]}66` : 'none',
           }} />
-          <span style={{ fontSize: 13 }}>{statusLabel[omlxStatus]}</span>
+          <span style={{ fontSize: 13 }}>{idleForCustom ? t('status.customInUse') : statusLabel[omlxStatus]}</span>
           {isConnected && (
             <span style={{ fontSize: 11, color: 'var(--muted)' }}>
               {omlxUrl} · {t('status.modelCount', { count: omlxModels.length })}
@@ -253,7 +255,7 @@ export function ModelServiceSettings() {
         </div>
       </div>
 
-      {detectError && (
+      {detectError && !idleForCustom && (
         <div style={{ fontSize: 12, color: '#f44336', padding: '6px 18px', marginBottom: 2, background: 'rgba(244,67,54,0.08)', borderRadius: 6 }}>
           {'key' in detectError ? t(detectError.key) : detectError.raw}
         </div>

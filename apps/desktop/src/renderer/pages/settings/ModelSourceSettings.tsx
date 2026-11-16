@@ -17,6 +17,9 @@ export function ModelSourceSettings({ onChange }: { onChange?: (source: ModelSou
   const [models, setModels] = useState<string[]>([])
   const [busy, setBusy] = useState<'detect' | 'apply' | null>(null)
   const [note, setNote] = useState<Note>(null)
+  // Shown right next to 「检测」, so the answer is where the click was.
+  const [detected, setDetected] = useState<Note>(null)
+  const [typing, setTyping] = useState(false)
 
   async function load() {
     const source = await window.agent24.modelSourceGet().catch(() => null)
@@ -29,16 +32,18 @@ export function ModelSourceSettings({ onChange }: { onChange?: (source: ModelSou
   async function detect() {
     setBusy('detect')
     setNote(null)
+    setDetected(null)
     const base = url.trim().replace(/\/+$/, '').replace(/\/v1$/, '')
     const r = await window.agent24.omlxModels(base, '').catch(() => ({ ok: false, models: [] as string[] }))
     setBusy(null)
     if (r.ok) {
       setModels(r.models)
-      if (!model && r.models[0]) setModel(r.models[0])
-      setNote({ ok: true, key: 'detected', vars: { count: r.models.length } })
+      setTyping(false)
+      if (!r.models.includes(model) && r.models[0]) setModel(r.models[0])
+      setDetected({ ok: true, key: 'detected', vars: { count: r.models.length } })
     } else {
       setModels([])
-      setNote({ ok: false, key: 'detectFailed', vars: { url: base } })
+      setDetected({ ok: false, key: 'detectFailed', vars: { url: base } })
     }
   }
 
@@ -67,13 +72,26 @@ export function ModelSourceSettings({ onChange }: { onChange?: (source: ModelSou
           <button className="btn btn-ghost" disabled={busy !== null} onClick={() => { void detect() }}>
             {busy === 'detect' ? t('detecting') : t('detect')}
           </button>
+          {detected && (
+            <span role={detected.ok ? 'status' : 'alert'}
+              style={{ fontSize: 13, fontWeight: 600, alignSelf: 'center', color: detected.ok ? '#4caf50' : '#f44336' }}>
+              {detected.ok ? '✓ ' : '✕ '}{t(detected.key, detected.vars)}
+            </span>
+          )}
         </div>
       </div>
       <div className="setting-row">
         <label htmlFor="model-source-model">{t('model')}</label>
-        <input id="model-source-model" list="model-source-models" value={model} placeholder={t('modelPlaceholder')}
-          onChange={(e) => setModel(e.target.value)} style={{ width: 240 }} />
-        <datalist id="model-source-models">{models.map((m) => <option key={m} value={m} />)}</datalist>
+        {models.length > 0 && !typing ? (
+          <select id="model-source-model" value={model} style={{ width: 240 }}
+            onChange={(e) => { if (e.target.value === '') setTyping(true); else setModel(e.target.value) }}>
+            {models.map((m) => <option key={m} value={m}>{m}</option>)}
+            <option value="">{t('typeOther')}</option>
+          </select>
+        ) : (
+          <input id="model-source-model" value={model} placeholder={t('modelPlaceholder')}
+            onChange={(e) => setModel(e.target.value)} style={{ width: 240 }} />
+        )}
       </div>
       <div className="setting-row">
         <span />
