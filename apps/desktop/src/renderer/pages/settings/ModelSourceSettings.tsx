@@ -22,7 +22,8 @@ export function ModelSourceSettings({ onChange }: { onChange?: (source: ModelSou
   const [typing, setTyping] = useState(false)
 
   async function load() {
-    const source = await window.agent24.modelSourceGet().catch(() => null)
+    // A window without this preload (an older test double) reads it as not set.
+    const source = await Promise.resolve().then(() => window.agent24.modelSourceGet()).catch(() => null) ?? null
     setCurrent(source)
     if (source) { setUrl(source.url); setModel(source.model) }
     onChange?.(source)
