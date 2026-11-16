@@ -20,6 +20,14 @@ type SchedKey = keyof typeof schedulesMessages.en
 
 type SpecType = 'cron' | 'every' | 'at'
 
+/** A `datetime-local` value (`YYYY-MM-DDTHH:mm`, this machine's local time)
+ *  as the UTC ISO 8601 the daemon takes (`…Z`, whole seconds); '' when there
+ *  is none. The daemon stays authoritative for the time it stores. */
+function localToIso(value: string): string {
+  const at = value ? new Date(value) : null
+  return at && !Number.isNaN(at.getTime()) ? at.toISOString().replace(/\.\d{3}Z$/, 'Z') : ''
+}
+
 function buildSpec(type: SpecType, expr: string, tz: string, secs: string, ts: string): ScheduleSpec {
   if (type === 'cron') return { type: 'cron', expr, tz: tz.trim() || null }
   if (type === 'every') return { type: 'every', secs: Number(secs) }
@@ -67,6 +75,7 @@ export default function SchedulesPage() {
   const [tz, setTz] = useState('UTC')
   const [secs, setSecs] = useState('3600')
   const [ts, setTs] = useState('')
+  const [atLocal, setAtLocal] = useState('')
 
   // Monotonic request token: only the latest refresh's result may land, so a
   // slow poll can't overwrite fresher post-mutation state (review C7).
@@ -349,10 +358,10 @@ export default function SchedulesPage() {
           {specType === 'at' && (
             <input
               aria-label={t('form.tsLabel')}
-              placeholder="2026-08-01T09:00:00Z"
-              value={ts}
-              onChange={(e) => setTs(e.target.value)}
-              style={{ ...inputStyle, fontFamily: 'monospace' }}
+              type="datetime-local"
+              value={atLocal}
+              onChange={(e) => { setAtLocal(e.target.value); setTs(localToIso(e.target.value)) }}
+              style={inputStyle}
             />
           )}
 
