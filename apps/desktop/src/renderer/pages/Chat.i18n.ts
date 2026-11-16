@@ -2,6 +2,7 @@ import { defineMessages } from '../i18n'
 
 export const chatMessages = defineMessages({
   en: {
+    'doc.context': 'this conversation is about it', 'doc.remove': 'Stop using this document',
     'newChat': 'New chat',
     'turns.label': 'Turns in this chat',
     'turns.mark': 'Turn {n}: {prompt}',
@@ -91,6 +92,7 @@ export const chatMessages = defineMessages({
     'run.failed': '⚠️ The reply failed: {error}',
   },
   zh: {
+    'doc.context': '本对话以它为上下文', 'doc.remove': '不再附带这份文档',
     'newChat': '新对话',
     'turns.label': '本次对话的回合',
     'turns.mark': '第 {n} 轮：{prompt}',
@@ -179,6 +181,7 @@ export const chatMessages = defineMessages({
     'run.failed': '⚠️ 回答失败：{error}',
   },
   th: {
+    'doc.context': 'บทสนทนานี้อ้างอิงเอกสารนี้', 'doc.remove': 'เลิกแนบเอกสารนี้',
     'newChat': 'แชตใหม่',
     'turns.label': 'รอบการสนทนาในแชตนี้',
     'turns.mark': 'รอบที่ {n}: {prompt}',

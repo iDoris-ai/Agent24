@@ -3,11 +3,13 @@
 // text is the user's document: it is shown, never logged. Above it, one
 // page as the OS renders it, so the text can be checked against the page.
 
-import { Fragment, useEffect, useRef, useState } from 'react'
+import { Fragment, useContext, useEffect, useRef, useState } from 'react'
 import type { components } from '@agent24/api-client'
 import { describeError } from './importStore'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
+import { CapabilitiesContext } from '../../capabilities/types'
+import { askAboutDocument } from '../chat/doc-context'
 
 type Detail = components['schemas']['DocumentDetail']
 type Block = components['schemas']['DocumentsTextBlock']
@@ -26,6 +28,7 @@ export function readableSize(bytes: number): string {
 
 export default function DocumentDetail({ documentId, onClose }: { documentId: string; onClose: () => void }) {
   const t = useT(documentsMessages)
+  const { open } = useContext(CapabilitiesContext)
   const api = window.agent24.documents
   const [detail, setDetail] = useState<Detail | null>(null)
   const [blocks, setBlocks] = useState<Block[]>([])
@@ -136,9 +139,20 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
         <div role="heading" aria-level={2} tabIndex={-1} ref={heading} style={{ fontWeight: 600 }}>
           {detail?.title ?? ''}
         </div>
-        <button className="btn btn-ghost" onClick={onClose}>
-          {t('detail.close')}
-        </button>
+        <div style={{ display: 'flex', gap: 6 }}>
+          {detail && (
+            <button className="btn btn-primary" onClick={() => {
+              // F1: a new conversation about this document, its text sent with each turn.
+              askAboutDocument({ id: detail.document_id, title: detail.title ?? '', revision: detail.head.revision })
+              open('assistant', 'other')
+            }}>
+              {t('detail.ask')}
+            </button>
+          )}
+          <button className="btn btn-ghost" onClick={onClose}>
+            {t('detail.close')}
+          </button>
+        </div>
       </div>
       {detail && (
         <p style={{ color: 'var(--muted)', fontSize: 12 }}>
