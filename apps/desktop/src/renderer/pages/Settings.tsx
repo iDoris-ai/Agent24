@@ -7,6 +7,7 @@ import { CliToolSettings } from './settings/CliToolSettings'
 import { ResidentServiceSettings } from './settings/ResidentServiceSettings'
 import { KnowledgeSettings } from './settings/KnowledgeSettings'
 import { ModelServiceSettings } from './settings/ModelServiceSettings'
+import { ModelSourceSettings } from './settings/ModelSourceSettings'
 import { SidebarPrefs } from './settings/SidebarPrefs'
 
 // Tab ownership of the blocks that used to be one scrolling page:
@@ -103,6 +104,7 @@ export default function SettingsPage({ initialTab }: { initialTab?: string } = {
         {tab === 'general' && <GeneralTab />}
         {keepModels.current && (
           <div hidden={tab !== 'models'}>
+            <ModelSourceSettings />
             <ModelServiceSettings />
           </div>
         )}

@@ -61,7 +61,10 @@ export function ModelServiceSettings() {
       return
     }
     let detected = probed
-    if (!detected) {
+    // A custom local model service is set (Settings → Models): it is used
+    // first, so oMLX is not started for it.
+    const custom = detected ? null : await window.agent24.modelSourceGet?.().catch(() => null)
+    if (!detected && !custom) {
       // Auto-start oMLX
       setOmlxStatus('starting')
       const started = await window.agent24.omlxStart(AUTO_START_PORT, AUTO_START_KEY)
@@ -81,7 +84,7 @@ export function ModelServiceSettings() {
       applyDetected(detected.url, detected.apiKey, detected.models)
     } else {
       setOmlxStatus('disconnected')
-      setDetectError({ key: 'error.startConnect' })
+      if (!custom) setDetectError({ key: 'error.startConnect' })
     }
   }
 
