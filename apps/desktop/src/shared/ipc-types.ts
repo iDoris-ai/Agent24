@@ -36,6 +36,10 @@ export const IpcChannels = {
   // M5 B4c2: Settings → General → background service switch.
   ResidentServiceStatus: 'resident-service:status',
   ResidentServiceSet: 'resident-service:set',
+  // Model source setting: a local OpenAI-compatible endpoint the daemon uses first.
+  ModelSourceGet: 'model-source:get',
+  ModelSourceSet: 'model-source:set',
+  ModelSourceClear: 'model-source:clear',
   AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
@@ -649,3 +653,14 @@ export interface RunEvent {
   type: (typeof RUN_EVENT_TYPES)[number]
   run_id: string
 }
+
+/** Model source setting: a loopback OpenAI-compatible base URL (no `/v1`) and a model name. */
+export interface ModelSource { url: string; model: string }
+
+/** A saved (or cleared) model source and how the daemon took it: `restarted`
+ * (it is in use), or `restart_failed` with a code (it is used from the next
+ * daemon start). */
+export type ModelSourceResult =
+  | { ok: true; restart: 'restarted' }
+  | { ok: true; restart: 'restart_failed'; code: string }
+  | { ok: false; reason: 'invalid_url' | 'invalid_model' | 'no_data_dir' | 'not_saved' }

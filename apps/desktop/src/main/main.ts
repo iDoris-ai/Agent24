@@ -11,6 +11,8 @@ import { createScheduleConversations, type ScheduleConversations } from './sched
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
+import { registerModelSource } from './ipc/model-source'
+import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
@@ -644,6 +646,14 @@ app.whenReady().then(async () => {
       return result
     },
   })
+  // Settings → Models → custom local model service: the daemon reads the
+  // file as it starts, so a change restarts it (the service daemon through
+  // the same presence-confirmed restart as an upgrade).
+  registerModelSource({
+    guard,
+    file: () => { const dir = tryDataDir(); return dir === null ? null : modelSourcePath(dir) },
+    restart: restartDaemonForModelSource,
+  })
   mainWin = createMainWindow()
   void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
@@ -815,6 +825,20 @@ app.whenReady().then(async () => {
   // macOS: re-open window when dock icon clicked with no windows open
   app.on('activate', () => showOrCreateWindow())
 })
+
+async function restartDaemonForModelSource(): Promise<{ ok: true } | { ok: false; code: string }> {
+  const service = serviceDaemonOf(backendManager)
+  if (service) {
+    const dataDir = tryDataDir()
+    if (dataDir === null) return { ok: false, code: 'no_data_dir' }
+    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
+    const outcome = await upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold }))
+    return outcome.ok ? { ok: true } : { ok: false, code: outcome.code }
+  }
+  if (backendManager.isExternalDaemon()) return { ok: false, code: 'external_daemon' }
+  backendManager.restart()
+  return { ok: true }
+}
 
 // M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
 // Settings switch and the tray's 「完全退出」, one at a time (B4c3).

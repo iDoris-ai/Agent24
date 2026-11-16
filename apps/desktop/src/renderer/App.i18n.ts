@@ -25,6 +25,7 @@ export const appMessages = defineMessages({
     'llm.needsKey': 'oMLX is running but needs an API key (Settings)',
     'llm.noChatModel': 'No chat model available (only image-gen / embedding models found)',
     'llm.daemonDefault': '{model} · Agent24 default',
+    'llm.custom': '{model} · custom local service',
   },
   zh: {
     'nav.home': '总览', 'title.home': '总览',
@@ -50,6 +51,7 @@ export const appMessages = defineMessages({
     'llm.needsKey': 'oMLX 已运行，需要 API key（见设置）',
     'llm.noChatModel': '无可用对话模型（仅检测到生图/嵌入等模型）',
     'llm.daemonDefault': '{model} · Agent24 默认',
+    'llm.custom': '{model} · 自定义本地服务',
   },
   th: {
     'nav.home': 'ภาพรวม', 'title.home': 'ภาพรวม',
@@ -75,5 +77,6 @@ export const appMessages = defineMessages({
     'llm.needsKey': 'oMLX ทำงานอยู่แต่ต้องใช้คีย์ API (ดูที่การตั้งค่า)',
     'llm.noChatModel': 'ไม่มีโมเดลแชท (พบเฉพาะโมเดลสร้างภาพ / embedding)',
     'llm.daemonDefault': '{model} · ค่าเริ่มต้นของ Agent24',
+    'llm.custom': '{model} · บริการในเครื่องแบบกำหนดเอง',
   },
 })

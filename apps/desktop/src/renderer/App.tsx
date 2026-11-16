@@ -107,6 +107,8 @@ function AppShell(): JSX.Element {
   // actual displayed label is the `llmLabel` derived value below.
   const [fallbackLlmLabel, setFallbackLlmLabel] = useState(LLM_DETECTING)
   const [daemonDefaultModel, setDaemonDefaultModel] = useState<string | null>(null)
+  // Settings → Models → custom local model service, when set (read on each health tick).
+  const [customModel, setCustomModel] = useState<string | null>(null)
   const [backendPort, setBackendPort] = useState<number | null>(null)
   const initDone = useRef(false)
 
@@ -119,7 +121,9 @@ function AppShell(): JSX.Element {
   const t = useT(appMessages)
   const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel', [LLM_NEEDS_KEY]: 'llm.needsKey' } as const
   const fallbackKey = FALLBACK_KEYS[fallbackLlmLabel as keyof typeof FALLBACK_KEYS]
-  const llmLabel = daemonDefaultModel
+  const llmLabel = customModel
+    ? t('llm.custom', { model: customModel })
+    : daemonDefaultModel
     ? t('llm.daemonDefault', { model: daemonDefaultModel })
     : fallbackKey ? t(fallbackKey) : fallbackLlmLabel
 
@@ -134,6 +138,7 @@ function AppShell(): JSX.Element {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
+          void window.agent24.modelSourceGet?.().then((s) => setCustomModel(s?.model ?? null), () => setCustomModel(null))
           if (res.ok) setRefusal(null)
           else void window.agent24.backendRefusal?.().then(setRefusal, () => setRefusal(null))
           if (res.ok) {
@@ -172,6 +177,9 @@ function AppShell(): JSX.Element {
         setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
         return
       }
+      // A custom local model service is set: it is used first, so no oMLX
+      // is started for it (the topbar names it from the daemon's default model).
+      if (await window.agent24.modelSourceGet?.().catch(() => null)) return
       // Try to start oMLX
       const started = await window.agent24.omlxStart(8088, '')
       if (started.ok) {

@@ -224,6 +224,69 @@ fn thinking_switch(backend: &str, tier: Tier) -> ThinkingSwitch {
     }
 }
 
+/// A user-chosen local OpenAI-compatible endpoint (model source setting):
+/// `<data_dir>/model-source.json`, `{"url": "...", "model": "..."}`, written
+/// by the desktop app. Only a loopback `url` is ever used.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSource {
+    pub url: String,
+    pub model: String,
+}
+
+/// Read and check `path`. `None` when it is not there (silently), or is not
+/// a usable source (with a warning): the router is then built as before.
+pub fn read_model_source(path: &std::path::Path) -> Option<ModelSource> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct File {
+        url: String,
+        model: String,
+    }
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!("model source {}: unreadable ({e}); ignored", path.display());
+            return None;
+        }
+    };
+    let checked = serde_json::from_str::<File>(&text)
+        .map_err(|_| "not {\"url\", \"model\"} JSON")
+        .and_then(|f| check_model_source(f.url, f.model));
+    match checked {
+        Ok(source) => Some(source),
+        Err(why) => {
+            // Never the url itself: a rejected one may carry credentials.
+            tracing::warn!("model source {}: {why}; ignored", path.display());
+            None
+        }
+    }
+}
+
+const MODEL_SOURCE_MAX_MODEL: usize = 256;
+
+/// The url is a bare origin (`scheme://host[:port]`: no credentials, path,
+/// query or fragment; the provider adds `/v1/...`) that `env_local_tier`
+/// judges Local, so it is labeled and built exactly as a loopback
+/// `OLLAMA_URL` override is. Anything else is refused, never made Remote.
+fn check_model_source(url: String, model: String) -> Result<ModelSource, &'static str> {
+    let parsed = reqwest::Url::parse(&url).map_err(|_| "url does not parse")?;
+    if url != parsed.origin().ascii_serialization() {
+        return Err("url is not a bare scheme://host:port");
+    }
+    if env_local_tier(&url) != Tier::Local {
+        return Err("url is not loopback");
+    }
+    let model = model.trim().to_owned();
+    if model.is_empty()
+        || model.len() > MODEL_SOURCE_MAX_MODEL
+        || model.chars().any(char::is_control)
+    {
+        return Err("model name is empty, too long or has control characters");
+    }
+    Ok(ModelSource { url, model })
+}
+
 /// The open-enum tier string reported on `/models` for a judged tier.
 fn tier_label(t: Tier) -> &'static str {
     match t {
@@ -356,7 +419,16 @@ impl ModelRouter {
     /// added by the daemon when configured; with only local providers, a
     /// Complex task simply falls back to them.
     pub fn from_env() -> Self {
+        Self::from_env_with_source(None)
+    }
+
+    /// [`Self::from_env`], with a [`ModelSource`] (already checked by
+    /// [`read_model_source`]) put first in the local chain.
+    pub fn from_env_with_source(source: Option<ModelSource>) -> Self {
         if std::env::var_os("IDORIS_URL").is_some() {
+            if source.is_some() {
+                tracing::warn!("IDORIS_URL is set: the model source setting is not used");
+            }
             let router = Self::with_defaults(Vec::new());
             *router.idoris.write().unwrap_or_else(|p| p.into_inner()) =
                 Some(crate::IdorisGateway::from_env().map(Arc::new));
@@ -365,8 +437,12 @@ impl ModelRouter {
         let omlx_url =
             std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
         let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
-        let default_model =
-            std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "Qwen3-8B-4bit".to_owned());
+        // The model source's model is the default one: chat and schedules ask
+        // for none, so it is what they get.
+        let default_model = match &source {
+            Some(s) => s.model.clone(),
+            None => std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "Qwen3-8B-4bit".to_owned()),
+        };
         // Validate locality before trusting the `Local` label: an OMLX_URL
         // pointed at a non-loopback address is treated as Remote so a
         // LocalOnly task never silently leaks to it (review D2).
@@ -404,7 +480,19 @@ impl ModelRouter {
             };
         let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
         let ollama = build("ollama", ollama_url, None, ollama_tier);
-        let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
+        let mut providers = Vec::with_capacity(3);
+        // The model source goes first. Judged again here (it is a `pub` type):
+        // only a Local one is built at all, and then `loopback_only()`; its
+        // name is its own (no oMLX or Ollama switch is sent to it).
+        if let Some(s) = source {
+            let tier = env_local_tier(&s.url);
+            if tier == Tier::Local {
+                providers.push((build("custom", s.url, None, tier), tier));
+            }
+        }
+        providers.push((omlx, omlx_tier));
+        providers.push((ollama, ollama_tier));
+        let mut router = Self::with_defaults(providers);
         router.default_model = Some(default_model);
         router
     }
@@ -1712,6 +1800,168 @@ mod tests {
         );
         let _ = p.complete(&req, &c).await;
         assert_eq!(redirected.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // ── Model source setting (M1) ──────────────────────────────────────────
+    fn source_file(body: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("a24-model-source-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("model-source.json");
+        std::fs::write(&file, body).unwrap();
+        (dir, file)
+    }
+
+    fn read_source(url: &str, model: &str) -> Option<ModelSource> {
+        let body = serde_json::json!({ "url": url, "model": model }).to_string();
+        let (dir, file) = source_file(&body);
+        let got = read_model_source(&file);
+        std::fs::remove_dir_all(dir).unwrap();
+        got
+    }
+
+    #[test]
+    fn a_model_source_must_be_loopback() {
+        for url in [
+            "http://127.0.0.1:1234",
+            "http://localhost:1234",
+            "http://[::1]:1234",
+            "http://127.0.0.2:1234",
+        ] {
+            assert_eq!(
+                read_source(url, "qwen"),
+                Some(ModelSource {
+                    url: url.to_owned(),
+                    model: "qwen".to_owned()
+                }),
+                "{url}"
+            );
+        }
+        for url in [
+            "http://localhost.evil:1234",
+            "http://localhost.evil.com",
+            "http://127.0.0.1.nip.io:1234",
+            "http://127.0.0.1@evil.com:1234",
+            "http://user:pw@127.0.0.1:1234",
+            "http://evil@localhost:1234",
+            "http://0.0.0.0:1234",
+            "http://[::ffff:127.0.0.1]:1234",
+            "http://10.0.0.5:1234",
+            "http://192.168.1.2:1234",
+            "https://api.openai.com",
+            "ftp://127.0.0.1:1234",
+            "127.0.0.1:1234",
+            "http://127.0.0.1:1234?x=1",
+            "http://127.0.0.1:1234#frag",
+            "http://127.0.0.1:1234/v1",
+            "",
+        ] {
+            assert_eq!(read_source(url, "qwen"), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_model_source_needs_a_model_name_and_a_well_formed_file() {
+        assert_eq!(read_source("http://127.0.0.1:1234", ""), None);
+        assert_eq!(read_source("http://127.0.0.1:1234", "   "), None);
+        assert_eq!(read_source("http://127.0.0.1:1234", "a\nb"), None);
+        assert_eq!(read_source("http://127.0.0.1:1234", &"m".repeat(300)), None);
+        for body in [
+            "",
+            "{",
+            "[]",
+            r#"{"url":"http://127.0.0.1:1234"}"#,
+            r#"{"model":"m"}"#,
+        ] {
+            let (dir, file) = source_file(body);
+            assert_eq!(read_model_source(&file), None, "{body}");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+        let missing = std::env::temp_dir().join(format!(
+            "a24-none-{}/model-source.json",
+            uuid::Uuid::new_v4()
+        ));
+        assert_eq!(read_model_source(&missing), None);
+    }
+
+    #[test]
+    fn without_a_model_source_the_chain_is_unchanged() {
+        let a = ModelRouter::from_env();
+        let b = ModelRouter::from_env_with_source(None);
+        let names = |r: &ModelRouter| {
+            r.providers
+                .iter()
+                .map(|p| (p.provider.name().to_owned(), p.tier))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&a), names(&b));
+        assert_eq!(
+            names(&b)
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect::<Vec<_>>(),
+            ["omlx", "ollama"]
+        );
+        assert_eq!(a.default_model(), b.default_model());
+    }
+
+    #[tokio::test]
+    async fn a_model_source_goes_first_with_its_model_and_no_thinking_switch() {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for s in l.incoming() {
+                let Ok(mut s) = s else { continue };
+                let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 65536];
+                while let Ok(n) = s.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                }
+                let text = String::from_utf8_lossy(&got).to_string();
+                let _ = tx.send(
+                    text.split_once("\r\n\r\n")
+                        .map(|(_, b)| b.to_owned())
+                        .unwrap_or_default(),
+                );
+                let _ = s.write_all(http_ok().as_bytes());
+            }
+        });
+        let source = ModelSource {
+            url: format!("http://127.0.0.1:{port}"),
+            model: "lm-qwen".to_owned(),
+        };
+        let r = ModelRouter::from_env_with_source(Some(source));
+        assert_eq!(r.providers[0].provider.name(), "custom");
+        assert_eq!(r.providers[0].tier, Tier::Local);
+        assert_eq!(
+            r.providers
+                .iter()
+                .map(|p| p.provider.name())
+                .collect::<Vec<_>>(),
+            ["custom", "omlx", "ollama"]
+        );
+        assert_eq!(r.default_model(), Some("lm-qwen"));
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..Default::default()
+        };
+        let req = CompletionRequest {
+            disable_thinking: true,
+            ..secret_request()
+        };
+        r.complete(profile, &req, &CancellationToken::new())
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(body["model"], "lm-qwen", "{body}");
+        assert!(body.get("reasoning_effort").is_none(), "{body}");
+        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
     }
 
     #[test]
