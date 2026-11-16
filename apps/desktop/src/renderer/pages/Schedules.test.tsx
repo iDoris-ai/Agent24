@@ -101,11 +101,42 @@ describe('SchedulesPage', () => {
     fireEvent.change(screen.getByLabelText('prompt'), { target: { value: 'do it' } })
     fireEvent.click(screen.getByRole('button', { name: '一次性' }))
     // past timestamp → preview error → create blocked
-    fireEvent.change(screen.getByLabelText('触发时间'), { target: { value: '2000-01-01T00:00:00Z' } })
+    fireEvent.change(screen.getByLabelText('触发时间'), { target: { value: '2000-01-01T00:00' } })
     expect(screen.getByTestId('preview').textContent).toContain('已过')
     fireEvent.click(screen.getByRole('button', { name: '创建' }))
     expect(screen.getByText(/调度规格无效/)).toBeInTheDocument()
     expect(proxy.mock.calls.every((c) => c[0].method !== 'POST')).toBe(true)
+  })
+
+  // QA 真机：一次性日程只能手输 ISO 8601，很难输对。改成原生日期时间选择器，
+  // 按本机时区选，提交时换成后端接受的 UTC ISO 8601（不带毫秒）。
+  it('picks a one-time fire time with a local date-time picker and sends it as UTC ISO 8601', async () => {
+    mount([])
+    render(<SchedulesPage />)
+    fireEvent.change(screen.getByLabelText('名称'), { target: { value: 'once' } })
+    fireEvent.change(screen.getByLabelText('prompt'), { target: { value: 'do it' } })
+    fireEvent.click(screen.getByRole('button', { name: '一次性' }))
+    const picker = screen.getByLabelText('触发时间')
+    expect(picker).toHaveAttribute('type', 'datetime-local')
+    fireEvent.change(picker, { target: { value: '2099-03-04T05:06' } })
+    const utc = new Date(2099, 2, 4, 5, 6).toISOString().replace(/\.\d{3}Z$/, 'Z')
+    expect(screen.getByTestId('preview').textContent).toContain(utc.slice(0, 16).replace('T', ' '))
+    fireEvent.click(screen.getByRole('button', { name: '创建' }))
+    await waitFor(() =>
+      expect(calls).toContainEqual(expect.objectContaining({
+        method: 'POST',
+        path: '/api/v1/schedules',
+        body: expect.objectContaining({ spec: { type: 'at', ts: utc } }),
+      })),
+    )
+  })
+
+  it('a one-time schedule with no time picked says to pick one, not ISO 8601', () => {
+    mount([])
+    render(<SchedulesPage />)
+    fireEvent.click(screen.getByRole('button', { name: '一次性' }))
+    expect(screen.getByTestId('preview').textContent).toContain('请选择触发时间')
+    expect(screen.getByTestId('preview').textContent).not.toContain('ISO')
   })
 
   it('summarizes every / at / cron spec types in the list', async () => {
