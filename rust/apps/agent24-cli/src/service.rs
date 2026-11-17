@@ -537,6 +537,23 @@ pub fn status() -> (bool, Option<PathBuf>, bool) {
     (installed, plist, loaded())
 }
 
+/// The LaunchAgent plist is on disk (`status`'s `installed`). A clean
+/// `daemon stop` then a manual `daemon start` would leave that daemon
+/// outside launchd (FU-68).
+pub fn service_installed() -> bool {
+    plist_path().is_some_and(|p| p.is_file())
+}
+
+/// Restart command for the operator. Installed: `launchctl kickstart -k`
+/// so launchd still owns the process. Not installed: the manual pair.
+pub fn restart_command(service_installed: bool) -> &'static str {
+    if service_installed {
+        "launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24"
+    } else {
+        "agent24 daemon stop && agent24 daemon start"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -1109,6 +1126,20 @@ mod tests {
                 "gui/501".to_owned(),
                 plist.to_string_lossy().into_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn restart_command_kickstarts_an_installed_launch_agent() {
+        let cmd = restart_command(true);
+        assert_eq!(cmd, "launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24");
+        assert!(
+            !cmd.contains("daemon stop"),
+            "an installed service must not be told to stop and start by hand: {cmd}"
+        );
+        assert_eq!(
+            restart_command(false),
+            "agent24 daemon stop && agent24 daemon start"
         );
     }
 

@@ -52,6 +52,31 @@ use crate::domain::{MountOutcome, MountReport, RefusalReason, ResourceStatus};
 use crate::routes::read_body_or_response;
 use crate::server::AppState;
 
+/// The LaunchAgent plist from `agent24 service install` (`service.rs`
+/// `LABEL`). Present means a restart must stay under launchd (FU-68).
+fn launch_agent_installed() -> bool {
+    launch_agent_installed_in(std::env::var_os("HOME").as_deref())
+}
+
+fn launch_agent_installed_in(home: Option<&std::ffi::OsStr>) -> bool {
+    let Some(home) = home else {
+        return false;
+    };
+    std::path::Path::new(home)
+        .join("Library/LaunchAgents/ai.auraai.agent24.plist")
+        .is_file()
+}
+
+/// Installed service: `launchctl kickstart -k` (launchd still owns the
+/// process). No plist: the manual stop+start, unchanged.
+fn restart_command(service_installed: bool) -> &'static str {
+    if service_installed {
+        "launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24"
+    } else {
+        "agent24 daemon stop && agent24 daemon start"
+    }
+}
+
 /// Render one module for the wire, combining what the config says NOW with what
 /// the daemon did at startup.
 fn view(
@@ -60,6 +85,24 @@ fn view(
     registry_usable: bool,
     live: Option<&agent24_os_proto::supervisor::Status>,
     hot: Option<bool>,
+) -> DomainOsView {
+    view_with_service(
+        report,
+        enabled_now,
+        registry_usable,
+        live,
+        hot,
+        launch_agent_installed(),
+    )
+}
+
+fn view_with_service(
+    report: &MountReport,
+    enabled_now: bool,
+    registry_usable: bool,
+    live: Option<&agent24_os_proto::supervisor::Status>,
+    hot: Option<bool>,
+    service_installed: bool,
 ) -> DomainOsView {
     use agent24_os_proto::supervisor::Status;
     // `hot`: `None` if no `os disable` asked to stop it since the daemon
@@ -125,19 +168,23 @@ fn view(
             // `os disable`/`enable` cannot bring the supervisor back
             // (`enable` only changes config, it does not create a new
             // supervisor in a running daemon — see the design doc).
-            Status::PackageChanged { reason, code } => (
-                "degraded",
-                Some(match code {
-                    Some(code) => format!(
-                        "package changed ({code}): {reason} — restart the daemon to pick up the \
-                         current package (`agent24 daemon stop && agent24 daemon start`)"
-                    ),
-                    None => format!(
-                        "package changed: {reason} — restart the daemon to pick up the current \
-                         package (`agent24 daemon stop && agent24 daemon start`)"
-                    ),
-                }),
-            ),
+            // FU-68: the command depends on whether launchd owns the daemon.
+            Status::PackageChanged { reason, code } => {
+                let cmd = restart_command(service_installed);
+                (
+                    "degraded",
+                    Some(match code {
+                        Some(code) => format!(
+                            "package changed ({code}): {reason} — restart the daemon to pick up the \
+                             current package (`{cmd}`)"
+                        ),
+                        None => format!(
+                            "package changed: {reason} — restart the daemon to pick up the current \
+                             package (`{cmd}`)"
+                        ),
+                    }),
+                )
+            }
             Status::StopFailed { error } => ("degraded", Some(error.clone())),
             Status::Stopped => ("degraded", Some("stopped".to_owned())),
             Status::Panicked => ("degraded", Some("its supervisor panicked".to_owned())),
@@ -1599,7 +1646,7 @@ mod tests {
             reason: "the package directory no longer exists".to_owned(),
             code: None,
         };
-        let v = view(&r, true, true, Some(&changed), None);
+        let v = view_with_service(&r, true, true, Some(&changed), None, false);
         assert_eq!(v.state, "degraded");
         let detail = v.detail.unwrap();
         assert!(
@@ -1614,6 +1661,41 @@ mod tests {
             !detail.contains("disable") && !detail.contains("enable"),
             "advice that cannot restart a stopped supervisor: {detail}"
         );
+    }
+
+    /// FU-68: a LaunchAgent plist means the recovery command is
+    /// `launchctl kickstart -k`, which launchd still owns. The manual
+    /// stop+start is only the no-plist path (the test above).
+    #[test]
+    fn a_package_changed_module_kickstarts_when_the_launch_agent_is_installed() {
+        use agent24_os_proto::supervisor::Status;
+        let r = report("pkg", MountOutcome::Mounted);
+        let changed = Status::PackageChanged {
+            reason: "the package directory no longer exists".to_owned(),
+            code: Some("package_changed"),
+        };
+        let detail = view_with_service(&r, true, true, Some(&changed), None, true)
+            .detail
+            .unwrap();
+        assert!(
+            detail.contains("launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24"),
+            "{detail}"
+        );
+        assert!(
+            !detail.contains("agent24 daemon stop && agent24 daemon start"),
+            "{detail}"
+        );
+        assert!(detail.contains("package_changed"), "{detail}");
+
+        let home = tempfile::tempdir().unwrap();
+        let plist = home
+            .path()
+            .join("Library/LaunchAgents/ai.auraai.agent24.plist");
+        assert!(!launch_agent_installed_in(Some(home.path().as_os_str())));
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, b"plist").unwrap();
+        assert!(launch_agent_installed_in(Some(home.path().as_os_str())));
+        assert!(!launch_agent_installed_in(None));
     }
 
     /// A package mounted at start is reported by its supervisor's status NOW:
