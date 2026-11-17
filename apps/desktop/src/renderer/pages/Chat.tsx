@@ -11,6 +11,7 @@ import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
+import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
   forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
@@ -200,6 +201,14 @@ export default function ChatPage() {
     draft.apply(request)
     setMessages(prev => [...prev, userMsg])
     setInput('')
+    // F1: a conversation about a document carries its text with each turn.
+    const doc = documentOf(sessionId)
+    const read = window.agent24.documents?.request
+    if (doc && read) {
+      const body = await documentText(doc, read as Parameters<typeof documentText>[1]).catch(() => null)
+      const last = request.messages[request.messages.length - 1]
+      if (body && body.text.trim() && last?.role === 'user') last.content = withDocument(doc, body, last.content)
+    }
     await requestReply(messages.length, request)
   }
 
@@ -261,6 +270,16 @@ export default function ChatPage() {
     void markConversationSeen(record.id)
   }
   useEffect(() => registerChatPage(id => void openSaved(id), newChat))
+
+  // F1: asked from a document's page: a new conversation about it (this one
+  // when it is still empty).
+  const askedDocument = useSyncExternalStore(subscribeDocContext, pendingDocument)
+  const boundDocument = useSyncExternalStore(subscribeDocContext, () => documentOf(sessionId))
+  useEffect(() => {
+    if (!askedDocument || requestInFlight.current) return
+    if (messages.length > 0) startNewChat(null)
+    else bindPendingDocument(sessionId)
+  }, [askedDocument, sessionId, messages.length])
 
   const setDelivery = (index: number, delivery: Delivery) => {
     setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
@@ -554,6 +573,14 @@ export default function ChatPage() {
       </div>
 
       {!archived && <DraftAttachments draft={draft} />}
+      {!archived && boundDocument && (
+        <div className="chat-draft">
+          <div className="chat-draft-chip" title={t('doc.context')}>
+            {'📄 '}{boundDocument.title}{' · '}{t('doc.context')}
+            <button className="chat-draft-remove" type="button" aria-label={t('doc.remove')} onClick={() => unbindDocument(sessionId)}>{'×'}</button>
+          </div>
+        </div>
+      )}
       {archived ? (
         <div className="chat-input-bar chat-archived-bar" role="status">
           <span className="chat-archived-notice">{t('archived.notice')}</span>
