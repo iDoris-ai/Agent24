@@ -257,8 +257,12 @@ fn clear_dir_contents(dir: &Path) -> Result<(), ProfileError> {
         let path = entry.path();
         let kind = entry.file_type().map_err(|error| fail(&path, error))?;
         if kind.is_dir() {
-            clear_dir_contents(&path)?;
-            std::fs::remove_dir(&path).map_err(|error| fail(&path, error))?;
+            // `remove_dir_all` clears any depth; the chmod walk is only for
+            // the read-only trees it cannot remove.
+            if std::fs::remove_dir_all(&path).is_err() {
+                clear_dir_contents(&path)?;
+                std::fs::remove_dir(&path).map_err(|error| fail(&path, error))?;
+            }
         } else {
             std::fs::remove_file(&path).map_err(|error| fail(&path, error))?;
         }
@@ -268,7 +272,12 @@ fn clear_dir_contents(dir: &Path) -> Result<(), ProfileError> {
 
 fn owner_rwx(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::symlink_metadata(dir)?.permissions().mode();
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        // Swapped for a symlink after the type check: chmod would follow it.
+        return Err(std::io::Error::other("not a directory"));
+    }
+    let mode = meta.permissions().mode();
     if mode & 0o700 == 0o700 {
         return Ok(());
     }

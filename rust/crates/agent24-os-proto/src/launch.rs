@@ -1466,6 +1466,19 @@ mod tests {
             crate::sandbox::reset_module_temp(&data).expect("a read-only tree is cleared");
             assert_eq!(std::fs::read_dir(data.join("tmp")).unwrap().count(), 0);
         }
+        // A tree deeper than PATH_MAX, built with relative paths.
+        {
+            // In a child shell: `set_current_dir` would move every test's cwd.
+            let built = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("i=0; while [ $i -lt 700 ]; do mkdir d && cd d || exit 1; i=$((i+1)); done")
+                .current_dir(data.join("tmp"))
+                .status()
+                .unwrap();
+            assert!(built.success());
+            crate::sandbox::reset_module_temp(&data).expect("a deep tree is cleared");
+            assert_eq!(std::fs::read_dir(data.join("tmp")).unwrap().count(), 0);
+        }
         // A symlink inside tmp: unlinked, its target kept.
         std::os::unix::fs::symlink(&elsewhere, data.join("tmp/link")).unwrap();
         crate::sandbox::reset_module_temp(&data).unwrap();
