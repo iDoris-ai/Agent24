@@ -120,15 +120,72 @@ async fn inputs(
     Ok(out)
 }
 
-/// `sha256:<hex>` and the size of the file at `path`.
-fn digest(path: &std::path::Path) -> std::io::Result<(String, i64)> {
-    let bytes = std::fs::read(path)?;
-    let hex: String = Sha256::digest(&bytes)
+/// The largest chunk an upload records (`upload_chunks.chunk_size`).
+const CHUNK: usize = 786_432;
+
+fn sha(bytes: &[u8]) -> String {
+    let hex: String = Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
+    format!("sha256:{hex}")
+}
+
+/// The file at `path`: its `sha256:<hex>`, size, and its chunks' offsets,
+/// sizes and hashes, as an upload records them.
+type Chunks = Vec<(i64, i64, String)>;
+fn digest(path: &std::path::Path) -> std::io::Result<(String, i64, Chunks)> {
+    let bytes = std::fs::read(path)?;
+    let mut chunks = Vec::new();
+    for (i, part) in bytes.chunks(CHUNK).enumerate() {
+        let offset = i64::try_from(i * CHUNK).map_err(std::io::Error::other)?;
+        let size = i64::try_from(part.len()).map_err(std::io::Error::other)?;
+        chunks.push((offset, size, sha(part)));
+    }
     let size = i64::try_from(bytes.len()).map_err(std::io::Error::other)?;
-    Ok((format!("sha256:{hex}"), size))
+    Ok((sha(&bytes), size, chunks))
+}
+
+/// The upload's rows, as the chunked upload writes them (the triggers in
+/// 0002/0004 allow no shortcut): receiving, each chunk, then complete.
+async fn record_upload(
+    storage: &Storage,
+    id: &str,
+    sha256: &str,
+    size: i64,
+    filename: &str,
+    chunks: &Chunks,
+) -> Result<(), sqlx::Error> {
+    let mut tx = storage.db.pool().begin_with("BEGIN IMMEDIATE").await?;
+    sqlx::query("INSERT INTO uploads (id, total_size, sha256, filename) VALUES (?, ?, ?, ?)")
+        .bind(id)
+        .bind(size)
+        .bind(sha256)
+        .bind(filename)
+        .execute(&mut *tx)
+        .await?;
+    for (offset, chunk_size, chunk_sha) in chunks {
+        sqlx::query(
+            "INSERT INTO upload_chunks (upload_id, chunk_offset, chunk_size, sha256) VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(offset)
+        .bind(chunk_size)
+        .bind(chunk_sha)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE uploads SET received = ?1,
+                    last_chunk_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                    status = CASE WHEN ?1 = total_size THEN 'complete' ELSE status END
+             WHERE id = ?2",
+        )
+        .bind(offset + chunk_size)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
 }
 
 pub async fn compose(
@@ -177,7 +234,7 @@ pub async fn compose(
         });
     }
     let read = data.clone();
-    let (sha256, size) = match blocking(move || digest(&read)).await {
+    let (sha256, size, chunks) = match blocking(move || digest(&read)).await {
         Ok(d) => d,
         Err(e) => {
             cleanup(dir).await;
@@ -195,17 +252,7 @@ pub async fn compose(
             .take(200)
             .collect::<String>()
     );
-    let wrote = sqlx::query(
-        "INSERT INTO uploads (id, total_size, sha256, filename, received, status, last_chunk_at)
-         VALUES (?, ?, ?, ?, ?, 'complete', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))",
-    )
-    .bind(&upload_id)
-    .bind(size)
-    .bind(&sha256)
-    .bind(&filename)
-    .bind(size)
-    .execute(storage.db.pool())
-    .await;
+    let wrote = record_upload(&storage, &upload_id, &sha256, size, &filename, &chunks).await;
     if let Err(e) = wrote {
         cleanup(dir).await;
         return Err(storage.db_failure(e).await);
