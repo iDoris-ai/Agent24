@@ -531,7 +531,8 @@ app.whenReady().then(async () => {
   // and start it again.
   void documentsModuleReady.then(async (outcome) => {
     if (outcome !== 'install_failed' || !launchAgentPlistExists()) return
-    for (let i = 0; i < 60 && !serviceDaemonOf(backendManager); i++) await new Promise((r) => setTimeout(r, 1000))
+    // Enrolled, and the presence connection up: the shutdown asks the box through it.
+    for (let i = 0; i < 90 && !(serviceDaemonOf(backendManager) && presenceConnection?.ready === true); i++) await new Promise((r) => setTimeout(r, 1000))
     const service = serviceDaemonOf(backendManager)
     const dataDir = tryDataDir()
     if (!service || dataDir === null) return
