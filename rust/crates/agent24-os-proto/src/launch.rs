@@ -1449,6 +1449,23 @@ mod tests {
                 .file_type()
                 .is_dir()
         );
+        // A Go-cache shape: a 0555 directory holding a 0444 file, and tmp at 0555.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cache = data.join("tmp/mod/pkg");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("f"), b"x").unwrap();
+            for (p, m) in [
+                (cache.join("f"), 0o444),
+                (cache.clone(), 0o555),
+                (data.join("tmp/mod"), 0o000),
+                (data.join("tmp"), 0o555),
+            ] {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+            }
+            crate::sandbox::reset_module_temp(&data).expect("a read-only tree is cleared");
+            assert_eq!(std::fs::read_dir(data.join("tmp")).unwrap().count(), 0);
+        }
         // A symlink inside tmp: unlinked, its target kept.
         std::os::unix::fs::symlink(&elsewhere, data.join("tmp/link")).unwrap();
         crate::sandbox::reset_module_temp(&data).unwrap();

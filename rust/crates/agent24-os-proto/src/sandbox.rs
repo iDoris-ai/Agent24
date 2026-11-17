@@ -240,38 +240,39 @@ fn create_temp(temp: &Path) -> Result<(), ProfileError> {
 }
 
 /// Remove entries in `dir` and nothing outside it. A symlink entry is unlinked,
-/// not followed.
+/// not followed. The module may have left read-only directories (a Go module
+/// cache is 0555 holding 0444 files), so each real directory is given owner
+/// rwx before it is read; the daemon owns these files. `chflags uchg` is left
+/// to an operator.
 fn clear_dir_contents(dir: &Path) -> Result<(), ProfileError> {
-    let entries = std::fs::read_dir(dir).map_err(|error| {
+    let fail = |what: &Path, error: std::io::Error| {
         ProfileError(format!(
-            "could not read the module temp directory {}: {error}",
-            dir.display()
+            "could not clear {} in the module temp directory: {error}",
+            what.display()
         ))
-    })?;
-    for entry in entries {
-        let entry = entry.map_err(|error| {
-            ProfileError(format!(
-                "could not read the module temp directory {}: {error}",
-                dir.display()
-            ))
-        })?;
+    };
+    owner_rwx(dir).map_err(|error| fail(dir, error))?;
+    for entry in std::fs::read_dir(dir).map_err(|error| fail(dir, error))? {
+        let entry = entry.map_err(|error| fail(dir, error))?;
         let path = entry.path();
-        let kind = entry.file_type().map_err(|error| {
-            ProfileError(format!("could not inspect {}: {error}", path.display()))
-        })?;
-        let removed = if kind.is_dir() {
-            std::fs::remove_dir_all(&path)
+        let kind = entry.file_type().map_err(|error| fail(&path, error))?;
+        if kind.is_dir() {
+            clear_dir_contents(&path)?;
+            std::fs::remove_dir(&path).map_err(|error| fail(&path, error))?;
         } else {
-            std::fs::remove_file(&path)
-        };
-        removed.map_err(|error| {
-            ProfileError(format!(
-                "could not clear {} in the module temp directory: {error}",
-                path.display()
-            ))
-        })?;
+            std::fs::remove_file(&path).map_err(|error| fail(&path, error))?;
+        }
     }
     Ok(())
+}
+
+fn owner_rwx(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::symlink_metadata(dir)?.permissions().mode();
+    if mode & 0o700 == 0o700 {
+        return Ok(());
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))
 }
 
 /// Canonicalise `path`, keeping a trailing component that does not exist yet
