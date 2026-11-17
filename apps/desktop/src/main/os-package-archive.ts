@@ -99,6 +99,9 @@ export function extractTarGz(file: string, dest: string): void {
       fs.mkdirSync(path.dirname(target), { recursive: true })
       assertNoSymlink(root, target)
       fs.writeFileSync(target, data, { flag: 'wx' })
+      // Keep the packaged permission bits: `os install` checks them against
+      // files.json. Only rwx survives, never setuid / setgid / sticky.
+      fs.chmodSync(target, octal(header, 100, 8) & 0o777)
     } else if (type === '5') {
       const target = safeArchivePath(root, name.replace(/\/$/, ''))
       fs.mkdirSync(target, { recursive: true })
