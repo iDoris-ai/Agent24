@@ -737,6 +737,27 @@ async fn schedule_changes_name_the_schedule_and_never_its_prompt() {
     );
 }
 
+/// Service-mode shell: no grant is `presence_required`, not `forbidden`.
+/// A confirmed grant stores the model. The dialog names the id the handler
+/// would store, and ignores the client's own summary.
+#[tokio::test]
+async fn shell_saves_the_default_model_only_after_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = agent24_memory::KvStore::open(&dir.path().join("memory.db"))
+        .await
+        .unwrap();
+    let d = daemon_with(|state| {
+        state.memory_kv = Some(kv);
+        state.router.set_default_model("EnvFallback");
+    })
+    .await;
+    let body = r#"{"model":"  Qwen3-30B  "}"#;
+    let text = d.ask("PUT", "/api/v1/models/default", body).await.unwrap();
+    assert!(text.contains("把默认聊天模型改为 \"Qwen3-30B\""), "{text}");
+    assert!(!text.contains("client says"), "{text}");
+    assert_eq!(d.state.router.default_model().as_deref(), Some("Qwen3-30B"));
+}
+
 #[tokio::test]
 async fn shutdown_has_its_fixed_text() {
     let d = daemon().await;
@@ -794,15 +815,18 @@ async fn a_query_string_leaves_nothing_to_approve() {
 }
 
 /// The level table is unchanged: every derived route is an Elevated row of
-/// its operation, and these are all of the three operations' Elevated rows.
+/// its operation, and these are all of those operations' Elevated rows.
 #[test]
-fn derived_routes_are_the_elevated_rows_of_the_three_operations() {
+fn derived_routes_are_the_elevated_rows_they_summarise() {
     let mut elevated: Vec<(String, String)> = policies()
         .iter()
         .filter(|p| {
             matches!(
                 p.operation,
-                Operation::ApprovalDecision | Operation::ScheduleManage | Operation::Shutdown
+                Operation::ApprovalDecision
+                    | Operation::ScheduleManage
+                    | Operation::Shutdown
+                    | Operation::ModelsAdmin
             ) && p.level == AssuranceLevel::Elevated
         })
         .map(|p| (p.method.to_owned(), p.template.to_owned()))

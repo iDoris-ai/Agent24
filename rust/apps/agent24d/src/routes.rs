@@ -66,7 +66,8 @@ pub(crate) struct PutDefaultModelBody {
 }
 
 /// `PUT /api/v1/models/default` — save the default chat model and use it on
-/// the next model-less completion. ProductHost only (see `host_only_route`).
+/// the next model-less completion. Elevated: ProductHost writes it directly;
+/// a service-mode shell confirms presence first.
 pub async fn put_default_model(
     State(state): State<AppState>,
     body: Result<Json<PutDefaultModelBody>, axum::extract::rejection::JsonRejection>,

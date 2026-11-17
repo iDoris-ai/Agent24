@@ -76,8 +76,9 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/idoris/operations/{id}/cancel", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
     row("POST", "/api/v1/chat", Operation::ChatCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/models", Operation::ModelsRead, AssuranceLevel::Everyday),
-    // ProductHost only: `host_only_route` refuses every other audience, and
-    // the shell token is not granted `ModelsAdmin`.
+    // Elevated: ProductHost writes it directly. A service-mode shell token
+    // holds `ModelsAdmin` and must confirm presence. The legacy shared token
+    // cannot elevate, so `legacy_unelevatable` still refuses it.
     row("PUT", "/api/v1/models/default", Operation::ModelsAdmin, AssuranceLevel::Elevated),
     row("GET", "/api/v1/decide/profile", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/capabilities/creative", Operation::CapabilityMint, AssuranceLevel::Elevated),

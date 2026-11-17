@@ -504,10 +504,10 @@ impl FirstPartyAuthority {
                     // `presence_desktop::gate` is the second, independent layer.
                     // `InboundWrite` is ProductHost-only the same way.
                     // `InboundIngest` is the dev-bridge component token only.
-                    // `ModelsAdmin` changes the daemon's default chat model
-                    // and is ProductHost-only the same way.
                     // Leaving them off this token means a later route that
                     // forgets its gate still stays closed to a shell.
+                    // `ModelsAdmin` stays: saving the default chat model is
+                    // Elevated, so a shell reaches it only after presence.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
                     } else {
@@ -518,7 +518,6 @@ impl FirstPartyAuthority {
                                 !op.is_presence_channel()
                                     && *op != Operation::InboundWrite
                                     && *op != Operation::InboundIngest
-                                    && *op != Operation::ModelsAdmin
                             })
                             .chain([Operation::ModuleRoute])
                             .collect()
@@ -687,7 +686,10 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
         // a summary the daemon derived from its own records.
         || (matches!(
             policy.operation,
-            Operation::ApprovalDecision | Operation::ScheduleManage | Operation::Shutdown
+            Operation::ApprovalDecision
+                | Operation::ScheduleManage
+                | Operation::Shutdown
+                | Operation::ModelsAdmin
         ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -830,8 +832,8 @@ pub(crate) const SUMMARY_MAX_UTF16: usize = 500;
 
 /// K-B3b: the routes whose summary `crate::elevation_summaries` derives.
 /// Every one is an Elevated row of the route policy; the level table itself
-/// is unchanged (`derived_routes_are_elevated_rows`).
-pub(crate) const DERIVED_ROUTES: [(&str, &str); 10] = [
+/// is unchanged (`derived_routes_are_the_elevated_rows_they_summarise`).
+pub(crate) const DERIVED_ROUTES: [(&str, &str); 11] = [
     ("POST", "/api/v1/approvals/{id}"),
     ("POST", "/api/v1/module-approvals/{id}"),
     (
@@ -845,6 +847,7 @@ pub(crate) const DERIVED_ROUTES: [(&str, &str); 10] = [
     ("POST", "/api/v1/schedules/{id}/suspend"),
     ("POST", "/api/v1/schedules/{id}/resume"),
     ("POST", "/api/v1/shutdown"),
+    ("PUT", "/api/v1/models/default"),
 ];
 
 pub(crate) fn derived_route(method: &str, template: &str) -> bool {
@@ -1132,7 +1135,7 @@ mod tests {
             .clone();
         assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
         assert!(!allowed.contains(&Operation::InboundIngest), "{allowed:?}");
-        assert!(!allowed.contains(&Operation::ModelsAdmin), "{allowed:?}");
+        assert!(allowed.contains(&Operation::ModelsAdmin), "{allowed:?}");
         assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
         assert!(
             store
