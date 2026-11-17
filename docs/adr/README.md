@@ -40,9 +40,9 @@
 | ADR-029 | [内核 ↔ 领域 OS 边界与 DomainModule 挂载缝](../decision.md) | 已接受（原文：采纳（边界原则）；挂载缝已实现） | 日志 | 领域系统可换且不改内核；原进程内编译方案已推翻，改走进程外 | ADR-030、ADR-031、ADR-039；ADR-026、ADR-028 |
 | ADR-031 | [ME-3 进程外模块的协议，按「缝」分别裁决](../decision.md) | 已接受（原文：采纳（裁决 FU-14，解除 ME-3 的开工前置）） | 日志 | 模块挂载缝不用会话协议，只定义出站回调；外壳那条缝本篇不裁 | ADR-029、ADR-K1-01；ADR-030 |
 | ADR-032 | [AgentEar（语音）与 iDoris（模型网关）接入 Agent24](../decision.md) | 已接受（原文：已接受） | 日志 | 语音端自启后附着接入；模型网关作兼容接口，不做成进程外模块 | [A3 设计](../design/A3-ATTACHED-MODULE.md)、[接入设计](../design/INTEGRATION-AGENTEAR-IDORIS.md) |
-| ADR-035 | [iDoris Admin session token 由可信 launcher 通过匿名 FD/HANDLE 一次性交付](../decision.md) | 部分取代（ADR-046 取代交给 Electron main 的条款；stdin 交给 iDoris 仍有效。原文：采纳（jason 明确拍板）） | 日志 | token 经继承的匿名句柄交给 iDoris，不落盘不走环境变量；桌面不再持有 | ADR-032、ADR-046；[launcher 设计](../agent/IDORIS-LAUNCHER-DESIGN.md) |
+| ADR-035 | [iDoris Admin session token 由可信 launcher 通过匿名 FD/HANDLE 一次性交付](../decision.md) | 部分取代（ADR-046 取代决策 1 后半、决策 3、决策 4、决策 5 的双管道丢副本、信任边界里的 Electron main。ADR-KB-02 不取代本篇任何一节。stdin 交给 iDoris 仍有效。原文：采纳（jason 明确拍板）） | 日志 | token 经 stdin 交给 iDoris，不落盘不走环境变量；桌面不再持有 Admin token | ADR-032、ADR-046、ADR-KB-02；[launcher 设计](../agent/IDORIS-LAUNCHER-DESIGN.md) |
 | ADR-036 | [硬件探测与整机内存账归 Agent24，模型选型归 iDoris](../decision.md) | 已接受（原文：采纳（jason 2026-10-14 拍板）） | 日志 | Agent24 管硬件探测和内存账（`agent24-hw`），iDoris 管选模型 | ADR-032；[HW-TIERS 设计](../design/HW-TIERS-capability-hardware-matrix.md)；ADR-033 |
-| ADR-046 | [iDoris 由 agent24d 托管](ADR-046-idoris-managed-host.md) | 已接受（2026-11-12，S0-8；S2-2 #1790） | adr/ | daemon 监督 iDoris；Admin token 只经 stdin 交给子进程；数据 key 在钥匙串；上游密钥走注入的 Provisioner | ADR-032、ADR-035、ADR-036、ADR-037 |
+| ADR-046 | [iDoris 由 agent24d 托管](ADR-046-idoris-managed-host.md) | 已接受（2026-11-17 订正；S0-8；IL-13 #1472，S2-2 #1790） | adr/ | daemon 监督 iDoris；Admin token 只经 stdin 交给子进程；安装/连接/启动/停止走 daemon 的生命周期 API；数据 key 在钥匙串 | ADR-032、ADR-035、ADR-036、ADR-037 |
 | ADR-033 | [`agent24-decide` 位于 L3，D0-1 只定契约](../decision.md) | 已接受（原文：采纳（D0-1）；D0-3 起 agent24d 已接入） | 日志 | 决策服务放在第三层，这一片不接到任何现有调用，也不能放宽权限 | ADR-034 |
 | ADR-034 | [`agent24-decide` 决策日志契约由 `agent24d` 实现](../decision.md) | 已接受（原文：采纳（D0-2）） | 日志 | 日志落库放在组合根进程，存储层与决策层互不依赖 | ADR-033 |
 | ADR-DOC-01 | [Documenting 的定位、进程形态与对外暴露](../documenting/adr/ADR-DOC-01-placement-and-integration.md) | 已接受（原文：Accepted） | DOC/ | Documenting 作为进程外 OS `documents`，工具由模块声明、内核执行资料政策 | ADR-DOC-02、ADR-K1-01；ADR-029、ADR-031、ADR-K1-02 |
@@ -50,7 +50,7 @@
 | ADR-DOC-03 | [DOCX 编辑引擎与转换 worker](../documenting/adr/ADR-DOC-03-docx-engine-and-conversion.md) | 搁置（待 #692 格式矩阵冻结；原为 Accepted 2026-10-08，但引擎只有 PDFKit，从未实现） | DOC/ | 文档引擎只用 SuperDoc 无头组件并按需下载；转换走 LibreOffice，同样按需 | ADR-DOC-01、ADR-DOC-02 |
 | ADR-KB-01a | [知识能力进入 Agent24 唯一主对话：单一主对话 + 只读检索证据](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) | 已接受（拆分后的 KB-01a；#1503–#1511、#1515、#1524） | KB/ | 迁移入口与编排权，复用 WeKnora 流程；只有一个主对话，检索只读、带出处 | [知识契约](../knowledge/CONTRACT-OPS-v2.md) |
 | ADR-KB-01b | [知识能力进入 Agent24 唯一主对话：KnowledgeView 管理页、深度子任务、写操作](../knowledge/ADR-KB-01-SINGLE-CONVERSATION.md) | 提议（拆分后的 KB-01b；挂 KB-C2 至 KB-C4） | KB/ | 管理页、深度知识子任务、写操作 / ContextPack / SOP 另行评审；尚未开工 | [知识契约](../knowledge/CONTRACT-OPS-v2.md) |
-| ADR-KB-02 | [知识库宿主的凭据交接与授权归属](../knowledge/ADR-KB-02-HOST-AUTHORITY.md) | 已接受（2026-11-12，S0-8；记录 KB-HOST-01） | KB/ | 长期登录态在桌面 safeStorage；短期凭据只在 daemon 内存；只有 ProductHost 能交接；Knowledge 工具保持 builtin | ADR-KB-01a、ADR-039、ADR-K1-03 |
+| ADR-KB-02 | [知识库宿主的凭据交接与授权归属](../knowledge/ADR-KB-02-HOST-AUTHORITY.md) | 已接受（2026-11-17 订正；S0-8；记录 KB-HOST-01，#1852 之后） | KB/ | 长期登录态在桌面 safeStorage；短期凭据只在 daemon 内存；ProductHost 或桌面外壳可交接；Knowledge 工具保持 builtin | ADR-KB-01a、ADR-039、ADR-K1-03 |
 | ADR-OD-001 | [Agent24 × Open Design 集成边界](../open-design-workspace/design/ADR-001-INTEGRATION-BOUNDARIES.md) | 已接受（原文：Accepted / P0 frozen） | OD/ | Agent24 是唯一 AI 控制面，Open Design 是创作工作区且不取得工具权限 | ADR-OD-002/003/004/005 |
 | ADR-OD-002 | [`a24.workspace.v1`](../open-design-workspace/design/ADR-002-WORKSPACE-CONTRACT.md) | 已接受（原文：Accepted / P0 frozen） | OD/ | workspace 注册表是身份、根目录和 run 绑定的唯一来源 | ADR-OD-001、ADR-OD-006；ADR-OD-005 |
 | ADR-OD-003 | [`agent24.open-design.v1` ACP bridge](../open-design-workspace/design/ADR-003-ACP-BRIDGE.md) | 已接受（原文：Accepted / P0 frozen） | OD/ | Open Design 经 stdio ACP 调 bundled `agent24 acp` | ADR-OD-002 |
@@ -194,6 +194,8 @@ Fable 初稿的五份 ADR 草案，原样保留、不再更新，最终版见上
 - 新文字里裸写 `ADR-001` 至 `ADR-006` 时，必须带路径或写成 `ADR-OD-00x`；不带前缀的 ADR-00x 只指 `docs/decision.md`。
 
 ## 核对记录
+
+2026-11-17（S0-8 订正）：#1852 之后知识库宿主增加桌面 `FirstPartyShell`（`shell:ai.auraai.agent24`），序号从查询串改到 JSON 正文，绑定变更在服务模式要在场确认。ADR-KB-02、ADR-046 按现行代码改行号和这几条。ADR-035 文首写明：被取代的节只归 ADR-046；ADR-KB-02 不取代它的任何一节。索引三行与文首对齐。未改 `docs/tracking/`。下一号仍是 ADR-047。
 
 2026-11-12（S0-8）：新增 ADR-KB-02、ADR-046；ADR-035 改为部分取代，被取代条款写在日志文首和 ADR-046 D3。下一号改为 ADR-047。未改 `docs/tracking/2026-11-10/`。
 
