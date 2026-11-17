@@ -71,6 +71,15 @@ describe('mac installer carries the documents module (T1-1)', () => {
     }
   })
 
+  it('mac extraResources copies .sin90-module to sin90-module and signs bin/sin90', () => {
+    const entries = pkg.build.mac.extraResources.filter((r) => r.to === 'sin90-module')
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.from).toBe('.sin90-module')
+    const binaries = (pkg.build.mac as { binaries?: string[] }).binaries ?? []
+    expect(binaries).toContain('Contents/Resources/sin90-module/bin/sin90')
+    expect(pkg.scripts['stage:sin90']).toBe('bash scripts/stage-sin90-module.sh')
+  })
+
   it('mac signs both module programs as binaries (T1-3: Hardened Runtime, the app\'s team)', () => {
     const binaries = (pkg.build.mac as { binaries?: string[] }).binaries ?? []
     expect(binaries).toEqual(expect.arrayContaining([
@@ -87,6 +96,9 @@ describe('mac installer carries the documents module (T1-1)', () => {
     expect(cargo).toBeGreaterThan(-1)
     expect(stage).toBeGreaterThan(cargo)
     expect(builder).toBeGreaterThan(stage)
+    const sin90 = release.indexOf('scripts/stage-sin90-module.sh" "$ARCH"')
+    expect(sin90).toBeGreaterThan(stage)
+    expect(builder).toBeGreaterThan(sin90)
   })
 
   it('build:mac builds and stages the module before electron-builder', () => {
@@ -94,7 +106,8 @@ describe('mac installer carries the documents module (T1-1)', () => {
     const at = (s: string): number => steps.indexOf(s)
     expect(at('pnpm build:rust:documents')).toBeGreaterThanOrEqual(0)
     expect(at('pnpm stage:documents')).toBeGreaterThan(at('pnpm build:rust:documents'))
-    expect(at('electron-builder --mac')).toBeGreaterThan(at('pnpm stage:documents'))
+    expect(at('pnpm stage:sin90')).toBeGreaterThan(at('pnpm stage:documents'))
+    expect(at('electron-builder --mac')).toBeGreaterThan(at('pnpm stage:sin90'))
     expect(pkg.scripts['build:win']).not.toMatch(/documents/)
     expect(pkg.scripts['build:linux']).not.toMatch(/documents/)
   })

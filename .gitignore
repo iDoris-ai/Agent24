@@ -6,6 +6,9 @@ apps/desktop/.open-design-component/
 apps/desktop/.open-design-component-dist/
 apps/desktop/.documents-module/
 apps/desktop/.documents-module.tmp.*/
+apps/desktop/.sin90-module/
+apps/desktop/.sin90-module.tmp.*/
+apps/desktop/.sin90-module-cache/
 apps/desktop/.open-design-build/
 .vite/
 .turbo/
