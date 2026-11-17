@@ -59,16 +59,7 @@ pub trait Engine: Send + Sync {
     fn render(&self, _media_type: &str, _path: &Path, _ask: RenderAsk) -> Render {
         Box::pin(async { Err(RenderError::Unsupported) })
     }
-
-    /// D2: a new PDF at `out` of `parts` — each a PDF and its pages (`all`
-    /// or `1-3,5`), in order — and its page count. An engine that does not
-    /// compose composes nothing.
-    fn compose(&self, _out: &Path, _parts: &[(std::path::PathBuf, String)]) -> Compose {
-        Box::pin(async { Err(RenderError::Unsupported) })
-    }
 }
-
-pub type Compose = Pin<Box<dyn Future<Output = Result<u32, RenderError>> + Send>>;
 
 /// A render asked for: a 1-based page; a scale from [`MIN_SCALE`] to
 /// [`MAX_SCALE`], which the engine may lower until the PNG fits in
