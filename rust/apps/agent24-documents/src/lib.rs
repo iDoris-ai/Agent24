@@ -13,6 +13,7 @@ pub mod authorization;
 pub mod blob;
 pub mod compose;
 pub mod db;
+pub mod derived;
 pub mod documents;
 pub mod engine;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod id;
 pub mod idem;
 pub mod imports;
 pub mod jobs;
+pub mod office;
 pub mod oplog;
 pub mod pdf_compose;
 pub mod read;
@@ -193,6 +195,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/imports", post(imports::handler::import))
         .route("/compositions", post(compose::compose))
+        .route(
+            "/documents/{document_id}/conversions",
+            post(office::convert),
+        )
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/retry", post(jobs::retry_job))
