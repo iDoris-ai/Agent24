@@ -896,9 +896,8 @@ mod tests {
                 "{bad}"
             );
         }
-        // positive control: the numeric form IS accepted on the REST path
-        // (unchanged there this round — see §6.3's trade-off)
-        assert!(next_fire::validate(&cron("0 7 * * 1-5").into()).is_ok());
+        // REST uses the same engine and refuses numbers too (FU-71).
+        assert!(next_fire::validate(&cron("0 7 * * 1-5").into()).is_err());
         for good in [
             "0 7 * * *",
             "0 7 * * MON-FRI",
@@ -974,8 +973,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next_fire::next_fire(&lower, sat).unwrap(), Some(first));
-        // negative control documenting WHY numbers are refused: the engine
-        // reads `1-5` as Sun..Thu, so from Saturday it fires on SUNDAY.
+        // Negative control documenting WHY numbers are refused at create:
+        // the engine reads `1-5` as Sun..Thu, so from Saturday a row saved
+        // before the rule fires on SUNDAY (it still computes, so the tick
+        // never disables it).
         let numeric = ScheduleSpec::Cron {
             expr: "0 7 * * 1-5".into(),
             tz: None,

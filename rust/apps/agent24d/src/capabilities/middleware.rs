@@ -627,6 +627,17 @@ async fn authorize(
                                 "Request body exceeds limit",
                             );
                         };
+                        // An id the handler rejects is 400 here, before presence.
+                        if method == Method::PUT
+                            && template == "/api/v1/models/default"
+                            && let Err(message) = crate::default_model::validate_put_body(&bytes)
+                        {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                message,
+                            );
+                        }
                         if !query
                             && let Some(authority) = &state.first_party
                             && let Some(summary) = crate::elevation_summaries::derive(

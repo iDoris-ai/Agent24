@@ -1805,6 +1805,56 @@ async fn skill_activation_business_failures_answer_before_elevation() {
     );
 }
 
+/// FU-132. The legacy shared token cannot change the default chat model.
+/// Mutation: delete the `PUT /api/v1/models/default` arm of
+/// `legacy_unelevatable` and the legacy call below saves the model.
+#[tokio::test]
+async fn default_model_refuses_legacy_and_creative_tokens_and_admits_the_host() {
+    let path = "/api/v1/models/default";
+    let body = r#"{"model":"Qwen3-30B"}"#;
+
+    let mut legacy = tests::state().await;
+    let dir = tempfile::tempdir().unwrap();
+    let kv = agent24_memory::KvStore::open(&dir.path().join("memory.db"))
+        .await
+        .unwrap();
+    legacy.memory_kv = Some(kv);
+    legacy.router.set_default_model("EnvFallback");
+    let refused = build_router(legacy.clone())
+        .oneshot(request("testtoken", "PUT", path, body, None))
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(refused).await, "forbidden");
+    assert_eq!(
+        legacy.router.default_model().as_deref(),
+        Some("EnvFallback")
+    );
+
+    let (mut state, host, creative) = tests::capability_state().await;
+    let dir = tempfile::tempdir().unwrap();
+    let kv = agent24_memory::KvStore::open(&dir.path().join("memory.db"))
+        .await
+        .unwrap();
+    state.memory_kv = Some(kv);
+    state.router.set_default_model("EnvFallback");
+    let router = build_router(state.clone());
+    let denied = router
+        .clone()
+        .oneshot(request(&creative, "PUT", path, body, None))
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert_eq!(error_code(denied).await, "forbidden");
+    assert_eq!(state.router.default_model().as_deref(), Some("EnvFallback"));
+    let admitted = router
+        .oneshot(request(&host, "PUT", path, body, None))
+        .await
+        .unwrap();
+    assert_eq!(admitted.status(), StatusCode::OK);
+    assert_eq!(state.router.default_model().as_deref(), Some("Qwen3-30B"));
+}
+
 /// The legacy shared token cannot be elevated, so it is refused outright. The
 /// host token (the desktop main process) is the one that may call directly,
 /// and a Creative token never can.
