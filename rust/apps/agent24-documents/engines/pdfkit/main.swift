@@ -1,10 +1,9 @@
 // agent24-documents-pdfkit: the slice-1 read engine of the Documenting OS
 // (ADR-DOC-01 D6 amendment, ADR-DOC-02 §3.1, §4). One run reads one file.
-// No network; no files written, apart from `compose`'s output.
+// No network, no files written.
 //
 //   agent24-documents-pdfkit parse <path> <media-type>
 //   agent24-documents-pdfkit render <path> <media-type> <page> <scale> <max-bytes> [x0,y0,x1,y1]
-//   agent24-documents-pdfkit compose <out.pdf> <in.pdf> <pages> [<in.pdf> <pages> …]   (compose.swift)
 //
 // `parse` (protocol 1, only on exit 0) writes one JSON object: each page's
 // size and its lines in reading order, each a text and a rectangle in CropBox
@@ -129,18 +128,6 @@ let usage = """
   """
 let args = CommandLine.arguments
 let command = args.count > 1 ? args[1] : ""
-if command == "compose" {
-  do {
-    try FileHandle.standardOutput.write(contentsOf: try composeCommand(Array(args[2...])))
-    exit(0)
-  } catch Failure.noPage {
-    fail(4, "no such page")
-  } catch Failure.failed(let why) {
-    fail(3, why)
-  } catch {
-    fail(3, error.localizedDescription)
-  }
-}
 if !(command == "parse" && args.count == 4) && !(command == "render" && (7...8).contains(args.count)) {
   fail(64, usage)
 }

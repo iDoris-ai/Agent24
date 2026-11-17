@@ -14,6 +14,8 @@ path = "src/main.rs"
 agent24-os-sdk = { path = "../../crates/agent24-os-sdk" }
 axum = { version = "0.8", default-features = false, features = ["json", "tokio", "http1"] }
 getrandom = { version = "0.3", features = ["std"] }
+# D2: split / merge PDFs by moving the original objects (no re-drawing).
+lopdf = { version = "0.47", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = "0.10"

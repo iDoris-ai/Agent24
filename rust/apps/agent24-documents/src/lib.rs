@@ -24,6 +24,7 @@ pub mod idem;
 pub mod imports;
 pub mod jobs;
 pub mod oplog;
+pub mod pdf_compose;
 pub mod read;
 pub mod scope;
 pub mod state;
