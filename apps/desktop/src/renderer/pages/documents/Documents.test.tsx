@@ -28,7 +28,7 @@ type Res = { ok: boolean; status: number; data?: unknown; error?: unknown }
 const ok = (data: unknown): Promise<Res> => Promise.resolve({ ok: true, status: 200, data })
 const err = (status: number, code: string, message: string, details?: unknown): Promise<Res> =>
   Promise.resolve({ ok: false, status, error: { code, message, ...(details ? { details } : {}) } })
-const IMPORT = { name: '导入文件（PDF、JPEG、PNG）' }
+const IMPORT = { name: '导入文件（PDF、图片、Word、Excel、PPT）' }
 
 interface Mock {
   request: ReturnType<typeof vi.fn>

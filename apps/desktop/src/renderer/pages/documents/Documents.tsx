@@ -33,6 +33,12 @@ const moduleNotInstalled = (res: { ok: boolean; status?: number; error?: { code?
   !res.ok && res.status === 404 && res.error?.code === 'not_found'
 const ALERT = { color: '#e5534b', fontSize: 13, margin: '8px 0' } as const
 const CELL = { padding: '6px 12px 6px 0', borderBottom: '1px solid var(--border)', textAlign: 'left' } as const
+const OFFICE_FORMAT: Record<string, string> = {
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'DOCX',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'XLSX',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'PPTX',
+}
+const formatOf = (media: string): string => OFFICE_FORMAT[media] ?? media
 
 export default function DocumentsPage() {
   const t = useT(documentsMessages)
@@ -300,7 +306,7 @@ export default function DocumentsPage() {
                     {d.title}
                   </button>
                 </td>
-                <td style={CELL}>{d.media_type}</td>
+                <td style={CELL}>{formatOf(d.media_type)}</td>
                 <td style={CELL}>{new Date(d.created_at).toLocaleString()}</td>
               </tr>
             ))}

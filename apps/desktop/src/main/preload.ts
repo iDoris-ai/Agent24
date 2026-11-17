@@ -38,6 +38,7 @@ import {
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
+  type OfficeEngineStatus,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type ApprovalDecisionInput,
@@ -300,13 +301,22 @@ const api = {
       ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
     /** T1-1/T1-2: the documents module as it is on disk now. */
     moduleStatus: (): Promise<DocumentsModuleStatus> => ipcRenderer.invoke(IpcChannels.DocumentsModuleStatus),
-    /** Picks a PDF, JPEG or PNG and imports it; null if the user cancels. */
+    /** Picks a PDF, JPEG, PNG, DOCX, XLSX or PPTX and imports it; null if the user cancels. */
     importFile: (): Promise<DocumentsResponse<'job'> | null> =>
       ipcRenderer.invoke(IpcChannels.DocumentsImportFile),
     onImportProgress: (cb: (p: DocumentsImportProgress) => void): (() => void) => {
       const listener = (_event: unknown, p: DocumentsImportProgress): void => cb(p)
       ipcRenderer.on(IpcChannels.DocumentsImportProgress, listener)
       return () => ipcRenderer.removeListener(IpcChannels.DocumentsImportProgress, listener)
+    },
+    officeEngineStatus: (): Promise<OfficeEngineStatus> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineStatus),
+    installOfficeEngine: (): Promise<OfficeEngineStatus> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineInstall),
+    onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
+      const listener = (_event: unknown, s: OfficeEngineStatus): void => cb(s)
+      ipcRenderer.on(IpcChannels.DocumentsOfficeEngineChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsOfficeEngineChanged, listener)
     },
     /** The OS's job and document events (hints: read the job or list again). */
     onEvent: (cb: (e: DocumentsEvent) => void): (() => void) => {

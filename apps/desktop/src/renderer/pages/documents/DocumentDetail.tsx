@@ -10,7 +10,14 @@ import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
-import { compose, pagesOk } from './compose'
+import { compose, convert, pagesOk } from './compose'
+
+const OFFICE_TYPE = new Set([
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+])
+const isOffice = (media: string): boolean => OFFICE_TYPE.has(media)
 
 type Detail = components['schemas']['DocumentDetail']
 type Block = components['schemas']['DocumentsTextBlock']
@@ -45,6 +52,54 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     if (out.ok) setSplitting(null)
   }
   const api = window.agent24.documents
+  // D1: an Office document is stored as-is. Convert it to PDF before preview.
+  const [convertBusy, setConvertBusy] = useState(false)
+  const [convertNote, setConvertNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const [needEngine, setNeedEngine] = useState(false)
+  const [downloadText, setDownloadText] = useState<string | null>(null)
+  const runConvert = async (id: string) => {
+    setConvertBusy(true)
+    setNeedEngine(false)
+    setConvertNote({ ok: true, text: t('compose.working') })
+    const out = await convert(api, id)
+    setConvertBusy(false)
+    if (out.ok) {
+      setConvertNote({ ok: true, text: t('compose.done') })
+      return
+    }
+    if (out.engineMissing) {
+      setConvertNote(null)
+      setNeedEngine(true)
+      return
+    }
+    setConvertNote({ ok: false, text: t('compose.failed', { error: out.message }) })
+  }
+  const downloadEngine = async (id: string) => {
+    setNeedEngine(false)
+    setConvertNote(null)
+    setDownloadText('')
+    const stop = api.onOfficeEngineChanged((s) => {
+      if (s.state !== 'installing') return
+      const received = s.received ?? 0
+      setDownloadText(s.total === undefined
+        ? `${(received / (1024 * 1024)).toFixed(1)} MB`
+        : t('office.downloading', { percent: Math.floor((received / s.total) * 100) }))
+    })
+    try {
+      const status = await api.installOfficeEngine()
+      setDownloadText(null)
+      if (status.state === 'ready') {
+        await runConvert(id)
+        return
+      }
+      setConvertNote({ ok: false, text: t('office.downloadFailed', { error: status.error ?? status.state }) })
+    } catch (error) {
+      setDownloadText(null)
+      setConvertNote({ ok: false, text: t('office.downloadFailed', { error: error instanceof Error ? error.message : String(error) }) })
+    } finally {
+      stop()
+    }
+  }
   const [detail, setDetail] = useState<Detail | null>(null)
   const [blocks, setBlocks] = useState<Block[]>([])
   // The pages read so far that were not fully parsed: a page cut short is
@@ -130,6 +185,10 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setLastPage(null)
     setRendering(false)
     setImageError(null)
+    setConvertBusy(false)
+    setConvertNote(null)
+    setNeedEngine(false)
+    setDownloadText(null)
     heading.current?.focus()
     void api.request({ op: 'get', documentId }).then((res) => {
       if (gen !== generation.current) return
@@ -138,8 +197,10 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
         return
       }
       setDetail(res.data)
-      void read(gen, res.data)
-      void show(res.data, 1)
+      if (!isOffice(res.data.head.media_type)) {
+        void read(gen, res.data)
+        void show(res.data, 1)
+      }
     })
     return () => {
       generation.current++
@@ -155,7 +216,7 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           {detail?.title ?? ''}
         </div>
         <div style={{ display: 'flex', gap: 6 }}>
-          {detail && (
+          {detail && !isOffice(detail.head.media_type) && (
             <button className="btn btn-primary" onClick={() => {
               // F1: a new conversation about this document, its text sent with each turn.
               askAboutDocument({ id: detail.document_id, title: detail.title ?? '', revision: detail.head.revision })
@@ -195,7 +256,25 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           })}
         </p>
       )}
-      {detail && (
+      {detail && isOffice(detail.head.media_type) && (
+        <div style={{ margin: '8px 0' }}>
+          <p>{t('office.note')}</p>
+          <button className="btn btn-primary" disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id)}>
+            {t('office.convert')}
+          </button>
+          {needEngine && (
+            <>
+              <p>{t('office.needEngine')}</p>
+              <button className="btn btn-primary" disabled={downloadText !== null} onClick={() => void downloadEngine(detail.document_id)}>
+                {t('office.download')}
+              </button>
+            </>
+          )}
+          {downloadText ? <p role="status">{downloadText}</p> : null}
+          {convertNote && <p role={convertNote.ok ? 'status' : 'alert'}>{convertNote.text}</p>}
+        </div>
+      )}
+      {detail && !isOffice(detail.head.media_type) && (
         <figure style={{ margin: '8px 0' }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <button
@@ -234,7 +313,7 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           {error}
         </div>
       )}
-      {detail && !loading && !error && blocks.length === 0 && !more && unparsed.size === 0 && (
+      {detail && !isOffice(detail.head.media_type) && !loading && !error && blocks.length === 0 && !more && unparsed.size === 0 && (
         <p style={{ color: 'var(--muted)' }}>{t('detail.noText')}</p>
       )}
       <div style={{ fontSize: 13, whiteSpace: 'pre-wrap' }}>

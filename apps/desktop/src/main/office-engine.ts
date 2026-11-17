@@ -8,8 +8,16 @@
 // Design and the measurements behind it:
 // stop-the-world/ui-materials/2026-11-18-d1-office-to-pdf-design.md
 
+import crypto from 'node:crypto'
+import { execFile as execFileCb } from 'node:child_process'
+import { once } from 'node:events'
+import fs from 'node:fs'
+import { mkdir, mkdtemp, rename, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import type { OfficeEngineStatus } from '../shared/ipc-types'
+
+const execFile = promisify(execFileCb)
 
 export const LIBREOFFICE_VERSION = '26.8.3'
 
@@ -59,19 +67,205 @@ export interface OfficeEngineDeps {
 
 /** Downloads and installs once; status() is what the page shows. */
 export class OfficeEngine {
+  private readonly listeners = new Set<(status: OfficeEngineStatus) => void>()
+  private inflight: Promise<OfficeEngineStatus> | null = null
+  /** True only while an install is in progress this run. */
+  private active = false
+  private received = 0
+  private total: number | undefined
+  /** Why the last install in this run failed, if it did. */
+  private failure: string | null = null
+  private lastNote = 0
+  private noteTimer: ReturnType<typeof setTimeout> | null = null
+
   constructor(private readonly deps: OfficeEngineDeps) {}
 
   status(): OfficeEngineStatus {
+    if (this.active) {
+      const status: OfficeEngineStatus = { state: 'installing', received: this.received }
+      if (this.total !== undefined) status.total = this.total
+      return status
+    }
+    const dataDir = this.deps.dataDir()
+    if (dataDir === null) return { state: 'failed', error: 'no data directory' }
+    if (fs.existsSync(path.join(officeEngineDir(dataDir), 'READY.json'))) return { state: 'ready' }
+    if (this.failure !== null) return { state: 'failed', error: this.failure }
     return { state: 'missing' }
   }
 
   /** Starts (or joins) the install; resolves with the final status. */
   install(): Promise<OfficeEngineStatus> {
-    return Promise.resolve(this.status())
+    if (this.inflight) return this.inflight
+    const run = this.execute().finally(() => {
+      this.active = false
+      if (this.noteTimer) {
+        clearTimeout(this.noteTimer)
+        this.noteTimer = null
+      }
+      if (this.inflight === run) this.inflight = null
+    })
+    this.inflight = run
+    return run
   }
 
   onChange(listener: (status: OfficeEngineStatus) => void): () => void {
-    void listener
-    return () => {}
+    this.listeners.add(listener)
+    return () => { this.listeners.delete(listener) }
+  }
+
+  private emit(status: OfficeEngineStatus): void {
+    if (this.noteTimer) {
+      clearTimeout(this.noteTimer)
+      this.noteTimer = null
+    }
+    this.lastNote = Date.now()
+    for (const listener of [...this.listeners]) listener(status)
+  }
+
+  /** Progress changes notify at most once every 200 ms. */
+  private noteProgress(received: number): void {
+    this.received = received
+    const since = Date.now() - this.lastNote
+    if (since >= 200) {
+      this.emit(this.status())
+      return
+    }
+    if (this.noteTimer) return
+    this.noteTimer = setTimeout(() => {
+      this.noteTimer = null
+      if (!this.active) return
+      this.emit(this.status())
+    }, 200 - since)
+  }
+
+  private fail(error: string): OfficeEngineStatus {
+    this.active = false
+    this.failure = error
+    const status: OfficeEngineStatus = { state: 'failed', error }
+    this.emit(status)
+    return status
+  }
+
+  private async execute(): Promise<OfficeEngineStatus> {
+    const dataDir = this.deps.dataDir()
+    if (dataDir === null) return this.fail('no data directory')
+    const finalDir = officeEngineDir(dataDir)
+    const work = `${finalDir}.partial`
+    const dmg = this.deps.arch === 'arm64' ? LIBREOFFICE_DMG.arm64 : LIBREOFFICE_DMG.x64
+    const items = [
+      { url: dmg.url, sha256: dmg.sha256, dest: path.join(work, 'LibreOffice.dmg'), name: 'LibreOffice.dmg' },
+      ...OFFICE_FONTS.map((font) => ({
+        url: font.url, sha256: font.sha256, dest: path.join(work, 'fonts', font.name), name: font.name,
+      })),
+    ]
+    this.total = dmg.size === 0 ? undefined : dmg.size + OFFICE_FONTS.reduce((sum, font) => sum + font.size, 0)
+    this.received = 0
+    this.failure = null
+    this.active = true
+    this.emit(this.status())
+    const ac = new AbortController()
+    try {
+      await rm(work, { recursive: true, force: true })
+      await mkdir(path.join(work, 'fonts'), { recursive: true })
+      let done = 0
+      for (const item of items) {
+        let current = 0
+        await this.deps.download(item.url, item.dest, (bytes) => {
+          current = bytes
+          this.noteProgress(done + bytes)
+        }, ac.signal)
+        if (current === 0) {
+          current = (await stat(item.dest)).size
+          this.noteProgress(done + current)
+        }
+        done += current
+        const hash = await this.deps.sha256(item.dest)
+        if (hash !== item.sha256) throw new Error(`sha256 mismatch: ${item.name}`)
+      }
+      const dmgPath = path.join(work, 'LibreOffice.dmg')
+      await this.deps.extractApp(dmgPath, path.join(work, 'LibreOffice.app'))
+      await rm(dmgPath)
+      await writeFile(path.join(work, 'READY.json'), JSON.stringify({
+        version: LIBREOFFICE_VERSION,
+        dmg_sha256: dmg.sha256,
+        fonts: OFFICE_FONTS.map((font) => font.name),
+      }))
+      await rm(finalDir, { recursive: true, force: true })
+      await rename(work, finalDir)
+      this.active = false
+      const ready: OfficeEngineStatus = { state: 'ready' }
+      this.emit(ready)
+      return ready
+    } catch (error) {
+      ac.abort()
+      await rm(work, { recursive: true, force: true }).catch(() => {})
+      return this.fail(error instanceof Error ? error.message : String(error))
+    }
+  }
+}
+
+/** The installer the app runs: fetch, sha256, and hdiutil. */
+export function realOfficeEngineDeps(dataDir: () => string | null): OfficeEngineDeps {
+  return {
+    dataDir,
+    arch: process.arch,
+    download: async (url, dest, progress, signal) => {
+      const res = await fetch(url, { redirect: 'follow', signal })
+      if (!res.ok) {
+        await res.body?.cancel().catch(() => {})
+        throw new Error(`HTTP ${res.status}`)
+      }
+      if (!res.body) throw new Error('empty body')
+      await mkdir(path.dirname(dest), { recursive: true })
+      const ws = fs.createWriteStream(dest)
+      const reader = res.body.getReader()
+      const broken = new Promise<never>((_, reject) => { ws.on('error', reject) })
+      let received = 0
+      try {
+        for (;;) {
+          const { done, value } = await Promise.race([reader.read(), broken])
+          if (done) break
+          received += value.byteLength
+          if (!ws.write(value)) await Promise.race([once(ws, 'drain').then(() => undefined), broken])
+          progress(received)
+        }
+        await Promise.race([
+          new Promise<void>((resolve, reject) => { ws.end((error?: Error | null) => (error ? reject(error) : resolve())) }),
+          broken,
+        ])
+      } catch (error) {
+        ws.destroy()
+        await reader.cancel().catch(() => {})
+        throw error
+      }
+    },
+    sha256: (file) => new Promise((resolve, reject) => {
+      const hash = crypto.createHash('sha256')
+      fs.createReadStream(file)
+        .on('data', (chunk) => hash.update(chunk))
+        .on('error', reject)
+        .on('end', () => resolve(hash.digest('hex')))
+    }),
+    extractApp: async (dmg, destApp) => {
+      const parent = await mkdtemp(path.join(path.dirname(dmg), '..', 'mount-'))
+      let mount: string | null = null
+      try {
+        const attached = await execFile('hdiutil', ['attach', '-nobrowse', '-readonly', '-mountrandom', parent, dmg])
+        const points = String(attached.stdout).split(/\s+/).filter((part) => part.startsWith('/'))
+        for (const point of points) {
+          try {
+            if ((await stat(path.join(point, 'LibreOffice.app'))).isDirectory()) {
+              mount = point
+              break
+            }
+          } catch { /* a /dev node, or not this volume */ }
+        }
+        if (!mount) throw new Error('LibreOffice.app was not in the disk image')
+        await execFile('ditto', [path.join(mount, 'LibreOffice.app'), destApp])
+      } finally {
+        if (mount) await execFile('hdiutil', ['detach', mount, '-force']).catch(() => {})
+        await rm(parent, { recursive: true, force: true }).catch(() => {})
+      }
+    },
   }
 }
