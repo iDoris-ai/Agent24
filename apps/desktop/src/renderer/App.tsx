@@ -32,29 +32,12 @@ import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
 import { QuickSwitch } from './components/QuickSwitch'
+import { isChatModelId } from './pages/settings/chatModels'
 
-// FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
-// (see fetchOmlxModels in main/ipc/index.ts) — so a real "is this a chat
-// model" flag isn't available to filter on. Until it is, exclude known
-// non-chat model families by name so the chat page's default model is never
-// silently a text-to-image / video / ASR / TTS / embedding / rerank model
-// (FU-89 was filed because it picked `models[0]` unconditionally and that
-// happened to be a FLUX image model).
-const NON_CHAT_MODEL_PATTERNS: RegExp[] = [
-  /flux/i, /stable-?diffusion/i, /\bsdxl\b/i, /\bsd3\b/i, /kolors/i, /pixart/i, // image gen
-  /\bltx\b/i, /cogvideo/i, /hunyuan-?video/i, /\bwan-?2/i,                     // video gen
-  /whisper/i, /cosyvoice/i, /\btts\b/i, /xtts/i, /\bvits\b/i, /\bf5-tts\b/i, /\bbark\b/i, // ASR/TTS
-  /\bbge\b/i, /\bgte\b/i, /\be5\b/i, /embed/i, /rerank/i,                      // embedding/rerank
-  // FU-89 follow-up: a real demo picked GLM-OCR-bf16 as the "chat" model —
-  // OCR/vision-language models answer with layout/caption text, not
-  // conversation, and must be excluded the same way image-gen models are.
-  /ocr/i, /-vl\b/i, /\bvl-/i, /paddleocr/i, /mage-vl/i,                        // OCR / vision-language
-]
-
-/** First model id that doesn't look like a known non-chat model, or
- * `undefined` if every candidate is (FU-89). Exported for its unit test. */
+/** First model id that looks like a chat model, or `undefined` if every
+ * candidate is filtered out. The rule lives in `chatModels.ts`. */
 export function pickChatModel(models: string[]): string | undefined {
-  return models.find((m) => !NON_CHAT_MODEL_PATTERNS.some((re) => re.test(m)))
+  return models.find((m) => isChatModelId(m))
 }
 
 // Sentinels for the oMLX-derived fallback label; translated at render time so
@@ -149,8 +132,8 @@ function AppShell(): JSX.Element {
 
   // ME4-desktop-model-ui: the daemon's OWN default model always wins over a
   // client-side guess from a locally-detected oMLX model list — that guess
-  // is what let an OCR/VL model reach the topbar in the first place (see the
-  // NON_CHAT_MODEL_PATTERNS comment above). Falls back to the oMLX-derived
+  // is what let an OCR/VL model reach the topbar in the first place (see
+  // `isChatModelId`). Falls back to the oMLX-derived
   // label only when the daemon has none to report (e.g. an older daemon
   // build, or the router was never built via `from_env`).
   const t = useT(appMessages)

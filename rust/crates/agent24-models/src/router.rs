@@ -132,14 +132,11 @@ pub struct ModelRouter {
     health: Mutex<HashMap<String, Health>>,
     base_cooldown: Duration,
     max_cooldown: Duration,
-    /// ME4-desktop-model-ui: the `DEFAULT_MODEL` env var this router was
-    /// built with, for a client (desktop's topbar) to ask "what does Agent24
-    /// actually default to" instead of guessing from a locally-detected
-    /// model list. Only [`Self::from_env`] sets it — a hand-built router
-    /// (every other constructor, mostly tests and per-module
-    /// `with_separate_health()` copies) has no single "the" default model to
-    /// report, so this stays `None` there rather than a misleading guess.
-    default_model: Option<String>,
+    /// The chat model used when a request names none. [`Self::from_env`]
+    /// seeds it; the daemon may replace it at runtime ([`Self::set_default_model`]).
+    /// Shared with [`Self::with_separate_health`] so a later update is visible
+    /// on both. A hand-built router starts as `None`.
+    default_model: Arc<Mutex<Option<String>>>,
 }
 
 /// Absolute ceiling on any cooldown, independent of the caller's `max_cooldown`
@@ -302,7 +299,7 @@ impl ModelRouter {
             health: Mutex::new(HashMap::new()),
             base_cooldown,
             max_cooldown,
-            default_model: None,
+            default_model: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -328,18 +325,27 @@ impl ModelRouter {
             health: Mutex::new(HashMap::new()),
             base_cooldown: self.base_cooldown,
             max_cooldown: self.max_cooldown,
-            default_model: self.default_model.clone(),
+            default_model: Arc::clone(&self.default_model),
         }
     }
 
-    /// ME4-desktop-model-ui: the `DEFAULT_MODEL` this router was built with
-    /// ([`Self::from_env`] only) — `None` for a hand-built router (tests,
-    /// and every `with_separate_health()` copy of one that was never given
-    /// one either). Never a guess: a caller that gets `None` back has no
-    /// single "the default model" to show and must say so, not fall back to
-    /// picking one itself.
-    pub fn default_model(&self) -> Option<&str> {
-        self.default_model.as_deref()
+    /// Current default chat model, if one has been set. `None` means the
+    /// caller has nothing to display and must not invent one.
+    pub fn default_model(&self) -> Option<String> {
+        self.default_model
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+
+    /// Replace the default chat model. Takes effect on the next local
+    /// completion that does not name its own model, including on a
+    /// [`Self::with_separate_health`] copy.
+    pub fn set_default_model(&self, model: impl Into<String>) {
+        *self
+            .default_model
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(model.into());
     }
 
     /// Convenience default: 2s base, 60s cap. Same PRIVACY CONTRACT as
@@ -356,17 +362,18 @@ impl ModelRouter {
     /// added by the daemon when configured; with only local providers, a
     /// Complex task simply falls back to them.
     pub fn from_env() -> Self {
+        let default_model =
+            crate::default_model_from_env(std::env::var("DEFAULT_MODEL").ok().as_deref());
         if std::env::var_os("IDORIS_URL").is_some() {
             let router = Self::with_defaults(Vec::new());
+            router.set_default_model(default_model);
             *router.idoris.write().unwrap_or_else(|p| p.into_inner()) =
                 Some(crate::IdorisGateway::from_env().map(Arc::new));
             return router;
         }
         let omlx_url =
             std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
-        let default_model =
-            std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "Qwen3-8B-4bit".to_owned());
+        let omlx_key = crate::omlx_api_key_from_process_env();
         // Validate locality before trusting the `Local` label: an OMLX_URL
         // pointed at a non-loopback address is treated as Remote so a
         // LocalOnly task never silently leaks to it (review D2).
@@ -402,10 +409,10 @@ impl ModelRouter {
                 };
                 Arc::new(p)
             };
-        let omlx = build("omlx", omlx_url, Some(omlx_key), omlx_tier);
+        let omlx = build("omlx", omlx_url, omlx_key, omlx_tier);
         let ollama = build("ollama", ollama_url, None, ollama_tier);
-        let mut router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
-        router.default_model = Some(default_model);
+        let router = Self::with_defaults(vec![(omlx, omlx_tier), (ollama, ollama_tier)]);
+        router.set_default_model(default_model.clone());
         router
     }
 
@@ -571,6 +578,21 @@ impl ModelRouter {
                 .complete(profile, req, cancel, request_id)
                 .await;
         }
+        // The provider baked its default at construction. Stamp the live
+        // default onto a model-less request so a runtime change is what gets
+        // sent. An explicit model is left alone. The iDoris branch above
+        // returns before this and is not rewritten.
+        let stamped;
+        let req = match (req.model.is_none(), self.default_model()) {
+            (true, Some(model)) => {
+                stamped = CompletionRequest {
+                    model: Some(model),
+                    ..req.clone()
+                };
+                &stamped
+            }
+            _ => req,
+        };
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -1750,6 +1772,59 @@ mod tests {
         let r = ModelRouter::with_defaults(vec![]);
         assert_eq!(r.default_model(), None);
         assert_eq!(r.with_separate_health().default_model(), None);
+    }
+
+    #[tokio::test]
+    async fn set_default_model_is_what_a_model_less_request_sends() {
+        struct Seen(StdMutex<Option<String>>);
+        #[async_trait]
+        impl ModelProvider for Seen {
+            fn name(&self) -> &str {
+                "seen"
+            }
+            async fn complete(
+                &self,
+                req: &CompletionRequest,
+                _cancel: &CancellationToken,
+            ) -> Result<CompletionResponse, ModelError> {
+                *self.0.lock().unwrap() = req.model.clone();
+                Ok(CompletionResponse {
+                    message: Msg::assistant(Some("ok".to_owned()), vec![]),
+                    usage: Usage {
+                        prompt_tokens: 1,
+                        completion_tokens: 1,
+                        total_tokens: 2,
+                        cost_usd: 0.0,
+                    },
+                    model_id: None,
+                })
+            }
+            async fn models(
+                &self,
+                _cancel: &CancellationToken,
+            ) -> Result<Vec<crate::Model>, ModelError> {
+                Ok(vec![])
+            }
+        }
+        let seen = Arc::new(Seen(StdMutex::new(None)));
+        let router = router(vec![(seen.clone(), Tier::Local)]);
+        router.set_default_model("Qwen3-30B");
+        assert_eq!(
+            router.with_separate_health().default_model().as_deref(),
+            Some("Qwen3-30B")
+        );
+        router
+            .complete(TaskProfile::default(), &req(), &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(seen.0.lock().unwrap().as_deref(), Some("Qwen3-30B"));
+        let mut explicit = req();
+        explicit.model = Some("kept".to_owned());
+        router
+            .complete(TaskProfile::default(), &explicit, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(seen.0.lock().unwrap().as_deref(), Some("kept"));
     }
 
     #[test]

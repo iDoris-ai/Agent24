@@ -321,6 +321,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/models/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Save the default chat model
+         * @description ProductHost only. The id is stored in the daemon's existing settings kv and used on the next local completion that does not name a model. Empty, longer than 128 characters, or containing a control character is 400. The memory base missing is 503.
+         */
+        put: operations["putDefaultModel"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/os": {
         parameters: {
             query?: never;
@@ -5261,7 +5281,49 @@ export interface operations {
                 content: {
                     "application/json": {
                         models: components["schemas"]["Model"][];
+                        /** @description The daemon's current default chat model. A saved value wins over DEFAULT_MODEL, which wins over Qwen3-8B-4bit. Null only when this router was built without one. */
+                        default_model?: string | null;
                     };
+                };
+            };
+        };
+    };
+    putDefaultModel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    model: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The stored model id */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        model: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description The settings store is not available on this daemon */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };

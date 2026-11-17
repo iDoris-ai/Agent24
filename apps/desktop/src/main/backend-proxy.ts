@@ -74,6 +74,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // Optional UI manifests; daemons without this endpoint keep the static registry.
   r('GET', '/api/modules'),
   r('GET', '/api/v1/models'),
+  r('PUT', '/api/v1/models/default'), // [E] ProductHost writes the default chat model
   r('POST', '/api/v1/chat', CHAT_TIMEOUT_MS),
   // A real session for the main chat, so its turns can go to /runs too
   // (Knowledge on; Everyday in route_policy.rs).

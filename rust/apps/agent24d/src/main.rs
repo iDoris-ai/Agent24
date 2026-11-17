@@ -83,6 +83,7 @@ mod host_bootstrap {
         }
     }
 }
+mod default_model;
 mod lifecycle;
 mod mcp;
 mod memory_callback;

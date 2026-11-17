@@ -56,7 +56,10 @@ fn host_only_route(method: &Method, path: &str) -> bool {
             "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
         ) || is_component_report(path)))
         || (method == Method::PUT
-            && matches!(path, "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy"))
+            && matches!(
+                path,
+                "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy" | "/api/v1/models/default"
+            ))
 }
 
 /// `POST /api/v1/skills/{id}/activate` is `skills.activate`, Elevated. The

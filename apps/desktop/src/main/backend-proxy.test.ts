@@ -42,6 +42,11 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/approvals?status=pending')).toBe(false)
     expect(isAllowedProxyRoute('get', '/api/v1/models')).toBe(false)
   })
+  it('lets the desktop save the default chat model', () => {
+    expect(isAllowedProxyRoute('PUT', '/api/v1/models/default')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/models/default')).toBe(false)
+    expect(isAllowedProxyRoute('GET', '/api/v1/models/default')).toBe(false)
+  })
   it('rejects control characters anywhere in path or query (header/request-line smuggling)', () => {
     for (const bad of ['\n', '\r', '\0', '\t', '\u001f', '\u007f']) {
       expect(isAllowedProxyRoute('GET', `/api/v1/runs?x=1${bad}Host: evil`), JSON.stringify(bad)).toBe(false)
