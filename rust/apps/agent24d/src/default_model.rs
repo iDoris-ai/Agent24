@@ -17,20 +17,30 @@ pub(crate) struct SavedDefaultChatModel {
     pub model: String,
 }
 
-/// Trimmed model id. Empty, longer than 128 characters, or any control
-/// character is rejected. The stored value is the trimmed id.
+/// Trimmed model id. Empty, longer than [`crate::capabilities::first_party::SHOWN_MAX_CHARS`]
+/// (120), or any character [`crate::capabilities::first_party::hidden`] refuses
+/// is rejected. The stored value is the trimmed id. An id the presence dialog
+/// cannot show is not saved.
 pub(crate) fn validate_model_id(raw: &str) -> Result<String, &'static str> {
     let model = raw.trim();
     if model.is_empty() {
         return Err("model is empty");
     }
-    if model.chars().count() > 128 {
+    if model.chars().count() > crate::capabilities::first_party::SHOWN_MAX_CHARS {
         return Err("model is too long");
     }
-    if model.chars().any(char::is_control) {
-        return Err("model contains a control character");
+    if model.chars().any(crate::capabilities::first_party::hidden) {
+        return Err("model contains a character that cannot be shown");
     }
     Ok(model.to_owned())
+}
+
+/// `Ok` when the id can be shown. The shell gate returns this error as 400
+/// before presence.
+pub(crate) fn validate_put_body(bytes: &[u8]) -> Result<(), &'static str> {
+    let parsed: crate::routes::PutDefaultModelBody =
+        serde_json::from_slice(bytes).map_err(|_| "model is required")?;
+    validate_model_id(&parsed.model).map(|_| ())
 }
 
 /// Saved value wins over whatever the router was built with. A missing row

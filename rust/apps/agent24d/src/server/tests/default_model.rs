@@ -69,8 +69,10 @@
             "{}",
             r#"{"model":""}"#,
             r#"{"model":"   "}"#,
+            &format!(r#"{{"model":"{}"}}"#, "m".repeat(121)),
             &format!(r#"{{"model":"{}"}}"#, "m".repeat(129)),
             "{\"model\":\"ab\\u0001c\"}",
+            "{\"model\":\"ab\\u200bc\"}",
         ] {
             let res = put_default(&app, &host, body).await;
             assert_eq!(res.status(), StatusCode::BAD_REQUEST, "{body}");
