@@ -34,7 +34,10 @@ export type OsPackageCode =
   | 'checksum_mismatch'
   | 'checksum_missing'
   | 'extract_rejected'
+  | 'manifest_mismatch'
   | 'cli_failed'
+  | 'upgrade_failed_rolled_back'
+  | 'upgrade_failed_rollback_failed'
   | 'daemon_running'
   | 'service_shutdown'
 
@@ -68,6 +71,48 @@ export class OsInstallPauseError extends Error {
 
 function fail(code: OsPackageCode, message: string): OsPackageResult {
   return { ok: false, code, message }
+}
+
+function cliFailure(deps: InstallOsPackageDeps, cli: CliResult): OsPackageResult {
+  const message = lastLine(cli.output)
+  if (deps.leavesDaemonRunning() && /singleton\.lock|is held/i.test(cli.output)) {
+    return fail('daemon_running', message)
+  }
+  return fail('cli_failed', message)
+}
+
+/** The unpacked manifest names this id at this release. Otherwise the installed tree stays. */
+function releaseManifest(root: string, id: string, releaseVersion: string): OsPackageResult | { ok: true } {
+  let text: string
+  try {
+    text = fs.readFileSync(path.join(root, 'domain-os.yml'), 'utf8')
+  } catch (error) {
+    return fail('manifest_mismatch', error instanceof Error ? error.message : String(error))
+  }
+  if (manifestName(text) !== id || !versionMatchesRelease(text, releaseVersion)) {
+    const name = manifestName(text) ?? 'unreadable'
+    const version = manifestVersion(text) ?? 'unreadable'
+    return fail('manifest_mismatch', `package manifest is ${name} ${version}`)
+  }
+  return { ok: true }
+}
+
+function lastLine(output: string): string {
+  return output.trim().split('\n').pop() ?? ''
+}
+
+/** Top-level `name:` (quoted or not), same shape as `manifestVersion`. */
+function manifestName(text: string): string | null {
+  const match = /^name:[ \t]*(?:"([^"\n]*)"|'([^'\n]*)'|([^\s#]+))[ \t]*(?:#.*)?$/m.exec(text)
+  const name = match ? (match[1] ?? match[2] ?? match[3] ?? '') : ''
+  return name === '' ? null : name
+}
+
+/** `version` equals the release version. A single leading `v` on either side is ignored. */
+function versionMatchesRelease(manifestText: string, releaseVersion: string): boolean {
+  const version = manifestVersion(manifestText)
+  if (version === null) return false
+  return version.replace(/^v/, '') === releaseVersion.replace(/^v/, '')
 }
 
 function sha256File(file: string): string {
@@ -149,13 +194,17 @@ export async function lookupOsPackage(id: string, arch: string, fetchJson: (url:
   return parseLatestRelease(body, arch)
 }
 
-/** Download, check SHA256SUMS, unpack, then `agent24 os install` (uninstall first when older). */
+/** Download, check SHA256SUMS, unpack, bind the manifest to the release, then `os install`.
+ * An older install is verified and copied aside before `os uninstall`. A failed
+ * `os install` is rolled back from that copy. `os uninstall` drops consent grants;
+ * the rollback does not put them back. */
 export async function performOsPackageInstall(id: string, deps: InstallOsPackageDeps): Promise<OsPackageResult> {
   const entry = osPackageEntry(id)
   if (!entry) return fail('not_registered', id)
   if (deps.platform !== 'darwin') return fail('unsupported_platform', deps.platform)
   if (deps.packagesRoot === null) return fail('no_packages_root', 'the data directory could not be resolved')
-  const installed = installedPackage(deps.packagesRoot, id)
+  const packagesRoot = deps.packagesRoot
+  const installed = installedPackage(packagesRoot, id)
   if (installed.kind === 'unreadable') {
     return fail('installed_unreadable', `${id} is installed but its manifest cannot be read`)
   }
@@ -221,29 +270,40 @@ export async function performOsPackageInstall(id: string, deps: InstallOsPackage
     } catch (error) {
       return fail('extract_rejected', error instanceof Error ? error.message : String(error))
     }
+    const bound = releaseManifest(root, id, release.version)
+    if (!bound.ok) return bound
     report('install', 0, null)
     const upgrading = installed.kind === 'version'
-    let cli: CliResult
     try {
-      cli = await deps.withDaemonStopped(async () => {
-        if (upgrading) {
-          const removed = await deps.runCli(['os', 'uninstall', id])
-          if (removed.code !== 0) return removed
-        }
-        return deps.runCli(['os', 'install', root])
+      if (!upgrading) {
+        return await deps.withDaemonStopped(async () => {
+          const added = await deps.runCli(['os', 'install', root])
+          if (added.code !== 0) return cliFailure(deps, added)
+          return { ok: true, version: release.version, upgraded: false }
+        })
+      }
+      const verified = await deps.runCli(['package-integrity', 'verify', '--root', root])
+      if (verified.code !== 0) return fail('cli_failed', lastLine(verified.output))
+      const backup = path.join(work, 'backup')
+      try {
+        fs.cpSync(joinLiteral(packagesRoot, id), backup, { recursive: true })
+      } catch (error) {
+        return fail('cli_failed', error instanceof Error ? error.message : String(error))
+      }
+      return await deps.withDaemonStopped(async () => {
+        const removed = await deps.runCli(['os', 'uninstall', id])
+        if (removed.code !== 0) return cliFailure(deps, removed)
+        const added = await deps.runCli(['os', 'install', root])
+        if (added.code === 0) return { ok: true, version: release.version, upgraded: true }
+        const rolled = await deps.runCli(['os', 'install', backup])
+        const why = lastLine(added.output)
+        if (rolled.code !== 0) return fail('upgrade_failed_rollback_failed', `${why}; ${lastLine(rolled.output)}`)
+        return fail('upgrade_failed_rolled_back', why)
       })
     } catch (error) {
       if (error instanceof OsInstallPauseError) return fail(error.code, error.message)
       return fail('daemon_running', error instanceof Error ? error.message : String(error))
     }
-    if (cli.code !== 0) {
-      const message = cli.output.trim().split('\n').pop() ?? ''
-      if (deps.leavesDaemonRunning() && /singleton\.lock|is held/i.test(cli.output)) {
-        return fail('daemon_running', message)
-      }
-      return fail('cli_failed', message)
-    }
-    return { ok: true, version: release.version, upgraded: upgrading }
   } finally {
     await fs.promises.rm(work, { recursive: true, force: true })
   }

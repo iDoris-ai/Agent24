@@ -18,9 +18,10 @@
 
 1. 登记表决定去哪个 URL。它不是信任根。
 2. `SHA256SUMS` 只用来发现下载损坏或被换包。对不上就拒绝，不调用 `os install`。
-3. 解压拒绝绝对路径、`..` 和链接条目，避免 tar 写到临时目录外面。
+3. 解压拒绝绝对路径、`..` 和链接条目，避免 tar 写到临时目录外面。gzip 展开不超过 1 GiB，条目不超过 10000，条目内容累计不超过 1 GiB。发布 JSON 和 `SHA256SUMS` 的响应体不超过 64 KiB。
 4. 安装命令是应用自带的 `agent24 os install <解压目录>`。签名和 `files.json` 仍由这条命令离线校验（Developer ID，Team HYAP444FN9），与 documents 模块同一条路。桌面不再写一套验签。
-5. 已装同版本返回 409 `already_installed`。已装更旧的版本先 `agent24 os uninstall <id>` 再 install。这两条命令都不改数据目录，也不改 `os.json`。本地版本比发布更新时也不降级。
+5. 解压之后、卸载之前读解出目录的 `domain-os.yml`。`name` 必须等于登记 id，`version` 必须等于该发布的版本（tag 去掉开头的一个 `v`）。对不上就拒绝，已装目录不动。
+6. 已装同版本返回 409 `already_installed`。本地版本比发布更新时也不降级。已装更旧才升级，顺序是：`agent24 package-integrity verify --root <解出目录>`（只读校验 files.json 和原生格式，不验签名；失败则不卸载），把 `<packagesRoot>/<id>` 整目录复制到本次工作目录，再 `os uninstall <id>`，再 `os install`。`os uninstall` 会撤销该模块的 consent grants。新包装不上时用备份再执行 `os install <备份目录>`：成功返回 `upgrade_failed_rolled_back`，备份也失败返回 `upgrade_failed_rollback_failed`。回滚只装回包目录，不恢复已撤销的授权。这两条命令都不改数据目录，也不改 `os.json`。
 
 ## 页面
 

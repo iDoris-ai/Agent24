@@ -7,6 +7,9 @@ import { isAllowedDownloadRedirect } from '../shared/os-package-registry'
 
 const MAX_REDIRECTS = 5
 
+/** Release JSON and SHA256SUMS. The archive download has its own byte cap. */
+export const MAX_CONTROL_RESPONSE_BYTES = 64 * 1024
+
 export class DownloadRejected extends Error {
   constructor(message: string) {
     super(message)
@@ -14,18 +17,35 @@ export class DownloadRejected extends Error {
   }
 }
 
-export function requestHttps(url: string, redirectOk: (next: string) => boolean, timeoutMs = 60_000): Promise<Buffer> {
-  return readHttps(url, redirectOk, timeoutMs, null)
+export function requestHttps(
+  url: string,
+  redirectOk: (next: string) => boolean,
+  timeoutMs = 60_000,
+  maxBytes = MAX_CONTROL_RESPONSE_BYTES,
+): Promise<Buffer> {
+  return readHttps(url, redirectOk, timeoutMs, maxBytes, null)
 }
 
 function readHttps(
   url: string,
   redirectOk: (next: string) => boolean,
   timeoutMs: number,
+  maxBytes: number,
   onData: ((chunk: Buffer, received: number, total: number | null) => void) | null,
   redirects = 0,
 ): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    let settled = false
+    const fail = (error: unknown): void => {
+      if (settled) return
+      settled = true
+      reject(error instanceof Error ? error : new DownloadRejected(String(error)))
+    }
+    const ok = (body: Buffer): void => {
+      if (settled) return
+      settled = true
+      resolve(body)
+    }
     const req = https.get(url, {
       headers: { 'User-Agent': 'Agent24', Accept: 'application/vnd.github+json' },
       timeout: timeoutMs,
@@ -35,35 +55,45 @@ function readHttps(
       if (status >= 300 && status < 400 && location) {
         res.resume()
         if (redirects >= MAX_REDIRECTS) {
-          reject(new DownloadRejected('too many redirects'))
+          fail(new DownloadRejected('too many redirects'))
           return
         }
         const next = new URL(location, url).href
         if (!redirectOk(next)) {
-          reject(new DownloadRejected('redirect is not a GitHub release URL'))
+          fail(new DownloadRejected('redirect is not a GitHub release URL'))
           return
         }
-        resolve(readHttps(next, redirectOk, timeoutMs, onData, redirects + 1))
+        readHttps(next, redirectOk, timeoutMs, maxBytes, onData, redirects + 1).then(ok, fail)
         return
       }
       if (status !== 200) {
         res.resume()
-        reject(new DownloadRejected(`download status ${status}`))
+        fail(new DownloadRejected(`download status ${status}`))
         return
       }
       const total = contentLength(res.headers['content-length'])
+      if (total !== null && total > maxBytes) {
+        res.resume()
+        fail(new DownloadRejected('response is too large'))
+        return
+      }
       const chunks: Buffer[] = []
       let received = 0
       res.on('data', (chunk: Buffer) => {
         received += chunk.length
+        if (received > maxBytes) {
+          res.destroy()
+          fail(new DownloadRejected('response is too large'))
+          return
+        }
         if (onData) onData(chunk, received, total)
         else chunks.push(chunk)
       })
-      res.on('end', () => resolve(onData ? Buffer.alloc(0) : Buffer.concat(chunks)))
-      res.on('error', reject)
+      res.on('end', () => ok(onData ? Buffer.alloc(0) : Buffer.concat(chunks)))
+      res.on('error', fail)
     })
     req.on('timeout', () => req.destroy(new DownloadRejected('download timed out')))
-    req.on('error', reject)
+    req.on('error', fail)
   })
 }
 

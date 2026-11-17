@@ -6,6 +6,20 @@ import path from 'node:path'
 import zlib from 'node:zlib'
 
 const BLOCK = 512
+const GIBIBYTE = 1024 * 1024 * 1024
+
+/** gzip output, payload bytes, and entry count. Past any of these is ArchiveRejected. */
+export const DEFAULT_ARCHIVE_LIMITS = {
+  maxOutputLength: GIBIBYTE,
+  maxEntries: 10_000,
+  maxBytes: GIBIBYTE,
+}
+
+export interface ArchiveLimits {
+  maxOutputLength: number
+  maxEntries: number
+  maxBytes: number
+}
 
 export class ArchiveRejected extends Error {
   constructor(message: string) {
@@ -63,10 +77,12 @@ function assertNoSymlink(root: string, target: string): void {
 }
 
 /** Extracts `file` (gzip + ustar) into `dest`, which must already exist. */
-export function extractTarGz(file: string, dest: string): void {
-  const raw = zlib.gunzipSync(fs.readFileSync(file))
+export function extractTarGz(file: string, dest: string, limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS): void {
+  const raw = gunzipLimited(fs.readFileSync(file), limits.maxOutputLength)
   const root = fs.realpathSync(dest)
   let offset = 0
+  let entries = 0
+  let totalBytes = 0
   let longName: string | null = null
   while (offset + BLOCK <= raw.length) {
     const header = raw.subarray(offset, offset + BLOCK)
@@ -80,6 +96,10 @@ export function extractTarGz(file: string, dest: string): void {
     const type = String.fromCharCode(header[156] ?? 0)
     const size = octal(header, 124, 12)
     if (size < 0 || offset + size > raw.length) throw new ArchiveRejected('tar entry extends past the archive')
+    entries += 1
+    totalBytes += size
+    if (entries > limits.maxEntries) throw new ArchiveRejected('archive has too many entries')
+    if (totalBytes > limits.maxBytes) throw new ArchiveRejected('archive expands past the size limit')
     const data = raw.subarray(offset, offset + size)
     offset += Math.ceil(size / BLOCK) * BLOCK
     if (type === 'L') {
@@ -114,5 +134,17 @@ export function extractTarGz(file: string, dest: string): void {
   }
   if (offset < raw.length && !raw.subarray(offset).every((byte) => byte === 0)) {
     throw new ArchiveRejected('tar ended mid-header')
+  }
+}
+
+function gunzipLimited(compressed: Buffer, maxOutputLength: number): Buffer {
+  try {
+    return zlib.gunzipSync(compressed, { maxOutputLength })
+  } catch (error) {
+    const code = typeof error === 'object' && error !== null && 'code' in error
+      ? String((error as { code: unknown }).code)
+      : ''
+    if (code === 'ERR_BUFFER_TOO_LARGE') throw new ArchiveRejected('gzip expands past the size limit')
+    throw new ArchiveRejected(error instanceof Error ? error.message : 'gzip could not be read')
   }
 }

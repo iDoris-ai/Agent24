@@ -3,7 +3,7 @@ import os from 'node:os'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ArchiveRejected, extractTarGz } from './os-package-archive'
+import { ArchiveRejected, DEFAULT_ARCHIVE_LIMITS, extractTarGz } from './os-package-archive'
 
 const dirs: string[] = []
 
@@ -77,5 +77,42 @@ describe('extractTarGz', () => {
     expect(() => extractTarGz(file, dest)).toThrow(ArchiveRejected)
     expect(fs.existsSync(path.join(dest, 'outside.txt'))).toBe(false)
     expect(fs.existsSync('/tmp/outside.txt') && name === '/tmp/outside.txt' ? fs.readFileSync('/tmp/outside.txt', 'utf8') : '').not.toBe('x')
+  })
+
+  it('caps gunzip output, entry count, and payload bytes at 1 GiB and 10000 entries', () => {
+    expect(DEFAULT_ARCHIVE_LIMITS).toEqual({
+      maxOutputLength: 1024 * 1024 * 1024,
+      maxEntries: 10_000,
+      maxBytes: 1024 * 1024 * 1024,
+    })
+  })
+
+  it('rejects a gzip that expands past the limit', () => {
+    const dest = tempDir()
+    const file = path.join(tempDir(), 'bomb.tar.gz')
+    fs.writeFileSync(file, zlib.gzipSync(Buffer.alloc(2000, 1)))
+    expect(() => extractTarGz(file, dest, { maxOutputLength: 100, maxEntries: 10, maxBytes: 1000 }))
+      .toThrow(/gzip expands past the size limit/)
+    expect(fs.readdirSync(dest)).toEqual([])
+  })
+
+  it('rejects an archive with more entries than the limit', () => {
+    const dest = tempDir()
+    const file = archive([
+      { name: 'a.txt', type: '0', body: 'a' },
+      { name: 'b.txt', type: '0', body: 'b' },
+      { name: 'c.txt', type: '0', body: 'c' },
+    ])
+    expect(() => extractTarGz(file, dest, { maxOutputLength: 1_000_000, maxEntries: 2, maxBytes: 1_000_000 }))
+      .toThrow(/too many entries/)
+    expect(fs.existsSync(path.join(dest, 'c.txt'))).toBe(false)
+  })
+
+  it('rejects an archive whose payload bytes pass the limit', () => {
+    const dest = tempDir()
+    const file = archive([{ name: 'a.txt', type: '0', body: 'hello world' }])
+    expect(() => extractTarGz(file, dest, { maxOutputLength: 1_000_000, maxEntries: 10, maxBytes: 4 }))
+      .toThrow(/expands past the size limit/)
+    expect(fs.existsSync(path.join(dest, 'a.txt'))).toBe(false)
   })
 })

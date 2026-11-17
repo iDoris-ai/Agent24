@@ -127,7 +127,151 @@ describe('performOsPackageInstall', () => {
       downloadText: async () => `${hash}  ${ASSET}\n`,
     }))
     expect(result).toEqual({ ok: true, version: '0.5.2', upgraded: true })
-    expect(calls.map((args) => args.slice(0, 2))).toEqual([['os', 'uninstall'], ['os', 'install']])
+    expect(calls.map((args) => args.slice(0, 2))).toEqual([
+      ['package-integrity', 'verify'],
+      ['os', 'uninstall'],
+      ['os', 'install'],
+    ])
+    expect(calls[0]?.slice(1, 3)).toEqual(['verify', '--root'])
     expect(fs.existsSync(path.join(root, 'os.json'))).toBe(false)
   })
+
+  it.each([
+    { label: 'a different name', manifest: 'name: other\nversion: 0.5.2\n' },
+    { label: 'a different version', manifest: 'name: sin90\nversion: 0.5.1\n' },
+  ])('rejects $label and does not touch the installed package', async ({ manifest }) => {
+    const root = tempDir()
+    const pkg = path.join(root, 'packages', 'sin90')
+    fs.mkdirSync(pkg, { recursive: true })
+    fs.writeFileSync(path.join(pkg, 'domain-os.yml'), 'name: sin90\nversion: 0.5.1\n')
+    const packed = packageArchive(manifest)
+    const runCli = vi.fn(async () => ({ code: 0, output: '' }))
+    const result = await performOsPackageInstall('sin90', deps({
+      root,
+      runCli,
+      download: async (_url, dest) => { fs.writeFileSync(dest, packed.bytes) },
+      downloadText: async () => packed.sums,
+    }))
+    expect(result).toMatchObject({ ok: false, code: 'manifest_mismatch' })
+    expect(runCli).not.toHaveBeenCalled()
+    expect(fs.readFileSync(path.join(pkg, 'domain-os.yml'), 'utf8')).toBe('name: sin90\nversion: 0.5.1\n')
+  })
+
+  it('treats a leading v on the manifest version as the release version', async () => {
+    const root = tempDir()
+    const pkg = path.join(root, 'packages', 'sin90')
+    fs.mkdirSync(pkg, { recursive: true })
+    fs.writeFileSync(path.join(pkg, 'domain-os.yml'), 'name: sin90\nversion: 0.5.1\n')
+    const packed = packageArchive('name: sin90\nversion: "v0.5.2"\n')
+    const calls: string[][] = []
+    const result = await performOsPackageInstall('sin90', deps({
+      root,
+      runCli: async (args) => {
+        calls.push(args)
+        return { code: 0, output: 'ok' }
+      },
+      download: async (_url, dest) => { fs.writeFileSync(dest, packed.bytes) },
+      downloadText: async () => packed.sums,
+    }))
+    expect(result).toEqual({ ok: true, version: '0.5.2', upgraded: true })
+    expect(calls.map((args) => args.slice(0, 2))).toEqual([
+      ['package-integrity', 'verify'],
+      ['os', 'uninstall'],
+      ['os', 'install'],
+    ])
+  })
+
+  it('does not uninstall when package-integrity verify fails', async () => {
+    const root = tempDir()
+    const pkg = path.join(root, 'packages', 'sin90')
+    fs.mkdirSync(pkg, { recursive: true })
+    fs.writeFileSync(path.join(pkg, 'domain-os.yml'), 'name: sin90\nversion: 0.5.1\n')
+    const packed = packageArchive('name: sin90\nversion: 0.5.2\n')
+    const calls: string[][] = []
+    const result = await performOsPackageInstall('sin90', deps({
+      root,
+      runCli: async (args) => {
+        calls.push(args)
+        return { code: 1, output: 'hash_mismatch: bin/sin90' }
+      },
+      download: async (_url, dest) => { fs.writeFileSync(dest, packed.bytes) },
+      downloadText: async () => packed.sums,
+    }))
+    expect(result).toMatchObject({ ok: false, code: 'cli_failed', message: 'hash_mismatch: bin/sin90' })
+    expect(calls.map((args) => args.slice(0, 2))).toEqual([['package-integrity', 'verify']])
+    expect(fs.readFileSync(path.join(pkg, 'domain-os.yml'), 'utf8')).toContain('version: 0.5.1')
+  })
+
+  it('installs the backup when the new package fails, and the old version remains', async () => {
+    const root = tempDir()
+    const pkg = path.join(root, 'packages', 'sin90')
+    fs.mkdirSync(pkg, { recursive: true })
+    fs.writeFileSync(path.join(pkg, 'domain-os.yml'), 'name: sin90\nversion: 0.5.1\n')
+    const packed = packageArchive('name: sin90\nversion: 0.5.2\n')
+    const calls: string[][] = []
+    const result = await performOsPackageInstall('sin90', deps({
+      root,
+      runCli: async (args) => {
+        calls.push(args)
+        if (args[0] === 'package-integrity') return { code: 0, output: '' }
+        if (args[1] === 'uninstall') {
+          fs.rmSync(pkg, { recursive: true, force: true })
+          return { code: 0, output: 'removed' }
+        }
+        const manifest = fs.readFileSync(path.join(args[2]!, 'domain-os.yml'), 'utf8')
+        if (manifest.includes('version: 0.5.2')) return { code: 1, output: 'signature rejected' }
+        fs.cpSync(args[2]!, pkg, { recursive: true })
+        return { code: 0, output: 'installed' }
+      },
+      download: async (_url, dest) => { fs.writeFileSync(dest, packed.bytes) },
+      downloadText: async () => packed.sums,
+    }))
+    expect(result).toMatchObject({ ok: false, code: 'upgrade_failed_rolled_back', message: 'signature rejected' })
+    expect(calls.map((args) => args.slice(0, 2))).toEqual([
+      ['package-integrity', 'verify'],
+      ['os', 'uninstall'],
+      ['os', 'install'],
+      ['os', 'install'],
+    ])
+    expect(calls[3]?.[2]).toMatch(/backup$/)
+    expect(fs.readFileSync(path.join(pkg, 'domain-os.yml'), 'utf8')).toContain('version: 0.5.1')
+  })
+
+  it('reports upgrade_failed_rollback_failed when the backup install fails', async () => {
+    const root = tempDir()
+    const pkg = path.join(root, 'packages', 'sin90')
+    fs.mkdirSync(pkg, { recursive: true })
+    fs.writeFileSync(path.join(pkg, 'domain-os.yml'), 'name: sin90\nversion: 0.5.1\n')
+    const packed = packageArchive('name: sin90\nversion: 0.5.2\n')
+    const result = await performOsPackageInstall('sin90', deps({
+      root,
+      runCli: async (args) => {
+        if (args[0] === 'package-integrity') return { code: 0, output: '' }
+        if (args[1] === 'uninstall') {
+          fs.rmSync(pkg, { recursive: true, force: true })
+          return { code: 0, output: 'removed' }
+        }
+        const manifest = fs.readFileSync(path.join(args[2]!, 'domain-os.yml'), 'utf8')
+        if (manifest.includes('version: 0.5.2')) return { code: 1, output: 'signature rejected' }
+        return { code: 1, output: 'backup install failed' }
+      },
+      download: async (_url, dest) => { fs.writeFileSync(dest, packed.bytes) },
+      downloadText: async () => packed.sums,
+    }))
+    expect(result).toEqual({
+      ok: false,
+      code: 'upgrade_failed_rollback_failed',
+      message: 'signature rejected; backup install failed',
+    })
+    expect(fs.existsSync(pkg)).toBe(false)
+  })
 })
+
+function packageArchive(manifest: string): { bytes: Buffer; sums: string } {
+  const bytes = tarGz([
+    { name: 'sin90-0.5.2-macos-arm64', type: '5' },
+    { name: 'sin90-0.5.2-macos-arm64/domain-os.yml', type: '0', body: manifest },
+  ])
+  const hash = crypto.createHash('sha256').update(bytes).digest('hex')
+  return { bytes, sums: `${hash}  ${ASSET}\n` }
+}
