@@ -157,6 +157,9 @@ const api = {
     ipcRenderer.invoke(IpcChannels.AgentEarUnpair),
   backendEndpoint: (): Promise<BackendEndpointResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendEndpoint),
+  /** Ask main to start the daemon again (the tray's restart). */
+  retryBackend: (): Promise<BackendEndpointResult | null> =>
+    ipcRenderer.invoke(IpcChannels.BackendEndpoint, 'retry'),
   backendRefusal: (): Promise<BackendRefusalResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendRefusal),
   creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>

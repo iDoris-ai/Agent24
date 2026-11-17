@@ -153,6 +153,25 @@ it('a status read that fails later keeps the switch and the failure shown (PR-Da
   expect(screen.getByRole('alert').textContent).toContain('exit_1')
 })
 
+it('installs from the button, and uninstalls once the service is there', async () => {
+  render(<ResidentServiceSettings />)
+  fireEvent.click(await screen.findByRole('button', { name: 'Install background service' }))
+  expect(set).toHaveBeenCalledWith(true)
+  set.mockClear()
+  status.mockResolvedValue({ available: true, installed: true })
+  fireEvent.focus(window)
+  fireEvent.click(await screen.findByRole('button', { name: 'Uninstall' }))
+  expect(screen.getByText('Installed')).toBeInTheDocument()
+  expect(set).toHaveBeenCalledWith(false)
+  expect(screen.queryByRole('button', { name: 'Install background service' })).not.toBeInTheDocument()
+})
+
+it('names the install button in Chinese', async () => {
+  setLocale('zh')
+  render(<ResidentServiceSettings />)
+  expect(await screen.findByRole('button', { name: '安装后台服务' })).toBeInTheDocument()
+})
+
 it('not connected: the way out by the CLI is named too (PR-Daemon #1784 N3)', async () => {
   set.mockResolvedValue({ ok: false, stage: 'shutdown', code: 'not_connected' })
   status.mockResolvedValue({ available: true, installed: true })

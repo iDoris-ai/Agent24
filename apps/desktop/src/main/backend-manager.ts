@@ -67,6 +67,13 @@ export interface BackendEndpoint {
   port: number
 }
 
+/** Why a daemon this app spawned did not come up. Surfaced on the existing
+ * backend endpoint IPC; the renderer does not get a second status channel. */
+export interface DaemonStartupFailure {
+  code: string
+  error: string
+}
+
 /** How main authenticates to the daemon. Held apart from `BackendEndpoint` so
  * the credential never travels with the port toward the renderer. `none` is
  * only the node mock, which takes no credential. */
@@ -135,6 +142,42 @@ function connectionKey(): string | null {
   return `${conn.port}\u0000${conn.authHeaders.Authorization ?? ''}\u0000${currentAuthMode ?? ''}`
 }
 
+/** Last reason the daemon this app spawned failed to start. Cleared once a
+ * connection is published. Read by the backend endpoint IPC. */
+let startupFailure: DaemonStartupFailure | null = null
+
+export function getDaemonStartupFailure(): DaemonStartupFailure | null {
+  return startupFailure ? { code: startupFailure.code, error: startupFailure.error } : null
+}
+
+let failureEpoch = 0
+
+function noteStartupFailure(next: DaemonStartupFailure | null): void {
+  failureEpoch += 1
+  startupFailure = next
+}
+
+/** `{"type":"failed","code","error"}` from agent24d's stdout. Anything else
+ * is a log line. */
+export function parseDaemonFailureLine(line: string): DaemonStartupFailure | null {
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('{')) return null
+  let parsed: unknown
+  try { parsed = JSON.parse(trimmed) } catch { return null }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
+  const record = parsed as Record<string, unknown>
+  if (record.type !== 'failed') return null
+  const code = typeof record.code === 'string' && record.code.trim() !== '' ? record.code.trim() : 'start_failed'
+  const error = typeof record.error === 'string' ? record.error.trim() : ''
+  return { code: code.slice(0, 80), error: error.slice(0, 2000) }
+}
+
+/** Non-zero exit with no `failed` line: the last stderr line, or the code. */
+export function stderrExitFailure(lastStderr: string, code: number): DaemonStartupFailure {
+  const error = lastStderr.trim().slice(0, 2000)
+  return { code: 'exit', error: error || `exit ${code}` }
+}
+
 function publishConnection(
   next: { port: number; auth: DaemonAuth } | null, authMode: DaemonAuthMode | null, session: EnrolSession | null = null,
 ): void {
@@ -143,6 +186,7 @@ function publishConnection(
   currentSession = next ? session : null
   const connected = daemonConnection() !== null
   currentAuthMode = connected ? authMode : null
+  if (next) noteStartupFailure(null)
   const after = connectionKey()
   if (!after || after === before) return
   for (const listener of [...daemonReadyListeners]) {
@@ -1190,10 +1234,22 @@ export class BackendManager {
     // Every callback guards on identity: a stale child's late ready line or
     // exit event must never clobber the current child's state (review B5)
     const rls: readline.Interface[] = []
+    let reported: DaemonStartupFailure | null = null
+    let lastStderr = ''
+    const remember = (failure: DaemonStartupFailure): void => {
+      reported = failure
+      if (this.child === child) noteStartupFailure(failure)
+    }
     if (child.stdout) {
       const rl = readline.createInterface({ input: child.stdout })
       rls.push(rl)
       rl.on('line', (line) => {
+        const failed = parseDaemonFailureLine(line)
+        if (failed) {
+          remember(failed)
+          console.error(`[backend:${this.kind}]`, line)
+          return
+        }
         // SPEC-002 §4: scan for the first type=="ready" JSON line — it is not
         // necessarily the first stdout line (init logs may precede it)
         try {
@@ -1222,17 +1278,31 @@ export class BackendManager {
     if (child.stderr) {
       const rl = readline.createInterface({ input: child.stderr })
       rls.push(rl)
-      rl.on('line', (line) => console.error(`[backend:${this.kind}]`, line))
+      rl.on('line', (line) => {
+        const trimmed = line.trim()
+        if (trimmed) lastStderr = trimmed
+        console.error(`[backend:${this.kind}]`, line)
+      })
     }
     child.on('close', () => {
       for (const rl of rls) rl.close()
     })
     child.on('exit', (code) => {
       console.warn(`[backend:${this.kind}] exited with code ${String(code)}`)
-      if (this.child === child) {
+      const currentChild = this.child === child
+      if (currentChild) {
         this.child = null
         publishConnection(null, null)
       }
+      if (!currentChild || typeof code !== 'number' || code === 0) return
+      // readline delivers the last stdout/stderr lines on the I/O turn. Wait
+      // one turn so a `failed` line written just before exit is not missed.
+      // A newer note (a later child, a ready line) bumps the epoch and wins.
+      const epoch = failureEpoch
+      setImmediate(() => {
+        if (failureEpoch !== epoch) return
+        noteStartupFailure(reported ?? stderrExitFailure(lastStderr, code))
+      })
     })
     child.on('error', (err) => {
       // spawn failures (e.g. ENOENT for a missing agent24d binary) emit
@@ -1242,6 +1312,7 @@ export class BackendManager {
       if (this.child === child) {
         this.child = null
         publishConnection(null, null)
+        if (!reported) noteStartupFailure({ code: 'spawn', error: err.message.slice(0, 2000) })
       }
     })
   }
@@ -1302,6 +1373,7 @@ export class BackendManager {
       this.lastHealthy = alive
       if (alive) {
         this.failureCount = 0
+        noteStartupFailure(null)
         return
       }
 
@@ -1368,6 +1440,7 @@ export class BackendManager {
   stop(): void {
     this.lifecycle += 1
     this.disposed = true
+    noteStartupFailure(null)
     if (this.healthTimer) {
       clearInterval(this.healthTimer)
       this.healthTimer = null

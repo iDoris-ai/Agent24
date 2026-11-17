@@ -128,10 +128,13 @@ vi.mock('node:child_process', async (orig) => ({
 }))
 
 const endpoint = { port: 0, token: 'daemon-secret' }
+const startupFailure = { current: null as { code: string; error: string } | null }
+const retried = { n: 0 }
 type Elevate = (r: { method: string; path: string; body: string; summary: string }) => Promise<string>
 const elevation: { current: ((fn: (elevate: Elevate, token: string) => Promise<unknown>) => Promise<unknown>) | null } = { current: null }
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: endpoint.port }),
+  getDaemonStartupFailure: () => startupFailure.current,
   daemonConnection: () => ({ port: endpoint.port, authHeaders: { Authorization: `Bearer ${endpoint.token}` } }),
   daemonCliEndpoint: () => ({ port: endpoint.port, token: endpoint.token }),
   daemonElevation: () => elevation.current,
@@ -288,6 +291,7 @@ beforeAll(async () => {
       keptOmlx.push(k)
     },
     stopKeptOmlx: () => { keptStop.calls++; return keptStop.impl() },
+    retryDaemon: () => { retried.n += 1 },
     documentsModule: () => docStatus,
     documentsModuleActions: { uninstall: () => docUninstall(), install: () => docInstall() },
     guard: createIpcGuard({
@@ -2445,9 +2449,24 @@ describe('D1 navigation preferences IPC', () => {
 
 describe('backend:endpoint hands the renderer the port only (KB-HOST-01 PR-A1)', () => {
   it('returns exactly {port}, with no credential, while main holds one', async () => {
+    startupFailure.current = null
     const result = await call(IpcChannels.BackendEndpoint)
     expect(result).toEqual({ port: endpoint.port })
     expect(JSON.stringify(result)).not.toContain(endpoint.token)
+  })
+
+  it('adds the startup failure on the same channel, and retry restarts the daemon', async () => {
+    startupFailure.current = { code: 'start_failed', error: 'migration 34 was previously applied but is missing in the resolved migrations' }
+    retried.n = 0
+    try {
+      expect(await call(IpcChannels.BackendEndpoint)).toEqual({ port: endpoint.port, startupFailure: startupFailure.current })
+      expect(JSON.stringify(await call(IpcChannels.BackendEndpoint, 'retry'))).not.toContain(endpoint.token)
+      expect(retried.n).toBe(1)
+      await call(IpcChannels.BackendEndpoint, 'nope')
+      expect(retried.n).toBe(1)
+    } finally {
+      startupFailure.current = null
+    }
   })
 })
 
