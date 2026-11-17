@@ -134,7 +134,7 @@ pub async fn compose(
                 crate::pdf_compose::ComposeError::NoPage => {
                     ApiError::invalid_request("a page is past the document's last page")
                 }
-                e => ApiError::unprocessable("compose_failed", e.to_string()),
+                e => ApiError::unprocessable("parse_failed", e.to_string()),
             })
     })
     .await

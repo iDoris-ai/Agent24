@@ -139,6 +139,14 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
     profile.push_str(")\n(deny file-write*\n    (literal ");
     profile.push_str(&quote(&data_dir)?);
     profile.push_str(")\n");
+    // D1 (documents' Office → PDF): LibreOffice's single-instance pipe is a
+    // socket it can only create at `/tmp/OSL_PIPE_*`, or `/var/tmp/OSL_PIPE_*`
+    // when `/tmp` is not writable (osl `pipe.cxx`, hard-coded); without it
+    // `soffice --convert-to` exits 1. Only that name, and the directory node
+    // (its writability is checked first), never anything else in it.
+    profile.push_str(
+        ")\n(allow file-write*\n    (literal \"/private/var/tmp\")\n    (regex #\"^/private/var/tmp/OSL_PIPE_\")\n",
+    );
     profile.push_str(
         ")\n\
          (allow network-inbound\n    (local unix-socket)\n)\n\

@@ -38,7 +38,12 @@ enum Checked {
 }
 
 /// Hashes the `received` bytes of an upload and reads its format.
-fn check_data(path: &std::path::Path, received: u64, declared: &str) -> std::io::Result<Checked> {
+fn check_data(
+    path: &std::path::Path,
+    received: u64,
+    declared: &str,
+    filename: Option<&str>,
+) -> std::io::Result<Checked> {
     let mut reader = std::fs::File::open(path)?.take(received);
     let mut hasher = Sha256::new();
     let mut head = Vec::new();
@@ -62,7 +67,10 @@ fn check_data(path: &std::path::Path, received: u64, declared: &str) -> std::io:
         .collect();
     Ok(if seen != received || format!("sha256:{hex}") != declared {
         Checked::Mismatch
-    } else if media_type(&head).is_none() {
+    } else if media_type(&head)
+        .or_else(|| crate::office::office_media_type(&head, filename))
+        .is_none()
+    {
         Checked::Unsupported
     } else {
         Checked::Ok
@@ -157,15 +165,15 @@ async fn start(storage: &Arc<Storage>, req: ImportRequest, request: String) -> A
     }
     #[cfg(test)]
     super::handler_test::after_lookup(&req.upload_id).await;
-    let row: Option<(i64, String, String, bool)> = sqlx::query_as(
-        "SELECT received, status, sha256,
+    let row: Option<(i64, String, String, Option<String>, bool)> = sqlx::query_as(
+        "SELECT received, status, sha256, filename,
                 julianday('now') > julianday(coalesce(last_chunk_at, created_at), '+24 hours')
          FROM uploads WHERE id = ?",
     )
     .bind(&req.upload_id)
     .fetch_optional(pool)
     .await?;
-    let Some((received, status, sha256, stale)) = row else {
+    let Some((received, status, sha256, filename, stale)) = row else {
         return Err(Fail::Api(ApiError::not_found("no such upload")));
     };
     if status == "expired" || (status != "imported" && stale) {
@@ -179,7 +187,7 @@ async fn start(storage: &Arc<Storage>, req: ImportRequest, request: String) -> A
     }
     let path = upload_dir(storage.data_dir(), &req.upload_id).join("data");
     let size = u64::try_from(received).map_err(|e| Fail::Db(sqlx::Error::Decode(Box::new(e))))?;
-    match blocking(move || check_data(&path, size, &sha256)).await {
+    match blocking(move || check_data(&path, size, &sha256, filename.as_deref())).await {
         Ok(Checked::Ok) => {}
         Ok(Checked::Mismatch) => {
             return Err(Fail::Api(ApiError::unprocessable(
@@ -190,7 +198,7 @@ async fn start(storage: &Arc<Storage>, req: ImportRequest, request: String) -> A
         Ok(Checked::Unsupported) => {
             return Err(Fail::Api(ApiError::unprocessable(
                 "unsupported_format",
-                "slice 1 imports PDF, JPEG and PNG",
+                "imports PDF, JPEG, PNG, DOCX, XLSX and PPTX",
             )));
         }
         Err(e) => return Err(Fail::Api(ApiError::storage_unavailable(io_cause(&e)))),
