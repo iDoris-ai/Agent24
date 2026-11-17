@@ -15,7 +15,6 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
-use crate::engine::{RenderError, pdfkit};
 use crate::error::ApiError;
 use crate::id::{IdKind, is_id, new_id};
 use crate::imports::handler::import_upload;
@@ -199,13 +198,6 @@ pub async fn compose(
         .await
         .map_err(ApiError::storage_unavailable)?;
     let parts = inputs(&storage, &req.parts).await?;
-    let engine = state
-        .layers()
-        .engine()
-        .ok_or_else(|| {
-            ApiError::engine_unavailable(pdfkit::ENGINE_ID, "no PDF engine on this platform")
-        })?
-        .clone();
     let upload_id = new_id(IdKind::Upload)
         .map_err(|_| ApiError::internal("could not generate an upload id"))?;
     let dir = upload_dir(storage.data_dir(), &upload_id);
@@ -214,21 +206,16 @@ pub async fn compose(
         .await
         .map_err(|e| ApiError::storage_unavailable(io_cause(&e)))?;
     let data = dir.join("data");
-    let composed = engine.compose(&data, &parts).await;
+    let target = data.clone();
+    let composed = blocking(move || crate::pdf_compose::compose(&parts, &target)).await;
     let cleanup = |dir: PathBuf| async move {
         let _ = blocking(move || std::fs::remove_dir_all(dir)).await;
     };
     if let Err(e) = composed {
         cleanup(dir).await;
         return Err(match e {
-            RenderError::NoPage => {
+            crate::pdf_compose::ComposeError::NoPage => {
                 ApiError::invalid_request("a page is past the document's last page")
-            }
-            RenderError::Unsupported => {
-                ApiError::engine_unavailable(pdfkit::ENGINE_ID, "no PDF engine on this platform")
-            }
-            RenderError::TooSlow => {
-                ApiError::engine_unavailable(pdfkit::ENGINE_ID, "the engine took too long")
             }
             e => ApiError::unprocessable("compose_failed", e.to_string()),
         });
