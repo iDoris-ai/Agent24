@@ -9,4 +9,4 @@ mkdir -p "$out"
 # is the build machine's own macOS, and the helper will not start on an older one.
 xcrun swiftc -O -swift-version 5 -target "$(uname -m)-apple-macos13.0" \
   -framework PDFKit -framework Vision -framework AppKit -framework CoreImage \
-  -o "$out/agent24-documents-pdfkit" "$here/main.swift" "$here/ocr.swift" "$here/render.swift"
+  -o "$out/agent24-documents-pdfkit" "$here/main.swift" "$here/ocr.swift" "$here/render.swift" "$here/compose.swift"

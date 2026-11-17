@@ -58,6 +58,19 @@ fn region_ok(r: &str) -> bool {
     r.split(',').count() == 4 && r.split(',').all(coordinate_ok)
 }
 
+/// D2 pages: `all`, or 1-based pages and ranges like `1-3,5` (the OS checks the order).
+fn pages_ok(s: &str) -> bool {
+    let number = |n: &str| {
+        (1..=6).contains(&n.len()) && !n.starts_with('0') && n.bytes().all(|b| b.is_ascii_digit())
+    };
+    s == "all"
+        || (s.len() <= 200
+            && s.split(',').all(|part| match part.split_once('-') {
+                Some((a, b)) => number(a) && number(b),
+                None => number(part),
+            }))
+}
+
 /// An `Idempotency-Key`: 1–200 visible ASCII characters, no spaces.
 fn key_ok(k: &str) -> bool {
     (1..=200).contains(&k.len()) && k.bytes().all(|b| (0x21..=0x7e).contains(&b))
@@ -230,6 +243,36 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let path = format!("{BASE}/documents/{document}/revisions/{revision}/pages/{page}");
             let (method, path, body, headers, _) = get(with_query(path, &query));
             (method, path, body, headers, Answer::Png { asked })
+        }
+        // D2: a new document of pages of existing ones (split, merge).
+        "compose" => {
+            let parts = k.0.get("parts")?.as_array()?;
+            if !(1..=20).contains(&parts.len()) {
+                return None;
+            }
+            let mut out = Vec::with_capacity(parts.len());
+            for part in parts {
+                let p = Keys(part.as_object()?);
+                let mut one = json!({"document_id": p.id("documentId", "doc_")?});
+                if let Some(pages) = p.optional("pages", |v| v.as_str().filter(|s| pages_ok(s)))? {
+                    one["pages"] = json!(pages);
+                }
+                out.push(one);
+            }
+            let mut body = json!({"parts": out});
+            if let Some(title) = k.optional("title", |v| {
+                v.as_str()
+                    .filter(|t| (1..=500).contains(&t.chars().count()))
+            })? {
+                body["title"] = json!(title);
+            }
+            (
+                Method::Post,
+                format!("{BASE}/compositions"),
+                Some(body),
+                Vec::new(),
+                Answer::Json,
+            )
         }
         op @ ("job" | "cancelJob" | "retryJob") => {
             let job = k.id("jobId", "job_")?;

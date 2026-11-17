@@ -7,6 +7,7 @@ import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
+import { Markdown } from '../components/Markdown'
 import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
@@ -517,7 +518,7 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.content}
+              {m.role === 'assistant' ? <Markdown text={m.content} /> : m.content}
               {m.role === 'user' && m.delivery.kind === 'headroom' && (
                 <div role="group" aria-label={t('headroom.explanation')} style={{ marginTop: 8 }}>
                   <p role="status">{t('headroom.explanation')}</p>

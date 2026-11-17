@@ -24,6 +24,8 @@ pub const FORMATS: [&str; 3] = ["application/pdf", "image/jpeg", "image/png"];
 
 /// One parse, from start to exit (§3.1).
 const TIMEOUT: Duration = Duration::from_secs(120);
+/// One compose (D2): a few hundred pages copied, well inside a tool call.
+const COMPOSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// One render: within the kernel proxy's 10 s for a response's head (§4).
 const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
 /// A render's header line, at most.
@@ -159,6 +161,10 @@ impl Engine for PdfKit {
         })
     }
 
+    fn compose(&self, out: &Path, parts: &[(PathBuf, String)]) -> super::Compose {
+        self.compose_run(out, parts)
+    }
+
     fn render(&self, media_type: &str, path: &Path, ask: RenderAsk) -> Render {
         let mut args: Vec<OsString> = vec![
             "render".into(),
@@ -186,6 +192,42 @@ impl Engine for PdfKit {
                 Some(6) => Err(RenderError::TooLarge),
                 Some(code) => Err(failed(format!(
                     "the engine could not render the file ({code}): {}",
+                    ran.said
+                ))),
+                None => Err(failed("the engine stopped".into())),
+            }
+        })
+    }
+}
+
+impl PdfKit {
+    /// `compose` (compose.swift): its JSON line, `{"pages":N}`.
+    fn compose_run(&self, out: &Path, parts: &[(PathBuf, String)]) -> super::Compose {
+        let mut args: Vec<OsString> = vec!["compose".into(), out.into()];
+        for (file, pages) in parts {
+            args.push(file.into());
+            args.push(pages.into());
+        }
+        let run = self.run(&args, COMPOSE_TIMEOUT, MAX_HEAD);
+        Box::pin(async move {
+            let failed = RenderError::Failed;
+            let ran = run.await.map_err(|e| match e {
+                RunError::TooLong => RenderError::TooSlow,
+                RunError::Other(why) => failed(why),
+            })?;
+            match ran.code {
+                Some(0) => {
+                    #[derive(Deserialize)]
+                    struct Done {
+                        pages: u32,
+                    }
+                    serde_json::from_slice::<Done>(ran.out.trim_ascii())
+                        .map(|d| d.pages)
+                        .map_err(|e| failed(format!("the engine's compose answer is not one: {e}")))
+                }
+                Some(4) => Err(RenderError::NoPage),
+                Some(code) => Err(failed(format!(
+                    "the engine could not compose ({code}): {}",
                     ran.said
                 ))),
                 None => Err(failed("the engine stopped".into())),

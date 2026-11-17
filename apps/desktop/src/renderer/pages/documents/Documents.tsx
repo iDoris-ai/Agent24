@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import DocumentDetail from './DocumentDetail'
+import { compose } from './compose'
 import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 import type { DocumentsModuleStatus } from '../../../shared/ipc-types'
@@ -177,6 +178,17 @@ export default function DocumentsPage() {
   }, [reload, imp.imported])
 
   const { importing, progress, job, error } = imp
+  // D2: PDFs ticked for merging, in the order ticked, and how the last split or merge went.
+  const [picked, setPicked] = useState<string[]>([])
+  const [composing, setComposing] = useState<{ working: boolean; message: string | null; ok: boolean }>({ working: false, message: null, ok: true })
+  const merge = async () => {
+    const chosen = picked.map((id) => docs.find((d) => d.document_id === id)).filter((d) => d !== undefined)
+    setComposing({ working: true, message: null, ok: true })
+    const title = t('merge.title', { names: chosen.map((d) => d.title).join(' + ') }).slice(0, 500)
+    const out = await compose(api, chosen.map((d) => ({ documentId: d.document_id })), title)
+    setComposing({ working: false, ok: out.ok, message: out.ok ? t('compose.done') : t('compose.failed', { error: out.message }) })
+    if (out.ok) { setPicked([]); void reload() }
+  }
   return (
     <div className="content">
       <div className="page-title" role="heading" aria-level={1} tabIndex={-1} ref={pageTitle}>
@@ -233,6 +245,14 @@ export default function DocumentsPage() {
             {t('import.cancel')}
           </button>
         )}
+        {picked.length >= 2 && (
+          <button className="btn" onClick={() => void merge()} disabled={composing.working}>
+            {t('merge.button', { count: picked.length })}
+          </button>
+        )}
+        {(composing.working || composing.message) && (
+          <span role={composing.ok ? 'status' : 'alert'}>{composing.working ? t('compose.working') : composing.message}</span>
+        )}
         {canRetry(imp) && (
           <button className="btn btn-ghost" onClick={() => void retryImport(api)} disabled={imp.acting}>
             {t('import.retry')}
@@ -259,6 +279,7 @@ export default function DocumentsPage() {
         <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
           <thead>
             <tr>
+              <th style={CELL} />
               <th style={CELL}>{t('list.title')}</th>
               <th style={CELL}>{t('list.format')}</th>
               <th style={CELL}>{t('list.importedAt')}</th>
@@ -267,6 +288,13 @@ export default function DocumentsPage() {
           <tbody>
             {docs.map((d) => (
               <tr key={d.document_id}>
+                <td style={CELL}>
+                  {d.media_type === 'application/pdf' && (
+                    <input type="checkbox" aria-label={t('merge.select', { title: d.title })}
+                      checked={picked.includes(d.document_id)}
+                      onChange={(e) => setPicked((p) => e.target.checked ? [...p, d.document_id] : p.filter((x) => x !== d.document_id))} />
+                  )}
+                </td>
                 <td style={CELL}>
                   <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
                     {d.title}

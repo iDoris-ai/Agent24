@@ -11,6 +11,7 @@
 
 pub mod authorization;
 pub mod blob;
+pub mod compose;
 pub mod db;
 pub mod documents;
 pub mod engine;
@@ -190,6 +191,7 @@ pub fn router(state: AppState) -> Router {
             get(extractions::get_extraction),
         )
         .route("/imports", post(imports::handler::import))
+        .route("/compositions", post(compose::compose))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/retry", post(jobs::retry_job))

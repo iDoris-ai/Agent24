@@ -118,6 +118,26 @@ pub async fn import(
     }
 }
 
+/// D2: imports an upload the OS wrote itself (`compose.rs`), as `POST
+/// /imports` would.
+pub async fn import_upload(
+    storage: &Arc<Storage>,
+    upload_id: String,
+    title: Option<String>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    let mut params = json!({ "upload_id": upload_id });
+    if let Some(title) = &title {
+        params["title"] = json!(title);
+    }
+    let request = request_sha256(&params).map_err(|e| ApiError::invalid_request(e.to_string()))?;
+    let req = ImportRequest { upload_id, title };
+    match start(storage, req, request).await {
+        Ok(answer) => Ok(answer),
+        Err(Fail::Api(e)) => Err(e),
+        Err(Fail::Db(e)) => Err(storage.db_failure(e).await),
+    }
+}
+
 async fn claimed(
     executor: impl sqlx::SqliteExecutor<'_>,
     upload_id: &str,
