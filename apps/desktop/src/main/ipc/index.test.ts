@@ -2672,3 +2672,15 @@ describe('app:set-locale', () => {
     resetMainLocaleForTest()
   })
 })
+
+describe('OSI-1 OsPackageInstall', () => {
+  it('rejects an id that is not in the registry and does not confirm', async () => {
+    const res = await call(IpcChannels.OsPackageInstall, 'cos72')
+    expect(res.ok).toBe(false)
+    expect(res.status).toBe(400)
+    expect(res.data.error.code).toBe('not_registered')
+    expect(showMessageBox).not.toHaveBeenCalled()
+    const missing = await call(IpcChannels.OsPackageInstall, '../sin90')
+    expect(missing.data.error.code).toBe('not_registered')
+  })
+})

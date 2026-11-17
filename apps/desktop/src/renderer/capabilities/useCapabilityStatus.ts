@@ -108,9 +108,8 @@ export function useCapabilityStatus(active: boolean): CapabilityStatusFn {
     return cap('status.state', { state: component.state })
   }
 
-  // Sin90, Cos72, Documents and any other OS package row share the capability
-  // id with the component id. A failed integrity reason replaces the default
-  // Built-in / Open label. Any other state leaves that label alone.
+  // Documents and other packages: a failed integrity reason replaces the
+  // default Built-in / Open label. Any other state leaves that label alone.
   const osPackage = (id: string): string | undefined => {
     if (list.status !== 'ready') return undefined
     const component = findComponent(list.components, id)
@@ -118,8 +117,25 @@ export function useCapabilityStatus(active: boolean): CapabilityStatusFn {
     return packageIntegrityHint(component.reason)
   }
 
+  // Sin90 and Cos72 are not built in. The card says what the component row says.
+  const domainOs = (id: string): string => {
+    if (list.status === 'idle' || list.status === 'loading') return cap('status.loading')
+    if (list.status === 'error') return cap('status.unavailable')
+    const component = findComponent(list.components, id)
+    if (!component || component.state === 'absent') return cap('os.notInstalled')
+    if (component.state === 'failed') {
+      return packageIntegrityHint(component.reason) ?? cap('os.failed', { reason: component.reason ?? component.state })
+    }
+    if (component.state === 'ready' || component.state === 'installed') {
+      const version = component.version?.replace(/^v/, '')
+      return cap('os.installed', { version: version || '?' })
+    }
+    return cap('status.state', { state: component.state })
+  }
+
   const status = (id: string): string | undefined => {
     if (!active) return undefined
+    if (id === 'sin90' || id === 'cos72') return domainOs(id)
     if (!TRACKED.has(id)) return osPackage(id)
     if (list.status === 'idle' || list.status === 'loading') return cap('status.loading')
     if (list.status === 'error') return cap('status.unavailable')

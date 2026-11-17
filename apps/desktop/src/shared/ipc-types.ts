@@ -54,6 +54,10 @@ export const IpcChannels = {
   // No arguments: the module is fixed in main. Each runs the app's CLI.
   OsModuleUninstall: 'os-module:uninstall',
   OsModuleInstallBundled: 'os-module:install-bundled',
+  // OSI-1: download a registered domain OS (Sin90) and `agent24 os install` it.
+  OsPackageInstall: 'os-package:install',
+  OsPackageLatest: 'os-package:latest',
+  OsPackageProgress: 'os-package:progress',
   CommInstall: 'comm:install',
   // Private-key backup: native confirm + native save dialog in main; the
   // backend writes the file itself, so the key never crosses IPC.
@@ -353,6 +357,14 @@ export interface BackendProxyResponse {
   ok: boolean
   status: number
   data: unknown
+}
+
+/** OSI-1: main → renderer while `OsPackageInstall` is downloading. */
+export interface OsPackageProgress {
+  id: string
+  phase: 'download' | 'verify' | 'extract' | 'install'
+  received: number
+  total: number | null
 }
 
 /** A1: a decision for `POST /api/v1/approvals/{id}`. The daemon offers the valid

@@ -51,6 +51,8 @@ import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { KnowledgeHost } from './knowledge-host'
 import { serviceDaemonOf } from './service-daemon'
+import { fetchOsPackageRelease, OsInstallPauseError, performOsPackageInstall } from './os-package-install'
+import { realOsServicePause, runWhileServiceStopped } from './os-package-service'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 import { knowledgeAppInstanceId } from './knowledge-app-instance'
@@ -606,6 +608,39 @@ app.whenReady().then(async () => {
       uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
+    // OSI-1: a child daemon is stopped around `os install` (the documents
+    // path). An enrolled LaunchAgent daemon is shut down, then kickstarted,
+    // and whileServiceRestarts keeps this app from spawning its own child
+    // so it enrols with the service again. Any other daemon is left running.
+    osPackageLatest: (id) => fetchOsPackageRelease(id, process.arch),
+    osPackageInstall: (id, confirm, onProgress) => performOsPackageInstall(id, {
+      platform: process.platform,
+      arch: process.arch,
+      userDataDir: app.getPath('userData'),
+      packagesRoot: packagesRootFor(process.env, tryDataDir()),
+      runCli: execCli(cliBinary(), 120_000),
+      confirm,
+      onProgress,
+      leavesDaemonRunning: () => {
+        const service = serviceDaemonOf(backendManager)
+        return backendManager.isExternalDaemon() || (process.platform === 'darwin' && launchAgentPlistExists() && service === null)
+      },
+      withDaemonStopped: async <T>(work: () => Promise<T>): Promise<T> => {
+        const service = serviceDaemonOf(backendManager)
+        if (process.platform === 'darwin' && launchAgentPlistExists() && service) {
+          const paused = await backendManager.whileServiceRestarts(() => runWhileServiceStopped(realOsServicePause(service.pid), work))
+          if (!paused.ok) {
+            throw new OsInstallPauseError(
+              paused.stage === 'shutdown' ? 'service_shutdown' : 'daemon_running',
+              paused.code,
+            )
+          }
+          return paused.value
+        }
+        if (backendManager.isExternalDaemon() || (process.platform === 'darwin' && launchAgentPlistExists())) return work()
+        return backendManager.whileStopped(work)
+      },
+    }),
     keepOwnedOmlxOnQuit: () => {
       // Read first: it also clears a record whose plist is gone.
       const left = plistLeftByStop()
