@@ -39,13 +39,28 @@ pub fn fmt_iso(dt: DateTime<Utc>) -> String {
 /// 7-field (with a trailing year) is rejected so the wire contract stays
 /// unambiguous.
 fn normalize_cron(expr: &str) -> Result<String, SpecError> {
-    let fields = expr.split_whitespace().count();
-    match fields {
+    let fields: Vec<&str> = expr.split_whitespace().collect();
+    // Digits in day-of-week are refused: this engine counts Sunday as 1,
+    // POSIX counts it as 0. Names mean the same thing either way.
+    let dow = match fields.len() {
+        5 => fields[4],
+        6 => fields[5],
+        n => {
+            return Err(SpecError::Invalid(format!(
+                "cron expression must have 5 or 6 fields (6th is a leading seconds field), got {n}"
+            )));
+        }
+    };
+    if dow.bytes().any(|byte| byte.is_ascii_digit()) {
+        return Err(SpecError::Invalid(
+            "day-of-week must be `*` or names (MON..SUN); numbers are refused \
+             because this engine counts Sunday as 1, not POSIX 0"
+                .to_owned(),
+        ));
+    }
+    match fields.len() {
         5 => Ok(format!("0 {expr}")),
-        6 => Ok(expr.to_owned()),
-        n => Err(SpecError::Invalid(format!(
-            "cron expression must have 5 or 6 fields (6th is a leading seconds field), got {n}"
-        ))),
+        _ => Ok(expr.to_owned()),
     }
 }
 
@@ -195,6 +210,30 @@ mod tests {
             .is_err()
         );
         assert!(validate(&ScheduleSpec::Every { secs: 60 }).is_ok());
+    }
+
+    /// FU-71. Mutation: drop the digit check and `1-5` validates, then fires Sunday.
+    #[test]
+    fn numeric_dow_is_refused_and_mon_fri_fires_on_monday() {
+        use chrono::Datelike;
+
+        let numeric = ScheduleSpec::Cron {
+            expr: "0 7 * * 1-5".to_owned(),
+            tz: None,
+        };
+        assert!(validate(&numeric).is_err());
+        let saturday = utc("2026-09-26T12:00:00Z");
+        assert_eq!(saturday.weekday(), chrono::Weekday::Sat);
+        assert!(next_fire(&numeric, saturday).is_err());
+
+        let named = ScheduleSpec::Cron {
+            expr: "0 7 * * MON-FRI".to_owned(),
+            tz: None,
+        };
+        assert!(validate(&named).is_ok());
+        let first = next_fire(&named, saturday).unwrap().unwrap();
+        assert_eq!(fmt_iso(first), "2026-09-28T07:00:00Z");
+        assert_eq!(first.weekday(), chrono::Weekday::Mon);
     }
 
     #[test]

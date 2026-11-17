@@ -896,9 +896,8 @@ mod tests {
                 "{bad}"
             );
         }
-        // positive control: the numeric form IS accepted on the REST path
-        // (unchanged there this round — see §6.3's trade-off)
-        assert!(next_fire::validate(&cron("0 7 * * 1-5").into()).is_ok());
+        // REST uses the same engine and refuses numbers too (FU-71).
+        assert!(next_fire::validate(&cron("0 7 * * 1-5").into()).is_err());
         for good in [
             "0 7 * * *",
             "0 7 * * MON-FRI",
@@ -974,14 +973,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next_fire::next_fire(&lower, sat).unwrap(), Some(first));
-        // negative control documenting WHY numbers are refused: the engine
-        // reads `1-5` as Sun..Thu, so from Saturday it fires on SUNDAY.
+        // Numbers are refused by the shared engine, so this does not fire
+        // on Sunday (the old Sunday-is-1 reading of `1-5`).
         let numeric = ScheduleSpec::Cron {
             expr: "0 7 * * 1-5".into(),
             tz: None,
         };
-        let n = next_fire::next_fire(&numeric, sat).unwrap().unwrap();
-        assert_eq!(n.weekday(), chrono::Weekday::Sun);
+        assert!(next_fire::next_fire(&numeric, sat).is_err());
     }
 
     // ── `bound_or_timeout` (used by the next cut's three `Handler`s) ────
