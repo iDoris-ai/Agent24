@@ -81,6 +81,9 @@ const _: () = assert!(agent24_os_fd::LISTEN_FD == launch::LISTEN_FD);
 #[derive(Debug)]
 pub enum EnvError {
     Missing(&'static str),
+    /// The variable is set, but its bytes are not UTF-8. Not [`Self::Missing`]:
+    /// a missing variable and a corrupt one are different failures (FU-94).
+    NotUtf8(&'static str),
 }
 
 /// Three of the four spawn variables. The listen fd is deliberately NOT
@@ -120,7 +123,7 @@ impl ModuleEnv {
             callback_sock: var(launch::ENV_CALLBACK_SOCK)?.into(),
             handshake_token: var(launch::ENV_HANDSHAKE_TOKEN)?
                 .into_string()
-                .map_err(|_| EnvError::Missing(launch::ENV_HANDSHAKE_TOKEN))?,
+                .map_err(|_| EnvError::NotUtf8(launch::ENV_HANDSHAKE_TOKEN))?,
         })
     }
 
@@ -159,6 +162,9 @@ pub enum ConnectError {
         message: String,
     },
     Protocol(String),
+    /// The kernel accepted the callback connection and then did not answer
+    /// `initialize` within [`HANDSHAKE_TIMEOUT`] (FU-95).
+    Timeout,
 }
 
 impl std::fmt::Display for ConnectError {
@@ -171,6 +177,7 @@ impl std::fmt::Display for ConnectError {
                 message,
             } => write!(f, "handshake refused ({code} {kind:?}): {message}"),
             Self::Protocol(m) => write!(f, "protocol error: {m}"),
+            Self::Timeout => write!(f, "handshake timed out waiting for the kernel"),
         }
     }
 }
@@ -266,6 +273,10 @@ pub struct CallOptions {
 
 pub const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(35);
 const _: () = assert!(DEFAULT_RESPONSE_TIMEOUT.as_secs() > crate::rpc::CALL_TIMEOUT.as_secs());
+
+/// How long `initialize` waits for the kernel's reply. Same bound as one
+/// callback call: past this the module fails instead of hanging (FU-95).
+pub const HANDSHAKE_TIMEOUT: Duration = crate::rpc::CALL_TIMEOUT;
 
 impl Default for CallOptions {
     fn default() -> Self {
@@ -727,6 +738,15 @@ async fn handshake(
     env: &ModuleEnv,
     hello: &Hello<'_>,
 ) -> Result<(Offer, UnixStream, Vec<u8>), ConnectError> {
+    handshake_within(stream, env, hello, HANDSHAKE_TIMEOUT).await
+}
+
+async fn handshake_within(
+    stream: UnixStream,
+    env: &ModuleEnv,
+    hello: &Hello<'_>,
+    timeout: Duration,
+) -> Result<(Offer, UnixStream, Vec<u8>), ConnectError> {
     let mut reader = BufReader::new(stream);
 
     let id = "1".to_owned();
@@ -753,9 +773,12 @@ async fn handshake(
         .map_err(ConnectError::Io)?;
     reader.get_mut().flush().await.map_err(ConnectError::Io)?;
 
-    let line = crate::rpc::read_frame_async(&mut reader)
-        .await
-        .map_err(|e| ConnectError::Protocol(e.to_string()))?;
+    let line = match tokio::time::timeout(timeout, crate::rpc::read_frame_async(&mut reader)).await
+    {
+        Ok(Ok(line)) => line,
+        Ok(Err(e)) => return Err(ConnectError::Protocol(e.to_string())),
+        Err(_elapsed) => return Err(ConnectError::Timeout),
+    };
     let resp: Value =
         serde_json::from_slice(&line).map_err(|e| ConnectError::Protocol(e.to_string()))?;
     let got_id = resp.get("id").and_then(Value::as_str).unwrap_or_default();
@@ -1203,6 +1226,64 @@ mod tests {
     #[test]
     fn os_fd_and_proto_agree_on_the_listen_fd_env_var_name() {
         assert_eq!(agent24_os_fd::ENV_LISTEN_FD, launch::ENV_LISTEN_FD);
+    }
+
+    fn env_with_token(token: Option<OsString>) -> Result<ModuleEnv, EnvError> {
+        ModuleEnv::from_vars(|k| match k {
+            launch::ENV_HANDSHAKE_TOKEN => token.clone(),
+            launch::ENV_CALLBACK_SOCK => Some("/tmp/cb.sock".into()),
+            launch::ENV_DATA_DIR => Some("/tmp/data".into()),
+            _ => None,
+        })
+    }
+
+    /// FU-94: a token that is not UTF-8 is a parse error, not "unset".
+    #[test]
+    fn a_non_utf8_handshake_token_is_not_reported_as_missing() {
+        use std::os::unix::ffi::OsStringExt;
+        let err = env_with_token(Some(OsString::from_vec(vec![0xff, 0xfe]))).unwrap_err();
+        assert!(
+            matches!(err, EnvError::NotUtf8(launch::ENV_HANDSHAKE_TOKEN)),
+            "{err:?}"
+        );
+        assert!(!matches!(err, EnvError::Missing(_)), "{err:?}");
+    }
+
+    /// Positive control: the variable really absent is still `Missing`.
+    #[test]
+    fn a_missing_handshake_token_is_still_missing() {
+        let err = env_with_token(None).unwrap_err();
+        assert!(
+            matches!(err, EnvError::Missing(launch::ENV_HANDSHAKE_TOKEN)),
+            "{err:?}"
+        );
+    }
+
+    /// FU-95(a): the kernel connects and writes no handshake reply. The SDK
+    /// returns a timeout instead of blocking. The outer bound is what fails
+    /// this test if the read is unbounded again.
+    #[tokio::test]
+    async fn handshake_fails_when_the_kernel_never_answers() {
+        let (client, server) = connected_pair().await;
+        let env = env_with_token(Some("tok".into())).unwrap();
+        let hello = Hello {
+            module: "m",
+            manifest_bytes: b"x",
+            capabilities: &[],
+            protocol_min: 1,
+            protocol_max: 1,
+        };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            handshake_within(client, &env, &hello, Duration::from_millis(200)),
+        )
+        .await;
+        drop(server);
+        match outcome {
+            Ok(Err(ConnectError::Timeout)) => {}
+            Ok(other) => panic!("expected a timeout error, got {other:?}"),
+            Err(_) => panic!("handshake hung instead of failing within the budget"),
+        }
     }
 
     // -- J-S19: lenient handshake reply parsing --------------------------
