@@ -1752,7 +1752,8 @@ async fn install_with_consent(
         Ok(dest) => {
             println!("installed {}", dest.display());
             println!(
-                "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+                "{}",
+                install_takes_effect_line(service::service_installed())
             );
             // An ephemeral daemon (`agent24 chat` with nothing running)
             // resolves a different packages root and will never see this
@@ -3141,7 +3142,29 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
     }
 }
 
+/// FU-68: an installed LaunchAgent must be restarted with `kickstart`,
+/// not `daemon stop && daemon start` (a clean exit is not restarted, and
+/// the manual start is not launchd's child). No plist: the old command.
+fn install_takes_effect_line(service_installed: bool) -> String {
+    format!(
+        "  it takes effect at the next daemon start: {}",
+        service::restart_command(service_installed)
+    )
+}
+
+fn restart_apply_line(enabled: bool, service_installed: bool) -> String {
+    format!(
+        "    config says {} — restart the daemon to apply ({})",
+        if enabled { "enabled" } else { "disabled" },
+        service::restart_command(service_installed)
+    )
+}
+
 fn print_os(list: &agent24_protocol::DomainOsList) {
+    print_os_with(list, service::service_installed())
+}
+
+fn print_os_with(list: &agent24_protocol::DomainOsList, service_installed: bool) {
     // The registry problem FIRST, because until it is fixed nothing else the user
     // does here takes effect — including the toggle they probably just tried.
     if let Some(err) = &list.registry_error {
@@ -3184,10 +3207,7 @@ fn print_os(list: &agent24_protocol::DomainOsList) {
             println!("    declared models could not be checked");
         }
         if m.restart_required {
-            println!(
-                "    config says {} — restart the daemon to apply (agent24 daemon stop && agent24 daemon start)",
-                if m.enabled { "enabled" } else { "disabled" }
-            );
+            println!("{}", restart_apply_line(m.enabled, service_installed));
         }
     }
 }
@@ -3553,6 +3573,34 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn restart_hints_kickstart_when_the_launch_agent_is_installed() {
+        let apply = restart_apply_line(true, true);
+        assert!(
+            apply.contains("launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24"),
+            "{apply}"
+        );
+        assert!(
+            !apply.contains("agent24 daemon stop && agent24 daemon start"),
+            "{apply}"
+        );
+        let install = install_takes_effect_line(true);
+        assert!(install.contains("launchctl kickstart -k"), "{install}");
+        assert!(!install.contains("daemon stop"), "{install}");
+    }
+
+    #[test]
+    fn restart_hints_stay_stop_then_start_when_no_launch_agent_is_installed() {
+        assert_eq!(
+            restart_apply_line(false, false),
+            "    config says disabled — restart the daemon to apply (agent24 daemon stop && agent24 daemon start)"
+        );
+        assert_eq!(
+            install_takes_effect_line(false),
+            "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+        );
+    }
 
     #[test]
     fn trusted_team_commands_parse_and_help_explains_builtin() {
