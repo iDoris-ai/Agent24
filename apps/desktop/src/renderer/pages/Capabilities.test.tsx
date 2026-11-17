@@ -29,7 +29,7 @@ const GROUP_BLURBS = [
   'Built into Agent24',
   'Separate services: on this Mac or your team server',
   'Large, downloaded on demand',
-  'Loadable modules',
+  'Sin90 ships with Agent24',
   'Small actions Assistant and Documents can use',
   'Background parts of Agent24',
 ]

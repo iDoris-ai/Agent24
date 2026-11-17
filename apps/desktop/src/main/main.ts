@@ -23,9 +23,11 @@ import { documentsEvent } from './documents'
 import { cliBinary } from './documents-cli'
 import {
   CODESIGN,
+  DOCUMENTS_OS,
+  SIN90_OS,
   type BundledModuleDeps,
   documentsModuleOnDisk,
-  ensureBundledDocumentsModule,
+  ensureBundledOsModules,
   execCli,
   installBundledDocumentsModule,
   packagesRootFor,
@@ -506,13 +508,13 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   //
-  // T1-1 (#1159 Q1 = A): the documents module the mac app carries is
-  // installed first, so the daemon this start spawns mounts it: start() waits
-  // for it, and tray actions in the meantime only record what the user wants.
-  // Never rejects; a failure is a warning and the daemon starts all the same.
-  const documentsDeps: BundledModuleDeps = {
+  // T1-1 (#1159 Q1 = A) and OSI-2: the documents and Sin90 packages the mac
+  // app carries are installed, in that order, before the daemon starts, so
+  // this start mounts them. Never rejects; a failure is a warning and the
+  // daemon starts all the same. Sin90 does not replace an equal or newer install.
+  const bundledDeps = (resourceName: string): BundledModuleDeps => ({
     bundleDir: app.isPackaged && process.platform === 'darwin'
-      ? path.join(process.resourcesPath, 'documents-module')
+      ? path.join(process.resourcesPath, resourceName)
       : null,
     // Contents/Resources → the .app whose signature sets the rule.
     appBundle: app.isPackaged ? path.resolve(process.resourcesPath, '..', '..') : null,
@@ -522,11 +524,16 @@ app.whenReady().then(async () => {
     runCli: execCli(cliBinary()),
     warn: (message) => console.warn(message),
     info: (message) => console.log(message),
-  }
-  const documentsModuleReady = ensureBundledDocumentsModule(documentsDeps)
-  backendManager.holdStartUntil(documentsModuleReady)
+  })
+  const documentsDeps = bundledDeps('documents-module')
+  const sin90Deps = bundledDeps('sin90-module')
+  const bundledModulesReady = ensureBundledOsModules([
+    { spec: DOCUMENTS_OS, deps: documentsDeps },
+    { spec: SIN90_OS, deps: sin90Deps },
+  ])
+  backendManager.holdStartUntil(bundledModulesReady)
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
-    await documentsModuleReady
+    await bundledModulesReady
     const external = backendManager.isExternalDaemon()
     let result: ModuleActionResult
     try {
@@ -672,7 +679,7 @@ app.whenReady().then(async () => {
       if (!residentAvailable()) return { ok: false, stage: 'unavailable', code: 'unavailable' }
       const result = await setResident(on, {
         installed: launchAgentPlistExists,
-        install: () => residentInstall(documentsModuleReady),
+        install: () => residentInstall(bundledModulesReady),
         stop: residentStop,
         record: recordConsent,
       })
@@ -681,7 +688,7 @@ app.whenReady().then(async () => {
     },
   })
   mainWin = createMainWindow()
-  void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
+  void askResidentConsent(bundledModulesReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   // M4 A7: Knowledge's dialogs and drafts in their conversations' pending[].

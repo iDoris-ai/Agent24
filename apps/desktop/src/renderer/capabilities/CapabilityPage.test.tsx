@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BackendProxyRequest } from '../../shared/ipc-types'
 import { setLocale } from '../i18n'
@@ -50,7 +50,25 @@ describe('CapabilityPage domain OS', () => {
     render(<CapabilityPage capability={sin90} />)
     expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
     expect(await screen.findByRole('button', { name: 'Update to v0.5.3' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Install the latest version' })).not.toBeInTheDocument()
     expect(screen.queryByText(/Enable this domain OS in Tools/)).not.toBeInTheDocument()
+    expect(screen.getByText('Ships with Agent24. Work with the Sin90 domain OS.')).toBeInTheDocument()
+  })
+
+  it('shows Installed v0.5.2 with no install button when the mounted version is current', async () => {
+    modules = [module('0.5.2')]
+    osPackageLatest.mockResolvedValue({ ok: true, status: 200, data: { version: '0.5.2', upgraded: false } })
+    render(<CapabilityPage capability={sin90} />)
+    expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
+    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    act(() => setLocale('zh'))
+    expect(screen.getByRole('status')).toHaveTextContent('已安装 v0.5.2')
+    expect(screen.queryByRole('button', { name: '安装最新版' })).not.toBeInTheDocument()
+    expect(screen.getByText('随 Agent24 安装，用来使用 Sin90 领域 OS。')).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(screen.getByRole('status')).toHaveTextContent('ติดตั้งแล้ว v0.5.2')
+    expect(screen.getByText('มากับ Agent24 ใช้ทำงานกับ Domain OS ของ Sin90')).toBeInTheDocument()
+    act(() => setLocale('en'))
   })
 
   it('offers to install the latest version when Sin90 is not installed', async () => {

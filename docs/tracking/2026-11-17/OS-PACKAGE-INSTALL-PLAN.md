@@ -33,6 +33,35 @@ Sin90 页读 `GET /api/v1/os`：`mounted` 显示已安装的版本；不在列�
 - 已连上的 LaunchAgent：先走现有的 elevated `POST /api/v1/shutdown`（本机确认框），等进程退出，再执行 uninstall/install，然后 `launchctl kickstart -k`。外面套着 `whileServiceRestarts`，避免桌面在空窗期自己再起一个 daemon，装完后按原有探测重新连上服务 daemon。用户拒绝停服务则不安装。
 - 没连上的外部 daemon，或开了常驻服务但还没 enrol：不杀进程。若 CLI 报锁被占用，界面说明先 `agent24 daemon stop`，或在设置里关掉常驻服务后再试。
 
+## OSI-2 随包 Sin90
+
+2026-11-18。Sin90 v0.5.2 跟 mac 安装包走，首启用应用自带的 `agent24 os install` 装上。按需下载和升级仍走上面的 OSI-1。
+
+钉的版本和摘要在 `apps/desktop/scripts/sin90-pin.json`。`stage-sin90-module.sh` 只下载这一版、这一架构的资产，sha256 必须和 pin 里写死的值一致，否则失败退出。对过的包缓存在 `apps/desktop/.sin90-module-cache/`。pin 里的两个 sha256 取自该 release 的 `SHA256SUMS`：
+
+- `sin90-0.5.2-macos-arm64.tar.gz` = `2fe0d068f2e08691ce5c21b808504bcb6987b970029cc5e03342e2d3e251479d`
+- `sin90-0.5.2-macos-x64.tar.gz` = `e8f3a63711f9b9950e48c6b514bc5d5490833edb5f532f571450251271400b5c`
+
+stage 时丢掉 `files.json`。electron-builder 会重签 app 里所有 Mach-O，`bin/sin90` 的字节会变，发布包自带的清单对不上。安装前先验 codesign（Team HYAP444FN9、Hardened Runtime，和 documents 同一条），再在私有临时副本上生成完整性数据，然后 `os install`。不改 daemon 的信任规则。
+
+随包版本和 OSI-1 升级不互相降级：
+
+- 没装 → 装随包的 0.5.2。
+- 已装版本低于随包版本 → 先 `os uninstall` 再 `os install`。数据目录和 `os.json` 都不动。
+- 已装版本等于或高于随包版本 → 不动。用户经 OSI-1 升到更新的版本后，下一次启动不会被随包旧版盖回去。
+- 用户卸载标记 `sin90-module.json`（`uninstalledByUser: true`）在 → 不装。
+
+documents 仍是「任何载荷不同就重装」，和这次的版本比较不是同一条规则。两个模块在 daemon 启动前串行安装，一个失败不挡另一个，也不挡 app 启动。
+
+页面：已挂载时不显示「安装最新版」。状态是「已安装 v0.5.2」。有更新的 OSI-1 发布时仍显示「更新到 v…」。能力中心这一组不再写成按需另行下载。
+
+### FU（OSI-2）
+
+- 桌面还没有 Sin90 的卸载按钮。标记文件在才会跳过；只跑 `agent24 os uninstall sin90` 时，下次启动会再装随包版。
+- 已装版本不是 `X.Y.Z` 时留下不动，不猜该不该升级。
+- Linux / Windows 不随包。
+- 换钉的版本要改 pin 并重新 stage。不在启动时对照 GitHub 最新版。
+
 ## FU
 
 - Linux / Windows 资产、以及非 `vX.Y.Z` 的预发布。

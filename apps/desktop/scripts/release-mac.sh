@@ -110,6 +110,15 @@ for f in domain-os.yml bin/agent24-documents bin/agent24-documents-pdfkit; do
   [[ -f "$DESKTOP_DIR/.documents-module/$f" ]] || die "documents 模块缺少 $f（stage-documents-module.sh）"
 done
 
+step "2a2/6 Sin90 模块（OSI-2：Resources/sin90-module，首次启动由 App 安装；同版或更高版不降级）"
+# 钉死的发布包按 $ARCH 下载并校验 sha256，解压后丢掉 files.json（electron-builder
+# 会重签 bin/sin90，发布包里的哈希对不上）。安装前的验签与 documents 同一条规则。
+bash "$DESKTOP_DIR/scripts/stage-sin90-module.sh" "$ARCH"
+for f in domain-os.yml bin/sin90; do
+  [[ -f "$DESKTOP_DIR/.sin90-module/$f" ]] || die "sin90 模块缺少 $f（stage-sin90-module.sh）"
+done
+[[ ! -e "$DESKTOP_DIR/.sin90-module/files.json" ]] || die "sin90 模块不应带 files.json（重签后哈希会对不上）"
+
 step "2b/6 Open Design 按需组件（darwin-${ARCH}：构建 → 签名原生模块 → 公证 → 打 tarball + 清单）"
 [[ "${ARCH}" == "arm64" ]] || die "Open Design 组件目前只支持 arm64（AGENT24_ARCH=${ARCH}）"
 # 先清掉陈旧产物：旧清单 / 旧 tarball 绝不能混进这次的包
