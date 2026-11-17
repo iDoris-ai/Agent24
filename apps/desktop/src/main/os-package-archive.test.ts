@@ -39,7 +39,7 @@ function archive(entries: { name: string; type: string; body?: string; mode?: st
   const parts: Buffer[] = []
   for (const entry of entries) {
     const body = Buffer.from(entry.body ?? '')
-    parts.push(header(entry.name, entry.type === '5' ? 0 : body.length, entry.type, entry.mode))
+    parts.push(header(entry.name, entry.type === '5' ? 0 : body.length, entry.type, entry.mode ?? (entry.type === '5' ? '0000755' : undefined)))
     if (entry.type !== '5' && body.length > 0) {
       parts.push(body, Buffer.alloc((512 - (body.length % 512)) % 512))
     }
@@ -68,6 +68,19 @@ describe('extractTarGz', () => {
     ]), dest)
     expect(fs.statSync(path.join(dest, 'pkg/bin/sin90')).mode & 0o7777).toBe(0o755)
     expect(fs.statSync(path.join(dest, 'pkg/domain-os.yml')).mode & 0o7777).toBe(0o444)
+  })
+
+  it('keeps directory permission bits, even a read-only one with files inside', () => {
+    const dest = tempDir()
+    extractTarGz(archive([
+      { name: 'pkg', type: '5', mode: '0000700' },
+      { name: 'pkg/bin', type: '5', mode: '0000500' },
+      { name: 'pkg/bin/sin90', type: '0', body: 'bin', mode: '0000500' },
+    ]), dest)
+    expect(fs.statSync(path.join(dest, 'pkg')).mode & 0o7777).toBe(0o700)
+    expect(fs.statSync(path.join(dest, 'pkg/bin')).mode & 0o7777).toBe(0o500)
+    expect(fs.readFileSync(path.join(dest, 'pkg/bin/sin90'), 'utf8')).toBe('bin')
+    fs.chmodSync(path.join(dest, 'pkg/bin'), 0o700)
   })
 
   it.each(['../outside.txt', '/tmp/outside.txt', 'pkg/../../outside.txt', 'link'])('refuses %s', (name) => {

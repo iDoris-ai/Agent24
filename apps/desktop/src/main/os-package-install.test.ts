@@ -19,7 +19,7 @@ afterEach(() => {
 function header(name: string, size: number, type: string): Buffer {
   const block = Buffer.alloc(512)
   block.write(name)
-  block.write('0000644\0', 100)
+  block.write(type === '5' ? '0000755\0' : '0000644\0', 100)
   block.write('0000000\0', 108)
   block.write('0000000\0', 116)
   block.write(`${size.toString(8).padStart(11, '0')}\0`, 124)

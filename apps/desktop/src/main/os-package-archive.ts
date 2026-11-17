@@ -78,6 +78,15 @@ function assertNoSymlink(root: string, target: string): void {
 
 /** Extracts `file` (gzip + ustar) into `dest`, which must already exist. */
 export function extractTarGz(file: string, dest: string, limits: ArchiveLimits = DEFAULT_ARCHIVE_LIMITS): void {
+  const dirModes: [string, number][] = []
+  extractEntries(file, dest, limits, dirModes)
+  // Directory bits last and deepest first, so a read-only directory does not
+  // block writing the files inside it. `os install` and `package-integrity
+  // verify` both compare them with the package.
+  for (const [dir, mode] of dirModes.sort((x, y) => y[0].length - x[0].length)) fs.chmodSync(dir, mode)
+}
+
+function extractEntries(file: string, dest: string, limits: ArchiveLimits, dirModes: [string, number][]): void {
   const raw = gunzipLimited(fs.readFileSync(file), limits.maxOutputLength)
   const root = fs.realpathSync(dest)
   let offset = 0
@@ -126,6 +135,7 @@ export function extractTarGz(file: string, dest: string, limits: ArchiveLimits =
       const target = safeArchivePath(root, name.replace(/\/$/, ''))
       fs.mkdirSync(target, { recursive: true })
       assertNoSymlink(root, target)
+      dirModes.push([target, octal(header, 100, 8) & 0o777])
     } else if (type === '1' || type === '2') {
       throw new ArchiveRejected(`refusing link entry ${name}`)
     } else {
