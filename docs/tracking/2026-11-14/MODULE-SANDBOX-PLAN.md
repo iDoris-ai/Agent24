@@ -82,7 +82,7 @@ SBX-1b（2026-11-15，本机）用同一份最小 profile，但**不再放行用
 - SBX-2 不探测进程是否真在沙箱里。macOS 上 OS 模块即使 stopped、failed 或还没装上（Documents 空行），也标 `isolated`。
 - SBX-2 对读不到 manifest（`d9` 缺失）的域模块行标 `form_not_covered`，不猜它是不是包。
 - SBX-2 能力中心只给能对上组件 id 的卡片挂标签；对不上的能力行不显示。未知 `isolation` 短码当没有该字段，不让整行失败。
-- `<data>/tmp` 若被模块换成链接或普通文件，下次启动只删这个条目（链接不跟随）再重建目录，模块不会因此起不来（#1865 评审 M1）。清空时给每层目录补上属主 rwx，只读树（Go 模块缓存 0555/0444、权限 000 的目录、tmp 本身 555）也能清掉（#1865 评审 M1'）；先试 `remove_dir_all`（任意深度），失败才走补权限的逐层清理（#1865 评审 M2）。`chflags uchg` 锁住的文件和 `<data>` 本身被改成只读，留给人工处理。
+- `<data>/tmp` 若被模块换成链接或普通文件，下次启动只删这个条目（链接不跟随）再重建目录，模块不会因此起不来（#1865 评审 M1）。清空时给每层目录补上属主 rwx，只读树（Go 模块缓存 0555/0444、权限 000 的目录、tmp 本身 555）也能清掉（#1865 评审 M1'）；先试 `remove_dir_all`（任意深度），失败才走补权限的逐层清理（#1865 评审 M2）。只读且超过 PATH_MAX 深度的树仍会让兜底失败，需模块刻意构造，不处理。`chflags uchg` 锁住的文件和 `<data>` 本身被改成只读，留给人工处理。
 - 模块临时目录在 `symlink_metadata`（`reset_module_temp`）通过之后、`clear_dir_contents` 清空之前被换成链接：不处理；以后再做时改用 `openat`/`O_NOFOLLOW`。
 - 经 `confstr(_CS_DARWIN_USER_TEMP_DIR)` / `NSTemporaryDirectory()` 取临时目录的模块会拿到用户临时目录并被拒（EPERM）；模块约定应写明用 `TMPDIR`。
 - Linux 上数据目录本身若是符号链接，模块临时目录会建在链接指到的地方（macOS 上 `check_data_dir` 会先拒绝）。
