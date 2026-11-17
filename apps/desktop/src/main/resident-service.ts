@@ -9,7 +9,9 @@ import { execFile } from 'node:child_process'
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { daemonConnection, daemonElevation, DAEMON_EXIT_WAIT_MS, processAlive, readExternalDaemonState } from './backend-manager'
+import { daemonConnection, daemonElevation, DAEMON_EXIT_WAIT_MS, processAlive, readExternalDaemonState, type BackendStatusDetail } from './backend-manager'
+import { REJECTED_CODES } from './daemon-enroll'
+import type { BackendRefusalResult } from '../shared/ipc-types'
 import { sendElevating } from './elevated-request'
 
 export const SERVICE_LABEL = 'ai.auraai.agent24'
@@ -527,8 +529,9 @@ export interface StopDeps {
   /** Not enrolled, yet a live service daemon is on record (the tray's
    * disconnect, a refused enrolment): it is not stopped without the presence
    * box (Codex B4c1 C1), so nothing changes until this app is enrolled again.
-   * Not enrolled and none on record (a crash loop, waiting): the uninstall's
-   * bootout stops whatever launchd runs. */
+   * Not enrolled and none on record (a crash loop, waiting), or the one on
+   * record refused this app for good (QA 0.6.1 §3c: no presence connection
+   * to ask through): the uninstall's bootout stops whatever launchd runs. */
   unreachable: () => boolean
   /** Resolves true once the daemon that was shut down has exited; false when
    * the wait ran out (the bootout then stops it). */
@@ -590,7 +593,7 @@ const realStopSystem = (): StopSystem => ({
 /** The real steps for the enrolled service daemon `pid` (null when not
  * enrolled), with the bundled CLI. */
 export function serviceStopDeps(
-  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void; leftInstalled?: () => void },
+  o: { cli: string; pid: number | null; spawned: (pid: number) => boolean; hold: StopDeps['hold']; record: () => void; leftInstalled?: () => void; refused?: (pid: number) => boolean },
   sys: StopSystem = realStopSystem(),
 ): StopDeps {
   const pid = o.pid
@@ -598,7 +601,7 @@ export function serviceStopDeps(
     shutdown: pid === null ? null : sys.shutdown,
     unreachable: () => {
       const other = pid === null ? serviceRecordPid(sys.record(), o.spawned) : null
-      return other !== null && sys.alive(other)
+      return other !== null && sys.alive(other) && !(o.refused?.(other) ?? false)
     },
     exited: () => until(() => pid === null || !sys.alive(pid), sys.exitWaitMs),
     uninstall: () => sys.run(o.cli, ['service', 'uninstall'], process.env),
@@ -606,6 +609,19 @@ export function serviceStopDeps(
     record: o.record,
     ...(o.leftInstalled ? { leftInstalled: o.leftInstalled } : {}),
   }
+}
+
+/** QA 0.6.1 §3c: the service daemon `pid` refused this app for good (an
+ * unsigned build, another protocol): this app has no presence connection to
+ * ask through while that daemon runs, so the stop goes straight to the
+ * uninstall, as `agent24 service uninstall` would. */
+export function refusedThisApp(detail: BackendStatusDetail | null, pid: number): boolean {
+  return detail?.kind === 'enrol_refused' && detail.pid === pid && REJECTED_CODES.has(detail.code)
+}
+
+/** What the window is told of a refused enrolment (the daemon's code only). */
+export function enrolRefusal(detail: BackendStatusDetail | null): BackendRefusalResult | null {
+  return detail?.kind === 'enrol_refused' ? { code: detail.code, permanent: REJECTED_CODES.has(detail.code) } : null
 }
 
 // ── M5 B4c2: the Settings switch ──────────────────────────────────────────

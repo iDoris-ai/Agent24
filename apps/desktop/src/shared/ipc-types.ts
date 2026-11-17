@@ -43,6 +43,8 @@ export const IpcChannels = {
   ShellOpenExternal: 'shell:open-external',
   BackendProxy: 'backend:proxy',
   BackendEndpoint: 'backend:endpoint',
+  // QA 0.6.1 §3c: why the service daemon did not take this app, if it did not.
+  BackendRefusal: 'backend:refusal',
   // A1: elevated daemon operations the generic `backendProxy` no longer
   // forwards. Each asks the user through a native dialog in the main process
   // before sending anything.
@@ -374,6 +376,13 @@ export interface DaemonStartupFailure {
 export interface BackendEndpointResult {
   port: number | null
   startupFailure?: DaemonStartupFailure
+}
+
+/** The service daemon did not enrol this app: its code, and whether retrying
+ * can help (`permanent`: identity_rejected, unsupported_version). */
+export interface BackendRefusalResult {
+  code: string
+  permanent: boolean
 }
 
 export interface CreativeViewBounds {

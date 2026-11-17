@@ -236,6 +236,7 @@ button { cursor: pointer; font-family: var(--font); }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #555; flex-shrink: 0; }
 .status-dot.online { background: #4caf50; box-shadow: 0 0 4px #4caf5066; }
 .status-dot.offline { background: #f44336; }
+.backend-refused-hint { margin: 6px 0 0; font-size: 11px; line-height: 1.4; color: var(--muted); }
 
 /* ── Main area ── */
 .main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }

@@ -1,6 +1,6 @@
 // M5 B4c: the tray's 「完全退出」: stopping the service for good (resident-service.ts).
 import { afterEach, describe, expect, it } from 'vitest'
-import { serviceStopDeps, stopService, type StopDeps, type StopSystem } from './resident-service'
+import { enrolRefusal, refusedThisApp, serviceStopDeps, stopService, type StopDeps, type StopSystem } from './resident-service'
 import { buildTrayView, type TrayInput } from './tray-menu'
 import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
@@ -189,6 +189,37 @@ describe('serviceStopDeps (the real steps over a fake system)', () => {
   ] as const)('not unreachable: %s', (_name, pid, o, spawned) => {
     const live = { record: () => ({ pid: 5151, enrollEndpoint: '/tmp/e.sock' }), alive: () => true }
     expect(system(pid, { ...live, ...o }, spawned).deps.unreachable()).toBe(false)
+  })
+
+  // QA 0.6.1 §3c: an unsigned build the service daemon refused can never get
+  // the presence box, so the switch and 「完全退出」 must still remove the service:
+  // the uninstall's bootout stops it, as `agent24 service uninstall` would.
+  it('not unreachable: the live daemon on record refused this app for good', async () => {
+    const live = { record: () => ({ pid: 5151, enrollEndpoint: '/tmp/e.sock' }), alive: () => true }
+    const sys: StopSystem = { run: async () => {}, shutdown: async () => ({ status: 202 }), exitWaitMs: 0, ...live }
+    const deps = (refused: (pid: number) => boolean) => serviceStopDeps({ cli: 'x', pid: null, spawned: () => false, hold: (w) => w(), record: () => {}, refused }, sys)
+    expect(deps((pid) => pid === 5151).unreachable()).toBe(false)
+    expect(deps((pid) => pid === 6161).unreachable()).toBe(true)
+    const calls: string[] = []
+    const stop = deps((pid) => pid === 5151)
+    expect(await stopService({ ...stop, uninstall: async () => { calls.push('uninstall') }, record: () => { calls.push('record') } })).toEqual({ ok: true })
+    expect(calls).toEqual(['uninstall', 'record'])
+  })
+
+  it('refusedThisApp: only a lasting refusal (identity_rejected, unsupported_version) by that very daemon', () => {
+    expect(refusedThisApp({ kind: 'enrol_refused', code: 'identity_rejected', pid: 5151 }, 5151)).toBe(true)
+    expect(refusedThisApp({ kind: 'enrol_refused', code: 'unsupported_version', pid: 5151 }, 5151)).toBe(true)
+    expect(refusedThisApp({ kind: 'enrol_refused', code: 'identity_rejected', pid: 5151 }, 6161)).toBe(false)
+    expect(refusedThisApp({ kind: 'enrol_refused', code: 'timeout', pid: 5151 }, 5151)).toBe(false)
+    expect(refusedThisApp({ kind: 'protocol_mismatch', daemonVersion: 9, clientVersion: 1, pid: 5151 }, 5151)).toBe(false)
+    expect(refusedThisApp(null, 5151)).toBe(false)
+  })
+
+  it('enrolRefusal: the code for the window, and whether retrying can help', () => {
+    expect(enrolRefusal({ kind: 'enrol_refused', code: 'identity_rejected', pid: 5151 })).toEqual({ code: 'identity_rejected', permanent: true })
+    expect(enrolRefusal({ kind: 'enrol_refused', code: 'timeout', pid: 5151 })).toEqual({ code: 'timeout', permanent: false })
+    expect(enrolRefusal({ kind: 'protocol_mismatch', daemonVersion: 9, clientVersion: 1, pid: 5151 })).toBeNull()
+    expect(enrolRefusal(null)).toBeNull()
   })
 
   it('exited: true once the pid is gone', async () => {

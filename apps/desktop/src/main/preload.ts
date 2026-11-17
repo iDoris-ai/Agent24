@@ -8,6 +8,7 @@ import type { ChatGroupsState, ChatHistoryOrganize, ChatHistoryRecord, ChatHisto
 import {
   IpcChannels,
   type BackendEndpointResult,
+  type BackendRefusalResult,
   type CommImportPickResult,
   type CliToolStatus,
   type CliInstallResult,
@@ -159,6 +160,8 @@ const api = {
   /** Ask main to start the daemon again (the tray's restart). */
   retryBackend: (): Promise<BackendEndpointResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendEndpoint, 'retry'),
+  backendRefusal: (): Promise<BackendRefusalResult | null> =>
+    ipcRenderer.invoke(IpcChannels.BackendRefusal),
   creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>
     ipcRenderer.invoke(IpcChannels.CreativeShow, bounds),
   creativeRestart: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>

@@ -132,6 +132,8 @@ function AppShell(): JSX.Element {
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
   const [startupFailure, setStartupFailure] = useState<DaemonStartupFailure | null>(null)
   const [reasonOpen, setReasonOpen] = useState(false)
+  // QA 0.6.1 §3c: the service daemon's refusal, said instead of plain offline.
+  const [refusal, setRefusal] = useState<{ code: string; permanent: boolean } | null>(null)
   const [version, setVersion] = useState<string>('')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const [darkMode, setDarkMode] = useState(true)
@@ -174,6 +176,8 @@ function AppShell(): JSX.Element {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
+          if (res.ok) setRefusal(null)
+          else void window.agent24.backendRefusal?.().then(setRefusal, () => setRefusal(null))
           if (res.ok) {
             setStartupFailure(null)
             void listOsModules()
@@ -266,12 +270,16 @@ function AppShell(): JSX.Element {
             {backendOk === true && (
               <span>{t('backend.online')}{backendPort !== null ? ` :${backendPort}` : ''}</span>
             )}
-            {backendOk === false && (
+            {backendOk === false && !refusal && (
               <BackendOffline failure={startupFailure} reasonOpen={reasonOpen} onToggleReason={() => setReasonOpen((open) => !open)}
                 onRetry={() => { void window.agent24.retryBackend() }} />
             )}
+            {backendOk === false && refusal && (
+              <span>{t(refusal.permanent ? 'backend.refused' : 'backend.enrolRetrying', { code: refusal.code })}</span>
+            )}
             {backendOk === null && <span>{t('backend.checking')}</span>}
           </div>
+          {backendOk === false && refusal?.permanent && <p className="backend-refused-hint">{t('backend.refusedHint')}</p>}
         </div>
       </aside>
 
