@@ -90,6 +90,11 @@ pub async fn derive(
             )
         }
         ("POST", "/api/v1/shutdown") => SHUTDOWN_TEXT.to_owned(),
+        ("PUT", "/api/v1/models/default") => {
+            let parsed: crate::routes::PutDefaultModelBody = serde_json::from_slice(body).ok()?;
+            let model = crate::default_model::validate_model_id(&parsed.model).ok()?;
+            format!("把默认聊天模型改为 {}", shown(&model)?)
+        }
         _ => return None,
     };
     // The length is checked where it is authoritative: `remember` on the

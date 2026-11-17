@@ -56,10 +56,7 @@ fn host_only_route(method: &Method, path: &str) -> bool {
             "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
         ) || is_component_report(path)))
         || (method == Method::PUT
-            && matches!(
-                path,
-                "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy" | "/api/v1/models/default"
-            ))
+            && matches!(path, "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy"))
 }
 
 /// `POST /api/v1/skills/{id}/activate` is `skills.activate`, Elevated. The
@@ -70,6 +67,14 @@ fn skill_activate_route(method: &Method, path: &str) -> bool {
             .strip_prefix("/api/v1/skills/")
             .and_then(|rest| rest.strip_suffix("/activate"))
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
+}
+
+/// Elevated routes the legacy shared token cannot confirm. Service mode
+/// reaches them with a shell token plus presence; this token has no
+/// presence channel. Saving the default chat model is one of them.
+fn legacy_unelevatable(method: &Method, path: &str) -> bool {
+    skill_activate_route(method, path)
+        || (method == Method::PUT && path == "/api/v1/models/default")
 }
 
 /// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
@@ -91,7 +96,7 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
         .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
     {
         if host_only_route(req.method(), req.uri().path())
-            || skill_activate_route(req.method(), req.uri().path())
+            || legacy_unelevatable(req.method(), req.uri().path())
         {
             return error_response(
                 StatusCode::FORBIDDEN,
