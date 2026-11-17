@@ -209,6 +209,26 @@ export function serviceUpgradeDeps(
   }
 }
 
+/** D2: runs `work` with the service daemon stopped (the presence box once,
+ * as an upgrade), then starts it again. The documents module can only be
+ * replaced while no daemon holds the store's lock. Nothing happens when the
+ * shutdown is refused. */
+export function whileServiceStopped<T>(deps: UpgradeDeps, work: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; code: string }> {
+  return deps.hold(async () => {
+    const down = await deps.shutdown()
+    if (down.status < 200 || down.status >= 300) return { ok: false as const, code: down.code ?? `http_${down.status}` }
+    await deps.exited()
+    let value: T
+    try {
+      value = await work()
+    } finally {
+      try { await deps.kickstart() } catch { /* reported below */ }
+    }
+    if (!(await deps.started())) return { ok: false as const, code: 'not_started' }
+    return { ok: true as const, value }
+  })
+}
+
 export type UpgradeHint = null | { kind: 'needed' } | { kind: 'failed'; code: string }
 
 /** One upgrade per run, asked once the enrolled service daemon's version is

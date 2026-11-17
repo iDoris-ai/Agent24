@@ -17,7 +17,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -525,6 +525,21 @@ app.whenReady().then(async () => {
   }
   const documentsModuleReady = ensureBundledDocumentsModule(documentsDeps)
   backendManager.holdStartUntil(documentsModuleReady)
+  // Service mode: the LaunchAgent's daemon holds the store, so a newer bundled
+  // documents module could not replace the installed one above. Once enrolled
+  // with that daemon, stop it (the presence box once), replace the module,
+  // and start it again.
+  void documentsModuleReady.then(async (outcome) => {
+    if (outcome !== 'install_failed' || !launchAgentPlistExists()) return
+    for (let i = 0; i < 60 && !serviceDaemonOf(backendManager); i++) await new Promise((r) => setTimeout(r, 1000))
+    const service = serviceDaemonOf(backendManager)
+    const dataDir = tryDataDir()
+    if (!service || dataDir === null) return
+    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
+    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
+    const done = await whileServiceStopped(deps, () => ensureBundledDocumentsModule(documentsDeps))
+    console.log('[documents-module] replaced with the service daemon stopped:', done.ok ? done.value : done.code)
+  })
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
     await documentsModuleReady
     const external = backendManager.isExternalDaemon()
