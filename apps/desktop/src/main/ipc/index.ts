@@ -38,6 +38,7 @@ import type {
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
+  BackendRefusalResult,
   BackendProxyRequest,
   BackendProxyResponse,
   LlmStatusResult,
@@ -697,6 +698,8 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** QA 0.6.1 §3c: why the service daemon did not enrol this app, if it did not. */
+  backendRefusal?: () => BackendRefusalResult | null
   /** M4 A6: the conversation a schedule's runs go to (schedule-conversations.ts). */
   scheduleConversation?: (scheduleId: string) => string | null
   /** T1-1/T1-2: the documents module as it is on disk now. */
@@ -896,6 +899,7 @@ export function registerIpcHandlers(options: {
     const endpoint = getBackendEndpoint()
     return endpoint ? { port: endpoint.port } : null
   })
+  handle(IpcChannels.BackendRefusal, (): BackendRefusalResult | null => options.backendRefusal?.() ?? null)
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
     documentsCall(req, daemonCliEndpoint),
   )
