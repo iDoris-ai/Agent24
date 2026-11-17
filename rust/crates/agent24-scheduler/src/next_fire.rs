@@ -39,28 +39,13 @@ pub fn fmt_iso(dt: DateTime<Utc>) -> String {
 /// 7-field (with a trailing year) is rejected so the wire contract stays
 /// unambiguous.
 fn normalize_cron(expr: &str) -> Result<String, SpecError> {
-    let fields: Vec<&str> = expr.split_whitespace().collect();
-    // Digits in day-of-week are refused: this engine counts Sunday as 1,
-    // POSIX counts it as 0. Names mean the same thing either way.
-    let dow = match fields.len() {
-        5 => fields[4],
-        6 => fields[5],
-        n => {
-            return Err(SpecError::Invalid(format!(
-                "cron expression must have 5 or 6 fields (6th is a leading seconds field), got {n}"
-            )));
-        }
-    };
-    if dow.bytes().any(|byte| byte.is_ascii_digit()) {
-        return Err(SpecError::Invalid(
-            "day-of-week must be `*` or names (MON..SUN); numbers are refused \
-             because this engine counts Sunday as 1, not POSIX 0"
-                .to_owned(),
-        ));
-    }
-    match fields.len() {
+    let fields = expr.split_whitespace().count();
+    match fields {
         5 => Ok(format!("0 {expr}")),
-        _ => Ok(expr.to_owned()),
+        6 => Ok(expr.to_owned()),
+        n => Err(SpecError::Invalid(format!(
+            "cron expression must have 5 or 6 fields (6th is a leading seconds field), got {n}"
+        ))),
     }
 }
 
@@ -73,6 +58,18 @@ pub fn validate(spec: &ScheduleSpec) -> Result<(), SpecError> {
                     .map_err(|_| SpecError::Invalid(format!("unknown timezone: {tz}")))?;
             }
             let normalized = normalize_cron(expr)?;
+            // Digits in day-of-week are refused for new and edited schedules:
+            // this engine counts Sunday as 1, POSIX counts it as 0. Names mean
+            // the same either way. Only here, not in `next_fire`: a row saved
+            // before this rule keeps firing instead of being disabled at tick.
+            let dow = normalized.split_whitespace().nth(5).unwrap_or("");
+            if dow.bytes().any(|byte| byte.is_ascii_digit()) {
+                return Err(SpecError::Invalid(
+                    "day-of-week must be `*` or names (MON..SUN); numbers are refused \
+                     because this engine counts Sunday as 1, not POSIX 0"
+                        .to_owned(),
+                ));
+            }
             CronSchedule::from_str(&normalized)
                 .map_err(|e| SpecError::Invalid(format!("invalid cron expression: {e}")))?;
             Ok(())
@@ -224,7 +221,9 @@ mod tests {
         assert!(validate(&numeric).is_err());
         let saturday = utc("2026-09-26T12:00:00Z");
         assert_eq!(saturday.weekday(), chrono::Weekday::Sat);
-        assert!(next_fire(&numeric, saturday).is_err());
+        // A row saved before the rule still computes, so the tick never
+        // disables it.
+        assert!(next_fire(&numeric, saturday).unwrap().is_some());
 
         let named = ScheduleSpec::Cron {
             expr: "0 7 * * MON-FRI".to_owned(),

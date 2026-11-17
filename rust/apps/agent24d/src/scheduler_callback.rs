@@ -973,13 +973,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next_fire::next_fire(&lower, sat).unwrap(), Some(first));
-        // Numbers are refused by the shared engine, so this does not fire
-        // on Sunday (the old Sunday-is-1 reading of `1-5`).
+        // Negative control documenting WHY numbers are refused at create:
+        // the engine reads `1-5` as Sun..Thu, so from Saturday a row saved
+        // before the rule fires on SUNDAY (it still computes, so the tick
+        // never disables it).
         let numeric = ScheduleSpec::Cron {
             expr: "0 7 * * 1-5".into(),
             tz: None,
         };
-        assert!(next_fire::next_fire(&numeric, sat).is_err());
+        let n = next_fire::next_fire(&numeric, sat).unwrap().unwrap();
+        assert_eq!(n.weekday(), chrono::Weekday::Sun);
     }
 
     // ── `bound_or_timeout` (used by the next cut's three `Handler`s) ────
