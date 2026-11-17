@@ -115,7 +115,7 @@ step "2a2/6 Sin90 模块（OSI-2：Resources/sin90-module，首次启动由 App 
 # 会重签 bin/sin90，发布包里的哈希对不上）。安装前的验签与 documents 同一条规则。
 bash "$DESKTOP_DIR/scripts/stage-sin90-module.sh" "$ARCH"
 for f in domain-os.yml bin/sin90; do
-  [[ -f "$DESKTOP_DIR/.sin90-module/$f" ]] || die "sin90 模块缺少 $f（stage-sin90-module.sh）"
+  [[ -f "$DESKTOP_DIR/.sin90-module/$f" ]] || die "sin90 模块缺少 ${f}（stage-sin90-module.sh）"
 done
 [[ ! -e "$DESKTOP_DIR/.sin90-module/files.json" ]] || die "sin90 模块不应带 files.json（重签后哈希会对不上）"
 

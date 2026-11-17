@@ -116,9 +116,9 @@ f="$SIN90MOD/bin/sin90"
 check_bin "$f"
 if [[ "$APP_TEAM" =~ ^[A-Z0-9]{10}$ ]]; then
   codesign --verify --strict -R "=anchor apple generic and certificate leaf[subject.OU] = \"$APP_TEAM\"" "$f" 2>&1 \
-    || { echo "TEAM-MISMATCH  sin90-module/bin/sin90（App 的 Team ID：$APP_TEAM）"; BAD=1; }
+    || { echo "TEAM-MISMATCH  sin90-module/bin/sin90（App 的 Team ID：${APP_TEAM}）"; BAD=1; }
 elif [[ "$EXPECT_NOTARIZED" == 1 ]]; then
-  echo "App 没有 Team ID（$APP_TEAM）"; BAD=1
+  echo "App 没有 Team ID（${APP_TEAM}）"; BAD=1
 fi
 # 其余 Resources 下的 Mach-O（含 .node / 辅助二进制），逐个必须已签
 while IFS= read -r f; do
