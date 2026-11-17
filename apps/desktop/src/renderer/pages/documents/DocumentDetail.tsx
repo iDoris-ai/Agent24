@@ -74,6 +74,22 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     }
     setConvertNote({ ok: false, text: t('compose.failed', { error: out.message }) })
   }
+  // A download started elsewhere (another opening of this page) is shown
+  // here too, and keeps 「转换为 PDF」 off until it ends.
+  useEffect(() => {
+    const show = (s: { state: string; received?: number; total?: number }) => {
+      if (s.state !== 'installing') return
+      const received = s.received ?? 0
+      setDownloadText(s.total === undefined
+        ? `${(received / (1024 * 1024)).toFixed(1)} MB`
+        : t('office.downloading', { percent: Math.floor((received / s.total) * 100) }))
+    }
+    void api.officeEngineStatus?.().then(show, () => {})
+    return api.onOfficeEngineChanged?.((s) => {
+      if (s.state === 'installing') show(s)
+      else setDownloadText(null)
+    })
+  }, [api])
   const downloadEngine = async (id: string) => {
     setNeedEngine(false)
     setConvertNote(null)
