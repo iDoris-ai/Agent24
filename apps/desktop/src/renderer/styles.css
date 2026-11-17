@@ -515,3 +515,16 @@ button { cursor: pointer; font-family: var(--font); }
 .task-card-knowledge { font-size: 11px; color: var(--muted); margin-top: 2px; }
 .task-card-handover { display: block; margin-top: 6px; }
 .task-card-handover-button { font-size: 11.5px; padding: 1px 8px; }
+
+/* Assistant replies rendered from Markdown (components/Markdown.tsx). */
+.md { white-space: normal; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md-p { margin: 0 0 8px; }
+.md-list { margin: 0 0 8px; padding-left: 20px; }
+.md-list li { margin: 2px 0; }
+.md-h { font-weight: 600; margin: 10px 0 6px; }
+.md-h1 { font-size: 1.2em; } .md-h2 { font-size: 1.1em; }
+.md-pre { background: var(--surface2); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 0 0 8px; white-space: pre; }
+.md code { background: var(--surface2); padding: 0 4px; border-radius: 4px; font-size: 0.92em; }
+.md-pre code { background: none; padding: 0; }

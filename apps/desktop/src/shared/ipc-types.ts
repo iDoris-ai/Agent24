@@ -574,6 +574,8 @@ export type DocumentsRequest =
       region?: string
     }
   | { op: 'job'; jobId: DocSchemas['JobIdString'] }
+  /** D2: a new document of pages of existing PDFs (split: one part; merge: several). */
+  | { op: 'compose'; parts: Array<{ documentId: DocSchemas['DocumentIdString']; pages?: string }>; title?: string }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
 
@@ -589,6 +591,8 @@ export interface DocumentsResults {
   /** The PNG in standard base64; `scale` is the one the OS used. */
   renderPage: { media_type: 'image/png'; bytes: number; scale: number; png: string }
   job: DocSchemas['DocumentsJob']
+  /** The import job of the new document. */
+  compose: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
 }

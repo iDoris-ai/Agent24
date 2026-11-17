@@ -10,6 +10,7 @@ import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
+import { compose, pagesOk } from './compose'
 
 type Detail = components['schemas']['DocumentDetail']
 type Block = components['schemas']['DocumentsTextBlock']
@@ -29,6 +30,20 @@ export function readableSize(bytes: number): string {
 export default function DocumentDetail({ documentId, onClose }: { documentId: string; onClose: () => void }) {
   const t = useT(documentsMessages)
   const { open } = useContext(CapabilitiesContext)
+  // D2: split out some pages as a new document.
+  const [splitting, setSplitting] = useState<string | null>(null)
+  const [splitNote, setSplitNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const [splitBusy, setSplitBusy] = useState(false)
+  const split = async (head: Detail, pages: string) => {
+    if (!pagesOk(pages)) { setSplitNote({ ok: false, text: t('split.invalid') }); return }
+    setSplitBusy(true)
+    setSplitNote({ ok: true, text: t('compose.working') })
+    const title = t('split.title', { title: head.title ?? '', pages }).slice(0, 500)
+    const out = await compose(api, [{ documentId: head.document_id, pages }], title)
+    setSplitBusy(false)
+    setSplitNote(out.ok ? { ok: true, text: t('compose.done') } : { ok: false, text: t('compose.failed', { error: out.message }) })
+    if (out.ok) setSplitting(null)
+  }
   const api = window.agent24.documents
   const [detail, setDetail] = useState<Detail | null>(null)
   const [blocks, setBlocks] = useState<Block[]>([])
@@ -149,11 +164,27 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
               {t('detail.ask')}
             </button>
           )}
+          {detail?.head.media_type === 'application/pdf' && (
+            <button className="btn btn-ghost" onClick={() => { setSplitting(splitting === null ? '' : null); setSplitNote(null) }}>
+              {t('split.button')}
+            </button>
+          )}
           <button className="btn btn-ghost" onClick={onClose}>
             {t('detail.close')}
           </button>
         </div>
       </div>
+      {detail && splitting !== null && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '8px 0' }}>
+          <input aria-label={t('split.pages')} placeholder={t('split.pages')} value={splitting}
+            onChange={(e) => setSplitting(e.target.value.replace(/\s+/g, ''))} style={{ width: 160 }} />
+          <button className="btn btn-primary" disabled={splitBusy || splitting === ''} onClick={() => void split(detail, splitting)}>
+            {t('split.go')}
+          </button>
+          <button className="btn btn-ghost" disabled={splitBusy} onClick={() => setSplitting(null)}>{t('split.cancel')}</button>
+        </div>
+      )}
+      {splitNote && <p role={splitNote.ok ? 'status' : 'alert'} style={{ fontSize: 12, margin: '4px 0' }}>{splitNote.text}</p>}
       {detail && (
         <p style={{ color: 'var(--muted)', fontSize: 12 }}>
           {t('detail.meta', {
