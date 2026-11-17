@@ -135,6 +135,7 @@ fn prepare_seatbelt(
     data_dir: &Path,
     callback_sock: &Path,
     program: &Path,
+    office_pipe: bool,
 ) -> Result<(PathBuf, String), LaunchError> {
     ensure_seatbelt_available(Path::new("/usr/bin/sandbox-exec"))?;
     let exec_program = crate::sandbox::canonical(program).map_err(|error| {
@@ -161,6 +162,7 @@ fn prepare_seatbelt(
         also_programs: &also,
         temp_dir: &temp,
         home_dir: home.as_deref(),
+        office_pipe,
     })
     .map_err(|error| LaunchError::SandboxUnavailable(error.0))?;
     Ok((exec_program, profile))
@@ -687,8 +689,14 @@ fn start(
         return Err(LaunchError::Spawn(error));
     }
     #[cfg(target_os = "macos")]
-    let (exec_program, seatbelt) =
-        prepare_seatbelt(spec.package_dir, spec.data_dir, spec.callback_sock, program)?;
+    let (exec_program, seatbelt) = prepare_seatbelt(
+        spec.package_dir,
+        spec.data_dir,
+        spec.callback_sock,
+        program,
+        // D1: only the documents module runs LibreOffice.
+        spec.name == "documents",
+    )?;
     #[cfg(not(target_os = "macos"))]
     let exec_program = program.to_path_buf();
     // The generation's address is the path its listener is bound at (D4,
