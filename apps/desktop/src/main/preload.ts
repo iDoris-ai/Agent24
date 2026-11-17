@@ -16,6 +16,7 @@ import {
   type ResidentServiceStatus,
   type DocumentsEvent,
   type DocumentsModuleStatus,
+  type OsPackageProgress,
   type KnowledgeConfigureInput,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
@@ -148,6 +149,15 @@ const api = {
   osModuleUninstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsModuleUninstall),
   /** T1-2: elevated; installs the documents module the app carries. Main asks first. */
   osModuleInstallBundled: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsModuleInstallBundled),
+  /** OSI-1: latest registered release (version only). An unknown id is rejected in main. */
+  osPackageLatest: (id: string): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsPackageLatest, id),
+  /** OSI-1: native confirm, download, SHA256SUMS, then `agent24 os install`. */
+  osPackageInstall: (id: string): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsPackageInstall, id),
+  onOsPackageProgress: (cb: (progress: OsPackageProgress) => void): (() => void) => {
+    const listener = (_event: unknown, progress: OsPackageProgress): void => cb(progress)
+    ipcRenderer.on(IpcChannels.OsPackageProgress, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.OsPackageProgress, listener)
+  },
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
    *  Main asks the user in a native dialog before sending. */
   agentearSetEnabled: (enabled: boolean): Promise<BackendProxyResponse> =>

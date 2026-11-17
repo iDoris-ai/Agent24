@@ -216,12 +216,20 @@ describe('OS package capability status', () => {
     expect(result.current(id)).toBe(prompt)
   })
 
-  it('leaves the default label when the package is not an integrity refusal', async () => {
-    rows = [row('sin90', 'failed', 'refused'), row('cos72', 'ready')]
+  it('shows a real label for Sin90 and Cos72, and leaves other packages on the default', async () => {
+    rows = [row('sin90', 'failed', 'refused'), { ...row('cos72', 'ready'), version: '0.1.0' }, row('documents', 'ready')]
     const { result } = renderHook(() => useCapabilityStatus(true))
     await act(async () => {})
-    expect(result.current('sin90')).toBeUndefined()
-    expect(result.current('cos72')).toBeUndefined()
+    expect(result.current('sin90')).toBe('失败：refused')
+    expect(result.current('cos72')).toBe('已安装 v0.1.0')
+    expect(result.current('documents')).toBeUndefined()
+  })
+
+  it('says Sin90 is not installed when the component row is absent', async () => {
+    rows = [row('sin90', 'absent')]
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    expect(result.current('sin90')).toBe('未安装')
   })
 })
 

@@ -48,6 +48,8 @@ export interface NavPrefs {
 export const SLOT_MIN = 1
 export const SLOT_MAX = 6
 export const NAV_PREFS_DEFAULT: NavPrefs = {
+  // Sin90 is installed on demand, so it is not pinned for a new profile.
+  // A profile that already pinned it keeps that pin.
   pinned: ['documents', 'design', 'create'],
   slotCount: 3,
   showOverview: true,
