@@ -13,8 +13,14 @@ describe('D2b document intents in a conversation about a document', () => {
   it('leaves ordinary questions to the model', () => {
     expect(parseDocIntent('第2页说了什么？')).toBeNull()
     expect(parseDocIntent('付款期限是多少')).toBeNull()
-    expect(parseDocIntent('拆分一下')).toBeNull()
-    expect(parseDocIntent('把第4到2页拆出来')).toBeNull()
+    expect(parseDocIntent('这个条款怎么拆解理解？')).toBeNull()
+  })
+
+  it('asks how to say it when the pages or the other document are missing', () => {
+    expect(parseDocIntent('拆分一下')).toEqual({ kind: 'unclear', about: 'split' })
+    expect(parseDocIntent('帮我把它拆开')).toEqual({ kind: 'unclear', about: 'split' })
+    expect(parseDocIntent('把这两份合并')).toEqual({ kind: 'unclear', about: 'merge' })
+    expect(parseDocIntent('把第4到2页拆出来')).toEqual({ kind: 'unclear', about: 'split' })
   })
 
   it('reads a merge with a named document', () => {

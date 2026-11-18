@@ -8,6 +8,9 @@
 export type DocIntent =
   | { kind: 'split'; pages: string }
   | { kind: 'merge'; other: string }
+  /** Asked to split or merge, but not said which pages / with what: answered
+   * with how to say it, never silently left to the model. */
+  | { kind: 'unclear'; about: 'split' | 'merge' }
 
 const CN_DIGITS: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 }
 
@@ -27,13 +30,15 @@ function number(s: string): number | null {
 const NUM = '(\\d+|[零〇一二两三四五六七八九十百]+)'
 const RANGE = new RegExp(`第?\\s*${NUM}\\s*(?:页)?\\s*(?:[-–—~到至]\\s*第?\\s*${NUM})?\\s*页`, 'g')
 const SPLIT_VERB = /(拆|提取|抽取|抽出|取出|单独|另存|导出|摘出)/
+const SPLIT_ASKED = /(拆分|拆出|拆成|拆开|拆下|拆一下|单独拆|分割|提取.*页|抽取.*页)/
+const MERGE_ASKED = /(合并|合成一份|拼成一份|合在一起)/
 const MERGE = /(?:和|与|跟|同)\s*[《「“"]([^》」”"]{1,200})[》」”"]\s*(?:合并|合成|拼|合在一起|放在一起)/
 
 /** What `text` asks for, or null for anything else (an ordinary question). */
 export function parseDocIntent(text: string): DocIntent | null {
   const merge = MERGE.exec(text)
   if (merge) return { kind: 'merge', other: merge[1].trim() }
-  if (!SPLIT_VERB.test(text)) return null
+  if (!SPLIT_VERB.test(text)) return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
   const ranges: string[] = []
   for (const m of text.matchAll(RANGE)) {
     const a = number(m[1])
@@ -42,7 +47,9 @@ export function parseDocIntent(text: string): DocIntent | null {
     if (b !== null && b < a) continue
     ranges.push(b === null || b === a ? String(a) : `${a}-${b}`)
   }
-  return ranges.length ? { kind: 'split', pages: ranges.join(',') } : null
+  if (ranges.length) return { kind: 'split', pages: ranges.join(',') }
+  if (SPLIT_ASKED.test(text)) return { kind: 'unclear', about: 'split' }
+  return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
 }
 
 /** The document whose title best matches what the user named: an exact

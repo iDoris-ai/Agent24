@@ -8,6 +8,11 @@ import { findByTitle, type DocIntent } from './doc-intent'
 type Api = Window['agent24']['documents']
 
 export async function runDocIntent(api: Api, doc: DocumentRef, intent: DocIntent): Promise<string> {
+  if (intent.kind === 'unclear') {
+    return intent.about === 'split'
+      ? `要拆分《${doc.title}》，请说清页码，例如「拆出第 2-4 页」或「把第 3 页单独拆出来」。`
+      : '要合并，请用书名号写出另一份文档的标题，例如「和《附件.pdf》合并」。'
+  }
   if (intent.kind === 'split') {
     const title = `${doc.title}（第 ${intent.pages} 页）`.slice(0, 500)
     const out = await compose(api, [{ documentId: doc.id, pages: intent.pages }], title)
