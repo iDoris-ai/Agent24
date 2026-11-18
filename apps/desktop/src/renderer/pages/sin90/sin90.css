@@ -34,6 +34,9 @@
 }
 .sin90-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 8px; }
 .sin90-rhythm { margin: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+.sin90-bar, .sin90-drawer { margin-top: 16px; border: 1px solid var(--border); border-radius: var(--radius); padding: 12px; }
+.sin90-bar { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.sin90-drawer { display: flex; flex-direction: column; gap: 12px; }
 .sin90-rhythm h3, .sin90-body h3 { font-size: 13px; margin: 0; }
 .sin90-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 @media (max-width: 800px) {

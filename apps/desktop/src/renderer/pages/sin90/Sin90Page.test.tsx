@@ -18,6 +18,8 @@ let weeks: unknown[] = []
 let blocks: unknown[] = []
 let routines: unknown[] = []
 let rhythms: unknown[] = []
+let proposals: unknown[] = []
+let reviews: unknown[] = []
 let attentionReads = 0
 let keyAvailable = false
 const gets: string[] = []
@@ -36,10 +38,13 @@ beforeEach(() => {
   blocks = []
   routines = []
   rhythms = []
+  proposals = []
+  reviews = []
   attentionReads = 0
   gets.length = 0
   keyAvailable = false
-  sin90Write.mockClear()
+  sin90Write.mockReset()
+  sin90Write.mockResolvedValue({ ok: true, status: 201, data: { id: 'new' } })
   Object.defineProperty(window, 'agent24', {
     configurable: true,
     value: {
@@ -54,6 +59,8 @@ beforeEach(() => {
         if (req.path === '/api/v1/sin90/schedule-blocks') return { ok: true, status: 200, data: { blocks } }
         if (req.path === '/api/v1/sin90/routines') return { ok: true, status: 200, data: { routines } }
         if (req.path === '/api/v1/sin90/rhythms') return { ok: true, status: 200, data: { rhythms } }
+        if (req.path === '/api/v1/sin90/proposals') return { ok: true, status: 200, data: { proposals } }
+        if (req.path === '/api/v1/sin90/reviews') return { ok: true, status: 200, data: { reviews } }
         if (req.path.includes('/attention')) {
           attentionReads += 1
           const actual = attentionReads === 1 ? 0 : 90
@@ -166,6 +173,8 @@ describe('Sin90 read-only page', () => {
     render(<Sin90Page />)
     expect(await screen.findByText('Nothing is planned this week')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Open a week' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Open proposals' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Draft the weekly review · Suggest' })).not.toBeInTheDocument()
     expect(screen.queryByRole('columnheader')).not.toBeInTheDocument()
     expect(screen.queryByText('Monday')).not.toBeInTheDocument()
     expect(document.querySelector('.sin90-calendar')).toBeNull()
@@ -209,5 +218,64 @@ describe('Sin90 read-only page', () => {
     act(() => setLocale('th'))
     expect(screen.getByRole('button', { name: 'เริ่มสัปดาห์นี้' })).toBeInTheDocument()
     expect(screen.getByRole('list', { name: 'บล็อก' })).toBeInTheDocument()
+  })
+
+  it('says a carry-over in Chinese and drops it from pending after accept', async () => {
+    keyAvailable = true
+    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
+    proposals = [{
+      id: 'p1', status: 'pending', source: 'rule', rationale: 'still open', created_at: 't',
+      ops: [{ op: 'carry_over_task', task_id: 'a', to_week: 'w2' }],
+    }]
+    sin90Write.mockImplementation(async (body: Record<string, unknown>) => {
+      if (body['op'] === 'acceptProposal') proposals = []
+      return { ok: true, status: 200, data: { proposal_id: 'p1', event_ids: [] } }
+    })
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Open proposals' }))
+    expect(await screen.findByText('Carry the unfinished task into a week')).toBeInTheDocument()
+    expect(screen.getByText('Rule')).toBeInTheDocument()
+    act(() => setLocale('zh'))
+    expect(screen.getByText('把未完成的任务结到某一周')).toBeInTheDocument()
+    expect(screen.getByText('规则')).toBeInTheDocument()
+    expect(screen.getByText('待你确认的提案 (1)')).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(screen.getByText('ยกงานที่ยังไม่เสร็จไปอีกสัปดาห์')).toBeInTheDocument()
+    act(() => setLocale('zh'))
+    fireEvent.click(screen.getByRole('button', { name: '接受' }))
+    await waitFor(() => expect(screen.queryByText('把未完成的任务结到某一周')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: '打开提案' })).not.toBeInTheDocument()
+    expect(sin90Write).toHaveBeenCalledWith({ op: 'acceptProposal', id: 'p1' })
+  })
+
+  it('refreshes proposals after a suggestion and does not mark the task done', async () => {
+    keyAvailable = true
+    const iso = isoWeekUTC(new Date())
+    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
+    tasksByDirection = { d1: [task('a', 'Write the plan', 'd1', 'backlog')] }
+    weeks = [{ id: 'w1', status: 'active', iso_week: iso, created_at: 't', updated_at: 't' }]
+    reviews = [{ id: 'rev1', kind: 'weekly', status: 'draft', period: iso }]
+    render(<Sin90Page />)
+    expect(await screen.findByRole('button', { name: 'Draft the weekly review · Suggest' })).toBeEnabled()
+    const tasksBefore = gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length
+    const proposalsBefore = gets.filter((path) => path === '/api/v1/sin90/proposals').length
+    fireEvent.click(screen.getByRole('button', { name: 'Classify the inbox · Suggest' }))
+    await waitFor(() => expect(gets.filter((path) => path === '/api/v1/sin90/proposals').length).toBeGreaterThan(proposalsBefore))
+    expect(gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length).toBe(tasksBefore)
+    expect(sin90Write).toHaveBeenCalledWith({ op: 'aiClassify' })
+    expect(sin90Write).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'transitionTask' }))
+    expect(within(screen.getByRole('listitem', { name: 'Write the plan' })).getByText('Backlog')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Plan this week · Suggest' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Plan this week · Suggest' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'aiPropose', weekId: 'w1' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: 'Draft the weekly review · Suggest' })).toBeEnabled())
+    fireEvent.click(screen.getByRole('button', { name: 'Draft the weekly review · Suggest' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'aiSummarize', reviewId: 'rev1' }))
+    expect(gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length).toBe(tasksBefore)
+    expect(screen.queryByText('已安排')).not.toBeInTheDocument()
+    act(() => setLocale('zh'))
+    expect(screen.getByRole('button', { name: '给收件箱分类 · 生成建议' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '为这周排期 · 生成建议' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '写周复盘 · 生成建议' })).toBeInTheDocument()
   })
 })

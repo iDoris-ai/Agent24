@@ -139,6 +139,8 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/sin90/schedule-blocks'),
   r('GET', '/api/v1/sin90/routines'),
   r('GET', '/api/v1/sin90/rhythms'),
+  r('GET', '/api/v1/sin90/proposals'),
+  r('GET', '/api/v1/sin90/reviews'),
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,

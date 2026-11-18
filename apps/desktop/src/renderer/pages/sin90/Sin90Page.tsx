@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT, type T } from '../../i18n'
-import { fetchAreas, fetchBlocks, fetchDirections, fetchRhythms, fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks, sin90Write, writesAvailable } from './api'
+import { fetchAreas, fetchBlocks, fetchDirections, fetchProposals, fetchReviews, fetchRhythms, fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks, sin90Write, writesAvailable } from './api'
 import {
-  blockTransitions, blocksForDirection, canCarry, currentWeek, firstDirectionId, groupDirections, isoWeekUTC, latestRhythm, nextIsoWeek, routineNext, routinesForDirection, taskTransitions, weekNext,
-  type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
+  blockTransitions, blocksForDirection, canCarry, currentWeek, firstDirectionId, groupDirections, isoWeekUTC, latestRhythm, nextIsoWeek, routineNext, routinesForDirection, taskTransitions, weekNext, weeklyDraftReviewId,
+  type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
 } from './model'
+import { describeOp, sourceLabel } from './sentences'
 import { sin90Messages } from './Sin90.i18n'
 import './sin90.css'
 
@@ -167,6 +168,9 @@ export function Sin90Page() {
   const [blocks, setBlocks] = useState<Sin90Block[]>([])
   const [routines, setRoutines] = useState<Sin90Routine[]>([])
   const [rhythms, setRhythms] = useState<Sin90Rhythm[]>([])
+  const [proposals, setProposals] = useState<Sin90Proposal[]>([])
+  const [reviews, setReviews] = useState<Sin90Review[]>([])
+  const [drawerOpen, setDrawerOpen] = useState(false)
   const [attention, setAttention] = useState<Sin90WeekAttention | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [title, setTitle] = useState('')
@@ -192,11 +196,11 @@ export function Sin90Page() {
         const [nextTasks, rhythmRows] = nextSelected
           ? await Promise.all([
             fetchTasks(nextSelected),
-            Promise.all([fetchWeeks(), fetchBlocks(), fetchRoutines(), fetchRhythms()]),
+            Promise.all([fetchWeeks(), fetchBlocks(), fetchRoutines(), fetchRhythms(), fetchProposals(), fetchReviews()]),
           ])
-          : [[], [[], [], [], []]] as const
+          : [[], [[], [], [], [], [], []]] as const
         if (token !== seq.current) return
-        const [nextWeeks, nextBlocks, nextRoutines, nextRhythms] = rhythmRows
+        const [nextWeeks, nextBlocks, nextRoutines, nextRhythms, nextProposals, nextReviews] = rhythmRows
         const week = currentWeek(nextWeeks, isoWeekUTC(new Date()))
         const nextAttention = week ? await fetchWeekAttention(week.id) : null
         if (token !== seq.current) return
@@ -209,6 +213,8 @@ export function Sin90Page() {
         setBlocks([...nextBlocks])
         setRoutines([...nextRoutines])
         setRhythms([...nextRhythms])
+        setProposals([...nextProposals])
+        setReviews([...nextReviews])
         setAttention(nextAttention)
       } catch (err) {
         if (token !== seq.current) return
@@ -239,8 +245,26 @@ export function Sin90Page() {
     }).finally(() => setBusy(false))
   }
 
+  // AI only files a proposal. Refresh that list; leave tasks as the last GET left them.
+  const suggest = (body: Record<string, unknown>) => {
+    if (!enabled) return
+    setBusy(true)
+    setError(null)
+    void sin90Write(body).then(() => fetchProposals()).then((next) => {
+      setProposals(next)
+      setDrawerOpen(true)
+    }).catch((err: unknown) => {
+      setError(err instanceof Error ? err.message : 'write')
+    }).finally(() => setBusy(false))
+  }
+
   const current = directions.find((d) => d.id === selected) ?? null
   const knownTasks = [...tasks, ...(today?.must_do ?? []), ...(today?.inbox ?? [])]
+  const week = currentWeek(weeks, isoWeekUTC(new Date()))
+  const reviewId = weeklyDraftReviewId(reviews, isoWeekUTC(new Date()))
+  const pending = proposals.filter((proposal) => proposal.status === 'pending')
+  const taskName = (id: string) => knownTasks.find((task) => task.id === id)?.title ?? id
+  const directionName = (id: string) => directions.find((direction) => direction.id === id)?.title ?? id
 
   return <div data-sin90-page="">
     {canWrite === false && <p role="status">{t('writesOff')}</p>}
@@ -306,10 +330,17 @@ export function Sin90Page() {
           <span className="tag">{directionLabel(t, current.status)}</span>
         </div>
         <p className="sin90-muted">{t('window', { window: current.target_window })}</p>
-        <Rhythm directionId={current.id} week={currentWeek(weeks, isoWeekUTC(new Date()))} attention={attention}
+        <Rhythm directionId={current.id} week={week} attention={attention}
           blocks={blocksForDirection(blocks, current.id, tasks)} routines={routinesForDirection(routines, current.id)}
           rhythm={latestRhythm(rhythms)} directions={directions} tasks={tasks} enabled={enabled}
           minutes={blockMinutes} onMinutes={setBlockMinutes} onWrite={write} />
+        <div className="sin90-actions">
+          <button type="button" className="btn btn-ghost" disabled={!enabled} onClick={() => suggest({ op: 'aiClassify' })}>{t('suggestClassify')}</button>
+          {week && (week.status === 'planning' || week.status === 'active') && <button type="button" className="btn btn-ghost" disabled={!enabled}
+            onClick={() => suggest({ op: 'aiPropose', weekId: week.id })}>{t('suggestWeek')}</button>}
+          {reviewId && <button type="button" className="btn btn-ghost" disabled={!enabled}
+            onClick={() => suggest({ op: 'aiSummarize', reviewId })}>{t('suggestReview')}</button>}
+        </div>
         <h3>{t('tasks')}</h3>
         {tasks.length === 0 ? <p>{t('noTasks')}</p> : <ul className="sin90-queue">
           {tasks.map((task) => <li key={task.id} className="sin90-row" aria-label={task.title}>
@@ -324,6 +355,25 @@ export function Sin90Page() {
             onClick={() => write({ op: 'createTask', title: taskTitle, directionId: current.id })}>{t('newTask')}</button>
         </div>
       </section>}
+    </div>}
+    {pending.length > 0 && <div className="sin90-bar">
+      <span>{t('proposals', { n: pending.length })}</span>
+      <button type="button" className="btn btn-primary" onClick={() => setDrawerOpen((open) => !open)}>
+        {drawerOpen ? t('closeProposals') : t('openProposals')}
+      </button>
+    </div>}
+    {pending.length > 0 && drawerOpen && <div className="sin90-drawer" role="dialog" aria-label={t('proposals', { n: pending.length })}>
+      {pending.map((proposal) => <article key={proposal.id}>
+        <p className="tag">{sourceLabel(proposal.source)}</p>
+        {proposal.ops.map((op, index) => <p key={index}>{describeOp(op, taskName, directionName)}</p>)}
+        {proposal.rationale && <p className="sin90-muted">{proposal.rationale}</p>}
+        <span className="sin90-actions">
+          <button type="button" className="btn btn-primary" disabled={!enabled}
+            onClick={() => write({ op: 'acceptProposal', id: proposal.id })}>{t('accept')}</button>
+          <button type="button" className="btn btn-ghost" disabled={!enabled}
+            onClick={() => write({ op: 'rejectProposal', id: proposal.id })}>{t('reject')}</button>
+        </span>
+      </article>)}
     </div>}
   </div>
 }

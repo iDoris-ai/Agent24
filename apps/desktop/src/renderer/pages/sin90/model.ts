@@ -301,6 +301,54 @@ export function routinesForDirection(routines: readonly Sin90Routine[], directio
   return routines.filter((routine) => routine.direction_id === directionId && routine.status !== 'retired')
 }
 
+export interface Sin90Proposal {
+  id: string
+  status: string
+  source: string
+  ops: unknown[]
+  rationale: string | null
+}
+
+export interface Sin90Review {
+  id: string
+  kind: string
+  status: string
+  period: string
+}
+
+export function parseProposal(v: unknown): Sin90Proposal | null {
+  if (!isObj(v) || !Array.isArray(v['ops'])) return null
+  const id = str(v['id'])
+  const status = str(v['status'])
+  const source = str(v['source'])
+  if (!id || !status || !source) return null
+  return { id, status, source, ops: v['ops'], rationale: str(v['rationale']) }
+}
+
+export function parseReview(v: unknown): Sin90Review | null {
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const kind = str(v['kind'])
+  const status = str(v['status'])
+  const period = str(v['period'])
+  if (!id || !kind || !status || !period) return null
+  return { id, kind, status, period }
+}
+
+export function readProposals(data: unknown): Sin90Proposal[] {
+  return list(data, 'proposals', parseProposal)
+}
+
+export function readReviews(data: unknown): Sin90Review[] {
+  return list(data, 'reviews', parseReview)
+}
+
+/** A weekly review that is still a draft. Prefer the one for this ISO week. */
+export function weeklyDraftReviewId(reviews: readonly Sin90Review[], iso: string): string | null {
+  const drafts = reviews.filter((review) => review.kind === 'weekly' && review.status === 'draft')
+  return (drafts.find((review) => review.period === iso) ?? drafts[0])?.id ?? null
+}
+
 /** Newest quota that is still in force. Retired quotas stay off the page. */
 export function latestRhythm(rhythms: readonly Sin90Rhythm[]): Sin90Rhythm | null {
   const open = rhythms.filter((rhythm) => rhythm.status !== 'retired')

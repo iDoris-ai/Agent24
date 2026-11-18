@@ -1,8 +1,8 @@
 // Read-only Sin90 calls. Writes do not go through this proxy.
 
 import {
-  readAreas, readBlocks, readDirections, readRhythms, readRoutines, readTasks, readToday, readWeekAttention, readWeeks,
-  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
+  readAreas, readBlocks, readDirections, readProposals, readReviews, readRhythms, readRoutines, readTasks, readToday, readWeekAttention, readWeeks,
+  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
 } from './model'
 
 function errorMessage(data: unknown, fallback: string): string {
@@ -49,6 +49,14 @@ export function fetchRoutines(): Promise<Sin90Routine[]> {
 
 export function fetchRhythms(): Promise<Sin90Rhythm[]> {
   return sin90Get('/api/v1/sin90/rhythms').then(readRhythms)
+}
+
+export function fetchProposals(): Promise<Sin90Proposal[]> {
+  return sin90Get('/api/v1/sin90/proposals').then(readProposals)
+}
+
+export function fetchReviews(): Promise<Sin90Review[]> {
+  return sin90Get('/api/v1/sin90/reviews').then(readReviews)
 }
 
 export function fetchWeekAttention(weekId: string): Promise<Sin90WeekAttention> {
