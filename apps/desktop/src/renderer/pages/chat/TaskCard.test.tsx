@@ -7,7 +7,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
-import { HandOver, TaskCards, elapsed, resetHandOversForTests } from './TaskCard'
+import { HandOver, TaskCards, approvalText, elapsed, resetHandOversForTests } from './TaskCard'
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
@@ -482,5 +482,15 @@ describe('deleting a conversation stops its tasks still going on (M4 A6, PR-Daem
 describe('elapsed', () => {
   it.each([[0, '00:00'], [65_000, '01:05'], [3_725_000, '1:02:05'], [-5, '00:00']])('%i ms is %s', (ms, text) => {
     expect(elapsed(ms)).toBe(text)
+  })
+})
+
+describe('approvalText (D2b)', () => {
+  const t = (key: string, vars?: Record<string, string>) => `${key}${vars ? JSON.stringify(vars) : ''}`
+  it('says what a documents tool will do', () => {
+    expect(approvalText({ summary: 'documents.list: {"limit":10}' }, t)).toBe('task.ask.list')
+    expect(approvalText({ summary: 'documents.compose: {"parts":[{"document_id":"a.pdf","pages":"1"}],"title":"A1"}' }, t))
+      .toBe('task.ask.compose{"title":"A1","parts":"task.ask.part{\\"doc\\":\\"a.pdf\\",\\"pages\\":\\"1\\"}"}')
+    expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('shell_exec: {"argv":["ls"]}')
   })
 })

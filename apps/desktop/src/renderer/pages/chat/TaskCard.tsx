@@ -56,6 +56,26 @@ function pendingOf(list: readonly Approval[], runId: string, type: string): Appr
   return list.find(a => a.run_id === runId && a.available_decisions.includes(type)) ?? null
 }
 
+/** What the approval asks, in words (D2b: documents tools by name and what
+ *  they make; anything else as the daemon's summary, cut short). */
+export function approvalText(a: Pick<Approval, 'summary'>, t: (key: string, vars?: Record<string, string>) => string): string {
+  const summary = typeof a.summary === 'string' ? a.summary : ''
+  const cut = summary.indexOf(': ')
+  const tool = cut > 0 ? summary.slice(0, cut) : summary
+  let args: Record<string, unknown> = {}
+  try { args = cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {} } catch { /* the summary as it is */ }
+  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  if (tool === 'documents.list') return t('task.ask.list')
+  if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
+  if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
+    const parts = (args['parts'] as Array<Record<string, unknown>>)
+      .map(p => t('task.ask.part', { doc: str(p['document_id']), pages: str(p['pages']) || 'all' }))
+      .join(' + ')
+    return t('task.ask.compose', { title: str(args['title']), parts })
+  }
+  return summary.length > 160 ? `${summary.slice(0, 160)}…` : summary
+}
+
 /** The tasks of the conversation the page shows. */
 export function TaskCards({ conversation }: { conversation: string }) {
   const t = useT(chatMessages)
@@ -105,14 +125,24 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
   // once it waits, and again when it is decided.
   const waiting = status === 'awaiting_approval'
   const [offers, setOffers] = useState<Offers | null>(null)
+  // D2b: which approval it waits on, asked again while it waits: a run that
+  // goes on to its next tool call waits on a new one without leaving the state.
+  const [asking, setAsking] = useState<Approval | null>(null)
   useEffect(() => {
     setOffers(null)
+    setAsking(null)
     if (!waiting) return
     let live = true
-    listPendingApprovals()
-      .then(list => { if (live) setOffers(offersOf(list, task.run_id)) })
+    const look = () => listPendingApprovals()
+      .then(list => {
+        if (!live) return
+        setOffers(offersOf(list, task.run_id))
+        setAsking(list.find(a => a.run_id === task.run_id) ?? null)
+      })
       .catch(() => { if (live) setOffers(NO_OFFERS) })
-    return () => { live = false }
+    void look()
+    const timer = setInterval(() => void look(), 2000)
+    return () => { live = false; clearInterval(timer) }
   }, [waiting, task.run_id])
   const decide = (decision: Decision) => act(async () => {
     const approval = pendingOf(await listPendingApprovals(), task.run_id, decision.type)
@@ -130,6 +160,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     <div className={`task-card${active ? ' active' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
+      {waiting && asking && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string)}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
       {failed && <span className="task-card-error" role="alert">{failed}</span>}
       {status === 'completed' && view?.output && (

@@ -206,7 +206,10 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     let Ok(scope) = Scope::parse(call.context.authorized_resources.as_ref()) else {
         return Envelope::error(PERMISSION_DENIED, false);
     };
-    let ToolCall { context, arguments } = call;
+    let ToolCall {
+        context,
+        mut arguments,
+    } = call;
     let run = Run {
         run_id: context.run_id.clone(),
         tool_call_id: context.tool_call_id.clone(),
@@ -216,6 +219,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
     let work = async move {
         // The scope is checked here, for every operation, before it runs
         // (K1-06a §4.1): an operation `admit` has no row for never runs.
+        named_by_title(state, scope, op, &mut arguments).await?;
         admit(state, scope, op, &arguments).await?;
         match op {
             "extract" => extract(state, run, accepted, claim_holds, arguments).await,
@@ -537,6 +541,92 @@ fn resource(op: &str) -> Option<Resource> {
         "list" => Some(Resource::Listing),
         "compose" => Some(Resource::Parts),
         _ => None,
+    }
+}
+
+/// D2b (Loop 2): a model often names a document by its file name rather than
+/// its id. For `get` and `compose`, a `document_id` that is not an id is
+/// looked up among the titles of the documents in `scope`: the one whose
+/// title, without extension, case and 《》, equals it (or else the only one
+/// containing it) stands for it. Anything else is left as it was, and the
+/// service answers not found.
+async fn named_by_title(
+    state: &AppState,
+    scope: &Scope,
+    op: &str,
+    arguments: &mut Map<String, Value>,
+) -> Result<(), Envelope> {
+    let mut slots: Vec<&mut Value> = match op {
+        "get" => arguments.get_mut("document_id").into_iter().collect(),
+        "compose" => match arguments.get_mut("parts") {
+            Some(Value::Array(parts)) => parts
+                .iter_mut()
+                .filter_map(|p| p.get_mut("document_id"))
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    slots.retain(|v| v.as_str().is_some_and(|s| !is_id(IdKind::Document, s)));
+    if slots.is_empty() {
+        return Ok(());
+    }
+    let storage = ready(state).await?;
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, title FROM documents")
+        .fetch_all(storage.db.pool())
+        .await
+        .map_err(|_| refused(&ApiError::internal("cannot read the titles")))?;
+    let titles: Vec<(String, String)> = rows
+        .into_iter()
+        .filter(|(id, _)| scope.allows_document(id))
+        .map(|(id, title)| (id, plain_title(&title)))
+        .collect();
+    for slot in slots {
+        let wanted = plain_title(slot.as_str().unwrap_or_default());
+        if wanted.is_empty() {
+            continue;
+        }
+        let only = |hits: Vec<&String>| (hits.len() == 1).then(|| hits[0].clone());
+        let exact = only(
+            titles
+                .iter()
+                .filter(|(_, t)| *t == wanted)
+                .map(|(id, _)| id)
+                .collect(),
+        );
+        let found = exact.or_else(|| {
+            only(
+                titles
+                    .iter()
+                    .filter(|(_, t)| t.contains(&wanted))
+                    .map(|(id, _)| id)
+                    .collect(),
+            )
+        });
+        if let Some(id) = found {
+            *slot = Value::String(id);
+        }
+    }
+    Ok(())
+}
+
+/// A title or a name for it, compared without case, quotes, surrounding
+/// space and a file extension.
+fn plain_title(raw: &str) -> String {
+    let s = raw
+        .trim()
+        .trim_matches(|c| matches!(c, '《' | '》' | '「' | '」' | '"' | '“' | '”'))
+        .trim()
+        .to_lowercase();
+    match s.rsplit_once('.') {
+        Some((stem, ext))
+            if !stem.is_empty()
+                && (1..=5).contains(&ext.len())
+                && ext.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            stem.to_owned()
+        }
+        _ => s,
     }
 }
 
@@ -1047,6 +1137,52 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let got = payload(&call(&state, "job_get", json!({ "job_id": JOB })).await);
         assert_eq!(got, job);
+    }
+
+    #[tokio::test]
+    async fn a_document_named_by_its_file_name_is_found_in_the_scope() {
+        let (_dir, state) = opened().await;
+        let policy = add_document(&state, 1, "'CFYAD26-9770136.pdf'").await;
+        let _other = add_document(&state, 2, "'other.pdf'").await;
+        let outside = add_document(&state, 3, "'secret.pdf'").await;
+        let scope = [policy.as_str(), _other.as_str()];
+        // The file name without extension, as the model wrote it: that document.
+        let body = call_in(
+            &state,
+            "get",
+            &scope,
+            json!({ "document_id": "CFYAD26-9770136" }),
+        )
+        .await;
+        assert_eq!(payload(&body)["document_id"], json!(policy));
+        // With quotes and the extension too.
+        let body = call_in(
+            &state,
+            "get",
+            &scope,
+            json!({ "document_id": "《cfyad26-9770136.PDF》" }),
+        )
+        .await;
+        assert_eq!(payload(&body)["document_id"], json!(policy));
+        // A title outside the scope stays unknown.
+        let body = call_in(&state, "get", &scope, json!({ "document_id": "secret" })).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("\"error\""),
+            "{outside}"
+        );
+        // compose: each part by name; past the scope (the blob is no PDF here).
+        let args = json!({ "parts": [{ "document_id": "CFYAD26-9770136", "pages": "1" }] });
+        let body =
+            String::from_utf8_lossy(&call_in(&state, "compose", &scope, args).await).into_owned();
+        assert!(!body.contains("not_found"), "{body}");
+    }
+
+    #[test]
+    fn a_title_is_compared_without_case_quotes_or_extension() {
+        assert_eq!(plain_title(" 《Report.PDF》 "), "report");
+        assert_eq!(plain_title("a.b.docx"), "a.b");
+        assert_eq!(plain_title("v1.2026"), "v1");
+        assert_eq!(plain_title("no-extension"), "no-extension");
     }
 
     #[tokio::test]
