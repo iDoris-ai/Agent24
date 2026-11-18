@@ -12,6 +12,8 @@ import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
+import { runDocIntent } from './chat/doc-intent-run'
+import { parseDocIntent } from './chat/doc-intent'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
@@ -204,6 +206,23 @@ export default function ChatPage() {
     setInput('')
     // F1: a conversation about a document carries its text with each turn.
     const doc = documentOf(sessionId)
+    // D2b: 「拆出第 2-4 页」「和《X》合并」 about that document are done here,
+    // not asked of the model (which does not call tools reliably).
+    const intent = doc ? parseDocIntent(text) : null
+    if (doc && intent && window.agent24.documents) {
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      try {
+        const reply = await runDocIntent(window.agent24.documents, doc, intent)
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: reply }])
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      return
+    }
     const read = window.agent24.documents?.request
     if (doc && read) {
       const body = await documentText(doc, read as Parameters<typeof documentText>[1]).catch(() => null)
