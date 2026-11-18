@@ -58,7 +58,8 @@ describe('CapabilityPage domain OS', () => {
     expect(await screen.findByRole('button', { name: 'Update to v0.5.3' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Install the latest version' })).not.toBeInTheDocument()
     expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
-    expect(screen.getByText('Ships with Agent24. Work with the Sin90 domain OS.')).toBeInTheDocument()
+    expect(screen.queryByText('Ships with Agent24. Work with the Sin90 domain OS.')).not.toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Sin90 · Life system' })).toBeInTheDocument()
   })
 
   it('shows the Sin90 page with no install button when the mounted version is current', async () => {
@@ -71,10 +72,10 @@ describe('CapabilityPage domain OS', () => {
     expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
     act(() => setLocale('zh'))
     expect(screen.getByText('先定一个方向')).toBeInTheDocument()
-    expect(screen.getByText('随 Agent24 安装，用来使用 Sin90 领域 OS。')).toBeInTheDocument()
+    expect(screen.queryByText('随 Agent24 安装，用来使用 Sin90 领域 OS。')).not.toBeInTheDocument()
     act(() => setLocale('th'))
     expect(screen.getByText('กำหนดทิศทางก่อน')).toBeInTheDocument()
-    expect(screen.getByText('มากับ Agent24 ใช้ทำงานกับ Domain OS ของ Sin90')).toBeInTheDocument()
+    expect(screen.queryByText('มากับ Agent24 ใช้ทำงานกับ Domain OS ของ Sin90')).not.toBeInTheDocument()
     act(() => setLocale('en'))
   })
 

@@ -6,6 +6,8 @@ export interface Sin90Area {
   title: string
   status: string
   sort_key: number
+  current_state?: string | null
+  ideal_state?: string | null
 }
 
 export interface Sin90Direction {
@@ -14,6 +16,7 @@ export interface Sin90Direction {
   title: string
   status: string
   target_window: string
+  goal_3y?: string | null
 }
 
 export interface Sin90Task {
@@ -58,7 +61,8 @@ export function parseArea(v: unknown): Sin90Area | null {
   const status = str(v['status'])
   if (!id || !title || !status) return null
   const sort = v['sort_key']
-  return { id, title, status, sort_key: typeof sort === 'number' ? sort : 0 }
+  return { id, title, status, sort_key: typeof sort === 'number' ? sort : 0,
+    current_state: optStr(v['current_state']), ideal_state: optStr(v['ideal_state']) }
 }
 
 export function parseDirection(v: unknown): Sin90Direction | null {
@@ -68,7 +72,8 @@ export function parseDirection(v: unknown): Sin90Direction | null {
   const status = str(v['status'])
   const target = str(v['target_window'])
   if (!id || !title || !status || !target) return null
-  return { id, area_id: optStr(v['area_id']), title, status, target_window: target }
+  return { id, area_id: optStr(v['area_id']), title, status, target_window: target,
+    goal_3y: optStr(v['goal_3y']) }
 }
 
 export function parseTask(v: unknown): Sin90Task | null {

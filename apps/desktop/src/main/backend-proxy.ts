@@ -134,11 +134,13 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('POST', '/api/v1/comm/daemon/start'), // [E]
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
   // Sin90 reads are Everyday. Writes stay on the main-process Sin90 IPC,
-  // which attaches the human key. Do not add POST/PATCH/PUT here.
+  // which attaches the human key. The life-systems pack install is registered
+  // below as the one dedicated POST needed by this page.
   r('GET', '/api/v1/sin90/today'),
   r('GET', '/api/v1/sin90/directions'),
   r('GET', '/api/v1/sin90/tasks'),
   r('GET', '/api/v1/sin90/areas'),
+  r('GET', '/api/v1/sin90/period-plans'),
   r('GET', '/api/v1/sin90/weeks'),
   r('GET', '/api/v1/sin90/weeks/{id}/attention'),
   r('GET', '/api/v1/sin90/schedule-blocks'),
@@ -146,6 +148,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/sin90/rhythms'),
   r('GET', '/api/v1/sin90/proposals'),
   r('GET', '/api/v1/sin90/reviews'),
+  r('POST', '/api/v1/sin90/packs/install'),
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,

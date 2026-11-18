@@ -34,9 +34,14 @@ describe('performSin90Write', () => {
     }, HUMAN)
   })
 
+  it('installs the default life systems pack through the human-key write path', async () => {
+    const { api, request } = caller(true)
+    expect((await performSin90Write({ op: 'installPack' }, api)).ok).toBe(true)
+    expect(request).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/sin90/packs/install', body: {} }, HUMAN)
+  })
+
   it('refuses an unknown operation and a bad transition without sending', async () => {
     const { api, request } = caller(true)
-    expect((await performSin90Write({ op: 'installPack' }, api)).ok).toBe(false)
     expect((await performSin90Write({ op: 'transitionTask', id: 'task_1', to: 'carried_over' }, api)).ok).toBe(false)
     expect((await performSin90Write({ op: 'transitionTask', id: '../x', to: 'done' }, api)).ok).toBe(false)
     expect(request).not.toHaveBeenCalled()

@@ -37,6 +37,11 @@ export function fetchAreas(): Promise<Sin90Area[]> {
   return sin90Get('/api/v1/sin90/areas').then(readAreas)
 }
 
+/** Optional Sin90 v0.6 endpoint. Older daemons return no plan data. */
+export function fetchPeriodPlans(): Promise<unknown | null> {
+  return sin90Get('/api/v1/sin90/period-plans').catch(() => null)
+}
+
 export function fetchDirections(): Promise<Sin90Direction[]> {
   return sin90Get('/api/v1/sin90/directions').then(readDirections)
 }

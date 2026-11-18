@@ -81,6 +81,8 @@ export async function performSin90Write(req: unknown, caller: Sin90Caller): Prom
       const value = text(req['text'])
       return value ? caller.request(route('POST', '/api/v1/sin90/capture', { text: value }), human) : bad()
     }
+    case 'installPack':
+      return caller.request(route('POST', '/api/v1/sin90/packs/install', {}), human)
     case 'createDirection': {
       const title = text(req['title'])
       const target = text(req['targetWindow'], 32)
