@@ -6,7 +6,7 @@ describe('D2b document intents in a conversation about a document', () => {
     expect(parseDocIntent('把第2到4页拆出来')).toEqual({ kind: 'split', pages: '2-4' })
     expect(parseDocIntent('拆出第 2-4 页')).toEqual({ kind: 'split', pages: '2-4' })
     expect(parseDocIntent('把第三页单独拆出来')).toEqual({ kind: 'split', pages: '3' })
-    expect(parseDocIntent('提取第1页和第5到七页')).toEqual({ kind: 'split', pages: '1,5-7' })
+    expect(parseDocIntent('提取第1页和第5到七页成新文档')).toEqual({ kind: 'split', pages: '1,5-7' })
     expect(parseDocIntent('拆分出第十二页')).toEqual({ kind: 'split', pages: '12' })
   })
 
@@ -80,5 +80,19 @@ describe('findByTitle with the extension named (General 11-18)', () => {
   it('takes the newest of the same full title, and says how many there were', () => {
     expect(findByTitle(docs, '中文测试合同.pdf')).toEqual({ match: docs[1], among: 2 })
     expect(findByTitle(docs, '中文测试合同.docx')).toEqual({ match: docs[2] })
+  })
+})
+
+describe('parseDocIntent: questions about a page are not splits (PR-Daemon #1909 ①)', () => {
+  it.each(['帮我提取第2页的关键信息', '第3页单独说了什么', '请取出第5页的金额', '导出第2页说的要点'])('%s → null', (text) => {
+    expect(parseDocIntent(text)).toBeNull()
+  })
+  it.each([
+    ['把第 2 页提取成新文档', '2'],
+    ['把第3页单独存成一份 PDF', '3'],
+    ['取出第5页另存', '5'],
+    ['拆出第 2-4 页', '2-4'],
+  ])('%s → split %s', (text, pages) => {
+    expect(parseDocIntent(text)).toEqual({ kind: 'split', pages })
   })
 })

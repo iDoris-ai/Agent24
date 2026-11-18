@@ -140,6 +140,14 @@ export interface UpgradeDeps {
   between?: () => Promise<unknown>
 }
 
+/** A restart of the service daemon for another reason than an upgrade (a
+ * model source saved): the installed file is replaced only when the same gate
+ * as an upgrade says so, a packaged app whose bundled daemon is newer;
+ * otherwise it is only stopped and started (PR-Daemon #1909 ⑤). */
+export function restartDeps(deps: UpgradeDeps, gate: { fromBundle: boolean; bundled: string | null; running: string | null }): UpgradeDeps {
+  return gate.fromBundle && upgradeNeeded(gate.bundled, gate.running) ? deps : { ...deps, copy: () => 'same' }
+}
+
 /** Nothing is started when the shutdown was refused. Once it was approved the
  * service is always started again, since a clean exit is not restarted by
  * launchd (PR-Daemon B5a N1): from the old file, left whole, when the old

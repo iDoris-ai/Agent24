@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, UPGRADE_RETRY_MS, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, UPGRADE_RETRY_MS, restartDeps, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView, SERVICE_WAIT_HINT_MS } from './tray-menu'
@@ -574,5 +574,24 @@ describe('CrashLoopDetector (M5 B5 ②)', () => {
     expect(tip).not.toContain('has not started')
     expect(tip).not.toContain('Waiting for the background service')
     expect(tip.split('`agent24 service uninstall`').length - 1).toBe(1)
+  })
+})
+
+// PR-Daemon #1909 ⑤: saving a model source restarts the service daemon; the
+// installed file is replaced only when an upgrade is due, never just because it differs.
+describe('restartDeps', () => {
+  it('only restarts unless the bundled daemon is newer in a packaged app', async () => {
+    for (const [gate, copies] of [
+      [{ fromBundle: true, bundled: '0.6.20', running: '0.6.20' }, false],
+      [{ fromBundle: true, bundled: '0.6.19', running: '0.6.20' }, false],
+      [{ fromBundle: false, bundled: '0.6.21', running: '0.6.20' }, false],
+      [{ fromBundle: true, bundled: null, running: '0.6.20' }, false],
+      [{ fromBundle: true, bundled: '0.6.21', running: '0.6.20' }, true],
+    ] as const) {
+      const { calls, deps } = steps()
+      await upgradeService(restartDeps(deps, gate))
+      expect(calls.includes('copy'), JSON.stringify(gate)).toBe(copies)
+      expect(calls).toContain('kickstart')
+    }
   })
 })

@@ -22,7 +22,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -1012,7 +1012,10 @@ async function restartDaemonForModelSource(): Promise<{ ok: true } | { ok: false
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, code: 'no_data_dir' }
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    const outcome = await upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold }))
+    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
+    // Restarted to read the model source again; replaced only through the upgrade's own gate.
+    const gate = { fromBundle: upgradesFromBundle(app.isPackaged, process.env), bundled: bundledVersion, running: backendManager.serviceDaemonVersion() }
+    const outcome = await upgradeService(restartDeps(deps, gate))
     return outcome.ok ? { ok: true } : { ok: false, code: outcome.code }
   }
   if (backendManager.isExternalDaemon()) return { ok: false, code: 'external_daemon' }

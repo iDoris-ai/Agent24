@@ -219,15 +219,19 @@ export default function ChatPage() {
     // lightweight compose path below still handles a named split/merge.
     const wantsDocTool = /拆|合并|合成|split|merge|combine/i.test(text)
     if (wantsDocTool && window.agent24.documents?.agentAccess) {
+      // Busy from before the wait: no second turn, no switch of conversation
+      // while the grants are brought up to date (PR-Daemon #1909 ④).
+      requestInFlight.current = true
+      setLoading(true)
       const access = await window.agent24.documents.agentAccess('sync').catch(() => null)
       if (access?.enabled && access.ok !== false) {
         const last = request.messages[request.messages.length - 1]
         if (last?.role === 'user') last.content = docAgentPrompt(doc, text.trim())
-        requestInFlight.current = true
-        setLoading(true)
         await replyWithKnowledge(messages.length, request, false)
         return
       }
+      requestInFlight.current = false
+      setLoading(false)
     }
     // D3: 「总结/检查这份文档」 — same check as the document page, as a text report.
     if (/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
@@ -355,7 +359,16 @@ export default function ChatPage() {
     }
     const read = window.agent24.documents?.request
     if (doc && read) {
-      const body = await documentText(doc, read as Parameters<typeof documentText>[1]).catch(() => null)
+      // PR-Daemon #1909 ④: busy while the document is read, page by page;
+      // released with no await between here and requestReply, which takes it again.
+      requestInFlight.current = true
+      setLoading(true)
+      let body: Awaited<ReturnType<typeof documentText>> | null = null
+      try {
+        body = await documentText(doc, read as Parameters<typeof documentText>[1]).catch(() => null)
+      } finally {
+        requestInFlight.current = false
+      }
       const last = request.messages[request.messages.length - 1]
       if (body && body.text.trim() && last?.role === 'user') last.content = withDocument(doc, body, last.content)
     }
