@@ -20,6 +20,7 @@ import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenc
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsEvent } from './documents'
+import { sin90Event } from './sin90-event'
 import { cliBinary } from './documents-cli'
 import {
   CODESIGN,
@@ -121,6 +122,8 @@ const agentEarBridge = new AgentEarEventBridge(
   (event) => {
     const doc = documentsEvent(event)
     if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
+    const sin = sin90Event(event)
+    if (sin && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.Sin90Event, sin)
   },
   // M4 A3: runs' changes, for the history list's filters.
   (event) => {
@@ -154,6 +157,7 @@ const agentEarBridge = new AgentEarEventBridge(
       if (!res.ok || !Array.isArray(list)) throw new Error(`approvals_unavailable_${res.status}`)
       return list
     }).catch((err) => console.error('[main] pending approvals not caught up', err))
+    if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.Sin90Event, { kind: 'connected', payload: {} })
   },
 )
 

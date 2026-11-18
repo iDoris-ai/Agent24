@@ -23,7 +23,10 @@ let reviews: unknown[] = []
 let attentionReads = 0
 let keyAvailable = false
 const gets: string[] = []
-const sin90Write = vi.fn(async () => ({ ok: true, status: 201, data: { id: 'new' } }))
+const sin90Write = vi.fn(async (_body: Record<string, unknown>): Promise<{ ok: boolean; status: number; data: unknown }> => (
+  { ok: true, status: 201, data: { id: 'new' } }
+))
+let emitSin90: ((event: { kind: string; payload: unknown }) => void) | null = null
 
 function task(id: string, title: string, direction_id: string | null, status = 'backlog') {
   return { id, title, direction_id, week_id: null, status, kind: 'other', energy: 'mid', est_minutes: null, carried_from: null, created_at: 't', updated_at: 't' }
@@ -42,6 +45,7 @@ beforeEach(() => {
   reviews = []
   attentionReads = 0
   gets.length = 0
+  emitSin90 = null
   keyAvailable = false
   sin90Write.mockReset()
   sin90Write.mockResolvedValue({ ok: true, status: 201, data: { id: 'new' } })
@@ -50,6 +54,10 @@ beforeEach(() => {
     value: {
       sin90Write,
       sin90KeyStatus: async () => ({ available: keyAvailable }),
+      onSin90Event: (cb: (event: { kind: string; payload: unknown }) => void) => {
+        emitSin90 = cb
+        return () => { if (emitSin90 === cb) emitSin90 = null }
+      },
       backendProxy: async (req: BackendProxyRequest) => {
         gets.push(req.path)
         if (req.path === '/api/v1/sin90/today') return { ok: true, status: 200, data: today }
@@ -277,5 +285,29 @@ describe('Sin90 read-only page', () => {
     expect(screen.getByRole('button', { name: '给收件箱分类 · 生成建议' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '为这周排期 · 生成建议' })).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '写周复盘 · 生成建议' })).toBeInTheDocument()
+  })
+
+  it('reloads tasks from the next GET after task.transitioned, not from the event body', async () => {
+    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
+    tasksByDirection = { d1: [task('a', 'Write the plan', 'd1', 'planned')] }
+    render(<Sin90Page />)
+    expect(await screen.findByText('Write the plan')).toBeInTheDocument()
+    const before = gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length
+    expect(before).toBeGreaterThan(0)
+    tasksByDirection = { d1: [task('a', 'Ship the page', 'd1', 'done')] }
+    act(() => emitSin90?.({ kind: 'task.transitioned', payload: { title: 'from-event-body', task_id: 'a', to: 'done' } }))
+    await waitFor(() => expect(screen.getByText('Ship the page')).toBeInTheDocument())
+    expect(screen.queryByText('from-event-body')).not.toBeInTheDocument()
+    expect(screen.queryByText('Write the plan')).not.toBeInTheDocument()
+    expect(gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length).toBeGreaterThan(before)
+  })
+
+  it('requests today again when the event socket reconnects', async () => {
+    render(<Sin90Page />)
+    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
+    const before = gets.filter((path) => path === '/api/v1/sin90/today').length
+    expect(before).toBeGreaterThan(0)
+    act(() => emitSin90?.({ kind: 'connected', payload: {} }))
+    await waitFor(() => expect(gets.filter((path) => path === '/api/v1/sin90/today').length).toBeGreaterThan(before))
   })
 })

@@ -5,6 +5,7 @@ import {
   blockTransitions, blocksForDirection, canCarry, currentWeek, firstDirectionId, groupDirections, isoWeekUTC, latestRhythm, nextIsoWeek, routineNext, routinesForDirection, taskTransitions, weekNext, weeklyDraftReviewId,
   type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
 } from './model'
+import { sin90ShouldRefresh } from './refresh'
 import { describeOp, sourceLabel } from './sentences'
 import { sin90Messages } from './Sin90.i18n'
 import './sin90.css'
@@ -224,6 +225,15 @@ export function Sin90Page() {
   }, [])
 
   useEffect(() => { load(null) }, [load])
+  const selectedRef = useRef<string | null>(null)
+  selectedRef.current = selected
+  useEffect(() => {
+    const listen = window.agent24.onSin90Event
+    if (!listen) return
+    return listen((event) => {
+      if (sin90ShouldRefresh(event.kind)) load(selectedRef.current)
+    })
+  }, [load])
   useEffect(() => {
     let live = true
     void writesAvailable().then((ok) => { if (live) setCanWrite(ok) })

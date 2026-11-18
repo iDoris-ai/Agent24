@@ -111,6 +111,12 @@ const api = {
     ipcRenderer.invoke(IpcChannels.Sin90Write, req),
   sin90KeyStatus: (): Promise<{ available: boolean }> =>
     ipcRenderer.invoke(IpcChannels.Sin90KeyStatus),
+  /** Sin90 hints from the existing events socket, including `{kind:'connected'}` on open. */
+  onSin90Event: (cb: (event: { kind: string; payload: unknown }) => void): (() => void) => {
+    const listener = (_event: unknown, event: { kind: string; payload: unknown }): void => cb(event)
+    ipcRenderer.on(IpcChannels.Sin90Event, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.Sin90Event, listener)
+  },
   /** A1: elevated; main asks the user in a native dialog before sending. */
   approvalDecide: (id: string, decision: ApprovalDecisionInput): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
