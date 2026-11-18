@@ -1,6 +1,9 @@
 // Read-only Sin90 calls. Writes do not go through this proxy.
 
-import { readAreas, readDirections, readTasks, readToday, type Sin90Area, type Sin90Direction, type Sin90Task, type Sin90Today } from './model'
+import {
+  readAreas, readBlocks, readDirections, readRhythms, readRoutines, readTasks, readToday, readWeekAttention, readWeeks,
+  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
+} from './model'
 
 function errorMessage(data: unknown, fallback: string): string {
   if (typeof data === 'object' && data !== null && 'error' in data) {
@@ -30,6 +33,26 @@ export function fetchTasks(directionId: string): Promise<Sin90Task[]> {
 
 export function fetchToday(): Promise<Sin90Today> {
   return sin90Get('/api/v1/sin90/today').then(readToday)
+}
+
+export function fetchWeeks(): Promise<Sin90Week[]> {
+  return sin90Get('/api/v1/sin90/weeks').then(readWeeks)
+}
+
+export function fetchBlocks(): Promise<Sin90Block[]> {
+  return sin90Get('/api/v1/sin90/schedule-blocks').then(readBlocks)
+}
+
+export function fetchRoutines(): Promise<Sin90Routine[]> {
+  return sin90Get('/api/v1/sin90/routines').then(readRoutines)
+}
+
+export function fetchRhythms(): Promise<Sin90Rhythm[]> {
+  return sin90Get('/api/v1/sin90/rhythms').then(readRhythms)
+}
+
+export function fetchWeekAttention(weekId: string): Promise<Sin90WeekAttention> {
+  return sin90Get(`/api/v1/sin90/weeks/${encodeURIComponent(weekId)}/attention`).then(readWeekAttention)
 }
 
 export async function writesAvailable(): Promise<boolean> {

@@ -52,42 +52,40 @@ function optStr(v: unknown): string | null {
 }
 
 export function parseArea(v: unknown): Sin90Area | null {
-  if (!isObj(v) || !str(v['id']) || !str(v['title']) || !str(v['status'])) return null
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const title = str(v['title'])
+  const status = str(v['status'])
+  if (!id || !title || !status) return null
   const sort = v['sort_key']
-  return { id: v['id'], title: v['title'], status: v['status'], sort_key: typeof sort === 'number' ? sort : 0 }
+  return { id, title, status, sort_key: typeof sort === 'number' ? sort : 0 }
 }
 
 export function parseDirection(v: unknown): Sin90Direction | null {
-  if (!isObj(v) || !str(v['id']) || !str(v['title']) || !str(v['status']) || !str(v['target_window'])) return null
-  return {
-    id: v['id'],
-    area_id: optStr(v['area_id']),
-    title: v['title'],
-    status: v['status'],
-    target_window: v['target_window'],
-  }
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const title = str(v['title'])
+  const status = str(v['status'])
+  const target = str(v['target_window'])
+  if (!id || !title || !status || !target) return null
+  return { id, area_id: optStr(v['area_id']), title, status, target_window: target }
 }
 
 export function parseTask(v: unknown): Sin90Task | null {
-  if (!isObj(v) || !str(v['id']) || !str(v['title']) || !str(v['status'])) return null
-  return {
-    id: v['id'],
-    direction_id: optStr(v['direction_id']),
-    week_id: optStr(v['week_id']),
-    title: v['title'],
-    status: v['status'],
-  }
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const title = str(v['title'])
+  const status = str(v['status'])
+  if (!id || !title || !status) return null
+  return { id, direction_id: optStr(v['direction_id']), week_id: optStr(v['week_id']), title, status }
 }
 
 export function parseBlock(v: unknown): Sin90Block | null {
-  if (!isObj(v) || !str(v['id']) || !str(v['status']) || typeof v['planned_minutes'] !== 'number') return null
-  return {
-    id: v['id'],
-    direction_id: optStr(v['direction_id']),
-    task_id: optStr(v['task_id']),
-    status: v['status'],
-    planned_minutes: v['planned_minutes'],
-  }
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const status = str(v['status'])
+  if (!id || !status || typeof v['planned_minutes'] !== 'number') return null
+  return { id, direction_id: optStr(v['direction_id']), task_id: optStr(v['task_id']), status, planned_minutes: v['planned_minutes'] }
 }
 
 function list<T>(data: unknown, key: string, parse: (v: unknown) => T | null): T[] {
@@ -178,4 +176,134 @@ export function isoWeekUTC(date: Date): string {
 
 export function nextIsoWeek(date: Date): string {
   return isoWeekUTC(new Date(date.getTime() + 7 * 86400000))
+}
+
+export interface Sin90Week {
+  id: string
+  status: string
+  iso_week: string
+}
+
+export interface Sin90Routine {
+  id: string
+  direction_id: string | null
+  title: string
+  status: string
+}
+
+export interface Sin90Allocation {
+  direction_id: string
+  pct: number
+}
+
+export interface Sin90Rhythm {
+  id: string
+  status: string
+  created_at: string
+  allocations: Sin90Allocation[]
+}
+
+export interface Sin90WeekAttention {
+  planned_min: number
+  actual_min: number
+  deviation_min: number
+}
+
+export function parseWeek(v: unknown): Sin90Week | null {
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const status = str(v['status'])
+  const iso = str(v['iso_week'])
+  if (!id || !status || !iso) return null
+  return { id, status, iso_week: iso }
+}
+
+export function parseRoutine(v: unknown): Sin90Routine | null {
+  if (!isObj(v)) return null
+  const id = str(v['id'])
+  const title = str(v['title'])
+  const status = str(v['status'])
+  if (!id || !title || !status) return null
+  return { id, direction_id: optStr(v['direction_id']), title, status }
+}
+
+export function parseRhythm(v: unknown): Sin90Rhythm | null {
+  if (!isObj(v) || !Array.isArray(v['allocations'])) return null
+  const id = str(v['id'])
+  const status = str(v['status'])
+  if (!id || !status) return null
+  const allocations: Sin90Allocation[] = []
+  for (const row of v['allocations']) {
+    if (!isObj(row) || typeof row['pct'] !== 'number') continue
+    const directionId = str(row['direction_id'])
+    if (!directionId) continue
+    allocations.push({ direction_id: directionId, pct: row['pct'] })
+  }
+  return { id, status, created_at: str(v['created_at']) ?? '', allocations }
+}
+
+export function readWeeks(data: unknown): Sin90Week[] {
+  return list(data, 'weeks', parseWeek)
+}
+
+export function readBlocks(data: unknown): Sin90Block[] {
+  return list(data, 'blocks', parseBlock)
+}
+
+export function readRoutines(data: unknown): Sin90Routine[] {
+  return list(data, 'routines', parseRoutine)
+}
+
+export function readRhythms(data: unknown): Sin90Rhythm[] {
+  return list(data, 'rhythms', parseRhythm)
+}
+
+export function readWeekAttention(data: unknown): Sin90WeekAttention {
+  if (!isObj(data) || typeof data['planned_min'] !== 'number' || typeof data['actual_min'] !== 'number' || typeof data['deviation_min'] !== 'number') {
+    throw new Error('sin90: missing attention')
+  }
+  return { planned_min: data['planned_min'], actual_min: data['actual_min'], deviation_min: data['deviation_min'] }
+}
+
+/** The week whose label is this ISO week. Blocks have no date, so the week is the only time container. */
+export function currentWeek(weeks: readonly Sin90Week[], iso: string): Sin90Week | null {
+  return weeks.find((week) => week.iso_week === iso) ?? null
+}
+
+export function weekNext(status: string): 'active' | 'reviewing' | 'closed' | null {
+  if (status === 'planning') return 'active'
+  if (status === 'active') return 'reviewing'
+  if (status === 'reviewing') return 'closed'
+  return null
+}
+
+export function blockTransitions(status: string): Array<'started' | 'completed' | 'skipped'> {
+  if (status === 'planned') return ['started', 'skipped']
+  if (status === 'started') return ['completed', 'skipped']
+  return []
+}
+
+export function routineNext(status: string): 'active' | 'paused' | null {
+  if (status === 'active') return 'paused'
+  if (status === 'paused') return 'active'
+  return null
+}
+
+export function blocksForDirection(blocks: readonly Sin90Block[], directionId: string, tasks: readonly Sin90Task[]): Sin90Block[] {
+  return blocks.filter((block) => {
+    if (block.direction_id) return block.direction_id === directionId
+    if (!block.task_id) return false
+    return tasks.some((task) => task.id === block.task_id && task.direction_id === directionId)
+  })
+}
+
+export function routinesForDirection(routines: readonly Sin90Routine[], directionId: string): Sin90Routine[] {
+  return routines.filter((routine) => routine.direction_id === directionId && routine.status !== 'retired')
+}
+
+/** Newest quota that is still in force. Retired quotas stay off the page. */
+export function latestRhythm(rhythms: readonly Sin90Rhythm[]): Sin90Rhythm | null {
+  const open = rhythms.filter((rhythm) => rhythm.status !== 'retired')
+  open.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
+  return open[0] ?? null
 }

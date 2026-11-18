@@ -33,6 +33,8 @@
   color: var(--text); font: inherit; font-size: 13px; padding: 6px 8px;
 }
 .sin90-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 8px; }
+.sin90-rhythm { margin: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+.sin90-rhythm h3, .sin90-body h3 { font-size: 13px; margin: 0; }
 .sin90-actions { display: flex; flex-wrap: wrap; gap: 6px; }
 @media (max-width: 800px) {
   .sin90-today, .sin90-body { grid-template-columns: 1fr; }

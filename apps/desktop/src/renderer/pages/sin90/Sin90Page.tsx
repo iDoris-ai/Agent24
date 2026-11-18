@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT, type T } from '../../i18n'
-import { fetchAreas, fetchDirections, fetchTasks, fetchToday, sin90Write, writesAvailable } from './api'
-import { canCarry, firstDirectionId, groupDirections, nextIsoWeek, taskTransitions, type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Task, type Sin90Today } from './model'
+import { fetchAreas, fetchBlocks, fetchDirections, fetchRhythms, fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks, sin90Write, writesAvailable } from './api'
+import {
+  blockTransitions, blocksForDirection, canCarry, currentWeek, firstDirectionId, groupDirections, isoWeekUTC, latestRhythm, nextIsoWeek, routineNext, routinesForDirection, taskTransitions, weekNext,
+  type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
+} from './model'
 import { sin90Messages } from './Sin90.i18n'
 import './sin90.css'
 
@@ -50,6 +53,109 @@ function blockTitle(block: Sin90Block, tasks: readonly Sin90Task[]): string | nu
   return tasks.find((task) => task.id === block.task_id)?.title ?? null
 }
 
+function weekLabel(t: T<Key>, status: string): string {
+  switch (status) {
+    case 'planning': return t('week.planning')
+    case 'active': return t('week.active')
+    case 'reviewing': return t('week.reviewing')
+    case 'closed': return t('week.closed')
+    default: return t('status.other', { status })
+  }
+}
+
+function blockLabel(t: T<Key>, status: string): string {
+  switch (status) {
+    case 'planned': return t('block.planned')
+    case 'started': return t('block.started')
+    case 'completed': return t('block.completed')
+    case 'skipped': return t('block.skipped')
+    default: return t('status.other', { status })
+  }
+}
+
+function weekAction(t: T<Key>, to: 'active' | 'reviewing' | 'closed'): string {
+  if (to === 'active') return t('startWeek')
+  if (to === 'reviewing') return t('reviewWeek')
+  return t('closeWeek')
+}
+
+function Rhythm({ directionId, week, attention, blocks, routines, rhythm, directions, tasks, enabled, minutes, onMinutes, onWrite }: {
+  directionId: string
+  week: Sin90Week | null
+  attention: Sin90WeekAttention | null
+  blocks: Sin90Block[]
+  routines: Sin90Routine[]
+  rhythm: Sin90Rhythm | null
+  directions: readonly Sin90Direction[]
+  tasks: readonly Sin90Task[]
+  enabled: boolean
+  minutes: string
+  onMinutes: (value: string) => void
+  onWrite: (body: Record<string, unknown>) => void
+}) {
+  const t = useT(sin90Messages)
+  const parsed = Number(minutes)
+  const minutesOk = Number.isInteger(parsed) && parsed >= 1 && parsed <= 10080
+  const step = week ? weekNext(week.status) : null
+  const quota = rhythm?.allocations.map((row) => {
+    const name = directions.find((direction) => direction.id === row.direction_id)?.title ?? row.direction_id
+    return `${name} ${row.pct}%`
+  }).join(' · ')
+  return <div className="sin90-rhythm" aria-label={t('rhythm')}>
+    <h3>{t('rhythm')}</h3>
+    {!week && <div className="sin90-row">
+      <p>{t('noWeek')}</p>
+      <button type="button" className="btn btn-primary" disabled={!enabled}
+        onClick={() => onWrite({ op: 'createWeek', isoWeek: isoWeekUTC(new Date()) })}>{t('openWeek')}</button>
+    </div>}
+    {week && <>
+      <div className="sin90-head">
+        <p>{t('thisWeek', { week: week.iso_week })}</p>
+        <span className="tag">{weekLabel(t, week.status)}</span>
+      </div>
+      {step && <button type="button" className="btn btn-primary" disabled={!enabled}
+        onClick={() => onWrite({ op: 'transitionWeek', id: week.id, to: step })}>{weekAction(t, step)}</button>}
+      {attention && <p className="sin90-muted" data-sin90-attention="">{t('attention', {
+        planned_min: attention.planned_min, actual_min: attention.actual_min, deviation_min: attention.deviation_min,
+      })}</p>}
+      <h3>{t('blocks')}</h3>
+      {blocks.length === 0 ? <p className="sin90-muted">{t('none')}</p> : <ul className="sin90-queue" aria-label={t('blocks')}>
+        {blocks.map((block) => {
+          const title = blockTitle(block, tasks)
+          return <li key={block.id} className="sin90-row" aria-label={title ?? String(block.planned_minutes)}>
+            <span>{t('minutes', { n: block.planned_minutes })}{title ? ` · ${title}` : ''}</span>
+            <span className="tag">{blockLabel(t, block.status)}</span>
+            <span className="sin90-actions">
+              {blockTransitions(block.status).map((to) => <button key={to} type="button" className="btn btn-ghost" disabled={!enabled}
+                onClick={() => onWrite({ op: 'transitionBlock', id: block.id, to })}>{t(`action.${to}`)}</button>)}
+            </span>
+          </li>
+        })}
+      </ul>}
+      <div className="sin90-row">
+        <input aria-label={t('blockMinutes')} inputMode="numeric" value={minutes} onChange={(e) => onMinutes(e.target.value)} />
+        <button type="button" className="btn btn-primary" disabled={!enabled || !minutesOk}
+          onClick={() => onWrite({ op: 'createBlock', plannedMinutes: parsed, directionId })}>{t('addBlock')}</button>
+      </div>
+    </>}
+    {routines.length > 0 && <>
+      <h3>{t('routines')}</h3>
+      <ul className="sin90-queue">
+        {routines.map((routine) => {
+          const to = routineNext(routine.status)
+          return <li key={routine.id} className="sin90-row" aria-label={routine.title}>
+            <span>{routine.title}</span>
+            <span className="tag">{routine.status === 'paused' ? t('routine.paused') : t('routine.active')}</span>
+            {to && <button type="button" className="btn btn-ghost" disabled={!enabled}
+              onClick={() => onWrite({ op: 'transitionRoutine', id: routine.id, to })}>{to === 'paused' ? t('pause') : t('resume')}</button>}
+          </li>
+        })}
+      </ul>
+    </>}
+    {quota && <p className="sin90-muted">{t('quota')} {quota}</p>}
+  </div>
+}
+
 export function Sin90Page() {
   const t = useT(sin90Messages)
   const [today, setToday] = useState<Sin90Today | null>(null)
@@ -57,11 +163,17 @@ export function Sin90Page() {
   const [directions, setDirections] = useState<Sin90Direction[]>([])
   const [selected, setSelected] = useState<string | null>(null)
   const [tasks, setTasks] = useState<Sin90Task[]>([])
+  const [weeks, setWeeks] = useState<Sin90Week[]>([])
+  const [blocks, setBlocks] = useState<Sin90Block[]>([])
+  const [routines, setRoutines] = useState<Sin90Routine[]>([])
+  const [rhythms, setRhythms] = useState<Sin90Rhythm[]>([])
+  const [attention, setAttention] = useState<Sin90WeekAttention | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [title, setTitle] = useState('')
   const [windowName, setWindowName] = useState('')
   const [taskTitle, setTaskTitle] = useState('')
   const [note, setNote] = useState('')
+  const [blockMinutes, setBlockMinutes] = useState('90')
   const [canWrite, setCanWrite] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const seq = useRef(0)
@@ -77,13 +189,27 @@ export function Sin90Page() {
         const nextSelected = directionId && dirs.some((d) => d.id === directionId)
           ? directionId
           : firstDirectionId(nextGroups)
-        const nextTasks = nextSelected ? await fetchTasks(nextSelected) : []
+        const [nextTasks, rhythmRows] = nextSelected
+          ? await Promise.all([
+            fetchTasks(nextSelected),
+            Promise.all([fetchWeeks(), fetchBlocks(), fetchRoutines(), fetchRhythms()]),
+          ])
+          : [[], [[], [], [], []]] as const
+        if (token !== seq.current) return
+        const [nextWeeks, nextBlocks, nextRoutines, nextRhythms] = rhythmRows
+        const week = currentWeek(nextWeeks, isoWeekUTC(new Date()))
+        const nextAttention = week ? await fetchWeekAttention(week.id) : null
         if (token !== seq.current) return
         setToday(nextToday)
         setGroups(nextGroups)
         setDirections(dirs)
         setSelected(nextSelected)
-        setTasks(nextTasks)
+        setTasks([...nextTasks])
+        setWeeks([...nextWeeks])
+        setBlocks([...nextBlocks])
+        setRoutines([...nextRoutines])
+        setRhythms([...nextRhythms])
+        setAttention(nextAttention)
       } catch (err) {
         if (token !== seq.current) return
         setError(err instanceof Error ? err.message : 'load')
@@ -133,10 +259,14 @@ export function Sin90Page() {
       </div>
       <div className="sin90-card">
         <h2>{t('nextBlock')}</h2>
-        {today.deep_block ? <p>
-          {t('minutes', { n: today.deep_block.planned_minutes })}
-          {blockTitle(today.deep_block, knownTasks) ? ` · ${blockTitle(today.deep_block, knownTasks)}` : ''}
-        </p> : <p className="sin90-muted">{t('none')}</p>}
+        {today.deep_block ? <div className="sin90-row">
+          <span>
+            {t('minutes', { n: today.deep_block.planned_minutes })}
+            {blockTitle(today.deep_block, knownTasks) ? ` · ${blockTitle(today.deep_block, knownTasks)}` : ''}
+          </span>
+          {today.deep_block.status === 'planned' && <button type="button" className="btn btn-ghost" disabled={!enabled}
+            onClick={() => { const block = today.deep_block; if (block) write({ op: 'transitionBlock', id: block.id, to: 'started' }) }}>{t('action.started')}</button>}
+        </div> : <p className="sin90-muted">{t('none')}</p>}
       </div>
       <div className="sin90-card">
         <h2>{t('inbox')}</h2>
@@ -176,6 +306,10 @@ export function Sin90Page() {
           <span className="tag">{directionLabel(t, current.status)}</span>
         </div>
         <p className="sin90-muted">{t('window', { window: current.target_window })}</p>
+        <Rhythm directionId={current.id} week={currentWeek(weeks, isoWeekUTC(new Date()))} attention={attention}
+          blocks={blocksForDirection(blocks, current.id, tasks)} routines={routinesForDirection(routines, current.id)}
+          rhythm={latestRhythm(rhythms)} directions={directions} tasks={tasks} enabled={enabled}
+          minutes={blockMinutes} onMinutes={setBlockMinutes} onWrite={write} />
         <h3>{t('tasks')}</h3>
         {tasks.length === 0 ? <p>{t('noTasks')}</p> : <ul className="sin90-queue">
           {tasks.map((task) => <li key={task.id} className="sin90-row" aria-label={task.title}>
