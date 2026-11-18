@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { docAgentPrompt, findByTitle, parseDocIntent } from './doc-intent'
+import { docAgentPrompt, findByTitle, parseDocIntent, subjectOf } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -55,5 +55,18 @@ describe('docAgentPrompt', () => {
     expect(docAgentPrompt(null, '把两份合并')).toBe(
       '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；document_id 可以直接填文件名）。\n把两份合并',
     )
+  })
+})
+
+describe('subjectOf (without the Agent, outside a document conversation)', () => {
+  it('is the first title named, unless it is the other of a merge', () => {
+    const split = parseDocIntent('把《CFYAD26-9770136.pdf》拆出第 1 页')!
+    expect(split).toEqual({ kind: 'split', pages: '1' })
+    expect(subjectOf('把《CFYAD26-9770136.pdf》拆出第 1 页', split)).toBe('CFYAD26-9770136.pdf')
+    const merge = parseDocIntent('把《A》和《B》合并')!
+    expect(subjectOf('把《A》和《B》合并', merge)).toBe('A')
+    const onlyOther = parseDocIntent('和《B》合并')!
+    expect(subjectOf('和《B》合并', onlyOther)).toBeNull()
+    expect(subjectOf('拆出第 1 页', split)).toBeNull()
   })
 })

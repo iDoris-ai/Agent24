@@ -56,6 +56,15 @@ export function parseDocIntent(text: string): DocIntent | null {
  * (extension aside); else, among titles containing it, the only shortest one
  * (an original over the documents made from it, 「合并：A + B」 or
  * 「A（第 2 页）」). `candidates` when that still leaves several. */
+/** The document a turn outside a document's conversation names first, as
+ * 「把《A.pdf》拆出第 1 页」「把《A》和《B》合并」 do; null if none, or if the
+ * only one named is the other of a merge. */
+export function subjectOf(text: string, intent: DocIntent): string | null {
+  const first = /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim()
+  if (!first) return null
+  return intent.kind === 'merge' && first === intent.other ? null : first
+}
+
 /** Prefix the user turn so the Agent uses documents tools (D2b 正式版). */
 export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；document_id 可以直接填文件名）。'
