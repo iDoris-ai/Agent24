@@ -11,6 +11,7 @@ import { documentsMessages } from './Documents.i18n'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
 import { compose, convert, pagesOk } from './compose'
+import { askWithProxy, checkDocument, type CheckReport, type Source } from './doc-check'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -137,6 +138,12 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   const [rendering, setRendering] = useState(false)
   const [imageError, setImageError] = useState<string | null>(null)
   const shown = useRef(0)
+  const [checking, setChecking] = useState(false)
+  const [checkDone, setCheckDone] = useState(0)
+  const [checkTotal, setCheckTotal] = useState(0)
+  const [checkError, setCheckError] = useState<string | null>(null)
+  const [report, setReport] = useState<CheckReport | null>(null)
+  const [highlight, setHighlight] = useState<string | null>(null)
 
   /** Renders page `n` of the head revision and shows it if it is still wanted. */
   const show = async (head: Detail, n: number) => {
@@ -189,6 +196,65 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setMore(res.data.next_cursor)
   }
 
+  const jumpTo = (head: Detail, source: Source) => {
+    if (source.page !== undefined) void show(head, source.page)
+    setHighlight(source.block_id)
+    requestAnimationFrame(() => {
+      document.getElementById(`blk-${source.block_id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+  }
+
+  const runCheck = async (head: Detail) => {
+    if (checking) return
+    const gen = generation.current
+    setChecking(true)
+    setCheckDone(0)
+    setCheckTotal(0)
+    setCheckError(null)
+    setReport(null)
+    try {
+      const collected: Block[] = []
+      const unparsedPages = new Set<number>()
+      let cursor: string | undefined
+      for (let i = 0; i < 50; i++) {
+        const res = await api.request({
+          op: 'readText',
+          documentId: head.document_id,
+          revision: head.head.revision,
+          ...(cursor === undefined ? {} : { cursor }),
+        })
+        if (gen !== generation.current) return
+        if (!res.ok) throw new Error(describeError(res))
+        collected.push(...res.data.blocks)
+        for (const r of res.data.unparsed_regions ?? []) {
+          if (r.page !== undefined) unparsedPages.add(r.page)
+        }
+        setBlocks([...collected])
+        setUnparsed(new Set(unparsedPages))
+        setMore(res.data.next_cursor)
+        if (!res.data.next_cursor) break
+        cursor = res.data.next_cursor
+      }
+      const proxy = window.agent24.backendProxy
+      if (!proxy) throw new Error('backend unavailable')
+      const result = await checkDocument({
+        ask: (prompt) => askWithProxy(proxy, prompt),
+        onProgress: (done, total) => {
+          if (gen !== generation.current) return
+          setCheckDone(done)
+          setCheckTotal(total)
+        },
+      }, head.title ?? '', collected.map((b) => ({ block_id: b.block_id, page: b.page, text: b.text })))
+      if (gen !== generation.current) return
+      setReport(result)
+    } catch (e) {
+      if (gen !== generation.current) return
+      setCheckError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (gen === generation.current) setChecking(false)
+    }
+  }
+
   useEffect(() => {
     const gen = ++generation.current
     setDetail(null)
@@ -205,6 +271,12 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setConvertNote(null)
     setNeedEngine(false)
     setDownloadText(null)
+    setChecking(false)
+    setCheckDone(0)
+    setCheckTotal(0)
+    setCheckError(null)
+    setReport(null)
+    setHighlight(null)
     heading.current?.focus()
     void api.request({ op: 'get', documentId }).then((res) => {
       if (gen !== generation.current) return
@@ -323,6 +395,24 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           )}
         </figure>
       )}
+      {detail && !isOffice(detail.head.media_type) && blocks.length > 0 && (
+        <div style={{ margin: '8px 0' }}>
+          <button className="btn btn-primary" disabled={checking} onClick={() => void runCheck(detail)}>
+            {t('check.button')}
+          </button>
+          {checking && (
+            <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>
+              {t('check.progress', { done: checkDone, total: checkTotal })}
+            </p>
+          )}
+          {checkError && (
+            <p role="alert" style={ALERT}>{checkError}</p>
+          )}
+          {report && (
+            <CheckResult report={report} t={t} onJump={(s) => jumpTo(detail, s)} />
+          )}
+        </div>
+      )}
       {unparsed.size > 0 && <p role="note">{t('detail.partial', { count: unparsed.size })}</p>}
       {error && (
         <div role="alert" style={ALERT}>
@@ -338,7 +428,15 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
             {b.page !== undefined && b.page !== blocks[i - 1]?.page && (
               <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 8 }}>{t('detail.page', { page: b.page })}</div>
             )}
-            <p style={{ margin: '4px 0' }}>{b.text}</p>
+            <p
+              id={`blk-${b.block_id}`}
+              style={{
+                margin: '4px 0',
+                background: highlight === b.block_id ? 'var(--accent-soft, rgba(255,200,0,0.25))' : undefined,
+              }}
+            >
+              {b.text}
+            </p>
           </Fragment>
         ))}
       </div>
@@ -348,5 +446,64 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
         </button>
       )}
     </section>
+  )
+}
+
+type TFn = ReturnType<typeof useT<keyof typeof documentsMessages.en>>
+
+function SourceLinks({ sources, onJump, t }: { sources: Source[]; onJump: (s: Source) => void; t: TFn }) {
+  return (
+    <>
+      {sources.map((s, i) => (
+        <button
+          key={`${s.block_id}-${i}`}
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => onJump(s)}
+          style={{ marginLeft: 6, fontSize: 12 }}
+        >
+          {s.page !== undefined ? t('check.page', { page: s.page }) : t('check.source')}
+        </button>
+      ))}
+    </>
+  )
+}
+
+function CheckResult({ report, t, onJump }: { report: CheckReport; t: TFn; onJump: (s: Source) => void }) {
+  const section = (title: string, note: string | null, rows: Array<{ text: string; sources: Source[] }>) => {
+    if (!rows.length) return null
+    return (
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontWeight: 600, fontSize: 13 }}>
+          {title}{note ? ` · ${note}` : ''}
+        </div>
+        {rows.map((row, i) => (
+          <div key={i} style={{ fontSize: 13, margin: '4px 0' }}>
+            {row.text}
+            <SourceLinks sources={row.sources} onJump={onJump} t={t} />
+          </div>
+        ))}
+      </div>
+    )
+  }
+  return (
+    <div style={{ marginTop: 8 }}>
+      {section(t('check.summary'), null, report.summary)}
+      {section(t('check.deadlines'), null, report.items.filter((i) => i.kind === 'deadline').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.amounts'), null, report.items.filter((i) => i.kind === 'amount').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.conditions'), null, report.items.filter((i) => i.kind === 'condition').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.conflicts'), null, report.conflicts)}
+      {report.missing.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>
+            {t('check.missing')} · {t('check.missingNote')}
+          </div>
+          {report.missing.map((m) => (
+            <div key={m} style={{ fontSize: 13, margin: '4px 0' }}>{m}</div>
+          ))}
+        </div>
+      )}
+      {report.cut && <p style={{ fontSize: 12, color: 'var(--muted)' }}>{t('check.cut')}</p>}
+    </div>
   )
 }

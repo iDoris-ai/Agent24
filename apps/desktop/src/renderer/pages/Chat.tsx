@@ -14,6 +14,7 @@ import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHisto
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
 import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
+import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
@@ -223,6 +224,39 @@ export default function ChatPage() {
         requestInFlight.current = true
         setLoading(true)
         await replyWithKnowledge(messages.length, request, false)
+        return
+      }
+    }
+    // D3: 「总结/检查这份文档」 — same check as the document page, as a text report.
+    if (/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+      const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
+      if (doc || named) {
+        const api = window.agent24.documents
+        requestInFlight.current = true
+        setLoading(true)
+        const index = messages.length
+        try {
+          const subject = doc ?? await namedDocument(api, named ?? '')
+          if (typeof subject === 'string') {
+            setDelivery(index, { kind: 'sent' })
+            setMessages(prev => [...prev, { role: 'assistant', content: subject }])
+          } else {
+            const blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
+            const report = await checkDocument(
+              { ask: (prompt) => askWithProxy(window.agent24.backendProxy, prompt) },
+              subject.title,
+              blocks,
+            )
+            setDelivery(index, { kind: 'sent' })
+            setMessages(prev => [...prev, { role: 'assistant', content: reportMarkdown(subject.title, report) }])
+          }
+        } catch (e) {
+          setDelivery(index, { kind: 'sent' })
+          setMessages(prev => [...prev, { role: 'assistant', content: `没能完成检查：${e instanceof Error ? e.message : String(e)}` }])
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
         return
       }
     }
