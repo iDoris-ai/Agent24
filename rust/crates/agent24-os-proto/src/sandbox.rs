@@ -463,9 +463,8 @@ mod tests {
         std::fs::create_dir_all(&package).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let sh = Path::new("/bin/sh");
-        let temp = std::env::temp_dir();
         let callback = root.join("cb.sock");
-        let mut asked = inputs(&package, &data, &callback, sh, &temp, None);
+        let mut asked = inputs(&package, &data, &callback, sh, None);
         assert!(!seatbelt_profile(&asked).unwrap().contains("OSL_PIPE"));
         asked.office_pipe = true;
         let profile = seatbelt_profile(&asked).unwrap();
