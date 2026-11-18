@@ -144,7 +144,7 @@ impl InboundService {
         let explicit = decision.disposition == Disposition::Explicit;
         // Refuse before the insert: a stored `starting` row with nothing to run
         // would hold this actor's in-flight slot until the next startup.
-        if explicit && prepared.text.as_deref().is_none_or(str::is_empty) {
+        if explicit && text_is_blank(prepared.text.as_deref()) {
             return Err(IngestError::Invalid(format!(
                 "event {} has no text",
                 prepared.id
@@ -312,9 +312,10 @@ impl InboundService {
                 "inbound source {channel} is not a session channel"
             )));
         }
-        // `None` is a missing body. `unwrap_or_default` used to start a run
-        // whose prompt was empty.
-        let Some(prompt) = event.text.filter(|text| !text.is_empty()) else {
+        // `None` is a missing body. An empty string and a whitespace-only
+        // body are the same: nothing to run. `unwrap_or_default` used to
+        // start a run whose prompt was empty.
+        let Some(prompt) = event.text.filter(|text| !text.trim().is_empty()) else {
             return Err(IngestError::Invalid(format!(
                 "event {event_id} has no text"
             )));
@@ -507,6 +508,11 @@ fn prepare(message: &InboundMessage) -> Result<Prepared, IngestError> {
         text: bound_text(message.text.clone()),
         meta: message.meta.clone(),
     })
+}
+
+/// `None`, `""`, and whitespace-only are not a prompt.
+fn text_is_blank(text: Option<&str>) -> bool {
+    text.is_none_or(|text| text.trim().is_empty())
 }
 
 fn bound_text(text: Option<String>) -> Option<String> {
@@ -1411,6 +1417,69 @@ mod tests {
         );
         assert_eq!(run_count(&store).await, 0);
         assert_eq!(state_of(&store, "hyphae:blank-empty").await, "start_failed");
+    }
+
+    /// FU-123, the blank-body half. Mutation: drop `trim` in `text_is_blank`
+    /// or `dispatch_inner` and this stores the row or starts a run.
+    #[tokio::test]
+    async fn whitespace_only_inbound_text_is_refused_like_an_empty_body() {
+        let (svc, store) = open_service(Arc::new(Fixed)).await;
+        allow(&store, "hyphae", "npub1").await;
+        watermark(&store, "hyphae", &stamp(120)).await;
+        let err = svc
+            .ingest(message("hyphae:spaces", "npub1", &stamp(30), " \t\n"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("no text")),
+            "{err:?}"
+        );
+        assert!(
+            store
+                .get_inbound_event("hyphae:spaces")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let row = NewInboundEvent {
+            id: "hyphae:stored-spaces".to_owned(),
+            source: "hyphae".to_owned(),
+            category: "direct".to_owned(),
+            recipient_identity: None,
+            thread_key: None,
+            actor: Some("npub-spaces".to_owned()),
+            human: true,
+            addressed: "direct".to_owned(),
+            at: stamp(30),
+            received_at: stamp(0),
+            text: Some("   ".to_owned()),
+            meta: None,
+            disposition: "explicit".to_owned(),
+            disposition_reason: None,
+            policy_version: Some("p".to_owned()),
+            run_state: Some("starting".to_owned()),
+        };
+        assert_eq!(
+            store.insert_inbound_event(&row).await.unwrap(),
+            InboundInsert::Inserted
+        );
+        let err = svc.dispatch("hyphae:stored-spaces").await.unwrap_err();
+        assert!(
+            matches!(err, IngestError::Invalid(ref message) if message.contains("no text")),
+            "{err:?}"
+        );
+        assert_eq!(run_count(&store).await, 0);
+        assert_eq!(
+            state_of(&store, "hyphae:stored-spaces").await,
+            "start_failed"
+        );
+
+        let next = svc
+            .ingest(message("hyphae:after-spaces", "npub1", &stamp(31), "hi"))
+            .await
+            .unwrap();
+        assert!(matches!(next, IngestOutcome::Started { .. }), "{next:?}");
     }
 
     #[tokio::test]

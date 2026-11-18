@@ -10,6 +10,7 @@ import {
 import type { DocumentsModuleStatus } from '../../shared/ipc-types'
 import { useT } from '../i18n'
 import { modulesManagerMessages } from './ModulesManager.i18n'
+import { KernelConsentCard } from '../kernel-consent/KernelConsentCard'
 
 // REV-01 (ADR-037 decision 1): the node-daemon-era npm module list / install /
 // marketplace sections are gone; this page now manages only the kernel-mounted
@@ -32,6 +33,10 @@ export default function ModulesManagerPage() {
   // An uninstall/install failure: shown on its own, so it does not hide the
   // list (or the Install row) the way a failed list read does.
   const [docError, setDocError] = useState<string | null>(null)
+  // Enabling a module that still has no consent asks on this page. Turning it
+  // off does not. The card itself checks the daemon and stays quiet when the
+  // module is exempt.
+  const [asking, setAsking] = useState<string | null>(null)
 
   const loadOsSeq = useRef(0)
 
@@ -66,9 +71,11 @@ export default function ModulesManagerPage() {
     setOsToggling(mod.name)
     setOsError(null)
     try {
-      const list = await setOsModuleEnabled(mod.name, !mod.enabled)
+      const turningOn = !mod.enabled
+      const list = await setOsModuleEnabled(mod.name, turningOn)
       setOsModules(list.modules)
       setOsRegistryError(list.registry_error ?? null)
+      setAsking(turningOn ? mod.name : null)
     } catch (e) {
       setOsError(t('error.toggleOs', { action: t(mod.enabled ? 'action.disable' : 'action.enable'), name: mod.name, msg: e instanceof Error ? e.message : String(e) }))
     } finally {
@@ -262,6 +269,7 @@ export default function ModulesManagerPage() {
               {osModules.map((m) => renderOsModule(m))}
               {!osError && renderDocumentsAbsent()}
             </div>
+            {asking && <KernelConsentCard name={asking} onDecided={() => setAsking(null)} />}
           </>
         )}
       </div>

@@ -34,6 +34,8 @@ export interface ComponentView {
   denied?: ComponentDenial[]
   /** Both views. Omitted when missing or not one of the two known shapes. */
   isolation?: ComponentIsolation
+  /** Host view. Whether this OS package needs a kernel consent card. */
+  kernel_consent?: 'exempt' | 'missing' | 'granted'
 }
 
 export interface ComponentDenial {
@@ -144,6 +146,9 @@ export function parseComponentView(value: unknown): ComponentView {
   if (row.isolation !== undefined) {
     const isolation = parseIsolation(row.isolation)
     if (isolation !== undefined) view.isolation = isolation
+  }
+  if (row.kernel_consent === 'exempt' || row.kernel_consent === 'missing' || row.kernel_consent === 'granted') {
+    view.kernel_consent = row.kernel_consent
   }
   return view
 }

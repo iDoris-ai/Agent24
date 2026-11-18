@@ -74,6 +74,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // Optional UI manifests; daemons without this endpoint keep the static registry.
   r('GET', '/api/modules'),
   r('GET', '/api/v1/models'),
+  r('PUT', '/api/v1/models/default'), // [E] ProductHost writes the default chat model
   r('POST', '/api/v1/chat', CHAT_TIMEOUT_MS),
   // A real session for the main chat, so its turns can go to /runs too
   // (Knowledge on; Everyday in route_policy.rs).
@@ -99,6 +100,11 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/approvals'),
   // domain OS / attached modules: read, plus module commands (speak, stop_playback)
   r('GET', '/api/v1/os'),
+  r('GET', '/api/v1/os/{name}/kernel-consent'),
+  // [E] The handler confirms in the native dialog before it writes. The
+  // renderer only sends the checked set; it cannot store consent itself.
+  r('POST', '/api/v1/os/{name}/kernel-consent'),
+  r('DELETE', '/api/v1/os/{name}/kernel-consent'),
   r('POST', '/api/v1/os/{name}/commands/{command}'), // [E]
   r('GET', '/api/v1/attached'),
   // memory
@@ -127,6 +133,19 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
+  // Sin90 reads are Everyday. Writes stay on the main-process Sin90 IPC,
+  // which attaches the human key. Do not add POST/PATCH/PUT here.
+  r('GET', '/api/v1/sin90/today'),
+  r('GET', '/api/v1/sin90/directions'),
+  r('GET', '/api/v1/sin90/tasks'),
+  r('GET', '/api/v1/sin90/areas'),
+  r('GET', '/api/v1/sin90/weeks'),
+  r('GET', '/api/v1/sin90/weeks/{id}/attention'),
+  r('GET', '/api/v1/sin90/schedule-blocks'),
+  r('GET', '/api/v1/sin90/routines'),
+  r('GET', '/api/v1/sin90/rhythms'),
+  r('GET', '/api/v1/sin90/proposals'),
+  r('GET', '/api/v1/sin90/reviews'),
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,
@@ -211,6 +230,8 @@ export interface ProxyOptions {
   host?: string
   timeoutMs?: number
   maxBytes?: number
+  /** Sin90 human key. Main sets this; the renderer cannot. */
+  actorKey?: string
 }
 
 export function validIdempotencyKey(value: unknown): value is string | undefined {
@@ -226,6 +247,9 @@ export function proxyRequest(
 ): Promise<BackendProxyResponse> {
   if (!validIdempotencyKey(req.idempotencyKey)) {
     return Promise.resolve(proxyError('invalid_request', 'invalid idempotency key'))
+  }
+  if (opts.actorKey !== undefined && !/^[\x21-\x7e]+$/.test(opts.actorKey)) {
+    return Promise.resolve(proxyError('invalid_request', 'invalid actor key'))
   }
   const timeoutMs = opts.timeoutMs ?? PROXY_TIMEOUT_MS
   const maxBytes = opts.maxBytes ?? PROXY_MAX_BODY_BYTES
@@ -266,6 +290,7 @@ export function proxyRequest(
             'Content-Type': 'application/json',
             ...endpoint.authHeaders,
             ...(req.idempotencyKey ? { 'Idempotency-Key': req.idempotencyKey } : {}),
+            ...(opts.actorKey ? { 'x-sin90-actor-key': opts.actorKey } : {}),
             ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
           },
         },

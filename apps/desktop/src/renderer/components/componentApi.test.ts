@@ -68,12 +68,24 @@ describe('parseComponentList', () => {
         { ...ROW, id: 'mcp-files', isolation: { state: 'isolated' } },
         { ...ROW, id: 'sin90', isolation: { state: 'not_isolated', reason: 'maybe' } },
         { ...ROW, id: 'cos72', isolation: 'seatbelt' },
+        { ...ROW, id: 'widget', kernel_consent: 'missing' },
+        { ...ROW, id: 'documents', kernel_consent: 'exempt' },
+        { ...ROW, id: 'sin90', kernel_consent: 'granted' },
+        { ...ROW, id: 'later', kernel_consent: 'later' },
       ],
     })
+    expect(rows.map((row) => row.kernel_consent)).toEqual([
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      'missing', 'exempt', 'granted', undefined,
+    ])
     expect(rows.map((row) => row.isolation)).toEqual([
       { state: 'isolated', mechanism: 'seatbelt' },
       { state: 'not_isolated', reason: 'platform_unsupported' },
       { state: 'not_isolated', reason: 'form_not_covered' },
+      undefined,
+      undefined,
+      undefined,
+      undefined,
       undefined,
       undefined,
       undefined,

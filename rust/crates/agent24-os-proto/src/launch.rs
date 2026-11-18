@@ -46,8 +46,12 @@ pub const LISTEN_FD: i32 = 3;
 /// environment can carry credentials (a provider's API key, a cloud token) that
 /// are the kernel's, not a module's. `LC_*` is inherited as a prefix. ⚖️ The
 /// list is a choice: enough for an interpreter to find itself and a locale, and
-/// nothing that names a credential.
-pub const INHERITED_ENV: &[&str] = &["PATH", "HOME", "LANG", "TZ", "TMPDIR", "USER"];
+/// nothing that names a credential. `TMPDIR`, `TMP` and `TEMP` are on the list
+/// so a module may see them; [`start`] replaces all three with that module's
+/// own temp directory.
+pub const INHERITED_ENV: &[&str] = &[
+    "PATH", "HOME", "LANG", "TZ", "TMPDIR", "TMP", "TEMP", "USER",
+];
 
 fn inherited(name: &std::ffi::OsStr) -> bool {
     name.to_str()
@@ -82,6 +86,9 @@ pub enum LaunchError {
     /// macOS could not confine the module (no `sandbox-exec`, or the profile
     /// could not be built). The module is not started.
     SandboxUnavailable(String),
+    /// The module temp directory could not be inspected, replaced, cleared or
+    /// created. The module is not started.
+    UnsafeTemp(String),
 }
 
 impl std::fmt::Display for LaunchError {
@@ -115,6 +122,7 @@ impl std::fmt::Display for LaunchError {
                 f,
                 "refusing to start the module without seatbelt isolation: {why}"
             ),
+            Self::UnsafeTemp(why) => write!(f, "{why}"),
         }
     }
 }
@@ -147,7 +155,6 @@ fn prepare_seatbelt(
     let home = std::env::vars_os().find_map(|(k, v)| (k == "HOME").then(|| PathBuf::from(v)));
     let data_dir = crate::sandbox::check_data_dir(data_dir, home.as_deref())
         .map_err(|error| LaunchError::SandboxUnavailable(error.0))?;
-    let temp = std::env::temp_dir();
     // A test launcher is a tiny binary that `execv`s an absolute interpreter
     // path compiled into it. The profile's program is the launcher, so that
     // interpreter would otherwise be unreadable. Production binaries are not
@@ -160,7 +167,6 @@ fn prepare_seatbelt(
         callback_sock,
         program,
         also_programs: &also,
-        temp_dir: &temp,
         home_dir: home.as_deref(),
         office_pipe,
     })
@@ -596,8 +602,10 @@ pub struct LaunchSpec<'a> {
 ///   written in a scripting language routinely starts helpers, and killing only
 ///   the pid we hold leaves them running.
 /// - **A cleared environment**: [`INHERITED_ENV`] plus the four `A24_*`
-///   variables. The token travels in the environment, not on the command line,
-///   because arguments are world-readable through `ps`.
+///   variables. `TMPDIR`, `TMP` and `TEMP` are then set to this module's own
+///   temp directory (`<data_dir>/tmp`), not the user's. The token travels in
+///   the environment, not on the command line, because arguments are
+///   world-readable through `ps`.
 /// - **fds 0–3 only**: stdin is `/dev/null`, stdout and stderr are pipes the
 ///   kernel drains, fd 3 is the listening socket, and the [`Trampoline`] flags
 ///   everything else close-on-exec before the module's program starts.
@@ -688,6 +696,8 @@ fn start(
     if let Err(error) = std::fs::create_dir_all(spec.data_dir) {
         return Err(LaunchError::Spawn(error));
     }
+    // On macOS, refuse a redirected data directory before creating anything
+    // inside it. `prepare_seatbelt` checks again when it builds the profile.
     #[cfg(target_os = "macos")]
     let (exec_program, seatbelt) = prepare_seatbelt(
         spec.package_dir,
@@ -699,6 +709,8 @@ fn start(
     )?;
     #[cfg(not(target_os = "macos"))]
     let exec_program = program.to_path_buf();
+    let module_temp = crate::sandbox::reset_module_temp(spec.data_dir)
+        .map_err(|error| LaunchError::UnsafeTemp(error.0))?;
     // The generation's address is the path its listener is bound at (D4,
     // FU-60): read now, before the listener moves into the command. Cloned,
     // not borrowed from `spec.http_path` — that value moves into the
@@ -719,6 +731,9 @@ fn start(
         .env(ENV_CALLBACK_SOCK, spec.callback_sock)
         .env(ENV_HANDSHAKE_TOKEN, &token)
         .env(ENV_DATA_DIR, spec.data_dir)
+        .env("TMPDIR", &module_temp)
+        .env("TMP", &module_temp)
+        .env("TEMP", &module_temp)
         .env(ENV_TRAMPOLINE, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1352,6 +1367,9 @@ mod tests {
             "precondition: the parent has a variable the child must not inherit"
         );
         let t = pkg();
+        let data = t.path().join("data");
+        std::fs::create_dir_all(data.join("tmp")).unwrap();
+        std::fs::write(data.join("tmp/stale"), b"old").unwrap();
         let mut p = start(t.path(), &cmd("sh", &["-c", "env > \"$A24_DATA_DIR/out\""])).await;
         exited(&mut p).await;
         let out = data_out(t.path());
@@ -1393,7 +1411,87 @@ mod tests {
         let sock = t.path().join("cb.sock");
         assert_eq!(env.get(ENV_DATA_DIR).copied(), data.to_str());
         assert_eq!(env.get(ENV_CALLBACK_SOCK).copied(), sock.to_str());
+        // Each start clears `<data>/tmp` and points the three temp variables at
+        // its canonical path, with the trailing slash macOS uses.
+        assert!(
+            !data.join("tmp/stale").exists(),
+            "a previous temp file survived"
+        );
+        let temp = crate::sandbox::canonical(&data.join("tmp")).unwrap();
+        let temp = format!("{}/", temp.display());
+        assert_eq!(env.get("TMPDIR").copied(), Some(temp.as_str()), "{env:?}");
+        assert_eq!(env.get("TMP").copied(), Some(temp.as_str()));
+        assert_eq!(env.get("TEMP").copied(), Some(temp.as_str()));
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// A symlink where `<data>/tmp` should be is not followed and not cleared.
+    /// Starting would otherwise delete whatever the link points at.
+    #[test]
+    fn an_odd_module_temp_entry_is_replaced_and_its_target_kept() {
+        let t = pkg();
+        let data = t.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let elsewhere = t.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("keep"), b"keep").unwrap();
+        // A symlink leaf: unlinked, not followed.
+        std::os::unix::fs::symlink(&elsewhere, data.join("tmp")).unwrap();
+        crate::sandbox::reset_module_temp(&data).expect("a symlink leaf is replaced");
+        assert!(
+            data.join("tmp")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+        assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
+        // A plain file leaf.
+        std::fs::remove_dir(data.join("tmp")).unwrap();
+        std::fs::write(data.join("tmp"), b"x").unwrap();
+        crate::sandbox::reset_module_temp(&data).expect("a file leaf is replaced");
+        assert!(
+            data.join("tmp")
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_dir()
+        );
+        // A Go-cache shape: a 0555 directory holding a 0444 file, and tmp at 0555.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cache = data.join("tmp/mod/pkg");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(cache.join("f"), b"x").unwrap();
+            for (p, m) in [
+                (cache.join("f"), 0o444),
+                (cache.clone(), 0o555),
+                (data.join("tmp/mod"), 0o000),
+                (data.join("tmp"), 0o555),
+            ] {
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+            }
+            crate::sandbox::reset_module_temp(&data).expect("a read-only tree is cleared");
+            assert_eq!(std::fs::read_dir(data.join("tmp")).unwrap().count(), 0);
+        }
+        // A tree deeper than PATH_MAX, built with relative paths.
+        {
+            // In a child shell: `set_current_dir` would move every test's cwd.
+            let built = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("i=0; while [ $i -lt 700 ]; do mkdir d && cd d || exit 1; i=$((i+1)); done")
+                .current_dir(data.join("tmp"))
+                .status()
+                .unwrap();
+            assert!(built.success());
+            crate::sandbox::reset_module_temp(&data).expect("a deep tree is cleared");
+            assert_eq!(std::fs::read_dir(data.join("tmp")).unwrap().count(), 0);
+        }
+        // A symlink inside tmp: unlinked, its target kept.
+        std::os::unix::fs::symlink(&elsewhere, data.join("tmp/link")).unwrap();
+        crate::sandbox::reset_module_temp(&data).unwrap();
+        assert!(data.join("tmp/link").symlink_metadata().is_err());
+        assert_eq!(std::fs::read(elsewhere.join("keep")).unwrap(), b"keep");
     }
 
     /// SPEC-ME3 §1: the kernel opens the listening socket and hands it over as
@@ -1976,6 +2074,150 @@ dump()
         assert_eq!(report["handshake"], "ok", "{report}");
         assert_eq!(report["tool"], "ok", "{report}");
         drop(tcp);
+        let _ = p.stop(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// SBX-1b: the module's `TMPDIR` is `<data>/tmp`. A write there succeeds,
+    /// a write in the daemon's user temp directory is refused, and the
+    /// handshake plus one HTTP call on the inherited listener still work.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn seatbelt_confines_the_user_temp_dir_and_the_handshake_still_works() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let user_temp = std::env::temp_dir();
+        let denied = user_temp.join(format!("a24-sbx1b-denied-{}", std::process::id()));
+        struct RemoveOnDrop(std::path::PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let _remove = RemoveOnDrop(denied.clone());
+        let denied_json = serde_json::to_string(&denied.display().to_string()).unwrap();
+        let script = format!(
+            r#"
+import json, os, socket
+data = os.environ["A24_DATA_DIR"]
+denied = {denied_json}
+report = {{}}
+module_tmp = os.environ["TMPDIR"]
+report["tmpdir"] = module_tmp
+report["tmp"] = os.environ.get("TMP")
+report["temp"] = os.environ.get("TEMP")
+with open(os.path.join(module_tmp, "mine"), "w") as fh:
+    fh.write("ok")
+report["module_tmp"] = "ok"
+try:
+    open(denied, "w").write("nope")
+    report["user_tmp"] = 0
+except OSError as e:
+    report["user_tmp"] = e.errno if e.errno is not None else -1
+def dump():
+    with open(os.path.join(data, "report.json"), "w") as fh:
+        json.dump(report, fh)
+dump()
+cb = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+cb.connect(os.environ["A24_CALLBACK_SOCK"])
+frame = {{"jsonrpc":"2.0","method":"initialize","id":"1","params":{{"protocol_versions":{{"min":1,"max":1}},"module":"sbx1b","manifest_digest":"sha256:abc","auth_token":os.environ["A24_HANDSHAKE_TOKEN"],"capabilities":[]}}}}
+cb.sendall((json.dumps(frame) + "\n").encode())
+buf = b""
+while b"\n" not in buf:
+    chunk = cb.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+report["handshake"] = "ok" if b'"result"' in buf else "bad"
+dump()
+http = socket.socket(fileno=int(os.environ["A24_LISTEN_FD"]))
+conn, _addr = http.accept()
+req = b""
+while b"\r\n\r\n" not in req:
+    chunk = conn.recv(4096)
+    if not chunk:
+        break
+    req += chunk
+conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ntool-ok")
+conn.close()
+report["tool"] = "ok"
+dump()
+"#
+        );
+
+        let state = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let callbacks = crate::endpoint::CallbackDir::create(state.path()).unwrap();
+        let cb = callbacks.listen_next().unwrap();
+        let cb_path = cb.path().to_owned();
+        let (http_listener, http_path) = listener();
+        let http_path_buf = http_path.path().to_owned();
+        let t = pkg();
+        let trampoline = test_trampoline();
+        let command = python(&script);
+        let mut p = spawn(LaunchSpec {
+            name: "t",
+            command: &command,
+            package_dir: t.path(),
+            data_dir: &t.path().join("data"),
+            callback_sock: &cb_path,
+            trampoline: &trampoline,
+            listener: http_listener,
+            http_path,
+        })
+        .await
+        .expect("spawn");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let stream = cb.accept_one(deadline).await.expect("callback connect");
+        let expect = crate::initialize::Expectation {
+            module: "sbx1b".to_owned(),
+            manifest_digest: "sha256:abc".to_owned(),
+            auth_token: p.token().to_owned(),
+            kernel_versions: crate::version::VersionRange::new(1, 1).unwrap(),
+            offer: crate::initialize::Offer::none(),
+        };
+        crate::endpoint::handshake(stream, &expect, deadline)
+            .await
+            .expect("handshake");
+
+        let mut conn = tokio::net::UnixStream::connect(&http_path_buf)
+            .await
+            .unwrap();
+        conn.write_all(b"POST /tool HTTP/1.1\r\nHost: module\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        let mut body = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            conn.read_to_end(&mut body),
+        )
+        .await
+        .expect("no tool answer within 30s")
+        .unwrap();
+        assert!(
+            body.windows(7).any(|window| window == b"tool-ok"),
+            "{body:?}"
+        );
+        let exit = exited(&mut p).await;
+        assert_eq!(exit.code, Some(0), "{exit}");
+        let data = t.path().join("data");
+        let report: serde_json::Value = serde_json::from_str(&read(&data, "report.json")).unwrap();
+        let temp = crate::sandbox::canonical(&data.join("tmp")).unwrap();
+        let temp = format!("{}/", temp.display());
+        assert_eq!(report["tmpdir"], temp, "{report}");
+        assert_eq!(report["tmp"], temp, "{report}");
+        assert_eq!(report["temp"], temp, "{report}");
+        assert_eq!(report["module_tmp"], "ok", "{report}");
+        assert_eq!(
+            std::fs::read_to_string(data.join("tmp/mine")).unwrap(),
+            "ok"
+        );
+        assert_eq!(report["user_tmp"], 1, "{report}");
+        assert!(!denied.exists(), "the module wrote the user temp directory");
+        assert_eq!(report["handshake"], "ok", "{report}");
+        assert_eq!(report["tool"], "ok", "{report}");
         let _ = p.stop(std::time::Duration::from_millis(100)).await;
     }
 }

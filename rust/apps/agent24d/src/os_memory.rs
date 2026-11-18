@@ -683,6 +683,10 @@ pub struct OsScopedMemory {
 }
 
 impl OsScopedMemory {
+    pub fn module(&self) -> &str {
+        &self.module
+    }
+
     pub fn new(partition: &OsMemoryPartition, kv: &agent24_memory::KvStore) -> Self {
         Self {
             key: partition.key.clone(),

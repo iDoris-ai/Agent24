@@ -15,6 +15,7 @@ interface Row {
   kernel_grants?: string[]
   declared?: { kernel: string[]; operations: string[] }
   isolation?: unknown
+  kernel_consent?: 'exempt' | 'missing' | 'granted'
 }
 
 let rows: Row[]
@@ -178,6 +179,19 @@ describe('communication capability status', () => {
     expect(result.current.grantsFor('documents')).toEqual(['events'])
     expect(result.current.grantsFor('communication')).toEqual([])
     expect(result.current.grantsFor('localModels')).toBeUndefined()
+    expect(result.current.consentFor('documents')).toBeUndefined()
+  })
+
+  it('reads kernel consent only from the host row', async () => {
+    rows = [
+      { ...row('documents', 'ready'), kernel_consent: 'exempt', kernel_grants: ['events'], declared: { kernel: ['events'], operations: [] } },
+      { ...row('sin90', 'ready'), kernel_consent: 'missing', kernel_grants: [], declared: { kernel: ['events'], operations: [] } },
+    ]
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    expect(result.current.consentFor('documents')).toBe('exempt')
+    expect(result.current.consentFor('sin90')).toBe('missing')
+    expect(result.current.consentFor('localModels')).toBeUndefined()
   })
 
   it('passes a parsed isolation through and drops a missing or illegal one', async () => {
@@ -216,12 +230,20 @@ describe('OS package capability status', () => {
     expect(result.current(id)).toBe(prompt)
   })
 
-  it('leaves the default label when the package is not an integrity refusal', async () => {
-    rows = [row('sin90', 'failed', 'refused'), row('cos72', 'ready')]
+  it('shows a real label for Sin90 and Cos72, and leaves other packages on the default', async () => {
+    rows = [row('sin90', 'failed', 'refused'), { ...row('cos72', 'ready'), version: '0.1.0' }, row('documents', 'ready')]
     const { result } = renderHook(() => useCapabilityStatus(true))
     await act(async () => {})
-    expect(result.current('sin90')).toBeUndefined()
-    expect(result.current('cos72')).toBeUndefined()
+    expect(result.current('sin90')).toBe('失败：refused')
+    expect(result.current('cos72')).toBe('已安装 v0.1.0')
+    expect(result.current('documents')).toBeUndefined()
+  })
+
+  it('says Sin90 is not installed when the component row is absent', async () => {
+    rows = [row('sin90', 'absent')]
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    expect(result.current('sin90')).toBe('未安装')
   })
 })
 

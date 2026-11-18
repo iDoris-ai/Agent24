@@ -38,15 +38,50 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { isDeepStrictEqual } from 'node:util'
 import { isAlias, isMap, isScalar, parseDocument, visit } from 'yaml'
+import { compareVersions } from '../shared/os-package-registry'
 import { joinLiteral } from './data-dir'
 
 export const MODULE = 'documents'
 /** Under userData; `{"uninstalledByUser": true}` while the user has it uninstalled. */
 export const MARKER_FILE = 'documents-module.json'
 const MANIFEST = 'domain-os.yml'
-/** The package's programs, checked before it is installed. */
+/** The documents package's programs, checked before it is installed. */
 const PROGRAMS = ['bin/agent24-documents', 'bin/agent24-documents-pdfkit'] as const
 export const CODESIGN = '/usr/bin/codesign'
+
+/**
+ * One OS package the mac app carries. `bytes` (documents) reinstalls when any
+ * payload file differs. `version` (Sin90) installs when missing, upgrades only
+ * when the installed version is lower, and leaves an equal or newer install
+ * alone so an OSI-1 upgrade is not replaced by the older bundle.
+ */
+export interface BundledOsSpec {
+  id: string
+  /** Log tag, without brackets. */
+  log: string
+  programs: readonly string[]
+  markerFile: string
+  stagingName: string
+  whenInstalled: 'bytes' | 'version'
+}
+
+export const DOCUMENTS_OS: BundledOsSpec = {
+  id: MODULE,
+  log: 'documents-module',
+  programs: PROGRAMS,
+  markerFile: MARKER_FILE,
+  stagingName: 'documents-module-staging',
+  whenInstalled: 'bytes',
+}
+
+export const SIN90_OS: BundledOsSpec = {
+  id: 'sin90',
+  log: 'sin90-module',
+  programs: ['bin/sin90'],
+  markerFile: 'sin90-module.json',
+  stagingName: 'sin90-module-staging',
+  whenInstalled: 'version',
+}
 /** Each CLI call; install copies about 10 MB. Past it the call is stopped. */
 export const CLI_TIMEOUT_MS = 60_000
 
@@ -199,6 +234,7 @@ export async function signatureProblem(
   bundleDir: string,
   appBundle: string | null,
   codesign: RunCli,
+  programs: readonly string[] = PROGRAMS,
 ): Promise<string | null> {
   if (appBundle === null) return 'the app bundle is unknown'
   const app = await codesign(['-dv', appBundle])
@@ -213,7 +249,7 @@ export async function signatureProblem(
       : ['--verify', '--strict', appBundle],
   )
   if (sealed.code !== 0) return `the app's signature does not verify: ${lastLine(sealed.output)}`
-  for (const rel of PROGRAMS) {
+  for (const rel of programs) {
     const file = path.join(bundleDir, rel)
     if (identity.kind === 'adhoc') {
       const r = await codesign(['--verify', '--strict', file])
@@ -230,8 +266,8 @@ export async function signatureProblem(
   return null
 }
 
-export function userUninstalled(userDataDir: string): boolean {
-  const text = readText(path.join(userDataDir, MARKER_FILE))
+export function userUninstalled(userDataDir: string, markerFile: string = MARKER_FILE): boolean {
+  const text = readText(path.join(userDataDir, markerFile))
   if (text === null) return false
   try {
     const v = JSON.parse(text) as unknown
@@ -246,13 +282,13 @@ function lastLine(output: string): string {
   return lines[lines.length - 1] ?? ''
 }
 
-function stagingDir(userDataDir: string): string {
-  return path.join(userDataDir, 'documents-module-staging')
+function stagingDir(userDataDir: string, name: string): string {
+  return path.join(userDataDir, name)
 }
 
 /** Called only after signatures pass. Keep the old installation until generate succeeds. */
-async function installWithIntegrity(bundleDir: string, userDataDir: string, runCli: RunCli, beforeInstall?: () => Promise<void>): Promise<CliResult> {
-  const tmp = stagingDir(userDataDir)
+async function installWithIntegrity(spec: BundledOsSpec, bundleDir: string, userDataDir: string, runCli: RunCli, beforeInstall?: () => Promise<void>): Promise<CliResult> {
+  const tmp = stagingDir(userDataDir, spec.stagingName)
   fs.mkdirSync(userDataDir, { recursive: true })
   fs.rmSync(tmp, { recursive: true, force: true })
   fs.mkdirSync(tmp, { mode: 0o700 })
@@ -263,7 +299,7 @@ async function installWithIntegrity(bundleDir: string, userDataDir: string, runC
     }
     const generated = await runCli([
       'package-integrity', 'generate', '--root', tmp,
-      ...PROGRAMS.flatMap((program) => ['--executable', program]),
+      ...spec.programs.flatMap((program) => ['--executable', program]),
     ])
     if (generated.code !== 0) {
       throw new Error(`package-integrity generate failed (rc=${generated.code}): ${lastLine(generated.output)}`)
@@ -275,61 +311,84 @@ async function installWithIntegrity(bundleDir: string, userDataDir: string, runC
   }
 }
 
-export async function ensureBundledDocumentsModule(deps: BundledModuleDeps): Promise<BundledModuleOutcome> {
+/** `version` policy: equal or newer stays. A version that is not X.Y.Z stays too (FU). */
+function versionIsCurrent(have: string, want: string): boolean {
+  const cmp = compareVersions(have, want)
+  return Number.isNaN(cmp) || cmp >= 0
+}
+
+export async function ensureBundledModule(spec: BundledOsSpec, deps: BundledModuleDeps): Promise<BundledModuleOutcome> {
+  const tag = spec.log
   try {
     // A crash after `os install` but before the cleanup below leaves the staging
     // copy behind, and the next launch returns `up_to_date` before installing
     // again; clear it here, on every launch.
-    fs.rmSync(stagingDir(deps.userDataDir), { recursive: true, force: true })
+    fs.rmSync(stagingDir(deps.userDataDir, spec.stagingName), { recursive: true, force: true })
     if (deps.bundleDir === null) return 'no_bundle'
     const bundled = readText(path.join(deps.bundleDir, MANIFEST))
     if (bundled === null) return 'no_bundle'
     const want = manifestVersion(bundled)
     if (want === null) {
-      deps.warn(`[documents-module] the bundled ${MANIFEST} in ${deps.bundleDir} has no version; not installing it`)
+      deps.warn(`[${tag}] the bundled ${MANIFEST} in ${deps.bundleDir} has no version; not installing it`)
       return 'bundle_invalid'
     }
-    if (userUninstalled(deps.userDataDir)) return 'skipped_user_uninstalled'
+    if (userUninstalled(deps.userDataDir, spec.markerFile)) return 'skipped_user_uninstalled'
     if (deps.packagesRoot === null) {
-      deps.warn('[documents-module] the data directory could not be resolved; not installing the documents module')
+      deps.warn(`[${tag}] the data directory could not be resolved; not installing the ${spec.id} module`)
       return 'no_packages_root'
     }
     // Joined literally, as the CLI's PathBuf::join does (no `..` folding).
-    const installedDir = joinLiteral(deps.packagesRoot, MODULE)
+    const installedDir = joinLiteral(deps.packagesRoot, spec.id)
     const upgrading = fs.existsSync(installedDir)
     let have: string | null = null
     if (upgrading) {
       const text = readText(joinLiteral(installedDir, MANIFEST))
       have = text === null ? null : manifestVersion(text)
       if (have === null) {
-        deps.warn(`[documents-module] ${installedDir} has no readable ${MANIFEST}; leaving it as it is`)
+        deps.warn(`[${tag}] ${installedDir} has no readable ${MANIFEST}; leaving it as it is`)
         return 'installed_unreadable'
       }
-      if (sameFiles(deps.bundleDir, installedDir)) return 'up_to_date'
+      if (spec.whenInstalled === 'bytes' ? sameFiles(deps.bundleDir, installedDir) : versionIsCurrent(have, want)) {
+        return 'up_to_date'
+      }
     }
-    const problem = await signatureProblem(deps.bundleDir, deps.appBundle, deps.codesign)
+    const problem = await signatureProblem(deps.bundleDir, deps.appBundle, deps.codesign, spec.programs)
     if (problem !== null) {
-      deps.warn(`[documents-module] not installing the bundled documents ${want}: ${problem}`)
+      deps.warn(`[${tag}] not installing the bundled ${spec.id} ${want}: ${problem}`)
       return 'signature_invalid'
     }
-    const added = await installWithIntegrity(deps.bundleDir, deps.userDataDir, deps.runCli, async () => {
+    const added = await installWithIntegrity(spec, deps.bundleDir, deps.userDataDir, deps.runCli, async () => {
       if (!upgrading) return
-      const removed = await deps.runCli(['os', 'uninstall', MODULE])
+      const removed = await deps.runCli(['os', 'uninstall', spec.id])
       if (removed.code !== 0) {
         throw new Error(`replacing ${have} with ${want}: os uninstall failed (rc=${removed.code}): ${lastLine(removed.output)}`)
       }
     })
     if (added.code !== 0) {
-      deps.warn(`[documents-module] os install failed (rc=${added.code}): ${lastLine(added.output)}`)
+      deps.warn(`[${tag}] os install failed (rc=${added.code}): ${lastLine(added.output)}`)
       return 'install_failed'
     }
     const where = /^installed .*$/m.exec(added.output)?.[0] ?? lastLine(added.output)
-    deps.info(`[documents-module] ${upgrading ? 'upgraded to' : 'installed'} documents ${want}: ${where}`)
+    deps.info(`[${tag}] ${upgrading ? 'upgraded to' : 'installed'} ${spec.id} ${want}: ${where}`)
     return upgrading ? 'upgraded' : 'installed'
   } catch (error) {
-    deps.warn(`[documents-module] ${error instanceof Error ? error.message : String(error)}`)
+    deps.warn(`[${tag}] ${error instanceof Error ? error.message : String(error)}`)
     return 'install_failed'
   }
+}
+
+/** Documents keeps its byte-compare rule. One call, as before. */
+export function ensureBundledDocumentsModule(deps: BundledModuleDeps): Promise<BundledModuleOutcome> {
+  return ensureBundledModule(DOCUMENTS_OS, deps)
+}
+
+/** Before the daemon starts: each carried module, in order. One failure does not skip the rest. */
+export async function ensureBundledOsModules(
+  items: readonly { spec: BundledOsSpec; deps: BundledModuleDeps }[],
+): Promise<BundledModuleOutcome[]> {
+  const outcomes: BundledModuleOutcome[] = []
+  for (const item of items) outcomes.push(await ensureBundledModule(item.spec, item.deps))
+  return outcomes
 }
 
 /** `A24_OS_PACKAGES` when set (as the CLI and daemon read it), else `<dataDir>/packages`. */
@@ -466,7 +525,7 @@ export async function installBundledDocumentsModule(deps: BundledModuleDeps): Pr
   }
   let r: CliResult
   try {
-    r = await installWithIntegrity(deps.bundleDir, deps.userDataDir, deps.runCli)
+    r = await installWithIntegrity(DOCUMENTS_OS, deps.bundleDir, deps.userDataDir, deps.runCli)
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     deps.warn(`[documents-module] ${message}`)

@@ -11,7 +11,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } f
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
 import { withDocumentsDelegation } from '../documents-delegation'
-import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint } from '../backend-manager'
+import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint, getDaemonStartupFailure } from '../backend-manager'
 import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import { approvalConfirmShown, sendElevating } from '../elevated-request'
 import type { KnowledgeController } from '../knowledge-settings'
@@ -30,12 +30,16 @@ import { readOmlxSettingsKey } from '../omlx-settings-key'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
+import { desktopSin90Write, sin90KeyAvailable } from '../sin90-write'
 import { importFile } from '../documents-import'
 import type { ModuleActionResult } from '../documents-module'
+import { formatBytes, type OsPackageResult } from '../os-package-install'
+import { isRegisteredOsPackage } from '../../shared/os-package-registry'
 import { IpcChannels } from '../../shared/ipc-types'
 import type {
   CommImportPickResult,
   DocumentsModuleStatus,
+  OsPackageProgress,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -710,6 +714,13 @@ export function registerIpcHandlers(options: {
     uninstall: () => Promise<ModuleActionResult>
     install: () => Promise<ModuleActionResult>
   }
+  /** OSI-1: install a registered domain OS. `id` is checked before this runs. */
+  osPackageInstall?: (
+    id: string,
+    confirm: (info: { name: string; version: string; bytes: number }) => Promise<boolean>,
+    onProgress: (progress: OsPackageProgress) => void,
+  ) => Promise<OsPackageResult>
+  osPackageLatest?: (id: string) => Promise<OsPackageResult>
   /** Test seam: the main-owned backup-password window. */
   promptBackupPassword?: (parent: BrowserWindow | null) => Promise<string | null>
   /** Test seam: the main-owned restore-password window. */
@@ -735,6 +746,8 @@ export function registerIpcHandlers(options: {
    * earlier quits left running and recorded, when its identity still matches.
    * Default: nothing. */
   stopKeptOmlx?: () => Promise<void>
+  /** Sidebar "retry start": the same restart the tray uses. */
+  retryDaemon?: () => void
 }): void {
   const promptBackupPassword = options.promptBackupPassword ?? openBackupPasswordWindow
   const promptRestorePassword = options.promptRestorePassword ?? openRestorePasswordWindow
@@ -745,6 +758,8 @@ export function registerIpcHandlers(options: {
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
+  const osPackageInstall = options.osPackageInstall ?? null
+  const osPackageLatest = options.osPackageLatest ?? null
   keepOwnedOmlxOnQuit = options.keepOwnedOmlxOnQuit ?? (() => false)
   rememberKept = options.rememberKeptOmlx ?? (() => {})
   stopKept = options.stopKeptOmlx ?? (() => Promise.resolve())
@@ -755,6 +770,8 @@ export function registerIpcHandlers(options: {
   })
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
+  handle(IpcChannels.Sin90KeyStatus, () => sin90KeyAvailable())
+  handle(IpcChannels.Sin90Write, (_event, req: unknown) => desktopSin90Write(req))
   // oMLX: auto-detect running server
   handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
     let authRequiredAt: string | null = null
@@ -896,9 +913,13 @@ export function registerIpcHandlers(options: {
   // backend:endpoint — the daemon's actual port (FU-93: the sidebar used to
   // show a hardcoded `:8765`, but agent24d is spawned with `--port 0` and
   // gets whatever the OS hands it).
-  handle(IpcChannels.BackendEndpoint, (): BackendEndpointResult | null => {
+  handle(IpcChannels.BackendEndpoint, (_event, action: unknown): BackendEndpointResult | null => {
+    if (action === 'retry') options.retryDaemon?.()
     const endpoint = getBackendEndpoint()
-    return endpoint ? { port: endpoint.port } : null
+    const startupFailure = getDaemonStartupFailure()
+    if (!endpoint && !startupFailure) return null
+    const port = endpoint?.port ?? null
+    return startupFailure ? { port, startupFailure } : { port }
   })
   handle(IpcChannels.BackendRefusal, (): BackendRefusalResult | null => options.backendRefusal?.() ?? null)
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
@@ -1467,6 +1488,47 @@ export function registerIpcHandlers(options: {
       return moduleActionResponse(await documentsModuleActions.install(), documentsModule().externalDaemon)
     }),
   )
+
+  // OSI-1: download a registered domain OS and install it with the app CLI.
+  // An id that is not in the registry never reaches the downloader.
+  const osPackageResponse = (result: OsPackageResult): BackendProxyResponse => {
+    if (result.ok) return { ok: true, status: 200, data: { version: result.version, upgraded: result.upgraded } }
+    const status = result.code === 'already_installed' ? 409
+      : result.code === 'cancelled' ? 499
+        : result.code === 'not_registered' ? 400
+          : 500
+    const message = result.code === 'already_installed' ? mt('err.osPkgAlready')
+      : result.code === 'cancelled' ? mt('err.cancelled')
+        : result.code === 'daemon_running' ? `${mt('err.osPkgFailed', { reason: clip(result.message, 300) })}\n${mt('err.osPkgExternal')}`
+          : result.code === 'service_shutdown' ? mt('err.osPkgService')
+            : mt('err.osPkgFailed', { reason: clip(result.message, 300) })
+    return { ok: false, status, data: { error: { code: result.code, message } } }
+  }
+  handle(IpcChannels.OsPackageLatest, (_event, id: unknown): Promise<BackendProxyResponse> => exclusive(async () => {
+    if (typeof id !== 'string' || !isRegisteredOsPackage(id)) {
+      return { ok: false, status: 400, data: { error: { code: 'not_registered', message: mt('err.osPkgNotRegistered') } } }
+    }
+    if (!osPackageLatest) return { ok: false, status: 404, data: { error: { code: 'unavailable', message: mt('err.osPkgNotRegistered') } } }
+    return osPackageResponse(await osPackageLatest(id))
+  }))
+  handle(IpcChannels.OsPackageInstall, (event, id: unknown): Promise<BackendProxyResponse> => exclusive(async () => {
+    if (typeof id !== 'string' || !isRegisteredOsPackage(id)) {
+      return { ok: false, status: 400, data: { error: { code: 'not_registered', message: mt('err.osPkgNotRegistered') } } }
+    }
+    if (!osPackageInstall) return { ok: false, status: 404, data: { error: { code: 'unavailable', message: mt('err.osPkgNotRegistered') } } }
+    const result = await osPackageInstall(
+      id,
+      (info) => confirmNative(
+        event,
+        mt('osPkg.install', { name: info.name, version: info.version }),
+        mt('osPkg.installDetail', { size: formatBytes(info.bytes) }),
+      ),
+      (progress) => {
+        if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.OsPackageProgress, progress)
+      },
+    )
+    return osPackageResponse(result)
+  }))
 
   // A-3: PATCH /api/v1/attached/agentear — disable / re-enable AgentEar.
   // Elevated in route_policy.rs; main sends it with the ProductHost credential,

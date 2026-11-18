@@ -8,3 +8,4 @@ include!("host_guard.rs");
 include!("registration_gate.rs");
 include!("guardian_triggers.rs");
 include!("fallback_dir.rs");
+include!("default_model.rs");

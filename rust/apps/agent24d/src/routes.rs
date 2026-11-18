@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::{RawQuery, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::server::{AppState, error_response};
 
@@ -58,6 +58,53 @@ pub async fn get_models(State(state): State<AppState>) -> Response {
     // never fall back to guessing itself.
     Json(serde_json::json!({ "models": models, "default_model": state.router.default_model() }))
         .into_response()
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PutDefaultModelBody {
+    pub model: String,
+}
+
+/// `PUT /api/v1/models/default` — save the default chat model and use it on
+/// the next model-less completion. Elevated: ProductHost writes it directly;
+/// a service-mode shell confirms presence first.
+pub async fn put_default_model(
+    State(state): State<AppState>,
+    body: Result<Json<PutDefaultModelBody>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(kv) = state.memory_kv.clone() else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "default_model_unavailable",
+            "default model store is unavailable",
+        );
+    };
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "model is required",
+            );
+        }
+    };
+    let model = match crate::default_model::validate_model_id(&body.model) {
+        Ok(model) => model,
+        Err(message) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid_request", message);
+        }
+    };
+    if let Err(err) = crate::default_model::store_default(&kv, &model).await {
+        tracing::error!("writing default chat model: {err}");
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            "could not store the default model",
+        );
+    }
+    state.router.set_default_model(model.clone());
+    Json(serde_json::json!({ "model": model })).into_response()
 }
 
 /// One `(module, day, served_by)` row's six counters, projected into the

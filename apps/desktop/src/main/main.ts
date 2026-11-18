@@ -30,12 +30,16 @@ import { documentsCall, documentsEvent } from './documents'
 import { withDocumentsDelegation } from './documents-delegation'
 import { importFile } from './documents-import'
 import { sendElevating } from './elevated-request'
+import { sin90Event } from './sin90-event'
 import { cliBinary } from './documents-cli'
 import {
   CODESIGN,
+  DOCUMENTS_OS,
+  SIN90_OS,
   type BundledModuleDeps,
   documentsModuleOnDisk,
   ensureBundledDocumentsModule,
+  ensureBundledOsModules,
   execCli,
   installBundledDocumentsModule,
   packagesRootFor,
@@ -61,6 +65,8 @@ import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { fileAppliedStore, KnowledgeHost } from './knowledge-host'
 import { serviceDaemonOf } from './service-daemon'
+import { fetchOsPackageRelease, OsInstallPauseError, performOsPackageInstall } from './os-package-install'
+import { realOsServicePause, runWhileServiceStopped } from './os-package-service'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 import { knowledgeAppInstanceId } from './knowledge-app-instance'
@@ -170,6 +176,8 @@ const agentEarBridge = new AgentEarEventBridge(
   (event) => {
     const doc = documentsEvent(event)
     if (doc && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.DocumentsEvent, doc)
+    const sin = sin90Event(event)
+    if (sin && mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.Sin90Event, sin)
   },
   // M4 A3: runs' changes, for the history list's filters.
   (event) => {
@@ -203,6 +211,7 @@ const agentEarBridge = new AgentEarEventBridge(
       if (!res.ok || !Array.isArray(list)) throw new Error(`approvals_unavailable_${res.status}`)
       return list
     }).catch((err) => console.error('[main] pending approvals not caught up', err))
+    if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.Sin90Event, { kind: 'connected', payload: {} })
   },
 )
 
@@ -557,13 +566,13 @@ app.whenReady().then(async () => {
   // read `backendManager.status()` / `getBackendEndpoint()` live, so this
   // resolving a beat later than the old synchronous spawn is harmless.
   //
-  // T1-1 (#1159 Q1 = A): the documents module the mac app carries is
-  // installed first, so the daemon this start spawns mounts it: start() waits
-  // for it, and tray actions in the meantime only record what the user wants.
-  // Never rejects; a failure is a warning and the daemon starts all the same.
-  const documentsDeps: BundledModuleDeps = {
+  // T1-1 (#1159 Q1 = A) and OSI-2: the documents and Sin90 packages the mac
+  // app carries are installed, in that order, before the daemon starts, so
+  // this start mounts them. Never rejects; a failure is a warning and the
+  // daemon starts all the same. Sin90 does not replace an equal or newer install.
+  const bundledDeps = (resourceName: string): BundledModuleDeps => ({
     bundleDir: app.isPackaged && process.platform === 'darwin'
-      ? path.join(process.resourcesPath, 'documents-module')
+      ? path.join(process.resourcesPath, resourceName)
       : null,
     // Contents/Resources → the .app whose signature sets the rule.
     appBundle: app.isPackaged ? path.resolve(process.resourcesPath, '..', '..') : null,
@@ -573,14 +582,19 @@ app.whenReady().then(async () => {
     runCli: execCli(cliBinary()),
     warn: (message) => console.warn(message),
     info: (message) => console.log(message),
-  }
-  const documentsModuleReady = ensureBundledDocumentsModule(documentsDeps)
-  backendManager.holdStartUntil(documentsModuleReady)
+  })
+  const documentsDeps = bundledDeps('documents-module')
+  const sin90Deps = bundledDeps('sin90-module')
+  const bundledModulesReady = ensureBundledOsModules([
+    { spec: DOCUMENTS_OS, deps: documentsDeps },
+    { spec: SIN90_OS, deps: sin90Deps },
+  ])
+  backendManager.holdStartUntil(bundledModulesReady)
   // Service mode: the LaunchAgent's daemon holds the store, so a newer bundled
   // documents module could not replace the installed one above. Once enrolled
   // with that daemon, stop it (the presence box once), replace the module,
   // and start it again.
-  void documentsModuleReady.then(async (outcome) => {
+  void bundledModulesReady.then(async ([outcome]) => {
     if (outcome !== 'install_failed' || !launchAgentPlistExists()) return
     moduleNeedsServiceStop = () => ensureBundledDocumentsModule(documentsDeps).finally(() => { moduleNeedsServiceStop = null })
     // Enrolled, and the presence connection up: the shutdown asks the box through it.
@@ -597,7 +611,7 @@ app.whenReady().then(async () => {
     console.log('[documents-module] replaced with the service daemon stopped:', done.ok ? done.value : done.code)
   })
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
-    await documentsModuleReady
+    await bundledModulesReady
     const external = backendManager.isExternalDaemon()
     let result: ModuleActionResult
     try {
@@ -682,6 +696,39 @@ app.whenReady().then(async () => {
       uninstall: () => documentsModuleAction(() => uninstallDocumentsModule({ ...documentsDeps, now: () => new Date() })),
       install: () => documentsModuleAction(() => installBundledDocumentsModule(documentsDeps)),
     },
+    // OSI-1: a child daemon is stopped around `os install` (the documents
+    // path). An enrolled LaunchAgent daemon is shut down, then kickstarted,
+    // and whileServiceRestarts keeps this app from spawning its own child
+    // so it enrols with the service again. Any other daemon is left running.
+    osPackageLatest: (id) => fetchOsPackageRelease(id, process.arch),
+    osPackageInstall: (id, confirm, onProgress) => performOsPackageInstall(id, {
+      platform: process.platform,
+      arch: process.arch,
+      userDataDir: app.getPath('userData'),
+      packagesRoot: packagesRootFor(process.env, tryDataDir()),
+      runCli: execCli(cliBinary(), 120_000),
+      confirm,
+      onProgress,
+      leavesDaemonRunning: () => {
+        const service = serviceDaemonOf(backendManager)
+        return backendManager.isExternalDaemon() || (process.platform === 'darwin' && launchAgentPlistExists() && service === null)
+      },
+      withDaemonStopped: async <T>(work: () => Promise<T>): Promise<T> => {
+        const service = serviceDaemonOf(backendManager)
+        if (process.platform === 'darwin' && launchAgentPlistExists() && service) {
+          const paused = await backendManager.whileServiceRestarts(() => runWhileServiceStopped(realOsServicePause(service.pid), work))
+          if (!paused.ok) {
+            throw new OsInstallPauseError(
+              paused.stage === 'shutdown' ? 'service_shutdown' : 'daemon_running',
+              paused.code,
+            )
+          }
+          return paused.value
+        }
+        if (backendManager.isExternalDaemon() || (process.platform === 'darwin' && launchAgentPlistExists())) return work()
+        return backendManager.whileStopped(work)
+      },
+    }),
     keepOwnedOmlxOnQuit: () => {
       // Read first: it also clears a record whose plist is gone.
       const left = plistLeftByStop()
@@ -691,6 +738,7 @@ app.whenReady().then(async () => {
     // 5s / 2s: the same bounds as ipc/index.ts OMLX_STOP_GRACE_MS / OMLX_KILL_FALLBACK_MS
     // (FU-114 terminateOwnedOmlx), inside the same OMLX_QUIT_STOP_BUDGET_MS.
     stopKeptOmlx: async () => { const dir = tryDataDir(); if (dir !== null) await stopKeptOmlx(keptOmlxPath(dir), realOmlxProcessProbe(), { graceMs: 5_000, killMs: 2_000 }) },
+    retryDaemon: () => { backendManager.restart(); refreshTray() },
   })
   cliTool = registerCliTool({
     guard, executable: process.execPath, resources: process.resourcesPath, packaged: app.isPackaged,
@@ -712,7 +760,7 @@ app.whenReady().then(async () => {
       if (!residentAvailable()) return { ok: false, stage: 'unavailable', code: 'unavailable' }
       const result = await setResident(on, {
         installed: launchAgentPlistExists,
-        install: () => residentInstall(documentsModuleReady),
+        install: () => residentInstall(bundledModulesReady),
         stop: residentStop,
         record: recordConsent,
       })
@@ -787,7 +835,7 @@ app.whenReady().then(async () => {
     },
   })
   mainWin = createMainWindow()
-  void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))
+  void askResidentConsent(bundledModulesReady).catch((err) => console.error('[main] resident consent', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   // M4 A7: Knowledge's dialogs and drafts in their conversations' pending[].

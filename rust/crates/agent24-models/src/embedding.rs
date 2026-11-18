@@ -104,9 +104,10 @@ impl EmbeddingClient {
                 .map_err(|_| ModelError::Provider("missing iDoris data key".into()))?;
             return Self::idoris(url, key, model);
         }
-        // Same variables and defaults as `ProviderRegistry::from_env`.
+        // Same variables as `ProviderRegistry::from_env`. An empty key sends
+        // no Authorization header (`build` drops it).
         let url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
+        let key = crate::omlx_api_key_from_process_env().unwrap_or_default();
         Self::direct(url, key, model)
     }
 

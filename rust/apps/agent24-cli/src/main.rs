@@ -370,6 +370,37 @@ enum OsAction {
         /// Module name, e.g. documents
         name: String,
     },
+    /// Kernel-capability consent for an OS module that is not bundled with the desktop
+    Consent {
+        #[command(subcommand)]
+        action: OsConsentAction,
+    },
+}
+
+/// `agent24 os consent show|grant|revoke`.
+#[derive(Subcommand)]
+enum OsConsentAction {
+    /// Print the card: fingerprint, and one sentence per capability
+    Show {
+        /// Module name
+        name: String,
+    },
+    /// Store the checked subset. The fingerprint must be the one `show` just printed.
+    Grant {
+        /// Module name
+        name: String,
+        /// Fingerprint printed by `show`
+        #[arg(long)]
+        fingerprint: String,
+        /// Comma-separated capability ids. Empty is a refusal.
+        #[arg(long)]
+        capabilities: String,
+    },
+    /// Delete the record. The next start holds no kernel capabilities.
+    Revoke {
+        /// Module name
+        name: String,
+    },
 }
 
 /// `agent24 os attach …` (A3-2a; §3.2/§3.6).
@@ -1752,7 +1783,8 @@ async fn install_with_consent(
         Ok(dest) => {
             println!("installed {}", dest.display());
             println!(
-                "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+                "{}",
+                install_takes_effect_line(service::service_installed())
             );
             // An ephemeral daemon (`agent24 chat` with nothing running)
             // resolves a different packages root and will never see this
@@ -1767,8 +1799,9 @@ async fn install_with_consent(
 }
 
 /// Removal happens only after consent revocation succeeds. A missing package
-/// is still a success and does not touch the store: there is nothing to revoke
-/// that this command would have left behind.
+/// is still a success. Its kernel-consent row is deleted anyway: the files
+/// may already be gone, and the next install of the same name must not
+/// inherit the old agreement.
 async fn uninstall_with_consent(
     name: &str,
     packages_root: &std::path::Path,
@@ -1779,11 +1812,15 @@ async fn uninstall_with_consent(
         Err(e) => return Err(e.to_string()),
         Ok(false) => {
             println!("{name} was not installed; nothing to remove");
+            delete_kernel_consent(name, state_dir, online).await?;
             return Ok(());
         }
         Ok(true) => {}
     }
     revoke_module_consent(name, state_dir, online).await?;
+    // Install does not delete this row. Uninstall does, before the files move,
+    // so a retry cannot report success while the consent is still stored.
+    delete_kernel_consent(name, state_dir, online).await?;
     match agent24_os_packages::install::uninstall(name, packages_root) {
         Err(e) => Err(e.to_string()),
         Ok(false) => {
@@ -1885,6 +1922,205 @@ async fn invalidate_module_consents_in(
     };
     let closed = db.close().await;
     result.and(closed)
+}
+
+async fn delete_kernel_consent(
+    name: &str,
+    state_dir: Option<&std::path::Path>,
+    online: Option<&Endpoint>,
+) -> Result<(), String> {
+    let deleted = if let Some(ep) = online {
+        delete_kernel_consent_online(ep, name, state_dir).await
+    } else {
+        delete_kernel_consent_in(state_dir, name).await
+    };
+    deleted.map_err(|why| consent_revocation_failed_message(&why))
+}
+
+async fn delete_kernel_consent_online(
+    ep: &Endpoint,
+    name: &str,
+    state_dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    let sent = send_elevating(
+        ep,
+        reqwest::Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        None,
+        Duration::from_secs(10),
+        false,
+    )
+    .await;
+    match sent {
+        Ok(res) if res.status.is_success() => Ok(()),
+        Ok(res) => {
+            let status = res.status;
+            let body = res.json_value().await;
+            // An exempt module has nothing to revoke. The row is already gone.
+            if status == reqwest::StatusCode::CONFLICT && body["error"]["code"] == "consent_exempt"
+            {
+                return Ok(());
+            }
+            if body["error"]["message"].as_str().is_some() {
+                Err(format!(
+                    "could not revoke {name} kernel consent: {}",
+                    daemon_error_line(&body)
+                ))
+            } else {
+                Err(format!(
+                    "could not revoke {name} kernel consent: daemon returned {status}"
+                ))
+            }
+        }
+        Err(err) => match delete_kernel_consent_in(state_dir, name).await {
+            Ok(()) => Ok(()),
+            Err(offline) => Err(format!(
+                "could not reach the daemon to revoke {name} kernel consent ({}); {offline}",
+                err.parts().1
+            )),
+        },
+    }
+}
+
+async fn delete_kernel_consent_in(
+    state_dir: Option<&std::path::Path>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(dir) = state_dir else {
+        eprintln!(
+            "  HOME is not set: cannot reach a consent store, so the kernel consent for {name} was not revoked"
+        );
+        return Ok(());
+    };
+    let db = offline_db::open_offline_store(dir).await.map_err(|err| {
+        format!("could not open the consent store to revoke {name} kernel consent: {err}")
+    })?;
+    let result = match &db {
+        offline_db::OfflineDb::Absent(_lock) => Ok(()),
+        offline_db::OfflineDb::Ready(store, _lock) => store
+            .delete_kernel_consent(name)
+            .await
+            .map_err(|err| format!("could not revoke {name} kernel consent: {err}")),
+    };
+    let closed = db.close().await;
+    result.and(closed)
+}
+
+/// One sentence per kernel capability. The daemon dialog uses the same words.
+fn kernel_phrase(capability: &str) -> &'static str {
+    match capability {
+        "events" => "以这个模块的名字发出事件",
+        "models" => "让内核替它调用模型",
+        "scheduler" => "登记和查看定时任务",
+        "memory" => "使用只属于它自己的那一份记忆",
+        "approval" => "发起审批、查询审批结果",
+        _ => "一项没有对应说明的内核能力",
+    }
+}
+
+fn print_kernel_consent(body: &serde_json::Value) {
+    println!(
+        "{} {}",
+        body["module"].as_str().unwrap_or("?"),
+        body["class"].as_str().unwrap_or("?")
+    );
+    println!("指纹 {}", body["fingerprint"].as_str().unwrap_or(""));
+    let agreed = body["consented"].as_array();
+    for cap in body["capabilities"].as_array().into_iter().flatten() {
+        let id = cap.as_str().unwrap_or("");
+        let on = agreed.is_some_and(|list| list.iter().any(|item| item.as_str() == Some(id)));
+        println!(
+            "{}{}",
+            kernel_phrase(id),
+            if on { "（已同意）" } else { "" }
+        );
+    }
+}
+
+async fn cmd_os_consent(action: OsConsentAction) -> Result<(), String> {
+    let ep = match attach_only_with_enrollment(true).await {
+        Ok(Some(ep)) => ep,
+        Err(err) => return Err(err),
+        Ok(None) => {
+            return Err(
+                "daemon not running; start it with `agent24 daemon start`.\n  \
+                 start the daemon, then run `agent24 os consent`"
+                    .to_owned(),
+            );
+        }
+    };
+    let sent = match &action {
+        OsConsentAction::Show { name } => {
+            send_elevating(
+                &ep,
+                reqwest::Method::GET,
+                &format!("/api/v1/os/{name}/kernel-consent"),
+                None,
+                Duration::from_secs(10),
+                false,
+            )
+            .await
+        }
+        OsConsentAction::Revoke { name } => {
+            send_elevating(
+                &ep,
+                reqwest::Method::DELETE,
+                &format!("/api/v1/os/{name}/kernel-consent"),
+                None,
+                Duration::from_secs(10),
+                false,
+            )
+            .await
+        }
+        OsConsentAction::Grant {
+            name,
+            fingerprint,
+            capabilities,
+        } => {
+            let caps: Vec<&str> = capabilities
+                .split(',')
+                .map(str::trim)
+                .filter(|cap| !cap.is_empty())
+                .collect();
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "fingerprint": fingerprint,
+                "capabilities": caps,
+            }))
+            .map_err(|err| err.to_string())?;
+            send_elevating(
+                &ep,
+                reqwest::Method::POST,
+                &format!("/api/v1/os/{name}/kernel-consent"),
+                Some(bytes),
+                Duration::from_secs(10),
+                true,
+            )
+            .await
+        }
+    };
+    let out = match sent {
+        Ok(res) if res.status.is_success() => {
+            match &action {
+                OsConsentAction::Revoke { name } => println!("已撤销 {name} 的内核同意"),
+                OsConsentAction::Show { .. } | OsConsentAction::Grant { .. } => {
+                    print_kernel_consent(&res.json_value().await);
+                }
+            }
+            Ok(())
+        }
+        Ok(res) => {
+            let status = res.status;
+            let body = res.json_value().await;
+            Err(if body["error"]["message"].as_str().is_some() {
+                daemon_error_line(&body)
+            } else {
+                format!("daemon returned {status}")
+            })
+        }
+        Err(err) => Err(err.parts().1),
+    };
+    finish(ep).await;
+    out
 }
 
 /// Consent revocation did not land. Package files have not been changed.
@@ -2004,6 +2240,9 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
     if let OsAction::TrustTeam { team_id } | OsAction::UntrustTeam { team_id } = &action {
         return cmd_os_trusted_team(matches!(action, OsAction::TrustTeam { .. }), team_id).await;
     }
+    if let OsAction::Consent { action } = action {
+        return cmd_os_consent(action).await;
+    }
     if let Some(done) = os_local(&action).await {
         return done;
     }
@@ -2037,7 +2276,8 @@ async fn cmd_os(action: OsAction) -> Result<(), String> {
         OsAction::Attach { .. }
         | OsAction::Delegate { .. }
         | OsAction::TrustTeam { .. }
-        | OsAction::UntrustTeam { .. } => unreachable!(),
+        | OsAction::UntrustTeam { .. }
+        | OsAction::Consent { .. } => unreachable!(),
         OsAction::TrustedTeams => bearer(
             &ep,
             client().get(format!("{}/api/v1/os/trusted-teams", ep.base)),
@@ -3128,6 +3368,7 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
         OsAction::TrustedTeams | OsAction::TrustTeam { .. } | OsAction::UntrustTeam { .. } => {
             "start the daemon to manage trusted teams".to_owned()
         }
+        OsAction::Consent { .. } => "start the daemon, then run `agent24 os consent`".to_owned(),
         OsAction::List => format!("read {path} to see what is configured"),
         OsAction::Enable { name } | OsAction::Disable { name } => {
             let key = serde_json::to_string(name).unwrap_or_else(|_| "\"?\"".to_owned());
@@ -3141,7 +3382,29 @@ fn offline_hint(path: &str, action: &OsAction) -> String {
     }
 }
 
+/// FU-68: an installed LaunchAgent must be restarted with `kickstart`,
+/// not `daemon stop && daemon start` (a clean exit is not restarted, and
+/// the manual start is not launchd's child). No plist: the old command.
+fn install_takes_effect_line(service_installed: bool) -> String {
+    format!(
+        "  it takes effect at the next daemon start: {}",
+        service::restart_command(service_installed)
+    )
+}
+
+fn restart_apply_line(enabled: bool, service_installed: bool) -> String {
+    format!(
+        "    config says {} — restart the daemon to apply ({})",
+        if enabled { "enabled" } else { "disabled" },
+        service::restart_command(service_installed)
+    )
+}
+
 fn print_os(list: &agent24_protocol::DomainOsList) {
+    print_os_with(list, service::service_installed())
+}
+
+fn print_os_with(list: &agent24_protocol::DomainOsList, service_installed: bool) {
     // The registry problem FIRST, because until it is fixed nothing else the user
     // does here takes effect — including the toggle they probably just tried.
     if let Some(err) = &list.registry_error {
@@ -3184,10 +3447,7 @@ fn print_os(list: &agent24_protocol::DomainOsList) {
             println!("    declared models could not be checked");
         }
         if m.restart_required {
-            println!(
-                "    config says {} — restart the daemon to apply (agent24 daemon stop && agent24 daemon start)",
-                if m.enabled { "enabled" } else { "disabled" }
-            );
+            println!("{}", restart_apply_line(m.enabled, service_installed));
         }
     }
 }
@@ -3555,6 +3815,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn restart_hints_kickstart_when_the_launch_agent_is_installed() {
+        let apply = restart_apply_line(true, true);
+        assert!(
+            apply.contains("launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24"),
+            "{apply}"
+        );
+        assert!(
+            !apply.contains("agent24 daemon stop && agent24 daemon start"),
+            "{apply}"
+        );
+        let install = install_takes_effect_line(true);
+        assert!(install.contains("launchctl kickstart -k"), "{install}");
+        assert!(!install.contains("daemon stop"), "{install}");
+    }
+
+    #[test]
+    fn restart_hints_stay_stop_then_start_when_no_launch_agent_is_installed() {
+        assert_eq!(
+            restart_apply_line(false, false),
+            "    config says disabled — restart the daemon to apply (agent24 daemon stop && agent24 daemon start)"
+        );
+        assert_eq!(
+            install_takes_effect_line(false),
+            "  it takes effect at the next daemon start: agent24 daemon stop && agent24 daemon start"
+        );
+    }
+
+    #[test]
     fn trusted_team_commands_parse_and_help_explains_builtin() {
         use clap::CommandFactory;
         for args in [
@@ -3696,6 +3984,130 @@ mod tests {
         invalidate_module_consents_in(Some(dir.path()), "consent-mod")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn uninstall_deletes_the_kernel_consent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        store
+            .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+                module: "widget".into(),
+                fingerprint: "k=events;o=".into(),
+                capabilities: vec!["events".into()],
+                team_id: None,
+                version: "1".into(),
+                decided_at: "2026-11-18T00:00:00Z".into(),
+                expires_at: "2026-12-18T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        drop(store);
+        delete_kernel_consent_in(Some(dir.path()), "widget")
+            .await
+            .unwrap();
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+    }
+
+    /// The package files are already gone. Uninstall still deletes the row.
+    /// Removing the `delete_kernel_consent` call on that branch fails this test.
+    #[tokio::test]
+    async fn uninstall_of_a_missing_package_deletes_the_kernel_consent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        store
+            .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+                module: "kc-missing-pkg".into(),
+                fingerprint: "k=events;o=".into(),
+                capabilities: vec!["events".into()],
+                team_id: None,
+                version: "1".into(),
+                decided_at: "2026-11-18T00:00:00Z".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        drop(store);
+        uninstall_with_consent("kc-missing-pkg", packages.path(), Some(dir.path()), None)
+            .await
+            .unwrap();
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        assert!(
+            store
+                .get_kernel_consent("kc-missing-pkg")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// `409 consent_exempt` means there is nothing to revoke. Both the missing
+    /// package branch and the installed branch succeed, and the installed
+    /// directory is moved away. Treating that 409 as an error fails this test.
+    #[tokio::test]
+    async fn uninstall_accepts_consent_exempt_for_a_missing_and_an_installed_package() {
+        let port = consent_exempt_stub();
+        let online = Endpoint {
+            base: format!("http://127.0.0.1:{port}"),
+            token: String::new(),
+            child: None,
+            session: None,
+        };
+        let packages = tempfile::tempdir().unwrap();
+        uninstall_with_consent("kc-exempt-missing", packages.path(), None, Some(&online))
+            .await
+            .unwrap();
+
+        let installed = packages.path().join("kc-exempt-installed");
+        std::fs::create_dir(&installed).unwrap();
+        uninstall_with_consent("kc-exempt-installed", packages.path(), None, Some(&online))
+            .await
+            .unwrap();
+        assert!(
+            !installed.exists(),
+            "the installed package directory must be moved away"
+        );
+    }
+
+    /// Kernel-consent DELETE is `409 consent_exempt`. Any other path is 204,
+    /// so module-consent revocation can finish before the kernel DELETE.
+    fn consent_exempt_stub() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut socket) = incoming else { continue };
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if req.contains("kernel-consent") {
+                    (
+                        "409 Conflict",
+                        r#"{"error":{"code":"consent_exempt","message":"exempt"}}"#,
+                    )
+                } else {
+                    ("204 No Content", "")
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn kernel_consent_phrases_are_the_card_sentences() {
+        assert_eq!(kernel_phrase("events"), "以这个模块的名字发出事件");
+        assert_eq!(kernel_phrase("models"), "让内核替它调用模型");
     }
 
     // ── CORE-5a / T10: offline entries share the daemon lock and dock markers ──

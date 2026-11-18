@@ -302,6 +302,24 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output, String> {
         .map_err(|e| format!("running launchctl {}: {e}", args.join(" ")))
 }
 
+fn launchctl_strings(args: &[String]) -> Result<std::process::Output, String> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    launchctl(&refs)
+}
+
+/// `install`'s launchctl calls, in order. `enable gui/<uid>/<label>` first:
+/// a label marked disabled refuses `bootstrap`. Then `bootstrap gui/<uid> <plist>`.
+pub fn install_launchctl_args(uid: u32, label: &str, plist: &Path) -> [Vec<String>; 2] {
+    [
+        vec!["enable".to_owned(), format!("gui/{uid}/{label}")],
+        vec![
+            "bootstrap".to_owned(),
+            format!("gui/{uid}"),
+            plist.to_string_lossy().into_owned(),
+        ],
+    ]
+}
+
 fn uid() -> u32 {
     // SAFETY-free: getuid via `id -u` avoids a libc dependency for one number.
     std::process::Command::new("id")
@@ -478,8 +496,11 @@ pub fn install(exec: &Path) -> Result<(PathBuf, PathBuf, Vec<String>), String> {
     let env = capture_env();
     write_install_files(&copy, &plist, &out_log, &err_log, &env)?;
 
-    let target = format!("gui/{}", uid());
-    let out = launchctl(&["bootstrap", &target, &plist.to_string_lossy()])?;
+    let steps = install_launchctl_args(uid(), LABEL, &plist);
+    // Best-effort. A disabled label refuses bootstrap; enable failing (the job
+    // is not loaded yet, or launchctl itself errors) must not hide that.
+    let _ = launchctl_strings(&steps[0]);
+    let out = launchctl_strings(&steps[1])?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
         return Err(format!(
@@ -514,6 +535,23 @@ pub fn status() -> (bool, Option<PathBuf>, bool) {
     let plist = plist_path();
     let installed = plist.as_ref().is_some_and(|p| p.exists());
     (installed, plist, loaded())
+}
+
+/// The LaunchAgent plist is on disk (`status`'s `installed`). A clean
+/// `daemon stop` then a manual `daemon start` would leave that daemon
+/// outside launchd (FU-68).
+pub fn service_installed() -> bool {
+    plist_path().is_some_and(|p| p.is_file())
+}
+
+/// Restart command for the operator. Installed: `launchctl kickstart -k`
+/// so launchd still owns the process. Not installed: the manual pair.
+pub fn restart_command(service_installed: bool) -> &'static str {
+    if service_installed {
+        "launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24"
+    } else {
+        "agent24 daemon stop && agent24 daemon start"
+    }
 }
 
 #[cfg(test)]
@@ -1070,6 +1108,38 @@ mod tests {
         assert_eq!(
             p,
             PathBuf::from("/Users/tester/Library/LaunchAgents/ai.auraai.agent24.plist")
+        );
+    }
+
+    #[test]
+    fn install_enables_the_label_before_bootstrap() {
+        let plist = Path::new("/Users/tester/Library/LaunchAgents/ai.auraai.agent24.plist");
+        let steps = install_launchctl_args(501, LABEL, plist);
+        assert_eq!(
+            steps[0],
+            vec!["enable".to_owned(), format!("gui/501/{LABEL}")]
+        );
+        assert_eq!(
+            steps[1],
+            vec![
+                "bootstrap".to_owned(),
+                "gui/501".to_owned(),
+                plist.to_string_lossy().into_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn restart_command_kickstarts_an_installed_launch_agent() {
+        let cmd = restart_command(true);
+        assert_eq!(cmd, "launchctl kickstart -k gui/$(id -u)/ai.auraai.agent24");
+        assert!(
+            !cmd.contains("daemon stop"),
+            "an installed service must not be told to stop and start by hand: {cmd}"
+        );
+        assert_eq!(
+            restart_command(false),
+            "agent24 daemon stop && agent24 daemon start"
         );
     }
 

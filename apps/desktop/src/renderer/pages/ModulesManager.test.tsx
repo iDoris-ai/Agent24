@@ -16,10 +16,17 @@ function mount(opts: {
   docStatus?: () => DocStatus
   uninstall?: () => Promise<Res>
   install?: () => Promise<Res>
+  kernelConsent?: () => unknown
 } = {}) {
   const backendProxy = vi.fn((req: { method: string; path: string; body?: unknown }) => {
     if (req.method === 'GET' && req.path === '/api/v1/os') {
       return Promise.resolve({ ok: true, status: 200, data: opts.osList ?? EMPTY_OS_LIST })
+    }
+    if (req.method === 'GET' && req.path.endsWith('/kernel-consent') && opts.kernelConsent) {
+      return Promise.resolve({ ok: true, status: 200, data: opts.kernelConsent() })
+    }
+    if (req.method === 'POST' && req.path.endsWith('/kernel-consent')) {
+      return Promise.resolve({ ok: false, status: 403, data: { error: { code: 'presence_denied', message: 'no' } } })
     }
     return Promise.resolve({ ok: true, status: 200, data: {} })
   })
@@ -91,6 +98,28 @@ describe('ModulesManagerPage — OS 模块 (FU-90)', () => {
   it('a registry_error from the daemon is surfaced', async () => {
     mount({ osList: { modules: [], registry_error: 'os.json disables ["ghost"]' } })
     await waitFor(() => expect(screen.getByText('os.json disables ["ghost"]')).toBeInTheDocument())
+  })
+
+  it('enabling a module that still needs consent shows the card, and a denial leaves it mounted', async () => {
+    const off: DomainOsView = {
+      ...SIN90, name: 'widget', enabled: false, state: 'disabled', granted: [],
+    }
+    const { osModuleSetEnabled } = mount({
+      osList: { modules: [off] },
+      onOsPatch: () => ({ modules: [{ ...off, enabled: true, state: 'mounted' }] }),
+      kernelConsent: () => ({
+        module: 'widget', class: 'missing', fingerprint: 'k=events;o=', version: '0.5.0',
+        team: null, origin: 'local', isolated: true, capabilities: ['events'], consented: null,
+      }),
+    })
+    await waitFor(() => expect(screen.getByRole('button', { name: '启用' })).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '启用' }))
+    expect(await screen.findByRole('checkbox', { name: '以这个模块的名字发出事件' })).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: '继续' }))
+    expect(await screen.findByText(/模块还在，只是没有内核能力/)).toBeInTheDocument()
+    expect(screen.getByText('已挂载')).toBeInTheDocument()
+    expect(screen.queryByText('失败')).not.toBeInTheDocument()
+    expect(osModuleSetEnabled).toHaveBeenCalledWith('widget', true)
   })
 
   it('clicking 停用 PATCHes enabled:false for that module and refreshes from the response', async () => {

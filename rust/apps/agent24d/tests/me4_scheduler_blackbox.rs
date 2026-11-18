@@ -49,6 +49,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/kernel_consent_fixture.rs"]
+mod kernel_consent_fixture;
+
 #[path = "support/signature_command.rs"]
 mod signature_command;
 
@@ -620,6 +623,7 @@ fn schedule_row(port: u16, token: &str) -> serde_json::Value {
 fn scheduler_callback_blackbox_round_trip() {
     let home = tmp_home();
     install(home.path());
+    kernel_consent_fixture::allow_kernel(home.path(), "blackbox", &["scheduler", "memory"]);
 
     // ── boot 1 ────────────────────────────────────────────────────────────
     let d1 = start(home.path());

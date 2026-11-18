@@ -9,6 +9,7 @@
 //!   first-class citizen from the first line (never retrofit).
 //! - Providers are registered in an ordered registry (no if/else factory).
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1005,6 +1006,73 @@ impl ModelProvider for OpenAiCompatProvider {
     }
 }
 
+/// Last-resort chat model when nothing saved and `DEFAULT_MODEL` is unset.
+/// iDoris is not consulted here; this is the offline fallback (wire 1.2.0 §2.9).
+pub const FALLBACK_CHAT_MODEL: &str = "Qwen3-8B-4bit";
+
+/// `DEFAULT_MODEL`, trimmed. Empty or absent becomes [`FALLBACK_CHAT_MODEL`].
+pub(crate) fn default_model_from_env(value: Option<&str>) -> String {
+    match value.map(str::trim).filter(|model| !model.is_empty()) {
+        Some(model) => model.to_owned(),
+        None => FALLBACK_CHAT_MODEL.to_owned(),
+    }
+}
+
+/// Settings files larger than this are treated as unreadable. A normal oMLX
+/// settings file is a few kilobytes.
+const OMLX_SETTINGS_READ_CAP: u64 = 1024 * 1024;
+
+/// oMLX bearer token, or `None` when the call should send no `Authorization`.
+///
+/// A non-empty `env_key` wins and the settings file is not opened. Otherwise
+/// `settings_path`'s `auth.api_key` is used. Missing, unreadable, oversized,
+/// or blank means no key. The key is never logged.
+pub(crate) fn omlx_api_key_from(
+    env_key: Option<&str>,
+    settings_path: Option<&Path>,
+) -> Option<String> {
+    if let Some(key) = env_key.map(str::trim).filter(|key| !key.is_empty()) {
+        return Some(key.to_owned());
+    }
+    settings_path.and_then(read_omlx_settings_api_key)
+}
+
+/// `auth.api_key` from an oMLX `settings.json`. `None` on any read or parse
+/// failure. Callers pass the path so tests never touch a real home directory.
+pub(crate) fn read_omlx_settings_api_key(path: &Path) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() || meta.len() > OMLX_SETTINGS_READ_CAP {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() as u64 > OMLX_SETTINGS_READ_CAP {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let key = value.get("auth")?.get("api_key")?.as_str()?.trim();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key.to_owned())
+    }
+}
+
+/// Process env, then `~/.omlx/settings.json` under `HOME`. A non-empty
+/// `OMLX_API_KEY` does not open the file.
+pub(crate) fn omlx_api_key_from_process_env() -> Option<String> {
+    let env_key = std::env::var("OMLX_API_KEY").ok();
+    let present = env_key
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|key| !key.is_empty());
+    let path = if present {
+        None
+    } else {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".omlx").join("settings.json"))
+    };
+    omlx_api_key_from(env_key.as_deref(), path.as_deref())
+}
+
 // ── Ordered registry (fallback chain; M-D replaces order with ModelRouter) ───
 
 pub struct ProviderRegistry {
@@ -1021,14 +1089,13 @@ impl ProviderRegistry {
     pub fn from_env() -> Self {
         let omlx_url =
             std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let omlx_key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
-        let default_model =
-            std::env::var("DEFAULT_MODEL").unwrap_or_else(|_| "Qwen3-8B-4bit".to_owned());
+        let omlx_key = omlx_api_key_from_process_env();
+        let default_model = default_model_from_env(std::env::var("DEFAULT_MODEL").ok().as_deref());
         Self::new(vec![
             Arc::new(OpenAiCompatProvider::new(
                 "omlx",
                 omlx_url,
-                Some(omlx_key),
+                omlx_key,
                 "local",
                 default_model.clone(),
             )),
@@ -1094,6 +1161,71 @@ mod tests {
         assert_eq!(wire["json_schema"]["name"], "sin90_intent");
         assert_eq!(wire["json_schema"]["strict"], true);
         assert_eq!(wire["json_schema"]["schema"]["type"], "object");
+    }
+
+    fn scratch_dir() -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "a24-omlx-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("scratch");
+        path
+    }
+
+    #[test]
+    fn default_model_falls_through_when_unset_or_blank() {
+        assert_eq!(default_model_from_env(None), FALLBACK_CHAT_MODEL);
+        assert_eq!(default_model_from_env(Some("  ")), FALLBACK_CHAT_MODEL);
+        assert_eq!(default_model_from_env(Some("  Qwen3-30B ")), "Qwen3-30B");
+    }
+
+    #[test]
+    fn omlx_api_key_env_beats_the_settings_file() {
+        let dir = scratch_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"auth":{"api_key":"from-file"}}"#).unwrap();
+        assert_eq!(
+            omlx_api_key_from(Some(" from-env "), Some(&path)).as_deref(),
+            Some("from-env")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn omlx_api_key_reads_the_settings_file_when_env_is_absent() {
+        let dir = scratch_dir();
+        let path = dir.join("settings.json");
+        std::fs::write(&path, r#"{"auth":{"api_key":" from-file "}}"#).unwrap();
+        assert_eq!(
+            omlx_api_key_from(None, Some(&path)).as_deref(),
+            Some("from-file")
+        );
+        assert_eq!(
+            omlx_api_key_from(Some("   "), Some(&path)).as_deref(),
+            Some("from-file")
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn omlx_api_key_is_absent_when_nothing_supplies_one() {
+        let dir = scratch_dir();
+        assert_eq!(omlx_api_key_from(None, None), None);
+        assert_eq!(
+            omlx_api_key_from(None, Some(&dir.join("missing.json"))),
+            None
+        );
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "not-json").unwrap();
+        assert_eq!(omlx_api_key_from(None, Some(&bad)), None);
+        let blank = dir.join("blank.json");
+        std::fs::write(&blank, r#"{"auth":{"api_key":"  "}}"#).unwrap();
+        assert_eq!(omlx_api_key_from(None, Some(&blank)), None);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     // ── H12: friendly provider errors ────────────────────────────────────────

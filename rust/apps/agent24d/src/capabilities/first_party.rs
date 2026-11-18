@@ -267,6 +267,27 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// Kernel consent: the summary lists the capabilities about to be stored.
+    /// Not a derived route — `DERIVED_ROUTES` stays the approval/schedule set.
+    pub fn remember_kernel_consent(
+        &self,
+        token_id: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::ModuleAdmin,
+                method: "POST".into(),
+                template: "/api/v1/os/{name}/kernel-consent".into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
@@ -310,6 +331,7 @@ impl FirstPartyAuthority {
                 | "/api/v1/skills/{id}/activate"
                 | "/api/v1/host/knowledge/bindings/{binding_id}"
                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+                | "/api/v1/os/{name}/kernel-consent"
         ) || derived_route(&target.method, &target.template)
         {
             return self
@@ -504,8 +526,10 @@ impl FirstPartyAuthority {
                     // `presence_desktop::gate` is the second, independent layer.
                     // `InboundWrite` is ProductHost-only the same way.
                     // `InboundIngest` is the dev-bridge component token only.
-                    // Leaving both off this token means a later route that
+                    // Leaving them off this token means a later route that
                     // forgets its gate still stays closed to a shell.
+                    // `ModelsAdmin` stays: saving the default chat model is
+                    // Elevated, so a shell reaches it only after presence.
                     allowed_operations: if self.docked {
                         [Operation::HealthRead, Operation::DiagnosticRead].into()
                     } else {
@@ -639,6 +663,7 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
             (method.as_str(), policy.template),
             ("POST", "/api/v1/attached")
                 | ("POST", "/api/v1/os/{name}/delegation")
+                | ("POST", "/api/v1/os/{name}/kernel-consent")
                 | ("PUT", "/api/v1/os/trusted-teams/{team}")
                 | ("DELETE", "/api/v1/os/trusted-teams/{team}")
         ))
@@ -684,7 +709,10 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
         // a summary the daemon derived from its own records.
         || (matches!(
             policy.operation,
-            Operation::ApprovalDecision | Operation::ScheduleManage | Operation::Shutdown
+            Operation::ApprovalDecision
+                | Operation::ScheduleManage
+                | Operation::Shutdown
+                | Operation::ModelsAdmin
         ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -827,8 +855,8 @@ pub(crate) const SUMMARY_MAX_UTF16: usize = 500;
 
 /// K-B3b: the routes whose summary `crate::elevation_summaries` derives.
 /// Every one is an Elevated row of the route policy; the level table itself
-/// is unchanged (`derived_routes_are_elevated_rows`).
-pub(crate) const DERIVED_ROUTES: [(&str, &str); 10] = [
+/// is unchanged (`derived_routes_are_the_elevated_rows_they_summarise`).
+pub(crate) const DERIVED_ROUTES: [(&str, &str); 11] = [
     ("POST", "/api/v1/approvals/{id}"),
     ("POST", "/api/v1/module-approvals/{id}"),
     (
@@ -842,6 +870,7 @@ pub(crate) const DERIVED_ROUTES: [(&str, &str); 10] = [
     ("POST", "/api/v1/schedules/{id}/suspend"),
     ("POST", "/api/v1/schedules/{id}/resume"),
     ("POST", "/api/v1/shutdown"),
+    ("PUT", "/api/v1/models/default"),
 ];
 
 pub(crate) fn derived_route(method: &str, template: &str) -> bool {
@@ -879,10 +908,14 @@ fn expires_rfc3339(secs: u64) -> Option<String> {
     chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).map(|stamp| stamp.to_rfc3339())
 }
 
-/// The approval text for `parsed`. Every request-supplied string it shows
-/// goes through [`shown`]; `None` leaves nothing to approve. The credential
-/// value is not one of them: the text has neither the value, nor a fragment
-/// of it, nor its length.
+/// The approval text for `parsed`. Every string it shows goes through
+/// [`shown`]; `None` leaves nothing to approve. For the endpoint that string
+/// is the one `parsed` holds, i.e. the raw value as `validate_base_url`
+/// normalised it (F1), not the raw value itself: a raw endpoint whose hidden
+/// characters the URL parser drops or percent-encodes (a newline in the host,
+/// a bidi override in the path) is shown, as the target it really connects
+/// to. The credential value is not shown at all: the text has neither the
+/// value, nor a fragment of it, nor its length.
 fn knowledge_summary(
     path: &str,
     credential_route: bool,
@@ -1125,6 +1158,7 @@ mod tests {
             .clone();
         assert!(!allowed.contains(&Operation::InboundWrite), "{allowed:?}");
         assert!(!allowed.contains(&Operation::InboundIngest), "{allowed:?}");
+        assert!(allowed.contains(&Operation::ModelsAdmin), "{allowed:?}");
         assert!(allowed.contains(&Operation::InboundRead), "{allowed:?}");
         assert!(
             store
@@ -1839,6 +1873,30 @@ mod tests {
         let summary = authority.target_summary("id", &del).unwrap();
         assert!(summary.contains("ABCDE12345"), "{summary}");
         assert!(summary.contains("stop trusting"), "{summary}");
+    }
+
+    #[test]
+    fn kernel_consent_grant_is_elevatable_without_joining_derived_routes() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        assert!(!derived_route("POST", "/api/v1/os/{name}/kernel-consent"));
+        assert_eq!(
+            resolve_target(&idoris("GET", "/api/v1/os/widget/kernel-consent", b"")).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
+        let body = br#"{"fingerprint":"k=events;o=","capabilities":["events"]}"#;
+        let target =
+            resolve_target(&idoris("POST", "/api/v1/os/widget/kernel-consent", body)).unwrap();
+        assert_eq!(target.operation, Operation::ModuleAdmin);
+        assert_eq!(target.template, "/api/v1/os/{name}/kernel-consent");
+        assert!(authority.target_summary("id", &target).is_none());
+        authority.remember_kernel_consent(
+            "id",
+            "/api/v1/os/widget/kernel-consent",
+            body,
+            "同意 widget 的内核能力：以这个模块的名字发出事件".into(),
+        );
+        let summary = authority.target_summary("id", &target).unwrap();
+        assert!(summary.contains("以这个模块的名字发出事件"), "{summary}");
     }
 
     #[test]

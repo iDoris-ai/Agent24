@@ -18,6 +18,7 @@ import {
   type ResidentServiceStatus,
   type DocumentsEvent,
   type DocumentsModuleStatus,
+  type OsPackageProgress,
   type KnowledgeConfigureInput,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
@@ -113,6 +114,17 @@ const api = {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
   backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.BackendProxy, req),
+  /** Sin90 write. Main attaches the human key. The page never sees the key. */
+  sin90Write: (req: unknown): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.Sin90Write, req),
+  sin90KeyStatus: (): Promise<{ available: boolean }> =>
+    ipcRenderer.invoke(IpcChannels.Sin90KeyStatus),
+  /** Sin90 hints from the existing events socket, including `{kind:'connected'}` on open. */
+  onSin90Event: (cb: (event: { kind: string; payload: unknown }) => void): (() => void) => {
+    const listener = (_event: unknown, event: { kind: string; payload: unknown }): void => cb(event)
+    ipcRenderer.on(IpcChannels.Sin90Event, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.Sin90Event, listener)
+  },
   /** A1: elevated; main asks the user in a native dialog before sending. */
   approvalDecide: (id: string, decision: ApprovalDecisionInput): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),
@@ -156,6 +168,15 @@ const api = {
   osModuleUninstall: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsModuleUninstall),
   /** T1-2: elevated; installs the documents module the app carries. Main asks first. */
   osModuleInstallBundled: (): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsModuleInstallBundled),
+  /** OSI-1: latest registered release (version only). An unknown id is rejected in main. */
+  osPackageLatest: (id: string): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsPackageLatest, id),
+  /** OSI-1: native confirm, download, SHA256SUMS, then `agent24 os install`. */
+  osPackageInstall: (id: string): Promise<BackendProxyResponse> => ipcRenderer.invoke(IpcChannels.OsPackageInstall, id),
+  onOsPackageProgress: (cb: (progress: OsPackageProgress) => void): (() => void) => {
+    const listener = (_event: unknown, progress: OsPackageProgress): void => cb(progress)
+    ipcRenderer.on(IpcChannels.OsPackageProgress, listener)
+    return () => ipcRenderer.removeListener(IpcChannels.OsPackageProgress, listener)
+  },
   /** A-3: elevated; disables/enables AgentEar (the name is fixed in main).
    *  Main asks the user in a native dialog before sending. */
   agentearSetEnabled: (enabled: boolean): Promise<BackendProxyResponse> =>
@@ -165,6 +186,9 @@ const api = {
     ipcRenderer.invoke(IpcChannels.AgentEarUnpair),
   backendEndpoint: (): Promise<BackendEndpointResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendEndpoint),
+  /** Ask main to start the daemon again (the tray's restart). */
+  retryBackend: (): Promise<BackendEndpointResult | null> =>
+    ipcRenderer.invoke(IpcChannels.BackendEndpoint, 'retry'),
   backendRefusal: (): Promise<BackendRefusalResult | null> =>
     ipcRenderer.invoke(IpcChannels.BackendRefusal),
   creativeShow: (bounds: CreativeViewBounds): Promise<CreativeViewResult> =>

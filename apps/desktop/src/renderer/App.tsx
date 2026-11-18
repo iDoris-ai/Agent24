@@ -1,5 +1,6 @@
 import { useContext, useEffect, useRef, useState } from 'react'
 import type { Agent24API } from '../main/preload'
+import type { DaemonStartupFailure } from '../shared/ipc-types'
 
 declare global {
   interface Window { agent24: Agent24API }
@@ -24,6 +25,7 @@ import { Breadcrumb } from './capabilities/Breadcrumb'
 import { CapabilityPage } from './capabilities/CapabilityPage'
 import CapabilitiesPage from './pages/Capabilities'
 import { useCapabilityStatus } from './capabilities/useCapabilityStatus'
+import { revokeKernelConsent } from './kernel-consent/kernelConsentApi'
 import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './capabilities/providers'
 import { CapabilitiesContext, NavPrefsContext } from './capabilities/types'
 import { capabilitiesMessages } from './capabilities/capabilities.i18n'
@@ -31,29 +33,12 @@ import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
 import { QuickSwitch } from './components/QuickSwitch'
+import { isChatModelId } from './pages/settings/chatModels'
 
-// FU-89: oMLX's `/v1/models` carries no type/capability field — only bare ids
-// (see fetchOmlxModels in main/ipc/index.ts) — so a real "is this a chat
-// model" flag isn't available to filter on. Until it is, exclude known
-// non-chat model families by name so the chat page's default model is never
-// silently a text-to-image / video / ASR / TTS / embedding / rerank model
-// (FU-89 was filed because it picked `models[0]` unconditionally and that
-// happened to be a FLUX image model).
-const NON_CHAT_MODEL_PATTERNS: RegExp[] = [
-  /flux/i, /stable-?diffusion/i, /\bsdxl\b/i, /\bsd3\b/i, /kolors/i, /pixart/i, // image gen
-  /\bltx\b/i, /cogvideo/i, /hunyuan-?video/i, /\bwan-?2/i,                     // video gen
-  /whisper/i, /cosyvoice/i, /\btts\b/i, /xtts/i, /\bvits\b/i, /\bf5-tts\b/i, /\bbark\b/i, // ASR/TTS
-  /\bbge\b/i, /\bgte\b/i, /\be5\b/i, /embed/i, /rerank/i,                      // embedding/rerank
-  // FU-89 follow-up: a real demo picked GLM-OCR-bf16 as the "chat" model —
-  // OCR/vision-language models answer with layout/caption text, not
-  // conversation, and must be excluded the same way image-gen models are.
-  /ocr/i, /-vl\b/i, /\bvl-/i, /paddleocr/i, /mage-vl/i,                        // OCR / vision-language
-]
-
-/** First model id that doesn't look like a known non-chat model, or
- * `undefined` if every candidate is (FU-89). Exported for its unit test. */
+/** First model id that looks like a chat model, or `undefined` if every
+ * candidate is filtered out. The rule lives in `chatModels.ts`. */
 export function pickChatModel(models: string[]): string | undefined {
-  return models.find((m) => !NON_CHAT_MODEL_PATTERNS.some((re) => re.test(m)))
+  return models.find((m) => isChatModelId(m))
 }
 
 // Sentinels for the oMLX-derived fallback label; translated at render time so
@@ -68,11 +53,45 @@ const LLM_NEEDS_KEY = '\u0000needs-key'
  * (`agent24-models::router::ModelRouter::from_env`), not a client-side guess.
  * `null`/missing/non-string all mean "the daemon has none to report" —
  * exported for its unit test. */
+/** A database newer than this binary (migration applied, then missing here). */
+export function daemonStartupHint(failure: { error: string } | null | undefined): 'migration_newer' | null {
+  if (!failure) return null
+  const error = failure.error
+  if (/migration/i.test(error) && /previously applied/i.test(error) && /missing/i.test(error)) return 'migration_newer'
+  return null
+}
+
 export function extractDaemonDefaultModel(res: { ok: boolean; data: unknown }): string | null {
   if (!res.ok) return null
   const data = res.data as { default_model?: unknown } | null
   const dm = data?.default_model
   return typeof dm === 'string' && dm.trim() !== '' ? dm : null
+}
+
+function BackendOffline({ failure, reasonOpen, onToggleReason, onRetry }: {
+  failure: DaemonStartupFailure | null
+  reasonOpen: boolean
+  onToggleReason: () => void
+  onRetry: () => void
+}): JSX.Element {
+  const t = useT(appMessages)
+  const hint = daemonStartupHint(failure)
+  const raw = failure ? (failure.error || failure.code) : ''
+  return (
+    <>
+      <span title={failure ? raw : undefined}>{failure ? t('backend.startFailed') : t('backend.offline')}</span>
+      {failure && (
+        <span className="backend-failure">
+          {hint === 'migration_newer' && <span className="backend-failure-hint" title={raw}>{t('backend.migrationNewer')}</span>}
+          <button type="button" className="backend-failure-toggle" aria-expanded={reasonOpen} title={raw} onClick={onToggleReason}>
+            {t('backend.reason')}
+          </button>
+          {reasonOpen && <span className="backend-failure-raw">{raw}</span>}
+        </span>
+      )}
+      <button type="button" className="backend-retry" onClick={onRetry}>{t('backend.retry')}</button>
+    </>
+  )
 }
 
 export function App(): JSX.Element {
@@ -95,6 +114,8 @@ function AppShell(): JSX.Element {
     if (!prefs.showOverview && route.kind === 'page' && route.page === 'home') open('assistant', 'other')
   }, [prefs.showOverview, route, open])
   const [backendOk, setBackendOk] = useState<boolean | null>(null)
+  const [startupFailure, setStartupFailure] = useState<DaemonStartupFailure | null>(null)
+  const [reasonOpen, setReasonOpen] = useState(false)
   // QA 0.6.1 §3c: the service daemon's refusal, said instead of plain offline.
   const [refusal, setRefusal] = useState<{ code: string; permanent: boolean } | null>(null)
   const [version, setVersion] = useState<string>('')
@@ -114,8 +135,8 @@ function AppShell(): JSX.Element {
 
   // ME4-desktop-model-ui: the daemon's OWN default model always wins over a
   // client-side guess from a locally-detected oMLX model list — that guess
-  // is what let an OCR/VL model reach the topbar in the first place (see the
-  // NON_CHAT_MODEL_PATTERNS comment above). Falls back to the oMLX-derived
+  // is what let an OCR/VL model reach the topbar in the first place (see
+  // `isChatModelId`). Falls back to the oMLX-derived
   // label only when the daemon has none to report (e.g. an older daemon
   // build, or the router was never built via `from_env`).
   const t = useT(appMessages)
@@ -134,6 +155,11 @@ function AppShell(): JSX.Element {
     void window.agent24.getAppVersion().then(setVersion)
 
     // Backend health + domain-OS module count polling
+    const readStartupFailure = () => {
+      void window.agent24.backendEndpoint()
+        .then((e) => setStartupFailure(e?.startupFailure ?? null))
+        .catch(() => { /* keep the last reason */ })
+    }
     const checkBackend = () => {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
@@ -142,6 +168,7 @@ function AppShell(): JSX.Element {
           if (res.ok) setRefusal(null)
           else void window.agent24.backendRefusal?.().then(setRefusal, () => setRefusal(null))
           if (res.ok) {
+            setStartupFailure(null)
             void listOsModules()
               .then((l) => setOsModuleCount(Array.isArray(l.modules) ? l.modules.filter((m) => m.state === 'mounted').length : 0))
               .catch(() => { /* keep the last count */ })
@@ -156,9 +183,11 @@ function AppShell(): JSX.Element {
                 if (dm) setDaemonDefaultModel(dm)
               })
               .catch(() => { /* fall back to the oMLX-derived label */ })
+          } else {
+            readStartupFailure()
           }
         })
-        .catch(() => setBackendOk(false))
+        .catch(() => { setBackendOk(false); readStartupFailure() })
     }
     checkBackend()
     const backendTimer = setInterval(checkBackend, 5000)
@@ -233,7 +262,10 @@ function AppShell(): JSX.Element {
             {backendOk === true && (
               <span>{t('backend.online')}{backendPort !== null ? ` :${backendPort}` : ''}</span>
             )}
-            {backendOk === false && !refusal && <span>{t('backend.offline')}</span>}
+            {backendOk === false && !refusal && (
+              <BackendOffline failure={startupFailure} reasonOpen={reasonOpen} onToggleReason={() => setReasonOpen((open) => !open)}
+                onRetry={() => { void window.agent24.retryBackend() }} />
+            )}
             {backendOk === false && refusal && (
               <span>{t(refusal.permanent ? 'backend.refused' : 'backend.enrolRetrying', { code: refusal.code })}</span>
             )}
@@ -305,7 +337,7 @@ function AppShell(): JSX.Element {
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
-        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} grantsFor={statusFor.grantsFor} isolationFor={statusFor.isolationFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
+        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} grantsFor={statusFor.grantsFor} isolationFor={statusFor.isolationFor} consentFor={statusFor.consentFor} onRevoke={(id) => { void revokeKernelConsent(id) }} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {selected && !['assistant', 'documents', 'schedules', 'communication', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}

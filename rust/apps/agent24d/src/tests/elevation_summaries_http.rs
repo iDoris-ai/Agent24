@@ -737,6 +737,94 @@ async fn schedule_changes_name_the_schedule_and_never_its_prompt() {
     );
 }
 
+/// FU-131. An id `shown` cannot display is 400 before presence, and the
+/// saved model stays put. A 120-character id still asks and is not saved yet.
+/// Mutation: skip the pre-presence check and the long id is `presence_required`.
+#[tokio::test]
+async fn unshowable_default_model_ids_are_400_before_presence() {
+    assert_eq!(crate::capabilities::first_party::SHOWN_MAX_CHARS, 120);
+    let dir = tempfile::tempdir().unwrap();
+    let kv = agent24_memory::KvStore::open(&dir.path().join("memory.db"))
+        .await
+        .unwrap();
+    let d = daemon_with(|state| {
+        state.memory_kv = Some(kv);
+        state.router.set_default_model("EnvFallback");
+    })
+    .await;
+    let hidden = "Qwen\u{200B}3".to_owned();
+    for model in ["m".repeat(121), "m".repeat(128), hidden] {
+        let body = serde_json::json!({ "model": model }).to_string();
+        let response = d
+            .router
+            .clone()
+            .oneshot(request(
+                &d.token.secret,
+                "PUT",
+                "/api/v1/models/default",
+                &body,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{model:?}");
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_request", "{model:?}");
+        assert_eq!(
+            d.state.router.default_model().as_deref(),
+            Some("EnvFallback")
+        );
+        assert!(
+            d.capture.0.lock().unwrap().is_empty(),
+            "presence was asked for {model:?}"
+        );
+    }
+
+    let body = serde_json::json!({ "model": "m".repeat(120) }).to_string();
+    let response = d
+        .router
+        .clone()
+        .oneshot(request(
+            &d.token.secret,
+            "PUT",
+            "/api/v1/models/default",
+            &body,
+            None,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["error"]["code"], "presence_required");
+    assert_eq!(
+        d.state.router.default_model().as_deref(),
+        Some("EnvFallback")
+    );
+}
+
+/// Service-mode shell: no grant is `presence_required`, not `forbidden`.
+/// A confirmed grant stores the model. The dialog names the id the handler
+/// would store, and ignores the client's own summary.
+#[tokio::test]
+async fn shell_saves_the_default_model_only_after_presence() {
+    let dir = tempfile::tempdir().unwrap();
+    let kv = agent24_memory::KvStore::open(&dir.path().join("memory.db"))
+        .await
+        .unwrap();
+    let d = daemon_with(|state| {
+        state.memory_kv = Some(kv);
+        state.router.set_default_model("EnvFallback");
+    })
+    .await;
+    let body = r#"{"model":"  Qwen3-30B  "}"#;
+    let text = d.ask("PUT", "/api/v1/models/default", body).await.unwrap();
+    assert!(text.contains("把默认聊天模型改为 \"Qwen3-30B\""), "{text}");
+    assert!(!text.contains("client says"), "{text}");
+    assert_eq!(d.state.router.default_model().as_deref(), Some("Qwen3-30B"));
+}
+
 #[tokio::test]
 async fn shutdown_has_its_fixed_text() {
     let d = daemon().await;
@@ -794,15 +882,18 @@ async fn a_query_string_leaves_nothing_to_approve() {
 }
 
 /// The level table is unchanged: every derived route is an Elevated row of
-/// its operation, and these are all of the three operations' Elevated rows.
+/// its operation, and these are all of those operations' Elevated rows.
 #[test]
-fn derived_routes_are_the_elevated_rows_of_the_three_operations() {
+fn derived_routes_are_the_elevated_rows_they_summarise() {
     let mut elevated: Vec<(String, String)> = policies()
         .iter()
         .filter(|p| {
             matches!(
                 p.operation,
-                Operation::ApprovalDecision | Operation::ScheduleManage | Operation::Shutdown
+                Operation::ApprovalDecision
+                    | Operation::ScheduleManage
+                    | Operation::Shutdown
+                    | Operation::ModelsAdmin
             ) && p.level == AssuranceLevel::Elevated
         })
         .map(|p| (p.method.to_owned(), p.template.to_owned()))

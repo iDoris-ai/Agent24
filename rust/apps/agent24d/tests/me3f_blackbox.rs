@@ -49,6 +49,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/kernel_consent_fixture.rs"]
+mod kernel_consent_fixture;
+
 #[path = "support/signature_command.rs"]
 mod signature_command;
 
@@ -384,6 +387,14 @@ fn a_package_from_outside_the_repo() {
     // down — this is the "not rebuilt" boundary: nothing from here on touches
     // source or runs `cargo build`.
     install(home.path());
+
+    // Not on the bundled list, so the restart lends events, memory and
+    // approval only after this consent row. The row is the card's record.
+    kernel_consent_fixture::allow_kernel(
+        home.path(),
+        "blackbox",
+        &["events", "memory", "approval"],
+    );
 
     // Second lifetime: a real restart, same binary, same $HOME.
     let d2 = start(home.path());

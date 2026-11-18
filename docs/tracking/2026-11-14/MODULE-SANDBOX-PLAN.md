@@ -35,11 +35,18 @@ ADR-K1-01 §113、ADR-K1-02 §114 都写明「OS 进程分离不等于文件系�
 - **python3**（pyenv 3.11.9，同样在家目录里的安装前缀）。SQLite `journal_mode=WAL` 在数据目录写出 `probe.db`、`probe.db-wal`、`probe.db-shm`。读家目录 EPERM，TCP EPERM。
 - **agent24-documents** 这次没有单独编出二进制再跑。它和上面一样是 libSystem 进程，SQLite WAL 落在数据目录，用的是同一份 profile。握手和 fd 3 上的工具调用由 SBX-1 的 macOS 测试走真实 `start()` 再验。
 
+SBX-1b（2026-11-15，本机）用同一份最小 profile，但**不再放行用户临时目录**，只把 `TMPDIR`、`TMP`、`TEMP` 设成 `<data>/tmp/`（canonical，末尾带 `/`）：
+
+- **node**（fnm v24.21.0，exec canonical 路径）：`os.tmpdir()` 是模块临时目录，写入成功，退出码 0。
+- **pyenv python 3.11.9**（模块走 PATH 时的 `python3 -I -S`）：`tempfile.gettempdir()` 是模块临时目录，写入成功，数据目录里 SQLite WAL 成功，退出码 0。
+- **Rust**（`std::env::temp_dir()`）：跟随 `TMPDIR`，末尾 `/` 保留，写入成功，退出码 0。
+- **`/usr/bin/python3`**（Xcode 桩）：`confstr(_CS_DARWIN_USER_TEMP_DIR)` **不看** `TMPDIR`，仍是 `/var/folders/…/T/`。桩要在这个目录**根上**创建 `xcrun_db` 和 `xcrun_db-<随机>`，没有更窄的子目录可以单独放行。只放行整个用户临时目录也不够：它还要读 `/Applications/Xcode.app/Contents/SharedFrameworks` 和 `Frameworks`，最小 profile 只放了 `developer_dir`（`…/Contents/Developer`），所以桩在改之前也起不来。不把用户临时目录加回去，也不加窄放行。桩在「整个 Xcode.app 可读且用户临时目录可写」时能跑起来，那时 Python 自己的 `tempfile.gettempdir()` 服从 `TMPDIR`。
+
 最小允许集合（最后匹配；`(deny default)` 打底）：
 
 - 进程：`process-exec`、`process-fork`、`signal`、`sysctl-read`、`mach-lookup`、`file-ioctl`。不放 `process*`、`ipc-posix-shm`（WAL 是数据目录里的普通文件）。
 - 读：`(literal "/")` 和 `(file-read-metadata (subpath "/"))` 都要有。没有前者 node 直接 SIGABRT（它要 stat 根目录）；没有后者，经 `/var` → `/private/var` 的路径 `lstat` 失败。这不放开文件内容。系统目录 `/usr`、`/bin`、`/sbin`、`/System`、`/Library`、`/private/etc`、`/dev`、`/opt/homebrew`、`/usr/local`，加上包目录、数据目录、临时目录，以及程序的父目录和祖父目录（canonical 与交给 exec 的原始路径各算一次）。祖父目录是 `/` 或家目录本身时不放行，所以 pyenv/fnm 能读到自己的库，家目录其余部分不行。`/usr/bin/python3` 是 Xcode 桩，会读 `/var/select/developer_dir`；链接在、且目标不在 `/usr`、`/Library`、`/System` 下时，把目标目录加进读（给系统 python 用）。
-- 写：数据目录、临时目录，以及 `/dev/null`、`/dev/zero`、`/dev/dtracehelper`（literal，不是 subpath）。
+- 写：数据目录（模块临时目录是其中的 `<data>/tmp`，每次启动清空重建，并设 `TMPDIR`/`TMP`/`TEMP`；用户临时目录不再放行），以及 `/dev/null`、`/dev/zero`、`/dev/dtracehelper`（literal，不是 subpath）。
 - 网络：不放行 `network*`。`(network-inbound (local unix-socket))` 让 fd 3 `accept`；`(network-bind (local unix-socket))` 让 `connect` 能绑本地 unix 端（比「只绑回调 socket」宽，见文末 FU）；`(network-outbound (remote unix-socket (path-literal …)))` 只写回调 socket 的 canonical 路径和原样路径。TCP 返回 EPERM（errno 1）。
 - 路径一律 canonical（`/var` → `/private/var`，`/tmp` → `/private/tmp`）。交给模块的 `A24_*` 仍是 daemon 原来的字符串，不改写。引号和反斜杠按 seatbelt 双引号规则转义。
 
@@ -69,9 +76,13 @@ ADR-K1-01 §113、ADR-K1-02 §114 都写明「OS 进程分离不等于文件系�
 - 本机这个会话继承了 fd 3 时，跳板测试可能失败；不为此改代码。
 - `agent24-documents` 二进制没有在 SBX-0 里单独跑过。
 - node 探针用错了 adopt-fd 的 API，fd 3 的 accept 是用 python 证明的，不是用 node。
-- 临时目录放行的是整个用户 `TMPDIR`（同一用户所有 app 共用），模块能读写别的进程和别的模块留在里面的文件，是模块之间的一条旁路。以后改为每个模块专属临时目录（如 `<data>/tmp` 并设 `TMPDIR`），需先实测 macOS `python3` 桩的 xcrun 缓存能否改指（#1863 评审建议 1）。
+- 临时目录放行整个用户 `TMPDIR` 的旁路已在 SBX-1b 收掉：每个模块只用 `<data>/tmp`。`/usr/bin/python3` 桩的 xcrun 缓存没有可窄放行的子路径，见 §3，不为此加回用户临时目录（#1863 评审建议 1，已做）。
 - `(allow mach-lookup)`、`(allow process-exec)` 不带过滤。直连 TCP 与 NSURLSession 已实测被拒，但 mach 服务面（LaunchServices、AppleEvents 等）没测。在收紧之前，不对外宣称「模块无法影响沙箱外」（#1863 评审建议 2）。
 - 读白名单包含整个 `/opt/homebrew`、`/usr/local`、`/Library`、`/private/etc`，其中配置文件的**内容**可读（可能含凭据），比「元数据可见」更强（#1863 评审建议 3）。
 - SBX-2 不探测进程是否真在沙箱里。macOS 上 OS 模块即使 stopped、failed 或还没装上（Documents 空行），也标 `isolated`。
 - SBX-2 对读不到 manifest（`d9` 缺失）的域模块行标 `form_not_covered`，不猜它是不是包。
 - SBX-2 能力中心只给能对上组件 id 的卡片挂标签；对不上的能力行不显示。未知 `isolation` 短码当没有该字段，不让整行失败。
+- `<data>/tmp` 若被模块换成链接或普通文件，下次启动只删这个条目（链接不跟随）再重建目录，模块不会因此起不来（#1865 评审 M1）。清空时给每层目录补上属主 rwx，只读树（Go 模块缓存 0555/0444、权限 000 的目录、tmp 本身 555）也能清掉（#1865 评审 M1'）；先试 `remove_dir_all`（任意深度），失败才走补权限的逐层清理（#1865 评审 M2）。只读且超过 PATH_MAX 深度的树仍会让兜底失败，需模块刻意构造，不处理。`chflags uchg` 锁住的文件和 `<data>` 本身被改成只读，留给人工处理。
+- 模块临时目录在 `symlink_metadata`（`reset_module_temp`）通过之后、`clear_dir_contents` 清空之前被换成链接：不处理；以后再做时改用 `openat`/`O_NOFOLLOW`。
+- 经 `confstr(_CS_DARWIN_USER_TEMP_DIR)` / `NSTemporaryDirectory()` 取临时目录的模块会拿到用户临时目录并被拒（EPERM）；模块约定应写明用 `TMPDIR`。
+- Linux 上数据目录本身若是符号链接，模块临时目录会建在链接指到的地方（macOS 上 `check_data_dir` 会先拒绝）。

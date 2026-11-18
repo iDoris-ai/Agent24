@@ -340,6 +340,20 @@ pub(crate) fn resolve(declared: &RequiresSpec, host: HostCap<'_>, consent: Conse
     }
 }
 
+/// Shrink a resolver grant to the kernel names the user consented to.
+/// Denial reasons stay the resolver's; consent only removes handles.
+/// `None` (exempt, or no store) leaves the grant unchanged.
+pub(crate) fn intersect_consented(granted: Grants, allowed: Option<&BTreeSet<String>>) -> Grants {
+    let Some(allowed) = allowed else {
+        return granted;
+    };
+    let kept: Vec<Capability> = granted
+        .iter()
+        .filter(|cap| allowed.contains(cap.as_str()))
+        .collect();
+    Grants::granting(&kept, &kept)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

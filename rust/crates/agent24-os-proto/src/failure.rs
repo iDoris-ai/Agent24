@@ -135,7 +135,8 @@ pub fn launch(e: &LaunchError) -> RunFailure {
         | LaunchError::UnsafeOwnership(_)
         | LaunchError::Inspect { .. }
         | LaunchError::TooLarge { .. }
-        | LaunchError::SandboxUnavailable(_) => FailureKind::Setup,
+        | LaunchError::SandboxUnavailable(_)
+        | LaunchError::UnsafeTemp(_) => FailureKind::Setup,
     };
     RunFailure::new(kind, format!("could not start the module: {e}"))
 }
@@ -302,6 +303,7 @@ mod tests {
                 package: "/a".into(),
             },
             LaunchError::SandboxUnavailable("sandbox-exec is not available".into()),
+            LaunchError::UnsafeTemp("the module temp directory is a symlink".into()),
         ];
         for e in &all {
             assert_eq!(launch(e).kind, Setup, "{e}");
