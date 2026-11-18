@@ -27,6 +27,7 @@ import {
 import { translate, useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import './communication.css'
+import { ErrorNotice } from '../../ui'
 import { getDefaultRelays } from './relayDefaults'
 import { parseRelayList } from '../../../shared/relay-list'
 import { listComponents, type ComponentView } from '../../components/componentApi'
@@ -163,6 +164,7 @@ export default function CommunicationPage() {
   const [daemon, setDaemon] = useState<CommDaemonStatus | null>(null)
   const [hyphaePhase, setHyphaePhase] = useState<HyphaePhase>({ kind: 'loading' })
   const [loadError, setLoadError] = useState<string | null>(null)
+  const [loadErrorDetails, setLoadErrorDetails] = useState<string | null>(null)
   const [notConfigured, setNotConfigured] = useState<{ kind: 'binary' | 'identity' | 'config'; detail: string } | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [pending, setPending] = useState<WriteAction | null>(null)
@@ -204,6 +206,7 @@ export default function CommunicationPage() {
     const token = ++sequence.current
     setRefreshing(true)
     setLoadError(null)
+    setLoadErrorDetails(null)
     const results = await Promise.allSettled([
       listCommIdentities(), listCommContacts(), listCommRelays(), getCommStatus(),
     ])
@@ -233,7 +236,8 @@ export default function CommunicationPage() {
         ? 'config' : setupMessages.some((m) => /hyphae binary|A24_HYPHAE_BIN/i.test(m)) ? 'binary' : 'identity',
       detail: [...new Set(setupMessages)].join(translate(communicationMessages, 'error.separator')),
     })
-    setLoadError(failures.length ? translate(communicationMessages, 'error.refresh', { details: failures.join(translate(communicationMessages, 'error.separator')) }) : null)
+    setLoadError(failures.length ? translate(communicationMessages, 'error.refresh') : null)
+    setLoadErrorDetails(failures.length ? failures.join(translate(communicationMessages, 'error.separator')) : null)
     try {
       const list = await listComponents()
       if (!mounted.current || token !== sequence.current) return
@@ -605,7 +609,7 @@ export default function CommunicationPage() {
         </button>
       </header>
 
-      {loadError && <div role="alert" className="comm-alert">{loadError}</div>}
+      {loadError && <ErrorNotice className="comm-alert" message={loadError} actionLabel={t('action.retry')} detailsLabel={t('error.details')} onAction={() => void refresh()} details={loadErrorDetails} />}
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">

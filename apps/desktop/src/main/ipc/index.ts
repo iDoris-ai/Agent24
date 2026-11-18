@@ -13,7 +13,8 @@ import { createChatHistoryStore } from '../chat-history'
 import { withDocumentsDelegation } from '../documents-delegation'
 import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint, getDaemonStartupFailure } from '../backend-manager'
 import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
-import { approvalConfirmShown, sendElevating } from '../elevated-request'
+import { approvalConfirmShown } from '../elevated-request'
+import { sendModuleWrite } from '../module-delegation'
 import type { KnowledgeController } from '../knowledge-settings'
 import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
@@ -412,7 +413,9 @@ function proxyToBackend(req: BackendProxyRequest, timeoutMs?: number): Promise<B
   // token for agent24d; fixed 8765 and no credential for the node mock).
   // Without a usable credential nothing is sent. With the service daemon an
   // elevated route is confirmed once and retried (M5 B3, elevated-request.ts).
-  return sendElevating(req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) }, {
+  // Module writes that come back `module_delegation_required` are delegated
+  // once and retried here, the same path Sin90's `sin90:write` uses.
+  return sendModuleWrite(req, { host: BACKEND_HOST, ...(timeoutMs === undefined ? {} : { timeoutMs }) }, {
     connection: daemonConnection,
     elevation: daemonElevation,
   })
