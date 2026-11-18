@@ -1799,8 +1799,9 @@ async fn install_with_consent(
 }
 
 /// Removal happens only after consent revocation succeeds. A missing package
-/// is still a success and does not touch the store: there is nothing to revoke
-/// that this command would have left behind.
+/// is still a success. Its kernel-consent row is deleted anyway: the files
+/// may already be gone, and the next install of the same name must not
+/// inherit the old agreement.
 async fn uninstall_with_consent(
     name: &str,
     packages_root: &std::path::Path,
@@ -1811,6 +1812,7 @@ async fn uninstall_with_consent(
         Err(e) => return Err(e.to_string()),
         Ok(false) => {
             println!("{name} was not installed; nothing to remove");
+            delete_kernel_consent(name, state_dir, online).await?;
             return Ok(());
         }
         Ok(true) => {}
@@ -4002,6 +4004,40 @@ mod tests {
             .unwrap();
         let store = agent24_store::Store::open(&path).await.unwrap();
         assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+    }
+
+    /// The package files are already gone. Uninstall still deletes the row.
+    /// Removing the `delete_kernel_consent` call on that branch fails this test.
+    #[tokio::test]
+    async fn uninstall_of_a_missing_package_deletes_the_kernel_consent_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let packages = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent24.db");
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        store
+            .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+                module: "kc-missing-pkg".into(),
+                fingerprint: "k=events;o=".into(),
+                capabilities: vec!["events".into()],
+                team_id: None,
+                version: "1".into(),
+                decided_at: "2026-11-18T00:00:00Z".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        drop(store);
+        uninstall_with_consent("kc-missing-pkg", packages.path(), Some(dir.path()), None)
+            .await
+            .unwrap();
+        let store = agent24_store::Store::open(&path).await.unwrap();
+        assert!(
+            store
+                .get_kernel_consent("kc-missing-pkg")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -417,6 +417,21 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn a_revoked_approval_grant_forbids_the_next_status() {
+        let name = "kc-approval-revoke";
+        let h = ApprovalStatusHandler {
+            module: name.to_owned(),
+            granted: granted(true),
+            broker: test_broker().await,
+        };
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(name, ["approval"], until);
+        crate::kernel_consent::track(name, std::iter::empty::<&str>(), until);
+        let err = h.call(json!({"approval_id": "missing"})).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
     // ── judgement 1: capability gating, all three methods ─────────────────
 
     #[tokio::test]

@@ -536,6 +536,24 @@ mod tests {
         assert_eq!(sent[0].kind, "task.transitioned");
     }
 
+    #[tokio::test]
+    async fn a_revoked_events_grant_forbids_the_next_emit() {
+        let name = "kc-events-revoke";
+        let (_bus, sink) = events(name);
+        let h = EventsEmitHandler {
+            generation: running_generation(),
+            name: name.to_owned(),
+            granted: granted(true),
+            sink: Some(sink),
+            limiter: generous_limiter(),
+        };
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(name, ["events"], until);
+        crate::kernel_consent::track(name, std::iter::empty::<&str>(), until);
+        let err = h.call(good_params()).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
     // ── judgement 2: unknown fields (deny_unknown_fields) ─────────────
 
     #[test]

@@ -1849,6 +1849,19 @@ mod handler_tests {
         })
     }
 
+    #[tokio::test]
+    async fn a_revoked_models_grant_forbids_the_next_complete() {
+        let name = "kc-models-revoke";
+        let local = stub("kc-models-local", Behave::Ok);
+        let (d, _) = deps(router(vec![(local, Tier::Local)]));
+        let h = handler(ModelGrant::new(name.to_owned(), ModelAccess::LocalOnly, d));
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(name, ["models"], until);
+        crate::kernel_consent::track(name, std::iter::empty::<&str>(), until);
+        let err = h.call(ok_params()).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
     // ---- J3: LocalOnly negative control / positive control ----
 
     #[tokio::test]

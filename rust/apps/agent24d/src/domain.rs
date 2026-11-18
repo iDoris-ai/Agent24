@@ -1563,11 +1563,13 @@ pub async fn mount_all_with_refusals(
                     .iter()
                     .map(|cap| cap.as_str().to_owned())
                     .collect();
+                let operations = crate::component_routes::kernel_consent_operations(&name);
                 let narrowed = crate::kernel_consent::narrow_for_mount(
                     kernel_store,
                     &name,
                     package.signing_team.as_deref(),
                     &kernel_names,
+                    &operations,
                 )
                 .await;
                 let (next, report) = mount_package(
@@ -3429,6 +3431,75 @@ while f.readline():
             for s in host.supervisors.close().running {
                 s.handle.stop().await.expect("a clean stop");
             }
+        }
+    }
+
+    /// No consent row: the package still mounts, but `granted` is empty and
+    /// the handshake does not hand it the events handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_package_with_no_consent_record_gets_no_handle() {
+        let name = "kcnorow";
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, name, "[events]", EVENTS_PROBE_MODULE);
+        let mut catalogue = discovered(&packages);
+        match &mut catalogue[0].build {
+            Build::Package(package) => package.signing_team = Some("OTHERTEAM1".into()),
+            Build::InProcess(_) => panic!("expected a package"),
+        }
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let (_, reports, _) = mount_all_with_refusals(
+            &catalogue,
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            &[],
+            test_callback_deps().await,
+            Some(&store),
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        assert!(
+            reports[0].granted.is_empty(),
+            "no record must not copy the declaration into granted: {:?}",
+            reports[0].granted
+        );
+
+        let probe_path = packages.join(name).join("probe.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let probe: serde_json::Value = loop {
+            if let Ok(bytes) = std::fs::read(&probe_path) {
+                break serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module never wrote its probe"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(probe["offers_events"].as_bool(), Some(false), "{probe}");
+        assert_eq!(
+            probe["emit_response"]["error"]["data"]["kind"].as_str(),
+            Some("forbidden"),
+            "{probe}"
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
         }
     }
 

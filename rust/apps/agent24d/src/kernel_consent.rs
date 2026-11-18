@@ -149,7 +149,7 @@ pub fn still_current(expires_at: &str, now: DateTime<Utc>) -> bool {
 }
 
 /// What a gated package may hold right now. `delete` means the stored row
-/// no longer applies (grown, expired, or unreadable).
+/// no longer applies (another team, grown, expired, or unreadable).
 pub struct Held {
     pub class: KernelConsentClass,
     pub grants: Vec<String>,
@@ -161,6 +161,7 @@ pub fn hold(
     offered: &[String],
     row: Option<&agent24_store::KernelConsentRow>,
     now: DateTime<Utc>,
+    current_team: Option<&str>,
 ) -> Held {
     let Some(row) = row else {
         return Held {
@@ -169,7 +170,10 @@ pub fn hold(
             delete: false,
         };
     };
-    if !still_current(&row.expires_at, now)
+    // The card shows the signing team. A row for a different team is not
+    // this package's consent. Off macOS both sides are `None`.
+    if row.team_id.as_deref() != current_team
+        || !still_current(&row.expires_at, now)
         || !same_or_shrink(&row.fingerprint, current_fingerprint)
     {
         return Held {
@@ -190,6 +194,10 @@ struct Live {
     expires: DateTime<Utc>,
 }
 
+/// One daemon per process. The key is only the module name, so two daemons
+/// in one process would share grants. Tests that share this map must use
+/// different module names: one test's `track` changes what another test's
+/// handler is allowed to do.
 static LIVE: Mutex<Option<HashMap<String, Live>>> = Mutex::new(None);
 
 fn live_map() -> std::sync::MutexGuard<'static, Option<HashMap<String, Live>>> {
@@ -232,17 +240,19 @@ pub async fn narrow_for_mount(
     name: &str,
     team: Option<&str>,
     kernel: &[String],
+    operations: &[String],
 ) -> Option<BTreeSet<String>> {
     let store = store?;
     if classify(name, team, cfg!(target_os = "macos")) == KernelConsentClass::Exempt {
         untrack(name);
         return None;
     }
-    let current = fingerprint(kernel, &[]);
+    // Same inputs as the card (`kernel_consent_operations` at the mount).
+    let current = fingerprint(kernel, operations);
     let offer = offered(kernel);
     let row = store.get_kernel_consent(name).await.ok().flatten();
     let now = Utc::now();
-    let held = hold(&current, &offer, row.as_ref(), now);
+    let held = hold(&current, &offer, row.as_ref(), now, team);
     if held.delete {
         let _ = store.delete_kernel_consent(name).await;
     }
@@ -342,12 +352,12 @@ mod tests {
             decided_at: "2026-11-01T00:00:00Z".into(),
             expires_at: "2026-11-01T00:00:00Z".into(),
         };
-        let expired = hold(&row.fingerprint, &offer, Some(&row), now);
+        let expired = hold(&row.fingerprint, &offer, Some(&row), now, None);
         assert!(expired.delete);
         assert!(expired.grants.is_empty());
         row.expires_at = "2026-12-18T00:00:00Z".into();
         let shrunk = fingerprint(&["events".into()], &[]);
-        let kept = hold(&shrunk, &["events".into()], Some(&row), now);
+        let kept = hold(&shrunk, &["events".into()], Some(&row), now, None);
         assert!(!kept.delete);
         assert_eq!(kept.grants, ["events"]);
         assert_eq!(kept.class, KernelConsentClass::Granted);
@@ -369,12 +379,12 @@ mod tests {
             })
             .await
             .unwrap();
-        let held = narrow_for_mount(Some(&store), "widget", Some("OTHERTEAM1"), &kernel)
+        let held = narrow_for_mount(Some(&store), "widget", Some("OTHERTEAM1"), &kernel, &[])
             .await
             .unwrap();
         assert!(held.contains("events") && held.contains("models"));
         store.delete_kernel_consent("widget").await.unwrap();
-        let next = narrow_for_mount(Some(&store), "widget", Some("OTHERTEAM1"), &kernel)
+        let next = narrow_for_mount(Some(&store), "widget", Some("OTHERTEAM1"), &kernel, &[])
             .await
             .unwrap();
         assert!(next.is_empty());
@@ -383,8 +393,79 @@ mod tests {
             "documents",
             Some(agent24_os_proc::DEVELOPER_ID_TEAM_ID),
             &["events".into()],
+            &[],
         )
         .await;
         assert!(exempt.is_none());
+    }
+
+    /// Same package name, different signing team: the mount holds nothing
+    /// and the old row is gone.
+    #[tokio::test]
+    async fn a_same_name_from_another_team_holds_nothing_and_the_row_is_deleted() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let kernel = vec!["events".into(), "models".into()];
+        store
+            .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+                module: "kc-team".into(),
+                fingerprint: fingerprint(&kernel, &[]),
+                capabilities: kernel.clone(),
+                team_id: Some("OTHERTEAM1".into()),
+                version: "1".into(),
+                decided_at: "2026-11-18T00:00:00Z".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        let held = narrow_for_mount(Some(&store), "kc-team", Some("EVILTEAM22"), &kernel, &[])
+            .await
+            .unwrap();
+        assert!(held.is_empty(), "{held:?}");
+        assert!(store.get_kernel_consent("kc-team").await.unwrap().is_none());
+    }
+
+    /// A read error narrows the mount to nothing. It does not skip the gate.
+    #[tokio::test]
+    async fn a_store_read_error_narrows_the_mount_to_nothing() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        sqlx::query("DROP TABLE kernel_consents")
+            .execute(agent24_store::test_hooks::pool(&store))
+            .await
+            .unwrap();
+        let kernel = vec!["events".into(), "models".into()];
+        let held =
+            narrow_for_mount(Some(&store), "kc-dberr", Some("OTHERTEAM1"), &kernel, &[]).await;
+        assert_eq!(held, Some(BTreeSet::new()));
+    }
+
+    /// Operations are part of the fingerprint, same as show and grant.
+    /// A stored row without them does not cover a declaration that added one.
+    #[tokio::test]
+    async fn a_mount_fingerprint_drops_the_row_when_operations_grow() {
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let kernel = vec!["events".into()];
+        store
+            .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+                module: "kc-ops".into(),
+                fingerprint: fingerprint(&kernel, &[]),
+                capabilities: kernel.clone(),
+                team_id: Some("OTHERTEAM1".into()),
+                version: "1".into(),
+                decided_at: "2026-11-18T00:00:00Z".into(),
+                expires_at: "2099-01-01T00:00:00Z".into(),
+            })
+            .await
+            .unwrap();
+        let held = narrow_for_mount(
+            Some(&store),
+            "kc-ops",
+            Some("OTHERTEAM1"),
+            &kernel,
+            &["documents.read".into()],
+        )
+        .await
+        .unwrap();
+        assert!(held.is_empty(), "{held:?}");
+        assert!(store.get_kernel_consent("kc-ops").await.unwrap().is_none());
     }
 }

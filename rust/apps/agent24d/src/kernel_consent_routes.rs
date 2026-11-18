@@ -207,6 +207,16 @@ pub async fn grant(
 }
 
 pub async fn revoke(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let Some(declared) = os_kernel_declaration(&state, &name) else {
+        return error_response(StatusCode::NOT_FOUND, "not_found", "OS module not found");
+    };
+    if declared.exempt {
+        return error_response(
+            StatusCode::CONFLICT,
+            "consent_exempt",
+            "这个模块随桌面自带，不用同意卡",
+        );
+    }
     if state.store.delete_kernel_consent(&name).await.is_err() {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -289,9 +299,20 @@ async fn view_json(
             ))
         })?;
         let now = Utc::now();
-        let held = kernel_consent::hold(&fingerprint, &capabilities, row.as_ref(), now);
+        let held = kernel_consent::hold(
+            &fingerprint,
+            &capabilities,
+            row.as_ref(),
+            now,
+            declared.team.as_deref(),
+        );
         if held.delete {
             let _ = state.store.delete_kernel_consent(name).await;
+            kernel_consent::track(
+                name,
+                std::iter::empty::<String>(),
+                now + chrono::Duration::days(365),
+            );
         }
         let class = match held.class {
             KernelConsentClass::Granted => "granted",

@@ -148,6 +148,17 @@ fn isolation_here(class: ComponentClass) -> Isolation {
     component_isolation(class, cfg!(target_os = "macos"))
 }
 
+/// Operations in the consent fingerprint. Documents uses the catalog.
+/// Every other package has none. Mount, show, and grant all call this.
+pub(crate) fn kernel_consent_operations(name: &str) -> Vec<String> {
+    if name != "documents" {
+        return Vec::new();
+    }
+    documents_catalog::DocumentsCatalog::embedded()
+        .map(|catalog| catalog.requires.operations)
+        .unwrap_or_default()
+}
+
 /// OS package classification. A name with no recorded team is `None` on
 /// macOS, which is not the built-in team, so a bundled name is not exempt.
 fn kernel_consent_of(state: &AppState, name: &str) -> crate::kernel_consent::KernelConsentClass {
@@ -189,10 +200,7 @@ pub(crate) fn os_kernel_declaration(state: &AppState, name: &str) -> Option<OsKe
         } else {
             catalog.as_ref()?.requires.kernel.clone()
         };
-        let operations = catalog
-            .as_ref()
-            .map(|catalog| catalog.requires.operations.clone())
-            .unwrap_or_default();
+        let operations = kernel_consent_operations(name);
         let version = report
             .map(|report| report.version.clone())
             .unwrap_or_else(|| {
@@ -216,7 +224,7 @@ pub(crate) fn os_kernel_declaration(state: &AppState, name: &str) -> Option<OsKe
     }
     Some(OsKernelDeclaration {
         kernel: d9.requires_kernel.clone(),
-        operations: Vec::new(),
+        operations: kernel_consent_operations(name),
         version: report.version.clone(),
         team,
         exempt,
@@ -1243,6 +1251,13 @@ async fn overlay_kernel_consent(state: &AppState, items: &mut [Item]) {
         };
         let current = crate::kernel_consent::fingerprint(&declared.kernel, &declared.operations);
         let offer = crate::kernel_consent::offered(&declared.kernel);
+        let team = {
+            let teams = state
+                .os_signing_teams
+                .read()
+                .unwrap_or_else(PoisonError::into_inner);
+            teams.get(&item.id).cloned().flatten()
+        };
         let row = match state.store.get_kernel_consent(&item.id).await {
             Ok(row) => row,
             Err(_) => {
@@ -1250,7 +1265,13 @@ async fn overlay_kernel_consent(state: &AppState, items: &mut [Item]) {
                 continue;
             }
         };
-        let held = crate::kernel_consent::hold(&current, &offer, row.as_ref(), chrono::Utc::now());
+        let held = crate::kernel_consent::hold(
+            &current,
+            &offer,
+            row.as_ref(),
+            chrono::Utc::now(),
+            team.as_deref(),
+        );
         if held.delete {
             let _ = state.store.delete_kernel_consent(&item.id).await;
         }

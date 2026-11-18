@@ -1594,6 +1594,21 @@ mod tests {
         assert_eq!(err.kind, Some(ErrorKind::Forbidden));
     }
 
+    #[tokio::test]
+    async fn a_revoked_scheduler_grant_forbids_the_next_upsert() {
+        let name = "kc-scheduler-revoke";
+        let fx = Fixture::new().await;
+        let h = fx.upsert(&running_generation(), name, granted());
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(name, ["scheduler"], until);
+        crate::kernel_consent::track(name, std::iter::empty::<&str>(), until);
+        let err = h
+            .call(json!({"key": "k", "spec": every_secs(3600)}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
     /// Deleting a key that never existed is `absent`, not an error (design
     /// §6.2) — the positive/negative pair C5.2 doesn't cover on its own.
     #[tokio::test]
