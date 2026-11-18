@@ -255,8 +255,13 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("min_daemon_protocol:"))
             .map(|v| v.trim().parse::<u32>().unwrap());
-        assert_eq!(min, Some(2));
+        // D2b: v4 is the kernel that takes grants for its tools (K1-6a-G).
+        assert_eq!(min, Some(4));
+        assert!(m.takes_grants());
         // And this kernel is new enough: `from_yaml` above accepted it.
+        // D2b: what an Agent may call; `compose` writes, so it is approved per call.
+        let tools: Vec<_> = m.tools().iter().map(|t| t.operation().to_owned()).collect();
+        assert_eq!(tools, ["list", "get", "compose"]);
     }
 
     #[test]

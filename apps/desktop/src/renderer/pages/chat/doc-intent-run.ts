@@ -7,6 +7,21 @@ import { findByTitle, type DocIntent } from './doc-intent'
 
 type Api = Window['agent24']['documents']
 
+/** The document a title names, as this conversation's would be; or what to
+ * say when none or several fit (D2b: without the Agent, a turn outside a
+ * document's conversation names its document). */
+export async function namedDocument(api: Api, named: string): Promise<DocumentRef | string> {
+  const listed = await api.request({ op: 'list', limit: 200 })
+  if (!listed.ok) return '没能读取文档列表。'
+  const found = findByTitle(listed.data.documents, named)
+  if (!found) return `没有找到标题含《${named}》的文档。`
+  if ('candidates' in found) {
+    const names = found.candidates.slice(0, 5).map((d) => `《${d.title}》`).join('、')
+    return `有几份文档都对得上：${names}。请用完整标题再说一次。`
+  }
+  return { id: found.match.document_id, title: found.match.title, revision: found.match.head_revision }
+}
+
 export async function runDocIntent(api: Api, doc: DocumentRef, intent: DocIntent): Promise<string> {
   if (intent.kind === 'unclear') {
     return intent.about === 'split'

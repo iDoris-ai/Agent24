@@ -38,7 +38,7 @@ interface Mock {
 }
 
 /** `list` answers from `lists` in turn (the last one repeats); `job` from `jobs`. */
-function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res>; moduleStatus?: () => Promise<{ bundled: boolean; installed: boolean; externalDaemon: boolean; turnedOff?: boolean }> }): Mock {
+function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Promise<Res>>; capabilities?: () => Promise<Res>; moduleStatus?: () => Promise<{ bundled: boolean; installed: boolean; externalDaemon: boolean; turnedOff?: boolean }>; agentAccess?: ReturnType<typeof vi.fn> }): Mock {
   const lists = [...(opts.lists ?? [() => ok({ documents: [], next_cursor: null })])]
   const jobs = [...(opts.jobs ?? [])]
   const m: Mock = { request: vi.fn(), importFile: vi.fn(() => Promise.resolve(null)), progress: null, event: null }
@@ -54,6 +54,7 @@ function mount(opts: { lists?: Array<() => Promise<Res>>; jobs?: Array<() => Pro
       request: m.request,
       importFile: m.importFile,
       ...(opts.moduleStatus ? { moduleStatus: opts.moduleStatus } : {}),
+      ...(opts.agentAccess ? { agentAccess: opts.agentAccess } : {}),
       onImportProgress: (cb: Mock['progress']) => {
         m.progress = cb
         return () => {
@@ -90,6 +91,24 @@ it('renders the English documents title by default', () => {
   mount({})
   render(<DocumentsPage />)
   expect(screen.getByRole('heading', { name: 'Documents' })).toBeInTheDocument()
+  expect(screen.queryByRole('button', { name: 'Allow Agent to use documents' })).not.toBeInTheDocument()
+})
+
+describe('DocumentsPage: Agent access', () => {
+  beforeEach(() => { setLocale('zh') })
+  it('shows the grant button and turns it on', async () => {
+    const until = '2026-12-18T00:00:00.000Z'
+    const agentAccess = vi.fn(async (action: string) => {
+      if (action === 'enable') return { enabled: true, until, ok: true }
+      return { enabled: false, until: null }
+    })
+    mount({ agentAccess })
+    render(<DocumentsPage />)
+    await waitFor(() => expect(agentAccess).toHaveBeenCalledWith('state'))
+    fireEvent.click(screen.getByRole('button', { name: '允许 Agent 使用文档' }))
+    await waitFor(() => expect(agentAccess).toHaveBeenCalledWith('enable'))
+    expect(await screen.findByRole('button', { name: /Agent 可使用文档（到 .*）· 关闭/ })).toBeInTheDocument()
+  })
 })
 
 describe('DocumentsPage: the list', () => {

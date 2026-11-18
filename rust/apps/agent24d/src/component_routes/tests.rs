@@ -3609,6 +3609,7 @@ async fn adr038_case4_timeout_sends_cancel_and_does_not_retry() {
 
 /// DOC-1-06b §3.1, the seven tools `POST /_a24/tools/{op}` actually dispatches.
 const DOC_TOOLS: &[&str] = &[
+    "documents.compose",
     "documents.extract",
     "documents.extraction_get",
     "documents.find",

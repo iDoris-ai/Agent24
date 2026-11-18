@@ -13,17 +13,19 @@ import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
 import { registerModelSource } from './ipc/model-source'
 import { registerOfficeEngine } from './ipc/office-engine'
+import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
 import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
 import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
-import { documentsEvent } from './documents'
+import { documentsCall, documentsEvent } from './documents'
+import { sendElevating } from './elevated-request'
 import { cliBinary } from './documents-cli'
 import {
   CODESIGN,
@@ -40,7 +42,7 @@ import { tryDataDir } from './data-dir'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
-import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types'
+import type { CreativeViewBounds, CreativeViewResult, DocumentsResults } from '../shared/ipc-types'
 import {
   CREATIVE_SESSION_PARTITION,
   OPEN_DESIGN_PIN_VERSION,
@@ -78,6 +80,8 @@ import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
+// D2b（Loop 2）：开发包打开模块工具授予入口（K1-6a-G 的宿主开关）；正式包不开。
+if (app.getVersion().includes('-dev')) process.env['A24_MODULE_TOOL_GRANTS'] ??= '1'
 const backendManager = new BackendManager({ isPackaged: app.isPackaged })
 // M5 B5: the service daemon brought up to the agent24d this app ships.
 let bundledVersion: string | null = null
@@ -691,6 +695,50 @@ app.whenReady().then(async () => {
     guard,
     engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
     windows: () => BrowserWindow.getAllWindows(),
+  })
+  registerDocAgentAccess({
+    guard,
+    deps: {
+      dataDir: tryDataDir,
+      send: (req) => sendElevating(req, { host: '127.0.0.1' }, { connection: daemonConnection, elevation: daemonElevation }),
+      documentIds: async () => {
+        const ids: string[] = []
+        let cursor: string | undefined
+        while (ids.length < 256) {
+          const res = await documentsCall(
+            cursor === undefined ? { op: 'list', limit: 200 } : { op: 'list', limit: 200, cursor },
+            daemonCliEndpoint,
+          )
+          if (!res.ok) throw new Error(res.error.code)
+          const page = res.data as DocumentsResults['list']
+          for (const doc of page.documents) {
+            if (ids.length >= 256) break
+            ids.push(doc.document_id)
+          }
+          if (!page.next_cursor || page.documents.length === 0) break
+          cursor = page.next_cursor
+        }
+        return ids
+      },
+    },
+    confirm: async () => {
+      const opts: Electron.MessageBoxOptions = {
+        type: 'warning',
+        buttons: [mt('dialog.confirm'), mt('dialog.cancel')],
+        defaultId: 1,
+        cancelId: 1,
+        message: mt('docAgent.confirm.message'),
+        detail: mt('docAgent.confirm.detail'),
+        noLink: true,
+      }
+      try {
+        const win = mainWin && !mainWin.isDestroyed() ? mainWin : BrowserWindow.getFocusedWindow()
+        const result = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+        return result.response === 0
+      } catch {
+        return false
+      }
+    },
   })
   mainWin = createMainWindow()
   void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))

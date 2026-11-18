@@ -12,8 +12,8 @@ import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
-import { runDocIntent } from './chat/doc-intent-run'
-import { parseDocIntent } from './chat/doc-intent'
+import { namedDocument, runDocIntent } from './chat/doc-intent-run'
+import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
@@ -212,15 +212,33 @@ export default function ChatPage() {
     setInput('')
     // F1: a conversation about a document carries its text with each turn.
     const doc = documentOf(sessionId)
+    // D2b 正式版: granted documents tools go to the Agent; otherwise the
+    // lightweight compose path below still handles a named split/merge.
+    const wantsDocTool = /拆|合并|合成|split|merge|combine/i.test(text)
+    if (wantsDocTool && window.agent24.documents?.agentAccess) {
+      const access = await window.agent24.documents.agentAccess('sync').catch(() => null)
+      if (access?.enabled && access.ok !== false) {
+        const last = request.messages[request.messages.length - 1]
+        if (last?.role === 'user') last.content = docAgentPrompt(doc, text.trim())
+        requestInFlight.current = true
+        setLoading(true)
+        await replyWithKnowledge(messages.length, request, false)
+        return
+      }
+    }
     // D2b: 「拆出第 2-4 页」「和《X》合并」 about that document are done here,
     // not asked of the model (which does not call tools reliably).
-    const intent = doc ? parseDocIntent(text) : null
-    if (doc && intent && window.agent24.documents) {
+    // Outside a document's conversation, the one the turn names in 《》.
+    const intent = parseDocIntent(text)
+    const named = !doc && intent && intent.kind !== 'unclear' ? subjectOf(text, intent) : null
+    if ((doc || named) && intent && window.agent24.documents) {
+      const api = window.agent24.documents
       requestInFlight.current = true
       setLoading(true)
       const index = messages.length
       try {
-        const reply = await runDocIntent(window.agent24.documents, doc, intent)
+        const subject = doc ?? await namedDocument(api, named ?? '')
+        const reply = typeof subject === 'string' ? subject : await runDocIntent(api, subject, intent)
         setDelivery(index, { kind: 'sent' })
         setMessages(prev => [...prev, { role: 'assistant', content: reply }])
       } finally {

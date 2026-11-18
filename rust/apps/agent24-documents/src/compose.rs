@@ -41,6 +41,13 @@ pub struct ComposeRequest {
     title: Option<String>,
 }
 
+impl ComposeRequest {
+    /// The documents its parts name, as given (D2b: the tool admits each).
+    pub fn document_ids(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().map(|p| p.document_id.as_str())
+    }
+}
+
 /// `all`, or ranges like `1-3,5`: each page at least 1, a range not backwards.
 #[must_use]
 pub fn pages_ok(spec: &str) -> bool {
@@ -121,13 +128,22 @@ pub async fn compose(
     body: Result<Json<ComposeRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     let Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
-    checked(&req)?;
     let storage = state
         .storage()
         .await
         .map_err(ApiError::storage_unavailable)?;
-    let parts = inputs(&storage, &req.parts).await?;
-    crate::derived::import_derived(&storage, req.title, "pdf", move |out| {
+    run(&storage, req).await
+}
+
+/// The service behind `POST /compositions` and the `compose` tool: the
+/// import job of the new document.
+pub async fn run(
+    storage: &Arc<Storage>,
+    req: ComposeRequest,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    checked(&req)?;
+    let parts = inputs(storage, &req.parts).await?;
+    crate::derived::import_derived(storage, req.title, "pdf", move |out| {
         crate::pdf_compose::compose(&parts, out)
             .map(|_| ())
             .map_err(|e| match e {
