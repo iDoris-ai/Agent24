@@ -15,6 +15,7 @@ interface Row {
   kernel_grants?: string[]
   declared?: { kernel: string[]; operations: string[] }
   isolation?: unknown
+  kernel_consent?: 'exempt' | 'missing' | 'granted'
 }
 
 let rows: Row[]
@@ -178,6 +179,19 @@ describe('communication capability status', () => {
     expect(result.current.grantsFor('documents')).toEqual(['events'])
     expect(result.current.grantsFor('communication')).toEqual([])
     expect(result.current.grantsFor('localModels')).toBeUndefined()
+    expect(result.current.consentFor('documents')).toBeUndefined()
+  })
+
+  it('reads kernel consent only from the host row', async () => {
+    rows = [
+      { ...row('documents', 'ready'), kernel_consent: 'exempt', kernel_grants: ['events'], declared: { kernel: ['events'], operations: [] } },
+      { ...row('sin90', 'ready'), kernel_consent: 'missing', kernel_grants: [], declared: { kernel: ['events'], operations: [] } },
+    ]
+    const { result } = renderHook(() => useCapabilityStatus(true))
+    await act(async () => {})
+    expect(result.current.consentFor('documents')).toBe('exempt')
+    expect(result.current.consentFor('sin90')).toBe('missing')
+    expect(result.current.consentFor('localModels')).toBeUndefined()
   })
 
   it('passes a parsed isolation through and drops a missing or illegal one', async () => {
