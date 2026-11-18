@@ -4,7 +4,13 @@
 // document's text (`withDocument`), so any model can answer from it (the
 // plain `/api/v1/chat` path has no tools). Kept for the app's run only.
 
-export interface DocumentRef { id: string; title: string; revision: number }
+export interface DocumentRef {
+  id: string
+  title: string
+  revision: number
+  /** Said before the answer: which of several same-named documents was taken. */
+  note?: string
+}
 
 type ReadText = (req: { op: 'readText'; documentId: string; revision: number; cursor?: string }) => Promise<
   { ok: true; data: { blocks: Array<{ text: string }>; next_cursor: string | null } } | { ok: false }

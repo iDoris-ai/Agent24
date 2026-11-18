@@ -70,3 +70,15 @@ describe('subjectOf (without the Agent, outside a document conversation)', () =>
     expect(subjectOf('拆出第 1 页', split)).toBeNull()
   })
 })
+
+describe('findByTitle with the extension named (General 11-18)', () => {
+  const docs = [
+    { document_id: 'a', title: '中文测试合同.pdf', created_at: '2026-11-18T01:00:00Z' },
+    { document_id: 'b', title: '中文测试合同.pdf', created_at: '2026-11-18T03:00:00Z' },
+    { document_id: 'c', title: '中文测试合同.docx', created_at: '2026-11-18T02:00:00Z' },
+  ]
+  it('takes the newest of the same full title, and says how many there were', () => {
+    expect(findByTitle(docs, '中文测试合同.pdf')).toEqual({ match: docs[1], among: 2 })
+    expect(findByTitle(docs, '中文测试合同.docx')).toEqual({ match: docs[2] })
+  })
+})

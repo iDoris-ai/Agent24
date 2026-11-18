@@ -1,6 +1,7 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import { execFile } from 'node:child_process'
 import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
@@ -13,6 +14,7 @@ import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
 import { registerModelSource } from './ipc/model-source'
 import { registerOfficeEngine } from './ipc/office-engine'
+import { registerTranslationExport } from './ipc/translation-export'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
 import { modelSourcePath } from './model-source'
@@ -25,6 +27,8 @@ import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenc
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
 import { documentsCall, documentsEvent } from './documents'
+import { withDocumentsDelegation } from './documents-delegation'
+import { importFile } from './documents-import'
 import { sendElevating } from './elevated-request'
 import { sin90Event } from './sin90-event'
 import { cliBinary } from './documents-cli'
@@ -83,6 +87,39 @@ import { knowledgeEntrySubmission } from './knowledge-entry-submit'
 import { newUlid } from './knowledge-bridge'
 import { entryTarget } from './knowledge-entry-extract'
 import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
+
+/** soffice, killed when it runs past `timeoutMs` (`execFile`'s timeout sends SIGTERM). */
+function runTimed(cmd: string, args: string[], timeoutMs: number): Promise<{ code: number | null }> {
+  return new Promise((resolve) => {
+    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error) => {
+      if (!error) {
+        resolve({ code: 0 })
+        return
+      }
+      const code = (error as { code?: unknown }).code
+      resolve({ code: typeof code === 'number' ? code : null })
+    })
+  })
+}
+
+/** Import a PDF and poll its job until it succeeds or fails, at most two minutes. */
+async function importTranslatedPdf(pdfPath: string): Promise<{ ok: boolean; message?: string }> {
+  const started = await withDocumentsDelegation(() => importFile(pdfPath, daemonCliEndpoint))
+  if (!started || !started.ok) {
+    return { ok: false, message: started && !started.ok ? started.error.message : 'import failed' }
+  }
+  let job: DocumentsResults['job'] = started.data
+  const deadline = Date.now() + 120_000
+  while (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
+    if (Date.now() >= deadline) return { ok: false, message: 'import timed out' }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const next = await documentsCall({ op: 'job', jobId: job.job_id }, daemonCliEndpoint)
+    if (!next.ok) return { ok: false, message: next.error.message }
+    job = next.data as DocumentsResults['job']
+  }
+  if (job.status === 'succeeded') return { ok: true }
+  return { ok: false, message: job.error?.message ?? job.status }
+}
 
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
@@ -743,6 +780,15 @@ app.whenReady().then(async () => {
     guard,
     engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
     windows: () => BrowserWindow.getAllWindows(),
+  })
+  registerTranslationExport({
+    guard,
+    deps: {
+      dataDir: () => tryDataDir(),
+      downloadsDir: () => app.getPath('downloads'),
+      run: runTimed,
+      importPdf: importTranslatedPdf,
+    },
   })
   registerDocAgentAccess({
     guard,

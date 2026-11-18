@@ -148,6 +148,10 @@ export const IpcChannels = {
   DocumentsOfficeEngineChanged: 'documents:office-engine-changed',
   // D2b: grant the Agent documents.list / get / compose for 30 days.
   DocumentsAgentAccess: 'documents:agent-access',
+  // D4: translated HTML → a DOCX in Downloads and a PDF in the document library.
+  DocumentsExportTranslation: 'documents:export-translation',
+  /** D4: show an exported file of the Downloads folder in Finder (its name only). */
+  DocumentsRevealDownload: 'documents:reveal-download',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -655,6 +659,14 @@ export type DocumentsEvent =
 export interface DocumentsImportProgress {
   sent: number
   total: number
+}
+
+/** D4: LibreOffice wrote the DOCX into Downloads, and the PDF's import finished. */
+export interface TranslationExportResult {
+  ok: boolean
+  docxName?: string
+  code?: string
+  message?: string
 }
 
 /** D2b: whether the Agent may use the documents library (host grant, 30 days). */
