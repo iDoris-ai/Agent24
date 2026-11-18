@@ -87,13 +87,21 @@ const serviceUpgrader = new ServiceUpgrader({
   running: () => backendManager.serviceDaemonVersion(),
   installed: launchAgentPlistExists,
   pid: () => serviceDaemonOf(backendManager)?.pid ?? null,
+  // U1: the elevated shutdown asks its box through the presence connection.
+  ready: () => presenceConnection?.ready === true,
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    return upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold }))
+    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold })
+    // U1: the bundled documents module waits for this stop too (one box, not two).
+    const replaceModule = moduleNeedsServiceStop
+    return upgradeService(replaceModule ? { ...deps, between: () => replaceModule() } : deps)
   },
 })
+/** Set when the bundled documents module could not be replaced at launch
+ * because the service daemon holds the store: the work to do once it is stopped. */
+let moduleNeedsServiceStop: (() => Promise<unknown>) | null = null
 const crashLoop = new CrashLoopDetector({
   now: () => Date.now(),
   installed: () => process.platform === 'darwin' && launchAgentPlistExists(),
@@ -533,14 +541,18 @@ app.whenReady().then(async () => {
   // and start it again.
   void documentsModuleReady.then(async (outcome) => {
     if (outcome !== 'install_failed' || !launchAgentPlistExists()) return
+    moduleNeedsServiceStop = () => ensureBundledDocumentsModule(documentsDeps).finally(() => { moduleNeedsServiceStop = null })
     // Enrolled, and the presence connection up: the shutdown asks the box through it.
     for (let i = 0; i < 90 && !(serviceDaemonOf(backendManager) && presenceConnection?.ready === true); i++) await new Promise((r) => setTimeout(r, 1000))
+    // U1: an upgrade of the service daemon is due: the module rides along in its stop.
+    await new Promise((r) => setTimeout(r, 5_000))
+    if (serviceUpgrader.due() || moduleNeedsServiceStop === null) return
     const service = serviceDaemonOf(backendManager)
     const dataDir = tryDataDir()
     if (!service || dataDir === null) return
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
     const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
-    const done = await whileServiceStopped(deps, () => ensureBundledDocumentsModule(documentsDeps))
+    const done = await whileServiceStopped(deps, () => moduleNeedsServiceStop?.() ?? Promise.resolve('up_to_date'))
     console.log('[documents-module] replaced with the service daemon stopped:', done.ok ? done.value : done.code)
   })
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {

@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
+  copyDaemonIfChanged, CrashLoopDetector, jobPid, jobRuns, LOOP_WINDOW_MS, parseDaemonVersion, ServiceUpgrader, serviceDaemonCopyPath, UPGRADE_RETRY_MS, serviceRecordPid, serviceUpgradeDeps, upgradeNeeded, upgradeService, upgradesFromBundle,
   type UpgradeDeps, type UpgradeOutcome, type UpgradeSystem,
 } from './resident-service'
 import { buildTrayView, SERVICE_WAIT_HINT_MS } from './tray-menu'
@@ -175,7 +175,7 @@ describe('upgradeService', () => {
     const { deps } = steps({ kickstart: async () => { throw new Error('launchctl: 113') } })
     const outcome = await upgradeService(deps)
     expect(outcome).toEqual({ ok: false, stage: 'kickstart', code: 'kickstart_failed' })
-    const upgrader = new ServiceUpgrader({ bundled: () => '0.6.1', running: () => '0.6.0', installed: () => true, pid: () => 42, run: async () => outcome })
+    const upgrader = new ServiceUpgrader({ bundled: () => '0.6.1', running: () => '0.6.0', installed: () => true, pid: () => 42, ready: () => true, run: async () => outcome })
     upgrader.tick()
     await vi.waitFor(() => expect(upgrader.hint()).toEqual({ kind: 'failed', code: 'kickstart_failed' }))
     setMainLocale('zh')
@@ -248,12 +248,47 @@ describe('serviceUpgradeDeps: the real steps on the system (QA #1744)', () => {
 })
 
 describe('ServiceUpgrader (PM 11-09: asked once per run, after enrolment)', () => {
-  function upgrader(o: { bundled?: string | null; running?: string | null; pid?: number | null; installed?: boolean; outcome?: UpgradeOutcome }) {
+  function upgrader(o: { bundled?: string | null; running?: string | null; pid?: number | null; installed?: boolean; outcome?: UpgradeOutcome; ready?: () => boolean; now?: () => number }) {
     const run = vi.fn(async () => o.outcome ?? ({ ok: true, copied: true } as const))
     const pick = <K extends 'bundled' | 'running' | 'pid'>(k: K, d: NonNullable<typeof o[K]>) => () => (k in o ? o[k] ?? null : d)
-    const u = new ServiceUpgrader({ bundled: pick('bundled', '0.6.1'), running: pick('running', '0.6.0'), installed: () => o.installed ?? true, pid: pick('pid', 42), run })
+    const u = new ServiceUpgrader({ bundled: pick('bundled', '0.6.1'), running: pick('running', '0.6.0'), installed: () => o.installed ?? true, pid: pick('pid', 42), ready: o.ready ?? (() => true), run, ...(o.now ? { now: o.now } : {}) })
     return { u, run }
   }
+
+  // U1 (Loop 1): asked before the presence connection was up, the shutdown
+  // answered presence_unavailable and the upgrade was never tried again.
+  it('waits for the presence connection before asking', () => {
+    let ready = false
+    const { u, run } = upgrader({ ready: () => ready })
+    u.tick()
+    expect(run).not.toHaveBeenCalled()
+    ready = true
+    u.tick()
+    expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('a shutdown no one could be asked: tried again after a while, then said', async () => {
+    let now = 0
+    const { u, run } = upgrader({ now: () => now, outcome: { ok: false, stage: 'shutdown', code: 'presence_unavailable' } })
+    for (let i = 0; i < 5; i++) {
+      u.tick()
+      await vi.waitFor(() => expect(run).toHaveBeenCalledTimes(i + 1))
+      await Promise.resolve()
+      u.tick()
+      expect(run).toHaveBeenCalledTimes(i + 1)
+      now += UPGRADE_RETRY_MS
+    }
+    u.tick()
+    expect(run).toHaveBeenCalledTimes(5)
+    expect(u.hint()).toEqual({ kind: 'failed', code: 'presence_unavailable' })
+  })
+
+  it('other work that needs the service stopped rides along in the same stop', async () => {
+    const { calls, deps } = steps()
+    const between = vi.fn(async () => { calls.push('module') })
+    await expect(upgradeService({ ...deps, between })).resolves.toEqual({ ok: true, copied: true })
+    expect(calls).toEqual(['hold', 'shutdown', 'exited', 'copy', 'module', 'kickstart', 'started', 'release'])
+  })
 
   it('versions that differ: one upgrade for that daemon, the hint until it is done', async () => {
     const { u, run } = upgrader({})
