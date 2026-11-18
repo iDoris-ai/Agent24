@@ -475,8 +475,14 @@ async fn finish_convert(
         ),
     };
     let written = sqlx::query(&format!(
-        "UPDATE jobs SET status = ?, error = ?, result_ref = ?, updated_at = {}
-         WHERE id = ? AND status = 'running'",
+        // A job cancelled while it ran (`cancelling`) ends `cancelled`, not
+        // left there (PR-Daemon #1915): the conversion is not stopped midway,
+        // so a PDF it made may still be in the library, but the job says cancelled.
+        "UPDATE jobs SET updated_at = {},
+                status = CASE status WHEN 'cancelling' THEN 'cancelled' ELSE ?1 END,
+                error = CASE status WHEN 'cancelling' THEN NULL ELSE ?2 END,
+                result_ref = CASE status WHEN 'cancelling' THEN NULL ELSE ?3 END
+         WHERE id = ?4 AND status IN ('running', 'cancelling')",
         crate::jobs::NOW
     ))
     .bind(status)
@@ -690,6 +696,40 @@ mod tests {
         let ended = ended.expect("the convert job never ended");
         assert_eq!(ended.status, "failed");
         assert_ne!(ended.error.unwrap()["code"], "engine_unavailable");
+
+        // Cancelled while it ran: it ends cancelled, not stuck cancelling (PR-Daemon #1915).
+        let res = crate::router(state.clone())
+            .oneshot(
+                Request::post(format!("/documents/{doc}/conversions"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let id = job["job_id"].as_str().unwrap().to_owned();
+        sqlx::query("UPDATE jobs SET status = 'cancelling' WHERE id = ?")
+            .bind(&id)
+            .execute(storage.db.pool())
+            .await
+            .unwrap();
+        let mut last = String::new();
+        for _ in 0..100 {
+            last = crate::jobs::load(storage.db.pool(), &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status;
+            if last != "cancelling" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(last, "cancelled");
     }
 
     #[test]
