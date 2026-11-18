@@ -28,15 +28,18 @@ describe('D2b document intents in a conversation about a document', () => {
     expect(parseDocIntent('把它跟「boil-water」合在一起')).toEqual({ kind: 'merge', other: 'boil-water' })
   })
 
-  it('finds the named document by title', () => {
+  it('finds the named document by title, the original over what was made from it', () => {
     const docs = [
       { document_id: 'doc_1', title: '保险单 B.pdf' },
       { document_id: 'doc_2', title: 'boil-water.pdf' },
-      { document_id: 'doc_3', title: 'boil-water notice.pdf' },
+      { document_id: 'doc_3', title: '合并：CFYAD26.pdf + boil-water.pdf' },
+      { document_id: 'doc_4', title: 'notice A.pdf' },
+      { document_id: 'doc_5', title: 'notice B.pdf' },
     ]
-    expect(findByTitle(docs, '保险单 B')?.document_id).toBe('doc_1')
-    expect(findByTitle(docs, 'boil-water')?.document_id).toBe('doc_2')
-    expect(findByTitle(docs, 'boil')).toBeNull()
+    expect(findByTitle(docs, '保险单 B')).toEqual({ match: docs[0] })
+    expect(findByTitle(docs, 'boil-water')).toEqual({ match: docs[1] })
+    expect(findByTitle(docs, 'boil')).toEqual({ match: docs[1] })
+    expect(findByTitle(docs, 'notice')).toEqual({ candidates: [docs[3], docs[4]] })
     expect(findByTitle(docs, '不存在')).toBeNull()
   })
 })

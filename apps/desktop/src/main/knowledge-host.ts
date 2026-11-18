@@ -28,6 +28,9 @@
 import { daemonConnection, daemonElevation, type DaemonConnection } from './backend-manager'
 import type { proxyRequest } from './backend-proxy'
 import type { EnrolSession } from './daemon-enroll'
+import crypto from 'node:crypto'
+import fs from 'node:fs'
+import path from 'node:path'
 import { sendElevating } from './elevated-request'
 import type { KnowledgeLogin, KnowledgeLoginStore, LoadResult } from './knowledge-logins'
 
@@ -66,7 +69,9 @@ export interface KnowledgeCredential {
 type Failure = 'not_started' | 'invalid_binding' | 'login_unavailable' | 'credential_unavailable' | 'not_saved'
   | 'daemon_unavailable' | 'binding_inactive' | 'stale_sequence' | 'refused' | 'unanswered' | 'not_asked'
 
-export type HostResult = { ok: true } | { ok: false; reason: Failure }
+/** `expiresAt`: K1, the credential the daemon already had and kept, when it
+ * was not sent again; the caller refreshes by that one, not the one it made. */
+export type HostResult = { ok: true; expiresAt?: number } | { ok: false; reason: Failure }
 
 /** Where an active binding's calls go: the Knowledge server's API base and the
  * knowledge bases they may search. From trusted settings only, never a renderer. */
@@ -121,6 +126,48 @@ export interface KnowledgeHostDeps {
   daemonIdentity?: () => string | null
   /** Wall-clock milliseconds, for the backoff of an unanswered confirmation. */
   nowMs?: () => number
+  /** K1: what each binding was last set to on the service daemon, kept across
+   * app restarts (hashes only), so a restart does not ask the presence box
+   * again for what that same daemon already has. */
+  applied?: AppliedStore | null
+}
+
+/** K1: per service daemon (`pid:generation`), the hashes of the activation and
+ * of the credential each binding last had confirmed. Never a credential. */
+export interface AppliedRecord { identity: string; bindings: Record<string, { activation: string; credential?: { hash: string; expiresAt: number } }> }
+export interface AppliedStore { load(): AppliedRecord | null; save(record: AppliedRecord): void }
+
+/** K1: a kept credential with less than this left is sent again. */
+const KEEP_CREDENTIAL_S = 3600
+
+function hash(value: unknown): string {
+  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex')
+}
+
+/** `<userData>/knowledge-applied.json`, owner-only, written next to it and renamed over it. */
+export function fileAppliedStore(file: string): AppliedStore {
+  return {
+    load: () => {
+      try {
+        const value = JSON.parse(fs.readFileSync(file, 'utf8')) as Partial<AppliedRecord>
+        return typeof value.identity === 'string' && value.bindings && typeof value.bindings === 'object'
+          ? { identity: value.identity, bindings: value.bindings }
+          : null
+      } catch {
+        return null
+      }
+    },
+    save: (record) => {
+      try {
+        fs.mkdirSync(path.dirname(file), { recursive: true })
+        const temp = `${file}.${process.pid}.tmp`
+        fs.writeFileSync(temp, JSON.stringify(record), { mode: 0o600 })
+        fs.renameSync(temp, file)
+      } catch {
+        // Not saved: the next restart asks once more, as before K1.
+      }
+    },
+  }
 }
 
 export class KnowledgeHost {
@@ -144,12 +191,13 @@ export class KnowledgeHost {
   // and still queued then does nothing.
   private readonly drops = new Map<string, number>()
   private readonly deps: Required<KnowledgeHostDeps>
+  private appliedRecord: AppliedRecord | null | undefined
 
   constructor(private readonly logins: KnowledgeLoginStore, deps: KnowledgeHostDeps = {}) {
     const nowSeconds = () => Math.floor(Date.now() / 1000)
     const connection = deps.connection ?? daemonConnection
     const elevation = deps.elevation ?? daemonElevation
-    this.deps = { connection, elevation, transport: elevatingTransport(connection, elevation), clock: new SequenceClock(), nowSeconds, daemonIdentity: () => null, nowMs: Date.now, ...deps }
+    this.deps = { connection, elevation, transport: elevatingTransport(connection, elevation), clock: new SequenceClock(), nowSeconds, daemonIdentity: () => null, nowMs: Date.now, applied: null, ...deps }
   }
 
   /** Loads the logins, once, before anything may change them (G4). A load
@@ -245,7 +293,10 @@ export class KnowledgeHost {
     this.refused.delete(bindingId)
     // As in activate(): no reconcile beside this change while it waits for the answer.
     this.unsynced.delete(bindingId)
-    return this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
+    const identity = this.deps.daemonIdentity()
+    const result = this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
+    if (result.ok) this.note(identity, bindingId, null)
+    return result
   }
 
   pushCredential(bindingId: string, credential: KnowledgeCredential): Promise<HostResult> {
@@ -256,7 +307,11 @@ export class KnowledgeHost {
     return this.operate(bindingId, async () => {
       const wanted = this.wanted.get(bindingId)
       if (wanted) wanted.credential = null
-      return this.track(bindingId, await this.send(bindingId, 'DELETE', '/credential'))
+      const identity = this.deps.daemonIdentity()
+      const result = this.track(bindingId, await this.send(bindingId, 'DELETE', '/credential'))
+      const seen = this.recorded(identity, bindingId)
+      if (result.ok && seen) this.note(identity, bindingId, { activation: seen.activation })
+      return result
     })
   }
 
@@ -288,7 +343,9 @@ export class KnowledgeHost {
       this.wanted.delete(bindingId)
       // Handled at once: the daemon call below must not leave a rejection unobserved.
       const marked = this.logins.markUnusable(bindingId).then(() => true, () => false)
+      const identity = this.deps.daemonIdentity()
       const dropped = this.track(bindingId, await this.send(bindingId, 'DELETE', ''))
+      if (dropped.ok) this.note(identity, bindingId, null)
       if (!(await marked)) return failure('not_saved')
       try {
         await this.logins.remove(bindingId)
@@ -297,6 +354,42 @@ export class KnowledgeHost {
       }
       return dropped
     })
+  }
+
+  /** What `bindingId` last had confirmed on the service daemon `identity`. */
+  private recorded(identity: string | null, bindingId: string): AppliedRecord['bindings'][string] | null {
+    if (identity === null || !this.deps.applied) return null
+    if (this.appliedRecord === undefined) this.appliedRecord = this.deps.applied.load()
+    return this.appliedRecord?.identity === identity ? (this.appliedRecord.bindings[bindingId] ?? null) : null
+  }
+
+  /** Notes a confirmed change on the service daemon `identity`. `null` drops the binding. */
+  private note(identity: string | null, bindingId: string, entry: AppliedRecord['bindings'][string] | null): void {
+    if (identity === null || !this.deps.applied) return
+    if (this.appliedRecord === undefined) this.appliedRecord = this.deps.applied.load()
+    const record: AppliedRecord = this.appliedRecord?.identity === identity ? this.appliedRecord : { identity, bindings: {} }
+    if (entry) record.bindings[bindingId] = entry
+    else delete record.bindings[bindingId]
+    this.appliedRecord = record
+    this.deps.applied.save(record)
+  }
+
+  /** Sends C, unless this service daemon already took this very one (K1). */
+  private async sendCredential(bindingId: string, credential: KnowledgeCredential): Promise<HostResult> {
+    const identity = this.deps.daemonIdentity()
+    // The same key: a new expiry alone is no reason to ask again while the
+    // one the daemon has still has an hour or more to go.
+    const hashed = hash([credential.kind, credential.value])
+    const seen = this.recorded(identity, bindingId)
+    const kept = seen?.credential
+    if (kept?.hash === hashed && kept.expiresAt - this.deps.nowSeconds() >= KEEP_CREDENTIAL_S && this.confirmed.has(bindingId)) {
+      const wanted = this.wanted.get(bindingId)
+      if (wanted?.credential) wanted.credential.expiresAt = kept.expiresAt
+      return { ok: true, expiresAt: kept.expiresAt }
+    }
+    const result = await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
+    if (result.ok && seen) this.note(identity, bindingId, { ...seen, credential: { hash: hashed, expiresAt: credential.expiresAt } })
+    return result
   }
 
   private operate(bindingId: string, task: () => Promise<HostResult>): Promise<HostResult> {
@@ -323,7 +416,7 @@ export class KnowledgeHost {
     if (!wanted) return failure('binding_inactive')
     const copy: KnowledgeCredential = { kind: credential.kind, value: credential.value, expiresAt: credential.expiresAt }
     wanted.credential = copy
-    const result = this.track(bindingId, await this.send(bindingId, 'PUT', '/credential', credentialBody(copy)))
+    const result = this.track(bindingId, await this.sendCredential(bindingId, copy))
     // Taken by the daemon whose activation is confirmed: its record is as wanted,
     // so a reconcile or a backoff still pending for it has nothing left to do.
     if (result.ok && this.confirmed.has(bindingId)) {
@@ -382,7 +475,7 @@ export class KnowledgeHost {
     }
     const credential = wanted?.credential
     if (credential && credential.expiresAt > this.deps.nowSeconds()) {
-      const pushed = await this.send(bindingId, 'PUT', '/credential', credentialBody(credential))
+      const pushed = await this.sendCredential(bindingId, credential)
       if (superseded()) return
       if (!pushed.ok && HELD.includes(pushed.reason)) {
         this.track(bindingId, pushed)
@@ -398,8 +491,20 @@ export class KnowledgeHost {
   /** Sends the wanted activation, and records it as taken by this connection. */
   private async activation(bindingId: string): Promise<HostResult> {
     const key = this.connectionKey
-    const result = await this.send(bindingId, 'PUT', '', activationBody(this.wanted.get(bindingId)?.endpoint ?? null))
+    const identity = this.deps.daemonIdentity()
+    const body = activationBody(this.wanted.get(bindingId)?.endpoint ?? null)
+    const hashed = hash(body)
+    // K1: this service daemon already has exactly this activation (a restart
+    // of the app, not of the daemon): nothing to ask the user again.
+    const seen = this.recorded(identity, bindingId)
+    if (seen?.activation === hashed) {
+      if (key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
+      return { ok: true }
+    }
+    const result = await this.send(bindingId, 'PUT', '', body)
     if (result.ok && key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
+    // An activation drops C in the daemon: the credential is not recorded any more.
+    if (result.ok) this.note(identity, bindingId, { activation: hashed })
     return result
   }
 

@@ -52,14 +52,23 @@ export function parseDocIntent(text: string): DocIntent | null {
   return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
 }
 
-/** The document whose title best matches what the user named: an exact
- * title first, then the only title that contains it. */
-export function findByTitle<T extends { document_id: string; title: string }>(docs: readonly T[], named: string): T | null {
+/** The document the user named: the only one whose title is exactly it
+ * (extension aside); else, among titles containing it, the only shortest one
+ * (an original over the documents made from it, 「合并：A + B」 or
+ * 「A（第 2 页）」). `candidates` when that still leaves several. */
+export function findByTitle<T extends { document_id: string; title: string }>(
+  docs: readonly T[],
+  named: string,
+): { match: T } | { candidates: T[] } | null {
   const want = named.trim().toLowerCase()
   if (!want) return null
   const strip = (t: string) => t.toLowerCase().replace(/\.(pdf|docx|xlsx|pptx|png|jpe?g)$/, '')
-  const exact = docs.filter((d) => d.title.toLowerCase() === want || strip(d.title) === strip(want))
-  if (exact.length === 1) return exact[0]
-  const partial = docs.filter((d) => d.title.toLowerCase().includes(want))
-  return partial.length === 1 ? partial[0] : null
+  const exact = docs.filter((d) => strip(d.title) === strip(want))
+  if (exact.length === 1) return { match: exact[0] }
+  const partial = exact.length > 1 ? exact : docs.filter((d) => d.title.toLowerCase().includes(want))
+  if (partial.length === 0) return null
+  if (partial.length === 1) return { match: partial[0] }
+  const shortest = Math.min(...partial.map((d) => d.title.length))
+  const best = partial.filter((d) => d.title.length === shortest)
+  return best.length === 1 ? { match: best[0] } : { candidates: partial }
 }

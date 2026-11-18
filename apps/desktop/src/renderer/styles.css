@@ -226,7 +226,7 @@ button { cursor: pointer; font-family: var(--font); }
 .backend-refused-hint { margin: 6px 0 0; font-size: 11px; line-height: 1.4; color: var(--muted); }
 
 /* ── Main area ── */
-.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.main { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; min-height: 0; }
 .topbar {
   height: 50px;
   border-bottom: 1px solid var(--border);
@@ -282,7 +282,9 @@ button { cursor: pointer; font-family: var(--font); }
 .btn-ghost:hover { color: var(--text); border-color: var(--muted); }
 
 /* ── Chat page ── */
-.chat-layout { display: flex; flex-direction: column; height: 100%; position: relative; }
+/* Fills what the page wrapper leaves (the proactive banner may sit above it) and
+   never grows past it: else a long reply pushed the composer out of the window. */
+.chat-layout { display: flex; flex-direction: column; flex: 1; min-height: 0; position: relative; }
 .chat-toolbar { display: flex; justify-content: flex-end; padding: 8px 24px 0; }
 .chat-messages { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 16px; position: relative; }
 /* Turn rail: one mark per turn at the chat's left edge; hover shows the turn's card. */

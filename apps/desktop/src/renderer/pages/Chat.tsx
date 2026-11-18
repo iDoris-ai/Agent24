@@ -187,7 +187,13 @@ export default function ChatPage() {
   }, [messages, sessionId, loading])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // Only the message list scrolls: scrollIntoView would also scroll every
+    // ancestor that overflows, and once moved the window's own layout up.
+    const box = messagesRef.current
+    if (box) {
+      if (typeof box.scrollTo === 'function') box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' })
+      else box.scrollTop = box.scrollHeight
+    }
     // The page follows the newest turn; so does the rail, even when the chat
     // is too short to scroll and no scroll event comes.
     setCurrentTurn(Math.max(0, turns.length - 1))
