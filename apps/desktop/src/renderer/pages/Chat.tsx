@@ -15,7 +15,8 @@ import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
 import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
-import { convert } from './documents/compose'
+import { paragraphsOf, translateParagraphs, translationHtml, type TargetLang } from './documents/doc-translate'
+import { convertedPdf } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
@@ -245,7 +246,7 @@ export default function ChatPage() {
             let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
             // A Word/Excel/PPT document has no text of its own: it is checked as the PDF it becomes.
             if (blocks.length === 0) {
-              const pdf = await convert(api, subject.id)
+              const pdf = await convertedPdf(api, subject.id, subject.title)
               if (pdf.ok && pdf.documentId) blocks = await readAllCheckBlocks((req) => api.request(req), pdf.documentId, 1)
             }
             const report = await checkDocument(
@@ -254,11 +255,74 @@ export default function ChatPage() {
               blocks,
             )
             setDelivery(index, { kind: 'sent' })
-            setMessages(prev => [...prev, { role: 'assistant', content: reportMarkdown(subject.title, report) }])
+            setMessages(prev => [...prev, { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + reportMarkdown(subject.title, report) }])
           }
         } catch (e) {
           setDelivery(index, { kind: 'sent' })
           setMessages(prev => [...prev, { role: 'assistant', content: `没能完成检查：${e instanceof Error ? e.message : String(e)}` }])
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
+        return
+      }
+    }
+    // D4: 「把这份翻译成英文」「翻译《X》」 — same translation as the document page.
+    if (/翻译|译成|translate/i.test(text) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+      const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
+      if (doc || named) {
+        const api = window.agent24.documents
+        const lang: TargetLang = /中文|汉语/.test(text) && !/英文|英语/.test(text) ? 'zh' : 'en'
+        const langName = lang === 'zh' ? '中文' : '英文'
+        requestInFlight.current = true
+        setLoading(true)
+        const index = messages.length
+        try {
+          const subject = doc ?? await namedDocument(api, named ?? '')
+          if (typeof subject === 'string') {
+            setDelivery(index, { kind: 'sent' })
+            setMessages(prev => [...prev, { role: 'assistant', content: subject }])
+          } else {
+            let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
+            if (blocks.length === 0) {
+              const pdf = await convertedPdf(api, subject.id, subject.title)
+              if (!pdf.ok) {
+                const why = pdf.engineMissing
+                  ? '需要先在文档页下载转换器（约 340 MB，只需一次）。'
+                  : `没能完成翻译：${pdf.message}`
+                setDelivery(index, { kind: 'sent' })
+                setMessages(prev => [...prev, { role: 'assistant', content: why }])
+                return
+              }
+              if (pdf.documentId) blocks = await readAllCheckBlocks((req) => api.request(req), pdf.documentId, 1)
+            }
+            const paras = paragraphsOf(blocks)
+            if (paras.length === 0) {
+              setDelivery(index, { kind: 'sent' })
+              setMessages(prev => [...prev, { role: 'assistant', content: '这份文档没有读出可以翻译的文字。' }])
+            } else {
+              const translated = await translateParagraphs(
+                { ask: (prompt) => askWithProxy(window.agent24.backendProxy, prompt) },
+                paras,
+                lang,
+              )
+              const out = await api.exportTranslation({
+                title: subject.title,
+                html: translationHtml(subject.title, translated, lang),
+                lang,
+              })
+              const reply = out.ok
+                ? `已翻译《${subject.title}》为${langName}：下载/${out.docxName}；PDF 已加入文档库。`
+                : out.code === 'engine_unavailable'
+                  ? '需要先在文档页下载转换器（约 340 MB，只需一次）。'
+                  : `没能完成翻译：${out.message ?? out.code ?? ''}`
+              setDelivery(index, { kind: 'sent' })
+              setMessages(prev => [...prev, { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + reply }])
+            }
+          }
+        } catch (e) {
+          setDelivery(index, { kind: 'sent' })
+          setMessages(prev => [...prev, { role: 'assistant', content: `没能完成翻译：${e instanceof Error ? e.message : String(e)}` }])
         } finally {
           requestInFlight.current = false
           setLoading(false)
@@ -278,7 +342,9 @@ export default function ChatPage() {
       const index = messages.length
       try {
         const subject = doc ?? await namedDocument(api, named ?? '')
-        const reply = typeof subject === 'string' ? subject : await runDocIntent(api, subject, intent)
+        const reply = typeof subject === 'string'
+          ? subject
+          : (subject.note ? `${subject.note}\n\n` : '') + await runDocIntent(api, subject, intent)
         setDelivery(index, { kind: 'sent' })
         setMessages(prev => [...prev, { role: 'assistant', content: reply }])
       } finally {

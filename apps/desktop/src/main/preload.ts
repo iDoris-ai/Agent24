@@ -40,6 +40,7 @@ import {
   type DocumentsResponse,
   type DocAgentAccess,
   type OfficeEngineStatus,
+  type TranslationExportResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type ApprovalDecisionInput,
@@ -316,6 +317,10 @@ const api = {
       ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineInstall),
     agentAccess: (action: 'state' | 'enable' | 'disable' | 'sync'): Promise<DocAgentAccess> =>
       ipcRenderer.invoke(IpcChannels.DocumentsAgentAccess, action),
+    /** D4: write the translated HTML to a DOCX in Downloads and import its PDF. */
+    revealDownload: (name: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.DocumentsRevealDownload, name),
+    exportTranslation: (req: { title: string; html: string; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
       const listener = (_event: unknown, s: OfficeEngineStatus): void => cb(s)
       ipcRenderer.on(IpcChannels.DocumentsOfficeEngineChanged, listener)

@@ -72,12 +72,22 @@ export function docAgentPrompt(doc: { id: string; title: string } | null, text: 
   return `${head}${hint}\n${text}`
 }
 
-export function findByTitle<T extends { document_id: string; title: string }>(
+export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(
   docs: readonly T[],
   named: string,
-): { match: T } | { candidates: T[] } | null {
+): { match: T; among?: number } | { candidates: T[] } | null {
   const want = named.trim().toLowerCase()
   if (!want) return null
+  // Named with its extension: only that title, extension and all. Several
+  // with exactly it (a file imported twice) are one name: the newest is taken,
+  // and the caller says which (General 11-18: 「请用完整标题再说一次」 was a dead end).
+  if (/\.[a-z0-9]{2,5}$/.test(want)) {
+    const same = docs.filter((d) => d.title.trim().toLowerCase() === want)
+    if (same.length > 0) {
+      const newest = [...same].sort((a, b) => (b.created_at ?? '').localeCompare(a.created_at ?? ''))[0]
+      return same.length > 1 ? { match: newest, among: same.length } : { match: newest }
+    }
+  }
   const strip = (t: string) => t.toLowerCase().replace(/\.(pdf|docx|xlsx|pptx|png|jpe?g)$/, '')
   const exact = docs.filter((d) => strip(d.title) === strip(want))
   if (exact.length === 1) return { match: exact[0] }
