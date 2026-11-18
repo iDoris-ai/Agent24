@@ -11,6 +11,7 @@ import { documentsMessages } from './Documents.i18n'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
 import { compose, convert, pagesOk } from './compose'
+import { askWithProxy, checkDocument, type CheckReport, type Source } from './doc-check'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -34,7 +35,14 @@ export function readableSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function DocumentDetail({ documentId, onClose }: { documentId: string; onClose: () => void }) {
+export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck = false }: {
+  documentId: string
+  onClose: () => void
+  /** D3: open another document (the PDF an Office one became), checked once it shows. */
+  onOpen?: (id: string, check: boolean) => void
+  /** D3: run 「总结并检查」 as soon as the text is read. */
+  autoCheck?: boolean
+}) {
   const t = useT(documentsMessages)
   const { open } = useContext(CapabilitiesContext)
   // D2: split out some pages as a new document.
@@ -57,7 +65,7 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   const [convertNote, setConvertNote] = useState<{ ok: boolean; text: string } | null>(null)
   const [needEngine, setNeedEngine] = useState(false)
   const [downloadText, setDownloadText] = useState<string | null>(null)
-  const runConvert = async (id: string) => {
+  const runConvert = async (id: string, thenCheck = false) => {
     setConvertBusy(true)
     setNeedEngine(false)
     setConvertNote({ ok: true, text: t('compose.working') })
@@ -65,6 +73,8 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setConvertBusy(false)
     if (out.ok) {
       setConvertNote({ ok: true, text: t('compose.done') })
+      // D3: a Word document is checked as the PDF it became, whose blocks have pages to go back to.
+      if (thenCheck && out.documentId && onOpen) onOpen(out.documentId, true)
       return
     }
     if (out.engineMissing) {
@@ -137,6 +147,12 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   const [rendering, setRendering] = useState(false)
   const [imageError, setImageError] = useState<string | null>(null)
   const shown = useRef(0)
+  const [checking, setChecking] = useState(false)
+  const [checkDone, setCheckDone] = useState(0)
+  const [checkTotal, setCheckTotal] = useState(0)
+  const [checkError, setCheckError] = useState<string | null>(null)
+  const [report, setReport] = useState<CheckReport | null>(null)
+  const [highlight, setHighlight] = useState<string | null>(null)
 
   /** Renders page `n` of the head revision and shows it if it is still wanted. */
   const show = async (head: Detail, n: number) => {
@@ -189,6 +205,65 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setMore(res.data.next_cursor)
   }
 
+  const jumpTo = (head: Detail, source: Source) => {
+    if (source.page !== undefined) void show(head, source.page)
+    setHighlight(source.block_id)
+    requestAnimationFrame(() => {
+      document.getElementById(`blk-${source.block_id}`)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    })
+  }
+
+  const runCheck = async (head: Detail) => {
+    if (checking) return
+    const gen = generation.current
+    setChecking(true)
+    setCheckDone(0)
+    setCheckTotal(0)
+    setCheckError(null)
+    setReport(null)
+    try {
+      const collected: Block[] = []
+      const unparsedPages = new Set<number>()
+      let cursor: string | undefined
+      for (let i = 0; i < 50; i++) {
+        const res = await api.request({
+          op: 'readText',
+          documentId: head.document_id,
+          revision: head.head.revision,
+          ...(cursor === undefined ? {} : { cursor }),
+        })
+        if (gen !== generation.current) return
+        if (!res.ok) throw new Error(describeError(res))
+        collected.push(...res.data.blocks)
+        for (const r of res.data.unparsed_regions ?? []) {
+          if (r.page !== undefined) unparsedPages.add(r.page)
+        }
+        setBlocks([...collected])
+        setUnparsed(new Set(unparsedPages))
+        setMore(res.data.next_cursor)
+        if (!res.data.next_cursor) break
+        cursor = res.data.next_cursor
+      }
+      const proxy = window.agent24.backendProxy
+      if (!proxy) throw new Error('backend unavailable')
+      const result = await checkDocument({
+        ask: (prompt) => askWithProxy(proxy, prompt),
+        onProgress: (done, total) => {
+          if (gen !== generation.current) return
+          setCheckDone(done)
+          setCheckTotal(total)
+        },
+      }, head.title ?? '', collected.map((b) => ({ block_id: b.block_id, page: b.page, text: b.text })))
+      if (gen !== generation.current) return
+      setReport(result)
+    } catch (e) {
+      if (gen !== generation.current) return
+      setCheckError(e instanceof Error ? e.message : String(e))
+    } finally {
+      if (gen === generation.current) setChecking(false)
+    }
+  }
+
   useEffect(() => {
     const gen = ++generation.current
     setDetail(null)
@@ -205,6 +280,12 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setConvertNote(null)
     setNeedEngine(false)
     setDownloadText(null)
+    setChecking(false)
+    setCheckDone(0)
+    setCheckTotal(0)
+    setCheckError(null)
+    setReport(null)
+    setHighlight(null)
     heading.current?.focus()
     void api.request({ op: 'get', documentId }).then((res) => {
       if (gen !== generation.current) return
@@ -224,6 +305,14 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     }
     // `read` and `show` check their refs; only the document matters.
   }, [api, documentId])
+  // D3: opened to be checked (an Office document's PDF): once, when its text is first read.
+  const autoChecked = useRef<string | null>(null)
+  useEffect(() => {
+    if (!autoCheck || !detail || detail.document_id !== documentId || blocks.length === 0 || loading) return
+    if (autoChecked.current === documentId) return
+    autoChecked.current = documentId
+    void runCheck(detail)
+  })
 
   return (
     <section aria-label={t('detail.label')} style={{ border: '1px solid var(--border)', borderRadius: 6, padding: 12, margin: '12px 0' }}>
@@ -246,11 +335,40 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
               {t('split.button')}
             </button>
           )}
+          {detail && !isOffice(detail.head.media_type) && blocks.length > 0 && (
+            <button className="btn btn-ghost" disabled={checking} onClick={() => void runCheck(detail)}>
+              {t('check.button')}
+            </button>
+          )}
+          {detail && isOffice(detail.head.media_type) && onOpen && (
+            <button className="btn btn-ghost" disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id, true)}>
+              {t('check.button')}
+            </button>
+          )}
           <button className="btn btn-ghost" onClick={onClose}>
             {t('detail.close')}
           </button>
         </div>
       </div>
+      {detail && (checking || checkError || report) && (
+        <div style={{ margin: '8px 0' }}>
+          {checking && (
+            <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>
+              {checkTotal === 0
+                ? t('check.reading')
+                : checkDone >= checkTotal - 1
+                  ? t('check.summing')
+                  : t('check.progress', { done: String(checkDone + 1), total: String(checkTotal - 1) })}
+            </p>
+          )}
+          {checkError && (
+            <p role="alert" style={ALERT}>{checkError}</p>
+          )}
+          {report && (
+            <CheckResult report={report} t={t} onJump={(s) => jumpTo(detail, s)} />
+          )}
+        </div>
+      )}
       {detail && splitting !== null && (
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '8px 0' }}>
           <input aria-label={t('split.pages')} placeholder={t('split.pages')} value={splitting}
@@ -338,7 +456,15 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
             {b.page !== undefined && b.page !== blocks[i - 1]?.page && (
               <div style={{ color: 'var(--muted)', fontSize: 12, marginTop: 8 }}>{t('detail.page', { page: b.page })}</div>
             )}
-            <p style={{ margin: '4px 0' }}>{b.text}</p>
+            <p
+              id={`blk-${b.block_id}`}
+              style={{
+                margin: '4px 0',
+                background: highlight === b.block_id ? 'var(--accent-soft, rgba(255,200,0,0.25))' : undefined,
+              }}
+            >
+              {b.text}
+            </p>
           </Fragment>
         ))}
       </div>
@@ -348,5 +474,65 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
         </button>
       )}
     </section>
+  )
+}
+
+type TFn = ReturnType<typeof useT<keyof typeof documentsMessages.en>>
+
+function SourceLinks({ sources, onJump, t }: { sources: Source[]; onJump: (s: Source) => void; t: TFn }) {
+  return (
+    <>
+      {sources.map((s, i) => (
+        <button
+          key={`${s.block_id}-${i}`}
+          type="button"
+          className="btn btn-ghost"
+          onClick={() => onJump(s)}
+          style={{ marginLeft: 6, fontSize: 12 }}
+        >
+          {s.page !== undefined ? t('check.page', { page: s.page }) : t('check.source')}
+        </button>
+      ))}
+    </>
+  )
+}
+
+function CheckResult({ report, t, onJump }: { report: CheckReport; t: TFn; onJump: (s: Source) => void }) {
+  const section = (title: string, note: string | null, rows: Array<{ text: string; sources: Source[] }>) => {
+    if (!rows.length) return null
+    return (
+      <div style={{ marginTop: 8 }}>
+        <div style={{ fontWeight: 600, fontSize: 13 }}>
+          {title}{note ? ` · ${note}` : ''}
+        </div>
+        {rows.map((row, i) => (
+          <div key={i} style={{ fontSize: 13, margin: '4px 0' }}>
+            {row.text}
+            <SourceLinks sources={row.sources} onJump={onJump} t={t} />
+          </div>
+        ))}
+      </div>
+    )
+  }
+  return (
+    <div style={{ marginTop: 8 }}>
+      {section(t('check.summary'), null, report.summary)}
+      {section(t('check.parties'), null, report.items.filter((i) => i.kind === 'party').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.deadlines'), null, report.items.filter((i) => i.kind === 'deadline').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.amounts'), null, report.items.filter((i) => i.kind === 'amount').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.conditions'), null, report.items.filter((i) => i.kind === 'condition').map((i) => ({ text: i.text, sources: [i.source] })))}
+      {section(t('check.conflicts'), null, report.conflicts)}
+      {report.missing.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div style={{ fontWeight: 600, fontSize: 13 }}>
+            {t('check.missing')} · {t('check.missingNote')}
+          </div>
+          {report.missing.map((m) => (
+            <div key={m} style={{ fontSize: 13, margin: '4px 0' }}>{m}</div>
+          ))}
+        </div>
+      )}
+      {report.cut && <p style={{ fontSize: 12, color: 'var(--muted)' }}>{t('check.cut')}</p>}
+    </div>
   )
 }
