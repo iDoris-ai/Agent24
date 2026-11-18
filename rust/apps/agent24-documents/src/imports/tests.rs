@@ -311,6 +311,29 @@ async fn a_title_overrides_the_filename_and_images_import_too() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_office_file_imports_with_its_office_type() {
+    let env = env().await;
+    let bytes = b"PK\x03\x04office";
+    let id = upload(&env.state, bytes, "x.docx").await;
+    let req = Request::post("/imports")
+        .header("content-type", "application/json")
+        .body(Body::from(json!({ "upload_id": id }).to_string()))
+        .unwrap();
+    let (status, v) = send(&env.state, req).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{v}");
+    let job = settled(&env.state, v["job_id"].as_str().unwrap()).await;
+    assert_eq!(job["status"], "succeeded", "{job}");
+    let doc = job["result"]["document_id"].as_str().unwrap();
+    let storage = env.state.storage().await.unwrap();
+    let media: String = sqlx::query_scalar("SELECT media_type FROM documents WHERE id = ?")
+        .bind(doc)
+        .fetch_one(storage.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(media, crate::office::DOCX);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_job_without_its_input_fails() {
     let env = env().await;
     let storage = env.state.storage().await.unwrap();

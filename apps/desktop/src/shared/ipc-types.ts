@@ -133,6 +133,10 @@ export const IpcChannels = {
   DocumentsEvent: 'documents:event',
   // T1-1: what this launch did with the documents module the app carries.
   DocumentsModuleStatus: 'documents:module-status',
+  // D1: the LibreOffice build Office → PDF converts with (main/office-engine.ts).
+  DocumentsOfficeEngineStatus: 'documents:office-engine-status',
+  DocumentsOfficeEngineInstall: 'documents:office-engine-install',
+  DocumentsOfficeEngineChanged: 'documents:office-engine-changed',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -576,6 +580,8 @@ export type DocumentsRequest =
   | { op: 'job'; jobId: DocSchemas['JobIdString'] }
   /** D2: a new document of pages of existing PDFs (split: one part; merge: several). */
   | { op: 'compose'; parts: Array<{ documentId: DocSchemas['DocumentIdString']; pages?: string }>; title?: string }
+  /** D1: an Office document (DOCX/XLSX/PPTX) as a new PDF document. */
+  | { op: 'convert'; documentId: DocSchemas['DocumentIdString']; title?: string }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
 
@@ -593,6 +599,8 @@ export interface DocumentsResults {
   job: DocSchemas['DocumentsJob']
   /** The import job of the new document. */
   compose: DocSchemas['DocumentsJob']
+  /** The import job of the new PDF document. */
+  convert: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
 }
@@ -668,3 +676,13 @@ export type ModelSourceResult =
   | { ok: true; restart: 'restarted' }
   | { ok: true; restart: 'restart_failed'; code: string }
   | { ok: false; reason: 'invalid_url' | 'invalid_model' | 'no_data_dir' | 'not_saved' }
+
+/** D1: the Office → PDF converter (LibreOffice) on this machine. */
+export interface OfficeEngineStatus {
+  state: 'missing' | 'installing' | 'ready' | 'failed'
+  /** While installing: bytes downloaded so far, and the total when known. */
+  received?: number
+  total?: number
+  /** When failed: why, shown as is. */
+  error?: string
+}

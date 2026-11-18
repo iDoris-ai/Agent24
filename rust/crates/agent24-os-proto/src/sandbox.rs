@@ -24,6 +24,10 @@ pub struct SeatbeltInputs<'a> {
     /// that already lives there (a `pyenv` or `fnm` install) and the data
     /// directory when that is under the home.
     pub home_dir: Option<&'a Path>,
+    /// D1: the module runs LibreOffice (documents' Office → PDF), whose
+    /// single-instance pipe must be created at `/var/tmp/OSL_PIPE_*`. Only
+    /// that module gets the rule; see [`seatbelt_profile`].
+    pub office_pipe: bool,
 }
 
 /// The profile could not be built. Starting the module anyway would run it
@@ -139,6 +143,17 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
     profile.push_str(")\n(deny file-write*\n    (literal ");
     profile.push_str(&quote(&data_dir)?);
     profile.push_str(")\n");
+    // D1 (documents' Office → PDF): LibreOffice's single-instance pipe is a
+    // socket it can only create at `/tmp/OSL_PIPE_*`, or `/var/tmp/OSL_PIPE_*`
+    // when `/tmp` is not writable (osl `pipe.cxx`, hard-coded); without it
+    // `soffice --convert-to` exits 1. Only for the module that runs it, only
+    // that name, and the directory node (its writability is checked first),
+    // never anything else in it.
+    if inputs.office_pipe {
+        profile.push_str(
+            ")\n(allow file-write*\n    (literal \"/private/var/tmp\")\n    (regex #\"^/private/var/tmp/OSL_PIPE_\")\n",
+        );
+    }
     profile.push_str(
         ")\n\
          (allow network-inbound\n    (local unix-socket)\n)\n\
@@ -340,7 +355,34 @@ mod tests {
             also_programs: &[],
             temp_dir: temp,
             home_dir: home,
+            office_pipe: false,
         }
+    }
+
+    /// D1: only a profile asked for it lets LibreOffice create its pipe, and
+    /// then only `/var/tmp/OSL_PIPE_*`.
+    #[test]
+    fn the_office_pipe_rule_is_only_for_the_module_that_asks() {
+        let t = tempfile::tempdir().unwrap();
+        let root = canonical(t.path()).unwrap();
+        let (package, data) = (root.join("pkg"), root.join("data"));
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let sh = Path::new("/bin/sh");
+        let temp = std::env::temp_dir();
+        let callback = root.join("cb.sock");
+        let mut asked = inputs(&package, &data, &callback, sh, &temp, None);
+        assert!(!seatbelt_profile(&asked).unwrap().contains("OSL_PIPE"));
+        asked.office_pipe = true;
+        let profile = seatbelt_profile(&asked).unwrap();
+        assert!(
+            profile.contains("(regex #\"^/private/var/tmp/OSL_PIPE_\")"),
+            "{profile}"
+        );
+        assert!(
+            !profile.contains("(subpath \"/private/var/tmp\")"),
+            "{profile}"
+        );
     }
 
     /// #1863 B2: under the generated profile the module writes inside its

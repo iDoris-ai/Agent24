@@ -12,6 +12,8 @@ import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from
 import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
 import { registerModelSource } from './ipc/model-source'
+import { registerOfficeEngine } from './ipc/office-engine'
+import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
 import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
@@ -669,6 +671,11 @@ app.whenReady().then(async () => {
     guard,
     file: () => { const dir = tryDataDir(); return dir === null ? null : modelSourcePath(dir) },
     restart: restartDaemonForModelSource,
+  })
+  registerOfficeEngine({
+    guard,
+    engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
+    windows: () => BrowserWindow.getAllWindows(),
   })
   mainWin = createMainWindow()
   void askResidentConsent(documentsModuleReady).catch((err) => console.error('[main] resident consent', err))

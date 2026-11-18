@@ -75,13 +75,16 @@ async fn import(storage: &Arc<Storage>, claim: &Claim) -> Result<(), sqlx::Error
     let path = upload_dir(storage.data_dir(), &upload_id).join("data");
     let size = u64::try_from(received).map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
     let store = storage.clone();
+    let named = filename.clone();
     let stored = blocking(move || -> Result<_, BlobError> {
         let mut reader = Head {
             inner: std::fs::File::open(&path)?.take(size),
             head: Vec::new(),
         };
         let blob = store.blobs.put(&mut reader)?;
-        Ok((blob, media_type(&reader.head)))
+        let media = media_type(&reader.head)
+            .or_else(|| crate::office::office_media_type(&reader.head, named.as_deref()));
+        Ok((blob, media))
     })
     .await;
     let (blob, media) = match stored {
@@ -110,7 +113,7 @@ async fn import(storage: &Arc<Storage>, claim: &Claim) -> Result<(), sqlx::Error
             .settle(
                 storage,
                 "unsupported_format",
-                "slice 1 imports PDF, JPEG and PNG",
+                "imports PDF, JPEG, PNG, DOCX, XLSX and PPTX",
             )
             .await;
     };

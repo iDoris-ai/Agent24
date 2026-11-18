@@ -274,6 +274,19 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
                 Answer::Json,
             )
         }
+        // D1: an Office document as a new PDF document.
+        "convert" => {
+            let document = k.id("documentId", "doc_")?;
+            let mut body = json!({});
+            if let Some(title) = k.optional("title", |v| {
+                v.as_str()
+                    .filter(|t| (1..=500).contains(&t.chars().count()))
+            })? {
+                body["title"] = json!(title);
+            }
+            let path = format!("{BASE}/documents/{document}/conversions");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
         op @ ("job" | "cancelJob" | "retryJob") => {
             let job = k.id("jobId", "job_")?;
             match op {

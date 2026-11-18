@@ -913,7 +913,7 @@ export function registerIpcHandlers(options: {
     const window = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
       properties: ['openFile'],
-      filters: [{ name: 'PDF, JPEG, PNG', extensions: ['pdf', 'jpg', 'jpeg', 'png'] }],
+      filters: [{ name: 'PDF, JPEG, PNG, Word, Excel, PowerPoint', extensions: ['pdf', 'jpg', 'jpeg', 'png', 'docx', 'xlsx', 'pptx'] }],
     }
     let picked: Electron.OpenDialogReturnValue
     try {
