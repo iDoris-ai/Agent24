@@ -407,12 +407,11 @@ impl FirstPartyAuthority {
         {
             return None;
         }
-        Some(format!(
-            "delegate module '{}'; version: {}; namespace: {}; routes_sha256: {}",
-            surface.name,
-            surface.version,
-            surface.namespace,
-            &surface.routes_sha256[..12]
+        Some(crate::elevation_summaries::module_delegation_summary(
+            &surface.name,
+            &surface.version,
+            &surface.namespace,
+            &surface.routes_sha256[..12],
         ))
     }
     pub fn set_provider(&self, provider: Option<Arc<dyn PresenceProvider>>) {
@@ -1713,6 +1712,7 @@ mod tests {
         let calls = capture.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
         for detail in [
+            "允许桌面写入 probe 模块的数据",
             "'probe'",
             "version: 2.3",
             "namespace: /api/v1/probe",

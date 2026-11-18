@@ -52,7 +52,16 @@ export function resetImportStore(): void {
   listeners.clear()
 }
 
+const DELEGATION_CODES = new Set([
+  'module_delegation_required',
+  'module_delegation_denied',
+  'presence_denied',
+  'presence_timeout',
+  'presence_unavailable',
+])
+
 export function describeError(res: DocumentsResponse & { ok: false }): string {
+  if (DELEGATION_CODES.has(res.error.code)) return translate(documentsMessages, 'error.moduleDelegation')
   const cause = res.error.details?.['cause']
   return translate(documentsMessages, 'error.details', {
     message: res.error.message,

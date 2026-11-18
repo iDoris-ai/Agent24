@@ -1,26 +1,44 @@
 :root {
-  --bg: #0a0a0a;
-  --surface: #141414;
-  --surface2: #1a1a1a;
-  --border: #222;
+  color-scheme: dark;
+  --bg: #0b0b0a;
+  --surface: #131311;
+  --surface2: #161614;
+  --border: #22221f;
+  --border-strong: #2c2b26;
+  --border-stronger: #3a3a33;
   --text: #f0f0e8;
-  --muted: #888;
+  --muted: #a8a89e;
+  --weak: #8a8a80;
   --accent: #e8c547;
   --accent-dim: rgba(232, 197, 71, 0.12);
+  --accent-surface: #1c1a12;
+  --accent-border: #3a3626;
+  --success: #5fbf7a;
+  --warning: #e0a35a;
+  --danger: #e07a6a;
   --radius: 8px;
   --font: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Segoe UI', sans-serif;
   --sidebar-w: 220px;
 }
 
 .app.light {
+  color-scheme: light;
   --bg: #f4f4ef;
   --surface: #ffffff;
   --surface2: #ecece7;
   --border: #ddddd8;
+  --border-strong: #c9c9c1;
+  --border-stronger: #b7b7ad;
   --text: #1a1a16;
   --muted: #777;
+  --weak: #888880;
   --accent: #b89a10;
   --accent-dim: rgba(184, 154, 16, 0.1);
+  --accent-surface: #f7f3df;
+  --accent-border: #d7ca8b;
+  --success: #247a43;
+  --warning: #9a5e16;
+  --danger: #b74436;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -28,6 +46,16 @@ html, body { height: 100%; }
 body { background: var(--bg); color: var(--text); font-family: var(--font); height: 100vh; overflow: hidden; }
 a { color: var(--accent); text-decoration: none; }
 button { cursor: pointer; font-family: var(--font); }
+:where(button) { min-height: 34px; padding: 6px 12px; color: var(--text); background: transparent; border: 1px solid var(--border-strong); border-radius: 8px; font: 500 13px/1.35 var(--font); transition: border-color .15s, background .15s, color .15s, opacity .15s; }
+:where(button):hover:not(:disabled) { border-color: var(--border-stronger); background: var(--surface2); }
+:where(button):focus-visible, :where(input, textarea, select):focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:where(button):disabled { opacity: .48; cursor: not-allowed; }
+:where(input:not([type="checkbox"]):not([type="radio"])), :where(textarea), :where(select) { min-height: 40px; padding: 9px 11px; color: var(--text); background: var(--surface2); border: 1px solid var(--border-strong); border-radius: 8px; font: 400 13px/1.4 var(--font); }
+:where(input, textarea, select):focus { border-color: var(--accent); outline: none; }
+:where(input, textarea, select)::placeholder { color: var(--weak); }
+:where(textarea) { min-height: 88px; resize: vertical; }
+:where(select) { cursor: pointer; }
+:where(input[type="checkbox"], input[type="radio"]) { accent-color: var(--accent); }
 
 /* ── Layout ── */
 .app { display: flex; height: 100vh; background: var(--bg); color: var(--text); }

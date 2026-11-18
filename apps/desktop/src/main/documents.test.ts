@@ -6,9 +6,11 @@
 import { EventEmitter } from 'node:events'
 import { PassThrough } from 'node:stream'
 import type { ChildProcess } from 'node:child_process'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+import type { BackendProxyRequest, BackendProxyResponse } from '../shared/ipc-types'
 import { documentsCall, documentsEvent } from './documents'
 import type { Spawner } from './documents-cli'
+import type { DelegationDeps } from './module-delegation'
 
 const DOC = 'doc_01K74Z3QJ8V5N2W9RTX6YB4MCD'
 const JOB = 'job_01K75A0B1C2D3E4F5G6H7J8K9M'
@@ -75,7 +77,81 @@ describe('documentsCall', () => {
     }
     expect(cli.calls).toEqual([])
   })
+
+  it('delegates the module that owns /api/v1/documents and runs the CLI once more', async () => {
+    const lines = [
+      { ok: false, status: 403, error: { code: 'module_delegation_required', message: 'Module surface requires delegation' } },
+      { ok: true, status: 201, data: { job_id: JOB, kind: 'import', status: 'queued' } },
+    ]
+    let n = 0
+    const calls: string[] = []
+    const spawn: Spawner = (bin, args) => {
+      calls.push(args.join(' '))
+      const result = lines[n] ?? lines[lines.length - 1]
+      n += 1
+      return scripted(result)(bin, args)
+    }
+    const sent: BackendProxyRequest[] = []
+    const delegation = scriptedDelegation(sent)
+    const res = await documentsCall({ op: 'import' }, () => EP, spawn, 'agent24', delegation)
+    expect(res).toEqual({ ok: true, status: 201, data: lines[1]!.data })
+    expect(calls).toHaveLength(2)
+    expect(sent.map((r) => `${r.method} ${r.path}`)).toEqual([
+      'GET /api/v1/os',
+      'POST /api/v1/os/docmod/delegation',
+    ])
+  })
+
+  it('returns the refusal and does not run the CLI again', async () => {
+    let n = 0
+    const spawn: Spawner = (bin, args) => {
+      n += 1
+      return scripted({ ok: false, status: 403, error: { code: 'module_delegation_required', message: 'Module surface requires delegation' } })(bin, args)
+    }
+    const delegation: DelegationDeps = {
+      connection: () => ({ port: 1, authHeaders: { Authorization: 'Bearer t' } }),
+      elevation: () => null,
+      send: vi.fn(async (_endpoint, req: BackendProxyRequest) => {
+        if (req.path === '/api/v1/os') {
+          return { ok: true, status: 200, data: { modules: [{ name: 'docmod', namespace: '/api/v1/documents' }] } }
+        }
+        return { ok: false, status: 403, data: { error: { code: 'presence_denied', message: 'The action was not confirmed' } } }
+      }),
+    }
+    const res = await documentsCall({ op: 'import' }, () => EP, spawn, 'agent24', delegation)
+    expect(n).toBe(1)
+    expect(res).toEqual({ ok: false, status: 403, error: { code: 'presence_denied', message: 'The action was not confirmed' } })
+  })
 })
+
+function scripted(result: object): Spawner {
+  return () => {
+    const child = new EventEmitter() as ChildProcess & EventEmitter
+    const stdin = new PassThrough()
+    const stdout = new PassThrough()
+    Object.assign(child, { stdin, stdout, stderr: new PassThrough(), kill: () => true })
+    stdin.on('data', () => {})
+    stdin.on('end', () => {
+      stdout.end(`${JSON.stringify({ type: 'result', ...result })}\n`)
+      stdout.on('end', () => setImmediate(() => child.emit('close', 0)))
+    })
+    return child
+  }
+}
+
+function scriptedDelegation(sent: BackendProxyRequest[]): DelegationDeps {
+  return {
+    connection: () => ({ port: 1, authHeaders: { Authorization: 'Bearer t' } }),
+    elevation: () => null,
+    send: vi.fn(async (_endpoint, req: BackendProxyRequest): Promise<BackendProxyResponse> => {
+      sent.push(req)
+      if (req.method === 'GET') {
+        return { ok: true, status: 200, data: { modules: [{ name: 'docmod', namespace: '/api/v1/documents' }] } }
+      }
+      return { ok: true, status: 200, data: { delegated: true } }
+    }),
+  }
+}
 
 describe('documentsEvent', () => {
   const ev = (module: string, kind: string, payload: Record<string, unknown>) => ({ module, kind, payload })

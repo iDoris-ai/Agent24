@@ -87,6 +87,27 @@ beforeEach(() => {
 afterEach(() => { cleanup(); setLocale('en') })
 
 describe('Sin90 read-only page', () => {
+  it('shows a write failure on the page', async () => {
+    keyAvailable = true
+    sin90Write.mockResolvedValue({
+      ok: false,
+      status: 403,
+      data: { error: { code: 'module_delegation_required', message: 'Module surface requires delegation' } },
+    })
+    render(<Sin90Page />)
+    fireEvent.change(await screen.findByLabelText('Title'), { target: { value: 'Ship' } })
+    fireEvent.change(screen.getByLabelText('Window'), { target: { value: '2026-Q4' } })
+    const button = screen.getByRole('button', { name: 'New direction' })
+    await waitFor(() => expect(button).toBeEnabled())
+    fireEvent.click(button)
+    expect(await screen.findByRole('alert')).toHaveTextContent('not allowed to write Sin90')
+    expect(screen.queryByText('Module surface requires delegation')).not.toBeInTheDocument()
+    act(() => setLocale('zh'))
+    expect(screen.getByRole('alert')).toHaveTextContent('还不能写入 Sin90')
+    act(() => setLocale('th'))
+    expect(screen.getByRole('alert')).toHaveTextContent('ยังไม่ได้รับอนุญาตให้เขียน Sin90')
+  })
+
   it('shows the empty direction form when nothing is stored', async () => {
     render(<Sin90Page />)
     expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
