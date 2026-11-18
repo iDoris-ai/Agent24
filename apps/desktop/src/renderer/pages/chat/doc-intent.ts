@@ -43,7 +43,12 @@ const MERGE = /(?:和|与|跟|同)\s*[《「“"]([^》」”"]{1,200})[》」�
 export function parseDocIntent(text: string): DocIntent | null {
   const merge = MERGE.exec(text)
   if (merge) return { kind: 'merge', other: merge[1].trim() }
-  const asksSplit = SPLIT_VERB.test(text) || (WEAK_SPLIT_VERB.test(text) && SPLIT_TARGET.test(text))
+  // A document's name is not what is asked: 「《合同.pdf》」 or 「合同.pdf」 says
+  // nothing of making a PDF (General 11-19, 0.6.37).
+  const said = text
+    .replace(/[《「“"][^》」”"]{0,200}[》」”"]/g, ' ')
+    .replace(/[^\s，。？！、]+\.(pdf|docx?|xlsx?|pptx?|png|jpe?g)\b/gi, ' ')
+  const asksSplit = SPLIT_VERB.test(said) || (WEAK_SPLIT_VERB.test(said) && SPLIT_TARGET.test(said))
   if (!asksSplit) return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
   const ranges: string[] = []
   for (const m of text.matchAll(RANGE)) {

@@ -84,7 +84,12 @@ describe('findByTitle with the extension named (General 11-18)', () => {
 })
 
 describe('parseDocIntent: questions about a page are not splits (PR-Daemon #1909 ①)', () => {
-  it.each(['帮我提取第2页的关键信息', '第3页单独说了什么', '请取出第5页的金额', '导出第2页说的要点'])('%s → null', (text) => {
+  it.each([
+    '帮我提取第2页的关键信息', '第3页单独说了什么', '请取出第5页的金额', '导出第2页说的要点',
+    // A document named with its file name is not a word for making a PDF (General 11-19).
+    '帮我提取《CFYAD26-9770136.pdf》第2页的关键信息', '帮我提取 CFYAD26-9770136.pdf 第2页的关键信息',
+    '《拆分方案.docx》第2页说了什么',
+  ])('%s → null', (text) => {
     expect(parseDocIntent(text)).toBeNull()
   })
   it.each([
@@ -92,6 +97,7 @@ describe('parseDocIntent: questions about a page are not splits (PR-Daemon #1909
     ['把第3页单独存成一份 PDF', '3'],
     ['取出第5页另存', '5'],
     ['拆出第 2-4 页', '2-4'],
+    ['把《合同.pdf》第2页提取成新文档', '2'],
   ])('%s → split %s', (text, pages) => {
     expect(parseDocIntent(text)).toEqual({ kind: 'split', pages })
   })
