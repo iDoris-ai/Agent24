@@ -7,6 +7,7 @@ import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import DocumentDetail from './DocumentDetail'
 import { compose } from './compose'
+import type { TargetLang } from './doc-translate'
 import { getLocale, useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 import type { DocAgentAccess, DocumentsModuleStatus } from '../../../shared/ipc-types'
@@ -113,6 +114,8 @@ export default function DocumentsPage() {
   const [open, setOpen] = useState<string | null>(null)
   // D3: the document opened to be checked straight away (an Office one's PDF).
   const [autoCheck, setAutoCheck] = useState<string | null>(null)
+  // D4: the PDF opened to be translated straight away, and into which language.
+  const [autoTranslate, setAutoTranslate] = useState<{ id: string; lang: TargetLang } | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
   // from a later page is not on the new first one).
@@ -313,8 +316,11 @@ export default function DocumentsPage() {
         <DocumentDetail
           documentId={open}
           autoCheck={autoCheck === open}
-          onOpen={(id, check) => { setAutoCheck(check ? id : null); setOpen(id) }}
+          autoTranslate={autoTranslate?.id === open ? autoTranslate.lang : null}
+          onOpen={(id, check) => { setAutoCheck(check ? id : null); setAutoTranslate(null); setOpen(id) }}
+          onTranslate={(id, lang) => { setAutoCheck(null); setAutoTranslate({ id, lang }); setOpen(id) }}
           onClose={() => {
+            setAutoTranslate(null)
             setOpen(null)
             ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
           }}
@@ -343,7 +349,7 @@ export default function DocumentsPage() {
                   )}
                 </td>
                 <td style={CELL}>
-                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
+                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
                     {d.title}
                   </button>
                 </td>

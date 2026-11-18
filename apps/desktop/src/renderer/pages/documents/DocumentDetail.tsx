@@ -11,7 +11,8 @@ import { documentsMessages } from './Documents.i18n'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
 import { compose, convert, pagesOk } from './compose'
-import { askWithProxy, checkDocument, type CheckReport, type Source } from './doc-check'
+import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
+import { paragraphsOf, translateParagraphs, translationHtml, type TargetLang } from './doc-translate'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -35,13 +36,17 @@ export function readableSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck = false }: {
+export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, autoCheck = false, autoTranslate = null }: {
   documentId: string
   onClose: () => void
   /** D3: open another document (the PDF an Office one became), checked once it shows. */
   onOpen?: (id: string, check: boolean) => void
+  /** D4: open the PDF an Office document became, then translate it. */
+  onTranslate?: (id: string, lang: TargetLang) => void
   /** D3: run 「总结并检查」 as soon as the text is read. */
   autoCheck?: boolean
+  /** D4: run the translation as soon as the text is read, into this language. */
+  autoTranslate?: TargetLang | null
 }) {
   const t = useT(documentsMessages)
   const { open } = useContext(CapabilitiesContext)
@@ -64,8 +69,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
   const [convertBusy, setConvertBusy] = useState(false)
   const [convertNote, setConvertNote] = useState<{ ok: boolean; text: string } | null>(null)
   const [needEngine, setNeedEngine] = useState(false)
+  const [translateAfterEngine, setTranslateAfterEngine] = useState<TargetLang | null>(null)
   const [downloadText, setDownloadText] = useState<string | null>(null)
-  const runConvert = async (id: string, thenCheck = false) => {
+  const runConvert = async (id: string, thenCheck = false, thenLang: TargetLang | null = null) => {
     setConvertBusy(true)
     setNeedEngine(false)
     setConvertNote({ ok: true, text: t('compose.working') })
@@ -74,12 +80,15 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
     if (out.ok) {
       setConvertNote({ ok: true, text: t('compose.done') })
       // D3: a Word document is checked as the PDF it became, whose blocks have pages to go back to.
-      if (thenCheck && out.documentId && onOpen) onOpen(out.documentId, true)
+      // D4: the same PDF is what gets translated.
+      if (thenLang && out.documentId && onTranslate) onTranslate(out.documentId, thenLang)
+      else if (thenCheck && out.documentId && onOpen) onOpen(out.documentId, true)
       return
     }
     if (out.engineMissing) {
       setConvertNote(null)
       setNeedEngine(true)
+      setTranslateAfterEngine(thenLang)
       return
     }
     setConvertNote({ ok: false, text: t('compose.failed', { error: out.message }) })
@@ -100,7 +109,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
       else setDownloadText(null)
     })
   }, [api])
-  const downloadEngine = async (id: string) => {
+  const downloadEngine = async (id: string, follow?: () => Promise<void>) => {
     setNeedEngine(false)
     setConvertNote(null)
     setDownloadText('')
@@ -115,7 +124,8 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
       const status = await api.installOfficeEngine()
       setDownloadText(null)
       if (status.state === 'ready') {
-        await runConvert(id)
+        if (follow) await follow()
+        else await runConvert(id)
         return
       }
       setConvertNote({ ok: false, text: t('office.downloadFailed', { error: status.error ?? status.state }) })
@@ -153,6 +163,12 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
   const [checkError, setCheckError] = useState<string | null>(null)
   const [report, setReport] = useState<CheckReport | null>(null)
   const [highlight, setHighlight] = useState<string | null>(null)
+  const [lang, setLang] = useState<TargetLang>(autoTranslate ?? 'en')
+  const [translating, setTranslating] = useState(false)
+  const [trDone, setTrDone] = useState(0)
+  const [trTotal, setTrTotal] = useState(0)
+  const [trNote, setTrNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const [trNeedEngine, setTrNeedEngine] = useState(false)
 
   /** Renders page `n` of the head revision and shows it if it is still wanted. */
   const show = async (head: Detail, n: number) => {
@@ -264,6 +280,53 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
     }
   }
 
+  const runTranslate = async (head: Detail, target: TargetLang) => {
+    if (translating || checking) return
+    const gen = generation.current
+    setTranslating(true)
+    setTrDone(0)
+    setTrTotal(0)
+    setTrNote(null)
+    setTrNeedEngine(false)
+    try {
+      const collected = await readAllCheckBlocks((req) => api.request(req), head.document_id, head.head.revision)
+      if (gen !== generation.current) return
+      const paras = paragraphsOf(collected)
+      if (paras.length === 0) {
+        setTrNote({ ok: false, text: t('translate.empty') })
+        return
+      }
+      const proxy = window.agent24.backendProxy
+      if (!proxy) throw new Error('backend unavailable')
+      const translated = await translateParagraphs({
+        ask: (prompt) => askWithProxy(proxy, prompt),
+        onProgress: (done, total) => {
+          if (gen !== generation.current) return
+          setTrDone(done)
+          setTrTotal(total)
+        },
+      }, paras, target)
+      if (gen !== generation.current) return
+      const html = translationHtml(head.title ?? '', translated, target)
+      const out = await api.exportTranslation({ title: head.title ?? '', html, lang: target })
+      if (gen !== generation.current) return
+      if (!out.ok) {
+        if (out.code === 'engine_unavailable') {
+          setTrNeedEngine(true)
+          return
+        }
+        setTrNote({ ok: false, text: t('translate.failed', { error: out.message ?? out.code ?? '' }) })
+        return
+      }
+      setTrNote({ ok: true, text: t('translate.done', { name: out.docxName ?? '' }) })
+    } catch (e) {
+      if (gen !== generation.current) return
+      setTrNote({ ok: false, text: t('translate.failed', { error: e instanceof Error ? e.message : String(e) }) })
+    } finally {
+      if (gen === generation.current) setTranslating(false)
+    }
+  }
+
   useEffect(() => {
     const gen = ++generation.current
     setDetail(null)
@@ -286,6 +349,13 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
     setCheckError(null)
     setReport(null)
     setHighlight(null)
+    setTranslating(false)
+    setTrDone(0)
+    setTrTotal(0)
+    setTrNote(null)
+    setTrNeedEngine(false)
+    setTranslateAfterEngine(null)
+    setLang(autoTranslate ?? 'en')
     heading.current?.focus()
     void api.request({ op: 'get', documentId }).then((res) => {
       if (gen !== generation.current) return
@@ -312,6 +382,14 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
     if (autoChecked.current === documentId) return
     autoChecked.current = documentId
     void runCheck(detail)
+  })
+  // D4: opened to be translated (an Office document's PDF): once, when its text is first read.
+  const autoTranslated = useRef<string | null>(null)
+  useEffect(() => {
+    if (!autoTranslate || !detail || detail.document_id !== documentId || blocks.length === 0 || loading || translating || checking) return
+    if (autoTranslated.current === documentId) return
+    autoTranslated.current = documentId
+    void runTranslate(detail, autoTranslate)
   })
 
   return (
@@ -345,6 +423,30 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
               {t('check.button')}
             </button>
           )}
+          {detail && ((!isOffice(detail.head.media_type) && blocks.length > 0) || (isOffice(detail.head.media_type) && onTranslate)) && (
+            <>
+              <select
+                aria-label={t('translate.lang')}
+                value={lang}
+                disabled={translating || convertBusy}
+                onChange={(e) => setLang(e.target.value === 'zh' ? 'zh' : 'en')}
+                style={{ fontSize: 13 }}
+              >
+                <option value="en">{t('translate.en')}</option>
+                <option value="zh">{t('translate.zh')}</option>
+              </select>
+              <button
+                className="btn btn-ghost"
+                disabled={translating || checking || convertBusy || downloadText !== null}
+                onClick={() => {
+                  if (isOffice(detail.head.media_type)) void runConvert(detail.document_id, false, lang)
+                  else void runTranslate(detail, lang)
+                }}
+              >
+                {t(lang === 'zh' ? 'translate.buttonZh' : 'translate.button')}
+              </button>
+            </>
+          )}
           <button className="btn btn-ghost" onClick={onClose}>
             {t('detail.close')}
           </button>
@@ -367,6 +469,34 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
           {report && (
             <CheckResult report={report} t={t} onJump={(s) => jumpTo(detail, s)} />
           )}
+        </div>
+      )}
+      {detail && (translating || trNote || trNeedEngine) && (
+        <div style={{ margin: '8px 0' }}>
+          {translating && (
+            <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>
+              {trTotal === 0
+                ? t('translate.reading')
+                : trDone >= trTotal
+                  ? t('translate.exporting')
+                  : t('translate.progress', { done: String(trDone + 1), total: String(trTotal) })}
+            </p>
+          )}
+          {trNote && (
+            <p role={trNote.ok ? 'status' : 'alert'} style={trNote.ok ? { fontSize: 12, margin: '4px 0' } : ALERT}>{trNote.text}</p>
+          )}
+          {!isOffice(detail.head.media_type) && convertNote && (
+            <p role={convertNote.ok ? 'status' : 'alert'} style={convertNote.ok ? { fontSize: 12, margin: '4px 0' } : ALERT}>{convertNote.text}</p>
+          )}
+          {trNeedEngine && !isOffice(detail.head.media_type) && (
+            <>
+              <p>{t('office.needEngine')}</p>
+              <button className="btn btn-primary" disabled={downloadText !== null} onClick={() => void downloadEngine(detail.document_id, () => runTranslate(detail, lang))}>
+                {t('office.download')}
+              </button>
+            </>
+          )}
+          {downloadText && !isOffice(detail.head.media_type) ? <p role="status">{downloadText}</p> : null}
         </div>
       )}
       {detail && splitting !== null && (
@@ -399,7 +529,10 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
           {needEngine && (
             <>
               <p>{t('office.needEngine')}</p>
-              <button className="btn btn-primary" disabled={downloadText !== null} onClick={() => void downloadEngine(detail.document_id)}>
+              <button className="btn btn-primary" disabled={downloadText !== null} onClick={() => void downloadEngine(
+                detail.document_id,
+                translateAfterEngine ? () => runConvert(detail.document_id, false, translateAfterEngine) : undefined,
+              )}>
                 {t('office.download')}
               </button>
             </>
