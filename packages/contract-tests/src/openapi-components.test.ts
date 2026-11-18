@@ -75,6 +75,7 @@ describe('ComponentList kernel grants', () => {
     expect(redactedProps).not.toContain('kernel_grants')
     expect(redactedProps).not.toContain('kernel_consent')
     expect(validateView({ ...hostRow, kernel_consent: 'exempt' }), JSON.stringify(validateView.errors)).toBe(true)
+    expect(validateView({ ...hostRow, kernel_consent: 'granted' })).toBe(true)
     expect(validateView({ ...hostRow, kernel_consent: 'later' })).toBe(false)
     const { isolation: _hostIsolation, ...withoutIsolation } = hostRow
     expect(validateView(withoutIsolation)).toBe(false)

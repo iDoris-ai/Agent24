@@ -159,6 +159,70 @@ fn kernel_consent_of(state: &AppState, name: &str) -> crate::kernel_consent::Ker
     crate::kernel_consent::classify(name, team, cfg!(target_os = "macos"))
 }
 
+/// The declaration the consent card and `GET /components` both fingerprint.
+/// Documents uses the catalog's operations (and its kernel when no manifest
+/// was read). Other packages use the mounted D9 kernel and no operations.
+pub(crate) struct OsKernelDeclaration {
+    pub kernel: Vec<String>,
+    pub operations: Vec<String>,
+    pub version: String,
+    pub team: Option<String>,
+    pub exempt: bool,
+}
+
+pub(crate) fn os_kernel_declaration(state: &AppState, name: &str) -> Option<OsKernelDeclaration> {
+    let teams = state
+        .os_signing_teams
+        .read()
+        .unwrap_or_else(PoisonError::into_inner);
+    let team = teams.get(name).cloned().flatten();
+    let exempt = crate::kernel_consent::classify(name, team.as_deref(), cfg!(target_os = "macos"))
+        == crate::kernel_consent::KernelConsentClass::Exempt;
+    if name == "documents" {
+        let catalog = documents_catalog::DocumentsCatalog::embedded().ok();
+        let report = state
+            .os_reports
+            .iter()
+            .find(|report| report.name == "documents" && !squats_builtin_name(&report.outcome));
+        let kernel = if let Some(d9) = report.and_then(|report| report.d9.as_ref()) {
+            d9.requires_kernel.clone()
+        } else {
+            catalog.as_ref()?.requires.kernel.clone()
+        };
+        let operations = catalog
+            .as_ref()
+            .map(|catalog| catalog.requires.operations.clone())
+            .unwrap_or_default();
+        let version = report
+            .map(|report| report.version.clone())
+            .unwrap_or_else(|| {
+                catalog
+                    .as_ref()
+                    .map(|catalog| catalog.version.clone())
+                    .unwrap_or_default()
+            });
+        return Some(OsKernelDeclaration {
+            kernel,
+            operations,
+            version,
+            team,
+            exempt,
+        });
+    }
+    let report = state.os_reports.iter().find(|report| report.name == name)?;
+    let d9 = report.d9.as_ref()?;
+    if d9.in_process {
+        return None;
+    }
+    Some(OsKernelDeclaration {
+        kernel: d9.requires_kernel.clone(),
+        operations: Vec::new(),
+        version: report.version.clone(),
+        team,
+        exempt,
+    })
+}
+
 /// Host-only kernel picture. `kernel_grants` is the mount's list.
 /// `declared` is `None` when the manifest was not read.
 struct KernelView {
@@ -193,8 +257,10 @@ pub struct Item {
     denied: Vec<Denial>,
     /// Seatbelt or why this row is not isolated. Both audiences.
     isolation: Isolation,
-    /// Host only. Present on an OS package: `exempt` skips the consent card,
-    /// `missing` means the card applies. Grants are unchanged in this slice.
+    /// Host only. Present on an OS package. `exempt` keeps the mount grant.
+    /// `missing` means the card applies and nothing usable is stored.
+    /// `granted` means a record is still in force; `kernel_grants` is then
+    /// the declaration, the ceiling, and that record.
     #[serde(skip_serializing_if = "Option::is_none")]
     kernel_consent: Option<crate::kernel_consent::KernelConsentClass>,
 }
@@ -1158,7 +1224,39 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items.push(open_design_item(state, now));
     items.extend(mcp_items(state));
     dedupe_component_ids(&mut items);
+    overlay_kernel_consent(state, &mut items).await;
     items
+}
+
+/// Non-exempt packages do not keep the mount snapshot. A missing, expired,
+/// or grown record clears `kernel_grants`. A same-or-smaller fingerprint
+/// keeps the record and shows the intersection. Exempt rows are left as the
+/// mount wrote them. This read does not update the live call map.
+async fn overlay_kernel_consent(state: &AppState, items: &mut [Item]) {
+    for item in items.iter_mut() {
+        if item.kernel_consent != Some(crate::kernel_consent::KernelConsentClass::Missing) {
+            continue;
+        }
+        let Some(declared) = item.declared.as_ref() else {
+            item.kernel_grants.clear();
+            continue;
+        };
+        let current = crate::kernel_consent::fingerprint(&declared.kernel, &declared.operations);
+        let offer = crate::kernel_consent::offered(&declared.kernel);
+        let row = match state.store.get_kernel_consent(&item.id).await {
+            Ok(row) => row,
+            Err(_) => {
+                item.kernel_grants.clear();
+                continue;
+            }
+        };
+        let held = crate::kernel_consent::hold(&current, &offer, row.as_ref(), chrono::Utc::now());
+        if held.delete {
+            let _ = state.store.delete_kernel_consent(&item.id).await;
+        }
+        item.kernel_consent = Some(held.class);
+        item.kernel_grants = held.grants;
+    }
 }
 
 // ---- providers for a skill run (SL-5) -------------------------------------------------

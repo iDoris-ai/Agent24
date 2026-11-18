@@ -788,6 +788,110 @@ paths:
               schema:
                 $ref: "#/components/schemas/TrustTeamError"
 
+  /os/{name}/kernel-consent:
+    get:
+      operationId: getKernelConsent
+      tags: [system]
+      summary: Show the kernel-capability consent card for one OS module
+      description: >-
+        Host and first-party shell. `class` is `exempt` for a bundled module
+        signed by the built-in team, `granted` when an unexpired record still
+        matches the declaration, otherwise `missing`. `capabilities` is the
+        declaration intersected with the out-of-process ceiling. `consented`
+        is the stored subset, or null when nothing is in force.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Consent card
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KernelConsent"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      operationId: grantKernelConsent
+      tags: [system]
+      summary: Store a kernel-capability consent after presence confirmation
+      description: >-
+        ProductHost confirms in the native dialog inside this handler.
+        FirstPartyShell must already carry an elevation grant whose summary
+        lists the same capabilities; the handler does not ask again.
+        An empty selection or a fingerprint that is not the one just shown
+        is 409 and writes nothing. An exempt module is 409 and does not
+        open a dialog.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KernelConsentGrant"
+      responses:
+        "200":
+          description: The card after the record is stored
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KernelConsent"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: Host required, or the native dialog was denied, unavailable, or timed out
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: consent_empty, fingerprint_mismatch, or consent_exempt
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      operationId: revokeKernelConsent
+      tags: [system]
+      summary: Revoke kernel-capability consent for one OS module
+      description: >-
+        Deletes the record. The next component read shows an empty
+        `kernel_grants` for a module that needs a card. Everyday; the
+        desktop capability center and `agent24 os consent revoke` share
+        this route.
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "204":
+          description: Record removed, or there was none
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "500":
+          description: The consent store could not be updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /os/{name}:
     patch:
       operationId: updateDomainOs
@@ -5896,13 +6000,16 @@ components:
           $ref: "#/components/schemas/ComponentIsolation"
         kernel_consent:
           type: string
-          enum: [exempt, missing]
+          enum: [exempt, missing, granted]
           description: >-
             Host only, and only on an OS package. `exempt`: the module name is
             on the bundled list (`documents`, `sin90`) and, on macOS, the
-            package team is the built-in team. `missing`: the kernel consent
-            card applies. Absent on every other row and on the redacted view.
-            This slice does not change `kernel_grants`.
+            package team is the built-in team; `kernel_grants` stays the mount
+            list. `missing`: the card applies and there is no usable record,
+            so `kernel_grants` is empty. `granted`: an unexpired record still
+            matches the declaration; `kernel_grants` is the declaration, the
+            ceiling, and the consented set. Absent on every other row and on
+            the redacted view.
         detail:
           type: object
           additionalProperties: true
@@ -5912,6 +6019,37 @@ components:
             consecutive_failures}}} and never includes relay URLs.
             detail.consecutive_failures remains the daemon restart counter, separate from
             detail.health.consecutive_failures.
+    KernelConsent:
+      type: object
+      required: [module, class, fingerprint, version, team, origin, isolated, capabilities, consented]
+      properties:
+        module: { type: string }
+        class:
+          type: string
+          enum: [exempt, missing, granted]
+        fingerprint: { type: string }
+        version: { type: string }
+        team:
+          type: [string, "null"]
+        origin:
+          type: string
+          enum: [bundled, local]
+        isolated: { type: boolean }
+        capabilities:
+          type: array
+          items: { type: string }
+        consented:
+          type: [array, "null"]
+          items: { type: string }
+    KernelConsentGrant:
+      type: object
+      required: [fingerprint, capabilities]
+      additionalProperties: false
+      properties:
+        fingerprint: { type: string }
+        capabilities:
+          type: array
+          items: { type: string }
     ComponentRedactedView:
       type: object
       description: >-

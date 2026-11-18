@@ -450,7 +450,9 @@ impl Handler for SchedulerUpsertHandler {
                 ))
             })?;
 
-            if !granted.has(Capability::Scheduler) {
+            if !granted.has(Capability::Scheduler)
+                || crate::kernel_consent::live_denies(&owner, "scheduler")
+            {
                 return Err(forbidden());
             }
 
@@ -577,7 +579,9 @@ impl Handler for SchedulerDeleteHandler {
                 ))
             })?;
 
-            if !granted.has(Capability::Scheduler) {
+            if !granted.has(Capability::Scheduler)
+                || crate::kernel_consent::live_denies(&owner, "scheduler")
+            {
                 return Err(forbidden());
             }
 
@@ -650,7 +654,9 @@ impl Handler for SchedulerListHandler {
                 ))
             })?;
 
-            if !granted.has(Capability::Scheduler) {
+            if !granted.has(Capability::Scheduler)
+                || crate::kernel_consent::live_denies(&owner, "scheduler")
+            {
                 return Err(forbidden());
             }
 

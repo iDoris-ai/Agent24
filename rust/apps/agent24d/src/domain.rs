@@ -1256,6 +1256,7 @@ pub async fn mount_all(
         approval_broker,
         &[],
         deps,
+        None,
     )
     .await
 }
@@ -1282,6 +1283,10 @@ pub async fn mount_all_with_refusals(
     // `CallbackDeps`'s own doc comment for why. Lent to each `mount_package`
     // call below as `&deps`; dropped when this function returns.
     deps: CallbackDeps,
+    // `None` leaves today's grant (tests and `mount_all`). `serve` passes the
+    // store so a package that needs a card does not receive kernel handles
+    // until a record exists.
+    kernel_store: Option<&agent24_store::Store>,
 ) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
     let mut app = Router::new();
     let mut reports = Vec::new();
@@ -1552,6 +1557,19 @@ pub async fn mount_all_with_refusals(
         // A PACKAGE is started, not constructed: its own path from here.
         let build = match &entry.build {
             Build::Package(package) => {
+                let kernel_names: Vec<String> = package
+                    .manifest
+                    .kernel_capabilities()
+                    .iter()
+                    .map(|cap| cap.as_str().to_owned())
+                    .collect();
+                let narrowed = crate::kernel_consent::narrow_for_mount(
+                    kernel_store,
+                    &name,
+                    package.signing_team.as_deref(),
+                    &kernel_names,
+                )
+                .await;
                 let (next, report) = mount_package(
                     app,
                     package,
@@ -1569,6 +1587,7 @@ pub async fn mount_all_with_refusals(
                     host,
                     approval_broker,
                     &deps,
+                    narrowed,
                 )
                 .await;
                 app = next;
@@ -2028,6 +2047,9 @@ async fn mount_package(
     // ME4-1.4.1 (design §10.3): borrowed, never by value — `CallbackDeps`
     // itself is only dropped when `mount_all` returns.
     deps: &CallbackDeps,
+    // `None` keeps the resolver grant (exempt, or no consent store).
+    // `Some` is the only set of kernel names this package may hold.
+    kernel_allowed: Option<BTreeSet<String>>,
 ) -> (Router, MountReport) {
     let MountTarget {
         name,
@@ -2120,12 +2142,15 @@ async fn mount_package(
     // T7a/ME-3e: computed once, before `supervise` — `Offer` and the
     // `MethodsFor` closure both need it, and it must be the SAME `Grants` that
     // ends up in `MountReport.granted` below (judgement 10's consistency).
-    let granted = requires::resolve(
-        &RequiresSpec::from_manifest(manifest),
-        GrantForm::OutOfProcess.host_cap(),
-        Consent::FirstPartyEnabled,
-    )
-    .granted;
+    let granted = requires::intersect_consented(
+        requires::resolve(
+            &RequiresSpec::from_manifest(manifest),
+            GrantForm::OutOfProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        )
+        .granted,
+        kernel_allowed.as_ref(),
+    );
     let broadcast: Arc<dyn EventBroadcast> = Arc::new(HubBroadcast(events.clone()));
     let event_sink = granted
         .has(Capability::Events)
@@ -6388,6 +6413,7 @@ raise SystemExit(3)
             &test_approval_broker(&hub).await,
             refusals,
             test_callback_deps().await,
+            None,
         )
         .await;
         (app, reports)
@@ -6595,6 +6621,7 @@ raise SystemExit(3)
             &test_approval_broker(&hub).await,
             &refusals,
             test_callback_deps().await,
+            None,
         )
         .await;
         assert_eq!(

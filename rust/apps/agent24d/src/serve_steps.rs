@@ -1389,6 +1389,7 @@ pub(super) async fn mount_domain_os(
             // that ordering matters).
             models: Some(model_deps.clone()),
         },
+        Some(&state.store),
     )
     .await;
     let (refusal_rows, package_dirs) =

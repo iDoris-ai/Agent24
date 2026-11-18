@@ -169,7 +169,9 @@ impl Handler for ApprovalSubmitHandler {
             // Step 1 (decision 4): capability check. No grant, no quota
             // charged, no record touched — never even reaches the token or
             // the closed set.
-            if !granted.has(Capability::Approval) {
+            if !granted.has(Capability::Approval)
+                || crate::kernel_consent::live_denies(&module, "approval")
+            {
                 return Err(RpcError::application(
                     ErrorKind::Forbidden,
                     "the `approval` capability was not granted to this module",
@@ -307,7 +309,9 @@ impl Handler for ApprovalStatusHandler {
             // check — v5 missed this (Codex round 5 High 3): without it, a
             // module whose `approval` grant was later revoked could still
             // read old approvals by a remembered id.
-            if !granted.has(Capability::Approval) {
+            if !granted.has(Capability::Approval)
+                || crate::kernel_consent::live_denies(&module, "approval")
+            {
                 return Err(RpcError::application(
                     ErrorKind::Forbidden,
                     "the `approval` capability was not granted to this module",

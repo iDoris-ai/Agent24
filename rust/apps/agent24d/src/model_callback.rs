@@ -786,6 +786,9 @@ impl Handler for ModelCompleteHandler {
             let Some(grant) = grant else {
                 return Err(forbidden());
             };
+            if crate::kernel_consent::live_denies(&grant.module, "models") {
+                return Err(forbidden());
+            };
             let (request, complexity, request_id) = parsed.into_request();
 
             // One lock: admission + the bound request's lifecycle (W4b). Does

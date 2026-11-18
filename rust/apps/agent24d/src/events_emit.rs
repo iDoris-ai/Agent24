@@ -315,7 +315,9 @@ impl Handler for EventsEmitHandler {
             })?;
 
             // 1. Capability: no grant, no quota charged, no event recorded.
-            if !granted.has(Capability::Events) {
+            if !granted.has(Capability::Events)
+                || crate::kernel_consent::live_denies(&module, "events")
+            {
                 return Err(RpcError::application(
                     ErrorKind::Forbidden,
                     "the `events` capability was not granted to this module",
