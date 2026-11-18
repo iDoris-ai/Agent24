@@ -117,6 +117,7 @@ function DomainOsPage({ capability, whenMounted }: { capability: CapabilityDef; 
       )}
       {phaseLabel && <p role="status">{phaseLabel}</p>}
       {failure && <p role="alert">{failure}</p>}
+      {component?.kernel_consent === 'missing' && <KernelConsentCard name={capability.id} />}
       {whenMounted()}
     </main>
   }

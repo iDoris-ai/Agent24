@@ -94,8 +94,8 @@ describe('CapabilityPage domain OS', () => {
   })
 
   it('shows the consent card when the module still needs one, and a denial leaves it installed', async () => {
-    modules = [module('0.5.2')]
-    components = [{ id: 'sin90', version: '0.5.2', state: 'ready', provides: [], kernel_consent: 'missing' }]
+    modules = [{ ...module('0.5.2'), name: 'cos72', namespace: '/api/v1/cos72' }]
+    components = [{ id: 'cos72', version: '0.5.2', state: 'ready', provides: [], kernel_consent: 'missing' }]
     const posts: BackendProxyRequest[] = []
     Object.defineProperty(window, 'agent24', {
       configurable: true,
@@ -103,10 +103,10 @@ describe('CapabilityPage domain OS', () => {
         backendProxy: async (req: BackendProxyRequest) => {
           if (req.path === '/api/v1/os') return { ok: true, status: 200, data: { modules } }
           if (req.path === '/api/v1/components') return { ok: true, status: 200, data: { components } }
-          if (req.method === 'GET' && req.path === '/api/v1/os/sin90/kernel-consent') {
+          if (req.method === 'GET' && req.path === '/api/v1/os/cos72/kernel-consent') {
             return {
               ok: true, status: 200, data: {
-                module: 'sin90', class: 'missing', fingerprint: 'k=events;o=', version: '0.5.2',
+                module: 'cos72', class: 'missing', fingerprint: 'k=events;o=', version: '0.5.2',
                 team: 'OTHER', origin: 'local', isolated: true, capabilities: ['events'], consented: null,
               },
             }
@@ -119,7 +119,7 @@ describe('CapabilityPage domain OS', () => {
         onOsPackageProgress: () => () => {},
       },
     })
-    render(<CapabilityPage capability={sin90} />)
+    render(<CapabilityPage capability={cos72} />)
     expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
     const box = await screen.findByRole('checkbox', { name: 'Send events under this module\'s name' })
     expect(box).toBeChecked()
@@ -131,9 +131,9 @@ describe('CapabilityPage domain OS', () => {
   })
 
   it('does not ask for an exempt module', async () => {
-    modules = [module('0.5.2')]
-    components = [{ id: 'sin90', version: '0.5.2', state: 'ready', provides: [], kernel_consent: 'exempt' }]
-    render(<CapabilityPage capability={sin90} />)
+    modules = [{ ...module('0.5.2'), name: 'cos72', namespace: '/api/v1/cos72' }]
+    components = [{ id: 'cos72', version: '0.5.2', state: 'ready', provides: [], kernel_consent: 'exempt' }]
+    render(<CapabilityPage capability={cos72} />)
     expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
   })
