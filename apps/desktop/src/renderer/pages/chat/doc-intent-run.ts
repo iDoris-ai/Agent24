@@ -23,8 +23,13 @@ export async function runDocIntent(api: Api, doc: DocumentRef, intent: DocIntent
   const listed = await api.request({ op: 'list', limit: 200 })
   if (!listed.ok) return '没能读取文档列表，合并没有进行。'
   const others = listed.data.documents.filter((d) => d.document_id !== doc.id)
-  const other = findByTitle(others, intent.other)
-  if (!other) return `没有找到唯一一份标题是《${intent.other}》的文档，请在「文档」页勾选后合并，或说得更完整一些。`
+  const found = findByTitle(others, intent.other)
+  if (!found) return `没有找到标题含《${intent.other}》的文档。`
+  if ('candidates' in found) {
+    const names = found.candidates.slice(0, 5).map((d) => `《${d.title}》`).join('、')
+    return `有几份文档都对得上：${names}。请用完整标题再说一次，例如「和${names.split('、')[0]}合并」。`
+  }
+  const other = found.match
   if (other.media_type !== 'application/pdf') return `《${other.title}》不是 PDF，先把它转换为 PDF 再合并。`
   const title = `合并：${doc.title} + ${other.title}`.slice(0, 500)
   const out = await compose(api, [{ documentId: doc.id }, { documentId: other.document_id }], title)
