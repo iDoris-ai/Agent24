@@ -137,6 +137,8 @@ export const IpcChannels = {
   DocumentsOfficeEngineStatus: 'documents:office-engine-status',
   DocumentsOfficeEngineInstall: 'documents:office-engine-install',
   DocumentsOfficeEngineChanged: 'documents:office-engine-changed',
+  // D2b: grant the Agent documents.list / get / compose for 30 days.
+  DocumentsAgentAccess: 'documents:agent-access',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -627,6 +629,14 @@ export type DocumentsEvent =
 export interface DocumentsImportProgress {
   sent: number
   total: number
+}
+
+/** D2b: whether the Agent may use the documents library (host grant, 30 days). */
+export interface DocAgentAccess {
+  enabled: boolean
+  until: string | null
+  ok?: boolean
+  code?: string
 }
 
 export type CliToolPathStatus = { path: string } & (

@@ -7,9 +7,9 @@ import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import DocumentDetail from './DocumentDetail'
 import { compose } from './compose'
-import { useT } from '../../i18n'
+import { getLocale, useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
-import type { DocumentsModuleStatus } from '../../../shared/ipc-types'
+import type { DocAgentAccess, DocumentsModuleStatus } from '../../../shared/ipc-types'
 
 type Doc = components['schemas']['Document']
 
@@ -39,6 +39,15 @@ const OFFICE_FORMAT: Record<string, string> = {
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'PPTX',
 }
 const formatOf = (media: string): string => OFFICE_FORMAT[media] ?? media
+
+function accessUntilDate(until: string | null): string {
+  if (!until) return ''
+  const d = new Date(until)
+  if (Number.isNaN(d.getTime())) return until
+  const locale = getLocale()
+  const tag = locale === 'zh' ? 'zh-CN' : locale === 'th' ? 'th-TH' : 'en'
+  return d.toLocaleDateString(tag, { year: 'numeric', month: 'short', day: 'numeric' })
+}
 
 export default function DocumentsPage() {
   const t = useT(documentsMessages)
@@ -92,6 +101,15 @@ export default function DocumentsPage() {
       .catch(() => {})
     return () => { live = false }
   }, [api, notInstalled])
+  const [agentAccess, setAgentAccess] = useState<DocAgentAccess | null>(null)
+  const [agentAccessBusy, setAgentAccessBusy] = useState(false)
+  useEffect(() => {
+    const fn = api.agentAccess
+    if (!fn) return
+    let live = true
+    void fn('state').then((s) => { if (live) setAgentAccess(s) }).catch(() => {})
+    return () => { live = false }
+  }, [api])
   const [open, setOpen] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
@@ -236,6 +254,25 @@ export default function DocumentsPage() {
         <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing || notInstalled}>
           {t('import.button')}
         </button>
+        {api.agentAccess && (
+          <button
+            className="btn"
+            disabled={agentAccessBusy}
+            onClick={() => {
+              const fn = api.agentAccess
+              if (!fn || agentAccessBusy) return
+              setAgentAccessBusy(true)
+              void fn(agentAccess?.enabled ? 'disable' : 'enable')
+                .then((s) => setAgentAccess(s))
+                .catch(() => {})
+                .finally(() => setAgentAccessBusy(false))
+            }}
+          >
+            {agentAccess?.enabled
+              ? t('agentAccess.on', { date: accessUntilDate(agentAccess.until) })
+              : t('agentAccess.off')}
+          </button>
+        )}
         {importing && !job && progress && progress.total > 0 && (
           <span role="status">{t('import.uploading', { percent: Math.floor((progress.sent / progress.total) * 100) })}</span>
         )}

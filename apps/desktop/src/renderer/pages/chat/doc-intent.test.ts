@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { findByTitle, parseDocIntent } from './doc-intent'
+import { docAgentPrompt, findByTitle, parseDocIntent } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -41,5 +41,19 @@ describe('D2b document intents in a conversation about a document', () => {
     expect(findByTitle(docs, 'boil')).toEqual({ match: docs[1] })
     expect(findByTitle(docs, 'notice')).toEqual({ candidates: [docs[3], docs[4]] })
     expect(findByTitle(docs, '不存在')).toBeNull()
+  })
+})
+
+describe('docAgentPrompt', () => {
+  it('names the current document when there is one, then the tools hint and the user text', () => {
+    expect(docAgentPrompt({ id: 'doc_1', title: '保单.pdf' }, '拆出第 2 页')).toBe(
+      '当前对话的文档：《保单.pdf》（document_id: doc_1）。\n需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档）。\n拆出第 2 页',
+    )
+  })
+
+  it('adds only the tools hint when there is no current document', () => {
+    expect(docAgentPrompt(null, '把两份合并')).toBe(
+      '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档）。\n把两份合并',
+    )
   })
 })

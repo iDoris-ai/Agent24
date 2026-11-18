@@ -38,6 +38,7 @@ import {
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
+  type DocAgentAccess,
   type OfficeEngineStatus,
   type BackendProxyRequest,
   type BackendProxyResponse,
@@ -313,6 +314,8 @@ const api = {
       ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineStatus),
     installOfficeEngine: (): Promise<OfficeEngineStatus> =>
       ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineInstall),
+    agentAccess: (action: 'state' | 'enable' | 'disable' | 'sync'): Promise<DocAgentAccess> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsAgentAccess, action),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
       const listener = (_event: unknown, s: OfficeEngineStatus): void => cb(s)
       ipcRenderer.on(IpcChannels.DocumentsOfficeEngineChanged, listener)

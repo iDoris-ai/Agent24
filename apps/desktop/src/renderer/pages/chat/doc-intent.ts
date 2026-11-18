@@ -56,6 +56,13 @@ export function parseDocIntent(text: string): DocIntent | null {
  * (extension aside); else, among titles containing it, the only shortest one
  * (an original over the documents made from it, 「合并：A + B」 or
  * 「A（第 2 页）」). `candidates` when that still leaves several. */
+/** Prefix the user turn so the Agent uses documents tools (D2b 正式版). */
+export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
+  const hint = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档）。'
+  const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
+  return `${head}${hint}\n${text}`
+}
+
 export function findByTitle<T extends { document_id: string; title: string }>(
   docs: readonly T[],
   named: string,
