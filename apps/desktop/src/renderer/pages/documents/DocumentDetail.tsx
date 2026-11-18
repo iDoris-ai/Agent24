@@ -167,7 +167,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
   const [translating, setTranslating] = useState(false)
   const [trDone, setTrDone] = useState(0)
   const [trTotal, setTrTotal] = useState(0)
-  const [trNote, setTrNote] = useState<{ ok: boolean; text: string } | null>(null)
+  const [trNote, setTrNote] = useState<{ ok: boolean; text: string; file?: string } | null>(null)
   const [trNeedEngine, setTrNeedEngine] = useState(false)
 
   /** Renders page `n` of the head revision and shows it if it is still wanted. */
@@ -318,7 +318,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
         setTrNote({ ok: false, text: t('translate.failed', { error: out.message ?? out.code ?? '' }) })
         return
       }
-      setTrNote({ ok: true, text: t('translate.done', { name: out.docxName ?? '' }) })
+      setTrNote({ ok: true, text: t('translate.done', { name: out.docxName ?? '' }), file: out.docxName })
     } catch (e) {
       if (gen !== generation.current) return
       setTrNote({ ok: false, text: t('translate.failed', { error: e instanceof Error ? e.message : String(e) }) })
@@ -483,7 +483,14 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
             </p>
           )}
           {trNote && (
-            <p role={trNote.ok ? 'status' : 'alert'} style={trNote.ok ? { fontSize: 12, margin: '4px 0' } : ALERT}>{trNote.text}</p>
+            <p role={trNote.ok ? 'status' : 'alert'} style={trNote.ok ? { fontSize: 12, margin: '4px 0' } : ALERT}>
+              {trNote.text}
+              {trNote.file && api.revealDownload && (
+                <button type="button" className="btn btn-ghost" style={{ marginLeft: 6, fontSize: 12 }} onClick={() => { void api.revealDownload?.(trNote.file ?? '') }}>
+                  {t('translate.reveal')}
+                </button>
+              )}
+            </p>
           )}
           {!isOffice(detail.head.media_type) && convertNote && (
             <p role={convertNote.ok ? 'status' : 'alert'} style={convertNote.ok ? { fontSize: 12, margin: '4px 0' } : ALERT}>{convertNote.text}</p>

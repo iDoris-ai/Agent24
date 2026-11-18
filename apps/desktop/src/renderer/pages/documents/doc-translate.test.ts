@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   BATCH_CHARS,
+  articleNumerals,
   joinWrapped,
   paragraphsOf,
   translateParagraphs,
@@ -114,5 +115,15 @@ describe('translateParagraphs (Qwen3 replies)', () => {
     expect(out).toEqual([para('Alpha', false), para('Beta', true)])
     const again = await translateParagraphs(asks(['[{"segment": "1", "translation": "A"}, {"segment": "2", "translation": "B"}]']), [para('甲。'), para('乙。')], 'en')
     expect(again.map((p) => p.text)).toEqual(['A', 'B'])
+  })
+})
+
+describe('articleNumerals (General 11-18)', () => {
+  it('writes article numbers as numerals', () => {
+    expect(articleNumerals('Article One: Leased Property')).toBe('Article 1: Leased Property')
+    expect(articleNumerals('Article Twelve Rent')).toBe('Article 12 Rent')
+    expect(articleNumerals('The first clause: Lease')).toBe('Article 1: Lease')
+    expect(articleNumerals('Article 3 Rent: RMB 8,500')).toBe('Article 3 Rent: RMB 8,500')
+    expect(articleNumerals('Article Seven of the law')).toBe('Article 7 of the law')
   })
 })

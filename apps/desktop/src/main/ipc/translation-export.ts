@@ -1,4 +1,5 @@
-import { ipcMain } from 'electron'
+import path from 'node:path'
+import { ipcMain, shell } from 'electron'
 import { IpcChannels, type TranslationExportResult } from '../../shared/ipc-types'
 import { exportTranslation, type ExportDeps } from '../translation-export'
 import type { IpcGuard } from './guard'
@@ -23,6 +24,15 @@ function requestOf(raw: unknown): { title: string; html: string; lang: 'en' | 'z
 
 /** D4: HTML of a translation → DOCX in Downloads and PDF in the document library. */
 export function registerTranslationExport(options: { guard: IpcGuard; deps: ExportDeps }): void {
+  // ① 「在 Finder 中显示」: a bare file name of the Downloads folder, nothing else.
+  ipcMain.handle(IpcChannels.DocumentsRevealDownload, options.guard((_event, ...args: unknown[]) => {
+    const name = args[0]
+    if (args.length !== 1 || typeof name !== 'string' || name === '' || name !== path.basename(name) || name.startsWith('.')) {
+      throw new Error('documents:reveal-download takes a file name')
+    }
+    shell.showItemInFolder(path.join(options.deps.downloadsDir(), name))
+    return true
+  }))
   ipcMain.handle(IpcChannels.DocumentsExportTranslation, options.guard(async (_event, ...args: unknown[]) => {
     if (args.length !== 1) throw new Error('documents:export-translation takes one argument')
     const req = requestOf(args[0])

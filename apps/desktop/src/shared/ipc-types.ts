@@ -141,6 +141,8 @@ export const IpcChannels = {
   DocumentsAgentAccess: 'documents:agent-access',
   // D4: translated HTML → a DOCX in Downloads and a PDF in the document library.
   DocumentsExportTranslation: 'documents:export-translation',
+  /** D4: show an exported file of the Downloads folder in Finder (its name only). */
+  DocumentsRevealDownload: 'documents:reveal-download',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
