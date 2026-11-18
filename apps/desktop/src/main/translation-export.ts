@@ -50,7 +50,9 @@ export function safeTitle(title: string): string {
     if (code <= 0x1f || code === 0x7f || UNSAFE_NAME.has(ch)) continue
     cleaned += ch
   }
-  const trimmed = cleaned.trim().slice(0, 80).trim()
+  // The original's extension goes: 「合同.pdf」 is exported as 「合同-English.docx」.
+  const stem = cleaned.trim().replace(/\.(pdf|docx?|xlsx?|pptx?|png|jpe?g|txt|md|html?)$/i, '')
+  const trimmed = stem.slice(0, 80).trim()
   return trimmed || 'translation'
 }
 

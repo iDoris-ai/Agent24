@@ -4,7 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { LIBREOFFICE_VERSION } from './office-engine'
-import { exportTranslation, type ExportDeps } from './translation-export'
+import { exportTranslation, safeTitle, type ExportDeps } from './translation-export'
 
 const roots: string[] = []
 
@@ -159,5 +159,13 @@ describe('exportTranslation', () => {
     expect(importPdf).not.toHaveBeenCalled()
     expect(leftovers(dataDir)).toEqual([])
     expect(fs.existsSync(downloads)).toBe(false)
+  })
+})
+
+describe('safeTitle (General 11-18)', () => {
+  it('drops the original extension', () => {
+    expect(safeTitle('房屋租赁合同-测试.pdf')).toBe('房屋租赁合同-测试')
+    expect(safeTitle('Report.DOCX')).toBe('Report')
+    expect(safeTitle('v1.2 plan')).toBe('v1.2 plan')
   })
 })
