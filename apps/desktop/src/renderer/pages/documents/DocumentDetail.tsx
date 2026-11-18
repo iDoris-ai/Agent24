@@ -36,9 +36,11 @@ export function readableSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, autoCheck = false, autoTranslate = null }: {
+export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, onAdded, autoCheck = false, autoTranslate = null }: {
   documentId: string
   onClose: () => void
+  /** A new document was made here (split, conversion): the list reads itself again. */
+  onAdded?: () => void
   /** D3: open another document (the PDF an Office one became), checked once it shows. */
   onOpen?: (id: string, check: boolean) => void
   /** D4: open the PDF an Office document became, then translate it. */
@@ -62,7 +64,10 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     const out = await compose(api, [{ documentId: head.document_id, pages }], title)
     setSplitBusy(false)
     setSplitNote(out.ok ? { ok: true, text: t('compose.done') } : { ok: false, text: t('compose.failed', { error: out.message }) })
-    if (out.ok) setSplitting(null)
+    if (out.ok) {
+      setSplitting(null)
+      onAdded?.()
+    }
   }
   const api = window.agent24.documents
   // D1: an Office document is stored as-is. Convert it to PDF before preview.
@@ -80,6 +85,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     setConvertBusy(false)
     if (out.ok) {
       setConvertNote({ ok: true, text: t('compose.done') })
+      onAdded?.()
       // D3: a Word document is checked as the PDF it became, whose blocks have pages to go back to.
       // D4: the same PDF is what gets translated.
       if (thenLang && out.documentId && onTranslate) onTranslate(out.documentId, thenLang)
