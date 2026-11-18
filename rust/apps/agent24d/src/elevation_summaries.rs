@@ -36,6 +36,24 @@ pub const UNTITLED: &str = "untitled";
 /// The fixed shutdown text.
 pub const SHUTDOWN_TEXT: &str = "stop the Agent24 background service (running work stops)";
 
+/// Presence text for `POST /api/v1/os/{name}/delegation`.
+///
+/// Not a [`crate::capabilities::first_party::DERIVED_ROUTES`] row. That list
+/// is exactly the Elevated rows of approval, schedule, shutdown and models
+/// (`derived_routes_are_the_elevated_rows_they_summarise`). The surface is
+/// read at elevate time, the same way kernel consent stays off that list.
+/// `routes_prefix` is the first 12 hex digits of `routes_sha256`.
+pub fn module_delegation_summary(
+    name: &str,
+    version: &str,
+    namespace: &str,
+    routes_prefix: &str,
+) -> String {
+    format!(
+        "允许桌面写入 {name} 模块的数据; delegate module '{name}'; version: {version}; namespace: {namespace}; routes_sha256: {routes_prefix}"
+    )
+}
+
 /// The text for `method` + `template` at `path` with `body`, or `None`.
 pub async fn derive(
     state: &AppState,

@@ -5,12 +5,26 @@ import {
   type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
 } from './model'
 
-function errorMessage(data: unknown, fallback: string): string {
-  if (typeof data === 'object' && data !== null && 'error' in data) {
-    const message = (data as { error?: { message?: unknown } }).error?.message
-    if (typeof message === 'string' && message) return message
+export class WriteFailed extends Error {
+  constructor(message: string, readonly code: string) {
+    super(message)
+    this.name = 'WriteFailed'
   }
-  return fallback
+}
+
+function errorOf(data: unknown): { code: string; message: string } {
+  if (typeof data === 'object' && data !== null && 'error' in data) {
+    const error = (data as { error?: { code?: unknown; message?: unknown } }).error
+    return {
+      code: typeof error?.code === 'string' ? error.code : '',
+      message: typeof error?.message === 'string' ? error.message : '',
+    }
+  }
+  return { code: '', message: '' }
+}
+
+function errorMessage(data: unknown, fallback: string): string {
+  return errorOf(data).message || fallback
 }
 
 export async function sin90Get(path: string): Promise<unknown> {
@@ -77,5 +91,8 @@ export async function sin90Write(body: Record<string, unknown>): Promise<void> {
   const write = window.agent24.sin90Write
   if (!write) throw new Error('sin90 write is unavailable')
   const res = await write(body)
-  if (!res.ok) throw new Error(errorMessage(res.data, 'sin90 write failed'))
+  if (!res.ok) {
+    const { code, message } = errorOf(res.data)
+    throw new WriteFailed(message || 'sin90 write failed', code)
+  }
 }
