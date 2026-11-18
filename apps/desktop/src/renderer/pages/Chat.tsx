@@ -15,6 +15,7 @@ import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
 import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
+import { convert } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
@@ -241,7 +242,12 @@ export default function ChatPage() {
             setDelivery(index, { kind: 'sent' })
             setMessages(prev => [...prev, { role: 'assistant', content: subject }])
           } else {
-            const blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
+            let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
+            // A Word/Excel/PPT document has no text of its own: it is checked as the PDF it becomes.
+            if (blocks.length === 0) {
+              const pdf = await convert(api, subject.id)
+              if (pdf.ok && pdf.documentId) blocks = await readAllCheckBlocks((req) => api.request(req), pdf.documentId, 1)
+            }
             const report = await checkDocument(
               { ask: (prompt) => askWithProxy(window.agent24.backendProxy, prompt) },
               subject.title,

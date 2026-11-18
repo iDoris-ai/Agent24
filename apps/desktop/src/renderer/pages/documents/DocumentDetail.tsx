@@ -35,7 +35,14 @@ export function readableSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function DocumentDetail({ documentId, onClose }: { documentId: string; onClose: () => void }) {
+export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck = false }: {
+  documentId: string
+  onClose: () => void
+  /** D3: open another document (the PDF an Office one became), checked once it shows. */
+  onOpen?: (id: string, check: boolean) => void
+  /** D3: run 「总结并检查」 as soon as the text is read. */
+  autoCheck?: boolean
+}) {
   const t = useT(documentsMessages)
   const { open } = useContext(CapabilitiesContext)
   // D2: split out some pages as a new document.
@@ -58,7 +65,7 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
   const [convertNote, setConvertNote] = useState<{ ok: boolean; text: string } | null>(null)
   const [needEngine, setNeedEngine] = useState(false)
   const [downloadText, setDownloadText] = useState<string | null>(null)
-  const runConvert = async (id: string) => {
+  const runConvert = async (id: string, thenCheck = false) => {
     setConvertBusy(true)
     setNeedEngine(false)
     setConvertNote({ ok: true, text: t('compose.working') })
@@ -66,6 +73,8 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     setConvertBusy(false)
     if (out.ok) {
       setConvertNote({ ok: true, text: t('compose.done') })
+      // D3: a Word document is checked as the PDF it became, whose blocks have pages to go back to.
+      if (thenCheck && out.documentId && onOpen) onOpen(out.documentId, true)
       return
     }
     if (out.engineMissing) {
@@ -296,6 +305,14 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
     }
     // `read` and `show` check their refs; only the document matters.
   }, [api, documentId])
+  // D3: opened to be checked (an Office document's PDF): once, when its text is first read.
+  const autoChecked = useRef<string | null>(null)
+  useEffect(() => {
+    if (!autoCheck || !detail || detail.document_id !== documentId || blocks.length === 0 || loading) return
+    if (autoChecked.current === documentId) return
+    autoChecked.current = documentId
+    void runCheck(detail)
+  })
 
   return (
     <section aria-label={t('detail.label')} style={{ border: '1px solid var(--border)', borderRadius: 6, padding: 12, margin: '12px 0' }}>
@@ -350,6 +367,11 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           <button className="btn btn-primary" disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id)}>
             {t('office.convert')}
           </button>
+          {onOpen && (
+            <button className="btn" style={{ marginLeft: 8 }} disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id, true)}>
+              {t('check.convertAndCheck')}
+            </button>
+          )}
           {needEngine && (
             <>
               <p>{t('office.needEngine')}</p>
@@ -402,7 +424,11 @@ export default function DocumentDetail({ documentId, onClose }: { documentId: st
           </button>
           {checking && (
             <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>
-              {t('check.progress', { done: checkDone, total: checkTotal })}
+              {checkTotal === 0
+                ? t('check.reading')
+                : checkDone >= checkTotal - 1
+                  ? t('check.summing')
+                  : t('check.progress', { done: String(checkDone + 1), total: String(checkTotal - 1) })}
             </p>
           )}
           {checkError && (

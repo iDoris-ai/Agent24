@@ -111,6 +111,8 @@ export default function DocumentsPage() {
     return () => { live = false }
   }, [api])
   const [open, setOpen] = useState<string | null>(null)
+  // D3: the document opened to be checked straight away (an Office one's PDF).
+  const [autoCheck, setAutoCheck] = useState<string | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
   // from a later page is not on the new first one).
@@ -310,6 +312,8 @@ export default function DocumentsPage() {
       {open && (
         <DocumentDetail
           documentId={open}
+          autoCheck={autoCheck === open}
+          onOpen={(id, check) => { setAutoCheck(check ? id : null); setOpen(id) }}
           onClose={() => {
             setOpen(null)
             ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
