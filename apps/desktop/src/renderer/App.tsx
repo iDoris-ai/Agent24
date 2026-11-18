@@ -25,6 +25,7 @@ import { Breadcrumb } from './capabilities/Breadcrumb'
 import { CapabilityPage } from './capabilities/CapabilityPage'
 import CapabilitiesPage from './pages/Capabilities'
 import { useCapabilityStatus } from './capabilities/useCapabilityStatus'
+import { revokeKernelConsent } from './kernel-consent/kernelConsentApi'
 import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './capabilities/providers'
 import { CapabilitiesContext, NavPrefsContext } from './capabilities/types'
 import { capabilitiesMessages } from './capabilities/capabilities.i18n'
@@ -327,7 +328,7 @@ function AppShell(): JSX.Element {
         {page === 'models'           && <ModelsPage />}
         {page === 'memory'           && <MemoryPage />}
         {page === 'settings'         && <SettingsPage key={route.kind === 'page' ? route.key : undefined} initialTab={route.kind === 'page' ? route.initialTab : undefined} />}
-        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} grantsFor={statusFor.grantsFor} isolationFor={statusFor.isolationFor} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
+        {page === 'capabilities'     && <CapabilitiesPage statusFor={statusFor} grantsFor={statusFor.grantsFor} isolationFor={statusFor.isolationFor} consentFor={statusFor.consentFor} onRevoke={(id) => { void revokeKernelConsent(id) }} onOpenSettings={() => open('settings/general', 'capabilities', { focus: 'slots' })} />}
         {page === 'modules-manager'  && <ModulesManagerPage />}
         {selected && !['assistant', 'documents', 'schedules', 'communication', 'voice', 'creative', 'knowledgeBase', 'models', 'memory', 'modules-manager'].includes(selected.page)
           && <CapabilityPage capability={selected} />}

@@ -42,6 +42,8 @@ function renderPage(opts: {
   statusFor?: (id: string) => string | undefined
   grantsFor?: (id: string) => readonly string[] | undefined
   isolationFor?: (id: string) => { state: 'isolated'; mechanism: 'seatbelt' } | { state: 'not_isolated'; reason: 'platform_unsupported' | 'form_not_covered' } | undefined
+  consentFor?: (id: string) => 'exempt' | 'missing' | 'granted' | undefined
+  onRevoke?: (id: string) => void
   onOpenSettings?: () => void
 } = {}) {
   cleanup()
@@ -52,7 +54,7 @@ function renderPage(opts: {
   render(
     <CapabilitiesContext.Provider value={{ defs: opts.defs ?? DEFS, open }}>
       <NavPrefsContext.Provider value={{ prefs, setPrefs: next => setPrefs(typeof next === 'function' ? next(prefs) : next) }}>
-        <CapabilitiesPage statusFor={opts.statusFor} grantsFor={opts.grantsFor} isolationFor={opts.isolationFor} onOpenSettings={onOpenSettings} />
+        <CapabilitiesPage statusFor={opts.statusFor} grantsFor={opts.grantsFor} isolationFor={opts.isolationFor} consentFor={opts.consentFor} onRevoke={opts.onRevoke} onOpenSettings={onOpenSettings} />
       </NavPrefsContext.Provider>
     </CapabilitiesContext.Provider>,
   )
@@ -171,17 +173,35 @@ describe('CapabilitiesPage', () => {
     renderPage({
       grantsFor: (id) => id === 'documents' ? ['events'] : id === 'sin90' ? [] : undefined,
     })
-    expect(within(row('Documents')).getByText('Kernel capabilities: events')).toBeInTheDocument()
+    expect(within(row('Documents')).getByText('Kernel capabilities: Send events under this module\'s name')).toBeInTheDocument()
     expect(within(row('Sin90')).getByText('Kernel capabilities: none')).toBeInTheDocument()
     expect(within(row('Assistant')).queryByText(/Kernel capabilities/)).not.toBeInTheDocument()
     expect(within(row('Documents')).queryByRole('textbox')).not.toBeInTheDocument()
 
     act(() => setLocale('zh'))
-    expect(within(row('文档')).getByText('内核能力：events')).toBeInTheDocument()
+    expect(within(row('文档')).getByText('内核能力：以这个模块的名字发出事件')).toBeInTheDocument()
     expect(within(row('Sin90')).getByText('内核能力：无')).toBeInTheDocument()
     act(() => setLocale('th'))
-    expect(within(row('เอกสาร')).getByText('ความสามารถเคอร์เนล: events')).toBeInTheDocument()
+    expect(within(row('เอกสาร')).getByText('ความสามารถเคอร์เนล: ส่งเหตุการณ์ในชื่อของโมดูลนี้')).toBeInTheDocument()
     expect(within(row('Sin90')).getByText('ความสามารถเคอร์เนล: ไม่มี')).toBeInTheDocument()
+    act(() => setLocale('en'))
+  })
+
+  it('offers stop authorization only on a module that needs a card', () => {
+    const onRevoke = vi.fn()
+    renderPage({
+      grantsFor: (id) => id === 'documents' || id === 'sin90' ? ['events'] : undefined,
+      consentFor: (id) => id === 'documents' ? 'exempt' : id === 'sin90' ? 'granted' : undefined,
+      onRevoke,
+    })
+    expect(within(row('Documents')).queryByRole('button', { name: 'Stop authorization' })).not.toBeInTheDocument()
+    fireEvent.click(within(row('Sin90')).getByRole('button', { name: 'Stop authorization' }))
+    expect(onRevoke).toHaveBeenCalledWith('sin90')
+    act(() => setLocale('zh'))
+    expect(within(row('文档')).queryByRole('button', { name: '停止授权' })).not.toBeInTheDocument()
+    expect(within(row('Sin90')).getByRole('button', { name: '停止授权' })).toBeInTheDocument()
+    act(() => setLocale('th'))
+    expect(within(row('Sin90')).getByRole('button', { name: 'หยุดการอนุญาต' })).toBeInTheDocument()
     act(() => setLocale('en'))
   })
 
