@@ -587,10 +587,15 @@ async fn an_exempt_module_does_not_open_a_dialog() {
 #[tokio::test]
 async fn revoke_of_an_exempt_module_is_conflict_and_a_missing_module_is_not_found() {
     let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
     state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
         "documents".into(),
         Some(agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned()),
     )])));
+    store
+        .upsert_kernel_consent(&kernel_consent_row("documents"))
+        .await
+        .unwrap();
     let app = build_router(state);
     let (status, body) = call(
         &app,
@@ -602,17 +607,83 @@ async fn revoke_of_an_exempt_module_is_conflict_and_a_missing_module_is_not_foun
     .await;
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
     assert_eq!(body["error"]["code"], "consent_exempt");
+    assert!(
+        store
+            .get_kernel_consent("documents")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Tracking an empty set here would deny the bundled module's callbacks.
+    assert!(!crate::kernel_consent::live_denies("documents", "events"));
+}
 
-    let (status, body) = call(
+/// The name was never mounted. DELETE still removes the row and answers 2xx.
+/// Restoring the 404 return before the delete fails this test.
+#[tokio::test]
+async fn delete_of_an_unreported_name_removes_the_kernel_consent_row() {
+    let name = "kc-unreported";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    state.os_reports = Arc::new(vec![]);
+    store
+        .upsert_kernel_consent(&kernel_consent_row(name))
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, _) = call(
         &app,
         Method::DELETE,
-        "/api/v1/os/kc-no-such/kernel-consent",
+        &format!("/api/v1/os/{name}/kernel-consent"),
         Some(&host),
         "",
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
-    assert_eq!(body["error"]["code"], "not_found");
+    assert!(status.is_success(), "{status}");
+    assert!(store.get_kernel_consent(name).await.unwrap().is_none());
+}
+
+/// A degraded report whose manifest was not read has no declaration.
+/// DELETE still removes the row. Restoring the 404 return fails this test.
+#[tokio::test]
+async fn delete_of_a_degraded_report_without_d9_removes_the_kernel_consent_row() {
+    let name = "kc-degraded";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    let mut report = os_report(
+        name,
+        MountOutcome::Degraded("integrity".into()),
+        d9(name, false, "kc-degraded-tasks", &["events"]),
+    );
+    report.d9 = None;
+    state.os_reports = Arc::new(vec![report]);
+    store
+        .upsert_kernel_consent(&kernel_consent_row(name))
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert!(store.get_kernel_consent(name).await.unwrap().is_none());
+}
+
+fn kernel_consent_row(module: &str) -> agent24_store::KernelConsentRow {
+    agent24_store::KernelConsentRow {
+        module: module.to_owned(),
+        fingerprint: "k=events;o=".into(),
+        capabilities: vec!["events".into()],
+        team_id: Some("OTHERTEAM1".into()),
+        version: "1".into(),
+        decided_at: "2026-11-18T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
+    }
 }
 
 #[tokio::test]
@@ -676,6 +747,63 @@ async fn revoke_clears_the_live_grant() {
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     assert!(crate::kernel_consent::live_denies(name, "events"));
+}
+
+/// Dropping `track` from `store_grant` leaves the empty set written by revoke,
+/// so `live_denies` stays true and this test fails.
+#[tokio::test]
+async fn grant_revoke_grant_shows_granted_and_does_not_deny_live() {
+    let name = "kc-regrant";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.presence_provider = Some(Arc::new(ScriptedPresence {
+        outcome: PresenceOutcome::Allowed,
+        calls: calls.clone(),
+        summary: Arc::new(std::sync::Mutex::new(String::new())),
+    }));
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        name.into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    let mut module = os_report(
+        name,
+        MountOutcome::Mounted,
+        d9(name, false, "kc-regrant-tasks", &["events"]),
+    );
+    module.granted = vec!["events".into()];
+    state.os_reports = Arc::new(vec![module]);
+    let app = build_router(state);
+    let grant = grant_body("k=events;o=", &["events"]);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        &grant,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        &grant,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, name)["kernel_consent"], "granted");
+    assert!(!crate::kernel_consent::live_denies(name, "events"));
 }
 
 #[tokio::test]

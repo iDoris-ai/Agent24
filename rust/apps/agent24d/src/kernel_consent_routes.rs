@@ -207,21 +207,23 @@ pub async fn grant(
 }
 
 pub async fn revoke(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let Some(declared) = os_kernel_declaration(&state, &name) else {
-        return error_response(StatusCode::NOT_FOUND, "not_found", "OS module not found");
-    };
-    if declared.exempt {
-        return error_response(
-            StatusCode::CONFLICT,
-            "consent_exempt",
-            "这个模块随桌面自带，不用同意卡",
-        );
-    }
+    // DELETE is idempotent. A missing declaration still drops the row: the
+    // package may be broken or not mounted yet, and uninstall has to clear it.
+    let declared = os_kernel_declaration(&state, &name);
+    let exempt = declared.as_ref().is_some_and(|declared| declared.exempt);
     if state.store.delete_kernel_consent(&name).await.is_err() {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "store_unavailable",
             "could not delete the kernel consent",
+        );
+    }
+    if exempt {
+        // Do not `track`. An empty set would deny a bundled module's callbacks.
+        return error_response(
+            StatusCode::CONFLICT,
+            "consent_exempt",
+            "这个模块随桌面自带，不用同意卡",
         );
     }
     let now = Utc::now();

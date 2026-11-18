@@ -171,7 +171,9 @@ pub fn hold(
         };
     };
     // The card shows the signing team. A row for a different team is not
-    // this package's consent. Off macOS both sides are `None`.
+    // this package's consent. Off macOS both sides are `None`. On macOS a
+    // team read that fails is stored as `None`: the mismatch deletes the
+    // row and asks for the card again, so the user consents once more.
     if row.team_id.as_deref() != current_team
         || !still_current(&row.expires_at, now)
         || !same_or_shrink(&row.fingerprint, current_fingerprint)

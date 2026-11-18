@@ -1956,6 +1956,11 @@ async fn delete_kernel_consent_online(
         Ok(res) => {
             let status = res.status;
             let body = res.json_value().await;
+            // An exempt module has nothing to revoke. The row is already gone.
+            if status == reqwest::StatusCode::CONFLICT && body["error"]["code"] == "consent_exempt"
+            {
+                return Ok(());
+            }
             if body["error"]["message"].as_str().is_some() {
                 Err(format!(
                     "could not revoke {name} kernel consent: {}",
@@ -4038,6 +4043,65 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// `409 consent_exempt` means there is nothing to revoke. Both the missing
+    /// package branch and the installed branch succeed, and the installed
+    /// directory is moved away. Treating that 409 as an error fails this test.
+    #[tokio::test]
+    async fn uninstall_accepts_consent_exempt_for_a_missing_and_an_installed_package() {
+        let port = consent_exempt_stub();
+        let online = Endpoint {
+            base: format!("http://127.0.0.1:{port}"),
+            token: String::new(),
+            child: None,
+            session: None,
+        };
+        let packages = tempfile::tempdir().unwrap();
+        uninstall_with_consent("kc-exempt-missing", packages.path(), None, Some(&online))
+            .await
+            .unwrap();
+
+        let installed = packages.path().join("kc-exempt-installed");
+        std::fs::create_dir(&installed).unwrap();
+        uninstall_with_consent("kc-exempt-installed", packages.path(), None, Some(&online))
+            .await
+            .unwrap();
+        assert!(
+            !installed.exists(),
+            "the installed package directory must be moved away"
+        );
+    }
+
+    /// Kernel-consent DELETE is `409 consent_exempt`. Any other path is 204,
+    /// so module-consent revocation can finish before the kernel DELETE.
+    fn consent_exempt_stub() -> u16 {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(mut socket) = incoming else { continue };
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let (status, body) = if req.contains("kernel-consent") {
+                    (
+                        "409 Conflict",
+                        r#"{"error":{"code":"consent_exempt","message":"exempt"}}"#,
+                    )
+                } else {
+                    ("204 No Content", "")
+                };
+                let reply = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(reply.as_bytes());
+            }
+        });
+        port
     }
 
     #[test]
