@@ -148,6 +148,17 @@ fn isolation_here(class: ComponentClass) -> Isolation {
     component_isolation(class, cfg!(target_os = "macos"))
 }
 
+/// OS package classification. A name with no recorded team is `None` on
+/// macOS, which is not the built-in team, so a bundled name is not exempt.
+fn kernel_consent_of(state: &AppState, name: &str) -> crate::kernel_consent::KernelConsentClass {
+    let teams = state
+        .os_signing_teams
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let team = teams.get(name).and_then(|team| team.as_deref());
+    crate::kernel_consent::classify(name, team, cfg!(target_os = "macos"))
+}
+
 /// Host-only kernel picture. `kernel_grants` is the mount's list.
 /// `declared` is `None` when the manifest was not read.
 struct KernelView {
@@ -182,6 +193,10 @@ pub struct Item {
     denied: Vec<Denial>,
     /// Seatbelt or why this row is not isolated. Both audiences.
     isolation: Isolation,
+    /// Host only. Present on an OS package: `exempt` skips the consent card,
+    /// `missing` means the card applies. Grants are unchanged in this slice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kernel_consent: Option<crate::kernel_consent::KernelConsentClass>,
 }
 
 /// What a non-host audience sees in capability mode (see [`sees_everything`]): the fields are
@@ -210,6 +225,7 @@ impl Item {
             declared: None,
             denied: Vec::new(),
             isolation: isolation_here(class_of(form)),
+            kernel_consent: None,
         }
     }
     fn with(mut self, f: impl FnOnce(&mut Self)) -> Self {
@@ -879,12 +895,14 @@ fn documents_item(state: &AppState) -> Item {
             .get("documents")
             .map(|rx| rx.borrow().clone())
     });
-    documents_shown(
+    let mut item = documents_shown(
         report,
         outcome.as_ref(),
         live.as_ref(),
         documents_catalog::DocumentsCatalog::embedded(),
-    )
+    );
+    item.kernel_consent = Some(kernel_consent_of(state, "documents"));
+    item
 }
 
 /// Domain OS and in-process modules other than the builtins. Documents stays
@@ -1010,6 +1028,7 @@ fn os_module_items(state: &AppState) -> Vec<Item> {
                 // OS module (FU). In-process stays `form_not_covered`.
                 if d9.is_some_and(|d| !d.in_process) {
                     i.isolation = isolation_here(ComponentClass::OsModule);
+                    i.kernel_consent = Some(kernel_consent_of(state, &report.name));
                 }
                 i.set_kernel(kernel);
                 i.version = if report.version.is_empty() {

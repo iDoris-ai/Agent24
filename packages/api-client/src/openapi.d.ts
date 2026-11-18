@@ -2687,6 +2687,11 @@ export interface components {
             /** @description Host only. Closed reasons an item is not in `kernel_grants`. */
             denied: components["schemas"]["ComponentDenial"][];
             isolation: components["schemas"]["ComponentIsolation"];
+            /**
+             * @description Host only, and only on an OS package. `exempt`: the module name is on the bundled list (`documents`, `sin90`) and, on macOS, the package team is the built-in team. `missing`: the kernel consent card applies. Absent on every other row and on the redacted view. This slice does not change `kernel_grants`.
+             * @enum {string}
+             */
+            kernel_consent?: "exempt" | "missing";
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
                 [key: string]: unknown;

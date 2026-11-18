@@ -926,6 +926,9 @@ pub struct Package {
     /// `sha256:<hex>` of the manifest's bytes — what the module must report in
     /// its handshake.
     pub digest: String,
+    /// macOS Developer ID team of the package executable, when it was read.
+    /// `None` off macOS, or when the team could not be read. Not a grant.
+    pub signing_team: Option<String>,
 }
 
 /// What the daemon lends every out-of-process module: where their callback
@@ -2870,6 +2873,7 @@ while f.readline():
                 manifest: d.manifest,
                 dir: d.dir,
                 digest: d.digest,
+                signing_team: None,
             })),
         })
         .collect()
@@ -3715,6 +3719,7 @@ raise SystemExit(3)
                     manifest: d.manifest,
                     dir: d.dir,
                     digest: d.digest,
+                    signing_team: None,
                 })),
             })
             .collect()
@@ -4772,6 +4777,7 @@ raise SystemExit(3)
                 manifest: DomainOsManifest::from_yaml(&alpha_yaml).unwrap(),
                 dir: tmp.path().join("alpha"),
                 digest: "sha256:00".to_owned(),
+                signing_team: None,
             })),
         };
         let beta = FakeModule::from_yaml(
@@ -6336,6 +6342,7 @@ raise SystemExit(3)
                     manifest: d.manifest,
                     dir: d.dir,
                     digest: d.digest,
+                    signing_team: None,
                 })),
             })
             .collect();

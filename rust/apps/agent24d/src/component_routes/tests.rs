@@ -274,6 +274,84 @@ async fn components_show_the_mount_grant_not_the_resolver() {
         isolation_json(false)
     );
     assert!(!redacted.to_string().contains("no_channel"));
+    assert!(row.get("kernel_consent").is_none());
+}
+
+/// Bundled name plus the built-in team is `exempt`. The same name with
+/// another team, and any other package, is `missing`. The redacted view
+/// does not carry the field. Grants are still the mount list.
+#[tokio::test]
+async fn kernel_consent_classifies_bundled_packages_without_changing_grants() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let builtin = agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned();
+    state.os_signing_teams =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+            ("documents".into(), Some(builtin.clone())),
+            ("sin90".into(), Some(builtin)),
+            ("documents-foreign".into(), Some("OTHERTEAM1".into())),
+            ("widget".into(), Some("OTHERTEAM1".into())),
+        ])));
+    let mut documents = os_report(
+        "documents",
+        MountOutcome::Mounted,
+        d9("documents", false, "documents-tasks", &["events"]),
+    );
+    documents.granted = vec!["events".into()];
+    let mut sin90 = os_report(
+        "sin90",
+        MountOutcome::Mounted,
+        d9("sin90", false, "sin90-tasks", &["events", "models"]),
+    );
+    sin90.granted = vec!["events".into(), "models".into()];
+    let mut widget = os_report(
+        "widget",
+        MountOutcome::Mounted,
+        d9("widget", false, "widget-tasks", &["events"]),
+    );
+    widget.granted = vec!["events".into()];
+    state.os_reports = std::sync::Arc::new(vec![documents, sin90, widget]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "documents")["kernel_consent"], "exempt");
+    assert_eq!(find(&full, "documents")["kernel_grants"], json!(["events"]));
+    assert_eq!(find(&full, "sin90")["kernel_consent"], "exempt");
+    assert_eq!(
+        find(&full, "sin90")["kernel_grants"],
+        json!(["events", "models"])
+    );
+    assert_eq!(find(&full, "widget")["kernel_consent"], "missing");
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!(["events"]));
+    assert!(find(&full, "hyphae").get("kernel_consent").is_none());
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let row = find(&redacted, "widget");
+    assert!(row.get("kernel_consent").is_none());
+    assert!(row.get("kernel_grants").is_none());
+}
+
+/// Same module name, team is not the built-in team: the card applies.
+#[tokio::test]
+async fn a_bundled_name_signed_by_another_team_is_not_exempt() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    state.os_signing_teams = std::sync::Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::from([("sin90".into(), Some("OTHERTEAM1".into()))]),
+    ));
+    state.os_reports = std::sync::Arc::new(vec![os_report(
+        "sin90",
+        MountOutcome::Mounted,
+        d9("sin90", false, "sin90-tasks", &["events"]),
+    )]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "sin90")["kernel_consent"], "missing");
 }
 
 fn denial_code<'a>(row: &'a Value, item: &str) -> Option<&'a str> {

@@ -5894,6 +5894,15 @@ components:
             $ref: "#/components/schemas/ComponentDenial"
         isolation:
           $ref: "#/components/schemas/ComponentIsolation"
+        kernel_consent:
+          type: string
+          enum: [exempt, missing]
+          description: >-
+            Host only, and only on an OS package. `exempt`: the module name is
+            on the bundled list (`documents`, `sin90`) and, on macOS, the
+            package team is the built-in team. `missing`: the kernel consent
+            card applies. Absent on every other row and on the redacted view.
+            This slice does not change `kernel_grants`.
         detail:
           type: object
           additionalProperties: true
