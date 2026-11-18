@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest'
 import {
   CHUNK_CHARS,
-  CONTRACT_CHECKLIST,
+  CONTRACT_CHECKLIST, missingOf,
   MAX_CHUNKS,
   checkDocument,
   reportMarkdown,
@@ -101,8 +101,13 @@ describe('checkDocument', () => {
     ])
     expect(report.summary.map((c) => c.text)).toEqual(['有效摘要'])
     expect(report.conflicts.map((c) => c.text)).toEqual(['两处不一致'])
-    expect(report.missing).toEqual(['争议解决', '合同当事人'])
+    expect(report.missing).toEqual(['合同当事人', '争议解决'])
     expect(report.missing.every((m) => CONTRACT_CHECKLIST.includes(m))).toBe(true)
+  })
+
+  it('never says an element is missing when the text has it (General 11-18)', () => {
+    const blocks = [block('a', '出租方（甲方）：北京某某科技有限公司；乙方：张三。租期自2026年1月1日至2026年12月31日，月租金5000元。', 1)]
+    expect(missingOf(['合同当事人', '合同期限', '付款金额与方式', '争议解决'], blocks)).toEqual(['争议解决'])
   })
 
   it('cuts after MAX_CHUNKS and asks once per kept chunk plus the summary', async () => {

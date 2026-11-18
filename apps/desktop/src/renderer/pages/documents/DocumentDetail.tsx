@@ -335,11 +335,40 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
               {t('split.button')}
             </button>
           )}
+          {detail && !isOffice(detail.head.media_type) && blocks.length > 0 && (
+            <button className="btn btn-ghost" disabled={checking} onClick={() => void runCheck(detail)}>
+              {t('check.button')}
+            </button>
+          )}
+          {detail && isOffice(detail.head.media_type) && onOpen && (
+            <button className="btn btn-ghost" disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id, true)}>
+              {t('check.button')}
+            </button>
+          )}
           <button className="btn btn-ghost" onClick={onClose}>
             {t('detail.close')}
           </button>
         </div>
       </div>
+      {detail && (checking || checkError || report) && (
+        <div style={{ margin: '8px 0' }}>
+          {checking && (
+            <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>
+              {checkTotal === 0
+                ? t('check.reading')
+                : checkDone >= checkTotal - 1
+                  ? t('check.summing')
+                  : t('check.progress', { done: String(checkDone + 1), total: String(checkTotal - 1) })}
+            </p>
+          )}
+          {checkError && (
+            <p role="alert" style={ALERT}>{checkError}</p>
+          )}
+          {report && (
+            <CheckResult report={report} t={t} onJump={(s) => jumpTo(detail, s)} />
+          )}
+        </div>
+      )}
       {detail && splitting !== null && (
         <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '8px 0' }}>
           <input aria-label={t('split.pages')} placeholder={t('split.pages')} value={splitting}
@@ -367,11 +396,6 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
           <button className="btn btn-primary" disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id)}>
             {t('office.convert')}
           </button>
-          {onOpen && (
-            <button className="btn" style={{ marginLeft: 8 }} disabled={convertBusy || downloadText !== null} onClick={() => void runConvert(detail.document_id, true)}>
-              {t('check.convertAndCheck')}
-            </button>
-          )}
           {needEngine && (
             <>
               <p>{t('office.needEngine')}</p>
@@ -416,28 +440,6 @@ export default function DocumentDetail({ documentId, onClose, onOpen, autoCheck 
             />
           )}
         </figure>
-      )}
-      {detail && !isOffice(detail.head.media_type) && blocks.length > 0 && (
-        <div style={{ margin: '8px 0' }}>
-          <button className="btn btn-primary" disabled={checking} onClick={() => void runCheck(detail)}>
-            {t('check.button')}
-          </button>
-          {checking && (
-            <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>
-              {checkTotal === 0
-                ? t('check.reading')
-                : checkDone >= checkTotal - 1
-                  ? t('check.summing')
-                  : t('check.progress', { done: String(checkDone + 1), total: String(checkTotal - 1) })}
-            </p>
-          )}
-          {checkError && (
-            <p role="alert" style={ALERT}>{checkError}</p>
-          )}
-          {report && (
-            <CheckResult report={report} t={t} onJump={(s) => jumpTo(detail, s)} />
-          )}
-        </div>
       )}
       {unparsed.size > 0 && <p role="note">{t('detail.partial', { count: unparsed.size })}</p>}
       {error && (
@@ -515,6 +517,7 @@ function CheckResult({ report, t, onJump }: { report: CheckReport; t: TFn; onJum
   return (
     <div style={{ marginTop: 8 }}>
       {section(t('check.summary'), null, report.summary)}
+      {section(t('check.parties'), null, report.items.filter((i) => i.kind === 'party').map((i) => ({ text: i.text, sources: [i.source] })))}
       {section(t('check.deadlines'), null, report.items.filter((i) => i.kind === 'deadline').map((i) => ({ text: i.text, sources: [i.source] })))}
       {section(t('check.amounts'), null, report.items.filter((i) => i.kind === 'amount').map((i) => ({ text: i.text, sources: [i.source] })))}
       {section(t('check.conditions'), null, report.items.filter((i) => i.kind === 'condition').map((i) => ({ text: i.text, sources: [i.source] })))}
