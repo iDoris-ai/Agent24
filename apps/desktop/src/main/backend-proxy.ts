@@ -128,6 +128,19 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
+  // Sin90 reads are Everyday. Writes stay on the main-process Sin90 IPC,
+  // which attaches the human key. Do not add POST/PATCH/PUT here.
+  r('GET', '/api/v1/sin90/today'),
+  r('GET', '/api/v1/sin90/directions'),
+  r('GET', '/api/v1/sin90/tasks'),
+  r('GET', '/api/v1/sin90/areas'),
+  r('GET', '/api/v1/sin90/weeks'),
+  r('GET', '/api/v1/sin90/weeks/{id}/attention'),
+  r('GET', '/api/v1/sin90/schedule-blocks'),
+  r('GET', '/api/v1/sin90/routines'),
+  r('GET', '/api/v1/sin90/rhythms'),
+  r('GET', '/api/v1/sin90/proposals'),
+  r('GET', '/api/v1/sin90/reviews'),
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,
@@ -212,6 +225,8 @@ export interface ProxyOptions {
   host?: string
   timeoutMs?: number
   maxBytes?: number
+  /** Sin90 human key. Main sets this; the renderer cannot. */
+  actorKey?: string
 }
 
 export function validIdempotencyKey(value: unknown): value is string | undefined {
@@ -227,6 +242,9 @@ export function proxyRequest(
 ): Promise<BackendProxyResponse> {
   if (!validIdempotencyKey(req.idempotencyKey)) {
     return Promise.resolve(proxyError('invalid_request', 'invalid idempotency key'))
+  }
+  if (opts.actorKey !== undefined && !/^[\x21-\x7e]+$/.test(opts.actorKey)) {
+    return Promise.resolve(proxyError('invalid_request', 'invalid actor key'))
   }
   const timeoutMs = opts.timeoutMs ?? PROXY_TIMEOUT_MS
   const maxBytes = opts.maxBytes ?? PROXY_MAX_BODY_BYTES
@@ -267,6 +285,7 @@ export function proxyRequest(
             'Content-Type': 'application/json',
             ...endpoint.authHeaders,
             ...(req.idempotencyKey ? { 'Idempotency-Key': req.idempotencyKey } : {}),
+            ...(opts.actorKey ? { 'x-sin90-actor-key': opts.actorKey } : {}),
             ...(body ? { 'Content-Length': Buffer.byteLength(body) } : {}),
           },
         },

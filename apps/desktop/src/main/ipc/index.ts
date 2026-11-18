@@ -29,6 +29,7 @@ import { readOmlxSettingsKey } from '../omlx-settings-key'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
+import { desktopSin90Write, sin90KeyAvailable } from '../sin90-write'
 import { importFile } from '../documents-import'
 import type { ModuleActionResult } from '../documents-module'
 import { formatBytes, type OsPackageResult } from '../os-package-install'
@@ -768,6 +769,8 @@ export function registerIpcHandlers(options: {
   })
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
+  handle(IpcChannels.Sin90KeyStatus, () => sin90KeyAvailable())
+  handle(IpcChannels.Sin90Write, (_event, req: unknown) => desktopSin90Write(req))
   // oMLX: auto-detect running server
   handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
     let authRequiredAt: string | null = null

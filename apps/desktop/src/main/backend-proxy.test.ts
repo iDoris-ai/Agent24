@@ -105,6 +105,27 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/components/{id}/report')).toBe(false)
     expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/report'))).toBe(false)
   })
+  it('allows Sin90 reads and keeps Sin90 writes off the proxy', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/today')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/directions')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/tasks?direction_id=d1')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/areas')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/weeks')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/weeks/w1/attention')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/schedule-blocks')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/routines')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/rhythms')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/proposals')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/reviews')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/proposals/p1/accept')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/ai/classify')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/weeks')).toBe(false)
+    expect(isAllowedProxyRoute('PATCH', '/api/v1/sin90/schedule-blocks/b1')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/directions')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/tasks')).toBe(false)
+    expect(isAllowedProxyRoute('PATCH', '/api/v1/sin90/tasks/t1')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/capture')).toBe(false)
+  })
   it('gives chat a longer deadline than the default', () => {
     expect(findAllowedRoute('POST', '/api/v1/chat')?.timeoutMs).toBe(CHAT_TIMEOUT_MS)
     expect(CHAT_TIMEOUT_MS).toBeGreaterThan(PROXY_TIMEOUT_MS)
@@ -196,6 +217,21 @@ describe('A2 proxyRequest', () => {
   it('defaults are 30 s and 8 MiB', () => {
     expect(PROXY_TIMEOUT_MS).toBe(30_000)
     expect(PROXY_MAX_BODY_BYTES).toBe(8 * 1024 * 1024)
+  })
+
+  it('sends the Sin90 actor key as its own header and not in the error body', async () => {
+    const key = 'h'.repeat(48)
+    let seen: string | undefined
+    const ep = await serve((q, res) => {
+      seen = q.headers['x-sin90-actor-key'] as string | undefined
+      res.end('{"ok":true}')
+    })
+    const out = await proxyRequest(ep, { method: 'POST', path: '/api/v1/sin90/capture' }, { actorKey: key })
+    expect(seen).toBe(key)
+    expect(JSON.stringify(out)).not.toContain(key)
+    const refused = await proxyRequest(ep, { method: 'POST', path: '/x' }, { actorKey: 'bad key' })
+    expect(refused.ok).toBe(false)
+    expect(JSON.stringify(refused)).not.toContain('bad key')
   })
 
   it('passes a normal JSON response through', async () => {

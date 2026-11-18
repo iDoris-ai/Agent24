@@ -321,3 +321,8 @@ Sin90 把事件交给内核 `_a24/events/emit`。内核在 `GET /api/v1/events` 
 - OSI-1 的状态卡还没落地。片 1 用「未挂载则保持今天的占位」接上，不并行做安装 UI。
 - 真机 GET 的 200 体没打到（capabilities 模式，未签名进程不能 enroll）。片 1 的 CDP 是第一次对上响应形状的机会。
 - 本地旧仓库 `/Users/jason/Dev/iDoris-ai/Sin90` 的工作区曾停在旧版（主会话 11-17 已 fetch，`v0.5.2` tag 已含 `actor-keys.json`），和已装的 0.5.2 不是同一棵树。以后对 Sin90 行为，以已装包和 `sin90-design` 的 `v0.5.2` 为准。
+- 重复项能改标题（PATCH），这一轮页面没做。
+- 不建重复项、不建配额、不装领域包。
+- 方向的 `area_id` 指向已归档或不认识的领域时，分组会丢掉它，不放进「未归类」。
+- 今天区不展示 `fired_routines` 和 `kernel_suspended_routines`。
+- 节奏区只打开并显示当前 ISO 周。更早仍是 `planning` / `active` 的周不另列。

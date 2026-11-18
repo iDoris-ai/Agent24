@@ -5,6 +5,7 @@ import { compareVersions, isRegisteredOsPackage } from '../../shared/os-package-
 import { packageIntegrityHint } from '../components/packageIntegrity'
 import { useComponentList } from '../components/useComponentList'
 import { listOsModules, type DomainOsView } from '../pages/agent/api'
+import { Sin90Page } from '../pages/sin90/Sin90Page'
 import { capabilitiesMessages } from './capabilities.i18n'
 import type { CapabilityDef } from './types'
 
@@ -13,6 +14,7 @@ function versionLabel(version: string): string {
 }
 
 export function CapabilityPage({ capability }: { capability: CapabilityDef }) {
+  if (capability.id === 'sin90') return <DomainOsPage capability={capability} whenMounted={() => <Sin90Page />} />
   if (capability.group === 'domainOs') return <DomainOsPage capability={capability} />
   return <Placeholder capability={capability} />
 }
@@ -29,7 +31,7 @@ function Placeholder({ capability }: { capability: CapabilityDef }) {
   </main>
 }
 
-function DomainOsPage({ capability }: { capability: CapabilityDef }) {
+function DomainOsPage({ capability, whenMounted }: { capability: CapabilityDef; whenMounted?: () => JSX.Element }) {
   const c = useT(capabilitiesMessages)
   const registered = isRegisteredOsPackage(capability.id)
   const components = useComponentList(true)
@@ -104,6 +106,19 @@ function DomainOsPage({ capability }: { capability: CapabilityDef }) {
   else if (mounted && installedVersion) status = c('os.installed', { version: installedVersion })
   else if (modules && !mounted) status = c('os.notInstalled')
   else if (osError) status = c('status.unavailable')
+
+  if (mounted && whenMounted) {
+    return <main className="content">
+      <h1 className="page-title">{c(capability.nameKey)}</h1>
+      <p className="page-sub">{c(capability.descKey)}</p>
+      {registered && newer && latest && (
+        <button type="button" disabled={busy} onClick={() => void install()}>{c('os.updateTo', { version: versionLabel(latest) })}</button>
+      )}
+      {phaseLabel && <p role="status">{phaseLabel}</p>}
+      {failure && <p role="alert">{failure}</p>}
+      {whenMounted()}
+    </main>
+  }
 
   return <main className="content">
     <h1 className="page-title">{c(capability.nameKey)}</h1>
