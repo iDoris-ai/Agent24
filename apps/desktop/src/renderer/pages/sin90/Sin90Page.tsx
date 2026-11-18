@@ -66,7 +66,8 @@ export function Sin90Page() {
         const visibleDirections = d.filter((item) => item.id !== 'sin90-triage')
         const gs = groupDirections(a, visibleDirections)
         const chosen = directionId && d.some((item) => item.id === directionId) ? directionId : firstDirectionId(gs)
-        const [ts, data] = chosen ? await Promise.all([fetchTasks(chosen), Promise.all([fetchWeeks(), fetchBlocks(), fetchRoutines(), fetchRhythms(), fetchProposals(), fetchReviews()])]) : [[], [[], [], [], [], [], []]] as const
+        // Week data loads even with no direction yet, so a new user can open a week.
+        const [ts, data] = await Promise.all([chosen ? fetchTasks(chosen) : Promise.resolve([] as Awaited<ReturnType<typeof fetchTasks>>), Promise.all([fetchWeeks(), fetchBlocks(), fetchRoutines(), fetchRhythms(), fetchProposals(), fetchReviews()])])
         const [ws, bs, rs, rys, ps, revs] = data
         const wk = currentWeek(ws, isoWeekUTC(new Date()))
         const att = wk ? await fetchWeekAttention(wk.id).catch(() => null) : null
