@@ -5,6 +5,8 @@
 import type { DocumentsImportProgress, DocumentsResponse } from '../shared/ipc-types'
 import type { CliEndpoint } from './backend-manager'
 import { cliBinary, runDocumentsCli, spawnCli, type Spawner } from './documents-cli'
+import { retryDocumentsWrite } from './documents'
+import { daemonDelegationDeps, type DelegationDeps } from './module-delegation'
 
 /** Imports the file at `path` into the daemon at `endpoint()`; on success
  * the answer is the import job. */
@@ -14,7 +16,11 @@ export function importFile(
   onProgress: (p: DocumentsImportProgress) => void = () => {},
   run: Spawner = spawnCli,
   bin: string = cliBinary(),
+  delegation: DelegationDeps = daemonDelegationDeps(),
 ): Promise<DocumentsResponse<'job'>> {
   const args = ['documents', 'import', '--host-stdin', '--json']
-  return runDocumentsCli(args, { path }, endpoint, onProgress, run, bin) as Promise<DocumentsResponse<'job'>>
+  return retryDocumentsWrite(
+    () => runDocumentsCli(args, { path }, endpoint, onProgress, run, bin),
+    delegation,
+  ) as Promise<DocumentsResponse<'job'>>
 }

@@ -3,8 +3,9 @@
 
 import { randomBytes } from 'node:crypto'
 import type { BackendProxyRequest, BackendProxyResponse, HttpMethod } from '../shared/ipc-types'
-import { daemonConnection } from './backend-manager'
-import { proxyError, proxyRequest } from './backend-proxy'
+import { daemonConnection, daemonElevation } from './backend-manager'
+import { proxyError } from './backend-proxy'
+import { sendModuleWrite } from './module-delegation'
 import { readInstalledHumanKey, type HumanKey } from './sin90-key'
 
 const ID = /^[A-Za-z0-9_-]{1,80}$/
@@ -180,10 +181,10 @@ export function sin90KeyAvailable(): { available: boolean } {
 export function desktopSin90Write(req: unknown): Promise<BackendProxyResponse> {
   return performSin90Write(req, {
     key: () => readInstalledHumanKey(),
-    request: (sent, actorKey) => {
-      const conn = daemonConnection()
-      if (!conn) return Promise.resolve(proxyError('backend_not_ready', 'daemon is not ready'))
-      return proxyRequest(conn, sent, actorKey ? { actorKey } : {})
-    },
+    request: (sent, actorKey) => sendModuleWrite(
+      sent,
+      actorKey ? { actorKey } : {},
+      { connection: daemonConnection, elevation: daemonElevation },
+    ),
   })
 }

@@ -6,20 +6,32 @@
 
 import type { CliEndpoint } from './backend-manager'
 import type { ModuleEvent } from './agentear-events'
-import type { DocumentsEvent, DocumentsResponse } from '../shared/ipc-types'
+import type { BackendProxyResponse, DocumentsEvent, DocumentsResponse } from '../shared/ipc-types'
 import { cliBinary, fail, runDocumentsCli, spawnCli, type Spawner } from './documents-cli'
+import {
+  daemonDelegationDeps,
+  displayed,
+  DOCUMENTS_MODULE_PREFIX,
+  establishModuleDelegation,
+  MODULE_DELEGATION_REQUIRED,
+  type DelegationDeps,
+} from './module-delegation'
 
 const DOCUMENT_ID = /^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$/
 const JOB_ID = /^job_[0-7][0-9A-HJKMNP-TV-Z]{25}$/
 
 /** Runs one operation the renderer asked for. What is not an allowed
  * operation the CLI refuses, unsent, as 400 `invalid_request`; so does main
- * for a request that is not even JSON. */
+ * for a request that is not even JSON.
+ *
+ * A write the service daemon answers with `module_delegation_required` is
+ * delegated once (`module-delegation.ts`) and the CLI is run once more. */
 export function documentsCall(
   req: unknown,
   endpoint: () => CliEndpoint | null,
   run: Spawner = spawnCli,
   bin: string = cliBinary(),
+  delegation: DelegationDeps = daemonDelegationDeps(),
 ): Promise<DocumentsResponse> {
   try {
     if (JSON.stringify(req) === undefined) throw new Error('not JSON')
@@ -27,7 +39,33 @@ export function documentsCall(
     return Promise.resolve(fail(400, 'invalid_request', 'not an allowed documents operation'))
   }
   const args = ['documents', 'request', '--host-stdin', '--json']
-  return runDocumentsCli(args, { request: req }, endpoint, () => {}, run, bin)
+  return retryDocumentsWrite(
+    () => runDocumentsCli(args, { request: req }, endpoint, () => {}, run, bin),
+    delegation,
+  )
+}
+
+/** One documents CLI run. On `module_delegation_required`, delegate the
+ * module that owns {@link DOCUMENTS_MODULE_PREFIX} and run it once more. */
+export async function retryDocumentsWrite(
+  runOnce: () => Promise<DocumentsResponse>,
+  delegation: DelegationDeps = daemonDelegationDeps(),
+): Promise<DocumentsResponse> {
+  const first = await runOnce()
+  if (first.ok || first.error.code !== MODULE_DELEGATION_REQUIRED) return first
+  const established = await establishModuleDelegation(DOCUMENTS_MODULE_PREFIX, { host: '127.0.0.1' }, delegation)
+  if (!established.ok) return delegationToDocuments(established)
+  return runOnce()
+}
+
+function delegationToDocuments(res: BackendProxyResponse): DocumentsResponse {
+  const shown = displayed(res)
+  const error = (shown.data as { error?: { code?: unknown; message?: unknown } } | null)?.error
+  const code = typeof error?.code === 'string' && error.code ? error.code : 'module_delegation_denied'
+  const message = typeof error?.message === 'string' && error.message
+    ? error.message
+    : 'The desktop could not get permission to write this module'
+  return fail(shown.status || 403, code, message)
 }
 
 /** The Documenting OS's event in a WS module event, or null: another

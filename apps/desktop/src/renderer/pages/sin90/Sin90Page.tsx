@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT, type T } from '../../i18n'
-import { fetchAreas, fetchBlocks, fetchDirections, fetchProposals, fetchReviews, fetchRhythms, fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks, sin90Write, writesAvailable } from './api'
+import { fetchAreas, fetchBlocks, fetchDirections, fetchProposals, fetchReviews, fetchRhythms, fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks, sin90Write, WriteFailed, writesAvailable } from './api'
 import {
   blockTransitions, blocksForDirection, canCarry, currentWeek, firstDirectionId, groupDirections, isoWeekUTC, latestRhythm, nextIsoWeek, routineNext, routinesForDirection, taskTransitions, weekNext, weeklyDraftReviewId,
   type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
@@ -158,6 +158,25 @@ function Rhythm({ directionId, week, attention, blocks, routines, rhythm, direct
   </div>
 }
 
+const DELEGATION_CODES = new Set([
+  'module_delegation_required',
+  'module_delegation_denied',
+  'presence_denied',
+  'presence_timeout',
+  'presence_unavailable',
+])
+
+function failureOf(err: unknown): { code: string; message: string } {
+  if (err instanceof WriteFailed) return { code: err.code, message: err.message }
+  return { code: '', message: err instanceof Error ? err.message : 'write' }
+}
+
+function failureText(t: T<Key>, failure: { code: string; message: string }): string {
+  if (failure.code === 'load') return failure.message || t('loadError')
+  if (DELEGATION_CODES.has(failure.code)) return t('error.moduleDelegation')
+  return t('writeFailed', { message: failure.message || 'write' })
+}
+
 export function Sin90Page() {
   const t = useT(sin90Messages)
   const [today, setToday] = useState<Sin90Today | null>(null)
@@ -173,7 +192,7 @@ export function Sin90Page() {
   const [reviews, setReviews] = useState<Sin90Review[]>([])
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [attention, setAttention] = useState<Sin90WeekAttention | null>(null)
-  const [error, setError] = useState<string | null>(null)
+  const [failure, setFailure] = useState<{ code: string; message: string } | null>(null)
   const [title, setTitle] = useState('')
   const [windowName, setWindowName] = useState('')
   const [taskTitle, setTaskTitle] = useState('')
@@ -185,7 +204,7 @@ export function Sin90Page() {
 
   const load = useCallback((directionId: string | null) => {
     const token = ++seq.current
-    setError(null)
+    setFailure(null)
     void (async () => {
       try {
         const [nextToday, areas, dirs] = await Promise.all([fetchToday(), fetchAreas(), fetchDirections()])
@@ -219,7 +238,7 @@ export function Sin90Page() {
         setAttention(nextAttention)
       } catch (err) {
         if (token !== seq.current) return
-        setError(err instanceof Error ? err.message : 'load')
+        setFailure({ code: 'load', message: err instanceof Error ? err.message : 'load' })
       }
     })()
   }, [])
@@ -244,14 +263,14 @@ export function Sin90Page() {
   const write = (body: Record<string, unknown>) => {
     if (!enabled) return
     setBusy(true)
-    setError(null)
+    setFailure(null)
     void sin90Write(body).then(() => {
       if (body['op'] === 'createDirection') { setTitle(''); setWindowName('') }
       if (body['op'] === 'createTask') setTaskTitle('')
       if (body['op'] === 'capture') setNote('')
       load(selected)
     }).catch((err: unknown) => {
-      setError(err instanceof Error ? err.message : 'write')
+      setFailure(failureOf(err))
     }).finally(() => setBusy(false))
   }
 
@@ -259,12 +278,12 @@ export function Sin90Page() {
   const suggest = (body: Record<string, unknown>) => {
     if (!enabled) return
     setBusy(true)
-    setError(null)
+    setFailure(null)
     void sin90Write(body).then(() => fetchProposals()).then((next) => {
       setProposals(next)
       setDrawerOpen(true)
     }).catch((err: unknown) => {
-      setError(err instanceof Error ? err.message : 'write')
+      setFailure(failureOf(err))
     }).finally(() => setBusy(false))
   }
 
@@ -276,6 +295,7 @@ export function Sin90Page() {
   const taskName = (id: string) => knownTasks.find((task) => task.id === id)?.title ?? id
   const directionName = (id: string) => directions.find((direction) => direction.id === id)?.title ?? id
 
+  const error = failure ? failureText(t, failure) : null
   return <div data-sin90-page="">
     {canWrite === false && <p role="status">{t('writesOff')}</p>}
     {error && <p role="alert">{error}</p>}
