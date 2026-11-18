@@ -23,7 +23,7 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 
 use crate::error::ApiError;
-use crate::id::{IdKind, is_id};
+use crate::id::{IdKind, is_id, new_id};
 use crate::jobs::Job;
 use crate::state::{AppState, blob_cause, io_cause};
 
@@ -303,9 +303,15 @@ static CONVERTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn convert_failure(error: ConvertError) -> ApiError {
     match error {
-        ConvertError::TooSlow => {
-            ApiError::engine_unavailable("libreoffice", "the conversion took too long")
-        }
+        // Not `engine_unavailable`, which is 「not installed」 to every client
+        // (PR-Daemon #1909 ③): the converter is there, this file was too much for it.
+        ConvertError::TooSlow => ApiError::unprocessable(
+            "parse_failed",
+            format!(
+                "the conversion took longer than {} s: the file may be too large or complex",
+                CONVERT_TIMEOUT.as_secs()
+            ),
+        ),
         ConvertError::Failed(message) => ApiError::unprocessable("parse_failed", message),
     }
 }
@@ -392,8 +398,32 @@ pub async fn convert(
         Some(title) => Some(title),
         None => default_title(&storage, &id).await,
     };
+    // PR-Daemon #1909 ③: the conversion can take far longer than the kernel
+    // waits for an answer (10 s to the head), so the answer is a `convert`
+    // job, running; it ends when the new PDF is imported, its result that
+    // document. A restart ends it `interrupted` (`jobs::recover`).
+    let job_id =
+        new_id(IdKind::Job).map_err(|_| ApiError::internal("could not generate a job id"))?;
+    let inserted = sqlx::query(
+        "INSERT INTO jobs (id, kind, document_id, revision, status, origin)
+         VALUES (?, 'convert', ?, ?, 'running', json_object('kind', 'page'))",
+    )
+    .bind(&job_id)
+    .bind(&id)
+    .bind(head)
+    .execute(storage.db.pool())
+    .await;
+    if let Err(e) = inserted {
+        return Err(storage.db_failure(e).await);
+    }
+    let job = match crate::jobs::load(storage.db.pool(), &job_id).await {
+        Ok(Some(job)) => job,
+        Ok(None) => return Err(ApiError::internal("the convert job was not written")),
+        Err(e) => return Err(storage.db_failure(e).await),
+    };
     let data_dir = storage.data_dir().to_path_buf();
-    crate::derived::import_derived(&storage, title, "pdf", move |out| {
+    let owned = storage.clone();
+    let make = move |out: &Path| {
         let _held = match CONVERTING.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -418,8 +448,97 @@ pub async fn convert(
         })();
         let _ = std::fs::remove_dir_all(&work);
         result
-    })
-    .await
+    };
+    let made = async move { crate::derived::import_derived(&owned, title, "pdf", make).await };
+    tokio::spawn(finish_convert(storage, job_id, made));
+    Ok((StatusCode::ACCEPTED, Json(job)))
+}
+
+/// Runs the conversion and its import, then ends the `convert` job as the
+/// import ended: succeeded with the new document as its result, or failed
+/// with the conversion's or the import's error.
+async fn finish_convert(
+    storage: std::sync::Arc<crate::state::Storage>,
+    job_id: String,
+    made: impl std::future::Future<Output = Result<(StatusCode, Json<Job>), ApiError>> + Send,
+) {
+    let ended = match made.await {
+        Err(e) => Err((e.code().to_owned(), e.message().to_owned())),
+        Ok((_, Json(import))) => wait_import(&storage, &import.job_id).await,
+    };
+    let (status, error, result) = match ended {
+        Ok(document) => ("succeeded", None, Some(document)),
+        Err((code, message)) => (
+            "failed",
+            Some(serde_json::json!({ "code": code, "message": message }).to_string()),
+            None,
+        ),
+    };
+    let written = sqlx::query(&format!(
+        "UPDATE jobs SET status = ?, error = ?, result_ref = ?, updated_at = {}
+         WHERE id = ? AND status = 'running'",
+        crate::jobs::NOW
+    ))
+    .bind(status)
+    .bind(error)
+    .bind(result)
+    .bind(&job_id)
+    .execute(storage.db.pool())
+    .await;
+    if let Err(e) = written {
+        tracing::warn!(job = %job_id, error = %e, "documents: the convert job could not be ended");
+    }
+}
+
+/// The import job's end: its document, or its error. Waits at most ten minutes.
+async fn wait_import(
+    storage: &crate::state::Storage,
+    import: &str,
+) -> Result<String, (String, String)> {
+    for _ in 0..1200 {
+        match crate::jobs::load(storage.db.pool(), import).await {
+            Ok(Some(job)) => match job.status.as_str() {
+                "succeeded" => {
+                    return job.document_id.ok_or_else(|| {
+                        (
+                            "storage_unavailable".to_owned(),
+                            "the import named no document".to_owned(),
+                        )
+                    });
+                }
+                "failed" | "cancelled" | "interrupted" => {
+                    let code = job
+                        .error
+                        .as_ref()
+                        .and_then(|e| e.get("code"))
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|c| crate::error::CODES.contains(c))
+                        .unwrap_or("storage_unavailable")
+                        .to_owned();
+                    let message = job
+                        .error
+                        .as_ref()
+                        .and_then(|e| e.get("message"))
+                        .and_then(serde_json::Value::as_str)
+                        .map_or_else(|| format!("the import ended {}", job.status), str::to_owned);
+                    return Err((code, message));
+                }
+                _ => {}
+            },
+            Ok(None) => {
+                return Err((
+                    "storage_unavailable".into(),
+                    "the import job is gone".into(),
+                ));
+            }
+            Err(_) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err((
+        "storage_unavailable".into(),
+        "the import did not end in time".into(),
+    ))
 }
 
 #[cfg(test)]
@@ -497,6 +616,80 @@ mod tests {
             )));
         }
         assert_eq!(xml_escape("A&B<C>D\"E"), "A&amp;B&lt;C&gt;D&quot;E");
+    }
+
+    /// PR-Daemon #1909 ③: the request answers at once with a running
+    /// `convert` job, however long the converter takes; a converter that
+    /// fails ends the job failed, never as 「not installed」.
+    #[tokio::test]
+    async fn a_conversion_answers_at_once_with_a_job_that_ends_later() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::open(dir.path()).await;
+        let storage = state.storage().await.unwrap();
+        let data = storage.data_dir().to_path_buf();
+        let program = engine_dir(&data).join("LibreOffice.app/Contents/MacOS/soffice");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        executable(&program, "#!/bin/sh\nsleep 2\nexit 3\n");
+        std::fs::write(engine_dir(&data).join("READY.json"), b"{}").unwrap();
+        let doc = "doc_01K74Z3QJ8V5N2W9RTX6Y00001";
+        let sha = storage
+            .blobs
+            .put_bytes(b"PK not really a docx")
+            .unwrap()
+            .sha256;
+        sqlx::raw_sql(&format!(
+            "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                    VALUES ('{doc}', 'a.docx', '{DOCX}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+             INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                    VALUES ('{doc}', 1, '{sha}', 1, '{DOCX}', 'import');"
+        ))
+        .execute(storage.db.pool())
+        .await
+        .unwrap();
+
+        let started = Instant::now();
+        let res = crate::router(state.clone())
+            .oneshot(
+                Request::post(format!("/documents/{doc}/conversions"))
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "answered after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(res.status(), StatusCode::ACCEPTED);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let job: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            (job["kind"].as_str(), job["status"].as_str()),
+            (Some("convert"), Some("running"))
+        );
+        let id = job["job_id"].as_str().unwrap().to_owned();
+        let mut ended = None;
+        for _ in 0..100 {
+            let job = crate::jobs::load(storage.db.pool(), &id)
+                .await
+                .unwrap()
+                .unwrap();
+            if job.status != "running" {
+                ended = Some(job);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let ended = ended.expect("the convert job never ended");
+        assert_eq!(ended.status, "failed");
+        assert_ne!(ended.error.unwrap()["code"], "engine_unavailable");
     }
 
     #[test]

@@ -73,6 +73,7 @@ pub fn compose(parts: &[(PathBuf, String)], out: &Path) -> Result<u32, ComposeEr
                 return Err(ComposeError::NoPage);
             };
             inherit_page_attrs(&mut doc, page_id)?;
+            narrow_to_page(&mut doc, page_id)?;
         }
         doc.renumber_objects_with(next_id);
         next_id = doc
@@ -166,6 +167,69 @@ fn inherit_page_attrs(doc: &mut Document, page_id: ObjectId) -> Result<(), Compo
             doc.get_dictionary_mut(page_id)
                 .map_err(failed)?
                 .set(key.to_vec(), value);
+        }
+    }
+    Ok(())
+}
+
+/// PR-Daemon #1909 ②: what a page takes along is only what it uses. Its
+/// `/Resources` (often shared by every page at the Pages node) keeps of
+/// `/XObject` only the names its content draws with `Do`, written as the
+/// page's own dictionary, the shared one left as it is; its form widgets drop
+/// `/Parent`, the field whose `/Kids` lead to the widgets of other pages. The
+/// output has no AcroForm (the catalog is new), so a widget keeps only its
+/// appearance. Unreachable objects then go in `prune_objects`. A content
+/// stream that cannot be read leaves the resources as they were.
+fn narrow_to_page(doc: &mut Document, page_id: ObjectId) -> Result<(), ComposeError> {
+    let content = doc.get_page_content(page_id);
+    if let Ok(ops) = lopdf::content::Content::decode(&content) {
+        let used: HashSet<Vec<u8>> = ops
+            .operations
+            .iter()
+            .filter(|op| op.operator == "Do")
+            .filter_map(|op| op.operands.first())
+            .filter_map(|name| name.as_name().ok().map(<[u8]>::to_vec))
+            .collect();
+        let resources = doc
+            .get_dictionary(page_id)
+            .map_err(failed)?
+            .get(b"Resources")
+            .ok()
+            .cloned();
+        if let Some(resources) = resources {
+            let mut resources = match doc.dereference(&resources) {
+                Ok((_, Object::Dictionary(dict))) => dict.clone(),
+                _ => return Ok(()),
+            };
+            if let Ok(xobjects) = resources.get(b"XObject").cloned()
+                && let Ok((_, Object::Dictionary(all))) = doc.dereference(&xobjects)
+            {
+                let mut kept = lopdf::Dictionary::new();
+                for (name, value) in all.iter() {
+                    if used.contains(name) {
+                        kept.set(name.clone(), value.clone());
+                    }
+                }
+                resources.set("XObject", kept);
+                doc.get_dictionary_mut(page_id)
+                    .map_err(failed)?
+                    .set("Resources", resources);
+            }
+        }
+    }
+    let annots: Vec<ObjectId> = match doc.get_dictionary(page_id).map_err(failed)?.get(b"Annots") {
+        Ok(Object::Array(items)) => items.iter().filter_map(|o| o.as_reference().ok()).collect(),
+        Ok(Object::Reference(id)) => match doc.get_object(*id) {
+            Ok(Object::Array(items)) => {
+                items.iter().filter_map(|o| o.as_reference().ok()).collect()
+            }
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    };
+    for id in annots {
+        if let Ok(annot) = doc.get_dictionary_mut(id) {
+            annot.remove(b"Parent");
         }
     }
     Ok(())
@@ -371,6 +435,82 @@ mod tests {
             compose(&[(text, "all".into())], &out),
             Err(ComposeError::Failed(_))
         ));
+    }
+
+    /// Three pages, one image each, all named in one `/Resources` at the
+    /// Pages node; pages 1 and 2 each carry a widget of one shared field.
+    fn shared_images_and_form_pdf(path: &Path) {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let field_id = doc.new_object_id();
+        let mut xobjects = lopdf::Dictionary::new();
+        for i in 1..=3 {
+            let image = Stream::new(
+                dictionary! {
+                    "Type" => "XObject", "Subtype" => "Image", "Width" => 1, "Height" => 1,
+                    "ColorSpace" => "DeviceGray", "BitsPerComponent" => 8,
+                },
+                format!("IMG-BYTES-{i}").into_bytes(),
+            );
+            xobjects.set(format!("IMG{i}"), doc.add_object(image));
+        }
+        let mut kids = Vec::new();
+        let mut widgets = Vec::new();
+        for i in 1..=3 {
+            let content = format!("q 10 0 0 10 0 0 cm /IMG{i} Do Q");
+            let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+            let page_id = doc.new_object_id();
+            let mut page =
+                dictionary! { "Type" => "Page", "Parent" => pages_id, "Contents" => content_id };
+            if i <= 2 {
+                let ap = doc.add_object(Stream::new(
+                    dictionary! {},
+                    format!("WIDGET-AP-{i}").into_bytes(),
+                ));
+                let widget = doc.add_object(dictionary! {
+                    "Type" => "Annot", "Subtype" => "Widget", "Parent" => field_id, "P" => page_id,
+                    "Rect" => vec![0.into(), 0.into(), 10.into(), 10.into()],
+                    "AP" => dictionary! { "N" => ap },
+                });
+                widgets.push(Object::Reference(widget));
+                page.set("Annots", vec![Object::Reference(widget)]);
+            }
+            doc.objects.insert(page_id, Object::Dictionary(page));
+            kids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            field_id,
+            Object::Dictionary(dictionary! { "FT" => "Tx", "T" => "name", "Kids" => widgets }),
+        );
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => kids, "Count" => 3u32,
+                "Resources" => dictionary! { "XObject" => xobjects },
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        doc.save(path).unwrap();
+    }
+
+    #[test]
+    fn split_takes_only_the_images_and_widgets_of_its_pages() {
+        let dir = UniqueDir::new();
+        let src = dir.path().join("src.pdf");
+        let out = dir.path().join("one.pdf");
+        shared_images_and_form_pdf(&src);
+        compose(&[(src, "1".into())], &out).unwrap();
+        let bytes = std::fs::read(&out).unwrap();
+        let has = |needle: &str| bytes.windows(needle.len()).any(|w| w == needle.as_bytes());
+        assert!(
+            has("IMG-BYTES-1") && has("WIDGET-AP-1"),
+            "page 1's own image and widget"
+        );
+        for gone in ["IMG-BYTES-2", "IMG-BYTES-3", "WIDGET-AP-2"] {
+            assert!(!has(gone), "{gone} came along with page 1");
+        }
     }
 
     #[test]

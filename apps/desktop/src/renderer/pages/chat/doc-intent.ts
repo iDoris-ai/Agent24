@@ -29,8 +29,13 @@ function number(s: string): number | null {
 
 const NUM = '(\\d+|[零〇一二两三四五六七八九十百]+)'
 const RANGE = new RegExp(`第?\\s*${NUM}\\s*(?:页)?\\s*(?:[-–—~到至]\\s*第?\\s*${NUM})?\\s*页`, 'g')
-const SPLIT_VERB = /(拆|提取|抽取|抽出|取出|单独|另存|导出|摘出)/
-const SPLIT_ASKED = /(拆分|拆出|拆成|拆开|拆下|拆一下|单独拆|分割|提取.*页|抽取.*页)/
+/** Verbs that by themselves ask for a new document of pages. */
+const SPLIT_VERB = /(拆|分割|另存)/
+/** Verbs that also ask questions about pages (「提取第 2 页的关键信息」「第 3 页单独说了
+ * 什么」): a split only with a word saying a document is made (PR-Daemon #1909 ①). */
+const WEAK_SPLIT_VERB = /(提取|抽取|抽出|取出|单独|导出|摘出)/
+const SPLIT_TARGET = /(文档|文件|存成|存为|另存|新的一份|成一份|单独一份|PDF|pdf)/
+const SPLIT_ASKED = /(拆分|拆出|拆成|拆开|拆下|拆一下|单独拆|分割)/
 const MERGE_ASKED = /(合并|合成一份|拼成一份|合在一起)/
 const MERGE = /(?:和|与|跟|同)\s*[《「“"]([^》」”"]{1,200})[》」”"]\s*(?:合并|合成|拼|合在一起|放在一起)/
 
@@ -38,7 +43,8 @@ const MERGE = /(?:和|与|跟|同)\s*[《「“"]([^》」”"]{1,200})[》」�
 export function parseDocIntent(text: string): DocIntent | null {
   const merge = MERGE.exec(text)
   if (merge) return { kind: 'merge', other: merge[1].trim() }
-  if (!SPLIT_VERB.test(text)) return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
+  const asksSplit = SPLIT_VERB.test(text) || (WEAK_SPLIT_VERB.test(text) && SPLIT_TARGET.test(text))
+  if (!asksSplit) return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
   const ranges: string[] = []
   for (const m of text.matchAll(RANGE)) {
     const a = number(m[1])

@@ -19,7 +19,8 @@ export function pagesOk(spec: string): boolean {
 export type ComposeOutcome = { ok: true; documentId: string | null } | { ok: false; message: string; engineMissing?: true }
 
 async function waitJob(api: Api, job: Job, sleep: Sleep): Promise<ComposeOutcome> {
-  for (let i = 0; i < 120 && (job.status === 'queued' || job.status === 'running'); i++) {
+  // An Office conversion runs up to 120 s before its import (PR-Daemon #1909 ③): wait up to 5 minutes.
+  for (let i = 0; i < 300 && (job.status === 'queued' || job.status === 'running'); i++) {
     await sleep(1000)
     const next = await api.request({ op: 'job', jobId: job.job_id })
     if (!next.ok) break
