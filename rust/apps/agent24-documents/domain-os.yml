@@ -13,5 +13,58 @@ impl_kind: out_of_process_provider
 spawn:
   command: bin/agent24-documents
 # Extraction sends `temperature` (ADR-DOC-02 §3.2), which only a v2 kernel takes
-# (ME4-S2b): an older one refuses this package when it is installed or mounted.
-min_daemon_protocol: 2
+# (ME4-S2b). D2b: v4 is the kernel that takes grants for these tools (K1-6a-G).
+min_daemon_protocol: 4
+# D2b (Loop 2): what an Agent may call, once the user has granted it the
+# documents (`doc:<id>`). Each call of `compose` is still approved by the user.
+tools:
+  - operation: list
+    description: "List the documents in the user's library on this machine that the user allowed. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      properties:
+        cursor: { type: string }
+        limit: { type: integer, minimum: 1, maximum: 200 }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  - operation: get
+    description: "Get one document's title, format, pages and current revision by its id. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  - operation: compose
+    description: "Make a NEW PDF document from pages of PDF documents in the library: split (one part, some pages) or merge (several parts). The originals are never changed. Returns the import job; the new document is its result."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [parts]
+      properties:
+        parts:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            type: object
+            additionalProperties: false
+            required: [document_id]
+            properties:
+              document_id: { type: string, description: "id of a PDF document (from documents.list)" }
+              pages: { type: string, description: "\"all\" (default) or 1-based pages and ranges such as \"1-3,5\"" }
+        title: { type: string, description: "title of the new document" }
+    risk: write_local
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]

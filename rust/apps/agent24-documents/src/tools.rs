@@ -225,6 +225,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "read_range" => read_range(state, accepted, arguments).await,
             "find" => find(state, accepted, arguments).await,
             "extraction_get" => extraction_get(state, arguments).await,
+            "compose" => compose(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -370,6 +371,18 @@ async fn get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     completed(documents::get(&storage, &args.document_id).await)
 }
 
+/// D2b: split or merge PDFs already here into a new document; the answer is
+/// its import job, as `POST /compositions` answers. The parts were admitted.
+async fn compose(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let req: crate::compose::ComposeRequest = parse(arguments)?;
+    let storage = ready(state).await?;
+    completed(
+        crate::compose::run(&storage, req)
+            .await
+            .map(|(_, job)| job.0),
+    )
+}
+
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: JobGetArgs = parse(arguments)?;
     let storage = ready(state).await?;
@@ -512,6 +525,8 @@ enum Resource {
     Extraction,
     /// None: the operation filters by the scope itself (`list`).
     Listing,
+    /// Every `parts[].document_id` (`compose`).
+    Parts,
 }
 
 fn resource(op: &str) -> Option<Resource> {
@@ -520,6 +535,7 @@ fn resource(op: &str) -> Option<Resource> {
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
+        "compose" => Some(Resource::Parts),
         _ => None,
     }
 }
@@ -543,6 +559,22 @@ async fn admit(
     let (kind, id, absent) = match resource(op) {
         None => return Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         Some(Resource::Listing) => return Ok(()),
+        Some(Resource::Parts) => {
+            // Each part's document in the scope, or the call reads as one
+            // naming a document that is not here (K1-06a §2.4).
+            let Some(Value::Array(parts)) = arguments.get("parts") else {
+                return Err(Envelope::error(INVALID_INPUT, false));
+            };
+            for part in parts {
+                let Some(Value::String(id)) = part.get("document_id") else {
+                    return Err(Envelope::error(INVALID_INPUT, false));
+                };
+                if is_id(IdKind::Document, id) && !scope.allows_document(id) {
+                    return Err(refused(&ApiError::not_found("no such document")));
+                }
+            }
+            return Ok(());
+        }
         Some(Resource::Document) => (IdKind::Document, named("document_id")?, "no such document"),
         Some(Resource::Job) => (IdKind::Job, named("job_id")?, "no such job"),
         Some(Resource::Extraction) => (
@@ -1015,6 +1047,27 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let got = payload(&call(&state, "job_get", json!({ "job_id": JOB })).await);
         assert_eq!(got, job);
+    }
+
+    #[tokio::test]
+    async fn compose_takes_only_documents_in_the_scope() {
+        let (_dir, state) = opened().await;
+        let inside = add_document(&state, 1, "'a'").await;
+        let outside = add_document(&state, 2, "'b'").await;
+        let parts = |ids: &[&str]| json!({ "parts": ids.iter().map(|id| json!({ "document_id": id, "pages": "1" })).collect::<Vec<_>>() });
+        // One part outside the scope: as if no such document, nothing composed.
+        let body = call_in(&state, "compose", &[&inside], parts(&[&inside, &outside])).await;
+        assert_module_error(&body, "not_found", false);
+        // All inside: past the scope, to the service (whose blob is no PDF here).
+        let body = call_in(&state, "compose", &[&inside], parts(&[&inside])).await;
+        let answer = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            !answer.contains("not_found") && answer.contains("\"error\""),
+            "{answer}"
+        );
+        // No parts array: invalid input before storage is read.
+        let body = call_in(&state, "compose", &[&inside], json!({ "title": "x" })).await;
+        assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
     }
 
     #[tokio::test]
