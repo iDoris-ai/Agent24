@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import http from 'node:http'
 import os from 'node:os'
 import path from 'node:path'
-import { KnowledgeHost, SequenceClock, elevatingTransport, unansweredRetryDelayMs, validBindingId, type HostTransport, type KnowledgeCredential } from './knowledge-host'
+import { KnowledgeHost, SequenceClock, fileAppliedStore, type AppliedRecord, type AppliedStore, elevatingTransport, unansweredRetryDelayMs, validBindingId, type HostTransport, type KnowledgeCredential } from './knowledge-host'
 import { KnowledgeLoginStore, type KnowledgeLogin, type SecretBox } from './knowledge-logins'
 import type { DaemonConnection } from './backend-manager'
 import { proxyError } from './backend-proxy'
@@ -93,6 +93,76 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
   })
   afterEach(() => {
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  // K1: an app restart in service mode asked the presence box again for the
+  // binding and its credential, though the service daemon kept both.
+  describe('K1: what the service daemon already has is not asked again', () => {
+    const memory = (): AppliedStore & { record: AppliedRecord | null } => {
+      const m = { record: null as AppliedRecord | null, load: () => m.record && structuredClone(m.record), save: (r: AppliedRecord) => { m.record = structuredClone(r) } }
+      return m
+    }
+    const hostOn = (applied: AppliedStore, identity: string | null) => {
+      const host = new KnowledgeHost(store, {
+        connection: daemon.connection, transport: daemon.transport, clock: new SequenceClock(() => now),
+        nowSeconds: () => NOW, daemonIdentity: () => identity, applied,
+      })
+      host.start()
+      return host
+    }
+    const endpoint = { endpoint: 'http://127.0.0.1:18282', knowledgeBaseIds: ['kb1'] }
+
+    it('a restarted app sends nothing for the same binding and credential on the same daemon', async () => {
+      const applied = memory()
+      const first = hostOn(applied, '100:gen1')
+      expect((await first.activate('b1', endpoint)).ok).toBe(true)
+      expect((await first.pushCredential('b1', credential('C1', NOW + 7200))).ok).toBe(true)
+      expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}`, `PUT ${B1}/credential`])
+      expect(JSON.stringify(applied.record)).not.toContain('C1')
+
+      daemon.sent.length = 0
+      const again = hostOn(applied, '100:gen1')
+      expect((await again.activate('b1', endpoint)).ok).toBe(true)
+      // A new expiry for the same key: kept, and the kept expiry is answered.
+      expect(await again.pushCredential('b1', credential('C1', NOW + 9000))).toEqual({ ok: true, expiresAt: NOW + 7200 })
+      expect(daemon.sent).toEqual([])
+      expect(again.isActive('b1')).toBe(true)
+    })
+
+    it('a changed endpoint, a new credential or another daemon is sent', async () => {
+      const applied = memory()
+      const first = hostOn(applied, '100:gen1')
+      await first.activate('b1', endpoint)
+      await first.pushCredential('b1', credential('C1'))
+      daemon.sent.length = 0
+      const restarted = hostOn(applied, '100:gen1')
+      await restarted.activate('b1', endpoint)
+      await restarted.pushCredential('b1', credential('C2'))
+      expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}/credential`])
+      daemon.sent.length = 0
+      await hostOn(applied, '100:gen1').activate('b1', { ...endpoint, knowledgeBaseIds: ['kb2'] })
+      expect(daemon.sent.map((r) => r.method)).toEqual(['PUT'])
+      daemon.sent.length = 0
+      await hostOn(applied, '200:gen2').activate('b1', { ...endpoint, knowledgeBaseIds: ['kb2'] })
+      expect(daemon.sent.map((r) => r.method)).toEqual(['PUT'])
+    })
+
+    it('without a service daemon (the own child of the app) every start sends as before', async () => {
+      const applied = memory()
+      await hostOn(applied, null).activate('b1', endpoint)
+      await hostOn(applied, null).activate('b1', endpoint)
+      expect(daemon.sent).toHaveLength(2)
+      expect(applied.record).toBeNull()
+    })
+
+    it('the file store keeps hashes only, owner-only', () => {
+      const file = path.join(dir, 'applied.json')
+      const s = fileAppliedStore(file)
+      expect(s.load()).toBeNull()
+      s.save({ identity: '1:g', bindings: { b1: { activation: 'aa' } } })
+      expect(s.load()).toEqual({ identity: '1:g', bindings: { b1: { activation: 'aa' } } })
+      expect(fs.statSync(file).mode & 0o777).toBe(0o600)
+    })
   })
 
   it('accepts exactly the binding ids the daemon accepts', () => {

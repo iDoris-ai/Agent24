@@ -53,7 +53,7 @@ import {
 import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
-import { KnowledgeHost } from './knowledge-host'
+import { fileAppliedStore, KnowledgeHost } from './knowledge-host'
 import { serviceDaemonOf } from './service-daemon'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
@@ -580,6 +580,9 @@ app.whenReady().then(async () => {
   // anything can change them; the reason is logged, never the contents.
   const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
   knowledgeHost = new KnowledgeHost(loginStore, {
+    // K1: an app restart does not ask the service daemon's presence box again
+    // for a binding it already has as wanted.
+    applied: fileAppliedStore(path.join(app.getPath('userData'), 'knowledge-applied.json')),
     daemonIdentity: () => {
       const daemon = serviceDaemonOf(backendManager)
       return daemon ? `${daemon.pid}:${daemon.generation}` : null
