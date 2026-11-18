@@ -93,6 +93,51 @@ describe('CapabilityPage domain OS', () => {
     await waitFor(() => expect(osPackageInstall).toHaveBeenCalledWith('sin90'))
   })
 
+  it('shows the consent card when the module still needs one, and a denial leaves it installed', async () => {
+    modules = [module('0.5.2')]
+    components = [{ id: 'sin90', version: '0.5.2', state: 'ready', provides: [], kernel_consent: 'missing' }]
+    const posts: BackendProxyRequest[] = []
+    Object.defineProperty(window, 'agent24', {
+      configurable: true,
+      value: {
+        backendProxy: async (req: BackendProxyRequest) => {
+          if (req.path === '/api/v1/os') return { ok: true, status: 200, data: { modules } }
+          if (req.path === '/api/v1/components') return { ok: true, status: 200, data: { components } }
+          if (req.method === 'GET' && req.path === '/api/v1/os/sin90/kernel-consent') {
+            return {
+              ok: true, status: 200, data: {
+                module: 'sin90', class: 'missing', fingerprint: 'k=events;o=', version: '0.5.2',
+                team: 'OTHER', origin: 'local', isolated: true, capabilities: ['events'], consented: null,
+              },
+            }
+          }
+          posts.push(req)
+          return { ok: false, status: 403, data: { error: { code: 'presence_denied', message: 'no' } } }
+        },
+        osPackageInstall,
+        osPackageLatest,
+        onOsPackageProgress: () => () => {},
+      },
+    })
+    render(<CapabilityPage capability={sin90} />)
+    expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
+    const box = await screen.findByRole('checkbox', { name: 'Send events under this module\'s name' })
+    expect(box).toBeChecked()
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+    await waitFor(() => expect(posts).toHaveLength(1))
+    expect(screen.getByText(/without kernel capabilities/)).toBeInTheDocument()
+    expect(screen.getAllByRole('status').some((node) => node.textContent?.includes('Installed v0.5.2'))).toBe(true)
+    expect(screen.queryByText(/Failed/)).not.toBeInTheDocument()
+  })
+
+  it('does not ask for an exempt module', async () => {
+    modules = [module('0.5.2')]
+    components = [{ id: 'sin90', version: '0.5.2', state: 'ready', provides: [], kernel_consent: 'exempt' }]
+    render(<CapabilityPage capability={sin90} />)
+    expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument()
+  })
+
   it('shows an integrity failure and does not offer Cos72 a download', async () => {
     components = [{ id: 'sin90', version: '0.5.2', state: 'failed', reason: 'hash_mismatch', provides: [] }]
     const { unmount } = render(<CapabilityPage capability={sin90} />)

@@ -7,6 +7,7 @@ import { useComponentList } from '../components/useComponentList'
 import { listOsModules, type DomainOsView } from '../pages/agent/api'
 import { Sin90Page } from '../pages/sin90/Sin90Page'
 import { capabilitiesMessages } from './capabilities.i18n'
+import { KernelConsentCard } from '../kernel-consent/KernelConsentCard'
 import type { CapabilityDef } from './types'
 
 function versionLabel(version: string): string {
@@ -136,5 +137,6 @@ function DomainOsPage({ capability, whenMounted }: { capability: CapabilityDef; 
     {!registered && <p>{c('os.notOffered')}</p>}
     {phaseLabel && <p role="status">{phaseLabel}</p>}
     {failure && <p role="alert">{failure}</p>}
+    {component?.kernel_consent === 'missing' && <KernelConsentCard name={capability.id} />}
   </main>
 }
