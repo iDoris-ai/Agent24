@@ -10,7 +10,7 @@ import { useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
-import { compose, convert, pagesOk } from './compose'
+import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
 import { paragraphsOf, translateParagraphs, translationHtml, type TargetLang } from './doc-translate'
 
@@ -75,7 +75,8 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     setConvertBusy(true)
     setNeedEngine(false)
     setConvertNote({ ok: true, text: t('compose.working') })
-    const out = await convert(api, id)
+    // Checking or translating reuses the PDF converted for it before.
+    const out = thenCheck || thenLang ? await convertedPdf(api, id, detail?.title ?? '') : await convert(api, id)
     setConvertBusy(false)
     if (out.ok) {
       setConvertNote({ ok: true, text: t('compose.done') })

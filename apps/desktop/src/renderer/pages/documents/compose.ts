@@ -47,3 +47,23 @@ export async function convert(api: Api, documentId: string, title?: string, slee
   }
   return waitJob(api, res.data, sleep)
 }
+
+/** The title of the PDF a document is converted to for checking or translating. */
+export function convertedTitle(title: string): string {
+  return `${title.replace(/\.(docx?|xlsx?|pptx?)$/i, '')}（转换）.pdf`.slice(0, 500)
+}
+
+/** D3/D4: the PDF of an Office document, the one converted before if there is
+ * one (newest), else converted now under 「<名>（转换）.pdf」, so neither the
+ * original's own PDF nor a heap of same-named copies is mistaken for it. */
+export async function convertedPdf(api: Api, documentId: string, title: string): Promise<ComposeOutcome> {
+  const want = convertedTitle(title)
+  const listed = await api.request({ op: 'list', limit: 200 })
+  if (listed.ok) {
+    const done = listed.data.documents
+      .filter((d) => d.title === want && d.media_type === 'application/pdf')
+      .sort((a, b) => b.created_at.localeCompare(a.created_at))[0]
+    if (done) return { ok: true, documentId: done.document_id }
+  }
+  return convert(api, documentId, want)
+}

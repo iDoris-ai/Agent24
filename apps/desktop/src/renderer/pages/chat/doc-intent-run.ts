@@ -19,7 +19,12 @@ export async function namedDocument(api: Api, named: string): Promise<DocumentRe
     const names = found.candidates.slice(0, 5).map((d) => `《${d.title}》`).join('、')
     return `有几份文档都对得上：${names}。请用完整标题再说一次。`
   }
-  return { id: found.match.document_id, title: found.match.title, revision: found.match.head_revision }
+  const ref: DocumentRef = { id: found.match.document_id, title: found.match.title, revision: found.match.head_revision }
+  if (found.among) {
+    const when = found.match.created_at.replace('T', ' ').slice(0, 16)
+    ref.note = `文档库里有 ${found.among} 份《${found.match.title}》，用的是最新导入的一份（${when}）。`
+  }
+  return ref
 }
 
 export async function runDocIntent(api: Api, doc: DocumentRef, intent: DocIntent): Promise<string> {

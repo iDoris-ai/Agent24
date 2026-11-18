@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import {
   BATCH_CHARS,
   articleNumerals,
+  cleanTranslation,
   joinWrapped,
   paragraphsOf,
   translateParagraphs,
@@ -125,5 +126,12 @@ describe('articleNumerals (General 11-18)', () => {
     expect(articleNumerals('The first clause: Lease')).toBe('Article 1: Lease')
     expect(articleNumerals('Article 3 Rent: RMB 8,500')).toBe('Article 3 Rent: RMB 8,500')
     expect(articleNumerals('Article Seven of the law')).toBe('Article 7 of the law')
+  })
+})
+
+describe('cleanTranslation (General 11-18)', () => {
+  it('drops invisible and replacement characters and Chinese full stops in English', () => {
+    expect(cleanTranslation('borne by Party B.。\uFFFD\u200B', 'en')).toBe('borne by Party B.')
+    expect(cleanTranslation('由乙方承担。', 'zh')).toBe('由乙方承担。')
   })
 })

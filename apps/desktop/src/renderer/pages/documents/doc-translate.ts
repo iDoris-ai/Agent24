@@ -172,6 +172,19 @@ export function articleNumerals(text: string): string {
     })
 }
 
+/** What a model's translation should not carry into the file: invisible and
+ * replacement characters, and (into English) Chinese full stops, which show
+ * as boxes in fonts without them (General 11-18, Article 5). */
+export function cleanTranslation(text: string, lang: TargetLang): string {
+  let out = [...text].filter((ch) => {
+    const c = ch.codePointAt(0) ?? 0
+    const control = c < 0x20 && c !== 0x09 && c !== 0x0a && c !== 0x0d
+    return !control && !(c >= 0x200b && c <= 0x200f) && c !== 0x2028 && c !== 0x2029 && c !== 0xfeff && c !== 0xfffd
+  }).join('')
+  if (lang === 'en') out = out.replace(/[。．]/g, '.').replace(/\.{2,}(?=\s|$)/g, '.')
+  return out.trim()
+}
+
 export async function translateParagraphs(deps: TranslateDeps, paras: readonly Para[], lang: TargetLang): Promise<Para[]> {
   const batches = batchesOf(paras)
   const total = batches.length
@@ -182,12 +195,13 @@ export async function translateParagraphs(deps: TranslateDeps, paras: readonly P
     const parsed = parseStringArray(await deps.ask(batchPrompt(batch, lang)))
     if (parsed && parsed.length === batch.length) {
       for (let j = 0; j < batch.length; j++) {
-        const text = lang === 'en' ? articleNumerals(parsed[j].trim()) : parsed[j].trim()
+        const clean = cleanTranslation(parsed[j], lang)
+        const text = lang === 'en' ? articleNumerals(clean) : clean
         out.push({ text: text || batch[j].text, pageBreakBefore: batch[j].pageBreakBefore })
       }
     } else {
       for (const para of batch) {
-        const one = await translateOne(deps.ask, para.text, lang)
+        const one = cleanTranslation(await translateOne(deps.ask, para.text, lang), lang) || para.text
         out.push({ text: lang === 'en' ? articleNumerals(one) : one, pageBreakBefore: para.pageBreakBefore })
       }
     }

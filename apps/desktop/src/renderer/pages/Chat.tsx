@@ -16,7 +16,7 @@ import { namedDocument, runDocIntent } from './chat/doc-intent-run'
 import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, translationHtml, type TargetLang } from './documents/doc-translate'
-import { convert } from './documents/compose'
+import { convertedPdf } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
@@ -246,7 +246,7 @@ export default function ChatPage() {
             let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
             // A Word/Excel/PPT document has no text of its own: it is checked as the PDF it becomes.
             if (blocks.length === 0) {
-              const pdf = await convert(api, subject.id)
+              const pdf = await convertedPdf(api, subject.id, subject.title)
               if (pdf.ok && pdf.documentId) blocks = await readAllCheckBlocks((req) => api.request(req), pdf.documentId, 1)
             }
             const report = await checkDocument(
@@ -255,7 +255,7 @@ export default function ChatPage() {
               blocks,
             )
             setDelivery(index, { kind: 'sent' })
-            setMessages(prev => [...prev, { role: 'assistant', content: reportMarkdown(subject.title, report) }])
+            setMessages(prev => [...prev, { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + reportMarkdown(subject.title, report) }])
           }
         } catch (e) {
           setDelivery(index, { kind: 'sent' })
@@ -285,7 +285,7 @@ export default function ChatPage() {
           } else {
             let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
             if (blocks.length === 0) {
-              const pdf = await convert(api, subject.id)
+              const pdf = await convertedPdf(api, subject.id, subject.title)
               if (!pdf.ok) {
                 const why = pdf.engineMissing
                   ? '需要先在文档页下载转换器（约 340 MB，只需一次）。'
@@ -317,7 +317,7 @@ export default function ChatPage() {
                   ? '需要先在文档页下载转换器（约 340 MB，只需一次）。'
                   : `没能完成翻译：${out.message ?? out.code ?? ''}`
               setDelivery(index, { kind: 'sent' })
-              setMessages(prev => [...prev, { role: 'assistant', content: reply }])
+              setMessages(prev => [...prev, { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + reply }])
             }
           }
         } catch (e) {
@@ -342,7 +342,9 @@ export default function ChatPage() {
       const index = messages.length
       try {
         const subject = doc ?? await namedDocument(api, named ?? '')
-        const reply = typeof subject === 'string' ? subject : await runDocIntent(api, subject, intent)
+        const reply = typeof subject === 'string'
+          ? subject
+          : (subject.note ? `${subject.note}\n\n` : '') + await runDocIntent(api, subject, intent)
         setDelivery(index, { kind: 'sent' })
         setMessages(prev => [...prev, { role: 'assistant', content: reply }])
       } finally {
