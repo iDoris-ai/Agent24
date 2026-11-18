@@ -89,6 +89,10 @@ describe('parseDocIntent: questions about a page are not splits (PR-Daemon #1909
     // A document named with its file name is not a word for making a PDF (General 11-19).
     '帮我提取《CFYAD26-9770136.pdf》第2页的关键信息', '帮我提取 CFYAD26-9770136.pdf 第2页的关键信息',
     '《拆分方案.docx》第2页说了什么',
+    // PR-Daemon #1915: 「文档/文件」 in a question, and questions themselves.
+    '这份文档第2页的关键信息帮我提取一下', '提取第2页的文件内容',
+    '第3页导出的金额是多少，文档里写了吗', '总结一下这份文件第4页，单独列出金额',
+    '能把第2页拆出来吗？',
   ])('%s → null', (text) => {
     expect(parseDocIntent(text)).toBeNull()
   })
@@ -98,6 +102,7 @@ describe('parseDocIntent: questions about a page are not splits (PR-Daemon #1909
     ['取出第5页另存', '5'],
     ['拆出第 2-4 页', '2-4'],
     ['把《合同.pdf》第2页提取成新文档', '2'],
+    ['把第2页单独存成一份', '2'],
   ])('%s → split %s', (text, pages) => {
     expect(parseDocIntent(text)).toEqual({ kind: 'split', pages })
   })

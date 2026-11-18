@@ -34,7 +34,11 @@ const SPLIT_VERB = /(拆|分割|另存)/
 /** Verbs that also ask questions about pages (「提取第 2 页的关键信息」「第 3 页单独说了
  * 什么」): a split only with a word saying a document is made (PR-Daemon #1909 ①). */
 const WEAK_SPLIT_VERB = /(提取|抽取|抽出|取出|单独|导出|摘出)/
-const SPLIT_TARGET = /(文档|文件|存成|存为|另存|新的一份|成一份|单独一份|PDF|pdf)/
+/** Only words that make something new: 「文档/文件/PDF」 are in every question
+ * about a document (PR-Daemon #1915: 「提取第2页的文件内容」). */
+const SPLIT_TARGET = /(存成|存为|另存|新的一份|成一份|单独一份|新文档|新的文档|新文件|新的文件)/
+/** A question is never a split, whatever verb it has (PR-Daemon #1915). */
+const QUESTION = /(是多少|多少|什么|哪些|哪个|吗|呢|怎么|如何|为什么|[？?])/
 const SPLIT_ASKED = /(拆分|拆出|拆成|拆开|拆下|拆一下|单独拆|分割)/
 const MERGE_ASKED = /(合并|合成一份|拼成一份|合在一起)/
 const MERGE = /(?:和|与|跟|同)\s*[《「“"]([^》」”"]{1,200})[》」”"]\s*(?:合并|合成|拼|合在一起|放在一起)/
@@ -48,7 +52,7 @@ export function parseDocIntent(text: string): DocIntent | null {
   const said = text
     .replace(/[《「“"][^》」”"]{0,200}[》」”"]/g, ' ')
     .replace(/[^\s，。？！、]+\.(pdf|docx?|xlsx?|pptx?|png|jpe?g)\b/gi, ' ')
-  const asksSplit = SPLIT_VERB.test(said) || (WEAK_SPLIT_VERB.test(said) && SPLIT_TARGET.test(said))
+  const asksSplit = !QUESTION.test(said) && (SPLIT_VERB.test(said) || (WEAK_SPLIT_VERB.test(said) && SPLIT_TARGET.test(said)))
   if (!asksSplit) return MERGE_ASKED.test(text) ? { kind: 'unclear', about: 'merge' } : null
   const ranges: string[] = []
   for (const m of text.matchAll(RANGE)) {
