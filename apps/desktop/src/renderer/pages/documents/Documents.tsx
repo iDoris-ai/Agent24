@@ -316,6 +316,7 @@ export default function DocumentsPage() {
         <DocumentDetail
           documentId={open}
           autoCheck={autoCheck === open}
+          onAdded={() => void reload()}
           autoTranslate={autoTranslate?.id === open ? autoTranslate.lang : null}
           onOpen={(id, check) => { setAutoCheck(check ? id : null); setAutoTranslate(null); setOpen(id) }}
           onTranslate={(id, lang) => { setAutoCheck(null); setAutoTranslate({ id, lang }); setOpen(id) }}

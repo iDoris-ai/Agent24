@@ -86,4 +86,18 @@ describe('DocumentsPage: Office documents', () => {
     expect(request.mock.calls.filter(([r]) => r.op === 'renderPage')).toHaveLength(0)
     expect(request.mock.calls.some(([r]) => r.op === 'convert' && r.documentId === doc(1, DOCX).document_id)).toBe(true)
   })
+
+  // General 11-19 (0.6.37): 「完成」 said the new document was in the list, which had not been read again.
+  it('reads the list again once a conversion is done', async () => {
+    const job = { job_id: 'job_01K74Z3QJ8V5N2W9RTX6YB4M01', kind: 'convert', status: 'succeeded', attempt: 1,
+      result: { document_id: doc(9, 'application/pdf').document_id, revision: 1 },
+      created_at: '2026-10-08T09:00:00.000Z', updated_at: '2026-10-08T09:00:00.000Z' }
+    const request = mount([doc(1, DOCX)], () => ok(detail(1, DOCX)), () => ok(job))
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    await waitFor(() => expect(request.mock.calls.filter(([r]) => r.op === 'list').length).toBeGreaterThan(0))
+    const before = request.mock.calls.filter(([r]) => r.op === 'list').length
+    fireEvent.click(await screen.findByRole('button', { name: '转换为 PDF' }))
+    await waitFor(() => expect(request.mock.calls.filter(([r]) => r.op === 'list').length).toBeGreaterThan(before))
+  })
 })
