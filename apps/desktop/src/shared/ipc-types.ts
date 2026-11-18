@@ -54,6 +54,9 @@ export const IpcChannels = {
   // No arguments: the module is fixed in main. Each runs the app's CLI.
   OsModuleUninstall: 'os-module:uninstall',
   OsModuleInstallBundled: 'os-module:install-bundled',
+  // Sin90 writes. Main attaches the human key; the renderer names an operation.
+  Sin90Write: 'sin90:write',
+  Sin90KeyStatus: 'sin90:key-status',
   // OSI-1: download a registered domain OS (Sin90) and `agent24 os install` it.
   OsPackageInstall: 'os-package:install',
   OsPackageLatest: 'os-package:latest',

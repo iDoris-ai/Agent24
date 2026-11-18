@@ -106,6 +106,11 @@ const api = {
   openExternal: (url: string): Promise<void> => ipcRenderer.invoke(IpcChannels.ShellOpenExternal, url),
   backendProxy: (req: BackendProxyRequest): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.BackendProxy, req),
+  /** Sin90 write. Main attaches the human key. The page never sees the key. */
+  sin90Write: (req: unknown): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.Sin90Write, req),
+  sin90KeyStatus: (): Promise<{ available: boolean }> =>
+    ipcRenderer.invoke(IpcChannels.Sin90KeyStatus),
   /** A1: elevated; main asks the user in a native dialog before sending. */
   approvalDecide: (id: string, decision: ApprovalDecisionInput): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.ApprovalDecide, id, decision),

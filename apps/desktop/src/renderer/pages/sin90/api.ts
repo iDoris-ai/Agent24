@@ -31,3 +31,20 @@ export function fetchTasks(directionId: string): Promise<Sin90Task[]> {
 export function fetchToday(): Promise<Sin90Today> {
   return sin90Get('/api/v1/sin90/today').then(readToday)
 }
+
+export async function writesAvailable(): Promise<boolean> {
+  const ask = window.agent24.sin90KeyStatus
+  if (!ask) return false
+  try {
+    return (await ask()).available === true
+  } catch {
+    return false
+  }
+}
+
+export async function sin90Write(body: Record<string, unknown>): Promise<void> {
+  const write = window.agent24.sin90Write
+  if (!write) throw new Error('sin90 write is unavailable')
+  const res = await write(body)
+  if (!res.ok) throw new Error(errorMessage(res.data, 'sin90 write failed'))
+}

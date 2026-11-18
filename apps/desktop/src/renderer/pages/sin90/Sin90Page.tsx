@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useT, type T } from '../../i18n'
-import { fetchAreas, fetchDirections, fetchTasks, fetchToday } from './api'
-import { firstDirectionId, groupDirections, type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Task, type Sin90Today } from './model'
+import { fetchAreas, fetchDirections, fetchTasks, fetchToday, sin90Write, writesAvailable } from './api'
+import { canCarry, firstDirectionId, groupDirections, nextIsoWeek, taskTransitions, type DirectionGroup, type Sin90Block, type Sin90Direction, type Sin90Task, type Sin90Today } from './model'
 import { sin90Messages } from './Sin90.i18n'
 import './sin90.css'
 
@@ -30,6 +30,21 @@ function taskLabel(t: T<Key>, status: string): string {
   }
 }
 
+function TaskActions({ task, enabled, onWrite }: {
+  task: Sin90Task
+  enabled: boolean
+  onWrite: (body: Record<string, unknown>) => void
+}) {
+  const t = useT(sin90Messages)
+  const edges = taskTransitions(task.status)
+  return <span className="sin90-actions">
+    {edges.map((to) => <button key={to} type="button" className="btn btn-ghost" disabled={!enabled}
+      onClick={() => onWrite({ op: 'transitionTask', id: task.id, to })}>{t(`action.${to}`)}</button>)}
+    {canCarry(task.status) && <button type="button" className="btn btn-ghost" disabled={!enabled}
+      onClick={() => onWrite({ op: 'carryOver', taskId: task.id, isoWeek: nextIsoWeek(new Date()) })}>{t('carry')}</button>}
+  </span>
+}
+
 function blockTitle(block: Sin90Block, tasks: readonly Sin90Task[]): string | null {
   if (!block.task_id) return null
   return tasks.find((task) => task.id === block.task_id)?.title ?? null
@@ -45,6 +60,10 @@ export function Sin90Page() {
   const [error, setError] = useState<string | null>(null)
   const [title, setTitle] = useState('')
   const [windowName, setWindowName] = useState('')
+  const [taskTitle, setTaskTitle] = useState('')
+  const [note, setNote] = useState('')
+  const [canWrite, setCanWrite] = useState<boolean | null>(null)
+  const [busy, setBusy] = useState(false)
   const seq = useRef(0)
 
   const load = useCallback((directionId: string | null) => {
@@ -73,20 +92,42 @@ export function Sin90Page() {
   }, [])
 
   useEffect(() => { load(null) }, [load])
+  useEffect(() => {
+    let live = true
+    void writesAvailable().then((ok) => { if (live) setCanWrite(ok) })
+    return () => { live = false }
+  }, [])
+
+  const enabled = canWrite === true && !busy
+  const write = (body: Record<string, unknown>) => {
+    if (!enabled) return
+    setBusy(true)
+    setError(null)
+    void sin90Write(body).then(() => {
+      if (body['op'] === 'createDirection') { setTitle(''); setWindowName('') }
+      if (body['op'] === 'createTask') setTaskTitle('')
+      if (body['op'] === 'capture') setNote('')
+      load(selected)
+    }).catch((err: unknown) => {
+      setError(err instanceof Error ? err.message : 'write')
+    }).finally(() => setBusy(false))
+  }
 
   const current = directions.find((d) => d.id === selected) ?? null
   const knownTasks = [...tasks, ...(today?.must_do ?? []), ...(today?.inbox ?? [])]
 
   return <div data-sin90-page="">
+    {canWrite === false && <p role="status">{t('writesOff')}</p>}
     {error && <p role="alert">{error}</p>}
     {!groups && !error && <p role="status">{t('loading')}</p>}
     {today && <section className="sin90-today" aria-label={t('today')}>
       <div className="sin90-card">
         <h2>{t('mustDo')}</h2>
         {today.must_do.length === 0 ? <p className="sin90-muted">{t('none')}</p> : <ul className="sin90-queue">
-          {today.must_do.map((task) => <li key={task.id} className="sin90-row">
+          {today.must_do.map((task) => <li key={task.id} className="sin90-row" aria-label={task.title}>
             <span>{task.title}</span>
             <span className="tag">{taskLabel(t, task.status)}</span>
+            <TaskActions task={task} enabled={enabled} onWrite={write} />
           </li>)}
         </ul>}
       </div>
@@ -102,7 +143,10 @@ export function Sin90Page() {
         {today.inbox.length > 0 && <ul className="sin90-queue">
           {today.inbox.map((task) => <li key={task.id}>{task.title}</li>)}
         </ul>}
-        <input aria-label={t('inbox')} placeholder={t('capturePlaceholder')} />
+        <div className="sin90-row">
+          <input aria-label={t('inbox')} placeholder={t('capturePlaceholder')} value={note} onChange={(e) => setNote(e.target.value)} />
+          <button type="button" className="btn btn-primary" disabled={!enabled || !note.trim()} onClick={() => write({ op: 'capture', text: note })}>{t('capture')}</button>
+        </div>
       </div>
     </section>}
     {groups && groups.length === 0 && <div className="sin90-card">
@@ -110,6 +154,8 @@ export function Sin90Page() {
       <div className="sin90-fields">
         <label>{t('directionTitle')}<input value={title} onChange={(e) => setTitle(e.target.value)} /></label>
         <label>{t('directionWindow')}<input value={windowName} onChange={(e) => setWindowName(e.target.value)} placeholder="2026-Q4" /></label>
+        <button type="button" className="btn btn-primary" disabled={!enabled || !title.trim() || !windowName.trim()}
+          onClick={() => write({ op: 'createDirection', title, targetWindow: windowName })}>{t('newDirection')}</button>
       </div>
     </div>}
     {groups && groups.length > 0 && <div className="sin90-body">
@@ -132,11 +178,17 @@ export function Sin90Page() {
         <p className="sin90-muted">{t('window', { window: current.target_window })}</p>
         <h3>{t('tasks')}</h3>
         {tasks.length === 0 ? <p>{t('noTasks')}</p> : <ul className="sin90-queue">
-          {tasks.map((task) => <li key={task.id} className="sin90-row">
+          {tasks.map((task) => <li key={task.id} className="sin90-row" aria-label={task.title}>
             <span>{task.title}</span>
             <span className="tag">{taskLabel(t, task.status)}</span>
+            <TaskActions task={task} enabled={enabled} onWrite={write} />
           </li>)}
         </ul>}
+        <div className="sin90-row">
+          <input aria-label={t('newTaskTitle')} value={taskTitle} onChange={(e) => setTaskTitle(e.target.value)} />
+          <button type="button" className="btn btn-primary" disabled={!enabled || !taskTitle.trim()}
+            onClick={() => write({ op: 'createTask', title: taskTitle, directionId: current.id })}>{t('newTask')}</button>
+        </div>
       </section>}
     </div>}
   </div>

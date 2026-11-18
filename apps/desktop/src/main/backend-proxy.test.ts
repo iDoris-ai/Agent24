@@ -208,6 +208,21 @@ describe('A2 proxyRequest', () => {
     expect(PROXY_MAX_BODY_BYTES).toBe(8 * 1024 * 1024)
   })
 
+  it('sends the Sin90 actor key as its own header and not in the error body', async () => {
+    const key = 'h'.repeat(48)
+    let seen: string | undefined
+    const ep = await serve((q, res) => {
+      seen = q.headers['x-sin90-actor-key'] as string | undefined
+      res.end('{"ok":true}')
+    })
+    const out = await proxyRequest(ep, { method: 'POST', path: '/api/v1/sin90/capture' }, { actorKey: key })
+    expect(seen).toBe(key)
+    expect(JSON.stringify(out)).not.toContain(key)
+    const refused = await proxyRequest(ep, { method: 'POST', path: '/x' }, { actorKey: 'bad key' })
+    expect(refused.ok).toBe(false)
+    expect(JSON.stringify(refused)).not.toContain('bad key')
+  })
+
   it('passes a normal JSON response through', async () => {
     const ep = await serve((_q, res) => res.end('{"a":1}'))
     const out = await proxyRequest(ep, { method: 'GET', path: '/x' })

@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BackendProxyRequest } from '../../../shared/ipc-types'
 import { setLocale } from '../../i18n'
 import { Sin90Page } from './Sin90Page'
@@ -13,6 +13,8 @@ const emptyToday = {
 let directions: unknown[] = []
 let tasksByDirection: Record<string, unknown[]> = {}
 let today: unknown = emptyToday
+let keyAvailable = false
+const sin90Write = vi.fn(async () => ({ ok: true, status: 201, data: { id: 'new' } }))
 
 function task(id: string, title: string, direction_id: string | null, status = 'backlog') {
   return { id, title, direction_id, week_id: null, status, kind: 'other', energy: 'mid', est_minutes: null, carried_from: null, created_at: 't', updated_at: 't' }
@@ -23,9 +25,13 @@ beforeEach(() => {
   directions = []
   tasksByDirection = {}
   today = emptyToday
+  keyAvailable = false
+  sin90Write.mockClear()
   Object.defineProperty(window, 'agent24', {
     configurable: true,
     value: {
+      sin90Write,
+      sin90KeyStatus: async () => ({ available: keyAvailable }),
       backendProxy: async (req: BackendProxyRequest) => {
         if (req.path === '/api/v1/sin90/today') return { ok: true, status: 200, data: today }
         if (req.path === '/api/v1/sin90/directions') return { ok: true, status: 200, data: { directions } }
@@ -93,5 +99,42 @@ describe('Sin90 read-only page', () => {
     act(() => setLocale('th'))
     expect(screen.getByText('กำหนดทิศทางก่อน')).toBeInTheDocument()
     expect(screen.getByText('ต้องทำ')).toBeInTheDocument()
+    expect(screen.getByText('อ่านกุญแจมนุษย์ไม่ได้ การเขียนจึงปิดอยู่')).toBeInTheDocument()
+  })
+
+  it('renders only the legal button for each task status', async () => {
+    keyAvailable = true
+    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
+    tasksByDirection = {
+      d1: [
+        task('b', 'Backlog item', 'd1', 'backlog'),
+        task('p', 'Planned item', 'd1', 'planned'),
+        task('r', 'Running item', 'd1', 'in_progress'),
+        task('n', 'Done item', 'd1', 'done'),
+      ],
+    }
+    render(<Sin90Page />)
+    const backlog = within(await screen.findByRole('listitem', { name: 'Backlog item' }))
+    expect(backlog.getByRole('button', { name: 'Plan it' })).toBeEnabled()
+    expect(within(screen.getByRole('listitem', { name: 'Backlog item' })).getByRole('button', { name: 'Drop' })).toBeEnabled()
+    expect(within(screen.getByRole('listitem', { name: 'Backlog item' })).queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Backlog item' })).queryByRole('button', { name: 'Done' })).not.toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Planned item' })).getByRole('button', { name: 'Start' })).toBeEnabled()
+    expect(within(screen.getByRole('listitem', { name: 'Planned item' })).queryByRole('button', { name: 'Plan it' })).not.toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Planned item' })).queryByRole('button', { name: 'Done' })).not.toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Running item' })).getByRole('button', { name: 'Done' })).toBeEnabled()
+    expect(within(screen.getByRole('listitem', { name: 'Running item' })).queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
+    expect(within(screen.getByRole('listitem', { name: 'Done item' })).queryByRole('button')).not.toBeInTheDocument()
+  })
+
+  it('does not send a write while the human key is missing', async () => {
+    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
+    tasksByDirection = { d1: [task('b', 'Backlog item', 'd1', 'backlog')] }
+    render(<Sin90Page />)
+    const button = await within(await screen.findByRole('listitem', { name: 'Backlog item' })).findByRole('button', { name: 'Plan it' })
+    expect(button).toBeDisabled()
+    expect(screen.getByText('Writes are off because the human key could not be read.')).toBeInTheDocument()
+    fireEvent.click(button)
+    expect(sin90Write).not.toHaveBeenCalled()
   })
 })

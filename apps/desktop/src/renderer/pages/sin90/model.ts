@@ -151,3 +151,31 @@ export function groupDirections(areas: readonly Sin90Area[], directions: readonl
 export function firstDirectionId(groups: readonly DirectionGroup[]): string | null {
   return groups[0]?.directions[0]?.id ?? null
 }
+
+/** Direct task edges the page may PATCH. Carrying over is a proposal, not an edge here. */
+export function taskTransitions(status: string): Array<'planned' | 'in_progress' | 'done' | 'dropped'> {
+  switch (status) {
+    case 'backlog': return ['planned', 'dropped']
+    case 'planned': return ['in_progress', 'dropped']
+    case 'in_progress': return ['done', 'dropped']
+    default: return []
+  }
+}
+
+export function canCarry(status: string): boolean {
+  return status === 'backlog' || status === 'planned' || status === 'in_progress'
+}
+
+/** ISO week label in UTC, `YYYY-Www`. */
+export function isoWeekUTC(date: Date): string {
+  const utc = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
+  const day = utc.getUTCDay() || 7
+  utc.setUTCDate(utc.getUTCDate() + 4 - day)
+  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1))
+  const week = Math.ceil((((utc.getTime() - yearStart.getTime()) / 86400000) + 1) / 7)
+  return `${utc.getUTCFullYear()}-W${String(week).padStart(2, '0')}`
+}
+
+export function nextIsoWeek(date: Date): string {
+  return isoWeekUTC(new Date(date.getTime() + 7 * 86400000))
+}
