@@ -100,6 +100,11 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/approvals'),
   // domain OS / attached modules: read, plus module commands (speak, stop_playback)
   r('GET', '/api/v1/os'),
+  r('GET', '/api/v1/os/{name}/kernel-consent'),
+  // [E] The handler confirms in the native dialog before it writes. The
+  // renderer only sends the checked set; it cannot store consent itself.
+  r('POST', '/api/v1/os/{name}/kernel-consent'),
+  r('DELETE', '/api/v1/os/{name}/kernel-consent'),
   r('POST', '/api/v1/os/{name}/commands/{command}'), // [E]
   r('GET', '/api/v1/attached'),
   // memory

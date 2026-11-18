@@ -267,6 +267,27 @@ impl FirstPartyAuthority {
             summary,
         );
     }
+    /// Kernel consent: the summary lists the capabilities about to be stored.
+    /// Not a derived route — `DERIVED_ROUTES` stays the approval/schedule set.
+    pub fn remember_kernel_consent(
+        &self,
+        token_id: &str,
+        path: &str,
+        bytes: &[u8],
+        summary: String,
+    ) {
+        self.remember(
+            token_id,
+            Target {
+                operation: Operation::ModuleAdmin,
+                method: "POST".into(),
+                template: "/api/v1/os/{name}/kernel-consent".into(),
+                path: path.into(),
+                body_sha256: body_digest(bytes),
+            },
+            summary,
+        );
+    }
     fn remember(&self, token_id: &str, target: Target, summary: String) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
@@ -310,6 +331,7 @@ impl FirstPartyAuthority {
                 | "/api/v1/skills/{id}/activate"
                 | "/api/v1/host/knowledge/bindings/{binding_id}"
                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
+                | "/api/v1/os/{name}/kernel-consent"
         ) || derived_route(&target.method, &target.template)
         {
             return self
@@ -641,6 +663,7 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
             (method.as_str(), policy.template),
             ("POST", "/api/v1/attached")
                 | ("POST", "/api/v1/os/{name}/delegation")
+                | ("POST", "/api/v1/os/{name}/kernel-consent")
                 | ("PUT", "/api/v1/os/trusted-teams/{team}")
                 | ("DELETE", "/api/v1/os/trusted-teams/{team}")
         ))
@@ -1850,6 +1873,30 @@ mod tests {
         let summary = authority.target_summary("id", &del).unwrap();
         assert!(summary.contains("ABCDE12345"), "{summary}");
         assert!(summary.contains("stop trusting"), "{summary}");
+    }
+
+    #[test]
+    fn kernel_consent_grant_is_elevatable_without_joining_derived_routes() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        assert!(!derived_route("POST", "/api/v1/os/{name}/kernel-consent"));
+        assert_eq!(
+            resolve_target(&idoris("GET", "/api/v1/os/widget/kernel-consent", b"")).unwrap_err(),
+            EnrollErrorCode::NotElevatedOperation
+        );
+        let body = br#"{"fingerprint":"k=events;o=","capabilities":["events"]}"#;
+        let target =
+            resolve_target(&idoris("POST", "/api/v1/os/widget/kernel-consent", body)).unwrap();
+        assert_eq!(target.operation, Operation::ModuleAdmin);
+        assert_eq!(target.template, "/api/v1/os/{name}/kernel-consent");
+        assert!(authority.target_summary("id", &target).is_none());
+        authority.remember_kernel_consent(
+            "id",
+            "/api/v1/os/widget/kernel-consent",
+            body,
+            "同意 widget 的内核能力：以这个模块的名字发出事件".into(),
+        );
+        let summary = authority.target_summary("id", &target).unwrap();
+        assert!(summary.contains("以这个模块的名字发出事件"), "{summary}");
     }
 
     #[test]

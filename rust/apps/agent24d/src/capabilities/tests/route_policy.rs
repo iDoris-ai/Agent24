@@ -298,6 +298,37 @@ fn section_3_rows_match_operation_and_level() {
         level: AssuranceLevel::Elevated,
     });
 
+    // CONSENT-2 extends the frozen table: showing the card is an everyday
+    // module read, writing consent is elevated module admin, and stopping
+    // it reuses the everyday consent-revoke operation.
+    for (method, path, operation, level) in [
+        (
+            "GET",
+            "/os/{name}/kernel-consent",
+            "ModuleRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/os/{name}/kernel-consent",
+            "ModuleAdmin",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "DELETE",
+            "/os/{name}/kernel-consent",
+            "ConsentRevoke",
+            AssuranceLevel::Everyday,
+        ),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: operation.into(),
+            level,
+        });
+    }
+
     let mut catalog = BTreeSet::new();
     for policy in policies() {
         assert!(

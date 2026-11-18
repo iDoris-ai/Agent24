@@ -1,7 +1,11 @@
 #![allow(clippy::unwrap_used)]
 use super::*;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use crate::capabilities::presence::PresenceOutcome;
 
 use crate::capabilities::first_party::test_peer;
 use crate::domain::MountOutcome;
@@ -220,15 +224,14 @@ async fn components_show_the_mount_grant_not_the_resolver() {
         .unwrap()
         .secret
         .to_string();
+    state.os_signing_teams = Arc::new(std::sync::RwLock::new(HashMap::from([(
+        "sin90".into(),
+        Some(agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned()),
+    )])));
     let mut report = os_report(
-        "modelnodeps",
+        "sin90",
         MountOutcome::Mounted,
-        d9(
-            "modelnodeps",
-            false,
-            "modelnodeps-tasks",
-            &["events", "models"],
-        ),
+        d9("sin90", false, "sin90-tasks", &["events", "models"]),
     );
     report.granted = vec!["events".into()];
     let spec = requires::RequiresSpec::parse(&["events", "models"], &[] as &[&str]);
@@ -245,7 +248,7 @@ async fn components_show_the_mount_grant_not_the_resolver() {
     state.os_reports = Arc::new(vec![report]);
     let app = build_router(state);
     let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
-    let row = find(&full, "modelnodeps");
+    let row = find(&full, "sin90");
     assert_eq!(row["kernel_grants"], json!(["events"]));
     assert_eq!(row["isolation"], isolation_json(true));
     assert_eq!(
@@ -265,7 +268,7 @@ async fn components_show_the_mount_grant_not_the_resolver() {
     );
 
     let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
-    let row = find(&redacted, "modelnodeps");
+    let row = find(&redacted, "sin90");
     assert!(row.get("denied").is_none());
     assert!(row.get("kernel_grants").is_none());
     assert_eq!(row["isolation"], isolation_json(true));
@@ -274,6 +277,706 @@ async fn components_show_the_mount_grant_not_the_resolver() {
         isolation_json(false)
     );
     assert!(!redacted.to_string().contains("no_channel"));
+    assert!(row.get("kernel_consent").is_none());
+}
+
+/// Bundled name plus the built-in team is `exempt`. The same name with
+/// another team, and any other package, is `missing`. The redacted view
+/// does not carry the field. Grants are still the mount list.
+#[tokio::test]
+async fn kernel_consent_classifies_bundled_packages_without_changing_grants() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let first_party = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let builtin = agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned();
+    state.os_signing_teams =
+        std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+            ("documents".into(), Some(builtin.clone())),
+            ("sin90".into(), Some(builtin)),
+            ("documents-foreign".into(), Some("OTHERTEAM1".into())),
+            ("widget".into(), Some("OTHERTEAM1".into())),
+        ])));
+    let mut documents = os_report(
+        "documents",
+        MountOutcome::Mounted,
+        d9("documents", false, "documents-tasks", &["events"]),
+    );
+    documents.granted = vec!["events".into()];
+    let mut sin90 = os_report(
+        "sin90",
+        MountOutcome::Mounted,
+        d9("sin90", false, "sin90-tasks", &["events", "models"]),
+    );
+    sin90.granted = vec!["events".into(), "models".into()];
+    let mut widget = os_report(
+        "widget",
+        MountOutcome::Mounted,
+        d9("widget", false, "widget-tasks", &["events"]),
+    );
+    widget.granted = vec!["events".into()];
+    state.os_reports = std::sync::Arc::new(vec![documents, sin90, widget]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "documents")["kernel_consent"], "exempt");
+    assert_eq!(find(&full, "documents")["kernel_grants"], json!(["events"]));
+    assert_eq!(find(&full, "sin90")["kernel_consent"], "exempt");
+    assert_eq!(
+        find(&full, "sin90")["kernel_grants"],
+        json!(["events", "models"])
+    );
+    assert_eq!(find(&full, "widget")["kernel_consent"], "missing");
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!([]));
+    assert!(find(&full, "hyphae").get("kernel_consent").is_none());
+
+    let (_, redacted) = call(&app, Method::GET, GET, Some(&first_party), "").await;
+    let row = find(&redacted, "widget");
+    assert!(row.get("kernel_consent").is_none());
+    assert!(row.get("kernel_grants").is_none());
+}
+
+/// A trusted foreign team may load. Before a consent record, the kernel
+/// grant is empty. After the native dialog allows the checked set, the next
+/// read is that set. This assertion failed before the gate (the row copied
+/// `events` and `models` from the mount).
+#[tokio::test]
+async fn a_trusted_foreign_team_holds_nothing_until_it_is_granted() {
+    let (app, host, store, calls, summary) = widget_app(PresenceOutcome::Allowed).await;
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_consent"], "missing");
+    assert_eq!(find(&full, "widget")["state"], "ready");
+    assert_eq!(
+        find(&full, "widget")["kernel_grants"],
+        json!([]),
+        "declared ∩ ceiling is not a grant until the user consents"
+    );
+    let (status, granted) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=events,models;o=", &["events", "models"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{granted}");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let shown = summary.lock().unwrap().clone();
+    assert!(shown.contains("以这个模块的名字发出事件"), "{shown}");
+    assert!(shown.contains("让内核替它调用模型"), "{shown}");
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_consent"], "granted");
+    assert_eq!(
+        find(&full, "widget")["kernel_grants"],
+        json!(["events", "models"])
+    );
+    let row = store.get_kernel_consent("widget").await.unwrap().unwrap();
+    let expires = chrono::DateTime::parse_from_rfc3339(&row.expires_at).unwrap();
+    let decided = chrono::DateTime::parse_from_rfc3339(&row.decided_at).unwrap();
+    let days = (expires - decided).num_days();
+    assert!((29..=31).contains(&days), "{days}");
+
+    let (status, partial) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=events,models;o=", &["events"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{partial}");
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!(["events"]));
+}
+
+#[tokio::test]
+async fn an_expired_record_is_dropped_and_a_shrink_keeps_the_rest() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        "widget".into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    let mut widget = os_report(
+        "widget",
+        MountOutcome::Mounted,
+        d9("widget", false, "widget-tasks", &["events"]),
+    );
+    widget.granted = vec!["events".into(), "models".into()];
+    state.os_reports = Arc::new(vec![widget]);
+    store
+        .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+            module: "widget".into(),
+            fingerprint: "k=events,models;o=".into(),
+            capabilities: vec!["events".into(), "models".into()],
+            team_id: Some("OTHERTEAM1".into()),
+            version: "1".into(),
+            decided_at: "2026-10-01T00:00:00Z".into(),
+            expires_at: "2026-10-02T00:00:00Z".into(),
+        })
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_consent"], "missing");
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!([]));
+    assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+
+    store
+        .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+            module: "widget".into(),
+            fingerprint: "k=events,models;o=".into(),
+            capabilities: vec!["events".into(), "models".into()],
+            team_id: Some("OTHERTEAM1".into()),
+            version: "1".into(),
+            decided_at: "2026-11-18T00:00:00Z".into(),
+            expires_at: "2099-01-01T00:00:00Z".into(),
+        })
+        .await
+        .unwrap();
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_consent"], "granted");
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!(["events"]));
+    assert!(store.get_kernel_consent("widget").await.unwrap().is_some());
+}
+
+#[tokio::test]
+async fn uninstall_then_the_next_read_holds_nothing() {
+    let (app, host, store, _, _) = widget_app(PresenceOutcome::Allowed).await;
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=events,models;o=", &["events", "models"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    store.delete_kernel_consent("widget").await.unwrap();
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!([]));
+    assert_eq!(find(&full, "widget")["kernel_consent"], "missing");
+}
+
+#[tokio::test]
+async fn revoke_clears_the_next_component_read() {
+    let (app, host, store, calls, _) = widget_app(PresenceOutcome::Allowed).await;
+    let (status, _) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=events,models;o=", &["events", "models"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(
+        find(&full, "widget")["kernel_grants"],
+        json!(["events", "models"])
+    );
+
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "revoke does not open a dialog"
+    );
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!([]));
+    assert_eq!(find(&full, "widget")["kernel_consent"], "missing");
+    assert_ne!(find(&full, "widget")["state"], "failed");
+    assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn a_denied_or_empty_or_mismatched_consent_writes_nothing() {
+    let (app, host, store, calls, _) = widget_app(PresenceOutcome::Denied).await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=events,models;o=", &["events"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "presence_denied");
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "widget")["kernel_grants"], json!([]));
+    assert_ne!(find(&full, "widget")["state"], "failed");
+
+    let (app, host, store, calls, _) = widget_app(PresenceOutcome::Unavailable).await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=nope;o=", &["events"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "fingerprint_mismatch");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body("k=events,models;o=", &[]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "consent_empty");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_exempt_module_does_not_open_a_dialog() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.presence_provider = Some(Arc::new(ScriptedPresence {
+        outcome: PresenceOutcome::Allowed,
+        calls: calls.clone(),
+        summary: Arc::new(std::sync::Mutex::new(String::new())),
+    }));
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        "documents".into(),
+        Some(agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned()),
+    )])));
+    let app = build_router(state);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/documents/kernel-consent",
+        Some(&host),
+        &grant_body("k=events;o=", &["events"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "consent_exempt");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn revoke_of_an_exempt_module_is_conflict_and_a_missing_module_is_not_found() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        "documents".into(),
+        Some(agent24_os_proc::DEVELOPER_ID_TEAM_ID.to_owned()),
+    )])));
+    store
+        .upsert_kernel_consent(&kernel_consent_row("documents"))
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        "/api/v1/os/documents/kernel-consent",
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "consent_exempt");
+    assert!(
+        store
+            .get_kernel_consent("documents")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // Tracking an empty set here would deny the bundled module's callbacks.
+    assert!(!crate::kernel_consent::live_denies("documents", "events"));
+}
+
+/// The name was never mounted. DELETE still removes the row and answers 2xx.
+/// Restoring the 404 return before the delete fails this test.
+#[tokio::test]
+async fn delete_of_an_unreported_name_removes_the_kernel_consent_row() {
+    let name = "kc-unreported";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    state.os_reports = Arc::new(vec![]);
+    store
+        .upsert_kernel_consent(&kernel_consent_row(name))
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert!(store.get_kernel_consent(name).await.unwrap().is_none());
+}
+
+/// A degraded report whose manifest was not read has no declaration.
+/// DELETE still removes the row. Restoring the 404 return fails this test.
+#[tokio::test]
+async fn delete_of_a_degraded_report_without_d9_removes_the_kernel_consent_row() {
+    let name = "kc-degraded";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    let mut report = os_report(
+        name,
+        MountOutcome::Degraded("integrity".into()),
+        d9(name, false, "kc-degraded-tasks", &["events"]),
+    );
+    report.d9 = None;
+    state.os_reports = Arc::new(vec![report]);
+    store
+        .upsert_kernel_consent(&kernel_consent_row(name))
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert!(status.is_success(), "{status}");
+    assert!(store.get_kernel_consent(name).await.unwrap().is_none());
+}
+
+fn kernel_consent_row(module: &str) -> agent24_store::KernelConsentRow {
+    agent24_store::KernelConsentRow {
+        module: module.to_owned(),
+        fingerprint: "k=events;o=".into(),
+        capabilities: vec!["events".into()],
+        team_id: Some("OTHERTEAM1".into()),
+        version: "1".into(),
+        decided_at: "2026-11-18T00:00:00Z".into(),
+        expires_at: "2099-01-01T00:00:00Z".into(),
+    }
+}
+
+#[tokio::test]
+async fn a_grant_stores_only_the_intersection_with_the_declaration() {
+    let (app, host, store, _, _) = widget_app(PresenceOutcome::Allowed).await;
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&host),
+        &grant_body(
+            "k=events,models;o=",
+            &["events", "memory", "scheduler", "not-a-cap"],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let row = store.get_kernel_consent("widget").await.unwrap().unwrap();
+    assert_eq!(row.capabilities, vec!["events".to_owned()]);
+}
+
+#[tokio::test]
+async fn revoke_clears_the_live_grant() {
+    let name = "kc-live-revoke";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.presence_provider = Some(Arc::new(ScriptedPresence {
+        outcome: PresenceOutcome::Allowed,
+        calls: calls.clone(),
+        summary: Arc::new(std::sync::Mutex::new(String::new())),
+    }));
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        name.into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    let mut module = os_report(
+        name,
+        MountOutcome::Mounted,
+        d9(name, false, "kc-live-tasks", &["events"]),
+    );
+    module.granted = vec!["events".into()];
+    state.os_reports = Arc::new(vec![module]);
+    let app = build_router(state);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        &grant_body("k=events;o=", &["events"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(!crate::kernel_consent::live_denies(name, "events"));
+    let (status, body) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    assert!(crate::kernel_consent::live_denies(name, "events"));
+}
+
+/// Dropping `track` from `store_grant` leaves the empty set written by revoke,
+/// so `live_denies` stays true and this test fails.
+#[tokio::test]
+async fn grant_revoke_grant_shows_granted_and_does_not_deny_live() {
+    let name = "kc-regrant";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    state.presence_provider = Some(Arc::new(ScriptedPresence {
+        outcome: PresenceOutcome::Allowed,
+        calls: calls.clone(),
+        summary: Arc::new(std::sync::Mutex::new(String::new())),
+    }));
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        name.into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    let mut module = os_report(
+        name,
+        MountOutcome::Mounted,
+        d9(name, false, "kc-regrant-tasks", &["events"]),
+    );
+    module.granted = vec!["events".into()];
+    state.os_reports = Arc::new(vec![module]);
+    let app = build_router(state);
+    let grant = grant_body("k=events;o=", &["events"]);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        &grant,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, _) = call(
+        &app,
+        Method::DELETE,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        &grant,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, name)["kernel_consent"], "granted");
+    assert!(!crate::kernel_consent::live_denies(name, "events"));
+}
+
+#[tokio::test]
+async fn an_expired_view_clears_the_live_grant() {
+    let name = "kc-view-expire";
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        name.into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    state.os_reports = Arc::new(vec![os_report(
+        name,
+        MountOutcome::Mounted,
+        d9(name, false, "kc-view-tasks", &["events"]),
+    )]);
+    let until = chrono::Utc::now() + chrono::Duration::days(30);
+    crate::kernel_consent::track(name, ["events"], until);
+    store
+        .upsert_kernel_consent(&agent24_store::KernelConsentRow {
+            module: name.into(),
+            fingerprint: "k=events,models;o=".into(),
+            capabilities: vec!["events".into(), "models".into()],
+            team_id: Some("OTHERTEAM1".into()),
+            version: "1".into(),
+            decided_at: "2026-10-01T00:00:00Z".into(),
+            expires_at: "2026-10-02T00:00:00Z".into(),
+        })
+        .await
+        .unwrap();
+    let app = build_router(state);
+    let (status, body) = call(
+        &app,
+        Method::GET,
+        &format!("/api/v1/os/{name}/kernel-consent"),
+        Some(&host),
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["class"], "missing");
+    assert!(store.get_kernel_consent(name).await.unwrap().is_none());
+    assert!(crate::kernel_consent::live_denies(name, "events"));
+}
+
+#[tokio::test]
+async fn a_shell_cannot_store_consent_without_the_native_dialog() {
+    let (mut state, _host, _) = server_tests::capability_state().await;
+    let shell = state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .issue(&test_peer("daemon-test"))
+        .unwrap()
+        .secret
+        .to_string();
+    let store = state.store.clone();
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        "widget".into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    let mut widget = os_report(
+        "widget",
+        MountOutcome::Mounted,
+        d9("widget", false, "widget-tasks", &["events", "models"]),
+    );
+    widget.granted = vec!["events".into(), "models".into()];
+    state.os_reports = Arc::new(vec![widget]);
+    let app = build_router(state);
+    let (status, body) = call(
+        &app,
+        Method::POST,
+        "/api/v1/os/widget/kernel-consent",
+        Some(&shell),
+        &grant_body("k=events,models;o=", &["events", "models"]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "presence_required");
+    assert!(store.get_kernel_consent("widget").await.unwrap().is_none());
+}
+
+fn grant_body(fingerprint: &str, capabilities: &[&str]) -> String {
+    json!({"fingerprint": fingerprint, "capabilities": capabilities}).to_string()
+}
+
+async fn widget_app(
+    outcome: PresenceOutcome,
+) -> (
+    axum::Router,
+    String,
+    agent24_store::Store,
+    Arc<AtomicUsize>,
+    Arc<std::sync::Mutex<String>>,
+) {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    let store = state.store.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let summary = Arc::new(std::sync::Mutex::new(String::new()));
+    state.presence_provider = Some(Arc::new(ScriptedPresence {
+        outcome,
+        calls: calls.clone(),
+        summary: summary.clone(),
+    }));
+    state.os_signing_teams = Arc::new(RwLock::new(HashMap::from([(
+        "widget".into(),
+        Some("OTHERTEAM1".into()),
+    )])));
+    let mut widget = os_report(
+        "widget",
+        MountOutcome::Mounted,
+        d9("widget", false, "widget-tasks", &["events", "models"]),
+    );
+    widget.granted = vec!["events".into(), "models".into()];
+    state.os_reports = Arc::new(vec![widget]);
+    let app = build_router(state);
+    (app, host, store, calls, summary)
+}
+
+struct ScriptedPresence {
+    outcome: PresenceOutcome,
+    calls: Arc<AtomicUsize>,
+    summary: Arc<std::sync::Mutex<String>>,
+}
+
+#[async_trait::async_trait]
+impl crate::capabilities::presence::PresenceProvider for ScriptedPresence {
+    async fn confirm(
+        &self,
+        req: crate::capabilities::presence::PresenceRequest,
+        _cancel: CancellationToken,
+    ) -> PresenceOutcome {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.summary.lock().unwrap() = req.summary;
+        self.outcome
+    }
+}
+
+/// Same module name, team is not the built-in team: the card applies.
+/// Off macOS there is no team to read, so a bundled name stays exempt.
+#[tokio::test]
+#[cfg(target_os = "macos")]
+async fn a_bundled_name_signed_by_another_team_is_not_exempt() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    state.os_signing_teams = std::sync::Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::from([("sin90".into(), Some("OTHERTEAM1".into()))]),
+    ));
+    state.os_reports = std::sync::Arc::new(vec![os_report(
+        "sin90",
+        MountOutcome::Mounted,
+        d9("sin90", false, "sin90-tasks", &["events"]),
+    )]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "sin90")["kernel_consent"], "missing");
+}
+
+/// Off macOS the bundled names are exempt by name alone.
+#[tokio::test]
+#[cfg(not(target_os = "macos"))]
+async fn a_bundled_name_is_exempt_by_name_where_there_is_no_team() {
+    let (mut state, host, _) = server_tests::capability_state().await;
+    state.os_signing_teams = std::sync::Arc::new(std::sync::RwLock::new(
+        std::collections::HashMap::from([("sin90".into(), Some("OTHERTEAM1".into()))]),
+    ));
+    state.os_reports = std::sync::Arc::new(vec![os_report(
+        "sin90",
+        MountOutcome::Mounted,
+        d9("sin90", false, "sin90-tasks", &["events"]),
+    )]);
+    let app = build_router(state);
+    let (_, full) = call(&app, Method::GET, GET, Some(&host), "").await;
+    assert_eq!(find(&full, "sin90")["kernel_consent"], "exempt");
 }
 
 fn denial_code<'a>(row: &'a Value, item: &str) -> Option<&'a str> {
@@ -340,7 +1043,7 @@ async fn no_channel_tracks_the_effective_outcome_not_the_startup_report() {
 
     let was = find(&body, "wasmounted");
     assert_eq!(was["state"], "stopped");
-    assert_eq!(was["kernel_grants"], json!(["events"]));
+    assert_eq!(was["kernel_grants"], json!([]));
     assert!(!has_no_channel(was), "startup Mounted must not win: {was}");
     assert_eq!(denial_code(was, "memory"), Some("not_declared"));
 

@@ -59,6 +59,11 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('GET', 'api/v1/models')).toBe(false)
     expect(isAllowedProxyRoute('GET', '//api/v1/models')).toBe(false)
   })
+  it('proxies kernel consent and lets the handler confirm the write', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/os/widget/kernel-consent')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/os/widget/kernel-consent')).toBe(true)
+    expect(isAllowedProxyRoute('DELETE', '/api/v1/os/widget/kernel-consent')).toBe(true)
+  })
   it('never contains an elevated route', () => {
     const forbidden: [string, string][] = [
       ['POST', '/api/v1/approvals/x'], ['POST', '/api/v1/module-approvals/x'], ['POST', '/api/v1/shutdown'],

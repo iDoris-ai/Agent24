@@ -436,6 +436,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             post(establish_module_delegation),
         )
         .route(
+            "/api/v1/os/{name}/kernel-consent",
+            get(crate::kernel_consent_routes::show)
+                .post(crate::kernel_consent_routes::grant)
+                .delete(crate::kernel_consent_routes::revoke),
+        )
+        .route(
             "/api/v1/os/{name}",
             axum::routing::patch(crate::os_routes::patch_os),
         )

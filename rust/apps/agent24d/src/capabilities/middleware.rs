@@ -605,6 +605,43 @@ async fn authorize(
                                 &bytes,
                             );
                         }
+                    } else if method == Method::POST
+                        && template == "/api/v1/os/{name}/kernel-consent"
+                    {
+                        // 409 before any dialog: empty, fingerprint mismatch,
+                        // or a bundled module that does not take a card.
+                        let request_path = req.uri().path().to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        match crate::kernel_consent_routes::shell_summary(
+                            state,
+                            &request_path,
+                            &bytes,
+                        ) {
+                            crate::kernel_consent_routes::ShellPrecheck::Refuse(response) => {
+                                return response;
+                            }
+                            crate::kernel_consent_routes::ShellPrecheck::Ask(summary) => {
+                                if let Some(authority) = &state.first_party {
+                                    authority.remember_kernel_consent(
+                                        &authorization.claims.capability_id,
+                                        &request_path,
+                                        &bytes,
+                                        summary,
+                                    );
+                                }
+                            }
+                        }
                     } else if crate::capabilities::first_party::derived_route(
                         method.as_str(),
                         template,

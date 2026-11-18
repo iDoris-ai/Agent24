@@ -133,6 +133,10 @@ pub struct AppState {
     /// Empty until `serve` replaces it after the mount pass, same ordering
     /// reason as `os_reports` above.
     pub package_dirs: Arc<std::collections::HashMap<String, std::path::PathBuf>>,
+    /// Signing team read from each package executable at discovery.
+    /// `None` means the team was not read (not macOS, or unreadable).
+    /// Tests set this directly. Not a grant.
+    pub os_signing_teams: Arc<std::sync::RwLock<std::collections::HashMap<String, Option<String>>>>,
     /// The live status of each out-of-process module, by name: what `agent24
     /// os list` reports beyond the startup verdict (a package can be mounted
     /// and since have given up).
@@ -381,6 +385,7 @@ impl AppState {
             // Empty for the same reason and until the same moment as `os_reports`
             // above — see that field's comment.
             package_dirs: Arc::new(std::collections::HashMap::new()),
+            os_signing_teams: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             module_status: Arc::new(std::collections::HashMap::new()),
             supervisors: None,
             module_tool_cards: None,
