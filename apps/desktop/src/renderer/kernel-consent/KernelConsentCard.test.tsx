@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { BackendProxyRequest, BackendProxyResponse } from '../../shared/ipc-types'
 import { setLocale } from '../i18n'
 import { KernelConsentCard } from './KernelConsentCard'
