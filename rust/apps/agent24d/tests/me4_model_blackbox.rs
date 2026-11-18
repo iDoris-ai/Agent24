@@ -62,6 +62,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/kernel_consent_fixture.rs"]
+mod kernel_consent_fixture;
+
 #[path = "support/signature_command.rs"]
 mod signature_command;
 
@@ -799,6 +802,8 @@ fn model_complete_blackbox_round_trip() {
         "model_access: remote_allowed\n",
     );
     install(home.path(), "m_none", "", "");
+    kernel_consent_fixture::allow_kernel(home.path(), "m_local", &["models"]);
+    kernel_consent_fixture::allow_kernel(home.path(), "m_remote", &["models"]);
 
     let d1 = start(home.path(), &omlx_url, &ollama_url, &[]);
     wait_mounted(d1.port, &d1.token, "m_local", || d1.recent_stderr());
@@ -1115,14 +1120,16 @@ fn model_complete_blackbox_round_trip() {
 /// (`http://127.0.0.1:8088` by default) with a model actually loaded. L5:
 /// `OMLX_API_KEY`/`DEFAULT_MODEL`, if this test process itself has them set,
 /// are passed through to the spawned daemon (`start`'s `extra_env`) — the
-/// daemon's own `env_clear()` would otherwise silently fall back to the
-/// built-in defaults (`xiaobao8088`/`Qwen3-8B-4bit`), which is not what a
-/// real oMLX server configured with a different key or model wants.
+/// daemon's own `env_clear()` would otherwise drop them. With no key in the
+/// environment or in `~/.omlx/settings.json`, chat goes out with no
+/// `Authorization` header. Unset `DEFAULT_MODEL` still falls back to
+/// `Qwen3-8B-4bit`. Pass both through when the real server expects them.
 #[test]
 #[ignore = "requires a real oMLX server listening on OMLX_URL; run with --exact --ignored"]
 fn real_omlx_smoke() {
     let home = tmp_home();
     install(home.path(), "m_local", "models", "");
+    kernel_consent_fixture::allow_kernel(home.path(), "m_local", &["models"]);
     let omlx_url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
     let omlx_key = std::env::var("OMLX_API_KEY").ok();
     let default_model = std::env::var("DEFAULT_MODEL").ok();

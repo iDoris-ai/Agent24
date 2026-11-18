@@ -48,6 +48,16 @@ export function ResidentServiceSettings() {
       <input id="resident-service-on" type="checkbox" checked={status.installed} disabled={busy}
         onChange={(e) => { void change(e.target.checked) }} />
     </div>
+    <div className="setting-row">
+      {status.installed ? (
+        <>
+          <span>{t('installed')}</span>
+          <button type="button" disabled={busy} onClick={() => { void change(false) }}>{t('uninstall')}</button>
+        </>
+      ) : (
+        <button type="button" disabled={busy} onClick={() => { void change(true) }}>{t('install')}</button>
+      )}
+    </div>
     {busy && <p role="status">{t('busy')}</p>}
     {message && <p role="alert">{message}</p>}
   </section>

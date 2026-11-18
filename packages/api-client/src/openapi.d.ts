@@ -321,6 +321,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/models/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Save the default chat model
+         * @description ProductHost only. The id is stored in the daemon's existing settings kv and used on the next local completion that does not name a model. Empty, longer than 128 characters, or containing a control character is 400. The memory base missing is 503.
+         */
+        put: operations["putDefaultModel"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/os": {
         parameters: {
             query?: never;
@@ -374,6 +394,34 @@ export interface paths {
          * @description Requires ModuleAdmin elevation, like enabling or disabling a module. No request body. The built-in team cannot be removed.
          */
         delete: operations["untrustTeam"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/os/{name}/kernel-consent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Show the kernel-capability consent card for one OS module
+         * @description Host and first-party shell. `class` is `exempt` for a bundled module signed by the built-in team, `granted` when an unexpired record still matches the declaration, otherwise `missing`. `capabilities` is the declaration intersected with the out-of-process ceiling. `consented` is the stored subset, or null when nothing is in force.
+         */
+        get: operations["getKernelConsent"];
+        put?: never;
+        /**
+         * Store a kernel-capability consent after presence confirmation
+         * @description ProductHost confirms in the native dialog inside this handler. FirstPartyShell must already carry an elevation grant whose summary lists the same capabilities; the handler does not ask again. An empty selection or a fingerprint that is not the one just shown is 409 and writes nothing. An exempt module is 409 and does not open a dialog.
+         */
+        post: operations["grantKernelConsent"];
+        /**
+         * Revoke kernel-capability consent for one OS module
+         * @description Deletes the record. The next component read shows an empty `kernel_grants` for a module that needs a card. Everyday; the desktop capability center and `agent24 os consent revoke` share this route.
+         */
+        delete: operations["revokeKernelConsent"];
         options?: never;
         head?: never;
         patch?: never;
@@ -2667,10 +2715,32 @@ export interface components {
             /** @description Host only. Closed reasons an item is not in `kernel_grants`. */
             denied: components["schemas"]["ComponentDenial"][];
             isolation: components["schemas"]["ComponentIsolation"];
+            /**
+             * @description Host only, and only on an OS package. `exempt`: the module name is on the bundled list (`documents`, `sin90`) and, on macOS, the package team is the built-in team; `kernel_grants` stays the mount list. `missing`: the card applies and there is no usable record, so `kernel_grants` is empty. `granted`: an unexpired record still matches the declaration; `kernel_grants` is the declaration, the ceiling, and the consented set. Absent on every other row and on the redacted view.
+             * @enum {string}
+             */
+            kernel_consent?: "exempt" | "missing" | "granted";
             /** @description Ports, contract expectation, counters, messages; host only. For Hyphae, detail.health is {consecutive_failures, degraded, checks: {probe: {ok, consecutive_failures}}} and never includes relay URLs. detail.consecutive_failures remains the daemon restart counter, separate from detail.health.consecutive_failures. */
             detail?: {
                 [key: string]: unknown;
             };
+        };
+        KernelConsent: {
+            module: string;
+            /** @enum {string} */
+            class: "exempt" | "missing" | "granted";
+            fingerprint: string;
+            version: string;
+            team: string | null;
+            /** @enum {string} */
+            origin: "bundled" | "local";
+            isolated: boolean;
+            capabilities: string[];
+            consented: string[] | null;
+        };
+        KernelConsentGrant: {
+            fingerprint: string;
+            capabilities: string[];
         };
         /** @description What every audience other than the host sees. No path, pid, port, message, team id, commit, kernel grant, denial, or Hyphae health probes. `isolation` is included: it is not sensitive. */
         ComponentRedactedView: {
@@ -5261,7 +5331,49 @@ export interface operations {
                 content: {
                     "application/json": {
                         models: components["schemas"]["Model"][];
+                        /** @description The daemon's current default chat model. A saved value wins over DEFAULT_MODEL, which wins over Qwen3-8B-4bit. Null only when this router was built without one. */
+                        default_model?: string | null;
                     };
+                };
+            };
+        };
+    };
+    putDefaultModel: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    model: string;
+                };
+            };
+        };
+        responses: {
+            /** @description The stored model id */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        model: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description The settings store is not available on this daemon */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };
@@ -5406,6 +5518,109 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TrustTeamError"];
+                };
+            };
+        };
+    };
+    getKernelConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Consent card */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KernelConsent"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    grantKernelConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KernelConsentGrant"];
+            };
+        };
+        responses: {
+            /** @description The card after the record is stored */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["KernelConsent"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            /** @description Host required, or the native dialog was denied, unavailable, or timed out */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            /** @description consent_empty, fingerprint_mismatch, or consent_exempt */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    revokeKernelConsent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record removed, or there was none */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description The consent store could not be updated */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
         };

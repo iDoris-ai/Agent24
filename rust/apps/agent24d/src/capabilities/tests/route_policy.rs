@@ -291,6 +291,43 @@ fn section_3_rows_match_operation_and_level() {
         operation: "SkillsActivate".into(),
         level: AssuranceLevel::Elevated,
     });
+    fixed.push(DesignRow {
+        method: "PUT".into(),
+        path: "/models/default".into(),
+        operation: "ModelsAdmin".into(),
+        level: AssuranceLevel::Elevated,
+    });
+
+    // CONSENT-2 extends the frozen table: showing the card is an everyday
+    // module read, writing consent is elevated module admin, and stopping
+    // it reuses the everyday consent-revoke operation.
+    for (method, path, operation, level) in [
+        (
+            "GET",
+            "/os/{name}/kernel-consent",
+            "ModuleRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "POST",
+            "/os/{name}/kernel-consent",
+            "ModuleAdmin",
+            AssuranceLevel::Elevated,
+        ),
+        (
+            "DELETE",
+            "/os/{name}/kernel-consent",
+            "ConsentRevoke",
+            AssuranceLevel::Everyday,
+        ),
+    ] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: path.into(),
+            operation: operation.into(),
+            level,
+        });
+    }
 
     let mut catalog = BTreeSet::new();
     for policy in policies() {
@@ -340,7 +377,6 @@ fn section_3_rows_match_operation_and_level() {
 #[test]
 fn unmapped_operations_have_no_level_and_only_models_are_global() {
     for operation in [
-        Operation::ModelsAdmin,
         Operation::WorkspaceCreate,
         Operation::WorkspaceRelease,
         Operation::HostLease,
@@ -479,6 +515,14 @@ fn method_splits_shutdown_and_memory_settings() {
     assert_eq!(
         required_operation(&Method::PUT, "/api/v1/memory/settings"),
         Some(Operation::MemorySettingsWrite)
+    );
+    assert_eq!(
+        required_operation(&Method::PUT, "/api/v1/models/default"),
+        Some(Operation::ModelsAdmin)
+    );
+    assert_eq!(
+        Operation::ModelsAdmin.assurance_level(),
+        Some(AssuranceLevel::Elevated)
     );
     assert_eq!(
         Operation::MemoryRead.assurance_level(),

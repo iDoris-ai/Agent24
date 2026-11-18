@@ -1426,19 +1426,19 @@ D0-2 要求"在 `agent24-decide` 里定义写入/追加/导出/删除的 trait�
 ## ADR-035：iDoris Admin session token 由可信 launcher 通过匿名 inherited FD/HANDLE 一次性交付
 
 **日期**：2026-10-08
-**状态**：⚠️ 部分取代（2026-11-12，S0-8。原文：✅ 采纳（jason 明确拍板；追踪 issue：Agent24 #765））
+**状态**：⚠️ 部分取代（2026-11-17 订正；初标 2026-11-12，S0-8。原文：✅ 采纳（jason 明确拍板；追踪 issue：Agent24 #765））
 
-**部分取代（2026-11-12）**：启动者改成 agent24d 里的 supervisor，桌面不再持有 Admin token。现行交接见 [ADR-046](adr/ADR-046-idoris-managed-host.md) D3（IL-13；S2-2 #1790）。
+**部分取代（2026-11-17）**。S0-8 的两份正文里，只有 [ADR-046](adr/ADR-046-idoris-managed-host.md) 取代本篇的节。[ADR-KB-02](knowledge/ADR-KB-02-HOST-AUTHORITY.md) 记的是知识库登录态和短期凭据 C，不取代本篇任何一节。
 
-仍有效：daemon 用 CSPRNG 生成一次性 Admin session token，经匿名 stdin 管道交给它拉起的 iDoris（`serve --admin-token-stdin`）；token 不进 argv、环境变量、普通文件、stdout/stderr 或日志。决策 2（Windows 用显式 allowlist 的 inherited HANDLE，禁止继承全部句柄）没有被本篇取代，仍是那一侧的决定。
-
-被 ADR-046 取代的条款：
+被 ADR-046 取代的节（现行见该篇 D3、D6；IL-13 #1472，S2-2 #1790）：
 
 - 决策 1 的后半：第二条匿名管道交给 Agent24 Electron main 的专用 inherited FD。
 - 决策 3：Electron main 读 65 字节帧，token 只驻留 main 进程内存。
 - 决策 4：renderer 只获得零参数 `idorisStatus()`，由 main 里的 Admin HTTP client 访问冻结路由。
-- 决策 5 里「写完两条管道后 launcher 丢掉自己的副本」：daemon 在该子进程这一代的内存里保留副本，用于本机 Admin 就绪检查和日志脱敏，子进程结构丢弃时一起丢掉；不交给桌面。
+- 决策 5 里「写完两条管道后 launcher 丢掉自己的副本」：daemon 在该子进程这一代的内存里保留副本，用于本机 Admin 就绪检查，子进程结构丢弃时一起丢掉；不交给桌面。
 - 信任边界里「消费 token 的 Agent24 Electron main」：消费者是 daemon 的 supervisor。
+
+仍有效：决策 1 的前半。daemon 生成一次性 Admin session token，经匿名 stdin 管道交给它拉起的 iDoris（`serve --admin-token-stdin`）；token 不进 argv、环境变量、普通文件、stdout/stderr 或日志。决策 2（Windows 用显式 allowlist 的 inherited HANDLE，禁止继承全部句柄）没有被取代。当前 `supervisor.rs` 只有 stdin 管道，HANDLE 白名单未在该文件落地，见 ADR-046 D3 的 FU。
 
 下面的正文保留 2026-10-08 的原文，供对照。上文列出的条款以 ADR-046 为准。
 
@@ -1639,7 +1639,7 @@ jason 2026-10-26 描述的产品形态是：Agent24 是要下载运行的客户�
 - **ADR-022**：「默认 MLX」收窄为 Apple Silicon 上的默认值；其他平台的默认运行时由 iDoris 按档位选择。
 - **ADR-026 #11**：TUI 仍不是第二个运行时，但对齐范围从运维面扩大为全部对外能力（决策 4）。
 - **ADR-027**：移动瘦壳「经 HTTP/WS 直连 daemon」和其遗留项（bind-address、远程认证）被决策 6 取代；双壳技术选型（Tauri / Expo）留待遥控设计时再定。
-- **ADR-035**：不变。iDoris Admin token 仍只经匿名 FD/HANDLE 交付，不落普通文件。
+- **ADR-035**：2026-11-17 起标为部分取代。交给 Electron main 的条款（决策 1 后半、决策 3、决策 4、决策 5 的双管道丢副本、信任边界里的 Electron main）以 [ADR-046](adr/ADR-046-idoris-managed-host.md) 为准。stdin 交给 iDoris、不落普通文件仍然有效。知识库凭据不在本篇，见 [ADR-KB-02](knowledge/ADR-KB-02-HOST-AUTHORITY.md)，那一篇不改本条。
 - **open-design ADR-004、ADR-005**：capability 模型、「不设共享宿主秘密」的结论保持不变。修订两点：一是宿主权限除了父进程管道，新增一条获取通道，即决策 3 的本机登记握手（经身份校验，只属于本进程，有 TTL）；二是 daemon 不再必须由桌面拉起并绑定父进程（决策 2 服务模式）。ADR-004 的「Electron main 是唯一宿主」改为「Electron main 是一方宿主级客户端之一」。
 - **SPEC-002 §4**：stdout ready 行每次启动交付 token 的握手，只适用于子进程模式。服务模式改走登记端点，需要同步修订。
 - **KB-HOST-01（#1184，ab/weknora）、OD-M11 F11.1**：桌面经 stdin 管道拥有 daemon 降为「子进程模式退路」。

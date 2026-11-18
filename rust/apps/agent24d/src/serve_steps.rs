@@ -1363,6 +1363,13 @@ pub(super) async fn mount_domain_os(
     crate::os_memory::OsMemoryCatalog,
     std::collections::HashMap<String, std::path::PathBuf>,
 ) {
+    if let Ok(mut teams) = state.os_signing_teams.write() {
+        for entry in catalogue {
+            if let crate::domain::Build::Package(package) = &entry.build {
+                teams.insert(entry.name.clone(), package.signing_team.clone());
+            }
+        }
+    }
     let (module_routes, mut reports, partitions) = crate::domain::mount_all_with_refusals(
         &catalogue,
         &os_root,
@@ -1391,6 +1398,7 @@ pub(super) async fn mount_domain_os(
             // that ordering matters).
             models: Some(model_deps.clone()),
         },
+        Some(&state.store),
     )
     .await;
     let (refusal_rows, package_dirs) =

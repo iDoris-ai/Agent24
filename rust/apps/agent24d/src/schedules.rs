@@ -527,6 +527,40 @@ mod schedules_rest_guard {
 
     // ── C2.1: REST can never construct a module row ─────────────────────────
 
+    /// FU-71. Mutation: drop the digit check in `normalize_cron` and this POST is 201.
+    #[tokio::test]
+    async fn post_numeric_dow_is_rejected() {
+        let state = crate::server::tests::state().await;
+        let body = serde_json::json!({
+            "name": "weekdays",
+            "spec": {"type": "cron", "expr": "0 7 * * 1-5"},
+            "action": {"type": "agent_run", "prompt": "hi"},
+        });
+        let (status, body) = body_json(
+            create_schedule(
+                State(state.clone()),
+                req_json("POST", "/api/v1/schedules", body),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["error"]["code"], "invalid_request");
+        assert!(state.scheduler.list().await.unwrap().is_empty());
+
+        let named = serde_json::json!({
+            "name": "weekdays",
+            "spec": {"type": "cron", "expr": "0 7 * * MON-FRI"},
+            "action": {"type": "agent_run", "prompt": "hi"},
+        });
+        let (status, created) = body_json(
+            create_schedule(State(state), req_json("POST", "/api/v1/schedules", named)).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["spec"]["expr"], "0 7 * * MON-FRI");
+    }
+
     #[tokio::test]
     async fn post_module_delivery_action_is_400() {
         let state = crate::server::tests::state().await;

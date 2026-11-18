@@ -27,6 +27,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+#[path = "support/kernel_consent_fixture.rs"]
+mod kernel_consent_fixture;
+
 #[path = "support/signature_command.rs"]
 mod signature_command;
 
@@ -271,6 +274,7 @@ fn start_hanging_provider() -> StubProvider {
 fn model_shutdown_wiring_lands_the_cancelled_call_in_the_store() {
     let home = tmp_home();
     install(home.path());
+    kernel_consent_fixture::allow_kernel(home.path(), "probe", &["models"]);
     let provider = start_hanging_provider();
     let mut d = start(home.path(), provider.port);
 

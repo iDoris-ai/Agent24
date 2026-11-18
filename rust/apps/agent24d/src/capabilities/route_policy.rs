@@ -76,6 +76,10 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/idoris/operations/{id}/cancel", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
     row("POST", "/api/v1/chat", Operation::ChatCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/models", Operation::ModelsRead, AssuranceLevel::Everyday),
+    // Elevated: ProductHost writes it directly. A service-mode shell token
+    // holds `ModelsAdmin` and must confirm presence. The legacy shared token
+    // cannot elevate, so `legacy_unelevatable` still refuses it.
+    row("PUT", "/api/v1/models/default", Operation::ModelsAdmin, AssuranceLevel::Elevated),
     row("GET", "/api/v1/decide/profile", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/capabilities/creative", Operation::CapabilityMint, AssuranceLevel::Elevated),
     row("POST", "/api/v1/capabilities/bridge", Operation::CapabilityMint, AssuranceLevel::Elevated),
@@ -124,6 +128,9 @@ const POLICIES: &[RoutePolicy] = &[
     row("GET", "/api/v1/os", Operation::ModuleRead, AssuranceLevel::Everyday),
     row("PATCH", "/api/v1/os/{name}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/os/{name}/delegation", Operation::ModuleAdmin, AssuranceLevel::Elevated),
+    row("GET", "/api/v1/os/{name}/kernel-consent", Operation::ModuleRead, AssuranceLevel::Everyday),
+    row("POST", "/api/v1/os/{name}/kernel-consent", Operation::ModuleAdmin, AssuranceLevel::Elevated),
+    row("DELETE", "/api/v1/os/{name}/kernel-consent", Operation::ConsentRevoke, AssuranceLevel::Everyday),
     row("POST", "/api/v1/os/{name}/stop", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/os/{name}/commands/{command}", Operation::ModuleAdmin, AssuranceLevel::Elevated),
     row("POST", "/api/v1/shutdown", Operation::Shutdown, AssuranceLevel::Elevated),

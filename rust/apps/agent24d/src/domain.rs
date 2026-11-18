@@ -926,6 +926,9 @@ pub struct Package {
     /// `sha256:<hex>` of the manifest's bytes — what the module must report in
     /// its handshake.
     pub digest: String,
+    /// macOS Developer ID team of the package executable, when it was read.
+    /// `None` off macOS, or when the team could not be read. Not a grant.
+    pub signing_team: Option<String>,
 }
 
 /// What the daemon lends every out-of-process module: where their callback
@@ -1253,6 +1256,7 @@ pub async fn mount_all(
         approval_broker,
         &[],
         deps,
+        None,
     )
     .await
 }
@@ -1279,6 +1283,10 @@ pub async fn mount_all_with_refusals(
     // `CallbackDeps`'s own doc comment for why. Lent to each `mount_package`
     // call below as `&deps`; dropped when this function returns.
     deps: CallbackDeps,
+    // `None` leaves today's grant (tests and `mount_all`). `serve` passes the
+    // store so a package that needs a card does not receive kernel handles
+    // until a record exists.
+    kernel_store: Option<&agent24_store::Store>,
 ) -> (Router, Vec<MountReport>, crate::os_memory::OsMemoryCatalog) {
     let mut app = Router::new();
     let mut reports = Vec::new();
@@ -1549,6 +1557,21 @@ pub async fn mount_all_with_refusals(
         // A PACKAGE is started, not constructed: its own path from here.
         let build = match &entry.build {
             Build::Package(package) => {
+                let kernel_names: Vec<String> = package
+                    .manifest
+                    .kernel_capabilities()
+                    .iter()
+                    .map(|cap| cap.as_str().to_owned())
+                    .collect();
+                let operations = crate::component_routes::kernel_consent_operations(&name);
+                let narrowed = crate::kernel_consent::narrow_for_mount(
+                    kernel_store,
+                    &name,
+                    package.signing_team.as_deref(),
+                    &kernel_names,
+                    &operations,
+                )
+                .await;
                 let (next, report) = mount_package(
                     app,
                     package,
@@ -1566,6 +1589,7 @@ pub async fn mount_all_with_refusals(
                     host,
                     approval_broker,
                     &deps,
+                    narrowed,
                 )
                 .await;
                 app = next;
@@ -2025,6 +2049,9 @@ async fn mount_package(
     // ME4-1.4.1 (design §10.3): borrowed, never by value — `CallbackDeps`
     // itself is only dropped when `mount_all` returns.
     deps: &CallbackDeps,
+    // `None` keeps the resolver grant (exempt, or no consent store).
+    // `Some` is the only set of kernel names this package may hold.
+    kernel_allowed: Option<BTreeSet<String>>,
 ) -> (Router, MountReport) {
     let MountTarget {
         name,
@@ -2117,12 +2144,15 @@ async fn mount_package(
     // T7a/ME-3e: computed once, before `supervise` — `Offer` and the
     // `MethodsFor` closure both need it, and it must be the SAME `Grants` that
     // ends up in `MountReport.granted` below (judgement 10's consistency).
-    let granted = requires::resolve(
-        &RequiresSpec::from_manifest(manifest),
-        GrantForm::OutOfProcess.host_cap(),
-        Consent::FirstPartyEnabled,
-    )
-    .granted;
+    let granted = requires::intersect_consented(
+        requires::resolve(
+            &RequiresSpec::from_manifest(manifest),
+            GrantForm::OutOfProcess.host_cap(),
+            Consent::FirstPartyEnabled,
+        )
+        .granted,
+        kernel_allowed.as_ref(),
+    );
     let broadcast: Arc<dyn EventBroadcast> = Arc::new(HubBroadcast(events.clone()));
     let event_sink = granted
         .has(Capability::Events)
@@ -2870,6 +2900,7 @@ while f.readline():
                 manifest: d.manifest,
                 dir: d.dir,
                 digest: d.digest,
+                signing_team: None,
             })),
         })
         .collect()
@@ -3403,6 +3434,75 @@ while f.readline():
         }
     }
 
+    /// No consent row: the package still mounts, but `granted` is empty and
+    /// the handshake does not hand it the events handle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_package_with_no_consent_record_gets_no_handle() {
+        let name = "kcnorow";
+        let tmp = tempfile::Builder::new()
+            .prefix("a24")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let packages = tmp.path().join("packages");
+        write_package_with(&packages, name, "[events]", EVENTS_PROBE_MODULE);
+        let mut catalogue = discovered(&packages);
+        match &mut catalogue[0].build {
+            Build::Package(package) => package.signing_team = Some("OTHERTEAM1".into()),
+            Build::InProcess(_) => panic!("expected a package"),
+        }
+        let store = agent24_store::Store::open_memory().await.unwrap();
+        let host = test_host(tmp.path());
+        let hub = crate::events::EventsHub::default();
+        let (_, reports, _) = mount_all_with_refusals(
+            &catalogue,
+            &tmp.path().join("os"),
+            &hub,
+            Ok(&all_enabled()),
+            &no_models(),
+            None,
+            Ok(&host),
+            &test_approval_broker(&hub).await,
+            &[],
+            test_callback_deps().await,
+            Some(&store),
+        )
+        .await;
+        assert_eq!(
+            reports[0].outcome,
+            MountOutcome::Mounted,
+            "{:?}",
+            reports[0]
+        );
+        assert!(
+            reports[0].granted.is_empty(),
+            "no record must not copy the declaration into granted: {:?}",
+            reports[0].granted
+        );
+
+        let probe_path = packages.join(name).join("probe.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let probe: serde_json::Value = loop {
+            if let Ok(bytes) = std::fs::read(&probe_path) {
+                break serde_json::from_slice(&bytes).unwrap();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the module never wrote its probe"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(probe["offers_events"].as_bool(), Some(false), "{probe}");
+        assert_eq!(
+            probe["emit_response"]["error"]["data"]["kind"].as_str(),
+            Some("forbidden"),
+            "{probe}"
+        );
+
+        for s in host.supervisors.close().running {
+            s.handle.stop().await.expect("a clean stop");
+        }
+    }
+
     /// A full `AppState` with one package, `remote`, started and Running —
     /// for tests that need a real HTTP route (`stop_now_os`, `patch_os`)
     /// rather than just `Supervisors` directly. Builds on `running_package`'s
@@ -3715,6 +3815,7 @@ raise SystemExit(3)
                     manifest: d.manifest,
                     dir: d.dir,
                     digest: d.digest,
+                    signing_team: None,
                 })),
             })
             .collect()
@@ -4772,6 +4873,7 @@ raise SystemExit(3)
                 manifest: DomainOsManifest::from_yaml(&alpha_yaml).unwrap(),
                 dir: tmp.path().join("alpha"),
                 digest: "sha256:00".to_owned(),
+                signing_team: None,
             })),
         };
         let beta = FakeModule::from_yaml(
@@ -6336,6 +6438,7 @@ raise SystemExit(3)
                     manifest: d.manifest,
                     dir: d.dir,
                     digest: d.digest,
+                    signing_team: None,
                 })),
             })
             .collect();
@@ -6381,6 +6484,7 @@ raise SystemExit(3)
             &test_approval_broker(&hub).await,
             refusals,
             test_callback_deps().await,
+            None,
         )
         .await;
         (app, reports)
@@ -6588,6 +6692,7 @@ raise SystemExit(3)
             &test_approval_broker(&hub).await,
             &refusals,
             test_callback_deps().await,
+            None,
         )
         .await;
         assert_eq!(

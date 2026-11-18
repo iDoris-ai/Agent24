@@ -124,6 +124,7 @@ vi.mock('electron', () => ({
 
 vi.mock('../backend-manager', () => ({
   getBackendEndpoint: () => ({ port: h.endpoint.port }),
+  getDaemonStartupFailure: () => null,
   daemonConnection: () => ({ port: h.endpoint.port, authHeaders: { Authorization: `Bearer ${h.endpoint.token}` } }),
   daemonCliEndpoint: () => ({ port: h.endpoint.port, token: h.endpoint.token }),
   daemonElevation: () => null,

@@ -70,6 +70,7 @@ mod conn_phase;
 mod decision_log;
 mod inbound;
 mod inbound_scrub;
+mod kernel_consents;
 mod legacy_recovery;
 mod message_origin;
 mod model_call_timings;
@@ -150,6 +151,7 @@ pub use inbound::{
 pub use inbound_scrub::{
     INBOUND_SCRUB_PLACEHOLDER, InboundScrubReport, InboundScrubSession, MEMORY_GRACE_SECS,
 };
+pub use kernel_consents::KernelConsentRow;
 pub use legacy_recovery::{
     LegacyRecoveryHold, RecoveryDecisionEffect, RecoveryState, recovery_decision_effect,
 };

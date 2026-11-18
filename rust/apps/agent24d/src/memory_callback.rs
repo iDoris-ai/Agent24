@@ -123,6 +123,9 @@ impl Handler for RememberHandler {
             let Some(handle) = entitlement.private_handle() else {
                 return Err(forbidden());
             };
+            if crate::kernel_consent::live_denies(handle.memory.module(), "memory") {
+                return Err(forbidden());
+            }
 
             let lifecycle = match generation.admit_callback_bound(parsed.request_id.as_deref()) {
                 Ok(lifecycle) => lifecycle,
@@ -171,6 +174,9 @@ impl Handler for RecallHandler {
             let Some(handle) = entitlement.private_handle() else {
                 return Err(forbidden());
             };
+            if crate::kernel_consent::live_denies(handle.memory.module(), "memory") {
+                return Err(forbidden());
+            }
 
             let lifecycle = match generation.admit_callback_bound(parsed.request_id.as_deref()) {
                 Ok(lifecycle) => lifecycle,
@@ -218,6 +224,9 @@ impl Handler for RecentHandler {
             let Some(handle) = entitlement.private_handle() else {
                 return Err(forbidden());
             };
+            if crate::kernel_consent::live_denies(handle.memory.module(), "memory") {
+                return Err(forbidden());
+            }
 
             let lifecycle = match generation.admit_callback_bound(parsed.request_id.as_deref()) {
                 Ok(lifecycle) => lifecycle,
@@ -478,6 +487,57 @@ mod tests {
             ok.get("id").is_some(),
             "a real handle must really write a memory: {ok}"
         );
+    }
+
+    fn revoke_memory(name: &str) {
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(name, ["memory"], until);
+        crate::kernel_consent::track(name, std::iter::empty::<&str>(), until);
+    }
+
+    #[tokio::test]
+    async fn a_revoked_memory_grant_forbids_the_next_remember() {
+        let name = "kc-mem-remember";
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let h = RememberHandler {
+            generation: running_generation(),
+            entitlement: granted_entitlement(&kv, "alice", name).await,
+        };
+        revoke_memory(name);
+        let err = h
+            .call(json!({"kind": "note", "body": {}}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_memory_grant_forbids_the_next_recall() {
+        let name = "kc-mem-recall";
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let h = RecallHandler {
+            generation: running_generation(),
+            entitlement: granted_entitlement(&kv, "alice", name).await,
+        };
+        revoke_memory(name);
+        let err = h
+            .call(json!({"query": "note", "page_size": 1}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_memory_grant_forbids_the_next_recent() {
+        let name = "kc-mem-recent";
+        let kv = agent24_memory::KvStore::open_memory().await.unwrap();
+        let h = RecentHandler {
+            generation: running_generation(),
+            entitlement: granted_entitlement(&kv, "alice", name).await,
+        };
+        revoke_memory(name);
+        let err = h.call(json!({"page_size": 1})).await.unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
     }
 
     // ── judgement 6 (partial — Revoked's own state machine is covered by

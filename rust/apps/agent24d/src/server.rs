@@ -9,7 +9,7 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 // Child test modules resolve these through `use super::*`, the same names
 // `server.rs` imported before the split.
 #[cfg(test)]
@@ -254,6 +254,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route(
+            "/api/v1/models/default",
+            put(crate::routes::put_default_model),
+        )
+        .route(
             "/api/v1/decide/profile",
             get(crate::decide_routes::get_decide_profile),
         )
@@ -430,6 +434,12 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route(
             "/api/v1/os/{name}/delegation",
             post(establish_module_delegation),
+        )
+        .route(
+            "/api/v1/os/{name}/kernel-consent",
+            get(crate::kernel_consent_routes::show)
+                .post(crate::kernel_consent_routes::grant)
+                .delete(crate::kernel_consent_routes::revoke),
         )
         .route(
             "/api/v1/os/{name}",

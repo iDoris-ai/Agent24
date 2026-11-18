@@ -12,6 +12,7 @@ const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
 const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
+const mockRetryBackend = vi.fn()
 const mockSetNavPrefs = vi.fn()
 
 beforeEach(() => {
@@ -20,6 +21,7 @@ beforeEach(() => {
   mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [], runs: [] } })
   mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
+  mockRetryBackend.mockResolvedValue(null)
   mockSetNavPrefs.mockResolvedValue(undefined)
 
   Object.defineProperty(window, 'agent24', {
@@ -30,6 +32,7 @@ beforeEach(() => {
       omlxStart: mockOmlxStart,
       omlxModels: mockOmlxModels,
       backendEndpoint: mockBackendEndpoint,
+      retryBackend: mockRetryBackend,
       getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }),
       setNavPrefs: mockSetNavPrefs,
       agentearSnapshot: vi.fn().mockResolvedValue([]),
@@ -94,6 +97,33 @@ describe('App', () => {
       expect(screen.getByText('后端服务运行中 :60128')).toBeInTheDocument()
     })
     expect(screen.queryByText(/:8765/)).not.toBeInTheDocument()
+  })
+
+  it('shows offline with a retry, and no start-failure copy when the daemon gave no reason', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 0, data: null })
+    mockBackendEndpoint.mockResolvedValue(null)
+    await act(async () => { render(<App />) })
+    await waitFor(() => expect(screen.getByText('后端服务离线')).toBeInTheDocument())
+    expect(screen.queryByText('后台启动失败')).not.toBeInTheDocument()
+    expect(screen.queryByText('数据库比当前 App 新，请安装最新版 Agent24')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重试启动' }))
+    expect(mockRetryBackend).toHaveBeenCalledTimes(1)
+  })
+
+  it('shows the start failure, the migration hint, the raw reason, and retry', async () => {
+    const error = 'migration 34 was previously applied but is missing in the resolved migrations'
+    mockBackendProxy.mockResolvedValue({ ok: false, status: 0, data: null })
+    mockBackendEndpoint.mockResolvedValue({ port: null, startupFailure: { code: 'start_failed', error } })
+    await act(async () => { render(<App />) })
+    await waitFor(() => expect(screen.getByText('后台启动失败')).toBeInTheDocument())
+    expect(screen.getByText('数据库比当前 App 新，请安装最新版 Agent24')).toBeInTheDocument()
+    expect(screen.getAllByTitle(error).length).toBeGreaterThan(0)
+    expect(screen.queryByText(error)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '原因' }))
+    expect(screen.getByText(error)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '重试启动' }))
+    expect(mockRetryBackend).toHaveBeenCalledTimes(1)
+    expect(screen.queryByText('后端服务离线')).not.toBeInTheDocument()
   })
 
   it('shows plain "running" text when the port is not yet known', async () => {

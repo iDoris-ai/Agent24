@@ -14,6 +14,9 @@ import { capabilitiesMessages as catalogMessages } from '../capabilities/capabil
 import SkillBar from './skills/SkillBar'
 import { IsolationTag } from '../components/IsolationTag'
 import type { ComponentIsolation } from '../components/componentApi'
+import type { KernelConsentClass } from '../kernel-consent/kernelConsentApi'
+import { kernelCapabilityPhrase } from '../kernel-consent/KernelConsentCard'
+import { kernelConsentMessages } from '../kernel-consent/kernelConsent.i18n'
 
 /** Row that shows the pending-approval count. Matches the capability id. */
 
@@ -46,16 +49,24 @@ export interface CapabilitiesPageProps {
    */
   isolationFor?: (id: CapabilityId) => ComponentIsolation | undefined
   /**
+   * Host-only. `exempt` is a bundled module and has no stop button.
+   * `granted` can be revoked. Absent on a redacted view.
+   */
+  consentFor?: (id: CapabilityId) => KernelConsentClass | undefined
+  /** Same daemon route as `agent24 os consent revoke`. */
+  onRevoke?: (id: CapabilityId) => void
+  /**
    * Slots-full note. Settings is not a capability id, so the link cannot go
    * through `open`.
    */
   onOpenSettings?: () => void
 }
 
-export default function CapabilitiesPage({ statusFor, grantsFor, isolationFor, onOpenSettings }: CapabilitiesPageProps) {
+export default function CapabilitiesPage({ statusFor, grantsFor, isolationFor, consentFor, onRevoke, onOpenSettings }: CapabilitiesPageProps) {
   const { defs, open } = useContext(CapabilitiesContext)
   const { prefs, pinnedCount = prefs.pinned.length, setPrefs } = useContext(NavPrefsContext)
   const t = useT(capabilitiesMessages)
+  const consentText = useT(kernelConsentMessages)
   const c = useT(catalogMessages)
   const baseId = useId()
   const slotsFull = pinnedCount >= prefs.slotCount
@@ -144,7 +155,13 @@ export default function CapabilitiesPage({ statusFor, grantsFor, isolationFor, o
                   const pin = pinOf(def)
                   const grants = grantsFor?.(def.id)
                   const grantText = grants === undefined ? undefined
-                    : t('grants.line', { grants: grants.length === 0 ? t('grants.none') : grants.join(t('grants.sep')) })
+                    : t('grants.line', {
+                      grants: grants.length === 0
+                        ? t('grants.none')
+                        : grants.map((id) => kernelCapabilityPhrase(consentText, id)).join(t('grants.sep')),
+                    })
+                  const consent = consentFor?.(def.id)
+                  const canStop = consent === 'granted' || consent === 'missing'
                   return (
                     <li key={def.id} className="cap-row" aria-label={name}>
                       <div className="cap-copy">
@@ -162,6 +179,11 @@ export default function CapabilitiesPage({ statusFor, grantsFor, isolationFor, o
                         <button type="button" className="btn btn-primary" onClick={() => open(def.id, 'capabilities')}>
                           {t('action.open')}
                         </button>
+                        {canStop && (
+                          <button type="button" className="btn btn-ghost" onClick={() => onRevoke?.(def.id)}>
+                            {consentText('stop')}
+                          </button>
+                        )}
                         <button
                           type="button"
                           className="btn btn-ghost"

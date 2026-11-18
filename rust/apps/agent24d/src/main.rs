@@ -48,6 +48,8 @@ mod host_bootstrap;
 mod hyphae_install;
 mod idoris_routes;
 mod inbound;
+mod kernel_consent;
+mod kernel_consent_routes;
 mod knowledge_backend;
 mod knowledge_routes;
 mod knowledge_tools;
@@ -83,6 +85,7 @@ mod host_bootstrap {
         }
     }
 }
+mod default_model;
 mod lifecycle;
 mod mcp;
 mod memory_callback;

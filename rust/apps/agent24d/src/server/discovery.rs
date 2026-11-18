@@ -79,6 +79,28 @@ pub(crate) fn module_tools_if_live(
     }
 }
 
+/// Team of the package executable on macOS. `None` elsewhere, or when the
+/// team cannot be read. A relative spawn path only; anything else is unread.
+fn signing_team_of(
+    policy: &agent24_os_packages::signature::Policy,
+    manifest: &agent24_domain::DomainOsManifest,
+    dir: &std::path::Path,
+) -> Option<String> {
+    if std::env::consts::OS != "macos" {
+        return None;
+    }
+    let command = manifest.spawn()?.command.as_str();
+    if command.is_empty() || command.starts_with('/') || command.split('/').any(|part| part == "..")
+    {
+        return None;
+    }
+    agent24_components::sign::SignatureVerifier::team_id(
+        policy.verifier.as_ref(),
+        &dir.join(command),
+    )
+    .ok()
+}
+
 pub(super) fn os_signature_policy() -> agent24_os_packages::signature::Policy {
     #[cfg(test)]
     {
@@ -179,6 +201,7 @@ pub(super) fn with_discovered_policy(
             "discovered domain OS {name:?} v{version} at {}",
             d.dir.display()
         );
+        let signing_team = signing_team_of(signature, &d.manifest, &d.dir);
         catalogue.push(crate::domain::Installed {
             name,
             version,
@@ -186,6 +209,7 @@ pub(super) fn with_discovered_policy(
                 manifest: d.manifest,
                 dir: d.dir,
                 digest: d.digest,
+                signing_team,
             })),
         });
     }

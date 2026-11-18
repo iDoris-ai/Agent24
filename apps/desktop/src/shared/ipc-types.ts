@@ -58,6 +58,15 @@ export const IpcChannels = {
   // No arguments: the module is fixed in main. Each runs the app's CLI.
   OsModuleUninstall: 'os-module:uninstall',
   OsModuleInstallBundled: 'os-module:install-bundled',
+  // Sin90 writes. Main attaches the human key; the renderer names an operation.
+  Sin90Write: 'sin90:write',
+  Sin90KeyStatus: 'sin90:key-status',
+  // Pushed from the one /api/v1/events socket. `{kind:'connected'}` is a reconnect.
+  Sin90Event: 'sin90:event',
+  // OSI-1: download a registered domain OS (Sin90) and `agent24 os install` it.
+  OsPackageInstall: 'os-package:install',
+  OsPackageLatest: 'os-package:latest',
+  OsPackageProgress: 'os-package:progress',
   CommInstall: 'comm:install',
   // Private-key backup: native confirm + native save dialog in main; the
   // backend writes the file itself, so the key never crosses IPC.
@@ -365,6 +374,14 @@ export interface BackendProxyResponse {
   data: unknown
 }
 
+/** OSI-1: main → renderer while `OsPackageInstall` is downloading. */
+export interface OsPackageProgress {
+  id: string
+  phase: 'download' | 'verify' | 'extract' | 'install'
+  received: number
+  total: number | null
+}
+
 /** A1: a decision for `POST /api/v1/approvals/{id}`. The daemon offers the valid
  *  set per approval (`available_decisions`), so `type` is an open string here. */
 export interface ApprovalDecisionInput {
@@ -372,11 +389,20 @@ export interface ApprovalDecisionInput {
   reason?: string
 }
 
+/** Why the daemon this app spawned last failed to start. `error` is the
+ * daemon's own text (the `failed` line, or the last stderr line). */
+export interface DaemonStartupFailure {
+  code: string
+  error: string
+}
+
 /** FU-93: the backend daemon's actual (dynamic) port, so the sidebar can show
- * it instead of a hardcoded guess. `null` while the daemon has not announced
- * its ready line yet. */
+ * it instead of a hardcoded guess. `port` is null while the daemon has not
+ * announced its ready line. `startupFailure` is the last start failure, when
+ * there is one. */
 export interface BackendEndpointResult {
-  port: number
+  port: number | null
+  startupFailure?: DaemonStartupFailure
 }
 
 /** The service daemon did not enrol this app: its code, and whether retrying

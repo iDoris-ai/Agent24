@@ -19,7 +19,6 @@ pub struct SeatbeltInputs<'a> {
     /// `program` (a test launcher's interpreter). Same prefix rule as
     /// `program`.
     pub also_programs: &'a [&'a Path],
-    pub temp_dir: &'a Path,
     /// The user's home. Its contents stay unreadable, except a program prefix
     /// that already lives there (a `pyenv` or `fnm` install) and the data
     /// directory when that is under the home.
@@ -67,7 +66,6 @@ const WRITE_DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/dtracehelper"];
 pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileError> {
     let package = canonical(inputs.package_dir)?;
     let data = canonical(inputs.data_dir)?;
-    let temp = canonical(inputs.temp_dir)?;
     let callback = canonical(inputs.callback_sock)?;
     let home = inputs
         .home_dir
@@ -86,13 +84,15 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
     }
     push_unique(&mut reads, package);
     push_unique(&mut reads, data.clone());
-    push_unique(&mut reads, temp.clone());
     for path in std::iter::once(inputs.program).chain(inputs.also_programs.iter().copied()) {
         add_program(&mut reads, path, home.as_deref())?;
     }
 
     let data_dir = data.clone();
-    let mut writes = vec![data, temp];
+    // The module's scratch directory is `<data>/tmp`, already inside this
+    // write root. The user temp directory is not a root: every module would
+    // otherwise share it with the rest of the user (SBX-1b).
+    let mut writes = vec![data];
     for dev in WRITE_DEVICES {
         push_unique(&mut writes, PathBuf::from(*dev));
     }
@@ -201,6 +201,102 @@ pub fn check_data_dir(data_dir: &Path, home: Option<&Path>) -> Result<PathBuf, P
         )));
     }
     Ok(data)
+}
+
+/// `<data_dir>/tmp`, cleared on every start, then handed to the module as
+/// `TMPDIR`, `TMP` and `TEMP`.
+///
+/// The leaf is inspected with `symlink_metadata` before anything is removed.
+/// A symlink (or anything that is not a plain directory) is unlinked, never
+/// followed, and a fresh directory made in its place. Only entries inside a
+/// real directory are removed. The returned path is canonical and ends with `/`,
+/// which is how macOS spells `TMPDIR`.
+///
+/// # Errors
+///
+/// [`ProfileError`] when the leaf cannot be inspected, removed, created,
+/// cleared or canonicalised.
+pub fn reset_module_temp(data_dir: &Path) -> Result<PathBuf, ProfileError> {
+    let temp = data_dir.join("tmp");
+    match std::fs::symlink_metadata(&temp) {
+        Ok(meta) if meta.file_type().is_dir() => clear_dir_contents(&temp)?,
+        Ok(_) => {
+            // A symlink or file left by the module itself: unlink the leaf (a
+            // symlink is not followed) and start over, so a module cannot
+            // switch off its own restarts.
+            std::fs::remove_file(&temp).map_err(|error| {
+                ProfileError(format!(
+                    "could not remove the odd module temp entry {}: {error}",
+                    temp.display()
+                ))
+            })?;
+            create_temp(&temp)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => create_temp(&temp)?,
+        Err(error) => {
+            return Err(ProfileError(format!(
+                "could not inspect the module temp directory {}: {error}",
+                temp.display()
+            )));
+        }
+    }
+    let mut canon = canonical(&temp)?.into_os_string();
+    canon.push("/");
+    Ok(PathBuf::from(canon))
+}
+
+fn create_temp(temp: &Path) -> Result<(), ProfileError> {
+    std::fs::create_dir(temp).map_err(|error| {
+        ProfileError(format!(
+            "could not create the module temp directory {}: {error}",
+            temp.display()
+        ))
+    })
+}
+
+/// Remove entries in `dir` and nothing outside it. A symlink entry is unlinked,
+/// not followed. The module may have left read-only directories (a Go module
+/// cache is 0555 holding 0444 files), so each real directory is given owner
+/// rwx before it is read; the daemon owns these files. `chflags uchg` is left
+/// to an operator.
+fn clear_dir_contents(dir: &Path) -> Result<(), ProfileError> {
+    let fail = |what: &Path, error: std::io::Error| {
+        ProfileError(format!(
+            "could not clear {} in the module temp directory: {error}",
+            what.display()
+        ))
+    };
+    owner_rwx(dir).map_err(|error| fail(dir, error))?;
+    for entry in std::fs::read_dir(dir).map_err(|error| fail(dir, error))? {
+        let entry = entry.map_err(|error| fail(dir, error))?;
+        let path = entry.path();
+        let kind = entry.file_type().map_err(|error| fail(&path, error))?;
+        if kind.is_dir() {
+            // `remove_dir_all` clears any depth; the chmod walk is only for
+            // the read-only trees it cannot remove.
+            if std::fs::remove_dir_all(&path).is_err() {
+                clear_dir_contents(&path)?;
+                std::fs::remove_dir(&path).map_err(|error| fail(&path, error))?;
+            }
+        } else {
+            std::fs::remove_file(&path).map_err(|error| fail(&path, error))?;
+        }
+    }
+    Ok(())
+}
+
+fn owner_rwx(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::symlink_metadata(dir)?;
+    if !meta.file_type().is_dir() {
+        // Swapped for a symlink after the type check: chmod would follow it.
+        return Err(std::io::Error::other("not a directory"));
+    }
+    let mode = meta.permissions().mode();
+    if mode & 0o700 == 0o700 {
+        return Ok(());
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700))
 }
 
 /// Canonicalise `path`, keeping a trailing component that does not exist yet
@@ -344,7 +440,6 @@ mod tests {
         data: &'a Path,
         callback: &'a Path,
         program: &'a Path,
-        temp: &'a Path,
         home: Option<&'a Path>,
     ) -> SeatbeltInputs<'a> {
         SeatbeltInputs {
@@ -353,7 +448,6 @@ mod tests {
             callback_sock: callback,
             program,
             also_programs: &[],
-            temp_dir: temp,
             home_dir: home,
             office_pipe: false,
         }
@@ -397,15 +491,8 @@ mod tests {
         std::fs::create_dir_all(&package).unwrap();
         std::fs::create_dir_all(&data).unwrap();
         let sh = Path::new("/bin/sh");
-        let profile = seatbelt_profile(&inputs(
-            &package,
-            &data,
-            &root.join("cb.sock"),
-            sh,
-            &std::env::temp_dir(),
-            None,
-        ))
-        .unwrap();
+        let profile =
+            seatbelt_profile(&inputs(&package, &data, &root.join("cb.sock"), sh, None)).unwrap();
         let run = |script: &str| {
             std::process::Command::new("/usr/bin/sandbox-exec")
                 .arg("-p")
@@ -459,7 +546,6 @@ mod tests {
             &data,
             &callback,
             Path::new("/bin/sh"),
-            &temp,
             None,
         ))
         .unwrap();
@@ -477,30 +563,28 @@ mod tests {
         let data = root.path().join("data");
         std::fs::create_dir(&package).unwrap();
         // Data is named but not created: canonicalise keeps the missing leaf.
-        let temp = std::env::temp_dir();
-        let callback = temp.join(format!("a24-sbx-{}.sock", std::process::id()));
+        let user_temp = std::env::temp_dir();
+        let callback = user_temp.join(format!("a24-sbx-{}.sock", std::process::id()));
         let home = PathBuf::from("/Users/sbx-home-not-real");
         let profile = seatbelt_profile(&inputs(
             &package,
             &data,
             &callback,
             Path::new("/bin/sh"),
-            &temp,
             Some(&home),
         ))
         .unwrap();
-        let canon_temp = canonical(&temp).unwrap();
-        assert!(
-            profile.contains(&canon_temp.display().to_string()),
-            "temp {canon_temp:?} not in profile"
-        );
-        // On macOS the temp directory is `/var/folders/…` and canonicalises
-        // under `/private`. The profile must carry the canonical spelling.
+        // The user temp directory is not a read or write root. The closing
+        // quote keeps a longer data path that merely lives under it (this
+        // test's tempdir does) from matching.
+        let canon_temp = canonical(&user_temp).unwrap();
+        let as_subpath = format!("(subpath \"{}\")", canon_temp.display());
+        let as_literal = format!("(literal \"{}\")", canon_temp.display());
+        assert!(!profile.contains(&as_subpath), "{profile}");
+        assert!(!profile.contains(&as_literal), "{profile}");
         if canon_temp.starts_with("/private/") {
-            assert!(
-                !profile.contains(&format!("(subpath \"{}\")", temp.display())),
-                "non-canonical temp path leaked into a subpath filter"
-            );
+            let raw = format!("(subpath \"{}\")", user_temp.display());
+            assert!(!profile.contains(&raw), "{profile}");
         }
         let canon_data = canonical(&data).unwrap();
         assert!(profile.contains(&format!("(subpath \"{}\")", canon_data.display())));
@@ -543,7 +627,6 @@ mod tests {
             &data,
             &temp.join("cb.sock"),
             &program,
-            &temp,
             Some(&home),
         ))
         .unwrap();

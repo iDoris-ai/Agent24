@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useT } from '../../i18n'
 import { settingsMessages } from '../Settings.i18n'
+import { isChatModelId } from './chatModels'
 
 type OmlxStatus = 'detecting' | 'connected' | 'disconnected' | 'starting' | 'stopping'
 type ModelCategory = 'resident' | 'ondemand'
@@ -37,6 +38,8 @@ export function ModelServiceSettings({ customInUse = false }: { customInUse?: bo
   const [categories, setCategories] = useState<Record<string, ModelCategory>>(loadCategories)
   const [warmingUp, setWarmingUp] = useState<Record<string, boolean>>({})
   const [detectError, setDetectError] = useState<DetectError>(null)
+  const [daemonOffline, setDaemonOffline] = useState(true)
+  const [saveError, setSaveError] = useState(false)
   const [testResult, setTestResult] = useState<TestResult>(null)
   const testTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const initDone = useRef(false)
@@ -47,8 +50,49 @@ export function ModelServiceSettings({ customInUse = false }: { customInUse?: bo
   useEffect(() => {
     if (initDone.current) return
     initDone.current = true
+    void loadDaemonDefault()
     void initialize()
   }, [])
+
+  async function loadDaemonDefault() {
+    const proxy = window.agent24.backendProxy
+    if (typeof proxy !== 'function') {
+      setDaemonOffline(true)
+      return
+    }
+    try {
+      const res = await proxy({ method: 'GET', path: '/api/v1/models' })
+      if (!res.ok) {
+        setDaemonOffline(true)
+        return
+      }
+      const data = res.data as { default_model?: unknown } | null
+      setDaemonOffline(false)
+      setOmlxActiveModel(typeof data?.default_model === 'string' ? data.default_model : '')
+    } catch {
+      setDaemonOffline(true)
+    }
+  }
+
+  async function selectDefault(model: string) {
+    if (daemonOffline) return
+    const proxy = window.agent24.backendProxy
+    if (typeof proxy !== 'function') {
+      setDaemonOffline(true)
+      return
+    }
+    setSaveError(false)
+    try {
+      const res = await proxy({ method: 'PUT', path: '/api/v1/models/default', body: { model } })
+      if (!res.ok) {
+        setSaveError(true)
+        return
+      }
+      setOmlxActiveModel(model)
+    } catch {
+      setSaveError(true)
+    }
+  }
 
   async function initialize() {
     setOmlxStatus('detecting')
@@ -98,13 +142,13 @@ export function ModelServiceSettings({ customInUse = false }: { customInUse?: bo
   }
 
   function applyDetected(url: string, key: string, models: string[]) {
+    const chat = models.filter(isChatModelId)
     setKeyNeeded(false)
-    setOmlxModels(models)
-    setOmlxActiveModel((m) => m || models[0] || '')
+    setOmlxModels(chat)
     setOmlxStatus('connected')
     // Warmup resident models
     const cats = loadCategories()
-    const residents = models.filter((m) => cats[m] === 'resident')
+    const residents = chat.filter((m) => cats[m] === 'resident')
     if (residents.length > 0) void warmupModels(url, key, residents)
   }
 
@@ -309,16 +353,29 @@ export function ModelServiceSettings({ customInUse = false }: { customInUse?: bo
           <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', padding: '8px 18px 4px', letterSpacing: '0.6px', textTransform: 'uppercase' }}>
             {t('models.heading')}
           </div>
+          {daemonOffline && (
+            <div style={{ fontSize: 12, color: 'var(--muted)', padding: '4px 18px' }}>
+              {t('models.daemonOffline')}
+            </div>
+          )}
+          {saveError && (
+            <div style={{ fontSize: 12, color: '#f44336', padding: '4px 18px' }}>
+              {t('models.saveError')}
+            </div>
+          )}
           {omlxModels.map((model) => {
             const cat: ModelCategory = categories[model] ?? 'ondemand'
             const isWarmingUp = warmingUp[model]
             const isActive = omlxActiveModel === model
             return (
               <div key={model} className="setting-row" style={{ marginBottom: 2, alignItems: 'center' }}
-                onClick={() => setOmlxActiveModel(model)}
+                onClick={() => { void selectDefault(model) }}
                 role="button"
-                tabIndex={0}
-                onKeyDown={(e) => e.key === 'Enter' && setOmlxActiveModel(model)}
+                aria-label={model}
+                aria-pressed={isActive}
+                aria-disabled={daemonOffline}
+                tabIndex={daemonOffline ? -1 : 0}
+                onKeyDown={(e) => { if (e.key === 'Enter') void selectDefault(model) }}
               >
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, cursor: 'pointer' }}>
                   <span style={{

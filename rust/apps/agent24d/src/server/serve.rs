@@ -85,6 +85,9 @@ pub async fn serve(
     .await?;
     let (guardian, memory_base, memory) =
         serve_steps::open_guardian_and_memory(ephemeral, &router, &cancel, &startup).await;
+    if let Some(kv) = &memory_base {
+        crate::default_model::apply_saved(&router, kv).await;
+    }
     // Captured before `memory` moves into the run loop. The background task
     // installs into this same slot, so the breaker stays on the one retriever.
     let embed_backfill = memory

@@ -450,7 +450,9 @@ impl Handler for SchedulerUpsertHandler {
                 ))
             })?;
 
-            if !granted.has(Capability::Scheduler) {
+            if !granted.has(Capability::Scheduler)
+                || crate::kernel_consent::live_denies(&owner, "scheduler")
+            {
                 return Err(forbidden());
             }
 
@@ -577,7 +579,9 @@ impl Handler for SchedulerDeleteHandler {
                 ))
             })?;
 
-            if !granted.has(Capability::Scheduler) {
+            if !granted.has(Capability::Scheduler)
+                || crate::kernel_consent::live_denies(&owner, "scheduler")
+            {
                 return Err(forbidden());
             }
 
@@ -650,7 +654,9 @@ impl Handler for SchedulerListHandler {
                 ))
             })?;
 
-            if !granted.has(Capability::Scheduler) {
+            if !granted.has(Capability::Scheduler)
+                || crate::kernel_consent::live_denies(&owner, "scheduler")
+            {
                 return Err(forbidden());
             }
 
@@ -896,9 +902,8 @@ mod tests {
                 "{bad}"
             );
         }
-        // positive control: the numeric form IS accepted on the REST path
-        // (unchanged there this round — see §6.3's trade-off)
-        assert!(next_fire::validate(&cron("0 7 * * 1-5").into()).is_ok());
+        // REST uses the same engine and refuses numbers too (FU-71).
+        assert!(next_fire::validate(&cron("0 7 * * 1-5").into()).is_err());
         for good in [
             "0 7 * * *",
             "0 7 * * MON-FRI",
@@ -974,8 +979,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(next_fire::next_fire(&lower, sat).unwrap(), Some(first));
-        // negative control documenting WHY numbers are refused: the engine
-        // reads `1-5` as Sun..Thu, so from Saturday it fires on SUNDAY.
+        // Negative control documenting WHY numbers are refused at create:
+        // the engine reads `1-5` as Sun..Thu, so from Saturday a row saved
+        // before the rule fires on SUNDAY (it still computes, so the tick
+        // never disables it).
         let numeric = ScheduleSpec::Cron {
             expr: "0 7 * * 1-5".into(),
             tz: None,
@@ -1582,6 +1589,21 @@ mod tests {
         let err = fx
             .list(&g, "m", ungranted())
             .call(json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, Some(ErrorKind::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_scheduler_grant_forbids_the_next_upsert() {
+        let name = "kc-scheduler-revoke";
+        let fx = Fixture::new().await;
+        let h = fx.upsert(&running_generation(), name, granted());
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(name, ["scheduler"], until);
+        crate::kernel_consent::track(name, std::iter::empty::<&str>(), until);
+        let err = h
+            .call(json!({"key": "k", "spec": every_secs(3600)}))
             .await
             .unwrap_err();
         assert_eq!(err.kind, Some(ErrorKind::Forbidden));

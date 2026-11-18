@@ -151,7 +151,21 @@ async fn run(rig: &Rig, session: &str, prompt: &str) -> Run {
         })
         .await
         .unwrap();
-    wait_terminal(&rig.store, &started.id).await
+    wait_terminal_with_memory_deadline(&rig.store, &started.id).await
+}
+
+/// Runs here go through memory imports/writes, which can take well past the
+/// shared 2 s `wait_terminal` under CI load (#1853). Same 42 s ceiling as
+/// `session_failure_tests::wait_terminal_with_memory_deadline`.
+async fn wait_terminal_with_memory_deadline(store: &Store, id: &str) -> Run {
+    for _ in 0..2_100 {
+        let run = store.get_run(id).await.unwrap().unwrap();
+        if agent24_core::run_is_terminal(run.status) {
+            return run;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("run {id} did not finish within the memory write deadline");
 }
 
 /// T6 + the "never says remembered" half of T5, over EVERY event a rig saw.
@@ -386,7 +400,9 @@ async fn a_failed_legacy_import_fails_the_run_typed_and_a_retry_recovers_the_his
         .await
         .unwrap();
     assert_eq!(
-        wait_terminal(&r.store, &second.id).await.status,
+        wait_terminal_with_memory_deadline(&r.store, &second.id)
+            .await
+            .status,
         RunStatus::Completed
     );
     let seen = r.provider.seen.lock().unwrap();

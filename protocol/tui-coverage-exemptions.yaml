@@ -158,6 +158,9 @@ exemptions:
   - operationId: putInboundPolicy
     category: planned-tui-2
     fallback: "仅桌面（host-only），CLI 不可写"
+  - operationId: putDefaultModel
+    category: planned-tui-2
+    fallback: "Elevated（ModelsAdmin，需在场确认），CLI 不可写；启动时也可用 DEFAULT_MODEL 环境变量"
   - operationId: listInboundEvents
     category: planned-tui-2
     fallback: "raw-http，入站事件列表只给 API（正文前 50 字）；TUI-2 增加对应 agent24 子命令"

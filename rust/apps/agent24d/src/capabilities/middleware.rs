@@ -69,6 +69,14 @@ fn skill_activate_route(method: &Method, path: &str) -> bool {
             .is_some_and(|id| !id.is_empty() && !id.contains('/'))
 }
 
+/// Elevated routes the legacy shared token cannot confirm. Service mode
+/// reaches them with a shell token plus presence; this token has no
+/// presence channel. Saving the default chat model is one of them.
+fn legacy_unelevatable(method: &Method, path: &str) -> bool {
+    skill_activate_route(method, path)
+        || (method == Method::PUT && path == "/api/v1/models/default")
+}
+
 /// `/api/v1/components/{id}/report`: the desktop's status push (ADR-038 D5).
 fn is_component_report(path: &str) -> bool {
     path.strip_prefix("/api/v1/components/")
@@ -88,7 +96,7 @@ async fn legacy_auth(state: AppState, req: Request<Body>, next: Next) -> Respons
         .is_some_and(|presented| constant_time_eq(presented.as_bytes(), state.token.as_bytes()))
     {
         if host_only_route(req.method(), req.uri().path())
-            || skill_activate_route(req.method(), req.uri().path())
+            || legacy_unelevatable(req.method(), req.uri().path())
         {
             return error_response(
                 StatusCode::FORBIDDEN,
@@ -597,6 +605,43 @@ async fn authorize(
                                 &bytes,
                             );
                         }
+                    } else if method == Method::POST
+                        && template == "/api/v1/os/{name}/kernel-consent"
+                    {
+                        // 409 before any dialog: empty, fingerprint mismatch,
+                        // or a bundled module that does not take a card.
+                        let request_path = req.uri().path().to_owned();
+                        let Ok(bytes) = axum::body::to_bytes(
+                            req.into_body(),
+                            agent24_domain::http::MAX_BODY_BYTES,
+                        )
+                        .await
+                        else {
+                            return error_response(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "payload_too_large",
+                                "Request body exceeds limit",
+                            );
+                        };
+                        match crate::kernel_consent_routes::shell_summary(
+                            state,
+                            &request_path,
+                            &bytes,
+                        ) {
+                            crate::kernel_consent_routes::ShellPrecheck::Refuse(response) => {
+                                return response;
+                            }
+                            crate::kernel_consent_routes::ShellPrecheck::Ask(summary) => {
+                                if let Some(authority) = &state.first_party {
+                                    authority.remember_kernel_consent(
+                                        &authorization.claims.capability_id,
+                                        &request_path,
+                                        &bytes,
+                                        summary,
+                                    );
+                                }
+                            }
+                        }
                     } else if crate::capabilities::first_party::derived_route(
                         method.as_str(),
                         template,
@@ -619,6 +664,17 @@ async fn authorize(
                                 "Request body exceeds limit",
                             );
                         };
+                        // An id the handler rejects is 400 here, before presence.
+                        if method == Method::PUT
+                            && template == "/api/v1/models/default"
+                            && let Err(message) = crate::default_model::validate_put_body(&bytes)
+                        {
+                            return error_response(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                message,
+                            );
+                        }
                         if !query
                             && let Some(authority) = &state.first_party
                             && let Some(summary) = crate::elevation_summaries::derive(
