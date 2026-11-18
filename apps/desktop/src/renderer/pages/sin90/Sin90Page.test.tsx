@@ -47,6 +47,42 @@ beforeEach(() => {
 })
 afterEach(() => { cleanup(); setLocale('en') })
 
+describe('Sin90 writes', () => {
+  it('accepts all classify suggestions one after another', async () => {
+    today = { must_do: [], deep_block: null, inbox: [task('t9', '约牙医', 'backlog')], carry_over_candidates: [] }
+    proposals = ['p1', 'p2'].map((id) => ({ id, status: 'pending', source: 'local_brain', ops: [{ op: 'assign_task_direction', task_id: 't9', direction_id: 'd1' }] }))
+    let inFlight = 0
+    let maxInFlight = 0
+    sin90Write.mockImplementation(async () => {
+      inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '全部采纳' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledTimes(2))
+    expect(sin90Write.mock.calls.map((call) => call[0])).toEqual([
+      { op: 'acceptProposal', id: 'p1' },
+      { op: 'acceptProposal', id: 'p2' },
+    ])
+    expect(maxInFlight).toBe(1)
+  })
+
+  it('shows the plain delegation message for every permission-style refusal', async () => {
+    for (const code of ['module_delegation_denied', 'presence_denied', 'presence_timeout', 'presence_unavailable']) {
+      cleanup()
+      today = { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] }
+      sin90Write.mockResolvedValueOnce({ ok: false, status: 403, data: { error: { code, message: 'raw english' } } })
+      render(<Sin90Page />)
+      fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '一条' } })
+      fireEvent.click(screen.getByRole('button', { name: '记下' }))
+      expect(await screen.findByText('桌面还不能写入 Sin90。请在确认框里允许，然后再试一次。')).toBeInTheDocument()
+      expect(screen.queryByText(/raw english/)).not.toBeInTheDocument()
+    }
+  })
+})
+
 describe('Sin90 three layers', () => {
   it('starts on Today and switches among the three tabs', async () => {
     render(<Sin90Page />)

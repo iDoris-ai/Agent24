@@ -122,7 +122,7 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/rhythms')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/proposals')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/reviews')).toBe(true)
-    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/packs/install')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/packs/install')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/proposals/p1/accept')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/ai/classify')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/weeks')).toBe(false)

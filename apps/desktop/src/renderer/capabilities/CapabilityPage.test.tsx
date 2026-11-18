@@ -54,7 +54,7 @@ describe('CapabilityPage domain OS', () => {
   it('shows the Sin90 page and an update when a newer release exists', async () => {
     modules = [module('0.5.2')]
     render(<CapabilityPage capability={sin90} />)
-    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Sin90 · Life system' })).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: 'Update to v0.5.3' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Install the latest version' })).not.toBeInTheDocument()
     expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
@@ -66,15 +66,15 @@ describe('CapabilityPage domain OS', () => {
     modules = [module('0.5.2')]
     osPackageLatest.mockResolvedValue({ ok: true, status: 200, data: { version: '0.5.2', upgraded: false } })
     render(<CapabilityPage capability={sin90} />)
-    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
+    expect(await screen.findByRole('heading', { name: 'Sin90 · Life system' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Install the latest version' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /Update to/ })).not.toBeInTheDocument()
     expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
     act(() => setLocale('zh'))
-    expect(screen.getByText('先定一个方向')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Sin90 · 人生系统' })).toBeInTheDocument()
     expect(screen.queryByText('随 Agent24 安装，用来使用 Sin90 领域 OS。')).not.toBeInTheDocument()
     act(() => setLocale('th'))
-    expect(screen.getByText('กำหนดทิศทางก่อน')).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Sin90 · ระบบชีวิต' })).toBeInTheDocument()
     expect(screen.queryByText('มากับ Agent24 ใช้ทำงานกับ Domain OS ของ Sin90')).not.toBeInTheDocument()
     act(() => setLocale('en'))
   })
@@ -82,7 +82,7 @@ describe('CapabilityPage domain OS', () => {
   it('does not render the Sin90 page when the module is not mounted', async () => {
     render(<CapabilityPage capability={sin90} />)
     expect(await screen.findByRole('button', { name: 'Install the latest version' })).toBeInTheDocument()
-    expect(screen.queryByText('Set a direction first')).not.toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Sin90 · Life system' })).not.toBeInTheDocument()
     expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
   })
 

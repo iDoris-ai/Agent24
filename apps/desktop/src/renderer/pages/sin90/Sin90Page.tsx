@@ -32,6 +32,14 @@ function periodPlanLabels(data: unknown, period: string): string[] {
 }
 
 const tabs: Layer[] = ['direction', 'rhythm', 'today']
+const DELEGATION_CODES = new Set([
+  'module_delegation_required',
+  'module_delegation_denied',
+  'presence_denied',
+  'presence_timeout',
+  'presence_unavailable',
+])
+
 export function Sin90Page() {
   const t = useT(sin90Messages)
   const [layer, setLayer] = useState<Layer>('today')
@@ -83,7 +91,7 @@ export function Sin90Page() {
   const write = (body: Record<string, unknown>) => {
     if (!canWrite || busy) return
     setBusy(true); setFailure(null)
-    void sin90Write(body).then(() => { if (body['op'] === 'capture') setNote(''); load(selected) }).catch((err: unknown) => { setFailure(err instanceof WriteFailed && err.code === 'module_delegation_required' ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) }).finally(() => setBusy(false))
+    void sin90Write(body).then(() => { if (body['op'] === 'capture') setNote(''); load(selected) }).catch((err: unknown) => { setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) }).finally(() => setBusy(false))
   }
   const enabled = canWrite && !busy
   const direction = directions.find((item) => item.id === selected) ?? null
@@ -93,13 +101,18 @@ export function Sin90Page() {
   const taskTitle = (id: string) => [...tasks, ...(today?.must_do ?? []), ...(today?.inbox ?? [])].find((task) => task.id === id)?.title ?? id
   const dirTitle = (id: string) => directions.find((item) => item.id === id)?.title ?? id
   const layerName = (value: Layer) => value === 'direction' ? t('layer.direction') : value === 'rhythm' ? t('layer.rhythm') : t('today')
-  const acceptAll = () => { for (const proposal of pending) write({ op: 'acceptProposal', id: proposal.id }) }
+  // One at a time: `write` guards on `busy`, so a loop of writes would race.
+  const acceptAll = () => {
+    if (!canWrite || busy) return
+    setBusy(true); setFailure(null)
+    void (async () => { try { for (const proposal of pending) await sin90Write({ op: 'acceptProposal', id: proposal.id }) } catch (err) { setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) } finally { setBusy(false); load(selected) } })()
+  }
   const completeTask = (task: Sin90Task) => {
     const paths: Record<string, string[]> = { backlog: ['planned', 'in_progress', 'done'], planned: ['in_progress', 'done'], in_progress: ['done'] }
     const path = paths[task.status]
     if (!path) { setFailure(t('taskNoCompletePath')); return }
     setBusy(true); setFailure(null)
-    void (async () => { try { for (const to of path) await sin90Write({ op: 'transitionTask', id: task.id, to }); load(selected) } catch (err) { setFailure(err instanceof Error ? err.message : t('loadError')) } finally { setBusy(false) } })()
+    void (async () => { try { for (const to of path) await sin90Write({ op: 'transitionTask', id: task.id, to }) } catch (err) { setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) } finally { setBusy(false); load(selected) } })()
   }
   const capture = () => { if (note.trim()) write({ op: 'capture', text: note }) }
   const reviewMode = layer === 'review'
