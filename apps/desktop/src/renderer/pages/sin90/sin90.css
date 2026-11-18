@@ -1,0 +1,39 @@
+.sin90-today {
+  display: grid;
+  grid-template-columns: 1.2fr 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.sin90-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px;
+}
+.sin90-card h2 { font-size: 13px; font-weight: 600; margin-bottom: 8px; }
+.sin90-body {
+  display: grid;
+  grid-template-columns: 220px 1fr;
+  gap: 16px;
+  align-items: start;
+}
+.sin90-list, .sin90-queue { list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.sin90-dir {
+  display: block; width: 100%; text-align: left;
+  background: transparent; color: var(--text); border: 0; border-radius: 6px;
+  padding: 6px 8px; font-size: 13px;
+}
+.sin90-dir[aria-current="true"] { background: var(--accent-dim); }
+.sin90-group { font-size: 11px; color: var(--muted); margin: 10px 0 4px; }
+.sin90-row { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.sin90-muted { color: var(--muted); font-size: 12px; }
+.sin90-fields { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.sin90-fields input, .sin90-inline input {
+  background: var(--surface2); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font: inherit; font-size: 13px; padding: 6px 8px;
+}
+.sin90-head { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; margin-bottom: 8px; }
+.sin90-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+@media (max-width: 800px) {
+  .sin90-today, .sin90-body { grid-template-columns: 1fr; }
+}

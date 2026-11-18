@@ -128,6 +128,12 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/comm/daemon'),
   r('POST', '/api/v1/comm/daemon/start'), // [E]
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
+  // Sin90 reads are Everyday. Writes stay on the main-process Sin90 IPC,
+  // which attaches the human key. Do not add POST/PATCH/PUT here.
+  r('GET', '/api/v1/sin90/today'),
+  r('GET', '/api/v1/sin90/directions'),
+  r('GET', '/api/v1/sin90/tasks'),
+  r('GET', '/api/v1/sin90/areas'),
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,

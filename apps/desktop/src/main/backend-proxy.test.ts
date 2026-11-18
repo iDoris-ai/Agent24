@@ -105,6 +105,16 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/components/{id}/report')).toBe(false)
     expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/report'))).toBe(false)
   })
+  it('allows Sin90 reads and keeps Sin90 writes off the proxy', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/today')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/directions')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/tasks?direction_id=d1')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/areas')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/directions')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/tasks')).toBe(false)
+    expect(isAllowedProxyRoute('PATCH', '/api/v1/sin90/tasks/t1')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/capture')).toBe(false)
+  })
   it('gives chat a longer deadline than the default', () => {
     expect(findAllowedRoute('POST', '/api/v1/chat')?.timeoutMs).toBe(CHAT_TIMEOUT_MS)
     expect(CHAT_TIMEOUT_MS).toBeGreaterThan(PROXY_TIMEOUT_MS)

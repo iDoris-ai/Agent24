@@ -33,6 +33,12 @@ beforeEach(() => {
       backendProxy: async (req: BackendProxyRequest) => {
         if (req.path === '/api/v1/os') return { ok: true, status: 200, data: { modules } }
         if (req.path === '/api/v1/components') return { ok: true, status: 200, data: { components } }
+        if (req.path === '/api/v1/sin90/today') {
+          return { ok: true, status: 200, data: { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] } }
+        }
+        if (req.path === '/api/v1/sin90/directions') return { ok: true, status: 200, data: { directions: [] } }
+        if (req.path === '/api/v1/sin90/areas') return { ok: true, status: 200, data: { areas: [] } }
+        if (req.path.startsWith('/api/v1/sin90/tasks')) return { ok: true, status: 200, data: { tasks: [] } }
         throw new Error(String(req.path))
       },
       osPackageInstall,
@@ -45,30 +51,37 @@ beforeEach(() => {
 afterEach(() => cleanup())
 
 describe('CapabilityPage domain OS', () => {
-  it('shows the mounted version and an update when a newer release exists', async () => {
+  it('shows the Sin90 page and an update when a newer release exists', async () => {
     modules = [module('0.5.2')]
     render(<CapabilityPage capability={sin90} />)
-    expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
+    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
     expect(await screen.findByRole('button', { name: 'Update to v0.5.3' })).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Install the latest version' })).not.toBeInTheDocument()
-    expect(screen.queryByText(/Enable this domain OS in Tools/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
     expect(screen.getByText('Ships with Agent24. Work with the Sin90 domain OS.')).toBeInTheDocument()
   })
 
-  it('shows Installed v0.5.2 with no install button when the mounted version is current', async () => {
+  it('shows the Sin90 page with no install button when the mounted version is current', async () => {
     modules = [module('0.5.2')]
     osPackageLatest.mockResolvedValue({ ok: true, status: 200, data: { version: '0.5.2', upgraded: false } })
     render(<CapabilityPage capability={sin90} />)
-    expect(await screen.findByRole('status')).toHaveTextContent('Installed v0.5.2')
+    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
     expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
     act(() => setLocale('zh'))
-    expect(screen.getByRole('status')).toHaveTextContent('已安装 v0.5.2')
-    expect(screen.queryByRole('button', { name: '安装最新版' })).not.toBeInTheDocument()
+    expect(screen.getByText('先定一个方向')).toBeInTheDocument()
     expect(screen.getByText('随 Agent24 安装，用来使用 Sin90 领域 OS。')).toBeInTheDocument()
     act(() => setLocale('th'))
-    expect(screen.getByRole('status')).toHaveTextContent('ติดตั้งแล้ว v0.5.2')
+    expect(screen.getByText('กำหนดทิศทางก่อน')).toBeInTheDocument()
     expect(screen.getByText('มากับ Agent24 ใช้ทำงานกับ Domain OS ของ Sin90')).toBeInTheDocument()
     act(() => setLocale('en'))
+  })
+
+  it('does not render the Sin90 page when the module is not mounted', async () => {
+    render(<CapabilityPage capability={sin90} />)
+    expect(await screen.findByRole('button', { name: 'Install the latest version' })).toBeInTheDocument()
+    expect(screen.queryByText('Set a direction first')).not.toBeInTheDocument()
+    expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
   })
 
   it('offers to install the latest version when Sin90 is not installed', async () => {
