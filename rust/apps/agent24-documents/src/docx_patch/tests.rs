@@ -327,3 +327,158 @@ fn a_field_the_template_does_not_have_and_no_values_are_refused() {
         vec![(1, 8, "x".into()), (14, 19, "y".into())]
     );
 }
+
+// ── PR-Daemon #1930 B1/B2 ──
+
+/// The template with `extra` entries added (deflated).
+fn with_entries(extra: &[(String, Vec<u8>)]) -> Vec<u8> {
+    use std::io::Write;
+    let mut archive = ZipArchive::new(Cursor::new(TEMPLATE)).unwrap();
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    for i in 0..archive.len() {
+        writer
+            .raw_copy_file(archive.by_index_raw(i).unwrap())
+            .unwrap();
+    }
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for (name, bytes) in extra {
+        writer.start_file(name.as_str(), options).unwrap();
+        writer.write_all(bytes).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// Sets the uncompressed size the zip declares for `name` (local header and
+/// central directory) to `size`, whatever the entry really holds.
+fn declare_size(zip: &mut [u8], name: &str, size: u32) {
+    let name = name.as_bytes();
+    let mut i = 0;
+    while i + 46 < zip.len() {
+        let (sig, at, name_len_at, name_at) = match &zip[i..i + 4] {
+            b"PK\x03\x04" => (true, i + 22, i + 26, i + 30),
+            b"PK\x01\x02" => (true, i + 24, i + 28, i + 46),
+            _ => (false, 0, 0, 0),
+        };
+        if sig {
+            let len = u16::from_le_bytes([zip[name_len_at], zip[name_len_at + 1]]) as usize;
+            if zip.get(name_at..name_at + len) == Some(name) {
+                zip[at..at + 4].copy_from_slice(&size.to_le_bytes());
+            }
+        }
+        i += 1;
+    }
+}
+
+fn header(text_len: usize) -> Vec<u8> {
+    let mut xml = String::from(
+        r#"<?xml version="1.0"?><w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:p><w:r><w:t>"#,
+    );
+    xml.push_str(&" ".repeat(text_len));
+    xml.push_str("</w:t></w:r></w:p></w:hdr>");
+    xml.into_bytes()
+}
+
+#[test]
+fn a_header_larger_than_its_zip_entry_says_is_read_only_up_to_the_limit() {
+    let big = (MAX_DOCUMENT_XML_BYTES + 1024) as usize;
+    let mut docx = with_entries(&[("word/header9.xml".into(), header(big))]);
+    declare_size(&mut docx, "word/header9.xml", 100);
+    assert!(matches!(list_fields(&docx), Err(PatchError::TooLarge)));
+}
+
+#[test]
+fn many_headers_or_too_many_bytes_of_them_are_refused() {
+    let many: Vec<(String, Vec<u8>)> = (0..MAX_TEXT_PARTS)
+        .map(|i| (format!("word/header{}.xml", 100 + i), header(10)))
+        .collect();
+    assert!(matches!(
+        list_fields(&with_entries(&many)),
+        Err(PatchError::TooLarge)
+    ));
+    // Each under the per-part limit, together over the budget.
+    let each = (MAX_TEXT_PARTS_BYTES / 3) as usize;
+    let heavy: Vec<(String, Vec<u8>)> = (0..4)
+        .map(|i| (format!("word/footer{}.xml", 100 + i), header(each)))
+        .collect();
+    assert!(matches!(
+        list_fields(&with_entries(&heavy)),
+        Err(PatchError::TooLarge)
+    ));
+    // A few small ones are fine.
+    assert!(list_fields(&with_entries(&many[..3])).is_ok());
+}
+
+/// The fixture with paragraph `index`'s first run replaced by `run`.
+fn with_run_in(index: usize, run: &str) -> (Vec<u8>, String) {
+    let xml = entry(FIXTURE, "word/document.xml");
+    let paras = scan_paragraphs(&xml).unwrap();
+    let p = &paras[index];
+    let para = &xml[p.start..p.end];
+    let at = para.find("<w:r>").or_else(|| para.find("<w:r ")).unwrap();
+    let new_para = format!("{}{run}{}", &para[..at], &para[at..]);
+    let new_xml = format!("{}{new_para}{}", &xml[..p.start], &xml[p.end..]);
+    let parts = std::collections::BTreeMap::from([("word/document.xml".to_owned(), new_xml)]);
+    let docx = splice_parts(FIXTURE, &parts, NOW).unwrap();
+    let text = list_paragraphs(&docx).unwrap()[index].text.clone();
+    (docx, text)
+}
+
+#[test]
+fn a_paragraph_holding_a_picture_or_link_is_refused_and_says_what() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    for (run, what) in [
+        (
+            "<w:r><w:drawing><wp:inline/></w:drawing></w:r>",
+            "w:drawing",
+        ),
+        (
+            r#"<w:hyperlink r:id="rId99"><w:r><w:t>链接</w:t></w:r></w:hyperlink>"#,
+            "w:hyperlink",
+        ),
+        (r#"<w:r><w:footnoteReference w:id="1"/></w:r>"#, "footnote"),
+    ] {
+        let (docx, text) = with_run_in(index, run);
+        for tracked in [false, true] {
+            let edit = ParaEdit {
+                index,
+                text: "新".into(),
+                tracked,
+                expect: Some(text.clone()),
+            };
+            match apply(&docx, &[edit], "A", NOW) {
+                Err(PatchError::Invalid(why)) => assert!(why.contains(what), "{why}"),
+                other => panic!("{run}: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_comment_reference_sharing_a_run_with_text_is_refused() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let (docx, text) = with_run_in(
+        index,
+        r#"<w:r><w:t>旧字</w:t><w:commentReference w:id="7"/></w:r>"#,
+    );
+    let edit = ParaEdit {
+        index,
+        text: "新".into(),
+        tracked: false,
+        expect: Some(text),
+    };
+    match apply(&docx, &[edit], "A", NOW) {
+        Err(PatchError::Invalid(why)) => assert!(why.contains("comment reference"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+}

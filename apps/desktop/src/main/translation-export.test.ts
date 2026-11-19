@@ -4,7 +4,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { crc32, docxBytes } from './docx-write'
-import { exportTranslation, safeTitle, saveToDownloads, type ExportDeps } from './translation-export'
+import { exportTranslation, safeTitle, saveToDownloads, writeUnique, type ExportDeps } from './translation-export'
 
 const roots: string[] = []
 
@@ -124,5 +124,16 @@ describe('saveToDownloads (D5a)', () => {
       fetchContent: vi.fn(async () => ({ ok: false as const, code: 'not_found', message: 'no such document' })),
     }
     expect(await saveToDownloads(deps, 'doc_x', 'a')).toEqual({ ok: false, code: 'not_found', message: 'no such document' })
+  })
+})
+
+describe('writeUnique (PR-Daemon #1930 F3)', () => {
+  it('never writes through a dangling link of that name: the next name is taken instead', () => {
+    const downloads = tempDir()
+    const outside = path.join(tempDir(), 'outside.docx')
+    fs.symlinkSync(outside, path.join(downloads, 'a.docx'))
+    expect(writeUnique(downloads, 'a', '.docx', Buffer.from('x'))).toBe('a (2).docx')
+    expect(fs.existsSync(outside)).toBe(false)
+    expect(fs.readFileSync(path.join(downloads, 'a (2).docx'), 'utf8')).toBe('x')
   })
 })

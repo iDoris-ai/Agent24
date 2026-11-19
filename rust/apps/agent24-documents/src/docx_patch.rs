@@ -21,6 +21,10 @@ pub const MAX_DOCX_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_DOCUMENT_XML_BYTES: u64 = 20 * 1024 * 1024;
 /// Edits in one patch, at most.
 pub const MAX_EDITS: usize = 200;
+/// PR-Daemon #1930 B1: the text parts a fill reads (body, headers, footers),
+/// at most this many, and at most this many bytes uncompressed all together.
+pub const MAX_TEXT_PARTS: usize = 32;
+pub const MAX_TEXT_PARTS_BYTES: u64 = 32 * 1024 * 1024;
 
 const DOCUMENT: &str = "word/document.xml";
 const CORE: &str = "docProps/core.xml";
@@ -102,6 +106,14 @@ pub fn apply(
             && paragraph_text(&xml[p.start..p.end]) != *expect
         {
             return Err(PatchError::Stale(edit.index));
+        }
+        // PR-Daemon #1930 B2: a paragraph is rewritten as one run, so one
+        // holding more than text would lose it: refused, and said what.
+        if let Some(what) = not_plain_text(&xml[p.start..p.end]) {
+            return Err(PatchError::Invalid(format!(
+                "paragraph {} contains {what}, which rewriting it would lose; edit it in Word or WPS",
+                edit.index
+            )));
         }
     }
     let mut next_id = max_revision_id(&xml) + 1;
@@ -263,17 +275,25 @@ fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
         .filter(|n| is_text_part(n))
         .map(str::to_owned)
         .collect();
+    // PR-Daemon #1930 B1: what is read is bounded, not what the zip says it holds.
+    if names.len() > MAX_TEXT_PARTS {
+        return Err(PatchError::TooLarge);
+    }
     let mut out = Vec::new();
+    let mut total: u64 = 0;
     for name in names {
-        let mut file = archive
+        let file = archive
             .by_name(&name)
             .map_err(|e| PatchError::NotDocx(e.to_string()))?;
-        if file.size() > MAX_DOCUMENT_XML_BYTES {
+        let limit = MAX_DOCUMENT_XML_BYTES.min(MAX_TEXT_PARTS_BYTES - total);
+        let mut xml = String::new();
+        file.take(limit + 1)
+            .read_to_string(&mut xml)
+            .map_err(|e| PatchError::NotDocx(e.to_string()))?;
+        if xml.len() as u64 > limit {
             return Err(PatchError::TooLarge);
         }
-        let mut xml = String::new();
-        file.read_to_string(&mut xml)
-            .map_err(|e| PatchError::NotDocx(e.to_string()))?;
+        total += xml.len() as u64;
         out.push((name, xml));
     }
     out.sort_by_key(|(n, _)| (n != DOCUMENT, n.clone()));
@@ -408,6 +428,7 @@ fn splice_parts(
             archive
                 .by_index(i)
                 .map_err(zip_err)?
+                .take(1024 * 1024)
                 .read_to_string(&mut core)
                 .map_err(io_err)?;
             set_modified(&core, now_iso)
@@ -744,6 +765,50 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
         new_run("t", &edit.text)
     };
     format!("{open_tag}{ppr}{before}{body}{after}</w:p>")
+}
+
+/// PR-Daemon #1930 B2: what in `para` a rewrite as one run would lose, named
+/// for the user; None for a paragraph of text runs (and bookmarks, comment
+/// ranges and a run holding only a comment reference, which are kept).
+fn not_plain_text(para: &str) -> Option<&'static str> {
+    const KINDS: &[(&str, &str)] = &[
+        ("<w:drawing", "a picture (w:drawing)"),
+        ("<w:pict", "a picture (w:pict)"),
+        ("<w:object", "an embedded object (w:object)"),
+        ("<w:hyperlink", "a link (w:hyperlink)"),
+        ("<w:fldSimple", "a field (w:fldSimple)"),
+        ("<w:fldChar", "a field (w:fldChar)"),
+        ("<w:instrText", "a field (w:instrText)"),
+        ("<w:footnoteReference", "a footnote reference"),
+        ("<w:endnoteReference", "an endnote reference"),
+        ("<w:sdt", "a content control (w:sdt)"),
+        (
+            "<mc:AlternateContent",
+            "alternate content (mc:AlternateContent)",
+        ),
+        ("<w:txbxContent", "a text box"),
+    ];
+    for (tag, what) in KINDS {
+        if para.match_indices(tag).any(|(i, _)| {
+            matches!(
+                para.as_bytes().get(i + tag.len()),
+                Some(b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
+            )
+        }) {
+            return Some(what);
+        }
+    }
+    // A comment reference sharing its run with text: the text would stay behind.
+    for (name, start, end) in children(para) {
+        let run = &para[start..end];
+        if name == "w:r"
+            && run.contains("<w:commentReference")
+            && (run.contains("<w:t>") || run.contains("<w:t "))
+        {
+            return Some("a comment reference in a run with text");
+        }
+    }
+    None
 }
 
 /// The first text run's `w:rPr`, as written.
