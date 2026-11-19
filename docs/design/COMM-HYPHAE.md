@@ -196,6 +196,7 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
 | `POST /comm/relay/probe` | `{url?}` | `{url,connected}`，写入 daemon 状态的 `relay_probe` | `relay info [U] --timeout 5`，只在手动触发时执行 |
 | `POST /comm/send` | `{to, content, from?, encrypt=true}` | §5.1 | `agent msg --from F --to T --content C [--encrypt=false]` ⚿ |
 | `GET /comm/history?as=&limit=` | limit 1..=200 | 收件历史 | `history inbox --as A --limit N` |
+| `GET /comm/history/conversation?with=W&as=&limit=` | with 必填；limit 1..=200 | 与联系人的双向历史 | `history conversation --with W --as A --limit N` |
 | `POST /comm/inbox/pull`（COMM-3 新增，原表没有） | `{as?}` | 透传 `agent inbox` 的返回值 | `agent inbox --as A --password-stdin` ⚿ |
 | `GET /comm/outbox?failed_only=` | — | outbox 条目 | `storage outbox list [--failed-only]` |
 | `POST /comm/outbox/{event_id}/retry` | — | `{event_id,attempted,sent,queued,…}` | `storage outbox retry --id E`：沿用原签名事件 |

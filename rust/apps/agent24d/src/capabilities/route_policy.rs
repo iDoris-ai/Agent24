@@ -169,6 +169,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/comm/daemon/stop", Operation::CommWrite, AssuranceLevel::Elevated),
     row("POST", "/api/v1/comm/send", Operation::CommWrite, AssuranceLevel::Elevated),
     row("GET", "/api/v1/comm/history", Operation::CommRead, AssuranceLevel::Everyday),
+    row("GET", "/api/v1/comm/history/conversation", Operation::CommRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/comm/inbox/pull", Operation::CommWrite, AssuranceLevel::Elevated),
     row("GET", "/api/v1/comm/outbox", Operation::CommRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/comm/outbox/{event_id}/retry", Operation::CommWrite, AssuranceLevel::Elevated),

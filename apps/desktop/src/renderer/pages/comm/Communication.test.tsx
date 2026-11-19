@@ -6,7 +6,7 @@ import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
-  addCommContact, sendCommMessage, listCommHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
+  addCommContact, sendCommMessage, listCommHistory, getCommConversationHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
   revealCommExport, setCommRelay, probeCommRelay,
   CommApiError, type CommDaemonStatus,
 } from './api'
@@ -33,7 +33,7 @@ vi.mock('./api', async (importActual) => {
     CommApiError: actual.CommApiError,
     getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
     startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
-    addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
+    addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), getCommConversationHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
     revealCommExport: vi.fn().mockResolvedValue(undefined),
     setCommRelay: vi.fn(), probeCommRelay: vi.fn(),
   }
@@ -78,6 +78,7 @@ function success() {
   vi.mocked(stopCommDaemon).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
   vi.mocked(unlockComm).mockResolvedValue({ unlocked: true, remembered: false })
   vi.mocked(listCommHistory).mockResolvedValue([])
+  vi.mocked(getCommConversationHistory).mockResolvedValue([])
   vi.mocked(setCommRelay).mockResolvedValue(relayConfig)
   vi.mocked(probeCommRelay).mockResolvedValue({ url: 'wss://relay.example', connected: true, error: null })
 }
@@ -99,6 +100,9 @@ describe('CommunicationPage', () => {
     vi.mocked(listCommHistory).mockResolvedValue([
       { id: 'old', from: stranger, to: 'npub1alice', direction: 'in', content: '陌生人旧消息', at: '2026-02-01T09:00:00Z' },
       { id: 'out', from: 'npub1alice', to: 'npub1bob', direction: 'out', content: '我发给 Bob', at: '2026-02-02T11:00:00Z' },
+    ])
+    vi.mocked(getCommConversationHistory).mockResolvedValue([
+      { id: 'out', from: 'npub1alice', to: 'npub1bob', direction: 'out', content: '我发给 Bob', at: '2026-02-02T11:00:00Z' },
       { id: 'new', from: 'npub1bob', to: 'npub1alice', direction: 'in', content: 'Bob 回复', at: '2026-02-03T12:00:00Z' },
     ])
     rtlRender(<CommunicationPage />)
@@ -106,24 +110,24 @@ describe('CommunicationPage', () => {
     const strangerRow = await screen.findByRole('button', { name: /npub1strange…000000/i })
     expect(bob.compareDocumentPosition(strangerRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     fireEvent.click(bob)
+    await waitFor(() => expect(getCommConversationHistory).toHaveBeenCalledWith('bob'))
     expect(await screen.findByText('我发给 Bob')).toBeInTheDocument()
     expect(screen.getByText('我发给 Bob').closest('.comm-message-row')).toHaveClass('mine')
     expect(screen.getAllByText('Bob 回复').find((node) => node.classList.contains('comm-message-bubble'))?.closest('.comm-message-row')).not.toHaveClass('mine')
   })
 
-  it('sends on Enter through CommSend, keeps the optimistic message, and offers retry on failure', async () => {
+  it('sends on Enter without staging the outgoing message in the UI', async () => {
     success()
     vi.mocked(listCommHistory).mockResolvedValue([{ id: 'in', from: 'npub1bob', content: 'hi', at: '2026-02-03T12:00:00Z' }])
-    vi.mocked(sendCommMessage).mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce({ published_to: 1 })
+    vi.mocked(sendCommMessage).mockRejectedValueOnce(new Error('offline'))
     rtlRender(<CommunicationPage />)
     fireEvent.click(await screen.findByRole('button', { name: /bob/i }))
     const input = screen.getByRole('textbox', { name: '输入消息' })
     fireEvent.change(input, { target: { value: 'hello' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith('npub1bob', 'hello'))
-    expect(await screen.findByText('重试')).toBeInTheDocument()
-    fireEvent.click(screen.getByText('重试'))
-    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledTimes(2))
+    expect(await screen.findByRole('alert')).toHaveTextContent('offline')
+    expect(screen.queryByText('hello')).toBeNull()
   })
 
   it('opens settings from the chat header and keeps existing management controls there', async () => {

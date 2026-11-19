@@ -9,6 +9,7 @@ import {
   getCommStatus as pollCommStatus,
   listCommContacts,
   listCommHistory,
+  getCommConversationHistory,
   listCommIdentities,
   pickCommBackup,
   restoreCommIdentity,
@@ -31,6 +32,7 @@ import { ErrorNotice } from '../../ui'
 import { getDefaultRelays } from './relayDefaults'
 import { parseRelayList } from '../../../shared/relay-list'
 import { listComponents, type ComponentView } from '../../components/componentApi'
+import { filterHumanCommMessages } from './history-filter'
 
 type HyphaePhase =
   | { kind: 'loading' }
@@ -197,7 +199,7 @@ export default function CommunicationPage() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [contactSearch, setContactSearch] = useState('')
   const [selectedPeer, setSelectedPeer] = useState<string | null>(null)
-  const [failedMessages, setFailedMessages] = useState<{ id: string; peer: string; content: string }[]>([])
+  const [conversationHistory, setConversationHistory] = useState<CommHistoryItem[] | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
@@ -255,20 +257,37 @@ export default function CommunicationPage() {
 
   const loadHistory = useCallback(async () => {
     try {
-      const items = await listCommHistory(20)
-      if (mounted.current) setHistory((current) => [...items, ...(current ?? []).filter((item) => item.direction === 'out')])
+      const items = await listCommHistory(200)
+      if (mounted.current) setHistory(filterHumanCommMessages(items))
     } catch {
       // The list is a convenience; the status cards already report real failures.
       if (mounted.current) setHistory(null)
     }
   }, [])
 
+  const loadConversation = useCallback(async (peer: string | null) => {
+    if (!peer) { setConversationHistory(null); return }
+    try {
+      const items = await getCommConversationHistory(contacts?.find((item) => item.npub === peer)?.nickname ?? peer)
+      if (mounted.current && selectedPeer === peer) setConversationHistory(filterHumanCommMessages(items))
+    } catch {
+      if (mounted.current) setConversationHistory(null)
+    }
+  }, [contacts, selectedPeer])
+
+  useEffect(() => { void loadConversation(selectedPeer) }, [selectedPeer, contacts, loadConversation])
+
   useEffect(() => {
-    const timer = setInterval(() => { if (document.visibilityState === 'visible') void loadHistory() }, 10_000)
-    const onVisibility = () => { if (document.visibilityState === 'visible') void loadHistory() }
+    const poll = () => {
+      if (document.visibilityState !== 'visible') return
+      void loadHistory()
+      if (selectedPeer) void loadConversation(selectedPeer)
+    }
+    const timer = setInterval(poll, 10_000)
+    const onVisibility = poll
     document.addEventListener('visibilitychange', onVisibility)
     return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility) }
-  }, [loadHistory])
+  }, [loadHistory, loadConversation, selectedPeer])
 
   useEffect(() => {
     mounted.current = true
@@ -565,8 +584,6 @@ export default function CommunicationPage() {
       setActionError(t('message.recipientInvalid'))
       return
     }
-    const optimistic = { id: `pending-${Date.now()}`, from: identities?.find((item) => item.default)?.npub ?? '', to, direction: 'out' as const, content: body, at: new Date().toISOString() }
-    setHistory((items) => [...(items ?? []), optimistic])
     setMessageText('')
     setPending('send')
     setActionError(null)
@@ -575,17 +592,14 @@ export default function CommunicationPage() {
     try {
       const result = await sendCommMessage(to, body)
       if (mounted.current) {
-        setHistory((items) => (items ?? []).map((item) => item.id === optimistic.id ? { ...item, id: `sent-${optimistic.id}` } : item))
         setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
       }
     } catch (error) {
       if (mounted.current) {
-        setHistory((items) => (items ?? []).filter((item) => item.id !== optimistic.id))
-        setFailedMessages((items) => [...items, { id: optimistic.id, peer: to, content: body }])
         setActionError(messageOf(error))
       }
     } finally {
-      if (mounted.current) { setPending(null); void loadHistory() }
+      if (mounted.current) { setPending(null); void loadHistory(); void loadConversation(selectedPeer) }
     }
   }
 
@@ -688,7 +702,11 @@ export default function CommunicationPage() {
                 if (!peer) continue
                 peers.set(peer, [...(peers.get(peer) ?? []), item])
               }
-              const rows = [...peers.entries()].map(([peer, items]) => ({ peer, items, last: items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) }))
+              const rows = [...peers.entries()].map(([peer, items]) => {
+                const latest = peer === selectedPeer && conversationHistory?.length ? conversationHistory.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) : null
+                const last = latest && (!items.length || Date.parse(latest.at) > Date.parse(items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b).at)) ? latest : items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b)
+                return { peer, items, last }
+              })
                 .filter(({ peer, last }) => `${contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)} ${last.content}`.toLowerCase().includes(contactSearch.toLowerCase()))
                 .sort((a, b) => Date.parse(b.last.at) - Date.parse(a.last.at))
               return rows.map(({ peer, last }) => {
@@ -706,24 +724,24 @@ export default function CommunicationPage() {
           </div>
         </aside>
         <div className="comm-chat-main">
-          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div><button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
+          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div>{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
           <div className="comm-message-stream">
             {selectedPeer ? (() => {
               const me = identities?.find((item) => item.default)
-              const messages = (history ?? []).filter((item) => {
+              const source = conversationHistory ?? history ?? []
+              const messages = source.filter((item) => {
                 const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
                 return peer === selectedPeer
               })
               let day = ''
-              return messages.map((item) => {
+              return messages.length ? messages.map((item) => {
                 const isMine = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname
                 const date = item.at ? new Date(item.at) : new Date()
                 const dayLabel = date.toLocaleDateString()
                 const newDay = day !== dayLabel; day = dayLabel
                 return <div key={item.id} className={`comm-message-row${isMine ? ' mine' : ''}`}>{newDay && <span className="comm-day-label">{dayLabel}</span>}<div className="comm-message-bubble">{item.content}<small>{item.id.startsWith('pending-') ? t('message.sending') : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div></div>
-              })
+              }) : <p className="comm-chat-empty">{t('chat.empty')}</p>
             })() : <p className="comm-chat-empty">{t('chat.empty')}</p>}
-            {failedMessages.filter((item) => item.peer === selectedPeer).map((item) => <div className="comm-message-row mine" key={`failed-${item.id}`}><div className="comm-message-bubble failed">{item.content}<button type="button" disabled={pending === 'send'} onClick={() => { void sendCommMessage(item.peer, item.content).then(() => { setFailedMessages((all) => all.filter((x) => x.id !== item.id)); void loadHistory() }).catch((error) => setActionError(messageOf(error))) }}>{t('chat.retry')}</button></div></div>)}
           </div>
           <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>
         </div>
