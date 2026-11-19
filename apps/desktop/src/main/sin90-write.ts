@@ -14,6 +14,9 @@ const TASK_TO = new Set(['planned', 'in_progress', 'done', 'dropped'])
 const WEEK_TO = new Set(['active', 'reviewing', 'closed'])
 const BLOCK_TO = new Set(['started', 'completed', 'skipped'])
 const ROUTINE_TO = new Set(['active', 'paused'])
+const PLAN_KINDS = new Set(['year', 'half', 'quarter', 'month'])
+const PLAN_METRICS = new Set(['none', 'count', 'minutes'])
+const PLAN_STATUSES = new Set(['draft', 'active', 'done', 'missed', 'dropped'])
 
 export interface Sin90Caller {
   key: () => HumanKey
@@ -92,6 +95,66 @@ export async function performSin90Write(req: unknown, caller: Sin90Caller): Prom
       return caller.request(route('POST', '/api/v1/sin90/directions', {
         title, target_window: target, ...(area ? { area_id: area } : {}),
       }), human)
+    }
+    case 'updateArea': {
+      const area = id(req['id'])
+      const body: Record<string, unknown> = {}
+      for (const field of ['to', 'current_state', 'ideal_state'] as const) {
+        if (!(field in req)) continue
+        const value = req[field]
+        if (field === 'to' ? (value !== 'active' && value !== 'archived') : value !== null && !text(value)) return bad()
+        body[field] = value === null ? null : text(value)
+      }
+      if (!area || Object.keys(body).length === 0) return bad()
+      return caller.request(route('PATCH', `/api/v1/sin90/areas/${area}`, body), human)
+    }
+    case 'updateDirection': {
+      const direction = id(req['id'])
+      if (!direction) return bad()
+      const body: Record<string, unknown> = {}
+      for (const [input, output, max] of [['title','title',500],['status','status',32],['targetWindow','target_window',32],['goal3y','goal_3y',2000]] as const) {
+        if (!(input in req)) continue
+        const value = req[input]
+        const nullable = input === 'goal3y'
+        if (value === null && !nullable) return bad()
+        if (value !== null && !text(value, max)) return bad()
+        body[output] = value === null ? null : text(value, max)
+      }
+      for (const [input, output] of [['areaId','area_id'],['goalFromYear','goal_from_year']] as const) {
+        if (!(input in req)) continue
+        const value = req[input]
+        if (value !== null && !(input === 'goalFromYear' && typeof value === 'number' && Number.isInteger(value) && value >= 1 && value <= 9997) && !(input === 'areaId' && id(value))) return bad()
+        body[output] = value
+      }
+      if (!Object.keys(body).length || (body['status'] !== undefined && !new Set(['draft','active','paused','achieved','abandoned']).has(String(body['status'])))) return bad()
+      return caller.request(route('PATCH', `/api/v1/sin90/directions/${direction}`, body), human)
+    }
+    case 'createPeriodPlan': {
+      const direction = id(req['directionId'])
+      const kind = req['kind']; const period = text(req['period'], 16); const target = text(req['target'])
+      const parent = req['parentId'] === undefined || req['parentId'] === null ? null : id(req['parentId'])
+      const metric = req['metric'] ?? 'none'; const metricTarget = req['metricTarget'] ?? null
+      const routine = req['routineId'] === undefined || req['routineId'] === null ? null : id(req['routineId'])
+      const status = req['status'] ?? 'draft'
+      const validPeriod = kind === 'year' ? /^\d{4}$/.test(period ?? '') : kind === 'half' ? /^\d{4}-H[12]$/.test(period ?? '') : kind === 'quarter' ? /^\d{4}-Q[1-4]$/.test(period ?? '') : kind === 'month' ? /^\d{4}-(0[1-9]|1[0-2])$/.test(period ?? '') : false
+      if (!direction || typeof kind !== 'string' || !PLAN_KINDS.has(kind) || !period || !validPeriod || !target || (kind === 'year' && parent !== null) || (kind !== 'year' && parent === null) || (req['parentId'] != null && !parent) || typeof metric !== 'string' || !PLAN_METRICS.has(metric) || (metricTarget !== null && (!Number.isInteger(metricTarget) || Number(metricTarget) < 0)) || (req['routineId'] != null && !routine) || typeof status !== 'string' || !PLAN_STATUSES.has(status)) return bad()
+      return caller.request(route('POST', '/api/v1/sin90/period-plans', { direction_id: direction, kind, period, parent_id: parent, target, metric, metric_target: metricTarget, routine_id: routine, status }), human)
+    }
+    case 'updatePeriodPlan': {
+      const plan = id(req['id']); if (!plan) return bad()
+      const body: Record<string, unknown> = {}
+      if ('target' in req) { const value = text(req['target']); if (!value) return bad(); body['target'] = value }
+      if ('metric' in req) { if (typeof req['metric'] !== 'string' || !PLAN_METRICS.has(req['metric'])) return bad(); body['metric'] = req['metric'] }
+      if ('metricTarget' in req) { const value = req['metricTarget']; if (value !== null && (!Number.isInteger(value) || Number(value) < 0)) return bad(); body['metric_target'] = value }
+      if ('routineId' in req) { const value = req['routineId']; if (value !== null && !id(value)) return bad(); body['routine_id'] = value }
+      if ('status' in req) { if (typeof req['status'] !== 'string' || !PLAN_STATUSES.has(req['status'])) return bad(); body['status'] = req['status'] }
+      if (!Object.keys(body).length) return bad()
+      return caller.request(route('PATCH', `/api/v1/sin90/period-plans/${plan}`, body), human)
+    }
+    case 'putReviewSettings': {
+      const { auto, cadence, weekday, hour } = req
+      if (typeof auto !== 'boolean' || (cadence !== 'weekly' && cadence !== 'monthly') || !Number.isInteger(weekday) || Number(weekday) < 1 || Number(weekday) > 7 || !Number.isInteger(hour) || Number(hour) < 0 || Number(hour) > 23) return bad()
+      return caller.request(route('PUT', '/api/v1/sin90/settings/review', { auto, cadence, weekday, hour }), human)
     }
     case 'createTask': {
       const title = text(req['title'])

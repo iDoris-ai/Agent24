@@ -17,6 +17,28 @@ export interface Sin90Direction {
   status: string
   target_window: string
   goal_3y?: string | null
+  goal_from_year?: number | null
+}
+
+export interface Sin90PeriodPlan {
+  id: string; direction_id: string; kind: 'year' | 'half' | 'quarter' | 'month'; period: string
+  parent_id: string | null; target: string; metric: 'none' | 'count' | 'minutes'; metric_target: number | null
+  routine_id: string | null; status: string
+}
+export interface Sin90PlanProgress { plan_id: string; actual: number | null; expected: number | null; status: 'on_track' | 'behind' | 'at_risk'; miss_streak: number }
+export interface Sin90ReviewSettings { auto: boolean; cadence: 'weekly' | 'monthly'; weekday: number; hour: number }
+
+export function legalPlanParents(kind: Sin90PeriodPlan['kind'], period: string, plans: readonly Sin90PeriodPlan[], directionId: string): Sin90PeriodPlan[] {
+  const allowed: Record<Sin90PeriodPlan['kind'], readonly Sin90PeriodPlan['kind'][]> = {
+    year: [], half: ['year'], quarter: ['half', 'year'], month: ['quarter'],
+  }
+  return plans.filter((parent) => {
+    if (parent.direction_id !== directionId || !allowed[kind].includes(parent.kind) || parent.status === 'dropped') return false
+    if (parent.period.slice(0, 4) !== period.slice(0, 4)) return false
+    if (parent.kind === 'half' && kind === 'quarter') return Math.floor((Number(period.slice(6)) - 1) / 2) === Number(parent.period.slice(6)) - 1
+    if (parent.kind === 'quarter' && kind === 'month') return Math.floor((Number(period.slice(5)) - 1) / 3) + 1 === Number(parent.period.slice(6))
+    return true
+  })
 }
 
 export interface Sin90Task {
@@ -73,7 +95,32 @@ export function parseDirection(v: unknown): Sin90Direction | null {
   const target = str(v['target_window'])
   if (!id || !title || !status || !target) return null
   return { id, area_id: optStr(v['area_id']), title, status, target_window: target,
-    goal_3y: optStr(v['goal_3y']) }
+    goal_3y: optStr(v['goal_3y']), goal_from_year: typeof v['goal_from_year'] === 'number' ? v['goal_from_year'] : null }
+}
+
+export function readPeriodPlans(data: unknown): Sin90PeriodPlan[] {
+  if (!isObj(data) || !Array.isArray(data['period_plans'])) return []
+  return data['period_plans'].filter((row): row is Record<string, unknown> => isObj(row)
+    && typeof row['id'] === 'string' && typeof row['direction_id'] === 'string'
+    && (row['kind'] === 'year' || row['kind'] === 'half' || row['kind'] === 'quarter' || row['kind'] === 'month') && typeof row['period'] === 'string'
+    && typeof row['target'] === 'string' && typeof row['metric'] === 'string'
+    && typeof row['metric'] === 'string' && ['none','count','minutes'].includes(row['metric'])
+    && typeof row['status'] === 'string').map((row) => ({
+      id: String(row['id']), direction_id: String(row['direction_id']), kind: PLAN_KINDS.find((kind) => kind === row['kind']) ?? 'year', period: String(row['period']),
+      parent_id: optStr(row['parent_id']), target: String(row['target']), metric: row['metric'] === 'count' || row['metric'] === 'minutes' ? row['metric'] : 'none',
+      metric_target: typeof row['metric_target'] === 'number' ? row['metric_target'] : null,
+      routine_id: optStr(row['routine_id']), status: String(row['status']),
+    }))
+}
+const PLAN_KINDS = ['year', 'half', 'quarter', 'month'] as const
+
+export function readPlanProgress(data: unknown): Sin90PlanProgress[] {
+  if (!isObj(data) || !Array.isArray(data['progress'])) return []
+  return data['progress'].filter((row): row is Record<string, unknown> => isObj(row) && typeof row['plan_id'] === 'string')
+    .map((row) => ({ plan_id: String(row['plan_id']), actual: typeof row['actual'] === 'number' ? row['actual'] : null,
+      expected: typeof row['expected'] === 'number' ? row['expected'] : null,
+      status: row['status'] === 'behind' || row['status'] === 'at_risk' ? row['status'] : 'on_track',
+      miss_streak: typeof row['miss_streak'] === 'number' ? row['miss_streak'] : 0 }))
 }
 
 export function parseTask(v: unknown): Sin90Task | null {

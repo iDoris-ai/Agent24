@@ -47,6 +47,25 @@ describe('performSin90Write', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
+  it('validates every new Sin90 write before sending and maps accepted payloads', async () => {
+    const { api, request } = caller(true)
+    for (const value of [
+      { op: 'updateArea', id: 'a1' }, { op: 'updateArea', id: 'a1', ideal_state: '' },
+      { op: 'updateDirection', id: '../d', goal3y: 'goal' }, { op: 'updateDirection', id: 'd1' },
+      { op: 'createPeriodPlan', directionId: 'd1', kind: 'century', period: 'x', target: 'goal' },
+      { op: 'createPeriodPlan', directionId: 'd1', kind: 'year', period: '2026', target: 'goal', parentId: 'p1' },
+      { op: 'updatePeriodPlan', id: 'p1' }, { op: 'updatePeriodPlan', id: 'p1', status: 'active-ish' },
+      { op: 'putReviewSettings', auto: true, cadence: 'daily', weekday: 8, hour: 25 },
+    ]) expect((await performSin90Write(value, api)).ok).toBe(false)
+    expect(request).not.toHaveBeenCalled()
+    await performSin90Write({ op: 'updateDirection', id: 'd1', goal3y: '旅行', goalFromYear: 2026 }, api)
+    await performSin90Write({ op: 'createPeriodPlan', directionId: 'd1', kind: 'year', period: '2026', target: '健康', metric: 'count', metricTarget: 12 }, api)
+    await performSin90Write({ op: 'putReviewSettings', auto: false, cadence: 'monthly', weekday: 1, hour: 9 }, api)
+    expect(request).toHaveBeenNthCalledWith(1, { method: 'PATCH', path: '/api/v1/sin90/directions/d1', body: { goal_3y: '旅行', goal_from_year: 2026 } }, HUMAN)
+    expect(request).toHaveBeenNthCalledWith(2, { method: 'POST', path: '/api/v1/sin90/period-plans', body: { direction_id: 'd1', kind: 'year', period: '2026', parent_id: null, target: '健康', metric: 'count', metric_target: 12, routine_id: null, status: 'draft' } }, HUMAN)
+    expect(request).toHaveBeenNthCalledWith(3, { method: 'PUT', path: '/api/v1/sin90/settings/review', body: { auto: false, cadence: 'monthly', weekday: 1, hour: 9 } }, HUMAN)
+  })
+
   it('carries a task over by creating the week when it is missing, then a proposal', async () => {
     const calls: BackendProxyRequest[] = []
     const keys: Array<string | null> = []

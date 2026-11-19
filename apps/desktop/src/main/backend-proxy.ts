@@ -140,6 +140,8 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/sin90/tasks'),
   r('GET', '/api/v1/sin90/areas'),
   r('GET', '/api/v1/sin90/period-plans'),
+  r('GET', '/api/v1/sin90/progress'),
+  r('GET', '/api/v1/sin90/settings/review'),
   r('GET', '/api/v1/sin90/weeks'),
   r('GET', '/api/v1/sin90/weeks/{id}/attention'),
   r('GET', '/api/v1/sin90/schedule-blocks'),

@@ -2,7 +2,8 @@
 
 import {
   readAreas, readBlocks, readDirections, readProposals, readReviews, readRhythms, readRoutines, readTasks, readToday, readWeekAttention, readWeeks,
-  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
+  readPeriodPlans, readPlanProgress,
+  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention, type Sin90PeriodPlan, type Sin90PlanProgress, type Sin90ReviewSettings,
 } from './model'
 
 export class WriteFailed extends Error {
@@ -40,6 +41,18 @@ export function fetchAreas(): Promise<Sin90Area[]> {
 /** Optional Sin90 v0.6 endpoint. Older daemons return no plan data. */
 export function fetchPeriodPlans(): Promise<unknown | null> {
   return sin90Get('/api/v1/sin90/period-plans').catch(() => null)
+}
+export function fetchPlans(): Promise<Sin90PeriodPlan[]> { return sin90Get('/api/v1/sin90/period-plans').then(readPeriodPlans).catch(() => []) }
+export function fetchProgress(directionId: string): Promise<Sin90PlanProgress[]> {
+  return sin90Get(`/api/v1/sin90/progress?direction_id=${encodeURIComponent(directionId)}`).then(readPlanProgress)
+}
+export function fetchReviewSettings(): Promise<Sin90ReviewSettings> {
+  return sin90Get('/api/v1/sin90/settings/review').then((value) => {
+    if (typeof value !== 'object' || value === null || !('auto' in value) || typeof value.auto !== 'boolean'
+      || !('cadence' in value) || (value.cadence !== 'weekly' && value.cadence !== 'monthly')
+      || !('weekday' in value) || typeof value.weekday !== 'number' || !('hour' in value) || typeof value.hour !== 'number') throw new Error('Invalid review settings')
+    return { auto: value.auto, cadence: value.cadence, weekday: value.weekday, hour: value.hour }
+  })
 }
 
 export function fetchDirections(): Promise<Sin90Direction[]> {

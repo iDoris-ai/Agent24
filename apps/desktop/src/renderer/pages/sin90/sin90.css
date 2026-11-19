@@ -40,4 +40,9 @@
 .sin90-row-actions { display: flex; gap: 6px; }
 .sin90-add-block { display: flex; align-items: end; gap: 8px; }
 .sin90-add-block .ui-field { width: 140px; }
+.sin90-direction-editor { align-items: stretch !important; }
+.sin90-direction-editor details { width: 100%; }
+.sin90-direction-editor summary { display: flex; align-items: center; gap: 8px; cursor: pointer; }
+.sin90-direction-editor .sin90-detail { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; margin: 10px 0; }
+.sin90-risk { color: var(--danger, #c33); font-weight: 700; }
 @media (max-width: 900px) { .sin90-period-columns { grid-template-columns: 1fr; } .sin90-period-columns > .ui-card:first-child { grid-column: auto; } }
