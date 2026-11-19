@@ -291,11 +291,25 @@ pub async fn change(
         ParsedChange::Activate {
             seq,
             endpoint: None,
+            ..
         } => change_response(registry.apply(&host, &binding_id, seq, Change::Activate)),
         ParsedChange::Activate {
             seq,
             endpoint: Some(endpoint),
+            credential: None,
         } => change_response(registry.activate(&host, &binding_id, seq, endpoint)),
+        ParsedChange::Activate {
+            seq,
+            endpoint: Some(endpoint),
+            credential: Some((credential, expires_at)),
+        } => change_response(registry.activate_with_credential(
+            &host,
+            &binding_id,
+            seq,
+            endpoint,
+            credential,
+            expires_at,
+        )),
         ParsedChange::Deactivate { seq } => {
             change_response(registry.apply(&host, &binding_id, seq, Change::Deactivate))
         }
@@ -336,10 +350,12 @@ fn endpoint_of(body: &[u8]) -> Option<Endpoint> {
 /// One Knowledge host change, parsed the same way the handler applies it and
 /// the presence summary describes it. `seq` is greater than 0.
 pub(crate) enum ParsedChange {
-    /// `endpoint` absent: every call of the binding is refused.
+    /// `endpoint` absent: every call of the binding is refused. U1: with an
+    /// endpoint, C may come in the same request (a replay to a new daemon).
     Activate {
         seq: u64,
         endpoint: Option<Endpoint>,
+        credential: Option<(Credential, UnixSeconds)>,
     },
     Deactivate {
         seq: u64,
@@ -366,6 +382,17 @@ struct ActivateFull {
     seq: u64,
     endpoint: String,
     knowledge_base_ids: Vec<String>,
+    /// U1: C with the activation, `{"kind", "value", "expires_at"}`.
+    #[serde(default)]
+    credential: Option<CredentialBody>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CredentialBody {
+    kind: CredentialKind,
+    value: String,
+    expires_at: UnixSeconds,
 }
 
 #[derive(Deserialize)]
@@ -430,33 +457,49 @@ fn parse_activation(bytes: &[u8]) -> Option<ParsedChange> {
             "knowledge_base_ids": body.knowledge_base_ids,
         }))
         .ok()?;
+        let credential = match body.credential {
+            None => None,
+            Some(c) => Some(credential_of(c.kind, c.value, c.expires_at)?),
+        };
         return Some(ParsedChange::Activate {
             seq,
             endpoint: Some(endpoint_of(&raw)?),
+            credential,
         });
     }
     let body: SeqBody = serde_json::from_slice(bytes).ok()?;
     Some(ParsedChange::Activate {
         seq: seq_of(body.seq)?,
         endpoint: None,
+        credential: None,
     })
+}
+
+/// C as the credential route takes it: visible ASCII (it goes into a request
+/// header as it is), at most [`MAX_CREDENTIAL_BYTES`], not yet expired.
+fn credential_of(
+    kind: CredentialKind,
+    value: String,
+    expires_at: UnixSeconds,
+) -> Option<(Credential, UnixSeconds)> {
+    let value_ok = !value.is_empty()
+        && value.len() <= MAX_CREDENTIAL_BYTES
+        && value.bytes().all(|b| b.is_ascii_graphic());
+    if !value_ok || expires_at <= unix_now() {
+        return None;
+    }
+    let credential = match kind {
+        CredentialKind::Bearer => Credential::Bearer(value),
+        CredentialKind::ApiKey => Credential::ApiKey(value),
+    };
+    Some((credential, expires_at))
 }
 
 /// Same rules as the registry's own check; a test pins the two together.
 fn parse_credential(bytes: &[u8]) -> Option<ParsedChange> {
     let body: CredentialRequest = serde_json::from_slice(bytes).ok()?;
     let seq = seq_of(body.seq)?;
-    // Visible ASCII only: C goes into a request header as it is.
-    let value_ok = !body.value.is_empty()
-        && body.value.len() <= MAX_CREDENTIAL_BYTES
-        && body.value.bytes().all(|b| b.is_ascii_graphic());
-    if !value_ok || body.expires_at <= unix_now() {
-        return None;
-    }
-    let credential = match body.kind {
-        CredentialKind::Bearer => Credential::Bearer(body.value),
-        CredentialKind::ApiKey => Credential::ApiKey(body.value),
-    };
+    let (credential, _) = credential_of(body.kind, body.value, body.expires_at)?;
     Some(ParsedChange::PushCredential {
         seq,
         credential,

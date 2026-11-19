@@ -22,6 +22,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { SERVICE_LABEL, upgradeByLaunchd } from './resident-service'
 import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
@@ -133,14 +134,19 @@ const serviceUpgrader = new ServiceUpgrader({
   running: () => backendManager.serviceDaemonVersion(),
   installed: launchAgentPlistExists,
   pid: () => serviceDaemonOf(backendManager)?.pid ?? null,
-  // U1: the elevated shutdown asks its box through the presence connection.
+  // U1: enrolled and the presence connection up (the Knowledge replay that follows asks through it).
   ready: () => presenceConnection?.ready === true,
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold })
-    // U1: the bundled documents module waits for this stop too (one box, not two).
+    // U1 (option C): stopped and started again by launchd, no presence box;
+    // the Knowledge binding replayed to the new daemon is the one box left.
+    const deps = upgradeByLaunchd(
+      serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold }),
+      { uid: process.getuid!(), plist: path.join(app.getPath('home'), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`) },
+    )
+    // U1: the bundled documents module waits for this stop too.
     const replaceModule = moduleNeedsServiceStop
     return upgradeService(replaceModule ? { ...deps, between: () => replaceModule() } : deps)
   },

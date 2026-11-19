@@ -4,6 +4,8 @@
 // the daemon runs its modules from its own path. So: an elevated
 // `POST /shutdown` (the presence box, once), wait for that daemon to exit,
 // copy when the bytes differ, `launchctl kickstart -k`. The entry to it is B4's.
+// U1 (David 11-19): the upgrade itself now stops and starts the job through
+// launchd (`upgradeByLaunchd`), with no presence box; see `bootoutService`.
 
 import { execFile } from 'node:child_process'
 import crypto from 'node:crypto'
@@ -111,6 +113,39 @@ export function kickstartService(uid: number): Promise<void> {
   return new Promise((resolve, reject) => {
     execFile('launchctl', ['kickstart', '-k', `gui/${uid}/${SERVICE_LABEL}`], { timeout: 30_000 }, (err) => (err ? reject(err) : resolve()))
   })
+}
+
+/** U1 (David 11-19, option C): the app replacing the daemon it ships stops the
+ * LaunchAgent's job itself, `launchctl bootout`, with no presence box. Any
+ * process of this user can run that command, so the box on `/shutdown` never
+ * guarded this way of stopping the service; the app taking it gives nothing
+ * new to anyone. Only the upgrade uses it: a stop the user asks for (the
+ * tray's 「完全退出」), a restart for a model source and the documents
+ * module's replacement still go through the elevated `/shutdown`.
+ * A failed bootout is `bootout_failed`: the upgrade stops there, nothing is
+ * replaced, and the hint says it failed. */
+export function bootoutService(uid: number, run: typeof execFile = execFile): Promise<{ status: number; code?: string }> {
+  return new Promise((resolve) => {
+    run('launchctl', ['bootout', `gui/${uid}/${SERVICE_LABEL}`], { timeout: 30_000 }, (err) => resolve(err ? { status: 500, code: 'bootout_failed' } : { status: 200 }))
+  })
+}
+
+/** After a bootout the job is no longer loaded: `bootstrap` loads its plist
+ * again, and RunAtLoad starts it. */
+export function bootstrapService(uid: number, plist: string, run: typeof execFile = execFile): Promise<void> {
+  return new Promise((resolve, reject) => {
+    run('launchctl', ['bootstrap', `gui/${uid}`, plist], { timeout: 30_000 }, (err) => (err ? reject(err) : resolve()))
+  })
+}
+
+/** U1: the upgrade's own stop and start (bootout, then bootstrap), in place of
+ * the elevated shutdown and kickstart the other restarts use. */
+export function upgradeByLaunchd(deps: UpgradeDeps, o: { uid: number; plist: string; run?: typeof execFile }): UpgradeDeps {
+  return {
+    ...deps,
+    shutdown: () => bootoutService(o.uid, o.run),
+    kickstart: () => bootstrapService(o.uid, o.plist, o.run),
+  }
 }
 
 /** The elevated `POST /api/v1/shutdown` (the presence box): its status and,
