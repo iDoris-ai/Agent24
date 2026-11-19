@@ -5,7 +5,7 @@
 // `POST /shutdown` (the presence box, once), wait for that daemon to exit,
 // copy when the bytes differ, `launchctl kickstart -k`. The entry to it is B4's.
 // U1 (David 11-19): the upgrade itself now stops and starts the job through
-// launchd (`upgradeByLaunchd`), with no presence box; see `bootoutService`.
+// launchd (`upgradeServiceByLaunchd`), with no presence box; see `bootoutService`.
 
 import { execFile } from 'node:child_process'
 import crypto from 'node:crypto'
