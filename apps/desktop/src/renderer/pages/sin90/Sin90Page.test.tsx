@@ -147,6 +147,10 @@ describe('Sin90 three layers', () => {
     render(<Sin90Page />)
     const button = await screen.findByRole('button', { name: '换成 中文 版示范' })
     fireEvent.click(button)
+    // Replaces all data, so it asks first like every other reset (#1917 M2).
+    expect(await screen.findByText(/加载示范前会自动保存一份当前数据/)).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset', template: 'graduate', lang: 'zh' }))
   })
 

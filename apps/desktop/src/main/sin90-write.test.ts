@@ -92,7 +92,7 @@ describe('performSin90Write', () => {
     expect(body.status).toBe('pending')
   })
 
-  it('validates and performs dataReset, dataRestoreBackup, dataExport, dataImport', async () => {
+  it('validates and performs dataReset and dataRestoreBackup; whole-database ops are not on sin90:write', async () => {
     const { api, request } = caller(true)
 
     // Illegal requests
@@ -104,9 +104,9 @@ describe('performSin90Write', () => {
       { op: 'dataRestoreBackup', name: 'notjson.txt' },
       { op: 'dataRestoreBackup', name: '' },
       { op: 'dataRestoreBackup' },
-      { op: 'dataImport' },
-      { op: 'dataImport', backup: null },
-      { op: 'dataImport', backup: { format: 'other-format' } },
+      // Export/import only exist behind the native file dialogs (#1917 M1).
+      { op: 'dataExport' },
+      { op: 'dataImport', backup: { format: 'sin90-backup', schema: 18, tables: {} } },
     ]) {
       expect((await performSin90Write(badReq, api)).ok).toBe(false)
     }
@@ -124,14 +124,6 @@ describe('performSin90Write', () => {
     await performSin90Write({ op: 'dataRestoreBackup', name: 'auto-20261119-1234.json' }, api)
     expect(request).toHaveBeenNthCalledWith(3, { method: 'POST', path: '/api/v1/sin90/data/restore-backup', body: { name: 'auto-20261119-1234.json' } }, HUMAN)
 
-    // Valid dataExport
-    await performSin90Write({ op: 'dataExport' }, api)
-    expect(request).toHaveBeenNthCalledWith(4, { method: 'POST', path: '/api/v1/sin90/data/export' }, HUMAN)
-
-    // Valid dataImport
-    const backupObj = { format: 'sin90-backup', schema: 18, tables: {} }
-    await performSin90Write({ op: 'dataImport', backup: backupObj }, api)
-    expect(request).toHaveBeenNthCalledWith(5, { method: 'POST', path: '/api/v1/sin90/data/import', body: { backup: backupObj } }, HUMAN)
   })
 
   it('exportSin90ToFile handles success, cancel, and failures', async () => {

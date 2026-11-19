@@ -246,7 +246,14 @@ export function Sin90Page() {
   }
 
   const handleSwitchDemoLanguage = () => {
-    write({ op: 'dataReset', template: 'graduate', lang: currentLocale })
+    setConfirmAction({
+      title: t('dataPanelLoadDemoAction'),
+      message: t('dataPanelLoadDemoConfirm'),
+      onConfirm: () => {
+        setConfirmAction(null)
+        write({ op: 'dataReset', template: 'graduate', lang: currentLocale })
+      },
+    })
   }
 
   const handleClear = () => {

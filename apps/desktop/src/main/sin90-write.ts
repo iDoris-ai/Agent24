@@ -252,13 +252,6 @@ export async function performSin90Write(req: unknown, caller: Sin90Caller): Prom
       if (typeof name !== 'string' || !BACKUP_NAME.test(name)) return bad()
       return caller.request(route('POST', '/api/v1/sin90/data/restore-backup', { name }), human)
     }
-    case 'dataExport':
-      return caller.request(route('POST', '/api/v1/sin90/data/export'), human)
-    case 'dataImport': {
-      const backup = req['backup']
-      if (!isObj(backup) || backup['format'] !== 'sin90-backup') return bad()
-      return caller.request(route('POST', '/api/v1/sin90/data/import', { backup }), human)
-    }
     default:
       return bad()
   }
@@ -322,12 +315,21 @@ function sin90Error(code: string, message: string, status = 400): BackendProxyRe
   return { ok: false, status, data: { error: { code, message } } }
 }
 
+/** Whole-database export/import. Reachable only from the file-dialog IPCs below,
+ *  never from the renderer's generic `sin90:write`, so the renderer never holds a
+ *  backup and cannot replace the database without the native dialog. */
+function dataTransfer(caller: Sin90Caller, path: string, body?: Record<string, unknown>): Promise<BackendProxyResponse> {
+  const key = caller.key()
+  if (!key.ok) return Promise.resolve(proxyError('forbidden', 'human key unavailable'))
+  return caller.request(route('POST', path, body), key.human)
+}
+
 export async function exportSin90ToFile(
   caller: Sin90Caller = defaultCaller(),
   dialogBridge: Sin90DialogBridge = defaultDialogBridge,
   fsBridge: Sin90FsBridge = defaultFsBridge,
 ): Promise<BackendProxyResponse> {
-  const exported = await performSin90Write({ op: 'dataExport' }, caller)
+  const exported = await dataTransfer(caller, '/api/v1/sin90/data/export')
   if (!exported.ok) return exported
 
   let picked: { canceled: boolean; filePath?: string }
@@ -391,7 +393,7 @@ export async function importSin90FromFile(
     return sin90Error('invalid_backup', 'backup file must have format "sin90-backup"', 400)
   }
 
-  return performSin90Write({ op: 'dataImport', backup: parsed }, caller)
+  return dataTransfer(caller, '/api/v1/sin90/data/import', { backup: parsed })
 }
 
 /** IPC entry. The human key stays in this process. */
