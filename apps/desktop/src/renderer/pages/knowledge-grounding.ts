@@ -31,8 +31,15 @@ export function citedChunks(text: string): string[] {
 
 /** `knowledge` null: the run had no Knowledge binding, so searched nothing. */
 export function grounding(text: string, knowledge: RunKnowledge | null): Grounding {
-  const read = new Set((knowledge?.read_chunks ?? []).map((c) => `${c.knowledge_id}#${c.chunk_id}`))
-  const unread = citedChunks(text).filter((id) => !read.has(id))
+  const chunks = knowledge?.read_chunks ?? []
+  const read = new Set(chunks.map((c) => `${c.knowledge_id}#${c.chunk_id}`))
+  // K3 (11-19): a small model writes a source its own way, `file.pdf#<document id>`
+  // (qwen3-8b: `s01-02-en-epa-boil-water.pdf#17b1f6d6-…`, read as `pdf#17b1f6d6-…`).
+  // After `#`, the ID of a document the run read stands for that document.
+  // A chunk ID after another document's ID is still another source.
+  const documents = new Set(chunks.map((c) => c.knowledge_id))
+  const known = (cited: string) => read.has(cited) || documents.has(cited.slice(cited.indexOf('#') + 1))
+  const unread = citedChunks(text).filter((id) => !known(id))
   if (!knowledge?.searched) return { kind: 'notSearched', unread }
   return { kind: read.size > 0 ? 'read' : 'nothingRead', unread }
 }

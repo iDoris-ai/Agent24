@@ -331,14 +331,16 @@ pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> R
                 None => None,
                 Some(_) => match state.store.list_tool_calls(&run.id).await {
                     Ok(calls) => {
-                        // K3: what each knowledge_search answered, for its hits.
-                        let answers = match state.store.list_run_messages(&run.id).await {
-                            Ok(messages) => messages
-                                .into_iter()
-                                .filter_map(|m| Some((m.tool_call_id?, m.content?)))
-                                .collect(),
-                            Err(err) => return map_store_error(err),
-                        };
+                        // K3: what the run's tools answered, for its searches' hits.
+                        let answers: Vec<String> =
+                            match state.store.list_run_messages(&run.id).await {
+                                Ok(messages) => messages
+                                    .into_iter()
+                                    .filter(|m| m.role == "tool")
+                                    .filter_map(|m| m.content)
+                                    .collect(),
+                                Err(err) => return map_store_error(err),
+                            };
                         Some(run_knowledge_with(&calls, &answers))
                     }
                     Err(err) => return map_store_error(err),

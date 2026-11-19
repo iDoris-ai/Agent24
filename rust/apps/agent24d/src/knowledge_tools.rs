@@ -170,15 +170,15 @@ pub struct ReadChunk {
 
 #[cfg(test)]
 pub fn run_knowledge(calls: &[ToolCall]) -> RunKnowledge {
-    run_knowledge_with(calls, &std::collections::HashMap::new())
+    run_knowledge_with(calls, &[])
 }
 
-/// [`run_knowledge`], with what each call answered (the run's tool messages,
-/// by tool call id): a completed search's hits count as read (K3).
-pub fn run_knowledge_with(
-    calls: &[ToolCall],
-    answers: &std::collections::HashMap<String, String>,
-) -> RunKnowledge {
+/// [`run_knowledge`], with the run's tool messages (`answers`): the hits of
+/// each search answer among them count as read (K3). A tool message carries
+/// the provider's call id, not the stored call's, so answers are told by
+/// their own `kind`; only a search that completed answers with one (a failed
+/// call's message is its error text).
+pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledge {
     let mut knowledge = RunKnowledge {
         searched: false,
         read_chunks: Vec::new(),
@@ -195,15 +195,6 @@ pub fn run_knowledge_with(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         };
-        if call.tool == SEARCH
-            && let Some(answer) = answers.get(&call.id)
-        {
-            for chunk in search_hits(answer) {
-                if !knowledge.read_chunks.contains(&chunk) {
-                    knowledge.read_chunks.push(chunk);
-                }
-            }
-        }
         if let (READ, Some(knowledge_id), Some(chunk_id)) =
             (call.tool.as_str(), text("knowledge_id"), text("chunk_id"))
         {
@@ -211,6 +202,16 @@ pub fn run_knowledge_with(
                 knowledge_id,
                 chunk_id,
             };
+            if !knowledge.read_chunks.contains(&chunk) {
+                knowledge.read_chunks.push(chunk);
+            }
+        }
+    }
+    if calls
+        .iter()
+        .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed)
+    {
+        for chunk in answers.iter().flat_map(|a| search_hits(a)) {
             if !knowledge.read_chunks.contains(&chunk) {
                 knowledge.read_chunks.push(chunk);
             }

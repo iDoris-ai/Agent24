@@ -369,8 +369,8 @@ fn a_completed_searchs_hits_count_as_read() {
         ],
     })
     .to_string();
-    let answers =
-        std::collections::HashMap::from([("tc_knowledge_search".to_owned(), answer.clone())]);
+    // A tool message carries the provider's call id, not the stored call's (11-19, David Mac).
+    let answers = [answer.clone()];
     let done = [stored(
         SEARCH,
         ToolCallStatus::Completed,
@@ -389,9 +389,9 @@ fn a_completed_searchs_hits_count_as_read() {
         json!({ "query": "q" }),
     )];
     assert_eq!(run_knowledge_with(&failed, &answers).read_chunks, vec![]);
-    let other = std::collections::HashMap::from([(
-        "tc_knowledge_search".to_owned(),
+    let other = [
         json!({ "kind": "knowledge.read", "evidence": [{ "knowledge_id": "doc-9", "chunk_id": "chk-9" }] }).to_string(),
-    )]);
+        "tool error: failed: {}".to_owned(),
+    ];
     assert_eq!(run_knowledge_with(&done, &other).read_chunks, vec![]);
 }
