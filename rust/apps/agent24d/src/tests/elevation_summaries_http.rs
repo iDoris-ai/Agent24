@@ -88,6 +88,7 @@ fn with_cards(state: &mut AppState) {
         summary: summary.clone(),
         resource_kinds: vec!["path".to_owned(), "url".to_owned()],
         takes_grants,
+        host_read: false,
     };
     state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
         notice: Arc::new(|_| {

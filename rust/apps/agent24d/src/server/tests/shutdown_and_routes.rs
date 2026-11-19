@@ -622,6 +622,7 @@
             summary: summary.clone(),
             resource_kinds: vec!["doc".to_owned()],
             takes_grants,
+            host_read: false,
         };
         let gate = source(true).gate_request();
         let mut old = summary.clone();
