@@ -111,6 +111,10 @@ const api = {
     ipcRenderer.invoke(IpcChannels.Sin90Write, req),
   sin90KeyStatus: (): Promise<{ available: boolean }> =>
     ipcRenderer.invoke(IpcChannels.Sin90KeyStatus),
+  sin90ExportToFile: (): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.Sin90ExportToFile),
+  sin90ImportFromFile: (): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.Sin90ImportFromFile),
   /** Sin90 hints from the existing events socket, including `{kind:'connected'}` on open. */
   onSin90Event: (cb: (event: { kind: string; payload: unknown }) => void): (() => void) => {
     const listener = (_event: unknown, event: { kind: string; payload: unknown }): void => cb(event)
