@@ -68,7 +68,9 @@ impl Tool for KnowledgeTool {
         let (name, description) = match self.kind {
             Kind::Search => (
                 SEARCH,
-                "Search the user's knowledge bases. Returns ranked passages as \
+                "Search the user's knowledge bases. Leave knowledge_base_ids \
+                 out unless the user named one: the search then covers all of \
+                 them. Returns ranked passages as \
                  clues, each with the document and chunk it came from. Before \
                  relying on a passage, read it back with knowledge_read (its \
                  knowledge_id, chunk_id and content_tag): only evidence whose \

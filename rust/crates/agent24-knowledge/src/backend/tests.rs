@@ -228,7 +228,7 @@ async fn a_search_goes_to_the_binding_scope_under_its_generation() {
 }
 
 #[tokio::test]
-async fn the_knowledge_bases_named_are_cut_to_the_binding_and_none_left_sends_nothing() {
+async fn the_knowledge_bases_named_are_cut_to_the_binding_and_none_left_searches_the_binding() {
     let s = setup(Answer::Fixture("search.ok.json"));
     s.backend
         .search(RUN, query(Some(vec!["kb-b", "kb-z"])))
@@ -237,12 +237,14 @@ async fn the_knowledge_bases_named_are_cut_to_the_binding_and_none_left_sends_no
     let sent = s.server.sent.lock().unwrap()[0].1.clone();
     assert_eq!(sent["scope"]["knowledge_base_ids"], json!(["kb-b"]));
 
-    let outside = s.backend.search(RUN, query(Some(vec!["kb-z"]))).await;
-    let Err(Failure::Envelope(envelope)) = outside else {
-        panic!("{outside:?}");
-    };
-    assert_eq!(envelope.error.code(), crate::ErrorCode::Forbidden);
-    assert_eq!(s.server.sent.lock().unwrap().len(), 1);
+    // Only a made-up name (qwen3-8b, 11-19: `home_knowledge`): the binding's
+    // own knowledge bases are searched, never one outside them.
+    s.backend
+        .search(RUN, query(Some(vec!["kb-z"])))
+        .await
+        .unwrap();
+    let sent = s.server.sent.lock().unwrap()[1].1.clone();
+    assert_eq!(sent["scope"]["knowledge_base_ids"], json!(["kb-a", "kb-b"]));
 }
 
 #[tokio::test]
