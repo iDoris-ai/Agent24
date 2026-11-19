@@ -111,6 +111,13 @@ impl Row {
                 }
                 Some(json!({ "document_id": self.document_id, "revision": self.revision }))
             }
+            // D1: the PDF the conversion imported (PR-Daemon #1909 ③).
+            ("succeeded", "convert") => match self.result_ref.as_deref() {
+                Some(doc) if is_id(IdKind::Document, doc) => {
+                    Some(json!({ "document_id": doc, "revision": 1 }))
+                }
+                other => return Err(format!("a succeeded conversion with result {other:?}")),
+            },
             ("succeeded", "extract") => match self.result_ref.as_deref() {
                 Some(ext) if is_id(IdKind::Extraction, ext) => {
                     Some(json!({ "extraction_id": ext }))

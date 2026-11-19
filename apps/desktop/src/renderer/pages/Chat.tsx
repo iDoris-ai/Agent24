@@ -7,10 +7,17 @@ import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
+import { Markdown } from '../components/Markdown'
 import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
+import { namedDocument, runDocIntent } from './chat/doc-intent-run'
+import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
+import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
+import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
+import { convertedPdf } from './documents/compose'
+import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import {
   forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
@@ -183,7 +190,13 @@ export default function ChatPage() {
   }, [messages, sessionId, loading])
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    // Only the message list scrolls: scrollIntoView would also scroll every
+    // ancestor that overflows, and once moved the window's own layout up.
+    const box = messagesRef.current
+    if (box) {
+      if (typeof box.scrollTo === 'function') box.scrollTo({ top: box.scrollHeight, behavior: 'smooth' })
+      else box.scrollTop = box.scrollHeight
+    }
     // The page follows the newest turn; so does the rail, even when the chat
     // is too short to scroll and no scroll event comes.
     setCurrentTurn(Math.max(0, turns.length - 1))
@@ -200,6 +213,165 @@ export default function ChatPage() {
     draft.apply(request)
     setMessages(prev => [...prev, userMsg])
     setInput('')
+    // F1: a conversation about a document carries its text with each turn.
+    const doc = documentOf(sessionId)
+    // D2b 正式版: granted documents tools go to the Agent; otherwise the
+    // lightweight compose path below still handles a named split/merge.
+    const wantsDocTool = /拆|合并|合成|split|merge|combine/i.test(text)
+    if (wantsDocTool && window.agent24.documents?.agentAccess) {
+      // Busy from before the wait: no second turn, no switch of conversation
+      // while the grants are brought up to date (PR-Daemon #1909 ④).
+      requestInFlight.current = true
+      setLoading(true)
+      const access = await window.agent24.documents.agentAccess('sync').catch(() => null)
+      if (access?.enabled && access.ok !== false) {
+        const last = request.messages[request.messages.length - 1]
+        if (last?.role === 'user') last.content = docAgentPrompt(doc, text.trim())
+        await replyWithKnowledge(messages.length, request, false)
+        return
+      }
+      requestInFlight.current = false
+      setLoading(false)
+    }
+    // D3: 「总结/检查这份文档」 — same check as the document page, as a text report.
+    if (/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+      const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
+      if (doc || named) {
+        const api = window.agent24.documents
+        requestInFlight.current = true
+        setLoading(true)
+        const index = messages.length
+        try {
+          const subject = doc ?? await namedDocument(api, named ?? '')
+          if (typeof subject === 'string') {
+            setDelivery(index, { kind: 'sent' })
+            setMessages(prev => [...prev, { role: 'assistant', content: subject }])
+          } else {
+            let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
+            // A Word/Excel/PPT document has no text of its own: it is checked as the PDF it becomes.
+            if (blocks.length === 0) {
+              const pdf = await convertedPdf(api, subject.id, subject.title)
+              if (pdf.ok && pdf.documentId) blocks = await readAllCheckBlocks((req) => api.request(req), pdf.documentId, 1)
+            }
+            const report = await checkDocument(
+              { ask: (prompt) => askWithProxy(window.agent24.backendProxy, prompt) },
+              subject.title,
+              blocks,
+            )
+            setDelivery(index, { kind: 'sent' })
+            setMessages(prev => [...prev, { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + reportMarkdown(subject.title, report) }])
+          }
+        } catch (e) {
+          setDelivery(index, { kind: 'sent' })
+          setMessages(prev => [...prev, { role: 'assistant', content: `没能完成检查：${e instanceof Error ? e.message : String(e)}` }])
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
+        return
+      }
+    }
+    // D4: 「把这份翻译成英文」「翻译《X》」 — same translation as the document page.
+    if (/翻译|译成|translate/i.test(text) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+      const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
+      if (doc || named) {
+        const api = window.agent24.documents
+        const lang: TargetLang = /中文|汉语/.test(text) && !/英文|英语/.test(text) ? 'zh' : 'en'
+        const langName = lang === 'zh' ? '中文' : '英文'
+        requestInFlight.current = true
+        setLoading(true)
+        const index = messages.length
+        try {
+          const subject = doc ?? await namedDocument(api, named ?? '')
+          if (typeof subject === 'string') {
+            setDelivery(index, { kind: 'sent' })
+            setMessages(prev => [...prev, { role: 'assistant', content: subject }])
+          } else {
+            let blocks = await readAllCheckBlocks((req) => api.request(req), subject.id, subject.revision)
+            if (blocks.length === 0) {
+              const pdf = await convertedPdf(api, subject.id, subject.title)
+              if (!pdf.ok) {
+                const why = pdf.engineMissing
+                  ? '需要先在文档页下载转换器（约 340 MB，只需一次）。'
+                  : `没能完成翻译：${pdf.message}`
+                setDelivery(index, { kind: 'sent' })
+                setMessages(prev => [...prev, { role: 'assistant', content: why }])
+                return
+              }
+              if (pdf.documentId) blocks = await readAllCheckBlocks((req) => api.request(req), pdf.documentId, 1)
+            }
+            const paras = paragraphsOf(blocks)
+            if (paras.length === 0) {
+              setDelivery(index, { kind: 'sent' })
+              setMessages(prev => [...prev, { role: 'assistant', content: '这份文档没有读出可以翻译的文字。' }])
+            } else {
+              const translated = await translateParagraphs(
+                { ask: (prompt) => askWithProxy(window.agent24.backendProxy, prompt) },
+                paras,
+                lang,
+              )
+              const out = await api.exportTranslation({
+                title: subject.title,
+                paragraphs: translated,
+                lang,
+              })
+              const reply = out.ok
+                ? `已翻译《${subject.title}》为${langName}：下载/${out.docxName}；PDF 已加入文档库。`
+                : out.code === 'engine_unavailable'
+                  ? '需要先在文档页下载转换器（约 340 MB，只需一次）。'
+                  : `没能完成翻译：${out.message ?? out.code ?? ''}`
+              setDelivery(index, { kind: 'sent' })
+              setMessages(prev => [...prev, { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + reply }])
+            }
+          }
+        } catch (e) {
+          setDelivery(index, { kind: 'sent' })
+          setMessages(prev => [...prev, { role: 'assistant', content: `没能完成翻译：${e instanceof Error ? e.message : String(e)}` }])
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
+        return
+      }
+    }
+    // D2b: 「拆出第 2-4 页」「和《X》合并」 about that document are done here,
+    // not asked of the model (which does not call tools reliably).
+    // Outside a document's conversation, the one the turn names in 《》.
+    const intent = parseDocIntent(text)
+    const named = !doc && intent && intent.kind !== 'unclear' ? subjectOf(text, intent) : null
+    if ((doc || named) && intent && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      try {
+        const subject = doc ?? await namedDocument(api, named ?? '')
+        const reply = typeof subject === 'string'
+          ? subject
+          : (subject.note ? `${subject.note}\n\n` : '') + await runDocIntent(api, subject, intent)
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: reply }])
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      return
+    }
+    const read = window.agent24.documents?.request
+    if (doc && read) {
+      // PR-Daemon #1909 ④: busy while the document is read, page by page;
+      // released with no await between here and requestReply, which takes it again.
+      requestInFlight.current = true
+      setLoading(true)
+      let body: Awaited<ReturnType<typeof documentText>> | null = null
+      try {
+        body = await documentText(doc, read as Parameters<typeof documentText>[1]).catch(() => null)
+      } finally {
+        requestInFlight.current = false
+      }
+      const last = request.messages[request.messages.length - 1]
+      if (body && body.text.trim() && last?.role === 'user') last.content = withDocument(doc, body, last.content)
+    }
     await requestReply(messages.length, request)
   }
 
@@ -261,6 +433,16 @@ export default function ChatPage() {
     void markConversationSeen(record.id)
   }
   useEffect(() => registerChatPage(id => void openSaved(id), newChat))
+
+  // F1: asked from a document's page: a new conversation about it (this one
+  // when it is still empty).
+  const askedDocument = useSyncExternalStore(subscribeDocContext, pendingDocument)
+  const boundDocument = useSyncExternalStore(subscribeDocContext, () => documentOf(sessionId))
+  useEffect(() => {
+    if (!askedDocument || requestInFlight.current) return
+    if (messages.length > 0) startNewChat(null)
+    else bindPendingDocument(sessionId)
+  }, [askedDocument, sessionId, messages.length])
 
   const setDelivery = (index: number, delivery: Delivery) => {
     setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
@@ -498,7 +680,7 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.content}
+              {m.role === 'assistant' ? <Markdown text={m.content} /> : m.content}
               {m.role === 'user' && m.delivery.kind === 'headroom' && (
                 <div role="group" aria-label={t('headroom.explanation')} style={{ marginTop: 8 }}>
                   <p role="status">{t('headroom.explanation')}</p>
@@ -554,6 +736,14 @@ export default function ChatPage() {
       </div>
 
       {!archived && <DraftAttachments draft={draft} />}
+      {!archived && boundDocument && (
+        <div className="chat-draft">
+          <div className="chat-draft-chip" title={t('doc.context')}>
+            {'📄 '}{boundDocument.title}{' · '}{t('doc.context')}
+            <button className="chat-draft-remove" type="button" aria-label={t('doc.remove')} onClick={() => unbindDocument(sessionId)}>{'×'}</button>
+          </div>
+        </div>
+      )}
       {archived ? (
         <div className="chat-input-bar chat-archived-bar" role="status">
           <span className="chat-archived-notice">{t('archived.notice')}</span>

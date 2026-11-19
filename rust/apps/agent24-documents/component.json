@@ -18,7 +18,8 @@
         "documents.find",
         "documents.extract",
         "documents.job_get",
-        "documents.extraction_get"
+        "documents.extraction_get",
+        "documents.compose"
       ]
     }
   ],

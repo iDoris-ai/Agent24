@@ -1,4 +1,6 @@
 // M5 B4c: the tray's 「完全退出」: stopping the service for good (resident-service.ts).
+import fs from 'node:fs'
+import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { enrolRefusal, refusedThisApp, serviceStopDeps, stopService, type StopDeps, type StopSystem } from './resident-service'
 import { buildTrayView, type TrayInput } from './tray-menu'
@@ -213,6 +215,16 @@ describe('serviceStopDeps (the real steps over a fake system)', () => {
     expect(refusedThisApp({ kind: 'enrol_refused', code: 'timeout', pid: 5151 }, 5151)).toBe(false)
     expect(refusedThisApp({ kind: 'protocol_mismatch', daemonVersion: 9, clientVersion: 1, pid: 5151 }, 5151)).toBe(false)
     expect(refusedThisApp(null, 5151)).toBe(false)
+  })
+
+  // QA L2: the one place that lets a stop skip the presence box is main.ts's
+  // residentStop; it must read the manager's own refusal for that pid.
+  it('main.ts residentStop passes the manager\'s refusal for the pid on record', () => {
+    const main = fs.readFileSync(path.join(__dirname, 'main.ts'), 'utf8')
+    const stop = main.slice(main.indexOf('function residentStop(): Promise<StopOutcome> {'))
+    const body = stop.slice(0, stop.indexOf('\n}\n'))
+    expect(body).toContain('serviceStopDeps({')
+    expect(body).toContain('refused: (pid) => refusedThisApp(backendManager.statusDetail(), pid),')
   })
 
   it('enrolRefusal: the code for the window, and whether retrying can help', () => {

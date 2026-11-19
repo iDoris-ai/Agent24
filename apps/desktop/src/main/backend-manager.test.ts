@@ -33,6 +33,7 @@ import {
 import { serviceDaemonOf } from './service-daemon'
 import { CLIENT_PROTOCOL_VERSION } from './protocol-compatibility'
 import { EnrolError } from './daemon-enroll'
+import { refusedThisApp } from './resident-service'
 
 describe('deriveStatus (F1b tray daemon status)', () => {
   it('a user-initiated stop pins `stopped`, even if a stale endpoint lingers', () => {
@@ -2224,6 +2225,8 @@ describe('BackendManager enrols with the LaunchAgent daemon (M5 B2)', () => {
     try {
       expect(manager.status()).toBe('error')
       expect(manager.statusDetail()).toEqual({ kind: 'enrol_refused', code, pid: 4242 })
+      // QA L2: what main.ts's residentStop reads: only a lasting refusal lets a stop skip the presence box.
+      expect(refusedThisApp(manager.statusDetail(), 4242)).toBe(code !== 'timeout')
       expect(manager.foreignDaemonPid()).toBeNull()
       expect(manager.isExternalDaemon()).toBe(false)
       expect(daemonConnection()).toBeNull()

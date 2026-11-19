@@ -141,10 +141,12 @@ describe('App', () => {
     const backendRefusal = vi.fn().mockResolvedValue({ code: 'identity_rejected', permanent: true })
     Object.assign(window.agent24, { backendRefusal })
     await act(async () => { render(<App />) })
+    // The overview page says it too (Home.test.tsx); this is the sidebar's.
+    const footer = () => within(document.querySelector('.sidebar-footer') as HTMLElement)
     await waitFor(() => {
-      expect(screen.getByText('后台服务拒绝了本应用（identity_rejected）')).toBeInTheDocument()
+      expect(footer().getByText('后台服务拒绝了本应用（identity_rejected）')).toBeInTheDocument()
     })
-    expect(screen.getByText(/设置 → 通用/)).toBeInTheDocument()
+    expect(footer().getByText(/设置 → 通用/)).toBeInTheDocument()
     expect(screen.queryByText('后端服务离线')).not.toBeInTheDocument()
   })
 
@@ -153,7 +155,7 @@ describe('App', () => {
     Object.assign(window.agent24, { backendRefusal: vi.fn().mockResolvedValue({ code: 'timeout', permanent: false }) })
     await act(async () => { render(<App />) })
     await waitFor(() => {
-      expect(screen.getByText('后台服务登记失败（timeout），正在重试')).toBeInTheDocument()
+      expect(within(document.querySelector('.sidebar-footer') as HTMLElement).getByText('后台服务登记失败（timeout），正在重试')).toBeInTheDocument()
     })
   })
 

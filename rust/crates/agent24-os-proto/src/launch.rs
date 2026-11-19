@@ -143,6 +143,7 @@ fn prepare_seatbelt(
     data_dir: &Path,
     callback_sock: &Path,
     program: &Path,
+    office_pipe: bool,
 ) -> Result<(PathBuf, String), LaunchError> {
     ensure_seatbelt_available(Path::new("/usr/bin/sandbox-exec"))?;
     let exec_program = crate::sandbox::canonical(program).map_err(|error| {
@@ -167,6 +168,7 @@ fn prepare_seatbelt(
         program,
         also_programs: &also,
         home_dir: home.as_deref(),
+        office_pipe,
     })
     .map_err(|error| LaunchError::SandboxUnavailable(error.0))?;
     Ok((exec_program, profile))
@@ -697,8 +699,14 @@ fn start(
     // On macOS, refuse a redirected data directory before creating anything
     // inside it. `prepare_seatbelt` checks again when it builds the profile.
     #[cfg(target_os = "macos")]
-    let (exec_program, seatbelt) =
-        prepare_seatbelt(spec.package_dir, spec.data_dir, spec.callback_sock, program)?;
+    let (exec_program, seatbelt) = prepare_seatbelt(
+        spec.package_dir,
+        spec.data_dir,
+        spec.callback_sock,
+        program,
+        // D1: only the documents module runs LibreOffice.
+        spec.name == "documents",
+    )?;
     #[cfg(not(target_os = "macos"))]
     let exec_program = program.to_path_buf();
     let module_temp = crate::sandbox::reset_module_temp(spec.data_dir)

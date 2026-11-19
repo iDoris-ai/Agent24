@@ -186,6 +186,8 @@ const en = {
   'agentear.enableDetail': 'AgentEar will be allowed to connect to Agent24 again with its existing pairing.',
   'agentear.unpairMessage': 'Unpair AgentEar?',
   'agentear.unpairDetail': 'AgentEar\'s credential is revoked and it disconnects immediately. This cannot be undone: to use AgentEar with Agent24 again you must pair AgentEar again from its menu bar.',
+  'docAgent.confirm.message': 'Allow the Agent to use your document library?',
+  'docAgent.confirm.detail': 'The Agent can list and read documents, and split or merge PDFs into new documents (originals stay as they are). It will ask you again before creating each new document. This lasts 30 days; you can turn it off on the Documents page at any time.',
 } as const
 
 export type MainMessageKey = keyof typeof en
@@ -354,6 +356,8 @@ const zh: Record<MainMessageKey, string> = {
   'agentear.enableDetail': 'AgentEar 将被允许用现有配对再次连接 Agent24。',
   'agentear.unpairMessage': '确认解除与 AgentEar 的配对？',
   'agentear.unpairDetail': 'AgentEar 的凭据会被撤销并立即断开。此操作不可撤回：之后要在 Agent24 中继续使用 AgentEar，必须在 AgentEar 菜单栏里重新配对。',
+  'docAgent.confirm.message': '允许 Agent 使用你的文档库？',
+  'docAgent.confirm.detail': 'Agent 可以列出、查看文档，并把 PDF 拆分或合并成新文档（原件不变）。每次生成新文档前都会再问你。有效 30 天，可随时在文档页关闭。',
 }
 
 const th: Record<MainMessageKey, string> = {
@@ -520,6 +524,8 @@ const th: Record<MainMessageKey, string> = {
   'agentear.enableDetail': 'AgentEar จะได้รับอนุญาตให้เชื่อมต่อกับ Agent24 อีกครั้งด้วยการจับคู่เดิม',
   'agentear.unpairMessage': 'ยืนยันยกเลิกการจับคู่ AgentEar?',
   'agentear.unpairDetail': 'ข้อมูลรับรองของ AgentEar จะถูกเพิกถอนและตัดการเชื่อมต่อทันที ย้อนกลับไม่ได้ หากต้องการใช้ AgentEar กับ Agent24 อีก ต้องจับคู่ใหม่จากแถบเมนูของ AgentEar',
+  'docAgent.confirm.message': 'อนุญาตให้ Agent ใช้คลังเอกสารของคุณ?',
+  'docAgent.confirm.detail': 'Agent สามารถแสดงรายการและดูเอกสาร รวมถึงแยกหรือรวม PDF เป็นเอกสารใหม่ได้ (ต้นฉบับไม่เปลี่ยน) จะถามคุณอีกครั้งก่อนสร้างเอกสารใหม่ทุกครั้ง มีผล 30 วัน และปิดได้ตลอดเวลาที่หน้าเอกสาร',
 }
 
 const TABLE: Record<MainLocale, Record<MainMessageKey, string>> = { en, zh, th }

@@ -20,6 +20,22 @@ describe('HomePage', () => {
     expect(screen.getByRole('button', { name: /Play|Pause/ })).toBeDisabled()
   })
 
+  // QA 0.6.1 §3c: the service daemon refused this build. Its /health answers,
+  // so 「not answering /api/v1/health」 was wrong; say the refusal and the way out.
+  it('says the service refused this app, not that /health is silent', () => {
+    render(<HomePage backendOk={false} refusal={{ code: 'identity_rejected', permanent: true }} {...props} />)
+    expect(screen.queryByText(/not answering/)).not.toBeInTheDocument()
+    expect(screen.queryByText('Offline')).not.toBeInTheDocument()
+    expect(screen.getAllByText(/The background service refused this app \(identity_rejected\)/)).toHaveLength(2)
+    expect(screen.getByText(/Settings → General/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /Play|Pause/ })).toBeDisabled()
+  })
+
+  it('a refusal that is retried says so', () => {
+    render(<HomePage backendOk={false} refusal={{ code: 'timeout', permanent: false }} {...props} />)
+    expect(screen.getAllByText(/Could not enrol with the background service \(timeout\); retrying/)).toHaveLength(2)
+  })
+
   it('steps with the arrow keys and keeps readout and aria in sync', () => {
     render(<HomePage backendOk={true} {...props} />)
     const fig = screen.getByRole('slider')

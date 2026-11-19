@@ -304,7 +304,9 @@ export class KnowledgeController {
     })
     // Replayed by the host on a daemon not up yet, or after the backoff of a
     // confirmation not answered in time or not asked at all (#1852 B1).
-    if (result.ok || result.reason === 'daemon_unavailable' || result.reason === 'unanswered' || result.reason === 'not_asked') this.pushedUntil = expiresAt
+    // K1: the daemon kept the one it had (same key): refresh by that one's expiry.
+    if (result.ok) this.pushedUntil = result.expiresAt ?? expiresAt
+    else if (result.reason === 'daemon_unavailable' || result.reason === 'unanswered' || result.reason === 'not_asked') this.pushedUntil = expiresAt
     return result
   }
 

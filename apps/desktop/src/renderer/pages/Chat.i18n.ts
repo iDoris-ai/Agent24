@@ -2,6 +2,7 @@ import { defineMessages } from '../i18n'
 
 export const chatMessages = defineMessages({
   en: {
+    'doc.context': 'this conversation is about it', 'doc.remove': 'Stop using this document',
     'newChat': 'New chat',
     'turns.label': 'Turns in this chat',
     'turns.mark': 'Turn {n}: {prompt}',
@@ -49,6 +50,8 @@ export const chatMessages = defineMessages({
     'proactive.bannerLabel': 'The assistant has {n} thing(s) you have not seen yet. Open the earliest',
     'task.list': 'Tasks in this conversation', 'task.card': 'Task: {status}',
     'task.status.queued': 'Queued', 'task.status.running': 'Running', 'task.status.awaiting': 'Needs your OK',
+    'task.ask.list': 'List your documents', 'task.ask.get': 'Look at document {doc}',
+    'task.ask.compose': 'Make the new document "{title}" from {parts}', 'task.ask.part': '{doc} (pages {pages})',
     'task.status.completed': 'Done', 'task.status.failed': 'Failed', 'task.status.cancelled': 'Stopped',
     'task.status.missing': 'Not found', 'task.status.unknown': 'Checking…',
     'task.confirm': 'Confirm', 'task.stop': 'Stop', 'task.noApproval': 'Nothing to confirm right now', 'task.decideInTui': 'This one can only be decided in the terminal: agent24 tui', 'task.deny': 'Deny', 'task.denyReason': 'Why deny? (the assistant is told)', 'task.denySend': 'Deny', 'task.denyCancel': 'Cancel',
@@ -91,6 +94,7 @@ export const chatMessages = defineMessages({
     'run.failed': '⚠️ The reply failed: {error}',
   },
   zh: {
+    'doc.context': '本对话以它为上下文', 'doc.remove': '不再附带这份文档',
     'newChat': '新对话',
     'turns.label': '本次对话的回合',
     'turns.mark': '第 {n} 轮：{prompt}',
@@ -137,6 +141,8 @@ export const chatMessages = defineMessages({
     'proactive.bannerLabel': '助理有 {n} 件事你还没看，打开最早的一件',
     'task.list': '这条对话里的任务', 'task.card': '任务：{status}',
     'task.status.queued': '排队中', 'task.status.running': '运行中', 'task.status.awaiting': '等你确认',
+    'task.ask.list': '查看文档列表', 'task.ask.get': '查看文档 {doc}',
+    'task.ask.compose': '生成新文档「{title}」：{parts}', 'task.ask.part': '{doc}（第 {pages} 页）',
     'task.status.completed': '已完成', 'task.status.failed': '失败', 'task.status.cancelled': '已停止',
     'task.status.missing': '找不到', 'task.status.unknown': '查询中…',
     'task.confirm': '确认', 'task.stop': '停止', 'task.noApproval': '现在没有要确认的事', 'task.decideInTui': '这一项只能在终端里处理：agent24 tui', 'task.deny': '拒绝', 'task.denyReason': '拒绝的理由（会告诉助理）', 'task.denySend': '拒绝', 'task.denyCancel': '取消',
@@ -179,6 +185,7 @@ export const chatMessages = defineMessages({
     'run.failed': '⚠️ 回答失败：{error}',
   },
   th: {
+    'doc.context': 'บทสนทนานี้อ้างอิงเอกสารนี้', 'doc.remove': 'เลิกแนบเอกสารนี้',
     'newChat': 'แชตใหม่',
     'turns.label': 'รอบการสนทนาในแชตนี้',
     'turns.mark': 'รอบที่ {n}: {prompt}',
@@ -225,6 +232,8 @@ export const chatMessages = defineMessages({
     'proactive.bannerLabel': 'ผู้ช่วยมี {n} เรื่องที่คุณยังไม่ได้ดู เปิดเรื่องแรกสุด',
     'task.list': 'งานในบทสนทนานี้', 'task.card': 'งาน: {status}',
     'task.status.queued': 'รอคิว', 'task.status.running': 'กำลังทำงาน', 'task.status.awaiting': 'รอคุณยืนยัน',
+    'task.ask.list': 'ดูรายการเอกสาร', 'task.ask.get': 'ดูเอกสาร {doc}',
+    'task.ask.compose': 'สร้างเอกสารใหม่ "{title}" จาก {parts}', 'task.ask.part': '{doc} (หน้า {pages})',
     'task.status.completed': 'เสร็จแล้ว', 'task.status.failed': 'ล้มเหลว', 'task.status.cancelled': 'หยุดแล้ว',
     'task.status.missing': 'ไม่พบ', 'task.status.unknown': 'กำลังตรวจสอบ…',
     'task.confirm': 'ยืนยัน', 'task.stop': 'หยุด', 'task.noApproval': 'ตอนนี้ไม่มีอะไรให้ยืนยัน', 'task.decideInTui': 'รายการนี้ตัดสินได้ในเทอร์มินัลเท่านั้น: agent24 tui', 'task.deny': 'ปฏิเสธ', 'task.denyReason': 'เหตุผลที่ปฏิเสธ (จะแจ้งให้ผู้ช่วยทราบ)', 'task.denySend': 'ปฏิเสธ', 'task.denyCancel': 'ยกเลิก',

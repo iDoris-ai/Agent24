@@ -226,6 +226,11 @@ impl ApiError {
         self.code
     }
 
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
     /// `details.retryable`, which every constructor sets.
     #[must_use]
     pub fn retryable(&self) -> bool {

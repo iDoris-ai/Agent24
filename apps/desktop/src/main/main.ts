@@ -11,15 +11,24 @@ import { createScheduleConversations, type ScheduleConversations } from './sched
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
+import { registerModelSource } from './ipc/model-source'
+import { registerOfficeEngine } from './ipc/office-engine'
+import { registerTranslationExport } from './ipc/translation-export'
+import { registerDocAgentAccess } from './ipc/doc-agent-access'
+import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
+import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
-import { BackendManager, daemonAuthMode, daemonConnection, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
-import { documentsEvent } from './documents'
+import { documentsCall, documentsEvent } from './documents'
+import { withDocumentsDelegation } from './documents-delegation'
+import { importFile } from './documents-import'
+import { sendElevating } from './elevated-request'
 import { sin90Event } from './sin90-event'
 import { cliBinary } from './documents-cli'
 import {
@@ -28,6 +37,7 @@ import {
   SIN90_OS,
   type BundledModuleDeps,
   documentsModuleOnDisk,
+  ensureBundledDocumentsModule,
   ensureBundledOsModules,
   execCli,
   installBundledDocumentsModule,
@@ -39,7 +49,7 @@ import { tryDataDir } from './data-dir'
 import { AgentEarEventLog } from './agentear-log'
 import { ModelCallLog } from './model-call-log'
 import { IpcChannels } from '../shared/ipc-types'
-import type { CreativeViewBounds, CreativeViewResult } from '../shared/ipc-types'
+import type { CreativeViewBounds, CreativeViewResult, DocumentsResults } from '../shared/ipc-types'
 import {
   CREATIVE_SESSION_PARTITION,
   OPEN_DESIGN_PIN_VERSION,
@@ -52,7 +62,7 @@ import {
 import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
-import { KnowledgeHost } from './knowledge-host'
+import { fileAppliedStore, KnowledgeHost } from './knowledge-host'
 import { serviceDaemonOf } from './service-daemon'
 import { fetchOsPackageRelease, OsInstallPauseError, performOsPackageInstall } from './os-package-install'
 import { realOsServicePause, runWhileServiceStopped } from './os-package-service'
@@ -77,8 +87,42 @@ import { newUlid } from './knowledge-bridge'
 import { entryTarget } from './knowledge-entry-extract'
 import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 
+/** A documents job, read until it ends or `ms` pass. */
+async function documentsJobEnd(job: DocumentsResults['job'], ms: number): Promise<{ ok: true; job: DocumentsResults['job'] } | { ok: false; code?: string; message: string }> {
+  const deadline = Date.now() + ms
+  while (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
+    if (Date.now() >= deadline) return { ok: false, message: 'timed out' }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const next = await documentsCall({ op: 'job', jobId: job.job_id }, daemonCliEndpoint)
+    if (!next.ok) return { ok: false, code: next.error.code, message: next.error.message }
+    job = next.data as DocumentsResults['job']
+  }
+  if (job.status === 'succeeded') return { ok: true, job }
+  return { ok: false, code: job.error?.code, message: job.error?.message ?? job.status }
+}
+
+/** D4 (PR-Daemon #1915 B1): the translation's DOCX imported, then made a PDF
+ * by the documents module in its sandbox; nothing is run here. */
+async function importAndConvertTranslation(docxPath: string, pdfTitle: string): Promise<{ ok: boolean; code?: string; message?: string }> {
+  const started = await withDocumentsDelegation(() => importFile(docxPath, daemonCliEndpoint))
+  if (!started || !started.ok) {
+    return { ok: false, message: started && !started.ok ? started.error.message : 'import failed' }
+  }
+  const imported = await documentsJobEnd(started.data, 120_000)
+  if (!imported.ok) return imported
+  const docx = (imported.job.result as { document_id?: string } | undefined)?.document_id ?? imported.job.document_id
+  if (!docx) return { ok: false, message: 'the import named no document' }
+  const converting = await withDocumentsDelegation(() => documentsCall({ op: 'convert', documentId: docx, title: pdfTitle }, daemonCliEndpoint))
+  if (!converting.ok) return { ok: false, code: converting.error.code, message: converting.error.message }
+  // A conversion runs up to 120 s before its import.
+  const converted = await documentsJobEnd(converting.data as DocumentsResults['job'], 300_000)
+  return converted.ok ? { ok: true } : converted
+}
+
 const isDev = process.env.NODE_ENV === 'development'
 setBundledPackaged(app.isPackaged)
+// D2b（Loop 2）：开发包打开模块工具授予入口（K1-6a-G 的宿主开关）；正式包不开。
+if (app.getVersion().includes('-dev')) process.env['A24_MODULE_TOOL_GRANTS'] ??= '1'
 const backendManager = new BackendManager({ isPackaged: app.isPackaged })
 // M5 B5: the service daemon brought up to the agent24d this app ships.
 let bundledVersion: string | null = null
@@ -88,13 +132,21 @@ const serviceUpgrader = new ServiceUpgrader({
   running: () => backendManager.serviceDaemonVersion(),
   installed: launchAgentPlistExists,
   pid: () => serviceDaemonOf(backendManager)?.pid ?? null,
+  // U1: the elevated shutdown asks its box through the presence connection.
+  ready: () => presenceConnection?.ready === true,
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    return upgradeService(serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold }))
+    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold })
+    // U1: the bundled documents module waits for this stop too (one box, not two).
+    const replaceModule = moduleNeedsServiceStop
+    return upgradeService(replaceModule ? { ...deps, between: () => replaceModule() } : deps)
   },
 })
+/** Set when the bundled documents module could not be replaced at launch
+ * because the service daemon holds the store: the work to do once it is stopped. */
+let moduleNeedsServiceStop: (() => Promise<unknown>) | null = null
 const crashLoop = new CrashLoopDetector({
   now: () => Date.now(),
   installed: () => process.platform === 'darwin' && launchAgentPlistExists(),
@@ -536,6 +588,26 @@ app.whenReady().then(async () => {
     { spec: SIN90_OS, deps: sin90Deps },
   ])
   backendManager.holdStartUntil(bundledModulesReady)
+  // Service mode: the LaunchAgent's daemon holds the store, so a newer bundled
+  // documents module could not replace the installed one above. Once enrolled
+  // with that daemon, stop it (the presence box once), replace the module,
+  // and start it again.
+  void bundledModulesReady.then(async ([outcome]) => {
+    if (outcome !== 'install_failed' || !launchAgentPlistExists()) return
+    moduleNeedsServiceStop = () => ensureBundledDocumentsModule(documentsDeps).finally(() => { moduleNeedsServiceStop = null })
+    // Enrolled, and the presence connection up: the shutdown asks the box through it.
+    for (let i = 0; i < 90 && !(serviceDaemonOf(backendManager) && presenceConnection?.ready === true); i++) await new Promise((r) => setTimeout(r, 1000))
+    // U1: an upgrade of the service daemon is due: the module rides along in its stop.
+    await new Promise((r) => setTimeout(r, 5_000))
+    if (serviceUpgrader.due() || moduleNeedsServiceStop === null) return
+    const service = serviceDaemonOf(backendManager)
+    const dataDir = tryDataDir()
+    if (!service || dataDir === null) return
+    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
+    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
+    const done = await whileServiceStopped(deps, () => moduleNeedsServiceStop?.() ?? Promise.resolve('up_to_date'))
+    console.log('[documents-module] replaced with the service daemon stopped:', done.ok ? done.value : done.code)
+  })
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
     await bundledModulesReady
     const external = backendManager.isExternalDaemon()
@@ -573,6 +645,9 @@ app.whenReady().then(async () => {
   // anything can change them; the reason is logged, never the contents.
   const loginStore = new KnowledgeLoginStore(app.getPath('userData'), safeStorage)
   knowledgeHost = new KnowledgeHost(loginStore, {
+    // K1: an app restart does not ask the service daemon's presence box again
+    // for a binding it already has as wanted.
+    applied: fileAppliedStore(path.join(app.getPath('userData'), 'knowledge-applied.json')),
     daemonIdentity: () => {
       const daemon = serviceDaemonOf(backendManager)
       return daemon ? `${daemon.pid}:${daemon.generation}` : null
@@ -689,6 +764,71 @@ app.whenReady().then(async () => {
       })
       refreshTray()
       return result
+    },
+  })
+  // Settings → Models → custom local model service: the daemon reads the
+  // file as it starts, so a change restarts it (the service daemon through
+  // the same presence-confirmed restart as an upgrade).
+  registerModelSource({
+    guard,
+    file: () => { const dir = tryDataDir(); return dir === null ? null : modelSourcePath(dir) },
+    restart: restartDaemonForModelSource,
+  })
+  registerOfficeEngine({
+    guard,
+    engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
+    windows: () => BrowserWindow.getAllWindows(),
+  })
+  registerTranslationExport({
+    guard,
+    deps: {
+      dataDir: () => tryDataDir(),
+      downloadsDir: () => app.getPath('downloads'),
+      importAndConvert: importAndConvertTranslation,
+    },
+  })
+  registerDocAgentAccess({
+    guard,
+    deps: {
+      dataDir: tryDataDir,
+      send: (req) => sendElevating(req, { host: '127.0.0.1' }, { connection: daemonConnection, elevation: daemonElevation }),
+      documentIds: async () => {
+        const ids: string[] = []
+        let cursor: string | undefined
+        while (ids.length < 256) {
+          const res = await documentsCall(
+            cursor === undefined ? { op: 'list', limit: 200 } : { op: 'list', limit: 200, cursor },
+            daemonCliEndpoint,
+          )
+          if (!res.ok) throw new Error(res.error.code)
+          const page = res.data as DocumentsResults['list']
+          for (const doc of page.documents) {
+            if (ids.length >= 256) break
+            ids.push(doc.document_id)
+          }
+          if (!page.next_cursor || page.documents.length === 0) break
+          cursor = page.next_cursor
+        }
+        return ids
+      },
+    },
+    confirm: async () => {
+      const opts: Electron.MessageBoxOptions = {
+        type: 'warning',
+        buttons: [mt('dialog.confirm'), mt('dialog.cancel')],
+        defaultId: 1,
+        cancelId: 1,
+        message: mt('docAgent.confirm.message'),
+        detail: mt('docAgent.confirm.detail'),
+        noLink: true,
+      }
+      try {
+        const win = mainWin && !mainWin.isDestroyed() ? mainWin : BrowserWindow.getFocusedWindow()
+        const result = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts)
+        return result.response === 0
+      } catch {
+        return false
+      }
     },
   })
   mainWin = createMainWindow()
@@ -862,6 +1002,23 @@ app.whenReady().then(async () => {
   // macOS: re-open window when dock icon clicked with no windows open
   app.on('activate', () => showOrCreateWindow())
 })
+
+async function restartDaemonForModelSource(): Promise<{ ok: true } | { ok: false; code: string }> {
+  const service = serviceDaemonOf(backendManager)
+  if (service) {
+    const dataDir = tryDataDir()
+    if (dataDir === null) return { ok: false, code: 'no_data_dir' }
+    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
+    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
+    // Restarted to read the model source again; replaced only through the upgrade's own gate.
+    const gate = { fromBundle: upgradesFromBundle(app.isPackaged, process.env), bundled: bundledVersion, running: backendManager.serviceDaemonVersion() }
+    const outcome = await upgradeService(restartDeps(deps, gate))
+    return outcome.ok ? { ok: true } : { ok: false, code: outcome.code }
+  }
+  if (backendManager.isExternalDaemon()) return { ok: false, code: 'external_daemon' }
+  backendManager.restart()
+  return { ok: true }
+}
 
 // M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
 // Settings switch and the tray's 「完全退出」, one at a time (B4c3).

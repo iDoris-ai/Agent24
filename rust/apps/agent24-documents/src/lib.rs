@@ -11,7 +11,9 @@
 
 pub mod authorization;
 pub mod blob;
+pub mod compose;
 pub mod db;
+pub mod derived;
 pub mod documents;
 pub mod engine;
 pub mod error;
@@ -22,7 +24,9 @@ pub mod id;
 pub mod idem;
 pub mod imports;
 pub mod jobs;
+pub mod office;
 pub mod oplog;
+pub mod pdf_compose;
 pub mod read;
 pub mod scope;
 pub mod state;
@@ -190,6 +194,11 @@ pub fn router(state: AppState) -> Router {
             get(extractions::get_extraction),
         )
         .route("/imports", post(imports::handler::import))
+        .route("/compositions", post(compose::compose))
+        .route(
+            "/documents/{document_id}/conversions",
+            post(office::convert),
+        )
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/retry", post(jobs::retry_job))
@@ -246,8 +255,13 @@ mod tests {
             .lines()
             .find_map(|l| l.strip_prefix("min_daemon_protocol:"))
             .map(|v| v.trim().parse::<u32>().unwrap());
-        assert_eq!(min, Some(2));
+        // D2b: v4 is the kernel that takes grants for its tools (K1-6a-G).
+        assert_eq!(min, Some(4));
+        assert!(m.takes_grants());
         // And this kernel is new enough: `from_yaml` above accepted it.
+        // D2b: what an Agent may call; `compose` writes, so it is approved per call.
+        let tools: Vec<_> = m.tools().iter().map(|t| t.operation().to_owned()).collect();
+        assert_eq!(tools, ["list", "get", "compose"]);
     }
 
     #[test]

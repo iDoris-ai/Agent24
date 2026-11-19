@@ -13,6 +13,8 @@ import {
   type CliToolStatus,
   type CliInstallResult,
   type ResidentServiceResult,
+  type ModelSource,
+  type ModelSourceResult,
   type ResidentServiceStatus,
   type DocumentsEvent,
   type DocumentsModuleStatus,
@@ -37,6 +39,9 @@ import {
   type DocumentsImportProgress,
   type DocumentsRequest,
   type DocumentsResponse,
+  type DocAgentAccess,
+  type OfficeEngineStatus,
+  type TranslationExportResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type ApprovalDecisionInput,
@@ -99,6 +104,9 @@ const api = {
   repairUserCli: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolRepairUser),
   residentServiceStatus: (): Promise<ResidentServiceStatus> => ipcRenderer.invoke(IpcChannels.ResidentServiceStatus),
   setResidentService: (on: boolean): Promise<ResidentServiceResult> => ipcRenderer.invoke(IpcChannels.ResidentServiceSet, on),
+  modelSourceGet: (): Promise<ModelSource | null> => ipcRenderer.invoke(IpcChannels.ModelSourceGet),
+  modelSourceSet: (url: string, model: string): Promise<ModelSourceResult> => ipcRenderer.invoke(IpcChannels.ModelSourceSet, url, model),
+  modelSourceClear: (): Promise<ModelSourceResult> => ipcRenderer.invoke(IpcChannels.ModelSourceClear),
   setAppLocale: (locale: import('../shared/i18n').Locale): Promise<void> => ipcRenderer.invoke(IpcChannels.AppLocale, locale),
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
   setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),
@@ -323,13 +331,28 @@ const api = {
       ipcRenderer.invoke(IpcChannels.DocumentsRequest, req),
     /** T1-1/T1-2: the documents module as it is on disk now. */
     moduleStatus: (): Promise<DocumentsModuleStatus> => ipcRenderer.invoke(IpcChannels.DocumentsModuleStatus),
-    /** Picks a PDF, JPEG or PNG and imports it; null if the user cancels. */
+    /** Picks a PDF, JPEG, PNG, DOCX, XLSX or PPTX and imports it; null if the user cancels. */
     importFile: (): Promise<DocumentsResponse<'job'> | null> =>
       ipcRenderer.invoke(IpcChannels.DocumentsImportFile),
     onImportProgress: (cb: (p: DocumentsImportProgress) => void): (() => void) => {
       const listener = (_event: unknown, p: DocumentsImportProgress): void => cb(p)
       ipcRenderer.on(IpcChannels.DocumentsImportProgress, listener)
       return () => ipcRenderer.removeListener(IpcChannels.DocumentsImportProgress, listener)
+    },
+    officeEngineStatus: (): Promise<OfficeEngineStatus> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineStatus),
+    installOfficeEngine: (): Promise<OfficeEngineStatus> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsOfficeEngineInstall),
+    agentAccess: (action: 'state' | 'enable' | 'disable' | 'sync'): Promise<DocAgentAccess> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsAgentAccess, action),
+    /** D4: write the translated HTML to a DOCX in Downloads and import its PDF. */
+    revealDownload: (name: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.DocumentsRevealDownload, name),
+    exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
+    onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
+      const listener = (_event: unknown, s: OfficeEngineStatus): void => cb(s)
+      ipcRenderer.on(IpcChannels.DocumentsOfficeEngineChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsOfficeEngineChanged, listener)
     },
     /** The OS's job and document events (hints: read the job or list again). */
     onEvent: (cb: (e: DocumentsEvent) => void): (() => void) => {

@@ -6,9 +6,11 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import DocumentDetail from './DocumentDetail'
-import { useT } from '../../i18n'
+import { compose } from './compose'
+import type { TargetLang } from './doc-translate'
+import { getLocale, useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
-import type { DocumentsModuleStatus } from '../../../shared/ipc-types'
+import type { DocAgentAccess, DocumentsModuleStatus } from '../../../shared/ipc-types'
 
 type Doc = components['schemas']['Document']
 
@@ -32,6 +34,21 @@ const moduleNotInstalled = (res: { ok: boolean; status?: number; error?: { code?
   !res.ok && res.status === 404 && res.error?.code === 'not_found'
 const ALERT = { color: '#e5534b', fontSize: 13, margin: '8px 0' } as const
 const CELL = { padding: '6px 12px 6px 0', borderBottom: '1px solid var(--border)', textAlign: 'left' } as const
+const OFFICE_FORMAT: Record<string, string> = {
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'DOCX',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'XLSX',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'PPTX',
+}
+const formatOf = (media: string): string => OFFICE_FORMAT[media] ?? media
+
+function accessUntilDate(until: string | null): string {
+  if (!until) return ''
+  const d = new Date(until)
+  if (Number.isNaN(d.getTime())) return until
+  const locale = getLocale()
+  const tag = locale === 'zh' ? 'zh-CN' : locale === 'th' ? 'th-TH' : 'en'
+  return d.toLocaleDateString(tag, { year: 'numeric', month: 'short', day: 'numeric' })
+}
 
 export default function DocumentsPage() {
   const t = useT(documentsMessages)
@@ -85,7 +102,21 @@ export default function DocumentsPage() {
       .catch(() => {})
     return () => { live = false }
   }, [api, notInstalled])
+  const [agentAccess, setAgentAccess] = useState<DocAgentAccess | null>(null)
+  const [agentAccessBusy, setAgentAccessBusy] = useState(false)
+  const [agentAccessNote, setAgentAccessNote] = useState<string | null>(null)
+  useEffect(() => {
+    const fn = api.agentAccess
+    if (!fn) return
+    let live = true
+    void fn('state').then((s) => { if (live) setAgentAccess(s) }).catch(() => {})
+    return () => { live = false }
+  }, [api])
   const [open, setOpen] = useState<string | null>(null)
+  // D3: the document opened to be checked straight away (an Office one's PDF).
+  const [autoCheck, setAutoCheck] = useState<string | null>(null)
+  // D4: the PDF opened to be translated straight away, and into which language.
+  const [autoTranslate, setAutoTranslate] = useState<{ id: string; lang: TargetLang } | null>(null)
   // The title that opened the details, given focus back when they close;
   // the page's title if a reload has since taken its row away (a document
   // from a later page is not on the new first one).
@@ -177,6 +208,17 @@ export default function DocumentsPage() {
   }, [reload, imp.imported])
 
   const { importing, progress, job, error } = imp
+  // D2: PDFs ticked for merging, in the order ticked, and how the last split or merge went.
+  const [picked, setPicked] = useState<string[]>([])
+  const [composing, setComposing] = useState<{ working: boolean; message: string | null; ok: boolean }>({ working: false, message: null, ok: true })
+  const merge = async () => {
+    const chosen = picked.map((id) => docs.find((d) => d.document_id === id)).filter((d) => d !== undefined)
+    setComposing({ working: true, message: null, ok: true })
+    const title = t('merge.title', { names: chosen.map((d) => d.title).join(' + ') }).slice(0, 500)
+    const out = await compose(api, chosen.map((d) => ({ documentId: d.document_id })), title)
+    setComposing({ working: false, ok: out.ok, message: out.ok ? t('compose.done') : t('compose.failed', { error: out.message }) })
+    if (out.ok) { setPicked([]); void reload() }
+  }
   return (
     <div className="content">
       <div className="page-title" role="heading" aria-level={1} tabIndex={-1} ref={pageTitle}>
@@ -218,6 +260,31 @@ export default function DocumentsPage() {
         <button className="btn btn-primary" onClick={() => void startImport(api)} disabled={importing || notInstalled}>
           {t('import.button')}
         </button>
+        {api.agentAccess && (
+          <button
+            className="btn"
+            disabled={agentAccessBusy}
+            onClick={() => {
+              const fn = api.agentAccess
+              if (!fn || agentAccessBusy) return
+              setAgentAccessBusy(true)
+              const turningOff = agentAccess?.enabled === true
+              setAgentAccessNote(null)
+              void fn(turningOff ? 'disable' : 'enable')
+                .then((s) => {
+                  setAgentAccess(s)
+                  if (s.ok === false) setAgentAccessNote(t(turningOff ? 'agentAccess.offFailed' : 'agentAccess.onFailed', { code: s.code ?? '' }))
+                })
+                .catch(() => {})
+                .finally(() => setAgentAccessBusy(false))
+            }}
+          >
+            {agentAccess?.enabled
+              ? t('agentAccess.on', { date: accessUntilDate(agentAccess.until) })
+              : t('agentAccess.off')}
+          </button>
+        )}
+        {agentAccessNote && <span role="alert" style={{ fontSize: 12, color: 'var(--danger, #c0392b)' }}>{agentAccessNote}</span>}
         {importing && !job && progress && progress.total > 0 && (
           <span role="status">{t('import.uploading', { percent: Math.floor((progress.sent / progress.total) * 100) })}</span>
         )}
@@ -233,6 +300,14 @@ export default function DocumentsPage() {
             {t('import.cancel')}
           </button>
         )}
+        {picked.length >= 2 && (
+          <button className="btn" onClick={() => void merge()} disabled={composing.working}>
+            {t('merge.button', { count: picked.length })}
+          </button>
+        )}
+        {(composing.working || composing.message) && (
+          <span role={composing.ok ? 'status' : 'alert'}>{composing.working ? t('compose.working') : composing.message}</span>
+        )}
         {canRetry(imp) && (
           <button className="btn btn-ghost" onClick={() => void retryImport(api)} disabled={imp.acting}>
             {t('import.retry')}
@@ -247,7 +322,13 @@ export default function DocumentsPage() {
       {open && (
         <DocumentDetail
           documentId={open}
+          autoCheck={autoCheck === open}
+          onAdded={() => void reload()}
+          autoTranslate={autoTranslate?.id === open ? autoTranslate.lang : null}
+          onOpen={(id, check) => { setAutoCheck(check ? id : null); setAutoTranslate(null); setOpen(id) }}
+          onTranslate={(id, lang) => { setAutoCheck(null); setAutoTranslate({ id, lang }); setOpen(id) }}
           onClose={() => {
+            setAutoTranslate(null)
             setOpen(null)
             ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
           }}
@@ -259,6 +340,7 @@ export default function DocumentsPage() {
         <table style={{ borderCollapse: 'collapse', width: '100%', fontSize: 13 }}>
           <thead>
             <tr>
+              <th style={CELL} />
               <th style={CELL}>{t('list.title')}</th>
               <th style={CELL}>{t('list.format')}</th>
               <th style={CELL}>{t('list.importedAt')}</th>
@@ -268,11 +350,18 @@ export default function DocumentsPage() {
             {docs.map((d) => (
               <tr key={d.document_id}>
                 <td style={CELL}>
-                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
+                  {d.media_type === 'application/pdf' && (
+                    <input type="checkbox" aria-label={t('merge.select', { title: d.title })}
+                      checked={picked.includes(d.document_id)}
+                      onChange={(e) => setPicked((p) => e.target.checked ? [...p, d.document_id] : p.filter((x) => x !== d.document_id))} />
+                  )}
+                </td>
+                <td style={CELL}>
+                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
                     {d.title}
                   </button>
                 </td>
-                <td style={CELL}>{d.media_type}</td>
+                <td style={CELL}>{formatOf(d.media_type)}</td>
                 <td style={CELL}>{new Date(d.created_at).toLocaleString()}</td>
               </tr>
             ))}

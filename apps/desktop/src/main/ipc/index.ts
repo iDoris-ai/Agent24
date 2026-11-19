@@ -10,6 +10,7 @@ import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
+import { withDocumentsDelegation } from '../documents-delegation'
 import { daemonCliEndpoint, daemonConnection, daemonElevation, getBackendEndpoint, getDaemonStartupFailure } from '../backend-manager'
 import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '../backend-proxy'
 import { approvalConfirmShown } from '../elevated-request'
@@ -927,7 +928,7 @@ export function registerIpcHandlers(options: {
   })
   handle(IpcChannels.BackendRefusal, (): BackendRefusalResult | null => options.backendRefusal?.() ?? null)
   handle(IpcChannels.DocumentsRequest, (_event, req: unknown) =>
-    documentsCall(req, daemonCliEndpoint),
+    withDocumentsDelegation(() => documentsCall(req, daemonCliEndpoint)),
   )
   handle(IpcChannels.DocumentsModuleStatus, async (): Promise<DocumentsModuleStatus> => {
     const status = documentsModule()
@@ -938,7 +939,7 @@ export function registerIpcHandlers(options: {
     const window = BrowserWindow.fromWebContents(event.sender)
     const options: Electron.OpenDialogOptions = {
       properties: ['openFile'],
-      filters: [{ name: 'PDF, JPEG, PNG', extensions: ['pdf', 'jpg', 'jpeg', 'png'] }],
+      filters: [{ name: 'PDF, JPEG, PNG, Word, Excel, PowerPoint', extensions: ['pdf', 'jpg', 'jpeg', 'png', 'docx', 'xlsx', 'pptx'] }],
     }
     let picked: Electron.OpenDialogReturnValue
     try {
@@ -948,9 +949,9 @@ export function registerIpcHandlers(options: {
     }
     const path = picked.filePaths[0]
     if (picked.canceled || !path) return null
-    return importFile(path, daemonCliEndpoint, (p) => {
+    return withDocumentsDelegation(() => importFile(path, daemonCliEndpoint, (p) => {
       if (!event.sender.isDestroyed()) event.sender.send(IpcChannels.DocumentsImportProgress, p)
-    })
+    }))
   })
   handle(IpcChannels.BackendProxy, (_event, req: unknown) => {
     if (!isBackendProxyRequest(req)) {

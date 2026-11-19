@@ -135,6 +135,17 @@ export interface UpgradeDeps {
   started: () => Promise<boolean>
   /** Runs `work` with this app spawning nothing of its own (the lock is the service's). */
   hold: <T>(work: () => Promise<T>) => Promise<T>
+  /** U1: more work that needs the service stopped (the bundled documents
+   * module replaced), done in the same stop so the user confirms once. */
+  between?: () => Promise<unknown>
+}
+
+/** A restart of the service daemon for another reason than an upgrade (a
+ * model source saved): the installed file is replaced only when the same gate
+ * as an upgrade says so, a packaged app whose bundled daemon is newer;
+ * otherwise it is only stopped and started (PR-Daemon #1909 ⑤). */
+export function restartDeps(deps: UpgradeDeps, gate: { fromBundle: boolean; bundled: string | null; running: string | null }): UpgradeDeps {
+  return gate.fromBundle && upgradeNeeded(gate.bundled, gate.running) ? deps : { ...deps, copy: () => 'same' }
 }
 
 /** Nothing is started when the shutdown was refused. Once it was approved the
@@ -154,6 +165,8 @@ export function upgradeService(deps: UpgradeDeps): Promise<UpgradeOutcome> {
       } catch (err) {
         copyError = (err as NodeJS.ErrnoException).code ?? 'copy_failed'
       }
+      // Its failure is the documents module's own to report; the service starts again regardless.
+      try { await deps.between?.() } catch { /* reported by the work itself */ }
     }
     try {
       await deps.kickstart()
@@ -209,14 +222,44 @@ export function serviceUpgradeDeps(
   }
 }
 
+/** D2: runs `work` with the service daemon stopped (the presence box once,
+ * as an upgrade), then starts it again. The documents module can only be
+ * replaced while no daemon holds the store's lock. Nothing happens when the
+ * shutdown is refused. */
+export function whileServiceStopped<T>(deps: UpgradeDeps, work: () => Promise<T>): Promise<{ ok: true; value: T } | { ok: false; code: string }> {
+  return deps.hold(async () => {
+    const down = await deps.shutdown()
+    if (down.status < 200 || down.status >= 300) return { ok: false as const, code: down.code ?? `http_${down.status}` }
+    await deps.exited()
+    let value: T
+    try {
+      value = await work()
+    } finally {
+      try { await deps.kickstart() } catch { /* reported below */ }
+    }
+    if (!(await deps.started())) return { ok: false as const, code: 'not_started' }
+    return { ok: true as const, value }
+  })
+}
+
 export type UpgradeHint = null | { kind: 'needed' } | { kind: 'failed'; code: string }
 
 /** One upgrade per run, asked once the enrolled service daemon's version is
  * not the bundled one: the presence box is the user's say (PM 11-09). A
  * refused box leaves the hint and is not asked again until the next launch. */
+/** U1: the shutdown could not be asked of anyone (the presence connection not
+ * up yet, a daemon going away): not a refusal, so it is tried again. */
+const UNASKED: readonly string[] = ['presence_unavailable', 'closed', 'busy', 'timeout', 'daemon_unavailable', 'backend_not_ready', 'shutdown_failed', 'http_503']
+/** U1: how long after an unasked shutdown it is tried again, and how many times. */
+export const UPGRADE_RETRY_MS = 30_000
+export const UPGRADE_ATTEMPTS = 5
+
 export class ServiceUpgrader {
   private tried = false
   private failed: string | null = null
+  private running = false
+  private attempts = 0
+  private retryAt = 0
 
   constructor(private readonly deps: {
     bundled: () => string | null
@@ -224,16 +267,40 @@ export class ServiceUpgrader {
     /** The LaunchAgent's plist is there: kickstart restarts that job only (Codex B5a C2). */
     installed: () => boolean
     pid: () => number | null
+    /** U1: enrolled with the service daemon and its presence connection up:
+     * the elevated shutdown can show its box. Asked before that, it answered
+     * `presence_unavailable` and the upgrade was never tried again. */
+    ready: () => boolean
     run: (pid: number) => Promise<UpgradeOutcome>
+    now?: () => number
   }) {}
 
+  /** An upgrade is due (or under way): other work that needs the service
+   * stopped waits for it and rides along (`UpgradeDeps.between`). */
+  due(): boolean {
+    return this.running || (!this.tried && this.deps.installed() && upgradeNeeded(this.deps.bundled(), this.deps.running()))
+  }
+
   tick(): void {
+    const now = (this.deps.now ?? Date.now)()
     const pid = this.deps.pid()
-    if (this.tried || pid === null || !this.deps.installed() || !upgradeNeeded(this.deps.bundled(), this.deps.running())) return
-    this.tried = true
+    if (this.tried || this.running || now < this.retryAt || pid === null || !this.deps.ready()) return
+    if (!this.deps.installed() || !upgradeNeeded(this.deps.bundled(), this.deps.running())) return
+    this.running = true
+    this.attempts++
     void this.deps.run(pid).then(
-      (o) => { if (!o.ok && o.stage !== 'shutdown') this.failed = o.code },
-      () => { this.failed = 'upgrade_failed' },
+      (o) => {
+        this.running = false
+        if (o.ok) { this.tried = true; return }
+        if (o.stage === 'shutdown' && UNASKED.includes(o.code) && this.attempts < UPGRADE_ATTEMPTS) {
+          this.retryAt = now + UPGRADE_RETRY_MS
+          return
+        }
+        this.tried = true
+        // A refused box is the user's say; anything else is shown (U1: never silent).
+        if (!(o.stage === 'shutdown' && o.code === 'presence_denied')) this.failed = o.code
+      },
+      () => { this.running = false; this.tried = true; this.failed = 'upgrade_failed' },
     )
   }
 
@@ -531,7 +598,10 @@ export interface StopDeps {
    * box (Codex B4c1 C1), so nothing changes until this app is enrolled again.
    * Not enrolled and none on record (a crash loop, waiting), or the one on
    * record refused this app for good (QA 0.6.1 §3c: no presence connection
-   * to ask through): the uninstall's bootout stops whatever launchd runs. */
+   * to ask through): the uninstall's bootout stops whatever launchd runs.
+   * That last case is a deliberate exception to Codex B4c1 C1: there the
+   * daemon would enrol this app, so its box is asked; a refused one never
+   * will, and the stop is what `agent24 service uninstall` does anyway. */
   unreachable: () => boolean
   /** Resolves true once the daemon that was shut down has exited; false when
    * the wait ran out (the bootout then stops it). */

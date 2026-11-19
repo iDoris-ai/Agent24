@@ -6,7 +6,7 @@ export const residentServiceMessages = defineMessages({
   en: {
     title: 'Background service',
     label: 'Run in the background and start at login',
-    hint: 'Agent24 keeps working after you close its window. Turning this off asks you to confirm, then stops the background service.',
+    hint: 'Agent24 keeps working after you close its window. Turning this off asks you to confirm, then stops the background service. If the background service refused this app, it is stopped and removed without asking.',
     install: 'Install background service',
     installed: 'Installed',
     uninstall: 'Uninstall',
@@ -22,7 +22,7 @@ export const residentServiceMessages = defineMessages({
   zh: {
     title: '后台服务',
     label: '在后台运行并随登录启动',
-    hint: '关掉窗口后 Agent24 仍会继续工作。关闭这一项会先请你确认，然后停止后台服务。',
+    hint: '关掉窗口后 Agent24 仍会继续工作。关闭这一项会先请你确认，然后停止后台服务。如果后台服务拒绝了本应用，则不再确认，直接停止并移除它。',
     install: '安装后台服务',
     installed: '已安装',
     uninstall: '卸载',
@@ -38,7 +38,7 @@ export const residentServiceMessages = defineMessages({
   th: {
     title: 'บริการเบื้องหลัง',
     label: 'ทำงานเบื้องหลังและเริ่มเมื่อเข้าสู่ระบบ',
-    hint: 'Agent24 จะทำงานต่อหลังจากปิดหน้าต่าง การปิดตัวเลือกนี้จะขอให้คุณยืนยันก่อน แล้วจึงหยุดบริการเบื้องหลัง',
+    hint: 'Agent24 จะทำงานต่อหลังจากปิดหน้าต่าง การปิดตัวเลือกนี้จะขอให้คุณยืนยันก่อน แล้วจึงหยุดบริการเบื้องหลัง หากบริการเบื้องหลังปฏิเสธแอปนี้ จะหยุดและนำออกโดยไม่ถาม',
     install: 'ติดตั้งบริการเบื้องหลัง',
     installed: 'ติดตั้งแล้ว',
     uninstall: 'ถอนการติดตั้ง',

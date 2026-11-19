@@ -984,3 +984,36 @@ describe('ID-HR-2 chat confirmation', () => {
     }
   })
 })
+
+// PR-Daemon #1909 ④: while a document conversation reads its document (page
+// by page, before the model is asked), the page is busy: a second Enter sends
+// nothing, and the one reply that comes lands in this conversation.
+describe('ChatPage: reading the document before the turn', () => {
+  beforeEach(() => { setLocale('zh') })
+  it('is busy while the document is read: a second Enter sends nothing', async () => {
+    const { askAboutDocument, resetDocContextForTests } = await import('./chat/doc-context')
+    resetDocContextForTests()
+    let release: (v: unknown) => void = () => {}
+    const request = vi.fn(() => new Promise((r) => { release = r }))
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'answer' } } })
+    askAboutDocument({ id: 'doc_1', title: '合同.pdf', revision: 1 })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '付款期限是多少' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(request).toHaveBeenCalled())
+    fireEvent.change(textarea, { target: { value: '第二句' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    release({ ok: true, data: { blocks: [{ text: '每月 5 日前付款。' }], next_cursor: null } })
+    await waitFor(() => expect(screen.getByText('answer')).toBeInTheDocument())
+    const chats = mockBackendProxy.mock.calls.filter(([req]) => req.path === '/api/v1/chat')
+    expect(chats).toHaveLength(1)
+    expect(chats[0][0].body.messages.at(-1).content).toContain('付款期限是多少')
+    resetDocContextForTests()
+  })
+})

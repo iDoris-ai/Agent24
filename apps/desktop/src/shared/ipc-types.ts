@@ -36,6 +36,10 @@ export const IpcChannels = {
   // M5 B4c2: Settings → General → background service switch.
   ResidentServiceStatus: 'resident-service:status',
   ResidentServiceSet: 'resident-service:set',
+  // Model source setting: a local OpenAI-compatible endpoint the daemon uses first.
+  ModelSourceGet: 'model-source:get',
+  ModelSourceSet: 'model-source:set',
+  ModelSourceClear: 'model-source:clear',
   AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
@@ -140,6 +144,16 @@ export const IpcChannels = {
   DocumentsEvent: 'documents:event',
   // T1-1: what this launch did with the documents module the app carries.
   DocumentsModuleStatus: 'documents:module-status',
+  // D1: the LibreOffice build Office → PDF converts with (main/office-engine.ts).
+  DocumentsOfficeEngineStatus: 'documents:office-engine-status',
+  DocumentsOfficeEngineInstall: 'documents:office-engine-install',
+  DocumentsOfficeEngineChanged: 'documents:office-engine-changed',
+  // D2b: grant the Agent documents.list / get / compose for 30 days.
+  DocumentsAgentAccess: 'documents:agent-access',
+  // D4: translated HTML → a DOCX in Downloads and a PDF in the document library.
+  DocumentsExportTranslation: 'documents:export-translation',
+  /** D4: show an exported file of the Downloads folder in Finder (its name only). */
+  DocumentsRevealDownload: 'documents:reveal-download',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -598,6 +612,10 @@ export type DocumentsRequest =
       region?: string
     }
   | { op: 'job'; jobId: DocSchemas['JobIdString'] }
+  /** D2: a new document of pages of existing PDFs (split: one part; merge: several). */
+  | { op: 'compose'; parts: Array<{ documentId: DocSchemas['DocumentIdString']; pages?: string }>; title?: string }
+  /** D1: an Office document (DOCX/XLSX/PPTX) as a new PDF document. */
+  | { op: 'convert'; documentId: DocSchemas['DocumentIdString']; title?: string }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
 
@@ -613,6 +631,10 @@ export interface DocumentsResults {
   /** The PNG in standard base64; `scale` is the one the OS used. */
   renderPage: { media_type: 'image/png'; bytes: number; scale: number; png: string }
   job: DocSchemas['DocumentsJob']
+  /** The import job of the new document. */
+  compose: DocSchemas['DocumentsJob']
+  /** The import job of the new PDF document. */
+  convert: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
 }
@@ -639,6 +661,22 @@ export type DocumentsEvent =
 export interface DocumentsImportProgress {
   sent: number
   total: number
+}
+
+/** D4: LibreOffice wrote the DOCX into Downloads, and the PDF's import finished. */
+export interface TranslationExportResult {
+  ok: boolean
+  docxName?: string
+  code?: string
+  message?: string
+}
+
+/** D2b: whether the Agent may use the documents library (host grant, 30 days). */
+export interface DocAgentAccess {
+  enabled: boolean
+  until: string | null
+  ok?: boolean
+  code?: string
 }
 
 export type CliToolPathStatus = { path: string } & (
@@ -676,4 +714,25 @@ export const RUN_EVENT_TYPES = ['run.started', 'run.completed', 'run.failed', 'r
 export interface RunEvent {
   type: (typeof RUN_EVENT_TYPES)[number]
   run_id: string
+}
+
+/** Model source setting: a loopback OpenAI-compatible base URL (no `/v1`) and a model name. */
+export interface ModelSource { url: string; model: string }
+
+/** A saved (or cleared) model source and how the daemon took it: `restarted`
+ * (it is in use), or `restart_failed` with a code (it is used from the next
+ * daemon start). */
+export type ModelSourceResult =
+  | { ok: true; restart: 'restarted' }
+  | { ok: true; restart: 'restart_failed'; code: string }
+  | { ok: false; reason: 'invalid_url' | 'invalid_model' | 'no_data_dir' | 'not_saved' }
+
+/** D1: the Office → PDF converter (LibreOffice) on this machine. */
+export interface OfficeEngineStatus {
+  state: 'missing' | 'installing' | 'ready' | 'failed'
+  /** While installing: bytes downloaded so far, and the total when known. */
+  received?: number
+  total?: number
+  /** When failed: why, shown as is. */
+  error?: string
 }

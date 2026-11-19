@@ -4,6 +4,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { beforeEach, expect, it, vi } from 'vitest'
 import { ResidentServiceSettings } from './ResidentServiceSettings'
 import { setLocale } from '../../i18n'
+import { residentServiceMessages } from '../../../shared/resident-service.i18n'
 import type { ResidentServiceResult } from '../../../shared/ipc-types'
 
 const status = vi.fn()
@@ -178,4 +179,18 @@ it('not connected: the way out by the CLI is named too (PR-Daemon #1784 N3)', as
   render(<ResidentServiceSettings />)
   fireEvent.click(await screen.findByLabelText(label))
   expect((await screen.findByRole('alert')).textContent).toContain('agent24 service uninstall')
+})
+
+// PR-Daemon #1873 FU 1: a service that refused this app (QA 0.6.1 §3c) is
+// stopped with no confirmation (resident-service.ts serviceStopDeps), and the
+// sidebar sends the user here. The hint must not promise a confirmation then.
+it('the hint says when turning it off asks to confirm, and when it does not', () => {
+  const words = {
+    en: ['asks you to confirm', 'refused this app', 'without asking'],
+    zh: ['先请你确认', '拒绝了本应用', '不再确认'],
+    th: ['ขอให้คุณยืนยัน', 'ปฏิเสธแอปนี้', 'โดยไม่ถาม'],
+  } as const
+  for (const locale of ['en', 'zh', 'th'] as const) {
+    for (const word of words[locale]) expect(residentServiceMessages[locale].hint).toContain(word)
+  }
 })
