@@ -15,6 +15,7 @@ pub mod compose;
 pub mod db;
 pub mod derived;
 pub mod documents;
+pub mod docx_patch;
 pub mod engine;
 pub mod error;
 pub mod events;
@@ -26,6 +27,7 @@ pub mod imports;
 pub mod jobs;
 pub mod office;
 pub mod oplog;
+pub mod patch;
 pub mod pdf_compose;
 pub mod read;
 pub mod scope;
@@ -199,6 +201,12 @@ pub fn router(state: AppState) -> Router {
             "/documents/{document_id}/conversions",
             post(office::convert),
         )
+        // E1b: a DOCX's paragraphs, and some of them edited into a new document.
+        .route(
+            "/documents/{document_id}/paragraphs",
+            get(patch::paragraphs),
+        )
+        .route("/documents/{document_id}/patches", post(patch::patch))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/retry", post(jobs::retry_job))
