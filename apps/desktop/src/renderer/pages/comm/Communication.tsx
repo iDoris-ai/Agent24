@@ -210,6 +210,8 @@ export default function CommunicationPage() {
   const [localOutgoing, setLocalOutgoing] = useState<LocalOutgoing[]>([])
   const streamRef = useRef<HTMLDivElement>(null)
   const streamWasAtBottom = useRef(true)
+  // The peer on screen now; a late reply for an earlier peer must not land.
+  const selectedPeerRef = useRef<string | null>(null)
   const lastStreamPeer = useRef<string | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
@@ -284,17 +286,17 @@ export default function CommunicationPage() {
     if (!peer) { setConversationHistory(null); return }
     try {
       const items = await getCommConversationHistory(contacts?.find((item) => item.npub === peer)?.nickname ?? peer)
-      if (mounted.current && selectedPeer === peer) {
+      if (mounted.current && selectedPeerRef.current === peer) {
         const filtered = filterHumanCommMessages(items)
         setConversationHistory(filtered)
         setLocalOutgoing((pendingItems) => pendingItems.filter((local) => local.peer !== peer || local.state === 'failed' || !filtered.some((item) => item.direction === 'out' && item.content === local.content && Math.abs(Date.parse(item.at) - Date.parse(local.at)) < 120_000)))
       }
     } catch {
-      if (mounted.current) setConversationHistory(null)
+      if (mounted.current && selectedPeerRef.current === peer) setConversationHistory(null)
     }
-  }, [contacts, selectedPeer])
+  }, [contacts])
 
-  useEffect(() => { void loadConversation(selectedPeer) }, [selectedPeer, contacts, loadConversation])
+  useEffect(() => { selectedPeerRef.current = selectedPeer; void loadConversation(selectedPeer) }, [selectedPeer, contacts, loadConversation])
 
   useEffect(() => {
     const stream = streamRef.current
@@ -776,7 +778,7 @@ export default function CommunicationPage() {
               return messages.length || localMessages.length ? [...rendered, ...localMessages.map((item) => <div key={item.id} className="comm-message-row mine"><div className={`comm-message-bubble${item.state === 'failed' ? ' failed' : ''}`}>{item.content}<small>{item.state === 'sending' ? t('message.sending') : item.state === 'failed' ? item.error : new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>{item.state === 'failed' && <><button type="button" onClick={() => void submitMessage(item)}>{t('message.retry')}</button><button type="button" onClick={() => setLocalOutgoing((items) => items.filter((entry) => entry.id !== item.id))}>{t('message.delete')}</button></>}</div></div>)] : <p className="comm-chat-empty">{t('chat.empty')}</p>
             })() : <p className="comm-chat-empty">{t('chat.empty')}</p>}
           </div>
-          <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>
+          <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>
         </div>
       </section>}
 

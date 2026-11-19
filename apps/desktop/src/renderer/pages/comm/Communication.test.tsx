@@ -138,6 +138,22 @@ describe('CommunicationPage', () => {
     expect(sendCommMessage).toHaveBeenLastCalledWith('npub1bob', 'hello')
   })
 
+  it('does not send while an input method is composing', async () => {
+    success()
+    vi.mocked(listCommHistory).mockResolvedValue([{ id: 'in', from: 'npub1bob', content: 'hi', at: '2026-02-03T12:00:00Z' }])
+    vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 1 })
+    rtlRender(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /bob/i }))
+    const input = screen.getByRole('textbox', { name: '输入消息' })
+    fireEvent.change(input, { target: { value: 'nihao' } })
+    // Enter that confirms a pinyin candidate must not send the half-typed text.
+    fireEvent.keyDown(input, { key: 'Enter', isComposing: true })
+    fireEvent.keyDown(input, { key: 'Enter', keyCode: 229 })
+    expect(sendCommMessage).not.toHaveBeenCalled()
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith('npub1bob', 'nihao'))
+  })
+
   it('opens settings from the chat header and keeps existing management controls there', async () => {
     success()
     rtlRender(<CommunicationPage />)
