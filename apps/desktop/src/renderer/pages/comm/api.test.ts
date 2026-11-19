@@ -212,10 +212,10 @@ describe('COMM contact, send, history and export wrappers', () => {
     expect(proxy).not.toHaveBeenCalled()
   })
   it('keeps only displayable history rows', async () => {
-    setProxy(() => successful([{ id: 'e1', from: 'npub1bob', content: 'hello', created_at: 1_700_000_000 }, { id: 'x' }]))
+    setProxy(() => successful([{ id: 'e1', from: 'npub1bob', to: 'npub1alice', direction: 'in', plaintext: 'hello', created_at: 1_700_000_000 }, { id: 'x' }]))
     const rows = await listCommHistory(5)
     expect(rows).toHaveLength(1)
-    expect(rows[0]).toMatchObject({ id: 'e1', from: 'npub1bob', content: 'hello' })
+    expect(rows[0]).toMatchObject({ id: 'e1', from: 'npub1bob', to: 'npub1alice', direction: 'in', content: 'hello' })
   })
   it('exports through the dedicated IPC with the nickname ONLY (no password crosses from the page), and rejects a cancel with its code', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not export keys') })

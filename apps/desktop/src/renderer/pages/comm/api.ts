@@ -348,6 +348,8 @@ export const sendCommMessage = (to: string, content: string): Promise<CommSendRe
 export interface CommHistoryItem {
   id: string
   from: string
+  to?: string
+  direction?: 'in' | 'out'
   content: string
   at: string
 }
@@ -366,11 +368,14 @@ function toHistoryItems(value: unknown[]): CommHistoryItem[] {
     if (!isRecord(row)) continue
     const content = [row['content'], row['plaintext']].find(string)
     if (content === undefined) continue
-    const from = [row['from'], row['sender'], row['sender_npub']].find(string) ?? ''
+    const from = [row['from'], row['sender'], row['sender_npub'], row['peer_npub'], row['pubkey']].find(string) ?? ''
     const id = row['id']
+    const direction = String(row['direction'] ?? row['type'] ?? '').toLowerCase()
     items.push({
       id: typeof id === 'string' || typeof id === 'number' ? String(id) : `${items.length}`,
       from,
+      to: [row['to'], row['recipient'], row['recipient_npub'], row['to_npub']].find(string) ?? '',
+      direction: row['is_outgoing'] === true || ['out', 'outgoing', 'sent'].includes(direction) ? 'out' : 'in',
       content,
       at: historyTime(row['created_at'] ?? row['received_at'] ?? row['time'] ?? row['ts']),
     })

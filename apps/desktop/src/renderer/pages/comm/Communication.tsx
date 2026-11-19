@@ -194,6 +194,10 @@ export default function CommunicationPage() {
   const [restoreNickname, setRestoreNickname] = useState('')
   const [restoreDefault, setRestoreDefault] = useState(false)
   const [history, setHistory] = useState<CommHistoryItem[] | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [contactSearch, setContactSearch] = useState('')
+  const [selectedPeer, setSelectedPeer] = useState<string | null>(null)
+  const [failedMessages, setFailedMessages] = useState<{ id: string; peer: string; content: string }[]>([])
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
@@ -252,12 +256,19 @@ export default function CommunicationPage() {
   const loadHistory = useCallback(async () => {
     try {
       const items = await listCommHistory(20)
-      if (mounted.current) setHistory(items)
+      if (mounted.current) setHistory((current) => [...items, ...(current ?? []).filter((item) => item.direction === 'out')])
     } catch {
       // The list is a convenience; the status cards already report real failures.
       if (mounted.current) setHistory(null)
     }
   }, [])
+
+  useEffect(() => {
+    const timer = setInterval(() => { if (document.visibilityState === 'visible') void loadHistory() }, 10_000)
+    const onVisibility = () => { if (document.visibilityState === 'visible') void loadHistory() }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility) }
+  }, [loadHistory])
 
   useEffect(() => {
     mounted.current = true
@@ -546,26 +557,33 @@ export default function CommunicationPage() {
   }
 
   const submitMessage = async () => {
-    if (pending) return
-    const to = messageTo.trim()
-    if (!to || !messageText.trim()) return
+    const to = selectedPeer ?? messageTo.trim()
+    const body = messageText.trim()
+    if (pending === 'send' || !to || !body) return
     // A contact nickname or any raw npub; contacts are only a local name book.
     if (!to.startsWith('npub1') && !contacts?.some((c) => c.nickname === to)) {
       setActionError(t('message.recipientInvalid'))
       return
     }
+    const optimistic = { id: `pending-${Date.now()}`, from: identities?.find((item) => item.default)?.npub ?? '', to, direction: 'out' as const, content: body, at: new Date().toISOString() }
+    setHistory((items) => [...(items ?? []), optimistic])
+    setMessageText('')
     setPending('send')
     setActionError(null)
     setNotice(null)
     setExportedPath(null)
     try {
-      const result = await sendCommMessage(to, messageText)
+      const result = await sendCommMessage(to, body)
       if (mounted.current) {
-        setMessageText('')
+        setHistory((items) => (items ?? []).map((item) => item.id === optimistic.id ? { ...item, id: `sent-${optimistic.id}` } : item))
         setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
       }
     } catch (error) {
-      if (mounted.current) setActionError(messageOf(error))
+      if (mounted.current) {
+        setHistory((items) => (items ?? []).filter((item) => item.id !== optimistic.id))
+        setFailedMessages((items) => [...items, { id: optimistic.id, peer: to, content: body }])
+        setActionError(messageOf(error))
+      }
     } finally {
       if (mounted.current) { setPending(null); void loadHistory() }
     }
@@ -601,14 +619,7 @@ export default function CommunicationPage() {
         : !relays.configured ? 'no_relay' : 'ready'
       : null
   return (
-    <main className="content comm-page">
-      <header className="comm-heading">
-        <div><h1>{t('page.title')}</h1><p>{t('page.subtitle')}</p></div>
-        <button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>
-          {refreshing ? t('action.refreshing') : t('action.refresh')}
-        </button>
-      </header>
-
+    <main className={`content comm-page${settingsOpen ? ' settings-open' : ''}`}>
       {loadError && <ErrorNotice className="comm-alert" message={loadError} actionLabel={t('action.retry')} detailsLabel={t('error.details')} onAction={() => void refresh()} details={loadErrorDetails} />}
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
@@ -664,7 +675,61 @@ export default function CommunicationPage() {
         </section>
       )}
 
-      {!setupOnly && <>
+      {!settingsOpen && <section className="comm-chat-shell" aria-label={t('chat.title')}>
+        <aside className="comm-chat-sidebar" aria-label={t('chat.conversations')}>
+          <div className="comm-chat-sidebar-head"><h1>{t('chat.title')}</h1><button type="button" aria-label={t('contact.add')} disabled={setupOnly} onClick={() => { setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>+</button></div>
+          <input aria-label={t('chat.search')} placeholder={t('chat.search')} value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} />
+          <div className="comm-conversation-list">
+            {(() => {
+              const me = identities?.find((item) => item.default)
+              const peers = new Map<string, CommHistoryItem[]>()
+              for (const item of history ?? []) {
+                const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
+                if (!peer) continue
+                peers.set(peer, [...(peers.get(peer) ?? []), item])
+              }
+              const rows = [...peers.entries()].map(([peer, items]) => ({ peer, items, last: items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) }))
+                .filter(({ peer, last }) => `${contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)} ${last.content}`.toLowerCase().includes(contactSearch.toLowerCase()))
+                .sort((a, b) => Date.parse(b.last.at) - Date.parse(a.last.at))
+              return rows.map(({ peer, last }) => {
+                const name = contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)
+                return <button type="button" key={peer} className={`comm-conversation${selectedPeer === peer ? ' selected' : ''}`} onClick={() => setSelectedPeer(peer)}>
+                  <span className="comm-avatar">{name.slice(0, 1).toUpperCase()}</span><span className="comm-conversation-copy"><strong>{name}<time>{last.at ? new Date(last.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</time></strong><small>{last.content}</small></span>
+                </button>
+              })
+            })()}
+            {(!history?.length) && <p className="comm-chat-empty">{t('chat.empty')}</p>}
+          </div>
+          <div className="comm-my-address"><span className={daemon?.process.state === 'running' && daemon.relay_probe?.connected ? 'online-dot' : 'offline-dot'} />
+            <div><strong>{t('chat.myAddress')}</strong><small>{shortNpub(identities?.find((item) => item.default)?.npub ?? '')} · {daemon?.process.state === 'running' && daemon.relay_probe?.connected ? t('chat.connected') : t('chat.disconnected')}</small></div>
+            <button type="button" disabled={!identities?.find((item) => item.default)} onClick={() => { const me = identities?.find((item) => item.default); if (me) void copyNpub(me.npub) }}>{t('identity.copy')}</button>
+          </div>
+        </aside>
+        <div className="comm-chat-main">
+          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div><button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
+          <div className="comm-message-stream">
+            {selectedPeer ? (() => {
+              const me = identities?.find((item) => item.default)
+              const messages = (history ?? []).filter((item) => {
+                const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
+                return peer === selectedPeer
+              })
+              let day = ''
+              return messages.map((item) => {
+                const isMine = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname
+                const date = item.at ? new Date(item.at) : new Date()
+                const dayLabel = date.toLocaleDateString()
+                const newDay = day !== dayLabel; day = dayLabel
+                return <div key={item.id} className={`comm-message-row${isMine ? ' mine' : ''}`}>{newDay && <span className="comm-day-label">{dayLabel}</span>}<div className="comm-message-bubble">{item.content}<small>{item.id.startsWith('pending-') ? t('message.sending') : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div></div>
+              })
+            })() : <p className="comm-chat-empty">{t('chat.empty')}</p>}
+            {failedMessages.filter((item) => item.peer === selectedPeer).map((item) => <div className="comm-message-row mine" key={`failed-${item.id}`}><div className="comm-message-bubble failed">{item.content}<button type="button" disabled={pending === 'send'} onClick={() => { void sendCommMessage(item.peer, item.content).then(() => { setFailedMessages((all) => all.filter((x) => x.id !== item.id)); void loadHistory() }).catch((error) => setActionError(messageOf(error))) }}>{t('chat.retry')}</button></div></div>)}
+          </div>
+          <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>
+        </div>
+      </section>}
+
+      {settingsOpen && !setupOnly && <section className="comm-settings-panel" aria-label={t('chat.settings')}><div className="comm-section-heading"><h2>{t('chat.settings')}</h2><div className="comm-actions"><button type="button" onClick={() => setSettingsOpen(false)}>{t('chat.closeSettings')}</button><button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button></div></div>
       <section className="comm-card">
         <h2>{t('section.identities')}</h2>
         {identities === null ? <p className="comm-muted">{t('empty.data')}</p> : identities.length === 0 ? <p className="comm-muted">{t('empty.identities')}</p> : (
@@ -778,7 +843,7 @@ export default function CommunicationPage() {
           {unlockError && <p role="alert" className="comm-unlock-error">{unlockError}</p>}
         </form>}
       </section>
-      </>}
+      </section>}
     </main>
   )
 }

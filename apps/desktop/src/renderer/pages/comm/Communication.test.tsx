@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
 import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 import {
@@ -38,6 +38,13 @@ vi.mock('./api', async (importActual) => {
     setCommRelay: vi.fn(), probeCommRelay: vi.fn(),
   }
 })
+
+function renderSettingsPage() {
+  const result = rtlRender(<CommunicationPage />)
+  const settings = screen.queryByRole('button', { name: /设置|Settings|ตั้งค่า/ })
+  if (settings) fireEvent.click(settings)
+  return result
+}
 
 const identity = { nickname: 'alice', npub: 'npub1alice', default: true, encrypted: true }
 const contact = { nickname: 'bob', npub: 'npub1bob', role: 'friend' }
@@ -85,13 +92,55 @@ afterEach(() => {
 
 describe('CommunicationPage', () => {
   beforeEach(() => { setLocale('zh') })
+
+  it('groups history by peer, sorts conversations by latest message, and renders selected messages on opposite sides', async () => {
+    success()
+    const stranger = 'npub1strangeraddresslongenoughtoshorten0000000000000000000000000000000000000000000'
+    vi.mocked(listCommHistory).mockResolvedValue([
+      { id: 'old', from: stranger, to: 'npub1alice', direction: 'in', content: '陌生人旧消息', at: '2026-02-01T09:00:00Z' },
+      { id: 'out', from: 'npub1alice', to: 'npub1bob', direction: 'out', content: '我发给 Bob', at: '2026-02-02T11:00:00Z' },
+      { id: 'new', from: 'npub1bob', to: 'npub1alice', direction: 'in', content: 'Bob 回复', at: '2026-02-03T12:00:00Z' },
+    ])
+    rtlRender(<CommunicationPage />)
+    const bob = await screen.findByRole('button', { name: /bob/i })
+    const strangerRow = await screen.findByRole('button', { name: /npub1strange…000000/i })
+    expect(bob.compareDocumentPosition(strangerRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    fireEvent.click(bob)
+    expect(await screen.findByText('我发给 Bob')).toBeInTheDocument()
+    expect(screen.getByText('我发给 Bob').closest('.comm-message-row')).toHaveClass('mine')
+    expect(screen.getAllByText('Bob 回复').find((node) => node.classList.contains('comm-message-bubble'))?.closest('.comm-message-row')).not.toHaveClass('mine')
+  })
+
+  it('sends on Enter through CommSend, keeps the optimistic message, and offers retry on failure', async () => {
+    success()
+    vi.mocked(listCommHistory).mockResolvedValue([{ id: 'in', from: 'npub1bob', content: 'hi', at: '2026-02-03T12:00:00Z' }])
+    vi.mocked(sendCommMessage).mockRejectedValueOnce(new Error('offline')).mockResolvedValueOnce({ published_to: 1 })
+    rtlRender(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /bob/i }))
+    const input = screen.getByRole('textbox', { name: '输入消息' })
+    fireEvent.change(input, { target: { value: 'hello' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith('npub1bob', 'hello'))
+    expect(await screen.findByText('重试')).toBeInTheDocument()
+    fireEvent.click(screen.getByText('重试'))
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledTimes(2))
+  })
+
+  it('opens settings from the chat header and keeps existing management controls there', async () => {
+    success()
+    rtlRender(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '设置' }))
+    expect(await screen.findByRole('heading', { name: '身份' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Hyphae 服务' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Relay' })).toBeInTheDocument()
+  })
   it('offers one-click download when the binary is missing', async () => {
     success()
     for (const fn of [listCommIdentities, listCommContacts, listCommRelays]) {
       vi.mocked(fn).mockRejectedValue(new CommApiError('no Hyphae binary is configured', 409, 'not_configured'))
     }
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, installable: true, installed_version: null })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     vi.mocked(installComm).mockImplementation(async () => {
       success()
       return { installed_version: 'v0.28.1', path: '/state/components/hyphae/v0.28.1/hyphae', restart_required: false, reason: null }
@@ -109,7 +158,7 @@ describe('CommunicationPage', () => {
     }
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, installable: true, installed_version: null })
     vi.mocked(installComm).mockRejectedValue(new CommApiError('raw daemon text', 422, 'hyphae_signature_rejected'))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: '下载并设置' }))
     expect(await screen.findByText(/验证公证需要联网/)).toBeInTheDocument()
     expect(screen.queryByText(/raw daemon text/)).not.toBeInTheDocument()
@@ -128,14 +177,14 @@ describe('CommunicationPage', () => {
       process: { ...status.process, state: 'not_configured', reason: 'binary_rejected' },
     })
     hyphaeBox.component = { ...readyHyphae, version: null, state: 'failed', reason }
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByText(text)).toBeInTheDocument()
     expect(screen.queryByText('故障')).not.toBeInTheDocument()
   })
 
   it('renders identities, contacts, relay source, and independent status dimensions', async () => {
     success()
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByText('npub1alice')).toBeInTheDocument()
     expect(screen.getAllByText('默认身份')).toHaveLength(2)
     expect(screen.getByText('npub1bob')).toBeInTheDocument()
@@ -156,7 +205,7 @@ describe('CommunicationPage', () => {
     vi.mocked(listCommContacts).mockRejectedValue(nc())
     vi.mocked(listCommRelays).mockRejectedValue(nc())
     vi.mocked(getCommStatus).mockRejectedValue(nc())
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByText('通信尚未配置')).toBeInTheDocument()
     expect(screen.getByText('agent24 comm identity create <昵称> --default')).toBeInTheDocument()
     expect(screen.queryByRole('alert')).toBeNull()
@@ -166,7 +215,7 @@ describe('CommunicationPage', () => {
   it('not_configured because no Hyphae binary: binary guidance (not the identity command) plus the daemon detail', async () => {
     const nc = () => new CommApiError('no Hyphae binary is configured; set A24_HYPHAE_BIN (COMM-HYPHAE.md §3)', 409, 'not_configured')
     for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) vi.mocked(fn).mockRejectedValue(nc())
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByText('下载并设置 Hyphae，即可在这台电脑上使用通信功能。')).toBeInTheDocument()
     expect(screen.getByText('当前平台或 Agent24 版本暂不支持下载 Hyphae。')).toBeInTheDocument()
     expect(screen.getByText(/详情：no Hyphae binary is configured/)).toBeInTheDocument()
@@ -183,7 +232,7 @@ describe('CommunicationPage', () => {
     for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) {
       vi.mocked(fn).mockRejectedValue(new CommApiError(message, 409, 'not_configured'))
     }
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByRole('heading', { name: '通信配置有误' })).toBeInTheDocument()
     expect(screen.getByText(`详情：${message}`)).toBeInTheDocument()
     expect(screen.queryByText('agent24 comm identity create <昵称> --default')).toBeNull()
@@ -196,7 +245,7 @@ describe('CommunicationPage', () => {
     vi.mocked(listCommContacts).mockRejectedValue(nc())
     vi.mocked(listCommRelays).mockRejectedValue(new CommApiError('relay exploded', 500, 'internal'))
     vi.mocked(getCommStatus).mockRejectedValue(nc())
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const alert = await screen.findByRole('alert')
     expect(alert).toHaveTextContent('relay exploded')
     expect(alert).not.toHaveTextContent('身份：')
@@ -207,7 +256,7 @@ describe('CommunicationPage', () => {
     for (const fn of [listCommIdentities, listCommContacts, listCommRelays, getCommStatus]) {
       vi.mocked(fn).mockRejectedValue(new CommApiError('daemon down', 503, 'unavailable'))
     }
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByRole('alert')).toHaveTextContent('daemon down')
     expect(screen.queryByText('通信尚未配置')).toBeNull()
   })
@@ -217,7 +266,7 @@ describe('CommunicationPage', () => {
     vi.mocked(listCommRelays).mockResolvedValue({ relays: [], source: 'default', configured: false })
     mirrorHyphae('locked')
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'locked', reason: 'binary_rejected' } })
-    const { rerender } = render(<CommunicationPage />)
+    const { rerender } = renderSettingsPage()
     expect(await screen.findByText('已锁定')).toBeInTheDocument()
     expect(screen.getByText('原因 binary_rejected：Hyphae 二进制校验失败')).toBeInTheDocument()
     expect(screen.getByText('来源：default · 未配置')).toBeInTheDocument()
@@ -231,7 +280,7 @@ describe('CommunicationPage', () => {
 
   it('preserves loaded data and marks it potentially stale when refresh fails', async () => {
     success()
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByText('npub1alice')).toBeInTheDocument()
     vi.mocked(listCommContacts).mockRejectedValueOnce(new Error('locked'))
     fireEvent.click(screen.getByRole('button', { name: '刷新' }))
@@ -247,7 +296,7 @@ describe('CommunicationPage', () => {
     success()
     let resolveOld!: (value: typeof status) => void
     vi.mocked(getCommStatus).mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(screen.getByRole('button', { name: '启动服务' }))
     await waitFor(() => expect(getCommStatus).toHaveBeenCalledTimes(2))
     await waitFor(() => expect(screen.getByText('运行中')).toBeInTheDocument())
@@ -260,7 +309,7 @@ describe('CommunicationPage', () => {
     success()
     let resolvePending!: (value: typeof status) => void
     vi.mocked(getCommStatus).mockReturnValueOnce(new Promise((resolve) => { resolvePending = resolve }))
-    const view = render(<CommunicationPage />)
+    const view = renderSettingsPage()
     view.unmount()
     resolvePending({ ...status, process: { ...status.process, state: 'gave_up' } })
     await Promise.resolve()
@@ -270,7 +319,7 @@ describe('CommunicationPage', () => {
   it('unlock asks main (which owns the password window) and defaults remember to false', async () => {
     success()
     vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(screen.queryByLabelText('Keystore 口令')).toBeNull()
     fireEvent.click(await screen.findByRole('button', { name: '解锁' }))
     await waitFor(() => expect(unlockComm).toHaveBeenCalledWith(false))
@@ -284,7 +333,7 @@ describe('CommunicationPage', () => {
     success()
     let finish!: (value: typeof status) => void
     vi.mocked(startCommDaemon).mockReturnValue(new Promise((resolve) => { finish = resolve }))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     const button = screen.getByRole('button', { name: '启动服务' })
     fireEvent.click(button)
@@ -300,7 +349,7 @@ describe('CommunicationPage', () => {
     vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
     const fetchSpy = vi.spyOn(window, 'fetch')
     const storageSet = vi.spyOn(Storage.prototype, 'setItem')
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     fireEvent.click(await screen.findByRole('button', { name: '解锁' }))
     await waitFor(() => expect(unlockComm).toHaveBeenCalled())
@@ -310,10 +359,10 @@ describe('CommunicationPage', () => {
 })
 
 describe('CommunicationPage English default', () => {
-  it('shows the English page heading', async () => {
+  it('shows the English chat heading', async () => {
     success()
-    render(<CommunicationPage />)
-    expect(screen.getByRole('heading', { name: 'Communication overview' })).toBeInTheDocument()
+    renderSettingsPage()
+    expect(screen.getByRole('heading', { name: 'Messages' })).toBeInTheDocument()
   })
 })
 
@@ -324,7 +373,7 @@ describe('CommunicationPage usability', () => {
 
   it('hides the unlock form in the normal state', async () => {
     success()
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     expect(screen.queryByLabelText('Keystore password')).toBeNull()
     expect(screen.queryByRole('button', { name: 'Unlock' })).toBeNull()
@@ -337,7 +386,7 @@ describe('CommunicationPage usability', () => {
   ])('shows the unlock form with an explanation when %s', async (_name, process) => {
     success()
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, ...process } })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByRole('button', { name: 'Unlock' })).toBeInTheDocument()
     expect(screen.queryByLabelText('Keystore password')).toBeNull()
     expect(screen.getByText(/generated and kept in the system keychain automatically/)).toBeInTheDocument()
@@ -347,7 +396,7 @@ describe('CommunicationPage usability', () => {
     success()
     vi.mocked(getCommStatus).mockResolvedValue(lockedStatus)
     vi.mocked(unlockComm).mockRejectedValueOnce(new CommApiError('keychain_unavailable: denied', 423, 'locked'))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Unlock' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('keychain_unavailable')
   })
@@ -358,7 +407,7 @@ describe('CommunicationPage usability', () => {
     const starting: CommDaemonStatus = { ...status, process: { ...status.process, state: 'starting' } }
     mirrorHyphae('starting')
     vi.mocked(getCommStatus).mockResolvedValue(starting)
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await act(async () => { await vi.advanceTimersByTimeAsync(10) })
     expect(screen.getByTestId('comm-spinner')).toBeInTheDocument()
     expect(screen.getByText('Starting…')).toBeInTheDocument()
@@ -384,7 +433,7 @@ describe('CommunicationPage usability', () => {
       .mockImplementationOnce(() => new Promise((resolve) => { release.poll = resolve }))
       .mockImplementationOnce(async () => [readyComponent])
     try {
-      render(<CommunicationPage />)
+      renderSettingsPage()
       await act(async () => { await vi.advanceTimersByTimeAsync(10) })
       expect(screen.getByText('Starting…')).toBeInTheDocument()
 
@@ -420,7 +469,7 @@ describe('CommunicationPage usability', () => {
       .mockImplementationOnce(() => new Promise((resolve) => { release.slow = resolve }))
       .mockImplementationOnce(async () => [readyComponent])
     try {
-      render(<CommunicationPage />)
+      renderSettingsPage()
       await act(async () => { await vi.advanceTimersByTimeAsync(10) })
       expect(screen.getByText('Starting…')).toBeInTheDocument()
 
@@ -448,7 +497,7 @@ describe('CommunicationPage usability', () => {
     success()
     vi.useFakeTimers()
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'backoff' } })
-    const view = render(<CommunicationPage />)
+    const view = renderSettingsPage()
     await act(async () => { await vi.advanceTimersByTimeAsync(10) })
     await act(async () => { await vi.advanceTimersByTimeAsync(40_000) })
     const calls = vi.mocked(getCommStatus).mock.calls.length
@@ -463,7 +512,7 @@ describe('CommunicationPage usability', () => {
     success()
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Copy alice' }))
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('npub1alice'))
     expect(screen.getByText('Send this address to a colleague so they can add you.')).toBeInTheDocument()
@@ -472,7 +521,7 @@ describe('CommunicationPage usability', () => {
   it('adds a contact after validating the npub prefix', async () => {
     success()
     vi.mocked(addCommContact).mockResolvedValue({})
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     expect(screen.getByText(/1\. Exchange npub addresses/)).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Nickname'), { target: { value: 'carol' } })
@@ -491,8 +540,8 @@ describe('CommunicationPage usability', () => {
     success()
     vi.mocked(listCommHistory).mockResolvedValue([{ id: 'e1', from: 'bob', content: 'hello there', at: '10:00' }])
     vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 2 })
-    render(<CommunicationPage />)
-    expect(await screen.findByText('hello there')).toBeInTheDocument()
+    renderSettingsPage()
+    expect((await screen.findAllByText('hello there')).length).toBeGreaterThan(0)
     fireEvent.change(screen.getByLabelText('To'), { target: { value: 'bob' } })
     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'hi bob' } })
     fireEvent.click(screen.getByRole('button', { name: 'Send' }))
@@ -506,7 +555,7 @@ describe('CommunicationPage usability', () => {
     vi.mocked(exportCommIdentity)
       .mockRejectedValueOnce(new CommApiError('cancelled', 499, 'cancelled'))
       .mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec', warnings: [] })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const button = await screen.findByRole('button', { name: 'Export private key backup alice' })
     fireEvent.click(button)
     await waitFor(() => expect(exportCommIdentity).toHaveBeenCalledTimes(1))
@@ -523,7 +572,7 @@ describe('CommunicationPage usability', () => {
   it('shows an existing-file refusal as an error', async () => {
     success()
     vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('A file with that name already exists', 409, 'target_exists'))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('already exists')
   })
@@ -536,7 +585,7 @@ describe('CommunicationPage usability', () => {
       { id: 'a', from: stranger, content: 'who dis', at: '' },
       { id: 'b', from: 'npub1bob', content: 'from a contact', at: '' },
     ])
-    render(<CommunicationPage />)
+    renderSettingsPage()
     expect(await screen.findByText('who dis')).toBeInTheDocument()
     expect(screen.queryByText(stranger)).toBeNull()
     expect(screen.getAllByRole('button', { name: 'Add as contact' })).toHaveLength(1)
@@ -550,7 +599,7 @@ describe('CommunicationPage usability', () => {
       { id: 'a', from: stranger, content: 'who dis', at: '' },
       { id: 'b', from: 'npub1bob', content: 'from a contact', at: '' },
     ])
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('who dis')
     const replies = screen.getAllByRole('button', { name: 'Reply' })
     fireEvent.click(replies[1]!)
@@ -562,7 +611,7 @@ describe('CommunicationPage usability', () => {
   it('sends to a raw npub that is not a contact, and rejects an unknown name', async () => {
     success()
     vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 1 })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     expect(screen.getByText(/anyone with your npub can message you/)).toBeInTheDocument()
     fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'hello' } })
@@ -580,7 +629,7 @@ describe('CommunicationPage usability', () => {
     success()
     vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk1', fileName: 'work-laptop.ncryptsec' })
     vi.mocked(restoreCommIdentity).mockResolvedValueOnce({ status: 'imported', nickname: 'work-laptop', npub: 'npub1w' })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Restore from backup' }))
     const nickname = await screen.findByLabelText('Nickname for the restored identity')
     expect(nickname).toHaveValue('work-laptop')
@@ -594,7 +643,7 @@ describe('CommunicationPage usability', () => {
   it('a cancelled file dialog shows no form; a cancelled password window keeps the form for a retry', async () => {
     success()
     vi.mocked(pickCommBackup).mockResolvedValueOnce(null)
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const button = await screen.findByRole('button', { name: 'Restore from backup' })
     fireEvent.click(button)
     await waitFor(() => expect(pickCommBackup).toHaveBeenCalledTimes(1))
@@ -616,7 +665,7 @@ describe('CommunicationPage usability', () => {
       .mockResolvedValueOnce({ status: 'already_present', nickname: 'alice', npub: 'npub1alice' })
       .mockRejectedValueOnce(new CommApiError('exists', 409, 'nickname_exists'))
       .mockRejectedValueOnce(new CommApiError('too old', 409, 'hyphae_too_old'))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const open = async () => {
       const opener = await screen.findByRole('button', { name: 'Restore from backup' })
       await waitFor(() => expect(opener).toBeEnabled())
@@ -634,7 +683,7 @@ describe('CommunicationPage usability', () => {
   it('shows "Requires Hyphae v0.28.0 or newer" when the key backup is not supported', async () => {
     success()
     vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('too old', 409, 'hyphae_too_old'))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('Requires Hyphae v0.28.0 or newer')
   })
@@ -644,7 +693,7 @@ describe('CommunicationPage usability', () => {
     vi.mocked(listCommIdentities).mockResolvedValue([])
     vi.mocked(pickCommBackup).mockResolvedValueOnce({ ticket: 'tk4', fileName: 'first.ncryptsec' })
     vi.mocked(restoreCommIdentity).mockResolvedValueOnce({ status: 'imported', nickname: 'first', npub: 'npub1f' })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const wizard = await screen.findByTestId('comm-setup')
     expect(wizard).toHaveAttribute('data-state', 'no_identity')
     fireEvent.click(screen.getByRole('button', { name: 'Restore from backup' }))
@@ -660,7 +709,7 @@ describe('CommunicationPage usability', () => {
       nickname: 'alice', npub: 'npub1alice', path: '/safe/alice.ncryptsec',
       warnings: [{ code: 'cleanup_failed', path: '/safe/.agent24-backup-ab12.tmp' }, { code: 'durability_unconfirmed' }],
     })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByText(/saved to \/safe\/alice\.ncryptsec/)).toBeInTheDocument()
     expect(screen.getByText(/could not be removed: \/safe\/\.agent24-backup-ab12\.tmp/)).toBeInTheDocument()
@@ -671,7 +720,7 @@ describe('CommunicationPage usability', () => {
   it('shows no warning when the export is clean', async () => {
     success()
     vi.mocked(exportCommIdentity).mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/safe/a.ncryptsec', warnings: [] })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByText(/saved to \/safe\/a\.ncryptsec/)).toBeInTheDocument()
     expect(document.querySelector('.comm-warning')).toBeNull()
@@ -679,7 +728,7 @@ describe('CommunicationPage usability', () => {
 
   it('marks completed setup steps in green and leaves the current step unmarked', async () => {
     success()
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const card = await screen.findByTestId('comm-setup')
     expect(card.querySelectorAll('.comm-step-mark')).toHaveLength(3)
     expect(card.textContent).toContain('Download Hyphae ✓')
@@ -713,7 +762,7 @@ describe('CommunicationPage usability', () => {
   ])('clears pending after export $name so Restore and Stop are usable', async ({ arm, pathText }) => {
     success()
     arm()
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
     if (pathText) {
@@ -734,7 +783,7 @@ describe('CommunicationPage usability', () => {
     success()
     let finish: (value: Awaited<ReturnType<typeof exportCommIdentity>>) => void = () => {}
     vi.mocked(exportCommIdentity).mockImplementation(() => new Promise((resolve) => { finish = resolve }))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     vi.useFakeTimers()
     fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
@@ -761,7 +810,7 @@ describe('CommunicationPage usability', () => {
     vi.spyOn(window.navigator, 'platform', 'get').mockReturnValue(platform)
     vi.spyOn(window.navigator, 'userAgent', 'get').mockReturnValue('')
     vi.mocked(exportCommIdentity).mockResolvedValueOnce({ nickname: 'alice', npub: 'npub1alice', path: '/p/a.ncryptsec', warnings: [] })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByRole('button', { name: label })).toBeInTheDocument()
@@ -771,7 +820,7 @@ describe('CommunicationPage usability', () => {
   it('a 409 export_in_progress from the daemon reads as "still finishing"', async () => {
     success()
     vi.mocked(exportCommIdentity).mockRejectedValueOnce(new CommApiError('export_in_progress: another key backup is already running', 409, 'conflict'))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByText('npub1alice')
     fireEvent.click(screen.getByRole('button', { name: 'Export private key backup alice' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('still finishing')
@@ -788,7 +837,7 @@ describe('CommunicationPage usability', () => {
         mirrorHyphae(state)
         vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
       }
-      render(<CommunicationPage />)
+      renderSettingsPage()
       return screen.findByRole('button', { name: 'Stop service' })
     }
     expect(await stopFor('gave_up')).toBeEnabled()
@@ -805,7 +854,7 @@ describe('CommunicationPage usability', () => {
     const updated = { relays: ['wss://one.example', 'ws://127.0.0.1:7777'], source: 'config', configured: true }
     vi.mocked(listCommRelays).mockResolvedValueOnce(relayConfig).mockResolvedValue(updated)
     vi.mocked(setCommRelay).mockResolvedValue(updated)
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const input = await screen.findByLabelText('Relay addresses (one per line)')
     fireEvent.change(input, { target: { value: updated.relays.join('\n') } })
     fireEvent.click(screen.getByRole('button', { name: 'Save relays' }))
@@ -817,7 +866,7 @@ describe('CommunicationPage usability', () => {
 
   it('does not send a relay list the main-process gate would reject', async () => {
     success()
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const input = await screen.findByLabelText('Relay addresses (one per line)')
     const submit = screen.getByRole('button', { name: 'Save relays' })
     for (const value of [
@@ -835,7 +884,7 @@ describe('CommunicationPage usability', () => {
     success()
     let rejectSave!: (error: Error) => void
     vi.mocked(setCommRelay).mockReturnValueOnce(new Promise((_resolve, reject) => { rejectSave = reject }))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const input = await screen.findByLabelText('Relay addresses (one per line)')
     fireEvent.change(input, { target: { value: 'wss://new.example' } })
     const submit = screen.getByRole('button', { name: 'Save relays' })
@@ -854,7 +903,7 @@ describe('CommunicationPage usability', () => {
     success()
     let resolveSave!: (value: typeof relayConfig) => void
     vi.mocked(setCommRelay).mockReturnValueOnce(new Promise((resolve) => { resolveSave = resolve }))
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const input = await screen.findByLabelText('Relay addresses (one per line)')
     fireEvent.change(input, { target: { value: 'wss://a.example' } })
     fireEvent.click(screen.getByRole('button', { name: 'Save relays' }))
@@ -873,7 +922,7 @@ describe('CommunicationPage usability', () => {
       .mockReturnValueOnce(new Promise((resolve) => { resolveOld = resolve }))
       .mockResolvedValue(updated)
     vi.mocked(setCommRelay).mockResolvedValue(updated)
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const input = await screen.findByLabelText('Relay addresses (one per line)')
     fireEvent.change(input, { target: { value: updated.relays.join('\n') } })
     fireEvent.click(screen.getByRole('button', { name: 'Save relays' }))
@@ -892,7 +941,7 @@ describe('CommunicationPage usability', () => {
       catch_up: { state: 'incomplete', last_incomplete_at_ms: 150 },
     })
     vi.mocked(probeCommRelay).mockResolvedValue({ url: 'wss://relay.example', connected: false, error: 'offline' })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     await screen.findByLabelText('Relay addresses (one per line)')
     expect(probeCommRelay).not.toHaveBeenCalled()
     fireEvent.click(screen.getByRole('button', { name: 'Probe relay' }))
@@ -909,7 +958,7 @@ describe('CommunicationPage usability', () => {
       success()
       mirrorHyphae(state)
       vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state } })
-      render(<CommunicationPage />)
+      renderSettingsPage()
       const stop = await screen.findByRole('button', { name: 'Stop service' })
       expect(stop).toBeEnabled()
       expect(stop).not.toHaveAttribute('title')
@@ -919,7 +968,7 @@ describe('CommunicationPage usability', () => {
     success()
     mirrorHyphae('stopped')
     vi.mocked(getCommStatus).mockResolvedValue({ ...status, process: { ...status.process, state: 'stopped' } })
-    render(<CommunicationPage />)
+    renderSettingsPage()
     const stop = await screen.findByRole('button', { name: 'Stop service' })
     expect(stop).toBeDisabled()
     expect(stop).toHaveAttribute('title', 'Service is not running')

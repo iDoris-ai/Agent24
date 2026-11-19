@@ -176,6 +176,7 @@ it('shows probe success without treating it as a running daemon', async () => {
   render(<CommunicationPage />)
   fireEvent.click(await screen.findByRole('button', { name: 'Connect relay' }))
   expect(await screen.findByText('Last handshake succeeded')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
   expect(screen.getByText('Stopped')).not.toHaveClass('comm-state-running')
   expect(screen.getByTestId('comm-setup')).toHaveAttribute('data-state', 'no_relay')
 })
