@@ -80,6 +80,13 @@ function hyphaeLabel(component: ComponentView, t: (key: keyof typeof communicati
 }
 
 type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send' | 'restore' | 'relaySave' | 'relayProbe'
+type LocalOutgoing = { id: string; peer: string; content: string; at: string; state: 'sending' | 'sent' } | { id: string; peer: string; content: string; at: string; state: 'failed'; error: string }
+
+function recentPeer(items: CommHistoryItem[]): string | null {
+  const latest = [...items].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]
+  if (!latest) return null
+  return latest.direction === 'out' ? latest.to || latest.from : latest.from
+}
 
 function relayValues(value: string): string[] {
   return value.split(/\r?\n/).map((relay) => relay.trim()).filter(Boolean)
@@ -200,6 +207,10 @@ export default function CommunicationPage() {
   const [contactSearch, setContactSearch] = useState('')
   const [selectedPeer, setSelectedPeer] = useState<string | null>(null)
   const [conversationHistory, setConversationHistory] = useState<CommHistoryItem[] | null>(null)
+  const [localOutgoing, setLocalOutgoing] = useState<LocalOutgoing[]>([])
+  const streamRef = useRef<HTMLDivElement>(null)
+  const streamWasAtBottom = useRef(true)
+  const lastStreamPeer = useRef<string | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
@@ -258,7 +269,11 @@ export default function CommunicationPage() {
   const loadHistory = useCallback(async () => {
     try {
       const items = await listCommHistory(200)
-      if (mounted.current) setHistory(filterHumanCommMessages(items))
+      if (mounted.current) {
+        const filtered = filterHumanCommMessages(items)
+        setHistory(filtered)
+        setSelectedPeer((current) => current ?? recentPeer(filtered))
+      }
     } catch {
       // The list is a convenience; the status cards already report real failures.
       if (mounted.current) setHistory(null)
@@ -269,13 +284,24 @@ export default function CommunicationPage() {
     if (!peer) { setConversationHistory(null); return }
     try {
       const items = await getCommConversationHistory(contacts?.find((item) => item.npub === peer)?.nickname ?? peer)
-      if (mounted.current && selectedPeer === peer) setConversationHistory(filterHumanCommMessages(items))
+      if (mounted.current && selectedPeer === peer) {
+        const filtered = filterHumanCommMessages(items)
+        setConversationHistory(filtered)
+        setLocalOutgoing((pendingItems) => pendingItems.filter((local) => local.peer !== peer || local.state === 'failed' || !filtered.some((item) => item.direction === 'out' && item.content === local.content && Math.abs(Date.parse(item.at) - Date.parse(local.at)) < 120_000)))
+      }
     } catch {
       if (mounted.current) setConversationHistory(null)
     }
   }, [contacts, selectedPeer])
 
   useEffect(() => { void loadConversation(selectedPeer) }, [selectedPeer, contacts, loadConversation])
+
+  useEffect(() => {
+    const stream = streamRef.current
+    if (!stream) return
+    if (lastStreamPeer.current !== selectedPeer || streamWasAtBottom.current) stream.scrollTop = stream.scrollHeight
+    lastStreamPeer.current = selectedPeer
+  }, [selectedPeer, conversationHistory, localOutgoing])
 
   useEffect(() => {
     const poll = () => {
@@ -575,16 +601,19 @@ export default function CommunicationPage() {
     }
   }
 
-  const submitMessage = async () => {
-    const to = selectedPeer ?? messageTo.trim()
-    const body = messageText.trim()
+  const submitMessage = async (retry?: Extract<LocalOutgoing, { state: 'failed' }>) => {
+    const to = retry?.peer ?? selectedPeer ?? messageTo.trim()
+    const body = retry?.content ?? messageText.trim()
     if (pending === 'send' || !to || !body) return
     // A contact nickname or any raw npub; contacts are only a local name book.
     if (!to.startsWith('npub1') && !contacts?.some((c) => c.nickname === to)) {
       setActionError(t('message.recipientInvalid'))
       return
     }
+    const localId = retry?.id ?? `local-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const at = retry?.at ?? new Date().toISOString()
     setMessageText('')
+    setLocalOutgoing((items) => [...items.filter((item) => item.id !== localId), { id: localId, peer: to, content: body, at, state: 'sending' }])
     setPending('send')
     setActionError(null)
     setNotice(null)
@@ -592,11 +621,12 @@ export default function CommunicationPage() {
     try {
       const result = await sendCommMessage(to, body)
       if (mounted.current) {
+        setLocalOutgoing((items) => items.map((item) => item.id === localId ? { id: localId, peer: to, content: body, at, state: 'sent' } : item))
         setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
       }
     } catch (error) {
       if (mounted.current) {
-        setActionError(messageOf(error))
+        setLocalOutgoing((items) => items.map((item) => item.id === localId ? { id: localId, peer: to, content: body, at, state: 'failed', error: messageOf(error).slice(0, 160) } : item))
       }
     } finally {
       if (mounted.current) { setPending(null); void loadHistory(); void loadConversation(selectedPeer) }
@@ -643,7 +673,7 @@ export default function CommunicationPage() {
       </div>}
       {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
-      {setupState && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
+      {setupState && (setupState !== 'ready' || settingsOpen) && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
         <h2>{t('wizard.title')}</h2>
         <ol className="comm-steps">
           <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? <span className="comm-step-mark"> ✓</span> : null}</li>
@@ -725,7 +755,7 @@ export default function CommunicationPage() {
         </aside>
         <div className="comm-chat-main">
           <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div>{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
-          <div className="comm-message-stream">
+          <div className="comm-message-stream" ref={streamRef} onScroll={(event) => { const el = event.currentTarget; streamWasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}>
             {selectedPeer ? (() => {
               const me = identities?.find((item) => item.default)
               const source = conversationHistory ?? history ?? []
@@ -733,14 +763,17 @@ export default function CommunicationPage() {
                 const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
                 return peer === selectedPeer
               })
+              const sortedMessages = [...messages].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
               let day = ''
-              return messages.length ? messages.map((item) => {
+              const rendered = sortedMessages.map((item) => {
                 const isMine = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname
                 const date = item.at ? new Date(item.at) : new Date()
                 const dayLabel = date.toLocaleDateString()
                 const newDay = day !== dayLabel; day = dayLabel
                 return <div key={item.id} className={`comm-message-row${isMine ? ' mine' : ''}`}>{newDay && <span className="comm-day-label">{dayLabel}</span>}<div className="comm-message-bubble">{item.content}<small>{item.id.startsWith('pending-') ? t('message.sending') : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div></div>
-              }) : <p className="comm-chat-empty">{t('chat.empty')}</p>
+              })
+              const localMessages = localOutgoing.filter((item) => item.peer === selectedPeer)
+              return messages.length || localMessages.length ? [...rendered, ...localMessages.map((item) => <div key={item.id} className="comm-message-row mine"><div className={`comm-message-bubble${item.state === 'failed' ? ' failed' : ''}`}>{item.content}<small>{item.state === 'sending' ? t('message.sending') : item.state === 'failed' ? item.error : new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>{item.state === 'failed' && <><button type="button" onClick={() => void submitMessage(item)}>{t('message.retry')}</button><button type="button" onClick={() => setLocalOutgoing((items) => items.filter((entry) => entry.id !== item.id))}>{t('message.delete')}</button></>}</div></div>)] : <p className="comm-chat-empty">{t('chat.empty')}</p>
             })() : <p className="comm-chat-empty">{t('chat.empty')}</p>}
           </div>
           <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>

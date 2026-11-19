@@ -109,14 +109,16 @@ describe('CommunicationPage', () => {
     const bob = await screen.findByRole('button', { name: /bob/i })
     const strangerRow = await screen.findByRole('button', { name: /npub1strange…000000/i })
     expect(bob.compareDocumentPosition(strangerRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    fireEvent.click(bob)
     await waitFor(() => expect(getCommConversationHistory).toHaveBeenCalledWith('bob'))
     expect(await screen.findByText('我发给 Bob')).toBeInTheDocument()
+    const stream = document.querySelector('.comm-message-stream')!
+    const rows = [...stream.querySelectorAll('.comm-message-row')]
+    expect(rows.findIndex((node) => node.textContent?.includes('我发给 Bob'))).toBeLessThan(rows.findIndex((node) => node.textContent?.includes('Bob 回复')))
     expect(screen.getByText('我发给 Bob').closest('.comm-message-row')).toHaveClass('mine')
     expect(screen.getAllByText('Bob 回复').find((node) => node.classList.contains('comm-message-bubble'))?.closest('.comm-message-row')).not.toHaveClass('mine')
   })
 
-  it('sends on Enter without staging the outgoing message in the UI', async () => {
+  it('keeps a failed outgoing bubble and retries the same content', async () => {
     success()
     vi.mocked(listCommHistory).mockResolvedValue([{ id: 'in', from: 'npub1bob', content: 'hi', at: '2026-02-03T12:00:00Z' }])
     vi.mocked(sendCommMessage).mockRejectedValueOnce(new Error('offline'))
@@ -126,14 +128,23 @@ describe('CommunicationPage', () => {
     fireEvent.change(input, { target: { value: 'hello' } })
     fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith('npub1bob', 'hello'))
-    expect(await screen.findByRole('alert')).toHaveTextContent('offline')
-    expect(screen.queryByText('hello')).toBeNull()
+    expect(await screen.findByText('offline')).toBeInTheDocument()
+    expect(screen.getByText('hello')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).toBeNull()
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
+    vi.mocked(sendCommMessage).mockResolvedValueOnce({ published_to: 1 })
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledTimes(2))
+    expect(sendCommMessage).toHaveBeenLastCalledWith('npub1bob', 'hello')
   })
 
   it('opens settings from the chat header and keeps existing management controls there', async () => {
     success()
     rtlRender(<CommunicationPage />)
+    await waitFor(() => expect(listCommIdentities).toHaveBeenCalled())
+    expect(screen.queryByTestId('comm-setup')).toBeNull()
     fireEvent.click(await screen.findByRole('button', { name: '设置' }))
+    expect(await screen.findByTestId('comm-setup')).toBeInTheDocument()
     expect(await screen.findByRole('heading', { name: '身份' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Hyphae 服务' })).toBeInTheDocument()
     expect(screen.getByRole('heading', { name: 'Relay' })).toBeInTheDocument()
