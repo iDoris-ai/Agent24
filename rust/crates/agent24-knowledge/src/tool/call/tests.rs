@@ -228,6 +228,25 @@ fn a_result_is_rendered_as_evidence_for_the_run_it_belongs_to() {
     assert_eq!(read[0].1.chunk_id.as_deref(), Some("chk-11"));
 }
 
+/// K3: ids the model named outside the binding are written into the answer
+/// (the run's record keeps it); none named, nothing written.
+#[test]
+fn a_search_says_which_named_knowledge_bases_it_did_not_search() {
+    let backend = Backend::ok("search.ok.json");
+    let args = json!({ "query": "差旅", "knowledge_base_ids": ["home_knowledge"] });
+    let out = block(search(&backend, "run-7", &input(args))).unwrap();
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["ignored_knowledge_base_ids"], json!(["home_knowledge"]));
+    let out = block(search(
+        &backend,
+        "run-7",
+        &input(json!({ "query": "差旅" })),
+    ))
+    .unwrap();
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert!(out.get("ignored_knowledge_base_ids").is_none());
+}
+
 #[test]
 fn a_server_refusal_keeps_code_reason_and_retryable_but_never_the_servers_words() {
     let out = search_refusal(envelope("search.unauthorized-revoked.json"));

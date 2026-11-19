@@ -669,6 +669,10 @@ export default function ChatPage() {
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Loop 3 FU: an Enter that ends an input method's composition (pinyin, or
+    // macOS committing a suggested word) is that, not 「send」: half an
+    // English sentence went out while typing it (General 11-19).
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       void send(input)
