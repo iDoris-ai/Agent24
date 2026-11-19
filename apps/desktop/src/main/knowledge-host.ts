@@ -459,7 +459,10 @@ export class KnowledgeHost {
     // the answer is about the old change and notes nothing; the user's change
     // tracks itself.
     const superseded = () => this.wanted.get(bindingId) !== wanted
-    const result = wanted ? await this.activation(bindingId) : await this.send(bindingId, 'DELETE', '')
+    // U1: an unexpired C goes with the activation, one request and one box
+    // (not two) on a daemon that has neither, as after an upgrade.
+    const along = wanted?.endpoint && wanted.credential && wanted.credential.expiresAt > this.deps.nowSeconds() ? wanted.credential : null
+    const result: HostResult & { withCredential?: boolean } = wanted ? await this.activation(bindingId, along) : await this.send(bindingId, 'DELETE', '')
     if (superseded()) return
     if (!result.ok) {
       // Not answered, on whichever daemon it was asked: the user is away, so
@@ -474,7 +477,7 @@ export class KnowledgeHost {
       return
     }
     const credential = wanted?.credential
-    if (credential && credential.expiresAt > this.deps.nowSeconds()) {
+    if (credential && credential.expiresAt > this.deps.nowSeconds() && !(result.ok && result.withCredential)) {
       const pushed = await this.sendCredential(bindingId, credential)
       if (superseded()) return
       if (!pushed.ok && HELD.includes(pushed.reason)) {
@@ -488,8 +491,10 @@ export class KnowledgeHost {
     this.held.delete(bindingId)
   }
 
-  /** Sends the wanted activation, and records it as taken by this connection. */
-  private async activation(bindingId: string): Promise<HostResult> {
+  /** Sends the wanted activation, and records it as taken by this connection.
+   * U1: with `credential`, C goes in the same request (`withCredential` then);
+   * a daemon too old to take it (400) is sent the activation alone. */
+  private async activation(bindingId: string, credential: KnowledgeCredential | null = null): Promise<HostResult & { withCredential?: boolean }> {
     const key = this.connectionKey
     const identity = this.deps.daemonIdentity()
     const body = activationBody(this.wanted.get(bindingId)?.endpoint ?? null)
@@ -501,6 +506,16 @@ export class KnowledgeHost {
       if (key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
       return { ok: true }
     }
+    if (credential) {
+      const seen400: { status?: number } = {}
+      const merged = await this.send(bindingId, 'PUT', '', { ...body, credential: credentialBody(credential) }, seen400)
+      if (merged.ok) {
+        if (key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
+        this.note(identity, bindingId, { activation: hashed, credential: { hash: hash([credential.kind, credential.value]), expiresAt: credential.expiresAt } })
+        return { ok: true, withCredential: true }
+      }
+      if (seen400.status !== 400) return merged
+    }
     const result = await this.send(bindingId, 'PUT', '', body)
     if (result.ok && key === this.connectionKey && this.wanted.has(bindingId)) this.confirmed.add(bindingId)
     // An activation drops C in the daemon: the credential is not recorded any more.
@@ -510,7 +525,7 @@ export class KnowledgeHost {
 
   /** Sends one change, again under a new number while the daemon calls it
    * stale. A PUT stops once its binding is no longer the one wanted. */
-  private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, fields: Record<string, unknown> = {}): Promise<HostResult> {
+  private async send(bindingId: string, method: 'PUT' | 'DELETE', suffix: string, fields: Record<string, unknown> = {}, seen?: { status?: number }): Promise<HostResult> {
     let last: Failure = 'stale_sequence'
     const entry = this.wanted.get(bindingId)
     for (let attempt = 0; attempt < MAX_STALE_RETRIES; attempt++) {
@@ -529,6 +544,7 @@ export class KnowledgeHost {
       }
       if (response.status >= 200 && response.status < 300) return { ok: true }
       last = classify(response)
+      if (seen) seen.status = response.status
       if (last !== 'stale_sequence') return failure(last)
     }
     return failure(last)

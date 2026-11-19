@@ -339,6 +339,33 @@ impl KnowledgeHostRegistry {
         })
     }
 
+    /// U1: [`Self::activate`] and [`Self::push_credential`] as one change
+    /// under one `seq`, so a replay to a new daemon is one request and one
+    /// presence box. Both are checked first; a refused one stores nothing.
+    pub fn activate_with_credential(
+        &self,
+        host: &str,
+        binding: &str,
+        seq: u64,
+        endpoint: Endpoint,
+        credential: Credential,
+        expires_at: UnixSeconds,
+    ) -> Result<(), ChangeError> {
+        validate_endpoint(&endpoint)?;
+        validate_credential(&credential, expires_at)?;
+        self.change(host, binding, seq, |entry| {
+            entry.active = true;
+            entry.activated_seq = seq;
+            entry.endpoint = Some(endpoint);
+            entry.credential = Some(CurrentCredential {
+                credential,
+                seq,
+                expires_at,
+            });
+            Ok(())
+        })
+    }
+
     /// Generation, endpoint and C of `binding` if `host` has it active; an
     /// expired C reads as none. A missing record or a poisoned lock counts as
     /// inactive.

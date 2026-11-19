@@ -386,7 +386,9 @@ describe('KnowledgeController and confirmation (M5 B6 c2)', () => {
     return respond(req)
   }
   const make = () => new KnowledgeController(host, logins, new KnowledgeSettingsStore(dir), { nowSeconds: () => now })
-  const pushes = () => sent.filter((s) => s.method === 'PUT' && s.path === `${BINDING}/credential`).length
+  // U1: a replay sends C with the activation (one request): a push either way.
+  const carriesC = (s: { path: string; body?: string }) => s.path.endsWith('/credential') || (s.body ?? '').includes('"credential"')
+  const pushes = () => sent.filter((s) => s.method === 'PUT' && carriesC(s)).length
   const settle = () => new Promise((resolve) => setTimeout(resolve, 20))
 
   beforeEach(() => {
@@ -472,7 +474,7 @@ describe('KnowledgeController and confirmation (M5 B6 c2)', () => {
   // would not ask (#1852 B1).
   it.each(['presence_timeout', 'not_elevated_operation'])('a push %s is not asked again by the tick: the host replays it after its backoff', async (code) => {
     const c = await onAndDue()
-    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code } : { status: 204 })
+    respond = async (req) => (carriesC(req) ? { status: 403, code } : { status: 204 })
     await c.tick()
     expect(pushes()).toBe(1)
     respond = async () => ({ status: 204 })
@@ -486,7 +488,8 @@ describe('KnowledgeController and confirmation (M5 B6 c2)', () => {
     now += 10 * 60
     host.sync()
     await vi.waitFor(() => expect(pushes()).toBe(2))
-    expect(sent.map((s) => `${s.method} ${s.path}`).slice(-2)).toEqual([`PUT ${BINDING}`, `PUT ${BINDING}/credential`])
+    // U1: the activation and its C in one request.
+    expect(sent.map((s) => `${s.method} ${s.path}`).slice(-1)).toEqual([`PUT ${BINDING}`])
     await c.tick()
     expect(pushes()).toBe(2)
   })
@@ -564,7 +567,7 @@ describe('KnowledgeController and confirmation (M5 B6 c2)', () => {
     await c.configure(GOOD)
     await c.setEnabled(true)
     sent = []
-    respond = async (req) => (req.path.endsWith('/credential') ? { status: 403, code: 'presence_denied' } : { status: 204 })
+    respond = async (req) => (carriesC(req) ? { status: 403, code: 'presence_denied' } : { status: 204 })
     identity = '100:g2'
     conn = { port: 9, authHeaders: { Authorization: 'Bearer new' } }
     host.sync()

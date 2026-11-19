@@ -425,6 +425,53 @@ describe('KnowledgeHost (KB-HOST-01 PR-B2b)', () => {
     expect(daemon.sent.filter((r) => r.path === B1)).toHaveLength(1)
   })
 
+  it('U1: replays an endpoint binding and its C to a new daemon as one request (one box), C sent once', async () => {
+    const host = makeHost()
+    host.start()
+    const endpoint = { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] }
+    await host.activate('b1', endpoint)
+    await host.pushCredential('b1', credential('C1'))
+    daemon.sent.length = 0
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    host.sync()
+    await vi.waitFor(() => expect(host.isActive('b1')).toBe(true))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}`])
+    const body = JSON.parse(daemon.sent[0]!.body!) as Record<string, unknown>
+    expect(body).toMatchObject({ endpoint: 'https://kb.example/api/v1', knowledge_base_ids: ['kb-a'], credential: { kind: 'bearer', value: 'C1', expires_at: NOW + 600 } })
+  })
+
+  it('U1: a daemon too old to take C with the activation (400) gets the two requests as before', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
+    await host.pushCredential('b1', credential('C1'))
+    daemon.sent.length = 0
+    daemon.respondWith((req) => (req.body?.includes('"credential"') ? { status: 400, code: 'invalid_request' } : { status: 204 }))
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent).toHaveLength(3))
+    expect(daemon.sent.map((r) => `${r.method} ${r.path}`)).toEqual([`PUT ${B1}`, `PUT ${B1}`, `PUT ${B1}/credential`])
+    await vi.waitFor(() => expect(host.isActive('b1')).toBe(true))
+  })
+
+  it('U1: a user refusing the one box is not asked a second time', async () => {
+    const host = makeHost()
+    host.start()
+    await host.activate('b1', { endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] })
+    await host.pushCredential('b1', credential('C1'))
+    daemon.sent.length = 0
+    daemon.respondWith(() => ({ status: 403, code: 'presence_denied' }))
+    daemon.setConnection({ port: 2, authHeaders: { Authorization: 'Bearer t2' } })
+    host.sync()
+    await vi.waitFor(() => expect(daemon.sent).toHaveLength(1))
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    host.sync()
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(daemon.sent).toHaveLength(1)
+    expect(host.isActive('b1')).toBe(false)
+  })
+
   it('does not hand a new daemon a C that was revoked or dropped by a reactivation', async () => {
     const host = makeHost()
     host.start()

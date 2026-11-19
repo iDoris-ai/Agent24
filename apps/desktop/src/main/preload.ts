@@ -259,6 +259,8 @@ const api = {
   // Knowledge settings: the key goes in, never comes back (main/knowledge-settings.ts).
   knowledge: {
     status: (): Promise<KnowledgeStatus> => ipcRenderer.invoke(IpcChannels.KnowledgeStatus),
+    /** K2: check the server now. */
+    check: (): Promise<KnowledgeStatus | null> => ipcRenderer.invoke(IpcChannels.KnowledgeCheck),
     configure: (input: KnowledgeConfigureInput): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
@@ -349,6 +351,9 @@ const api = {
       ipcRenderer.invoke(IpcChannels.DocumentsAgentAccess, action),
     /** D4: write the translated HTML to a DOCX in Downloads and import its PDF. */
     revealDownload: (name: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.DocumentsRevealDownload, name),
+    /** D5a: a library document saved to Downloads; `docxName` is the file's name. */
+    saveDownload: (documentId: string, title: string): Promise<TranslationExportResult> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title),
     exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
       ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {

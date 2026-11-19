@@ -396,8 +396,16 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         let (transport, credential_seq, allowed) = self.transport(&pin, &now)?;
         let generation = now.generation;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let ids = match &query.knowledge_base_ids {
-            None => allowed,
+        // A model often names a knowledge base it made up (qwen3-8b, 11-19:
+        // `home_knowledge`); the user asked about *their* knowledge bases.
+        // Names outside the binding are dropped, and when none is left the
+        // search covers every knowledge base the binding allows: never
+        // wider than the binding, but no longer a refusal that reads to the
+        // user as 「知识库里没有」.
+        let ids: Vec<String> = match &query.knowledge_base_ids {
+            None => allowed.clone(),
+            // The ids dropped are written into the run's record by the tool
+            // (`ignored_knowledge_base_ids`, tool/call.rs).
             Some(named) => named
                 .as_slice()
                 .iter()
@@ -405,6 +413,9 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
                 .cloned()
                 .collect(),
         };
+        // Scope semantics (K3), never wider than the binding: only names
+        // outside it searches all of it; any name inside it searches just those.
+        let ids = if ids.is_empty() { allowed } else { ids };
         let Ok(knowledge_base_ids) = NonEmpty::try_from(ids) else {
             return Err(empty_scope(&request_id, generation));
         };

@@ -54,3 +54,11 @@ describe('knowledge-grounding', () => {
     expect(grounding('答案。来源：doc-7#chk-71', { searched: true, read_chunks: [] })).toEqual({ kind: 'nothingRead', unread: ['doc-7#chk-71'] })
   })
 })
+
+describe('grounding (K3: a source written the model\'s own way)', () => {
+  it('takes `file.pdf#<document id>` as the document the run read, and still marks a made-up one', () => {
+    const knowledge = { searched: true, read_chunks: [{ knowledge_id: '17b1f6d6-c8a6-4c99-bd44-83d2d5ad3c4d', chunk_id: 'a1457516-da54-469f-bf96-a16dd9ef9460' }] }
+    const text = 'Boil for 3 minutes.\n来源：s01-02-en-epa-boil-water.pdf#17b1f6d6-c8a6-4c99-bd44-83d2d5ad3c4d\nother.pdf#00000000-0000-0000-0000-000000000000'
+    expect(grounding(text, knowledge)).toEqual({ kind: 'read', unread: ['pdf#00000000-0000-0000-0000-000000000000'] })
+  })
+})

@@ -53,6 +53,9 @@ interface AssistantMessage {
   /** Answered without Knowledge although its switch is On: main had no
    *  binding for a run, so the turn went to `/api/v1/chat`. */
   knowledgeInactive?: boolean
+  /** K2: Knowledge is On but its server did not answer the check before this
+   *  turn (unreachable / unauthorized / not_found): answered without it. */
+  knowledgeDown?: KnowledgeDown
   /** The run that answered, when the turn went to /runs (Knowledge). */
   runId?: string
 }
@@ -105,6 +108,8 @@ export function genChatSessionId(): string {
   chatSessionIdCounter += 1
   return `chat_${Date.now().toString(36)}_${chatSessionIdCounter}_${Math.random().toString(36).slice(2, 8)}`
 }
+
+type KnowledgeDown = 'unreachable' | 'unauthorized' | 'not_found'
 
 export default function ChatPage() {
   const t = useT(chatMessages)
@@ -217,7 +222,8 @@ export default function ChatPage() {
     const doc = documentOf(sessionId)
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
-    const wantsDocTool = /拆|合并|合成|split|merge|combine/i.test(text)
+    // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
+    const wantsDocTool = /拆|合并|合成|split|merge|combine|模板|填写|填好|填入|生成初稿|修订|改写|template|fill/i.test(text)
     if (wantsDocTool && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
@@ -358,19 +364,28 @@ export default function ChatPage() {
       return
     }
     const read = window.agent24.documents?.request
-    if (doc && read) {
+    // Loop 3 FU: a question outside a document's conversation that names a
+    // document in 《》 is asked about that document, as F1 asks about this one.
+    const titled = !doc && window.agent24.documents ? /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null : null
+    if ((doc || titled) && read && window.agent24.documents) {
       // PR-Daemon #1909 ④: busy while the document is read, page by page;
       // released with no await between here and requestReply, which takes it again.
       requestInFlight.current = true
       setLoading(true)
+      let about = doc
       let body: Awaited<ReturnType<typeof documentText>> | null = null
       try {
-        body = await documentText(doc, read as Parameters<typeof documentText>[1]).catch(() => null)
+        if (!about && titled) {
+          // Not a document of the library (or several are): asked as it was.
+          const named = await namedDocument(window.agent24.documents, titled).catch(() => null)
+          about = named && typeof named !== 'string' ? named : null
+        }
+        if (about) body = await documentText(about, read as Parameters<typeof documentText>[1]).catch(() => null)
       } finally {
         requestInFlight.current = false
       }
       const last = request.messages[request.messages.length - 1]
-      if (body && body.text.trim() && last?.role === 'user') last.content = withDocument(doc, body, last.content)
+      if (about && body && body.text.trim() && last?.role === 'user') last.content = withDocument(about, body, last.content)
     }
     await requestReply(messages.length, request)
   }
@@ -465,10 +480,20 @@ export default function ChatPage() {
 
     // Asked of main on every turn: it may have turned On since the page opened.
     const knowledge = await window.agent24.knowledge?.status().then((status) => status, () => null)
+    // K2: a server the last check could not reach is asked once more; still
+    // down, the turn is answered without Knowledge and says so, never as if
+    // the knowledge bases had nothing (the demo stack, 11-17: 25 hours unseen).
+    let knowledgeDown: KnowledgeDown | null = null
+    const down = (state: string | undefined): state is KnowledgeDown => state === 'unreachable' || state === 'unauthorized' || state === 'not_found'
+    if (knowledge?.enabled === true && down(knowledge.reachability?.state)) {
+      const fresh = await window.agent24.knowledge?.check?.().then((s) => s, () => null)
+      const state = fresh?.reachability?.state ?? knowledge.reachability?.state
+      if (down(state)) knowledgeDown = state
+    }
     // A chosen skill rides on RunCreate, which `/api/v1/chat` does not have:
     // such a turn goes to the run path with Knowledge on or off.
     const skill = skillForConversation(sessionId)
-    if (knowledge?.active === true || skill) {
+    if ((knowledge?.active === true && knowledgeDown === null) || skill) {
       const scope = knowledge?.active === true ? JSON.stringify([knowledge.endpoint, knowledge.knowledgeBaseIds]) : 'no-knowledge'
       if (runScope.current !== scope) {
         runSession.current = null
@@ -479,7 +504,7 @@ export default function ChatPage() {
     }
     // On but not in effect (no binding, e.g. a daemon started from the CLI):
     // the reply still comes, and says it did not use Knowledge.
-    const knowledgeInactive = knowledge?.enabled === true
+    const knowledgeInactive = knowledge?.enabled === true && knowledgeDown === null
 
     // Call backend LLM gateway via IPC proxy
     try {
@@ -532,7 +557,7 @@ export default function ChatPage() {
         totalMs: server.totalMs ?? totalMs,
       }
       setDelivery(index, { kind: 'sent' })
-      setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt, knowledgeInactive }])
+      setMessages(prev => [...prev, { role: 'assistant', content: reply, suffix, memoryReceipt, knowledgeInactive, ...(knowledgeDown ? { knowledgeDown } : {}) }])
     } catch (e) {
       setDelivery(index, { kind: 'notSent' })
       // `failure.code` above is the only input: `backend_not_ready` gets the
@@ -644,6 +669,10 @@ export default function ChatPage() {
   }
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    // Loop 3 FU: an Enter that ends an input method's composition (pinyin, or
+    // macOS committing a suggested word) is that, not 「send」: half an
+    // English sentence went out while typing it (General 11-19).
+    if (e.nativeEvent.isComposing || e.keyCode === 229) return
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
       void send(input)
@@ -707,6 +736,9 @@ export default function ChatPage() {
               )}
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
+              )}
+              {m.role === 'assistant' && m.knowledgeDown && (
+                <div role="note" style={{ fontSize: 12, color: 'var(--danger, #c0392b)', marginTop: 2 }}>{t(`knowledge.down.${m.knowledgeDown}`)}</div>
               )}
               {m.role === 'assistant' && m.knowledge && m.knowledge.unread.length > 0 && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>

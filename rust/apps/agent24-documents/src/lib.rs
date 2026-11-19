@@ -15,6 +15,7 @@ pub mod compose;
 pub mod db;
 pub mod derived;
 pub mod documents;
+pub mod docx_patch;
 pub mod engine;
 pub mod error;
 pub mod events;
@@ -26,6 +27,7 @@ pub mod imports;
 pub mod jobs;
 pub mod office;
 pub mod oplog;
+pub mod patch;
 pub mod pdf_compose;
 pub mod read;
 pub mod scope;
@@ -199,6 +201,16 @@ pub fn router(state: AppState) -> Router {
             "/documents/{document_id}/conversions",
             post(office::convert),
         )
+        // E1b: a DOCX's paragraphs, and some of them edited into a new document.
+        .route(
+            "/documents/{document_id}/paragraphs",
+            get(patch::paragraphs),
+        )
+        .route("/documents/{document_id}/patches", post(patch::patch))
+        // D5a: a template's `{{fields}}`, and a new document with them filled.
+        .route("/documents/{document_id}/fields", get(patch::fields))
+        .route("/documents/{document_id}/fill", post(patch::fill))
+        .route("/documents/{document_id}/content", get(patch::content))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
         .route("/jobs/{job_id}/retry", post(jobs::retry_job))
@@ -259,9 +271,21 @@ mod tests {
         assert_eq!(min, Some(4));
         assert!(m.takes_grants());
         // And this kernel is new enough: `from_yaml` above accepted it.
-        // D2b: what an Agent may call; `compose` writes, so it is approved per call.
+        // D2b, E1b/D5a: what an Agent may call; the writes (`compose`,
+        // `patch`, `fill`) are approved per call.
         let tools: Vec<_> = m.tools().iter().map(|t| t.operation().to_owned()).collect();
-        assert_eq!(tools, ["list", "get", "compose"]);
+        assert_eq!(
+            tools,
+            [
+                "list",
+                "get",
+                "compose",
+                "paragraphs",
+                "patch",
+                "fields",
+                "fill"
+            ]
+        );
     }
 
     #[test]

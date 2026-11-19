@@ -230,6 +230,10 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "find" => find(state, accepted, arguments).await,
             "extraction_get" => extraction_get(state, arguments).await,
             "compose" => compose(state, arguments).await,
+            "paragraphs" => paragraphs(state, arguments).await,
+            "patch" => patch(state, arguments).await,
+            "fields" => fields(state, arguments).await,
+            "fill" => fill(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -387,6 +391,62 @@ async fn compose(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     )
 }
 
+/// E1b/D5a: the request without `document_id`, and that id.
+fn split_document(
+    mut arguments: Map<String, Value>,
+) -> Result<(String, Map<String, Value>), Envelope> {
+    match arguments.remove("document_id") {
+        Some(Value::String(id)) => Ok((id, arguments)),
+        _ => Err(Envelope::error(INVALID_INPUT, false)),
+    }
+}
+
+/// E1b: a DOCX's paragraphs, by index (read).
+async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let (id, rest) = split_document(arguments)?;
+    if !rest.is_empty() {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    let storage = ready(state).await?;
+    completed(crate::patch::paragraphs_of(&storage, id).await)
+}
+
+/// E1b: some paragraphs edited into a new document (write; approved per call).
+async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let (id, rest) = split_document(arguments)?;
+    let req: crate::patch::PatchRequest = parse(rest)?;
+    let storage = ready(state).await?;
+    completed(
+        crate::patch::patch_run(&storage, id, req)
+            .await
+            .map(|(_, job)| job.0),
+    )
+}
+
+/// D5a: a template's `{{fields}}` (read).
+async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let (id, rest) = split_document(arguments)?;
+    if !rest.is_empty() {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    let storage = ready(state).await?;
+    completed(crate::patch::fields_of(&storage, id).await)
+}
+
+/// D5a: a new document of the template with its fields filled (write; approved per call).
+/// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
+async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let (id, mut rest) = split_document(arguments)?;
+    rest.remove("title");
+    let req: crate::patch::FillRequest = parse(rest)?;
+    let storage = ready(state).await?;
+    completed(
+        crate::patch::fill_run(&storage, id, req)
+            .await
+            .map(|(_, job)| job.0),
+    )
+}
+
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: JobGetArgs = parse(arguments)?;
     let storage = ready(state).await?;
@@ -535,7 +595,9 @@ enum Resource {
 
 fn resource(op: &str) -> Option<Resource> {
     match op {
-        "get" | "read_range" | "find" | "extract" => Some(Resource::Document),
+        "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill" => {
+            Some(Resource::Document)
+        }
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
@@ -557,7 +619,9 @@ async fn named_by_title(
     arguments: &mut Map<String, Value>,
 ) -> Result<(), Envelope> {
     let mut slots: Vec<&mut Value> = match op {
-        "get" => arguments.get_mut("document_id").into_iter().collect(),
+        "get" | "paragraphs" | "patch" | "fields" | "fill" => {
+            arguments.get_mut("document_id").into_iter().collect()
+        }
         "compose" => match arguments.get_mut("parts") {
             Some(Value::Array(parts)) => parts
                 .iter_mut()
@@ -1204,6 +1268,76 @@ mod tests {
         // No parts array: invalid input before storage is read.
         let body = call_in(&state, "compose", &[&inside], json!({ "title": "x" })).await;
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    #[tokio::test]
+    async fn fill_and_patch_take_only_documents_in_the_scope_named_by_title_too() {
+        let (_dir, state) = opened().await;
+        let inside = add_document(&state, 1, "'租赁合同模板.docx'").await;
+        let outside = add_document(&state, 2, "'secret.docx'").await;
+        let fill = |id: &str| json!({ "document_id": id, "values": { "甲方": "x" } });
+        for (op, args) in [
+            ("fill", fill(&outside)),
+            ("fields", json!({ "document_id": outside })),
+            ("paragraphs", json!({ "document_id": outside })),
+            (
+                "patch",
+                json!({ "document_id": outside, "edits": [{ "index": 0, "text": "x" }] }),
+            ),
+        ] {
+            let body = call_in(&state, op, &[&inside], args).await;
+            assert_module_error(&body, "not_found", false);
+        }
+        // By its title, inside: past the scope, to the service (the blob is no DOCX here).
+        let body = call_in(&state, "fill", &[&inside], fill("租赁合同模板")).await;
+        let answer = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            !answer.contains("not_found") && answer.contains("\"error\""),
+            "{answer}"
+        );
+        // A key the tool does not take: invalid input.
+        let body = call_in(
+            &state,
+            "fields",
+            &[&inside],
+            json!({ "document_id": inside, "x": 1 }),
+        )
+        .await;
+        assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    #[tokio::test]
+    async fn fill_names_the_new_document_after_the_template_whatever_title_the_model_gives() {
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let sha = storage.blobs.put_bytes(template).unwrap().sha256;
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6Y00077";
+        let docx = crate::office::DOCX;
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                        VALUES ('{id}', '租赁模板.docx', '{docx}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                template.len()
+            ),
+        )
+        .await;
+        let args = json!({ "document_id": id, "values": { "出租方": "明远" }, "title": "房屋租赁合同-李四" });
+        let body = call_in(&state, "fill", &[id], args).await;
+        assert_eq!(
+            payload(&body)["kind"],
+            "import",
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let filename: String = sqlx::query_scalar("SELECT filename FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(filename, "租赁模板（填写）.docx");
     }
 
     #[tokio::test]
