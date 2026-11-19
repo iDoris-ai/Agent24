@@ -776,8 +776,6 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.Sin90Write, (_event, req: unknown) => desktopSin90Write(req))
   handle(IpcChannels.Sin90ExportToFile, () => desktopSin90ExportToFile())
   handle(IpcChannels.Sin90ImportFromFile, () => desktopSin90ImportFromFile())
-  handle('sin90:exportToFile', () => desktopSin90ExportToFile())
-  handle('sin90:importFromFile', () => desktopSin90ImportFromFile())
   // oMLX: auto-detect running server
   handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
     let authRequiredAt: string | null = null

@@ -2689,7 +2689,7 @@ describe('Sin90 exportToFile and importFromFile IPC handlers', () => {
   it('registers handlers for Sin90 export and import', () => {
     expect(handlers.get(IpcChannels.Sin90ExportToFile)).toBeDefined()
     expect(handlers.get(IpcChannels.Sin90ImportFromFile)).toBeDefined()
-    expect(handlers.get('sin90:exportToFile')).toBeDefined()
-    expect(handlers.get('sin90:importFromFile')).toBeDefined()
+    expect(handlers.get('sin90:export-to-file')).toBeDefined()
+    expect(handlers.get('sin90:import-from-file')).toBeDefined()
   })
 })
