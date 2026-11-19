@@ -61,6 +61,7 @@ export const IpcChannels = {
   // Sin90 writes. Main attaches the human key; the renderer names an operation.
   Sin90Write: 'sin90:write',
   Sin90KeyStatus: 'sin90:key-status',
+  ClipboardWriteText: 'clipboard:write-text',
   Sin90ExportToFile: 'sin90:export-to-file',
   Sin90ImportFromFile: 'sin90:import-from-file',
   // Pushed from the one /api/v1/events socket. `{kind:'connected'}` is a reconnect.
