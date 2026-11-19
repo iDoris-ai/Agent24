@@ -164,6 +164,7 @@ ADR-037 决策 5 写「签名加公证流程已跑通」。facts §4 只证实�
 | DELETE | /module-consents/modules/{module} | ConsentRevoke | 日常 |
 | DELETE | /module-consents/modules/{module}/tools/{tool} | ConsentRevoke | 日常 |
 | POST | /module-consents/modules/{module}/tools/{tool} | ApprovalDecision | 提升 |
+| POST | /module-consents/modules/{module}/tools | ApprovalDecision | 提升 |
 | GET | /module-consents/modules/{module}/tools/{tool}/card | ConfigRead | 日常 |
 | GET | /tool-overrides | ConfigRead | 日常 |
 | GET | /standing-grants | ConfigRead | 日常 |

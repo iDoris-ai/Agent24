@@ -46,6 +46,10 @@ fn install(home: &Path) {
          tools:\n  - operation: list-notes\n    description: lists notes\n    \
          input_schema: {type: object, properties: {}}\n    risk: read\n    \
          output_privacy: local_only\n    resource_kinds: [note]\n    \
+         timeout_ms: 5000\n    inline_wait_ms: 1000\n\
+         \x20 - operation: get-note\n    description: reads a note\n    \
+         input_schema: {type: object, properties: {}}\n    risk: read\n    \
+         output_privacy: local_only\n    resource_kinds: [note]\n    \
          timeout_ms: 5000\n    inline_wait_ms: 1000\n",
     )
     .unwrap();
@@ -267,6 +271,90 @@ fn a_decision_on_the_running_card_is_written() {
         from_now > chrono::Duration::days(6) && from_now <= chrono::Duration::days(7),
         "{written}"
     );
+}
+
+/// A1 (Loop 4) through the real binary: several tools of one module granted
+/// in one request (one confirmation in service mode). Every tool is checked
+/// before any is written; one that is not current, not of this module, or
+/// named twice refuses the whole batch.
+#[test]
+fn several_tools_of_one_module_are_granted_at_once_or_not_at_all() {
+    let home = tempfile::tempdir().unwrap();
+    install(home.path());
+    let d = start_with(home.path(), &[("A24_MODULE_TOOL_GRANTS", "1")], &[]);
+    let card = running_card(&d);
+    let (status, other) = get(
+        &d,
+        "/api/v1/module-consents/modules/noted/tools/get-note/card",
+    );
+    assert_eq!(status, 200, "{other}");
+    const BATCH: &str = "/api/v1/module-consents/modules/noted/tools";
+    let one = |tool: &str, c: &serde_json::Value| {
+        serde_json::json!({ "tool": tool, "fingerprint": c["fingerprint"],
+                            "module_version": c["module_version"], "artifact": c["artifact"] })
+    };
+    let batch = |tools: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "tools": tools,
+            "resources": ["note:n1"],
+            "expires_at": (chrono::Utc::now() + chrono::Duration::days(7)).to_rfc3339(),
+        })
+        .to_string()
+    };
+    let mut stale = one("get-note", &other);
+    stale["fingerprint"] = "sha256:other".into();
+    for (tools, code) in [
+        (vec![one("list-notes", &card), stale], (409, "card_changed")),
+        (
+            vec![one("list-notes", &card), one("nope", &card)],
+            (404, "not_found"),
+        ),
+        (
+            vec![one("list-notes", &card), one("list-notes", &card)],
+            (422, "invalid_decision"),
+        ),
+        (vec![], (422, "invalid_decision")),
+    ] {
+        let (status, body) = send(&d, "POST", BATCH, &batch(tools));
+        assert_eq!(
+            (status, body["error"]["code"].as_str().unwrap_or("")),
+            code,
+            "{body}"
+        );
+    }
+    // Another module's tools are not reached through this module's path.
+    let (status, _) = send(
+        &d,
+        "POST",
+        "/api/v1/module-consents/modules/idle/tools",
+        &batch(vec![one("list-notes", &card)]),
+    );
+    // idle's own list-notes: no note resources, no running identity either.
+    assert!((400..500).contains(&status), "{status}");
+    let (_, list) = get(&d, "/api/v1/module-consents");
+    assert_eq!(
+        list["authorizations"],
+        serde_json::json!([]),
+        "nothing written"
+    );
+    let (status, body) = send(
+        &d,
+        "POST",
+        BATCH,
+        &batch(vec![one("list-notes", &card), one("get-note", &other)]),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["authorizations"].as_array().unwrap().len(), 2);
+    let (_, list) = get(&d, "/api/v1/module-consents");
+    let mut tools: Vec<&str> = list["authorizations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["status"] == "granted" && a["module"] == "noted")
+        .map(|a| a["tool"].as_str().unwrap())
+        .collect();
+    tools.sort_unstable();
+    assert_eq!(tools, ["get-note", "list-notes"], "{list}");
 }
 
 /// F6: an ephemeral daemon, whose store does not outlive it, takes no
