@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor, within } from '@testing-library/react'
 import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 import {
@@ -548,8 +548,26 @@ describe('CommunicationPage usability', () => {
     renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Copy alice' }))
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('npub1alice'))
-    expect(await screen.findByRole('status')).toHaveTextContent('Copied')
+    // In Settings the button itself says it worked.
+    expect(await screen.findByRole('button', { name: 'Copy alice' })).toHaveTextContent('Copied')
     expect(screen.getByText('Send this address to a colleague so they can add you.')).toBeInTheDocument()
+  })
+
+  it('copies My address through the main process and says so beside it', async () => {
+    success()
+    const copyText = vi.fn().mockResolvedValue(true)
+    const w = window as unknown as { agent24?: Record<string, unknown> }
+    const had = w.agent24
+    w.agent24 = { ...(had ?? {}), copyText }
+    try {
+      rtlRender(<CommunicationPage />)
+      const footer = await screen.findByText('My address')
+      fireEvent.click(within(footer.closest('.comm-my-address') as HTMLElement).getByRole('button', { name: 'Copy' }))
+      await waitFor(() => expect(copyText).toHaveBeenCalledWith('npub1alice'))
+      expect(within(footer.closest('.comm-my-address') as HTMLElement).getByRole('status')).toHaveTextContent('Copied')
+    } finally {
+      w.agent24 = had
+    }
   })
 
   it('adds a contact after validating the npub prefix', async () => {
@@ -647,6 +665,13 @@ describe('CommunicationPage usability', () => {
     expect(await screen.findByText('from a contact')).toBeInTheDocument()
     expect(screen.getByLabelText('Write a message')).toBeEnabled()
     expect(screen.queryByLabelText('To')).toBeNull()
+    // A stranger has no nickname: the reply goes to the raw npub.
+    vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 1 })
+    fireEvent.click(screen.getByRole('button', { name: /who dis/ }))
+    const input = screen.getByLabelText('Write a message')
+    fireEvent.change(input, { target: { value: 'hello' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
+    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith(stranger, 'hello'))
   })
 
 

@@ -7,7 +7,7 @@ import { randomBytes } from 'node:crypto'
 import http from 'node:http'
 import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
-import { app, BrowserWindow, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
+import { app, BrowserWindow, clipboard, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
 import { createChatHistoryStore } from '../chat-history'
 import { withDocumentsDelegation } from '../documents-delegation'
@@ -774,6 +774,11 @@ export function registerIpcHandlers(options: {
   omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   handle(IpcChannels.Sin90KeyStatus, () => sin90KeyAvailable())
+  handle(IpcChannels.ClipboardWriteText, (_event, text: unknown) => {
+    if (typeof text !== 'string' || text.length === 0 || text.length > 4096) return false
+    clipboard.writeText(text)
+    return true
+  })
   handle(IpcChannels.Sin90Write, (_event, req: unknown) => desktopSin90Write(req))
   handle(IpcChannels.Sin90ExportToFile, () => desktopSin90ExportToFile())
   handle(IpcChannels.Sin90ImportFromFile, () => desktopSin90ImportFromFile())

@@ -427,7 +427,8 @@ export default function CommunicationPage() {
 
   const copyNpub = async (npub: string) => {
     try {
-      await navigator.clipboard.writeText(npub)
+      const viaMain = window.agent24?.copyText
+      if (viaMain) { if (!(await viaMain(npub))) throw new Error('copy refused') } else await navigator.clipboard.writeText(npub)
       setCopied(npub)
       setCopyFeedback(t('identity.copied'))
       setTimeout(() => { if (mounted.current) setCopied((current) => (current === npub ? null : current)) }, 2000)
@@ -680,7 +681,6 @@ export default function CommunicationPage() {
   return (
     <main className={`content comm-page${settingsOpen ? ' settings-open' : ''}`}>
       {loadError && <ErrorNotice className="comm-alert" message={loadError} actionLabel={t('action.retry')} detailsLabel={t('error.details')} onAction={() => void refresh()} details={loadErrorDetails} />}
-      {copyFeedback && <div role={copyFeedback === t('identity.copyFailed') ? 'alert' : 'status'} className={copyFeedback === t('identity.copyFailed') ? 'comm-alert' : 'comm-notice'}>{copyFeedback}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">
         <span>{notice}</span>
@@ -766,8 +766,8 @@ export default function CommunicationPage() {
             })()}
             {(!history?.length) && <p className="comm-chat-empty">{t('chat.empty')}</p>}
           </div>
-          <div className="comm-my-address"><span className={daemon?.process.state === 'running' && daemon.relay_probe?.connected ? 'online-dot' : 'offline-dot'} />
-            <div><strong>{t('chat.myAddress')}</strong><small>{shortNpub(identities?.find((item) => item.default)?.npub ?? '')} · {daemon?.process.state === 'running' && daemon.relay_probe?.connected ? t('chat.connected') : t('chat.disconnected')}</small></div>
+          <div className="comm-my-address"><span className={daemon?.process.state === 'running' && daemon.relay_probe?.connected !== false ? 'online-dot' : 'offline-dot'} />
+            <div><strong>{t('chat.myAddress')}</strong><small>{shortNpub(identities?.find((item) => item.default)?.npub ?? '')} · {daemon?.process.state === 'running' && daemon.relay_probe?.connected !== false ? t('chat.connected') : t('chat.disconnected')}</small>{copyFeedback && <small role={copyFeedback === t('identity.copyFailed') ? 'alert' : 'status'} className={copyFeedback === t('identity.copyFailed') ? 'comm-copy-feedback failed' : 'comm-copy-feedback'}>{copyFeedback}</small>}</div>
             <button type="button" disabled={!identities?.find((item) => item.default)} onClick={() => { const me = identities?.find((item) => item.default); if (me) void copyNpub(me.npub) }}>{t('identity.copy')}</button>
           </div>
         </aside>

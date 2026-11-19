@@ -97,3 +97,6 @@
 .comm-page.settings-open .comm-chat-shell { display: none; }
 .comm-back-button { font-size: 16px; font-weight: 700; padding: 9px 14px; }
 .comm-chat-action-alert { grid-column: 1 / -1; margin: 10px; }
+
+.comm-copy-feedback { display: block; color: var(--success, #7fd18f); }
+.comm-copy-feedback.failed { color: var(--danger, #e57373); }
