@@ -153,14 +153,256 @@ fn read_document(docx: &[u8]) -> Result<(Archive<'_>, String), PatchError> {
 /// The DOCX again: `document_xml` as `word/document.xml`, `core.xml`'s
 /// modified time set, every other entry copied as stored, in the same order.
 fn splice(docx: &[u8], document_xml: &str, now_iso: &str) -> Result<Vec<u8>, PatchError> {
+    let parts = std::collections::BTreeMap::from([(DOCUMENT.to_owned(), document_xml.to_owned())]);
+    splice_parts(docx, &parts, now_iso)
+}
+
+/// `core.xml` with `dcterms:modified` set to `now_iso`, or None (copied as
+/// stored) when it has none.
+fn set_modified(core: &str, now_iso: &str) -> Option<String> {
+    let open = core.find("<dcterms:modified")?;
+    let value_start = open + core[open..].find('>')? + 1;
+    let value_end = value_start + core[value_start..].find("</dcterms:modified>")?;
+    Some(format!(
+        "{}{}{}",
+        &core[..value_start],
+        escape_text(now_iso),
+        &core[value_end..]
+    ))
+}
+
+// ── D5a: template fields `{{name}}`, filled where they stand ──
+
+/// A field in a template, and how many times it appears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FieldInfo {
+    pub name: String,
+    pub count: usize,
+}
+
+/// The parts fields are looked for in: the body, headers and footers.
+fn is_text_part(name: &str) -> bool {
+    name == DOCUMENT
+        || (name.starts_with("word/header") || name.starts_with("word/footer"))
+            && name.ends_with(".xml")
+            && !name.contains("/_rels/")
+}
+
+/// The `{{name}}` fields of a template, in order of first appearance.
+pub fn list_fields(docx: &[u8]) -> Result<Vec<FieldInfo>, PatchError> {
+    let mut fields: Vec<FieldInfo> = Vec::new();
+    for (_, xml) in text_parts(docx)? {
+        for para in scan_all_paragraphs(&xml)? {
+            let texts = t_texts(&xml[para.start..para.end]);
+            let joined: String = texts.iter().map(|t| t.text.as_str()).collect();
+            for (_, _, name) in placeholders(&joined) {
+                match fields.iter_mut().find(|f| f.name == name) {
+                    Some(f) => f.count += 1,
+                    None => fields.push(FieldInfo { name, count: 1 }),
+                }
+            }
+        }
+    }
+    Ok(fields)
+}
+
+/// The template with each `{{name}}` of `values` replaced, in the body,
+/// tables, headers and footers. A field inside one `w:t` changes only that
+/// text; one Word split across runs is written into the run of its first
+/// character and taken out of the others, which keep the rest of their text
+/// and every run property: the paragraph is never rewritten. Fields without
+/// a value are left as they are. Every other zip entry is copied as stored.
+pub fn fill(
+    docx: &[u8],
+    values: &std::collections::BTreeMap<String, String>,
+    now_iso: &str,
+) -> Result<Vec<u8>, PatchError> {
+    if values.is_empty() || values.len() > MAX_EDITS {
+        return Err(PatchError::Invalid(format!(
+            "1 to {MAX_EDITS} values are needed"
+        )));
+    }
+    let known = list_fields(docx)?;
+    if let Some(unknown) = values.keys().find(|k| !known.iter().any(|f| &f.name == *k)) {
+        return Err(PatchError::Invalid(format!(
+            "the template has no field {{{{{unknown}}}}}"
+        )));
+    }
+    let mut rewritten = std::collections::BTreeMap::new();
+    for (name, xml) in text_parts(docx)? {
+        let mut out = String::with_capacity(xml.len());
+        let mut cursor = 0;
+        let mut changed = false;
+        for para in scan_all_paragraphs(&xml)? {
+            let slice = &xml[para.start..para.end];
+            if let Some(filled) = fill_paragraph(slice, values) {
+                out.push_str(&xml[cursor..para.start]);
+                out.push_str(&filled);
+                cursor = para.end;
+                changed = true;
+            }
+        }
+        if changed {
+            out.push_str(&xml[cursor..]);
+            rewritten.insert(name, out);
+        }
+    }
+    if rewritten.is_empty() {
+        return Err(PatchError::Invalid(
+            "no field of the values is in the template".into(),
+        ));
+    }
+    splice_parts(docx, &rewritten, now_iso)
+}
+
+/// Each text part of the DOCX, by name, as text.
+fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
+    let (mut archive, _) = read_document(docx)?;
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|n| is_text_part(n))
+        .map(str::to_owned)
+        .collect();
+    let mut out = Vec::new();
+    for name in names {
+        let mut file = archive
+            .by_name(&name)
+            .map_err(|e| PatchError::NotDocx(e.to_string()))?;
+        if file.size() > MAX_DOCUMENT_XML_BYTES {
+            return Err(PatchError::TooLarge);
+        }
+        let mut xml = String::new();
+        file.read_to_string(&mut xml)
+            .map_err(|e| PatchError::NotDocx(e.to_string()))?;
+        out.push((name, xml));
+    }
+    out.sort_by_key(|(n, _)| (n != DOCUMENT, n.clone()));
+    Ok(out)
+}
+
+/// One `w:t` of a paragraph: where its text lies in the slice, and the text.
+struct TextSpan {
+    open_start: usize,
+    open_end: usize,
+    close_start: usize,
+    text: String,
+}
+
+/// The paragraph's own `w:t`, in order (not those of a nested paragraph).
+fn t_texts(para: &str) -> Vec<TextSpan> {
+    let Ok(all) = tags(para) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut depth_p = 0usize;
+    let mut open: Option<(usize, usize)> = None;
+    for tag in all {
+        match (tag.kind, tag.name) {
+            (TagKind::Open, "w:p") => depth_p += 1,
+            (TagKind::Close, "w:p") => depth_p = depth_p.saturating_sub(1),
+            (TagKind::Open, "w:t") if depth_p <= 1 => open = Some((tag.start, tag.end)),
+            (TagKind::Close, "w:t") => {
+                if let Some((open_start, open_end)) = open.take() {
+                    out.push(TextSpan {
+                        open_start,
+                        open_end,
+                        close_start: tag.start,
+                        text: decode(&para[open_end..tag.start]),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Each `{{ name }}` in `text`: its char range and the name, trimmed.
+fn placeholders(text: &str) -> Vec<(usize, usize, String)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i + 1 < chars.len() {
+        if chars[i] == '{' && chars[i + 1] == '{' {
+            let mut j = i + 2;
+            while j + 1 < chars.len() && !(chars[j] == '}' && chars[j + 1] == '}') {
+                if chars[j] == '{' || chars[j] == '}' || j - i > 66 {
+                    break;
+                }
+                j += 1;
+            }
+            if j + 1 < chars.len() && chars[j] == '}' && chars[j + 1] == '}' {
+                let name: String = chars[i + 2..j].iter().collect::<String>().trim().to_owned();
+                if !name.is_empty() {
+                    out.push((i, j + 2, name));
+                    i = j + 2;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// The paragraph with its fields filled, or None when it has none to fill.
+fn fill_paragraph(
+    para: &str,
+    values: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    let texts = t_texts(para);
+    let joined: String = texts.iter().map(|t| t.text.as_str()).collect();
+    let spans: Vec<(usize, usize, &String)> = placeholders(&joined)
+        .into_iter()
+        .filter_map(|(s, e, name)| values.get_key_value(&name).map(|(_, v)| (s, e, v)))
+        .collect();
+    if spans.is_empty() {
+        return None;
+    }
+    // Each char of the joined text belongs to one w:t: rebuild every w:t's text,
+    // a field's value going where its first char was.
+    let mut new_texts: Vec<String> = vec![String::new(); texts.len()];
+    let mut pos = 0usize;
+    for (ti, t) in texts.iter().enumerate() {
+        for ch in t.text.chars() {
+            match spans.iter().find(|(s, e, _)| (*s..*e).contains(&pos)) {
+                Some((s, _, value)) if *s == pos => new_texts[ti].push_str(value),
+                Some(_) => {}
+                None => new_texts[ti].push(ch),
+            }
+            pos += 1;
+        }
+    }
+    let mut out = String::with_capacity(para.len() + 64);
+    let mut cursor = 0;
+    for (t, new) in texts.iter().zip(&new_texts) {
+        if *new == t.text {
+            continue;
+        }
+        out.push_str(&para[cursor..t.open_start]);
+        out.push_str("<w:t xml:space=\"preserve\">");
+        out.push_str(&escape_text(new));
+        cursor = t.close_start;
+        let _ = t.open_end;
+    }
+    out.push_str(&para[cursor..]);
+    Some(out)
+}
+
+/// Like [`splice`], with any number of parts rewritten.
+fn splice_parts(
+    docx: &[u8],
+    parts: &std::collections::BTreeMap<String, String>,
+    now_iso: &str,
+) -> Result<Vec<u8>, PatchError> {
     let zip_err = |e: zip::result::ZipError| PatchError::NotDocx(e.to_string());
     let io_err = |e: std::io::Error| PatchError::NotDocx(e.to_string());
     let mut archive = ZipArchive::new(Cursor::new(docx)).map_err(zip_err)?;
     let mut writer = ZipWriter::new(Cursor::new(Vec::with_capacity(docx.len() + 4096)));
     for i in 0..archive.len() {
         let name = archive.by_index_raw(i).map_err(zip_err)?.name().to_owned();
-        let rewrite = if name == DOCUMENT {
-            Some(document_xml.to_owned())
+        let rewrite = if let Some(content) = parts.get(&name) {
+            Some(content.clone())
         } else if name == CORE {
             let mut core = String::new();
             archive
@@ -195,18 +437,44 @@ fn splice(docx: &[u8], document_xml: &str, now_iso: &str) -> Result<Vec<u8>, Pat
     Ok(writer.finish().map_err(zip_err)?.into_inner())
 }
 
-/// `core.xml` with `dcterms:modified` set to `now_iso`, or None (copied as
-/// stored) when it has none.
-fn set_modified(core: &str, now_iso: &str) -> Option<String> {
-    let open = core.find("<dcterms:modified")?;
-    let value_start = open + core[open..].find('>')? + 1;
-    let value_end = value_start + core[value_start..].find("</dcterms:modified>")?;
-    Some(format!(
-        "{}{}{}",
-        &core[..value_start],
-        escape_text(now_iso),
-        &core[value_end..]
-    ))
+/// Every paragraph not inside another, wherever it is (a header has no body).
+fn scan_all_paragraphs(xml: &str) -> Result<Vec<Para>, PatchError> {
+    let mut paras = Vec::new();
+    let mut depth = 0usize;
+    let mut open: Option<usize> = None;
+    let mut stack: Vec<&str> = Vec::new();
+    for tag in tags(xml)? {
+        match tag.kind {
+            TagKind::Open => {
+                if tag.name == "w:p" {
+                    if depth == 0 {
+                        open = Some(tag.start);
+                    }
+                    depth += 1;
+                }
+                stack.push(tag.name);
+            }
+            TagKind::Close => {
+                if stack.pop() != Some(tag.name) {
+                    return Err(broken());
+                }
+                if tag.name == "w:p" {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0
+                        && let Some(start) = open.take()
+                    {
+                        paras.push(Para {
+                            start,
+                            end: tag.end,
+                            in_table: false,
+                        });
+                    }
+                }
+            }
+            TagKind::Empty => {}
+        }
+    }
+    Ok(paras)
 }
 
 // ── A scanner that knows tags and their byte offsets, nothing more ──

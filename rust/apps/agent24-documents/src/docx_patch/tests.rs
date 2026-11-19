@@ -204,3 +204,126 @@ fn the_scanner_reads_entities_empty_paragraphs_and_nested_text_boxes() {
     assert!(paras[2].in_table && !paras[1].in_table);
     assert_eq!(max_revision_id("<a w:id=\"7\"/><b w:id=\"12\"/>"), 12);
 }
+
+// ── D5a: template fields ──
+
+const TEMPLATE: &[u8] = include_bytes!("../../tests/fixtures/template-lease.docx");
+
+fn values(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+        .collect()
+}
+
+#[test]
+fn lists_the_fields_of_a_template_also_split_across_runs_tables_and_headers() {
+    let names: Vec<String> = list_fields(TEMPLATE)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    for name in [
+        "合同编号",
+        "出租方",
+        "承租方",
+        "房屋地址",
+        "面积",
+        "月租金",
+        "押金",
+        "物业费",
+        "签订日期",
+    ] {
+        assert!(
+            names.contains(&name.to_owned()),
+            "{name} missing from {names:?}"
+        );
+    }
+    // The body's first, then headers.
+    assert_eq!(names[0], "出租方");
+}
+
+#[test]
+fn fills_fields_where_they_stand_keeping_bold_and_underline() {
+    let filled = fill(
+        TEMPLATE,
+        &values(&[
+            ("合同编号", "MY-2026-0137"),
+            ("出租方", "上海明远置业有限公司"),
+            ("房屋地址", "上海市普陀区真北路 1288 号"),
+            ("月租金", "8,500"),
+            ("押金", "17,000"),
+            ("签订日期", "2025 年 12 月 20 日"),
+        ]),
+        NOW,
+    )
+    .unwrap();
+    let doc = entry(&filled, "word/document.xml");
+    let old = entry(TEMPLATE, "word/document.xml");
+    // Split across runs: the value in the first char's run, the others emptied of it.
+    let paras = scan_paragraphs(&doc).unwrap();
+    let text = |prefix: &str| {
+        paras
+            .iter()
+            .map(|p| paragraph_text(&doc[p.start..p.end]))
+            .find(|t| t.starts_with(prefix))
+            .unwrap()
+    };
+    assert_eq!(
+        text("出租方（甲方）："),
+        "出租方（甲方）：上海明远置业有限公司"
+    );
+    assert_eq!(
+        text("第一条"),
+        "第一条 租赁房屋位于 上海市普陀区真北路 1288 号，建筑面积 {{面积}} 平方米。"
+    );
+    assert_eq!(text("签订日期："), "签订日期：2025 年 12 月 20 日");
+    // The bold label run and the underlined value run are still there, as they were.
+    let lessor = paras
+        .iter()
+        .map(|p| &doc[p.start..p.end])
+        .find(|p| p.contains("上海明远置业"))
+        .unwrap();
+    assert!(lessor.contains("<w:b/>"), "{lessor}");
+    assert!(lessor.contains("<w:u w:val=\"single\"/>"), "{lessor}");
+    // In a table cell too, and a field with no value stays.
+    assert!(doc.contains("17,000"));
+    assert!(doc.contains("{{物业费}}") || doc.contains("物业费}}"));
+    // Paragraphs without a field: the very bytes they were.
+    let old_paras = scan_paragraphs(&old).unwrap();
+    for (o, n) in old_paras.iter().zip(&paras) {
+        let (o, n) = (&old[o.start..o.end], &doc[n.start..n.end]);
+        if !o.contains("{{") && !o.contains("}}") {
+            assert_eq!(o, n);
+        }
+    }
+    // The header's field, and every entry but the parts filled kept as stored.
+    let header = (1..=3)
+        .map(|i| format!("word/header{i}.xml"))
+        .find(|n| raw_entries(&filled).iter().any(|e| &e.0 == n))
+        .unwrap();
+    assert!(entry(&filled, &header).contains("MY-2026-0137"));
+    let (before, after) = (raw_entries(TEMPLATE), raw_entries(&filled));
+    for (b, a) in before.iter().zip(&after) {
+        if b.0 == "word/document.xml" || b.0 == header || b.0 == "docProps/core.xml" {
+            continue;
+        }
+        assert_eq!(b, a, "{} changed", b.0);
+    }
+}
+
+#[test]
+fn a_field_the_template_does_not_have_and_no_values_are_refused() {
+    assert!(matches!(
+        fill(TEMPLATE, &values(&[("不存在", "x")]), NOW),
+        Err(PatchError::Invalid(_))
+    ));
+    assert!(matches!(
+        fill(TEMPLATE, &values(&[]), NOW),
+        Err(PatchError::Invalid(_))
+    ));
+    assert_eq!(
+        placeholders("a{{ x }}b{{}}c{{y}}"),
+        vec![(1, 8, "x".into()), (14, 19, "y".into())]
+    );
+}

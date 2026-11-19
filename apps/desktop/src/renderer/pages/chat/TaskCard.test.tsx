@@ -503,4 +503,12 @@ describe('approvalText (D2b)', () => {
       .toBe('task.ask.compose{"title":"A1","parts":"task.ask.part{\\"doc\\":\\"a.pdf\\",\\"pages\\":\\"1\\"}"}')
     expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('shell_exec: {"argv":["ls"]}')
   })
+  it('says what a fill or a patch will write (E1b/D5a)', () => {
+    expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","values":{"甲方":"明远","租金":"8,500"}}' }, t))
+      .toBe('task.ask.fill{"doc":"模板.docx","values":"甲方=明远，租金=8,500"}')
+    expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x","tracked":true}]}' }, t))
+      .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}')
+    expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}]}' }, t))
+      .toBe('task.ask.patch{"doc":"a.docx","n":"1"}')
+  })
 })
