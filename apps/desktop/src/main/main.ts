@@ -1,7 +1,6 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
-import { execFile } from 'node:child_process'
 import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
@@ -88,37 +87,36 @@ import { newUlid } from './knowledge-bridge'
 import { entryTarget } from './knowledge-entry-extract'
 import { CHAT_TIMEOUT_MS, proxyError, proxyRequest } from './backend-proxy'
 
-/** soffice, killed when it runs past `timeoutMs` (`execFile`'s timeout sends SIGTERM). */
-function runTimed(cmd: string, args: string[], timeoutMs: number): Promise<{ code: number | null }> {
-  return new Promise((resolve) => {
-    execFile(cmd, args, { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 }, (error) => {
-      if (!error) {
-        resolve({ code: 0 })
-        return
-      }
-      const code = (error as { code?: unknown }).code
-      resolve({ code: typeof code === 'number' ? code : null })
-    })
-  })
+/** A documents job, read until it ends or `ms` pass. */
+async function documentsJobEnd(job: DocumentsResults['job'], ms: number): Promise<{ ok: true; job: DocumentsResults['job'] } | { ok: false; code?: string; message: string }> {
+  const deadline = Date.now() + ms
+  while (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
+    if (Date.now() >= deadline) return { ok: false, message: 'timed out' }
+    await new Promise((resolve) => setTimeout(resolve, 1000))
+    const next = await documentsCall({ op: 'job', jobId: job.job_id }, daemonCliEndpoint)
+    if (!next.ok) return { ok: false, code: next.error.code, message: next.error.message }
+    job = next.data as DocumentsResults['job']
+  }
+  if (job.status === 'succeeded') return { ok: true, job }
+  return { ok: false, code: job.error?.code, message: job.error?.message ?? job.status }
 }
 
-/** Import a PDF and poll its job until it succeeds or fails, at most two minutes. */
-async function importTranslatedPdf(pdfPath: string): Promise<{ ok: boolean; message?: string }> {
-  const started = await withDocumentsDelegation(() => importFile(pdfPath, daemonCliEndpoint))
+/** D4 (PR-Daemon #1915 B1): the translation's DOCX imported, then made a PDF
+ * by the documents module in its sandbox; nothing is run here. */
+async function importAndConvertTranslation(docxPath: string, pdfTitle: string): Promise<{ ok: boolean; code?: string; message?: string }> {
+  const started = await withDocumentsDelegation(() => importFile(docxPath, daemonCliEndpoint))
   if (!started || !started.ok) {
     return { ok: false, message: started && !started.ok ? started.error.message : 'import failed' }
   }
-  let job: DocumentsResults['job'] = started.data
-  const deadline = Date.now() + 120_000
-  while (job.status === 'queued' || job.status === 'running' || job.status === 'cancelling') {
-    if (Date.now() >= deadline) return { ok: false, message: 'import timed out' }
-    await new Promise((resolve) => setTimeout(resolve, 1000))
-    const next = await documentsCall({ op: 'job', jobId: job.job_id }, daemonCliEndpoint)
-    if (!next.ok) return { ok: false, message: next.error.message }
-    job = next.data as DocumentsResults['job']
-  }
-  if (job.status === 'succeeded') return { ok: true }
-  return { ok: false, message: job.error?.message ?? job.status }
+  const imported = await documentsJobEnd(started.data, 120_000)
+  if (!imported.ok) return imported
+  const docx = (imported.job.result as { document_id?: string } | undefined)?.document_id ?? imported.job.document_id
+  if (!docx) return { ok: false, message: 'the import named no document' }
+  const converting = await withDocumentsDelegation(() => documentsCall({ op: 'convert', documentId: docx, title: pdfTitle }, daemonCliEndpoint))
+  if (!converting.ok) return { ok: false, code: converting.error.code, message: converting.error.message }
+  // A conversion runs up to 120 s before its import.
+  const converted = await documentsJobEnd(converting.data as DocumentsResults['job'], 300_000)
+  return converted.ok ? { ok: true } : converted
 }
 
 const isDev = process.env.NODE_ENV === 'development'
@@ -786,8 +784,7 @@ app.whenReady().then(async () => {
     deps: {
       dataDir: () => tryDataDir(),
       downloadsDir: () => app.getPath('downloads'),
-      run: runTimed,
-      importPdf: importTranslatedPdf,
+      importAndConvert: importAndConvertTranslation,
     },
   })
   registerDocAgentAccess({

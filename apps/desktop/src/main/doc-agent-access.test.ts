@@ -134,9 +134,32 @@ describe('doc-agent-access', () => {
   it('disable deletes the file', async () => {
     await enable(deps())
     expect(fs.existsSync(path.join(dir, ACCESS_FILE))).toBe(true)
-    expect(await disable(deps())).toEqual({ enabled: false, until: null })
+    expect(await disable(deps())).toEqual({ enabled: false, until: null, ok: true })
     expect(fs.existsSync(path.join(dir, ACCESS_FILE))).toBe(false)
     expect(send.mock.calls.some(([req]) => req.method === 'DELETE' && req.path === '/api/v1/module-consents/modules/documents')).toBe(true)
     expect(state(deps())).toEqual({ enabled: false, until: null })
+  })
+})
+
+// PR-Daemon #1915 B2: turning off is not reported done while the grants live.
+describe('disable when the daemon does not end the grants', () => {
+  it('keeps access on and says so when DELETE answers 503; 404 counts as done', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-agent-access-'))
+    let status = 503
+    const send = vi.fn(async (req: { method: string; path: string }) => {
+      if (req.method === 'DELETE') return { ok: status < 300, status, data: { error: { code: status === 503 ? 'storage_unavailable' : 'not_found' } } }
+      if (req.path.endsWith('/card')) return { ok: true, status: 200, data: { fingerprint: 'f', module_version: '1', artifact: 'a' } }
+      if (req.path === '/api/v1/module-consents') return { ok: true, status: 200, data: { authorizations: [] } }
+      return { ok: true, status: 200, data: {} }
+    })
+    const d: DocAgentAccessDeps = { dataDir: () => dir, send: send as DocAgentAccessDeps['send'], documentIds: async () => ['doc_a'], now: () => Date.parse('2026-11-19T00:00:00Z') }
+    await enable(d)
+    const off = await disable(d)
+    expect(off).toMatchObject({ enabled: true, ok: false, code: 'storage_unavailable' })
+    expect(state(d).enabled).toBe(true)
+    status = 404
+    expect(await disable(d)).toEqual({ enabled: false, until: null, ok: true })
+    expect(state(d).enabled).toBe(false)
+    fs.rmSync(dir, { recursive: true, force: true })
   })
 })

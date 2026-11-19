@@ -162,20 +162,26 @@ async function enableUnlocked(deps: DocAgentAccessDeps): Promise<DocAgentAccessR
   return syncUnlocked(deps)
 }
 
-async function disableUnlocked(deps: DocAgentAccessDeps): Promise<DocAgentAccessState> {
-  await deps.send({ method: 'DELETE', path: `/api/v1/module-consents/modules/${MODULE}` }).catch(() => undefined)
+/** Off only once the daemon has ended the grants (2xx), or holds none (404).
+ * Otherwise the file stays, so the page still says on, and says the turning
+ * off did not happen (PR-Daemon #1915 B2: it said off while the grants lived). */
+async function disableUnlocked(deps: DocAgentAccessDeps): Promise<DocAgentAccessResult> {
+  const res = await deps.send({ method: 'DELETE', path: `/api/v1/module-consents/modules/${MODULE}` }).catch(() => null)
+  if (res === null || !(res.ok || res.status === 404)) {
+    return { ...state(deps), ok: false, code: res === null ? 'daemon_unreachable' : responseCode(res) }
+  }
   const dir = deps.dataDir()
   if (dir !== null) {
     try { fs.unlinkSync(filePath(dir)) } catch { /* already gone */ }
   }
-  return { enabled: false, until: null }
+  return { enabled: false, until: null, ok: true }
 }
 
 export function enable(deps: DocAgentAccessDeps): Promise<DocAgentAccessResult> {
   return runExclusive(() => enableUnlocked(deps))
 }
 
-export function disable(deps: DocAgentAccessDeps): Promise<DocAgentAccessState> {
+export function disable(deps: DocAgentAccessDeps): Promise<DocAgentAccessResult> {
   return runExclusive(() => disableUnlocked(deps))
 }
 
