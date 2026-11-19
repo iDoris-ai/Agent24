@@ -620,6 +620,16 @@ export type DocumentsRequest =
   | { op: 'compose'; parts: Array<{ documentId: DocSchemas['DocumentIdString']; pages?: string }>; title?: string }
   /** D1: an Office document (DOCX/XLSX/PPTX) as a new PDF document. */
   | { op: 'convert'; documentId: DocSchemas['DocumentIdString']; title?: string }
+  /** E1b: a DOCX's paragraphs, by index. */
+  | { op: 'paragraphs'; documentId: DocSchemas['DocumentIdString'] }
+  /** E1b: some paragraphs of a DOCX edited (plainly or as tracked changes) into a new document. */
+  | {
+      op: 'patch'
+      documentId: DocSchemas['DocumentIdString']
+      edits: Array<{ index: number; text: string; tracked?: boolean; expect?: string }>
+      title?: string
+      author?: string
+    }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
 
@@ -639,6 +649,8 @@ export interface DocumentsResults {
   compose: DocSchemas['DocumentsJob']
   /** The import job of the new PDF document. */
   convert: DocSchemas['DocumentsJob']
+  paragraphs: { document_id: string; revision: number; paragraphs: Array<{ index: number; text: string; in_table: boolean }> }
+  patch: DocSchemas['DocumentsJob']
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
 }

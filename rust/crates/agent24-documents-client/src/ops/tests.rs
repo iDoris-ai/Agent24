@@ -630,3 +630,37 @@ async fn a_rendered_page_comes_back_as_json_with_its_png_and_scale() {
     let get = call(&json!({"op": "get", "documentId": DOC}), &ok).await;
     assert_eq!(get.code(), Some("invalid_response"));
 }
+
+/// E1b: the paragraphs and patch operations, and what they refuse.
+#[test]
+fn paragraphs_and_patch_map_to_their_routes_and_refuse_what_the_service_would() {
+    assert_eq!(
+        route_of(&json!({"op": "paragraphs", "documentId": DOC})),
+        Some((
+            Method::Get,
+            format!("/api/v1/documents/documents/{DOC}/paragraphs")
+        ))
+    );
+    let r = route(
+        &json!({"op": "patch", "documentId": DOC, "title": "改", "author": "A",
+        "edits": [{"index": 3, "text": "新", "tracked": true, "expect": "旧"}]}),
+    )
+    .unwrap();
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(r.path, format!("/api/v1/documents/documents/{DOC}/patches"));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"edits": [{"index": 3, "text": "新", "tracked": true, "expect": "旧"}], "title": "改", "author": "A"})
+    );
+    for bad in [
+        json!({"op": "patch", "documentId": DOC, "edits": []}),
+        json!({"op": "patch", "documentId": DOC}),
+        json!({"op": "patch", "documentId": "x", "edits": [{"index": 0, "text": "t"}]}),
+        json!({"op": "patch", "documentId": DOC, "edits": [{"index": -1, "text": "t"}]}),
+        json!({"op": "patch", "documentId": DOC, "edits": [{"index": 0, "text": "t", "other": 1}]}),
+        json!({"op": "patch", "documentId": DOC, "edits": [{"index": 0, "text": "t"}], "title": ""}),
+        json!({"op": "paragraphs", "documentId": "nope"}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
