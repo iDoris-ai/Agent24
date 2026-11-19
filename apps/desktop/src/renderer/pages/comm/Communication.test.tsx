@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render as rtlRender, screen, waitFor, within } from '@testing-library/react'
 import { setLocale } from '../../i18n'
 import CommunicationPage from './Communication'
 import {
@@ -183,6 +183,7 @@ describe('CommunicationPage', () => {
   })
 
   it('explains a rejected signature (often offline notarization) instead of a raw message', async () => {
+    setLocale('zh')
     success()
     for (const fn of [listCommIdentities, listCommContacts, listCommRelays]) {
       vi.mocked(fn).mockRejectedValue(new CommApiError('no Hyphae binary is configured', 409, 'not_configured'))
@@ -393,7 +394,8 @@ describe('CommunicationPage English default', () => {
   it('shows the English chat heading', async () => {
     success()
     renderSettingsPage()
-    expect(screen.getByRole('heading', { name: 'Messages' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: 'Settings' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '← Back to chats' })).toBeInTheDocument()
   })
 })
 
@@ -546,7 +548,26 @@ describe('CommunicationPage usability', () => {
     renderSettingsPage()
     fireEvent.click(await screen.findByRole('button', { name: 'Copy alice' }))
     await waitFor(() => expect(writeText).toHaveBeenCalledWith('npub1alice'))
+    // In Settings the button itself says it worked.
+    expect(await screen.findByRole('button', { name: 'Copy alice' })).toHaveTextContent('Copied')
     expect(screen.getByText('Send this address to a colleague so they can add you.')).toBeInTheDocument()
+  })
+
+  it('copies My address through the main process and says so beside it', async () => {
+    success()
+    const copyText = vi.fn().mockResolvedValue(true)
+    const w = window as unknown as { agent24?: Record<string, unknown> }
+    const had = w.agent24
+    w.agent24 = { ...(had ?? {}), copyText }
+    try {
+      rtlRender(<CommunicationPage />)
+      const footer = await screen.findByText('My address')
+      fireEvent.click(within(footer.closest('.comm-my-address') as HTMLElement).getByRole('button', { name: 'Copy' }))
+      await waitFor(() => expect(copyText).toHaveBeenCalledWith('npub1alice'))
+      expect(within(footer.closest('.comm-my-address') as HTMLElement).getByRole('status')).toHaveTextContent('Copied')
+    } finally {
+      w.agent24 = had
+    }
   })
 
   it('adds a contact after validating the npub prefix', async () => {
@@ -567,18 +588,28 @@ describe('CommunicationPage usability', () => {
     await waitFor(() => expect(listCommContacts).toHaveBeenCalledTimes(2))
   })
 
-  it('sends an encrypted message to a contact and reports relays; lists recent messages', async () => {
+  it('returns from settings to chats and removes the duplicate message form', async () => {
     success()
-    vi.mocked(listCommHistory).mockResolvedValue([{ id: 'e1', from: 'bob', content: 'hello there', at: '10:00' }])
-    vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 2 })
     renderSettingsPage()
-    expect((await screen.findAllByText('hello there')).length).toBeGreaterThan(0)
-    fireEvent.change(screen.getByLabelText('To'), { target: { value: 'bob' } })
-    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'hi bob' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith('bob', 'hi bob'))
-    expect(await screen.findByText('Published to 2 relay(s).')).toBeInTheDocument()
-    await waitFor(() => expect(listCommHistory).toHaveBeenCalledTimes(2))
+    expect(await screen.findByRole('button', { name: '← Back to chats' })).toBeInTheDocument()
+    expect(screen.queryByLabelText('To')).toBeNull()
+    fireEvent.click(screen.getByRole('button', { name: '← Back to chats' }))
+    expect(await screen.findByRole('region', { name: 'Messages' })).toBeInTheDocument()
+  })
+
+  it('shows contact failures inline and selects the new chat after success', async () => {
+    success()
+    vi.mocked(addCommContact).mockRejectedValueOnce(new Error('contact write failed')).mockResolvedValueOnce({})
+    renderSettingsPage()
+    fireEvent.change(await screen.findByLabelText('Nickname'), { target: { value: 'carol' } })
+    fireEvent.change(screen.getByLabelText('npub address'), { target: { value: 'npub1carol' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Add contact' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('contact write failed')
+    expect(screen.getByRole('form')).toContainElement(screen.getByRole('alert'))
+    fireEvent.click(screen.getByRole('button', { name: 'Add contact' }))
+    await waitFor(() => expect(screen.queryByRole('button', { name: '← Back to chats' })).toBeNull())
+    expect(screen.getByLabelText('Write a message')).toBeEnabled()
+    expect(screen.getAllByText('carol').length).toBeGreaterThan(0)
   })
 
   it('exports with the nickname only; the page has no password fields and a cancelled step is silent', async () => {
@@ -610,48 +641,36 @@ describe('CommunicationPage usability', () => {
 
   const stranger = 'npub1strangerstrangerstrangerstrangerstrangerstrangerxyz'
 
-  it('offers Add as contact for an unknown sender, prefilling the form, but not for a contact', async () => {
+  it('shows messages from an unknown sender in the selected chat without the removed settings actions', async () => {
     success()
     vi.mocked(listCommHistory).mockResolvedValue([
       { id: 'a', from: stranger, content: 'who dis', at: '' },
       { id: 'b', from: 'npub1bob', content: 'from a contact', at: '' },
     ])
-    renderSettingsPage()
+    rtlRender(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /who dis/ }))
     expect(await screen.findByText('who dis')).toBeInTheDocument()
-    expect(screen.queryByText(stranger)).toBeNull()
-    expect(screen.getAllByRole('button', { name: 'Add as contact' })).toHaveLength(1)
     fireEvent.click(screen.getByRole('button', { name: 'Add as contact' }))
     expect(screen.getByLabelText('npub address')).toHaveValue(stranger)
   })
 
-  it('Reply pre-selects the sender: contact nickname, or the raw npub for strangers', async () => {
+  it('selects a sender conversation to reply in the chat composer', async () => {
     success()
     vi.mocked(listCommHistory).mockResolvedValue([
       { id: 'a', from: stranger, content: 'who dis', at: '' },
       { id: 'b', from: 'npub1bob', content: 'from a contact', at: '' },
     ])
-    renderSettingsPage()
-    await screen.findByText('who dis')
-    const replies = screen.getAllByRole('button', { name: 'Reply' })
-    fireEvent.click(replies[1]!)
-    expect(screen.getByLabelText('To')).toHaveValue('bob')
-    fireEvent.click(replies[0]!)
-    expect(screen.getByLabelText('To')).toHaveValue(stranger)
-  })
-
-  it('sends to a raw npub that is not a contact, and rejects an unknown name', async () => {
-    success()
+    rtlRender(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /from a contact/ }))
+    expect(await screen.findByText('from a contact')).toBeInTheDocument()
+    expect(screen.getByLabelText('Write a message')).toBeEnabled()
+    expect(screen.queryByLabelText('To')).toBeNull()
+    // A stranger has no nickname: the reply goes to the raw npub.
     vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 1 })
-    renderSettingsPage()
-    await screen.findByText('npub1alice')
-    expect(screen.getByText(/anyone with your npub can message you/)).toBeInTheDocument()
-    fireEvent.change(screen.getByLabelText('Message'), { target: { value: 'hello' } })
-    fireEvent.change(screen.getByLabelText('To'), { target: { value: 'nobody' } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
-    expect(await screen.findByText(/Enter a contact name or an address starting with npub1/)).toBeInTheDocument()
-    expect(sendCommMessage).not.toHaveBeenCalled()
-    fireEvent.change(screen.getByLabelText('To'), { target: { value: stranger } })
-    fireEvent.click(screen.getByRole('button', { name: 'Send' }))
+    fireEvent.click(screen.getByRole('button', { name: /who dis/ }))
+    const input = screen.getByLabelText('Write a message')
+    fireEvent.change(input, { target: { value: 'hello' } })
+    fireEvent.keyDown(input, { key: 'Enter' })
     await waitFor(() => expect(sendCommMessage).toHaveBeenCalledWith(stranger, 'hello'))
   })
 

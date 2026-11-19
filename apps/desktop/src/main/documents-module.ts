@@ -391,6 +391,12 @@ export async function ensureBundledOsModules(
   return outcomes
 }
 
+/** The carried modules a launch could not replace (the service daemon held the
+ *  store). Service mode replaces each of them once that daemon is stopped. */
+export function modulesToReplaceWhileStopped<T>(items: readonly T[], outcomes: readonly BundledModuleOutcome[]): T[] {
+  return items.filter((_, i) => outcomes[i] === 'install_failed')
+}
+
 /** `A24_OS_PACKAGES` when set (as the CLI and daemon read it), else `<dataDir>/packages`. */
 export function packagesRootFor(env: NodeJS.ProcessEnv, dataDir: string | null): string | null {
   const over = env['A24_OS_PACKAGES']
