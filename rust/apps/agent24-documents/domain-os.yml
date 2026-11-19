@@ -68,3 +68,77 @@ tools:
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
+  # E1b/D5a (Loop 3): DOCX paragraphs and template fields. The writes make a
+  # NEW document; each call is approved by the user.
+  - operation: paragraphs
+    description: "List a DOCX document's paragraphs (index, text, whether in a table). document_id is its id from documents.list, or its file name/title. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  - operation: patch
+    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs; tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id, edits]
+      properties:
+        document_id: { type: string }
+        edits:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items:
+            type: object
+            additionalProperties: false
+            required: [index, text]
+            properties:
+              index: { type: integer, minimum: 0 }
+              text: { type: string }
+              tracked: { type: boolean }
+              expect: { type: string, description: "the paragraph's current text; the edit is refused if it changed" }
+        title: { type: string, description: "title of the new document" }
+    risk: write_local
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  - operation: fields
+    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  - operation: fill
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting. values maps a field name (without braces, as listed by documents.fields) to its text. The template is never changed. Returns the import job."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id, values]
+      properties:
+        document_id: { type: string }
+        values:
+          type: object
+          minProperties: 1
+          maxProperties: 200
+          additionalProperties: { type: string }
+        title: { type: string, description: "title of the new document" }
+    risk: write_local
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]

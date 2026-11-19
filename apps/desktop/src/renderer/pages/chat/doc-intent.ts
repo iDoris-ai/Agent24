@@ -82,7 +82,9 @@ export function subjectOf(text: string, intent: DocIntent): string | null {
 
 /** Prefix the user turn so the Agent uses documents tools (D2b 正式版). */
 export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
-  const hint = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；document_id 可以直接填文件名）。'
+  const hint = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；'
+    + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
+    + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写，tracked=true 写成修订；document_id 可以直接填文件名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
   return `${head}${hint}\n${text}`
 }

@@ -13,6 +13,7 @@ import { askAboutDocument } from '../chat/doc-context'
 import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
+import DocxTools from './DocxTools'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -20,6 +21,7 @@ const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.presentationml.presentation',
 ])
 const isOffice = (media: string): boolean => OFFICE_TYPE.has(media)
+const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 
 type Detail = components['schemas']['DocumentDetail']
 type Block = components['schemas']['DocumentsTextBlock']
@@ -552,6 +554,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
           )}
           {downloadText ? <p role="status">{downloadText}</p> : null}
           {convertNote && <p role={convertNote.ok ? 'status' : 'alert'}>{convertNote.text}</p>}
+          {detail.head.media_type === DOCX_TYPE && (
+            <DocxTools key={detail.document_id} api={api} documentId={detail.document_id} title={detail.title ?? ''} onAdded={onAdded} />
+          )}
         </div>
       )}
       {detail && !isOffice(detail.head.media_type) && (

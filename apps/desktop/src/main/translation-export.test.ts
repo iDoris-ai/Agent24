@@ -4,7 +4,7 @@ import path from 'node:path'
 import { execFileSync } from 'node:child_process'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { crc32, docxBytes } from './docx-write'
-import { exportTranslation, safeTitle, type ExportDeps } from './translation-export'
+import { exportTranslation, safeTitle, saveToDownloads, type ExportDeps } from './translation-export'
 
 const roots: string[] = []
 
@@ -97,5 +97,32 @@ describe('safeTitle (General 11-18)', () => {
     expect(safeTitle('房屋租赁合同-测试.pdf')).toBe('房屋租赁合同-测试')
     expect(safeTitle('Report.DOCX')).toBe('Report')
     expect(safeTitle('v1.2 plan')).toBe('v1.2 plan')
+  })
+})
+
+describe('saveToDownloads (D5a)', () => {
+  it('writes the document under its title with its type\'s extension, a taken name getting (2)', async () => {
+    const downloads = tempDir()
+    const deps: ExportDeps = {
+      dataDir: () => tempDir(),
+      downloadsDir: () => downloads,
+      importAndConvert: vi.fn(),
+      fetchContent: vi.fn(async () => ({ ok: true as const, data: Buffer.from('PK-docx').toString('base64'), mediaType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' })),
+    }
+    const first = await saveToDownloads(deps, 'doc_x', '租赁合同（填写）.docx')
+    expect(first).toEqual({ ok: true, docxName: '租赁合同（填写）.docx' })
+    expect(fs.readFileSync(path.join(downloads, '租赁合同（填写）.docx'), 'utf8')).toBe('PK-docx')
+    const second = await saveToDownloads(deps, 'doc_x', '租赁合同（填写）.docx')
+    expect(second.docxName).toBe('租赁合同（填写） (2).docx')
+  })
+
+  it('says why when the file cannot be read', async () => {
+    const deps: ExportDeps = {
+      dataDir: () => null,
+      downloadsDir: () => tempDir(),
+      importAndConvert: vi.fn(),
+      fetchContent: vi.fn(async () => ({ ok: false as const, code: 'not_found', message: 'no such document' })),
+    }
+    expect(await saveToDownloads(deps, 'doc_x', 'a')).toEqual({ ok: false, code: 'not_found', message: 'no such document' })
   })
 })

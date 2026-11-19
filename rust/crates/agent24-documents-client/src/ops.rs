@@ -84,6 +84,8 @@ enum Answer {
     /// A rendered page: PNG bytes and their scale ([`to_page`]), at most
     /// the one asked for (1 when none was).
     Png { asked: f64 },
+    /// A document's file: its bytes in base64 and its media type ([`to_file`]).
+    File,
 }
 
 /// The request's optional keys, each `None` when present but malformed.
@@ -327,6 +329,42 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let path = format!("{BASE}/documents/{document}/patches");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
+        // D5a: a DOCX template's `{{fields}}`.
+        "fields" => {
+            let document = k.id("documentId", "doc_")?;
+            let (method, path, body, headers, _) =
+                get(format!("{BASE}/documents/{document}/fields"));
+            (method, path, body, headers, Answer::Json)
+        }
+        // D5a: the template with its fields filled, as a new document.
+        "fill" => {
+            let document = k.id("documentId", "doc_")?;
+            let values = k.0.get("values")?.as_object()?;
+            if !(1..=200).contains(&values.len())
+                || values.iter().any(|(name, value)| {
+                    !(1..=64).contains(&name.chars().count())
+                        || value.as_str().is_none_or(|v| v.chars().count() > 100_000)
+                })
+            {
+                return None;
+            }
+            let mut body = json!({"values": values});
+            if let Some(title) = k.optional("title", |v| {
+                v.as_str()
+                    .filter(|t| (1..=500).contains(&t.chars().count()))
+            })? {
+                body["title"] = json!(title);
+            }
+            let path = format!("{BASE}/documents/{document}/fill");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        // D5a: the head revision's file, to be saved (at most the reply limit).
+        "content" => {
+            let document = k.id("documentId", "doc_")?;
+            let (method, path, body, headers, _) =
+                get(format!("{BASE}/documents/{document}/content"));
+            (method, path, body, headers, Answer::File)
+        }
         // D1: an Office document as a new PDF document.
         "convert" => {
             let document = k.id("documentId", "doc_")?;
@@ -427,6 +465,35 @@ fn to_page(reply: Reply, asked: f64) -> Response {
     }
 }
 
+/// A 2xx file reply as `{media_type, bytes, data}` (base64); anything else
+/// as [`to_response`] reads it.
+fn to_file(reply: Reply) -> Response {
+    let Reply::Http {
+        status,
+        headers,
+        body,
+    } = &reply
+    else {
+        return to_response(reply);
+    };
+    if !(200..300).contains(status) {
+        return to_response(reply);
+    }
+    let media_type = headers
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+        .map(|(_, v)| v.split(';').next().unwrap_or("").trim().to_owned())
+        .unwrap_or_default();
+    Response::Ok {
+        status: *status,
+        data: json!({
+            "media_type": media_type,
+            "bytes": body.len(),
+            "data": base64::engine::general_purpose::STANDARD.encode(body),
+        }),
+    }
+}
+
 /// The answer to a request [`route`] does not take: 400 `invalid_request`.
 pub fn refused() -> Response {
     Response::fail(400, "invalid_request", "not an allowed documents operation")
@@ -437,6 +504,7 @@ pub async fn call<T: Transport + Sync>(req: &Value, transport: &T) -> Response {
     match routed(req) {
         Some((request, Answer::Json)) => to_response(transport.send(request).await),
         Some((request, Answer::Png { asked })) => to_page(transport.send(request).await, asked),
+        Some((request, Answer::File)) => to_file(transport.send(request).await),
         None => refused(),
     }
 }

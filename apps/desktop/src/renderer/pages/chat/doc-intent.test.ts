@@ -44,16 +44,20 @@ describe('D2b document intents in a conversation about a document', () => {
   })
 })
 
+const HINT = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；'
+  + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
+  + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写，tracked=true 写成修订；document_id 可以直接填文件名）。'
+
 describe('docAgentPrompt', () => {
   it('names the current document when there is one, then the tools hint and the user text', () => {
     expect(docAgentPrompt({ id: 'doc_1', title: '保单.pdf' }, '拆出第 2 页')).toBe(
-      '当前对话的文档：《保单.pdf》（document_id: doc_1）。\n需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；document_id 可以直接填文件名）。\n拆出第 2 页',
+      `当前对话的文档：《保单.pdf》（document_id: doc_1）。\n${HINT}\n拆出第 2 页`,
     )
   })
 
   it('adds only the tools hint when there is no current document', () => {
     expect(docAgentPrompt(null, '把两份合并')).toBe(
-      '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；document_id 可以直接填文件名）。\n把两份合并',
+      `${HINT}\n把两份合并`,
     )
   })
 })

@@ -1,7 +1,7 @@
 import path from 'node:path'
 import { ipcMain, shell } from 'electron'
 import { IpcChannels, type TranslationExportResult } from '../../shared/ipc-types'
-import { exportTranslation, type ExportDeps } from '../translation-export'
+import { exportTranslation, saveToDownloads, type ExportDeps } from '../translation-export'
 import type { IpcGuard } from './guard'
 
 const MAX_TITLE = 500
@@ -50,5 +50,13 @@ export function registerTranslationExport(options: { guard: IpcGuard; deps: Expo
     const req = requestOf(args[0])
     if (!('title' in req)) return req
     return exportTranslation(options.deps, req)
+  }))
+  // D5a: a library document saved to Downloads (`documentId`, `title`).
+  ipcMain.handle(IpcChannels.DocumentsSaveDownload, options.guard(async (_event, ...args: unknown[]) => {
+    const [id, title] = args
+    if (args.length !== 2 || typeof id !== 'string' || !/^doc_[0-9A-Z]{26}$/.test(id) || typeof title !== 'string' || title.length > MAX_TITLE) {
+      throw new Error('documents:save-download takes a document id and a title')
+    }
+    return saveToDownloads(options.deps, id, title)
   }))
 }

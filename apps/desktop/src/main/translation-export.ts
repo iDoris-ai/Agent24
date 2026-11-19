@@ -17,6 +17,8 @@ export interface ExportDeps {
    * is in the library, or with why not (`engine_unavailable`: the converter
    * is not installed). */
   importAndConvert: (docxPath: string, pdfTitle: string) => Promise<{ ok: boolean; code?: string; message?: string }>
+  /** D5a: a library document's current file (the `content` op), base64. */
+  fetchContent?: (documentId: string) => Promise<{ ok: true; data: string; mediaType: string } | { ok: false; code?: string; message?: string }>
 }
 
 export interface ExportResult {
@@ -83,5 +85,33 @@ export async function exportTranslation(
     return { ok: false, code: 'export_failed', message: error instanceof Error ? error.message : String(error) }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+const EXT_OF: Record<string, string> = {
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'application/pdf': '.pdf',
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+}
+
+/** D5a: a library document (a filled template, a patched DOCX) saved as a
+ * file of the Downloads folder, under its title; a name already there gets
+ * 「 (2)」. */
+export async function saveToDownloads(deps: ExportDeps, documentId: string, title: string): Promise<ExportResult> {
+  if (!deps.fetchContent) return { ok: false, code: 'export_failed', message: 'saving is not available' }
+  const got = await deps.fetchContent(documentId)
+  if (!got.ok) return { ok: false, code: got.code ?? 'export_failed', message: got.message ?? 'the file could not be read' }
+  try {
+    const downloads = deps.downloadsDir()
+    fs.mkdirSync(downloads, { recursive: true })
+    const stem = safeTitle(title)
+    const name = uniqueName(downloads, stem === 'translation' ? 'document' : stem, EXT_OF[got.mediaType] ?? '')
+    fs.writeFileSync(path.join(downloads, name), Buffer.from(got.data, 'base64'))
+    return { ok: true, docxName: name }
+  } catch (e) {
+    return { ok: false, code: 'export_failed', message: e instanceof Error ? e.message : String(e) }
   }
 }

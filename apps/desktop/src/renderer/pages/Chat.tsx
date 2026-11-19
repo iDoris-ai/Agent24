@@ -222,7 +222,8 @@ export default function ChatPage() {
     const doc = documentOf(sessionId)
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
-    const wantsDocTool = /拆|合并|合成|split|merge|combine/i.test(text)
+    // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
+    const wantsDocTool = /拆|合并|合成|split|merge|combine|模板|填写|填好|填入|生成初稿|修订|改写|template|fill/i.test(text)
     if (wantsDocTool && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).

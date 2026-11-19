@@ -73,6 +73,18 @@ export function approvalText(a: Pick<Approval, 'summary'>, t: (key: string, vars
       .join(' + ')
     return t('task.ask.compose', { title: str(args['title']), parts })
   }
+  if (tool === 'documents.paragraphs') return t('task.ask.paragraphs', { doc: str(args['document_id']) })
+  if (tool === 'documents.fields') return t('task.ask.fields', { doc: str(args['document_id']) })
+  if (tool === 'documents.fill' && args['values'] && typeof args['values'] === 'object') {
+    const values = Object.entries(args['values'] as Record<string, unknown>)
+      .map(([k, v]) => `${k}=${str(v)}`)
+      .join('，')
+    return t('task.ask.fill', { doc: str(args['document_id']), values: values.length > 300 ? `${values.slice(0, 300)}…` : values })
+  }
+  if (tool === 'documents.patch' && Array.isArray(args['edits'])) {
+    const edits = args['edits'] as Array<Record<string, unknown>>
+    return t(edits.some(e => e['tracked'] === true) ? 'task.ask.patchTracked' : 'task.ask.patch', { doc: str(args['document_id']), n: String(edits.length) })
+  }
   return summary.length > 160 ? `${summary.slice(0, 160)}…` : summary
 }
 

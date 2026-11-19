@@ -36,6 +36,17 @@ export async function compose(api: Api, parts: Parts, title: string, sleep: Slee
   return waitJob(api, res.data, sleep)
 }
 
+/** E1b/D5a: a DOCX filled or patched into a new document; waits for its import. */
+export async function makeDocx(
+  api: Api,
+  req: Extract<DocumentsRequest, { op: 'fill' | 'patch' }>,
+  sleep: Sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)),
+): Promise<ComposeOutcome> {
+  const res = await api.request(req)
+  if (!res.ok) return { ok: false, message: describeError(res) }
+  return waitJob(api, res.data as Job, sleep)
+}
+
 /** Office → PDF. `engineMissing` is LibreOffice not installed yet. */
 export async function convert(api: Api, documentId: string, title?: string, sleep: Sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))): Promise<ComposeOutcome> {
   const res = await api.request(title === undefined ? { op: 'convert', documentId } : { op: 'convert', documentId, title })
