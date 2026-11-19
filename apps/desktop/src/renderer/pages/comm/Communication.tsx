@@ -194,9 +194,10 @@ export default function CommunicationPage() {
   const [contactNpub, setContactNpub] = useState('')
   const [contactRole, setContactRole] = useState('')
   const [contactError, setContactError] = useState<string | null>(null)
+  const [contactNotice, setContactNotice] = useState<string | null>(null)
+  const [copyFeedback, setCopyFeedback] = useState<string | null>(null)
   const [relayDraft, setRelayDraft] = useState('')
   const relayDraftDirty = useRef(false)
-  const [messageTo, setMessageTo] = useState('')
   const [messageText, setMessageText] = useState('')
   const contactNameRef = useRef<HTMLInputElement>(null)
   const [restore, setRestore] = useState<{ ticket: string; fileName: string } | null>(null)
@@ -240,7 +241,10 @@ export default function CommunicationPage() {
     }
     if (results[0].status === 'fulfilled') setIdentities(results[0].value)
     else fail('error.identities', results[0].reason)
-    if (results[1].status === 'fulfilled') setContacts(results[1].value)
+    if (results[1].status === 'fulfilled') {
+      const refreshedContacts = results[1].value
+      setContacts((current) => [...refreshedContacts, ...(current ?? []).filter((contact) => !refreshedContacts.some((item) => item.npub === contact.npub))])
+    }
     else fail('error.contacts', results[1].reason)
     if (results[2].status === 'fulfilled') {
       setRelays(results[2].value)
@@ -425,9 +429,11 @@ export default function CommunicationPage() {
     try {
       await navigator.clipboard.writeText(npub)
       setCopied(npub)
+      setCopyFeedback(t('identity.copied'))
       setTimeout(() => { if (mounted.current) setCopied((current) => (current === npub ? null : current)) }, 2000)
+      setTimeout(() => { if (mounted.current) setCopyFeedback(null) }, 2000)
     } catch {
-      setActionError(t('identity.copyFailed'))
+      setCopyFeedback(t('identity.copyFailed'))
     }
   }
 
@@ -586,6 +592,7 @@ export default function CommunicationPage() {
     const npubValue = contactNpub.trim()
     if (!npubValue.startsWith('npub1')) { setContactError(t('contact.npubInvalid')); return }
     setContactError(null)
+    setContactNotice(null)
     setPending('contact')
     setActionError(null)
     setNotice(null)
@@ -594,17 +601,23 @@ export default function CommunicationPage() {
       await addCommContact(contactName.trim(), npubValue, contactRole.trim())
       if (mounted.current) {
         setContactName(''); setContactNpub(''); setContactRole('')
-        setNotice(t('contact.added'))
+        setContacts((current) => [...(current ?? []).filter((item) => item.npub !== npubValue), { nickname: contactName.trim(), npub: npubValue, role: contactRole.trim() }])
+        setSelectedPeer(npubValue)
+        setSettingsOpen(false)
       }
     } catch (error) {
-      if (mounted.current) setActionError(messageOf(error))
+      if (mounted.current) {
+        const cancelled = typeof error === 'object' && error !== null && 'code' in error && error.code === 'cancelled'
+        setContactNotice(cancelled ? t('contact.cancelled') : null)
+        setContactError(cancelled ? null : messageOf(error))
+      }
     } finally {
       if (mounted.current) { setPending(null); void refresh() }
     }
   }
 
   const submitMessage = async (retry?: Extract<LocalOutgoing, { state: 'failed' }>) => {
-    const to = retry?.peer ?? selectedPeer ?? messageTo.trim()
+    const to = retry?.peer ?? selectedPeer ?? ''
     const body = retry?.content ?? messageText.trim()
     if (pending === 'send' || !to || !body) return
     // A contact nickname or any raw npub; contacts are only a local name book.
@@ -667,7 +680,7 @@ export default function CommunicationPage() {
   return (
     <main className={`content comm-page${settingsOpen ? ' settings-open' : ''}`}>
       {loadError && <ErrorNotice className="comm-alert" message={loadError} actionLabel={t('action.retry')} detailsLabel={t('error.details')} onAction={() => void refresh()} details={loadErrorDetails} />}
-      {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
+      {copyFeedback && <div role={copyFeedback === t('identity.copyFailed') ? 'alert' : 'status'} className={copyFeedback === t('identity.copyFailed') ? 'comm-alert' : 'comm-notice'}>{copyFeedback}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
       {notice && <div role="status" className="comm-notice">
         <span>{notice}</span>
@@ -676,6 +689,7 @@ export default function CommunicationPage() {
       {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
       {setupState && (setupState !== 'ready' || settingsOpen) && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
+        {actionError && setupState !== 'ready' && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
         <h2>{t('wizard.title')}</h2>
         <ol className="comm-steps">
           <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? <span className="comm-step-mark"> ✓</span> : null}</li>
@@ -722,13 +736,14 @@ export default function CommunicationPage() {
       )}
 
       {!settingsOpen && <section className="comm-chat-shell" aria-label={t('chat.title')}>
+        {actionError && setupState === 'ready' && <div role="alert" className="comm-alert comm-chat-action-alert">{t('error.action', { message: actionError })}</div>}
         <aside className="comm-chat-sidebar" aria-label={t('chat.conversations')}>
           <div className="comm-chat-sidebar-head"><h1>{t('chat.title')}</h1><button type="button" aria-label={t('contact.add')} disabled={setupOnly} onClick={() => { setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>+</button></div>
           <input aria-label={t('chat.search')} placeholder={t('chat.search')} value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} />
           <div className="comm-conversation-list">
             {(() => {
               const me = identities?.find((item) => item.default)
-              const peers = new Map<string, CommHistoryItem[]>()
+              const peers = new Map<string, CommHistoryItem[]>((contacts ?? []).map((contact) => [contact.npub, []]))
               for (const item of history ?? []) {
                 const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
                 if (!peer) continue
@@ -736,8 +751,9 @@ export default function CommunicationPage() {
               }
               const rows = [...peers.entries()].map(([peer, items]) => {
                 const latest = peer === selectedPeer && conversationHistory?.length ? conversationHistory.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) : null
-                const last = latest && (!items.length || Date.parse(latest.at) > Date.parse(items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b).at)) ? latest : items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b)
-                return { peer, items, last }
+                const recent = items.length ? items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) : null
+                const last = latest && (!recent || Date.parse(latest.at) > Date.parse(recent.at)) ? latest : recent
+                return { peer, items, last: last ?? { id: `empty-${peer}`, from: peer, content: '', at: '', direction: 'in' as const }}
               })
                 .filter(({ peer, last }) => `${contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)} ${last.content}`.toLowerCase().includes(contactSearch.toLowerCase()))
                 .sort((a, b) => Date.parse(b.last.at) - Date.parse(a.last.at))
@@ -782,7 +798,7 @@ export default function CommunicationPage() {
         </div>
       </section>}
 
-      {settingsOpen && !setupOnly && <section className="comm-settings-panel" aria-label={t('chat.settings')}><div className="comm-section-heading"><h2>{t('chat.settings')}</h2><div className="comm-actions"><button type="button" onClick={() => setSettingsOpen(false)}>{t('chat.closeSettings')}</button><button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button></div></div>
+      {settingsOpen && !setupOnly && <section className="comm-settings-panel" aria-label={t('chat.settings')}>{actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}<div className="comm-section-heading"><button type="button" className="comm-back-button" onClick={() => setSettingsOpen(false)}>← {t('chat.backToChats')}</button><h2>{t('chat.settings')}</h2><div className="comm-actions"><button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button></div></div>
       <section className="comm-card">
         <h2>{t('section.identities')}</h2>
         {identities === null ? <p className="comm-muted">{t('empty.data')}</p> : identities.length === 0 ? <p className="comm-muted">{t('empty.identities')}</p> : (
@@ -820,40 +836,14 @@ export default function CommunicationPage() {
 
       <section className="comm-card" aria-label={t('contact.add')}>
         <h2>{t('contact.add')}</h2>
-        <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void submitContact() }}>
+        <form aria-label={t('contact.add')} className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void submitContact() }}>
           <label>{t('contact.nickname')}<input ref={contactNameRef} value={contactName} onChange={(event) => setContactName(event.target.value)} /></label>
           <label>{t('contact.npub')}<input value={contactNpub} placeholder="npub1…" onChange={(event) => { setContactNpub(event.target.value); setContactError(null) }} /></label>
           <label>{t('contact.role')}<input value={contactRole} onChange={(event) => setContactRole(event.target.value)} /></label>
           <button type="submit" disabled={pending !== null || !contactName.trim() || !contactNpub.trim()}>{t('contact.add')}</button>
           {contactError && <p role="alert" className="comm-alert">{contactError}</p>}
+          {contactNotice && <p role="status" className="comm-notice">{contactNotice}</p>}
         </form>
-      </section>
-
-      <section className="comm-card">
-        <div className="comm-section-heading"><h2>{t('message.title')}</h2>
-          <button type="button" onClick={() => void loadHistory()}>{t('message.refresh')}</button></div>
-        <form className="comm-setup-form" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}>
-          <label>{t('message.to')}<input list="comm-recipients" value={messageTo} placeholder={t('message.toPlaceholder')} onChange={(event) => setMessageTo(event.target.value)} /></label>
-          <datalist id="comm-recipients">{(contacts ?? []).map((c) => <option key={`${c.nickname}:${c.npub}`} value={c.nickname} />)}</datalist>
-          <label>{t('message.content')}<textarea rows={2} value={messageText} onChange={(event) => setMessageText(event.target.value)} /></label>
-          <button type="submit" disabled={pending !== null || !messageTo.trim() || !messageText.trim()}>{pending === 'send' ? t('message.sending') : t('message.send')}</button>
-        </form>
-        <h3>{t('message.recent')}</h3>
-        {history && history.length > 0 ? (
-          <ul className="comm-history">{history.map((item) => {
-            const known = contacts?.find((c) => c.npub === item.from || c.nickname === item.from)
-            const isNpub = item.from.startsWith('npub1')
-            const sender = known ? known.nickname : isNpub ? shortNpub(item.from) : item.from
-            return <li key={item.id}>
-              <span className="comm-muted">{item.at}{item.at && sender ? ' · ' : ''}{sender}</span>
-              <div>{item.content}</div>
-              {item.from && <div className="comm-row-actions">
-                <button type="button" onClick={() => setMessageTo(known ? known.nickname : item.from)}>{t('message.reply')}</button>
-                {!known && isNpub && <button type="button" onClick={() => { setContactNpub(item.from); setContactError(null); contactNameRef.current?.focus() }}>{t('message.addContact')}</button>}
-              </div>}
-            </li>
-          })}</ul>
-        ) : <p className="comm-muted">{t('message.empty')}</p>}
       </section>
 
       <section className="comm-card">
