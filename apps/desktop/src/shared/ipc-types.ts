@@ -157,6 +157,8 @@ export const IpcChannels = {
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
+  /** K2: check the Knowledge server now; answers the status with the result. */
+  KnowledgeCheck: 'knowledge:check',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
   // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
@@ -215,6 +217,8 @@ export interface KnowledgeStatus {
   hasKey: boolean
   /** On, complete and activated in the daemon. */
   active: boolean
+  /** K2: whether the server answered the last check (absent: not checked by this main). */
+  reachability?: { state: 'unknown' | 'ok' | 'unreachable' | 'unauthorized' | 'not_found'; checkedAt: string | null }
 }
 
 /** The key is optional: left out, the saved one is kept. */

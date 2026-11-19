@@ -257,6 +257,8 @@ const api = {
   // Knowledge settings: the key goes in, never comes back (main/knowledge-settings.ts).
   knowledge: {
     status: (): Promise<KnowledgeStatus> => ipcRenderer.invoke(IpcChannels.KnowledgeStatus),
+    /** K2: check the server now. */
+    check: (): Promise<KnowledgeStatus | null> => ipcRenderer.invoke(IpcChannels.KnowledgeCheck),
     configure: (input: KnowledgeConfigureInput): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>

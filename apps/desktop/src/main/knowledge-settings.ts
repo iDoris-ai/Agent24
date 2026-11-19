@@ -23,6 +23,7 @@ import type { HostResult, KnowledgeHost } from './knowledge-host'
 import { isPlainHostname } from './knowledge-hostname'
 import type { KnowledgeLoginStore } from './knowledge-logins'
 import type { KnowledgeSettingsResult, KnowledgeStatus } from '../shared/ipc-types'
+import type { KnowledgeReachability, ProbeInputs } from './knowledge-reachability'
 
 /** The binding the settings drive: one per desktop for now. */
 export const KNOWLEDGE_BINDING = 'default'
@@ -144,7 +145,31 @@ export class KnowledgeController {
       knowledgeBaseIds: [...this.settings.knowledgeBaseIds],
       hasKey: this.key() !== null,
       active: this.bindingForRun() !== null,
+      ...(this.reachability ? { reachability: this.reachability.current() } : {}),
     }
+  }
+
+  private reachability: KnowledgeReachability | null = null
+
+  /** K2: the server check this controller reports in `status()`, re-run on every change of settings. */
+  attachReachability(reachability: KnowledgeReachability): void {
+    this.reachability = reachability
+    this.onChange(() => { void reachability.check() })
+  }
+
+  /** K2: check now; the status with the result. */
+  async checkReachability(): Promise<KnowledgeStatus> {
+    await this.reachability?.check()
+    return this.status()
+  }
+
+  /** K2: what the server check asks with, or null while Off or incomplete. */
+  probeInputs(): ProbeInputs | null {
+    const key = this.key()
+    const knowledgeBaseId = this.settings.knowledgeBaseIds[0]
+    return this.settings.enabled && this.complete() && key !== null && knowledgeBaseId
+      ? { endpoint: this.settings.endpoint, knowledgeBaseId, key }
+      : null
   }
 
   /** Called whenever the settings in effect may have changed (KB-C2-03: the

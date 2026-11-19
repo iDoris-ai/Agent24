@@ -187,10 +187,12 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
         )}
       </span>
       {waiting && denying && (
-        <form style={DENY_FORM} onSubmit={e => { e.preventDefault(); if (reason.trim()) void decide({ type: 'deny', reason: reason.trim() }) }}>
+        // Loop 3 FU: a reason is welcome, not required; 「拒绝」 with none sends
+        // a plain one, rather than a button that silently does nothing.
+        <form style={DENY_FORM} onSubmit={e => { e.preventDefault(); void decide({ type: 'deny', reason: reason.trim() || t('task.denyDefault') }) }}>
           <input style={DENY_INPUT} aria-label={t('task.denyReason')} placeholder={t('task.denyReason')} value={reason}
             onChange={e => setReason(e.target.value)} disabled={busy} autoFocus />
-          <button type="submit" className="btn" disabled={busy || reason.trim() === ''}>{t('task.denySend')}</button>
+          <button type="submit" className="btn" disabled={busy}>{t('task.denySend')}</button>
           <button type="button" className="btn" disabled={busy} onClick={() => setDenying(false)}>{t('task.denyCancel')}</button>
         </form>
       )}

@@ -15,6 +15,7 @@ import { registerModelSource } from './ipc/model-source'
 import { registerOfficeEngine } from './ipc/office-engine'
 import { registerTranslationExport } from './ipc/translation-export'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
+import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
 import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
@@ -658,6 +659,13 @@ app.whenReady().then(async () => {
   // The user's Knowledge settings drive the one binding; Off keeps it inactive.
   knowledge = new KnowledgeController(knowledgeHost, loginStore, new KnowledgeSettingsStore(app.getPath('userData')))
   void knowledge.apply()
+  // K2: is the bound Knowledge server answering? Checked every minute while On.
+  {
+    const controller = knowledge
+    const reachability = new KnowledgeReachability({ inputs: () => controller.probeInputs(), fetch: (url, init) => net.fetch(url, init) })
+    controller.attachReachability(reachability)
+    reachability.start()
+  }
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {

@@ -987,6 +987,7 @@ export function registerIpcHandlers(options: {
   })
 
   handle(IpcChannels.KnowledgeStatus, (): KnowledgeStatus | null => knowledge()?.status() ?? null)
+  handle(IpcChannels.KnowledgeCheck, (): Promise<KnowledgeStatus | null> => knowledge()?.checkReachability() ?? Promise.resolve(null))
   handle(IpcChannels.KnowledgeConfigure, (_event, input: unknown): Promise<KnowledgeSettingsResult> => {
     const controller = knowledge()
     if (!controller || typeof input !== 'object' || input === null) {
