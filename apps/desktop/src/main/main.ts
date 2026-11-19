@@ -37,8 +37,8 @@ import {
   SIN90_OS,
   type BundledModuleDeps,
   documentsModuleOnDisk,
-  ensureBundledDocumentsModule,
   ensureBundledOsModules,
+  modulesToReplaceWhileStopped,
   execCli,
   installBundledDocumentsModule,
   packagesRootFor,
@@ -139,12 +139,12 @@ const serviceUpgrader = new ServiceUpgrader({
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
     const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold })
-    // U1: the bundled documents module waits for this stop too (one box, not two).
+    // U1: bundled modules that could not be replaced wait for this stop too (one box, not two).
     const replaceModule = moduleNeedsServiceStop
     return upgradeService(replaceModule ? { ...deps, between: () => replaceModule() } : deps)
   },
 })
-/** Set when the bundled documents module could not be replaced at launch
+/** Set when a bundled module (documents, Sin90) could not be replaced at launch
  * because the service daemon holds the store: the work to do once it is stopped. */
 let moduleNeedsServiceStop: (() => Promise<unknown>) | null = null
 const crashLoop = new CrashLoopDetector({
@@ -589,12 +589,14 @@ app.whenReady().then(async () => {
   ])
   backendManager.holdStartUntil(bundledModulesReady)
   // Service mode: the LaunchAgent's daemon holds the store, so a newer bundled
-  // documents module could not replace the installed one above. Once enrolled
-  // with that daemon, stop it (the presence box once), replace the module,
-  // and start it again.
-  void bundledModulesReady.then(async ([outcome]) => {
-    if (outcome !== 'install_failed' || !launchAgentPlistExists()) return
-    moduleNeedsServiceStop = () => ensureBundledDocumentsModule(documentsDeps).finally(() => { moduleNeedsServiceStop = null })
+  // module (documents, Sin90) could not replace the installed one above. Once
+  // enrolled with that daemon, stop it (the presence box once), replace every
+  // module that failed, and start it again.
+  void bundledModulesReady.then(async (outcomes) => {
+    const carried = [{ spec: DOCUMENTS_OS, deps: documentsDeps }, { spec: SIN90_OS, deps: sin90Deps }]
+    const failed = modulesToReplaceWhileStopped(carried, outcomes)
+    if (failed.length === 0 || !launchAgentPlistExists()) return
+    moduleNeedsServiceStop = () => ensureBundledOsModules(failed).finally(() => { moduleNeedsServiceStop = null })
     // Enrolled, and the presence connection up: the shutdown asks the box through it.
     for (let i = 0; i < 90 && !(serviceDaemonOf(backendManager) && presenceConnection?.ready === true); i++) await new Promise((r) => setTimeout(r, 1000))
     // U1: an upgrade of the service daemon is due: the module rides along in its stop.
@@ -606,7 +608,7 @@ app.whenReady().then(async () => {
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
     const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
     const done = await whileServiceStopped(deps, () => moduleNeedsServiceStop?.() ?? Promise.resolve('up_to_date'))
-    console.log('[documents-module] replaced with the service daemon stopped:', done.ok ? done.value : done.code)
+    console.log('[bundled-modules] replaced with the service daemon stopped:', done.ok ? done.value : done.code)
   })
   const documentsModuleAction = async (run: () => Promise<ModuleActionResult>): Promise<ModuleActionResult> => {
     await bundledModulesReady
