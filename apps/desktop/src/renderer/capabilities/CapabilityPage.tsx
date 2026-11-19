@@ -109,6 +109,13 @@ function DomainOsPage({ capability, whenMounted }: { capability: CapabilityDef; 
   else if (osError) status = c('status.unavailable')
 
   if (mounted && whenMounted) {
+    if (capability.id === 'sin90') return <main className="content">
+      {registered && newer && latest && <button type="button" disabled={busy} onClick={() => void install()}>{c('os.updateTo', { version: versionLabel(latest) })}</button>}
+      {phaseLabel && <p role="status">{phaseLabel}</p>}
+      {failure && <p role="alert">{failure}</p>}
+      {component?.kernel_consent === 'missing' && <KernelConsentCard name={capability.id} />}
+      {whenMounted()}
+    </main>
     return <main className="content">
       <h1 className="page-title">{c(capability.nameKey)}</h1>
       <p className="page-sub">{c(capability.descKey)}</p>

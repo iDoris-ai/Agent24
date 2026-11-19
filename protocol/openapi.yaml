@@ -4264,6 +4264,35 @@ paths:
         "504":
           $ref: "#/components/responses/CommTimeout"
 
+  /comm/history/conversation:
+    get:
+      operationId: listCommConversation
+      tags: [comm]
+      summary: Two-way history with one peer (nickname or npub)
+      parameters:
+        - { name: with, in: query, required: true, schema: { type: string } }
+        - { name: as, in: query, required: false, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 200 } }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
   /comm/inbox/pull:
     post:
       operationId: pullCommInbox

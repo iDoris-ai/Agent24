@@ -6,6 +6,8 @@ export interface Sin90Area {
   title: string
   status: string
   sort_key: number
+  current_state?: string | null
+  ideal_state?: string | null
 }
 
 export interface Sin90Direction {
@@ -14,6 +16,29 @@ export interface Sin90Direction {
   title: string
   status: string
   target_window: string
+  goal_3y?: string | null
+  goal_from_year?: number | null
+}
+
+export interface Sin90PeriodPlan {
+  id: string; direction_id: string; kind: 'year' | 'half' | 'quarter' | 'month'; period: string
+  parent_id: string | null; target: string; metric: 'none' | 'count' | 'minutes'; metric_target: number | null
+  routine_id: string | null; status: string
+}
+export interface Sin90PlanProgress { plan_id: string; actual: number | null; expected: number | null; status: 'on_track' | 'behind' | 'at_risk'; miss_streak: number }
+export interface Sin90ReviewSettings { auto: boolean; cadence: 'weekly' | 'monthly'; weekday: number; hour: number }
+
+export function legalPlanParents(kind: Sin90PeriodPlan['kind'], period: string, plans: readonly Sin90PeriodPlan[], directionId: string): Sin90PeriodPlan[] {
+  const allowed: Record<Sin90PeriodPlan['kind'], readonly Sin90PeriodPlan['kind'][]> = {
+    year: [], half: ['year'], quarter: ['half', 'year'], month: ['quarter'],
+  }
+  return plans.filter((parent) => {
+    if (parent.direction_id !== directionId || !allowed[kind].includes(parent.kind) || parent.status === 'dropped') return false
+    if (parent.period.slice(0, 4) !== period.slice(0, 4)) return false
+    if (parent.kind === 'half' && kind === 'quarter') return Math.floor((Number(period.slice(6)) - 1) / 2) === Number(parent.period.slice(6)) - 1
+    if (parent.kind === 'quarter' && kind === 'month') return Math.floor((Number(period.slice(5)) - 1) / 3) + 1 === Number(parent.period.slice(6))
+    return true
+  })
 }
 
 export interface Sin90Task {
@@ -58,7 +83,8 @@ export function parseArea(v: unknown): Sin90Area | null {
   const status = str(v['status'])
   if (!id || !title || !status) return null
   const sort = v['sort_key']
-  return { id, title, status, sort_key: typeof sort === 'number' ? sort : 0 }
+  return { id, title, status, sort_key: typeof sort === 'number' ? sort : 0,
+    current_state: optStr(v['current_state']), ideal_state: optStr(v['ideal_state']) }
 }
 
 export function parseDirection(v: unknown): Sin90Direction | null {
@@ -68,7 +94,33 @@ export function parseDirection(v: unknown): Sin90Direction | null {
   const status = str(v['status'])
   const target = str(v['target_window'])
   if (!id || !title || !status || !target) return null
-  return { id, area_id: optStr(v['area_id']), title, status, target_window: target }
+  return { id, area_id: optStr(v['area_id']), title, status, target_window: target,
+    goal_3y: optStr(v['goal_3y']), goal_from_year: typeof v['goal_from_year'] === 'number' ? v['goal_from_year'] : null }
+}
+
+export function readPeriodPlans(data: unknown): Sin90PeriodPlan[] {
+  if (!isObj(data) || !Array.isArray(data['period_plans'])) return []
+  return data['period_plans'].filter((row): row is Record<string, unknown> => isObj(row)
+    && typeof row['id'] === 'string' && typeof row['direction_id'] === 'string'
+    && (row['kind'] === 'year' || row['kind'] === 'half' || row['kind'] === 'quarter' || row['kind'] === 'month') && typeof row['period'] === 'string'
+    && typeof row['target'] === 'string' && typeof row['metric'] === 'string'
+    && typeof row['metric'] === 'string' && ['none','count','minutes'].includes(row['metric'])
+    && typeof row['status'] === 'string').map((row) => ({
+      id: String(row['id']), direction_id: String(row['direction_id']), kind: PLAN_KINDS.find((kind) => kind === row['kind']) ?? 'year', period: String(row['period']),
+      parent_id: optStr(row['parent_id']), target: String(row['target']), metric: row['metric'] === 'count' || row['metric'] === 'minutes' ? row['metric'] : 'none',
+      metric_target: typeof row['metric_target'] === 'number' ? row['metric_target'] : null,
+      routine_id: optStr(row['routine_id']), status: String(row['status']),
+    }))
+}
+const PLAN_KINDS = ['year', 'half', 'quarter', 'month'] as const
+
+export function readPlanProgress(data: unknown): Sin90PlanProgress[] {
+  if (!isObj(data) || !Array.isArray(data['progress'])) return []
+  return data['progress'].filter((row): row is Record<string, unknown> => isObj(row) && typeof row['plan_id'] === 'string')
+    .map((row) => ({ plan_id: String(row['plan_id']), actual: typeof row['actual'] === 'number' ? row['actual'] : null,
+      expected: typeof row['expected'] === 'number' ? row['expected'] : null,
+      status: row['status'] === 'behind' || row['status'] === 'at_risk' ? row['status'] : 'on_track',
+      miss_streak: typeof row['miss_streak'] === 'number' ? row['miss_streak'] : 0 }))
 }
 
 export function parseTask(v: unknown): Sin90Task | null {
@@ -354,4 +406,82 @@ export function latestRhythm(rhythms: readonly Sin90Rhythm[]): Sin90Rhythm | nul
   const open = rhythms.filter((rhythm) => rhythm.status !== 'retired')
   open.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
   return open[0] ?? null
+}
+
+export interface Sin90TemplateInfo {
+  id: string
+  lang: string
+  loaded_at: string
+  title: string
+  guide: string
+}
+
+export interface Sin90BackupItem {
+  name: string
+  at: string
+  bytes: number
+}
+
+export interface Sin90DataCounts {
+  areas: number
+  directions: number
+  tasks: number
+  plans: number
+  routines: number
+}
+
+export interface Sin90DataStatus {
+  template: Sin90TemplateInfo | null
+  backups: Sin90BackupItem[]
+  counts: Sin90DataCounts
+}
+
+export interface Sin90TemplateChoice {
+  id: string
+  langs: string[]
+  title: string
+}
+
+export function parseDataStatus(v: unknown): Sin90DataStatus {
+  if (!isObj(v)) {
+    return {
+      template: null,
+      backups: [],
+      counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+    }
+  }
+  const tmplRaw = v['template']
+  const template: Sin90TemplateInfo | null = isObj(tmplRaw)
+    ? {
+        id: str(tmplRaw['id']) ?? '',
+        lang: str(tmplRaw['lang']) ?? '',
+        loaded_at: str(tmplRaw['loaded_at']) ?? '',
+        title: str(tmplRaw['title']) ?? '',
+        guide: str(tmplRaw['guide']) ?? '',
+      }
+    : null
+  const backupsRaw = Array.isArray(v['backups']) ? v['backups'] : []
+  const backups: Sin90BackupItem[] = backupsRaw.filter(isObj).map((b) => ({
+    name: str(b['name']) ?? '',
+    at: str(b['at']) ?? '',
+    bytes: typeof b['bytes'] === 'number' ? b['bytes'] : 0,
+  }))
+  const c = isObj(v['counts']) ? v['counts'] : {}
+  const counts: Sin90DataCounts = {
+    areas: typeof c['areas'] === 'number' ? c['areas'] : 0,
+    directions: typeof c['directions'] === 'number' ? c['directions'] : 0,
+    tasks: typeof c['tasks'] === 'number' ? c['tasks'] : 0,
+    plans: typeof c['plans'] === 'number' ? c['plans'] : 0,
+    routines: typeof c['routines'] === 'number' ? c['routines'] : 0,
+  }
+  return { template, backups, counts }
+}
+
+export function parseTemplates(v: unknown): Sin90TemplateChoice[] {
+  if (!Array.isArray(v)) return []
+  return v.filter(isObj).map((item) => ({
+    id: str(item['id']) ?? '',
+    langs: Array.isArray(item['langs']) ? item['langs'].filter((l): l is string => typeof l === 'string') : [],
+    title: str(item['title']) ?? '',
+  }))
 }

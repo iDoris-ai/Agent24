@@ -180,6 +180,7 @@ pub fn router(state: CommState) -> Router {
         .route("/daemon/stop", post(daemon_stop))
         .route("/send", post(send_message))
         .route("/history", get(get_history))
+        .route("/history/conversation", get(get_conversation_history))
         .route("/inbox/pull", post(pull_inbox))
         .route("/outbox", get(list_outbox))
         .route("/outbox/{event_id}/retry", post(retry_outbox))
@@ -1706,6 +1707,14 @@ struct HistoryQuery {
     limit: Option<u32>,
 }
 
+#[derive(Deserialize, Default)]
+struct ConversationHistoryQuery {
+    with: Option<String>,
+    #[serde(rename = "as")]
+    as_: Option<String>,
+    limit: Option<u32>,
+}
+
 /// `GET /comm/history?as=&limit=` → `history inbox --as A --limit N` (§4).
 /// Pull-based, not push-based (JOINT-ROUND1 F1): a caller that wants fresh
 /// inbound messages reflected here must call `POST /comm/inbox/pull` first
@@ -1729,6 +1738,61 @@ async fn get_history(
     };
     let limit_str = q.limit.map(|limit| limit.to_string());
     let mut argv: Vec<&str> = vec!["history", "inbox", "--as", &as_nickname];
+    if let Some(limit_str) = &limit_str {
+        argv.push("--limit");
+        argv.push(limit_str);
+    }
+    run_read(runner, &argv).await
+}
+
+/// `GET /comm/history/conversation?with=W&as=&limit=` → bidirectional history.
+async fn get_conversation_history(
+    State(state): State<CommState>,
+    query: Result<Query<ConversationHistoryQuery>, axum::extract::rejection::QueryRejection>,
+) -> CommResult {
+    let (runner, ..) = state.require_ready()?;
+    let Query(q) = query.map_err(|e| CommError::Invalid(e.body_text()))?;
+    let with = q
+        .with
+        .filter(|name| {
+            (!name.is_empty()
+                && !name.starts_with('-')
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)))
+                || (name.len() == 63
+                    && name.starts_with("npub1")
+                    && name[5..].bytes().all(|b| {
+                        b == b'0'
+                            || (b'2'..=b'9').contains(&b)
+                            || (b'a'..=b'c').contains(&b)
+                            || (b'h'..=b'j').contains(&b)
+                            || b == b'n'
+                            || (b'p'..=b'z').contains(&b)
+                    }))
+        })
+        .ok_or_else(|| CommError::Invalid("with must be a nickname or valid npub".to_owned()))?;
+    if let Some(limit) = q.limit
+        && !(1..=200).contains(&limit)
+    {
+        return Err(CommError::Invalid(format!(
+            "limit must be in 1..=200, got {limit}"
+        )));
+    }
+    let as_nickname = match q.as_ {
+        Some(nickname) => nickname,
+        None => resolve_default_nickname(runner).await?,
+    };
+    let limit_str = q.limit.map(|limit| limit.to_string());
+    let mut argv: Vec<&str> = vec![
+        "history",
+        "conversation",
+        "--with",
+        &with,
+        "--as",
+        &as_nickname,
+    ];
     if let Some(limit_str) = &limit_str {
         argv.push("--limit");
         argv.push(limit_str);
@@ -2937,7 +3001,7 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
             "#!/bin/sh\necho '{\"ok\":true,\"data\":{\"relays\":[],\"source\":\"default\"}}'\n";
         let state = ready_state_with_script(tmp.path(), script).await;
         let (status, body) = call(router(state), "GET", "/relay", None).await;
-        assert_eq!(status, StatusCode::OK);
+        assert_eq!(status, StatusCode::OK, "{body:?}");
         assert_eq!(body["ok"], true);
         assert_eq!(body["data"]["configured"], false);
     }
@@ -3934,6 +3998,61 @@ echo '{"ok":true,"data":{"relays":["wss://a","wss://b"],"source":"config"}}'
         let (status, body) = call(router(state), "GET", "/history?limit=0&as=alice", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
         assert_eq!(body["error"], "invalid");
+    }
+
+    #[tokio::test]
+    async fn conversation_history_maps_arguments_and_rejects_invalid_contact_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+[ "$1" = history ] && [ "$2" = conversation ] && [ "$3" = --with ] && [ "$4" = bob.smith ] && [ "$5" = --as ] && [ "$6" = alice ] && [ "$7" = --limit ] && [ "$8" = 17 ] || exit 9
+echo '{"ok":true,"data":[]}'
+"#;
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let (status, body) = call(
+            router(state.clone()),
+            "GET",
+            "/history/conversation?with=bob.smith&as=alice&limit=17",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
+        let (status, body) = call(
+            router(state.clone()),
+            "GET",
+            "/history/conversation?with=bad%20name&as=alice",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid");
+        // A leading dash would read as a CLI flag, not a nickname.
+        let (status, body) = call(
+            router(state),
+            "GET",
+            "/history/conversation?with=--help&as=alice",
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+        assert_eq!(body["error"], "invalid");
+    }
+
+    #[tokio::test]
+    async fn conversation_history_accepts_npub_for_unknown_peers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let npub = format!("npub1{}", "a".repeat(58));
+        let script = format!(
+            "#!/bin/sh\n[ \"$1\" = history ] && [ \"$2\" = conversation ] && [ \"$3\" = --with ] && [ \"$4\" = \"{npub}\" ] || exit 9\necho '{{\"ok\":true,\"data\":[]}}'\n"
+        );
+        let state = ready_state_with_script(tmp.path(), &script).await;
+        let (status, body) = call(
+            router(state),
+            "GET",
+            &format!("/history/conversation?with={npub}&as=alice"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body:?}");
     }
 
     /// Codex 挑战（B 端 gpt-6-astra）Medium：`?limit=abc` 这种连类型都不对的

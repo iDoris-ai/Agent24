@@ -1945,6 +1945,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/history/conversation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Two-way history with one peer (nickname or npub) */
+        get: operations["listCommConversation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/comm/inbox/pull": {
         parameters: {
             query?: never;
@@ -9002,6 +9019,36 @@ export interface operations {
     listCommHistory: {
         parameters: {
             query?: {
+                as?: string;
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    listCommConversation: {
+        parameters: {
+            query: {
+                with: string;
                 as?: string;
                 limit?: number;
             };

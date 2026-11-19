@@ -27,7 +27,7 @@
 - 对端回执。T01 冻结前，消息状态的 L3「对端确认」只预留位置（§5.1）。
 - `profile publish` 无头注册（`6bd9e437` 已在基线内，但需要单独验收）。
 - 群聊、TUI、`--auto-reply`。
-- relay 单次查询（`agent inbox`）、按联系人查会话（G7）。
+- relay 单次查询（`agent inbox`）。按联系人查会话已由 Hyphae v0.30.1 支持（G7 已解决），见 `GET /comm/history/conversation`。
 
 **原型阶段砍掉**（M12）：systemd 凭据、周期性 relay 探测、日志轮转。
 **Windows**：依赖 DEP-A7，见 §9。
@@ -196,6 +196,7 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
 | `POST /comm/relay/probe` | `{url?}` | `{url,connected}`，写入 daemon 状态的 `relay_probe` | `relay info [U] --timeout 5`，只在手动触发时执行 |
 | `POST /comm/send` | `{to, content, from?, encrypt=true}` | §5.1 | `agent msg --from F --to T --content C [--encrypt=false]` ⚿ |
 | `GET /comm/history?as=&limit=` | limit 1..=200 | 收件历史 | `history inbox --as A --limit N` |
+| `GET /comm/history/conversation?with=W&as=&limit=` | with 必填；limit 1..=200 | 与联系人的双向历史 | `history conversation --with W --as A --limit N` |
 | `POST /comm/inbox/pull`（COMM-3 新增，原表没有） | `{as?}` | 透传 `agent inbox` 的返回值 | `agent inbox --as A --password-stdin` ⚿ |
 | `GET /comm/outbox?failed_only=` | — | outbox 条目 | `storage outbox list [--failed-only]` |
 | `POST /comm/outbox/{event_id}/retry` | — | `{event_id,attempted,sent,queued,…}` | `storage outbox retry --id E`：沿用原签名事件 |
@@ -206,7 +207,7 @@ Agent24 现有的 token 鉴权照常适用。响应格式与 Hyphae 一致：`{o
 | `POST /comm/unlock` | 严格 `{password, remember?}`；remember 缺省 false | `{unlocked, remembered}` | 用真实 `identity check-password --password-stdin` 校验；`remember=true` 写入或替换钥匙串，false 仅保存在进程内 overlay（M4） |
 
 - `from` / `as` 缺省时，取 `identity list` 中 `default:true` 的那一项。
-- **已删除的路由**：`GET /comm/inbox`（M12）、`GET /comm/history?with=`。删后者是因为 `history conversation` 在基线版本不输出 JSON（H1、G7）。
+- **已删除的路由**：`GET /comm/inbox`（M12）、`GET /comm/history?with=`。删后者是因为 `history conversation` 在基线版本不输出 JSON（H1、G7）。锁定版本升到 Hyphae v0.30.1 后，`history conversation --json` 已可用，按联系人查会话以独立路由 `GET /comm/history/conversation` 重新提供（2026-11-19，#1919）。
 - **`POST /comm/inbox/pull`（COMM-3 补充，不在本文最初的路由表里）**：联调记录
   `docs/comm/JOINT-ROUND1.md` F1 发现 `history inbox` 是纯拉取式（pull-based），
   不是推送式——对加密 keystore，必须先成功执行一次 `agent inbox --as
@@ -470,7 +471,7 @@ COMM-3 + COMM-6 → 7
 | G4 | history 不带对端回执 | L3 等 T01 |
 | G5 | `--version` 输出 `dev` | 以 sha256 为准；建议 Hyphae release 用 ldflags 注入版本号 |
 | G6 | 非法 npub 返回 `other_error`（退出码 4） | comm 在调用前自行校验 |
-| G7 | `history conversation` 不支持 `--json`（H1）；另外 `storage info --json` 在数据库还没创建时也只输出文本 | 已删除 `?with=` 路由。请 Hyphae 为这两个命令补上 JSON envelope |
+| G7 | `history conversation` 不支持 `--json`（H1）；另外 `storage info --json` 在数据库还没创建时也只输出文本 | **已解决（v0.30.1）**：`history conversation --json` 可用，已新增 `GET /comm/history/conversation`。`storage info` 未核实 |
 | G8 | `SaveKeyStore` 是读-改-rename，中间无锁，并发写会丢失新身份的私钥（H3） | comm 用 KeystoreWriteLock 串行化。请 Hyphae 在 keystore 的读-改-写全程持有 flock |
 | G9 | 正文只能通过 `--content` 经 argv 传入（M7） | 列为已知限制。请 Hyphae 提供 `--content-file` 或 `--content-stdin` |
 
@@ -478,7 +479,7 @@ COMM-3 + COMM-6 → 7
 
 | 条目 | 评审意见 | 处置 |
 |---|---|---|
-| H1 | `history conversation` 没有 JSON 输出 | 删除 `GET /comm/history?with=`；新增 G7 |
+| H1 | `history conversation` 没有 JSON 输出 | **已解决（v0.30.1）**，见 G7 |
 | H2 | outbox 在 `outbox.json` 和 `.lock` 中，不在 db 里 | 更正 §2；import 复制 `outbox.json`；COMM-2b 验收加入「导入前后 outbox 条目数一致」 |
 | H3 | keystore 读-改-rename 无锁，会丢私钥 | 新增 `KeystoreWriteLock` 和 `run_keystore_write`，用于 create、use、contact add、import；COMM-2a 加入 10 路并发验收；新增 G8 |
 | H4 | 测试方案无法落地 | lock 加入配方与 Go 版本，并附本机复现的候选 hash；CI 按 lock 构建 linux-x64；T1/T2 下沉到 crate 内（oneshot 加 `test-lock-override` feature）；T3 走 agent24d 黑盒，计数 stub 照 me4 的做法 |

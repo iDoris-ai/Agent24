@@ -118,6 +118,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('POST', '/api/v1/comm/relay/probe'), // [E]
   r('GET', '/api/v1/comm/contact'),
   r('GET', '/api/v1/comm/history'),
+  r('GET', '/api/v1/comm/history/conversation'),
   // NOT here on purpose, each has its own validated IPC in main:
   //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm, own password window, save dialog)
   //   POST /api/v1/comm/identity/import  (CommImportPick + CommIdentityImport: native open dialog, own password window)
@@ -139,6 +140,9 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/sin90/directions'),
   r('GET', '/api/v1/sin90/tasks'),
   r('GET', '/api/v1/sin90/areas'),
+  r('GET', '/api/v1/sin90/period-plans'),
+  r('GET', '/api/v1/sin90/progress'),
+  r('GET', '/api/v1/sin90/settings/review'),
   r('GET', '/api/v1/sin90/weeks'),
   r('GET', '/api/v1/sin90/weeks/{id}/attention'),
   r('GET', '/api/v1/sin90/schedule-blocks'),
@@ -146,6 +150,8 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/sin90/rhythms'),
   r('GET', '/api/v1/sin90/proposals'),
   r('GET', '/api/v1/sin90/reviews'),
+  r('GET', '/api/v1/sin90/data/status'),
+  r('GET', '/api/v1/sin90/templates'),
 ]
 
 /** A path segment value a `{param}` may bind: no traversal, no separators,

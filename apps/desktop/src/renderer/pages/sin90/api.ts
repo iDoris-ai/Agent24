@@ -2,7 +2,9 @@
 
 import {
   readAreas, readBlocks, readDirections, readProposals, readReviews, readRhythms, readRoutines, readTasks, readToday, readWeekAttention, readWeeks,
-  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention,
+  readPeriodPlans, readPlanProgress, parseDataStatus, parseTemplates,
+  type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Rhythm, type Sin90Routine, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention, type Sin90PeriodPlan, type Sin90PlanProgress, type Sin90ReviewSettings,
+  type Sin90DataStatus, type Sin90TemplateChoice,
 } from './model'
 
 export class WriteFailed extends Error {
@@ -35,6 +37,23 @@ export async function sin90Get(path: string): Promise<unknown> {
 
 export function fetchAreas(): Promise<Sin90Area[]> {
   return sin90Get('/api/v1/sin90/areas').then(readAreas)
+}
+
+/** Optional Sin90 v0.6 endpoint. Older daemons return no plan data. */
+export function fetchPeriodPlans(): Promise<unknown | null> {
+  return sin90Get('/api/v1/sin90/period-plans').catch(() => null)
+}
+export function fetchPlans(): Promise<Sin90PeriodPlan[]> { return sin90Get('/api/v1/sin90/period-plans').then(readPeriodPlans).catch(() => []) }
+export function fetchProgress(directionId: string): Promise<Sin90PlanProgress[]> {
+  return sin90Get(`/api/v1/sin90/progress?direction_id=${encodeURIComponent(directionId)}`).then(readPlanProgress)
+}
+export function fetchReviewSettings(): Promise<Sin90ReviewSettings> {
+  return sin90Get('/api/v1/sin90/settings/review').then((value) => {
+    if (typeof value !== 'object' || value === null || !('auto' in value) || typeof value.auto !== 'boolean'
+      || !('cadence' in value) || (value.cadence !== 'weekly' && value.cadence !== 'monthly')
+      || !('weekday' in value) || typeof value.weekday !== 'number' || !('hour' in value) || typeof value.hour !== 'number') throw new Error('Invalid review settings')
+    return { auto: value.auto, cadence: value.cadence, weekday: value.weekday, hour: value.hour }
+  })
 }
 
 export function fetchDirections(): Promise<Sin90Direction[]> {
@@ -77,6 +96,14 @@ export function fetchWeekAttention(weekId: string): Promise<Sin90WeekAttention> 
   return sin90Get(`/api/v1/sin90/weeks/${encodeURIComponent(weekId)}/attention`).then(readWeekAttention)
 }
 
+export function fetchDataStatus(): Promise<Sin90DataStatus> {
+  return sin90Get('/api/v1/sin90/data/status').then(parseDataStatus)
+}
+
+export function fetchTemplates(): Promise<Sin90TemplateChoice[]> {
+  return sin90Get('/api/v1/sin90/templates').then(parseTemplates)
+}
+
 export async function writesAvailable(): Promise<boolean> {
   const ask = window.agent24.sin90KeyStatus
   if (!ask) return false
@@ -94,5 +121,27 @@ export async function sin90Write(body: Record<string, unknown>): Promise<void> {
   if (!res.ok) {
     const { code, message } = errorOf(res.data)
     throw new WriteFailed(message || 'sin90 write failed', code)
+  }
+}
+
+export async function exportToFile(): Promise<void> {
+  const exportFn = window.agent24.sin90ExportToFile
+  if (!exportFn) throw new Error('Export is unavailable')
+  const res = await exportFn()
+  if (!res.ok) {
+    const { code, message } = errorOf(res.data)
+    if (code === 'cancelled') return
+    throw new WriteFailed(message || 'Export failed', code)
+  }
+}
+
+export async function importFromFile(): Promise<void> {
+  const importFn = window.agent24.sin90ImportFromFile
+  if (!importFn) throw new Error('Import is unavailable')
+  const res = await importFn()
+  if (!res.ok) {
+    const { code, message } = errorOf(res.data)
+    if (code === 'cancelled') return
+    throw new WriteFailed(message || 'Import failed', code)
   }
 }

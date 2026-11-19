@@ -92,6 +92,7 @@ describe('A1 findAllowedRoute', () => {
     }
     expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/comm/history/conversation?with=bob')).toBe(true)
   })
   // SL-4. Mutation: add ('POST', '/api/v1/skills/{id}/activate') to ALLOWED_PROXY_ROUTES and this goes red.
   it('keeps skill activation and rollback off the proxy (main-process IPC only)', () => {
@@ -115,6 +116,9 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/directions')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/tasks?direction_id=d1')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/areas')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/period-plans')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/progress?direction_id=d1')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/settings/review')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/weeks')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/weeks/w1/attention')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/schedule-blocks')).toBe(true)
@@ -122,10 +126,22 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/rhythms')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/proposals')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/reviews')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/data/status')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/templates')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/data/export')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/data/import')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/data/reset')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/data/restore-backup')).toBe(false)
+    expect(
+      ALLOWED_PROXY_ROUTES.filter((route) => route.template.startsWith('/api/v1/sin90'))
+        .every((route) => route.method === 'GET'),
+    ).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/packs/install')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/proposals/p1/accept')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/ai/classify')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/weeks')).toBe(false)
     expect(isAllowedProxyRoute('PATCH', '/api/v1/sin90/schedule-blocks/b1')).toBe(false)
+    for (const [method, path] of [['POST','/api/v1/sin90/period-plans'],['PATCH','/api/v1/sin90/period-plans/p1'],['PATCH','/api/v1/sin90/areas/a1'],['PATCH','/api/v1/sin90/directions/d1'],['PUT','/api/v1/sin90/settings/review']]) expect(isAllowedProxyRoute(method, path)).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/directions')).toBe(false)
     expect(isAllowedProxyRoute('POST', '/api/v1/sin90/tasks')).toBe(false)
     expect(isAllowedProxyRoute('PATCH', '/api/v1/sin90/tasks/t1')).toBe(false)

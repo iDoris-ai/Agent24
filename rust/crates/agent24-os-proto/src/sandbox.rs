@@ -49,6 +49,9 @@ const SYSTEM_READ: &[&str] = &[
     "/System",
     "/Library",
     "/private/etc",
+    // `/etc/localtime` links here; without it the module sees no local zone
+    // (UTC, no IANA name) and every "local day" or "Sunday 18:00" is off.
+    "/private/var/db/timezone",
     "/dev",
     "/opt/homebrew",
     "/usr/local",
@@ -510,6 +513,33 @@ mod tests {
         assert!(run(&format!("echo x > '{d}/f' && rm '{d}/f'")));
         assert!(!run(&format!("/bin/mv '{d}' '{d}.old'")));
         assert!(data.is_dir() && !root.join("data.old").exists());
+    }
+
+    /// A module reads the local time zone: `/etc/localtime` resolves into
+    /// `/var/db/timezone`, which must be readable under the profile.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_local_time_zone_is_readable_under_the_profile() {
+        let t = tempfile::tempdir().unwrap();
+        let root = canonical(t.path()).unwrap();
+        let package = root.join("pkg");
+        let data = root.join("data");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::create_dir_all(&data).unwrap();
+        let sh = Path::new("/bin/sh");
+        let profile =
+            seatbelt_profile(&inputs(&package, &data, &root.join("cb.sock"), sh, None)).unwrap();
+        let ok = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-p")
+            .arg(&profile)
+            .arg(sh)
+            .arg("-c")
+            .arg("/bin/cat /etc/localtime > /dev/null")
+            .current_dir(&data)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "the zone file behind /etc/localtime must be readable");
     }
 
     #[test]

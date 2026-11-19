@@ -1,334 +1,400 @@
 // @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { BackendProxyRequest } from '../../../shared/ipc-types'
 import { setLocale } from '../../i18n'
-import { isoWeekUTC } from './model'
 import { Sin90Page } from './Sin90Page'
+import { isoWeekUTC } from './model'
+import { legalPlanParents, readPeriodPlans } from './model'
 
-const emptyToday = {
-  must_do: [], deep_block: null, inbox: [], carry_over_candidates: [],
-  fired_routines: [], kernel_suspended_routines: [],
-}
-
+let areas: unknown[] = []
 let directions: unknown[] = []
-let tasksByDirection: Record<string, unknown[]> = {}
-let today: unknown = emptyToday
+let tasks: unknown[] = []
+let today: unknown = { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] }
 let weeks: unknown[] = []
 let blocks: unknown[] = []
-let routines: unknown[] = []
-let rhythms: unknown[] = []
 let proposals: unknown[] = []
 let reviews: unknown[] = []
-let attentionReads = 0
-let keyAvailable = false
-const gets: string[] = []
-const sin90Write = vi.fn(async (_body: Record<string, unknown>): Promise<{ ok: boolean; status: number; data: unknown }> => (
-  { ok: true, status: 201, data: { id: 'new' } }
-))
-let emitSin90: ((event: { kind: string; payload: unknown }) => void) | null = null
-
-function task(id: string, title: string, direction_id: string | null, status = 'backlog') {
-  return { id, title, direction_id, week_id: null, status, kind: 'other', energy: 'mid', est_minutes: null, carried_from: null, created_at: 't', updated_at: 't' }
+let periodPlans: unknown | null = null
+let failToday = false
+let dataStatus: unknown = {
+  template: null,
+  backups: [],
+  counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
 }
+let templates: unknown = []
+const getPaths: string[] = []
+const sin90Write = vi.fn(async (_body: Record<string, unknown>) => ({ ok: true, status: 200, data: {} }))
+const sin90ExportToFile = vi.fn(async () => ({ ok: true, status: 200, data: { ok: true } }))
+const sin90ImportFromFile = vi.fn(async () => ({ ok: true, status: 200, data: { ok: true } }))
+function task(id: string, title: string, status = 'in_progress') { return { id, title, status, direction_id: 'd1', week_id: null } }
 
 beforeEach(() => {
-  setLocale('en')
-  directions = []
-  tasksByDirection = {}
-  today = emptyToday
-  weeks = []
-  blocks = []
-  routines = []
-  rhythms = []
-  proposals = []
-  reviews = []
-  attentionReads = 0
-  gets.length = 0
-  emitSin90 = null
-  keyAvailable = false
-  sin90Write.mockReset()
-  sin90Write.mockResolvedValue({ ok: true, status: 201, data: { id: 'new' } })
-  Object.defineProperty(window, 'agent24', {
-    configurable: true,
-    value: {
-      sin90Write,
-      sin90KeyStatus: async () => ({ available: keyAvailable }),
-      onSin90Event: (cb: (event: { kind: string; payload: unknown }) => void) => {
-        emitSin90 = cb
-        return () => { if (emitSin90 === cb) emitSin90 = null }
-      },
-      backendProxy: async (req: BackendProxyRequest) => {
-        gets.push(req.path)
-        if (req.path === '/api/v1/sin90/today') return { ok: true, status: 200, data: today }
-        if (req.path === '/api/v1/sin90/directions') return { ok: true, status: 200, data: { directions } }
-        if (req.path === '/api/v1/sin90/areas') return { ok: true, status: 200, data: { areas: [] } }
-        if (req.path === '/api/v1/sin90/weeks') return { ok: true, status: 200, data: { weeks } }
-        if (req.path === '/api/v1/sin90/schedule-blocks') return { ok: true, status: 200, data: { blocks } }
-        if (req.path === '/api/v1/sin90/routines') return { ok: true, status: 200, data: { routines } }
-        if (req.path === '/api/v1/sin90/rhythms') return { ok: true, status: 200, data: { rhythms } }
-        if (req.path === '/api/v1/sin90/proposals') return { ok: true, status: 200, data: { proposals } }
-        if (req.path === '/api/v1/sin90/reviews') return { ok: true, status: 200, data: { reviews } }
-        if (req.path.includes('/attention')) {
-          attentionReads += 1
-          const actual = attentionReads === 1 ? 0 : 90
-          return { ok: true, status: 200, data: { week_id: 'w1', planned_min: 90, actual_min: actual, deviation_min: actual - 90 } }
-        }
-        if (req.path.startsWith('/api/v1/sin90/tasks')) {
-          const id = new URL(req.path, 'http://local').searchParams.get('direction_id') ?? ''
-          return { ok: true, status: 200, data: { tasks: tasksByDirection[id] ?? [] } }
-        }
-        throw new Error(req.path)
-      },
+  setLocale('zh'); areas = []; directions = []; tasks = []; weeks = []; blocks = []; proposals = []; reviews = []; periodPlans = null; failToday = false; getPaths.length = 0
+  today = { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] }
+  dataStatus = {
+    template: null,
+    backups: [],
+    counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+  }
+  templates = []
+  window.localStorage.clear()
+  sin90Write.mockReset(); sin90Write.mockResolvedValue({ ok: true, status: 200, data: {} })
+  sin90ExportToFile.mockReset(); sin90ExportToFile.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
+  sin90ImportFromFile.mockReset(); sin90ImportFromFile.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
+  Object.defineProperty(window, 'agent24', { configurable: true, value: {
+    sin90Write, sin90KeyStatus: async () => ({ available: true }),
+    sin90ExportToFile, sin90ImportFromFile,
+    onSin90Event: () => () => undefined,
+    backendProxy: async (req: BackendProxyRequest) => {
+      getPaths.push(req.path)
+      if (req.path.endsWith('/today')) return failToday ? { ok: false, status: 500, data: { error: { message: '不可用' } } } : { ok: true, status: 200, data: today }
+      if (req.path.endsWith('/areas')) return { ok: true, status: 200, data: { areas } }
+      if (req.path.endsWith('/directions')) return { ok: true, status: 200, data: { directions } }
+      if (req.path.endsWith('/weeks')) return { ok: true, status: 200, data: { weeks } }
+      if (req.path.endsWith('/schedule-blocks')) return { ok: true, status: 200, data: { blocks } }
+      if (req.path.endsWith('/routines')) return { ok: true, status: 200, data: { routines: [] } }
+      if (req.path.endsWith('/rhythms')) return { ok: true, status: 200, data: { rhythms: [] } }
+      if (req.path.endsWith('/proposals')) return { ok: true, status: 200, data: { proposals } }
+      if (req.path.endsWith('/reviews')) return { ok: true, status: 200, data: { reviews } }
+      if (req.path.includes('/progress?')) return { ok: true, status: 200, data: { progress: [{ plan_id: 'p1', actual: 1, expected: 5, status: 'at_risk', miss_streak: 3 }] } }
+      if (req.path.endsWith('/settings/review')) return { ok: true, status: 200, data: { auto: true, cadence: 'weekly', weekday: 7, hour: 18 } }
+      if (req.path.includes('/tasks?')) return { ok: true, status: 200, data: { tasks } }
+      if (req.path.includes('/attention')) return { ok: true, status: 200, data: { planned_min: 120, actual_min: 60, deviation_min: -60 } }
+      if (req.path.endsWith('/period-plans')) return periodPlans ? { ok: true, status: 200, data: periodPlans } : { ok: false, status: 404, data: {} }
+      if (req.path.endsWith('/data/status')) return { ok: true, status: 200, data: dataStatus }
+      if (req.path.endsWith('/templates')) return { ok: true, status: 200, data: templates }
+      throw new Error(req.path)
     },
+  } })
+})
+afterEach(() => { cleanup(); setLocale('en') })
+
+describe('Sin90 writes', () => {
+  it('accepts all classify suggestions one after another', async () => {
+    today = { must_do: [], deep_block: null, inbox: [task('t9', '约牙医', 'backlog')], carry_over_candidates: [] }
+    proposals = ['p1', 'p2'].map((id) => ({ id, status: 'pending', source: 'local_brain', ops: [{ op: 'assign_task_direction', task_id: 't9', direction_id: 'd1' }] }))
+    let inFlight = 0
+    let maxInFlight = 0
+    sin90Write.mockImplementation(async () => {
+      inFlight += 1; maxInFlight = Math.max(maxInFlight, inFlight)
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      inFlight -= 1
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '全部采纳' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledTimes(2))
+    expect(sin90Write.mock.calls.map((call) => call[0])).toEqual([
+      { op: 'acceptProposal', id: 'p1' },
+      { op: 'acceptProposal', id: 'p2' },
+    ])
+    expect(maxInFlight).toBe(1)
+  })
+
+  it('shows the plain delegation message for every permission-style refusal', async () => {
+    for (const code of ['module_delegation_denied', 'presence_denied', 'presence_timeout', 'presence_unavailable']) {
+      cleanup()
+      today = { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] }
+      sin90Write.mockResolvedValueOnce({ ok: false, status: 403, data: { error: { code, message: 'raw english' } } })
+      render(<Sin90Page />)
+      fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '一条' } })
+      fireEvent.click(screen.getByRole('button', { name: '记下' }))
+      expect(await screen.findByText('桌面还不能写入 Sin90。请在确认框里允许，然后再试一次。')).toBeInTheDocument()
+      expect(screen.queryByText(/raw english/)).not.toBeInTheDocument()
+    }
   })
 })
 
-afterEach(() => { cleanup(); setLocale('en') })
-
-describe('Sin90 read-only page', () => {
-  it('shows a write failure on the page', async () => {
-    keyAvailable = true
-    sin90Write.mockResolvedValue({
-      ok: false,
-      status: 403,
-      data: { error: { code: 'module_delegation_required', message: 'Module surface requires delegation' } },
-    })
+describe('Sin90 three layers', () => {
+  it('starts on Today and switches among the three tabs', async () => {
     render(<Sin90Page />)
-    fireEvent.change(await screen.findByLabelText('Title'), { target: { value: 'Ship' } })
-    fireEvent.change(screen.getByLabelText('Window'), { target: { value: '2026-Q4' } })
-    const button = screen.getByRole('button', { name: 'New direction' })
-    await waitFor(() => expect(button).toBeEnabled())
+    await screen.findByRole('tab', { name: '今天' })
+    expect(screen.getByRole('tab', { name: '今天' })).toHaveAttribute('aria-selected', 'true')
+    fireEvent.click(screen.getByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('人生系统')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
+    expect(await screen.findByText('年度')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '今天' }))
+    expect(await screen.findByLabelText(/随手记/)).toBeInTheDocument()
+  })
+
+  it('opens the separate review view from the review button', async () => {
+    render(<Sin90Page />)
+    await screen.findByRole('button', { name: '复盘' })
+    fireEvent.click(screen.getByRole('button', { name: '复盘' }))
+    expect(await screen.findByText('最近的复盘')).toBeInTheDocument()
+    expect(screen.getByLabelText('频率')).toBeInTheDocument()
+    expect(screen.getByRole('tab', { name: '今天' })).toHaveAttribute('aria-selected', 'false')
+    expect(screen.getByRole('tab', { name: '方向' })).toHaveAttribute('aria-selected', 'false')
+    expect(screen.getByRole('button', { name: '复盘' })).toHaveClass('ui-button--primary')
+    fireEvent.click(screen.getByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('人生系统')).toBeInTheDocument()
+  })
+
+  it('captures a quick note and completes a must-do item using the legal transition', async () => {
+    today = { must_do: [task('t1', '写完方案')], deep_block: null, inbox: [], carry_over_candidates: [] }
+    render(<Sin90Page />)
+    fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '给同事回信' } })
+    fireEvent.click(screen.getByRole('button', { name: '记下' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'capture', text: '给同事回信' }))
+    fireEvent.click(within(screen.getByRole('listitem', { name: '写完方案' })).getByLabelText('完成'))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionTask', id: 't1', to: 'done' }))
+  })
+
+  it('offers a demo language switch when the loaded template differs from the UI', async () => {
+    dataStatus = { template: { id: 'graduate', lang: 'en', loaded_at: '2026-11-18T00:00:00Z', title: 'Graduate', guide: 'Guide' }, backups: [], counts: { areas: 1, directions: 1, tasks: 0, plans: 0, routines: 0 } }
+    render(<Sin90Page />)
+    const button = await screen.findByRole('button', { name: '换成 中文 版示范' })
     fireEvent.click(button)
-    expect(await screen.findByRole('alert')).toHaveTextContent('not allowed to write Sin90')
-    expect(screen.queryByText('Module surface requires delegation')).not.toBeInTheDocument()
-    act(() => setLocale('zh'))
-    expect(screen.getByRole('alert')).toHaveTextContent('还不能写入 Sin90')
-    act(() => setLocale('th'))
-    expect(screen.getByRole('alert')).toHaveTextContent('ยังไม่ได้รับอนุญาตให้เขียน Sin90')
-  })
-
-  it('shows the empty direction form when nothing is stored', async () => {
-    render(<Sin90Page />)
-    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
-    expect(screen.getByLabelText('Title')).toBeInTheDocument()
-    expect(screen.getByLabelText('Window')).toBeInTheDocument()
-    expect(screen.queryByText('Not set up')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('Inbox')).toBeInTheDocument()
-  })
-
-  it('renders three must-do tasks from today', async () => {
-    today = {
-      ...emptyToday,
-      must_do: [task('a', 'Write the plan', 'd1'), task('b', 'Review the diff', 'd1'), task('c', 'Ship the page', 'd1')],
-      deep_block: { id: 'blk', direction_id: 'd1', task_id: 'a', status: 'planned', planned_minutes: 90, created_at: 't', updated_at: 't' },
-    }
-    directions = [{ id: 'd1', area_id: null, title: 'Q4 delivery', status: 'draft', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    tasksByDirection = { d1: [task('a', 'Write the plan', 'd1')] }
-    render(<Sin90Page />)
-    expect((await screen.findAllByText('Write the plan')).length).toBeGreaterThan(0)
-    expect(screen.getByText('Review the diff')).toBeInTheDocument()
-    expect(screen.getByText('Ship the page')).toBeInTheDocument()
-    expect(screen.getByText(/90 min/)).toBeInTheDocument()
-  })
-
-  it('filters tasks to the direction that was selected', async () => {
-    directions = [
-      { id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' },
-      { id: 'd2', area_id: null, title: 'Study', status: 'draft', target_window: 'ongoing', created_at: 't', updated_at: 't' },
-    ]
-    tasksByDirection = {
-      d1: [task('a', 'Write the plan', 'd1')],
-      d2: [task('b', 'Read the notes', 'd2')],
-    }
-    render(<Sin90Page />)
-    expect(await screen.findByText('Write the plan')).toBeInTheDocument()
-    expect(screen.queryByText('Read the notes')).not.toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: 'Study' }))
-    await waitFor(() => expect(screen.getByText('Read the notes')).toBeInTheDocument())
-    expect(screen.queryByText('Write the plan')).not.toBeInTheDocument()
-  })
-
-  it('uses the same keys in Chinese and Thai', async () => {
-    render(<Sin90Page />)
-    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
-    act(() => setLocale('zh'))
-    expect(screen.getByText('先定一个方向')).toBeInTheDocument()
-    expect(screen.getByText('必做')).toBeInTheDocument()
-    act(() => setLocale('th'))
-    expect(screen.getByText('กำหนดทิศทางก่อน')).toBeInTheDocument()
-    expect(screen.getByText('ต้องทำ')).toBeInTheDocument()
-    expect(screen.getByText('อ่านกุญแจมนุษย์ไม่ได้ การเขียนจึงปิดอยู่')).toBeInTheDocument()
-  })
-
-  it('renders only the legal button for each task status', async () => {
-    keyAvailable = true
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    tasksByDirection = {
-      d1: [
-        task('b', 'Backlog item', 'd1', 'backlog'),
-        task('p', 'Planned item', 'd1', 'planned'),
-        task('r', 'Running item', 'd1', 'in_progress'),
-        task('n', 'Done item', 'd1', 'done'),
-      ],
-    }
-    render(<Sin90Page />)
-    const backlog = within(await screen.findByRole('listitem', { name: 'Backlog item' }))
-    expect(backlog.getByRole('button', { name: 'Plan it' })).toBeEnabled()
-    expect(within(screen.getByRole('listitem', { name: 'Backlog item' })).getByRole('button', { name: 'Drop' })).toBeEnabled()
-    expect(within(screen.getByRole('listitem', { name: 'Backlog item' })).queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
-    expect(within(screen.getByRole('listitem', { name: 'Backlog item' })).queryByRole('button', { name: 'Done' })).not.toBeInTheDocument()
-    expect(within(screen.getByRole('listitem', { name: 'Planned item' })).getByRole('button', { name: 'Start' })).toBeEnabled()
-    expect(within(screen.getByRole('listitem', { name: 'Planned item' })).queryByRole('button', { name: 'Plan it' })).not.toBeInTheDocument()
-    expect(within(screen.getByRole('listitem', { name: 'Planned item' })).queryByRole('button', { name: 'Done' })).not.toBeInTheDocument()
-    expect(within(screen.getByRole('listitem', { name: 'Running item' })).getByRole('button', { name: 'Done' })).toBeEnabled()
-    expect(within(screen.getByRole('listitem', { name: 'Running item' })).queryByRole('button', { name: 'Start' })).not.toBeInTheDocument()
-    expect(within(screen.getByRole('listitem', { name: 'Done item' })).queryByRole('button')).not.toBeInTheDocument()
-  })
-
-  it('does not send a write while the human key is missing', async () => {
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    tasksByDirection = { d1: [task('b', 'Backlog item', 'd1', 'backlog')] }
-    render(<Sin90Page />)
-    const button = await within(await screen.findByRole('listitem', { name: 'Backlog item' })).findByRole('button', { name: 'Plan it' })
-    expect(button).toBeDisabled()
-    expect(screen.getByText('Writes are off because the human key could not be read.')).toBeInTheDocument()
-    fireEvent.click(button)
+    // Replaces all data, so it asks first like every other reset (#1917 M2).
+    expect(await screen.findByText(/加载示范前会自动保存一份当前数据/)).toBeInTheDocument()
     expect(sin90Write).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset', template: 'graduate', lang: 'zh' }))
   })
 
-  it('shows an empty week in three languages and no day grid', async () => {
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
+  it('places a must-do direction label below the full-width title', async () => {
+    directions = [{ id: 'd1', area_id: null, title: '一个很长很长的方向名称', status: 'active', target_window: 'ongoing' }]
+    today = { must_do: [task('t1', '必做事项标题')], deep_block: null, inbox: [], carry_over_candidates: [] }
     render(<Sin90Page />)
-    expect(await screen.findByText('Nothing is planned this week')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Open a week' })).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Open proposals' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: 'Draft the weekly review · Suggest' })).not.toBeInTheDocument()
-    expect(screen.queryByRole('columnheader')).not.toBeInTheDocument()
-    expect(screen.queryByText('Monday')).not.toBeInTheDocument()
-    expect(document.querySelector('.sin90-calendar')).toBeNull()
-    act(() => setLocale('zh'))
-    expect(screen.getByText('这周还没有安排')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '开一周' })).toBeInTheDocument()
-    act(() => setLocale('th'))
-    expect(screen.getByText('สัปดาห์นี้ยังไม่ได้จัด')).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'เปิดสัปดาห์' })).toBeInTheDocument()
+    const row = await screen.findByRole('listitem', { name: '必做事项标题' })
+    expect(within(row).getByText('一个很长很长的方向名称')).toHaveClass('sin90-task-direction')
+    expect(row.querySelector('.sin90-task-direction')?.getAttribute('title')).toBe('一个很长很长的方向名称')
   })
 
-  it('renders blocks as a queue and requests attention again after one is completed', async () => {
-    keyAvailable = true
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    tasksByDirection = { d1: [task('a', 'Write the plan', 'd1')] }
-    weeks = [{ id: 'w1', status: 'planning', iso_week: isoWeekUTC(new Date()), created_at: 't', updated_at: 't' }]
-    blocks = [{ id: 'blk', direction_id: 'd1', task_id: 'a', status: 'started', planned_minutes: 90, created_at: 't', updated_at: 't' }]
-    routines = [{ id: 'r1', direction_id: 'd1', title: 'Deep work', kind: 'deep_work', status: 'active', cron: '0 9 * * *', tz: 'UTC', created_at: 't', updated_at: 't' }]
-    rhythms = [{ id: 'rh', status: 'active', created_at: 't2', allocations: [{ direction_id: 'd1', pct: 70 }] }]
+  it('keeps area state read-only until edit is selected', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1, current_state: '偶尔散步', ideal_state: '规律运动' }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多运动', status: 'active', target_window: 'ongoing' }]
     render(<Sin90Page />)
-    const queue = await screen.findByRole('list', { name: 'Blocks' })
-    expect(queue.className).toContain('sin90-queue')
-    expect(within(queue).getAllByRole('listitem')).toHaveLength(1)
-    expect(screen.queryByRole('columnheader')).not.toBeInTheDocument()
-    expect(screen.queryByText('Monday')).not.toBeInTheDocument()
-    expect(screen.queryByText('Sunday')).not.toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Start this week' })).toBeEnabled()
-    expect(screen.getByText(/actual 0/)).toBeInTheDocument()
-    expect(screen.getByText(/Delivery 70%/)).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: /retire/i })).not.toBeInTheDocument()
-    expect(within(screen.getByRole('listitem', { name: 'Deep work' })).getByRole('button', { name: 'Pause' })).toBeEnabled()
-    const before = gets.filter((path) => path.includes('/attention')).length
-    expect(before).toBe(1)
-    fireEvent.click(within(queue).getByRole('button', { name: 'Complete' }))
-    await waitFor(() => expect(screen.getByText(/actual 90/)).toBeInTheDocument())
-    expect(gets.filter((path) => path.includes('/attention')).length).toBeGreaterThan(before)
-    expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionBlock', id: 'blk', to: 'completed' })
-    act(() => setLocale('zh'))
-    expect(screen.getByRole('button', { name: '开始这周' })).toBeInTheDocument()
-    expect(screen.getByRole('list', { name: '块' })).toBeInTheDocument()
-    act(() => setLocale('th'))
-    expect(screen.getByRole('button', { name: 'เริ่มสัปดาห์นี้' })).toBeInTheDocument()
-    expect(screen.getByRole('list', { name: 'บล็อก' })).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('偶尔散步')).toBeInTheDocument()
+    expect(screen.queryByLabelText('现在的状态')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    expect(screen.getByLabelText('现在的状态')).toHaveValue('偶尔散步')
+    expect(screen.getByLabelText('想要的状态')).toHaveValue('规律运动')
   })
 
-  it('says a carry-over in Chinese and drops it from pending after accept', async () => {
-    keyAvailable = true
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    proposals = [{
-      id: 'p1', status: 'pending', source: 'rule', rationale: 'still open', created_at: 't',
-      ops: [{ op: 'carry_over_task', task_id: 'a', to_week: 'w2' }],
-    }]
-    sin90Write.mockImplementation(async (body: Record<string, unknown>) => {
-      if (body['op'] === 'acceptProposal') proposals = []
-      return { ok: true, status: 200, data: { proposal_id: 'p1', event_ids: [] } }
+  it('uses clear placeholders where the server has no planning data', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1 }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing' }]
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('三年目标：')).toBeInTheDocument()
+    expect(screen.getByLabelText('三年目标').closest('details')).not.toHaveProperty('open', true)
+    expect(screen.queryByText(/半马|40 周|300/)).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
+    expect(await screen.findByText('年度')).toBeInTheDocument()
+  })
+
+  it('shows a three-year goal when the directions response contains one', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1 }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing', goal_3y: '每年走 1000 公里' }]
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('每年走 1000 公里')).toBeInTheDocument()
+    expect(screen.getByLabelText('三年目标').closest('details')).not.toHaveProperty('open', true)
+  })
+
+  it('saves an edited three-year goal through the registered write operation', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1 }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing' }]
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    fireEvent.click(await screen.findByText('编辑计划'))
+    fireEvent.change(await screen.findByLabelText('三年目标'), { target: { value: '每周徒步一次' } })
+    fireEvent.click(screen.getAllByRole('button', { name: '保存' }).at(-1)!)
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'updateDirection', id: 'd1', goal3y: '每周徒步一次', goalFromYear: null }))
+  })
+
+  it('offers only same-direction plans at valid upper levels as parents', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1 }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing' }]
+    periodPlans = { period_plans: [
+      { id: 'year1', direction_id: 'd1', kind: 'year', period: String(new Date().getFullYear()), target: '年度', metric: 'none', status: 'active' },
+      { id: 'foreign', direction_id: 'd2', kind: 'year', period: String(new Date().getFullYear()), target: '别的方向', metric: 'none', status: 'active' },
+      { id: 'half1', direction_id: 'd1', kind: 'half', period: `${new Date().getFullYear()}-H${new Date().getMonth() < 6 ? 1 : 2}`, target: '半年', metric: 'none', status: 'active' },
+    ] }
+    expect(readPeriodPlans(periodPlans)).toHaveLength(3)
+    expect(legalPlanParents('quarter', `${new Date().getFullYear()}-Q${Math.floor(new Date().getMonth() / 3) + 1}`,  readPeriodPlans(periodPlans), 'd1')).toHaveLength(2)
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    fireEvent.click(await screen.findByText('编辑计划'))
+    fireEvent.change(screen.getByLabelText('计划层级'), { target: { value: 'quarter' } })
+    const parent = screen.getAllByRole('combobox')[1]!
+    expect(within(parent).getByRole('option', { name: /年度/ })).toBeInTheDocument()
+    expect(within(parent).getByRole('option', { name: /半年/ })).toBeInTheDocument()
+    expect(within(parent).queryByRole('option', { name: /别的方向/ })).not.toBeInTheDocument()
+  })
+
+  it('shows real rhythm columns and a consecutive-miss risk marker', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1 }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing' }]
+    periodPlans = { period_plans: [{ id: 'p1', direction_id: 'd1', kind: 'month', period: '2026-11', target: '走路 20 次', metric: 'count', metric_target: 20, status: 'active' }] }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '节奏' }))
+    expect(await screen.findByText(/走路 20 次/)).toBeInTheDocument()
+    expect(screen.getByText(/有风险/)).toBeInTheDocument()
+    expect(screen.getByText('已连续 3 周未达标')).toBeInTheDocument()
+    expect(document.querySelector('.sin90-rhythm-direction')).toBeInTheDocument()
+    expect(document.querySelector('.sin90-rhythm-target')).toHaveClass('sin90-rhythm-target')
+    expect(document.querySelector('.sin90-period-no-half .sin90-half-empty')).toBeInTheDocument()
+  })
+
+  it('saves review settings with PUT semantics through the dedicated write op', async () => {
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '复盘' }))
+    fireEvent.change(await screen.findByLabelText('频率'), { target: { value: 'monthly' } })
+    fireEvent.click(screen.getAllByRole('button', { name: '保存' }).at(-1)!)
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'putReviewSettings', auto: true, cadence: 'monthly', weekday: 7, hour: 18 }))
+  })
+
+  it('offers to install the five systems when areas are empty', async () => {
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('还没有人生系统')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /装上人生系统/ }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'installPack' }))
+  })
+
+  it('hides the seed triage direction and translates queued block status', async () => {
+    const weekLabel = isoWeekUTC(new Date())
+    areas = [{ id: 'a1', title: '工作', status: 'active', sort_key: 1 }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '交付', status: 'active', target_window: 'ongoing' }, { id: 'sin90-triage', area_id: null, title: '待定', status: 'active', target_window: 'n/a' }]
+    tasks = [task('t1', '写方案')]
+    weeks = [{ id: 'w1', status: 'planning', iso_week: weekLabel }]
+    blocks = [{ id: 'b1', direction_id: 'd1', task_id: 't1', status: 'planned', planned_minutes: 40 }]
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('交付')).toBeInTheDocument()
+    expect(screen.queryByText('待定')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
+    expect(await screen.findByText('排队中')).toBeInTheDocument()
+    expect(screen.queryByText('planned')).not.toBeInTheDocument()
+  })
+
+  it('uses ErrorNotice when loading fails', async () => {
+    failToday = true
+    render(<Sin90Page />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('不可用')
+    expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
+  })
+})
+
+describe('Sin90 demo banner & data panel', () => {
+  it('shows demo banner when template is present, requires confirmation before clearing', async () => {
+    dataStatus = {
+      template: {
+        id: 'graduate',
+        lang: 'zh',
+        loaded_at: '2026-11-19 09:00',
+        title: '示范：刚毕业的第一年',
+        guide: '欢迎体验 Sin90 示范数据。',
+      },
+      backups: [],
+      counts: { areas: 5, directions: 6, tasks: 7, plans: 10, routines: 2 },
+    }
+    render(<Sin90Page />)
+    expect(await screen.findByText('你正在看示范数据：示范：刚毕业的第一年')).toBeInTheDocument()
+    expect(screen.getByText('欢迎体验 Sin90 示范数据。')).toBeInTheDocument()
+
+    // Click clear button on banner
+    fireEvent.click(screen.getByRole('button', { name: '清空，从我自己开始' }))
+    expect(await screen.findByText(/清空前会自动保存一份当前数据/)).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+
+    // Confirm
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset' }))
+  })
+
+  it('dismisses demo banner on "Got it" and persists state to localStorage', async () => {
+    dataStatus = {
+      template: {
+        id: 'graduate',
+        lang: 'zh',
+        loaded_at: '2026-11-19 09:00',
+        title: '示范：刚毕业的第一年',
+        guide: '欢迎体验 Sin90 示范数据。',
+      },
+      backups: [],
+      counts: { areas: 5, directions: 6, tasks: 7, plans: 10, routines: 2 },
+    }
+    render(<Sin90Page />)
+    expect(await screen.findByText('你正在看示范数据：示范：刚毕业的第一年')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '知道了' }))
+    await waitFor(() => {
+      expect(screen.queryByText('你正在看示范数据：示范：刚毕业的第一年')).not.toBeInTheDocument()
     })
-    render(<Sin90Page />)
-    fireEvent.click(await screen.findByRole('button', { name: 'Open proposals' }))
-    expect(await screen.findByText('Carry the unfinished task into a week')).toBeInTheDocument()
-    expect(screen.getByText('Rule')).toBeInTheDocument()
-    act(() => setLocale('zh'))
-    expect(screen.getByText('把未完成的任务结到某一周')).toBeInTheDocument()
-    expect(screen.getByText('规则')).toBeInTheDocument()
-    expect(screen.getByText('待你确认的提案 (1)')).toBeInTheDocument()
-    act(() => setLocale('th'))
-    expect(screen.getByText('ยกงานที่ยังไม่เสร็จไปอีกสัปดาห์')).toBeInTheDocument()
-    act(() => setLocale('zh'))
-    fireEvent.click(screen.getByRole('button', { name: '接受' }))
-    await waitFor(() => expect(screen.queryByText('把未完成的任务结到某一周')).not.toBeInTheDocument())
-    expect(screen.queryByRole('button', { name: '打开提案' })).not.toBeInTheDocument()
-    expect(sin90Write).toHaveBeenCalledWith({ op: 'acceptProposal', id: 'p1' })
+    expect(window.localStorage.getItem('sin90:demo-banner-dismissed')).toBe('1')
   })
 
-  it('refreshes proposals after a suggestion and does not mark the task done', async () => {
-    keyAvailable = true
-    const iso = isoWeekUTC(new Date())
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    tasksByDirection = { d1: [task('a', 'Write the plan', 'd1', 'backlog')] }
-    weeks = [{ id: 'w1', status: 'active', iso_week: iso, created_at: 't', updated_at: 't' }]
-    reviews = [{ id: 'rev1', kind: 'weekly', status: 'draft', period: iso }]
+  it('data panel lists backups and triggers dataRestoreBackup after confirmation', async () => {
+    dataStatus = {
+      template: null,
+      backups: [{ name: 'auto-20261119-01.json', at: '2026-11-19 10:00:00', bytes: 2048 }],
+      counts: { areas: 5, directions: 4, tasks: 3, plans: 2, routines: 1 },
+    }
     render(<Sin90Page />)
-    expect(await screen.findByRole('button', { name: 'Draft the weekly review · Suggest' })).toBeEnabled()
-    const tasksBefore = gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length
-    const proposalsBefore = gets.filter((path) => path === '/api/v1/sin90/proposals').length
-    fireEvent.click(screen.getByRole('button', { name: 'Classify the inbox · Suggest' }))
-    await waitFor(() => expect(gets.filter((path) => path === '/api/v1/sin90/proposals').length).toBeGreaterThan(proposalsBefore))
-    expect(gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length).toBe(tasksBefore)
-    expect(sin90Write).toHaveBeenCalledWith({ op: 'aiClassify' })
-    expect(sin90Write).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'transitionTask' }))
-    expect(within(screen.getByRole('listitem', { name: 'Write the plan' })).getByText('Backlog')).toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Plan this week · Suggest' })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: 'Plan this week · Suggest' }))
-    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'aiPropose', weekId: 'w1' }))
-    await waitFor(() => expect(screen.getByRole('button', { name: 'Draft the weekly review · Suggest' })).toBeEnabled())
-    fireEvent.click(screen.getByRole('button', { name: 'Draft the weekly review · Suggest' }))
-    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'aiSummarize', reviewId: 'rev1' }))
-    expect(gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length).toBe(tasksBefore)
-    expect(screen.queryByText('已安排')).not.toBeInTheDocument()
-    act(() => setLocale('zh'))
-    expect(screen.getByRole('button', { name: '给收件箱分类 · 生成建议' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '为这周排期 · 生成建议' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: '写周复盘 · 生成建议' })).toBeInTheDocument()
+    fireEvent.click(await screen.findByRole('button', { name: '数据' }))
+
+    expect(await screen.findByText('Sin90 数据管理')).toBeInTheDocument()
+    expect(screen.getByText(/5 个系统 · 4 个方向 · 2 条计划 · 3 个任务/)).toBeInTheDocument()
+    expect(screen.getByText('当前为个人数据（非示范）')).toBeInTheDocument()
+    expect(screen.getByText('auto-20261119-01.json')).toBeInTheDocument()
+
+    // Click restore
+    fireEvent.click(screen.getByRole('button', { name: '恢复到这个时间点' }))
+    expect(await screen.findByText(/确定要恢复备份「auto-20261119-01.json」吗/)).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+
+    // Confirm
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataRestoreBackup', name: 'auto-20261119-01.json' }))
   })
 
-  it('reloads tasks from the next GET after task.transitioned, not from the event body', async () => {
-    directions = [{ id: 'd1', area_id: null, title: 'Delivery', status: 'active', target_window: '2026-Q4', created_at: 't', updated_at: 't' }]
-    tasksByDirection = { d1: [task('a', 'Write the plan', 'd1', 'planned')] }
+  it('data panel triggers export and import IPCs', async () => {
+    dataStatus = {
+      template: null,
+      backups: [],
+      counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+    }
     render(<Sin90Page />)
-    expect(await screen.findByText('Write the plan')).toBeInTheDocument()
-    const before = gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length
-    expect(before).toBeGreaterThan(0)
-    tasksByDirection = { d1: [task('a', 'Ship the page', 'd1', 'done')] }
-    act(() => emitSin90?.({ kind: 'task.transitioned', payload: { title: 'from-event-body', task_id: 'a', to: 'done' } }))
-    await waitFor(() => expect(screen.getByText('Ship the page')).toBeInTheDocument())
-    expect(screen.queryByText('from-event-body')).not.toBeInTheDocument()
-    expect(screen.queryByText('Write the plan')).not.toBeInTheDocument()
-    expect(gets.filter((path) => path.startsWith('/api/v1/sin90/tasks')).length).toBeGreaterThan(before)
+    fireEvent.click(await screen.findByRole('button', { name: '数据' }))
+
+    // Export
+    fireEvent.click(await screen.findByRole('button', { name: '导出备份' }))
+    await waitFor(() => expect(sin90ExportToFile).toHaveBeenCalled())
+
+    // Import
+    fireEvent.click(screen.getByRole('button', { name: '从文件恢复' }))
+    expect(await screen.findByText(/确定要从所选文件恢复吗/)).toBeInTheDocument()
+    expect(sin90ImportFromFile).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90ImportFromFile).toHaveBeenCalled())
   })
 
-  it('requests today again when the event socket reconnects', async () => {
+  it('data panel supports loading demo with language and clearing to empty', async () => {
+    dataStatus = {
+      template: null,
+      backups: [],
+      counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+    }
     render(<Sin90Page />)
-    expect(await screen.findByText('Set a direction first')).toBeInTheDocument()
-    const before = gets.filter((path) => path === '/api/v1/sin90/today').length
-    expect(before).toBeGreaterThan(0)
-    act(() => emitSin90?.({ kind: 'connected', payload: {} }))
-    await waitFor(() => expect(gets.filter((path) => path === '/api/v1/sin90/today').length).toBeGreaterThan(before))
+    fireEvent.click(await screen.findByRole('button', { name: '数据' }))
+
+    // Load demo
+    fireEvent.click(await screen.findByRole('button', { name: '加载示范数据' }))
+    expect(await screen.findByText(/确定要加载示范数据吗/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset', template: 'graduate', lang: 'zh' }))
+
+    // Clear to empty
+    fireEvent.click(screen.getByRole('button', { name: '清空成空白' }))
+    expect(await screen.findByText(/确定要清空为全新空白吗/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset' }))
   })
 })
