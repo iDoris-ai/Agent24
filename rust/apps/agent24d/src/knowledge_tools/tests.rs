@@ -134,12 +134,7 @@ async fn a_search_returns_the_rendered_evidence_for_the_calling_run() {
         .await
         .unwrap();
     assert!(out.contains("chk-11"), "{out}");
-    // The search, and its read-backs (K3), all for the calling run.
-    let runs = backend.runs.lock().unwrap();
-    assert!(
-        !runs.is_empty() && runs.iter().all(|r| r == "run-1"),
-        "{runs:?}"
-    );
+    assert_eq!(*backend.runs.lock().unwrap(), ["run-1"]);
 }
 
 #[tokio::test]
@@ -246,9 +241,9 @@ async fn earlier_knowledge_results_do_not_hold_back_another_knowledge_call() {
         let got = tool
             .call(&ctx, &input(args), &CancellationToken::new())
             .await;
-        // Past the egress check and on to the backend (a search also reads back, K3).
+        // Past the egress check and on to the backend.
         assert!(!matches!(got, Err(ToolError::Denied(_))), "{got:?}");
-        assert!(!backend.runs.lock().unwrap().is_empty());
+        assert_eq!(backend.runs.lock().unwrap().len(), 1);
     }
 }
 
@@ -355,38 +350,4 @@ fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
     // A search alone is a search, with nothing read back.
     let knowledge = run_knowledge(&calls[..1]);
     assert!(knowledge.searched && knowledge.read_chunks.is_empty());
-}
-
-/// K3: a search that read its best hits back counts them as read, each chunk
-/// an entry of `use: citation` names; clues and current text do not count.
-#[test]
-fn a_searchs_read_backs_count_as_reads() {
-    let chunk = |k: &str, c: &str| ReadChunk {
-        knowledge_id: k.into(),
-        chunk_id: c.into(),
-    };
-    let calls = [stored(
-        SEARCH,
-        ToolCallStatus::Completed,
-        json!({ "query": "q" }),
-    )];
-    let answer = json!({
-        "kind": "knowledge.search",
-        "evidence": [{ "use": "clue", "chunk_id": "chk-1" }],
-        "read_back": [
-            { "kind": "knowledge.read", "knowledge_id": "doc-1",
-              "evidence": [{ "use": "citation", "chunk_id": "chk-1" }] },
-            { "kind": "knowledge.read", "knowledge_id": "doc-2",
-              "evidence": [{ "use": "current_text", "chunk_id": "chk-2" }] },
-        ],
-    });
-    let answers =
-        std::collections::HashMap::from([("tc_knowledge_search".to_owned(), answer.to_string())]);
-    assert_eq!(
-        run_knowledge_with(&calls, &answers),
-        RunKnowledge {
-            searched: true,
-            read_chunks: vec![chunk("doc-1", "chk-1")]
-        }
-    );
 }

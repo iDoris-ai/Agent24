@@ -165,18 +165,7 @@ pub struct ReadChunk {
     pub chunk_id: String,
 }
 
-#[cfg(test)]
 pub fn run_knowledge(calls: &[ToolCall]) -> RunKnowledge {
-    run_knowledge_with(calls, &std::collections::HashMap::new())
-}
-
-/// [`run_knowledge`], with what each call answered (the run's tool messages,
-/// by tool call id): a search's read-backs (K3, `read_back`) count as reads,
-/// each chunk an entry of `use: citation` names, as a `knowledge_read` would.
-pub fn run_knowledge_with(
-    calls: &[ToolCall],
-    answers: &std::collections::HashMap<String, String>,
-) -> RunKnowledge {
     let mut knowledge = RunKnowledge {
         searched: false,
         read_chunks: Vec::new(),
@@ -193,15 +182,6 @@ pub fn run_knowledge_with(
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         };
-        if call.tool == SEARCH
-            && let Some(answer) = answers.get(&call.id)
-        {
-            for chunk in read_backs(answer) {
-                if !knowledge.read_chunks.contains(&chunk) {
-                    knowledge.read_chunks.push(chunk);
-                }
-            }
-        }
         if let (READ, Some(knowledge_id), Some(chunk_id)) =
             (call.tool.as_str(), text("knowledge_id"), text("chunk_id"))
         {
@@ -215,41 +195,6 @@ pub fn run_knowledge_with(
         }
     }
     knowledge
-}
-
-/// The chunks a search answer read back as citations (K3).
-fn read_backs(answer: &str) -> Vec<ReadChunk> {
-    let Ok(value) = serde_json::from_str::<Value>(answer) else {
-        return Vec::new();
-    };
-    let mut chunks = Vec::new();
-    for read in value
-        .get(agent24_knowledge::tool::call::READ_BACK)
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(knowledge_id) = read.get("knowledge_id").and_then(Value::as_str) else {
-            continue;
-        };
-        for entry in read
-            .get("evidence")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            if entry.get("use").and_then(Value::as_str) != Some("citation") {
-                continue;
-            }
-            if let Some(chunk_id) = entry.get("chunk_id").and_then(Value::as_str) {
-                chunks.push(ReadChunk {
-                    knowledge_id: knowledge_id.to_owned(),
-                    chunk_id: chunk_id.to_owned(),
-                });
-            }
-        }
-    }
-    chunks
 }
 
 /// The binding or its credential moved while the call was out (a credential
