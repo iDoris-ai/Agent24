@@ -20,6 +20,7 @@ import {
   signatureProblem,
   type BundledModuleDeps,
   type CliResult,
+  modulesToReplaceWhileStopped,
 } from './documents-module'
 
 let root: string
@@ -626,5 +627,15 @@ describe('sameFiles', () => {
     fs.symlinkSync(path.join(b, 'bin', 'agent24-documents'), path.join(copy, 'bin', 'agent24-documents'))
     expect(sameFiles(b, copy)).toBe(false)
     expect(sameFiles(b, path.join(root, 'missing'))).toBe(false)
+  })
+})
+
+describe('modulesToReplaceWhileStopped', () => {
+  it('picks every carried module the launch could not replace, not only documents', () => {
+    const carried = ['documents', 'sin90'] as const
+    // Service mode on a 0.6.1 → 0.7.0 upgrade: both failed while the service daemon held the store.
+    expect(modulesToReplaceWhileStopped(carried, ['install_failed', 'install_failed'])).toEqual(['documents', 'sin90'])
+    expect(modulesToReplaceWhileStopped(carried, ['up_to_date', 'install_failed'])).toEqual(['sin90'])
+    expect(modulesToReplaceWhileStopped(carried, ['upgraded', 'up_to_date'])).toEqual([])
   })
 })
