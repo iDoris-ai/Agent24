@@ -138,14 +138,77 @@ export function bootstrapService(uid: number, plist: string, run: typeof execFil
   })
 }
 
-/** U1: the upgrade's own stop and start (bootout, then bootstrap), in place of
- * the elevated shutdown and kickstart the other restarts use. */
-export function upgradeByLaunchd(deps: UpgradeDeps, o: { uid: number; plist: string; run?: typeof execFile }): UpgradeDeps {
-  return {
-    ...deps,
-    shutdown: () => bootoutService(o.uid, o.run),
-    kickstart: () => bootstrapService(o.uid, o.plist, o.run),
-  }
+/** U1: what the launchd upgrade needs besides `UpgradeDeps`. */
+export interface LaunchdUpgrade {
+  uid: number
+  plist: string
+  /** The installed copy launchd runs, and the bundled file it is made from. */
+  dest: string
+  src: string
+  /** `agent24d --version` of a file; null when it does not run. */
+  versionOf: (bin: string) => Promise<string | null>
+  run?: typeof execFile
+}
+
+export type LaunchdUpgradeOutcome = UpgradeOutcome
+
+/** U1 (David 11-19, option C; PM's two points): the upgrade stopped and
+ * started by launchd, no presence box. bootout → wait for the exit → keep the
+ * old file aside → copy → check the copy (same sha as the bundled file, and it
+ * runs and says the bundled version) → the documents module → bootstrap.
+ * A copy that fails its check is put back before anything starts
+ * (`verify_failed`); a start that fails puts the old file back and starts that
+ * (`rolled_back`), or says the service is down (`rollback_failed`). */
+export function upgradeServiceByLaunchd(deps: UpgradeDeps, o: LaunchdUpgrade): Promise<LaunchdUpgradeOutcome> {
+  return deps.hold(async (): Promise<LaunchdUpgradeOutcome> => {
+    const down = await bootoutService(o.uid, o.run)
+    if (down.status !== 200) return { ok: false, stage: 'shutdown', code: down.code ?? 'bootout_failed' }
+    const start = async () => {
+      try { await bootstrapService(o.uid, o.plist, o.run) } catch { return false }
+      return deps.started()
+    }
+    if (!(await deps.exited())) {
+      // Nothing touched: the old daemon is still there; launchd takes the job back.
+      await start()
+      return { ok: false, stage: 'exit', code: 'still_running' }
+    }
+    let old: Buffer | null = null
+    try { old = fs.readFileSync(o.dest) } catch { old = null }
+    const putBack = (): boolean => {
+      if (old === null) return false
+      try {
+        const temp = `${o.dest}.${process.pid}.restore`
+        fs.writeFileSync(temp, old, { mode: 0o755 })
+        fs.renameSync(temp, o.dest)
+        return true
+      } catch {
+        return false
+      }
+    }
+    let copied = false
+    try {
+      copied = deps.copy() === 'copied'
+    } catch (err) {
+      await start()
+      return { ok: false, stage: 'copy', code: (err as NodeJS.ErrnoException).code ?? 'copy_failed' }
+    }
+    if (copied) {
+      const [want, got] = await Promise.all([o.versionOf(o.src), o.versionOf(o.dest)])
+      if (sha256(o.dest) !== sha256(o.src) || want === null || got !== want) {
+        const back = putBack()
+        await start()
+        return { ok: false, stage: 'verify', code: back ? 'verify_failed' : 'verify_failed_not_restored' }
+      }
+    }
+    try { await deps.between?.() } catch { /* reported by the work itself */ }
+    if (await start()) return { ok: true, copied }
+    if (!copied || !putBack()) return { ok: false, stage: 'rollback', code: 'rollback_failed' }
+    // bootstrap may have loaded the job that then failed: out again, then the old file in.
+    await bootoutService(o.uid, o.run)
+    return (await start())
+      ? { ok: false, stage: 'rollback', code: 'rolled_back' }
+      : { ok: false, stage: 'rollback', code: 'rollback_failed' }
+  })
 }
 
 /** The elevated `POST /api/v1/shutdown` (the presence box): its status and,
@@ -157,7 +220,8 @@ export async function elevatedShutdown(): Promise<{ status: number; code?: strin
 
 export type UpgradeOutcome =
   | { ok: true; copied: boolean }
-  | { ok: false; stage: 'shutdown' | 'exit' | 'copy' | 'kickstart'; code: string }
+  // U1: 'verify' and 'rollback' come from the launchd upgrade only.
+  | { ok: false; stage: 'shutdown' | 'exit' | 'copy' | 'kickstart' | 'verify' | 'rollback'; code: string }
 
 export interface UpgradeDeps {
   /** The elevated `POST /api/v1/shutdown`: its status and, on a refusal, the daemon's code. */
