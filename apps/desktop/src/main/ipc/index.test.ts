@@ -2684,3 +2684,12 @@ describe('OSI-1 OsPackageInstall', () => {
     expect(missing.data.error.code).toBe('not_registered')
   })
 })
+
+describe('Sin90 exportToFile and importFromFile IPC handlers', () => {
+  it('registers handlers for Sin90 export and import', () => {
+    expect(handlers.get(IpcChannels.Sin90ExportToFile)).toBeDefined()
+    expect(handlers.get(IpcChannels.Sin90ImportFromFile)).toBeDefined()
+    expect(handlers.get('sin90:exportToFile')).toBeDefined()
+    expect(handlers.get('sin90:importFromFile')).toBeDefined()
+  })
+})

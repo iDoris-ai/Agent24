@@ -1,6 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import type { BackendProxyRequest, BackendProxyResponse } from '../shared/ipc-types'
-import { performSin90Write, type Sin90Caller } from './sin90-write'
+import {
+  exportSin90ToFile, importSin90FromFile, performSin90Write,
+  type Sin90Caller, type Sin90DialogBridge, type Sin90FsBridge,
+} from './sin90-write'
 
 const HUMAN = 'h'.repeat(48)
 
@@ -87,5 +90,124 @@ describe('performSin90Write', () => {
     expect(body.ops).toEqual([{ op: 'carry_over_task', task_id: 'task_1', to_week: 'week_1' }])
     expect(body.source).toBe('rule')
     expect(body.status).toBe('pending')
+  })
+
+  it('validates and performs dataReset, dataRestoreBackup, dataExport, dataImport', async () => {
+    const { api, request } = caller(true)
+
+    // Illegal requests
+    for (const badReq of [
+      { op: 'dataReset', template: 'freshman' },
+      { op: 'dataReset', template: 'graduate', lang: 'fr' },
+      { op: 'dataReset', lang: 'zh' }, // missing template
+      { op: 'dataRestoreBackup', name: '../escape.json' },
+      { op: 'dataRestoreBackup', name: 'notjson.txt' },
+      { op: 'dataRestoreBackup', name: '' },
+      { op: 'dataRestoreBackup' },
+      { op: 'dataImport' },
+      { op: 'dataImport', backup: null },
+      { op: 'dataImport', backup: { format: 'other-format' } },
+    ]) {
+      expect((await performSin90Write(badReq, api)).ok).toBe(false)
+    }
+    expect(request).not.toHaveBeenCalled()
+
+    // Valid dataReset (empty)
+    await performSin90Write({ op: 'dataReset' }, api)
+    expect(request).toHaveBeenNthCalledWith(1, { method: 'POST', path: '/api/v1/sin90/data/reset', body: {} }, HUMAN)
+
+    // Valid dataReset (template + lang)
+    await performSin90Write({ op: 'dataReset', template: 'graduate', lang: 'zh' }, api)
+    expect(request).toHaveBeenNthCalledWith(2, { method: 'POST', path: '/api/v1/sin90/data/reset', body: { template: 'graduate', lang: 'zh' } }, HUMAN)
+
+    // Valid dataRestoreBackup
+    await performSin90Write({ op: 'dataRestoreBackup', name: 'auto-20261119-1234.json' }, api)
+    expect(request).toHaveBeenNthCalledWith(3, { method: 'POST', path: '/api/v1/sin90/data/restore-backup', body: { name: 'auto-20261119-1234.json' } }, HUMAN)
+
+    // Valid dataExport
+    await performSin90Write({ op: 'dataExport' }, api)
+    expect(request).toHaveBeenNthCalledWith(4, { method: 'POST', path: '/api/v1/sin90/data/export' }, HUMAN)
+
+    // Valid dataImport
+    const backupObj = { format: 'sin90-backup', schema: 18, tables: {} }
+    await performSin90Write({ op: 'dataImport', backup: backupObj }, api)
+    expect(request).toHaveBeenNthCalledWith(5, { method: 'POST', path: '/api/v1/sin90/data/import', body: { backup: backupObj } }, HUMAN)
+  })
+
+  it('exportSin90ToFile handles success, cancel, and failures', async () => {
+    const { api, request } = caller(true)
+    const written: Record<string, string> = {}
+    const dialogBridge: Sin90DialogBridge = {
+      showSaveDialog: vi.fn(async () => ({ canceled: false, filePath: '/tmp/test-backup.json' })),
+      showOpenDialog: vi.fn(),
+    }
+    const fsBridge: Sin90FsBridge = {
+      readFile: vi.fn(),
+      writeFile: vi.fn(async (p, c) => { written[p] = c }),
+    }
+
+    // Success
+    request.mockResolvedValueOnce({ ok: true, status: 200, data: { format: 'sin90-backup', exported_at: '2026-11-19' } })
+    const res = await exportSin90ToFile(api, dialogBridge, fsBridge)
+    expect(res.ok).toBe(true)
+    expect(written['/tmp/test-backup.json']).toContain('sin90-backup')
+
+    // User canceled
+    dialogBridge.showSaveDialog = vi.fn(async () => ({ canceled: true }))
+    request.mockResolvedValueOnce({ ok: true, status: 200, data: { format: 'sin90-backup' } })
+    const cancelRes = await exportSin90ToFile(api, dialogBridge, fsBridge)
+    expect(cancelRes.ok).toBe(false)
+    expect(cancelRes.status).toBe(499)
+
+    // Write file failed
+    dialogBridge.showSaveDialog = vi.fn(async () => ({ canceled: false, filePath: '/tmp/bad.json' }))
+    fsBridge.writeFile = vi.fn(async () => { throw new Error('disk full') })
+    request.mockResolvedValueOnce({ ok: true, status: 200, data: { format: 'sin90-backup' } })
+    const writeErrRes = await exportSin90ToFile(api, dialogBridge, fsBridge)
+    expect(writeErrRes.ok).toBe(false)
+    expect(writeErrRes.status).toBe(500)
+  })
+
+  it('importSin90FromFile handles success, cancel, invalid JSON, and bad format', async () => {
+    const { api, request } = caller(true)
+    request.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
+
+    const dialogBridge: Sin90DialogBridge = {
+      showSaveDialog: vi.fn(),
+      showOpenDialog: vi.fn(async () => ({ canceled: false, filePaths: ['/tmp/import.json'] })),
+    }
+    let fileContent = JSON.stringify({ format: 'sin90-backup', schema: 18 })
+    const fsBridge: Sin90FsBridge = {
+      readFile: vi.fn(async () => fileContent),
+      writeFile: vi.fn(),
+    }
+
+    // Success
+    const res = await importSin90FromFile(api, dialogBridge, fsBridge)
+    expect(res.ok).toBe(true)
+    expect(request).toHaveBeenCalledWith({
+      method: 'POST',
+      path: '/api/v1/sin90/data/import',
+      body: { backup: { format: 'sin90-backup', schema: 18 } },
+    }, HUMAN)
+
+    // Cancel
+    dialogBridge.showOpenDialog = vi.fn(async () => ({ canceled: true, filePaths: [] }))
+    const cancelRes = await importSin90FromFile(api, dialogBridge, fsBridge)
+    expect(cancelRes.ok).toBe(false)
+    expect(cancelRes.status).toBe(499)
+
+    // Invalid JSON
+    dialogBridge.showOpenDialog = vi.fn(async () => ({ canceled: false, filePaths: ['/tmp/corrupt.json'] }))
+    fileContent = '{ bad json'
+    const jsonErrRes = await importSin90FromFile(api, dialogBridge, fsBridge)
+    expect(jsonErrRes.ok).toBe(false)
+    expect(jsonErrRes.status).toBe(400)
+
+    // Bad format
+    fileContent = JSON.stringify({ format: 'random-format' })
+    const formatErrRes = await importSin90FromFile(api, dialogBridge, fsBridge)
+    expect(formatErrRes.ok).toBe(false)
+    expect(formatErrRes.status).toBe(400)
   })
 })

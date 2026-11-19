@@ -17,16 +17,34 @@ let proposals: unknown[] = []
 let reviews: unknown[] = []
 let periodPlans: unknown | null = null
 let failToday = false
+let dataStatus: unknown = {
+  template: null,
+  backups: [],
+  counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+}
+let templates: unknown = []
 const getPaths: string[] = []
 const sin90Write = vi.fn(async (_body: Record<string, unknown>) => ({ ok: true, status: 200, data: {} }))
+const sin90ExportToFile = vi.fn(async () => ({ ok: true, status: 200, data: { ok: true } }))
+const sin90ImportFromFile = vi.fn(async () => ({ ok: true, status: 200, data: { ok: true } }))
 function task(id: string, title: string, status = 'in_progress') { return { id, title, status, direction_id: 'd1', week_id: null } }
 
 beforeEach(() => {
   setLocale('zh'); areas = []; directions = []; tasks = []; weeks = []; blocks = []; proposals = []; reviews = []; periodPlans = null; failToday = false; getPaths.length = 0
   today = { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] }
+  dataStatus = {
+    template: null,
+    backups: [],
+    counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+  }
+  templates = []
+  window.localStorage.clear()
   sin90Write.mockReset(); sin90Write.mockResolvedValue({ ok: true, status: 200, data: {} })
+  sin90ExportToFile.mockReset(); sin90ExportToFile.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
+  sin90ImportFromFile.mockReset(); sin90ImportFromFile.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
   Object.defineProperty(window, 'agent24', { configurable: true, value: {
     sin90Write, sin90KeyStatus: async () => ({ available: true }),
+    sin90ExportToFile, sin90ImportFromFile,
     onSin90Event: () => () => undefined,
     backendProxy: async (req: BackendProxyRequest) => {
       getPaths.push(req.path)
@@ -44,6 +62,8 @@ beforeEach(() => {
       if (req.path.includes('/tasks?')) return { ok: true, status: 200, data: { tasks } }
       if (req.path.includes('/attention')) return { ok: true, status: 200, data: { planned_min: 120, actual_min: 60, deviation_min: -60 } }
       if (req.path.endsWith('/period-plans')) return periodPlans ? { ok: true, status: 200, data: periodPlans } : { ok: false, status: 404, data: {} }
+      if (req.path.endsWith('/data/status')) return { ok: true, status: 200, data: dataStatus }
+      if (req.path.endsWith('/templates')) return { ok: true, status: 200, data: templates }
       throw new Error(req.path)
     },
   } })
@@ -222,5 +242,123 @@ describe('Sin90 three layers', () => {
     render(<Sin90Page />)
     expect(await screen.findByRole('alert')).toHaveTextContent('不可用')
     expect(screen.getByRole('button', { name: '重试' })).toBeInTheDocument()
+  })
+})
+
+describe('Sin90 demo banner & data panel', () => {
+  it('shows demo banner when template is present, requires confirmation before clearing', async () => {
+    dataStatus = {
+      template: {
+        id: 'graduate',
+        lang: 'zh',
+        loaded_at: '2026-11-19 09:00',
+        title: '示范：刚毕业的第一年',
+        guide: '欢迎体验 Sin90 示范数据。',
+      },
+      backups: [],
+      counts: { areas: 5, directions: 6, tasks: 7, plans: 10, routines: 2 },
+    }
+    render(<Sin90Page />)
+    expect(await screen.findByText('你正在看示范数据：示范：刚毕业的第一年')).toBeInTheDocument()
+    expect(screen.getByText('欢迎体验 Sin90 示范数据。')).toBeInTheDocument()
+
+    // Click clear button on banner
+    fireEvent.click(screen.getByRole('button', { name: '清空，从我自己开始' }))
+    expect(await screen.findByText(/清空前会自动保存一份当前数据/)).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+
+    // Confirm
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset' }))
+  })
+
+  it('dismisses demo banner on "Got it" and persists state to localStorage', async () => {
+    dataStatus = {
+      template: {
+        id: 'graduate',
+        lang: 'zh',
+        loaded_at: '2026-11-19 09:00',
+        title: '示范：刚毕业的第一年',
+        guide: '欢迎体验 Sin90 示范数据。',
+      },
+      backups: [],
+      counts: { areas: 5, directions: 6, tasks: 7, plans: 10, routines: 2 },
+    }
+    render(<Sin90Page />)
+    expect(await screen.findByText('你正在看示范数据：示范：刚毕业的第一年')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: '知道了' }))
+    await waitFor(() => {
+      expect(screen.queryByText('你正在看示范数据：示范：刚毕业的第一年')).not.toBeInTheDocument()
+    })
+    expect(window.localStorage.getItem('sin90:demo-banner-dismissed')).toBe('1')
+  })
+
+  it('data panel lists backups and triggers dataRestoreBackup after confirmation', async () => {
+    dataStatus = {
+      template: null,
+      backups: [{ name: 'auto-20261119-01.json', at: '2026-11-19 10:00:00', bytes: 2048 }],
+      counts: { areas: 5, directions: 4, tasks: 3, plans: 2, routines: 1 },
+    }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '数据' }))
+
+    expect(await screen.findByText('Sin90 数据管理')).toBeInTheDocument()
+    expect(screen.getByText(/5 个系统 · 4 个方向 · 2 条计划 · 3 个任务/)).toBeInTheDocument()
+    expect(screen.getByText('当前为个人数据（非示范）')).toBeInTheDocument()
+    expect(screen.getByText('auto-20261119-01.json')).toBeInTheDocument()
+
+    // Click restore
+    fireEvent.click(screen.getByRole('button', { name: '恢复到这个时间点' }))
+    expect(await screen.findByText(/确定要恢复备份「auto-20261119-01.json」吗/)).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+
+    // Confirm
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataRestoreBackup', name: 'auto-20261119-01.json' }))
+  })
+
+  it('data panel triggers export and import IPCs', async () => {
+    dataStatus = {
+      template: null,
+      backups: [],
+      counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+    }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '数据' }))
+
+    // Export
+    fireEvent.click(await screen.findByRole('button', { name: '导出备份' }))
+    await waitFor(() => expect(sin90ExportToFile).toHaveBeenCalled())
+
+    // Import
+    fireEvent.click(screen.getByRole('button', { name: '从文件恢复' }))
+    expect(await screen.findByText(/确定要从所选文件恢复吗/)).toBeInTheDocument()
+    expect(sin90ImportFromFile).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90ImportFromFile).toHaveBeenCalled())
+  })
+
+  it('data panel supports loading demo with language and clearing to empty', async () => {
+    dataStatus = {
+      template: null,
+      backups: [],
+      counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+    }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '数据' }))
+
+    // Load demo
+    fireEvent.click(await screen.findByRole('button', { name: '加载示范数据' }))
+    expect(await screen.findByText(/确定要加载示范数据吗/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset', template: 'graduate', lang: 'zh' }))
+
+    // Clear to empty
+    fireEvent.click(screen.getByRole('button', { name: '清空成空白' }))
+    expect(await screen.findByText(/确定要清空为全新空白吗/)).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '确认' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset' }))
   })
 })

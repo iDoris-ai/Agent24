@@ -407,3 +407,81 @@ export function latestRhythm(rhythms: readonly Sin90Rhythm[]): Sin90Rhythm | nul
   open.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
   return open[0] ?? null
 }
+
+export interface Sin90TemplateInfo {
+  id: string
+  lang: string
+  loaded_at: string
+  title: string
+  guide: string
+}
+
+export interface Sin90BackupItem {
+  name: string
+  at: string
+  bytes: number
+}
+
+export interface Sin90DataCounts {
+  areas: number
+  directions: number
+  tasks: number
+  plans: number
+  routines: number
+}
+
+export interface Sin90DataStatus {
+  template: Sin90TemplateInfo | null
+  backups: Sin90BackupItem[]
+  counts: Sin90DataCounts
+}
+
+export interface Sin90TemplateChoice {
+  id: string
+  langs: string[]
+  title: string
+}
+
+export function parseDataStatus(v: unknown): Sin90DataStatus {
+  if (!isObj(v)) {
+    return {
+      template: null,
+      backups: [],
+      counts: { areas: 0, directions: 0, tasks: 0, plans: 0, routines: 0 },
+    }
+  }
+  const tmplRaw = v['template']
+  const template: Sin90TemplateInfo | null = isObj(tmplRaw)
+    ? {
+        id: str(tmplRaw['id']) ?? '',
+        lang: str(tmplRaw['lang']) ?? '',
+        loaded_at: str(tmplRaw['loaded_at']) ?? '',
+        title: str(tmplRaw['title']) ?? '',
+        guide: str(tmplRaw['guide']) ?? '',
+      }
+    : null
+  const backupsRaw = Array.isArray(v['backups']) ? v['backups'] : []
+  const backups: Sin90BackupItem[] = backupsRaw.filter(isObj).map((b) => ({
+    name: str(b['name']) ?? '',
+    at: str(b['at']) ?? '',
+    bytes: typeof b['bytes'] === 'number' ? b['bytes'] : 0,
+  }))
+  const c = isObj(v['counts']) ? v['counts'] : {}
+  const counts: Sin90DataCounts = {
+    areas: typeof c['areas'] === 'number' ? c['areas'] : 0,
+    directions: typeof c['directions'] === 'number' ? c['directions'] : 0,
+    tasks: typeof c['tasks'] === 'number' ? c['tasks'] : 0,
+    plans: typeof c['plans'] === 'number' ? c['plans'] : 0,
+    routines: typeof c['routines'] === 'number' ? c['routines'] : 0,
+  }
+  return { template, backups, counts }
+}
+
+export function parseTemplates(v: unknown): Sin90TemplateChoice[] {
+  if (!Array.isArray(v)) return []
+  return v.filter(isObj).map((item) => ({
+    id: str(item['id']) ?? '',
+    langs: Array.isArray(item['langs']) ? item['langs'].filter((l): l is string => typeof l === 'string') : [],
+    title: str(item['title']) ?? '',
+  }))
+}

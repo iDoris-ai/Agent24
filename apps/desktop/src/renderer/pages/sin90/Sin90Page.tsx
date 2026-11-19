@@ -1,12 +1,36 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Badge, Button, Card, EmptyState, ErrorNotice, PageHeader, SegmentedTabs, Select, TextField } from '../../ui'
-import { useT, type T } from '../../i18n'
-import { fetchAreas, fetchBlocks, fetchDirections, fetchPlans, fetchProgress, fetchProposals, fetchReviews, fetchReviewSettings, fetchRhythms, fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks, sin90Write, WriteFailed, writesAvailable } from './api'
-import { blockTransitions, currentWeek, firstDirectionId, groupDirections, isoWeekUTC, latestRhythm, legalPlanParents, routineNext, taskTransitions, weekNext, type DirectionGroup, type Sin90Area, type Sin90Block, type Sin90Direction, type Sin90Proposal, type Sin90Review, type Sin90Task, type Sin90Today, type Sin90Week, type Sin90WeekAttention, type Sin90PeriodPlan, type Sin90PlanProgress, type Sin90ReviewSettings } from './model'
+import { useLocale, useT, type T } from '../../i18n'
+import {
+  exportToFile, fetchAreas, fetchBlocks, fetchDataStatus, fetchDirections, fetchPlans,
+  fetchProgress, fetchProposals, fetchReviews, fetchReviewSettings, fetchRhythms,
+  fetchRoutines, fetchTasks, fetchToday, fetchWeekAttention, fetchWeeks,
+  importFromFile, sin90Write, WriteFailed, writesAvailable,
+} from './api'
+import {
+  blockTransitions, currentWeek, firstDirectionId, groupDirections, isoWeekUTC,
+  latestRhythm, legalPlanParents, routineNext, taskTransitions, weekNext,
+  type DirectionGroup, type Sin90Area, type Sin90Block, type Sin90Direction,
+  type Sin90Proposal, type Sin90Review, type Sin90Task, type Sin90Today,
+  type Sin90Week, type Sin90WeekAttention, type Sin90PeriodPlan,
+  type Sin90PlanProgress, type Sin90ReviewSettings, type Sin90DataStatus,
+} from './model'
 import { sin90ShouldRefresh } from './refresh'
 import { describeOp, sourceLabel } from './sentences'
 import { sin90Messages } from './Sin90.i18n'
 import './sin90.css'
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+interface ConfirmState {
+  title: string
+  message: string
+  onConfirm: () => void
+}
 
 type Key = keyof typeof sin90Messages.en
 type Layer = 'direction' | 'rhythm' | 'today' | 'review'
@@ -34,6 +58,26 @@ const DELEGATION_CODES = new Set([
 
 export function Sin90Page() {
   const t = useT(sin90Messages)
+  const currentLocale = useLocale()
+  const initialLang = (currentLocale === 'zh' || currentLocale === 'en' || currentLocale === 'th') ? currentLocale : 'zh'
+  const [demoLang, setDemoLang] = useState<'zh' | 'en' | 'th'>(initialLang)
+  useEffect(() => {
+    if (currentLocale === 'zh' || currentLocale === 'en' || currentLocale === 'th') {
+      setDemoLang(currentLocale)
+    }
+  }, [currentLocale])
+
+  const [dataStatus, setDataStatus] = useState<Sin90DataStatus | null>(null)
+  const [bannerDismissed, setBannerDismissed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('sin90:demo-banner-dismissed') === '1'
+    } catch {
+      return false
+    }
+  })
+  const [dataPanelOpen, setDataPanelOpen] = useState(false)
+  const [confirmAction, setConfirmAction] = useState<ConfirmState | null>(null)
+
   const [layer, setLayer] = useState<Layer>('today')
   const [today, setToday] = useState<Sin90Today | null>(null)
   const [areas, setAreas] = useState<Sin90Area[]>([])
@@ -70,7 +114,13 @@ export function Sin90Page() {
     setFailure(null)
     void (async () => {
       try {
-        const [td, a, d, pp] = await Promise.all([fetchToday(), fetchAreas(), fetchDirections(), fetchPlans()])
+        const [td, a, d, pp, ds] = await Promise.all([
+          fetchToday(),
+          fetchAreas(),
+          fetchDirections(),
+          fetchPlans(),
+          fetchDataStatus().catch(() => null),
+        ])
         if (token !== seq.current) return
         const visibleDirections = d.filter((item) => item.id !== 'sin90-triage')
         const gs = groupDirections(a, visibleDirections)
@@ -82,6 +132,7 @@ export function Sin90Page() {
         const att = wk ? await fetchWeekAttention(wk.id).catch(() => null) : null
         if (token !== seq.current) return
         setToday(td); setAreas(a); setGroups(gs); setDirections(visibleDirections); setSelected(chosen); setTasks([...ts]); setWeeks([...ws]); setBlocks([...bs]); setRoutines([...rs]); setRhythms([...rys]); setProposals([...ps]); setReviews([...revs]); setAttention(att); setPeriodPlans(pp); setProgress(progressRows); setReviewSettings(settings)
+        if (ds) setDataStatus(ds)
       } catch (err) { if (token === seq.current) setFailure(err instanceof Error ? err.message : 'Could not load Sin90.') }
     })()
   }, [])
@@ -118,6 +169,91 @@ export function Sin90Page() {
   const capture = () => { if (note.trim()) write({ op: 'capture', text: note }) }
   const reviewMode = layer === 'review'
 
+  const onBannerClear = () => {
+    setConfirmAction({
+      title: t('demoBannerClear'),
+      message: t('demoBannerClearConfirm'),
+      onConfirm: () => {
+        setConfirmAction(null)
+        write({ op: 'dataReset' })
+      },
+    })
+  }
+
+  const dismissBanner = () => {
+    setBannerDismissed(true)
+    try {
+      localStorage.setItem('sin90:demo-banner-dismissed', '1')
+    } catch {
+      // ignore
+    }
+  }
+
+  const handleExport = () => {
+    if (!canWrite || busy) return
+    setBusy(true)
+    setFailure(null)
+    void exportToFile()
+      .catch((err: unknown) => {
+        setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError'))
+      })
+      .finally(() => setBusy(false))
+  }
+
+  const handleImport = () => {
+    setConfirmAction({
+      title: t('dataPanelImport'),
+      message: t('dataPanelImportConfirm'),
+      onConfirm: () => {
+        setConfirmAction(null)
+        if (!canWrite || busy) return
+        setBusy(true)
+        setFailure(null)
+        void importFromFile()
+          .then(() => load(selected))
+          .catch((err: unknown) => {
+            setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError'))
+          })
+          .finally(() => setBusy(false))
+      },
+    })
+  }
+
+  const handleRestoreBackup = (name: string) => {
+    setConfirmAction({
+      title: t('dataPanelRestoreBackup'),
+      message: t('dataPanelRestoreBackupConfirm', { name }),
+      onConfirm: () => {
+        setConfirmAction(null)
+        write({ op: 'dataRestoreBackup', name })
+      },
+    })
+  }
+
+  const handleLoadDemo = () => {
+    setConfirmAction({
+      title: t('dataPanelLoadDemoAction'),
+      message: t('dataPanelLoadDemoConfirm'),
+      onConfirm: () => {
+        setConfirmAction(null)
+        setBannerDismissed(false)
+        try { localStorage.removeItem('sin90:demo-banner-dismissed') } catch { /* ignore */ }
+        write({ op: 'dataReset', template: 'graduate', lang: demoLang })
+      },
+    })
+  }
+
+  const handleClear = () => {
+    setConfirmAction({
+      title: t('dataPanelClearAction'),
+      message: t('dataPanelClearConfirm'),
+      onConfirm: () => {
+        setConfirmAction(null)
+        write({ op: 'dataReset' })
+      },
+    })
+  }
+
   // Rhythm is the whole week: every block, not one direction's.
   const weekBlocks = blocks
   function renderWeek() { return <>
@@ -130,10 +266,151 @@ export function Sin90Page() {
   </>}
 
   return <main className="sin90-page">
-    <PageHeader title={t('pageTitle')} actions={<><SegmentedTabs label={t('layers')} tabs={tabs.map((value) => ({ value, label: layerName(value) }))} value={reviewMode ? '' : layer} onChange={(value) => { if (tabs.includes(value as Layer)) setLayer(value as Layer) }} /><Button variant={reviewMode ? 'primary' : 'secondary'} onClick={() => setLayer('review')} aria-label={t('review')}>↺ {t('review')}</Button></>} />
+    <PageHeader
+      title={t('pageTitle')}
+      actions={
+        <>
+          <SegmentedTabs label={t('layers')} tabs={tabs.map((value) => ({ value, label: layerName(value) }))} value={reviewMode ? '' : layer} onChange={(value) => { if (tabs.includes(value as Layer)) setLayer(value as Layer) }} />
+          <Button variant={reviewMode ? 'primary' : 'secondary'} onClick={() => setLayer('review')} aria-label={t('review')}>↺ {t('review')}</Button>
+          <Button variant={dataPanelOpen ? 'primary' : 'secondary'} onClick={() => setDataPanelOpen((v) => !v)} aria-label={t('dataPanelButton')}>{t('dataPanelButton')}</Button>
+        </>
+      }
+    />
     {failure && <ErrorNotice message={failure} actionLabel={t('retry')} onAction={() => load(selected)} />}
     {!canWrite && <p className="sin90-muted" role="status">{t('writesOff')}</p>}
     {!groups && !failure && <p role="status">{t('loading')}</p>}
+
+    {dataStatus?.template && !bannerDismissed && (
+      <aside className="sin90-demo-banner" aria-label={t('demoBannerTitle', { title: dataStatus.template.title })}>
+        <div className="sin90-demo-banner-header">
+          <span className="sin90-demo-banner-title">{t('demoBannerTitle', { title: dataStatus.template.title })}</span>
+        </div>
+        <p className="sin90-demo-banner-guide">{dataStatus.template.guide}</p>
+        <div className="sin90-demo-banner-actions">
+          <Button variant="primary" size="sm" disabled={!enabled} onClick={onBannerClear}>
+            {t('demoBannerClear')}
+          </Button>
+          <Button size="sm" onClick={dismissBanner}>
+            {t('demoBannerDismiss')}
+          </Button>
+        </div>
+      </aside>
+    )}
+
+    {confirmAction && !dataPanelOpen && (
+      <div className="sin90-confirm-card" role="alert">
+        <p><strong>{confirmAction.title}</strong></p>
+        <p>{confirmAction.message}</p>
+        <div className="sin90-confirm-actions">
+          <Button variant="danger" size="sm" disabled={!enabled} onClick={confirmAction.onConfirm}>
+            {t('dataPanelConfirmBtn')}
+          </Button>
+          <Button variant="secondary" size="sm" disabled={!enabled} onClick={() => setConfirmAction(null)}>
+            {t('dataPanelCancelBtn')}
+          </Button>
+        </div>
+      </div>
+    )}
+
+    {dataPanelOpen && (
+      <div className="sin90-view">
+        <Card title={t('dataPanelTitle')} actions={<Button size="sm" onClick={() => setDataPanelOpen(false)}>{t('dataPanelClose')}</Button>} className="sin90-data-panel-card">
+          {confirmAction && (
+            <div className="sin90-confirm-card" role="alert">
+              <p><strong>{confirmAction.title}</strong></p>
+              <p>{confirmAction.message}</p>
+              <div className="sin90-confirm-actions">
+                <Button variant="danger" size="sm" disabled={!enabled} onClick={confirmAction.onConfirm}>
+                  {t('dataPanelConfirmBtn')}
+                </Button>
+                <Button variant="secondary" size="sm" disabled={!enabled} onClick={() => setConfirmAction(null)}>
+                  {t('dataPanelCancelBtn')}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          <section className="sin90-data-section">
+            <h3>{t('dataPanelSummaryTitle')}</h3>
+            <p>
+              {t('dataPanelCounts', {
+                areas: dataStatus?.counts.areas ?? 0,
+                directions: dataStatus?.counts.directions ?? 0,
+                plans: dataStatus?.counts.plans ?? 0,
+                tasks: dataStatus?.counts.tasks ?? 0,
+              })}
+            </p>
+            <p className="sin90-muted">
+              {dataStatus?.template
+                ? t('dataPanelIsDemo', { title: dataStatus.template.title, time: dataStatus.template.loaded_at })
+                : t('dataPanelIsNotDemo')}
+            </p>
+          </section>
+
+          <section className="sin90-data-section">
+            <div className="sin90-row-actions">
+              <Button variant="secondary" disabled={!enabled} onClick={handleExport}>
+                {t('dataPanelExport')}
+              </Button>
+              <Button variant="secondary" disabled={!enabled} onClick={handleImport}>
+                {t('dataPanelImport')}
+              </Button>
+            </div>
+            <p className="sin90-muted">{t('dataPanelExportHint')}</p>
+          </section>
+
+          <section className="sin90-data-section">
+            <h3>{t('dataPanelBackupsTitle')}</h3>
+            {(!dataStatus?.backups || dataStatus.backups.length === 0) ? (
+              <p className="sin90-muted">{t('dataPanelBackupsNone')}</p>
+            ) : (
+              <ul className="sin90-queue">
+                {dataStatus.backups.map((b) => (
+                  <li key={b.name} className="sin90-backup-row">
+                    <span>
+                      <strong>{b.name}</strong>
+                      <br />
+                      <small>{b.at} · {formatBytes(b.bytes)}</small>
+                    </span>
+                    <Button size="sm" disabled={!enabled} onClick={() => handleRestoreBackup(b.name)}>
+                      {t('dataPanelRestoreBackup')}
+                    </Button>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </section>
+
+          <section className="sin90-data-section">
+            <h3>{t('dataPanelLoadDemoTitle')}</h3>
+            <div className="sin90-detail" style={{ display: 'flex', alignItems: 'end', gap: 12 }}>
+              <Select
+                id="sin90-demo-lang"
+                label={t('dataPanelLoadDemoLanguage')}
+                value={demoLang}
+                onChange={(e) => setDemoLang(e.target.value as 'zh' | 'en' | 'th')}
+              >
+                <option value="zh">中文 (zh)</option>
+                <option value="en">English (en)</option>
+                <option value="th">ไทย (th)</option>
+              </Select>
+              <Button disabled={!enabled} onClick={handleLoadDemo}>
+                {t('dataPanelLoadDemoAction')}
+              </Button>
+            </div>
+          </section>
+
+          <section className="sin90-data-section">
+            <h3>{t('dataPanelClearTitle')}</h3>
+            <div>
+              <Button variant="danger" disabled={!enabled} onClick={handleClear}>
+                {t('dataPanelClearAction')}
+              </Button>
+            </div>
+          </section>
+        </Card>
+      </div>
+    )}
 
     {layer === 'today' && today && <div className="sin90-view">
       <p className="sin90-capture-hint">{t('captureHint')}</p><form className="sin90-capture" onSubmit={(event) => { event.preventDefault(); capture() }}><TextField label={t('captureLabel')} placeholder={t('capturePlaceholder')} value={note} onChange={(event) => setNote(event.target.value)} /><Button type="submit" variant="primary" aria-label={t('capture')} disabled={!enabled || !note.trim()}>{t('capture')} ↵</Button></form>
