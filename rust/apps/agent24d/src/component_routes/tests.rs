@@ -4315,10 +4315,14 @@ const DOC_TOOLS: &[&str] = &[
     "documents.compose",
     "documents.extract",
     "documents.extraction_get",
+    "documents.fields",
+    "documents.fill",
     "documents.find",
     "documents.get",
     "documents.job_get",
     "documents.list",
+    "documents.paragraphs",
+    "documents.patch",
     "documents.read_range",
 ];
 
