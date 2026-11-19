@@ -538,6 +538,10 @@ enum CommAction {
         as_: Option<String>,
         #[arg(long)]
         limit: Option<u32>,
+        /// Show the two-way conversation with this contact (nickname or npub)
+        /// instead of the received-only inbox
+        #[arg(long)]
+        with: Option<String>,
     },
     /// Manually pull new inbound messages once. The daemon's own relay
     /// polling normally does this automatically (COMM-4a); use this only
@@ -2723,10 +2727,17 @@ fn comm_request(
                 "to": to, "content": content, "from": from, "encrypt": !no_encrypt
             })),
         ),
-        CommAction::History { as_, limit } => (
+        CommAction::History { as_, limit, with } => (
             reqwest::Method::GET,
             {
-                let mut path = "/api/v1/comm/history".to_owned();
+                let mut path = match &with {
+                    Some(peer) => {
+                        let mut path = "/api/v1/comm/history/conversation".to_owned();
+                        comm_groups::append_query(&mut path, "with", peer);
+                        path
+                    }
+                    None => "/api/v1/comm/history".to_owned(),
+                };
                 if let Some(a) = as_ {
                     comm_groups::append_query(&mut path, "as", &a);
                 }
