@@ -70,6 +70,9 @@ pub async fn derive(
         ("POST", "/api/v1/module-consents/modules/{module}/tools/{tool}") => {
             module_consent(state, path, body)?
         }
+        ("POST", "/api/v1/module-consents/modules/{module}/tools") => {
+            module_consents(state, path, body)?
+        }
         ("POST", "/api/v1/schedules") => schedule_create(body)?,
         ("PATCH", "/api/v1/schedules/{id}") => {
             let update: ScheduleUpdate = serde_json::from_slice(body).ok()?;
@@ -390,6 +393,47 @@ fn module_consent(state: &AppState, path: &str, body: &[u8]) -> Option<String> {
         if request.grants() { "grant" } else { "deny" },
         shown(module)?,
         shown(tool)?,
+        shown(request.expires_at()?)?
+    ))
+}
+
+/// A1: `POST /api/v1/module-consents/modules/{module}/tools`, every tool
+/// named, so the user sees all that one confirmation grants. Only for tools
+/// whose cards take grants; only grants (a batch never denies).
+fn module_consents(state: &AppState, path: &str, body: &[u8]) -> Option<String> {
+    let module = plain(
+        path.strip_prefix("/api/v1/module-consents/modules/")?
+            .strip_suffix("/tools")?,
+    )?;
+    state.module_grants.as_ref()?;
+    let cards = state.module_tool_cards.as_ref()?;
+    let request = crate::consent_routes::parse_batch_request(body)?;
+    let mut tools = Vec::new();
+    for tool in request.tool_names() {
+        let tool = plain(tool)?;
+        if !cards
+            .tools
+            .get(&(module.to_owned(), tool.to_owned()))?
+            .takes_grants
+        {
+            return None;
+        }
+        tools.push(tool);
+    }
+    let kinds = request.resource_kinds()?;
+    let resources = if kinds.is_empty() {
+        "no resources".to_owned()
+    } else {
+        format!(
+            "{} resource(s) of kind {}",
+            request.resource_count(),
+            shown(&kinds.join(", "))?
+        )
+    };
+    Some(format!(
+        "grant consent for module {} tools {} until {}; {resources}",
+        shown(module)?,
+        shown(&tools.join(", "))?,
         shown(request.expires_at()?)?
     ))
 }

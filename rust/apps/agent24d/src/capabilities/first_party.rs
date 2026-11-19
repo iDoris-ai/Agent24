@@ -855,13 +855,14 @@ pub(crate) const SUMMARY_MAX_UTF16: usize = 500;
 /// K-B3b: the routes whose summary `crate::elevation_summaries` derives.
 /// Every one is an Elevated row of the route policy; the level table itself
 /// is unchanged (`derived_routes_are_the_elevated_rows_they_summarise`).
-pub(crate) const DERIVED_ROUTES: [(&str, &str); 11] = [
+pub(crate) const DERIVED_ROUTES: [(&str, &str); 12] = [
     ("POST", "/api/v1/approvals/{id}"),
     ("POST", "/api/v1/module-approvals/{id}"),
     (
         "POST",
         "/api/v1/module-consents/modules/{module}/tools/{tool}",
     ),
+    ("POST", "/api/v1/module-consents/modules/{module}/tools"),
     ("POST", "/api/v1/schedules"),
     ("PATCH", "/api/v1/schedules/{id}"),
     ("DELETE", "/api/v1/schedules/{id}"),
