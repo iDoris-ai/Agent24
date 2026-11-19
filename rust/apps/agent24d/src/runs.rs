@@ -14,7 +14,7 @@ use serde::Serialize;
 use crate::routes::read_body_or_response;
 
 use crate::capabilities::Authorization;
-use crate::knowledge_tools::{RunKnowledge, run_knowledge};
+use crate::knowledge_tools::{RunKnowledge, run_knowledge_with};
 use crate::server::{AppState, error_response};
 
 fn map_agent_error(err: AgentError) -> Response {
@@ -330,7 +330,17 @@ pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> R
             let knowledge = match run.input.knowledge_binding_id {
                 None => None,
                 Some(_) => match state.store.list_tool_calls(&run.id).await {
-                    Ok(calls) => Some(run_knowledge(&calls)),
+                    Ok(calls) => {
+                        // K3: what each knowledge_search answered, for its hits.
+                        let answers = match state.store.list_run_messages(&run.id).await {
+                            Ok(messages) => messages
+                                .into_iter()
+                                .filter_map(|m| Some((m.tool_call_id?, m.content?)))
+                                .collect(),
+                            Err(err) => return map_store_error(err),
+                        };
+                        Some(run_knowledge_with(&calls, &answers))
+                    }
                     Err(err) => return map_store_error(err),
                 },
             };

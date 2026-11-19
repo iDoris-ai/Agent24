@@ -351,3 +351,47 @@ fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
     let knowledge = run_knowledge(&calls[..1]);
     assert!(knowledge.searched && knowledge.read_chunks.is_empty());
 }
+
+/// K3: a completed search's hits count as read, so an answer citing them is
+/// grounded; a search that failed, or another tool's answer, counts for nothing.
+#[test]
+fn a_completed_searchs_hits_count_as_read() {
+    let chunk = |k: &str, c: &str| ReadChunk {
+        knowledge_id: k.into(),
+        chunk_id: c.into(),
+    };
+    let answer = json!({
+        "kind": "knowledge.search",
+        "evidence": [
+            { "use": "clue", "knowledge_id": "doc-1", "chunk_id": "chk-1" },
+            { "use": "clue", "knowledge_id": "doc-2", "chunk_id": "chk-2" },
+            { "use": "clue", "knowledge_id": "doc-1", "chunk_id": "chk-1" },
+        ],
+    })
+    .to_string();
+    let answers =
+        std::collections::HashMap::from([("tc_knowledge_search".to_owned(), answer.clone())]);
+    let done = [stored(
+        SEARCH,
+        ToolCallStatus::Completed,
+        json!({ "query": "q" }),
+    )];
+    assert_eq!(
+        run_knowledge_with(&done, &answers),
+        RunKnowledge {
+            searched: true,
+            read_chunks: vec![chunk("doc-1", "chk-1"), chunk("doc-2", "chk-2")]
+        }
+    );
+    let failed = [stored(
+        SEARCH,
+        ToolCallStatus::Failed,
+        json!({ "query": "q" }),
+    )];
+    assert_eq!(run_knowledge_with(&failed, &answers).read_chunks, vec![]);
+    let other = std::collections::HashMap::from([(
+        "tc_knowledge_search".to_owned(),
+        json!({ "kind": "knowledge.read", "evidence": [{ "knowledge_id": "doc-9", "chunk_id": "chk-9" }] }).to_string(),
+    )]);
+    assert_eq!(run_knowledge_with(&done, &other).read_chunks, vec![]);
+}

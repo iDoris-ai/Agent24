@@ -404,6 +404,8 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
         // user as 「知识库里没有」.
         let ids: Vec<String> = match &query.knowledge_base_ids {
             None => allowed.clone(),
+            // The ids dropped are written into the run's record by the tool
+            // (`ignored_knowledge_base_ids`, tool/call.rs).
             Some(named) => named
                 .as_slice()
                 .iter()
@@ -411,6 +413,8 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
                 .cloned()
                 .collect(),
         };
+        // Scope semantics (K3), never wider than the binding: only names
+        // outside it searches all of it; any name inside it searches just those.
         let ids = if ids.is_empty() { allowed } else { ids };
         let Ok(knowledge_base_ids) = NonEmpty::try_from(ids) else {
             return Err(empty_scope(&request_id, generation));

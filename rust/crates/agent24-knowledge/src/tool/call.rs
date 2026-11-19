@@ -319,8 +319,33 @@ pub async fn search(
     input: &Map<String, Value>,
 ) -> Result<String, Refused> {
     let query = parse_search(input)?;
+    let named = query.knowledge_base_ids.clone();
     match backend.search(run_id, query).await {
-        Ok((request, response)) => Ok(render_search(&request, &response)),
+        Ok((request, response)) => {
+            let rendered = render_search(&request, &response);
+            // K3: ids the model named outside the binding were not searched;
+            // the answer (kept in the run's record) says which.
+            let sent = request.scope.knowledge_base_ids.as_slice();
+            let ignored: Vec<&String> = named
+                .as_ref()
+                .map(|n| {
+                    n.as_slice()
+                        .iter()
+                        .filter(|id| !sent.contains(id))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if ignored.is_empty() {
+                return Ok(rendered);
+            }
+            match serde_json::from_str::<Value>(&rendered) {
+                Ok(Value::Object(mut object)) => {
+                    object.insert("ignored_knowledge_base_ids".into(), json!(ignored));
+                    Ok(Value::Object(object).to_string())
+                }
+                _ => Ok(rendered),
+            }
+        }
         Err(failure) => Err(refusal("knowledge.search", failure)),
     }
 }

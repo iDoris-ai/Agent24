@@ -247,6 +247,43 @@ async fn the_knowledge_bases_named_are_cut_to_the_binding_and_none_left_searches
     assert_eq!(sent["scope"]["knowledge_base_ids"], json!(["kb-a", "kb-b"]));
 }
 
+/// K3 (PM 11-19): whatever ids the model sends, the scope sent is a subset
+/// of the binding's; only when none of them is in it is the whole binding searched.
+#[tokio::test]
+async fn whatever_ids_the_model_names_the_scope_sent_stays_inside_the_binding() {
+    let binding = ["kb-a", "kb-b"];
+    let cases: [Option<Vec<&str>>; 6] = [
+        None,
+        Some(vec!["kb-a"]),
+        Some(vec!["kb-z"]),
+        Some(vec!["kb-z", "kb-b", "kb-y"]),
+        Some(vec!["home_knowledge"]),
+        Some(vec!["kb-a", "kb-b", "kb-c"]),
+    ];
+    for (i, named) in cases.into_iter().enumerate() {
+        let s = setup(Answer::Fixture("search.ok.json"));
+        s.backend.search(RUN, query(named.clone())).await.unwrap();
+        let sent = s.server.sent.lock().unwrap()[0].1.clone();
+        let scope: Vec<String> =
+            serde_json::from_value(sent["scope"]["knowledge_base_ids"].clone()).unwrap();
+        assert!(!scope.is_empty(), "case {i}");
+        assert!(
+            scope.iter().all(|id| binding.contains(&id.as_str())),
+            "case {i}: {scope:?}"
+        );
+        if let Some(named) = named {
+            let inside: Vec<&str> = named
+                .iter()
+                .copied()
+                .filter(|id| binding.contains(id))
+                .collect();
+            if !inside.is_empty() {
+                assert_eq!(scope, inside, "case {i}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_answer_outside_the_scope_asked_is_refused() {
     // The fixture answers for kb-a and kb-b; only kb-b was asked.
