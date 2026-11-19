@@ -117,6 +117,8 @@ const api = {
   /** Sin90 write. Main attaches the human key. The page never sees the key. */
   sin90Write: (req: unknown): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.Sin90Write, req),
+  /** Plain text to the system clipboard (main process; works without page focus). */
+  copyText: (text: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.ClipboardWriteText, text),
   sin90KeyStatus: (): Promise<{ available: boolean }> =>
     ipcRenderer.invoke(IpcChannels.Sin90KeyStatus),
   sin90ExportToFile: (): Promise<BackendProxyResponse> =>
