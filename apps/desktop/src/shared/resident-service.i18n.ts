@@ -1,7 +1,6 @@
 import { defineMessages } from './i18n'
 
-// M5 B4c2: Settings → General → background service. `label` is named in the
-// first-launch box's detail (main-i18n `consent.detail`), so the two read the same.
+// Settings → General → background service.
 export const residentServiceMessages = defineMessages({
   en: {
     title: 'Background service',
