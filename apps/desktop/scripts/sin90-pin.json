@@ -1,13 +1,13 @@
 {
-  "version": "0.6.1",
+  "version": "0.7.0",
   "assets": {
     "arm64": {
-      "name": "sin90-0.6.1-macos-arm64.tar.gz",
-      "sha256": "30fff92f9e2f284a01c37fb65c037cde2ea101429a5a1f16d89b613070fb2e2d"
+      "name": "sin90-0.7.0-macos-arm64.tar.gz",
+      "sha256": "839788cb42e002d8a2e066b7df15d474004a6cffd852252dd803d408a4e6e3f8"
     },
     "x64": {
-      "name": "sin90-0.6.1-macos-x64.tar.gz",
-      "sha256": "428d99d7b55333e10d6d99f3ca31d5aa2605641354f4f7b34d6a6515d619ebb8"
+      "name": "sin90-0.7.0-macos-x64.tar.gz",
+      "sha256": "b11cefed96cfe969327f73a0ce507f304417f750ae4677dde5b15026a3c56a6a"
     }
   }
 }
