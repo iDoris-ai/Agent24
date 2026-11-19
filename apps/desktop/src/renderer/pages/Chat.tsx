@@ -675,7 +675,12 @@ export default function ChatPage() {
     if (e.nativeEvent.isComposing || e.keyCode === 229) return
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
-      void send(input)
+      // Loop 4: what the box holds now, not the last render's state: keys
+      // typed fast (the computer-use tool, a paste then Enter) can reach this
+      // Enter before React has rendered the text before it.
+      const typed = e.currentTarget.value
+      if (typed !== input) setInput(typed)
+      void send(typed)
     }
   }
 

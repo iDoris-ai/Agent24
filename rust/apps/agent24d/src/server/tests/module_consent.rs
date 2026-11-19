@@ -452,6 +452,7 @@
             },
             resource_kinds: vec!["doc".to_owned()],
             takes_grants,
+            host_read: false,
         };
         let running = StdArc::clone(running);
         state.module_tool_cards = Some(crate::consent_routes::ModuleToolCards {
