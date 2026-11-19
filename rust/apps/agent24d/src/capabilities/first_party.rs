@@ -927,12 +927,14 @@ fn knowledge_summary(
         ParsedChange::Activate {
             seq,
             endpoint: None,
+            ..
         } => Some(format!(
             "activate Knowledge binding {id} with no Knowledge service (every call refused); sequence {seq}"
         )),
         ParsedChange::Activate {
             seq,
             endpoint: Some(endpoint),
+            credential,
         } => {
             let base = shown(&endpoint.base_url)?;
             let bases = endpoint
@@ -941,8 +943,22 @@ fn knowledge_summary(
                 .map(|base_id| shown(base_id))
                 .collect::<Option<Vec<_>>>()?
                 .join(", ");
+            // U1: C with it is named by kind and expiry only, as on its own route.
+            let with = match credential {
+                None => String::new(),
+                Some((credential, expires_at)) => {
+                    let kind = shown(match credential {
+                        Credential::Bearer(_) => "bearer",
+                        Credential::ApiKey(_) => "api_key",
+                    })?;
+                    format!(
+                        ", with its credential ({kind}, valid until {})",
+                        expires_rfc3339(*expires_at)?
+                    )
+                }
+            };
             Some(format!(
-                "activate Knowledge binding {id} for {base}; knowledge bases: [{bases}]; sequence {seq}"
+                "activate Knowledge binding {id} for {base}; knowledge bases: [{bases}]{with}; sequence {seq}"
             ))
         }
         ParsedChange::Deactivate { seq } => {

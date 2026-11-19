@@ -434,8 +434,10 @@ async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
 }
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
+/// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
 async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
-    let (id, rest) = split_document(arguments)?;
+    let (id, mut rest) = split_document(arguments)?;
+    rest.remove("title");
     let req: crate::patch::FillRequest = parse(rest)?;
     let storage = ready(state).await?;
     completed(
@@ -1302,6 +1304,40 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    #[tokio::test]
+    async fn fill_names_the_new_document_after_the_template_whatever_title_the_model_gives() {
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let sha = storage.blobs.put_bytes(template).unwrap().sha256;
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6Y00077";
+        let docx = crate::office::DOCX;
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                        VALUES ('{id}', '租赁模板.docx', '{docx}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                template.len()
+            ),
+        )
+        .await;
+        let args = json!({ "document_id": id, "values": { "出租方": "明远" }, "title": "房屋租赁合同-李四" });
+        let body = call_in(&state, "fill", &[id], args).await;
+        assert_eq!(
+            payload(&body)["kind"],
+            "import",
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let filename: String = sqlx::query_scalar("SELECT filename FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(filename, "租赁模板（填写）.docx");
     }
 
     #[tokio::test]

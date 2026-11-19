@@ -124,7 +124,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fill
-    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting. values maps a field name (without braces, as listed by documents.fields) to its text. The template is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. The template is never changed. Returns the import job."
     input_schema:
       type: object
       additionalProperties: false
@@ -136,7 +136,6 @@ tools:
           minProperties: 1
           maxProperties: 200
           additionalProperties: { type: string }
-        title: { type: string, description: "title of the new document" }
     risk: write_local
     output_privacy: local_only
     timeout_ms: 30000
