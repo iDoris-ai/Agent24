@@ -1106,3 +1106,21 @@ describe('ChatPage: a question naming a document in 《》', () => {
     expect(chat.body.messages.at(-1).content).toBe('《红楼梦》讲了什么')
   })
 })
+
+// Loop 3 FU: an Enter that ends an input method's composition does not send.
+describe('ChatPage: Enter while composing', () => {
+  beforeEach(() => { setLocale('zh') })
+  it('sends nothing on an Enter that ends a composition, and sends on the next plain Enter', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ok' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'What does the knowledge base say' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false, isComposing: true })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false, keyCode: 229 })
+    expect(mockBackendProxy).not.toHaveBeenCalled()
+    fireEvent.change(textarea, { target: { value: 'What does the knowledge base say about boiling water?' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
+    expect(mockBackendProxy.mock.calls[0][0].body.messages.at(-1).content).toBe('What does the knowledge base say about boiling water?')
+  })
+})
