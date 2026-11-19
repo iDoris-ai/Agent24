@@ -1,8 +1,10 @@
 // K2 (Loop 3): whether the bound Knowledge server answers. The demo stack was
 // down for about 25 hours (11-17) and the app said nothing: answers silently
-// came back as 「没找到」. Main asks the server for the first bound knowledge
-// base every minute while Knowledge is on; the settings page shows the result
-// and a chat turn that would use Knowledge says so instead of answering blind.
+// came back as 「没找到」. Main asks the server's own readiness call for
+// Agent24 (`POST <endpoint>/agent24/knowledge/ready`, the one the daemon's
+// probe uses; the demo stack serves no other route) every minute while
+// Knowledge is on; the settings page shows the result and a chat turn that
+// would use Knowledge says so instead of answering blind.
 //
 // Nothing here writes a log of the key or of what the server answered.
 
@@ -82,17 +84,24 @@ export class KnowledgeReachability {
       state = 'unknown'
     } else {
       const base = inputs.endpoint.replace(/\/+$/, '')
-      const url = `${base}/knowledge-bases/${encodeURIComponent(inputs.knowledgeBaseId)}`
       const timeout = AbortSignal.timeout(this.deps.timeoutMs ?? TIMEOUT_MS)
+      const requestId = `k2-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
       try {
-        const res = await this.deps.fetch(url, {
-          method: 'GET',
-          headers: { 'X-API-Key': inputs.key },
+        const res = await this.deps.fetch(`${base}/agent24/knowledge/ready`, {
+          method: 'POST',
+          headers: { 'X-API-Key': inputs.key, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ protocol_version: 1, request_id: requestId, generation: 1 }),
           redirect: 'error',
           signal: timeout,
         })
         state = stateOfStatus(res.status)
-        void res.body?.cancel().catch(() => {})
+        if (state === 'ok') {
+          // Answered, but alive only if it says so (the daemon's probe reads the same field).
+          const body = (await res.json().catch(() => null)) as { live?: unknown } | null
+          if (body?.live !== true) state = 'unreachable'
+        } else {
+          void res.body?.cancel().catch(() => {})
+        }
       } catch {
         state = 'unreachable'
       }

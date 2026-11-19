@@ -89,7 +89,7 @@ export function KnowledgeSettings() {
             style={reach?.state === 'ok' ? { color: 'var(--muted)' } : { color: 'var(--danger, #c0392b)', fontWeight: 600 }}>
             {reachText}
             {' '}
-            <button type="button" className="btn btn-ghost" disabled={checking} onClick={() => void checkNow()}>{t('reach.check')}</button>
+            <button type="button" className="btn btn-ghost" disabled={checking} aria-busy={checking} onClick={() => void checkNow()}>{checking ? t('reach.checking') : t('reach.check')}</button>
           </p>
         )}
       </div>
