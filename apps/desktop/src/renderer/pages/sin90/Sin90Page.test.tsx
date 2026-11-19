@@ -112,7 +112,7 @@ describe('Sin90 three layers', () => {
     await screen.findByRole('tab', { name: '今天' })
     expect(screen.getByRole('tab', { name: '今天' })).toHaveAttribute('aria-selected', 'true')
     fireEvent.click(screen.getByRole('tab', { name: '方向' }))
-    expect(await screen.findByText('五个人生系统')).toBeInTheDocument()
+    expect(await screen.findByText('人生系统')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
     expect(await screen.findByText('年度')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('tab', { name: '今天' }))
@@ -129,7 +129,7 @@ describe('Sin90 three layers', () => {
     expect(screen.getByRole('tab', { name: '方向' })).toHaveAttribute('aria-selected', 'false')
     expect(screen.getByRole('button', { name: '复盘' })).toHaveClass('ui-button--primary')
     fireEvent.click(screen.getByRole('tab', { name: '方向' }))
-    expect(await screen.findByText('五个人生系统')).toBeInTheDocument()
+    expect(await screen.findByText('人生系统')).toBeInTheDocument()
   })
 
   it('captures a quick note and completes a must-do item using the legal transition', async () => {
@@ -142,13 +142,42 @@ describe('Sin90 three layers', () => {
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionTask', id: 't1', to: 'done' }))
   })
 
+  it('offers a demo language switch when the loaded template differs from the UI', async () => {
+    dataStatus = { template: { id: 'graduate', lang: 'en', loaded_at: '2026-11-18T00:00:00Z', title: 'Graduate', guide: 'Guide' }, backups: [], counts: { areas: 1, directions: 1, tasks: 0, plans: 0, routines: 0 } }
+    render(<Sin90Page />)
+    const button = await screen.findByRole('button', { name: '换成 中文 版示范' })
+    fireEvent.click(button)
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset', template: 'graduate', lang: 'zh' }))
+  })
+
+  it('places a must-do direction label below the full-width title', async () => {
+    directions = [{ id: 'd1', area_id: null, title: '一个很长很长的方向名称', status: 'active', target_window: 'ongoing' }]
+    today = { must_do: [task('t1', '必做事项标题')], deep_block: null, inbox: [], carry_over_candidates: [] }
+    render(<Sin90Page />)
+    const row = await screen.findByRole('listitem', { name: '必做事项标题' })
+    expect(within(row).getByText('一个很长很长的方向名称')).toHaveClass('sin90-task-direction')
+    expect(row.querySelector('.sin90-task-direction')?.getAttribute('title')).toBe('一个很长很长的方向名称')
+  })
+
+  it('keeps area state read-only until edit is selected', async () => {
+    areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1, current_state: '偶尔散步', ideal_state: '规律运动' }]
+    directions = [{ id: 'd1', area_id: 'a1', title: '多运动', status: 'active', target_window: 'ongoing' }]
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
+    expect(await screen.findByText('偶尔散步')).toBeInTheDocument()
+    expect(screen.queryByLabelText('现在的状态')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }))
+    expect(screen.getByLabelText('现在的状态')).toHaveValue('偶尔散步')
+    expect(screen.getByLabelText('想要的状态')).toHaveValue('规律运动')
+  })
+
   it('uses clear placeholders where the server has no planning data', async () => {
     areas = [{ id: 'a1', title: '健康', status: 'active', sort_key: 1 }]
     directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing' }]
     render(<Sin90Page />)
     fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
-    fireEvent.click(await screen.findByText('多走路'))
-    expect(await screen.findByLabelText('三年目标')).toBeInTheDocument()
+    expect(await screen.findByText('三年目标：')).toBeInTheDocument()
+    expect(screen.getByLabelText('三年目标').closest('details')).not.toHaveProperty('open', true)
     expect(screen.queryByText(/半马|40 周|300/)).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
     expect(await screen.findByText('年度')).toBeInTheDocument()
@@ -159,8 +188,8 @@ describe('Sin90 three layers', () => {
     directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing', goal_3y: '每年走 1000 公里' }]
     render(<Sin90Page />)
     fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
-    fireEvent.click(await screen.findByText('多走路'))
-    expect(await screen.findByLabelText('三年目标')).toHaveValue('每年走 1000 公里')
+    expect(await screen.findByText('每年走 1000 公里')).toBeInTheDocument()
+    expect(screen.getByLabelText('三年目标').closest('details')).not.toHaveProperty('open', true)
   })
 
   it('saves an edited three-year goal through the registered write operation', async () => {
@@ -168,7 +197,7 @@ describe('Sin90 three layers', () => {
     directions = [{ id: 'd1', area_id: 'a1', title: '多走路', status: 'active', target_window: 'ongoing' }]
     render(<Sin90Page />)
     fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
-    fireEvent.click(await screen.findByText('多走路'))
+    fireEvent.click(await screen.findByText('编辑计划'))
     fireEvent.change(await screen.findByLabelText('三年目标'), { target: { value: '每周徒步一次' } })
     fireEvent.click(screen.getAllByRole('button', { name: '保存' }).at(-1)!)
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'updateDirection', id: 'd1', goal3y: '每周徒步一次', goalFromYear: null }))
@@ -186,7 +215,7 @@ describe('Sin90 three layers', () => {
     expect(legalPlanParents('quarter', `${new Date().getFullYear()}-Q${Math.floor(new Date().getMonth() / 3) + 1}`,  readPeriodPlans(periodPlans), 'd1')).toHaveLength(2)
     render(<Sin90Page />)
     fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
-    fireEvent.click(await screen.findByText('多走路'))
+    fireEvent.click(await screen.findByText('编辑计划'))
     fireEvent.change(screen.getByLabelText('计划层级'), { target: { value: 'quarter' } })
     const parent = screen.getAllByRole('combobox')[1]!
     expect(within(parent).getByRole('option', { name: /年度/ })).toBeInTheDocument()
@@ -201,8 +230,11 @@ describe('Sin90 three layers', () => {
     render(<Sin90Page />)
     fireEvent.click(await screen.findByRole('tab', { name: '节奏' }))
     expect(await screen.findByText(/走路 20 次/)).toBeInTheDocument()
-    expect(screen.getByText('有风险')).toBeInTheDocument()
+    expect(screen.getByText(/有风险/)).toBeInTheDocument()
     expect(screen.getByText('已连续 3 周未达标')).toBeInTheDocument()
+    expect(document.querySelector('.sin90-rhythm-direction')).toBeInTheDocument()
+    expect(document.querySelector('.sin90-rhythm-target')).toHaveClass('sin90-rhythm-target')
+    expect(document.querySelector('.sin90-period-no-half .sin90-half-empty')).toBeInTheDocument()
   })
 
   it('saves review settings with PUT semantics through the dedicated write op', async () => {
@@ -217,7 +249,7 @@ describe('Sin90 three layers', () => {
     render(<Sin90Page />)
     fireEvent.click(await screen.findByRole('tab', { name: '方向' }))
     expect(await screen.findByText('还没有人生系统')).toBeInTheDocument()
-    fireEvent.click(screen.getByRole('button', { name: /装上五个系统/ }))
+    fireEvent.click(screen.getByRole('button', { name: /装上人生系统/ }))
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'installPack' }))
   })
 
