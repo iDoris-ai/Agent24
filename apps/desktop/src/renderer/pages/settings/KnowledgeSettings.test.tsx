@@ -54,3 +54,18 @@ describe('KnowledgeSettings', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Check the address')
   })
 })
+
+// K2: the last check of the server, red while it does not answer; 「Check now」 asks again.
+describe('KnowledgeSettings: the server check (K2)', () => {
+  it('shows a server that cannot be reached as an alert, and clears it after a check finds it back', async () => {
+    const on = { enabled: true, endpoint: 'http://127.0.0.1:18282/api/v1', knowledgeBaseIds: ['kb-a'], hasKey: true, active: true }
+    status.mockResolvedValue({ ...on, reachability: { state: 'unreachable', checkedAt: '2026-11-19T08:00:00Z' } })
+    const check = vi.fn().mockResolvedValue({ ...on, reachability: { state: 'ok', checkedAt: '2026-11-19T08:01:00Z' } })
+    ;(window.agent24.knowledge as unknown as Record<string, unknown>).check = check
+    render(<KnowledgeSettings />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Cannot reach the knowledge server')
+    fireEvent.click(screen.getByRole('button', { name: 'Check now' }))
+    await waitFor(() => expect(screen.queryByText(/Cannot reach the knowledge server/)).not.toBeInTheDocument())
+    expect(screen.getByText(/The knowledge server answers/)).toBeInTheDocument()
+  })
+})

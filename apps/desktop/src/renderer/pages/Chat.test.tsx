@@ -1017,3 +1017,92 @@ describe('ChatPage: reading the document before the turn', () => {
     resetDocContextForTests()
   })
 })
+
+// K2: a Knowledge server that did not answer is asked once more; still down,
+// the turn is answered without Knowledge and says so.
+describe('ChatPage: Knowledge server down (K2)', () => {
+  beforeEach(() => { setLocale('zh') })
+  it('answers without the knowledge run and says the knowledge base cannot be reached', async () => {
+    const down = { enabled: true, active: true, endpoint: 'http://127.0.0.1:18282/api/v1', knowledgeBaseIds: ['kb'], hasKey: true, reachability: { state: 'unreachable', checkedAt: '2026-11-19T08:00:00Z' } }
+    const check = vi.fn().mockResolvedValue(down)
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue(down), check } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'plain answer' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '押金是多少' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('plain answer')).toBeInTheDocument())
+    expect(check).toHaveBeenCalledTimes(1)
+    expect(screen.getByText(chatMessages.zh['knowledge.down.unreachable'])).toBeInTheDocument()
+    expect(mockBackendProxy.mock.calls.some(([req]) => req.path === '/api/v1/runs')).toBe(false)
+  })
+
+  it('uses Knowledge as before once the fresh check finds the server back', async () => {
+    const stale = { enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'], hasKey: true, reachability: { state: 'unreachable', checkedAt: null } }
+    const back = { ...stale, reachability: { state: 'ok', checkedAt: '2026-11-19T08:01:00Z' } }
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue(stale), check: vi.fn().mockResolvedValue(back) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'run_1', status: 'queued' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: 'from the knowledge base' }, knowledge: { searched: true, read_chunks: [] } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '押金是多少' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy.mock.calls.some(([req]) => req.path === '/api/v1/runs')).toBe(true))
+    expect(screen.queryByText(chatMessages.zh['knowledge.down.unreachable'])).not.toBeInTheDocument()
+  })
+})
+
+// Loop 3 FU: 「《合同.pdf》的押金是多少」 outside a document's conversation reads that document.
+describe('ChatPage: a question naming a document in 《》', () => {
+  beforeEach(() => { setLocale('zh') })
+  it('sends the named document with the question', async () => {
+    const request = vi.fn(async (req: { op: string }) => {
+      if (req.op === 'list') return { ok: true, data: { documents: [{ document_id: 'doc_1', title: '合同.pdf', head_revision: 1, media_type: 'application/pdf', created_at: '2026-11-19T00:00:00Z' }], next_cursor: null } }
+      if (req.op === 'readText') return { ok: true, data: { blocks: [{ text: '押金为人民币 17,000 元。' }], next_cursor: null } }
+      return { ok: false }
+    })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: '17,000 元' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《合同.pdf》的押金是多少' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('17,000 元')).toBeInTheDocument())
+    const chat = mockBackendProxy.mock.calls.find(([req]) => req.path === '/api/v1/chat')![0]
+    const last = chat.body.messages.at(-1).content as string
+    expect(last).toContain('押金为人民币 17,000 元。')
+    expect(last).toContain('《合同.pdf》的押金是多少')
+  })
+
+  it('asks as it was when no document has that title', async () => {
+    const request = vi.fn(async () => ({ ok: true, data: { documents: [], next_cursor: null } }))
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ok' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《红楼梦》讲了什么' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('ok')).toBeInTheDocument())
+    const chat = mockBackendProxy.mock.calls.find(([req]) => req.path === '/api/v1/chat')![0]
+    expect(chat.body.messages.at(-1).content).toBe('《红楼梦》讲了什么')
+  })
+})

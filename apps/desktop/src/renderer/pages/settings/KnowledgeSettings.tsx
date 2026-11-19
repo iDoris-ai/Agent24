@@ -54,12 +54,45 @@ export function KnowledgeSettings() {
   }).then((r) => { if (r.ok) setApiKey(''); return r }))
 
   const statusText = !status?.enabled ? t('statusOff') : status.active ? t('statusActive') : t('statusIncomplete')
+  // K2: what the last check of the server found, red unless it answered.
+  const reach = status?.enabled ? status.reachability : undefined
+  const reachTime = reach?.checkedAt ? new Date(reach.checkedAt).toLocaleTimeString() : ''
+  const reachText = reach && reach.state !== 'unknown' ? t(`reach.${reach.state}`, { time: reachTime }) : null
+  const [checking, setChecking] = useState(false)
+  async function checkNow() {
+    setChecking(true)
+    try {
+      const next = await window.agent24.knowledge?.check?.()
+      if (next) setStatus(next)
+    } catch {
+      // The status stays as it was.
+    } finally {
+      setChecking(false)
+    }
+  }
+  // While this page is open, show what main finds without a reload.
+  useEffect(() => {
+    if (!status?.enabled) return
+    const timer = setInterval(() => { void refresh(false) }, 15_000)
+    return () => clearInterval(timer)
+  }, [status?.enabled])
 
   return <section className="settings-section" aria-labelledby="knowledge-title">
     <h3 id="knowledge-title">{t('title')}</h3>
     <p className="settings-note">{t('hint')}</p>
     <div className="setting-row">
-      <div><label htmlFor="knowledge-enabled">{t('enabled')}</label><p role="status">{statusText}</p></div>
+      <div>
+        <label htmlFor="knowledge-enabled">{t('enabled')}</label>
+        <p role="status">{statusText}</p>
+        {reachText && (
+          <p role={reach?.state === 'ok' ? 'status' : 'alert'}
+            style={reach?.state === 'ok' ? { color: 'var(--muted)' } : { color: 'var(--danger, #c0392b)', fontWeight: 600 }}>
+            {reachText}
+            {' '}
+            <button type="button" className="btn btn-ghost" disabled={checking} onClick={() => void checkNow()}>{t('reach.check')}</button>
+          </p>
+        )}
+      </div>
       <input id="knowledge-enabled" type="checkbox" checked={status?.enabled ?? false} disabled={busy || !status}
         onChange={(e) => { const on = e.target.checked; void run(() => window.agent24.knowledge.setEnabled(on)) }} />
     </div>
