@@ -186,6 +186,13 @@ fn section_3_rows_match_operation_and_level() {
     });
 
     fixed.push(DesignRow {
+        method: "GET".into(),
+        path: "/comm/history/conversation".into(),
+        operation: "CommRead".into(),
+        level: AssuranceLevel::Everyday,
+    });
+
+    fixed.push(DesignRow {
         method: "POST".into(),
         path: "/comm/install".into(),
         operation: "ComponentInstall".into(),

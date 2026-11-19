@@ -9,6 +9,7 @@ import {
   getCommStatus as pollCommStatus,
   listCommContacts,
   listCommHistory,
+  getCommConversationHistory,
   listCommIdentities,
   pickCommBackup,
   restoreCommIdentity,
@@ -31,6 +32,7 @@ import { ErrorNotice } from '../../ui'
 import { getDefaultRelays } from './relayDefaults'
 import { parseRelayList } from '../../../shared/relay-list'
 import { listComponents, type ComponentView } from '../../components/componentApi'
+import { filterHumanCommMessages } from './history-filter'
 
 type HyphaePhase =
   | { kind: 'loading' }
@@ -78,6 +80,13 @@ function hyphaeLabel(component: ComponentView, t: (key: keyof typeof communicati
 }
 
 type WriteAction = 'start' | 'stop' | 'unlock' | 'install' | 'create' | 'import' | 'relay' | 'export' | 'contact' | 'send' | 'restore' | 'relaySave' | 'relayProbe'
+type LocalOutgoing = { id: string; peer: string; content: string; at: string; state: 'sending' | 'sent' } | { id: string; peer: string; content: string; at: string; state: 'failed'; error: string }
+
+function recentPeer(items: CommHistoryItem[]): string | null {
+  const latest = [...items].sort((a, b) => Date.parse(b.at) - Date.parse(a.at))[0]
+  if (!latest) return null
+  return latest.direction === 'out' ? latest.to || latest.from : latest.from
+}
 
 function relayValues(value: string): string[] {
   return value.split(/\r?\n/).map((relay) => relay.trim()).filter(Boolean)
@@ -194,6 +203,16 @@ export default function CommunicationPage() {
   const [restoreNickname, setRestoreNickname] = useState('')
   const [restoreDefault, setRestoreDefault] = useState(false)
   const [history, setHistory] = useState<CommHistoryItem[] | null>(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [contactSearch, setContactSearch] = useState('')
+  const [selectedPeer, setSelectedPeer] = useState<string | null>(null)
+  const [conversationHistory, setConversationHistory] = useState<CommHistoryItem[] | null>(null)
+  const [localOutgoing, setLocalOutgoing] = useState<LocalOutgoing[]>([])
+  const streamRef = useRef<HTMLDivElement>(null)
+  const streamWasAtBottom = useRef(true)
+  // The peer on screen now; a late reply for an earlier peer must not land.
+  const selectedPeerRef = useRef<string | null>(null)
+  const lastStreamPeer = useRef<string | null>(null)
   // A stale choice (no longer offered after a refresh) falls back to the default option.
   const relayOptions = [...defaults.map((relay) => relay.url), ...(relays?.relays ?? [])]
   const relayUrl = (selectedRelay && relayOptions.includes(selectedRelay) ? selectedRelay : '')
@@ -251,13 +270,52 @@ export default function CommunicationPage() {
 
   const loadHistory = useCallback(async () => {
     try {
-      const items = await listCommHistory(20)
-      if (mounted.current) setHistory(items)
+      const items = await listCommHistory(200)
+      if (mounted.current) {
+        const filtered = filterHumanCommMessages(items)
+        setHistory(filtered)
+        setSelectedPeer((current) => current ?? recentPeer(filtered))
+      }
     } catch {
       // The list is a convenience; the status cards already report real failures.
       if (mounted.current) setHistory(null)
     }
   }, [])
+
+  const loadConversation = useCallback(async (peer: string | null) => {
+    if (!peer) { setConversationHistory(null); return }
+    try {
+      const items = await getCommConversationHistory(contacts?.find((item) => item.npub === peer)?.nickname ?? peer)
+      if (mounted.current && selectedPeerRef.current === peer) {
+        const filtered = filterHumanCommMessages(items)
+        setConversationHistory(filtered)
+        setLocalOutgoing((pendingItems) => pendingItems.filter((local) => local.peer !== peer || local.state === 'failed' || !filtered.some((item) => item.direction === 'out' && item.content === local.content && Math.abs(Date.parse(item.at) - Date.parse(local.at)) < 120_000)))
+      }
+    } catch {
+      if (mounted.current && selectedPeerRef.current === peer) setConversationHistory(null)
+    }
+  }, [contacts])
+
+  useEffect(() => { selectedPeerRef.current = selectedPeer; void loadConversation(selectedPeer) }, [selectedPeer, contacts, loadConversation])
+
+  useEffect(() => {
+    const stream = streamRef.current
+    if (!stream) return
+    if (lastStreamPeer.current !== selectedPeer || streamWasAtBottom.current) stream.scrollTop = stream.scrollHeight
+    lastStreamPeer.current = selectedPeer
+  }, [selectedPeer, conversationHistory, localOutgoing])
+
+  useEffect(() => {
+    const poll = () => {
+      if (document.visibilityState !== 'visible') return
+      void loadHistory()
+      if (selectedPeer) void loadConversation(selectedPeer)
+    }
+    const timer = setInterval(poll, 10_000)
+    const onVisibility = poll
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility) }
+  }, [loadHistory, loadConversation, selectedPeer])
 
   useEffect(() => {
     mounted.current = true
@@ -545,29 +603,35 @@ export default function CommunicationPage() {
     }
   }
 
-  const submitMessage = async () => {
-    if (pending) return
-    const to = messageTo.trim()
-    if (!to || !messageText.trim()) return
+  const submitMessage = async (retry?: Extract<LocalOutgoing, { state: 'failed' }>) => {
+    const to = retry?.peer ?? selectedPeer ?? messageTo.trim()
+    const body = retry?.content ?? messageText.trim()
+    if (pending === 'send' || !to || !body) return
     // A contact nickname or any raw npub; contacts are only a local name book.
     if (!to.startsWith('npub1') && !contacts?.some((c) => c.nickname === to)) {
       setActionError(t('message.recipientInvalid'))
       return
     }
+    const localId = retry?.id ?? `local-${Date.now()}-${Math.random().toString(36).slice(2)}`
+    const at = retry?.at ?? new Date().toISOString()
+    setMessageText('')
+    setLocalOutgoing((items) => [...items.filter((item) => item.id !== localId), { id: localId, peer: to, content: body, at, state: 'sending' }])
     setPending('send')
     setActionError(null)
     setNotice(null)
     setExportedPath(null)
     try {
-      const result = await sendCommMessage(to, messageText)
+      const result = await sendCommMessage(to, body)
       if (mounted.current) {
-        setMessageText('')
+        setLocalOutgoing((items) => items.map((item) => item.id === localId ? { id: localId, peer: to, content: body, at, state: 'sent' } : item))
         setNotice(result.published_to > 0 ? t('message.sent', { count: result.published_to }) : t('message.queued'))
       }
     } catch (error) {
-      if (mounted.current) setActionError(messageOf(error))
+      if (mounted.current) {
+        setLocalOutgoing((items) => items.map((item) => item.id === localId ? { id: localId, peer: to, content: body, at, state: 'failed', error: messageOf(error).slice(0, 160) } : item))
+      }
     } finally {
-      if (mounted.current) { setPending(null); void loadHistory() }
+      if (mounted.current) { setPending(null); void loadHistory(); void loadConversation(selectedPeer) }
     }
   }
 
@@ -601,14 +665,7 @@ export default function CommunicationPage() {
         : !relays.configured ? 'no_relay' : 'ready'
       : null
   return (
-    <main className="content comm-page">
-      <header className="comm-heading">
-        <div><h1>{t('page.title')}</h1><p>{t('page.subtitle')}</p></div>
-        <button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>
-          {refreshing ? t('action.refreshing') : t('action.refresh')}
-        </button>
-      </header>
-
+    <main className={`content comm-page${settingsOpen ? ' settings-open' : ''}`}>
       {loadError && <ErrorNotice className="comm-alert" message={loadError} actionLabel={t('action.retry')} detailsLabel={t('error.details')} onAction={() => void refresh()} details={loadErrorDetails} />}
       {actionError && <div role="alert" className="comm-alert">{t('error.action', { message: actionError })}</div>}
       {pending === 'install' && <p role="status">{t('action.installing')}</p>}
@@ -618,7 +675,7 @@ export default function CommunicationPage() {
       </div>}
       {warnings.map((warning) => <div key={warning} role="status" className="comm-warning">{warning}</div>)}
 
-      {setupState && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
+      {setupState && (setupState !== 'ready' || settingsOpen) && <section className="comm-card" data-testid="comm-setup" data-state={setupState} aria-label={t('wizard.title')}>
         <h2>{t('wizard.title')}</h2>
         <ol className="comm-steps">
           <li aria-current={setupState === 'not_installed' || setupState === 'installing' ? 'step' : undefined}>{t('wizard.download')}{setupState !== 'not_installed' && setupState !== 'installing' ? <span className="comm-step-mark"> ✓</span> : null}</li>
@@ -664,7 +721,68 @@ export default function CommunicationPage() {
         </section>
       )}
 
-      {!setupOnly && <>
+      {!settingsOpen && <section className="comm-chat-shell" aria-label={t('chat.title')}>
+        <aside className="comm-chat-sidebar" aria-label={t('chat.conversations')}>
+          <div className="comm-chat-sidebar-head"><h1>{t('chat.title')}</h1><button type="button" aria-label={t('contact.add')} disabled={setupOnly} onClick={() => { setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>+</button></div>
+          <input aria-label={t('chat.search')} placeholder={t('chat.search')} value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} />
+          <div className="comm-conversation-list">
+            {(() => {
+              const me = identities?.find((item) => item.default)
+              const peers = new Map<string, CommHistoryItem[]>()
+              for (const item of history ?? []) {
+                const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
+                if (!peer) continue
+                peers.set(peer, [...(peers.get(peer) ?? []), item])
+              }
+              const rows = [...peers.entries()].map(([peer, items]) => {
+                const latest = peer === selectedPeer && conversationHistory?.length ? conversationHistory.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) : null
+                const last = latest && (!items.length || Date.parse(latest.at) > Date.parse(items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b).at)) ? latest : items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b)
+                return { peer, items, last }
+              })
+                .filter(({ peer, last }) => `${contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)} ${last.content}`.toLowerCase().includes(contactSearch.toLowerCase()))
+                .sort((a, b) => Date.parse(b.last.at) - Date.parse(a.last.at))
+              return rows.map(({ peer, last }) => {
+                const name = contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)
+                return <button type="button" key={peer} className={`comm-conversation${selectedPeer === peer ? ' selected' : ''}`} onClick={() => setSelectedPeer(peer)}>
+                  <span className="comm-avatar">{name.slice(0, 1).toUpperCase()}</span><span className="comm-conversation-copy"><strong>{name}<time>{last.at ? new Date(last.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</time></strong><small>{last.content}</small></span>
+                </button>
+              })
+            })()}
+            {(!history?.length) && <p className="comm-chat-empty">{t('chat.empty')}</p>}
+          </div>
+          <div className="comm-my-address"><span className={daemon?.process.state === 'running' && daemon.relay_probe?.connected ? 'online-dot' : 'offline-dot'} />
+            <div><strong>{t('chat.myAddress')}</strong><small>{shortNpub(identities?.find((item) => item.default)?.npub ?? '')} · {daemon?.process.state === 'running' && daemon.relay_probe?.connected ? t('chat.connected') : t('chat.disconnected')}</small></div>
+            <button type="button" disabled={!identities?.find((item) => item.default)} onClick={() => { const me = identities?.find((item) => item.default); if (me) void copyNpub(me.npub) }}>{t('identity.copy')}</button>
+          </div>
+        </aside>
+        <div className="comm-chat-main">
+          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div>{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
+          <div className="comm-message-stream" ref={streamRef} onScroll={(event) => { const el = event.currentTarget; streamWasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}>
+            {selectedPeer ? (() => {
+              const me = identities?.find((item) => item.default)
+              const source = conversationHistory ?? history ?? []
+              const messages = source.filter((item) => {
+                const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
+                return peer === selectedPeer
+              })
+              const sortedMessages = [...messages].sort((a, b) => Date.parse(a.at) - Date.parse(b.at))
+              let day = ''
+              const rendered = sortedMessages.map((item) => {
+                const isMine = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname
+                const date = item.at ? new Date(item.at) : new Date()
+                const dayLabel = date.toLocaleDateString()
+                const newDay = day !== dayLabel; day = dayLabel
+                return <div key={item.id} className={`comm-message-row${isMine ? ' mine' : ''}`}>{newDay && <span className="comm-day-label">{dayLabel}</span>}<div className="comm-message-bubble">{item.content}<small>{item.id.startsWith('pending-') ? t('message.sending') : date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small></div></div>
+              })
+              const localMessages = localOutgoing.filter((item) => item.peer === selectedPeer)
+              return messages.length || localMessages.length ? [...rendered, ...localMessages.map((item) => <div key={item.id} className="comm-message-row mine"><div className={`comm-message-bubble${item.state === 'failed' ? ' failed' : ''}`}>{item.content}<small>{item.state === 'sending' ? t('message.sending') : item.state === 'failed' ? item.error : new Date(item.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</small>{item.state === 'failed' && <><button type="button" onClick={() => void submitMessage(item)}>{t('message.retry')}</button><button type="button" onClick={() => setLocalOutgoing((items) => items.filter((entry) => entry.id !== item.id))}>{t('message.delete')}</button></>}</div></div>)] : <p className="comm-chat-empty">{t('chat.empty')}</p>
+            })() : <p className="comm-chat-empty">{t('chat.empty')}</p>}
+          </div>
+          <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>
+        </div>
+      </section>}
+
+      {settingsOpen && !setupOnly && <section className="comm-settings-panel" aria-label={t('chat.settings')}><div className="comm-section-heading"><h2>{t('chat.settings')}</h2><div className="comm-actions"><button type="button" onClick={() => setSettingsOpen(false)}>{t('chat.closeSettings')}</button><button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button></div></div>
       <section className="comm-card">
         <h2>{t('section.identities')}</h2>
         {identities === null ? <p className="comm-muted">{t('empty.data')}</p> : identities.length === 0 ? <p className="comm-muted">{t('empty.identities')}</p> : (
@@ -778,7 +896,7 @@ export default function CommunicationPage() {
           {unlockError && <p role="alert" className="comm-unlock-error">{unlockError}</p>}
         </form>}
       </section>
-      </>}
+      </section>}
     </main>
   )
 }

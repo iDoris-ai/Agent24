@@ -6,6 +6,7 @@ import {
   COMM_HTTP_TIMEOUT_MS,
   exportCommIdentity,
   listCommHistory,
+  getCommConversationHistory,
   revealCommExport,
   pickCommBackup,
   restoreCommIdentity,
@@ -212,10 +213,21 @@ describe('COMM contact, send, history and export wrappers', () => {
     expect(proxy).not.toHaveBeenCalled()
   })
   it('keeps only displayable history rows', async () => {
-    setProxy(() => successful([{ id: 'e1', from: 'npub1bob', content: 'hello', created_at: 1_700_000_000 }, { id: 'x' }]))
+    setProxy(() => successful([
+      { id: 'e1', sender_npub: 'npub1bob', recipient_npub: 'npub1alice', is_incoming: true, content: 'ciphertext', plaintext: 'hello', created_at: 1_700_000_000 },
+      { id: 'e2', sender_npub: 'npub1alice', recipient_npub: 'npub1bob', is_incoming: false, content: 'ciphertext', plaintext: 'sent', created_at: 1_700_000_001 },
+      { id: 'x', content: 'must never render ciphertext' },
+    ]))
     const rows = await listCommHistory(5)
-    expect(rows).toHaveLength(1)
-    expect(rows[0]).toMatchObject({ id: 'e1', from: 'npub1bob', content: 'hello' })
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toMatchObject({ id: 'e1', from: 'npub1bob', to: 'npub1alice', direction: 'in', content: 'hello' })
+    expect(rows[1]).toMatchObject({ id: 'e2', from: 'npub1alice', to: 'npub1bob', direction: 'out', content: 'sent' })
+    expect(rows.some((row) => row.content.includes('ciphertext'))).toBe(false)
+  })
+  it('loads bidirectional history through the conversation read route', async () => {
+    const proxy = setProxy(() => successful([{ id: 'e1', sender_npub: 'npub1bob', recipient_npub: 'npub1alice', is_incoming: true, plaintext: 'hello' }]))
+    await expect(getCommConversationHistory('bob.smith')).resolves.toMatchObject([{ from: 'npub1bob', to: 'npub1alice', direction: 'in', content: 'hello' }])
+    expect(proxy).toHaveBeenCalledWith({ method: 'GET', path: '/api/v1/comm/history/conversation?with=bob.smith&limit=200' })
   })
   it('exports through the dedicated IPC with the nickname ONLY (no password crosses from the page), and rejects a cancel with its code', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not export keys') })

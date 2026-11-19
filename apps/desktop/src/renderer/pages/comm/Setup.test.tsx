@@ -39,6 +39,7 @@ function setup({ installed = true, identities = [identity], configured = true, c
   window.agent24 = { ...window.agent24, backendProxy: proxy, commRelaySet, commHomeImport } as never
   return proxy
 }
+async function showSettings() { fireEvent.click(await screen.findByRole('button', { name: 'Settings' })) }
 beforeEach(() => { setLocale('en'); fixtures.aa = undefined })
 afterEach(() => { cleanup(); vi.restoreAllMocks() })
 
@@ -48,6 +49,10 @@ it.each([
 ])('derives %s from daemon reads', async (state, options) => {
   setup(options)
   render(<CommunicationPage />)
+  if (state === 'ready') {
+    await waitFor(() => expect(screen.queryByTestId('comm-setup')).toBeNull())
+    await showSettings()
+  }
   expect(await screen.findByTestId('comm-setup')).toHaveAttribute('data-state', state)
 })
 it('creates a default identity through backendProxy without persisting renderer state', async () => {
@@ -92,6 +97,7 @@ const writes = (proxy: ReturnType<typeof setup>) => proxy.mock.calls.map(([call]
 it('B1: connecting the already-first relay skips the PUT (no daemon restart) and only probes', async () => {
   const proxy = setup({ relayList: [A, B] })
   render(<CommunicationPage />)
+  await showSettings()
   fireEvent.click(await screen.findByRole('button', { name: 'Connect relay' }))
   await waitFor(() => expect(writes(proxy)).toHaveLength(1))
   expect(writes(proxy)).toEqual([{ method: 'POST', path: '/api/v1/comm/relay/probe', body: { url: A } }])
@@ -99,6 +105,7 @@ it('B1: connecting the already-first relay skips the PUT (no daemon restart) and
 it('B1: choosing another configured relay moves it first and keeps the rest of the list', async () => {
   const proxy = setup({ relayList: [A, B] })
   render(<CommunicationPage />)
+  await showSettings()
   fireEvent.change(await screen.findByRole('combobox', { name: 'Relay server' }), { target: { value: B } })
   fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
   await waitFor(() => expect(writes(proxy)).toHaveLength(2))
@@ -108,6 +115,7 @@ it('B1: the saved list is capped at 8 entries', async () => {
   const many = Array.from({ length: 8 }, (_, i) => `wss://r${i}.example`)
   const proxy = setup({ relayList: many })
   render(<CommunicationPage />)
+  await showSettings()
   fireEvent.change(await screen.findByRole('combobox', { name: 'Relay server' }), { target: { value: 'wss://relay.aastar.io' } })
   fireEvent.click(screen.getByRole('button', { name: 'Connect relay' }))
   await waitFor(() => expect(writes(proxy).length).toBeGreaterThan(0))
@@ -118,6 +126,7 @@ it('B1: the saved list is capped at 8 entries', async () => {
 it('F1: a failed handshake removes the relay check mark and the "setup is complete" claim', async () => {
   setup({ connected: false })
   render(<CommunicationPage />)
+  await showSettings()
   const card = await screen.findByTestId('comm-setup')
   await waitFor(() => expect(card.textContent).toContain('Connect relay ✓'))
   expect(card.querySelectorAll('.comm-step-mark')).toHaveLength(3)
@@ -132,6 +141,7 @@ it('F1: a failed handshake removes the relay check mark and the "setup is comple
 it('N2: a stale relay choice no longer offered after refresh falls back to the default option', async () => {
   setup({ relayList: [A, B] })
   render(<CommunicationPage />)
+  await showSettings()
   fireEvent.change(await screen.findByRole('combobox', { name: 'Relay server' }), { target: { value: B } })
   const C = 'wss://c.example'
   const proxy = setup({ relayList: [C] })
@@ -176,6 +186,7 @@ it('shows probe success without treating it as a running daemon', async () => {
   render(<CommunicationPage />)
   fireEvent.click(await screen.findByRole('button', { name: 'Connect relay' }))
   expect(await screen.findByText('Last handshake succeeded')).toBeInTheDocument()
+  fireEvent.click(screen.getByRole('button', { name: 'Settings' }))
   expect(screen.getByText('Stopped')).not.toHaveClass('comm-state-running')
   expect(screen.getByTestId('comm-setup')).toHaveAttribute('data-state', 'no_relay')
 })

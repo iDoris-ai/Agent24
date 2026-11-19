@@ -92,6 +92,7 @@ describe('A1 findAllowedRoute', () => {
     }
     expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/comm/history/conversation?with=bob')).toBe(true)
   })
   // SL-4. Mutation: add ('POST', '/api/v1/skills/{id}/activate') to ALLOWED_PROXY_ROUTES and this goes red.
   it('keeps skill activation and rollback off the proxy (main-process IPC only)', () => {
