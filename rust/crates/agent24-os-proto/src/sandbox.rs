@@ -151,7 +151,7 @@ pub fn seatbelt_profile(inputs: &SeatbeltInputs<'_>) -> Result<String, ProfileEr
     // never anything else in it.
     if inputs.office_pipe {
         profile.push_str(
-            ")\n(allow file-write*\n    (literal \"/private/var/tmp\")\n    (regex #\"^/private/var/tmp/OSL_PIPE_\")\n",
+            ")\n(allow file-write*\n    (literal \"/private/var/tmp\")\n    (regex #\"^/private/var/tmp/OSL_PIPE_[0-9]+_SingleOfficeIPC_[0-9a-fA-F]+$\")\n",
         );
     }
     profile.push_str(
@@ -469,7 +469,9 @@ mod tests {
         asked.office_pipe = true;
         let profile = seatbelt_profile(&asked).unwrap();
         assert!(
-            profile.contains("(regex #\"^/private/var/tmp/OSL_PIPE_\")"),
+            profile.contains(
+                "(regex #\"^/private/var/tmp/OSL_PIPE_[0-9]+_SingleOfficeIPC_[0-9a-fA-F]+$\")"
+            ),
             "{profile}"
         );
         assert!(

@@ -423,11 +423,27 @@ pub async fn convert(
     };
     let data_dir = storage.data_dir().to_path_buf();
     let owned = storage.clone();
+    let watched = storage.clone();
+    let this_job = job_id.clone();
+    let runtime = tokio::runtime::Handle::current();
     let make = move |out: &Path| {
         let _held = match CONVERTING.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
+        // Cancelled while it waited for the one conversion before it: not
+        // started at all (PR-Daemon #1915); `finish_convert` ends it cancelled.
+        let status: Option<String> = runtime
+            .block_on(
+                sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+                    .bind(&this_job)
+                    .fetch_optional(watched.db.pool()),
+            )
+            .ok()
+            .flatten();
+        if status.as_deref() == Some("cancelling") {
+            return Err(ApiError::invalid_request("the conversion was cancelled"));
+        }
         let work = data_dir
             .join("engines")
             .join("libreoffice")

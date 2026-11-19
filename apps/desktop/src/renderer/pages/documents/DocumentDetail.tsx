@@ -12,7 +12,7 @@ import { CapabilitiesContext } from '../../capabilities/types'
 import { askAboutDocument } from '../chat/doc-context'
 import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
-import { paragraphsOf, translateParagraphs, translationHtml, type TargetLang } from './doc-translate'
+import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -314,8 +314,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
         },
       }, paras, target)
       if (gen !== generation.current) return
-      const html = translationHtml(head.title ?? '', translated, target)
-      const out = await api.exportTranslation({ title: head.title ?? '', html, lang: target })
+      const out = await api.exportTranslation({ title: head.title ?? '', paragraphs: translated, lang: target })
       if (gen !== generation.current) return
       if (!out.ok) {
         if (out.code === 'engine_unavailable') {

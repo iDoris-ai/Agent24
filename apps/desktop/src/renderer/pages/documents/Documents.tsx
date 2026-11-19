@@ -104,6 +104,7 @@ export default function DocumentsPage() {
   }, [api, notInstalled])
   const [agentAccess, setAgentAccess] = useState<DocAgentAccess | null>(null)
   const [agentAccessBusy, setAgentAccessBusy] = useState(false)
+  const [agentAccessNote, setAgentAccessNote] = useState<string | null>(null)
   useEffect(() => {
     const fn = api.agentAccess
     if (!fn) return
@@ -267,8 +268,13 @@ export default function DocumentsPage() {
               const fn = api.agentAccess
               if (!fn || agentAccessBusy) return
               setAgentAccessBusy(true)
-              void fn(agentAccess?.enabled ? 'disable' : 'enable')
-                .then((s) => setAgentAccess(s))
+              const turningOff = agentAccess?.enabled === true
+              setAgentAccessNote(null)
+              void fn(turningOff ? 'disable' : 'enable')
+                .then((s) => {
+                  setAgentAccess(s)
+                  if (s.ok === false) setAgentAccessNote(t(turningOff ? 'agentAccess.offFailed' : 'agentAccess.onFailed', { code: s.code ?? '' }))
+                })
                 .catch(() => {})
                 .finally(() => setAgentAccessBusy(false))
             }}
@@ -278,6 +284,7 @@ export default function DocumentsPage() {
               : t('agentAccess.off')}
           </button>
         )}
+        {agentAccessNote && <span role="alert" style={{ fontSize: 12, color: 'var(--danger, #c0392b)' }}>{agentAccessNote}</span>}
         {importing && !job && progress && progress.total > 0 && (
           <span role="status">{t('import.uploading', { percent: Math.floor((progress.sent / progress.total) * 100) })}</span>
         )}

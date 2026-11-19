@@ -15,7 +15,7 @@ import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
 import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
-import { paragraphsOf, translateParagraphs, translationHtml, type TargetLang } from './documents/doc-translate'
+import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
@@ -312,7 +312,7 @@ export default function ChatPage() {
               )
               const out = await api.exportTranslation({
                 title: subject.title,
-                html: translationHtml(subject.title, translated, lang),
+                paragraphs: translated,
                 lang,
               })
               const reply = out.ok

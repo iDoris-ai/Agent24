@@ -343,7 +343,7 @@ const api = {
       ipcRenderer.invoke(IpcChannels.DocumentsAgentAccess, action),
     /** D4: write the translated HTML to a DOCX in Downloads and import its PDF. */
     revealDownload: (name: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.DocumentsRevealDownload, name),
-    exportTranslation: (req: { title: string; html: string; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
+    exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
       ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
       const listener = (_event: unknown, s: OfficeEngineStatus): void => cb(s)
