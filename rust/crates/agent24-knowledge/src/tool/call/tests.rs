@@ -26,6 +26,9 @@ fn input(v: Value) -> Map<String, Value> {
 /// Answers every call with `answer` and keeps what it was asked.
 struct Backend {
     answer: Result<&'static str, Failure>,
+    /// What a read answers when `answer` is a search fixture (K3 read-backs);
+    /// none: the chunk is not found.
+    read_answer: Option<&'static str>,
     searched: Mutex<Vec<(String, SearchQuery)>>,
     read: Mutex<Vec<(String, ReadQuery)>>,
 }
@@ -40,6 +43,7 @@ impl Backend {
     fn new(answer: Result<&'static str, Failure>) -> Self {
         Self {
             answer,
+            read_answer: None,
             searched: Mutex::new(Vec::new()),
             read: Mutex::new(Vec::new()),
         }
@@ -71,7 +75,14 @@ impl KnowledgeBackend for Backend {
         query: ReadQuery,
     ) -> Result<(ReadRequest, ReadResponse), Failure> {
         self.read.lock().unwrap().push((run_id.into(), query));
-        self.answer.clone().map(pair)
+        match &self.answer {
+            Ok(f) if f.starts_with("read") => Ok(pair(f)),
+            Ok(_) => match self.read_answer {
+                Some(f) => Ok(pair(f)),
+                None => Err(envelope("read.not-found.json")),
+            },
+            Err(e) => Err(e.clone()),
+        }
     }
 }
 
@@ -226,6 +237,45 @@ fn a_result_is_rendered_as_evidence_for_the_run_it_belongs_to() {
     let read = backend.read.lock().unwrap();
     assert_eq!(read[0].0, "run-7");
     assert_eq!(read[0].1.chunk_id.as_deref(), Some("chk-11"));
+}
+
+/// K3: the best hits are read back with the search, as knowledge_read would
+/// read them; a read that fails leaves the search as it was.
+#[test]
+fn a_search_reads_back_its_best_hits_as_citations() {
+    let mut backend = Backend::ok("search.ok.json");
+    backend.read_answer = Some("read.chunk.json");
+    let out = block(search(
+        &backend,
+        "run-7",
+        &input(json!({ "query": "差旅" })),
+    ))
+    .unwrap();
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(out["kind"], "knowledge.search");
+    let read_back = out[READ_BACK].as_array().unwrap();
+    let hits = out["evidence"].as_array().unwrap().len();
+    assert_eq!(read_back.len(), hits.min(AUTO_READ));
+    assert_eq!(read_back[0]["kind"], "knowledge.read");
+    // A citation read may follow its chunk page by page: at least one read each.
+    let read = backend.read.lock().unwrap();
+    assert!(read.len() >= hits.min(AUTO_READ));
+    assert!(read.iter().all(|(run, _)| run == "run-7"));
+    assert_eq!(
+        read[0].1.chunk_id.as_deref(),
+        out["evidence"][0]["chunk_id"].as_str()
+    );
+
+    // Reads that fail: the search answer has no read_back at all.
+    let backend = Backend::ok("search.ok.json");
+    let out = block(search(
+        &backend,
+        "run-7",
+        &input(json!({ "query": "差旅" })),
+    ))
+    .unwrap();
+    let out: Value = serde_json::from_str(&out).unwrap();
+    assert!(out.get(READ_BACK).is_none());
 }
 
 #[test]

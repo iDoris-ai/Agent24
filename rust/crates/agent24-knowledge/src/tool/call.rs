@@ -319,11 +319,52 @@ pub async fn search(
     input: &Map<String, Value>,
 ) -> Result<String, Refused> {
     let query = parse_search(input)?;
-    match backend.search(run_id, query).await {
-        Ok((request, response)) => Ok(render_search(&request, &response)),
-        Err(failure) => Err(refusal("knowledge.search", failure)),
+    let (request, response) = backend
+        .search(run_id, query)
+        .await
+        .map_err(|failure| refusal("knowledge.search", failure))?;
+    let rendered = render_search(&request, &response);
+    // K3 (Loop 3): a small model cites search passages without reading them
+    // back (qwen3-8b, 11-19), and a passage only a search returned is a clue,
+    // never a source. So the best hits are read back here, as `knowledge_read`
+    // would read them: what comes back as `use: citation` may be cited. A read
+    // that fails leaves its hit a clue; the search stands either way.
+    let mut read_back = Vec::new();
+    for hit in response.hits.iter().take(AUTO_READ) {
+        let mut args = Map::new();
+        args.insert(
+            "knowledge_id".into(),
+            Value::String(hit.knowledge_id.clone()),
+        );
+        args.insert("chunk_id".into(), Value::String(hit.chunk_id.clone()));
+        args.insert(
+            "content_tag".into(),
+            Value::String(hit.revision.content_tag.clone()),
+        );
+        if let Ok(text) = read(backend, run_id, &args).await
+            && let Ok(value) = serde_json::from_str::<Value>(&text)
+        {
+            read_back.push(value);
+        }
+    }
+    if read_back.is_empty() {
+        return Ok(rendered);
+    }
+    match serde_json::from_str::<Value>(&rendered) {
+        Ok(Value::Object(mut object)) => {
+            object.insert(READ_BACK.into(), Value::Array(read_back));
+            Ok(Value::Object(object).to_string())
+        }
+        _ => Ok(rendered),
     }
 }
+
+/// Hits a search reads back at once (K3): the best two, enough to cite from
+/// without filling a 16K-token context with whole chunks.
+pub const AUTO_READ: usize = 2;
+/// The key of the read-backs in a search's answer; each is a `knowledge.read`
+/// answer, its `use: citation` entries citable as any read's.
+pub const READ_BACK: &str = "read_back";
 
 pub async fn read(
     backend: &dyn KnowledgeBackend,
