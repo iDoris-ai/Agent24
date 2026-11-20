@@ -41,8 +41,10 @@ ASSET="$(basename "$URL")"
 for tree in app open-design open-design-web-standalone; do
   [[ ! -e "$RES/$tree" ]] || fail "Open Design 目录被打进了安装包：$RES/$tree"
 done
-if [[ -n "$(find "$RES" -maxdepth 2 -name '*.tar.gz' -print -quit)" ]]; then
-  find "$RES" -maxdepth 2 -name '*.tar.gz' >&2
+# iDoris is a core component bundled as its pinned release archive
+# (IDORIS-CORE IC-1); every other archive is an on-demand component leak.
+if [[ -n "$(find "$RES" -maxdepth 2 -name '*.tar.gz' -not -path "$RES/idoris-component/*" -print -quit)" ]]; then
+  find "$RES" -maxdepth 2 -name '*.tar.gz' -not -path "$RES/idoris-component/*" >&2
   fail "安装包 Resources 内发现 .tar.gz —— 按需组件绝不能进安装包"
 fi
 
