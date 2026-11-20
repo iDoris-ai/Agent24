@@ -23,7 +23,7 @@ import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
 import { SERVICE_LABEL, serviceDaemonCopyPath, upgradeServiceByLaunchd } from './resident-service'
-import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, autoInstallService, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -866,7 +866,7 @@ app.whenReady().then(async () => {
     },
   })
   mainWin = createMainWindow()
-  void askResidentConsent(bundledModulesReady).catch((err) => console.error('[main] resident consent', err))
+  void autoInstallResidentService(bundledModulesReady).catch((err) => console.error('[main] resident service auto-install', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   // M4 A7: Knowledge's dialogs and drafts in their conversations' pending[].
@@ -1100,35 +1100,21 @@ function recordConsent(answer: ConsentAnswer): void {
   if (dataDir !== null) writeConsent(consentPath(dataDir), answer, new Date())
 }
 
-// M5 B4b: asked once, with the window up. Allow installs the LaunchAgent,
-// after the bundled documents module's launch install, with this app's own
-// daemon stopped meanwhile; a failed install is undone and not
-// kept, so the next launch asks again (PM r1 ②).
-async function askResidentConsent(documentsReady: Promise<unknown>): Promise<void> {
+// Install the bundled LaunchAgent automatically after the documents module's
+// launch install, with this app's daemon stopped meanwhile. Failures are
+// retried on the next launch and do not change the stored answer.
+async function autoInstallResidentService(documentsReady: Promise<unknown>): Promise<void> {
   const dataDir = tryDataDir()
   if (dataDir === null) return
   const file = consentPath(dataDir)
   const fromBundle = upgradesFromBundle(app.isPackaged, process.env)
-  if (!shouldAskConsent({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
-  const outcome = await runConsent({
-    ask: async () => {
-      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
-      const { response } = await dialog.showMessageBox(mainWin, {
-        type: 'question',
-        buttons: [mt('consent.allow'), mt('consent.deny')],
-        defaultId: 0,
-        cancelId: 1,
-        message: mt('consent.message'),
-        detail: mt('consent.detail'),
-      })
-      return response === 0 ? 'allow' : 'declined'
-    },
+  if (!shouldAutoInstall({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
+  const outcome = await autoInstallService({
     install: () => residentInstall(documentsReady),
-    record: (answer) => writeConsent(file, answer, new Date()),
+    record: () => writeConsent(file, 'allow', new Date()),
   })
   if (typeof outcome === 'object') {
     console.warn('[main] resident service not installed:', outcome.failed)
-    if (mainWin && !mainWin.isDestroyed()) void dialog.showMessageBox(mainWin, { type: 'warning', message: mt('consent.failed', { code: outcome.failed }) })
   }
   refreshTray()
 }
