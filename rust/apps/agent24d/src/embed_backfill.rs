@@ -14,34 +14,42 @@ use agent24_models::router::ModelRouter;
 use agent24_protocol::Model;
 use tokio_util::sync::CancellationToken;
 
-/// Probe, attach, reindex, then wait for remembers. Returns when `cancel` fires
-/// or the embedder cannot be built (keyword search stays on).
+/// How long to wait before trying to open the embedder again.
+const OPEN_RETRY: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Probe, attach, reindex, then wait for remembers. Returns when `cancel` fires.
+/// Until the embedder opens, keyword search serves recall.
 pub async fn drive(link: EmbedBackfill, router: Arc<ModelRouter>, cancel: CancellationToken) {
     if cancel.is_cancelled() {
         return;
     }
-    let client = match EmbeddingClient::from_router(Arc::clone(&router)) {
-        Ok(client) => client,
-        Err(err) => {
-            tracing::info!(
-                reason = %log_reason(&err),
-                "vector recall off; keyword search stays"
-            );
-            return;
-        }
-    };
-    let opened = tokio::select! {
-        () = cancel.cancelled() => return,
-        opened = LocalEmbedder::open(link.kv(), client) => opened,
-    };
-    let embedder = match opened {
-        Ok(embedder) => Arc::new(embedder),
-        Err(err) => {
-            tracing::info!(
-                reason = %log_reason(&err),
-                "vector recall off; keyword search stays"
-            );
-            return;
+    // iDoris is set up in the background after the daemon starts and may
+    // restart later, so an empty slot is not final: keep trying until the
+    // embedder opens. Keyword search serves recall meanwhile.
+    let mut logged = false;
+    let embedder = loop {
+        let attempt = match EmbeddingClient::from_router(Arc::clone(&router)) {
+            Ok(client) => tokio::select! {
+                () = cancel.cancelled() => return,
+                opened = LocalEmbedder::open(link.kv(), client) => opened.map_err(|e| log_reason(&e)),
+            },
+            Err(err) => Err(log_reason(&err)),
+        };
+        match attempt {
+            Ok(embedder) => break Arc::new(embedder),
+            Err(err) => {
+                if !logged {
+                    tracing::info!(
+                        reason = %err,
+                        "vector recall waiting for iDoris; keyword search stays"
+                    );
+                    logged = true;
+                }
+                tokio::select! {
+                    () = cancel.cancelled() => return,
+                    () = tokio::time::sleep(OPEN_RETRY) => {}
+                }
+            }
         }
     };
     let rewriter = local_rewriter(&router, &cancel).await;

@@ -4,7 +4,7 @@
 // whitelist. agent24-idoris probe code stays: it configures oMLX for iDoris
 // itself (management plane), not an Agent24 model path.
 
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,36 +20,45 @@ const SKIP_DIRS = new Set([
   'fixtures',
   'tests',
   'test',
+  // packages/contract-tests: the contract test harness, not shipped code.
+  'contract-tests',
 ]);
 const SOURCE_EXT = new Set(['.rs', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 
-// Explicit exemptions. Do not add a file to hide a new direct model path.
-const WHITELIST = new Set([
-  // IC-4 deletes these desktop / node-daemon direct oMLX calls.
-  'apps/desktop/src/main/omlx-kept.ts',
-  'apps/desktop/src/main/omlx-quit-policy.ts',
-  'apps/desktop/src/main/ipc/index.ts',
-  'apps/desktop/src/renderer/App.tsx',
-  'apps/desktop/src/renderer/pages/Settings.i18n.ts',
-  'apps/desktop/src/renderer/pages/Chat.i18n.ts',
-  'apps/desktop/src/renderer/pages/settings/ModelServiceSettings.tsx',
-  'packages/node-daemon/src/llm-gateway.ts',
+// Explicit exemptions, each capped at the number of hits it has today: a new
+// direct endpoint added to an exempt file still fails. Do not raise a cap to
+// hide a new direct model path.
+const ALLOWED = new Map([
+  // IC-4 deletes these desktop / node-daemon direct oMLX calls; omlx-kept and
+  // omlx-quit-policy stay until iDoris owns the oMLX lifecycle (ID-3).
+  ['apps/desktop/src/main/omlx-kept.ts', 3],
+  ['apps/desktop/src/main/omlx-quit-policy.ts', 1],
+  ['apps/desktop/src/main/ipc/index.ts', 6],
+  ['apps/desktop/src/renderer/App.tsx', 1],
+  ['apps/desktop/src/renderer/pages/Settings.i18n.ts', 3],
+  ['apps/desktop/src/renderer/pages/Chat.i18n.ts', 3],
+  ['apps/desktop/src/renderer/pages/settings/ModelServiceSettings.tsx', 2],
+  ['packages/node-daemon/src/llm-gateway.ts', 12],
   // iDoris management plane: probe the local oMLX iDoris itself is configured
   // to use. Not an Agent24 chat or embedding client.
-  'rust/crates/agent24-idoris/src/omlx_probe.rs',
-  // IC-1 owns LaunchAgent env passthrough. A parallel slice edits this file.
-  'rust/apps/agent24-cli/src/service.rs',
-  // The hits are in this file's test module. A parallel slice owns the file.
-  'rust/apps/agent24d/src/idoris_routes.rs',
+  ['rust/crates/agent24-idoris/src/omlx_probe.rs', 1],
+  // The names appear only in the LaunchAgent env deny list and its tests.
+  ['rust/apps/agent24-cli/src/service.rs', 4],
+  // The hits are in this file's test module.
+  ['rust/apps/agent24d/src/idoris_routes.rs', 2],
 ]);
 
+// Test sources only: test directories, `*.test.*` / `*.spec.*`, Rust
+// `tests.rs` / `*_test(s).rs`. A name that merely contains "test"
+// (`latest.rs`, `contest.ts`) is production code and is scanned.
 function skipped(rel) {
   const parts = rel.split(path.sep);
   if (parts.some((part) => SKIP_DIRS.has(part))) return true;
-  return /test/i.test(path.basename(rel));
+  const base = path.basename(rel);
+  return /\.(test|spec)\.[cm]?[jt]sx?$/.test(base) || /^tests?\.rs$/.test(base) || /_tests?\.rs$/.test(base);
 }
 
-function walk(dir, hits) {
+function walk(dir, hits, root) {
   let entries;
   try {
     entries = readdirSync(dir);
@@ -58,8 +67,8 @@ function walk(dir, hits) {
   }
   for (const name of entries) {
     const abs = path.join(dir, name);
-    const rel = path.relative(ROOT, abs);
-    if (skipped(rel) || WHITELIST.has(rel)) continue;
+    const rel = path.relative(root, abs);
+    if (skipped(rel)) continue;
     let info;
     try {
       info = statSync(abs);
@@ -67,35 +76,52 @@ function walk(dir, hits) {
       continue;
     }
     if (info.isDirectory()) {
-      if (!SKIP_DIRS.has(name)) walk(abs, hits);
+      if (!SKIP_DIRS.has(name)) walk(abs, hits, root);
       continue;
     }
     if (!SOURCE_EXT.has(path.extname(name))) continue;
     const text = readFileSync(abs, 'utf8');
-    const lines = text.split(/\r?\n/);
-    lines.forEach((line, index) => {
-      if (NEEDLE.test(line)) hits.push(`${rel}:${index + 1}: ${line.trim()}`);
+    const found = [];
+    text.split(/\r?\n/).forEach((line, index) => {
+      if (NEEDLE.test(line)) found.push(`${rel}:${index + 1}: ${line.trim()}`);
     });
+    const allowed = ALLOWED.get(rel.split(path.sep).join('/')) ?? 0;
+    if (found.length > allowed) hits.push(...found);
   }
 }
 
-function scanTree() {
+function scanTree(root = ROOT) {
   const hits = [];
-  for (const root of ROOTS) walk(path.join(ROOT, root), hits);
+  for (const sub of ROOTS) walk(path.join(root, sub), hits, root);
   return hits;
 }
 
+// Runs the real traversal on a planted tree: a production file whose name
+// contains "test" and an exempt file pushed over its cap must both be caught,
+// and a real test file must not be.
 function selfTest() {
   const dir = mkdtempSync(path.join(tmpdir(), 'a24-no-direct-model-'));
-  const file = path.join(dir, 'violation.rs');
   try {
-    writeFileSync(file, 'fn bad() { let _ = "OMLX_URL"; }\n');
-    const text = readFileSync(file, 'utf8');
-    if (!NEEDLE.test(text)) {
-      console.error('self-test: planted violation was not detected');
+    const plant = (rel, text) => {
+      const abs = path.join(dir, rel);
+      mkdirSync(path.dirname(abs), { recursive: true });
+      writeFileSync(abs, text);
+    };
+    plant('rust/crates/x/src/latest.rs', 'const URL: &str = "OMLX_URL";\n');
+    plant('rust/crates/agent24-idoris/src/omlx_probe.rs', '8088\n8088\n');
+    plant('rust/crates/x/src/lib.test.ts', 'OMLX_URL\n');
+    plant('rust/crates/x/tests/it.rs', 'OMLX_URL\n');
+    const hits = scanTree(dir);
+    const caught = (rel) => hits.some((hit) => hit.startsWith(rel));
+    const ok = caught('rust/crates/x/src/latest.rs')
+      && caught('rust/crates/agent24-idoris/src/omlx_probe.rs')
+      && !caught('rust/crates/x/src/lib.test.ts')
+      && !caught('rust/crates/x/tests/it.rs');
+    if (!ok) {
+      console.error('self-test: planted violations not handled as expected', hits);
       process.exit(1);
     }
-    console.log('self-test: planted OMLX_URL violation detected');
+    console.log('self-test: planted violations detected, test files skipped');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

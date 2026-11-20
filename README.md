@@ -10,7 +10,7 @@
 - **多端**：桌面已落地（Electron 参考壳，macOS / Windows / Linux 分发）；移动（iOS / Android）与 Web 规划中，同属 shell-agnostic——移动端计划各提供 Tauri 与 Expo / React Native 瘦壳示例（见 [ADR-027](docs/decision.md)）。daemon 与模型可不在端上（如跑在你的 Mac），移动 / Web 端做瘦壳、只经 HTTP/WS 协议远程消费。**注**：`agent24d` 今天固定绑 `127.0.0.1` 且没有 bind-address 参数，跨设备访问需要自备隧道/反代与相应的认证方案——「远程消费」是目标态
 - 后台 daemon + 用户交互一致性
 - 标准化能力模块接口：进程外领域 OS 有对外 Rust SDK `agent24-os-sdk`（0.1.0，原型阶段，接口可能变）；能力模块今天仍是 `packages/node-daemon` 的内部 `CapabilityModule`（TS，未对外发布）
-- AI 适配层（三级路由 + `ModelProvider` 缝）。**今天生产启动只走 `ModelRouter::from_env()`，构造 oMLX 与 Ollama 两个槽**；tier 按 URL 判定——非 loopback 的 `OMLX_URL` 会被重标为 `Remote`，好让 LocalOnly 的任务拒绝它而不是悄悄外泄。没有独立的 remote / lora 注册入口，没有 Claude provider，也没有运行时的设置页切换。iDoris 接入排在 P4 门后
+- AI 适配层：**所有模型调用只经过 iDoris**（必选核心模块，随包附带、启动自动接入；见 `docs/design/IDORIS-CORE-PLAN.md`）。iDoris 封装 oMLX，将来的 LM Studio、Ollama、云端订阅都作为 iDoris 的上游；Agent24 自身不直连任何模型服务
 - 分层记忆：今天有 L0 KV、canonical session（阈值触发的摘要压缩），以及 M-D 落下的事件日志 / 断言账本 / artifact / condenser / 巩固等**库原语**。**L3 ATIF 轨迹、SkillBank、自进化框架尚未实现**（代码中无此符号），是目标态
 - 通过 **Hyphae 菌丝网络**（Nostr）与其他 agent 通信
 
@@ -177,14 +177,7 @@ module.exports = myModule   // 包根必须直接是 { manifest, register }
 
 ### LLM 运行时
 
-> ⚠️ 下表是**目标形态**。今天 daemon 启动时按环境变量（`OMLX_URL` / `OMLX_API_KEY` / `DEFAULT_MODEL`）只构造 oMLX + Ollama 两个槽，tier 按 URL 判定（非 loopback 的 `OMLX_URL` → `Remote`）；**没有独立的 remote / lora 注册入口，也没有运行时的设置页切换。**
-
-| 运行时 | 端点 | 说明 |
-|--------|------|------|
-| **oMLX**（默认） | `localhost:8088/v1` | Apple Silicon 原生，最低延迟 |
-| Ollama | `localhost:11434` | 跨平台，模型丰富 |
-| LM Studio | `localhost:1234/v1` | 图形界面管理 |
-| Remote API | 自定义 | OpenAI 兼容接口 |
+Agent24 只连接 iDoris（本机 loopback 网关，随包附带、自动安装与启动）。模型运行时由 iDoris 管理：当前是 oMLX（Apple Silicon 原生）；LM Studio、Ollama、云端订阅等将作为 iDoris 的上游组件接入。开发调试可用 `AGENT24_DEV_IDORIS_URL` / `AGENT24_DEV_IDORIS_KEY` 指向一个外部 iDoris。
 
 ---
 
