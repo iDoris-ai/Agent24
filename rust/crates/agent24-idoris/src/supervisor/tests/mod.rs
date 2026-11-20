@@ -11,7 +11,7 @@ const FIXTURE_FILES: [&str; 3] = [
 
 fn healthy() -> serde_json::Value {
     serde_json::json!({
-        "status": "ok", "service": "idoris", "version": "0.4.0",
+        "status": "ok", "service": "idoris", "version": "0.5.0",
         "contract_version": IdorisLock::embedded().tested_contract_version,
         "instance_id": "fixture-instance", "dev_no_key_enabled": false
     })
@@ -555,7 +555,7 @@ async fn leftover_four_fields_must_match_before_any_signal() {
 }
 
 #[tokio::test]
-#[ignore = "requires IDORIS_REAL_V040_DIR with the verified v0.4.0 release; runs real serve"]
+#[ignore = "requires IDORIS_REAL_V040_DIR with the verified v0.5.0 release; runs real serve"]
 async fn real_v040_ready_then_stop() {
     let release =
         PathBuf::from(std::env::var_os("IDORIS_REAL_V040_DIR").expect("set release directory"));

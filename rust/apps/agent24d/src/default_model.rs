@@ -73,3 +73,66 @@ pub(crate) async fn store_default(kv: &KvStore, model: &str) -> Result<(), Memor
     )
     .await
 }
+
+/// Seed the first chat default from the local iDoris recommendation. This is
+/// deliberately best effort and is called from a background task at startup.
+pub(crate) async fn seed_from_idoris(
+    router: std::sync::Arc<ModelRouter>,
+    kv: KvStore,
+    host: Option<std::sync::Arc<agent24_idoris::idoris_host::IdorisHost>>,
+) {
+    if !matches!(
+        kv.fetch::<SavedDefaultChatModel>(NAMESPACE, KEY).await,
+        Ok(None)
+    ) {
+        return;
+    }
+    let Some(host) = host else {
+        return;
+    };
+    let (source, recommendation) =
+        if let Some(v) = host.read_data_json("/v1/recommendation?role=chat").await {
+            ("idoris_http", Some(v))
+        } else {
+            (
+                "idoris_cli",
+                host.read_model_cli(&["recommend", "--role", "chat", "--json"])
+                    .await,
+            )
+        };
+    let Some(value) = recommendation else {
+        return;
+    };
+    match seed_recommendation(&kv, source, &value).await {
+        Ok(Some(model)) => router.set_default_model(model),
+        Ok(None) => {}
+        Err(err) => tracing::warn!("could not seed default chat model from iDoris: {err}"),
+    }
+}
+
+pub(crate) async fn seed_recommendation(
+    kv: &KvStore,
+    source: &str,
+    recommendation: &serde_json::Value,
+) -> Result<Option<String>, MemoryError> {
+    if !matches!(source, "idoris_http" | "idoris_cli")
+        || kv
+            .fetch::<SavedDefaultChatModel>(NAMESPACE, KEY)
+            .await?
+            .is_some()
+        || recommendation.get("installed") != Some(&serde_json::Value::Bool(true))
+    {
+        return Ok(None);
+    }
+    let Some(raw) = recommendation
+        .get("model_id")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return Ok(None);
+    };
+    let Ok(model) = validate_model_id(raw) else {
+        return Ok(None);
+    };
+    store_default(kv, &model).await?;
+    Ok(Some(model))
+}

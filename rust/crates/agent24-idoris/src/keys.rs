@@ -272,7 +272,7 @@ impl Keys {
         Ok(issued)
     }
 
-    /// v0.4.0 has no owner flag: filter the returned metadata by exact equality.
+    /// v0.5.0 has no owner flag: filter the returned metadata by exact equality.
     pub async fn list(&self, owner: Option<&str>) -> Result<Vec<KeyMetadata>, KeyError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
@@ -290,7 +290,7 @@ impl Keys {
             .collect())
     }
 
-    /// Both first-time and already-revoked v0.4.0 responses count as success.
+    /// Both first-time and already-revoked v0.5.0 responses count as success.
     pub async fn revoke(&self, key_id: &str) -> Result<(), KeyError> {
         if !valid_id(key_id) {
             return Err(KeyError::InvalidRequest);

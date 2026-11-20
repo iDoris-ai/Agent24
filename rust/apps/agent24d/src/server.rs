@@ -254,6 +254,14 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
         .route("/api/v1/chat", post(crate::routes::post_chat))
         .route("/api/v1/models", get(crate::routes::get_models))
         .route(
+            "/api/v1/models/recommendation",
+            get(crate::idoris_routes::model_recommendation),
+        )
+        .route(
+            "/api/v1/models/local",
+            get(crate::idoris_routes::local_models),
+        )
+        .route(
             "/api/v1/models/default",
             put(crate::routes::put_default_model),
         )
