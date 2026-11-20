@@ -3262,7 +3262,6 @@ mod tests {
         }
     }
 
-||||||| fb4f037e
     /// Loop 4 (General 11-20): a module call missing a required argument is
     /// refused before the approval gate is asked, so no card is shown for a
     /// call that could never run, and the model is told what is missing.
