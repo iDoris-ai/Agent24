@@ -172,6 +172,27 @@ export function parseDaemonFailureLine(line: string): DaemonStartupFailure | nul
   return { code: code.slice(0, 80), error: error.slice(0, 2000) }
 }
 
+/** The daemon this app starts writes its stderr here, beside the service's
+ * `agent24d.err.log`; past 20 MB the file is moved to `.1` at the next start.
+ * None when there is no data directory or the file cannot be opened. */
+export const APP_DAEMON_LOG = 'agent24d.app.log'
+const APP_DAEMON_LOG_MAX = 20 * 1024 * 1024
+export function appDaemonLog(dataDir: string | null): fs.WriteStream | null {
+  if (dataDir === null) return null
+  try {
+    const dir = path.join(dataDir, 'logs')
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const file = path.join(dir, APP_DAEMON_LOG)
+    const size = fs.statSync(file, { throwIfNoEntry: false })?.size ?? 0
+    if (size > APP_DAEMON_LOG_MAX) fs.renameSync(file, `${file}.1`)
+    const stream = fs.createWriteStream(file, { flags: 'a', mode: 0o600 })
+    stream.on('error', () => {})
+    return stream
+  } catch {
+    return null
+  }
+}
+
 /** Non-zero exit with no `failed` line: the last stderr line, or the code. */
 export function stderrExitFailure(lastStderr: string, code: number): DaemonStartupFailure {
   const error = lastStderr.trim().slice(0, 2000)
@@ -1278,10 +1299,15 @@ export class BackendManager {
     if (child.stderr) {
       const rl = readline.createInterface({ input: child.stderr })
       rls.push(rl)
+      // Loop 4 (General 11-20): the daemon this app runs logs where the
+      // service's does (~/.agent24/logs), so its record outlives the app.
+      const file = this.kind === 'node' ? null : appDaemonLog(tryDataDir())
+      child.on('close', () => file?.end())
       rl.on('line', (line) => {
         const trimmed = line.trim()
         if (trimmed) lastStderr = trimmed
         console.error(`[backend:${this.kind}]`, line)
+        file?.write(`${line}\n`)
       })
     }
     child.on('close', () => {
