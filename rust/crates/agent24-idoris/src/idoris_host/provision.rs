@@ -48,14 +48,14 @@ pub struct ConnectRequest {
 }
 #[derive(Serialize)]
 pub struct Candidate {
-    endpoint: String,
-    identity: &'static str,
-    authentication: &'static str,
-    models: Vec<String>,
+    pub endpoint: String,
+    pub identity: &'static str,
+    pub authentication: &'static str,
+    pub models: Vec<String>,
 }
 #[derive(Serialize)]
 pub struct Candidates {
-    candidates: Vec<Candidate>,
+    pub candidates: Vec<Candidate>,
     pub key_from_local_settings: bool,
 }
 #[derive(Serialize, Deserialize)]
@@ -111,17 +111,31 @@ impl Provisioner for SystemProvisioner {
         cancel: &CancellationToken,
         progress: watch::Sender<DownloadProgress>,
     ) -> Result<VerifiedArchive, Code> {
-        download_locked_asset(
-            IdorisLock::embedded(),
-            crate::host_triple().ok_or(Code::NotInstalled)?,
-            &root.join("cache"),
-            &DownloadOptions {
-                progress: Some(progress),
-                ..DownloadOptions::default()
-            },
-            cancel,
-        )
-        .await
+        if let Some(bundle) = std::env::var_os("AGENT24_IDORIS_BUNDLE") {
+            let path = std::path::PathBuf::from(bundle);
+            tokio::task::spawn_blocking(move || {
+                crate::download::bundled_locked_asset(
+                    IdorisLock::embedded(),
+                    crate::host_triple()
+                        .ok_or(crate::download::DownloadError::UnsupportedPlatform)?,
+                    &path,
+                )
+            })
+            .await
+            .map_err(|_| Code::NotInstalled)?
+        } else {
+            download_locked_asset(
+                IdorisLock::embedded(),
+                crate::host_triple().ok_or(Code::NotInstalled)?,
+                &root.join("cache"),
+                &DownloadOptions {
+                    progress: Some(progress),
+                    ..DownloadOptions::default()
+                },
+                cancel,
+            )
+            .await
+        }
         .map_err(|e| match e {
             crate::download::DownloadError::Cancelled => Code::Cancelled,
             crate::download::DownloadError::Busy => Code::Busy,
@@ -267,7 +281,99 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), Code> {
         Ok(())
     }
 }
+pub(super) async fn wait_operation(host: &Arc<IdorisHost>, id: &str) -> Result<(), Code> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let operation = host.operation(id).await?;
+        if let Some(result) = operation.result {
+            return match result {
+                Outcome::Succeeded => Ok(()),
+                Outcome::Failed | Outcome::Cancelled => {
+                    Err(operation.error_code.unwrap_or(Code::SetupFailed))
+                }
+            };
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Code::Busy);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 impl IdorisHost {
+    /// Best-effort first launch bootstrap. Callers should run this in the
+    /// background so an unavailable local oMLX never delays daemon readiness.
+    pub async fn bootstrap_core(self: &Arc<Self>) -> Result<(), Code> {
+        self.bootstrap_core_inner(None).await
+    }
+    #[cfg(test)]
+    pub(super) async fn bootstrap_core_with_candidates(
+        self: &Arc<Self>,
+        candidates: Candidates,
+    ) -> Result<(), Code> {
+        self.bootstrap_core_inner(Some(candidates)).await
+    }
+    async fn bootstrap_core_inner(
+        self: &Arc<Self>,
+        candidate_override: Option<Candidates>,
+    ) -> Result<(), Code> {
+        // Each bootstrap is a new attempt: a fixed idempotency key would replay
+        // the previous (possibly failed, or long finished) operation forever.
+        let attempt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let key = |step: &str| format!("core-{step}-{attempt}");
+        let status = self.status().await;
+        if status.state == State::NotInstalled {
+            let operation = self
+                .install(InstallRequest { consent: false }, Some(&key("install")))
+                .await?;
+            wait_operation(self, &operation.operation_id).await?;
+        }
+        let status = self.status().await;
+        if status.state == State::NotConfigured || status.roles.is_empty() {
+            let candidates = match candidate_override {
+                Some(candidates) => candidates,
+                None => self.candidates(None).await?,
+            };
+            let candidate = candidates
+                .candidates
+                .iter()
+                .find(|candidate| {
+                    candidate.identity == "omlx"
+                        && candidate.authentication == "ready"
+                        && candidate.models.iter().any(|m| is_chat_model_id(m))
+                })
+                .ok_or(Code::OmlxUnreachable)?;
+            let daily_model = candidate
+                .models
+                .iter()
+                .find(|m| is_chat_model_id(m))
+                .ok_or(Code::OmlxUnreachable)?
+                .clone();
+            let operation = self
+                .connect(
+                    ConnectRequest {
+                        endpoint: candidate.endpoint.clone(),
+                        daily_model,
+                        deep_model: None,
+                        save_omlx_key: false,
+                        replace: false,
+                        core_reserved_bytes: status
+                            .budget_suggestion
+                            .map(|budget| budget.core_reserved_bytes),
+                        consent: None,
+                    },
+                    Some(&key("connect")),
+                )
+                .await?;
+            wait_operation(self, &operation.operation_id).await?;
+        } else if status.state == State::Stopped {
+            let operation = self.submit(Action::Start, Some(&key("start"))).await?;
+            wait_operation(self, &operation.operation_id).await?;
+        }
+        Ok(())
+    }
     /// Constructor injection is available before the host is shared with routes.
     pub fn with_provisioner(
         mut self: Arc<Self>,
@@ -334,9 +440,6 @@ impl IdorisHost {
         request: InstallRequest,
         key: Option<&str>,
     ) -> Result<Operation, Code> {
-        if !request.consent {
-            return Err(Code::ConsentRequired);
-        }
         self.submit_provision(Action::Install, key, &request, None)
             .await
     }
@@ -348,13 +451,8 @@ impl IdorisHost {
         let endpoint = Endpoint::parse(&request.endpoint).map_err(|_| Code::InvalidRequest)?;
         let mut request = request;
         request.endpoint = endpoint.as_str().into();
-        let consent = request.consent.as_ref().ok_or(Code::ConsentRequired)?;
-        if !consent.share_omlx_key
-            || consent.daily_model != request.daily_model
-            || consent.deep_model != request.deep_model
-        {
-            return Err(Code::ConsentRequired);
-        }
+        // Core bootstrap is automatic. The selected models and upstream key are
+        // local configuration used only by iDoris and do not need a separate prompt.
         if std::iter::once(&request.daily_model)
             .chain(request.deep_model.iter())
             .any(|m| m.is_empty() || m.len() > 512 || m.chars().any(char::is_control))
@@ -1096,5 +1194,43 @@ impl IdorisHost {
         } else {
             self.rollback_connect(&pending, &keys).await
         }
+    }
+}
+
+/// oMLX lists every model it serves; the daily role needs a chat model, not an
+/// embedding, speech, OCR or image one. Same exclusions as the desktop picker.
+fn is_chat_model_id(id: &str) -> bool {
+    const NON_CHAT: [&str; 13] = [
+        "flux",
+        "ocr",
+        "tts",
+        "voice",
+        "whisper",
+        "asr",
+        "embed",
+        "bge",
+        "rerank",
+        "mage",
+        "diffusion",
+        "sd-",
+        "-vl",
+    ];
+    let name = id.to_ascii_lowercase();
+    !NON_CHAT.iter().any(|part| name.contains(part))
+}
+
+#[cfg(test)]
+mod chat_model_filter_tests {
+    #[test]
+    fn embedding_and_speech_models_are_not_picked_for_daily_chat() {
+        for id in [
+            "bge-m3-mlx-fp16",
+            "Qwen3-Embedding-0.6B",
+            "whisper-large",
+            "Qwen2.5-VL-7B",
+        ] {
+            assert!(!super::is_chat_model_id(id), "{id}");
+        }
+        assert!(super::is_chat_model_id("Qwen3-8B-4bit"));
     }
 }

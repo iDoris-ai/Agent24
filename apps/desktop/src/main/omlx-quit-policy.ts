@@ -1,3 +1,4 @@
+// 过渡：ID-3 后由 iDoris 接管并删除。
 // Whether quitting stops the oMLX this app started (FU-114). With the resident
 // service installed, quitting the app leaves the service daemon running (M5 B4),
 // and that daemon uses the same oMLX (127.0.0.1:8088 by default): it keeps

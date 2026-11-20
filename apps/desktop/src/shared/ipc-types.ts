@@ -36,10 +36,6 @@ export const IpcChannels = {
   // M5 B4c2: Settings → General → background service switch.
   ResidentServiceStatus: 'resident-service:status',
   ResidentServiceSet: 'resident-service:set',
-  // Model source setting: a local OpenAI-compatible endpoint the daemon uses first.
-  ModelSourceGet: 'model-source:get',
-  ModelSourceSet: 'model-source:set',
-  ModelSourceClear: 'model-source:clear',
   AppLocale: 'app:locale',
   AppPing: 'app:ping',
   AppVersion: 'app:version',
@@ -116,12 +112,8 @@ export const IpcChannels = {
   OpenDesignComponentPause: 'open-design-component:pause',
   // Push channel only (main -> renderer), mirrors AgentEarEvent's pattern.
   OpenDesignComponentProgress: 'open-design-component:progress',
-  OmlxDetect: 'omlx:detect',
-  OmlxModels: 'omlx:models',
   OmlxStart: 'omlx:start',
   OmlxStop: 'omlx:stop',
-  OmlxWarmup: 'omlx:warmup',
-  LlmStatus: 'llm:status',
   // A3-4: push channel only (main -> renderer via webContents.send). Not an
   // ipcMain.handle() target — see main/agentear-events.ts.
   AgentEarEvent: 'agentear:event',
@@ -468,27 +460,6 @@ export interface OpenDesignComponentStatusResult {
   overrideActive?: boolean
 }
 
-export interface OmlxDetectResult {
-  url: string
-  apiKey: string
-  models: string[]
-}
-
-/** A server answered on this address but demands an API key (401/403). The
- * renderer should point the user at the API key field, not say "disconnected". */
-export interface OmlxAuthRequiredResult {
-  authRequired: true
-  url: string
-}
-
-export interface OmlxModelsResult {
-  ok: boolean
-  models: string[]
-  error?: string
-  /** The server answered 401/403: it is running but needs an API key. */
-  authRequired?: boolean
-}
-
 export interface OmlxStartResult {
   ok: boolean
   url: string
@@ -499,18 +470,6 @@ export interface OmlxStopResult {
   ok: boolean
   /** False when this app had not spawned oMLX, so nothing was signalled. */
   stopped: boolean
-}
-
-export interface OmlxWarmupResult {
-  model: string
-  ok: boolean
-  error?: string
-}
-
-export interface LlmStatusResult {
-  provider: 'omlx' | 'ollama' | 'none'
-  url: string
-  model: string
 }
 
 // ── A3 attached modules (docs/design/A3-ATTACHED-MODULE.md) ────────────────────
@@ -743,17 +702,6 @@ export interface RunEvent {
   type: (typeof RUN_EVENT_TYPES)[number]
   run_id: string
 }
-
-/** Model source setting: a loopback OpenAI-compatible base URL (no `/v1`) and a model name. */
-export interface ModelSource { url: string; model: string }
-
-/** A saved (or cleared) model source and how the daemon took it: `restarted`
- * (it is in use), or `restart_failed` with a code (it is used from the next
- * daemon start). */
-export type ModelSourceResult =
-  | { ok: true; restart: 'restarted' }
-  | { ok: true; restart: 'restart_failed'; code: string }
-  | { ok: false; reason: 'invalid_url' | 'invalid_model' | 'no_data_dir' | 'not_saved' }
 
 /** D1: the Office → PDF converter (LibreOffice) on this machine. */
 export interface OfficeEngineStatus {

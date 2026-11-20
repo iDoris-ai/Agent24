@@ -11,6 +11,115 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+async fn query_idoris<H, HFut, C, CFut>(
+    http: H,
+    cli: C,
+) -> Option<(&'static str, serde_json::Value)>
+where
+    H: FnOnce() -> HFut,
+    HFut: std::future::Future<Output = Option<serde_json::Value>>,
+    C: FnOnce() -> CFut,
+    CFut: std::future::Future<Output = Option<serde_json::Value>>,
+{
+    if let Some(value) = http().await {
+        return Some(("idoris_http", value));
+    }
+    cli().await.map(|value| ("idoris_cli", value))
+}
+
+/// Machine-local chat model recommendation. HTTP is preferred while the
+/// managed daemon is ready; the verified executable is the offline fallback.
+#[derive(serde::Deserialize)]
+pub struct RecommendationQuery {
+    role: String,
+}
+
+pub async fn model_recommendation(
+    State(state): State<AppState>,
+    Query(query): Query<RecommendationQuery>,
+) -> Response {
+    if query.role != "chat" {
+        return crate::server::error_response(
+            axum::http::StatusCode::BAD_REQUEST,
+            "unsupported_role",
+            "only chat is supported",
+        );
+    }
+    if let Some(host) = state.idoris_host
+        && let Some((source, recommendation)) = query_idoris(
+            || host.read_data_json("/v1/recommendation?role=chat"),
+            || host.read_model_cli(&["recommend", "--role", "chat", "--json"]),
+        )
+        .await
+    {
+        return Json(serde_json::json!({"source":source, "recommendation":recommendation}))
+            .into_response();
+    }
+    let model = "Qwen3-8B-4bit";
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let installed = home
+        .map(|p| p.join(".omlx/models").join(model).is_dir())
+        .unwrap_or(false);
+    Json(serde_json::json!({"source":"fallback", "recommendation":{
+        "role":"chat", "model_id":model, "installed":installed, "size_bytes":null,
+        "est_memory_bytes":null, "fits":null, "reason":"idoris_unavailable", "host":null,
+        "alternatives":[]
+    }}))
+    .into_response()
+}
+
+pub async fn local_models(State(state): State<AppState>) -> Response {
+    if let Some(host) = state.idoris_host
+        && let Some((source, value)) = query_idoris(
+            || host.read_data_json("/v1/models/local"),
+            || host.read_model_cli(&["models", "local", "--json"]),
+        )
+        .await
+    {
+        return Json(serde_json::json!({"source":source, "models":value["models"]}))
+            .into_response();
+    }
+    Json(serde_json::json!({"source":"fallback", "models":null})).into_response()
+}
+
+#[cfg(test)]
+mod model_query_tests {
+    use super::query_idoris;
+    use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[tokio::test]
+    async fn http_success_does_not_call_the_cli() {
+        let cli_calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&cli_calls);
+        let result = query_idoris(
+            || async { Some(json!({"model_id":"http-model"})) },
+            || async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Some(json!({}))
+            },
+        )
+        .await;
+        assert_eq!(
+            result,
+            Some(("idoris_http", json!({"model_id":"http-model"})))
+        );
+        assert_eq!(cli_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unavailable_http_falls_back_to_cli_and_then_to_fallback() {
+        let result = query_idoris(|| async { None }, || async { Some(json!({"models":[]})) }).await;
+        assert_eq!(result, Some(("idoris_cli", json!({"models":[]}))));
+
+        let result = query_idoris(|| async { None }, || async { None }).await;
+        assert_eq!(result, None);
+    }
+}
+
 fn failure(code: Code) -> Response {
     (code.http_status(), Json(serde_json::json!({"error": {
         "code": code, "message": code.message(),
@@ -201,7 +310,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn connect_and_install_reject_missing_consent_and_plaintext_credential_fields() {
+    async fn core_connect_does_not_require_consent_and_plaintext_credentials_are_rejected() {
         use agent24_idoris::{idoris_host::IdorisHost, managed_idoris::ManagedIdoris};
         use std::sync::Arc;
         let (mut state, host, creative) = crate::server::tests::capability_state().await;
@@ -224,13 +333,7 @@ mod tests {
                 "connect",
                 serde_json::json!({"endpoint":"http://127.0.0.1:8088", "daily_model":"real-model"}),
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "consent_required",
-            ),
-            (
-                "install",
-                serde_json::json!({"consent":false}),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "consent_required",
+                "not_installed",
             ),
             (
                 "connect",

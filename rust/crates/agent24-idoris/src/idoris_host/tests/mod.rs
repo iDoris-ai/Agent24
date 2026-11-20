@@ -205,7 +205,7 @@ impl Fixture {
         }
         fs::write(root.join("components/scenario.json"), "{}").unwrap();
         let record = Installation {
-            version: "0.4.0".into(),
+            version: "0.5.0".into(),
             release_dir: root.join("release"),
             archive_path,
             components_dir: Some(root.join("components")),
@@ -605,7 +605,7 @@ impl Runtime for SmokeRuntime {
 }
 
 #[tokio::test]
-#[ignore = "requires IDORIS_REAL_V040_DIR; verifies signed v0.4.0 and runs real serve"]
+#[ignore = "requires IDORIS_REAL_V040_DIR; verifies signed v0.5.0 and runs real serve"]
 async fn real_v040_install_existing_start_running_stop() {
     use crate::{
         download::{DownloadOptions, download_locked_asset},
@@ -628,9 +628,9 @@ async fn real_v040_install_existing_start_running_stop() {
     )
     .await
     .unwrap();
-    let installed_dir = root.join("releases/0.4.0");
+    let installed_dir = root.join("releases/0.5.0");
     for part in [
-        "releases/0.4.0/config/components",
+        "releases/0.5.0/config/components",
         "components",
         "data/state",
     ] {
@@ -643,9 +643,9 @@ async fn real_v040_install_existing_start_running_stop() {
     }
     for part in [
         "releases",
-        "releases/0.4.0",
-        "releases/0.4.0/config",
-        "releases/0.4.0/config/components",
+        "releases/0.5.0",
+        "releases/0.5.0/config",
+        "releases/0.5.0/config/components",
     ] {
         mode(&root.join(part), 0o700);
     }
@@ -681,7 +681,7 @@ async fn real_v040_install_existing_start_running_stop() {
     )
     .unwrap();
     host.record_installation(Installation {
-        version: "0.4.0".into(),
+        version: "0.5.0".into(),
         release_dir: installed.directory().into(),
         archive_path: archive.path,
         components_dir: Some(root.join("components")),

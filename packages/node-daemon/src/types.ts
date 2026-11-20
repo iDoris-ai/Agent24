@@ -1,4 +1,4 @@
-import type { LLMGateway } from './llm-gateway'
+import type { LLMGateway } from './llm-unavailable'
 export type { ModuleManifest, ModuleType, Permission } from './manifest'
 
 // ── LLM ──────────────────────────────────────────────────────────────────────

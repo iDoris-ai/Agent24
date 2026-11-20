@@ -90,6 +90,10 @@ jobs:
         # `npm install --omit=dev` default already works); pnpm's does not.
         # Reverted to the default; the file-pruning step below is the
         # actual, working size reduction for this round.
+        # onnxruntime-node (OD dependency) downloads CUDA binaries on linux x64 by
+        # default; upstream removed them (404) and the smoke test never uses CUDA.
+        env:
+          ONNXRUNTIME_NODE_INSTALL_CUDA: skip
         run: |
           set -euo pipefail
           test "$(git -C open-design rev-parse HEAD)" = "$OPEN_DESIGN_SHA"

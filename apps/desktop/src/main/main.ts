@@ -11,19 +11,17 @@ import { createScheduleConversations, type ScheduleConversations } from './sched
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
-import { registerModelSource } from './ipc/model-source'
 import { registerOfficeEngine } from './ipc/office-engine'
 import { registerTranslationExport } from './ipc/translation-export'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
-import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
 import { SERVICE_LABEL, serviceDaemonCopyPath, upgradeServiceByLaunchd } from './resident-service'
-import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAskConsent, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, autoInstallService, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -520,6 +518,9 @@ app.on('second-instance', () => {
 })
 
 app.whenReady().then(async () => {
+  if (app.isPackaged && process.platform === 'darwin') {
+    process.env['AGENT24_IDORIS_BUNDLE'] = path.join(process.resourcesPath, 'idoris-component')
+  }
   if (!isPrimaryInstance) return
   // UI language for the tray and native dialogs: English unless the user chose
   // otherwise (the renderer reports its setting; the system locale is ignored).
@@ -794,14 +795,6 @@ app.whenReady().then(async () => {
       return result
     },
   })
-  // Settings → Models → custom local model service: the daemon reads the
-  // file as it starts, so a change restarts it (the service daemon through
-  // the same presence-confirmed restart as an upgrade).
-  registerModelSource({
-    guard,
-    file: () => { const dir = tryDataDir(); return dir === null ? null : modelSourcePath(dir) },
-    restart: restartDaemonForModelSource,
-  })
   registerOfficeEngine({
     guard,
     engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
@@ -866,7 +859,7 @@ app.whenReady().then(async () => {
     },
   })
   mainWin = createMainWindow()
-  void askResidentConsent(bundledModulesReady).catch((err) => console.error('[main] resident consent', err))
+  void autoInstallResidentService(bundledModulesReady).catch((err) => console.error('[main] resident service auto-install', err))
   // KB-C2-04a: main is the UI session's Provider in M2 (design §6).
   const knowledgeBindingTag = bindingTag(knowledgeAppInstanceId(app.getPath('userData')), KNOWLEDGE_BINDING)
   // M4 A7: Knowledge's dialogs and drafts in their conversations' pending[].
@@ -1037,23 +1030,6 @@ app.whenReady().then(async () => {
   app.on('activate', () => showOrCreateWindow())
 })
 
-async function restartDaemonForModelSource(): Promise<{ ok: true } | { ok: false; code: string }> {
-  const service = serviceDaemonOf(backendManager)
-  if (service) {
-    const dataDir = tryDataDir()
-    if (dataDir === null) return { ok: false, code: 'no_data_dir' }
-    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
-    // Restarted to read the model source again; replaced only through the upgrade's own gate.
-    const gate = { fromBundle: upgradesFromBundle(app.isPackaged, process.env), bundled: bundledVersion, running: backendManager.serviceDaemonVersion() }
-    const outcome = await upgradeService(restartDeps(deps, gate))
-    return outcome.ok ? { ok: true } : { ok: false, code: outcome.code }
-  }
-  if (backendManager.isExternalDaemon()) return { ok: false, code: 'external_daemon' }
-  backendManager.restart()
-  return { ok: true }
-}
-
 // M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
 // Settings switch and the tray's 「完全退出」, one at a time (B4c3).
 const residentOp = residentOps()
@@ -1100,35 +1076,21 @@ function recordConsent(answer: ConsentAnswer): void {
   if (dataDir !== null) writeConsent(consentPath(dataDir), answer, new Date())
 }
 
-// M5 B4b: asked once, with the window up. Allow installs the LaunchAgent,
-// after the bundled documents module's launch install, with this app's own
-// daemon stopped meanwhile; a failed install is undone and not
-// kept, so the next launch asks again (PM r1 ②).
-async function askResidentConsent(documentsReady: Promise<unknown>): Promise<void> {
+// Install the bundled LaunchAgent automatically after the documents module's
+// launch install, with this app's daemon stopped meanwhile. Failures are
+// retried on the next launch and do not change the stored answer.
+async function autoInstallResidentService(documentsReady: Promise<unknown>): Promise<void> {
   const dataDir = tryDataDir()
   if (dataDir === null) return
   const file = consentPath(dataDir)
   const fromBundle = upgradesFromBundle(app.isPackaged, process.env)
-  if (!shouldAskConsent({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
-  const outcome = await runConsent({
-    ask: async () => {
-      if (!mainWin || mainWin.isDestroyed()) mainWin = createMainWindow()
-      const { response } = await dialog.showMessageBox(mainWin, {
-        type: 'question',
-        buttons: [mt('consent.allow'), mt('consent.deny')],
-        defaultId: 0,
-        cancelId: 1,
-        message: mt('consent.message'),
-        detail: mt('consent.detail'),
-      })
-      return response === 0 ? 'allow' : 'declined'
-    },
+  if (!shouldAutoInstall({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
+  const outcome = await autoInstallService({
     install: () => residentInstall(documentsReady),
-    record: (answer) => writeConsent(file, answer, new Date()),
+    record: () => writeConsent(file, 'allow', new Date()),
   })
   if (typeof outcome === 'object') {
     console.warn('[main] resident service not installed:', outcome.failed)
-    if (mainWin && !mainWin.isDestroyed()) void dialog.showMessageBox(mainWin, { type: 'warning', message: mt('consent.failed', { code: outcome.failed }) })
   }
   refreshTray()
 }
