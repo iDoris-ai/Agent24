@@ -482,3 +482,37 @@ fn a_comment_reference_sharing_a_run_with_text_is_refused() {
         other => panic!("{other:?}"),
     }
 }
+
+/// PR-Daemon #1930 B2 (Loop 4): a whitelist. A formula or a pending tracked
+/// deletion in the paragraph would be lost by a rewrite: refused, named.
+#[test]
+fn a_paragraph_holding_a_formula_or_a_pending_deletion_is_refused_and_says_what() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    for (run, what) in [
+        (r#"<m:oMath><m:r><m:t>x=1</m:t></m:r></m:oMath>"#, "m:oMath"),
+        (
+            r#"<w:del w:id="91" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText>旧</w:delText></w:r></w:del>"#,
+            "w:del",
+        ),
+        (r#"<w:r><w:tab/><w:t>x</w:t></w:r>"#, "w:tab"),
+    ] {
+        let (docx, text) = with_run_in(index, run);
+        for tracked in [false, true] {
+            let edit = ParaEdit {
+                index,
+                text: "新".into(),
+                tracked,
+                expect: Some(text.clone()),
+            };
+            match apply(&docx, &[edit], "A", NOW) {
+                Err(PatchError::Invalid(why)) => assert!(why.contains(what), "{why}"),
+                other => panic!("{run}: {other:?}"),
+            }
+        }
+    }
+}

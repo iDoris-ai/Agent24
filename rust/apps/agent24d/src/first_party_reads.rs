@@ -6,9 +6,12 @@
 //! knowledge of it, never what the module says of itself. Here the host
 //! knows the tools by name from its own list ([`DOCUMENTS_READS`], not the
 //! manifest's `risk`), and knows the module is the one it ships by its bytes:
-//! the installed `bin/agent24-documents` must be byte for byte the one in
-//! this app's bundle (SHA-256). A third-party package named `documents`, or
-//! one whose program was changed, matches nothing and keeps `External`.
+//! the program the package is really started with (its manifest's
+//! `spawn.command`, resolved as the launcher resolves it, with no arguments)
+//! must be byte for byte the one in this app's bundle (SHA-256). A
+//! third-party package named `documents`, one whose program was changed, or
+//! one that keeps a copy of the real program as a decoy while starting
+//! another (PR-Daemon #1954 F1), matches nothing and keeps `External`.
 //! Every other tool of every module, and the documents module's own writes
 //! (`compose`, `patch`, `fill`, `extract`, ...), keep `External`.
 //!
@@ -54,21 +57,37 @@ fn sha256(path: &Path) -> Option<[u8; 32]> {
     Some(hasher.finalize().into())
 }
 
-/// Whether the package at `package_dir` runs the very program of `bundled`.
+/// Whether the package at `package_dir`, started by `spawn`, runs the very
+/// program of `bundled`: the program the launcher would start
+/// (`agent24_os_proto::launch::resolve`), with no arguments, hashes the same.
 #[must_use]
-pub fn is_bundled(package_dir: &Path, bundled: &Path) -> bool {
-    match (sha256(&package_dir.join(PROGRAM)), sha256(bundled)) {
+pub fn is_bundled(
+    package_dir: &Path,
+    spawn: &agent24_domain::SpawnCommand,
+    bundled: &Path,
+) -> bool {
+    if !spawn.args.is_empty() {
+        return false;
+    }
+    let Ok(started) = agent24_os_proto::launch::resolve(spawn, package_dir) else {
+        return false;
+    };
+    match (sha256(&started), sha256(bundled)) {
         (Some(installed), Some(shipped)) => installed == shipped,
         _ => false,
     }
 }
 
 /// The `(module, tool)` pairs that are first-party reads, for the documents
-/// package at `package_dir` (None: not a package) checked against `bundled`.
+/// package at `package_dir` started by `spawn` (None: not a package, or no
+/// spawn), checked against `bundled`.
 #[must_use]
-pub fn host_reads(package_dir: Option<&Path>, bundled: Option<&Path>) -> HashSet<(String, String)> {
-    match (package_dir, bundled) {
-        (Some(dir), Some(bundled)) if is_bundled(dir, bundled) => DOCUMENTS_READS
+pub fn host_reads(
+    package: Option<(&Path, &agent24_domain::SpawnCommand)>,
+    bundled: Option<&Path>,
+) -> HashSet<(String, String)> {
+    match (package, bundled) {
+        (Some((dir, spawn)), Some(bundled)) if is_bundled(dir, spawn, bundled) => DOCUMENTS_READS
             .iter()
             .map(|tool| (MODULE.to_owned(), (*tool).to_owned()))
             .collect(),
@@ -80,25 +99,46 @@ pub fn host_reads(package_dir: Option<&Path>, bundled: Option<&Path>) -> HashSet
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use agent24_domain::SpawnCommand;
+    use std::os::unix::fs::PermissionsExt;
 
-    fn package(dir: &Path, program: &[u8]) {
+    fn spawn(command: &str, args: &[&str]) -> SpawnCommand {
+        SpawnCommand {
+            command: command.to_owned(),
+            args: args.iter().map(|a| (*a).to_owned()).collect(),
+        }
+    }
+
+    /// A package tree the launcher accepts: owner-only, not group/other writable.
+    fn package(dir: &Path, files: &[(&str, &[u8])]) {
         std::fs::create_dir_all(dir.join("bin")).unwrap();
-        std::fs::write(dir.join(PROGRAM), program).unwrap();
+        for (name, bytes) in files {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        for d in [dir.to_path_buf(), dir.join("bin")] {
+            std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    fn bundle(root: &Path) -> std::path::PathBuf {
+        let bundled = root.join("bundle/documents-module");
+        package(&bundled, &[(PROGRAM, b"the program this app ships")]);
+        bundled.join(PROGRAM)
     }
 
     #[test]
     fn only_the_bundled_program_makes_its_reads_first_party() {
         let root = tempfile::tempdir().unwrap();
-        let bundled = root.path().join("bundle/documents-module");
-        package(&bundled, b"the program this app ships");
+        let shipped = bundle(root.path());
         let installed = root.path().join("packages/documents");
-        package(&installed, b"the program this app ships");
-        let reads = host_reads(Some(&installed), Some(&bundled.join(PROGRAM)));
+        package(&installed, &[(PROGRAM, b"the program this app ships")]);
+        let reads = host_reads(Some((&installed, &spawn(PROGRAM, &[]))), Some(&shipped));
         let mut names: Vec<&str> = reads.iter().map(|(_, t)| t.as_str()).collect();
         names.sort_unstable();
         assert_eq!(names, ["fields", "get", "list", "paragraphs"]);
         assert!(reads.iter().all(|(m, _)| m == "documents"));
-        // The writes are never on the list.
         for write in ["compose", "patch", "fill", "extract", "convert"] {
             assert!(!reads.contains(&("documents".to_owned(), write.to_owned())));
         }
@@ -107,16 +147,46 @@ mod tests {
     #[test]
     fn a_package_named_documents_that_is_not_the_bundled_one_gets_nothing() {
         let root = tempfile::tempdir().unwrap();
-        let bundled = root.path().join("bundle/documents-module");
-        package(&bundled, b"the program this app ships");
+        let shipped = bundle(root.path());
         let impostor = root.path().join("packages/documents");
-        package(&impostor, b"a third party's program");
-        assert!(host_reads(Some(&impostor), Some(&bundled.join(PROGRAM))).is_empty());
-        // No program at all, no bundle, or no package: nothing either.
+        package(&impostor, &[(PROGRAM, b"a third party's program")]);
+        assert!(host_reads(Some((&impostor, &spawn(PROGRAM, &[]))), Some(&shipped)).is_empty());
         let empty = root.path().join("packages/empty");
-        std::fs::create_dir_all(&empty).unwrap();
-        assert!(host_reads(Some(&empty), Some(&bundled.join(PROGRAM))).is_empty());
-        assert!(host_reads(Some(&impostor), None).is_empty());
-        assert!(host_reads(None, Some(&bundled.join(PROGRAM))).is_empty());
+        package(&empty, &[]);
+        assert!(host_reads(Some((&empty, &spawn(PROGRAM, &[]))), Some(&shipped)).is_empty());
+        assert!(host_reads(Some((&impostor, &spawn(PROGRAM, &[]))), None).is_empty());
+        assert!(host_reads(None, Some(&shipped)).is_empty());
+    }
+
+    /// PR-Daemon #1954 F1: a decoy copy of the real program at
+    /// `bin/agent24-documents`, while the manifest starts another program
+    /// (or the real one with arguments), is not the bundled module.
+    #[test]
+    fn a_decoy_copy_of_the_real_program_beside_another_started_one_gets_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let shipped = bundle(root.path());
+        let decoy = root.path().join("packages/documents");
+        package(
+            &decoy,
+            &[
+                (PROGRAM, b"the program this app ships"),
+                ("bin/evil", b"#!/bin/sh\n"),
+            ],
+        );
+        assert!(host_reads(Some((&decoy, &spawn("bin/evil", &[]))), Some(&shipped)).is_empty());
+        assert!(
+            host_reads(
+                Some((&decoy, &spawn(PROGRAM, &["--other"]))),
+                Some(&shipped)
+            )
+            .is_empty()
+        );
+        // A bare name resolved on PATH is never the bundled program either.
+        assert!(host_reads(Some((&decoy, &spawn("sh", &[]))), Some(&shipped)).is_empty());
+        // The same package started as the bundle is: first-party.
+        assert_eq!(
+            host_reads(Some((&decoy, &spawn(PROGRAM, &[]))), Some(&shipped)).len(),
+            4
+        );
     }
 }

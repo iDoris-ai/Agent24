@@ -770,7 +770,7 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
 /// PR-Daemon #1930 B2: what in `para` a rewrite as one run would lose, named
 /// for the user; None for a paragraph of text runs (and bookmarks, comment
 /// ranges and a run holding only a comment reference, which are kept).
-fn not_plain_text(para: &str) -> Option<&'static str> {
+fn not_plain_text(para: &str) -> Option<String> {
     const KINDS: &[(&str, &str)] = &[
         ("<w:drawing", "a picture (w:drawing)"),
         ("<w:pict", "a picture (w:pict)"),
@@ -795,7 +795,7 @@ fn not_plain_text(para: &str) -> Option<&'static str> {
                 Some(b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
             )
         }) {
-            return Some(what);
+            return Some((*what).to_owned());
         }
     }
     // A comment reference sharing its run with text: the text would stay behind.
@@ -805,7 +805,31 @@ fn not_plain_text(para: &str) -> Option<&'static str> {
             && run.contains("<w:commentReference")
             && (run.contains("<w:t>") || run.contains("<w:t "))
         {
-            return Some("a comment reference in a run with text");
+            return Some("a comment reference in a run with text".to_owned());
+        }
+    }
+    // PR-Daemon #1930 B2 (Loop 4): a whitelist, not only the list above. A
+    // paragraph holds only what a rewrite keeps or rebuilds — its properties,
+    // plain text runs, proofing marks, bookmarks and comment ranges; a run
+    // only its properties, text, a lone comment reference and a cached page
+    // break. Anything else (a formula m:oMath, a pending w:ins/w:del, w:sym,
+    // a break, a tab, w:ruby, a permission range, w:contentPart, ...) would be
+    // lost: refused, and named.
+    for (name, start, end) in children(para) {
+        match name {
+            "w:pPr" | "w:proofErr" => {}
+            name if is_marker(name) => {}
+            "w:r" => {
+                for (inner, _, _) in children(&para[start..end]) {
+                    if !matches!(
+                        inner,
+                        "w:rPr" | "w:t" | "w:commentReference" | "w:lastRenderedPageBreak"
+                    ) {
+                        return Some(format!("{inner} in a run"));
+                    }
+                }
+            }
+            other => return Some(other.to_owned()),
         }
     }
     None
