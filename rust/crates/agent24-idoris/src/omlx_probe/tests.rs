@@ -686,7 +686,9 @@ async fn untrusted_listener_never_receives_settings_key() {
 
 /// Keep-alive fixture: serves many requests per connection and records which
 /// connection each request arrived on.
-fn keep_alive_server() -> (Endpoint, Arc<Mutex<Vec<(usize, String)>>>) {
+type ConnLog = Arc<Mutex<Vec<(usize, String)>>>;
+
+fn keep_alive_server() -> (Endpoint, ConnLog) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let endpoint = endpoint(listener.local_addr().unwrap().port());
     let seen = Arc::new(Mutex::new(Vec::new()));
