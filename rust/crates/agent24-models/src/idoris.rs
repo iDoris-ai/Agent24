@@ -116,15 +116,30 @@ async fn error_fields(
 }
 
 impl IdorisGateway {
-    pub(crate) fn from_env() -> Result<Self, String> {
-        let raw = std::env::var("IDORIS_URL").map_err(|_| "invalid IDORIS_URL")?;
-        let secret = std::env::var("IDORIS_API_KEY").map_err(|_| "missing iDoris data key")?;
-        Self::from_credentials(&raw, Zeroizing::new(secret))
+    /// Development switch. `None` when `AGENT24_DEV_IDORIS_URL` is unset.
+    /// A set URL with a missing or rejected key is `Some(Err)` so the slot
+    /// blocks instead of opening a second, direct model path.
+    pub(crate) fn from_dev_env() -> Option<Result<Self, String>> {
+        let raw = match std::env::var("AGENT24_DEV_IDORIS_URL") {
+            Ok(raw) => raw,
+            Err(std::env::VarError::NotPresent) => return None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Some(Err("invalid iDoris gateway URL".into()));
+            }
+        };
+        if raw.trim().is_empty() {
+            return None;
+        }
+        let secret = match std::env::var("AGENT24_DEV_IDORIS_KEY") {
+            Ok(secret) if !secret.trim().is_empty() => secret,
+            _ => return Some(Err("missing iDoris data key".into())),
+        };
+        Some(Self::from_credentials(&raw, Zeroizing::new(secret)))
     }
 
     /// Construct an exclusive loopback gateway without modifying process state.
     pub fn from_credentials(url: &str, secret: Zeroizing<String>) -> Result<Self, String> {
-        let base = reqwest::Url::parse(url).map_err(|_| "invalid IDORIS_URL")?;
+        let base = reqwest::Url::parse(url).map_err(|_| "invalid iDoris gateway URL")?;
         if !crate::router::is_loopback_url(base.as_str())
             || !base.username().is_empty()
             || base.password().is_some()
@@ -132,7 +147,7 @@ impl IdorisGateway {
             || base.fragment().is_some()
             || base.path() != "/"
         {
-            return Err("IDORIS_URL must be a loopback HTTP(S) origin".into());
+            return Err("iDoris gateway URL must be a loopback HTTP(S) origin".into());
         }
         if !secret.starts_with("idk_") || secret.len() <= 4 {
             return Err("iDoris requires a virtual data key, not an Admin token".into());
@@ -153,6 +168,22 @@ impl IdorisGateway {
             client,
             request_timeout: Duration::from_secs(120),
         })
+    }
+
+    /// Origin without a trailing slash. Callers append `/v1/...`.
+    pub(crate) fn origin(&self) -> String {
+        self.base.as_str().trim_end_matches('/').to_owned()
+    }
+
+    /// Virtual data key carried on the Authorization header.
+    pub(crate) fn data_key(&self) -> Result<&str, ModelError> {
+        let raw = self
+            .key
+            .to_str()
+            .map_err(|_| ModelError::Provider("invalid iDoris data key".into()))?;
+        raw.strip_prefix("Bearer ")
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| ModelError::Provider("invalid iDoris data key".into()))
     }
 
     async fn send(
@@ -210,8 +241,8 @@ impl IdorisGateway {
                 )));
             }
             let message = match code {
-                401 => "iDoris rejected the data key (HTTP 401): check IDORIS_API_KEY".to_string(),
-                403 => "iDoris refused this role for the data key (HTTP 403): check the key's role scope or IDORIS_API_KEY".to_string(),
+                401 => "iDoris rejected the data key (HTTP 401): check the data key".to_string(),
+                403 => "iDoris refused this role for the data key (HTTP 403): check the key's role scope".to_string(),
                 _ => format!("iDoris refused the request (HTTP {code})"),
             };
             return Err(ModelError::Rejected {
@@ -472,6 +503,11 @@ fn gateway_body(req: &CompletionRequest, role: &str) -> serde_json::Value {
     let mut body = completion_body(req, role, true, false);
     if let Some(obj) = body.as_object_mut() {
         obj.remove("temperature");
+        // Agent24's data key is role-scoped (daily/deep/embed): a concrete model
+        // name is a role-less request and iDoris answers 403. The model behind
+        // a role is chosen by the iDoris binding, so the wire always names the
+        // role, whatever model a caller asked for.
+        obj.insert("model".into(), serde_json::Value::String(role.to_owned()));
     }
     body
 }
@@ -698,7 +734,7 @@ mod tests {
         match error_for(401, "{}").await {
             ModelError::Rejected { status, message } => {
                 assert_eq!(status, 401);
-                assert!(message.contains("IDORIS_API_KEY"), "{message}");
+                assert!(message.contains("data key"), "{message}");
                 assert!(!message.contains("idk_"), "{message}");
             }
             other => panic!("{other:?}"),
@@ -711,7 +747,7 @@ mod tests {
             ModelError::Rejected { status, message } => {
                 assert_eq!(status, 403);
                 assert!(message.contains("role"), "{message}");
-                assert!(message.contains("IDORIS_API_KEY"), "{message}");
+                assert!(message.contains("data key"), "{message}");
                 assert!(!message.contains("idk_"), "{message}");
             }
             other => panic!("{other:?}"),

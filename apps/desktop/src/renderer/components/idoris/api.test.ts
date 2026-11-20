@@ -4,7 +4,7 @@ import { IdorisError, parseOperation, parseStatus, type IdorisOperation, type Id
 const verification = { model_id: 'model', record_id: 'record', locality: 'loopback', verified_at: '2026-10-28T12:00:00Z' } satisfies NonNullable<IdorisStatus['verification']>
 const status = {
   state: 'not_configured', version: '0.4.0', data_port: 9011, admin_port: 9012,
-  roles: [], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification,
+  roles: ['daily', 'embed'], last_error: null, migration_pending: false, last_migration_error: null, current_operation: null, verification,
   budget_suggestion: { core_reserved_bytes: 123, idoris_budget_bytes: 456 }, budget_unavailable_reason: null,
 } satisfies IdorisStatus
 const operation = {
@@ -18,6 +18,14 @@ describe('iDoris response validation', () => {
   it('accepts complete valid snapshots', () => {
     expect(parseStatus(status)).toEqual(status)
     expect(parseOperation(operation)).toEqual(operation)
+  })
+  it('preserves unknown operation errors for display', () => {
+    expect(parseOperation({ ...operation, result: 'failed', error_code: 'future_error' }).error_code).toBe('future_error')
+  })
+  it('reads optional source metadata without requiring it from older daemons', () => {
+    expect(parseStatus({ ...status, source: 'openai_compat' }).source).toBe('openai_compat')
+    expect(parseStatus({ ...status, connection: { source: 'omlx' } }).source).toBe('omlx')
+    expect(parseStatus(status).source).toBeUndefined()
   })
   it.each([-1, 0.5, Number.MAX_SAFE_INTEGER + 1, NaN, '1'])('rejects invalid bytes %s in every budget and progress field', value => {
     expect(() => parseStatus({ ...status, budget_suggestion: { ...status.budget_suggestion, core_reserved_bytes: value } })).toThrow(invalidResponse)

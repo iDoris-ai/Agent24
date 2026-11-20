@@ -1,8 +1,9 @@
 import type { components } from '@agent24/api-client'
 import type { BackendProxyRequest } from '../../../shared/ipc-types'
 
-export type IdorisStatus = components['schemas']['IdorisStatus']
-export type IdorisOperation = components['schemas']['IdorisOperation']
+export type ModelSource = NonNullable<components['schemas']['IdorisConnectRequest']['source']>
+export type IdorisStatus = components['schemas']['IdorisStatus'] & { source?: ModelSource }
+export type IdorisOperation = Omit<components['schemas']['IdorisOperation'], 'error_code'> & { error_code: string | null }
 export type IdorisCandidates = components['schemas']['IdorisCandidates']
 export type ConnectRequest = components['schemas']['IdorisConnectRequest']
 
@@ -62,10 +63,12 @@ const codes: readonly components['schemas']['IdorisErrorCode'][] = [
 ]
 export function parseStatus(value: unknown): IdorisStatus {
   const v = object(value)
+  const source = v.source ?? (v.connection == null ? undefined : object(v.connection).source)
   return {
+    ...(source === undefined ? {} : { source: choice(source, ['omlx', 'openai_compat']) }),
     state: choice(v.state, ['not_installed', 'not_configured', 'stopped', 'starting', 'running', 'failed', 'instance_conflict']),
     version: v.version === null ? null : text(v.version), data_port: port(v.data_port), admin_port: port(v.admin_port),
-    roles: array(v.roles).map(role => choice(role, ['daily', 'deep'])),
+    roles: array(v.roles).map(role => choice(role, ['daily', 'deep', 'embed'])),
     last_error: v.last_error === null ? null : choice(v.last_error, codes),
     // Added with ADR-038 C1; an older daemon omits them, which reads as "no migration pending".
     migration_pending: v.migration_pending === undefined ? false : v.migration_pending === true,
@@ -82,7 +85,7 @@ export function parseOperation(value: unknown): IdorisOperation {
     operation_id: text(v.operation_id), action: choice(v.action, ['install', 'connect', 'start', 'stop']),
     phase: choice(v.phase, ['queued', 'downloading', 'verifying', 'installing', 'setup', 'issuing_key', 'starting', 'connecting', 'verifying_connection', 'rolling_back', 'done', 'stopping', 'completed']),
     result: v.result === null ? null : choice(v.result, ['succeeded', 'failed', 'cancelled']),
-    error_code: v.error_code === null ? null : choice(v.error_code, codes),
+    error_code: v.error_code === null ? null : text(v.error_code),
     cancellable: bool(v.cancellable),
     ...(v.download_progress === undefined ? {} : { download_progress: parseProgress(v.download_progress) }),
     ...(v.verification === undefined ? {} : { verification: parseVerification(v.verification) }),
@@ -108,6 +111,7 @@ async function request<T>(req: BackendProxyRequest, parse: (value: unknown) => T
   return parse(res.data)
 }
 export const getStatus = () => request({ method: 'GET', path: '/api/v1/idoris/status' }, parseStatus)
+export const getUpstreamModels = (endpoint: string) => request({ method: 'GET', path: `/api/v1/idoris/upstream-models?endpoint=${encodeURIComponent(endpoint)}` }, value => ({ models: array(object(value).models).map(text) }))
 export const getOperation = (id: string) => request({ method: 'GET', path: `/api/v1/idoris/operations/${encodeURIComponent(id)}` }, parseOperation)
 const candidatesPath = '/api/v1/idoris/omlx/candidates'
 export const getCandidates = (endpoint?: string) => request({ method: 'GET', path: endpoint ? `${candidatesPath}?endpoint=${encodeURIComponent(endpoint)}` : candidatesPath }, parseCandidates)

@@ -10,6 +10,69 @@ use zeroize::Zeroizing;
 const MAX_SETTINGS_BYTES: u64 = 64 * 1024;
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
+/// oMLX.app and its bundled Python: codesign verified on 2026-11-20.
+const OMLX_TEAM_ID: &str = "PSK5Q5T46L";
+
+/// Fail closed when the listening process cannot be authenticated.
+pub async fn listening_owner_is_omlx(port: u16) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let output = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::process::Command::new("/usr/sbin/lsof")
+                .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let Ok(Ok(output)) = output else {
+            return false;
+        };
+        if !output.status.success() {
+            return false;
+        }
+        let Ok(text) = std::str::from_utf8(&output.stdout) else {
+            return false;
+        };
+        let mut pids = text.split_whitespace();
+        let Some(pid) = pids
+            .next()
+            .and_then(|p| p.parse::<i32>().ok())
+            .filter(|p| *p > 0)
+        else {
+            return false;
+        };
+        if pids.next().is_some() {
+            return false;
+        }
+        tokio::task::spawn_blocking(move || {
+            use agent24_components::sign::{CodesignWith, SystemRunner, team_requirement};
+            use libproc::libproc::{bsd_info::BSDInfo, proc_pid::pidinfo};
+            if !pidinfo::<BSDInfo>(pid, 0)
+                .is_ok_and(|info| info.pbi_uid == nix::unistd::geteuid().as_raw())
+            {
+                return false;
+            }
+            let Ok(path) = agent24_os_proc::executable_path(pid) else {
+                return false;
+            };
+            let Ok(requirement) = team_requirement(OMLX_TEAM_ID) else {
+                return false;
+            };
+            CodesignWith(SystemRunner)
+                .check_requirement(&path, &requirement, false)
+                .is_ok()
+        })
+        .await
+        .unwrap_or(false)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (port, OMLX_TEAM_ID);
+        false
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint(url::Url);
 
@@ -44,6 +107,17 @@ impl Endpoint {
             return Err(InvalidEndpoint);
         }
         Ok(Self(url))
+    }
+    /// Configuration-only OpenAI-compatible origin; localhost is pinned to IPv4.
+    pub fn parse_openai_compat(input: &str) -> Result<Self, InvalidEndpoint> {
+        let normalized = input.replacen("://localhost", "://127.0.0.1", 1);
+        let endpoint = Self::parse(&normalized)?;
+        if endpoint.0.scheme() != "http"
+            || !matches!(endpoint.0.host_str(), Some("127.0.0.1" | "[::1]"))
+        {
+            return Err(InvalidEndpoint);
+        }
+        Ok(endpoint)
     }
     pub fn as_str(&self) -> &str {
         self.0.as_str()
@@ -115,6 +189,8 @@ pub struct ProbeResult {
 
 pub struct OmlxProbe {
     client: reqwest::Client,
+    #[cfg(test)]
+    owner_check: Option<fn(u16) -> bool>,
 }
 
 impl OmlxProbe {
@@ -122,14 +198,43 @@ impl OmlxProbe {
         Self::with_timeout(Duration::from_secs(2))
     }
     fn with_timeout(timeout: Duration) -> Result<Self, ProbeError> {
+        // No idle-connection reuse: the owner check authenticates the listener
+        // at check time, so a keyed request must open a fresh connection rather
+        // than ride one opened (possibly to an impostor) before the check.
         let client = reqwest::Client::builder()
             .no_proxy()
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(timeout)
             .timeout(timeout)
             .build()
             .map_err(|_| ProbeError)?;
-        Ok(Self { client })
+        Ok(Self {
+            client,
+            #[cfg(test)]
+            owner_check: None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_owner_check(mut self, check: fn(u16) -> bool) -> Self {
+        self.owner_check = Some(check);
+        self
+    }
+
+    async fn owner_is_omlx(&self, endpoint: &Endpoint) -> bool {
+        // The PID lookup authenticates the IPv4 loopback origin only.
+        if endpoint.0.host_str() != Some("127.0.0.1") {
+            return false;
+        }
+        let Some(port) = endpoint.0.port_or_known_default() else {
+            return false;
+        };
+        #[cfg(test)]
+        if let Some(check) = self.owner_check {
+            return check(port);
+        }
+        listening_owner_is_omlx(port).await
     }
 
     /// Probe all candidates in order. A key is eligible only for `confirmed`,
@@ -164,6 +269,14 @@ impl OmlxProbe {
                         && matches!(reply.code, 200 | 401 | 403)
                         && let Some(key) = key
                     {
+                        if !self.owner_is_omlx(endpoint).await {
+                            results.push(ProbeResult {
+                                endpoint: endpoint.clone(),
+                                identity,
+                                status: ProbeStatus::AuthRequired,
+                            });
+                            continue;
+                        }
                         used_key = Some(key);
                         match self.get(endpoint, "/v1/models", Some(key)).await {
                             Ok(authenticated) => reply = authenticated,
@@ -365,7 +478,7 @@ pub fn read_settings_key() -> Result<ApiKey, SettingsError> {
     read_settings_key_at(&user.dir.join(".omlx/settings.json"), uid.as_raw())
 }
 
-fn read_settings_key_at(path: &Path, euid: u32) -> Result<ApiKey, SettingsError> {
+pub(crate) fn read_settings_key_at(path: &Path, euid: u32) -> Result<ApiKey, SettingsError> {
     let parent = path.parent().ok_or(SettingsError::UnsafeFile)?;
     let directory = rustix::fs::open(
         parent,

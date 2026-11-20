@@ -319,16 +319,8 @@ pub(super) async fn open_store_workspace_and_idoris(
         .ok_or_else(|| std::io::Error::other("HOME not set"))?
         .join("workspace");
     std::fs::create_dir_all(&workspace)?;
-    // Model source setting: `<data_dir>/model-source.json`, written by the
-    // desktop app. Absent (or ephemeral): the router is built as before.
-    let model_source = if ephemeral {
-        None
-    } else {
-        agent24_protocol::state_file::state_dir().and_then(|dir| {
-            agent24_models::router::read_model_source(&dir.join("model-source.json"))
-        })
-    };
-    let router = Arc::new(ModelRouter::from_env_with_source(model_source));
+    // Chat goes only through the iDoris slot. model-source.json is not a provider.
+    let router = Arc::new(ModelRouter::from_env());
     let managed_idoris = if ephemeral {
         None
     } else {

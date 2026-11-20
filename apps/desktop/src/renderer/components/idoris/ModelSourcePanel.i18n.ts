@@ -1,0 +1,38 @@
+import { defineMessages } from '../../i18n'
+
+export const modelSourceMessages = defineMessages({
+  en: {
+    title: 'Model source', omlx: 'Local oMLX (recommended)', compat: 'LM Studio and other OpenAI-compatible services',
+    endpoint: 'Service address', placeholder: 'Local service address, for example the address shown in LM Studio',
+    read: 'Read models', daily: 'Daily chat model', choose: 'Choose a model', apply: 'Apply',
+    loading: 'Checking iDoris…', reading: 'Reading models…', applying: 'Applying…', switched: 'Switched',
+    noOmlx: 'No local oMLX detected', noModels: 'No models found. Load a model in the service and try again.',
+    noBudget: 'Memory budget unavailable. Refresh iDoris status and try again.',
+    invalid_response: 'The service returned an invalid response. Try again.',
+    backend_not_ready: 'The daemon is unavailable. Reconnect and try again.',
+    model_not_found: 'Model not found. Read the models again and choose an available one.',
+    hint: 'Chat goes through iDoris; this configures its upstream. LM Studio does not yet support vector recall.',
+  },
+  zh: {
+    title: '模型来源', omlx: '本机 oMLX（推荐）', compat: 'LM Studio 等 OpenAI 兼容服务',
+    endpoint: '服务地址', placeholder: '本机服务地址，例如 LM Studio 显示的地址',
+    read: '读取模型', daily: '日常对话模型', choose: '请选择模型', apply: '应用',
+    loading: '正在检测 iDoris…', reading: '正在读取模型…', applying: '正在应用…', switched: '已切换',
+    noOmlx: '未检测到本机 oMLX', noModels: '未读取到模型，请在服务中加载模型后重试。',
+    noBudget: '无法获取内存预算，请刷新 iDoris 状态后重试。',
+    invalid_response: '服务响应无效，请重试。', backend_not_ready: 'daemon 暂不可用，请重新连接后重试。',
+    model_not_found: '模型不存在，请重新读取模型并选择可用模型。',
+    hint: '对话只经 iDoris；这里配置的是 iDoris 的上游。LM Studio 暂不支持向量召回。',
+  },
+  th: {
+    title: 'แหล่งโมเดล', omlx: 'oMLX ในเครื่อง (แนะนำ)', compat: 'LM Studio และบริการที่รองรับ OpenAI',
+    endpoint: 'ที่อยู่บริการ', placeholder: 'ที่อยู่บริการในเครื่อง เช่น ที่อยู่ที่แสดงใน LM Studio',
+    read: 'อ่านโมเดล', daily: 'โมเดลแชตประจำวัน', choose: 'เลือกโมเดล', apply: 'นำไปใช้',
+    loading: 'กำลังตรวจสอบ iDoris…', reading: 'กำลังอ่านโมเดล…', applying: 'กำลังนำไปใช้…', switched: 'เปลี่ยนแล้ว',
+    noOmlx: 'ไม่พบ oMLX ในเครื่อง', noModels: 'ไม่พบโมเดล โปรดโหลดโมเดลในบริการแล้วลองใหม่',
+    noBudget: 'ไม่มีงบหน่วยความจำ โปรดรีเฟรชสถานะ iDoris แล้วลองใหม่',
+    invalid_response: 'บริการตอบกลับไม่ถูกต้อง โปรดลองใหม่', backend_not_ready: 'daemon ไม่พร้อมใช้งาน โปรดเชื่อมต่อใหม่แล้วลองอีกครั้ง',
+    model_not_found: 'ไม่พบโมเดล โปรดอ่านรายการอีกครั้งแล้วเลือกโมเดลที่พร้อมใช้งาน',
+    hint: 'แชตผ่าน iDoris เท่านั้น ที่นี่ใช้ตั้งค่าบริการต้นทางของ iDoris ขณะนี้ LM Studio ยังไม่รองรับการค้นคืนแบบเวกเตอร์',
+  },
+})

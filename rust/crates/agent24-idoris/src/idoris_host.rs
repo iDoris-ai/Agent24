@@ -31,6 +31,7 @@ use zeroize::Zeroizing;
 mod provision;
 pub use provision::{
     Candidates, ConnectConsent, ConnectRequest, InstallRequest, Provisioner, SystemProvisioner,
+    upstream_models,
 };
 
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.
@@ -41,6 +42,8 @@ pub const SHUTDOWN_BUDGET: Duration =
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Installation {
+    #[serde(default)]
+    pub connection: Option<ConnectRequest>,
     pub version: String,
     pub release_dir: PathBuf,
     pub archive_path: PathBuf,
@@ -184,11 +187,11 @@ impl Code {
     }
     pub fn message(self) -> &'static str {
         match self {
-            Self::OmlxUnreachable => "无法连接 oMLX",
+            Self::OmlxUnreachable => "无法连接本机模型上游",
             Self::OmlxAuthRequired => "oMLX 需要凭据",
             Self::OmlxAuthRejected => "oMLX 拒绝了凭据",
-            Self::UnknownService => "端点不是已确认的 oMLX 服务",
-            Self::ModelNotFound => "请选择 oMLX 中存在的模型",
+            Self::UnknownService => "端点不是支持的本机模型服务",
+            Self::ModelNotFound => "请选择上游中存在的模型",
             Self::ConsentRequired => "请确认凭据交接与选定模型",
             Self::SetupFailed => "iDoris 配置失败",
             Self::VerifyFailed => "iDoris 对话验证失败",
@@ -499,6 +502,17 @@ impl Runtime for SystemRuntime {
         })
         .await
         .map_err(|_| Code::StartFailed)?;
+        if r.connection
+            .as_ref()
+            .is_some_and(|c| c.source == "openai_compat")
+        {
+            return Ok(LaunchInputs {
+                budget: Budget {
+                    allocated_bytes: budget,
+                },
+                omlx_key: None,
+            });
+        }
         let key = if let Some(id) = &r.omlx_key_id {
             let keys = self
                 .omlx_keys
@@ -522,8 +536,13 @@ impl Runtime for SystemRuntime {
                 .map(ApiKey::new)
                 .transpose()
                 .map_err(|_| Code::NotConfigured)?;
-            let results = OmlxProbe::new()
-                .map_err(|_| Code::StartFailed)?
+            let provisioner = self
+                .provisioner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let results = provisioner
+                .omlx_probe()?
                 .probe(Some(&endpoint), api_key.as_ref())
                 .await;
             if !results
@@ -783,13 +802,35 @@ impl IdorisHost {
         ) {
             return None;
         }
-        let binary = {
+        let (binary, core) = {
             let inner = self.inner.lock().await;
-            inner.installation.as_ref()?.release_dir.join("idoris")
+            let record = inner.installation.as_ref()?;
+            (
+                record.release_dir.join("idoris"),
+                record.core_reserved_bytes,
+            )
         };
+        let mut args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        if args[0] == "recommend" {
+            // Without a budget the CLI sizes against nearly all of RAM, while the
+            // managed instance runs under the smaller Agent24 budget; a model it
+            // cannot load could then be recommended and saved as the default.
+            let core = match core {
+                Some(core) => core,
+                None => self.status().await.budget_suggestion?.core_reserved_bytes,
+            };
+            let budget = tokio::task::spawn_blocking(move || {
+                agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new())
+                    .idoris_budget_bytes(core)
+            })
+            .await
+            .ok()?;
+            args.push("--allocated-budget-bytes".to_owned());
+            args.push(budget.to_string());
+        }
         let output = tokio::time::timeout(Duration::from_secs(10), async {
             tokio::process::Command::new(binary)
-                .args(args)
+                .args(&args)
                 .kill_on_drop(true)
                 .output()
                 .await
