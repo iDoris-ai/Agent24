@@ -12,6 +12,7 @@ mod attach_commands;
 mod attach_grant;
 mod attached_routes;
 mod authz;
+mod first_party_reads;
 // Remaining public capability primitives are staged for the next endpoints.
 #[allow(
     dead_code,

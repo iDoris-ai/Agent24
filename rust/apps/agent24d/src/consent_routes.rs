@@ -295,9 +295,23 @@ pub struct ToolCardSource {
     pub resource_kinds: Vec<String>,
     /// The module speaks the grants protocol (§2.6); no card otherwise.
     pub takes_grants: bool,
+    /// Loop 4: the host knows this tool as a read of its own first-party
+    /// module ([`crate::first_party_reads`]): `Read`, not `External`.
+    pub host_read: bool,
 }
 
 impl ToolCardSource {
+    /// `External` for every module tool (ADR-K1-02 §2.1.1 item 6), but a
+    /// first-party read the host itself knows ([`Self::host_read`]).
+    #[must_use]
+    pub fn risk(&self) -> agent24_protocol::RiskClass {
+        if self.host_read {
+            agent24_protocol::RiskClass::Read
+        } else {
+            agent24_protocol::RiskClass::External
+        }
+    }
+
     /// What the tool's dispatch is gated with: this card's fingerprint and
     /// version, the running package's identity read per lookup (§2.2).
     pub fn gate_request(&self) -> agent24_policy::consent_gate::ConsentGateRequest {
@@ -306,7 +320,7 @@ impl ToolCardSource {
             op: self.summary.op.clone(),
             module_version: self.summary.module_version.clone(),
             current_scope_fingerprint: self.summary.scope_fingerprint(),
-            risk: agent24_protocol::RiskClass::External,
+            risk: self.risk(),
             org_restricted: false,
             source_restricted: false,
             // The host has no verified reversible-draft semantics for this
