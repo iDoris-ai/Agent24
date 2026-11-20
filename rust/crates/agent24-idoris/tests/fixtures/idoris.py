@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 root = Path(os.environ['IDORIS_COMPONENTS_DIR'])
-scenario = json.loads((root / 'scenario.json').read_text())
+scenario = json.loads((root / 'scenario.json').read_text()) if (root / 'scenario.json').exists() else {}
 mode = scenario.get('mode', 'healthy')
 if mode == 'no_read':
     time.sleep(60)

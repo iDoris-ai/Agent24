@@ -257,6 +257,7 @@ dependencies = [
  "agent24-components",
  "agent24-hw",
  "agent24-models",
+ "agent24-os-proc",
  "agent24-protocol",
  "async-trait",
  "axum",

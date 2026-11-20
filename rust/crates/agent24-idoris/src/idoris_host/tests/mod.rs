@@ -205,6 +205,7 @@ impl Fixture {
         }
         fs::write(root.join("components/scenario.json"), "{}").unwrap();
         let record = Installation {
+            connection: None,
             version: "0.5.0".into(),
             release_dir: root.join("release"),
             archive_path,
@@ -681,6 +682,7 @@ async fn real_v040_install_existing_start_running_stop() {
     )
     .unwrap();
     host.record_installation(Installation {
+        connection: None,
         version: "0.5.0".into(),
         release_dir: installed.directory().into(),
         archive_path: archive.path,

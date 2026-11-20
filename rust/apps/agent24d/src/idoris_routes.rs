@@ -120,7 +120,7 @@ mod model_query_tests {
     }
 }
 
-fn failure(code: Code) -> Response {
+pub(crate) fn failure(code: Code) -> Response {
     (code.http_status(), Json(serde_json::json!({"error": {
         "code": code, "message": code.message(),
         "retryable": matches!(code, Code::Busy | Code::KeychainLocked | Code::StartFailed),
@@ -229,6 +229,17 @@ pub async fn candidates(
         Err(code) => failure(code),
     }
 }
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpstreamQuery {
+    endpoint: String,
+}
+pub async fn upstream_models(Query(query): Query<UpstreamQuery>) -> Response {
+    match agent24_idoris::idoris_host::upstream_models(&query.endpoint).await {
+        Ok(models) => Json(serde_json::json!({"models": models})).into_response(),
+        Err(code) => failure(code),
+    }
+}
 pub async fn operation(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     let Some(host) = state.idoris_host else {
         return failure(Code::NotFound);
@@ -263,6 +274,10 @@ mod tests {
         let app = crate::server::build_router(state);
         for (method, path) in [
             (Method::GET, "/api/v1/idoris/status"),
+            (
+                Method::GET,
+                "/api/v1/idoris/upstream-models?endpoint=http%3A%2F%2Fexample.com",
+            ),
             (Method::POST, "/api/v1/idoris/install"),
             (Method::GET, "/api/v1/idoris/omlx/candidates"),
             (Method::POST, "/api/v1/idoris/connect"),
@@ -297,7 +312,11 @@ mod tests {
             assert_eq!(
                 crate::capabilities::required_operation(
                     &method,
-                    &path.replace("operations/missing", "operations/{id}"),
+                    &path
+                        .split('?')
+                        .next()
+                        .unwrap()
+                        .replace("operations/missing", "operations/{id}"),
                 ),
                 crate::capabilities::Operation::from_action(
                     if method == Method::GET && !path.ends_with("/candidates") {
@@ -308,6 +327,56 @@ mod tests {
                 )
             );
         }
+    }
+    #[tokio::test]
+    async fn upstream_models_returns_catalogue_only_to_host_and_rejects_remote_origin() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().route(
+                    "/v1/models",
+                    axum::routing::get(|| async {
+                        axum::Json(serde_json::json!({"data":[{"id":"local-model"}]}))
+                    }),
+                ),
+            )
+            .await
+            .unwrap();
+        });
+        let (state, host, creative) = crate::server::tests::capability_state().await;
+        let app = crate::server::build_router(state);
+        for (token, endpoint, expected) in [
+            (&host, endpoint.as_str(), StatusCode::OK),
+            (&creative, endpoint.as_str(), StatusCode::FORBIDDEN),
+            (&host, "http://example.com", StatusCode::BAD_REQUEST),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/v1/idoris/upstream-models?endpoint={endpoint}"
+                        ))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            if expected == StatusCode::OK {
+                assert_eq!(body, serde_json::json!({"models":["local-model"]}));
+            }
+        }
+        upstream.abort();
     }
     #[tokio::test]
     async fn core_connect_does_not_require_consent_and_plaintext_credentials_are_rejected() {

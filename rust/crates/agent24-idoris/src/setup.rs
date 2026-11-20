@@ -27,12 +27,14 @@ use zeroize::Zeroizing;
 pub enum Role {
     Daily,
     Deep,
+    Embed,
 }
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
             Self::Daily => "daily",
             Self::Deep => "deep",
+            Self::Embed => "embed",
         }
     }
 }
@@ -42,6 +44,7 @@ impl TryFrom<&str> for Role {
         match value {
             "daily" => Ok(Self::Daily),
             "deep" => Ok(Self::Deep),
+            "embed" => Ok(Self::Embed),
             _ => Err(SetupError::InvalidBindings),
         }
     }
@@ -126,6 +129,36 @@ pub struct SetupOutcome {
     pub components_dir: PathBuf,
     pub bindings: BTreeMap<Role, String>,
     pub auth_required: bool,
+}
+
+/// Create a fresh single-card OpenAI-compatible component generation. Values
+/// are validated by the host before reaching this writer.
+pub fn write_openai_compat_card(
+    instance_root: &Path,
+    endpoint: &str,
+    daily: &str,
+    deep: &str,
+) -> Result<SetupOutcome, SetupError> {
+    let components = components_root(instance_root)?;
+    let generation = tempfile::Builder::new()
+        .prefix("gen-")
+        .tempdir_in(&components)
+        .map_err(|_| SetupError::Io)?;
+    let card = format!(
+        "provider:\n  id: lmstudio\n  family: local\n  tier: local\n  capabilities: [chat]\n  privacy_class: local_only\n  cost: {{ input_per_m: 0, output_per_m: 0 }}\n  locality: loopback\nform: http_service\nendpoint: \"{endpoint}\"\nversion_pin: \"lmstudio@0\"\nprivacy_class: local_only\nallowed_egress: [loopback]\nfallback_policy: fail_closed\nfail_closed: true\nload_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}\nextensions:\n  _degradation: \"Removing these bindings disables role aliases on this backend.\"\n  idoris_role_models:\n    daily: \"{daily}\"\n    deep: \"{deep}\"\n"
+    );
+    std::fs::write(generation.path().join("lmstudio.yaml"), card).map_err(|_| SetupError::Io)?;
+    let path = generation.keep();
+    Ok(SetupOutcome {
+        components_dir: path,
+        bindings: [
+            (Role::Daily, daily.to_owned()),
+            (Role::Deep, deep.to_owned()),
+        ]
+        .into_iter()
+        .collect(),
+        auth_required: false,
+    })
 }
 
 /// A daily binding must be selected from the probe; deep is opt-in. Missing
@@ -223,6 +256,7 @@ async fn run_setup_with_timeout(
             "--out-dir",
         ])
         .arg(&out_dir)
+        .args(["--load-mode", "resident"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

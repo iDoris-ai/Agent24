@@ -141,18 +141,30 @@ impl FirstPartyAuthority {
                 else {
                     return;
                 };
+                let source = match body.source.as_str() {
+                    "omlx" => "oMLX",
+                    "openai_compat" => "OpenAI-compatible service",
+                    _ => return,
+                };
                 let (Some(endpoint), Some(daily), Some(deep)) = (
                     shown(&body.endpoint),
                     shown(&body.daily_model),
-                    body.deep_model
-                        .as_deref()
-                        .map_or_else(|| Some("none".to_owned()), shown),
+                    body.deep_model.as_deref().map_or_else(
+                        || {
+                            if body.source == "openai_compat" {
+                                shown(&body.daily_model)
+                            } else {
+                                Some("none".to_owned())
+                            }
+                        },
+                        shown,
+                    ),
                 ) else {
                     return;
                 };
                 format!(
-                    "connect iDoris to oMLX at {endpoint}; daily model: {daily}; deep model: {deep}; share the local oMLX credential with iDoris: {}; save oMLX credential: {}; replace existing connection: {}; core reserved bytes: {}",
-                    body.consent.as_ref().is_some_and(|c| c.share_omlx_key),
+                    "connect iDoris to {source} at {endpoint}; daily model: {daily}; deep model: {deep}; share the local oMLX credential with iDoris: {}; save oMLX credential: {}; replace existing connection: {}; core reserved bytes: {}",
+                    body.source == "omlx",
                     body.save_omlx_key,
                     body.replace,
                     body.core_reserved_bytes
@@ -1921,6 +1933,21 @@ mod tests {
         );
         let summary = authority.target_summary("id", &target).unwrap();
         assert!(summary.contains("以这个模块的名字发出事件"), "{summary}");
+    }
+
+    #[test]
+    fn openai_compat_summary_shows_actual_source_and_default_deep() {
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let body = serde_json::to_vec(&serde_json::json!({
+            "source":"openai_compat", "endpoint":"http://localhost:3456", "daily_model":"daily-m"
+        }))
+        .unwrap();
+        authority.remember_idoris_request("id", "/api/v1/idoris/connect", &body);
+        let target = resolve_target(&idoris("POST", "/api/v1/idoris/connect", &body)).unwrap();
+        let summary = authority.target_summary("id", &target).unwrap();
+        assert!(summary.contains("OpenAI-compatible service"));
+        assert!(summary.contains("deep model: \"daily-m\""));
+        assert!(summary.contains("share the local oMLX credential with iDoris: false"));
     }
 
     #[test]

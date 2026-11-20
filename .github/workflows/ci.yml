@@ -47,6 +47,11 @@ jobs:
           ELECTRON_SKIP_BINARY_DOWNLOAD: '1'
         run: pnpm install --frozen-lockfile
 
+      - name: No direct model endpoints
+        run: |
+          node scripts/check-no-direct-model.mjs
+          node scripts/check-no-direct-model.mjs --self-test
+
       - name: Typecheck
         run: pnpm typecheck && pnpm --filter @agent24/api-client typecheck
 
@@ -95,6 +100,11 @@ jobs:
             ~/.cargo/git
             rust/target
           key: cargo-${{ runner.os }}-${{ hashFiles('rust/Cargo.toml', 'rust/Cargo.lock') }}
+
+      - name: No direct model endpoints
+        run: |
+          node scripts/check-no-direct-model.mjs
+          node scripts/check-no-direct-model.mjs --self-test
 
       - name: fmt
         working-directory: rust
