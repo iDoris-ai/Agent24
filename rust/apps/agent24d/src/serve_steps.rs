@@ -383,6 +383,28 @@ pub(super) async fn open_store_workspace_and_idoris(
         router.block_idoris("iDoris restore unavailable");
         idoris_host = None;
     }
+    if let Some(host) = idoris_host
+        .as_ref()
+        .filter(|_| !ephemeral && std::env::var_os("AGENT24_IDORIS_BUNDLE").is_some())
+    {
+        let host = host.clone();
+        // oMLX may come up after the daemon (the app starts it), so a failed
+        // setup is retried every 30s until it succeeds.
+        tokio::spawn(async move {
+            while let Err(code) = host.bootstrap_core().await {
+                host.record_bootstrap_error(code).await;
+                if !bootstrap_retryable(code) {
+                    tracing::error!(?code, "iDoris core setup failed permanently");
+                    break;
+                }
+                tracing::warn!(
+                    ?code,
+                    "iDoris automatic core setup is pending; retrying in 30s"
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            }
+        });
+    }
     Ok((
         store,
         workspace,
@@ -2099,5 +2121,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+/// Only a bundle that speaks another contract cannot fix itself. VerifyFailed
+/// also covers a gateway or oMLX that is not ready yet, so it is retried.
+fn bootstrap_retryable(code: agent24_idoris::idoris_host::Code) -> bool {
+    !matches!(code, agent24_idoris::idoris_host::Code::ContractMismatch)
+}
+
+#[cfg(test)]
+mod bootstrap_retry_tests {
+    use agent24_idoris::idoris_host::Code;
+
+    #[test]
+    fn only_a_contract_mismatch_stops_core_bootstrap_retries() {
+        assert!(!super::bootstrap_retryable(Code::ContractMismatch));
+        for code in [
+            Code::VerifyFailed,
+            Code::OmlxUnreachable,
+            Code::Busy,
+            Code::SetupFailed,
+        ] {
+            assert!(super::bootstrap_retryable(code), "{code:?}");
+        }
     }
 }

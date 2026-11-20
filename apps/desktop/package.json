@@ -25,13 +25,14 @@
     "test:stage-open-design": "node --test scripts/stage-open-design-resources.test.mjs",
     "test:pack-open-design": "node --test scripts/pack-open-design-component.test.mjs",
     "test:open-design-mac-release": "node --test scripts/open-design-mac-release.test.mjs scripts/prepare-open-design-linux-resources.test.mjs scripts/check-open-design-release-asset.test.mjs",
-    "build:mac": "pnpm build:rust && pnpm build:rust:documents && pnpm stage:documents && pnpm stage:sin90 && pnpm build && electron-builder --mac",
+    "build:mac": "pnpm build:rust && pnpm build:rust:documents && pnpm stage:documents && pnpm stage:sin90 && pnpm stage:idoris && pnpm build && electron-builder --mac",
     "build:win": "pnpm build:rust && pnpm build && electron-builder --win",
     "build:linux": "pnpm build:rust && pnpm build && electron-builder --linux",
     "typecheck": "pnpm --filter @agent24/data-dir build && tsc --noEmit -p tsconfig.renderer.json && tsc --noEmit -p tsconfig.electron.json",
     "test": "pnpm --filter @agent24/data-dir build && node --test scripts/open-design-pin.test.mjs && vitest run",
     "test:watch": "vitest",
-    "release:mac": "bash scripts/release-mac.sh"
+    "release:mac": "bash scripts/release-mac.sh",
+    "stage:idoris": "bash scripts/stage-idoris-component.sh"
   },
   "dependencies": {
     "@agent24/api-client": "workspace:*",
@@ -109,6 +110,13 @@
           "filter": [
             "**/*",
             "!files.json"
+          ]
+        },
+        {
+          "from": ".idoris-component",
+          "to": "idoris-component",
+          "filter": [
+            "idoris-*.tar.gz"
           ]
         }
       ],

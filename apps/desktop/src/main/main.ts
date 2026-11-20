@@ -520,6 +520,9 @@ app.on('second-instance', () => {
 })
 
 app.whenReady().then(async () => {
+  if (app.isPackaged && process.platform === 'darwin') {
+    process.env['AGENT24_IDORIS_BUNDLE'] = path.join(process.resourcesPath, 'idoris-component')
+  }
   if (!isPrimaryInstance) return
   // UI language for the tray and native dialogs: English unless the user chose
   // otherwise (the renderer reports its setting; the system locale is ignored).

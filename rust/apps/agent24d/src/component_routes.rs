@@ -624,6 +624,7 @@ async fn idoris_item(state: &AppState) -> Item {
     let Some(host) = state.idoris_host.as_ref() else {
         return item.with(|i| {
             i.provides = provides;
+            i.detail = Some(json!({"core": true, "uninstallable": false}));
             if state.idoris_unavailable {
                 i.state = ComponentState::Failed;
                 i.reason = Some("persistence_failed".into());
@@ -649,6 +650,7 @@ async fn idoris_item(state: &AppState) -> Item {
                 .and_then(|c| serde_json::to_value(c).ok()?.as_str().map(str::to_owned))
         });
         i.detail = Some(json!({
+            "core": true, "uninstallable": false,
             "data_port": status.data_port, "admin_port": status.admin_port,
             "roles": status.roles, "current_operation": status.current_operation,
             "migration_pending": status.migration_pending,

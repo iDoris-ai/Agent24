@@ -80,6 +80,14 @@ describe('mac installer carries the documents module (T1-1)', () => {
     expect(pkg.scripts['stage:sin90']).toBe('bash scripts/stage-sin90-module.sh')
   })
 
+  it('mac includes the locked iDoris archive without extracting or re-signing it', () => {
+    const entries = pkg.build.mac.extraResources.filter((r) => r.to === 'idoris-component')
+    expect(entries).toHaveLength(1)
+    expect(entries[0]!.from).toBe('.idoris-component')
+    expect(entries[0]!.filter).toContain('idoris-*.tar.gz')
+    expect(pkg.scripts['stage:idoris']).toBe('bash scripts/stage-idoris-component.sh')
+  })
+
   it('mac signs both module programs as binaries (T1-3: Hardened Runtime, the app\'s team)', () => {
     const binaries = (pkg.build.mac as { binaries?: string[] }).binaries ?? []
     expect(binaries).toEqual(expect.arrayContaining([
@@ -98,7 +106,9 @@ describe('mac installer carries the documents module (T1-1)', () => {
     expect(builder).toBeGreaterThan(stage)
     const sin90 = release.indexOf('scripts/stage-sin90-module.sh" "$ARCH"')
     expect(sin90).toBeGreaterThan(stage)
+    const idoris = release.indexOf('scripts/stage-idoris-component.sh" "$ARCH"')
     expect(builder).toBeGreaterThan(sin90)
+    expect(builder).toBeGreaterThan(idoris)
   })
 
   it('build:mac builds and stages the module before electron-builder', () => {
@@ -107,7 +117,8 @@ describe('mac installer carries the documents module (T1-1)', () => {
     expect(at('pnpm build:rust:documents')).toBeGreaterThanOrEqual(0)
     expect(at('pnpm stage:documents')).toBeGreaterThan(at('pnpm build:rust:documents'))
     expect(at('pnpm stage:sin90')).toBeGreaterThan(at('pnpm stage:documents'))
-    expect(at('electron-builder --mac')).toBeGreaterThan(at('pnpm stage:sin90'))
+    expect(at('pnpm stage:idoris')).toBeGreaterThan(at('pnpm stage:sin90'))
+    expect(at('electron-builder --mac')).toBeGreaterThan(at('pnpm stage:idoris'))
     expect(pkg.scripts['build:win']).not.toMatch(/documents/)
     expect(pkg.scripts['build:linux']).not.toMatch(/documents/)
   })
