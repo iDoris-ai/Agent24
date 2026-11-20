@@ -256,19 +256,18 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 24] = [
+pub const PASSTHROUGH_VARS: [&str; 22] = [
     // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
     // workspace). Without it a LaunchAgent-started daemon keeps using
     // `~/.agent24` while the CLI that ran `service install` and the desktop app
     // look in the override directory, so neither ever finds the daemon. Caught
     // by `passthrough_list_matches_what_the_daemon_actually_reads`.
     "AGENT24_DATA_DIR",
+    // The packaged desktop gives the resident daemon its app-carried core archive.
+    "AGENT24_IDORIS_BUNDLE",
     // Keep exclusive gateway selection after service installation. The data key
     // is never written to a plist; v0.3.1 supports manual startup until separate
     // credential delivery is implemented. Missing key fails closed.
-    "IDORIS_URL",
-    "OMLX_URL",
-    "OMLX_API_KEY",
     "DEFAULT_MODEL",
     // VR-1: `EmbeddingClient::from_env` reads this. Unset means bge-m3-mlx-fp16.
     // A LaunchAgent that should pin another local embedding model only sees it
@@ -942,18 +941,25 @@ mod tests {
     }
 
     #[test]
-    fn captured_env_lands_in_the_plist_so_shell_exec_still_finds_tools() {
+    fn captured_env_lands_in_the_plist_but_model_upstream_secrets_do_not() {
         // launchd's default PATH is only /usr/bin:/bin:/usr/sbin:/sbin, so
         // without this a shell_exec for `node` works by hand and fails at 3am.
         let env = vec![
             ("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned()),
-            ("OMLX_URL".to_owned(), "http://127.0.0.1:8088".to_owned()),
+            (
+                "AGENT24_IDORIS_BUNDLE".to_owned(),
+                "/App/Resources/idoris-component".to_owned(),
+            ),
         ];
         let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &env);
         assert!(p.contains("<key>EnvironmentVariables</key>"));
         assert!(p.contains("<key>PATH</key>"));
         assert!(p.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
-        assert!(p.contains("<key>OMLX_URL</key>"));
+        assert!(p.contains("<key>AGENT24_IDORIS_BUNDLE</key>"));
+        for upstream in ["IDORIS_URL", "OMLX_URL", "OMLX_API_KEY"] {
+            assert!(!PASSTHROUGH_VARS.contains(&upstream));
+            assert!(!capture_env().iter().any(|(key, _)| key == upstream));
+        }
     }
 
     #[test]
@@ -1133,6 +1139,9 @@ mod tests {
         found.sort();
         found.dedup();
         for v in &found {
+            if ["IDORIS_URL", "OMLX_URL", "OMLX_API_KEY"].contains(&v.as_str()) {
+                continue; // IC-1 B9: upstream endpoints and credentials never enter LaunchAgent plists.
+            }
             assert!(
                 PASSTHROUGH_VARS.contains(&v.as_str()),
                 "{v} is read by the daemon but is not in PASSTHROUGH_VARS; a \

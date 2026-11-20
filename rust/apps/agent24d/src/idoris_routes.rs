@@ -201,7 +201,7 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn connect_and_install_reject_missing_consent_and_plaintext_credential_fields() {
+    async fn core_connect_does_not_require_consent_and_plaintext_credentials_are_rejected() {
         use agent24_idoris::{idoris_host::IdorisHost, managed_idoris::ManagedIdoris};
         use std::sync::Arc;
         let (mut state, host, creative) = crate::server::tests::capability_state().await;
@@ -224,13 +224,7 @@ mod tests {
                 "connect",
                 serde_json::json!({"endpoint":"http://127.0.0.1:8088", "daily_model":"real-model"}),
                 StatusCode::UNPROCESSABLE_ENTITY,
-                "consent_required",
-            ),
-            (
-                "install",
-                serde_json::json!({"consent":false}),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "consent_required",
+                "not_installed",
             ),
             (
                 "connect",

@@ -1,231 +1,90 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react'
+import { useCallback, useEffect, useId, useState } from 'react'
 import { useLocale, useT } from '../../i18n'
 import { listComponents, type ComponentView } from '../componentApi'
-import { cancelOperation, getCandidates, getOperation, getStatus, IdorisError, submitOperation, type IdorisCandidates, type IdorisOperation, type IdorisStatus } from './api'
+import { getCandidates, getStatus, IdorisError, submitOperation, type IdorisStatus } from './api'
 import { idorisErrors, idorisMessages } from './IdorisPanel.i18n'
 import './idoris.css'
 
-type IdorisComponentPhase =
-  | { kind: 'loading' }
-  | { kind: 'error' }
-  | { kind: 'ready'; component: ComponentView | null }
+type PanelState = { kind: 'loading' } | { kind: 'ready'; component: ComponentView | null } | { kind: 'error' }
 
-function idorisStateText(t: (key: keyof typeof idorisMessages.en, vars?: Record<string, string | number>) => string, component: ComponentView): string {
+function stateText(t: (key: keyof typeof idorisMessages.en, vars?: Record<string, string | number>) => string, component: ComponentView): string {
   switch (component.state) {
     case 'absent': return t('state.not_installed')
-    case 'installing': return t('phase.installing')
     case 'installed': return component.reason === 'not_configured' ? t('state.not_configured') : t('state.installed')
-    case 'starting': return t('state.starting')
     case 'ready': return t('state.running')
-    case 'degraded': return t('state.degraded')
-    case 'stopping': return t('state.stopping')
+    case 'starting': return t('state.starting')
     case 'stopped': return t('state.stopped')
-    case 'incompatible': return t('state.incompatible')
-    case 'failed': return component.reason === 'instance_conflict' ? t('state.instance_conflict') : t('state.failed')
+    case 'failed': return t('state.failed')
+    case 'degraded': return t('state.degraded')
     default: return component.state
   }
 }
 
-// Ports, roles, budget and operations still come from /api/v1/idoris/status.
-// Installed / running comes from GET /api/v1/components. Form choices live only
-// for this mount; no installation, credential or operation state is persisted.
+/** Core component status is read-only; daemon startup owns install and setup. */
 export default function IdorisPanel() {
   const t = useT(idorisMessages)
   const locale = useLocale()
   const id = useId()
   const [status, setStatus] = useState<IdorisStatus | null>(null)
-  const [componentPhase, setComponentPhase] = useState<IdorisComponentPhase>({ kind: 'loading' })
-  const [operation, setOperation] = useState<IdorisOperation | null>(null)
+  const [componentState, setComponentState] = useState<PanelState>({ kind: 'loading' })
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
-  const [discovery, setDiscovery] = useState<IdorisCandidates | null>(null)
-  const [endpoint, setEndpoint] = useState('')
-  const [confirmed, setConfirmed] = useState<IdorisCandidates | null>(null)
-  const [probing, setProbing] = useState(false)
-  const [daily, setDaily] = useState('')
-  const [deep, setDeep] = useState('')
-  const [core, setCore] = useState('')
-  const coreEdited = useRef(false)
-  const suggestedCore = useRef<number | null>(null)
-  const [consent, setConsent] = useState(false)
-  const [saveKey, setSaveKey] = useState(false)
-  const mounted = useRef(false)
-  const busyRef = useRef(false)
-  const trackedOperation = useRef<string | null>(null)
-  const poll = useRef<Promise<void> | null>(null)
-  const discoveryGeneration = useRef(0)
 
-  const reportError = useCallback((err: unknown) => {
-    if (mounted.current) setError(err instanceof IdorisError ? err.code : 'invalid_response')
+  const refresh = useCallback(async () => {
+    try {
+      const [next, components] = await Promise.all([getStatus(), listComponents()])
+      setStatus(next)
+      setComponentState({ kind: 'ready', component: components.find(item => item.id === 'idoris') ?? null })
+    } catch (cause) {
+      setError(cause instanceof IdorisError ? cause.code : 'invalid_response')
+      setComponentState({ kind: 'error' })
+    }
   }, [])
-  const refresh = useCallback((): Promise<void> => {
-    if (poll.current) return poll.current
-    const task = (async () => {
-      try {
-        const next = await getStatus()
-        const operationId = next.current_operation ?? trackedOperation.current
-        const op = operationId ? await getOperation(operationId) : null
-        let phase: IdorisComponentPhase
-        try {
-          const list = await listComponents()
-          phase = { kind: 'ready', component: list.find((item) => item.id === 'idoris') ?? null }
-        } catch {
-          phase = { kind: 'error' }
-        }
-        if (!mounted.current) return
-        setStatus(next)
-        setComponentPhase(phase)
-        if (!coreEdited.current && next.budget_suggestion && suggestedCore.current !== next.budget_suggestion.core_reserved_bytes) {
-          suggestedCore.current = next.budget_suggestion.core_reserved_bytes
-          setCore(String(suggestedCore.current)); setConsent(false)
-        }
-        if (op) {
-          setOperation(op)
-          trackedOperation.current = op.result === null ? op.operation_id : null
-          if (op.error_code) setError(op.error_code)
-        }
-      } catch (err) {
-        reportError(err)
-        if (mounted.current) setComponentPhase({ kind: 'error' })
-      }
-    })()
-    poll.current = task
-    void task.finally(() => { poll.current = null })
-    return task
-  }, [reportError])
   useEffect(() => {
-    mounted.current = true
     void refresh()
-    const timer = window.setInterval(() => { if (!busyRef.current) void refresh() }, 1000)
-    return () => { mounted.current = false; window.clearInterval(timer) }
+    const timer = window.setInterval(() => void refresh(), 2000)
+    return () => window.clearInterval(timer)
   }, [refresh])
 
-  const idorisComponent = componentPhase.kind === 'ready' ? componentPhase.component : null
-  const needsSetup = (idorisComponent?.state === 'installed' && idorisComponent.reason === 'not_configured')
-    || (idorisComponent?.state === 'failed' && idorisComponent.reason !== 'instance_conflict' && (status?.roles.length ?? 0) === 0)
-  const discover = useCallback(async (selected: string) => {
-    const generation = ++discoveryGeneration.current
-    setProbing(true); setConfirmed(null); setDaily(''); setDeep(''); setConsent(false)
+  const reconnect = async () => {
+    if (pending) return
+    setPending(true); setError(null)
     try {
-      const result = await getCandidates(selected || undefined)
-      if (!mounted.current || generation !== discoveryGeneration.current) return
-      if (selected) {
-        setConfirmed(result)
-        setDiscovery(previous => previous ? { ...previous, candidates: previous.candidates.map(c => result.candidates.find(fresh => fresh.endpoint === c.endpoint) ?? c) } : result)
-      } else setDiscovery(result)
-    } catch (err) { if (generation === discoveryGeneration.current) reportError(err) }
-    finally { if (mounted.current && generation === discoveryGeneration.current) setProbing(false) }
-  }, [reportError])
-  useEffect(() => {
-    if (needsSetup) void discover(endpoint)
-    return () => { discoveryGeneration.current += 1 }
-  }, [needsSetup, endpoint, discover])
-
-  const run = async (action: () => Promise<IdorisOperation>) => {
-    if (busyRef.current) return
-    busyRef.current = true; setPending(true); setError(null); setConsent(false)
-    try {
-      // Finish the outstanding read before a mutation so an older response
-      // cannot replace the operation returned by this action.
-      await poll.current
-      const op = await action()
-      if (!mounted.current) return
-      setOperation(op)
-      trackedOperation.current = op.operation_id
-    } catch (err) { reportError(err) }
-    finally {
-      busyRef.current = false
-      if (mounted.current) { setPending(false); void refresh() }
-    }
+      const current = await getStatus()
+      if (current.roles.length > 0 && current.state !== 'not_configured' && current.state !== 'not_installed') {
+        await submitOperation('start')
+      } else {
+        const discovery = await getCandidates()
+        const candidate = discovery.candidates.find(item => item.identity === 'omlx' && item.authentication === 'ready' && item.models.length > 0)
+        if (!candidate) throw new IdorisError('omlx_unreachable')
+        const daily = candidate.models[0]!
+        await submitOperation('connect', {
+          endpoint: candidate.endpoint, daily_model: daily, deep_model: null, save_omlx_key: false,
+          replace: false, core_reserved_bytes: current.budget_suggestion?.core_reserved_bytes ?? 0,
+          consent: { share_omlx_key: true, daily_model: daily, deep_model: null },
+        })
+      }
+      await refresh()
+    } catch (cause) {
+      setError(cause instanceof IdorisError ? cause.code : 'invalid_response')
+    } finally { setPending(false) }
   }
-  const active = operation?.result === null || Boolean(status?.current_operation)
-  const blocked = pending || active
-  const candidate = confirmed?.candidates.find(c => c.endpoint === endpoint)
-  const coreBytes = /^\d+$/.test(core) ? Number(core) : NaN
-  const canConnect = !blocked && !probing && candidate?.identity === 'omlx' && candidate.authentication === 'ready' && candidate.models.includes(daily) && (!deep || candidate.models.includes(deep)) && Number.isSafeInteger(coreBytes) && coreBytes >= 0 && consent
-  const errorCode = error ?? status?.last_error ?? (idorisComponent?.state === 'failed' && idorisComponent.reason === 'instance_conflict' ? 'instance_conflict' : null)
-  const errorText = Object.entries(idorisErrors).find(([code]) => code === errorCode)?.[1][locale] ?? t('errorGeneric')
-  const progress = operation?.phase === 'downloading' ? operation.download_progress : undefined
-  const receipt = status?.verification ?? (operation?.result === 'succeeded' ? operation.verification : undefined)
 
+  const component = componentState.kind === 'ready' ? componentState.component : null
+  const errorCode = error ?? status?.last_error ?? null
+  const message = Object.entries(idorisErrors).find(([code]) => code === errorCode)?.[1][locale] ?? t('errorGeneric')
   return <section className="idoris-panel" aria-labelledby={`${id}-title`}>
     <h2 id={`${id}-title`}>{t('title')}</h2>
-    {errorCode && <div role="alert">{errorText}</div>}
-    {!status && componentPhase.kind === 'loading' ? <p>{t('loading')}</p> : !status ? <p role="alert" data-testid="idoris-state" data-state="error">{t('component.error')}</p> : <>
-      {componentPhase.kind === 'loading' && <p data-testid="idoris-state" data-state="loading">{t('loading')}</p>}
-      {componentPhase.kind === 'error' && <p role="alert" data-testid="idoris-state" data-state="error">{t('component.error')}</p>}
-      {componentPhase.kind === 'ready' && !idorisComponent && <p data-testid="idoris-state" data-state="missing">{t('component.missing')}</p>}
-      {idorisComponent && <p data-testid="idoris-state" data-state={idorisComponent.state}>{idorisStateText(t, idorisComponent)}</p>}
+    {errorCode && <div role="alert">{message}</div>}
+    {!status && componentState.kind === 'loading' ? <p>{t('loading')}</p> : !status ? <p role="alert">{t('component.error')}</p> : <>
+      {componentState.kind === 'ready' && component && <p data-testid="idoris-state" data-state={component.state}>{stateText(t, component)}</p>}
+      {componentState.kind === 'ready' && !component && <p data-testid="idoris-state" data-state="missing">{t('component.missing')}</p>}
+      {componentState.kind === 'error' && <p role="alert">{t('component.error')}</p>}
       {status.version && <p>{t('version', { version: status.version })}</p>}
       {(status.data_port !== null || status.admin_port !== null) && <p>{t('ports', { data: status.data_port ?? t('unknown'), admin: status.admin_port ?? t('unknown') })}</p>}
-      {status.roles.length > 0 && <p>{t('roles', { roles: status.roles.join(', ') })}</p>}
-      {!status.roles.includes('deep') && status.roles.length > 0 && <p>{t('noDeep')}</p>}
-      {active && operation && <div className="idoris-progress" role="status" aria-live="polite">
-        <span>{t(`phase.${operation.phase}`)}</span>
-        <progress aria-label={t(`phase.${operation.phase}`)} max={progress?.bytes_total || undefined} value={progress?.bytes_total ? progress.bytes_done : undefined} />
-        {progress && <span>{progress.bytes_total === undefined ? t('downloaded', { done: `${progress.bytes_done} B` }) : t('downloadedTotal', { done: `${progress.bytes_done} B`, total: `${progress.bytes_total} B` })}</span>}
-        <button className="btn" disabled={pending || !operation.cancellable} onClick={() => { void run(() => cancelOperation(operation.operation_id)) }}>{t('cancel')}</button>
-      </div>}
-      {idorisComponent?.state === 'absent' && <>
-        <p>{t('installConsent')}</p>
-        <button className="btn btn-primary" disabled={blocked} onClick={() => { void run(() => submitOperation('install', { consent: true })) }}>{t('install')}</button>
-      </>}
-      {needsSetup && !active && <fieldset disabled={pending} className="idoris-setup">
-        <legend>{t('connect')}</legend>
-        <label htmlFor={`${id}-endpoint`}>{t('endpoint')}</label>
-        <select id={`${id}-endpoint`} value={endpoint} disabled={probing && !discovery} onChange={event => { setEndpoint(event.target.value); setConsent(false); setConfirmed(null); setDaily(''); setDeep('') }}>
-          <option value="">{t('chooseEndpoint')}</option>
-          {discovery?.candidates.map(c => <option key={c.endpoint} value={c.endpoint}>{c.endpoint} · {t(`identity.${c.identity}`)} · {t(`auth.${c.authentication}`)}</option>)}
-        </select>
-        {discovery && <ul className="idoris-candidates">
-          {discovery.candidates.map(c => <li key={c.endpoint}>
-            <code>{c.endpoint}</code>
-            <p>{t('identity', { identity: t(`identity.${c.identity}`), authentication: t(`auth.${c.authentication}`) })}</p>
-            {c.models.length > 0 && <p>{c.models.join(', ')}</p>}
-          </li>)}
-        </ul>}
-        {discovery?.candidates.length === 0 && <p>{t('noCandidates')}</p>}
-        {candidate && <>
-          <p>{t('identity', { identity: t(`identity.${candidate.identity}`), authentication: t(`auth.${candidate.authentication}`) })}</p>
-          {confirmed?.key_from_local_settings && <p>{t('localKey')}</p>}
-          {(candidate.authentication === 'auth_required' || candidate.authentication === 'auth_rejected') && <p>{t('authHelp')}</p>}
-          {candidate.authentication === 'unreachable' && <p>{t('noCandidates')}</p>}
-          {candidate.authentication === 'ready' && candidate.models.length === 0 && <p>{t('noModels')}</p>}
-        </>}
-        <label htmlFor={`${id}-daily`}>{t('daily')}</label>
-        <select id={`${id}-daily`} required value={daily} disabled={probing || candidate?.authentication !== 'ready'} onChange={event => { setDaily(event.target.value); setConsent(false) }}>
-          <option value="">{t('chooseModel')}</option>
-          {candidate?.models.map(model => <option key={model} value={model}>{model}</option>)}
-        </select>
-        <label htmlFor={`${id}-deep`}>{t('deep')}</label>
-        <select id={`${id}-deep`} value={deep} disabled={probing || candidate?.authentication !== 'ready'} onChange={event => { setDeep(event.target.value); setConsent(false) }}>
-          <option value="">{t('noDeep')}</option>
-          {candidate?.models.map(model => <option key={model} value={model}>{model}</option>)}
-        </select>
-        <label htmlFor={`${id}-core`}>{t('core')}</label>
-        <input id={`${id}-core`} type="text" inputMode="numeric" required value={core} aria-describedby={`${id}-budget-help`} onChange={event => { coreEdited.current = true; setCore(event.target.value); setConsent(false) }} />
-        <p id={`${id}-budget-help`}>{t('budgetHelp')}</p>
-        {status.budget_suggestion && <p>{t('budgetSuggestion', { core: `${status.budget_suggestion.core_reserved_bytes} B`, budget: `${status.budget_suggestion.idoris_budget_bytes} B` })}</p>}
-        {status.budget_unavailable_reason && <p>{t(`budget.${status.budget_unavailable_reason}`)}</p>}
-        <label className="idoris-check"><input type="checkbox" checked={consent} onChange={event => setConsent(event.target.checked)} />{t('consent')}</label>
-        <label className="idoris-check"><input type="checkbox" checked={saveKey} onChange={event => { setSaveKey(event.target.checked); setConsent(false) }} />{t('saveKey')}</label>
-        <button className="btn btn-primary" disabled={!canConnect} onClick={() => { void run(() => submitOperation('connect', {
-          endpoint, daily_model: daily, deep_model: deep || null, save_omlx_key: saveKey, replace: false, core_reserved_bytes: coreBytes,
-          consent: { share_omlx_key: true, daily_model: daily, deep_model: deep || null },
-        })) }}>{t('connect')}</button>
-      </fieldset>}
-      {idorisComponent?.state === 'ready' && <>
-        {receipt ? <div role="status">
-          <p>{t('verified')}</p>
-          <p>{t('verificationModel', { model: receipt.model_id })}</p>
-          <p>{t('verificationRecord', { record: receipt.record_id })}</p>
-          <p>{t('verificationLocality', { locality: receipt.locality })}</p>
-          <p>{t('verificationTime', { time: receipt.verified_at })}</p>
-        </div> : <p>{t('runningHint')}</p>}
-        <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('stop')) }}>{t('stop')}</button>
-      </>}
-      {(idorisComponent?.state === 'stopped' || (idorisComponent?.state === 'failed' && idorisComponent.reason !== 'instance_conflict' && status.roles.length > 0)) && <button className="btn" disabled={blocked} onClick={() => { void run(() => submitOperation('start')) }}>{t('start')}</button>}
+      {status.last_error && <p role="status">{t('errorGeneric')}</p>}
+      <button className="btn" disabled={pending} onClick={() => void reconnect()}>{pending ? t('phase.connecting') : t('connect')}</button>
+      <button className="btn" disabled={pending} onClick={() => void refresh()}>{t('retry')}</button>
     </>}
-    <button className="btn" disabled={pending || probing} onClick={() => { setError(null); void refresh(); if (needsSetup) void discover(endpoint) }}>{t('retry')}</button>
   </section>
 }

@@ -751,6 +751,9 @@ impl IdorisHost {
             .cloned()
             .ok_or(Code::NotFound)
     }
+    pub async fn record_bootstrap_error(&self, code: Code) {
+        self.inner.lock().await.last_error = Some(code);
+    }
     pub async fn restore(self: &Arc<Self>) -> Result<(), Code> {
         self.recover_connect().await?;
         let restore = self
