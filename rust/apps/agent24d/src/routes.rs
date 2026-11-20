@@ -1170,8 +1170,9 @@ mod tests {
                     "--nocapture",
                 ])
                 .env("A24_RECEIPT_PROBE_CHILD", "1")
-                .env("IDORIS_URL", url)
-                .env("IDORIS_API_KEY", "idk_nonsecret_receipt_fixture")
+                .env("AGENT24_DEV_IDORIS_URL", url)
+                .env("AGENT24_DEV_IDORIS_KEY", "idk_nonsecret_receipt_fixture")
+                .env_remove("DEFAULT_MODEL")
                 .output()
                 .unwrap()
         })

@@ -125,6 +125,11 @@ pub struct Served {
 
 type GatewaySnapshot = Option<Result<Arc<crate::IdorisGateway>, String>>;
 
+/// Chat and embeddings have one exit. Shown when that exit is not published.
+pub(crate) fn idoris_not_connected() -> &'static str {
+    "iDoris is not connected. Agent24 sends chat and embeddings only through iDoris. Start the bundled model service, or for development set AGENT24_DEV_IDORIS_URL and AGENT24_DEV_IDORIS_KEY to one iDoris gateway."
+}
+
 /// Routes completions across tiered providers with a health/cooldown loop.
 pub struct ModelRouter {
     idoris: Arc<RwLock<GatewaySnapshot>>,
@@ -137,6 +142,10 @@ pub struct ModelRouter {
     /// Shared with [`Self::with_separate_health`] so a later update is visible
     /// on both. A hand-built router starts as `None`.
     default_model: Arc<Mutex<Option<String>>>,
+    /// `from_env` has no direct model chain. An empty provider list then means
+    /// iDoris is missing. [`Self::with_defaults`] stays false so in-process
+    /// doubles keep the old empty-list behavior.
+    idoris_only: bool,
 }
 
 /// Absolute ceiling on any cooldown, independent of the caller's `max_cooldown`
@@ -193,8 +202,11 @@ fn env_local_tier(url: &str) -> Tier {
     }
 }
 
-/// How a `from_env` provider may be asked to skip a reasoning model's
-/// thinking (`CompletionRequest::disable_thinking`).
+/// How a direct local provider may be asked to skip a reasoning model's
+/// thinking (`CompletionRequest::disable_thinking`). Production routing no
+/// longer builds those providers; the mapping stays so its unit test can
+/// still name the rule.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThinkingSwitch {
     /// Never: the request body stays as it was before the switches existed.
@@ -212,6 +224,7 @@ enum ThinkingSwitch {
 /// a remote URL may be any OpenAI-compatible service, which may refuse it.
 /// A function of its own so a test can read it; `from_env` hands back
 /// `dyn ModelProvider`s, which do not say.
+#[cfg(test)]
 fn thinking_switch(backend: &str, tier: Tier) -> ThinkingSwitch {
     match backend {
         _ if !tier.is_local() => ThinkingSwitch::None,
@@ -265,7 +278,7 @@ const MODEL_SOURCE_MAX_MODEL: usize = 256;
 /// The url is a bare origin (`scheme://host[:port]`: no credentials, path,
 /// query or fragment; the provider adds `/v1/...`) that `env_local_tier`
 /// judges Local, so it is labeled and built exactly as a loopback
-/// `OLLAMA_URL` override is. Anything else is refused, never made Remote.
+/// local override is. Anything else is refused, never made Remote.
 fn check_model_source(url: String, model: String) -> Result<ModelSource, &'static str> {
     let parsed = reqwest::Url::parse(&url).map_err(|_| "url does not parse")?;
     if url != parsed.origin().ascii_serialization() {
@@ -285,6 +298,7 @@ fn check_model_source(url: String, model: String) -> Result<ModelSource, &'stati
 }
 
 /// The open-enum tier string reported on `/models` for a judged tier.
+#[cfg(test)]
 fn tier_label(t: Tier) -> &'static str {
     match t {
         Tier::Local => "local",
@@ -327,7 +341,7 @@ impl ModelRouter {
 
     pub fn idoris_gateway(&self) -> Result<Arc<crate::IdorisGateway>, ModelError> {
         self.gateway_snapshot()
-            .ok_or_else(|| ModelError::Unavailable("iDoris is not connected".into()))?
+            .ok_or_else(|| ModelError::Unavailable(idoris_not_connected().into()))?
             .map_err(ModelError::Provider)
     }
 
@@ -363,6 +377,7 @@ impl ModelRouter {
             base_cooldown,
             max_cooldown,
             default_model: Arc::new(Mutex::new(None)),
+            idoris_only: false,
         }
     }
 
@@ -389,6 +404,7 @@ impl ModelRouter {
             base_cooldown: self.base_cooldown,
             max_cooldown: self.max_cooldown,
             default_model: Arc::clone(&self.default_model),
+            idoris_only: self.idoris_only,
         }
     }
 
@@ -419,89 +435,38 @@ impl ModelRouter {
         Self::new(providers, Duration::from_secs(2), DEFAULT_MAX_COOLDOWN)
     }
 
-    /// The default local chain as tiered providers: oMLX (8088) and Ollama
-    /// (11434), both Local tier. Mirrors `ProviderRegistry::from_env` env vars
-    /// (OMLX_URL / OMLX_API_KEY / DEFAULT_MODEL). A remote/lora provider is
-    /// added by the daemon when configured; with only local providers, a
-    /// Complex task simply falls back to them.
+    /// The only production model exit is the iDoris slot.
+    ///
+    /// A non-empty `DEFAULT_MODEL` is the saved chat model. It is written onto
+    /// a request that does not name one, including through the gateway. Unset,
+    /// the gateway sends the iDoris role name.
+    ///
+    /// `AGENT24_DEV_IDORIS_URL` and `AGENT24_DEV_IDORIS_KEY` publish that one
+    /// gateway into the same slot a managed iDoris uses. There is no direct
+    /// provider and no fallback when the slot is empty.
     pub fn from_env() -> Self {
-        Self::from_env_with_source(None)
+        let mut router = Self::with_defaults(Vec::new());
+        router.idoris_only = true;
+        if let Ok(model) = std::env::var("DEFAULT_MODEL") {
+            let model = model.trim();
+            if !model.is_empty() {
+                router.set_default_model(model);
+            }
+        }
+        match crate::IdorisGateway::from_dev_env() {
+            Some(Ok(gateway)) => router.replace_idoris(gateway),
+            Some(Err(reason)) => router.block_idoris(&reason),
+            None => {}
+        }
+        router
     }
 
-    /// [`Self::from_env`], with a [`ModelSource`] (already checked by
-    /// [`read_model_source`]) put first in the local chain.
+    /// [`Self::from_env`]. `model-source.json` is not a provider.
     pub fn from_env_with_source(source: Option<ModelSource>) -> Self {
-        // The model source's model is the default one: chat and schedules ask
-        // for none, so it is what they get.
-        let default_model = match &source {
-            Some(s) => s.model.clone(),
-            None => crate::default_model_from_env(std::env::var("DEFAULT_MODEL").ok().as_deref()),
-        };
-        if std::env::var_os("IDORIS_URL").is_some() {
-            if source.is_some() {
-                tracing::warn!("IDORIS_URL is set: the model source setting is not used");
-            }
-            let router = Self::with_defaults(Vec::new());
-            router.set_default_model(default_model);
-            *router.idoris.write().unwrap_or_else(|p| p.into_inner()) =
-                Some(crate::IdorisGateway::from_env().map(Arc::new));
-            return router;
+        if source.is_some() {
+            tracing::warn!("model-source.json is ignored; models go through iDoris only");
         }
-        let omlx_url =
-            std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let omlx_key = crate::omlx_api_key_from_process_env();
-        // Validate locality before trusting the `Local` label: an OMLX_URL
-        // pointed at a non-loopback address is treated as Remote so a
-        // LocalOnly task never silently leaks to it (review D2).
-        let omlx_tier = env_local_tier(&omlx_url);
-        // ME4-S2 M5: overridable (was hard-coded). Labeled by the same rule
-        // as OMLX_URL, so a non-loopback value is Remote.
-        let ollama_url =
-            std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned());
-        let ollama_tier = env_local_tier(&ollama_url);
-        // v3 N1: a provider labeled Local talks ONLY to its loopback address —
-        // no proxy, no redirect. v3 L-e: its reported tier string is the
-        // judged tier, not a hard-coded "local".
-        // Review H2, ME4-S2c §4: which thinking switch each one may be sent
-        // is decided per PROVIDER INSTANCE by `thinking_switch`, not by tier.
-        let build =
-            |name: &str, url: String, key: Option<String>, tier: Tier| -> Arc<dyn ModelProvider> {
-                let p = crate::OpenAiCompatProvider::new(
-                    name,
-                    url,
-                    key,
-                    tier_label(tier),
-                    default_model.clone(),
-                );
-                let p = if tier.is_local() {
-                    p.loopback_only()
-                } else {
-                    p
-                };
-                let p = match thinking_switch(name, tier) {
-                    ThinkingSwitch::ChatTemplateKwargs => p.supports_chat_template_kwargs(),
-                    ThinkingSwitch::ReasoningEffort => p.supports_reasoning_effort(),
-                    ThinkingSwitch::None => p,
-                };
-                Arc::new(p)
-            };
-        let omlx = build("omlx", omlx_url, omlx_key, omlx_tier);
-        let ollama = build("ollama", ollama_url, None, ollama_tier);
-        let mut providers = Vec::with_capacity(3);
-        // The model source goes first. Judged again here (it is a `pub` type):
-        // only a Local one is built at all, and then `loopback_only()`; its
-        // name is its own (no oMLX or Ollama switch is sent to it).
-        if let Some(s) = source {
-            let tier = env_local_tier(&s.url);
-            if tier == Tier::Local {
-                providers.push((build("custom", s.url, None, tier), tier));
-            }
-        }
-        providers.push((omlx, omlx_tier));
-        providers.push((ollama, ollama_tier));
-        let router = Self::with_defaults(providers);
-        router.set_default_model(default_model.clone());
-        router
+        Self::from_env()
     }
 
     /// Provider indices to try, in order, for `profile` at `now`: tier
@@ -659,17 +624,9 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> Result<Served, ModelError> {
-        if let Some(gateway) = self.gateway_snapshot() {
-            return gateway
-                .as_ref()
-                .map_err(|e| ModelError::Provider(e.clone()))?
-                .complete(profile, req, cancel, request_id)
-                .await;
-        }
-        // The provider baked its default at construction. Stamp the live
-        // default onto a model-less request so a runtime change is what gets
-        // sent. An explicit model is left alone. The iDoris branch above
-        // returns before this and is not rewritten.
+        // Stamp the saved default before the gateway returns, so a model-less
+        // request carries it on the iDoris wire too. An explicit model is left
+        // alone. No saved default leaves the gateway's role name in place.
         let stamped;
         let req = match (req.model.is_none(), self.default_model()) {
             (true, Some(model)) => {
@@ -681,6 +638,16 @@ impl ModelRouter {
             }
             _ => req,
         };
+        if let Some(gateway) = self.gateway_snapshot() {
+            return gateway
+                .as_ref()
+                .map_err(|e| ModelError::Provider(e.clone()))?
+                .complete(profile, req, cancel, request_id)
+                .await;
+        }
+        if self.idoris_only {
+            return Err(ModelError::Unavailable(idoris_not_connected().into()));
+        }
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -796,6 +763,12 @@ impl ModelRouter {
                     models: Vec::new(),
                     failures: vec![format!("idoris-local: {error}")],
                 },
+            };
+        }
+        if self.idoris_only {
+            return ModelInventory {
+                models: Vec::new(),
+                failures: vec![format!("idoris-local: {}", idoris_not_connected())],
             };
         }
         let mut inv = ModelInventory::default();
@@ -1555,27 +1528,27 @@ mod tests {
     fn env_local_tier_uses_the_http_clients_own_parser() {
         // Positive controls.
         for u in [
-            "http://127.0.0.1:8088",
-            "http://localhost:8088",
-            "http://LOCALHOST:8088",
+            "http://127.0.0.1:9",
+            "http://localhost:9",
+            "http://LOCALHOST:9",
             "https://[::1]:8443",
-            "http://user:pw@127.0.0.1:8088", // real userinfo: host IS 127.0.0.1
-            "http://evil.example%2F@127.0.0.1:8088", // %2F stays in userinfo
-            "http://0x7f000001:8088",        // WHATWG normalises to 127.0.0.1
-            "http://loc\talhost:8088",       // tab stripped → localhost (reqwest agrees)
-            "http://127.0.0.1:8088?@evil.example", // `?` ends the authority → 127.0.0.1
+            "http://user:pw@127.0.0.1:9", // real userinfo: host IS 127.0.0.1
+            "http://evil.example%2F@127.0.0.1:9", // %2F stays in userinfo
+            "http://0x7f000001:9",        // WHATWG normalises to 127.0.0.1
+            "http://loc\talhost:9",       // tab stripped → localhost (reqwest agrees)
+            "http://127.0.0.1:9?@evil.example", // `?` ends the authority → 127.0.0.1
         ] {
             assert_eq!(env_local_tier(u), Tier::Local, "{u:?}");
         }
         // Must be Remote.
         for u in [
-            "http://evil.example\\@127.0.0.1:8088", // H1: `\` ends the authority → evil.example
+            "http://evil.example\\@127.0.0.1:9", // H1: `\` ends the authority → evil.example
             "http://evil.example:80\\@localhost/",
-            "http://127.0.0.1\t.evil.example:8088", // tab stripped → a domain
-            "http://[::ffff:127.0.0.1]:8088",       // mapped v6: not is_loopback()
-            "http://0.0.0.0:8088",
-            "http://localhost.:8088",
-            "http://192.168.1.50:8088",
+            "http://127.0.0.1\t.evil.example:9", // tab stripped → a domain
+            "http://[::ffff:127.0.0.1]:9",       // mapped v6: not is_loopback()
+            "http://0.0.0.0:9",
+            "http://localhost.:9",
+            "http://192.168.1.50:9",
             "https://inference.example.com",
             "not a url",
             "file:///tmp/x",
@@ -1584,7 +1557,7 @@ mod tests {
             assert_eq!(env_local_tier(u), Tier::Remote, "{u:?}");
         }
         // The reviewer's exact H1 vector, checked against the parser reqwest uses.
-        let h1 = "http://evil.example\\@127.0.0.1:8088";
+        let h1 = "http://evil.example\\@127.0.0.1:9";
         assert_eq!(
             reqwest::Url::parse(h1).unwrap().host_str(),
             Some("evil.example")
@@ -1635,150 +1608,148 @@ mod tests {
         }
     }
 
-    // The two CHILD tests below run only inside a fresh process started by
-    // `from_env_local_providers_ignore_http_proxy` (edition 2024 makes
-    // `set_var` unsafe and the workspace forbids unsafe, so the env is given
-    // to a new process). They are selected by exact name, not by an env var:
-    // `agent24-cli`'s PASSTHROUGH_VARS scanner collects every environment read
-    // under crates/, and a test-only variable would trip it.
-
-    /// Child: the production path — from_env labels OMLX_URL Local → loopback_only.
+    /// Child of `from_env_without_idoris_errors`. The parent strips the dev
+    /// gateway so this process cannot publish a slot or inherit a laptop URL.
     #[tokio::test]
-    #[ignore = "child process of from_env_local_providers_ignore_http_proxy"]
-    async fn proxy_child_from_env() {
-        let r = ModelRouter::from_env();
-        let profile = TaskProfile {
-            privacy: Privacy::LocalOnly,
-            ..Default::default()
-        };
-        let _ = r
-            .complete(profile, &secret_request(), &CancellationToken::new())
-            .await;
-    }
-
-    /// Child: positive control — the default client, same URL, same env.
-    #[tokio::test]
-    #[ignore = "child process of from_env_local_providers_ignore_http_proxy"]
-    async fn proxy_child_default_client() {
-        let url = std::env::var("OMLX_URL").unwrap_or_default(); // already in PASSTHROUGH_VARS
-        let p = crate::OpenAiCompatProvider::new("omlx", url, None, "local", "m");
-        let _ = p
-            .complete(&secret_request(), &CancellationToken::new())
-            .await;
-    }
-
-    fn run_child(test: &str, target: u16, proxy: u16) {
-        let exe = std::env::current_exe().unwrap();
-        let proxy_url = format!("http://127.0.0.1:{proxy}");
-        let status = std::process::Command::new(exe)
-            .args(["--exact", test, "--ignored", "--nocapture"])
-            .env("OMLX_URL", format!("http://127.0.0.1:{target}"))
-            .env("OLLAMA_URL", "http://127.0.0.1:1")
-            .env("HTTP_PROXY", &proxy_url)
-            .env("http_proxy", &proxy_url)
-            .env("ALL_PROXY", &proxy_url)
-            .env_remove("NO_PROXY")
-            .env_remove("no_proxy")
-            .status()
-            .unwrap();
-        assert!(status.success());
+    #[ignore = "child process of from_env_without_idoris_errors"]
+    async fn child_from_env_without_idoris() {
+        let router = ModelRouter::from_env();
+        assert!(router.providers.is_empty());
+        let err = router
+            .complete(
+                TaskProfile {
+                    privacy: Privacy::LocalOnly,
+                    ..Default::default()
+                },
+                &secret_request(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("iDoris"), "{message}");
+        assert!(matches!(err, ModelError::Unavailable(_)), "{err:?}");
+        let inventory = router.models_detailed(&CancellationToken::new()).await;
+        assert!(inventory.models.is_empty());
+        assert!(!inventory.is_complete());
+        assert!(
+            inventory
+                .failures
+                .iter()
+                .any(|line| line.contains("iDoris")),
+            "{inventory:?}"
+        );
     }
 
     #[test]
-    fn from_env_local_providers_ignore_http_proxy() {
-        let (tp, target) = thread_stub(http_ok());
-        let (pp, proxy) = thread_stub(http_ok());
-        run_child("router::tests::proxy_child_from_env", tp, pp);
-        assert_eq!(
-            proxy.load(std::sync::atomic::Ordering::SeqCst),
-            0,
-            "the proxy saw a Local provider's request"
-        );
-        assert_eq!(target.load(std::sync::atomic::Ordering::SeqCst), 1);
-        // Positive control: the default client under the same env goes through the proxy.
-        let (tp2, target2) = thread_stub(http_ok());
-        let (pp2, proxy2) = thread_stub(http_ok());
-        run_child("router::tests::proxy_child_default_client", tp2, pp2);
-        assert_eq!(
-            proxy2.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "measuring instrument: proxy env must take effect"
-        );
-        assert_eq!(target2.load(std::sync::atomic::Ordering::SeqCst), 0);
-    }
-
-    /// Child: `from_env`'s providers, each asked once with thinking off.
-    #[tokio::test]
-    #[ignore = "child process of from_env_sends_each_backend_its_own_thinking_switch"]
-    async fn switch_child_from_env() {
-        let r = ModelRouter::from_env();
-        let profile = TaskProfile {
-            privacy: Privacy::LocalOnly,
-            ..Default::default()
-        };
-        let req = CompletionRequest {
-            disable_thinking: true,
-            idoris_headroom_confirmed: false,
-            ..secret_request()
-        };
-        let _ = r.complete(profile, &req, &CancellationToken::new()).await;
-    }
-
-    #[test]
-    fn from_env_sends_each_backend_its_own_thinking_switch() {
-        // J3's wiring: oMLX refuses for now (503), so the router goes on to
-        // Ollama; each body is read as it came.
-        use std::io::{Read, Write};
-        fn stub(reply: String) -> (u16, std::sync::mpsc::Receiver<String>) {
-            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let port = l.local_addr().unwrap().port();
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                for s in l.incoming() {
-                    let Ok(mut s) = s else { continue };
-                    let _ = s.set_read_timeout(Some(Duration::from_millis(300)));
-                    let mut got = Vec::new();
-                    let mut buf = [0u8; 65536];
-                    while let Ok(n) = s.read(&mut buf) {
-                        if n == 0 {
-                            break;
-                        }
-                        got.extend_from_slice(&buf[..n]);
-                    }
-                    let text = String::from_utf8_lossy(&got).to_string();
-                    let body = text.split_once("\r\n\r\n").map(|(_, b)| b.to_owned());
-                    let _ = tx.send(body.unwrap_or_default());
-                    let _ = s.write_all(reply.as_bytes());
-                }
-            });
-            (port, rx)
-        }
-        let busy =
-            "HTTP/1.1 503 Service Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
-        let (omlx_port, omlx) = stub(busy.to_owned());
-        let (ollama_port, ollama) = stub(http_ok());
-        let exe = std::env::current_exe().unwrap();
-        let status = std::process::Command::new(exe)
+    fn from_env_without_idoris_errors() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "router::tests::switch_child_from_env",
+                "router::tests::child_from_env_without_idoris",
                 "--ignored",
                 "--nocapture",
             ])
-            .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
-            .env("OLLAMA_URL", format!("http://127.0.0.1:{ollama_port}"))
+            .env_remove("AGENT24_DEV_IDORIS_URL")
+            .env_remove("AGENT24_DEV_IDORIS_KEY")
+            .env_remove("DEFAULT_MODEL")
             .status()
             .unwrap();
         assert!(status.success());
-        let wait = Duration::from_secs(5);
-        let omlx: serde_json::Value =
-            serde_json::from_str(&omlx.recv_timeout(wait).unwrap()).unwrap();
-        let ollama: serde_json::Value =
-            serde_json::from_str(&ollama.recv_timeout(wait).unwrap()).unwrap();
-        assert!(omlx.get("chat_template_kwargs").is_some(), "{omlx}");
-        assert!(omlx.get("reasoning_effort").is_none(), "{omlx}");
-        assert_eq!(ollama["reasoning_effort"], "none", "{ollama}");
-        assert!(ollama.get("chat_template_kwargs").is_none(), "{ollama}");
+    }
+
+    fn idoris_health_body() -> String {
+        let version = agent24_idoris::IdorisLock::embedded()
+            .tested_contract_version
+            .as_str();
+        format!(
+            r#"{{"service":"idoris","version":"0.5.0","contract_version":"{version}","instance_id":"fixture","dev_no_key_enabled":false}}"#
+        )
+    }
+
+    /// One loopback iDoris: health, then chat. Returns the chat body.
+    fn idoris_chat_stub() -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let health = idoris_health_body();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut got = Vec::new();
+                let mut buf = [0u8; 65536];
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    got.extend_from_slice(&buf[..n]);
+                    if got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let text = String::from_utf8_lossy(&got);
+                let line = text.lines().next().unwrap_or("");
+                if line.starts_with("GET /health") {
+                    let raw = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{health}",
+                        health.len()
+                    );
+                    let _ = stream.write_all(raw.as_bytes());
+                    continue;
+                }
+                let body = text
+                    .split_once("\r\n\r\n")
+                    .map(|(_, body)| body.to_owned())
+                    .unwrap_or_default();
+                let _ = tx.send(body);
+                let payload = r#"{"model":"served","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}"#;
+                let raw = format!(
+                    "HTTP/1.1 200 OK\r\nx-idoris-served-locality: loopback\r\nx-idoris-record-id: rec_default\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    payload.len()
+                );
+                let _ = stream.write_all(raw.as_bytes());
+            }
+        });
+        (format!("http://127.0.0.1:{port}/"), rx)
+    }
+
+    #[tokio::test]
+    async fn saved_default_model_is_sent_through_the_idoris_gateway() {
+        let (url, bodies) = idoris_chat_stub();
+        let router = ModelRouter::with_defaults(vec![]);
+        router.replace_idoris(
+            crate::IdorisGateway::from_credentials(
+                &url,
+                zeroize::Zeroizing::new("idk_default_model_fixture".to_owned()),
+            )
+            .unwrap(),
+        );
+        router.set_default_model("Qwen3-30B");
+        let profile = TaskProfile {
+            privacy: Privacy::LocalOnly,
+            ..Default::default()
+        };
+        router
+            .complete(profile, &secret_request(), &CancellationToken::new())
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&bodies.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(body["model"], "Qwen3-30B", "{body}");
+
+        let explicit = CompletionRequest {
+            model: Some("named-by-caller".to_owned()),
+            ..secret_request()
+        };
+        router
+            .complete(profile, &explicit, &CancellationToken::new())
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_str(&bodies.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
+        assert_eq!(body["model"], "named-by-caller", "{body}");
     }
 
     #[tokio::test]
@@ -1916,13 +1887,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(names(&a), names(&b));
-        assert_eq!(
-            names(&b)
-                .iter()
-                .map(|(n, _)| n.as_str())
-                .collect::<Vec<_>>(),
-            ["omlx", "ollama"]
-        );
+        assert!(names(&b).is_empty());
         assert_eq!(a.default_model(), b.default_model());
     }
 
@@ -1958,32 +1923,30 @@ mod tests {
             model: "lm-qwen".to_owned(),
         };
         let r = ModelRouter::from_env_with_source(Some(source));
-        assert_eq!(r.providers[0].provider.name(), "custom");
-        assert_eq!(r.providers[0].tier, Tier::Local);
-        assert_eq!(
-            r.providers
-                .iter()
-                .map(|p| p.provider.name())
-                .collect::<Vec<_>>(),
-            ["custom", "omlx", "ollama"]
+        assert!(r.providers.is_empty());
+        let err = r
+            .complete(
+                TaskProfile {
+                    privacy: Privacy::LocalOnly,
+                    ..Default::default()
+                },
+                &secret_request(),
+                &CancellationToken::new(),
+            )
+            .await;
+        // A developer machine may already publish a dev gateway. Either way
+        // the model-source listener is not a provider.
+        match err {
+            Ok(_) => assert!(r.idoris_gateway().is_ok()),
+            Err(err) => {
+                let message = err.to_string();
+                assert!(message.contains("iDoris"), "{message}");
+            }
+        }
+        assert!(
+            rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "model-source.json must not be dialed"
         );
-        assert_eq!(r.default_model().as_deref(), Some("lm-qwen"));
-        let profile = TaskProfile {
-            privacy: Privacy::LocalOnly,
-            ..Default::default()
-        };
-        let req = CompletionRequest {
-            disable_thinking: true,
-            ..secret_request()
-        };
-        r.complete(profile, &req, &CancellationToken::new())
-            .await
-            .unwrap();
-        let body: serde_json::Value =
-            serde_json::from_str(&rx.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
-        assert_eq!(body["model"], "lm-qwen", "{body}");
-        assert!(body.get("reasoning_effort").is_none(), "{body}");
-        assert!(body.get("chat_template_kwargs").is_none(), "{body}");
     }
 
     #[test]
@@ -1996,8 +1959,8 @@ mod tests {
     fn only_a_local_ollama_is_sent_reasoning_effort() {
         // J3 (ME4-S2c): a local Ollama gets `reasoning_effort`; Ollama
         // judged remote and oMLX never do.
-        let local = env_local_tier("http://127.0.0.1:11434");
-        let remote = env_local_tier("http://10.0.0.5:11434");
+        let local = env_local_tier("http://127.0.0.1:9");
+        let remote = env_local_tier("http://10.0.0.5:9");
         assert_eq!(
             thinking_switch("ollama", local),
             ThinkingSwitch::ReasoningEffort

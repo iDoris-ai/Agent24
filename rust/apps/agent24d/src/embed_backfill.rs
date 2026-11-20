@@ -20,7 +20,7 @@ pub async fn drive(link: EmbedBackfill, router: Arc<ModelRouter>, cancel: Cancel
     if cancel.is_cancelled() {
         return;
     }
-    let client = match EmbeddingClient::from_env() {
+    let client = match EmbeddingClient::from_router(Arc::clone(&router)) {
         Ok(client) => client,
         Err(err) => {
             tracing::info!(

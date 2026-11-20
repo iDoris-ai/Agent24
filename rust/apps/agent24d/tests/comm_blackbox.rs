@@ -84,13 +84,24 @@ impl Counter {
                 request.push_str(&String::from_utf8_lossy(&body));
                 let mut stream = reader.into_inner();
                 let line = request.lines().next().unwrap_or("");
-                let (status, body) = if line.starts_with("GET /health ") {
-                    ("200 OK", json!({"status":"ok"}).to_string())
+                let (status, body, evidence) = if line.starts_with("GET /health ") {
+                    let version = agent24_idoris::IdorisLock::embedded()
+                        .tested_contract_version
+                        .as_str();
+                    (
+                        "200 OK",
+                        json!({"service":"idoris","version":"0.5.0-fixture","contract_version":version,"instance_id":"comm","dev_no_key_enabled":false}).to_string(),
+                        "",
+                    )
                 } else if line.starts_with("GET /counts ") {
-                    ("200 OK", json!({"models": model_count.load(Ordering::SeqCst), "modules": module_count.load(Ordering::SeqCst)}).to_string())
+                    (
+                        "200 OK",
+                        json!({"models": model_count.load(Ordering::SeqCst), "modules": module_count.load(Ordering::SeqCst)}).to_string(),
+                        "",
+                    )
                 } else if line.starts_with("POST /module-call ") {
                     module_count.fetch_add(1, Ordering::SeqCst);
-                    ("200 OK", "{}".to_owned())
+                    ("200 OK", "{}".to_owned(), "")
                 } else if line.starts_with("POST /v1/chat/completions ") {
                     model_count.fetch_add(1, Ordering::SeqCst);
                     // A real run must reach the mounted MCP tool before it can
@@ -101,13 +112,17 @@ impl Counter {
                     } else {
                         json!({"choices":[{"message":{"role":"assistant","content":null,"tool_calls":[{"id":"comm5b-call","type":"function","function":{"name":"mcp_fixture_echo","arguments":r#"{"text":"comm5b positive control"}"#}}]}}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"model":"comm5b-stub"})
                     };
-                    ("200 OK", body.to_string())
+                    (
+                        "200 OK",
+                        body.to_string(),
+                        "x-idoris-served-locality: loopback\r\nx-idoris-record-id: comm5b\r\n",
+                    )
                 } else {
-                    ("200 OK", "{}".to_owned())
+                    ("200 OK", "{}".to_owned(), "")
                 };
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\n{evidence}content-length: {}\r\nconnection: close\r\n\r\n{body}",
                     body.len()
                 );
             }
@@ -331,7 +346,8 @@ fn spawn_agent24d(
         .env("HOME", home.path())
         .env("A24_COMM_PASSWORD_STORE", "memory")
         .env("A24_HYPHAE_BIN", hyphae)
-        .env("OMLX_URL", model_url)
+        .env("AGENT24_DEV_IDORIS_URL", model_url)
+        .env("AGENT24_DEV_IDORIS_KEY", "idk_comm_blackbox_fixture")
         .env("DEFAULT_MODEL", "comm5b-stub")
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())

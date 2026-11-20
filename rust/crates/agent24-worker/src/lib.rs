@@ -169,10 +169,9 @@ impl HttpMlWorker {
     /// Build a client for a worker at `base_url` (e.g. `http://127.0.0.1:8099`).
     /// A trailing slash is trimmed so path joining is unambiguous.
     ///
-    /// FU-74: unlike `agent24-models`' providers (which point at
-    /// user-configured `OMLX_URL`/`OLLAMA_URL` and so can legitimately be
-    /// remote, hence that crate's `env_local_tier` + `loopback_only` gate),
-    /// the ML worker is — per this module's doc comment — "a separate process
+    /// FU-74: unlike a hand-built `agent24-models` provider (which can be
+    /// labeled remote, hence that crate's `env_local_tier` + `loopback_only`
+    /// gate), the ML worker is — per this module's doc comment — "a separate process
     /// the daemon spawns": there is no caller anywhere in the workspace today
     /// that points `base_url` at anything but a locally spawned worker, and no
     /// env var configures it. So this client is unconditionally loopback-only

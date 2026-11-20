@@ -185,12 +185,21 @@ fn handle_conn(
     }
     let request = format!("{header_text}{}", String::from_utf8_lossy(&body));
     let line = request.lines().next().unwrap_or("");
+    if line.starts_with("GET /health ") {
+        let payload = idoris_health();
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            payload.len()
+        );
+        return;
+    }
     if line.starts_with("POST /v1/chat/completions ") {
         chat.lock().unwrap().push(request);
         let payload = chat_ok();
         let _ = write!(
             stream,
-            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-idoris-served-locality: loopback\r\nx-idoris-record-id: vbrec\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
             payload.len()
         );
         return;
@@ -215,7 +224,7 @@ fn handle_conn(
                 let payload = embed_ok(&request);
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-idoris-served-locality: loopback\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
                     payload.len()
                 );
             }
@@ -233,7 +242,7 @@ fn handle_conn(
                 let payload = embed_ok(&request);
                 let _ = write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-idoris-served-locality: loopback\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{payload}",
                     payload.len()
                 );
             }
@@ -245,6 +254,15 @@ fn handle_conn(
         stream,
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{payload}"
     );
+}
+
+fn idoris_health() -> String {
+    let version = agent24_idoris::IdorisLock::embedded()
+        .tested_contract_version
+        .as_str();
+    format!(
+        r#"{{"service":"idoris","version":"0.5.0-fixture","contract_version":"{version}","instance_id":"vector-backfill","dev_no_key_enabled":false}}"#
+    )
 }
 
 fn chat_ok() -> String {
@@ -275,8 +293,11 @@ fn start_daemon(home: &Path, omlx_port: u16, ready_within: Duration) -> Daemon {
     let mut child = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
-        .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
-        .env("OMLX_API_KEY", "test-key")
+        .env(
+            "AGENT24_DEV_IDORIS_URL",
+            format!("http://127.0.0.1:{omlx_port}/"),
+        )
+        .env("AGENT24_DEV_IDORIS_KEY", "idk_vector_backfill_fixture")
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

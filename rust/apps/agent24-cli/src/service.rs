@@ -1115,6 +1115,11 @@ mod tests {
                                 // HTTP rescan does not read it. A LaunchAgent
                                 // must not keep this.
                                     | "AGENT24_SKILL_SCAN_DELAY_MS"
+                                // IC-2 dev switch. Points one process at an
+                                // external iDoris and must not be copied into
+                                // a LaunchAgent plist (the key is a secret).
+                                    | "AGENT24_DEV_IDORIS_URL"
+                                    | "AGENT24_DEV_IDORIS_KEY"
                             )
                         {
                             found.push(name);

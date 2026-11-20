@@ -50,11 +50,9 @@ impl ModelCatalog {
         // INCOMPLETE, not empty, is the disqualifier. An empty list from providers
         // that all answered honestly means the models really are absent; a
         // non-empty list from a partial sweep proves nothing about what is missing.
-        // (With NO providers configured at all, the sweep is vacuously complete and
-        // the answer is an honest "nothing is available". Note it does not say WHY:
-        // zero providers and providers that all answered with nothing are
-        // indistinguishable once the count is dropped. A `NoProviders` variant is
-        // worth adding when `agent24 os` has to explain this to a user.)
+        // A hand-built router with no providers is vacuously complete. Production
+        // `from_env` reports an iDoris failure instead, so "nothing is available"
+        // and "iDoris is not connected" stay different answers.
         if !inv.is_complete() {
             return Self(Err(format!(
                 "{} provider(s) did not answer: {}",

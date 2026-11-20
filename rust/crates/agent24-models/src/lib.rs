@@ -9,7 +9,6 @@
 //!   first-class citizen from the first line (never retrofit).
 //! - Providers are registered in an ordered registry (no if/else factory).
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -927,8 +926,8 @@ impl ModelProvider for OpenAiCompatProvider {
             body["stream_options"] = serde_json::json!({ "include_usage": true });
         }
         // ME4-S2c §4: a backend that does not know the thinking switch (an
-        // Ollama version or model that refuses `"none"`, an OMLX_URL that is
-        // not oMLX) refuses the whole request. Asked once more without it, it
+        // Ollama version or model that refuses `"none"`, or a local endpoint
+        // that is not oMLX) refuses the whole request. Asked once more without it, it
         // answers as it did before the switch existed, thinking and all,
         // rather than fail every `complexity: "simple"` call. A 400 for any
         // other reason costs one more refusal.
@@ -1011,6 +1010,8 @@ impl ModelProvider for OpenAiCompatProvider {
 pub const FALLBACK_CHAT_MODEL: &str = "Qwen3-8B-4bit";
 
 /// `DEFAULT_MODEL`, trimmed. Empty or absent becomes [`FALLBACK_CHAT_MODEL`].
+/// Production `from_env` does not seed this fallback into the iDoris wire model.
+#[cfg(test)]
 pub(crate) fn default_model_from_env(value: Option<&str>) -> String {
     match value.map(str::trim).filter(|model| !model.is_empty()) {
         Some(model) => model.to_owned(),
@@ -1019,7 +1020,9 @@ pub(crate) fn default_model_from_env(value: Option<&str>) -> String {
 }
 
 /// Settings files larger than this are treated as unreadable. A normal oMLX
-/// settings file is a few kilobytes.
+/// settings file is a few kilobytes. The direct oMLX provider is gone; the
+/// reader stays for the unit tests of the old settings shape.
+#[cfg(test)]
 const OMLX_SETTINGS_READ_CAP: u64 = 1024 * 1024;
 
 /// oMLX bearer token, or `None` when the call should send no `Authorization`.
@@ -1027,9 +1030,10 @@ const OMLX_SETTINGS_READ_CAP: u64 = 1024 * 1024;
 /// A non-empty `env_key` wins and the settings file is not opened. Otherwise
 /// `settings_path`'s `auth.api_key` is used. Missing, unreadable, oversized,
 /// or blank means no key. The key is never logged.
+#[cfg(test)]
 pub(crate) fn omlx_api_key_from(
     env_key: Option<&str>,
-    settings_path: Option<&Path>,
+    settings_path: Option<&std::path::Path>,
 ) -> Option<String> {
     if let Some(key) = env_key.map(str::trim).filter(|key| !key.is_empty()) {
         return Some(key.to_owned());
@@ -1039,7 +1043,8 @@ pub(crate) fn omlx_api_key_from(
 
 /// `auth.api_key` from an oMLX `settings.json`. `None` on any read or parse
 /// failure. Callers pass the path so tests never touch a real home directory.
-pub(crate) fn read_omlx_settings_api_key(path: &Path) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn read_omlx_settings_api_key(path: &std::path::Path) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() || meta.len() > OMLX_SETTINGS_READ_CAP {
         return None;
@@ -1057,22 +1062,6 @@ pub(crate) fn read_omlx_settings_api_key(path: &Path) -> Option<String> {
     }
 }
 
-/// Process env, then `~/.omlx/settings.json` under `HOME`. A non-empty
-/// `OMLX_API_KEY` does not open the file.
-pub(crate) fn omlx_api_key_from_process_env() -> Option<String> {
-    let env_key = std::env::var("OMLX_API_KEY").ok();
-    let present = env_key
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|key| !key.is_empty());
-    let path = if present {
-        None
-    } else {
-        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".omlx").join("settings.json"))
-    };
-    omlx_api_key_from(env_key.as_deref(), path.as_deref())
-}
-
 // ── Ordered registry (fallback chain; M-D replaces order with ModelRouter) ───
 
 pub struct ProviderRegistry {
@@ -1082,31 +1071,6 @@ pub struct ProviderRegistry {
 impl ProviderRegistry {
     pub fn new(providers: Vec<Arc<dyn ModelProvider>>) -> Self {
         Self { providers }
-    }
-
-    /// Default local chain: oMLX (8088) → Ollama (11434). Env overrides:
-    /// OMLX_URL / OMLX_API_KEY / DEFAULT_MODEL (mirrors the node daemon).
-    pub fn from_env() -> Self {
-        let omlx_url =
-            std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let omlx_key = omlx_api_key_from_process_env();
-        let default_model = default_model_from_env(std::env::var("DEFAULT_MODEL").ok().as_deref());
-        Self::new(vec![
-            Arc::new(OpenAiCompatProvider::new(
-                "omlx",
-                omlx_url,
-                omlx_key,
-                "local",
-                default_model.clone(),
-            )),
-            Arc::new(OpenAiCompatProvider::new(
-                "ollama",
-                "http://127.0.0.1:11434",
-                None,
-                "local",
-                default_model,
-            )),
-        ])
     }
 
     /// Try providers in order; only `Unavailable` falls through to the next.

@@ -298,9 +298,14 @@ async fn configured_gateway_is_the_only_http_target() {
             ])
             .env("A24_IDORIS_PROBE_CHILD", "1")
             .env_remove("A24_IDORIS_CASE")
-            .env("IDORIS_URL", gateway)
+            .env("IDORIS_URL", gateway.clone())
             .env(
                 "IDORIS_API_KEY",
+                "idk_1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .env("AGENT24_DEV_IDORIS_URL", gateway.clone())
+            .env(
+                "AGENT24_DEV_IDORIS_KEY",
                 "idk_1111111111111111111111111111111111111111111111111111111111111111",
             )
             .env("OMLX_URL", &direct)
@@ -431,9 +436,14 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
             ])
             .env("A24_IDORIS_PROBE_CHILD", "1")
             .env("A24_IDORIS_CASE", case)
-            .env("IDORIS_URL", gateway)
+            .env("IDORIS_URL", gateway.clone())
             .env(
                 "IDORIS_API_KEY",
+                "idk_1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .env("AGENT24_DEV_IDORIS_URL", gateway.clone())
+            .env(
+                "AGENT24_DEV_IDORIS_KEY",
                 "idk_1111111111111111111111111111111111111111111111111111111111111111",
             )
             .env("OMLX_URL", &direct)
@@ -441,12 +451,12 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
             .env_remove("DEFAULT_MODEL");
             if case == "missing-key" {
                 cmd.env_remove("IDORIS_API_KEY");
+                cmd.env_remove("AGENT24_DEV_IDORIS_KEY");
             }
             if case == "admin-key" {
-                cmd.env(
-                    "IDORIS_API_KEY",
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                );
+                let admin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                cmd.env("IDORIS_API_KEY", admin);
+                cmd.env("AGENT24_DEV_IDORIS_KEY", admin);
             }
             cmd.output().unwrap()
         })
@@ -529,10 +539,13 @@ async fn headroom_gateway_contract() {
                 .env("A24_IDORIS_PROBE_CHILD", "1")
                 .env("A24_IDORIS_CASE", case)
                 .env("A24_IDORIS_CONFIRMED", confirmed.to_string())
-                .env("IDORIS_URL", gateway)
+                .env("IDORIS_URL", gateway.clone())
                 .env("IDORIS_API_KEY", "idk_headroom_fixture")
+                .env("AGENT24_DEV_IDORIS_URL", gateway.clone())
+                .env("AGENT24_DEV_IDORIS_KEY", "idk_headroom_fixture")
                 .env("OMLX_URL", &direct)
                 .env("OLLAMA_URL", &direct)
+                .env_remove("DEFAULT_MODEL")
                 .output()
                 .unwrap()
         })

@@ -1,31 +1,30 @@
 //! Loopback embedding client (VR-1).
 //!
-//! Chat's route switch is reused: when `IDORIS_URL` is set, embeddings go to
-//! that origin's `/v1/embeddings`; otherwise they go straight to oMLX at
-//! `OMLX_URL` / `OMLX_API_KEY` (the same variables and defaults as
-//! [`crate::ProviderRegistry::from_env`], sent as `Authorization: Bearer` when
-//! the key is non-empty — the provider's `api_key` field). The model name is
-//! `A24_EMBED_MODEL`, default [`DEFAULT_EMBED_MODEL`].
+//! Production embeddings go to the iDoris slot's current gateway:
+//! `{origin}/v1/embeddings`, with that snapshot's data key. The address and
+//! key are read on every request, so a gateway restart is picked up without
+//! rebuilding the client. An empty or blocked slot fails the call. There is
+//! no direct model path.
 //!
-//! Locality is not the same in the two modes (§3.7):
-//! - **Direct oMLX** is local only because the URL is loopback (and the client
-//!   does not use a proxy or follow redirects, same as a Local chat provider).
-//!   There is no served-locality response header. A process listening on
-//!   loopback can still forward the body off-box; that is a configuration
-//!   choice, not something this client can see.
-//! - **iDoris** has that URL rule and also requires the response header
-//!   `x-idoris-served-locality: loopback`, with `X-iDoris-Privacy: local_only`
-//!   on the request. A missing or different header fails the call. There is
-//!   no fallback to direct oMLX.
+//! [`EmbeddingClient::direct`] remains for in-process tests of batching. It
+//! is local only because the URL is loopback (no proxy, no redirects). It
+//! does not require a served-locality header.
 //!
+//! iDoris requires `x-idoris-served-locality: loopback` on the response and
+//! sends `X-iDoris-Privacy: local_only`. A missing or different header fails
+//! the call.
+//!
+//! The model name is `A24_EMBED_MODEL`, default [`DEFAULT_EMBED_MODEL`].
 //! A non-loopback URL fails construction. It is not relabeled and not used.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
 use crate::ModelError;
+use crate::router::ModelRouter;
 
 /// bge-m3 on oMLX, fp16. VR-0: 1024 dimensions, already L2-normalized.
 pub const DEFAULT_EMBED_MODEL: &str = "bge-m3-mlx-fp16";
@@ -51,22 +50,28 @@ enum Route {
     Idoris,
 }
 
+#[derive(Clone)]
+enum Backend {
+    Fixed {
+        route: Route,
+        base_url: String,
+        api_key: Option<Zeroizing<String>>,
+    },
+    /// Live iDoris slot. Resolved on each request.
+    Router(Arc<ModelRouter>),
+}
+
 /// OpenAI-compatible `/v1/embeddings` against a loopback server.
 #[derive(Clone)]
 pub struct EmbeddingClient {
-    route: Route,
-    base_url: String,
-    /// Same role as [`crate::OpenAiCompatProvider`]'s `api_key`: `None` or empty
-    /// sends no `Authorization` header; otherwise `Bearer <key>`. Zeroized on drop.
-    api_key: Option<Zeroizing<String>>,
+    backend: Backend,
     model: String,
     client: reqwest::Client,
     timeout: Duration,
 }
 
 impl EmbeddingClient {
-    /// Direct oMLX. `base_url` must be loopback (`http://127.0.0.1:8088` in
-    /// production). Fails closed on any other host.
+    /// Fixed loopback endpoint for tests. Fails closed on any other host.
     pub fn direct(
         base_url: impl Into<String>,
         api_key: impl Into<String>,
@@ -93,22 +98,17 @@ impl EmbeddingClient {
         Self::build(Route::Idoris, base_url, Some(api_key), model)
     }
 
-    /// `IDORIS_URL` set → [`Self::idoris`] (no fallback). Otherwise the oMLX
-    /// URL and key chat already reads.
-    pub fn from_env() -> Result<Self, ModelError> {
+    /// Embeddings follow the router's current iDoris gateway. The slot is
+    /// read again on every request.
+    pub fn from_router(router: Arc<ModelRouter>) -> Result<Self, ModelError> {
         let model = resolve_model(std::env::var("A24_EMBED_MODEL"))?;
-        if std::env::var_os("IDORIS_URL").is_some() {
-            let url = std::env::var("IDORIS_URL")
-                .map_err(|_| ModelError::Provider("invalid IDORIS_URL".into()))?;
-            let key = std::env::var("IDORIS_API_KEY")
-                .map_err(|_| ModelError::Provider("missing iDoris data key".into()))?;
-            return Self::idoris(url, key, model);
-        }
-        // Same variables as `ProviderRegistry::from_env`. An empty key sends
-        // no Authorization header (`build` drops it).
-        let url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let key = crate::omlx_api_key_from_process_env().unwrap_or_default();
-        Self::direct(url, key, model)
+        let client = http_client()?;
+        Ok(Self {
+            backend: Backend::Router(router),
+            model,
+            client,
+            timeout: Duration::from_secs(120),
+        })
     }
 
     pub fn model(&self) -> &str {
@@ -139,7 +139,23 @@ impl EmbeddingClient {
         Ok(out)
     }
 
+    fn endpoint(&self) -> Result<(Route, String, Option<Zeroizing<String>>), ModelError> {
+        match &self.backend {
+            Backend::Fixed {
+                route,
+                base_url,
+                api_key,
+            } => Ok((*route, base_url.clone(), api_key.clone())),
+            Backend::Router(router) => {
+                let gateway = router.idoris_gateway()?;
+                let key = gateway.data_key()?.to_owned();
+                Ok((Route::Idoris, gateway.origin(), Some(Zeroizing::new(key))))
+            }
+        }
+    }
+
     async fn embed_batch(&self, input: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
+        let (route, base_url, api_key) = self.endpoint()?;
         let input_value = if input.len() == 1 {
             serde_json::Value::String(input[0].to_owned())
         } else {
@@ -153,13 +169,12 @@ impl EmbeddingClient {
         let body = serde_json::json!({ "model": self.model, "input": input_value });
         let mut request = self
             .client
-            .post(embeddings_url(&self.base_url))
+            .post(embeddings_url(&base_url))
             .timeout(self.timeout);
-        if self.route == Route::Idoris {
+        if route == Route::Idoris {
             request = request.header("X-iDoris-Privacy", "local_only");
         }
-        let response = self
-            .authed(request)
+        let response = authed(request, api_key.as_ref())
             .json(&body)
             .send()
             .await
@@ -169,7 +184,7 @@ impl EmbeddingClient {
             let fields = embed_error_fields(response).await;
             return Err(ModelError::Provider(embed_http_error(status, &fields)));
         }
-        if self.route == Route::Idoris && locality_header(&response)? != Some("loopback") {
+        if route == Route::Idoris && locality_header(&response)? != Some("loopback") {
             return Err(ModelError::Provider(
                 "iDoris did not attest loopback inference".into(),
             ));
@@ -191,26 +206,34 @@ impl EmbeddingClient {
         }
         ensure_loopback(&base_url)?;
         let api_key = api_key.filter(|key| !key.is_empty()).map(Zeroizing::new);
-        let client = crate::base_client_builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|err| ModelError::Provider(format!("cannot build embedding client: {err}")))?;
         Ok(Self {
-            route,
-            base_url,
-            api_key,
+            backend: Backend::Fixed {
+                route,
+                base_url,
+                api_key,
+            },
             model,
-            client,
+            client: http_client()?,
             timeout: Duration::from_secs(120),
         })
     }
+}
 
-    fn authed(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        match &self.api_key {
-            Some(key) if !key.is_empty() => request.bearer_auth(key.as_str()),
-            _ => request,
-        }
+fn http_client() -> Result<reqwest::Client, ModelError> {
+    crate::base_client_builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|err| ModelError::Provider(format!("cannot build embedding client: {err}")))
+}
+
+fn authed(
+    request: reqwest::RequestBuilder,
+    api_key: Option<&Zeroizing<String>>,
+) -> reqwest::RequestBuilder {
+    match api_key {
+        Some(key) if !key.is_empty() => request.bearer_auth(key.as_str()),
+        _ => request,
     }
 }
 
@@ -328,11 +351,11 @@ fn embeddings_url(base: &str) -> String {
 }
 
 /// Chat's iDoris client refuses anything that is not an HTTP(S) origin.
-/// Embeddings use the same rule so a path or query on `IDORIS_URL` cannot
-/// aim the request somewhere chat would have rejected.
+/// Embeddings use the same rule so a path or query cannot aim the request
+/// somewhere chat would have rejected.
 fn ensure_idoris_origin(url: &str) -> Result<(), ModelError> {
-    let base =
-        reqwest::Url::parse(url).map_err(|_| ModelError::Provider("invalid IDORIS_URL".into()))?;
+    let base = reqwest::Url::parse(url)
+        .map_err(|_| ModelError::Provider("invalid iDoris gateway URL".into()))?;
     if !base.username().is_empty()
         || base.password().is_some()
         || base.query().is_some()
@@ -340,7 +363,7 @@ fn ensure_idoris_origin(url: &str) -> Result<(), ModelError> {
         || base.path() != "/"
     {
         return Err(ModelError::Provider(
-            "IDORIS_URL must be a loopback HTTP(S) origin".into(),
+            "iDoris gateway URL must be a loopback HTTP(S) origin".into(),
         ));
     }
     Ok(())
@@ -462,7 +485,7 @@ mod tests {
                 "idk_fixture",
                 DEFAULT_EMBED_MODEL,
             ),
-            "path on IDORIS_URL",
+            "path on the gateway URL",
         );
         assert!(err.to_string().contains("origin"), "{err}");
         let err = must_fail(
@@ -656,6 +679,67 @@ mod tests {
             headers.contains("authorization: bearer idk_fixture"),
             "{headers}"
         );
+    }
+
+    fn publish(router: &ModelRouter, url: &str) {
+        router.replace_idoris(
+            crate::IdorisGateway::from_credentials(
+                url,
+                zeroize::Zeroizing::new("idk_embed_slot".to_owned()),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn embeddings_follow_the_current_idoris_slot_and_stop_when_it_is_empty() {
+        let vector = embed_json(&[axis(0)], &[0]);
+        let reply = |body: String| Scripted {
+            status: "200 OK",
+            extra_headers: "x-idoris-served-locality: loopback\r\n",
+            body,
+        };
+        let (url_a, server_a) = serve(vec![reply(vector.clone())]).await;
+        let (url_b, server_b) = serve(vec![reply(vector)]).await;
+        let router = Arc::new(ModelRouter::with_defaults(vec![]));
+        let client = EmbeddingClient::from_router(Arc::clone(&router))
+            .unwrap()
+            .with_timeout(Duration::from_secs(5));
+
+        let missing = client.embed(&["q"]).await.expect_err("empty slot");
+        assert!(missing.to_string().contains("iDoris"), "{missing}");
+
+        publish(&router, &url_a);
+        let first = client.embed(&["q"]).await.unwrap();
+        assert_eq!(first[0][0], 1.0);
+        publish(&router, &url_b);
+        let second = client.embed(&["q"]).await.unwrap();
+        assert_eq!(second[0][0], 1.0);
+
+        let captured_a = server_a.await.unwrap();
+        let captured_b = server_b.await.unwrap();
+        assert!(
+            captured_a[0].0.starts_with("POST /v1/embeddings "),
+            "{}",
+            captured_a[0].0
+        );
+        assert!(
+            captured_b[0].0.starts_with("POST /v1/embeddings "),
+            "{}",
+            captured_b[0].0
+        );
+        assert!(
+            captured_a[0]
+                .0
+                .to_ascii_lowercase()
+                .contains("authorization: bearer idk_embed_slot"),
+            "{}",
+            captured_a[0].0
+        );
+
+        router.block_idoris("gateway blocked");
+        let blocked = client.embed(&["q"]).await.expect_err("blocked slot");
+        assert!(blocked.to_string().contains("gateway blocked"), "{blocked}");
     }
 
     #[tokio::test]
