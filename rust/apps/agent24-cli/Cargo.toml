@@ -54,6 +54,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect"] }
 futures-util = { version = "0.3", default-features = false }
 fs2 = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 # os_uninstall_consents: a store that opens but refuses the revocation.

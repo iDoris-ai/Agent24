@@ -1,20 +1,15 @@
-// M5 B4b: first-launch consent and `agent24 service install` (resident-service.ts).
+// Resident service auto-install and `agent24 service install`.
 import { afterEach, describe, expect, it } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  CONSENT_VERSION, consentPath, installService, publicInstallReason, readConsent, runConsent, serviceInstallDeps, shouldAskConsent, writeConsent,
+  CONSENT_VERSION, consentPath, installService, publicInstallReason, readConsent, autoInstallService, serviceInstallDeps, shouldAutoInstall, writeConsent,
   type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem,
 } from './resident-service'
-import { mt, resetMainLocaleForTest, setMainLocale } from './main-i18n'
-import { residentServiceMessages } from '../shared/resident-service.i18n'
-import { appMessages } from '../renderer/App.i18n'
-import { settingsMessages } from '../renderer/pages/Settings.i18n'
 
 let root = ''
 afterEach(() => {
-  resetMainLocaleForTest()
   if (root) fs.rmSync(root, { recursive: true, force: true })
   root = ''
 })
@@ -61,21 +56,20 @@ describe('the consent file', () => {
   })
 })
 
-describe('shouldAskConsent', () => {
+describe('shouldAutoInstall', () => {
   const ask = { platform: 'darwin' as NodeJS.Platform, fromBundle: true, installed: false, consent: null }
   const kept = (answer: ConsentAnswer) => ({ version: CONSENT_VERSION, answer, at: '2026-11-10T08:00:00.000Z' })
-  it('a packaged macOS app with no LaunchAgent and no answer asks', () => {
-    expect(shouldAskConsent(ask)).toBe(true)
+  it.each([['no previous answer', null], ['previous allow', { version: CONSENT_VERSION, answer: 'allow' as const, at: '2026-11-10T08:00:00.000Z' }]])('%s installs automatically', (_name, consent) => {
+    expect(shouldAutoInstall({ ...ask, consent })).toBe(true)
   })
   it.each([
     ['Linux', { ...ask, platform: 'linux' as NodeJS.Platform }],
     ['Windows', { ...ask, platform: 'win32' as NodeJS.Platform }],
     ['a dev build or an AGENT24D_BIN override', { ...ask, fromBundle: false }],
     ['a LaunchAgent already there', { ...ask, installed: true }],
-    ['declined before', { ...ask, consent: kept('declined') }],
-    ['allowed before', { ...ask, consent: kept('allow') }],
+    ['declined before (CLI service uninstall)', { ...ask, consent: kept('declined') }],
   ])('%s does not ask', (_name, o) => {
-    expect(shouldAskConsent(o)).toBe(false)
+    expect(shouldAutoInstall(o)).toBe(false)
   })
 })
 
@@ -132,50 +126,36 @@ describe('installService', () => {
   })
 })
 
-describe('runConsent', () => {
-  function consent(answer: ConsentAnswer | Error, install: InstallOutcome | Error = { ok: true }) {
+describe('autoInstallService', () => {
+  function consent(install: InstallOutcome | Error = { ok: true }) {
     const recorded: ConsentAnswer[] = []
     let installs = 0
-    const run = runConsent({
-      ask: () => (answer instanceof Error ? Promise.reject(answer) : Promise.resolve(answer)),
+    const run = autoInstallService({
       install: () => { installs++; return install instanceof Error ? Promise.reject(install) : Promise.resolve(install) },
-      record: (a) => { recorded.push(a) },
+      record: () => { recorded.push('allow') },
     })
     return { run, recorded, installs: () => installs }
   }
 
-  it('not now: kept as declined, nothing installed', async () => {
-    const c = consent('declined')
-    expect(await c.run).toBe('declined')
-    expect(c.recorded).toEqual(['declined'])
-    expect(c.installs()).toBe(0)
-  })
-
-  it('allow, installed: kept as allow', async () => {
-    const c = consent('allow')
+  it('installs automatically and keeps allow on success', async () => {
+    const c = consent()
     expect(await c.run).toBe('installed')
     expect(c.recorded).toEqual(['allow'])
     expect(c.installs()).toBe(1)
   })
 
-  it('allow, but the install failed: nothing is kept, so the next launch asks again (PM r1 ②)', async () => {
-    const c = consent('allow', { ok: false, stage: 'start', code: 'not_started' })
+  it('a failed install is not kept, so the next launch retries', async () => {
+    const c = consent({ ok: false, stage: 'start', code: 'not_started' })
     expect(await c.run).toEqual({ failed: 'not_started' })
     expect(c.recorded).toEqual([])
   })
 
-  it('allow, but the install threw: nothing is kept', async () => {
-    const c = consent('allow', new Error('unexpected'))
+  it('a thrown install failure is not kept', async () => {
+    const c = consent(new Error('unexpected'))
     expect(await c.run).toEqual({ failed: 'install_failed' })
     expect(c.recorded).toEqual([])
   })
 
-  it('a box that failed to show: nothing is kept, nothing installed', async () => {
-    const c = consent(new Error('no window'))
-    expect(await c.run).toEqual({ failed: 'ask_failed' })
-    expect(c.recorded).toEqual([])
-    expect(c.installs()).toBe(0)
-  })
 })
 
 describe('serviceInstallDeps (the real steps over a fake system)', () => {
@@ -208,6 +188,7 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
     const { deps, runs } = system()
     await deps.uninstall()
     expect(runs.map((r) => [r.bin, ...r.args])).toEqual([['/App/backend/agent24', 'service', 'uninstall']])
+    expect(runs[0]!.env['AGENT24_SERVICE_KEEP_CONSENT']).toBe('1')
   })
 
   it('a failing run rejects', async () => {
@@ -269,11 +250,8 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
   })
 })
 
-describe('the consent box copy', () => {
-  it.each(['en', 'zh', 'th'] as const)('%s has every line, and the failure names its code', (locale) => {
-    setMainLocale(locale)
-    for (const key of ['consent.message', 'consent.detail', 'consent.allow', 'consent.deny'] as const) expect(mt(key)).not.toBe('')
-    expect(mt('consent.failed', { code: 'not_started' })).toContain('not_started')
+describe('public install failure details', () => {
+  it('limits output and redacts common secrets', () => {
     const reason = publicInstallReason(`${'x'.repeat(250)}\nsecond line`)
     expect(reason).toHaveLength(200)
     expect(reason).not.toContain('second')
@@ -281,19 +259,5 @@ describe('the consent box copy', () => {
     expect(secret).not.toContain('supersecret')
     expect(secret).not.toContain('abcdefghijklmnop')
     expect(secret).toContain('OMLX_API_KEY=[redacted]')
-    expect(mt('consent.failed', { code: `exit_1: ${publicInstallReason('Bootstrap failed: 5: Input/output error')}` })).toContain('Bootstrap failed: 5: Input/output error')
-    // What the box says matches what there is (QA on B4b), and a no is not asked again.
-    // M5 B4c2: the way back is the Settings switch, named as Settings names it.
-    expect(mt('consent.detail')).toContain(residentServiceMessages[locale].label)
-    // …at the page and tab names the app shows (PR-Daemon #1784 N3).
-    // Whole words: Thai 「การตั้งค่า」 holds 「ตั้งค่า」 as well.
-    const path = `${appMessages[locale]['nav.settings']} → ${settingsMessages[locale]['tabs.general']} → `
-    expect(mt('consent.detail')).toMatch(new RegExp(`(^|[\\s「])${path.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`))
-    expect(mt('consent.detail')).not.toContain('agent24 service')
-    expect(mt('consent.detail')).toContain(mt('consent.deny'))
-  })
-  it('the three languages differ', () => {
-    const lines = (['en', 'zh', 'th'] as const).map((l) => { setMainLocale(l); return mt('consent.message') })
-    expect(new Set(lines).size).toBe(3)
   })
 })

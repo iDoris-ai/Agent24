@@ -74,8 +74,11 @@ enum Command {
         #[arg(long)]
         confirm_headroom: bool,
     },
-    /// List models known to the daemon
-    Models,
+    /// List or inspect models known to the daemon
+    Models {
+        #[command(subcommand)]
+        action: Option<ModelsAction>,
+    },
     /// Lifecycle state of every component: iDoris, Hyphae, attached modules, Documents,
     /// Knowledge, Open Design (ADR-038 D5)
     Components {
@@ -221,6 +224,20 @@ enum Command {
     Dev {
         #[command(subcommand)]
         action: DevAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ModelsAction {
+    /// Ask iDoris which local chat model fits this machine
+    Recommend {
+        #[arg(long)]
+        json: bool,
+    },
+    /// List locally installed models and their kinds
+    Local {
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1679,6 +1696,39 @@ async fn cmd_models() -> Result<(), String> {
                         ""
                     },
                 );
+            }
+            Ok(())
+        }
+        Ok(res) => Err(format!("daemon returned {}", res.status())),
+        Err(e) => Err(e.to_string()),
+    };
+    finish(ep).await;
+    out
+}
+
+async fn cmd_model_read(json: bool, chat_role: bool) -> Result<(), String> {
+    let ep = connect().await?;
+    let request = if chat_role {
+        client()
+            .get(format!("{}/api/v1/models/recommendation", ep.base))
+            .query(&[("role", "chat")])
+    } else {
+        client().get(format!("{}/api/v1/models/local", ep.base))
+    };
+    let result = bearer(&ep, request)
+        .timeout(Duration::from_secs(12))
+        .send()
+        .await;
+    let out = match result {
+        Ok(res) if res.status().is_success() => {
+            let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&body).map_err(|e| e.to_string())?
+                );
+            } else {
+                println!("{}", body);
             }
             Ok(())
         }
@@ -3726,10 +3776,16 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             }
             println!("It now starts at login and restarts if it crashes.");
             println!("A clean `agent24 daemon stop` is respected (not resurrected).");
+            if let Err(e) = service::write_resident_consent("allow") {
+                eprintln!("warning: could not update resident consent: {e}");
+            }
             Ok(())
         }
         ServiceAction::Uninstall => {
             service::uninstall()?;
+            if let Err(e) = service::write_resident_consent("declined") {
+                eprintln!("warning: could not update resident consent: {e}");
+            }
             println!("24/7 disabled; the LaunchAgent and its daemon copy are stopped and removed.");
             Ok(())
         }
@@ -3762,7 +3818,13 @@ async fn main() -> std::process::ExitCode {
             session,
             confirm_headroom,
         } => cmd_chat(chat_request(message, model, session, confirm_headroom)).await,
-        Command::Models => cmd_models().await,
+        Command::Models { action: None } => cmd_models().await,
+        Command::Models {
+            action: Some(ModelsAction::Recommend { json }),
+        } => cmd_model_read(json, true).await,
+        Command::Models {
+            action: Some(ModelsAction::Local { json }),
+        } => cmd_model_read(json, false).await,
         Command::Idoris { action } => idoris::run(action).await,
         Command::Daemon { action } => cmd_daemon(action).await,
         Command::Service { action } => cmd_service(action),

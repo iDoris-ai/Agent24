@@ -34,3 +34,6 @@ listmonk/
 
 # docs/release/ 是发布验收文档，不是构建产物（apps/desktop/release 才是）
 !docs/release/
+apps/desktop/.idoris-component/
+apps/desktop/.idoris-component.tmp.*/
+apps/desktop/.idoris-component-cache/

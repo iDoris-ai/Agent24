@@ -487,11 +487,9 @@ export class CrashLoopDetector {
   }
 }
 
-// ── M5 B4b: first-launch consent and `agent24 service install` ──────────────
-// David 11-10 (a): asked once, installed only on yes. The answer is kept in
-// `<data_dir>/desktop/resident-consent.json` (asked / answer / time, nothing
-// else: N4). A yes whose install fails is not kept, so the next launch asks
-// again (PM r1 ②).
+// ── Resident service auto-install and `agent24 service install` ────────────
+// The answer is kept in `<data_dir>/desktop/resident-consent.json`; declined
+// disables automatic installation, while a missing service is repaired.
 
 export const CONSENT_VERSION = 1
 export const INSTALL_START_WAIT_MS = 30_000
@@ -539,10 +537,10 @@ export function writeConsent(file: string, answer: ConsentAnswer, now: Date): vo
   }
 }
 
-/** Only a packaged macOS app that ships its own daemon (`upgradesFromBundle`),
- * with no LaunchAgent yet and no kept answer. */
-export function shouldAskConsent(o: { platform: NodeJS.Platform; fromBundle: boolean; installed: boolean; consent: ConsentRecord | null }): boolean {
-  return o.platform === 'darwin' && o.fromBundle && !o.installed && o.consent === null
+/** Only a packaged macOS app that ships its own daemon installs automatically;
+ * an explicit decline remains respected. */
+export function shouldAutoInstall(o: { platform: NodeJS.Platform; fromBundle: boolean; installed: boolean; consent: ConsentRecord | null }): boolean {
+  return o.platform === 'darwin' && o.fromBundle && !o.installed && o.consent?.answer !== 'declined'
 }
 
 export type InstallOutcome = { ok: true } | { ok: false; stage: 'install' | 'start'; code: string }
@@ -614,22 +612,17 @@ export function installService(deps: InstallDeps): Promise<InstallOutcome> {
   })
 }
 
-export type ConsentOutcome = 'declined' | 'installed' | { failed: string }
+export type ConsentOutcome = 'installed' | { failed: string }
 
-/** Ask, then: no → kept as declined; yes → install, kept as allow only when it
- * worked. */
-export async function runConsent(deps: {
-  ask: () => Promise<ConsentAnswer>
+/** Install automatically and keep allow only after a successful install. */
+export async function autoInstallService(deps: {
   install: () => Promise<InstallOutcome>
-  record: (answer: ConsentAnswer) => void
+  record: () => void
 }): Promise<ConsentOutcome> {
-  let answer: ConsentAnswer
-  try { answer = await deps.ask() } catch { return { failed: 'ask_failed' } }
-  if (answer === 'declined') { deps.record('declined'); return 'declined' }
   let outcome: InstallOutcome
   try { outcome = await deps.install() } catch { return { failed: 'install_failed' } }
   if (!outcome.ok) return { failed: outcome.code }
-  deps.record('allow')
+  deps.record()
   return 'installed'
 }
 
@@ -670,7 +663,7 @@ export function serviceInstallDeps(
       before = sys.record()?.pid ?? null
       await sys.run(o.cli, ['service', 'install'], env)
     },
-    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], env),
+    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], { ...env, AGENT24_SERVICE_KEEP_CONSENT: '1' }),
     started: () => until(() => {
       const state = sys.record()
       return state !== null && state.pid !== before && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)

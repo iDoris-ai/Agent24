@@ -1,16 +1,14 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, fireEvent, waitFor, act, within } from '@testing-library/react'
-import { App, pickChatModel, extractDaemonDefaultModel } from './App'
+import { App, extractDaemonDefaultModel } from './App'
 import { LOCALE_STORAGE_KEY, setLocale } from './i18n'
 import { SETTINGS_TAB_STORAGE_KEY } from './pages/Settings'
 import type { IdorisStatus } from './components/idoris/api'
 
 const mockBackendProxy = vi.fn()
 const mockGetAppVersion = vi.fn()
-const mockOmlxDetect = vi.fn()
 const mockOmlxStart = vi.fn()
-const mockOmlxModels = vi.fn()
 const mockBackendEndpoint = vi.fn()
 const mockRetryBackend = vi.fn()
 const mockSetNavPrefs = vi.fn()
@@ -19,7 +17,7 @@ beforeEach(() => {
   vi.clearAllMocks()
   mockGetAppVersion.mockResolvedValue('1.0.0')
   mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [], runs: [] } })
-  mockOmlxDetect.mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] })
+  mockOmlxStart.mockResolvedValue({ ok: true, url: '' })
   mockBackendEndpoint.mockResolvedValue({ port: 60128 })
   mockRetryBackend.mockResolvedValue(null)
   mockSetNavPrefs.mockResolvedValue(undefined)
@@ -28,9 +26,7 @@ beforeEach(() => {
     value: {
       backendProxy: mockBackendProxy,
       getAppVersion: mockGetAppVersion,
-      omlxDetect: mockOmlxDetect,
       omlxStart: mockOmlxStart,
-      omlxModels: mockOmlxModels,
       backendEndpoint: mockBackendEndpoint,
       retryBackend: mockRetryBackend,
       getNavPrefs: vi.fn().mockResolvedValue({ pinned: ['documents', 'design', 'create'], slotCount: 3, showOverview: true }),
@@ -159,55 +155,7 @@ describe('App', () => {
     })
   })
 
-  it('shows oMLX model label after detection', async () => {
-    await act(async () => { render(<App />) })
-    await waitFor(() => {
-      expect(screen.getByText(/Qwen3-8B-4bit/)).toBeInTheDocument()
-    })
-  })
-
-  // FU-89: a live model list whose first entry is an image-gen model must not
-  // become the chat page's default — pickChatModel should skip it. Mutation
-  // check: removing the filter (using `detected.models[0]` directly again)
-  // turns this red, since it would show the FLUX model instead.
-  it('skips a leading image-gen model and defaults to a chat model (FU-89)', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      ok: true,
-      models: ['FLUX.2-klein-4B-mflux-4bit', 'Qwen3-8B-4bit'],
-    })
-    await act(async () => { render(<App />) })
-    await waitFor(() => {
-      expect(screen.getByText(/Qwen3-8B-4bit/)).toBeInTheDocument()
-    })
-    expect(screen.queryByText(/FLUX/)).not.toBeInTheDocument()
-  })
-
-  it('shows a message instead of a model when only non-chat models are available (FU-89)', async () => {
-    mockOmlxDetect.mockResolvedValue({ ok: true, models: ['FLUX.2-klein-4B-mflux-4bit', 'bge-m3'] })
-    await act(async () => { render(<App />) })
-    await waitFor(() => {
-      expect(screen.getByText(/无可用对话模型/)).toBeInTheDocument()
-    })
-  })
-
-  // Follow-up: a real demo's topbar showed an OCR model because the desktop
-  // was guessing from its own (unfiltered-enough) oMLX list instead of
-  // asking the daemon for its real default. Verifies BOTH halves of the fix:
-  // the OCR/VL filter, and preferring the daemon's `default_model`.
-  it('skips a leading OCR model and defaults to a chat model (FU-89 follow-up)', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      ok: true,
-      models: ['GLM-OCR-bf16', 'Qwen3-8B-4bit'],
-    })
-    await act(async () => { render(<App />) })
-    await waitFor(() => {
-      expect(screen.getByText(/Qwen3-8B-4bit/)).toBeInTheDocument()
-    })
-    expect(screen.queryByText(/GLM-OCR/)).not.toBeInTheDocument()
-  })
-
-  it('prefers the daemon\'s real default_model over the oMLX-detected fallback', async () => {
-    mockOmlxDetect.mockResolvedValue({ ok: true, models: ['GLM-OCR-bf16'] }) // would otherwise show "无可用对话模型"
+  it('shows the daemon default_model in the top bar', async () => {
     mockBackendProxy.mockImplementation((req: { method: string; path: string }) => {
       if (req.path === '/api/v1/models') {
         return Promise.resolve({
@@ -220,18 +168,16 @@ describe('App', () => {
     })
     await act(async () => { render(<App />) })
     await waitFor(() => {
-      expect(screen.getByText(/Qwen3\.6-35B-A3B-MLX-8bit/)).toBeInTheDocument()
+      expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · Agent24 默认')).toBeInTheDocument()
     })
-    expect(screen.queryByText(/无可用对话模型/)).not.toBeInTheDocument()
   })
 
-  it('falls back to the oMLX-derived label when the daemon reports no default_model', async () => {
-    // The generic beforeEach mock's /api/v1/models response (same as /health)
-    // has no `default_model` key at all — this is exactly today's behavior.
+  it('shows 模型服务未就绪 when the daemon has no default_model', async () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
-      expect(screen.getByText(/Qwen3-8B-4bit · oMLX/)).toBeInTheDocument()
+      expect(screen.getByText('模型服务未就绪')).toBeInTheDocument()
     })
+    expect(screen.queryByText(/Qwen3/)).not.toBeInTheDocument()
   })
 
   it('Home module count reads GET /api/v1/os', async () => {
@@ -324,35 +270,11 @@ describe('App', () => {
     })
   })
 
-  it('starts oMLX when not detected', async () => {
-    mockOmlxDetect.mockResolvedValue(null)
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '' })
-
+  it('starts the local model process without probing first', async () => {
     await act(async () => { render(<App />) })
     await waitFor(() => {
-      expect(mockOmlxStart).toHaveBeenCalled()
+      expect(mockOmlxStart).toHaveBeenCalledWith()
     })
-  })
-
-  it('shows No AI runtime when oMLX not detected and start fails', async () => {
-    mockOmlxDetect.mockResolvedValue(null)
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '' })
-
-    await act(async () => { render(<App />) })
-    await waitFor(() => {
-      expect(screen.getByText('无 AI 运行时')).toBeInTheDocument()
-    })
-  })
-
-  it('oMLX running but needs a key: says so and does not start a second oMLX', async () => {
-    mockOmlxDetect.mockResolvedValue({ authRequired: true, url: 'http://127.0.0.1:8088' })
-
-    await act(async () => { render(<App />) })
-    await waitFor(() => {
-      expect(screen.getByText('oMLX 已运行，需要 API key（见设置）')).toBeInTheDocument()
-    })
-    expect(screen.queryByText('无 AI 运行时')).toBeNull()
-    expect(mockOmlxStart).not.toHaveBeenCalled()
   })
 
   // M1-T14: switching to another page and back used to UNMOUNT ChatPage
@@ -585,47 +507,11 @@ describe('App language', () => {
     expect(document.documentElement.lang).toBe('th')
   })
 
-  it('relabels the fallback model message when the language changes', async () => {
-    mockOmlxDetect.mockResolvedValue({ ok: true, models: ['bge-m3'] })
+  it('relabels the not-ready model message when the language changes', async () => {
     await act(async () => { render(<App />) })
-    await waitFor(() => expect(screen.getByText(/No chat model available/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText('Model service not ready')).toBeInTheDocument())
     await act(async () => { setLocale('zh') })
-    expect(screen.getByText(/无可用对话模型/)).toBeInTheDocument()
-  })
-})
-
-describe('pickChatModel (FU-89)', () => {
-  it('picks the first model that is not a known non-chat family', () => {
-    expect(pickChatModel(['FLUX.2-klein-4B-mflux-4bit', 'Qwen3-8B-4bit'])).toBe('Qwen3-8B-4bit')
-    expect(pickChatModel(['Qwen3-8B-4bit', 'FLUX.2-klein-4B-mflux-4bit'])).toBe('Qwen3-8B-4bit')
-  })
-
-  it('skips image, video, ASR/TTS, embedding and rerank families', () => {
-    const nonChat = [
-      'FLUX.1-schnell', 'stable-diffusion-xl', 'LTX-2.3', 'mlx-whisper-large-v3',
-      'CosyVoice2-0.5B', 'bge-m3', 'ModernBERT-reranker',
-    ]
-    for (const m of nonChat) expect(pickChatModel([m])).toBeUndefined()
-  })
-
-  it('returns undefined when nothing looks like a chat model', () => {
-    expect(pickChatModel(['FLUX.1-schnell', 'bge-m3'])).toBeUndefined()
-  })
-
-  it('returns undefined for an empty list', () => {
-    expect(pickChatModel([])).toBeUndefined()
-  })
-
-  // FU-89 follow-up: a real demo's topbar defaulted to an OCR model because
-  // the filter list didn't cover OCR/vision-language families.
-  it('skips OCR / vision-language models even when listed first', () => {
-    expect(pickChatModel(['GLM-OCR-bf16', 'Qwen3.6-35B-A3B-MLX-8bit'])).toBe('Qwen3.6-35B-A3B-MLX-8bit')
-    expect(pickChatModel(['PaddleOCR-VL-1.6-4bit', 'Qwen3-8B-4bit'])).toBe('Qwen3-8B-4bit')
-    expect(pickChatModel(['Mage-VL', 'Qwen3-8B-4bit'])).toBe('Qwen3-8B-4bit')
-  })
-
-  it('returns undefined when only OCR/VL models are available', () => {
-    expect(pickChatModel(['GLM-OCR-bf16', 'PaddleOCR-VL-1.6-4bit', 'Mage-VL'])).toBeUndefined()
+    expect(screen.getByText('模型服务未就绪')).toBeInTheDocument()
   })
 })
 

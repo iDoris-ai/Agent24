@@ -18,6 +18,58 @@ use std::path::{Path, PathBuf};
 /// launchd job label; matches the desktop bundle's appId.
 pub const LABEL: &str = "ai.auraai.agent24";
 
+/// Best-effort mirror of desktop service consent, shared with the packaged app.
+pub fn write_resident_consent(answer: &str) -> Result<(), String> {
+    if keeps_consent(
+        std::env::var("AGENT24_SERVICE_KEEP_CONSENT")
+            .ok()
+            .as_deref(),
+    ) {
+        return Ok(());
+    }
+    let data_dir = agent24_protocol::data_dir::data_dir().map_err(|e| e.to_string())?;
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    write_resident_consent_at(&data_dir.join("desktop/resident-consent.json"), answer, &at)
+}
+
+/// The desktop app's rollback of a failed install sets this, so the next launch retries.
+fn keeps_consent(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn write_resident_consent_at(file: &Path, answer: &str, at: &str) -> Result<(), String> {
+    use std::io::Write;
+    let dir = file.parent().ok_or("consent path has no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let temp = dir.join(format!(".resident-consent.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let result = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&temp)?;
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"version": 1, "answer": answer, "at": at}))?;
+        f.write_all(&bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&temp, file)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(temp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
 /// `~/Library/LaunchAgents/ai.auraai.agent24.plist`
 pub fn plist_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| plist_path_in(Path::new(&h)))
@@ -204,19 +256,18 @@ pub fn render_plist(
 /// Config the daemon reads from the environment. launchd gives a LaunchAgent
 /// NONE of the login shell's environment, so without capturing these the 24/7
 /// daemon silently behaves differently from a manually started one.
-pub const PASSTHROUGH_VARS: [&str; 24] = [
+pub const PASSTHROUGH_VARS: [&str; 22] = [
     // MAINT-03: the data root (`daemon.json`, `agent24.db`, `logs/`, the tool
     // workspace). Without it a LaunchAgent-started daemon keeps using
     // `~/.agent24` while the CLI that ran `service install` and the desktop app
     // look in the override directory, so neither ever finds the daemon. Caught
     // by `passthrough_list_matches_what_the_daemon_actually_reads`.
     "AGENT24_DATA_DIR",
+    // The packaged desktop gives the resident daemon its app-carried core archive.
+    "AGENT24_IDORIS_BUNDLE",
     // Keep exclusive gateway selection after service installation. The data key
     // is never written to a plist; v0.3.1 supports manual startup until separate
     // credential delivery is implemented. Missing key fails closed.
-    "IDORIS_URL",
-    "OMLX_URL",
-    "OMLX_API_KEY",
     "DEFAULT_MODEL",
     // VR-1: `EmbeddingClient::from_env` reads this. Unset means bge-m3-mlx-fp16.
     // A LaunchAgent that should pin another local embedding model only sees it
@@ -561,6 +612,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn resident_consent_is_atomic_owner_only_and_uses_desktop_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("desktop/resident-consent.json");
+        write_resident_consent_at(&file, "declined", "2026-11-19T13:16:06.609Z").unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"version": 1, "answer": "declined", "at": "2026-11-19T13:16:06.609Z"})
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn keep_consent_only_for_the_rollback_marker() {
+        assert!(keeps_consent(Some("1")));
+        assert!(!keeps_consent(None));
+        assert!(!keeps_consent(Some("0")));
+    }
+
+    #[test]
     fn plist_has_the_supervision_keys_that_make_it_24_7() {
         let p = render_plist(
             Path::new("/opt/agent24d"),
@@ -858,18 +941,25 @@ mod tests {
     }
 
     #[test]
-    fn captured_env_lands_in_the_plist_so_shell_exec_still_finds_tools() {
+    fn captured_env_lands_in_the_plist_but_model_upstream_secrets_do_not() {
         // launchd's default PATH is only /usr/bin:/bin:/usr/sbin:/sbin, so
         // without this a shell_exec for `node` works by hand and fails at 3am.
         let env = vec![
             ("PATH".to_owned(), "/opt/homebrew/bin:/usr/bin".to_owned()),
-            ("OMLX_URL".to_owned(), "http://127.0.0.1:8088".to_owned()),
+            (
+                "AGENT24_IDORIS_BUNDLE".to_owned(),
+                "/App/Resources/idoris-component".to_owned(),
+            ),
         ];
         let p = render_plist(Path::new("/a"), Path::new("/o"), Path::new("/e"), &env);
         assert!(p.contains("<key>EnvironmentVariables</key>"));
         assert!(p.contains("<key>PATH</key>"));
         assert!(p.contains("<string>/opt/homebrew/bin:/usr/bin</string>"));
-        assert!(p.contains("<key>OMLX_URL</key>"));
+        assert!(p.contains("<key>AGENT24_IDORIS_BUNDLE</key>"));
+        for upstream in ["IDORIS_URL", "OMLX_URL", "OMLX_API_KEY"] {
+            assert!(!PASSTHROUGH_VARS.contains(&upstream));
+            assert!(!capture_env().iter().any(|(key, _)| key == upstream));
+        }
     }
 
     #[test]
@@ -1049,6 +1139,9 @@ mod tests {
         found.sort();
         found.dedup();
         for v in &found {
+            if ["IDORIS_URL", "OMLX_URL", "OMLX_API_KEY"].contains(&v.as_str()) {
+                continue; // IC-1 B9: upstream endpoints and credentials never enter LaunchAgent plists.
+            }
             assert!(
                 PASSTHROUGH_VARS.contains(&v.as_str()),
                 "{v} is read by the daemon but is not in PASSTHROUGH_VARS; a \

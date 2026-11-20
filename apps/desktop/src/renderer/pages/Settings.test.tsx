@@ -9,12 +9,6 @@ import { CapabilitiesProvider, useCapabilityRoute } from '../capabilities/provid
 import { CapabilitiesContext, NavPrefsContext, type CapabilityDef, type NavPrefs } from '../capabilities/types'
 import { CAPABILITIES, withDynamicCapabilities } from '../capabilities/registry'
 
-const mockOmlxDetect = vi.fn()
-const mockOmlxStart = vi.fn()
-const mockOmlxModels = vi.fn()
-const mockOmlxStop = vi.fn()
-const mockOmlxWarmup = vi.fn()
-
 function installAgent(extra: Record<string, unknown> = {}) {
   Object.defineProperty(window, 'agent24', {
     value: {
@@ -22,11 +16,6 @@ function installAgent(extra: Record<string, unknown> = {}) {
     { path: '/usr/local/bin/agent24', link: 'other', state: 'outdated', version: '0.3.0' },
     { path: '/home/test/.agent24/bin/agent24', link: 'current', state: 'current', version: '0.6.0' },
   ] }),
-      omlxDetect: mockOmlxDetect,
-      omlxStart: mockOmlxStart,
-      omlxModels: mockOmlxModels,
-      omlxStop: mockOmlxStop,
-      omlxWarmup: mockOmlxWarmup,
       ...extra,
     },
     writable: true,
@@ -36,13 +25,6 @@ function installAgent(extra: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   vi.clearAllMocks()
-  mockOmlxDetect.mockReset()
-  mockOmlxStart.mockReset()
-  mockOmlxModels.mockReset()
-  mockOmlxStop.mockReset()
-  mockOmlxWarmup.mockReset()
-  mockOmlxDetect.mockResolvedValue(null)
-  mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'not found' })
   window.localStorage.removeItem(SETTINGS_TAB_STORAGE_KEY)
   installAgent()
 })
@@ -138,7 +120,6 @@ describe('SettingsPage', () => {
   })
 
   it('exposes the bundled CLI installer when an older CLI is on PATH', async () => {
-    mockOmlxDetect.mockResolvedValue({ url: 'http://localhost:8088', apiKey: '', models: [] })
     await renderPage()
     await openTab('Command line tool')
     expect(await screen.findByText('Command line tool is outdated (0.3.0) — Update')).toBeInTheDocument()
@@ -150,173 +131,31 @@ describe('SettingsPage', () => {
     expect(screen.getByText('Settings')).toBeInTheDocument()
   })
 
-  it('shows Connected when oMLX detected', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      url: 'http://127.0.0.1:8088',
-      apiKey: 'test',
-      models: ['Qwen3-8B-4bit', 'Qwen3-30B'],
+  it('lists chat models from the daemon and has no direct model-service controls', async () => {
+    installAgent({
+      backendProxy: vi.fn(async (req: { method: string }) => {
+        if (req.method === 'GET') {
+          return {
+            ok: true,
+            status: 200,
+            data: {
+              models: [
+                { id: 'FLUX.1-schnell' },
+                { id: 'Qwen3-8B-4bit' },
+              ],
+              default_model: 'Qwen3-8B-4bit',
+            },
+          }
+        }
+        return { ok: true, status: 200, data: {} }
+      }),
     })
     await renderPage()
     await openTab('Models')
-    await waitFor(() => {
-      expect(screen.getByText('Connected')).toBeInTheDocument()
-    })
-    expect(screen.getByText(/2 model/)).toBeInTheDocument()
-  })
-
-  it('shows Disconnected when oMLX not reachable', async () => {
-    mockOmlxDetect.mockResolvedValue(null)
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'Failed' })
-    await renderPage()
-    await openTab('Models')
-    await waitFor(() => {
-      expect(screen.getByText('Disconnected')).toBeInTheDocument()
-    })
-  })
-
-  it('auto-detect button triggers re-detection', async () => {
-    mockOmlxDetect.mockResolvedValueOnce(null).mockResolvedValueOnce({
-      url: 'http://127.0.0.1:8088',
-      apiKey: 'test',
-      models: ['Qwen3-8B'],
-    })
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: '' })
-
-    await renderPage()
-    await openTab('Models')
-    await waitFor(() => screen.getByText('Disconnected'))
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Auto.?Detect/i }))
-    })
-    await waitFor(() => {
-      expect(screen.getByText('Connected')).toBeInTheDocument()
-    })
-  })
-
-  it('stop button calls omlxStop', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      url: 'http://127.0.0.1:8088',
-      apiKey: 'test',
-      models: ['Qwen3-8B'],
-    })
-    mockOmlxStop.mockResolvedValue({ ok: true, stopped: true })
-
-    await renderPage()
-    await openTab('Models')
-    await waitFor(() => screen.getByText('Connected'))
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Stop/i }))
-    })
-    expect(mockOmlxStop).toHaveBeenCalled()
-    await waitFor(() => {
-      expect(screen.getByText('Disconnected')).toBeInTheDocument()
-    })
-  })
-
-  it('stays connected when stop reports the oMLX was not started here', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      url: 'http://127.0.0.1:8088',
-      apiKey: 'test',
-      models: ['Qwen3-8B'],
-    })
-    mockOmlxStop.mockResolvedValue({ ok: true, stopped: false })
-
-    await renderPage()
-    await openTab('Models')
-    await waitFor(() => screen.getByText('Connected'))
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Stop/i }))
-    })
-    expect(mockOmlxStop).toHaveBeenCalled()
-    expect(screen.getByText('Connected')).toBeInTheDocument()
-    expect(screen.getByText(/1 model/)).toBeInTheDocument()
-    expect(screen.getByText('This oMLX was not started by this app. Stop it in the terminal that started it.')).toBeInTheDocument()
-  })
-
-  it('test connection shows result', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      url: 'http://127.0.0.1:8088',
-      apiKey: 'test',
-      models: ['Qwen3-8B'],
-    })
-    mockOmlxModels.mockResolvedValue({ ok: true, models: ['Qwen3-8B'] })
-
-    await renderPage()
-    await openTab('Models')
-    await waitFor(() => screen.getByText('Connected'))
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: /Test/i }))
-    })
-    await waitFor(() => {
-      expect(screen.getByText(/Connected — 1 model/)).toBeInTheDocument()
-    })
-  })
-
-  it('start oMLX button calls omlxStart', async () => {
-    // First call in initialize() fails, so page lands in Disconnected
-    mockOmlxDetect.mockResolvedValue(null)
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'Failed' })
-
-    await renderPage()
-    await openTab('Models')
-    await waitFor(() => {
-      expect(screen.getByText('Disconnected')).toBeInTheDocument()
-    })
-
-    // Now clicking "Start oMLX" calls startServer → omlxStart again
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'Still failing' })
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Start oMLX' }))
-    })
-    // omlxStart called twice total: once from initialize(), once from startServer()
-    expect(mockOmlxStart).toHaveBeenCalledTimes(2)
-  })
-
-  it('setCategory updates model category to resident and warms up', async () => {
-    mockOmlxDetect.mockResolvedValue({
-      url: 'http://127.0.0.1:8088',
-      apiKey: 'test',
-      models: ['Qwen3-8B'],
-    })
-    mockOmlxWarmup.mockResolvedValue(undefined)
-
-    await renderPage()
-    await openTab('Models')
-    // Wait for models to appear (which means connected + models loaded)
-    await waitFor(() => screen.getByText('Qwen3-8B'))
-
-    // Find all Resident buttons (one per model + one in the description text)
-    const residentBtns = screen.getAllByRole('button').filter(b => b.textContent === 'Resident')
-    expect(residentBtns.length).toBeGreaterThan(0)
-    await act(async () => {
-      fireEvent.click(residentBtns[0])
-    })
-    expect(mockOmlxWarmup).toHaveBeenCalledWith('http://127.0.0.1:8088', 'test', 'Qwen3-8B')
-  })
-
-  it('toggle API key visibility', async () => {
-    await renderPage()
-    await openTab('Models')
-    const eyeBtn = screen.getByTitle(/Show|Hide/)
-    fireEvent.click(eyeBtn)
-    expect(screen.getByTitle('Hide')).toBeInTheDocument()
-  })
-
-  it('keeps a typed API key when leaving and returning to Models', async () => {
-    await renderPage()
-    await openTab('Models')
-    fireEvent.change(await screen.findByLabelText('API Key'), { target: { value: 'secret-key' } })
-    await openTab('General')
-    // Label queries still see a mounted field. `hidden` is what takes it out of the page.
-    expect(screen.getByLabelText('API Key').closest('[hidden]')).not.toBeNull()
-    await openTab('Models')
-    expect(screen.getByLabelText('API Key').closest('[hidden]')).toBeNull()
-    expect(screen.getByLabelText('API Key')).toHaveValue('secret-key')
-    expect(mockOmlxDetect).toHaveBeenCalledTimes(1)
+    expect(await screen.findByRole('button', { name: 'Qwen3-8B-4bit' })).toHaveAttribute('aria-pressed', 'true')
+    expect(screen.queryByText('FLUX.1-schnell')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: /Auto-detect|Start oMLX|Test/ })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument()
   })
 })
 
@@ -327,55 +166,12 @@ describe('SettingsPage English default', () => {
     expect(screen.getByText('AI Model Service')).toBeInTheDocument()
   })
 
-  it('relabels a detection error when the language changes (not frozen in the old language)', async () => {
+  it('relabels the offline model message when the language changes', async () => {
     await renderPage()
     await openTab('Models')
-    await waitFor(() => expect(screen.getByText(/Could not start or connect/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText(/The daemon is offline/)).toBeInTheDocument())
     await act(async () => { setLocale('zh') })
-    expect(screen.getByText(/无法启动或连接 AI 模型服务/)).toBeInTheDocument()
-  })
-})
-
-describe('SettingsPage: oMLX needs an API key (401) vs really down', () => {
-  beforeEach(() => { setLocale('en') })
-
-  it('detect says authRequired: explains the key is needed, points at the key field, does not auto-start', async () => {
-    mockOmlxDetect.mockResolvedValue({ authRequired: true, url: 'http://127.0.0.1:8088' })
-    await renderPage()
-    await openTab('Models')
-    expect(await screen.findByText(/oMLX is running but requires an API key/)).toBeInTheDocument()
-    expect(mockOmlxStart).not.toHaveBeenCalled()
-    const keyField = screen.getByLabelText('API Key')
-    expect(keyField).toHaveAttribute('aria-invalid', 'true')
-    expect(keyField).toHaveFocus()
-    // not the generic "could not start or connect" message
-    expect(screen.queryByText(/Could not start or connect/)).toBeNull()
-  })
-
-  it('really down (detect null, start fails): still the generic connect error, key field not flagged', async () => {
-    mockOmlxDetect.mockResolvedValue(null)
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: 'nope' })
-    await renderPage()
-    await openTab('Models')
-    expect(await screen.findByText(/Could not start or connect/)).toBeInTheDocument()
-    expect(screen.queryByText(/requires an API key/)).toBeNull()
-    expect(screen.getByLabelText('API Key')).toHaveAttribute('aria-invalid', 'false')
-  })
-
-  it('Test button: 401 -> key-needed message; other failure -> plain failure text', async () => {
-    mockOmlxDetect.mockResolvedValue(null)
-    mockOmlxStart.mockResolvedValue({ ok: false, url: '', error: '' })
-    await renderPage()
-    await openTab('Models')
-    await screen.findByText(/Could not start or connect/)
-
-    mockOmlxModels.mockResolvedValueOnce({ ok: false, models: [], authRequired: true, error: 'authentication required' })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Test$/ })) })
-    expect(await screen.findByText(/requires an API key/)).toBeInTheDocument()
-
-    mockOmlxModels.mockResolvedValueOnce({ ok: false, models: [], error: 'no response or no models' })
-    await act(async () => { fireEvent.click(screen.getByRole('button', { name: /^Test$/ })) })
-    expect(await screen.findByText(/no response or no models/)).toBeInTheDocument()
+    expect(screen.getByText(/守护进程不在线/)).toBeInTheDocument()
   })
 })
 
@@ -706,17 +502,12 @@ describe('Settings voice link and previous blocks', () => {
 
     await openTab('Models')
     expect(screen.getByRole('heading', { name: 'AI Model Service' })).toBeInTheDocument()
-    expect(screen.getByText('Service URL')).toBeInTheDocument()
-    expect(screen.getByText('OpenAI-compatible API endpoint')).toBeInTheDocument()
-    expect(screen.getByLabelText('API Key')).toBeInTheDocument()
-    expect(screen.getByText('Leave empty if no auth required')).toBeInTheDocument()
-    await screen.findByText('Disconnected')
-    expect(screen.getByText('Start Port')).toBeInTheDocument()
-    expect(screen.getByText(/Port when clicking/)).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Auto-detect' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Start oMLX' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: /^Test$/ })).toBeInTheDocument()
-    expect(screen.getByText('Connect to list and configure models')).toBeInTheDocument()
+    expect(screen.getByText('Local model service (managed by iDoris)')).toBeInTheDocument()
+    expect(screen.getByText(/iDoris status is unavailable/)).toBeInTheDocument()
+    expect(screen.getByText(/The daemon is offline/)).toBeInTheDocument()
+    expect(screen.getByText('The daemon has not reported a chat model.')).toBeInTheDocument()
+    expect(screen.queryByLabelText('API Key')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Start oMLX' })).not.toBeInTheDocument()
 
     await openTab('Command line tool')
     expect(screen.getByRole('heading', { name: 'Command line tool' })).toBeInTheDocument()

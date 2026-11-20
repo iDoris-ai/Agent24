@@ -119,6 +119,10 @@ for f in domain-os.yml bin/sin90; do
 done
 [[ ! -e "$DESKTOP_DIR/.sin90-module/files.json" ]] || die "sin90 模块不应带 files.json（重签后哈希会对不上）"
 
+step "2a3/6 iDoris 核心组件归档（Resources/idoris-component，由 daemon 校验并安装）"
+bash "$DESKTOP_DIR/scripts/stage-idoris-component.sh" "$ARCH"
+[[ "$(find "$DESKTOP_DIR/.idoris-component" -maxdepth 1 -name 'idoris-*.tar.gz' -type f | wc -l | tr -d ' ')" == 1 ]] || die "iDoris staged archive missing"
+
 step "2b/6 Open Design 按需组件（darwin-${ARCH}：构建 → 签名原生模块 → 公证 → 打 tarball + 清单）"
 [[ "${ARCH}" == "arm64" ]] || die "Open Design 组件目前只支持 arm64（AGENT24_ARCH=${ARCH}）"
 # 先清掉陈旧产物：旧清单 / 旧 tarball 绝不能混进这次的包

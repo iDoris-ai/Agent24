@@ -49,9 +49,7 @@ beforeEach(() => {
     value: {
       backendProxy: vi.fn().mockResolvedValue({ ok: true, status: 200, data: { status: 'ok', ts: Date.now(), schedules: [], runs: [] } }),
       getAppVersion: vi.fn().mockResolvedValue('1.0.0'),
-      omlxDetect: vi.fn().mockResolvedValue({ ok: true, models: ['Qwen3-8B-4bit'] }),
-      omlxStart: vi.fn(),
-      omlxModels: vi.fn(),
+      omlxStart: vi.fn().mockResolvedValue({ ok: true, url: '' }),
       backendEndpoint: vi.fn().mockResolvedValue({ port: 60128 }),
       getNavPrefs: vi.fn().mockResolvedValue({ pinned: [], slotCount: 3, showOverview: false }),
       setNavPrefs: vi.fn().mockResolvedValue(undefined),
