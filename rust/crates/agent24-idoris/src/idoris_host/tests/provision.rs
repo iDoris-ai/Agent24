@@ -306,12 +306,15 @@ async fn install_reverifies_and_is_idempotent_and_cancellable() {
             .operation_id,
         op.operation_id
     );
-    assert!(matches!(
+    let core_install =
         x.f.host
             .install(InstallRequest { consent: false }, Some("no-consent"))
-            .await,
-        Err(Code::ConsentRequired)
-    ));
+            .await
+            .unwrap();
+    assert_eq!(
+        x.f.complete(&core_install).await.result,
+        Some(Outcome::Succeeded)
+    );
     let x = ConnectedFixture::new().await;
     x.provision.gate.store(true, Ordering::SeqCst);
     let op =
@@ -510,6 +513,54 @@ async fn connect_accepts_verification_model_id_at_the_limit() {
 }
 
 #[tokio::test]
+async fn core_bootstrap_installs_connects_and_starts_without_consent() {
+    let x = ConnectedFixture::new().await;
+    x.f.host
+        .bootstrap_core_with_candidates(Candidates {
+            candidates: vec![Candidate {
+                endpoint: x.endpoint.clone(),
+                identity: "omlx",
+                authentication: "ready",
+                models: vec!["real-model".into()],
+            }],
+            key_from_local_settings: true,
+        })
+        .await
+        .unwrap();
+    let status = x.f.host.status().await;
+    assert_eq!(status.state, State::Running);
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    assert!(!status.roles.is_empty());
+}
+#[tokio::test]
+async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
+    let x = ConnectedFixture::new().await;
+    let candidates = || Candidates {
+        candidates: vec![Candidate {
+            endpoint: x.endpoint.clone(),
+            identity: "omlx",
+            authentication: "ready",
+            models: vec!["real-model".into()],
+        }],
+        key_from_local_settings: true,
+    };
+    x.f.host
+        .bootstrap_core_with_candidates(candidates())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+        wait_operation(&x.f.host, &stop.operation_id).await.unwrap();
+        assert_eq!(x.f.host.status().await.state, State::Stopped);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        x.f.host
+            .bootstrap_core_with_candidates(candidates())
+            .await
+            .unwrap();
+        assert_eq!(x.f.host.status().await.state, State::Running);
+    }
+}
+#[tokio::test]
 async fn candidates_expose_identity_models_and_source_but_never_credentials() {
     let x = ConnectedFixture::new().await;
     let value =
@@ -607,30 +658,34 @@ async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
     x.assert_safe();
 }
 #[tokio::test]
-async fn connect_requires_consent_and_matching_selected_models() {
+async fn core_connect_needs_no_consent_and_still_checks_selected_models() {
     let x = ConnectedFixture::new().await;
     x.installed().await;
-    for consent in [
-        None,
-        Some(ConnectConsent {
-            share_omlx_key: false,
-            daily_model: "real-model".into(),
-            deep_model: None,
-        }),
-        Some(ConnectConsent {
-            share_omlx_key: true,
-            daily_model: "other-model".into(),
-            deep_model: None,
-        }),
-    ] {
-        let mut request = x.request();
-        request.consent = consent;
-        assert!(matches!(
-            x.f.host.connect(request, Some("no-consent")).await,
-            Err(Code::ConsentRequired)
-        ));
-    }
-    assert!(x.keys().is_empty());
+    let mut request = x.request();
+    request.consent = None;
+    let operation =
+        x.f.host
+            .connect(request, Some("core-connect"))
+            .await
+            .unwrap();
+    assert_eq!(
+        x.f.complete(&operation).await.result,
+        Some(Outcome::Succeeded)
+    );
+
+    let mut invalid = x.request();
+    invalid.consent = None;
+    invalid.replace = true;
+    invalid.daily_model = "not-a-real-model".into();
+    let operation =
+        x.f.host
+            .connect(invalid, Some("core-connect-invalid-model"))
+            .await
+            .unwrap();
+    assert_eq!(
+        x.f.complete(&operation).await.error_code,
+        Some(Code::ModelNotFound)
+    );
 }
 #[tokio::test]
 async fn each_connect_failure_preserves_receipt_and_revokes_new_keys() {
