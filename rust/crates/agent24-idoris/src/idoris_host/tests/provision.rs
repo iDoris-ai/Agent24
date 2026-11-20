@@ -140,7 +140,7 @@ impl Provisioner for Provision {
         }
         // A managed root other than the fixture's own receives a fresh copy, like a real install.
         if Some(root) != self.record.release_dir.parent() {
-            let release = root.join("v0.4.0");
+            let release = root.join("v0.5.0");
             // Like the real installer: an existing version directory is verified, not rewritten.
             if !release.exists() {
                 copy_release(&self.record.release_dir, &release);
@@ -1167,7 +1167,7 @@ async fn submit_rejects_install_and_connect_actions() {
 }
 
 #[tokio::test]
-#[ignore = "real signed v0.4.0/download; optional oMLX on 8088 and IDORIS_DAILY_MODEL"]
+#[ignore = "real signed v0.5.0/download; optional oMLX on 8088 and IDORIS_DAILY_MODEL"]
 async fn real_v040_install_reverify_and_connect_when_omlx_available() {
     let source = std::env::var_os("IDORIS_REAL_V040_DIR")
         .map(PathBuf::from)
@@ -1176,19 +1176,19 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
         });
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("idoris");
-    for part in ["0.4.0/config/components", "data/state"] {
+    for part in ["0.5.0/config/components", "data/state"] {
         fs::create_dir_all(root.join(part)).unwrap();
     }
     for path in [
         root.clone(),
-        root.join("0.4.0"),
-        root.join("0.4.0/config"),
-        root.join("0.4.0/config/components"),
+        root.join("0.5.0"),
+        root.join("0.5.0/config"),
+        root.join("0.5.0/config/components"),
     ] {
         mode(&path, 0o700);
     }
     for name in &IdorisLock::embedded().assets["aarch64-apple-darwin"].files {
-        let path = root.join("0.4.0").join(name);
+        let path = root.join("0.5.0").join(name);
         fs::copy(source.join(name), &path).unwrap();
         mode(&path, if name == "idoris" { 0o500 } else { 0o400 });
     }
@@ -1238,7 +1238,7 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
         .unwrap();
     assert_eq!(completed(&host, &op).await.result, Some(Outcome::Succeeded));
     eprintln!(
-        "PASS: pinned archive downloaded, real signed v0.4.0 tree reverified and install replay succeeded"
+        "PASS: pinned archive downloaded, real signed v0.5.0 tree reverified and install replay succeeded"
     );
     if tokio::net::TcpStream::connect("127.0.0.1:8088")
         .await
@@ -1512,7 +1512,7 @@ async fn inputs_reads_the_injected_upstream_key() {
         )
         .unwrap();
     let mut record = Installation {
-        version: "0.4.0".into(),
+        version: "0.5.0".into(),
         release_dir: dir.path().join("release"),
         archive_path: dir.path().join("archive.tar.gz"),
         components_dir: None,
@@ -1637,7 +1637,7 @@ async fn legacy_install_is_redownloaded_into_the_managed_root_and_marked_deletab
         std::slice::from_ref(&managed)
     );
     let record = x.f.host.inner.lock().await.installation.clone().unwrap();
-    assert_eq!(record.release_dir, managed.join("v0.4.0"));
+    assert_eq!(record.release_dir, managed.join("v0.5.0"));
     assert_eq!(record.install_root.as_ref(), Some(&managed));
     let saved: Installation =
         serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
@@ -1667,7 +1667,7 @@ async fn failed_migration_keeps_the_working_legacy_install_and_reports_it() {
         "receipt must still name the legacy copy"
     );
     assert!(!x.f.host.root.join("legacy-install.deletable.json").exists());
-    assert!(!managed.join("v0.4.0").exists());
+    assert!(!managed.join("v0.5.0").exists());
     let status = x.f.host.status().await;
     assert!(status.last_error.is_none());
     assert!(status.migration_pending);
@@ -1768,7 +1768,7 @@ fn deletable_allow_list_accepts_only_release_dirs_and_verified_archives() {
         old.join("cache/.verified"),
         old.join("cache/.hidden.verified"),
         old.join("cache/../data"),
-        old.join("0.4.0/../data"),
+        old.join("0.5.0/../data"),
         outside.path().join("0.4.0"),
         PathBuf::from("/"),
         PathBuf::new(),
@@ -1880,7 +1880,7 @@ async fn a_running_legacy_instance_is_not_deletable_until_it_has_left_the_old_re
     // Migrate while the old instance runs: the receipt moves, the process does not.
     run_install(&x, "mig-running").await;
     let record = x.f.host.inner.lock().await.installation.clone().unwrap();
-    assert_eq!(record.release_dir, managed.join("v0.4.0"));
+    assert_eq!(record.release_dir, managed.join("v0.5.0"));
     assert!(!marker.exists(), "an in-use release must not be listed");
     assert!(pending.exists(), "the paths wait in the queue");
 
@@ -1898,7 +1898,7 @@ async fn a_running_legacy_instance_is_not_deletable_until_it_has_left_the_old_re
     assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
     assert_eq!(
         x.f.host.inner.lock().await.supervisor_release,
-        Some(managed.join("v0.4.0"))
+        Some(managed.join("v0.5.0"))
     );
     let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
     assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));

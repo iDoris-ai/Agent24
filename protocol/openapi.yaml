@@ -629,6 +629,56 @@ paths:
                       wins over DEFAULT_MODEL, which wins over Qwen3-8B-4bit.
                       Null only when this router was built without one.
 
+  /models/recommendation:
+    get:
+      operationId: getModelRecommendation
+      tags: [system]
+      summary: Get the local chat model recommendation
+      parameters:
+        - name: role
+          in: query
+          required: true
+          schema: { type: string, enum: [chat] }
+      responses:
+        "200":
+          description: Recommendation source and iDoris response, or fallback recommendation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [source, recommendation]
+                properties:
+                  source: { type: string, enum: [idoris_http, idoris_cli, fallback] }
+                  recommendation: { type: object, additionalProperties: true }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+
+  /models/local:
+    get:
+      operationId: listLocalModels
+      tags: [system]
+      summary: List locally installed models reported by iDoris
+      responses:
+        "200":
+          description: Local model inventory, or null when iDoris is unavailable
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [source, models]
+                properties:
+                  source: { type: string, enum: [idoris_http, idoris_cli, fallback] }
+                  models:
+                    type: [array, "null"]
+                    items:
+                      type: object
+                      required: [omlx_id, kind, size_bytes, catalog_id]
+                      properties:
+                        omlx_id: { type: string }
+                        kind: { type: string }
+                        size_bytes: { type: [integer, "null"] }
+                        catalog_id: { type: [string, "null"] }
+
   /models/default:
     put:
       operationId: putDefaultModel
