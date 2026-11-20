@@ -4,6 +4,7 @@ import { listComponents, type ComponentView } from '../componentApi'
 import { getCandidates, getStatus, IdorisError, submitOperation, type IdorisStatus } from './api'
 import { idorisErrors, idorisMessages } from './IdorisPanel.i18n'
 import './idoris.css'
+import { isChatModelId } from '../../pages/settings/chatModels'
 
 type PanelState = { kind: 'loading' } | { kind: 'ready'; component: ComponentView | null } | { kind: 'error' }
 
@@ -55,9 +56,9 @@ export default function IdorisPanel() {
         await submitOperation('start')
       } else {
         const discovery = await getCandidates()
-        const candidate = discovery.candidates.find(item => item.identity === 'omlx' && item.authentication === 'ready' && item.models.length > 0)
+        const candidate = discovery.candidates.find(item => item.identity === 'omlx' && item.authentication === 'ready' && item.models.some(isChatModelId))
         if (!candidate) throw new IdorisError('omlx_unreachable')
-        const daily = candidate.models[0]!
+        const daily = candidate.models.find(isChatModelId)!
         await submitOperation('connect', {
           endpoint: candidate.endpoint, daily_model: daily, deep_model: null, save_omlx_key: false,
           replace: false, core_reserved_bytes: current.budget_suggestion?.core_reserved_bytes ?? 0,
