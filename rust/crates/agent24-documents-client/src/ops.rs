@@ -66,6 +66,7 @@ fn pages_ok(s: &str) -> bool {
     s == "all"
         || (s.len() <= 200
             && s.split(',').all(|part| match part.split_once('-') {
+                Some((a, "")) => number(a),
                 Some((a, b)) => number(a) && number(b),
                 None => number(part),
             }))

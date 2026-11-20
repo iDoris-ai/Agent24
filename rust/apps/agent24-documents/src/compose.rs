@@ -48,7 +48,8 @@ impl ComposeRequest {
     }
 }
 
-/// `all`, or ranges like `1-3,5`: each page at least 1, a range not backwards.
+/// `all`, or ranges like `1-3,5` and `2-` (to the last page): each page at
+/// least 1, a range not backwards.
 #[must_use]
 pub fn pages_ok(spec: &str) -> bool {
     if spec == "all" {
@@ -59,6 +60,8 @@ pub fn pages_ok(spec: &str) -> bool {
     };
     spec.len() <= 200
         && spec.split(',').all(|part| match part.split_once('-') {
+            // `2-`: to the last page (Loop 4).
+            Some((a, "")) => number(a),
             Some((a, b)) => {
                 number(a) && number(b) && a.parse::<u32>().ok() <= b.parse::<u32>().ok()
             }
@@ -75,7 +78,9 @@ fn checked(req: &ComposeRequest) -> Result<(), ApiError> {
             return Err(ApiError::invalid_request("not a document id"));
         }
         if part.pages.as_deref().is_some_and(|p| !pages_ok(p)) {
-            return Err(ApiError::invalid_request("pages is `all` or like 1-3,5"));
+            return Err(ApiError::invalid_request(
+                "pages is `all` or like 1-3,5 or 2- (to the last page)",
+            ));
         }
     }
     if req
@@ -162,11 +167,11 @@ mod tests {
 
     #[test]
     fn pages_are_all_or_ranges() {
-        for ok in ["all", "1", "1-3", "1-3,5", "2,4,6-9"] {
+        for ok in ["all", "1", "1-3", "1-3,5", "2,4,6-9", "2-", "1,3-"] {
             assert!(pages_ok(ok), "{ok}");
         }
         for bad in [
-            "", "0", "3-1", "1,,2", "a", "1-", "-2", "01", "1-3,", "1 - 3",
+            "", "0", "3-1", "1,,2", "a", "0-", "-2", "01", "1-3,", "1 - 3", "-",
         ] {
             assert!(!pages_ok(bad), "{bad}");
         }
