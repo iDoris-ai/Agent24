@@ -1,6 +1,6 @@
 //! Managed iDoris lifecycle. Setup, key storage and budget discovery stay injected.
 //!
-//! v0.4.0 (`20136552`) reads exactly 64 lowercase hex bytes plus LF from stdin,
+//! v0.5.0 (`01484547`) reads exactly 64 lowercase hex bytes plus LF from stdin,
 //! uses IDORIS_OMLX_API_KEY for serve, and exposes contract_version in /health.
 //! No readiness or error classification is inferred from diagnostic output.
 
@@ -375,7 +375,7 @@ where
         if status.success() {
             return Ok(StopReport::default());
         }
-        // v0.4.0 shares exit 1 between config/auth/budget/other failures. There
+        // v0.5.0 shares exit 1 between config/auth/budget/other failures. There
         // is no structured discriminator. Fail closed rather than retry any
         // of these. Only abnormal signal exits are provable crashes.
         if status.code().is_some() {

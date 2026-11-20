@@ -89,7 +89,7 @@ if mode == 'worker_then_crash_before_ready':
     os.kill(os.getpid(), signal.SIGKILL)
 
 health = {
-    'status': 'ok', 'service': 'idoris', 'version': '0.4.0',
+    'status': 'ok', 'service': 'idoris', 'version': '0.5.0',
     'contract_version': scenario.get('contract', '1.3.0'),
     'instance_id': 'fixture-instance', 'dev_no_key_enabled': False,
 }

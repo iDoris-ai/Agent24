@@ -5,7 +5,7 @@
 //! The selected endpoint carries the IL-04 probe result, so model membership is
 //! checked before executing iDoris. The caller serializes instance operations.
 //!
-//! Contract source: iDoris tag v0.4.0, crates/idoris-router/src/{cli,setup_omlx}.rs
+//! Contract source: iDoris tag v0.5.0, crates/idoris-router/src/{cli,setup_omlx}.rs
 //! and docs/interfaces/iDoris-Agent24-边界与接口规范.md (L2). The released
 //! binary's `setup --help` prints the same unified usage as `cli.rs`.
 
@@ -399,7 +399,7 @@ fn components_root(instance: &Path) -> Result<PathBuf, SetupError> {
     Ok(current)
 }
 
-// v0.4.0 has no closed JSON schema. Ignore additive fields but require the
+// v0.5.0 has no closed JSON schema. Ignore additive fields but require the
 // consumed success fields and the frozen status/code discriminants. Error
 // messages and unused `next` fields are never retained in public results.
 #[derive(Deserialize)]
