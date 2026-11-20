@@ -684,6 +684,127 @@ async fn untrusted_listener_never_receives_settings_key() {
     assert_eq!(result.status, ProbeStatus::AuthRequired);
 }
 
+/// Keep-alive fixture: serves many requests per connection and records which
+/// connection each request arrived on.
+fn keep_alive_server() -> (Endpoint, Arc<Mutex<Vec<(usize, String)>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = endpoint(listener.local_addr().unwrap().port());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    thread::spawn(move || {
+        for (conn, stream) in listener.incoming().enumerate() {
+            let Ok(mut stream) = stream else { return };
+            let log = log.clone();
+            thread::spawn(move || {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                loop {
+                    let mut request = Vec::new();
+                    let mut buf = [0; 1024];
+                    while !request.windows(4).any(|s| s == b"\r\n\r\n") {
+                        match stream.read(&mut buf) {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = String::from_utf8(request).unwrap();
+                    log.lock().unwrap().push((conn, request.clone()));
+                    let body = if is_identity(&request) {
+                        IDENTITY
+                    } else if has_auth(&request) {
+                        MODELS
+                    } else {
+                        ""
+                    };
+                    let code = if body.is_empty() {
+                        "401 Unauthorized"
+                    } else {
+                        "200 OK"
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 {code}\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    if stream.write_all(reply.as_bytes()).is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    (endpoint, seen)
+}
+
+#[tokio::test]
+async fn keyed_request_never_reuses_a_connection_opened_before_the_owner_check() {
+    let (endpoint, seen) = keep_alive_server();
+    let result = OmlxProbe::new()
+        .unwrap()
+        .with_owner_check(|_| true)
+        .probe_endpoints(
+            std::slice::from_ref(&endpoint),
+            Some(&endpoint),
+            Some(&key()),
+        )
+        .await
+        .remove(0);
+    assert!(
+        matches!(result.status, ProbeStatus::Ready { .. }),
+        "{:?}",
+        result.status
+    );
+    let seen = seen.lock().unwrap();
+    let keyed: Vec<usize> = seen
+        .iter()
+        .filter(|(_, r)| has_auth(r))
+        .map(|(c, _)| *c)
+        .collect();
+    let unkeyed: Vec<usize> = seen
+        .iter()
+        .filter(|(_, r)| !has_auth(r))
+        .map(|(c, _)| *c)
+        .collect();
+    assert!(!keyed.is_empty() && !unkeyed.is_empty(), "{seen:?}");
+    // The key must travel on a connection opened after every pre-check request.
+    assert!(
+        keyed.iter().all(|k| unkeyed.iter().all(|u| k > u)),
+        "{seen:?}"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn an_unsigned_local_listener_is_not_trusted_as_omlx() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut child = tokio::process::Command::new("/usr/bin/python3")
+        .args([
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(10), async {
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let trusted = listening_owner_is_omlx(port).await;
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    started.unwrap();
+    assert!(!trusted);
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 #[ignore = "requires the signed oMLX app listening locally"]

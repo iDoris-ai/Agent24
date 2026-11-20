@@ -187,8 +187,12 @@ impl OmlxProbe {
         Self::with_timeout(Duration::from_secs(2))
     }
     fn with_timeout(timeout: Duration) -> Result<Self, ProbeError> {
+        // No idle-connection reuse: the owner check authenticates the listener
+        // at check time, so a keyed request must open a fresh connection rather
+        // than ride one opened (possibly to an impostor) before the check.
         let client = reqwest::Client::builder()
             .no_proxy()
+            .pool_max_idle_per_host(0)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(timeout)
             .timeout(timeout)
