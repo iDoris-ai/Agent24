@@ -75,6 +75,10 @@ struct PendingConnect {
 /// Replace only platform boundaries in tests; setup, keys, supervisor and chat remain real.
 #[async_trait]
 pub trait Provisioner: Send + Sync {
+    fn omlx_probe(&self) -> Result<OmlxProbe, Code> {
+        OmlxProbe::new().map_err(|_| Code::OmlxUnreachable)
+    }
+
     async fn budget_suggestion(&self) -> Result<agent24_hw::IdorisBudgetSuggestion, &'static str> {
         tokio::task::spawn_blocking(|| {
             agent24_hw::HardwareReport::from_env(&agent24_hw::SystemProbe::new())
@@ -379,9 +383,34 @@ impl IdorisHost {
         }
         let status = self.status().await;
         if status.state == State::NotConfigured || status.roles.is_empty() {
-            let candidates = match candidate_override {
+            let mut candidates = match candidate_override {
                 Some(candidates) => candidates,
                 None => self.candidates(None).await?,
+            };
+            if candidates.key_from_local_settings {
+                for candidate in &mut candidates.candidates {
+                    if candidate.identity == "omlx" && candidate.authentication == "auth_required" {
+                        let endpoint = Endpoint::parse(&candidate.endpoint)
+                            .map_err(|_| Code::InvalidRequest)?;
+                        let confirmed = self.candidates(Some(endpoint.as_str())).await?;
+                        if let Some(updated) = confirmed
+                            .candidates
+                            .into_iter()
+                            .find(|c| c.endpoint == endpoint.as_str())
+                        {
+                            *candidate = updated;
+                        }
+                    }
+                }
+            }
+            let unavailable = if candidates
+                .candidates
+                .iter()
+                .any(|c| c.identity == "omlx" && c.authentication == "auth_required")
+            {
+                Code::OmlxAuthRequired
+            } else {
+                Code::OmlxUnreachable
             };
             let candidate = candidates
                 .candidates
@@ -391,7 +420,7 @@ impl IdorisHost {
                         && candidate.authentication == "ready"
                         && candidate.models.iter().any(|m| is_chat_model_id(m))
                 })
-                .ok_or(Code::OmlxUnreachable)?;
+                .ok_or(unavailable)?;
             let recommendation = self
                 .read_model_cli(&["recommend", "--role", "chat", "--json"])
                 .await;
@@ -451,8 +480,9 @@ impl IdorisHost {
             .map_err(|_| Code::InvalidRequest)?;
         // Discovery without a confirmed endpoint never sends a credential.
         let key = self.provisioner.upstream_key().await?;
-        let results = OmlxProbe::new()
-            .map_err(|_| Code::OmlxUnreachable)?
+        let results = self
+            .provisioner
+            .omlx_probe()?
             .probe(endpoint.as_ref(), key.as_ref())
             .await;
         Ok(Candidates {
@@ -898,7 +928,7 @@ impl IdorisHost {
                 result = upstream_models(endpoint.as_str()) => result?,
             }
         } else {
-            let probe_client = OmlxProbe::new().map_err(|_| Code::OmlxUnreachable)?;
+            let probe_client = self.provisioner.omlx_probe()?;
             let probes = tokio::select! {
                 biased; _ = cancel.cancelled() => return Err(Code::Cancelled),
                 results = probe_client.probe(Some(&endpoint), key.as_ref()) => results,

@@ -133,7 +133,8 @@ describe('SettingsPage', () => {
 
   it('lists chat models from the daemon and has no direct model-service controls', async () => {
     installAgent({
-      backendProxy: vi.fn(async (req: { method: string }) => {
+      backendProxy: vi.fn(async (req: { method: string; path: string }) => {
+        if (req.path === '/api/v1/models/local') return { ok: true, data: { models: null } }
         if (req.method === 'GET') {
           return {
             ok: true,
