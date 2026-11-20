@@ -248,6 +248,7 @@ async fn confirm_desktop(state: &AppState, name: &str, summary: &str) -> Presenc
         requester: RequesterIdentity {
             identifier: "desktop".to_owned(),
             pid: std::process::id() as i32,
+            kind: crate::capabilities::presence::RequesterKind::Desktop,
         },
         expires_at: unix_now().saturating_add(60),
     };
