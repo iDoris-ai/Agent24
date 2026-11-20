@@ -567,6 +567,15 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     assert_eq!(status.state, State::Running);
     assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
     assert!(!status.roles.is_empty());
+    // Complex tasks go out as idoris/deep: bootstrap must bind it (403 otherwise).
+    assert!(
+        status
+            .roles
+            .iter()
+            .any(|r| format!("{r:?}").to_lowercase().contains("deep")),
+        "{:?}",
+        status.roles
+    );
 }
 #[tokio::test]
 async fn bootstrap_authenticates_local_settings_key_before_connect() {

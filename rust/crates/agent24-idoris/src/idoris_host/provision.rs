@@ -431,8 +431,10 @@ impl IdorisHost {
                     ConnectRequest {
                         source: "omlx".into(),
                         endpoint: candidate.endpoint.clone(),
+                        // Complex tasks are sent as `idoris/deep`; an unbound deep
+                        // role leaves the key without it and iDoris answers 403.
+                        deep_model: Some(daily_model.clone()),
                         daily_model,
-                        deep_model: None,
                         save_omlx_key: false,
                         replace: false,
                         core_reserved_bytes: status
