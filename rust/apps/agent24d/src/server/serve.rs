@@ -87,6 +87,12 @@ pub async fn serve(
         serve_steps::open_guardian_and_memory(ephemeral, &router, &cancel, &startup).await;
     if let Some(kv) = &memory_base {
         crate::default_model::apply_saved(&router, kv).await;
+        let seed_router = router.clone();
+        let seed_kv = kv.clone();
+        let seed_host = idoris_host.clone();
+        tokio::spawn(async move {
+            crate::default_model::seed_from_idoris(seed_router, seed_kv, seed_host).await;
+        });
     }
     // Captured before `memory` moves into the run loop. The background task
     // installs into this same slot, so the breaker stays on the one retriever.

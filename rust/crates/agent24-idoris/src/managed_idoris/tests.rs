@@ -35,7 +35,7 @@ async fn server() -> Server {
             "/health",
             get(|State(f): State<Arc<Fixture>>| async move {
                 f.health.fetch_add(1, Ordering::SeqCst);
-                Json(serde_json::json!({"service":"idoris", "version":"0.4.0",
+                Json(serde_json::json!({"service":"idoris", "version":"0.5.0",
                 "contract_version": if f.invalid.load(Ordering::SeqCst) {"2.0.0"} else {"1.3.0"},
                 "instance_id":"fixture", "dev_no_key_enabled":false}))
             }),

@@ -7,17 +7,17 @@ fn embedded_release_and_asset_are_pinned() {
     let lock = IdorisLock::embedded();
     assert!(std::ptr::eq(lock, IdorisLock::embedded()));
     assert_eq!(lock.schema, 2);
-    assert_eq!(lock.tag, "v0.4.0");
-    assert_eq!(lock.commit, "20136552cac476ccf6f266a3210a1a021c717ea3");
+    assert_eq!(lock.tag, "v0.5.0");
+    assert_eq!(lock.commit, "014845472bc2d2d0efbc68d5739d293965aa00b2");
     assert_eq!(lock.team_id, "HYAP444FN9");
     assert_eq!((lock.contract_major, lock.min_contract_minor), (1, 1));
-    assert_eq!(lock.tested_contract_version, "1.1.0");
+    assert_eq!(lock.tested_contract_version, "1.2.0");
     assert_eq!(lock.assets.len(), 1);
     let asset = lock.asset_for("aarch64-apple-darwin").unwrap();
-    assert_eq!(asset.name, "idoris-v0.4.0-aarch64-apple-darwin.tar.gz");
+    assert_eq!(asset.name, "idoris-v0.5.0-aarch64-apple-darwin.tar.gz");
     assert_eq!(
         asset.sha256,
-        "ab46e0180090ef5143b8fb6ea98b0333f2ef9c3a137bab2dc3cf7307960476d5"
+        "7e93a2469df1dc58f449c87dde8c1752cfb4f0891a73018c4685b2a6bdc8ae51"
     );
     assert_eq!(
         asset.files,
@@ -35,7 +35,7 @@ fn embedded_release_and_asset_are_pinned() {
     );
     assert_eq!(
         lock.asset_url(asset),
-        "https://github.com/iDoris-ai/iDoris/releases/download/v0.4.0/idoris-v0.4.0-aarch64-apple-darwin.tar.gz"
+        "https://github.com/iDoris-ai/iDoris/releases/download/v0.5.0/idoris-v0.5.0-aarch64-apple-darwin.tar.gz"
     );
     assert!(lock.asset_for("x86_64-unknown-linux-gnu").is_none());
     assert_eq!(lock.capabilities.len(), 6);
@@ -45,7 +45,13 @@ fn embedded_release_and_asset_are_pinned() {
         ("L3", vec!["/589"]),
         ("L4", vec!["/591", "/594"]),
         ("L5", vec!["/586"]),
-        ("L6", vec!["v0.4.0", "71b37549-168c-44e6-8b66-970a3b949121"]),
+        (
+            "L6",
+            vec![
+                "v0.5.0",
+                "https://github.com/iDoris-ai/iDoris/releases/tag/v0.5.0",
+            ],
+        ),
     ]) {
         assert_eq!(capability.id, id);
         for reference in references {
@@ -59,7 +65,7 @@ fn invalid_lock_fields_are_rejected() {
     let cases = json!({
         "/schema": [1, 3],
         "/source/commit": ["2013655", "G".repeat(40), "20136552CAC476CCF6F266A3210A1A021C717EA3", "main"],
-        "/version": ["latest", "main", " v0.4.0", "v0.4.0\n", "v0.04.0", "v0.4", "v0.4.0-rc.1", "v0.4.0+build"],
+        "/version": ["latest", "main", " v0.5.0", "v0.5.0\n", "v0.05.0", "v0.5", "v0.5.0-rc.1", "v0.5.0+build"],
         "/assets/darwin-arm64/sha256": ["a".repeat(63), "a".repeat(65), "A".repeat(64), "g".repeat(64)],
         "/signing/macos_team_id": ["HYAP444FN", "hYAP444FN9", "HYAP444FN!"],
         "/assets/darwin-arm64/name": ["wrong.tar.gz"],
@@ -157,7 +163,7 @@ fn asset_triples_reject_path_and_url_syntax() {
     ] {
         let mut value: serde_json::Value = serde_json::from_str(EMBEDDED).unwrap();
         let mut asset = value["assets"]["darwin-arm64"].take();
-        asset["name"] = json!(format!("idoris-v0.4.0-{triple}.tar.gz"));
+        asset["name"] = json!(format!("idoris-v0.5.0-{triple}.tar.gz"));
         value["assets"] = json!({triple: asset});
         assert!(
             IdorisLock::parse(&value.to_string()).is_err(),

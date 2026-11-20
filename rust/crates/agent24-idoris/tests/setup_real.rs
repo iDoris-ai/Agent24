@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 /// Run manually with A24_IL05_MODEL_ID and A24_IL05_CORE_RESERVED_BYTES set.
 /// Credentials come only from the existing IL-04 in-memory settings reader.
 #[tokio::test]
-#[ignore = "requires signed v0.4.0, local oMLX:8088, and explicit model/core selection"]
+#[ignore = "requires signed v0.5.0, local oMLX:8088, and explicit model/core selection"]
 async fn real_v0_4_0_setup_with_local_omlx() {
     let endpoint = Endpoint::parse("http://127.0.0.1:8088").unwrap();
     let client = reqwest::Client::builder()
@@ -88,7 +88,7 @@ async fn real_v0_4_0_setup_with_local_omlx() {
     assert!(result.components_dir.join("omlx.yaml").is_file());
     assert!(result.components_dir.join("subscription.yaml").is_file());
     eprintln!(
-        "PASS real v0.4.0 setup: validated generation, daily binding, budget={} bytes",
+        "PASS real v0.5.0 setup: validated generation, daily binding, budget={} bytes",
         budget.bytes()
     );
 }
