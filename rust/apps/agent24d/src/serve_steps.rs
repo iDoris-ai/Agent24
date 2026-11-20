@@ -393,6 +393,16 @@ pub(super) async fn open_store_workspace_and_idoris(
         tokio::spawn(async move {
             while let Err(code) = host.bootstrap_core().await {
                 host.record_bootstrap_error(code).await;
+                // A bundle that fails verification or speaks another contract
+                // will not fix itself; retrying only repeats the failure.
+                if matches!(
+                    code,
+                    agent24_idoris::idoris_host::Code::VerifyFailed
+                        | agent24_idoris::idoris_host::Code::ContractMismatch
+                ) {
+                    tracing::error!(?code, "iDoris core setup failed permanently");
+                    break;
+                }
                 tracing::warn!(
                     ?code,
                     "iDoris automatic core setup is pending; retrying in 30s"

@@ -281,7 +281,7 @@ fn check_cancel(cancel: &CancellationToken) -> Result<(), Code> {
         Ok(())
     }
 }
-async fn wait_operation(host: &Arc<IdorisHost>, id: &str) -> Result<(), Code> {
+pub(super) async fn wait_operation(host: &Arc<IdorisHost>, id: &str) -> Result<(), Code> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(300);
     loop {
         let operation = host.operation(id).await?;
@@ -316,10 +316,17 @@ impl IdorisHost {
         self: &Arc<Self>,
         candidate_override: Option<Candidates>,
     ) -> Result<(), Code> {
+        // Each bootstrap is a new attempt: a fixed idempotency key would replay
+        // the previous (possibly failed, or long finished) operation forever.
+        let attempt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or_default();
+        let key = |step: &str| format!("core-{step}-{attempt}");
         let status = self.status().await;
         if status.state == State::NotInstalled {
             let operation = self
-                .install(InstallRequest { consent: false }, Some("core-install-v1"))
+                .install(InstallRequest { consent: false }, Some(&key("install")))
                 .await?;
             wait_operation(self, &operation.operation_id).await?;
         }
@@ -357,12 +364,12 @@ impl IdorisHost {
                             .map(|budget| budget.core_reserved_bytes),
                         consent: None,
                     },
-                    Some("core-connect-v1"),
+                    Some(&key("connect")),
                 )
                 .await?;
             wait_operation(self, &operation.operation_id).await?;
         } else if status.state == State::Stopped {
-            let operation = self.submit(Action::Start, Some("core-start-v1")).await?;
+            let operation = self.submit(Action::Start, Some(&key("start"))).await?;
             wait_operation(self, &operation.operation_id).await?;
         }
         Ok(())

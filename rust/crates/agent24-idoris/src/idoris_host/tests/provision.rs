@@ -533,6 +533,34 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     assert!(!status.roles.is_empty());
 }
 #[tokio::test]
+async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
+    let x = ConnectedFixture::new().await;
+    let candidates = || Candidates {
+        candidates: vec![Candidate {
+            endpoint: x.endpoint.clone(),
+            identity: "omlx",
+            authentication: "ready",
+            models: vec!["real-model".into()],
+        }],
+        key_from_local_settings: true,
+    };
+    x.f.host
+        .bootstrap_core_with_candidates(candidates())
+        .await
+        .unwrap();
+    for _ in 0..2 {
+        let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+        wait_operation(&x.f.host, &stop.operation_id).await.unwrap();
+        assert_eq!(x.f.host.status().await.state, State::Stopped);
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        x.f.host
+            .bootstrap_core_with_candidates(candidates())
+            .await
+            .unwrap();
+        assert_eq!(x.f.host.status().await.state, State::Running);
+    }
+}
+#[tokio::test]
 async fn candidates_expose_identity_models_and_source_but_never_credentials() {
     let x = ConnectedFixture::new().await;
     let value =
