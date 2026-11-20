@@ -2114,6 +2114,17 @@ impl ToolRegistry {
         // alongside a gated class. Deriving at the decision point makes that
         // combination unrepresentable in the gate's view.
         let declared = tool.info();
+        // Loop 4 (General 11-20, 0.6.56): a module call missing an argument
+        // its schema requires (`compose` with `{}`) could never run; it is
+        // refused here, before any approval card, so the model hears at once
+        // what to send instead of a human approving nothing.
+        if declared.source == "module"
+            && let Some(missing) = missing_required(&tool.parameters(), input)
+        {
+            return Err(ToolError::Invalid(format!(
+                "{name} needs the argument {missing:?}; call it again with it"
+            )));
+        }
         let effective = self.effective_risk(&declared);
         let info = ToolInfo::new(
             declared.name,
@@ -2375,6 +2386,19 @@ pub fn truncate(s: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}… [truncated {} bytes]", &s[..end], s.len() - end)
+}
+
+/// The first top-level key `schema` requires that `input` lacks (or holds
+/// as null), if any. Only `required` at the top is read: the module checks
+/// the rest, as before.
+fn missing_required(schema: &Value, input: &Map<String, Value>) -> Option<String> {
+    schema
+        .get("required")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|key| input.get(*key).is_none_or(Value::is_null))
+        .map(str::to_owned)
 }
 
 #[cfg(test)]
