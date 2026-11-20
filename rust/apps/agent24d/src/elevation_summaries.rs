@@ -50,7 +50,7 @@ pub fn module_delegation_summary(
     routes_prefix: &str,
 ) -> String {
     format!(
-        "允许桌面写入 {name} 模块的数据; delegate module '{name}'; version: {version}; namespace: {namespace}; routes_sha256: {routes_prefix}"
+        "允许发起方写入 {name} 模块的数据; delegate module '{name}'; version: {version}; namespace: {namespace}; routes_sha256: {routes_prefix}"
     )
 }
 

@@ -18,7 +18,9 @@ export interface PresenceChallenge {
   challenge_id: string
   operation: string
   summary: string
-  requester: { identifier: string; pid: number }
+  /** `kind` (Loop 4): who asks, from the executable the daemon verified;
+   * absent from an older daemon. */
+  requester: { identifier: string; pid: number; kind?: 'desktop' | 'cli' | 'other' }
   /** Unix seconds. */
   expires_at: number
 }
@@ -125,7 +127,7 @@ export function presenceDialogOptions(challenge: PresenceChallenge, t: typeof mt
     type: 'question',
     title: t('presence.title'),
     message: t('presence.message', {
-      requester: clip(challenge.requester.identifier),
+      requester: requesterLabel(challenge.requester, t),
       pid: challenge.requester.pid,
       operation: clip(challenge.operation),
     }),
@@ -136,6 +138,16 @@ export function presenceDialogOptions(challenge: PresenceChallenge, t: typeof mt
     cancelId: 1,
     noLink: true,
   }
+}
+
+/** Loop 4 (PM 11-20, a floor): the command line is never shown as the app
+ * (they share a signing identifier); the kind comes from the daemon. */
+export function requesterLabel(requester: PresenceChallenge['requester'], t: typeof mt): string {
+  const id = clip(requester.identifier)
+  if (requester.kind === 'cli') return t('presence.requester.cli', { identifier: id })
+  if (requester.kind === 'desktop') return t('presence.requester.desktop', { identifier: id })
+  if (requester.kind === 'other') return t('presence.requester.other', { identifier: id })
+  return id
 }
 
 export function parseChallenge(raw: unknown): PresenceChallenge | null {
@@ -156,7 +168,9 @@ export function parseChallenge(raw: unknown): PresenceChallenge | null {
     challenge_id: c.challenge_id,
     operation: c.operation,
     summary: c.summary,
-    requester: { identifier: req.identifier, pid: req.pid },
+    requester: req.kind === 'desktop' || req.kind === 'cli' || req.kind === 'other'
+      ? { identifier: req.identifier, pid: req.pid, kind: req.kind }
+      : { identifier: req.identifier, pid: req.pid },
     expires_at: c.expires_at,
   }
 }
