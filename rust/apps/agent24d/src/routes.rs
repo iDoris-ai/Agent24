@@ -56,8 +56,18 @@ pub async fn get_models(State(state): State<AppState>) -> Response {
     // first. `None` when this router was never built with one (tests, a
     // hand-built router) — a client seeing `null` here must say "unknown",
     // never fall back to guessing itself.
-    Json(serde_json::json!({ "models": models, "default_model": state.router.default_model() }))
-        .into_response()
+    // Loop 4: with chat answered by iDoris (#1945) and no default saved here,
+    // the default is the model iDoris was connected with for `daily`, not
+    // `null` (which the topbar shows as 「模型服务未就绪」 while chat works).
+    let default_model = match state.router.default_model() {
+        Some(model) => Some(model),
+        None if state.router.idoris_gateway().is_ok() => match &state.idoris_host {
+            Some(host) => host.daily_model().await,
+            None => None,
+        },
+        None => None,
+    };
+    Json(serde_json::json!({ "models": models, "default_model": default_model })).into_response()
 }
 
 #[derive(Debug, Deserialize)]
