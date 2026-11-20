@@ -134,10 +134,12 @@ fn edits_two_paragraphs_and_leaves_every_other_byte_as_it_was() {
     assert!(t.contains("<w:del w:id=\""), "{t}");
     assert!(t.contains("<w:ins w:id=\""), "{t}");
     assert!(t.contains("w:author=\"Agent24\""));
-    assert!(t.contains(&format!(
-        "<w:delText xml:space=\"preserve\">{}</w:delText>",
+    // The deleted runs are the original ones: rejecting gives back the text.
+    let del = &t[t.find("<w:del ").unwrap()..t.find("</w:del>").unwrap()];
+    assert_eq!(
+        paragraph_text(&del.replace("w:delText", "w:t")),
         paras[tracked].text
-    )));
+    );
     for marker in [
         "w:commentRangeStart",
         "w:commentRangeEnd",
@@ -481,4 +483,149 @@ fn a_comment_reference_sharing_a_run_with_text_is_refused() {
         Err(PatchError::Invalid(why)) => assert!(why.contains("comment reference"), "{why}"),
         other => panic!("{other:?}"),
     }
+}
+
+/// PR-Daemon #1930 B2 (Loop 4): a whitelist. A formula, a pending tracked
+/// deletion, a page break or a symbol in the paragraph would be lost by a
+/// rewrite: refused, named. A tab or a line break in a text run is text.
+#[test]
+fn a_paragraph_holding_a_formula_or_a_pending_deletion_is_refused_and_says_what() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    for (run, what) in [
+        (r#"<m:oMath><m:r><m:t>x=1</m:t></m:r></m:oMath>"#, "m:oMath"),
+        (
+            r#"<w:del w:id="91" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText>旧</w:delText></w:r></w:del>"#,
+            "w:del",
+        ),
+        (
+            r#"<w:r><w:br w:type="page"/></w:r>"#,
+            "page or column break",
+        ),
+        (
+            r#"<w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r>"#,
+            "w:sym",
+        ),
+    ] {
+        let (docx, text) = with_run_in(index, run);
+        for tracked in [false, true] {
+            let edit = ParaEdit {
+                index,
+                text: "新".into(),
+                tracked,
+                expect: Some(text.clone()),
+            };
+            match apply(&docx, &[edit], "A", NOW) {
+                Err(PatchError::Invalid(why)) => assert!(why.contains(what), "{why}"),
+                other => panic!("{run}: {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn a_paragraph_with_a_tab_or_a_line_break_is_still_rewritten() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let (docx, text) = with_run_in(
+        index,
+        r#"<w:r><w:t>甲</w:t><w:tab/><w:t>乙</w:t><w:br/></w:r>"#,
+    );
+    let edit = ParaEdit {
+        index,
+        text: "新的一段".into(),
+        tracked: false,
+        expect: Some(text),
+    };
+    let out = apply(&docx, &[edit], "A", NOW).unwrap();
+    assert_eq!(list_paragraphs(&out).unwrap()[index].text, "新的一段");
+}
+
+/// General 11-21 on 0.6.66: a tracked rewrite of a paragraph with tabs and a
+/// line break deletes the original runs as they were (tabs and the break
+/// kept), so rejecting the change gives back the paragraph as it was; tabs
+/// and line breaks in the new text are written as w:tab and w:br.
+#[test]
+fn rejecting_a_tracked_rewrite_gives_back_tabs_and_line_breaks() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let original = r#"<w:r><w:t>甲方</w:t><w:tab/><w:t>010</w:t><w:br/><w:t>乙方</w:t></w:r>"#;
+    let (docx, text) = with_run_in(index, original);
+    let before = entry(&docx, "word/document.xml");
+    let before_paras = scan_paragraphs(&before).unwrap();
+    let old_para = &before[before_paras[index].start..before_paras[index].end];
+    let edit = ParaEdit {
+        index,
+        text: "联系人\t张三\n电话".into(),
+        tracked: true,
+        expect: Some(text),
+    };
+    let out = apply(&docx, &[edit], "A", NOW).unwrap();
+    let xml = entry(&out, "word/document.xml");
+    let paras = scan_paragraphs(&xml).unwrap();
+    let para = &xml[paras[index].start..paras[index].end];
+    let del = &para[para.find("<w:del ").unwrap()..para.find("</w:del>").unwrap()];
+    let ins = &para[para.find("<w:ins ").unwrap()..para.find("</w:ins>").unwrap()];
+    // Rejecting: the deleted runs, delText back to t, are the original runs.
+    let rejected = del[del.find('>').unwrap() + 1..].replace("w:delText", "w:t");
+    for (_, s, e) in children(old_para)
+        .into_iter()
+        .filter(|(n, _, _)| *n == "w:r")
+    {
+        assert!(
+            rejected.contains(&old_para[s..e]),
+            "{} not in {rejected}",
+            &old_para[s..e]
+        );
+    }
+    // Accepting: the new text, a tab and a line break where \t and \n were,
+    // in that order, written as Word does.
+    let expected = r#"<w:t xml:space="preserve">联系人</w:t><w:tab/><w:t xml:space="preserve">张三</w:t><w:br/><w:t xml:space="preserve">电话</w:t>"#;
+    assert!(ins.contains(expected), "{ins}");
+    assert!(!ins.contains('\t') && !ins.contains('\n'), "{ins}");
+    // Rejecting keeps the order too: the tab before 010, the break before 乙方.
+    let order = |hay: &str, a: &str, b: &str| hay.find(a).unwrap() < hay.find(b).unwrap();
+    assert!(
+        order(&rejected, "<w:tab/>", "010") && order(&rejected, "<w:br/>", "乙方"),
+        "{rejected}"
+    );
+}
+
+/// PM 11-21: a plain (untracked) rewrite writes \t and \n as w:tab and w:br too.
+#[test]
+fn a_plain_rewrite_writes_tabs_and_line_breaks_as_word_does() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let text = list_paragraphs(FIXTURE).unwrap()[index].text.clone();
+    let edit = ParaEdit {
+        index,
+        text: "甲\t乙\n丙".into(),
+        tracked: false,
+        expect: Some(text),
+    };
+    let out = apply(FIXTURE, &[edit], "A", NOW).unwrap();
+    let xml = entry(&out, "word/document.xml");
+    let paras = scan_paragraphs(&xml).unwrap();
+    let para = &xml[paras[index].start..paras[index].end];
+    assert!(
+        para.contains(r#"<w:t xml:space="preserve">甲</w:t><w:tab/><w:t xml:space="preserve">乙</w:t><w:br/><w:t xml:space="preserve">丙</w:t>"#),
+        "{para}"
+    );
+    assert!(!para.contains("<w:del ") && !para.contains('\t'), "{para}");
 }

@@ -555,11 +555,17 @@ pub(super) async fn register_startup_tools(
             .iter()
             .find(|e| e.name == crate::first_party_reads::MODULE)
             .and_then(|e| match &e.build {
-                crate::domain::Build::Package(p) => Some(p.dir.clone()),
+                crate::domain::Build::Package(p) => p
+                    .manifest
+                    .spawn()
+                    .map(|spawn| (p.dir.clone(), spawn.clone())),
                 _ => None,
             });
         let bundled = crate::first_party_reads::bundled_program();
-        crate::first_party_reads::host_reads(package.as_deref(), bundled.as_deref())
+        crate::first_party_reads::host_reads(
+            package.as_ref().map(|(dir, spawn)| (dir.as_path(), spawn)),
+            bundled.as_deref(),
+        )
     };
     if !host_reads.is_empty() {
         tracing::info!(

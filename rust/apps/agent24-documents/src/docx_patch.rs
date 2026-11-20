@@ -726,8 +726,15 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
     let mut before = String::new();
     let mut after = String::new();
     let mut seen_content = false;
+    // The paragraph's own text runs, as written: a tracked rewrite deletes
+    // these very runs (General 11-21: tabs and breaks must come back when the
+    // change is rejected), not a flattened copy of their text.
+    let mut old_runs = String::new();
     for (name, start, end) in &kids {
         let slice = &para[*start..*end];
+        if *name == "w:r" && !slice.contains("<w:commentReference") {
+            old_runs.push_str(&as_deleted(slice));
+        }
         if *name == "w:pPr" {
             ppr.push_str(slice);
         } else if is_marker(name) {
@@ -743,11 +750,26 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
         }
     }
     let rpr = first_rpr(para).unwrap_or_default();
-    let new_run = |tag: &str, text: &str| {
-        format!(
-            "<w:r>{rpr}<w:{tag} xml:space=\"preserve\">{}</w:{tag}></w:r>",
-            escape_text(text)
-        )
+    // A tab and a line break in the new text are written as Word writes them.
+    let new_run = |text: &str| {
+        let mut inner = String::new();
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                inner.push_str("<w:br/>");
+            }
+            for (j, piece) in line.split('\t').enumerate() {
+                if j > 0 {
+                    inner.push_str("<w:tab/>");
+                }
+                if !piece.is_empty() {
+                    inner.push_str(&format!(
+                        "<w:t xml:space=\"preserve\">{}</w:t>",
+                        escape_text(piece)
+                    ));
+                }
+            }
+        }
+        format!("<w:r>{rpr}{inner}</w:r>")
     };
     let body = if edit.tracked {
         let attrs = format!(
@@ -756,21 +778,28 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
             escape_attr(date)
         );
         format!(
-            "<w:del w:id=\"{id}\" {attrs}>{}</w:del><w:ins w:id=\"{}\" {attrs}>{}</w:ins>",
-            new_run("delText", &paragraph_text(para)),
+            "<w:del w:id=\"{id}\" {attrs}>{old_runs}</w:del><w:ins w:id=\"{}\" {attrs}>{}</w:ins>",
             id + 1,
-            new_run("t", &edit.text)
+            new_run(&edit.text)
         )
     } else {
-        new_run("t", &edit.text)
+        new_run(&edit.text)
     };
     format!("{open_tag}{ppr}{before}{body}{after}</w:p>")
+}
+
+/// A text run as a deleted one: its `w:t` become `w:delText`; its
+/// properties, tabs and line breaks stay as they are.
+fn as_deleted(run: &str) -> String {
+    run.replace("<w:t>", "<w:delText>")
+        .replace("<w:t ", "<w:delText ")
+        .replace("</w:t>", "</w:delText>")
 }
 
 /// PR-Daemon #1930 B2: what in `para` a rewrite as one run would lose, named
 /// for the user; None for a paragraph of text runs (and bookmarks, comment
 /// ranges and a run holding only a comment reference, which are kept).
-fn not_plain_text(para: &str) -> Option<&'static str> {
+fn not_plain_text(para: &str) -> Option<String> {
     const KINDS: &[(&str, &str)] = &[
         ("<w:drawing", "a picture (w:drawing)"),
         ("<w:pict", "a picture (w:pict)"),
@@ -795,7 +824,7 @@ fn not_plain_text(para: &str) -> Option<&'static str> {
                 Some(b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
             )
         }) {
-            return Some(what);
+            return Some((*what).to_owned());
         }
     }
     // A comment reference sharing its run with text: the text would stay behind.
@@ -805,7 +834,40 @@ fn not_plain_text(para: &str) -> Option<&'static str> {
             && run.contains("<w:commentReference")
             && (run.contains("<w:t>") || run.contains("<w:t "))
         {
-            return Some("a comment reference in a run with text");
+            return Some("a comment reference in a run with text".to_owned());
+        }
+    }
+    // PR-Daemon #1930 B2 (Loop 4): a whitelist, not only the list above. A
+    // paragraph holds only what a rewrite keeps or rebuilds — its properties,
+    // plain text runs, proofing marks, bookmarks and comment ranges; a run
+    // only its properties, text, a lone comment reference and a cached page
+    // break. Anything else (a formula m:oMath, a pending w:ins/w:del, w:sym,
+    // a break, a tab, w:ruby, a permission range, w:contentPart, ...) would be
+    // lost: refused, and named.
+    for (name, start, end) in children(para) {
+        match name {
+            "w:pPr" | "w:proofErr" => {}
+            name if is_marker(name) => {}
+            "w:r" => {
+                for (inner, s, e) in children(&para[start..end]) {
+                    let element = &para[start..end][s..e];
+                    match inner {
+                        "w:rPr"
+                        | "w:t"
+                        | "w:tab"
+                        | "w:commentReference"
+                        | "w:lastRenderedPageBreak" => {}
+                        // A line break is text layout; a page or column break
+                        // is the document's pagination, which a rewrite drops.
+                        "w:br"
+                            if !element.contains("w:type=\"page\"")
+                                && !element.contains("w:type=\"column\"") => {}
+                        "w:br" => return Some("a page or column break (w:br)".to_owned()),
+                        other => return Some(format!("{other} in a run")),
+                    }
+                }
+            }
+            other => return Some(other.to_owned()),
         }
     }
     None
