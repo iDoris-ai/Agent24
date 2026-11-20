@@ -1753,7 +1753,8 @@ mod tests {
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(&bodies.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
-        assert_eq!(body["model"], "named-by-caller", "{body}");
+        // Even an explicitly named model goes out as the role alias.
+        assert_eq!(body["model"], "idoris/daily", "{body}");
     }
 
     #[tokio::test]

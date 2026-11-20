@@ -503,6 +503,11 @@ fn gateway_body(req: &CompletionRequest, role: &str) -> serde_json::Value {
     let mut body = completion_body(req, role, true, false);
     if let Some(obj) = body.as_object_mut() {
         obj.remove("temperature");
+        // Agent24's data key is role-scoped (daily/deep/embed): a concrete model
+        // name is a role-less request and iDoris answers 403. The model behind
+        // a role is chosen by the iDoris binding, so the wire always names the
+        // role, whatever model a caller asked for.
+        obj.insert("model".into(), serde_json::Value::String(role.to_owned()));
     }
     body
 }

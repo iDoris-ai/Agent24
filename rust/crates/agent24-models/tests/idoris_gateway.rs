@@ -52,6 +52,17 @@ async fn endpoint_with_redirect(
                 }
                 let request = String::from_utf8(bytes).unwrap();
                 let health = request.starts_with("GET /health ");
+                // iDoris enforces key scope: Agent24's key holds roles only, so a
+                // concrete (role-less) model name is 403 VIRTUAL_KEY_ROLE_FORBIDDEN.
+                let role_forbidden = request.starts_with("POST ")
+                    && request
+                        .split_once("\r\n\r\n")
+                        .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b).ok())
+                        .is_some_and(|b| {
+                            !b["model"]
+                                .as_str()
+                                .is_some_and(|m| m.starts_with("idoris/"))
+                        });
                 let confirmed = request
                     .to_ascii_lowercase()
                     .contains("x-idoris-headroom-breach: confirmed");
@@ -112,6 +123,9 @@ async fn endpoint_with_redirect(
                         body["error"].as_object_mut().unwrap().remove("reason_code");
                     }
                 }
+                if role_forbidden {
+                    body = serde_json::json!({"error": {"type":"role_forbidden","reason_code":"VIRTUAL_KEY_ROLE_FORBIDDEN"}});
+                }
                 let body = body.to_string();
                 let record = if content == "missing-record" {
                     ""
@@ -141,7 +155,9 @@ async fn endpoint_with_redirect(
                 } else {
                     ""
                 };
-                let status = if content == "redirect" && !health {
+                let status = if role_forbidden {
+                    "403 Forbidden"
+                } else if content == "redirect" && !health {
                     "307 Temporary Redirect"
                 } else if !health
                     && (headroom
