@@ -332,18 +332,34 @@ impl IdorisHost {
         }
         let status = self.status().await;
         if status.state == State::NotConfigured || status.roles.is_empty() {
-            let candidates = match candidate_override {
+            let mut candidates = match candidate_override {
                 Some(candidates) => candidates,
                 None => self.candidates(None).await?,
             };
+            let usable = |c: &Candidate| {
+                c.identity == "omlx"
+                    && c.authentication == "ready"
+                    && c.models.iter().any(|m| is_chat_model_id(m))
+            };
+            // Loop 4 (David Mac, oMLX 0.8.0 with its API key on): discovery
+            // sends no credential, so an oMLX that requires one is only
+            // `auth_required`. With the user's own key in ~/.omlx/settings.json,
+            // that one endpoint (an oMLX by its fingerprint) is probed again
+            // with the key, as `connect` would, before giving up.
+            if !candidates.candidates.iter().any(usable) && candidates.key_from_local_settings {
+                let locked = candidates
+                    .candidates
+                    .iter()
+                    .find(|c| c.identity == "omlx" && c.authentication == "auth_required")
+                    .map(|c| c.endpoint.clone());
+                if let Some(endpoint) = locked {
+                    candidates = self.candidates(Some(&endpoint)).await?;
+                }
+            }
             let candidate = candidates
                 .candidates
                 .iter()
-                .find(|candidate| {
-                    candidate.identity == "omlx"
-                        && candidate.authentication == "ready"
-                        && candidate.models.iter().any(|m| is_chat_model_id(m))
-                })
+                .find(|candidate| usable(candidate))
                 .ok_or(Code::OmlxUnreachable)?;
             let daily_model = candidate
                 .models

@@ -533,6 +533,44 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     assert!(!status.roles.is_empty());
 }
 #[tokio::test]
+async fn core_bootstrap_uses_the_local_key_for_an_omlx_that_requires_one() {
+    // Loop 4 (David Mac): discovery saw oMLX ask for a key; the key in
+    // ~/.omlx/settings.json gets it to ready, and the bootstrap connects.
+    let x = ConnectedFixture::new().await;
+    x.f.host
+        .bootstrap_core_with_candidates(Candidates {
+            candidates: vec![Candidate {
+                endpoint: x.endpoint.clone(),
+                identity: "omlx",
+                authentication: "auth_required",
+                models: vec![],
+            }],
+            key_from_local_settings: true,
+        })
+        .await
+        .unwrap();
+    let status = x.f.host.status().await;
+    assert_eq!(status.state, State::Running);
+    assert!(!status.roles.is_empty());
+}
+#[tokio::test]
+async fn core_bootstrap_without_a_local_key_does_not_probe_with_one() {
+    let x = ConnectedFixture::new().await;
+    let result =
+        x.f.host
+            .bootstrap_core_with_candidates(Candidates {
+                candidates: vec![Candidate {
+                    endpoint: x.endpoint.clone(),
+                    identity: "omlx",
+                    authentication: "auth_required",
+                    models: vec![],
+                }],
+                key_from_local_settings: false,
+            })
+            .await;
+    assert_eq!(result, Err(Code::OmlxUnreachable));
+}
+#[tokio::test]
 async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
     let x = ConnectedFixture::new().await;
     let candidates = || Candidates {
