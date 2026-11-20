@@ -2596,7 +2596,7 @@ export interface components {
             version: string | null;
             data_port: number | null;
             admin_port: number | null;
-            roles: ("daily" | "deep")[];
+            roles: ("daily" | "deep" | "embed")[];
             last_error: components["schemas"]["IdorisErrorCode"] | null;
             current_operation: string | null;
             verification: components["schemas"]["IdorisVerification"] | null;

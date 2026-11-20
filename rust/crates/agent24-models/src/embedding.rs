@@ -166,7 +166,12 @@ impl EmbeddingClient {
                     .collect(),
             )
         };
-        let body = serde_json::json!({ "model": self.model, "input": input_value });
+        let model = if route == Route::Idoris {
+            "idoris/embed"
+        } else {
+            self.model.as_str()
+        };
+        let body = serde_json::json!({ "model": model, "input": input_value });
         let mut request = self
             .client
             .post(embeddings_url(&base_url))
@@ -735,6 +740,14 @@ mod tests {
                 .contains("authorization: bearer idk_embed_slot"),
             "{}",
             captured_a[0].0
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&captured_a[0].1).unwrap()["model"],
+            "idoris/embed"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&captured_b[0].1).unwrap()["model"],
+            "idoris/embed"
         );
 
         router.block_idoris("gateway blocked");

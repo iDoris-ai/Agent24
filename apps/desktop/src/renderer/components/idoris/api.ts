@@ -65,7 +65,7 @@ export function parseStatus(value: unknown): IdorisStatus {
   return {
     state: choice(v.state, ['not_installed', 'not_configured', 'stopped', 'starting', 'running', 'failed', 'instance_conflict']),
     version: v.version === null ? null : text(v.version), data_port: port(v.data_port), admin_port: port(v.admin_port),
-    roles: array(v.roles).map(role => choice(role, ['daily', 'deep'])),
+    roles: array(v.roles).map(role => choice(role, ['daily', 'deep', 'embed'])),
     last_error: v.last_error === null ? null : choice(v.last_error, codes),
     // Added with ADR-038 C1; an older daemon omits them, which reads as "no migration pending".
     migration_pending: v.migration_pending === undefined ? false : v.migration_pending === true,

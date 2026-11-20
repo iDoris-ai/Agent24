@@ -204,7 +204,9 @@ impl Keys {
             || !install_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            || roles.iter().any(|role| !matches!(*role, "daily" | "deep"))
+            || roles
+                .iter()
+                .any(|role| !matches!(*role, "daily" | "deep" | "embed"))
         {
             return Err(KeyError::InvalidRequest);
         }
@@ -241,11 +243,13 @@ impl Keys {
         operation: &mut Operation,
         roles: &[&str],
     ) -> Result<IssuedKey, KeyError> {
-        let allowed_roles = if roles.contains(&"deep") {
-            vec!["daily", "deep"]
-        } else {
-            vec!["daily"]
-        };
+        let mut allowed_roles = vec!["daily"];
+        if roles.contains(&"deep") {
+            allowed_roles.push("deep");
+        }
+        if roles.contains(&"embed") {
+            allowed_roles.push("embed");
+        }
         let spec = serde_json::to_vec(&serde_json::json!({
             "owner": operation.owner,
             "allowed_privacy": ["local_only"],

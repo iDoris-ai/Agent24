@@ -27,12 +27,14 @@ use zeroize::Zeroizing;
 pub enum Role {
     Daily,
     Deep,
+    Embed,
 }
 impl Role {
     fn as_str(self) -> &'static str {
         match self {
             Self::Daily => "daily",
             Self::Deep => "deep",
+            Self::Embed => "embed",
         }
     }
 }
@@ -42,6 +44,7 @@ impl TryFrom<&str> for Role {
         match value {
             "daily" => Ok(Self::Daily),
             "deep" => Ok(Self::Deep),
+            "embed" => Ok(Self::Embed),
             _ => Err(SetupError::InvalidBindings),
         }
     }
@@ -223,6 +226,7 @@ async fn run_setup_with_timeout(
             "--out-dir",
         ])
         .arg(&out_dir)
+        .args(["--load-mode", "resident"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

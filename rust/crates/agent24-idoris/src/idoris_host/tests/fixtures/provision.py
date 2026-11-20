@@ -4,6 +4,7 @@ settings_path = fixture_root / 'provision-scenario.json'
 settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
 if sys.argv[1] == 'setup':
     args = sys.argv[1:]
+    assert args[args.index('--load-mode') + 1] == 'resident'
     endpoint = args[args.index('--endpoint') + 1]
     out = Path(args[args.index('--out-dir') + 1])
     secret_input = sys.stdin.buffer.read()

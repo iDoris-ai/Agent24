@@ -841,6 +841,10 @@ impl IdorisHost {
         if let Some(deep) = request.deep_model {
             bindings.push((Role::Deep, deep));
         }
+        const EMBED_MODEL: &str = "bge-m3-mlx-fp16";
+        if models.iter().any(|model| model == EMBED_MODEL) {
+            bindings.push((Role::Embed, EMBED_MODEL.to_owned()));
+        }
         let mut pending = PendingConnect {
             previous: previous.clone(),
             candidate: previous.clone(),
@@ -896,11 +900,11 @@ impl IdorisHost {
             write_json(&self.root.join("pending-connect.json"), &pending)?;
             check_cancel(cancel)?;
             self.phase(id, Phase::IssuingKey).await;
-            let roles: Vec<&str> = if bindings.len() == 2 {
-                vec!["daily", "deep"]
-            } else {
-                vec!["daily"]
-            };
+            let roles: Vec<&str> = bindings.iter().map(|(role, _)| match role {
+                Role::Daily => "daily",
+                Role::Deep => "deep",
+                Role::Embed => "embed",
+            }).collect();
             // Do not drop issuance on cancellation. Its bounded command must finish or compensate.
             let issued = keys
                 .issue_pending("managed", &roles)
