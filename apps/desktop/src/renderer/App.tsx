@@ -33,20 +33,6 @@ import logoSidebar from './assets/logo-sidebar.png'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
 import { QuickSwitch } from './components/QuickSwitch'
-import { isChatModelId } from './pages/settings/chatModels'
-
-/** First model id that looks like a chat model, or `undefined` if every
- * candidate is filtered out. The rule lives in `chatModels.ts`. */
-export function pickChatModel(models: string[]): string | undefined {
-  return models.find((m) => isChatModelId(m))
-}
-
-// Sentinels for the oMLX-derived fallback label; translated at render time so
-// switching language relabels them without re-detecting.
-const LLM_DETECTING = '\u0000detecting'
-const LLM_NO_RUNTIME = '\u0000no-runtime'
-const NO_CHAT_MODEL_LABEL = '\u0000no-chat-model'
-const LLM_NEEDS_KEY = '\u0000needs-key'
 
 /** ME4-desktop-model-ui: `GET /api/v1/models`'s `default_model` field
  * (`rust/apps/agent24d/src/routes.rs`) — the daemon's own `DEFAULT_MODEL`
@@ -123,30 +109,15 @@ function AppShell(): JSX.Element {
   const [darkMode, setDarkMode] = useState(true)
   // Domain-OS modules actually mounted (state==='mounted') in the daemon (`GET /api/v1/os`) — the Home card.
   const [osModuleCount, setOsModuleCount] = useState(0)
-  // Renamed from `llmLabel`: this is now only the oMLX-derived FALLBACK,
-  // used when the daemon has no `default_model` to report. The topbar's
-  // actual displayed label is the `llmLabel` derived value below.
-  const [fallbackLlmLabel, setFallbackLlmLabel] = useState(LLM_DETECTING)
   const [daemonDefaultModel, setDaemonDefaultModel] = useState<string | null>(null)
-  // Settings → Models → custom local model service, when set (read on each health tick).
-  const [customModel, setCustomModel] = useState<string | null>(null)
   const [backendPort, setBackendPort] = useState<number | null>(null)
   const initDone = useRef(false)
 
-  // ME4-desktop-model-ui: the daemon's OWN default model always wins over a
-  // client-side guess from a locally-detected oMLX model list — that guess
-  // is what let an OCR/VL model reach the topbar in the first place (see
-  // `isChatModelId`). Falls back to the oMLX-derived
-  // label only when the daemon has none to report (e.g. an older daemon
-  // build, or the router was never built via `from_env`).
+  // The top bar names only the daemon's default model. No local probe.
   const t = useT(appMessages)
-  const FALLBACK_KEYS = { [LLM_DETECTING]: 'llm.detecting', [LLM_NO_RUNTIME]: 'llm.noRuntime', [NO_CHAT_MODEL_LABEL]: 'llm.noChatModel', [LLM_NEEDS_KEY]: 'llm.needsKey' } as const
-  const fallbackKey = FALLBACK_KEYS[fallbackLlmLabel as keyof typeof FALLBACK_KEYS]
-  const llmLabel = customModel
-    ? t('llm.custom', { model: customModel })
-    : daemonDefaultModel
+  const llmLabel = daemonDefaultModel
     ? t('llm.daemonDefault', { model: daemonDefaultModel })
-    : fallbackKey ? t(fallbackKey) : fallbackLlmLabel
+    : t('llm.notReady')
 
   useEffect(() => {
     if (initDone.current) return
@@ -164,7 +135,6 @@ function AppShell(): JSX.Element {
       window.agent24.backendProxy({ method: 'GET', path: '/api/v1/health' })
         .then((res) => {
           setBackendOk(res.ok)
-          void window.agent24.modelSourceGet?.().then((s) => setCustomModel(s?.model ?? null), () => setCustomModel(null))
           if (res.ok) setRefusal(null)
           else void window.agent24.backendRefusal?.().then(setRefusal, () => setRefusal(null))
           if (res.ok) {
@@ -174,58 +144,21 @@ function AppShell(): JSX.Element {
               .catch(() => { /* keep the last count */ })
             // FU-93: show the daemon's real port, not a hardcoded guess.
             void window.agent24.backendEndpoint().then((e) => setBackendPort(e?.port ?? null))
-            // ME4-desktop-model-ui: ask the daemon what its OWN default
-            // model is, rather than only ever guessing from a locally
-            // detected oMLX list (see `llmLabel` above).
             void window.agent24.backendProxy({ method: 'GET', path: '/api/v1/models' })
-              .then((r) => {
-                const dm = extractDaemonDefaultModel(r)
-                if (dm) setDaemonDefaultModel(dm)
-              })
-              .catch(() => { /* fall back to the oMLX-derived label */ })
+              .then((r) => setDaemonDefaultModel(extractDaemonDefaultModel(r)))
+              .catch(() => setDaemonDefaultModel(null))
           } else {
+            setDaemonDefaultModel(null)
             readStartupFailure()
           }
         })
-        .catch(() => { setBackendOk(false); readStartupFailure() })
+        .catch(() => { setBackendOk(false); setDaemonDefaultModel(null); readStartupFailure() })
     }
     checkBackend()
     const backendTimer = setInterval(checkBackend, 5000)
 
-    // oMLX auto-detect on startup
-    void (async () => {
-      const detected = await window.agent24.omlxDetect()
-      if (detected && 'authRequired' in detected) {
-        // oMLX is running but wants an API key: starting another one would
-        // only collide with it. Say so; Settings has the key field.
-        setFallbackLlmLabel(LLM_NEEDS_KEY)
-        return
-      }
-      if (detected) {
-        const chatModel = pickChatModel(detected.models)
-        setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
-        return
-      }
-      // A custom local model service is set: it is used first, so no oMLX
-      // is started for it (the topbar names it from the daemon's default model).
-      if (await window.agent24.modelSourceGet?.().catch(() => null)) return
-      // Try to start oMLX
-      const started = await window.agent24.omlxStart(8088, '')
-      if (started.ok) {
-        // Poll until ready
-        for (let i = 0; i < 5; i++) {
-          await new Promise((r) => setTimeout(r, 2000))
-          const r = await window.agent24.omlxModels(started.url, '')
-          if (r.ok && r.models.length > 0) {
-            const chatModel = pickChatModel(r.models)
-            setFallbackLlmLabel(chatModel ? `${chatModel} · oMLX` : NO_CHAT_MODEL_LABEL)
-            if (chatModel) break
-          }
-        }
-      } else {
-        setFallbackLlmLabel(LLM_NO_RUNTIME)
-      }
-    })()
+    // 过渡：ID-3 后由 iDoris 接管并删除。不探测，直接拉起；main 自己跳过已在跑的进程。
+    void Promise.resolve(window.agent24.omlxStart()).catch(() => { /* the label comes from the daemon */ })
 
     return () => clearInterval(backendTimer)
   }, [])

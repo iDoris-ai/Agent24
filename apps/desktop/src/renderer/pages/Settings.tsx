@@ -7,7 +7,6 @@ import { CliToolSettings } from './settings/CliToolSettings'
 import { ResidentServiceSettings } from './settings/ResidentServiceSettings'
 import { KnowledgeSettings } from './settings/KnowledgeSettings'
 import { ModelServiceSettings } from './settings/ModelServiceSettings'
-import { ModelSourceSettings } from './settings/ModelSourceSettings'
 import { SidebarPrefs } from './settings/SidebarPrefs'
 
 // Tab ownership of the blocks that used to be one scrolling page:
@@ -56,11 +55,8 @@ export default function SettingsPage({ initialTab }: { initialTab?: string } = {
     }
   }, [initialTab])
   const tabRefs = useRef<Partial<Record<SettingsTab, HTMLButtonElement | null>>>({})
-  // The model form probes and may auto-start a service. Keep it mounted after
-  // the first visit so leaving the tab does not wipe a key the user typed.
+  // Keep the models block mounted after the first visit so a selection survives tab switches.
   const keepModels = useRef(tab === 'models')
-  // Custom local model service in use: the oMLX block below says so instead of 「未连接」.
-  const [customInUse, setCustomInUse] = useState(false)
   if (tab === 'models') keepModels.current = true
 
   function activate(next: SettingsTab, focus: boolean) {
@@ -106,8 +102,7 @@ export default function SettingsPage({ initialTab }: { initialTab?: string } = {
         {tab === 'general' && <GeneralTab />}
         {keepModels.current && (
           <div hidden={tab !== 'models'}>
-            <ModelSourceSettings onChange={(source) => setCustomInUse(source !== null)} />
-            <ModelServiceSettings customInUse={customInUse} />
+            <ModelServiceSettings />
           </div>
         )}
         {tab === 'voice' && <VoiceTab />}

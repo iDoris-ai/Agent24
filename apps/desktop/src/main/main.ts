@@ -11,19 +11,17 @@ import { createScheduleConversations, type ScheduleConversations } from './sched
 import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from './assistant-approvals'
 import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
-import { registerModelSource } from './ipc/model-source'
 import { registerOfficeEngine } from './ipc/office-engine'
 import { registerTranslationExport } from './ipc/translation-export'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
-import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
 import { SERVICE_LABEL, serviceDaemonCopyPath, upgradeServiceByLaunchd } from './resident-service'
-import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, autoInstallService, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, autoInstallService, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradesFromBundle, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -797,14 +795,6 @@ app.whenReady().then(async () => {
       return result
     },
   })
-  // Settings → Models → custom local model service: the daemon reads the
-  // file as it starts, so a change restarts it (the service daemon through
-  // the same presence-confirmed restart as an upgrade).
-  registerModelSource({
-    guard,
-    file: () => { const dir = tryDataDir(); return dir === null ? null : modelSourcePath(dir) },
-    restart: restartDaemonForModelSource,
-  })
   registerOfficeEngine({
     guard,
     engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
@@ -1039,23 +1029,6 @@ app.whenReady().then(async () => {
   // macOS: re-open window when dock icon clicked with no windows open
   app.on('activate', () => showOrCreateWindow())
 })
-
-async function restartDaemonForModelSource(): Promise<{ ok: true } | { ok: false; code: string }> {
-  const service = serviceDaemonOf(backendManager)
-  if (service) {
-    const dataDir = tryDataDir()
-    if (dataDir === null) return { ok: false, code: 'no_data_dir' }
-    const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid: service.pid, hold })
-    // Restarted to read the model source again; replaced only through the upgrade's own gate.
-    const gate = { fromBundle: upgradesFromBundle(app.isPackaged, process.env), bundled: bundledVersion, running: backendManager.serviceDaemonVersion() }
-    const outcome = await upgradeService(restartDeps(deps, gate))
-    return outcome.ok ? { ok: true } : { ok: false, code: outcome.code }
-  }
-  if (backendManager.isExternalDaemon()) return { ok: false, code: 'external_daemon' }
-  backendManager.restart()
-  return { ok: true }
-}
 
 // M5 B4b/B4c: the install and the stop, shared by the first-launch box, the
 // Settings switch and the tray's 「完全退出」, one at a time (B4c3).
