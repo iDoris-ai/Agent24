@@ -1308,6 +1308,16 @@ while True:
             out = b'{"error":{"message":"no embeddings","type":"not_found"}}'
             conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
             continue
+        # Health and inventory are not chat. Logging them would inflate
+        # request_count, and hanging them would freeze the call before chat.
+        if request_line.startswith("GET /health"):
+            out = b'{"service":"idoris","version":"0.5.0-fixture","contract_version":"__CONTRACT__","instance_id":"stub","dev_no_key_enabled":false}'
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
+            continue
+        if request_line.startswith("GET /v1/models"):
+            out = json.dumps({"data": [{"id": model_id}]}).encode()
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
+            continue
         mode = read_mode()
         if mode == "hang":
             dump_atomic("hang_result.json", {"phase": "waiting", "closed": None})
@@ -1337,7 +1347,7 @@ while True:
                 "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
                 "model": model_id,
             }).encode()
-        conn.sendall(b"HTTP/1.1 %s\r\nContent-Length: %d\r\nContent-Type: application/json\r\n\r\n%s" % (status, len(out), out))
+        conn.sendall(b"HTTP/1.1 %s\r\nContent-Length: %d\r\nContent-Type: application/json\r\nx-idoris-served-locality: loopback\r\nx-idoris-record-id: stubrec\r\n\r\n%s" % (status, len(out), out))
     except Exception as e:
         with open(os.path.join(control_dir, "error.txt"), "w") as out:
             out.write(repr(e))
@@ -1371,8 +1381,15 @@ impl Stub {
 
 fn start_stub(control_dir: &Path, model_id: &str) -> Stub {
     std::fs::create_dir_all(control_dir).unwrap();
+    let script = STUB_SCRIPT.replace(
+        "__CONTRACT__",
+        agent24_idoris::IdorisLock::embedded()
+            .tested_contract_version
+            .as_str(),
+    );
     let mut child = Command::new("python3")
-        .args(["-I", "-S", "-c", STUB_SCRIPT])
+        .args(["-I", "-S", "-c"])
+        .arg(script)
         .arg(control_dir)
         .arg(model_id)
         .env_clear()
@@ -1436,18 +1453,11 @@ fn c8_local_only_never_reaches_the_remote_stub() {
     let d = start(
         home.path(),
         &[
-            ("OMLX_URL", &format!("http://127.0.0.1:{}", local.port)),
-            // The IPv4-mapped IPv6 trick `me4_model_blackbox.rs` uses (J16/§2.3):
-            // `ModelRouter::from_env` labels a provider URL Remote only when it
-            // is NOT loopback (`agent24-models/src/router.rs::is_loopback_url`,
-            // which deliberately does not recognise `::ffff:127.0.0.1` as
-            // loopback even though the bytes still land on this machine) — a
-            // plain `127.0.0.1` OLLAMA_URL would be judged Local, defeating
-            // this test's whole point.
             (
-                "OLLAMA_URL",
-                &format!("http://[::ffff:127.0.0.1]:{}", remote.port),
+                "AGENT24_DEV_IDORIS_URL",
+                &format!("http://127.0.0.1:{}/", local.port),
             ),
+            ("AGENT24_DEV_IDORIS_KEY", "idk_a3_attach_fixture"),
         ],
     );
 
@@ -1579,7 +1589,13 @@ fn c9_shutdown_with_an_inflight_model_call_lands_a_cancelled_usage_row() {
 
     let mut d = start(
         home.path(),
-        &[("OMLX_URL", &format!("http://127.0.0.1:{}", hang.port))],
+        &[
+            (
+                "AGENT24_DEV_IDORIS_URL",
+                &format!("http://127.0.0.1:{}/", hang.port),
+            ),
+            ("AGENT24_DEV_IDORIS_KEY", "idk_a3_attach_fixture"),
+        ],
     );
     let reg = register_ok(&d, &manifest);
     let socket_path = reg["socket_path"].as_str().unwrap().to_owned();

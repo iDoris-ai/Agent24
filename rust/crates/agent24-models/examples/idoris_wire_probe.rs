@@ -14,8 +14,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         _ => return Err("expected simple|complex and a prompt".into()),
     };
     let prompt = args.next().ok_or("missing prompt")?;
-    if args.next().is_some() || std::env::var_os("IDORIS_URL").is_none() {
-        return Err("expected exactly two arguments and explicit IDORIS_URL".into());
+    if args.next().is_some() || std::env::var_os("AGENT24_DEV_IDORIS_URL").is_none() {
+        return Err("expected exactly two arguments and explicit AGENT24_DEV_IDORIS_URL".into());
     }
     let request = CompletionRequest {
         messages: vec![Msg::user(prompt)],

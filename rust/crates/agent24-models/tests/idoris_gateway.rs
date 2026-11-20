@@ -52,6 +52,17 @@ async fn endpoint_with_redirect(
                 }
                 let request = String::from_utf8(bytes).unwrap();
                 let health = request.starts_with("GET /health ");
+                // iDoris enforces key scope: Agent24's key holds roles only, so a
+                // concrete (role-less) model name is 403 VIRTUAL_KEY_ROLE_FORBIDDEN.
+                let role_forbidden = request.starts_with("POST ")
+                    && request
+                        .split_once("\r\n\r\n")
+                        .and_then(|(_, b)| serde_json::from_str::<serde_json::Value>(b).ok())
+                        .is_some_and(|b| {
+                            !b["model"]
+                                .as_str()
+                                .is_some_and(|m| m.starts_with("idoris/"))
+                        });
                 let confirmed = request
                     .to_ascii_lowercase()
                     .contains("x-idoris-headroom-breach: confirmed");
@@ -112,6 +123,9 @@ async fn endpoint_with_redirect(
                         body["error"].as_object_mut().unwrap().remove("reason_code");
                     }
                 }
+                if role_forbidden {
+                    body = serde_json::json!({"error": {"type":"role_forbidden","reason_code":"VIRTUAL_KEY_ROLE_FORBIDDEN"}});
+                }
                 let body = body.to_string();
                 let record = if content == "missing-record" {
                     ""
@@ -141,7 +155,9 @@ async fn endpoint_with_redirect(
                 } else {
                     ""
                 };
-                let status = if content == "redirect" && !health {
+                let status = if role_forbidden {
+                    "403 Forbidden"
+                } else if content == "redirect" && !health {
                     "307 Temporary Redirect"
                 } else if !health
                     && (headroom
@@ -298,9 +314,14 @@ async fn configured_gateway_is_the_only_http_target() {
             ])
             .env("A24_IDORIS_PROBE_CHILD", "1")
             .env_remove("A24_IDORIS_CASE")
-            .env("IDORIS_URL", gateway)
+            .env("IDORIS_URL", gateway.clone())
             .env(
                 "IDORIS_API_KEY",
+                "idk_1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .env("AGENT24_DEV_IDORIS_URL", gateway.clone())
+            .env(
+                "AGENT24_DEV_IDORIS_KEY",
                 "idk_1111111111111111111111111111111111111111111111111111111111111111",
             )
             .env("OMLX_URL", &direct)
@@ -431,9 +452,14 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
             ])
             .env("A24_IDORIS_PROBE_CHILD", "1")
             .env("A24_IDORIS_CASE", case)
-            .env("IDORIS_URL", gateway)
+            .env("IDORIS_URL", gateway.clone())
             .env(
                 "IDORIS_API_KEY",
+                "idk_1111111111111111111111111111111111111111111111111111111111111111",
+            )
+            .env("AGENT24_DEV_IDORIS_URL", gateway.clone())
+            .env(
+                "AGENT24_DEV_IDORIS_KEY",
                 "idk_1111111111111111111111111111111111111111111111111111111111111111",
             )
             .env("OMLX_URL", &direct)
@@ -441,12 +467,12 @@ async fn invalid_evidence_and_credentials_never_fall_back() {
             .env_remove("DEFAULT_MODEL");
             if case == "missing-key" {
                 cmd.env_remove("IDORIS_API_KEY");
+                cmd.env_remove("AGENT24_DEV_IDORIS_KEY");
             }
             if case == "admin-key" {
-                cmd.env(
-                    "IDORIS_API_KEY",
-                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
-                );
+                let admin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+                cmd.env("IDORIS_API_KEY", admin);
+                cmd.env("AGENT24_DEV_IDORIS_KEY", admin);
             }
             cmd.output().unwrap()
         })
@@ -529,10 +555,13 @@ async fn headroom_gateway_contract() {
                 .env("A24_IDORIS_PROBE_CHILD", "1")
                 .env("A24_IDORIS_CASE", case)
                 .env("A24_IDORIS_CONFIRMED", confirmed.to_string())
-                .env("IDORIS_URL", gateway)
+                .env("IDORIS_URL", gateway.clone())
                 .env("IDORIS_API_KEY", "idk_headroom_fixture")
+                .env("AGENT24_DEV_IDORIS_URL", gateway.clone())
+                .env("AGENT24_DEV_IDORIS_KEY", "idk_headroom_fixture")
                 .env("OMLX_URL", &direct)
                 .env("OLLAMA_URL", &direct)
+                .env_remove("DEFAULT_MODEL")
                 .output()
                 .unwrap()
         })

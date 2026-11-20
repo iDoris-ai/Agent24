@@ -4,6 +4,7 @@ import { getStatus, type IdorisStatus } from '../../components/idoris/api'
 import { idorisMessages } from '../../components/idoris/IdorisPanel.i18n'
 import { settingsMessages } from '../Settings.i18n'
 import { isChatModelId } from './chatModels'
+import ModelSourcePanel from '../../components/idoris/ModelSourcePanel'
 
 const IDORIS_STATE: Record<IdorisStatus['state'], 'state.not_installed' | 'state.not_configured' | 'state.stopped' | 'state.starting' | 'state.running' | 'state.failed' | 'state.instance_conflict'> = {
   not_installed: 'state.not_installed',
@@ -137,6 +138,7 @@ export function ModelServiceSettings(): JSX.Element {
 
   return (
     <div className="settings-section">
+      <ModelSourcePanel />
       <h3>{t('service.title')}</h3>
       <p style={{ fontSize: 12, color: 'var(--muted)', margin: '0 0 8px' }}>{t('service.hint')}</p>
       <p role="status" style={{ fontSize: 12, margin: '0 0 8px' }}>

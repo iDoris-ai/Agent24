@@ -241,6 +241,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             "/api/v1/idoris/omlx/candidates",
             get(crate::idoris_routes::candidates),
         )
+        .route(
+            "/api/v1/idoris/upstream-models",
+            get(crate::idoris_routes::upstream_models),
+        )
         .route("/api/v1/idoris/start", post(crate::idoris_routes::start))
         .route("/api/v1/idoris/stop", post(crate::idoris_routes::stop))
         .route(

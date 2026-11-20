@@ -144,7 +144,11 @@ fn start(home: &Path, omlx_port: u16) -> Daemon {
     let daemon = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"))
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
-        .env("OMLX_URL", format!("http://127.0.0.1:{omlx_port}"))
+        .env(
+            "AGENT24_DEV_IDORIS_URL",
+            format!("http://127.0.0.1:{omlx_port}/"),
+        )
+        .env("AGENT24_DEV_IDORIS_KEY", "idk_shutdown_wiring_fixture")
         .args(["serve", "--port", "0"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -228,6 +232,29 @@ fn start_hanging_provider() -> StubProvider {
             }
             let head = String::from_utf8_lossy(&buf[..n]);
             let line = head.lines().next().unwrap_or("");
+            if line.contains("GET /v1/models") {
+                let body = r#"{"data":[{"id":"probe-model"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                continue;
+            }
+            if line.contains("GET /health") {
+                let version = agent24_idoris::IdorisLock::embedded()
+                    .tested_contract_version
+                    .as_str();
+                let body = format!(
+                    r#"{{"service":"idoris","version":"0.5.0-fixture","contract_version":"{version}","instance_id":"shutdown","dev_no_key_enabled":false}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(resp.as_bytes());
+                continue;
+            }
             if line.contains("/v1/embeddings") {
                 let body = br#"{"error":{"message":"no embeddings","type":"not_found"}}"#;
                 let resp = format!(

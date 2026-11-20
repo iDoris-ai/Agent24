@@ -64,6 +64,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   // IL-13: host-only lifecycle API; Admin credentials never enter Electron.
   r('GET', '/api/v1/idoris/status'),
   r('GET', '/api/v1/idoris/omlx/candidates'),
+  r('GET', '/api/v1/idoris/upstream-models'),
   r('GET', '/api/v1/idoris/operations/{id}'),
   r('POST', '/api/v1/idoris/operations/{id}/cancel'),
   r('POST', '/api/v1/idoris/install'),

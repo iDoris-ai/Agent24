@@ -51,8 +51,8 @@
 //!
 //! ```text
 //! export PATH="$HOME/Library/Application Support/mbx/bin:$PATH"
-//! export OMLX_URL=http://127.0.0.1:8088
-//! export OMLX_API_KEY="$(python3 -c 'import json,os; print(json.load(open(os.path.expanduser("~/.omlx/settings.json")))["auth"]["api_key"])')"
+//! export AGENT24_DEV_IDORIS_URL=http://127.0.0.1:9
+//! export AGENT24_DEV_IDORIS_KEY=idk_dev_eval
 //! cd rust && cargo test -j 4 -p agent24-memory eval_m1::eval_m1_omlx -- --ignored --exact --nocapture
 //! ```
 //!
@@ -70,7 +70,6 @@ use crate::KvStore;
 use crate::assertion::{Assertion, AssertionStore};
 use crate::event::{Origin, Scope, Trust};
 use crate::writer::{Candidate, MemoryWriter};
-use agent24_models::ModelProvider;
 use serde_json::json;
 
 const OWNER: &str = "m1-eval-owner";
@@ -480,9 +479,9 @@ async fn run_eval(mode: Mode) {
             Some(store.hybrid_retriever(std::sync::Arc::new(NgramEmbedder)))
         }
         Mode::Real => {
-            let embedder = crate::embedder::LocalEmbedder::open(&store, omlx_client())
+            let embedder = crate::embedder::LocalEmbedder::open(&store, dev_embed_client())
                 .await
-                .expect("oMLX embedder did not open; is bge-m3 listening?");
+                .expect("iDoris embedder did not open; is the dev gateway listening?");
             store
                 .vector_retriever(embedder.clone())
                 .reindex(OWNER)
@@ -498,7 +497,7 @@ async fn run_eval(mode: Mode) {
                     std::time::Duration::from_secs(30),
                 );
             if let Some(model) = &rewrite_model {
-                let rewriter = std::sync::Arc::new(OmlxRewriter::new(model));
+                let rewriter = std::sync::Arc::new(DevRewriter::new(model));
                 let sample = rewriter
                     .complete("我对什么食物过敏")
                     .await
@@ -882,13 +881,14 @@ impl crate::vector::Embedder for NgramEmbedder {
     }
 }
 
-/// Same URL and key read as chat (`OMLX_URL` / `OMLX_API_KEY`, loopback only).
-/// Ignores `IDORIS_URL` so this run always hits the local oMLX named above.
-fn omlx_client() -> agent24_models::EmbeddingClient {
-    let url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-    let key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
-    agent24_models::EmbeddingClient::direct(url, key, agent24_models::DEFAULT_EMBED_MODEL)
-        .expect("OMLX_URL must be a loopback embeddings endpoint")
+/// Embeddings for the ignored real run. The gateway is whatever
+/// `AGENT24_DEV_IDORIS_URL` published into the iDoris slot.
+fn dev_embed_client() -> agent24_models::EmbeddingClient {
+    let router = std::sync::Arc::new(agent24_models::router::ModelRouter::from_env());
+    router
+        .idoris_gateway()
+        .expect("set AGENT24_DEV_IDORIS_URL and AGENT24_DEV_IDORIS_KEY");
+    agent24_models::EmbeddingClient::from_router(router).expect("embedding client")
 }
 
 /// Min cosine of each paraphrase against its own fact, and max cosine of each
@@ -961,26 +961,20 @@ async fn print_real_margins(store: &KvStore) {
 
 /// Local chat model for the three indirect questions. Same prompt as
 /// [`crate::hybrid::rewrite_prompt`]. `REWRITE_MODEL` is the model id.
-struct OmlxRewriter {
-    provider: agent24_models::OpenAiCompatProvider,
+/// The call goes through the dev iDoris slot, with the model named explicitly.
+struct DevRewriter {
+    router: std::sync::Arc<agent24_models::router::ModelRouter>,
     model: String,
 }
 
-impl OmlxRewriter {
+impl DevRewriter {
     fn new(model: &str) -> Self {
-        let url = std::env::var("OMLX_URL").unwrap_or_else(|_| "http://127.0.0.1:8088".to_owned());
-        let key = std::env::var("OMLX_API_KEY").unwrap_or_else(|_| "xiaobao8088".to_owned());
-        let provider = agent24_models::OpenAiCompatProvider::new(
-            "omlx",
-            url,
-            Some(key),
-            "local",
-            model.to_owned(),
-        )
-        .loopback_only()
-        .supports_chat_template_kwargs();
+        let router = std::sync::Arc::new(agent24_models::router::ModelRouter::from_env());
+        router
+            .idoris_gateway()
+            .expect("set AGENT24_DEV_IDORIS_URL and AGENT24_DEV_IDORIS_KEY");
         Self {
-            provider,
+            router,
             model: model.to_owned(),
         }
     }
@@ -1001,16 +995,23 @@ impl OmlxRewriter {
         };
         let cancel = tokio_util::sync::CancellationToken::new();
         let response = self
-            .provider
-            .complete(&req, &cancel)
+            .router
+            .complete(
+                agent24_models::router::TaskProfile {
+                    privacy: agent24_models::router::Privacy::LocalOnly,
+                    ..Default::default()
+                },
+                &req,
+                &cancel,
+            )
             .await
             .map_err(|err| err.to_string())?;
-        Ok(response.message.content.unwrap_or_default())
+        Ok(response.1.message.content.unwrap_or_default())
     }
 }
 
 #[async_trait::async_trait]
-impl crate::hybrid::QueryRewriter for OmlxRewriter {
+impl crate::hybrid::QueryRewriter for DevRewriter {
     async fn rewrite(&self, query: &str) -> std::result::Result<Vec<String>, String> {
         let text = self.complete(query).await?;
         println!("rewrite {query:?} -> {text:?}");
@@ -1019,7 +1020,7 @@ impl crate::hybrid::QueryRewriter for OmlxRewriter {
 }
 
 async fn omlx_embedder(store: &KvStore) -> crate::embedder::LocalEmbedder {
-    crate::embedder::LocalEmbedder::open(store, omlx_client())
+    crate::embedder::LocalEmbedder::open(store, dev_embed_client())
         .await
         .unwrap()
 }
@@ -1066,7 +1067,7 @@ async fn eval_m1_hybrid() {
 
 /// Real bge-m3 on the local oMLX. Not part of CI. Command in the module docs.
 #[tokio::test]
-#[ignore = "real oMLX bge-m3-mlx-fp16; set OMLX_URL and OMLX_API_KEY, then --ignored --exact"]
+#[ignore = "real bge-m3 through a dev iDoris gateway; set AGENT24_DEV_IDORIS_URL and AGENT24_DEV_IDORIS_KEY, then --ignored --exact"]
 async fn eval_m1_omlx() {
     run_eval(Mode::Real).await;
 }

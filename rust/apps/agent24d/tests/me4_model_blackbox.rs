@@ -277,6 +277,16 @@ while True:
             out = b'{"error":{"message":"no embeddings","type":"not_found"}}'
             conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
             continue
+        # Health and inventory are not chat. Logging them would inflate
+        # request_count, and hanging them would freeze the call before chat.
+        if request_line.startswith("GET /health"):
+            out = b'{"service":"idoris","version":"0.5.0-fixture","contract_version":"__CONTRACT__","instance_id":"stub","dev_no_key_enabled":false}'
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
+            continue
+        if request_line.startswith("GET /v1/models"):
+            out = json.dumps({"data": [{"id": model_id}]}).encode()
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n%s" % (len(out), out))
+            continue
         mode = read_mode()
         if mode == "hang":
             # Written BEFORE the requests.json append below (not after) —
@@ -315,7 +325,7 @@ while True:
                 "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
                 "model": model_id,
             }).encode()
-        conn.sendall(b"HTTP/1.1 %s\r\nContent-Length: %d\r\nContent-Type: application/json\r\n\r\n%s" % (status, len(out), out))
+        conn.sendall(b"HTTP/1.1 %s\r\nContent-Length: %d\r\nContent-Type: application/json\r\nx-idoris-served-locality: loopback\r\nx-idoris-record-id: stubrec\r\n\r\n%s" % (status, len(out), out))
     except Exception as e:
         with open(os.path.join(control_dir, "error.txt"), "w") as out:
             out.write(repr(e))
@@ -552,8 +562,9 @@ fn start(home: &Path, omlx_url: &str, ollama_url: &str, extra_env: &[(&str, &str
     let mut cmd = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24d"));
     cmd.env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("HOME", home)
-        .env("OMLX_URL", omlx_url)
-        .env("OLLAMA_URL", ollama_url);
+        .env("AGENT24_DEV_IDORIS_URL", omlx_url)
+        .env("AGENT24_DEV_IDORIS_KEY", "idk_me4_blackbox_fixture");
+    let _ = ollama_url;
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
@@ -729,8 +740,15 @@ impl Stub {
 
 fn start_stub(control_dir: &Path, model_id: &str) -> Stub {
     std::fs::create_dir_all(control_dir).unwrap();
+    let script = STUB_SCRIPT.replace(
+        "__CONTRACT__",
+        agent24_idoris::IdorisLock::embedded()
+            .tested_contract_version
+            .as_str(),
+    );
     let mut child = Command::new("python3")
-        .args(["-I", "-S", "-c", STUB_SCRIPT])
+        .args(["-I", "-S", "-c"])
+        .arg(script)
         .arg(control_dir)
         .arg(model_id)
         .env_clear()

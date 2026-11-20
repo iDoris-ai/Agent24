@@ -257,6 +257,9 @@ async fn explicit_deep_and_unique_owner_but_no_other_roles() {
     f.keys.issue("installation", &["deep"]).await.unwrap();
     let first: Value = serde_json::from_str(&f.read("spec")).unwrap();
     assert_eq!(first["allowed_roles"], json!(["daily", "deep"]));
+    f.keys.issue("installation", &["embed"]).await.unwrap();
+    let embed: Value = serde_json::from_str(&f.read("spec")).unwrap();
+    assert_eq!(embed["allowed_roles"], json!(["daily", "embed"]));
     f.keys.issue("installation", &["daily"]).await.unwrap();
     let second: Value = serde_json::from_str(&f.read("spec")).unwrap();
     assert_ne!(first["owner"], second["owner"]);
@@ -265,7 +268,7 @@ async fn explicit_deep_and_unique_owner_but_no_other_roles() {
     }
     assert_eq!(
         f.calls().iter().filter(|call| call[1] == "issue").count(),
-        2
+        3
     );
 }
 

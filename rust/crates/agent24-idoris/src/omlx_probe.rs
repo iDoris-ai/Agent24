@@ -108,6 +108,17 @@ impl Endpoint {
         }
         Ok(Self(url))
     }
+    /// Configuration-only OpenAI-compatible origin; localhost is pinned to IPv4.
+    pub fn parse_openai_compat(input: &str) -> Result<Self, InvalidEndpoint> {
+        let normalized = input.replacen("://localhost", "://127.0.0.1", 1);
+        let endpoint = Self::parse(&normalized)?;
+        if endpoint.0.scheme() != "http"
+            || !matches!(endpoint.0.host_str(), Some("127.0.0.1" | "[::1]"))
+        {
+            return Err(InvalidEndpoint);
+        }
+        Ok(endpoint)
+    }
     pub fn as_str(&self) -> &str {
         self.0.as_str()
     }
