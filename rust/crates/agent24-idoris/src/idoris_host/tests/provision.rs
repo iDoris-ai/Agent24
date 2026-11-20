@@ -551,6 +551,8 @@ async fn connect_accepts_verification_model_id_at_the_limit() {
 async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
+    // Not connected yet: no model to name.
+    assert_eq!(x.f.host.daily_model().await, None);
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
             candidates: vec![Candidate {
@@ -567,6 +569,8 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     assert_eq!(status.state, State::Running);
     assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
     assert!(!status.roles.is_empty());
+    // Loop 4: what the topbar names once chat goes through iDoris.
+    assert_eq!(x.f.host.daily_model().await.as_deref(), Some("real-model"));
     // Complex tasks go out as idoris/deep: bootstrap must bind it (403 otherwise).
     assert!(
         status
