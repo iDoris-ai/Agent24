@@ -590,7 +590,42 @@ fn rejecting_a_tracked_rewrite_gives_back_tabs_and_line_breaks() {
             &old_para[s..e]
         );
     }
-    // The new text: a tab and a line break, written as Word does.
-    assert!(ins.contains("<w:tab/>") && ins.contains("<w:br/>"), "{ins}");
+    // Accepting: the new text, a tab and a line break where \t and \n were,
+    // in that order, written as Word does.
+    let expected = r#"<w:t xml:space="preserve">联系人</w:t><w:tab/><w:t xml:space="preserve">张三</w:t><w:br/><w:t xml:space="preserve">电话</w:t>"#;
+    assert!(ins.contains(expected), "{ins}");
     assert!(!ins.contains('\t') && !ins.contains('\n'), "{ins}");
+    // Rejecting keeps the order too: the tab before 010, the break before 乙方.
+    let order = |hay: &str, a: &str, b: &str| hay.find(a).unwrap() < hay.find(b).unwrap();
+    assert!(
+        order(&rejected, "<w:tab/>", "010") && order(&rejected, "<w:br/>", "乙方"),
+        "{rejected}"
+    );
+}
+
+/// PM 11-21: a plain (untracked) rewrite writes \t and \n as w:tab and w:br too.
+#[test]
+fn a_plain_rewrite_writes_tabs_and_line_breaks_as_word_does() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let text = list_paragraphs(FIXTURE).unwrap()[index].text.clone();
+    let edit = ParaEdit {
+        index,
+        text: "甲\t乙\n丙".into(),
+        tracked: false,
+        expect: Some(text),
+    };
+    let out = apply(FIXTURE, &[edit], "A", NOW).unwrap();
+    let xml = entry(&out, "word/document.xml");
+    let paras = scan_paragraphs(&xml).unwrap();
+    let para = &xml[paras[index].start..paras[index].end];
+    assert!(
+        para.contains(r#"<w:t xml:space="preserve">甲</w:t><w:tab/><w:t xml:space="preserve">乙</w:t><w:br/><w:t xml:space="preserve">丙</w:t>"#),
+        "{para}"
+    );
+    assert!(!para.contains("<w:del ") && !para.contains('\t'), "{para}");
 }
