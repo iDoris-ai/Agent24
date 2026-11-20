@@ -3180,6 +3180,94 @@ mod tests {
         assert_eq!(runtime.calls.load(Ordering::SeqCst), 1);
     }
 
+    /// Loop 4 (General 11-20): a module call missing a required argument is
+    /// refused before the approval gate is asked, so no card is shown for a
+    /// call that could never run, and the model is told what is missing.
+    #[tokio::test]
+    async fn a_module_call_missing_a_required_argument_never_reaches_the_approval_gate() {
+        let yaml = format!(
+            "name: documents\nversion: 1.0.0\nroute_namespace: /api/v1/documents\nevent_module: documents\ndata_dir: ~/.agent24/os/documents/\nimpl_kind: in_process_crate\nmin_daemon_protocol: {}\ntools:\n  - operation: compose\n    description: d\n    input_schema: {{ type: object, required: [parts], properties: {{ parts: {{ type: array }} }} }}\n    risk: write_local\n    output_privacy: local_only\n    timeout_ms: 2000\n    inline_wait_ms: 1000\n",
+            agent24_domain::RESOURCE_KINDS_PROTOCOL,
+        );
+        let manifest = agent24_domain::DomainOsManifest::from_yaml(&yaml).unwrap();
+        let mut modules = agent24_domain::tool::ModuleToolRegistry::new();
+        modules
+            .register_module("documents", manifest.tools())
+            .unwrap();
+        let authorization: Arc<dyn ModuleToolAuthorization> = Arc::new(GrantingAuthorization);
+        let authorizations: HashMap<(String, String), Arc<dyn ModuleToolAuthorization>> = [(
+            ("documents".to_owned(), "compose".to_owned()),
+            Arc::clone(&authorization),
+        )]
+        .into_iter()
+        .collect();
+        let runtime = fake_module(true);
+        let view: Arc<dyn ModuleToolAdvertView> = Arc::new(TestAdvertView {
+            authorization: Arc::clone(&authorization),
+            running: Arc::clone(&runtime),
+            outbound_ready: AtomicBool::new(true),
+        });
+        let runtime_dyn: Arc<dyn ModuleToolRuntime> = runtime.clone();
+        let gate = Arc::new(CountingApproval {
+            calls: AtomicUsize::new(0),
+            deny: AtomicBool::new(false),
+        });
+        let mut tools = ToolRegistry::new().with_gate(gate.clone());
+        super::register_module_tools(
+            &mut tools,
+            &modules,
+            &authorizations,
+            &view,
+            &runtime_dyn,
+            &Store::open_memory().await.unwrap(),
+            &std::collections::HashSet::new(),
+        );
+        let mut empty = Map::new();
+        for args in [Map::new(), {
+            empty.insert("parts".into(), Value::Null);
+            empty
+        }] {
+            let Err(error) = tools
+                .dispatch(
+                    "documents.compose",
+                    &context(),
+                    &args,
+                    &CancellationToken::new(),
+                )
+                .await
+            else {
+                panic!("a call without parts must be refused");
+            };
+            assert!(
+                matches!(&error, ToolError::Invalid(why) if why.contains("parts")),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst),
+            0,
+            "no card for a call that could never run"
+        );
+        let mut args = Map::new();
+        args.insert(
+            "parts".into(),
+            serde_json::json!([{ "document_id": "a.pdf" }]),
+        );
+        let _ = tools
+            .dispatch(
+                "documents.compose",
+                &context(),
+                &args,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            gate.calls.load(Ordering::SeqCst),
+            1,
+            "a call with its arguments is asked as before"
+        );
+    }
+
     /// Loop 4 (option b): a tool on the host's first-party read list is
     /// registered `Read`, so the approval gate is not asked; the same tool
     /// off the list, and every other tool, is `External` and asked each call.
