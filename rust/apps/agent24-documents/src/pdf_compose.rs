@@ -33,7 +33,13 @@ pub fn page_list(spec: &str, count: u32) -> Result<Vec<u32>, ComposeError> {
     for part in spec.split(',') {
         if let Some((a, b)) = part.split_once('-') {
             let start = parse_page_number(a)?;
-            let end = parse_page_number(b)?;
+            // Loop 4 (General 11-20): `2-` is to the last page, as the model
+            // writes 「其余页」.
+            let end = if b.is_empty() {
+                count.max(start)
+            } else {
+                parse_page_number(b)?
+            };
             if start > end {
                 return Err(malformed_spec());
             }
@@ -355,11 +361,15 @@ mod tests {
         assert_eq!(page_list("1-3,5", 5).unwrap(), vec![1, 2, 3, 5]);
         assert_eq!(page_list("4", 3), Err(ComposeError::NoPage));
         assert_eq!(page_list("1-3,5", 4), Err(ComposeError::NoPage));
+        // Open to the end (「其余页」), and past the end is no page.
+        assert_eq!(page_list("2-", 4).unwrap(), vec![2, 3, 4]);
+        assert_eq!(page_list("1,3-", 3).unwrap(), vec![1, 3]);
+        assert_eq!(page_list("5-", 4), Err(ComposeError::NoPage));
     }
 
     #[test]
     fn page_list_rejects_malformed_specs() {
-        for spec in ["0", "3-1", "1,,2", "a"] {
+        for spec in ["0", "3-1", "1,,2", "a", "-2", "0-"] {
             assert!(
                 matches!(page_list(spec, 5), Err(ComposeError::Failed(_))),
                 "{spec}"
