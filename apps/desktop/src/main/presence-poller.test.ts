@@ -11,6 +11,7 @@ import {
   PresencePoller,
   showPresenceDialog,
   parseChallenge,
+  requesterLabel,
   type PresenceChallenge,
   type PresenceDialogOptions,
   type PresencePollerDeps,
@@ -350,6 +351,20 @@ describe('presence poller', () => {
     const after = h.calls.length
     await new Promise((r) => setTimeout(r, 20))
     expect(h.calls.length).toBe(after)
+  })
+})
+
+describe('requesterLabel (Loop 4: who asks, as the daemon says)', () => {
+  const t = ((key: string, vars?: Record<string, unknown>) => `${key}:${String(vars?.identifier ?? '')}`) as Parameters<typeof requesterLabel>[1]
+  it('names the command line, the app, another program; an older daemon as before', () => {
+    expect(requesterLabel({ identifier: 'ai.auraai.agent24', pid: 1, kind: 'cli' }, t)).toBe('presence.requester.cli:ai.auraai.agent24')
+    expect(requesterLabel({ identifier: 'ai.auraai.agent24', pid: 1, kind: 'desktop' }, t)).toBe('presence.requester.desktop:ai.auraai.agent24')
+    expect(requesterLabel({ identifier: 'x', pid: 1, kind: 'other' }, t)).toBe('presence.requester.other:x')
+    expect(requesterLabel({ identifier: 'ai.auraai.agent24', pid: 1 }, t)).toBe('ai.auraai.agent24')
+  })
+  it('keeps the kind the daemon sent, and drops one it does not know', () => {
+    expect(parseChallenge(challenge({ requester: { identifier: 'a', pid: 2, kind: 'cli' } }))?.requester).toEqual({ identifier: 'a', pid: 2, kind: 'cli' })
+    expect(parseChallenge({ ...challenge(), requester: { identifier: 'a', pid: 2, kind: 'root' } })?.requester).toEqual({ identifier: 'a', pid: 2 })
   })
 })
 
