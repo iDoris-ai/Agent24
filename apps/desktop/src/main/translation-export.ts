@@ -17,6 +17,8 @@ export interface ExportDeps {
    * is in the library, or with why not (`engine_unavailable`: the converter
    * is not installed). */
   importAndConvert: (docxPath: string, pdfTitle: string) => Promise<{ ok: boolean; code?: string; message?: string }>
+  /** D5a: a library document's current file (the `content` op), base64. */
+  fetchContent?: (documentId: string) => Promise<{ ok: true; data: string; mediaType: string } | { ok: false; code?: string; message?: string }>
 }
 
 export interface ExportResult {
@@ -46,14 +48,28 @@ function langSuffix(lang: 'en' | 'zh'): string {
   return lang === 'zh' ? '中文' : 'English'
 }
 
-function uniqueName(dir: string, stem: string, ext: string): string {
-  const first = `${stem}${ext}`
-  if (!fs.existsSync(path.join(dir, first))) return first
-  for (let n = 2; n < 1000; n++) {
-    const name = `${stem} (${n})${ext}`
-    if (!fs.existsSync(path.join(dir, name))) return name
+/** Writes `bytes` to a new file of `dir` named `stem` + `ext`, or `stem (n)` +
+ * `ext` when that is taken, and answers its name. Opened `wx`: a name that is
+ * there in any form, a dangling link too, is never written through
+ * (PR-Daemon #1930 F3). */
+export function writeUnique(dir: string, stem: string, ext: string, bytes: Uint8Array): string {
+  const names = [`${stem}${ext}`, ...Array.from({ length: 998 }, (_, i) => `${stem} (${i + 2})${ext}`), `${stem} (${Date.now()})${ext}`]
+  for (const name of names) {
+    let fd: number
+    try {
+      fd = fs.openSync(path.join(dir, name), 'wx', 0o644)
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'EEXIST') continue
+      throw err
+    }
+    try {
+      fs.writeFileSync(fd, bytes)
+    } finally {
+      fs.closeSync(fd)
+    }
+    return name
   }
-  return `${stem} (${Date.now()})${ext}`
+  throw new Error('no free file name')
 }
 
 export async function exportTranslation(
@@ -68,8 +84,7 @@ export async function exportTranslation(
     const docx = docxBytes(req.paragraphs)
     const downloads = deps.downloadsDir()
     fs.mkdirSync(downloads, { recursive: true })
-    const docxName = uniqueName(downloads, label, '.docx')
-    fs.writeFileSync(path.join(downloads, docxName), docx)
+    const docxName = writeUnique(downloads, label, '.docx', docx)
     fs.mkdirSync(tmp, { recursive: true })
     const importPath = path.join(tmp, `${label}.docx`)
     fs.writeFileSync(importPath, docx)
@@ -83,5 +98,32 @@ export async function exportTranslation(
     return { ok: false, code: 'export_failed', message: error instanceof Error ? error.message : String(error) }
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true })
+  }
+}
+
+const EXT_OF: Record<string, string> = {
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
+  'application/pdf': '.pdf',
+  'image/png': '.png',
+  'image/jpeg': '.jpg',
+}
+
+/** D5a: a library document (a filled template, a patched DOCX) saved as a
+ * file of the Downloads folder, under its title; a name already there gets
+ * 「 (2)」. */
+export async function saveToDownloads(deps: ExportDeps, documentId: string, title: string): Promise<ExportResult> {
+  if (!deps.fetchContent) return { ok: false, code: 'export_failed', message: 'saving is not available' }
+  const got = await deps.fetchContent(documentId)
+  if (!got.ok) return { ok: false, code: got.code ?? 'export_failed', message: got.message ?? 'the file could not be read' }
+  try {
+    const downloads = deps.downloadsDir()
+    fs.mkdirSync(downloads, { recursive: true })
+    const stem = safeTitle(title)
+    const name = writeUnique(downloads, stem === 'translation' ? 'document' : stem, EXT_OF[got.mediaType] ?? '', Buffer.from(got.data, 'base64'))
+    return { ok: true, docxName: name }
+  } catch (e) {
+    return { ok: false, code: 'export_failed', message: e instanceof Error ? e.message : String(e) }
   }
 }

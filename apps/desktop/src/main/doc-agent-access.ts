@@ -4,7 +4,8 @@
 import fs from 'node:fs'
 import path from 'node:path'
 
-export const DOC_AGENT_TOOLS = ['list', 'get', 'compose'] as const
+// E1b/D5a: paragraphs/fields read; patch/fill write a new DOCX, approved per call.
+export const DOC_AGENT_TOOLS = ['list', 'get', 'compose', 'paragraphs', 'patch', 'fields', 'fill'] as const
 export const ACCESS_DAYS = 30
 export const ACCESS_FILE = 'doc-agent-access.json'
 const MAX_RESOURCES = 256

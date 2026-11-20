@@ -88,7 +88,9 @@ describe('doc-agent-access', () => {
     const saved = JSON.parse(fs.readFileSync(path.join(dir, ACCESS_FILE), 'utf8')) as { until: string; granted: Record<string, string> }
     expect(saved.until).toBe(UNTIL)
     const key = `${CARD.fingerprint}|${CARD.artifact}|doc_a,doc_b`
-    expect(saved.granted).toEqual({ list: key, get: key, compose: key })
+    expect(saved.granted).toEqual(Object.fromEntries(DOC_AGENT_TOOLS.map((tool) => [tool, key])))
+    // E1b/D5a: the DOCX tools too.
+    expect(DOC_AGENT_TOOLS).toEqual(['list', 'get', 'compose', 'paragraphs', 'patch', 'fields', 'fill'])
   })
 
   it('skips POST on a later sync until the document set changes', async () => {

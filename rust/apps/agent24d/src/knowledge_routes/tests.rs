@@ -1747,3 +1747,71 @@ async fn the_approval_accepts_a_raw_endpoint_whose_hidden_characters_normalise_a
         );
     }
 }
+
+#[tokio::test]
+async fn an_activation_with_its_credential_is_one_change_under_one_sequence() {
+    let (state, host, _) = crate::server::tests::capability_state().await;
+    let registry = state.knowledge_host.clone();
+    let router = build_router(state);
+    let put = |body: serde_json::Value| with_body(Method::PUT, BINDING, &host, &body.to_string());
+    let endpoint = |credential: serde_json::Value| {
+        serde_json::json!({ "seq": 2, "endpoint": "https://kb.example/api/v1",
+                            "knowledge_base_ids": ["kb-a"], "credential": credential })
+    };
+    // A bad C refuses the whole activation: nothing is stored.
+    let expired =
+        serde_json::json!({ "kind": "api_key", "value": "KEY-1", "expires_at": unix_now() - 1 });
+    let (status, body) = send(&router, put(endpoint(expired))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(!body.contains("KEY-1"), "{body}");
+    assert!(registry.is_empty());
+    let good =
+        serde_json::json!({ "kind": "api_key", "value": "KEY-2", "expires_at": unix_now() + 600 });
+    let (status, _) = send(&router, put(endpoint(good))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let host_id = registry.only_host();
+    let now = registry.binding_now(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!(now.generation, 2);
+    let current = registry.credential(&host_id, "b1", unix_now()).unwrap();
+    assert_eq!(
+        (current.credential, current.seq),
+        (Credential::ApiKey("KEY-2".into()), 2)
+    );
+}
+
+#[tokio::test]
+async fn an_activation_with_its_credential_is_summarised_without_the_secret() {
+    let (state, peer, token, capture) = captured_shell().await;
+    let expires = unix_now() + 3_600;
+    let until = chrono::DateTime::<chrono::Utc>::from_timestamp(i64::try_from(expires).unwrap(), 0)
+        .unwrap()
+        .to_rfc3339();
+    let body = serde_json::json!({
+        "seq": 3,
+        "endpoint": "https://kb.example/api/v1",
+        "knowledge_base_ids": ["kb-a"],
+        "credential": { "kind": "api_key", "value": "ZZSECRETKEY", "expires_at": expires },
+    })
+    .to_string();
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .remember_knowledge_request(
+            &token.token_id,
+            "PUT",
+            BINDING_TEMPLATE,
+            BINDING,
+            body.as_bytes(),
+        );
+    let _grant = approve(&state, &peer, &token.token_id, "PUT", BINDING, &body).await;
+    let shown = capture.0.lock().unwrap();
+    let summary = shown.last().unwrap();
+    assert!(!summary.contains("ZZSECRETKEY"), "{summary}");
+    assert_eq!(
+        approval_details(summary),
+        format!(
+            "activate Knowledge binding \"b1\" for \"https://kb.example/api/v1\"; knowledge bases: [\"kb-a\"], with its credential (\"api_key\", valid until {until}); sequence 3"
+        )
+    );
+}

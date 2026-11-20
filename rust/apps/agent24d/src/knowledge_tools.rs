@@ -68,7 +68,9 @@ impl Tool for KnowledgeTool {
         let (name, description) = match self.kind {
             Kind::Search => (
                 SEARCH,
-                "Search the user's knowledge bases. Returns ranked passages as \
+                "Search the user's knowledge bases. Leave knowledge_base_ids \
+                 out unless the user named one: the search then covers all of \
+                 them. Returns ranked passages as \
                  clues, each with the document and chunk it came from. Before \
                  relying on a passage, read it back with knowledge_read (its \
                  knowledge_id, chunk_id and content_tag): only evidence whose \
@@ -153,7 +155,10 @@ pub struct RunKnowledge {
     /// Each chunk a completed `knowledge_read` named, in the order first read.
     /// Such a read completes only with that chunk of that document (the
     /// backend refuses an answer about another), so the run read these back,
-    /// as a citation or as current text.
+    /// as a citation or as current text. K3 (Loop 3, PM/General 11-19): each
+    /// chunk a completed `knowledge_search` of this run returned counts too:
+    /// the run did receive that passage from the knowledge base (qwen3-8b
+    /// cites search passages without reading them back).
     pub read_chunks: Vec<ReadChunk>,
 }
 
@@ -163,7 +168,17 @@ pub struct ReadChunk {
     pub chunk_id: String,
 }
 
+#[cfg(test)]
 pub fn run_knowledge(calls: &[ToolCall]) -> RunKnowledge {
+    run_knowledge_with(calls, &[])
+}
+
+/// [`run_knowledge`], with the run's tool messages (`answers`): the hits of
+/// each search answer among them count as read (K3). A tool message carries
+/// the provider's call id, not the stored call's, so answers are told by
+/// their own `kind`; only a search that completed answers with one (a failed
+/// call's message is its error text).
+pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledge {
     let mut knowledge = RunKnowledge {
         searched: false,
         read_chunks: Vec::new(),
@@ -192,7 +207,40 @@ pub fn run_knowledge(calls: &[ToolCall]) -> RunKnowledge {
             }
         }
     }
+    if calls
+        .iter()
+        .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed)
+    {
+        for chunk in answers.iter().flat_map(|a| search_hits(a)) {
+            if !knowledge.read_chunks.contains(&chunk) {
+                knowledge.read_chunks.push(chunk);
+            }
+        }
+    }
     knowledge
+}
+
+/// The chunks a search answer returned (K3): each evidence entry naming both
+/// its document and its chunk.
+fn search_hits(answer: &str) -> Vec<ReadChunk> {
+    let Ok(value) = serde_json::from_str::<Value>(answer) else {
+        return Vec::new();
+    };
+    if value.get("kind").and_then(Value::as_str) != Some("knowledge.search") {
+        return Vec::new();
+    }
+    value
+        .get("evidence")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|hit| {
+            Some(ReadChunk {
+                knowledge_id: hit.get("knowledge_id")?.as_str()?.to_owned(),
+                chunk_id: hit.get("chunk_id")?.as_str()?.to_owned(),
+            })
+        })
+        .collect()
 }
 
 /// The binding or its credential moved while the call was out (a credential

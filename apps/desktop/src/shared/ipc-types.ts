@@ -155,9 +155,13 @@ export const IpcChannels = {
   DocumentsExportTranslation: 'documents:export-translation',
   /** D4: show an exported file of the Downloads folder in Finder (its name only). */
   DocumentsRevealDownload: 'documents:reveal-download',
+  /** D5a: a library document's file saved to Downloads (its id, its title). */
+  DocumentsSaveDownload: 'documents:save-download',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
+  /** K2: check the Knowledge server now; answers the status with the result. */
+  KnowledgeCheck: 'knowledge:check',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
   // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
@@ -216,6 +220,8 @@ export interface KnowledgeStatus {
   hasKey: boolean
   /** On, complete and activated in the daemon. */
   active: boolean
+  /** K2: whether the server answered the last check (absent: not checked by this main). */
+  reachability?: { state: 'unknown' | 'ok' | 'unreachable' | 'unauthorized' | 'not_found'; checkedAt: string | null }
 }
 
 /** The key is optional: left out, the saved one is kept. */
@@ -617,6 +623,22 @@ export type DocumentsRequest =
   | { op: 'compose'; parts: Array<{ documentId: DocSchemas['DocumentIdString']; pages?: string }>; title?: string }
   /** D1: an Office document (DOCX/XLSX/PPTX) as a new PDF document. */
   | { op: 'convert'; documentId: DocSchemas['DocumentIdString']; title?: string }
+  /** E1b: a DOCX's paragraphs, by index. */
+  | { op: 'paragraphs'; documentId: DocSchemas['DocumentIdString'] }
+  /** E1b: some paragraphs of a DOCX edited (plainly or as tracked changes) into a new document. */
+  | {
+      op: 'patch'
+      documentId: DocSchemas['DocumentIdString']
+      edits: Array<{ index: number; text: string; tracked?: boolean; expect?: string }>
+      title?: string
+      author?: string
+    }
+  /** D5a: a DOCX template's `{{fields}}`. */
+  | { op: 'fields'; documentId: DocSchemas['DocumentIdString'] }
+  /** D5a: the template with its fields filled, as a new document. */
+  | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
+  /** D5a: the head revision's file (base64), to be saved. */
+  | { op: 'content'; documentId: DocSchemas['DocumentIdString'] }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
 
@@ -636,6 +658,11 @@ export interface DocumentsResults {
   compose: DocSchemas['DocumentsJob']
   /** The import job of the new PDF document. */
   convert: DocSchemas['DocumentsJob']
+  paragraphs: { document_id: string; revision: number; paragraphs: Array<{ index: number; text: string; in_table: boolean }> }
+  patch: DocSchemas['DocumentsJob']
+  fields: { document_id: string; revision: number; fields: Array<{ name: string; count: number }> }
+  fill: DocSchemas['DocumentsJob']
+  content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
 }

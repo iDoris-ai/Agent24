@@ -15,12 +15,14 @@ import { registerModelSource } from './ipc/model-source'
 import { registerOfficeEngine } from './ipc/office-engine'
 import { registerTranslationExport } from './ipc/translation-export'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
+import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
 import { modelSourcePath } from './model-source'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
+import { SERVICE_LABEL, serviceDaemonCopyPath, upgradeServiceByLaunchd } from './resident-service'
 import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, autoInstallService, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
@@ -132,18 +134,35 @@ const serviceUpgrader = new ServiceUpgrader({
   running: () => backendManager.serviceDaemonVersion(),
   installed: launchAgentPlistExists,
   pid: () => serviceDaemonOf(backendManager)?.pid ?? null,
-  // U1: the elevated shutdown asks its box through the presence connection.
+  // U1: enrolled and the presence connection up (the Knowledge replay that follows asks through it).
   ready: () => presenceConnection?.ready === true,
   run: async (pid) => {
     const dataDir = tryDataDir()
     if (dataDir === null) return { ok: false, stage: 'copy', code: 'no_data_dir' }
     const hold = <T>(work: () => Promise<T>) => backendManager.whileServiceRestarts(work)
-    const deps = serviceUpgradeDeps({ bin: resolveRustBinary(app.isPackaged), dataDir, pid, hold })
-    // U1: bundled modules that could not be replaced wait for this stop too (one box, not two).
+    // U1 (option C): stopped and started again by launchd, no presence box;
+    // the Knowledge binding replayed to the new daemon is the one box left.
+    const bin = resolveRustBinary(app.isPackaged)
+    const deps = serviceUpgradeDeps({ bin, dataDir, pid, hold })
+    // U1: bundled modules (documents, Sin90) that could not be replaced wait for this stop too.
     const replaceModule = moduleNeedsServiceStop
-    return upgradeService(replaceModule ? { ...deps, between: () => replaceModule() } : deps)
+    const outcome = await upgradeServiceByLaunchd(replaceModule ? { ...deps, between: () => replaceModule() } : deps, {
+      uid: process.getuid!(),
+      plist: path.join(app.getPath('home'), 'Library', 'LaunchAgents', `${SERVICE_LABEL}.plist`),
+      dest: serviceDaemonCopyPath(dataDir),
+      src: bin,
+      versionOf: bundledDaemonVersion,
+    })
+    // PM 11-19: a failed upgrade is said, not left to the tray's tooltip.
+    if (!outcome.ok) showUpgradeFailure(outcome.code)
+    return outcome
   },
 })
+/** U1: the upgrade did not finish: said in a box (not only the tray's tooltip). */
+function showUpgradeFailure(code: string): void {
+  const key = code === 'rolled_back' ? 'upgrade.rolledBack' : 'upgrade.failed'
+  void dialog.showMessageBox({ type: 'warning', message: mt(key, { code }), noLink: true }).catch(() => {})
+}
 /** Set when a bundled module (documents, Sin90) could not be replaced at launch
  * because the service daemon holds the store: the work to do once it is stopped. */
 let moduleNeedsServiceStop: (() => Promise<unknown>) | null = null
@@ -660,6 +679,13 @@ app.whenReady().then(async () => {
   // The user's Knowledge settings drive the one binding; Off keeps it inactive.
   knowledge = new KnowledgeController(knowledgeHost, loginStore, new KnowledgeSettingsStore(app.getPath('userData')))
   void knowledge.apply()
+  // K2: is the bound Knowledge server answering? Checked every minute while On.
+  {
+    const controller = knowledge
+    const reachability = new KnowledgeReachability({ inputs: () => controller.probeInputs(), fetch: (url, init) => net.fetch(url, init) })
+    controller.attachReachability(reachability)
+    reachability.start()
+  }
   session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
     callback({
       responseHeaders: {
@@ -787,6 +813,12 @@ app.whenReady().then(async () => {
       dataDir: () => tryDataDir(),
       downloadsDir: () => app.getPath('downloads'),
       importAndConvert: importAndConvertTranslation,
+      fetchContent: async (documentId) => {
+        const res = await withDocumentsDelegation(() => documentsCall({ op: 'content', documentId }, daemonCliEndpoint))
+        if (!res.ok) return { ok: false, code: res.error.code, message: res.error.message }
+        const file = res.data as DocumentsResults['content']
+        return { ok: true, data: file.data, mediaType: file.media_type }
+      },
     },
   })
   registerDocAgentAccess({

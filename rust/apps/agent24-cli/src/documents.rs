@@ -185,6 +185,67 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         json: bool,
     },
+    /// List a DOCX document's paragraphs, by index (for `documents patch`)
+    Paragraphs {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Rewrite some paragraphs of a DOCX document into a NEW document
+    /// (「<名>（修订）」); the original is not changed. Prints the import job
+    Patch {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// `INDEX=TEXT`: paragraph INDEX (from `documents paragraphs`) becomes TEXT; repeatable
+        #[arg(long = "edit", value_name = "INDEX=TEXT", required = true)]
+        edits: Vec<String>,
+        /// Write the edits as Word tracked changes, to be accepted or rejected
+        #[arg(long)]
+        tracked: bool,
+        /// The new document's title
+        #[arg(long)]
+        title: Option<String>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the `{{field}}` placeholders of a DOCX template
+    Fields {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Fill a DOCX template's `{{field}}` placeholders into a NEW document
+    /// (「<名>（填写）」), formatting kept; the template is not changed.
+    /// Prints the import job
+    Fill {
+        /// The template's id (`doc_…`)
+        document_id: String,
+        /// `NAME=VALUE`: field `{{NAME}}` becomes VALUE; repeatable
+        #[arg(long = "set", value_name = "NAME=VALUE", required = true)]
+        values: Vec<String>,
+        /// The new document's title
+        #[arg(long)]
+        title: Option<String>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save a document's current file (as imported or made: DOCX, PDF, ...)
+    Save {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// The file to write: into a new file beside it, then renamed over it
+        #[arg(long)]
+        out: PathBuf,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
     /// Run one operation given as the desktop's pages send it
     /// (`{"op":"get","documentId":..}`, ...)
     Request {
@@ -353,7 +414,100 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             json,
             host_stdin,
         } => request_op(request, json, host_stdin).await,
+        DocumentsAction::Paragraphs { document_id, json } => {
+            operation(json!({"op": "paragraphs", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Patch {
+            document_id,
+            edits,
+            tracked,
+            title,
+            json,
+        } => match patch_request(document_id, &edits, tracked, title) {
+            Ok(req) => operation(req, json).await,
+            Err(res) => report(&res, json),
+        },
+        DocumentsAction::Fields { document_id, json } => {
+            operation(json!({"op": "fields", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Fill {
+            document_id,
+            values,
+            title,
+            json,
+        } => match fill_request(document_id, &values, title) {
+            Ok(req) => operation(req, json).await,
+            Err(res) => report(&res, json),
+        },
+        DocumentsAction::Save {
+            document_id,
+            out,
+            json,
+        } => save(document_id, out, json).await,
     }
+}
+
+/// `KEY=VALUE` split at the first `=`; `what` names it in the refusal.
+fn pair<'a>(raw: &'a str, what: &str) -> Result<(&'a str, &'a str), Response> {
+    raw.split_once('=')
+        .filter(|(k, _)| !k.trim().is_empty())
+        .map(|(k, v)| (k.trim(), v))
+        .ok_or_else(|| invalid(format!("{what} must be KEY=VALUE, not {raw:?}")))
+}
+
+/// The `patch` operation of `--edit INDEX=TEXT`s.
+fn patch_request(
+    document_id: String,
+    edits: &[String],
+    tracked: bool,
+    title: Option<String>,
+) -> Result<Value, Response> {
+    let mut out = Vec::with_capacity(edits.len());
+    for raw in edits {
+        let (index, text) = pair(raw, "--edit")?;
+        let index: u64 = index
+            .parse()
+            .map_err(|_| invalid(format!("--edit's INDEX must be a number, not {index:?}")))?;
+        let mut one = json!({"index": index, "text": text});
+        put(&mut one, "tracked", tracked.then_some(true));
+        out.push(one);
+    }
+    let mut req = json!({"op": "patch", "documentId": document_id, "edits": out});
+    put(&mut req, "title", title);
+    Ok(req)
+}
+
+/// The `fill` operation of `--set NAME=VALUE`s.
+fn fill_request(
+    document_id: String,
+    values: &[String],
+    title: Option<String>,
+) -> Result<Value, Response> {
+    let mut map = serde_json::Map::new();
+    for raw in values {
+        let (name, value) = pair(raw, "--set")?;
+        map.insert(name.to_owned(), json!(value));
+    }
+    let mut req = json!({"op": "fill", "documentId": document_id, "values": map});
+    put(&mut req, "title", title);
+    Ok(req)
+}
+
+/// `documents save`: the document's file, written whole or not at all.
+async fn save(document_id: String, out: PathBuf, json: bool) -> Result<(), String> {
+    let mut res = against_daemon(&json!({"op": "content", "documentId": document_id})).await;
+    if let Response::Ok { data, .. } = &res
+        && let Err(failed) = write_file(data, "data", &out)
+    {
+        res = failed;
+    }
+    if let Response::Ok { data, .. } = &mut res
+        && let Some(shown) = data.as_object_mut()
+    {
+        shown.remove("data");
+        shown.insert("written_to".to_owned(), json!(out));
+    }
+    report(&res, json)
 }
 
 /// Sets `req[key]` when there is a value.
@@ -395,7 +549,7 @@ fn read_schema(path: &Path) -> Result<Value, Response> {
 async fn render(req: Value, out: Option<PathBuf>, json: bool) -> Result<(), String> {
     let mut res = against_daemon(&req).await;
     if let (Some(path), Response::Ok { data, .. }) = (&out, &res)
-        && let Err(failed) = write_page(data, path)
+        && let Err(failed) = write_file(data, "png", path)
     {
         res = failed;
     }
@@ -446,10 +600,10 @@ fn extract_request(
 /// nowhere (it cannot be resolved), or the rename fails (a directory at
 /// `path`). A file there is replaced, a named pipe too; another hard link
 /// keeps the old page.
-fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
+fn write_file(data: &Value, key: &str, path: &Path) -> Result<(), Response> {
     use base64::Engine as _;
     let png = data
-        .get("png")
+        .get(key)
         .and_then(Value::as_str)
         .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b).ok())
         .ok_or_else(|| Response::fail(502, "invalid_response", "the page is not base64"))?;
@@ -483,6 +637,11 @@ fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
         .map_err(unwritable)?;
     // A failure drops the part file, which removes it.
     part.persist(&target).map(drop).map_err(unwritable)
+}
+
+#[cfg(test)]
+fn write_page(data: &Value, path: &Path) -> Result<(), Response> {
+    write_file(data, "png", path)
 }
 
 /// A page with no file before it: its part file is made as a file made in
@@ -947,5 +1106,36 @@ mod tests {
             data: json!({"job_id": "job_1", "status": "queued"}),
         };
         assert!(report(&ok, true).is_ok());
+    }
+
+    #[test]
+    fn patch_and_fill_take_key_value_pairs_and_refuse_others() {
+        let req = patch_request(
+            "doc_x".into(),
+            &["3=新的第三条".into(), "5=a=b".into()],
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            json!({"op": "patch", "documentId": "doc_x", "edits": [
+                {"index": 3, "text": "新的第三条", "tracked": true},
+                {"index": 5, "text": "a=b", "tracked": true},
+            ]})
+        );
+        assert!(patch_request("doc_x".into(), &["three=x".into()], false, None).is_err());
+        let req = fill_request(
+            "doc_x".into(),
+            &["甲方=上海明远".into(), " 租金 =8,500".into()],
+            Some("t".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            req,
+            json!({"op": "fill", "documentId": "doc_x", "values": {"甲方": "上海明远", "租金": "8,500"}, "title": "t"})
+        );
+        assert!(fill_request("doc_x".into(), &["no-equals".into()], None).is_err());
+        assert!(fill_request("doc_x".into(), &["=x".into()], None).is_err());
     }
 }

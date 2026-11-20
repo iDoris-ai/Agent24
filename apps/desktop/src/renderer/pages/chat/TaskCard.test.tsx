@@ -177,25 +177,35 @@ describe('task cards (M4 A4)', () => {
     expect(within(card('等你确认')).getByRole('button', { name: '停止' })).toBeInTheDocument()
   })
 
-  it('denies with the reason given in the card, and sends nothing without one (M4 A6)', async () => {
+  it('denies with the reason given in the card (M4 A6)', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
     runs.run_1 = { status: 'awaiting_approval', started_at: at }
     approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'approve_for_session', 'deny', 'abort'] }]
     await show()
     fireEvent.click(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '拒绝' }))
-    const reason = within(card('等你确认')).getByRole('textbox', { name: '拒绝的理由（会告诉助理）' })
+    const reason = within(card('等你确认')).getByRole('textbox', { name: '拒绝的理由（可不填，会告诉助理）' })
     const send = () => within(card('等你确认')).getAllByRole('button', { name: '拒绝' }).find(b => b.getAttribute('type') === 'submit')!
     // While it is asked for, the card offers no "confirm".
     expect(within(card('等你确认')).queryByRole('button', { name: '确认' })).toBeNull()
-    expect(send()).toBeDisabled()
-    fireEvent.change(reason, { target: { value: '   ' } })
-    fireEvent.submit(reason.closest('form')!)
-    expect(approvalDecide).not.toHaveBeenCalled()
     fireEvent.change(reason, { target: { value: ' 不要删这个目录 ' } })
     fireEvent.click(send())
     await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'deny', reason: '不要删这个目录' }))
     expect(approvalDecide).toHaveBeenCalledTimes(1)
+  })
+
+  // Loop 3 FU (General 11-19): the second 「拒绝」 did nothing until a reason was typed, and nothing said so.
+  it('denies with a plain reason when none is given', async () => {
+    store.save(record('chat_a', '周报'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
+    await show()
+    fireEvent.click(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '拒绝' }))
+    const send = within(card('等你确认')).getAllByRole('button', { name: '拒绝' }).find(b => b.getAttribute('type') === 'submit')!
+    expect(send).not.toBeDisabled()
+    fireEvent.click(send)
+    await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'deny', reason: '用户拒绝了这一步。' }))
   })
 
   it('goes back from asking a reason without denying', async () => {
@@ -492,5 +502,13 @@ describe('approvalText (D2b)', () => {
     expect(approvalText({ summary: 'documents.compose: {"parts":[{"document_id":"a.pdf","pages":"1"}],"title":"A1"}' }, t))
       .toBe('task.ask.compose{"title":"A1","parts":"task.ask.part{\\"doc\\":\\"a.pdf\\",\\"pages\\":\\"1\\"}"}')
     expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('shell_exec: {"argv":["ls"]}')
+  })
+  it('says what a fill or a patch will write (E1b/D5a)', () => {
+    expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","values":{"甲方":"明远","租金":"8,500"}}' }, t))
+      .toBe('task.ask.fill{"doc":"模板.docx","values":"甲方=明远，租金=8,500"}')
+    expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x","tracked":true}]}' }, t))
+      .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}')
+    expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}]}' }, t))
+      .toBe('task.ask.patch{"doc":"a.docx","n":"1"}')
   })
 })
