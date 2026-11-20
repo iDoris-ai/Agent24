@@ -522,8 +522,13 @@ impl Runtime for SystemRuntime {
                 .map(ApiKey::new)
                 .transpose()
                 .map_err(|_| Code::NotConfigured)?;
-            let results = OmlxProbe::new()
-                .map_err(|_| Code::StartFailed)?
+            let provisioner = self
+                .provisioner
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let results = provisioner
+                .omlx_probe()?
                 .probe(Some(&endpoint), api_key.as_ref())
                 .await;
             if !results

@@ -3,6 +3,11 @@ use crate::idoris_host::provision::*;
 use crate::{keys::Keys, setup::SetupBudget};
 use std::sync::atomic::AtomicUsize;
 
+/// Bootstrap tests start a real iDoris fixture process group each; run
+/// concurrently they race the supervisor's group reclaim and report a false
+/// InstanceConflict. One at a time.
+static BOOTSTRAP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Default)]
 struct Store {
     entries: SyncMutex<BTreeMap<String, Zeroizing<String>>>,
@@ -55,6 +60,8 @@ struct Provision {
     budget_probes: AtomicUsize,
     verifications: AtomicUsize,
     no_key: AtomicBool,
+    owner_trusted: AtomicBool,
+    settings_dir: tempfile::TempDir,
     key_waiting: AtomicBool,
     budget_unavailable: AtomicBool,
     fail_install: AtomicBool,
@@ -76,6 +83,13 @@ fn copy_release(from: &Path, to: &Path) {
 }
 #[async_trait]
 impl Provisioner for Provision {
+    fn omlx_probe(&self) -> Result<OmlxProbe, Code> {
+        let trusted = self.owner_trusted.load(Ordering::SeqCst);
+        Ok(OmlxProbe::new()
+            .unwrap()
+            .with_owner_check(if trusted { |_| true } else { |_| false }))
+    }
+
     async fn budget_suggestion(&self) -> Result<agent24_hw::IdorisBudgetSuggestion, &'static str> {
         self.budget_probes.fetch_add(1, Ordering::SeqCst);
         tokio::task::yield_now().await;
@@ -161,9 +175,12 @@ impl Provisioner for Provision {
         if self.no_key.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        Ok(Some(
-            ApiKey::new(Zeroizing::new("sk-upstream-sensitive".into())).unwrap(),
-        ))
+        crate::omlx_probe::read_settings_key_at(
+            &self.settings_dir.path().join("settings.json"),
+            nix::unistd::geteuid().as_raw(),
+        )
+        .map(Some)
+        .map_err(|_| Code::KeyUnavailable)
     }
     async fn budget(&self, core: Option<u64>) -> Result<SetupBudget, Code> {
         SystemProvisioner.budget(core).await
@@ -176,6 +193,7 @@ struct ConnectedFixture {
     upstream: Arc<Store>,
     endpoint: String,
     server: tokio::task::JoinHandle<()>,
+    authorized_requests: Arc<AtomicUsize>,
 }
 impl Drop for ConnectedFixture {
     fn drop(&mut self) {
@@ -186,6 +204,14 @@ impl ConnectedFixture {
     async fn new() -> Self {
         use axum::{Json, Router, routing::get};
         let mut f = Fixture::new().await;
+        let settings_dir = tempfile::tempdir().unwrap();
+        let settings_path = settings_dir.path().join("settings.json");
+        fs::write(
+            &settings_path,
+            r#"{"auth":{"api_key":"sk-upstream-sensitive"}}"#,
+        )
+        .unwrap();
+        mode(&settings_path, 0o600);
         let provision = Arc::new(Provision {
             record: f.record.clone(),
             lock: f.runtime.lock.clone(),
@@ -195,6 +221,8 @@ impl ConnectedFixture {
             budget_probes: AtomicUsize::new(0),
             verifications: AtomicUsize::new(0),
             no_key: AtomicBool::new(false),
+            owner_trusted: AtomicBool::new(true),
+            settings_dir,
             key_waiting: AtomicBool::new(false),
             budget_unavailable: AtomicBool::new(false),
             fail_install: AtomicBool::new(false),
@@ -209,10 +237,15 @@ impl ConnectedFixture {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().route("/v1/models", get(|headers: axum::http::HeaderMap| async move {
+        let authorized_requests = Arc::new(AtomicUsize::new(0));
+        let seen_auth = authorized_requests.clone();
+        let app = Router::new().route("/v1/models", get(move |headers: axum::http::HeaderMap| {
+            let seen_auth = seen_auth.clone();
+            async move {
+            if headers.contains_key("authorization") { seen_auth.fetch_add(1, Ordering::SeqCst); }
             if headers.get("authorization").is_some_and(|v| v == "Bearer sk-upstream-sensitive") { (axum::http::StatusCode::OK, Json(json!({"data": [{"id": "real-model", "object":"model", "owned_by":"omlx"}]}))) }
             else { (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error":"auth required"}))) }
-        })).route("/openapi.json", get(|| async { Json(json!({"openapi":"3.1.0", "info":{"title":"oMLX API"}, "paths":{"/v1/models":{"get":{}}, "/health":{"get":{}}, "/api/status":{"get":{}}}})) }));
+        }})).route("/openapi.json", get(|| async { Json(json!({"openapi":"3.1.0", "info":{"title":"oMLX API"}, "paths":{"/v1/models":{"get":{}}, "/health":{"get":{}}, "/api/status":{"get":{}}}})) }));
         let server = tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
@@ -223,6 +256,7 @@ impl ConnectedFixture {
             upstream,
             endpoint,
             server,
+            authorized_requests,
         }
     }
     async fn installed(&self) {
@@ -514,6 +548,7 @@ async fn connect_accepts_verification_model_id_at_the_limit() {
 
 #[tokio::test]
 async fn core_bootstrap_installs_connects_and_starts_without_consent() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
@@ -533,7 +568,59 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     assert!(!status.roles.is_empty());
 }
 #[tokio::test]
+async fn bootstrap_authenticates_local_settings_key_before_connect() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    x.f.host
+        .bootstrap_core_with_candidates(Candidates {
+            candidates: vec![Candidate {
+                endpoint: x.endpoint.clone(),
+                identity: "omlx",
+                authentication: "auth_required",
+                models: vec![],
+            }],
+            key_from_local_settings: true,
+        })
+        .await
+        .unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+    assert!(x.upstream.entries.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_untrusted_key_required_listener_before_connect() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    x.provision.owner_trusted.store(false, Ordering::SeqCst);
+    let result =
+        x.f.host
+            .bootstrap_core_with_candidates(Candidates {
+                candidates: vec![Candidate {
+                    endpoint: x.endpoint.clone(),
+                    identity: "omlx",
+                    authentication: "auth_required",
+                    models: vec![],
+                }],
+                key_from_local_settings: true,
+            })
+            .await;
+    assert_eq!(result, Err(Code::OmlxAuthRequired));
+    assert_eq!(x.authorized_requests.load(Ordering::SeqCst), 0);
+    assert!(
+        x.f.host
+            .inner
+            .lock()
+            .await
+            .operations
+            .values()
+            .all(|op| op.action != Action::Connect)
+    );
+    assert!(!x.f.host.root.join("connection.json").exists());
+}
+
+#[tokio::test]
 async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     let candidates = || Candidates {
         candidates: vec![Candidate {
@@ -1417,6 +1504,10 @@ async fn connect_cancel_interrupts_pending_upstream_credential_read() {
 struct FixedUpstream(&'static str);
 #[async_trait]
 impl Provisioner for FixedUpstream {
+    fn omlx_probe(&self) -> Result<OmlxProbe, Code> {
+        Ok(OmlxProbe::new().unwrap().with_owner_check(|_| true))
+    }
+
     async fn download(
         &self,
         _: &Path,
