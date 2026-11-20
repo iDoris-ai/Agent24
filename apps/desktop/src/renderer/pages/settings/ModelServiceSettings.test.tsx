@@ -46,12 +46,14 @@ describe('ModelServiceSettings default chat model', () => {
     }))
     const view = render(<ModelServiceSettings />)
     expect(await screen.findByRole('button', { name: 'Qwen3-VL' })).toBeInTheDocument()
-    expect(screen.getAllByRole('button').map(button => button.getAttribute('aria-label'))).toEqual(['model-chat', 'Qwen3-VL'])
+    // Model rows are the labelled buttons; the model-source panel's own controls are not.
+    const modelButtons = () => screen.queryAllByRole('button').filter(button => button.hasAttribute('aria-label'))
+    expect(modelButtons().map(button => button.getAttribute('aria-label'))).toEqual(['model-chat', 'Qwen3-VL'])
     view.unmount()
     localModels = []
     render(<ModelServiceSettings />)
     expect(await screen.findByText('The daemon has not reported a chat model.')).toBeInTheDocument()
-    expect(screen.queryByRole('button')).not.toBeInTheDocument()
+    expect(modelButtons()).toEqual([])
   })
 
   it.each([
