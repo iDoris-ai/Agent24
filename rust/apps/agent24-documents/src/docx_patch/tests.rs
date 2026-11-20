@@ -483,8 +483,9 @@ fn a_comment_reference_sharing_a_run_with_text_is_refused() {
     }
 }
 
-/// PR-Daemon #1930 B2 (Loop 4): a whitelist. A formula or a pending tracked
-/// deletion in the paragraph would be lost by a rewrite: refused, named.
+/// PR-Daemon #1930 B2 (Loop 4): a whitelist. A formula, a pending tracked
+/// deletion, a page break or a symbol in the paragraph would be lost by a
+/// rewrite: refused, named. A tab or a line break in a text run is text.
 #[test]
 fn a_paragraph_holding_a_formula_or_a_pending_deletion_is_refused_and_says_what() {
     let index = list_paragraphs(FIXTURE)
@@ -499,7 +500,14 @@ fn a_paragraph_holding_a_formula_or_a_pending_deletion_is_refused_and_says_what(
             r#"<w:del w:id="91" w:author="A" w:date="2026-01-01T00:00:00Z"><w:r><w:delText>旧</w:delText></w:r></w:del>"#,
             "w:del",
         ),
-        (r#"<w:r><w:tab/><w:t>x</w:t></w:r>"#, "w:tab"),
+        (
+            r#"<w:r><w:br w:type="page"/></w:r>"#,
+            "page or column break",
+        ),
+        (
+            r#"<w:r><w:sym w:font="Wingdings" w:char="F0FC"/></w:r>"#,
+            "w:sym",
+        ),
     ] {
         let (docx, text) = with_run_in(index, run);
         for tracked in [false, true] {
@@ -515,4 +523,26 @@ fn a_paragraph_holding_a_formula_or_a_pending_deletion_is_refused_and_says_what(
             }
         }
     }
+}
+
+#[test]
+fn a_paragraph_with_a_tab_or_a_line_break_is_still_rewritten() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let (docx, text) = with_run_in(
+        index,
+        r#"<w:r><w:t>甲</w:t><w:tab/><w:t>乙</w:t><w:br/></w:r>"#,
+    );
+    let edit = ParaEdit {
+        index,
+        text: "新的一段".into(),
+        tracked: false,
+        expect: Some(text),
+    };
+    let out = apply(&docx, &[edit], "A", NOW).unwrap();
+    assert_eq!(list_paragraphs(&out).unwrap()[index].text, "新的一段");
 }

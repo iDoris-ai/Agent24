@@ -820,12 +820,21 @@ fn not_plain_text(para: &str) -> Option<String> {
             "w:pPr" | "w:proofErr" => {}
             name if is_marker(name) => {}
             "w:r" => {
-                for (inner, _, _) in children(&para[start..end]) {
-                    if !matches!(
-                        inner,
-                        "w:rPr" | "w:t" | "w:commentReference" | "w:lastRenderedPageBreak"
-                    ) {
-                        return Some(format!("{inner} in a run"));
+                for (inner, s, e) in children(&para[start..end]) {
+                    let element = &para[start..end][s..e];
+                    match inner {
+                        "w:rPr"
+                        | "w:t"
+                        | "w:tab"
+                        | "w:commentReference"
+                        | "w:lastRenderedPageBreak" => {}
+                        // A line break is text layout; a page or column break
+                        // is the document's pagination, which a rewrite drops.
+                        "w:br"
+                            if !element.contains("w:type=\"page\"")
+                                && !element.contains("w:type=\"column\"") => {}
+                        "w:br" => return Some("a page or column break (w:br)".to_owned()),
+                        other => return Some(format!("{other} in a run")),
                     }
                 }
             }
