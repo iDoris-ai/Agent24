@@ -365,7 +365,7 @@ export interface paths {
         get?: never;
         /**
          * Save the default chat model
-         * @description ProductHost only. The id is stored in the daemon's existing settings kv and used on the next local completion that does not name a model. Empty, longer than 128 characters, or containing a control character is 400. The memory base missing is 503.
+         * @description ProductHost only. The id is stored in the daemon's existing settings kv and used on the next local completion that does not name a model. If iDoris is connected, first replace its daily role binding using the current source and preserving other bindings. A failed connect returns an IdorisFailure and leaves the saved value unchanged. Empty, longer than 128 characters, or containing a control character is 400. The memory base missing is 503.
          */
         put: operations["putDefaultModel"];
         post?: never;
@@ -2297,6 +2297,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/idoris/upstream-models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read model IDs from a local OpenAI-compatible upstream
+         * @description Host-only configuration probe. HTTP loopback origin only, no credentials or redirects, five second timeout. Does not perform inference.
+         */
+        get: operations["getIdorisUpstreamModels"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/idoris/connect": {
         parameters: {
             query?: never;
@@ -2307,9 +2327,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Connect the managed installation to a selected oMLX backend
+         * Connect the managed installation to a local model backend
          * @description ProductHost capability or legacy host bearer required; Creative is forbidden.
-         *     Requires explicit credential-sharing and model consent. Runs setup, issues a data key, starts iDoris, and verifies one minimal daily chat before committing. A connected installation requires replace=true; failures compensate the new key and process and retain the previous configuration. Credentials are never accepted in the request or returned. Unknown setup failures retain the frozen setup_code on the operation. The first connection requires explicit core_reserved_bytes; subsequent connections may reuse the saved allocation.
+         *     Automatically provisions the selected source. openai_compat probes a loopback HTTP origin without credentials or redirects (five second timeout), writes only lmstudio.yaml and binds daily/deep (deep defaults to daily), never embed. omlx runs setup. Runs setup, issues a data key, starts iDoris, and verifies one minimal daily chat before committing. A connected installation requires replace=true; failures compensate the new key and process and retain the previous configuration. Credentials are never accepted in the request or returned. Unknown setup failures retain the frozen setup_code on the operation. The first connection requires explicit core_reserved_bytes; subsequent connections may reuse the saved allocation.
          *     Idempotency-Key is required. Replays return the original operation across restarts.
          *     Reusing a key with different input returns invalid_request. Other concurrent mutations return busy.
          *     The server records consent with its own timestamp. HTTP disconnect does not cancel an operation.
@@ -2540,7 +2560,12 @@ export interface components {
             deep_model?: string | null;
         };
         IdorisConnectRequest: {
-            /** @description Explicitly confirmed loopback HTTP oMLX origin, without credentials, path, query or fragment. */
+            /**
+             * @description Defaults to omlx when omitted.
+             * @enum {string}
+             */
+            source?: "omlx" | "openai_compat";
+            /** @description Loopback origin (openai_compat requires HTTP and 127.0.0.1, localhost or [::1]), without credentials, path, query or fragment. */
             endpoint: string;
             daily_model: string;
             deep_model?: string | null;
@@ -5476,6 +5501,10 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
             /** @description The settings store is not available on this daemon */
             503: {
                 headers: {
@@ -5485,6 +5514,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            504: components["responses"]["IdorisFailure"];
         };
     };
     listDomainOs: {
@@ -9683,6 +9713,35 @@ export interface operations {
             502: components["responses"]["IdorisFailure"];
             503: components["responses"]["IdorisFailure"];
             504: components["responses"]["IdorisFailure"];
+        };
+    };
+    getIdorisUpstreamModels: {
+        parameters: {
+            query: {
+                endpoint: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Available upstream model IDs */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        models: string[];
+                    };
+                };
+            };
+            400: components["responses"]["IdorisFailure"];
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
         };
     };
     connectIdoris: {

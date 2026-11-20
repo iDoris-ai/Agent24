@@ -349,7 +349,7 @@ fn connect_retries_with_same_key_and_verifies_through_normal_chat() {
         assert_eq!(requests[0].1, requests[1].1);
         assert_eq!(
             requests[0].1,
-            json!({"endpoint":"http://127.0.0.1:8088", "daily_model":"daily-real", "deep_model":"deep-real", "core_reserved_bytes":123, "save_omlx_key":true, "replace":true, "consent":{"share_omlx_key":true, "daily_model":"daily-real", "deep_model":"deep-real"}})
+            json!({"source":"omlx", "endpoint":"http://127.0.0.1:8088", "daily_model":"daily-real", "deep_model":"deep-real", "core_reserved_bytes":123, "save_omlx_key":true, "replace":true, "consent":{"share_omlx_key":true, "daily_model":"daily-real", "deep_model":"deep-real"}})
         );
         assert_eq!(requests[3].1["messages"][0]["role"], "user");
         assert!(
@@ -607,4 +607,57 @@ fn tty_connect_requires_yes_and_sends_the_confirmed_models() {
         }
         fixture.finish();
     }
+}
+
+#[test]
+fn upstream_models_encodes_endpoint_and_prints_only_model_ids() {
+    let fixture = Fixture::new(vec![step(
+        "GET",
+        "/api/v1/idoris/upstream-models?endpoint=http%3A%2F%2Flocalhost%3A3456",
+        json!({"models":["local-model"], "api_key":"sk-secret-sentinel"}),
+    )]);
+    let output = fixture
+        .command(&[
+            "upstream-models",
+            "--endpoint",
+            "http://localhost:3456",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output_json(&output, true),
+        json!({"models":["local-model"]})
+    );
+    fixture.finish();
+}
+
+#[test]
+fn openai_compat_connect_passes_source_to_daemon() {
+    let fixture = Fixture::new(vec![
+        step(
+            "POST",
+            "/api/v1/idoris/connect",
+            operation("connect", "done", Some("succeeded")),
+        ),
+        chat_reply(),
+    ]);
+    let output = fixture
+        .command(&[
+            "connect",
+            "--source",
+            "openai_compat",
+            "--endpoint",
+            "http://localhost:3456",
+            "--daily",
+            "daily-real",
+            "--yes",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output_json(&output, true)["result"], "succeeded");
+    let requests = fixture.finish();
+    assert_eq!(requests[0].1["source"], "openai_compat");
+    assert_eq!(requests[0].1["endpoint"], "http://localhost:3456");
 }

@@ -128,6 +128,12 @@ fn section_3_rows_match_operation_and_level() {
         ),
         (
             "GET",
+            "/idoris/upstream-models",
+            "IdorisRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
+            "GET",
             "/idoris/status",
             "IdorisRead",
             AssuranceLevel::Everyday,

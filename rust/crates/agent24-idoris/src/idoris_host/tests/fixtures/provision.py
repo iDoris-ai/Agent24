@@ -2,6 +2,12 @@
 fixture_root = Path(__file__).parent.parent
 settings_path = fixture_root / 'provision-scenario.json'
 settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+if sys.argv[1] == 'recommend':
+    # Agent24 must size the recommendation to its iDoris budget (#1940 F1).
+    if '--allocated-budget-bytes' not in sys.argv:
+        sys.exit(1)
+    print(json.dumps(settings.get('recommendation', {})))
+    sys.exit(0)
 if sys.argv[1] == 'setup':
     args = sys.argv[1:]
     assert args[args.index('--load-mode') + 1] == 'resident'

@@ -688,6 +688,9 @@ paths:
       description: >
         ProductHost only. The id is stored in the daemon's existing settings
         kv and used on the next local completion that does not name a model.
+        If iDoris is connected, first replace its daily role binding using the
+        current source and preserving other bindings. A failed connect returns
+        an IdorisFailure and leaves the saved value unchanged.
         Empty, longer than 128 characters, or containing a control character
         is 400. The memory base missing is 503.
       requestBody:
@@ -717,6 +720,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "504":
+          $ref: "#/components/responses/IdorisFailure"
         "503":
           description: The settings store is not available on this daemon
           content:
@@ -4910,15 +4923,50 @@ paths:
         "500":
           $ref: "#/components/responses/IdorisFailure"
 
+  /idoris/upstream-models:
+    get:
+      operationId: getIdorisUpstreamModels
+      tags: [idoris]
+      summary: Read model IDs from a local OpenAI-compatible upstream
+      description: Host-only configuration probe. HTTP loopback origin only, no credentials or redirects, five second timeout. Does not perform inference.
+      parameters:
+        - name: endpoint
+          in: query
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: Available upstream model IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [models]
+                properties:
+                  models:
+                    type: array
+                    items: { type: string }
+        "400":
+          $ref: "#/components/responses/IdorisFailure"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+
   /idoris/connect:
     post:
       operationId: connectIdoris
       tags: [idoris]
-      summary: Connect the managed installation to a selected oMLX backend
+      summary: Connect the managed installation to a local model backend
       x-tui-exemption: "IL-12: CLI lifecycle commands are implemented after IL-11."
       description: |
         ProductHost capability or legacy host bearer required; Creative is forbidden.
-        Requires explicit credential-sharing and model consent. Runs setup, issues a data key, starts iDoris, and verifies one minimal daily chat before committing. A connected installation requires replace=true; failures compensate the new key and process and retain the previous configuration. Credentials are never accepted in the request or returned. Unknown setup failures retain the frozen setup_code on the operation. The first connection requires explicit core_reserved_bytes; subsequent connections may reuse the saved allocation.
+        Automatically provisions the selected source. openai_compat probes a loopback HTTP origin without credentials or redirects (five second timeout), writes only lmstudio.yaml and binds daily/deep (deep defaults to daily), never embed. omlx runs setup. Runs setup, issues a data key, starts iDoris, and verifies one minimal daily chat before committing. A connected installation requires replace=true; failures compensate the new key and process and retain the previous configuration. Credentials are never accepted in the request or returned. Unknown setup failures retain the frozen setup_code on the operation. The first connection requires explicit core_reserved_bytes; subsequent connections may reuse the saved allocation.
         Idempotency-Key is required. Replays return the original operation across restarts.
         Reusing a key with different input returns invalid_request. Other concurrent mutations return busy.
         The server records consent with its own timestamp. HTTP disconnect does not cancel an operation.
@@ -5670,11 +5718,12 @@ components:
       additionalProperties: false
       required: [endpoint, daily_model]
       properties:
+        source: { type: string, enum: [omlx, openai_compat], description: Defaults to omlx when omitted. }
         endpoint:
           type: string
-          description: Explicitly confirmed loopback HTTP oMLX origin, without credentials, path, query or fragment.
-        daily_model: { type: string, minLength: 1, maxLength: 512 }
-        deep_model: { type: [string, "null"], minLength: 1, maxLength: 512 }
+          description: Loopback origin (openai_compat requires HTTP and 127.0.0.1, localhost or [::1]), without credentials, path, query or fragment.
+        daily_model: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:/-]+$" }
+        deep_model: { type: [string, "null"], minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:/-]+$" }
         save_omlx_key: { type: boolean, default: false }
         replace: { type: boolean, default: false }
         core_reserved_bytes:

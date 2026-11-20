@@ -36,7 +36,14 @@ pub enum IdorisAction {
     Stop(Output),
     /// List oMLX endpoints, identity, authentication and model IDs
     Candidates(Output),
-    /// Configure oMLX, issue credentials, start and verify normal chat
+    /// List models from a local OpenAI-compatible upstream
+    UpstreamModels {
+        #[arg(long)]
+        endpoint: String,
+        #[command(flatten)]
+        output: Output,
+    },
+    /// Configure a local source, issue credentials, start and verify normal chat
     Connect(Connect),
 }
 #[derive(Args)]
@@ -46,6 +53,8 @@ pub struct Output {
 }
 #[derive(Args)]
 pub struct Connect {
+    #[arg(long, default_value = "omlx", value_parser = ["omlx", "openai_compat"])]
+    source: String,
     #[arg(long)]
     endpoint: String,
     #[arg(long)]
@@ -109,11 +118,11 @@ fn english(code: &str) -> &'static str {
         "shutting_down" => "The daemon is shutting down.",
         "invalid_request" => "The daemon rejected the request format.",
         "persistence_failed" => "The daemon could not save the lifecycle record.",
-        "omlx_unreachable" => "oMLX is unreachable.",
+        "omlx_unreachable" => "The local model upstream is unreachable.",
         "omlx_auth_required" => "oMLX requires authentication.",
         "omlx_auth_rejected" => "oMLX rejected the credential.",
-        "unknown_service" => "The endpoint is not a confirmed oMLX service.",
-        "model_not_found" => "A selected model is not available in oMLX.",
+        "unknown_service" => "The endpoint is not a supported local model service.",
+        "model_not_found" => "A selected model is not available in the upstream.",
         "setup_failed" => "iDoris setup failed.",
         "verify_failed" => "Normal chat did not return verified local iDoris evidence.",
         "idoris_headroom_confirmation_required" => {
@@ -180,6 +189,10 @@ struct Candidate {
     endpoint: String,
     identity: String,
     authentication: String,
+    models: Vec<String>,
+}
+#[derive(Deserialize, Serialize)]
+struct UpstreamModels {
     models: Vec<String>,
 }
 #[derive(Deserialize, Serialize)]
@@ -435,7 +448,12 @@ async fn verify(ep: &Endpoint) -> Result<Value, Failure> {
 }
 
 async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failure> {
+    let mut query = None;
     let (method, path, body) = match action {
+        IdorisAction::UpstreamModels { endpoint, .. } => {
+            query = Some(endpoint);
+            (Method::GET, "/api/v1/idoris/upstream-models", None)
+        }
         IdorisAction::Status(_) => (Method::GET, "/api/v1/idoris/status", None),
         IdorisAction::Candidates(_) => (Method::GET, "/api/v1/idoris/omlx/candidates", None),
         IdorisAction::Install { yes, .. } => {
@@ -455,10 +473,23 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
             consent(
                 options.yes,
                 &format!(
-                    "Connect iDoris to oMLX at {} using daily={} and deep={}. Share the local oMLX credential with iDoris, issue a data credential, start iDoris and verify normal chat. Save oMLX credential: {}. Replace existing connection: {}. Core reserved bytes: {}.",
+                    "Connect iDoris to {} at {} using daily={} and deep={}. {} Issue a data credential, start iDoris and verify normal chat. Save oMLX credential: {}. Replace existing connection: {}. Core reserved bytes: {}.",
+                    options.source,
                     options.endpoint,
                     options.daily,
-                    options.deep.as_deref().unwrap_or("none"),
+                    options
+                        .deep
+                        .as_deref()
+                        .unwrap_or(if options.source == "openai_compat" {
+                            &options.daily
+                        } else {
+                            "none"
+                        }),
+                    if options.source == "omlx" {
+                        "Share the local oMLX credential with iDoris."
+                    } else {
+                        "The upstream is accessed without credentials."
+                    },
                     options.save_omlx_key,
                     options.replace,
                     options
@@ -471,7 +502,7 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
                 Method::POST,
                 "/api/v1/idoris/connect",
                 Some(
-                    json!({"endpoint":options.endpoint, "daily_model":options.daily, "deep_model":options.deep, "core_reserved_bytes":options.core_reserved_bytes, "save_omlx_key":options.save_omlx_key, "replace":options.replace,
+                    json!({"source":options.source, "endpoint":options.endpoint, "daily_model":options.daily, "deep_model":options.deep, "core_reserved_bytes":options.core_reserved_bytes, "save_omlx_key":options.save_omlx_key, "replace":options.replace,
                 "consent":{"share_omlx_key":true, "daily_model":options.daily, "deep_model":options.deep}}),
                 ),
             )
@@ -483,7 +514,17 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
     let ep = host().await?;
     let result = async {
         let key = mutation.then(|| uuid::Uuid::new_v4().to_string());
-        let response = request(&ep, method, path, body.as_ref(), key.as_deref()).await?;
+        let request_path = query
+            .as_ref()
+            .map(|endpoint| format!("{path}?endpoint={}", super::qs_encode(endpoint)));
+        let response = request(
+            &ep,
+            method,
+            request_path.as_deref().unwrap_or(path),
+            body.as_ref(),
+            key.as_deref(),
+        )
+        .await?;
         if mutation {
             let op = poll(&ep, decode(response).await?, json_output, &mut interrupt).await?;
             let mut value =
@@ -498,6 +539,9 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
         } else if path == "/api/v1/idoris/status" {
             let status: Status = decode(response).await?;
             serde_json::to_value(status).map_err(|_| Failure::local("invalid_response"))
+        } else if path == "/api/v1/idoris/upstream-models" {
+            let models: UpstreamModels = decode(response).await?;
+            serde_json::to_value(models).map_err(|_| Failure::local("invalid_response"))
         } else {
             let candidates: Candidates = decode(response).await?;
             serde_json::to_value(candidates).map_err(|_| Failure::local("invalid_response"))
@@ -514,7 +558,8 @@ pub async fn run(action: IdorisAction) -> Result<(), String> {
         | IdorisAction::Start(o)
         | IdorisAction::Stop(o)
         | IdorisAction::Candidates(o)
-        | IdorisAction::Install { output: o, .. } => o.json,
+        | IdorisAction::Install { output: o, .. }
+        | IdorisAction::UpstreamModels { output: o, .. } => o.json,
         IdorisAction::Connect(c) => c.output.json,
     };
     match execute(action, json_output).await {
@@ -547,6 +592,10 @@ fn print_human(value: &Value) {
                 c["authentication"].as_str().unwrap_or_default(),
                 c["models"]
             );
+        }
+    } else if let Some(models) = value["models"].as_array() {
+        for model in models {
+            println!("{}", model.as_str().unwrap_or_default());
         }
     } else if let Some(state) = value["state"].as_str() {
         println!(

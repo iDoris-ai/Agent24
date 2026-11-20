@@ -95,6 +95,11 @@ pub async fn put_default_model(
             return error_response(StatusCode::BAD_REQUEST, "invalid_request", message);
         }
     };
+    if let Some(host) = &state.idoris_host
+        && let Err(code) = host.replace_daily_model(&model).await
+    {
+        return crate::idoris_routes::failure(code);
+    }
     if let Err(err) = crate::default_model::store_default(&kv, &model).await {
         tracing::error!("writing default chat model: {err}");
         return error_response(

@@ -3,6 +3,11 @@ use crate::idoris_host::provision::*;
 use crate::{keys::Keys, setup::SetupBudget};
 use std::sync::atomic::AtomicUsize;
 
+/// Bootstrap tests start a real iDoris fixture process group each; run
+/// concurrently they race the supervisor's group reclaim and report a false
+/// InstanceConflict. One at a time.
+static BOOTSTRAP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Default)]
 struct Store {
     entries: SyncMutex<BTreeMap<String, Zeroizing<String>>>,
@@ -234,6 +239,7 @@ impl ConnectedFixture {
     }
     fn request(&self) -> ConnectRequest {
         ConnectRequest {
+            source: "omlx".into(),
             endpoint: self.endpoint.clone(),
             daily_model: "real-model".into(),
             deep_model: None,
@@ -514,6 +520,7 @@ async fn connect_accepts_verification_model_id_at_the_limit() {
 
 #[tokio::test]
 async fn core_bootstrap_installs_connects_and_starts_without_consent() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
@@ -534,6 +541,7 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
 }
 #[tokio::test]
 async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     let candidates = || Candidates {
         candidates: vec![Candidate {
@@ -1255,6 +1263,7 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
     record.admin_port = port().await;
     host.record_installation(record).await.unwrap();
     let request = ConnectRequest {
+        source: "omlx".into(),
         endpoint: "http://127.0.0.1:8088".into(),
         daily_model: model.clone(),
         deep_model: None,
@@ -1512,6 +1521,7 @@ async fn inputs_reads_the_injected_upstream_key() {
         )
         .unwrap();
     let mut record = Installation {
+        connection: None,
         version: "0.5.0".into(),
         release_dir: dir.path().join("release"),
         archive_path: dir.path().join("archive.tar.gz"),
@@ -1542,6 +1552,13 @@ async fn inputs_reads_the_injected_upstream_key() {
     record.omlx_key_id = Some("omlx_saved".into());
     let inputs = runtime.inputs(&record).await.unwrap();
     assert_eq!(inputs.omlx_key.as_ref().map(|key| key.as_str()), Some(KEY));
+    record.omlx_url = None;
+    record.omlx_key_id = None;
+    record.connection = Some(serde_json::from_value(json!({
+        "source":"openai_compat", "endpoint":"http://localhost:3456", "daily_model":"local-model"
+    })).unwrap());
+    let inputs = runtime.inputs(&record).await.unwrap();
+    assert!(inputs.omlx_key.is_none());
     drop(host);
     server.abort();
 }
@@ -1976,4 +1993,179 @@ async fn receipt_fields_added_in_c1_are_omitted_when_unset() {
     assert!(set.get("install_root").is_some() && set.get("notarized_verified_at").is_some());
     // And a receipt without them (an older daemon's) still loads.
     serde_json::from_value::<Installation>(bare).unwrap();
+}
+
+#[tokio::test]
+async fn openai_compat_connect_single_card_roles() {
+    use axum::{Json, Router, routing::get};
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    let original =
+        x.f.host
+            .connect(x.request(), Some("original-omlx"))
+            .await
+            .unwrap();
+    assert_eq!(
+        x.f.complete(&original).await.result,
+        Some(Outcome::Succeeded)
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(listener, Router::new().route("/v1/models", get(|headers: axum::http::HeaderMap| async move {
+            assert!(!headers.contains_key("authorization"));
+            Json(json!({"data":[{"id":"real-model"},{"id":"next-model"},{"id":"bge-m3-mlx-fp16"}]}))
+        }))).await.unwrap();
+    });
+    let mut request = x.request();
+    request.source = "openai_compat".into();
+    request.replace = true;
+    request.endpoint = endpoint;
+    let op =
+        x.f.host
+            .connect(request, Some("compat-connect"))
+            .await
+            .unwrap();
+    let completed = x.f.complete(&op).await;
+    assert_eq!(
+        completed.result,
+        Some(Outcome::Succeeded),
+        "{:?}",
+        completed.error_code
+    );
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.roles, vec![Role::Daily, Role::Deep]);
+    let dir = record.components_dir.unwrap();
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+    let card = fs::read_to_string(dir.join("lmstudio.yaml")).unwrap();
+    assert!(card.contains("id: lmstudio"));
+    assert!(card.contains("daily: \"real-model\""));
+    assert!(card.contains("deep: \"real-model\""));
+    assert!(!card.contains("embed:"));
+    assert_eq!(x.keys()[1]["allowed_roles"], json!(["daily", "deep"]));
+    // No upstream credential may be read on connect, replace or later restart.
+    x.provision.gate.store(true, Ordering::SeqCst);
+    x.f.host.replace_daily_model("next-model").await.unwrap();
+    let replaced = x.f.host.inner.lock().await.installation.clone().unwrap();
+    let selection = replaced.connection.as_ref().unwrap();
+    assert_eq!(selection.source, "openai_compat");
+    assert_eq!(selection.daily_model, "next-model");
+    assert_eq!(selection.deep_model.as_deref(), Some("real-model"));
+    assert_eq!(x.keys()[0]["status"], "revoked");
+    assert_eq!(x.keys()[1]["status"], "revoked");
+    assert_eq!(
+        x.f.host.replace_daily_model("missing").await,
+        Err(Code::ModelNotFound)
+    );
+    assert_eq!(
+        x.f.host
+            .inner
+            .lock()
+            .await
+            .installation
+            .as_ref()
+            .unwrap()
+            .key_id,
+        replaced.key_id
+    );
+    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+    wait_operation(&x.f.host, &stop.operation_id).await.unwrap();
+    let start = x.f.host.submit(Action::Start, None).await.unwrap();
+    wait_operation(&x.f.host, &start.operation_id)
+        .await
+        .unwrap();
+    x.assert_safe();
+    server.abort();
+}
+
+#[tokio::test]
+async fn openai_compat_validation_rejects_invalid_models_origins_and_redirects() {
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    for model in ["", "bad\nmodel", "bad model", "bad#model", &"a".repeat(129)] {
+        let mut request = x.request();
+        request.source = "openai_compat".into();
+        request.daily_model = model.into();
+        assert!(matches!(
+            x.f.host.connect(request, Some("invalid-model")).await,
+            Err(Code::InvalidRequest)
+        ));
+    }
+    for origin in [
+        "http://example.com",
+        "http://192.168.1.1",
+        "https://127.0.0.1",
+        "http://localhost.evil",
+        "http://127.0.0.1/path",
+        "http://u:p@localhost",
+        "http://[::2]",
+    ] {
+        assert_eq!(
+            upstream_models(origin).await,
+            Err(Code::InvalidRequest),
+            "{origin}"
+        );
+    }
+    assert!(Endpoint::parse_openai_compat("http://localhost:3456").is_ok());
+    assert!(Endpoint::parse_openai_compat("http://[::1]:3456").is_ok());
+    use axum::{Router, response::Redirect, routing::get};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            Router::new().route(
+                "/v1/models",
+                get(|| async { Redirect::temporary("http://example.com/v1/models") }),
+            ),
+        )
+        .await
+        .unwrap();
+    });
+    assert_eq!(upstream_models(&endpoint).await, Err(Code::OmlxUnreachable));
+    server.abort();
+}
+
+#[tokio::test]
+async fn bootstrap_uses_installed_recommendation_instead_of_first_candidate() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    x.scenario(json!({"recommendation":{"model_id":"real-model", "installed":true}}));
+    x.f.host
+        .bootstrap_core_with_candidates(Candidates {
+            candidates: vec![Candidate {
+                endpoint: x.endpoint.clone(),
+                identity: "omlx",
+                authentication: "ready",
+                models: vec!["other-chat".into(), "real-model".into()],
+            }],
+            key_from_local_settings: true,
+        })
+        .await
+        .unwrap();
+    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+    assert_eq!(record.connection.unwrap().daily_model, "real-model");
+}
+
+#[test]
+fn bootstrap_recommendation_requires_installed_candidate() {
+    let models = vec!["first-chat".into(), "second-chat".into()];
+    for recommendation in [
+        json!({"model_id":"absent", "installed":true}),
+        json!({"model_id":"second-chat", "installed":false}),
+        json!({}),
+    ] {
+        assert_eq!(
+            bootstrap_daily(&models, Some(&recommendation)).as_deref(),
+            Some("first-chat")
+        );
+    }
+    assert_eq!(
+        bootstrap_daily(
+            &models,
+            Some(&json!({"model_id":"second-chat", "installed":true}))
+        )
+        .as_deref(),
+        Some("second-chat")
+    );
 }

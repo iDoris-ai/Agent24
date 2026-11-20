@@ -197,3 +197,39 @@
             crate::default_model::NAMESPACE, crate::default_model::KEY,
         ).await.unwrap().is_none());
     }
+
+    #[tokio::test]
+    async fn put_default_connected_replaces_before_saving_and_preserves_value_on_failure() {
+        use agent24_idoris::{idoris_host::{ConnectRequest, IdorisHost, Installation}, managed_idoris::ManagedIdoris};
+        use std::sync::Arc;
+        let (mut state, host, _creative, dir) = memory_state().await;
+        let kv = state.memory_kv.clone().unwrap();
+        crate::default_model::store_default(&kv, "old-model").await.unwrap();
+        let managed = Arc::new(ManagedIdoris::new(state.router.clone(), dir.path().join("connection.json")).unwrap());
+        let idoris = IdorisHost::system(dir.path().to_path_buf(), dir.path().to_path_buf(), managed, state.router.clone()).unwrap();
+        let connection: ConnectRequest = serde_json::from_value(serde_json::json!({
+            "source":"openai_compat", "endpoint":"http://127.0.0.1:3456/", "daily_model":"old-model", "deep_model":"deep-model", "core_reserved_bytes":0
+        })).unwrap();
+        idoris.record_installation(Installation {
+            connection: Some(connection),
+            version: agent24_idoris::IdorisLock::embedded().tag.trim_start_matches('v').into(),
+            release_dir: dir.path().join("missing-release"),
+            archive_path: dir.path().join("archive.tar.gz"),
+            components_dir: Some(dir.path().join("components")),
+            key_id: Some("vk_fixture".into()), data_port: 23456, admin_port: 23457,
+            roles: vec![agent24_idoris::setup::Role::Daily, agent24_idoris::setup::Role::Deep],
+            core_reserved_bytes: Some(0), omlx_url: None, omlx_key_id: None,
+            desired_running: false, verification: None, install_root: None, notarized_verified_at: None,
+        }).await.unwrap();
+        state.idoris_host = Some(idoris.clone());
+        let router = state.router.clone();
+        let app = build_router(state);
+        let response = put_default(&app, &host, r#"{"model":"new-model"}"#).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(body_json(response).await["error"]["code"], "not_installed");
+        assert_eq!(kv.fetch::<crate::default_model::SavedDefaultChatModel>(crate::default_model::NAMESPACE, crate::default_model::KEY).await.unwrap().unwrap().model, "old-model");
+        assert_eq!(router.default_model().as_deref(), Some("EnvFallback"));
+        // A replace operation was attempted, rather than silently storing the id.
+        let operations: serde_json::Value = serde_json::from_slice(&std::fs::read(dir.path().join("operations.json")).unwrap()).unwrap();
+        assert!(operations.to_string().contains("connect"));
+    }
