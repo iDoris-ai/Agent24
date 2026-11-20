@@ -393,13 +393,7 @@ pub(super) async fn open_store_workspace_and_idoris(
         tokio::spawn(async move {
             while let Err(code) = host.bootstrap_core().await {
                 host.record_bootstrap_error(code).await;
-                // A bundle that fails verification or speaks another contract
-                // will not fix itself; retrying only repeats the failure.
-                if matches!(
-                    code,
-                    agent24_idoris::idoris_host::Code::VerifyFailed
-                        | agent24_idoris::idoris_host::Code::ContractMismatch
-                ) {
+                if !bootstrap_retryable(code) {
                     tracing::error!(?code, "iDoris core setup failed permanently");
                     break;
                 }
@@ -2127,5 +2121,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+/// Only a bundle that speaks another contract cannot fix itself. VerifyFailed
+/// also covers a gateway or oMLX that is not ready yet, so it is retried.
+fn bootstrap_retryable(code: agent24_idoris::idoris_host::Code) -> bool {
+    !matches!(code, agent24_idoris::idoris_host::Code::ContractMismatch)
+}
+
+#[cfg(test)]
+mod bootstrap_retry_tests {
+    use agent24_idoris::idoris_host::Code;
+
+    #[test]
+    fn only_a_contract_mismatch_stops_core_bootstrap_retries() {
+        assert!(!super::bootstrap_retryable(Code::ContractMismatch));
+        for code in [
+            Code::VerifyFailed,
+            Code::OmlxUnreachable,
+            Code::Busy,
+            Code::SetupFailed,
+        ] {
+            assert!(super::bootstrap_retryable(code), "{code:?}");
+        }
     }
 }
