@@ -22,11 +22,6 @@ const server: http.Server | null = null
 const PORT = 8765
 
 beforeAll(async () => {
-  // Patch process.env so LLMGateway doesn't try real oMLX
-  process.env['OMLX_URL'] = 'http://127.0.0.1:19999'
-  process.env['OMLX_API_KEY'] = 'test'
-
-  // Dynamic import AFTER env patch so module picks up the values
   const mod = await import('./server')
   // server.ts calls start() at module load — we need to intercept
   // Instead, we test via HTTP against the running server
@@ -97,6 +92,14 @@ describe('daemon server routes', () => {
   it('POST /api/llm/chat missing messages returns 400', async () => {
     const { status } = await request('POST', '/api/llm/chat', {})
     expect(status).toBe(400)
+  })
+
+  it('POST /api/llm/chat tells the caller to use the Rust daemon', async () => {
+    const { status, data } = await request('POST', '/api/llm/chat', {
+      messages: [{ role: 'user', content: 'hi' }],
+    })
+    expect(status).toBe(503)
+    expect((data as { error: string }).error).toBe('请使用 Rust daemon')
   })
 
   it('GET /unknown-path returns 404', async () => {

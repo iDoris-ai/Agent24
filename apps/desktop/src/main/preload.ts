@@ -13,8 +13,6 @@ import {
   type CliToolStatus,
   type CliInstallResult,
   type ResidentServiceResult,
-  type ModelSource,
-  type ModelSourceResult,
   type ResidentServiceStatus,
   type DocumentsEvent,
   type DocumentsModuleStatus,
@@ -47,16 +45,11 @@ import {
   type ApprovalDecisionInput,
   type CreativeViewBounds,
   type CreativeViewResult,
-  type LlmStatusResult,
   type ModelCallEnvelope,
   type RunEvent,
   type OpenDesignComponentStatusResult,
-  type OmlxAuthRequiredResult,
-  type OmlxDetectResult,
-  type OmlxModelsResult,
   type OmlxStartResult,
   type OmlxStopResult,
-  type OmlxWarmupResult,
 } from '../shared/ipc-types'
 
 const api = {
@@ -104,9 +97,7 @@ const api = {
   repairUserCli: (): Promise<CliInstallResult> => ipcRenderer.invoke(IpcChannels.CliToolRepairUser),
   residentServiceStatus: (): Promise<ResidentServiceStatus> => ipcRenderer.invoke(IpcChannels.ResidentServiceStatus),
   setResidentService: (on: boolean): Promise<ResidentServiceResult> => ipcRenderer.invoke(IpcChannels.ResidentServiceSet, on),
-  modelSourceGet: (): Promise<ModelSource | null> => ipcRenderer.invoke(IpcChannels.ModelSourceGet),
-  modelSourceSet: (url: string, model: string): Promise<ModelSourceResult> => ipcRenderer.invoke(IpcChannels.ModelSourceSet, url, model),
-  modelSourceClear: (): Promise<ModelSourceResult> => ipcRenderer.invoke(IpcChannels.ModelSourceClear),
+
   setAppLocale: (locale: import('../shared/i18n').Locale): Promise<void> => ipcRenderer.invoke(IpcChannels.AppLocale, locale),
   ping: (): Promise<string> => ipcRenderer.invoke(IpcChannels.AppPing),
   setUiLocale: (locale: string): Promise<void> => ipcRenderer.invoke(IpcChannels.AppSetLocale, locale),
@@ -216,18 +207,10 @@ const api = {
     ipcRenderer.on(IpcChannels.OpenDesignComponentProgress, listener)
     return () => ipcRenderer.removeListener(IpcChannels.OpenDesignComponentProgress, listener)
   },
-  omlxDetect: (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> =>
-    ipcRenderer.invoke(IpcChannels.OmlxDetect),
-  omlxModels: (url: string, apiKey: string): Promise<OmlxModelsResult> =>
-    ipcRenderer.invoke(IpcChannels.OmlxModels, url, apiKey),
-  omlxStart: (port: number, apiKey: string): Promise<OmlxStartResult> =>
-    ipcRenderer.invoke(IpcChannels.OmlxStart, port, apiKey),
+  omlxStart: (): Promise<OmlxStartResult> =>
+    ipcRenderer.invoke(IpcChannels.OmlxStart),
   omlxStop: (): Promise<OmlxStopResult> =>
     ipcRenderer.invoke(IpcChannels.OmlxStop),
-  omlxWarmup: (url: string, apiKey: string, modelId: string): Promise<OmlxWarmupResult> =>
-    ipcRenderer.invoke(IpcChannels.OmlxWarmup, url, apiKey, modelId),
-  llmStatus: (): Promise<LlmStatusResult> =>
-    ipcRenderer.invoke(IpcChannels.LlmStatus),
   // A3-4: subscribe to agentear.event/1 envelopes pushed from main
   // (agentear-events.ts / agentear-log.ts). Returns an unsubscribe function
   // so React effects can clean up on unmount without leaking listeners

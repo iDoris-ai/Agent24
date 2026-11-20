@@ -4,7 +4,7 @@
 // legacy flat { error: string } shape.
 
 import type http from 'node:http'
-import type { LLMGateway } from '../llm-gateway'
+import type { LLMGateway } from '../llm-unavailable'
 import type { LLMRequest } from '../types'
 import type { EventsHub, UsageBody } from './events-hub'
 import { readBodyLimited, ulid, PayloadTooLargeError } from './util'
@@ -37,7 +37,7 @@ function isValidChatBody(b: ChatBody): b is { messages: Array<{ role: string; co
   )
 }
 
-// Token estimate mirrors llm-gateway.ts usage logging (content length / 4)
+// Token estimate is content length / 4. The reference server no longer logs model usage.
 function estimateUsage(text: string): UsageBody {
   const completion = Math.ceil(text.length / 4)
   return { prompt_tokens: 0, completion_tokens: completion, total_tokens: completion, cost_usd: 0 }

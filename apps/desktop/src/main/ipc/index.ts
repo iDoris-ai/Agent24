@@ -4,8 +4,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomBytes } from 'node:crypto'
-import http from 'node:http'
-import https from 'node:https'
 import { execFile, type ChildProcess } from 'node:child_process'
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell, type IpcMainInvokeEvent } from 'electron'
 import { createNavPrefsStore } from '../nav-prefs'
@@ -16,7 +14,8 @@ import { findAllowedRoute, proxyError, timeoutFor, withKnowledgeBinding } from '
 import { approvalConfirmShown } from '../elevated-request'
 import { sendModuleWrite } from '../module-delegation'
 import type { KnowledgeController } from '../knowledge-settings'
-import { omlxEndpoint, parseLoopbackUrl, parsePort } from '../omlx-validate'
+import { OMLX_DEFAULT_PORT, omlxListenPortOccupied } from '../omlx-kept'
+import { parsePort } from '../omlx-validate'
 import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
 import { readBackupFile } from '../backup-file'
 import {
@@ -27,7 +26,6 @@ import {
 } from '../backup-password-window'
 import { mt, setMainLocale, isMainLocale } from '../main-i18n'
 import { handleSkillActivate } from '../skill-activate'
-import { readOmlxSettingsKey } from '../omlx-settings-key'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
@@ -47,19 +45,16 @@ import type {
   BackendRefusalResult,
   BackendProxyRequest,
   BackendProxyResponse,
-  LlmStatusResult,
-  OmlxAuthRequiredResult,
-  OmlxDetectResult,
-  OmlxModelsResult,
   OmlxStartResult,
   OmlxStopResult,
-  OmlxWarmupResult,
 } from '../../shared/ipc-types'
 
 const BACKEND_HOST = '127.0.0.1'
 
+// 过渡：ID-3 后由 iDoris 接管并删除。
 // oMLX server management. Only the child this app spawned; never a server the
-// user started themselves (FU-114).
+// user started themselves (FU-114). The start path may look at process/port
+// occupancy to avoid a second launch. It does not list or call models.
 let omlxProcess: ChildProcess | null = null
 /** In-flight stop. start and stop both await it so they cannot overlap. */
 let omlxStopping: Promise<void> | null = null
@@ -90,6 +85,8 @@ const OMLX_KILL_FALLBACK_MS = 2_000
 export const OMLX_QUIT_STOP_BUDGET_MS = OMLX_STOP_GRACE_MS + OMLX_KILL_FALLBACK_MS + 1_000
 let omlxStopGraceMs = OMLX_STOP_GRACE_MS
 let omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
+/** Whether `port` already has a listener. Not a model probe. */
+let omlxPortOccupied: (port: number) => Promise<boolean> = omlxListenPortOccupied
 
 export function setOmlxStopGraceMsForTests(ms: number): void {
   omlxStopGraceMs = ms
@@ -109,6 +106,12 @@ export function resetOmlxProcessForTests(): void {
   keptStopRun = null
   omlxStopGraceMs = OMLX_STOP_GRACE_MS
   omlxKillFallbackMs = OMLX_KILL_FALLBACK_MS
+  omlxPortOccupied = omlxListenPortOccupied
+}
+
+/** Test seam: replace the loopback port check. Null restores the real one. */
+export function setOmlxPortOccupiedForTests(fn: ((port: number) => Promise<boolean>) | null): void {
+  omlxPortOccupied = fn ?? omlxListenPortOccupied
 }
 
 function omlxExited(child: ChildProcess): boolean {
@@ -237,123 +240,6 @@ export function ensureOwnedOmlxQuit(): Promise<boolean> {
     if (ownedOmlxQuit === bounded) ownedOmlxQuit = null
   })
   return bounded
-}
-
-/** oMLX API key the user configured for THIS app (env `OMLX_API_KEY`, the same
- *  variable oMLX itself reads). Empty = none: probes that need a key are
- *  skipped rather than guessed with a built-in default. */
-function configuredOmlxKey(): string {
-  return (process.env['OMLX_API_KEY'] ?? '').trim()
-}
-
-/** Where to look for the user's own `~/.omlx/settings.json` (test seam). */
-let omlxSettingsPath: string | undefined
-
-/** The key to send for `base`: what the caller supplied or — when it sent none —
- *  the one in the user's own oMLX config, but only for the exact address that
- *  config says oMLX listens on. It is re-read every time (so a rotated or
- *  removed key is honoured at once), lives only in main-process memory, and is
- *  never returned over IPC or logged. */
-function effectiveOmlxKey(base: URL, supplied: string): string {
-  if (supplied) return supplied
-  const fromFile = readOmlxSettingsKey(omlxSettingsPath)
-  return fromFile && new URL(fromFile.url).origin === base.origin ? fromFile.apiKey : ''
-}
-
-interface OmlxProbeCandidate { url: string; apiKey: string; fromSettings?: boolean }
-
-function omlxProbeCandidates(ports: readonly number[] = [8088, 8000, 8001]): OmlxProbeCandidate[] {
-  const key = configuredOmlxKey()
-  const fromFile = readOmlxSettingsKey(omlxSettingsPath)
-  return [
-    // Keyed probe only when a key is configured.
-    ...(key && ports.includes(8088) ? [{ url: 'http://127.0.0.1:8088', apiKey: key }] : []),
-    // The user's own oMLX config, for the address that same config says oMLX
-    // listens on. No key is copied here: it is resolved from the file right
-    // before the request (effectiveOmlxKey), so it can never be stale.
-    ...(fromFile ? [{ url: fromFile.url, apiKey: '', fromSettings: true }] : []),
-    // Keyless probes: a keyed server answers 401 (reported as "auth required").
-    ...ports.map((port) => ({ url: `http://127.0.0.1:${port}`, apiKey: '' })),
-  ]
-}
-
-/** Loopback-only request to an oMLX/Ollama-style server. `base` must already
- *  have passed parseLoopbackUrl. */
-function loopbackRequest(
-  base: URL,
-  suffix: string,
-  init: { method: string; headers: Record<string, string>; timeout: number; body?: string },
-  onResponse: (res: http.IncomingMessage) => void,
-  onFail: (err: Error) => void,
-): void {
-  const target = omlxEndpoint(base, suffix)
-  const mod = target.protocol === 'https:' ? https : http
-  const req = mod.request(
-    {
-      hostname: target.hostname.replace(/^\[|\]$/g, ''),
-      port: target.port || (target.protocol === 'https:' ? 443 : 80),
-      path: target.pathname,
-      method: init.method,
-      headers: init.headers,
-      timeout: init.timeout,
-    },
-    onResponse,
-  )
-  req.on('error', onFail)
-  req.on('timeout', () => { req.destroy(); onFail(new Error('timeout')) })
-  if (init.body !== undefined) req.write(init.body)
-  req.end()
-}
-
-interface OmlxProbe { models: string[]; authRequired: boolean }
-
-function probeOmlx(url: unknown, apiKey: string): Promise<OmlxProbe> {
-  return new Promise((resolve) => {
-    const base = parseLoopbackUrl(url)
-    if (!base) { resolve({ models: [], authRequired: false }); return }
-    const headers: Record<string, string> = { 'Accept': 'application/json' }
-    const key = effectiveOmlxKey(base, apiKey)
-    const keyEncodings = key ? [
-      key,
-      Buffer.from(key).toString('base64').replace(/=+$/, ''),
-      Buffer.from(key).toString('base64url'),
-      Buffer.from(key).toString('hex'),
-      Buffer.from(key).toString('hex').toUpperCase(),
-    ] : []
-    if (key) headers['Authorization'] = `Bearer ${key}`
-    try {
-    loopbackRequest(
-      base,
-      '/v1/models',
-      { method: 'GET', headers, timeout: 2000 },
-      (res) => {
-        // 401/403: something is listening and wants a (different) key.
-        if (res.statusCode === 401 || res.statusCode === 403) {
-          res.resume()
-          resolve({ models: [], authRequired: true })
-          return
-        }
-        const chunks: Buffer[] = []
-        res.on('data', (c: Buffer) => chunks.push(c))
-        res.on('end', () => {
-          try {
-            const body = JSON.parse(Buffer.concat(chunks).toString()) as { data?: { id: string }[] }
-            // Only plain string ids, and never one that echoes the key back
-            // (a reflecting server must not turn into a way to hand it on).
-            const models = (body.data ?? []).map((m) => m.id)
-              .filter((id): id is string => typeof id === 'string' && !keyEncodings.some((encoded) => id.includes(encoded)))
-            resolve({ models, authRequired: false })
-          } catch { resolve({ models: [], authRequired: false }) }
-        })
-      },
-      () => resolve({ models: [], authRequired: false }),
-    )
-    } catch { resolve({ models: [], authRequired: false }) }
-  })
-}
-
-function fetchOmlxModels(url: unknown, apiKey: string): Promise<string[]> {
-  return probeOmlx(url, apiKey).then((probe) => probe.models)
 }
 
 // Allowlist of URL prefixes permitted for shell.openExternal. Anything
@@ -698,10 +584,6 @@ function moduleActionResponse(result: ModuleActionResult, externalDaemon: boolea
 }
 
 export function registerIpcHandlers(options: {
-  /** Test seam: where to look for the user's `~/.omlx/settings.json`. */
-  omlxSettingsPath?: string
-  /** Test seam: replace discovery ports to isolate probes from local services. */
-  omlxCandidatePorts?: readonly number[]
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
@@ -771,7 +653,6 @@ export function registerIpcHandlers(options: {
     // SIGTERM goes out before this listener returns when we own the child.
     void ensureOwnedOmlxQuit()
   })
-  omlxSettingsPath = options.omlxSettingsPath
   const handle: typeof ipcMain.handle = (channel, listener) => ipcMain.handle(channel, options.guard(listener))
   handle(IpcChannels.Sin90KeyStatus, () => sin90KeyAvailable())
   handle(IpcChannels.ClipboardWriteText, (_event, text: unknown) => {
@@ -782,40 +663,13 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.Sin90Write, (_event, req: unknown) => desktopSin90Write(req))
   handle(IpcChannels.Sin90ExportToFile, () => desktopSin90ExportToFile())
   handle(IpcChannels.Sin90ImportFromFile, () => desktopSin90ImportFromFile())
-  // oMLX: auto-detect running server
-  handle(IpcChannels.OmlxDetect, async (): Promise<OmlxDetectResult | OmlxAuthRequiredResult | null> => {
-    let authRequiredAt: string | null = null
-    for (const candidate of omlxProbeCandidates(options.omlxCandidatePorts)) {
-      const probe = await probeOmlx(candidate.url, candidate.apiKey)
-      if (probe.models.length > 0) {
-        if (candidate.fromSettings) {
-          // The renderer is handed an empty key, never the one from the user's
-          // config file; main re-reads it for later requests to this address.
-          return { url: candidate.url, apiKey: '', models: probe.models }
-        }
-        return { url: candidate.url, apiKey: candidate.apiKey, models: probe.models }
-      }
-      if (probe.authRequired && authRequiredAt === null) authRequiredAt = candidate.url
-    }
-    return authRequiredAt ? { authRequired: true, url: authRequiredAt } : null
-  })
-
-  // oMLX: list models from given url+key (url must be loopback http(s))
-  handle(IpcChannels.OmlxModels, async (_event, url: unknown, apiKey: unknown): Promise<OmlxModelsResult> => {
-    if (!parseLoopbackUrl(url)) return { ok: false, models: [], error: 'invalid url (loopback http/https only)' }
-    if (typeof apiKey === 'string' && hasControlChars(apiKey)) return { ok: false, models: [], error: 'forbidden: invalid api key' }
-    const probe = await probeOmlx(url, typeof apiKey === 'string' ? apiKey : '')
-    if (probe.models.length > 0) return { ok: true, models: probe.models }
-    if (probe.authRequired) return { ok: false, models: [], authRequired: true, error: 'authentication required' }
-    return { ok: false, models: [], error: 'no response or no models' }
-  })
-
-  // oMLX: start server via `omlx serve`
+  // 过渡：ID-3 后由 iDoris 接管并删除。不探测模型；端口已有监听或本进程已拉起就不重复启动。
   handle(IpcChannels.OmlxStart, async (_event, port: unknown, apiKey: unknown): Promise<OmlxStartResult> => {
     if (omlxStopping) await omlxStopping
-    const p = port === undefined ? 8000 : parsePort(port)
+    const p = port === undefined ? OMLX_DEFAULT_PORT : parsePort(port)
     if (p === null) return { ok: false, url: '', error: 'invalid port (integer 1-65535)' }
-    if (omlxProcess) return { ok: true, url: `http://127.0.0.1:${p}` }
+    const url = `http://127.0.0.1:${omlxProcess ? (omlxPort ?? p) : p}`
+    if (omlxProcess || await omlxPortOccupied(p)) return { ok: true, url }
     // The key goes to the child through its environment, never argv (argv is
     // world-readable via `ps`). oMLX reads OMLX_API_KEY — verified in
     // oMLX.app/Contents/Resources/omlx/settings.py (`os.getenv("OMLX_API_KEY")`
@@ -832,32 +686,7 @@ export function registerIpcHandlers(options: {
         omlxPort = null
       }
     })
-    return { ok: true, url: `http://127.0.0.1:${p}` }
-  })
-
-  // oMLX: warmup a model by sending a minimal chat request (triggers LLM load into memory)
-  handle(IpcChannels.OmlxWarmup, async (_event, url: unknown, apiKey: unknown, modelId: unknown): Promise<OmlxWarmupResult> => {
-    if (typeof modelId !== 'string') return { model: String(modelId), ok: false, error: 'invalid args' }
-    const base = parseLoopbackUrl(url)
-    if (!base) return { model: modelId, ok: false, error: 'invalid url (loopback http/https only)' }
-    const key = typeof apiKey === 'string' ? apiKey : ''
-    if (hasControlChars(key)) return { model: modelId, ok: false, error: 'forbidden: invalid api key' }
-    return new Promise((resolve) => {
-      const body = JSON.stringify({ model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 })
-      const headers: Record<string, string> = { 'Content-Type': 'application/json', 'Content-Length': String(Buffer.byteLength(body)) }
-      const sendKey = effectiveOmlxKey(base, key)
-      if (sendKey) headers['Authorization'] = `Bearer ${sendKey}`
-      loopbackRequest(
-        base,
-        '/v1/chat/completions',
-        { method: 'POST', headers, timeout: 60000, body },
-        (res) => {
-          res.resume()
-          resolve({ model: modelId, ok: (res.statusCode ?? 500) < 400 })
-        },
-        (e) => resolve({ model: modelId, ok: false, error: e.message }),
-      )
-    })
+    return { ok: true, url }
   })
 
   // oMLX: stop the server this app spawned. An empty slot means we did not
@@ -867,21 +696,6 @@ export function registerIpcHandlers(options: {
     const stopped = await stopOwnedOmlx()
     return { ok: true, stopped }
   })
-  // llm:status — current active LLM provider + model
-  handle(IpcChannels.LlmStatus, async (): Promise<LlmStatusResult> => {
-    // Try oMLX first
-    const omlxModels = await fetchOmlxModels('http://127.0.0.1:8088', configuredOmlxKey())
-    if (omlxModels.length > 0) {
-      return { provider: 'omlx', url: 'http://127.0.0.1:8088', model: omlxModels[0] }
-    }
-    // Try Ollama
-    const ollamaModels = await fetchOmlxModels('http://127.0.0.1:11434', '')
-    if (ollamaModels.length > 0) {
-      return { provider: 'ollama', url: 'http://127.0.0.1:11434', model: ollamaModels[0] }
-    }
-    return { provider: 'none', url: '', model: '' }
-  })
-
 
   // The renderer reports its UI language so the tray and native dialogs follow it.
   handle(IpcChannels.AppSetLocale, (_event, locale: unknown): void => {

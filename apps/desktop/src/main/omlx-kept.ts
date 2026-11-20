@@ -1,3 +1,4 @@
+// 过渡：ID-3 后由 iDoris 接管并删除。
 // PR#1 F1 follow-up (rulings 2026-11-13-pr1-omlx-orphan-ownership, 乙,
 // 2026-11-13-pr1-omlx-kept-deactivate, A, and
 // 2026-11-13-pr1-remaining-lows-gate-f, L-b). A quit that leaves the oMLX
@@ -15,7 +16,30 @@
 // stop (a known limit).
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
+import net from 'node:net'
 import path from 'node:path'
+
+/** Loopback port `omlx serve` uses until iDoris owns the process. */
+export const OMLX_DEFAULT_PORT = 8088
+
+/** True when something already accepts TCP on 127.0.0.1:`port`.
+ *  This is only "already started?"; it does not call a model API. */
+export function omlxListenPortOccupied(port: number, timeoutMs = 200): Promise<boolean> {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host: '127.0.0.1', port })
+    let settled = false
+    const finish = (occupied: boolean) => {
+      if (settled) return
+      settled = true
+      socket.destroy()
+      resolve(occupied)
+    }
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+  })
+}
 
 /** One oMLX left running by a quit. */
 export interface KeptOmlx {

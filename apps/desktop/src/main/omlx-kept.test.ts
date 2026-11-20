@@ -3,7 +3,7 @@ import net, { type AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { KEPT_OMLX_FORMAT, KEPT_OMLX_VERSION, keptOmlxPath, lsofFoundNothing, readKeptOmlx, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx, type OmlxProcessProbe, type ProbeRead } from './omlx-kept'
+import { KEPT_OMLX_FORMAT, KEPT_OMLX_VERSION, keptOmlxPath, lsofFoundNothing, omlxListenPortOccupied, readKeptOmlx, realOmlxProcessProbe, rememberKeptOmlx, stopKeptOmlx, type OmlxProcessProbe, type ProbeRead } from './omlx-kept'
 
 // PR#1 F1 follow-up (rulings 2026-11-13-pr1-omlx-orphan-ownership 乙,
 // 2026-11-13-pr1-omlx-kept-deactivate A, 2026-11-13-pr1-remaining-lows-gate-f L-b).
@@ -344,5 +344,19 @@ describe.skipIf(process.platform !== 'darwin')('realOmlxProcessProbe', () => {
     } finally {
       await new Promise<void>((r) => server.close(() => r()))
     }
+  })
+})
+
+describe('omlxListenPortOccupied', () => {
+  it('is true only when the loopback port already accepts a connection', async () => {
+    const server = net.createServer()
+    await new Promise<void>((r) => server.listen(0, '127.0.0.1', r))
+    const port = (server.address() as AddressInfo).port
+    try {
+      expect(await omlxListenPortOccupied(port, 300)).toBe(true)
+    } finally {
+      await new Promise<void>((r) => server.close(() => r()))
+    }
+    expect(await omlxListenPortOccupied(port, 200)).toBe(false)
   })
 })

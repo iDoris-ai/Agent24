@@ -156,7 +156,6 @@ beforeAll(async () => {
   await new Promise<void>((resolve) => daemon.listen(0, '127.0.0.1', resolve))
   endpoint.port = (daemon.address() as AddressInfo).port
   registerIpcHandlers({
-    omlxSettingsPath: os.tmpdir(),
     guard: createIpcGuard({
       getMainWindow: () => ({ isDestroyed: () => false, webContents: { mainFrame } }) as never,
       isTrustedUrl: (url) => url === APP_URL,

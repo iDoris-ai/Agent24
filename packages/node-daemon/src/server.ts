@@ -1,10 +1,10 @@
 // Backend daemon — Node.js built-in http server (M2 zero-dependency approach).
-// M3: community module installer, oMLX model management.
+// M3: community module installer. Model calls belong to the Rust daemon.
 // M4: BoxLite service container proxy (/api/svc/:moduleId/*).
 
 import http from 'node:http'
 import { URL } from 'node:url'
-import { LLMGateway } from './llm-gateway'
+import { LLMGateway } from './llm-unavailable'
 import {
   registerAll,
   getAllModules,
@@ -288,7 +288,7 @@ function registerCoreRoutes(): void {
 
   routes.set('GET /api/llm/usage', { handler: () => gateway.getUsage(), moduleId: 'system' })
 
-  // M3: list all models known to oMLX with load status
+  // Model listing is the Rust daemon's job. This reference server returns none.
   routes.set('GET /api/llm/models', {
     handler: () => gateway.listModels(),
     moduleId: 'system',
