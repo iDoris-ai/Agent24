@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  CONSENT_VERSION, consentPath, installService, publicInstallReason, readConsent, runConsent, serviceInstallDeps, shouldAutoInstall, writeConsent,
+  CONSENT_VERSION, consentPath, installService, publicInstallReason, readConsent, autoInstallService, serviceInstallDeps, shouldAutoInstall, writeConsent,
   type ConsentAnswer, type InstallDeps, type InstallOutcome, type InstallSystem,
 } from './resident-service'
 
@@ -67,7 +67,7 @@ describe('shouldAutoInstall', () => {
     ['Windows', { ...ask, platform: 'win32' as NodeJS.Platform }],
     ['a dev build or an AGENT24D_BIN override', { ...ask, fromBundle: false }],
     ['a LaunchAgent already there', { ...ask, installed: true }],
-    ['declined before', { ...ask, consent: kept('declined') }],
+    ['declined before (CLI service uninstall)', { ...ask, consent: kept('declined') }],
   ])('%s does not ask', (_name, o) => {
     expect(shouldAutoInstall(o)).toBe(false)
   })
@@ -126,11 +126,11 @@ describe('installService', () => {
   })
 })
 
-describe('runConsent', () => {
+describe('autoInstallService', () => {
   function consent(install: InstallOutcome | Error = { ok: true }) {
     const recorded: ConsentAnswer[] = []
     let installs = 0
-    const run = runConsent({
+    const run = autoInstallService({
       install: () => { installs++; return install instanceof Error ? Promise.reject(install) : Promise.resolve(install) },
       record: () => { recorded.push('allow') },
     })
@@ -188,6 +188,7 @@ describe('serviceInstallDeps (the real steps over a fake system)', () => {
     const { deps, runs } = system()
     await deps.uninstall()
     expect(runs.map((r) => [r.bin, ...r.args])).toEqual([['/App/backend/agent24', 'service', 'uninstall']])
+    expect(runs[0]!.env['AGENT24_SERVICE_KEEP_CONSENT']).toBe('1')
   })
 
   it('a failing run rejects', async () => {

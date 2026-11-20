@@ -18,6 +18,58 @@ use std::path::{Path, PathBuf};
 /// launchd job label; matches the desktop bundle's appId.
 pub const LABEL: &str = "ai.auraai.agent24";
 
+/// Best-effort mirror of desktop service consent, shared with the packaged app.
+pub fn write_resident_consent(answer: &str) -> Result<(), String> {
+    if keeps_consent(
+        std::env::var("AGENT24_SERVICE_KEEP_CONSENT")
+            .ok()
+            .as_deref(),
+    ) {
+        return Ok(());
+    }
+    let data_dir = agent24_protocol::data_dir::data_dir().map_err(|e| e.to_string())?;
+    let at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    write_resident_consent_at(&data_dir.join("desktop/resident-consent.json"), answer, &at)
+}
+
+/// The desktop app's rollback of a failed install sets this, so the next launch retries.
+fn keeps_consent(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+fn write_resident_consent_at(file: &Path, answer: &str, at: &str) -> Result<(), String> {
+    use std::io::Write;
+    let dir = file.parent().ok_or("consent path has no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let temp = dir.join(format!(".resident-consent.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&temp);
+    let result = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&temp)?;
+        let bytes =
+            serde_json::to_vec(&serde_json::json!({"version": 1, "answer": answer, "at": at}))?;
+        f.write_all(&bytes)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        f.sync_all()?;
+        std::fs::rename(&temp, file)
+    })();
+    if let Err(e) = result {
+        let _ = std::fs::remove_file(temp);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
 /// `~/Library/LaunchAgents/ai.auraai.agent24.plist`
 pub fn plist_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| plist_path_in(Path::new(&h)))
@@ -559,6 +611,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn resident_consent_is_atomic_owner_only_and_uses_desktop_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("desktop/resident-consent.json");
+        write_resident_consent_at(&file, "declined", "2026-11-19T13:16:06.609Z").unwrap();
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"version": 1, "answer": "declined", "at": "2026-11-19T13:16:06.609Z"})
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn keep_consent_only_for_the_rollback_marker() {
+        assert!(keeps_consent(Some("1")));
+        assert!(!keeps_consent(None));
+        assert!(!keeps_consent(Some("0")));
+    }
 
     #[test]
     fn plist_has_the_supervision_keys_that_make_it_24_7() {

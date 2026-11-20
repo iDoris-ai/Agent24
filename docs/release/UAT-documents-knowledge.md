@@ -213,7 +213,7 @@ W 组的细节（断线、超时、取消、内容变化、提示注入、撤权
 | F-02 | App 开着时命令行停不了它 | 终端 2：`agent24 daemon stop; echo rc=$?` | 报 `host authority unavailable`，rc 不为 0，daemon 仍在跑。这是预期 | |
 | F-03 | 退出 App，daemon 跟着退 | ⌘Q，等 5 秒。终端 2：`agent24 daemon status; ls ~/.agent24/daemon.json 2>&1` | `not running`、`No such file` | |
 | F-04 | 装了服务的用户不被接管 | 终端 2：`agent24 service install; sleep 3; agent24 daemon status`。按 1.3 启动 App，终端 2 贴回 `dm`；鼠标悬停菜单栏图标；新对话问 E-01 | 菜单栏提示里有「外部 daemon · pid …」，并说明 `agent24 service install` 起的 daemon 上知识库不生效、要先 `agent24 service uninstall`。这次启动的日志有 `reusing external daemon`，**没有** `taking over`。回答是普通回答，下方有「⚠️ 知识库已开启但当前未生效，这次回答没有使用知识库。如果 daemon 是 `agent24 service install` 装的，请运行 `agent24 service uninstall` 后重新打开 Agent24…」 | |
-| F-05 | 卸掉服务再打开就接管 | ⌘Q。终端 2：`agent24 service uninstall; ls ~/Library/LaunchAgents/ai.auraai.agent24.plist 2>&1`。按 1.3 启动，问 E-01 | plist 已不在。日志是 `taking over …`（服务卸掉时 daemon 还在跑）或直接 `spawned pid`。回答下方是「经知识库检索回答」，没有「未生效」 | |
+| F-05 | 卸掉服务再打开就接管 | ⌘Q。终端 2：`agent24 service uninstall; ls ~/Library/LaunchAgents/ai.auraai.agent24.plist 2>&1`。按 1.3 启动，问 E-01 | plist 已不在；`resident-consent.json` 的 `answer` 变为 `declined`，重开 App 不会自动装回服务。日志是 `taking over …`（服务卸掉时 daemon 还在跑）或直接 `spawned pid`。回答下方是「经知识库检索回答」，没有「未生效」 | |
 
 ## 9. G 组：跨线联合（两条线第一次在同一个包里）
 
@@ -221,7 +221,7 @@ W 组的细节（断线、超时、取消、内容变化、提示注入、撤权
 |---|---|---|---|---|
 | G-01 | 命令行 daemon 在跑时第一次启动新 App：模块安装和接管同时发生 | 前置：B-04 卸掉 documents 后清掉标记（`rm "$MK"`），或者用 A-02 那种还没升级的数据。⌘Q。终端 2：`agent24 daemon start`。按 1.3 启动 App，贴回 `dm` 的最后 5 行 | 日志里既有 `[documents-module] installed …`（或 `upgraded to …`），也有 `taking over CLI daemon …`，最后是 `spawned pid`、`ready on port`。「模块管理」里 documents「已挂载」，「文档」页可用；问 E-01，回答下方是「经知识库检索回答」 | |
 | G-02 | 装了服务的用户卸载模块 | ⌘Q。终端 2：`agent24 service install`。按 1.3 启动 App（会复用外部 daemon，同 F-04）。「模块管理」点 documents 的「卸载」并确认，终端 2 贴回 `ls ~/.agent24/packages; cat "$MK"` | 卸载照常执行，确认框同 B-04。App 不会去停外部 daemon，所以 documents 一行显示「已卸载，重启 daemon 后生效」，鼠标悬停提示「daemon 是在 Agent24 之外启动的，请重启它：…」。`packages` 里没有 `documents`，标记文件已写 | |
-| G-02b | 收尾：卸掉服务、装回模块 | ⌘Q。终端 2：`agent24 service uninstall`。按 1.3 启动，「模块管理」点「安装」并确认 | 启动后 documents 是「未安装…」（标记生效，不自动装回）；点「安装」后回到「已挂载」 | |
+| G-02b | 收尾：卸掉服务、装回模块 | ⌘Q。终端 2：`agent24 service uninstall`。按 1.3 启动，「模块管理」点「安装」并确认 | `resident-consent.json` 的 `answer` 变为 `declined`，重开 App 不会自动装回服务；启动后 documents 是「未安装…」（标记生效，不自动装回）；点「安装」后回到「已挂载」 | |
 | G-03 | 文档模块停用，不影响知识库 | 停用 documents（B-01），新对话问 E-01；然后重新启用 | 回答下方照常是「经知识库检索回答」 | |
 | G-04 | 同一会话里来回用 | 在「文档」页导入一份 PDF 并打开，切到助手问 E-02，再回「文档」页翻页 | 全程没有报错弹窗；两边各自正常 | |
 

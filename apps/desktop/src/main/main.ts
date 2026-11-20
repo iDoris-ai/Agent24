@@ -21,7 +21,7 @@ import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i1
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
 import { BackendManager, daemonAuthMode, daemonCliEndpoint, daemonConnection, daemonElevation, launchAgentPlistExists, onDaemonReady, processAlive, readExternalDaemonState, resolveBundledRustBinary, resolveRustBinary, setBundledPackaged } from './backend-manager'
-import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, runConsent, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
+import { whileServiceStopped, bundledDaemonVersion, consentPath, CrashLoopDetector, enrolRefusal, refusedThisApp, installedAndEnrolled, installService, readConsent, residentOps, autoInstallService, serviceInstallDeps, serviceRecordPid, serviceRuns, serviceStopDeps, ServiceUpgrader, serviceUpgradeDeps, setResident, shouldAutoInstall, stopFailureKey, stopService, upgradeService, upgradesFromBundle, restartDeps, writeConsent, type ConsentAnswer, type InstallOutcome, type StopOutcome } from './resident-service'
 import { PresencePoller, defaultPresenceDeps, presenceDialogOptions, showPresenceDialog } from './presence-poller'
 import { PresenceConnection } from './presence-connection'
 import { AgentEarEventBridge } from './agentear-events'
@@ -1077,7 +1077,7 @@ async function autoInstallResidentService(documentsReady: Promise<unknown>): Pro
   const file = consentPath(dataDir)
   const fromBundle = upgradesFromBundle(app.isPackaged, process.env)
   if (!shouldAutoInstall({ platform: process.platform, fromBundle, installed: launchAgentPlistExists(), consent: readConsent(file) })) return
-  const outcome = await runConsent({
+  const outcome = await autoInstallService({
     install: () => residentInstall(documentsReady),
     record: () => writeConsent(file, 'allow', new Date()),
   })

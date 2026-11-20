@@ -513,10 +513,10 @@ export function installService(deps: InstallDeps): Promise<InstallOutcome> {
   })
 }
 
-export type ConsentOutcome = 'declined' | 'installed' | { failed: string }
+export type ConsentOutcome = 'installed' | { failed: string }
 
 /** Install automatically and keep allow only after a successful install. */
-export async function runConsent(deps: {
+export async function autoInstallService(deps: {
   install: () => Promise<InstallOutcome>
   record: () => void
 }): Promise<ConsentOutcome> {
@@ -564,7 +564,7 @@ export function serviceInstallDeps(
       before = sys.record()?.pid ?? null
       await sys.run(o.cli, ['service', 'install'], env)
     },
-    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], env),
+    uninstall: () => sys.run(o.cli, ['service', 'uninstall'], { ...env, AGENT24_SERVICE_KEEP_CONSENT: '1' }),
     started: () => until(() => {
       const state = sys.record()
       return state !== null && state.pid !== before && state.enrollEndpoint !== undefined && !sys.spawned(state.pid) && sys.alive(state.pid)

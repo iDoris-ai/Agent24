@@ -3723,10 +3723,16 @@ fn cmd_service(action: ServiceAction) -> Result<(), String> {
             }
             println!("It now starts at login and restarts if it crashes.");
             println!("A clean `agent24 daemon stop` is respected (not resurrected).");
+            if let Err(e) = service::write_resident_consent("allow") {
+                eprintln!("warning: could not update resident consent: {e}");
+            }
             Ok(())
         }
         ServiceAction::Uninstall => {
             service::uninstall()?;
+            if let Err(e) = service::write_resident_consent("declined") {
+                eprintln!("warning: could not update resident consent: {e}");
+            }
             println!("24/7 disabled; the LaunchAgent and its daemon copy are stopped and removed.");
             Ok(())
         }
