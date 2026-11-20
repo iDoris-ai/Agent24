@@ -1025,3 +1025,51 @@ fn stamp(unix: i64) -> String {
     let second = sod % 60;
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z")
 }
+
+/// C1 (Loop 4): `documents` enrolls with a capabilities daemon (the one the
+/// desktop starts) instead of calling it "no running daemon". Here no
+/// documents module is installed, so the daemon's own answer comes back.
+#[test]
+fn real_capabilities_documents_enrolls_and_reaches_the_daemon() {
+    let host = Host::start("allow");
+    let out = host.cli(&["documents", "list", "--json"]);
+    let (stdout, stderr) = cli_text(&out);
+    assert!(
+        !stdout.contains("no running daemon") && !stderr.contains("no running daemon"),
+        "{stdout}{stderr}"
+    );
+    assert!(!stderr.contains("could not enrol"), "{stderr}");
+    let reply: Value =
+        serde_json::from_str(stdout.trim()).unwrap_or_else(|_| panic!("{stdout}{stderr}"));
+    // The daemon's own 404 for a namespace no module serves: it was reached
+    // with the enrolled token (without it: backend_incompatible, host authority).
+    assert_eq!(reply["status"], 404, "{reply}");
+    assert_eq!(reply["error"]["code"], "not_found", "{reply}");
+}
+
+/// C1: with no daemon at all, `documents` says to open the app; it does not
+/// start one of its own, and does not hang.
+#[test]
+fn documents_without_a_daemon_says_to_open_the_app() {
+    let home = tempfile::Builder::new()
+        .prefix("a24none")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let out = signature_command::clear_command(env!("CARGO_BIN_EXE_agent24"))
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", home.path())
+        .env("AGENT24D_BIN", home.path().join("no-ephemeral-daemon"))
+        .args(["documents", "list", "--json"])
+        .output()
+        .unwrap();
+    let (stdout, _) = cli_text(&out);
+    let reply: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(reply["error"]["code"], "backend_not_ready", "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("open the Agent24 app"),
+        "{reply}"
+    );
+}
