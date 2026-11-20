@@ -15,7 +15,7 @@ export class LLMGateway {
   }
 
   async chat(_req: LLMRequest, _moduleId: string): Promise<ChatMessage> {
-    throw Object.assign(new Error('请使用 Rust daemon'), { statusCode: 503 })
+    throw Object.assign(new Error('LLM unavailable in node-daemon: chat goes through the Rust daemon (agent24d)'), { statusCode: 503 })
   }
 
   getUsage(): LLMUsage[] {

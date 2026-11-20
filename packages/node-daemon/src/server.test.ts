@@ -99,7 +99,7 @@ describe('daemon server routes', () => {
       messages: [{ role: 'user', content: 'hi' }],
     })
     expect(status).toBe(503)
-    expect((data as { error: string }).error).toBe('请使用 Rust daemon')
+    expect((data as { error: string }).error).toBe('LLM unavailable in node-daemon: chat goes through the Rust daemon (agent24d)')
   })
 
   it('GET /unknown-path returns 404', async () => {
