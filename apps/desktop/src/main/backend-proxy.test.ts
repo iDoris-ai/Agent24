@@ -33,6 +33,11 @@ describe('A1 template matching ({param} = one safe segment)', () => {
 })
 
 describe('A1 findAllowedRoute', () => {
+  it('allows only the exact GET upstream-models route', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/idoris/upstream-models?endpoint=http%3A%2F%2Flocalhost')).toBe(true)
+    expect(isAllowedProxyRoute('POST', '/api/v1/idoris/upstream-models')).toBe(false)
+    expect(isAllowedProxyRoute('GET', '/api/v1/idoris/upstream-models/extra')).toBe(false)
+  })
   it('allows creating a confirmed rerun through the backend proxy', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/runs')).toBe(true)
   })
