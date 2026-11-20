@@ -417,6 +417,15 @@ fn splice_parts(
 ) -> Result<Vec<u8>, PatchError> {
     let zip_err = |e: zip::result::ZipError| PatchError::NotDocx(e.to_string());
     let io_err = |e: std::io::Error| PatchError::NotDocx(e.to_string());
+    // A part that does not parse would leave a DOCX that Word and WPS cannot
+    // open: refused here, before anything is written (PR-Daemon #1954 L2).
+    for (name, content) in parts {
+        if let Err(e) = roxmltree::Document::parse(content) {
+            return Err(PatchError::Invalid(format!(
+                "the edited {name} would not be valid XML ({e}); nothing was written"
+            )));
+        }
+    }
     let mut archive = ZipArchive::new(Cursor::new(docx)).map_err(zip_err)?;
     let mut writer = ZipWriter::new(Cursor::new(Vec::with_capacity(docx.len() + 4096)));
     for i in 0..archive.len() {

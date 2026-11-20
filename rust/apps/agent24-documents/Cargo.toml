@@ -23,6 +23,9 @@ sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio",
 thiserror = "2"
 # E1b: DOCX paragraph patches; every other entry is copied as stored (raw copy).
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# PR-Daemon #1954 L2 (PM: must fix): every part the patcher rewrites is parsed
+# once before it is written, so a broken document.xml is an error, never Ok.
+roxmltree = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

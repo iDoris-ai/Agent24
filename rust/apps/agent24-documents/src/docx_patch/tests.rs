@@ -682,3 +682,37 @@ fn deleted_runs_stay_valid_and_single_quoted_page_breaks_are_refused() {
     assert!(!is_page_or_column_break(r#"<w:br w:type="textWrapping"/>"#));
     assert!(not_plain_text(r#"<w:p><w:r><w:br w:type='page'/></w:r></w:p>"#).is_some());
 }
+
+/// PR-Daemon #1954 L2 (PM: must fix): a tracked rewrite of runs whose `<w:t`
+/// is followed by a line break or a tab writes a document.xml an XML parser
+/// reads; and a part that would not parse is an error, never Ok.
+#[test]
+fn a_tracked_rewrite_writes_xml_that_parses_and_broken_xml_is_refused() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let run = "<w:r><w:t\nxml:space=\"preserve\">甲</w:t\n><w:tab/><w:t\txml:space=\"preserve\">乙</w:t></w:r>";
+    let (docx, text) = with_run_in(index, run);
+    for tracked in [true, false] {
+        let edit = ParaEdit {
+            index,
+            text: "新".into(),
+            tracked,
+            expect: Some(text.clone()),
+        };
+        let out = apply(&docx, &[edit], "A", NOW).unwrap();
+        let xml = entry(&out, "word/document.xml");
+        roxmltree::Document::parse(&xml).unwrap_or_else(|e| panic!("tracked={tracked}: {e}"));
+    }
+    let broken = std::collections::BTreeMap::from([(
+        "word/document.xml".to_owned(),
+        "<w:document><w:body><w:p><w:delText>a</w:t></w:p></w:body></w:document>".to_owned(),
+    )]);
+    assert!(matches!(
+        splice_parts(FIXTURE, &broken, NOW),
+        Err(PatchError::Invalid(_))
+    ));
+}
