@@ -15,6 +15,38 @@ const IDORIS_STATE: Record<IdorisStatus['state'], 'state.not_installed' | 'state
   instance_conflict: 'state.instance_conflict',
 }
 
+const REASONS = {
+  tier_below_16gib: 'models.reason.tier_below_16gib',
+  tier_16_48gib: 'models.reason.tier_16_48gib',
+  tier_48_64gib: 'models.reason.tier_48_64gib',
+  tier_64gib_plus: 'models.reason.tier_64gib_plus',
+  fallback_does_not_fit: 'models.reason.fallback_does_not_fit',
+  insufficient_memory: 'models.reason.insufficient_memory',
+  idoris_unavailable: 'models.reason.idoris_unavailable',
+} satisfies Record<string, keyof typeof settingsMessages.en>
+
+function isObject(data: unknown): data is Record<string, unknown> {
+  return data !== null && typeof data === 'object' && !Array.isArray(data)
+}
+
+function localChatModelIds(data: unknown): string[] | null {
+  if (!isObject(data) || !Array.isArray(data.models)) return null
+  return data.models.flatMap((entry: unknown) =>
+    isObject(entry) && typeof entry.omlx_id === 'string' && (entry.kind === 'chat' || entry.kind === 'vision') ? [entry.omlx_id] : [])
+}
+
+type Recommendation = { modelId: string; installed: boolean; sizeBytes: number | null; reason: string }
+
+function parseRecommendation(data: unknown): Recommendation | null {
+  if (!isObject(data) || !isObject(data.recommendation)) return null
+  const rec = data.recommendation
+  if (typeof rec.model_id !== 'string' || typeof rec.installed !== 'boolean' || typeof rec.reason !== 'string') return null
+  return {
+    modelId: rec.model_id, installed: rec.installed, reason: rec.reason,
+    sizeBytes: typeof rec.size_bytes === 'number' ? rec.size_bytes : null,
+  }
+}
+
 function chatModelIds(data: unknown): { ids: string[]; defaultModel: string } {
   const body = data as { models?: unknown; default_model?: unknown } | null
   const raw = Array.isArray(body?.models) ? body.models : []
@@ -33,6 +65,7 @@ export function ModelServiceSettings(): JSX.Element {
   const t = useT(settingsMessages)
   const idorisT = useT(idorisMessages)
   const [models, setModels] = useState<string[]>([])
+  const [recommendation, setRecommendation] = useState<Recommendation | null>(null)
   const [active, setActive] = useState('')
   const [daemonOffline, setDaemonOffline] = useState(true)
   const [saveError, setSaveError] = useState(false)
@@ -49,13 +82,18 @@ export function ModelServiceSettings(): JSX.Element {
       return
     }
     try {
-      const res = await proxy({ method: 'GET', path: '/api/v1/models' })
+      const [res, local, recommended] = await Promise.all([
+        proxy({ method: 'GET', path: '/api/v1/models' }),
+        proxy({ method: 'GET', path: '/api/v1/models/local' }).catch(() => null),
+        proxy({ method: 'GET', path: '/api/v1/models/recommendation?role=chat' }).catch(() => null),
+      ])
+      setRecommendation(recommended?.ok ? parseRecommendation(recommended.data) : null)
       if (!res.ok) {
         setDaemonOffline(true)
         setModels([])
       } else {
         const parsed = chatModelIds(res.data)
-        setModels(parsed.ids)
+        setModels((local?.ok ? localChatModelIds(local.data) : null) ?? parsed.ids)
         setActive(parsed.defaultModel)
         setDaemonOffline(false)
       }
@@ -93,6 +131,10 @@ export function ModelServiceSettings(): JSX.Element {
     }
   }
 
+  const listedModels = recommendation && !recommendation.installed && !models.includes(recommendation.modelId)
+    ? [...models, recommendation.modelId] : models
+  const reasonKey = Object.entries(REASONS).find(([code]) => code === recommendation?.reason)?.[1]
+
   return (
     <div className="settings-section">
       <h3>{t('service.title')}</h3>
@@ -109,29 +151,45 @@ export function ModelServiceSettings(): JSX.Element {
       <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', padding: '8px 0 4px', letterSpacing: '0.6px', textTransform: 'uppercase' }}>
         {t('models.heading')}
       </div>
-      {models.length === 0 && (
+      {listedModels.length === 0 && (
         <div className="setting-row">
           <span style={{ fontSize: 12, color: 'var(--muted)' }}>{t('models.empty')}</span>
         </div>
       )}
-      {models.map((model) => {
+      {listedModels.map((model) => {
         const isActive = active === model
+        const recommended = recommendation?.modelId === model ? recommendation : null
+        const selectable = !daemonOffline && recommended?.installed !== false
         return (
           <div key={model} className="setting-row" style={{ marginBottom: 2, alignItems: 'center' }}
-            onClick={() => { void selectDefault(model) }}
-            role="button"
+            onClick={() => { if (selectable) void selectDefault(model) }}
+            role={recommended?.installed === false ? 'group' : 'button'}
             aria-label={model}
-            aria-pressed={isActive}
-            aria-disabled={daemonOffline}
-            tabIndex={daemonOffline ? -1 : 0}
-            onKeyDown={(e) => { if (e.key === 'Enter') void selectDefault(model) }}
+            aria-pressed={recommended?.installed === false ? undefined : isActive}
+            aria-disabled={!selectable}
+            tabIndex={selectable ? 0 : -1}
+            onKeyDown={(e) => { if (selectable && e.key === 'Enter') void selectDefault(model) }}
           >
             <span style={{
               width: 6, height: 6, borderRadius: '50%', flexShrink: 0,
               background: isActive ? 'var(--accent)' : 'var(--border)',
             }} />
-            <span style={{ fontSize: 13, fontWeight: isActive ? 600 : 400, color: isActive ? 'var(--accent)' : 'var(--text)' }}>
-              {model}
+            <span style={{ minWidth: 0, overflowWrap: 'anywhere' }}>
+              <span style={{ fontSize: 13, fontWeight: isActive ? 600 : 400, color: isActive ? 'var(--accent)' : 'var(--text)' }}>{model}</span>
+              {recommended && <span style={{ fontSize: 11, color: 'var(--accent)', border: '1px solid var(--accent)', borderRadius: 4, padding: '1px 5px', marginInlineStart: 8 }}>{t('models.recommended')}</span>}
+              {recommended && (
+                <span style={{ display: 'block', fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>
+                  {reasonKey ? t(reasonKey) : recommended.reason}
+                </span>
+              )}
+              {recommended?.installed === false && (
+                <>
+                  <span style={{ display: 'block', fontSize: 12, marginTop: 4 }}>{t('models.notDownloaded', {
+                    size: recommended.sizeBytes === null ? t('models.unknownSize') : t('models.approxSize', { size: (recommended.sizeBytes / 1_000_000_000).toFixed(1) }),
+                  })}</span>
+                  <span style={{ display: 'block', fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>{t('models.downloadSoon')}</span>
+                </>
+              )}
             </span>
           </div>
         )

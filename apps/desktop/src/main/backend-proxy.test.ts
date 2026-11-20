@@ -42,6 +42,11 @@ describe('A1 findAllowedRoute', () => {
     expect(isAllowedProxyRoute('POST', '/api/v1/approvals?status=pending')).toBe(false)
     expect(isAllowedProxyRoute('get', '/api/v1/models')).toBe(false)
   })
+  it.each(['/api/v1/models/local', '/api/v1/models/recommendation?role=chat'])('allows reading model guidance at %s', route => {
+    expect(isAllowedProxyRoute('GET', route)).toBe(true)
+    expect(isAllowedProxyRoute('POST', route)).toBe(false)
+    expect(isAllowedProxyRoute('PUT', route)).toBe(false)
+  })
   it('lets the desktop save the default chat model', () => {
     expect(isAllowedProxyRoute('PUT', '/api/v1/models/default')).toBe(true)
     expect(isAllowedProxyRoute('POST', '/api/v1/models/default')).toBe(false)
