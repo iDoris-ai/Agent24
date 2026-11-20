@@ -3,6 +3,11 @@ use crate::idoris_host::provision::*;
 use crate::{keys::Keys, setup::SetupBudget};
 use std::sync::atomic::AtomicUsize;
 
+/// Bootstrap tests start a real iDoris fixture process group each; run
+/// concurrently they race the supervisor's group reclaim and report a false
+/// InstanceConflict. One at a time.
+static BOOTSTRAP_SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[derive(Default)]
 struct Store {
     entries: SyncMutex<BTreeMap<String, Zeroizing<String>>>,
@@ -543,6 +548,7 @@ async fn connect_accepts_verification_model_id_at_the_limit() {
 
 #[tokio::test]
 async fn core_bootstrap_installs_connects_and_starts_without_consent() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
@@ -563,6 +569,7 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
 }
 #[tokio::test]
 async fn bootstrap_authenticates_local_settings_key_before_connect() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
@@ -582,6 +589,7 @@ async fn bootstrap_authenticates_local_settings_key_before_connect() {
 
 #[tokio::test]
 async fn bootstrap_rejects_untrusted_key_required_listener_before_connect() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     x.provision.owner_trusted.store(false, Ordering::SeqCst);
     let result =
@@ -612,6 +620,7 @@ async fn bootstrap_rejects_untrusted_key_required_listener_before_connect() {
 
 #[tokio::test]
 async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     let candidates = || Candidates {
         candidates: vec![Candidate {
