@@ -624,9 +624,21 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> Result<Served, ModelError> {
-        // Stamp the saved default before the gateway returns, so a model-less
-        // request carries it on the iDoris wire too. An explicit model is left
-        // alone. No saved default leaves the gateway's role name in place.
+        if let Some(gateway) = self.gateway_snapshot() {
+            return gateway
+                .as_ref()
+                .map_err(|e| ModelError::Provider(e.clone()))?
+                .complete(profile, req, cancel, request_id)
+                .await;
+        }
+        if self.idoris_only {
+            return Err(ModelError::Unavailable(idoris_not_connected().into()));
+        }
+        // iDoris data keys are role-scoped: a concrete model name on the wire
+        // is a role-less request and is refused (403). The gateway therefore
+        // always sends the role alias; the saved default reaches iDoris as the
+        // daily role's binding, not as a per-request model. Only the non-iDoris
+        // path below stamps it.
         let stamped;
         let req = match (req.model.is_none(), self.default_model()) {
             (true, Some(model)) => {
@@ -638,16 +650,6 @@ impl ModelRouter {
             }
             _ => req,
         };
-        if let Some(gateway) = self.gateway_snapshot() {
-            return gateway
-                .as_ref()
-                .map_err(|e| ModelError::Provider(e.clone()))?
-                .complete(profile, req, cancel, request_id)
-                .await;
-        }
-        if self.idoris_only {
-            return Err(ModelError::Unavailable(idoris_not_connected().into()));
-        }
         let route = self.route(profile, Instant::now());
         if route.is_empty() {
             return Err(ModelError::Unavailable(match profile.privacy {
@@ -1716,7 +1718,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn saved_default_model_is_sent_through_the_idoris_gateway() {
+    async fn the_idoris_gateway_sends_the_role_alias_not_the_saved_default() {
         let (url, bodies) = idoris_chat_stub();
         let router = ModelRouter::with_defaults(vec![]);
         router.replace_idoris(
@@ -1737,7 +1739,9 @@ mod tests {
             .unwrap();
         let body: serde_json::Value =
             serde_json::from_str(&bodies.recv_timeout(Duration::from_secs(5)).unwrap()).unwrap();
-        assert_eq!(body["model"], "Qwen3-30B", "{body}");
+        // A concrete name would be a role-less request and a role-scoped key
+        // gets 403; the default reaches iDoris as the daily binding instead.
+        assert_eq!(body["model"], "idoris/daily", "{body}");
 
         let explicit = CompletionRequest {
             model: Some("named-by-caller".to_owned()),
