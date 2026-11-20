@@ -134,10 +134,12 @@ fn edits_two_paragraphs_and_leaves_every_other_byte_as_it_was() {
     assert!(t.contains("<w:del w:id=\""), "{t}");
     assert!(t.contains("<w:ins w:id=\""), "{t}");
     assert!(t.contains("w:author=\"Agent24\""));
-    assert!(t.contains(&format!(
-        "<w:delText xml:space=\"preserve\">{}</w:delText>",
+    // The deleted runs are the original ones: rejecting gives back the text.
+    let del = &t[t.find("<w:del ").unwrap()..t.find("</w:del>").unwrap()];
+    assert_eq!(
+        paragraph_text(&del.replace("w:delText", "w:t")),
         paras[tracked].text
-    )));
+    );
     for marker in [
         "w:commentRangeStart",
         "w:commentRangeEnd",
@@ -545,4 +547,50 @@ fn a_paragraph_with_a_tab_or_a_line_break_is_still_rewritten() {
     };
     let out = apply(&docx, &[edit], "A", NOW).unwrap();
     assert_eq!(list_paragraphs(&out).unwrap()[index].text, "新的一段");
+}
+
+/// General 11-21 on 0.6.66: a tracked rewrite of a paragraph with tabs and a
+/// line break deletes the original runs as they were (tabs and the break
+/// kept), so rejecting the change gives back the paragraph as it was; tabs
+/// and line breaks in the new text are written as w:tab and w:br.
+#[test]
+fn rejecting_a_tracked_rewrite_gives_back_tabs_and_line_breaks() {
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    let original = r#"<w:r><w:t>甲方</w:t><w:tab/><w:t>010</w:t><w:br/><w:t>乙方</w:t></w:r>"#;
+    let (docx, text) = with_run_in(index, original);
+    let before = entry(&docx, "word/document.xml");
+    let before_paras = scan_paragraphs(&before).unwrap();
+    let old_para = &before[before_paras[index].start..before_paras[index].end];
+    let edit = ParaEdit {
+        index,
+        text: "联系人\t张三\n电话".into(),
+        tracked: true,
+        expect: Some(text),
+    };
+    let out = apply(&docx, &[edit], "A", NOW).unwrap();
+    let xml = entry(&out, "word/document.xml");
+    let paras = scan_paragraphs(&xml).unwrap();
+    let para = &xml[paras[index].start..paras[index].end];
+    let del = &para[para.find("<w:del ").unwrap()..para.find("</w:del>").unwrap()];
+    let ins = &para[para.find("<w:ins ").unwrap()..para.find("</w:ins>").unwrap()];
+    // Rejecting: the deleted runs, delText back to t, are the original runs.
+    let rejected = del[del.find('>').unwrap() + 1..].replace("w:delText", "w:t");
+    for (_, s, e) in children(old_para)
+        .into_iter()
+        .filter(|(n, _, _)| *n == "w:r")
+    {
+        assert!(
+            rejected.contains(&old_para[s..e]),
+            "{} not in {rejected}",
+            &old_para[s..e]
+        );
+    }
+    // The new text: a tab and a line break, written as Word does.
+    assert!(ins.contains("<w:tab/>") && ins.contains("<w:br/>"), "{ins}");
+    assert!(!ins.contains('\t') && !ins.contains('\n'), "{ins}");
 }
