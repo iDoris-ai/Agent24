@@ -180,6 +180,7 @@ fn omlx(request: &str) -> (u16, String) {
 async fn run(server: &Server, supplied: Option<&ApiKey>) -> ProbeResult {
     OmlxProbe::new()
         .unwrap()
+        .with_owner_check(|_| true)
         .probe_endpoints(
             std::slice::from_ref(&server.endpoint),
             Some(&server.endpoint),
@@ -387,6 +388,7 @@ async fn all_candidates_return_and_only_selected_endpoint_gets_key() {
     let endpoints = vec![first.endpoint.clone(), second.endpoint.clone()];
     let results = OmlxProbe::new()
         .unwrap()
+        .with_owner_check(|_| true)
         .probe_endpoints(&endpoints, Some(&second.endpoint), Some(&key()))
         .await;
     assert_eq!(results.len(), 2);
@@ -445,6 +447,7 @@ async fn redirects_are_never_followed_including_authenticated_requests() {
         });
         let result = OmlxProbe::new()
             .unwrap()
+            .with_owner_check(|_| true)
             .probe_endpoints(std::slice::from_ref(&source), Some(&source), Some(&key()))
             .await
             .remove(0);
@@ -654,4 +657,66 @@ fn settings_fifo_is_rejected_without_blocking() {
     let start = std::time::Instant::now();
     assert_eq!(fixture.read().unwrap_err(), SettingsError::UnsafeFile);
     assert!(start.elapsed() < Duration::from_millis(500));
+}
+
+#[tokio::test]
+async fn untrusted_listener_never_receives_settings_key() {
+    let server = Server::new(|r| {
+        if is_identity(r) {
+            (200, IDENTITY.into())
+        } else if has_auth(r) {
+            (200, MODELS.into())
+        } else {
+            (401, String::new())
+        }
+    });
+    let result = OmlxProbe::new()
+        .unwrap()
+        .with_owner_check(|_| false)
+        .probe_endpoints(
+            std::slice::from_ref(&server.endpoint),
+            Some(&server.endpoint),
+            Some(&key()),
+        )
+        .await
+        .remove(0);
+    assert!(server.requests().iter().all(|r| !has_auth(r)));
+    assert_eq!(result.status, ProbeStatus::AuthRequired);
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+#[ignore = "requires the signed oMLX app listening locally"]
+async fn real_omlx_listening_owner() {
+    assert!(listening_owner_is_omlx(candidates(None)[0].0.port().unwrap()).await);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let mut child = tokio::process::Command::new("/usr/bin/python3")
+        .args([
+            "-m",
+            "http.server",
+            &port.to_string(),
+            "--bind",
+            "127.0.0.1",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let started = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    let trusted = listening_owner_is_omlx(port).await;
+    child.kill().await.unwrap();
+    child.wait().await.unwrap();
+    started.unwrap();
+    assert!(!trusted);
 }

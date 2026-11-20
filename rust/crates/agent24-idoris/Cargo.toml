@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+agent24-os-proc = { path = "../agent24-os-proc" }
 agent24-components = { path = "../agent24-components" }
 agent24-hw = { path = "../agent24-hw" }
 agent24-protocol = { path = "../agent24-protocol" }
