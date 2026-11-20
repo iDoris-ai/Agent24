@@ -527,7 +527,11 @@ fn without_an_embedding_service_recall_stays_on_keywords() {
     let home = home_dir.path().to_path_buf();
     let stub = Stub::start(EmbedMode::Reject);
     let daemon = start_daemon(&home, stub.port, Duration::from_secs(30));
-    wait_stderr(&daemon, "vector recall waiting for iDoris", Duration::from_secs(10));
+    wait_stderr(
+        &daemon,
+        "vector recall waiting for iDoris",
+        Duration::from_secs(10),
+    );
     let log = stderr_text(&daemon);
     assert!(
         !log.contains(SECRET_BODY),
