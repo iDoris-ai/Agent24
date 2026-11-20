@@ -103,6 +103,7 @@ fn with_cards(state: &mut AppState) {
                 ("old-module".to_owned(), "read_document".to_owned()),
                 card(false),
             ),
+            (("doc-module".to_owned(), "find".to_owned()), card(true)),
         ])),
         artifact: Arc::new(|_: &str| Some("a".to_owned())),
     });
@@ -620,6 +621,50 @@ async fn a_module_consent_names_module_tool_expiry_and_resource_kinds_only() {
         "{text}"
     );
     assert!(!text.contains("SECRET-PATH"), "{text}");
+}
+
+/// A1: one confirmation for several tools names every one of them, and only
+/// tools of the module in the path that take grants.
+#[tokio::test]
+async fn a_batch_module_consent_lists_every_tool_it_grants() {
+    let d = daemon_with(with_cards).await;
+    let tool = |name: &str| serde_json::json!({ "tool": name, "fingerprint": "f", "module_version": "1.0.0", "artifact": "a" });
+    let body = |tools: Vec<serde_json::Value>| {
+        serde_json::json!({
+            "tools": tools,
+            "resources": ["path:/Users/someone/SECRET-PATH", "url:https://x"],
+            "expires_at": "2999-01-01T00:00:00Z",
+        })
+        .to_string()
+    };
+    let path = |module: &str| format!("/api/v1/module-consents/modules/{module}/tools");
+    let text = d
+        .ask(
+            "POST",
+            &path("doc-module"),
+            &body(vec![tool("read_document"), tool("find")]),
+        )
+        .await
+        .unwrap();
+    assert!(
+        text.ends_with(
+            "grant consent for module \"doc-module\" tools \"read_document, find\" until \"2999-01-01T00:00:00Z\"; 2 resource(s) of kind \"path, url\""
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("SECRET-PATH"), "{text}");
+    // A tool not of this module, one off the grants protocol, or a name twice: nothing to approve.
+    for (module, tools) in [
+        ("doc-module", vec![tool("read_document"), tool("nope")]),
+        ("old-module", vec![tool("read_document")]),
+        ("doc-module", vec![tool("find"), tool("find")]),
+    ] {
+        let r = d.ask("POST", &path(module), &body(tools)).await;
+        assert!(
+            matches!(r, Err(EnrollErrorCode::NotElevatedOperation)),
+            "{module}: {r:?}"
+        );
+    }
 }
 
 /// No card, a card off the grants protocol, or decisions closed on this
