@@ -418,7 +418,7 @@ async fn list_and_revoke_reject_unrecognized_or_mismatched_responses() {
 }
 
 #[tokio::test]
-#[ignore = "requires the pinned real v0.4.0 binary via IDORIS_TEST_BINARY"]
+#[ignore = "requires the pinned real v0.5.0 binary via IDORIS_TEST_BINARY"]
 async fn real_v040_issue_list_revoke() {
     let mut f = Fixture::new("ok", false);
     f.keys.binary = fs::canonicalize(std::env::var_os("IDORIS_TEST_BINARY").unwrap()).unwrap();

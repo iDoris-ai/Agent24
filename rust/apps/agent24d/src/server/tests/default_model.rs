@@ -111,3 +111,89 @@
             "default_model_unavailable"
         );
     }
+
+    #[tokio::test]
+    async fn recommendation_rejects_other_roles_and_returns_fallback_when_idoris_is_absent() {
+        let app = build_router(state().await);
+        let request = |uri: &str| {
+            Request::builder()
+                .uri(uri)
+                .header(header::AUTHORIZATION, "Bearer testtoken")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let rejected = app.clone().oneshot(request("/api/v1/models/recommendation?role=vision")).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        let missing_role = app.clone().oneshot(request("/api/v1/models/recommendation")).await.unwrap();
+        assert_eq!(missing_role.status(), StatusCode::BAD_REQUEST);
+        let response = app.clone().oneshot(request("/api/v1/models/recommendation?role=chat")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["source"], "fallback");
+        assert_eq!(body["recommendation"]["model_id"], "Qwen3-8B-4bit");
+        assert_eq!(body["recommendation"]["reason"], "idoris_unavailable");
+        let local = app.oneshot(request("/api/v1/models/local")).await.unwrap();
+        assert_eq!(body_json(local).await["models"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn startup_seed_without_idoris_does_not_save_or_replace_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = agent24_memory::KvStore::open(&dir.path().join("seed.db")).await.unwrap();
+        let router = std::sync::Arc::new(ModelRouter::with_defaults(vec![]));
+        router.set_default_model("EnvDefault");
+        crate::default_model::seed_from_idoris(std::sync::Arc::clone(&router), kv.clone(), None).await;
+        assert_eq!(router.default_model().as_deref(), Some("EnvDefault"));
+        assert!(kv.fetch::<crate::default_model::SavedDefaultChatModel>(
+            crate::default_model::NAMESPACE, crate::default_model::KEY
+        ).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn installed_idoris_recommendation_seeds_only_an_empty_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = agent24_memory::KvStore::open(&dir.path().join("seed-success.db"))
+            .await
+            .unwrap();
+        let router = ModelRouter::with_defaults(vec![]);
+        let recommendation = serde_json::json!({"model_id":"Qwen3.8-27B-OptiQ-4bit", "installed":true});
+        let selected = crate::default_model::seed_recommendation(
+            &kv, "idoris_http", &recommendation,
+        ).await.unwrap().unwrap();
+        router.set_default_model(selected);
+        assert_eq!(router.default_model().as_deref(), Some("Qwen3.8-27B-OptiQ-4bit"));
+        assert_eq!(
+            kv.fetch::<crate::default_model::SavedDefaultChatModel>(
+                crate::default_model::NAMESPACE,
+                crate::default_model::KEY,
+            ).await.unwrap().unwrap().model,
+            "Qwen3.8-27B-OptiQ-4bit",
+        );
+
+        crate::default_model::store_default(&kv, "UserChoice").await.unwrap();
+        let ignored = crate::default_model::seed_recommendation(
+            &kv, "idoris_http", &recommendation,
+        ).await.unwrap();
+        assert!(ignored.is_none());
+        assert_eq!(router.default_model().as_deref(), Some("Qwen3.8-27B-OptiQ-4bit"));
+    }
+
+    #[tokio::test]
+    async fn fallback_or_uninstalled_recommendations_are_not_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let kv = agent24_memory::KvStore::open(&dir.path().join("seed-fallback.db"))
+            .await
+            .unwrap();
+        for (source, recommendation) in [
+            ("fallback", serde_json::json!({"model_id":"Qwen3-8B-4bit", "installed":true})),
+            ("idoris_http", serde_json::json!({"model_id":"Qwen3-8B-4bit", "installed":false})),
+            ("idoris_http", serde_json::json!({"model_id":null, "installed":false})),
+        ] {
+            assert!(crate::default_model::seed_recommendation(
+                &kv, source, &recommendation,
+            ).await.unwrap().is_none());
+        }
+        assert!(kv.fetch::<crate::default_model::SavedDefaultChatModel>(
+            crate::default_model::NAMESPACE, crate::default_model::KEY,
+        ).await.unwrap().is_none());
+    }

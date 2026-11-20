@@ -321,6 +321,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/models/recommendation": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get the local chat model recommendation */
+        get: operations["getModelRecommendation"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/models/local": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List locally installed models reported by iDoris */
+        get: operations["listLocalModels"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/models/default": {
         parameters: {
             query?: never;
@@ -5350,6 +5384,64 @@ export interface operations {
                         models: components["schemas"]["Model"][];
                         /** @description The daemon's current default chat model. A saved value wins over DEFAULT_MODEL, which wins over Qwen3-8B-4bit. Null only when this router was built without one. */
                         default_model?: string | null;
+                    };
+                };
+            };
+        };
+    };
+    getModelRecommendation: {
+        parameters: {
+            query: {
+                role: "chat";
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recommendation source and iDoris response, or fallback recommendation */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        source: "idoris_http" | "idoris_cli" | "fallback";
+                        recommendation: {
+                            [key: string]: unknown;
+                        };
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+        };
+    };
+    listLocalModels: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local model inventory, or null when iDoris is unavailable */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @enum {string} */
+                        source: "idoris_http" | "idoris_cli" | "fallback";
+                        models: {
+                            omlx_id: string;
+                            kind: string;
+                            size_bytes: number | null;
+                            catalog_id: string | null;
+                        }[] | null;
                     };
                 };
             };

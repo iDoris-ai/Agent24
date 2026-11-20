@@ -742,6 +742,66 @@ impl IdorisHost {
         }
         status
     }
+
+    /// Read an iDoris data endpoint through the running managed instance. The
+    /// key remains in the keychain and is never exposed to the daemon caller.
+    pub async fn read_data_json(&self, path: &str) -> Option<serde_json::Value> {
+        if !matches!(path, "/v1/recommendation?role=chat" | "/v1/models/local") {
+            return None;
+        }
+        let record = {
+            let inner = self.inner.lock().await;
+            if inner.state != State::Running {
+                return None;
+            }
+            inner.installation.clone()?
+        };
+        let key_id = record.key_id.as_deref()?;
+        let key = self.secrets.secret(key_id).await.ok()?;
+        let response = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .ok()?
+            .get(format!("http://127.0.0.1:{}{}", record.data_port, path))
+            .bearer_auth(key.as_str())
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let bytes = response.bytes().await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Run a read-only CLI query from the verified managed release.
+    pub async fn read_model_cli(&self, args: &[&str]) -> Option<serde_json::Value> {
+        if !matches!(
+            args,
+            ["recommend", "--role", "chat", "--json"] | ["models", "local", "--json"]
+        ) {
+            return None;
+        }
+        let binary = {
+            let inner = self.inner.lock().await;
+            inner.installation.as_ref()?.release_dir.join("idoris")
+        };
+        let output = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::process::Command::new(binary)
+                .args(args)
+                .kill_on_drop(true)
+                .output()
+                .await
+        })
+        .await
+        .ok()?
+        .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        serde_json::from_slice(&output.stdout).ok()
+    }
     pub async fn operation(&self, id: &str) -> Result<Operation, Code> {
         self.inner
             .lock()
