@@ -135,6 +135,38 @@ describe('task cards (M4 A4)', () => {
     await waitFor(() => expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_1/cancel' }))
   })
 
+  it('says so when stopping a task that waits on an approval fails', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
+    const base = proxy.getMockImplementation() as (req: { method: string; path: string }) => Promise<unknown>
+    proxy.mockImplementation(async (req: { method: string; path: string }) =>
+      req.method === 'POST' && req.path === '/api/v1/runs/run_1/cancel'
+        ? { ok: false, status: 502, data: { error: { code: 'proxy_failed', message: 'daemon did not answer' } } }
+        : base(req))
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    fireEvent.click(await within(c).findByRole('button', { name: '停止' }))
+    await waitFor(() => expect(within(c).getByRole('alert').textContent).toContain('daemon did not answer'))
+  })
+
+  it('offers 「停止」 even while another action of the card is under way', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
+    // A confirm that never answers (the native box still open).
+    approvalDecide.mockImplementation(() => new Promise(() => {}))
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    fireEvent.click(await within(c).findByRole('button', { name: '确认' }))
+    await waitFor(() => expect(approvalDecide).toHaveBeenCalled())
+    expect(within(c).getByRole('button', { name: '停止' })).toBeEnabled()
+    fireEvent.click(within(c).getByRole('button', { name: '停止' }))
+    await waitFor(() => expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_1/cancel' }))
+  })
+
   it('stops a task with the cancel API', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
