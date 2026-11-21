@@ -89,6 +89,10 @@ describe('knowledgeQuery (M1 retrieval first, David 2026-11-21)', () => {
     expect(knowledgeQuery('记住：我最喜欢的水果是芒果。')).toBeNull()
     expect(knowledgeQuery('   ')).toBeNull()
   })
+  it('none when asked to write something new (General, 0.6.75)', () => {
+    for (const text of ['写一篇八百字散文', '帮我写一段公司介绍', '请帮我起草一封邮件', '给我写首诗']) expect(knowledgeQuery(text)).toBeNull()
+    for (const text of ['烧开水要多久', '高血压每天吃多少盐', '这份合同的押金是多少']) expect(knowledgeQuery(text)).toBe(text)
+  })
   it('goes on the run as knowledge_query', async () => {
     const proxy = vi.fn()
       .mockResolvedValueOnce({ ok: true, status: 201, data: { id: 'r1' } })

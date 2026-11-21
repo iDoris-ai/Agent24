@@ -23,11 +23,16 @@ export function knowledgePrompt(text: string): string {
   return REMEMBER.test(text) ? text : `${KNOWLEDGE_HINT}\n${text}`
 }
 
+/** Asked to write something new (「写一篇八百字散文」「帮我起草一段介绍」): the
+ * knowledge bases have nothing to add, so nothing is searched first (General,
+ * 0.6.75). The model can still search if it wants to. */
+const WRITE = /^(请|麻烦)?(你)?(帮我)?(写|起草|创作|编写|编一|作一)|写(一|个|篇|段|首|封)|作文|散文|诗歌|小说|文案/
+
 /** What the daemon searches first (RunCreate `knowledge_query`): the user's
- * own words, never on a 「记住…」 turn. */
+ * own words; none on a 「记住…」 turn or when asked to write something new. */
 export function knowledgeQuery(text: string): string | null {
   const q = text.trim()
-  return q.length === 0 || REMEMBER.test(q) ? null : q
+  return q.length === 0 || REMEMBER.test(q) || WRITE.test(q) ? null : q
 }
 
 export const POLL_MS = 1_000
