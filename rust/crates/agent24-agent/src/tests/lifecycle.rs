@@ -761,15 +761,19 @@ fn what_the_first_search_puts_in_is_three_short_passages() {
     let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
     let evidence = v["evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 3);
-    assert_eq!(evidence[0]["snippet"].as_str().unwrap().chars().count(), 201);
+    // PM 11-21: by rank, the first whole (600 here), the next two shorter.
+    assert_eq!(evidence[0]["snippet"].as_str().unwrap().chars().count(), 600);
+    assert_eq!(evidence[1]["snippet"].as_str().unwrap().chars().count(), 251);
+    assert_eq!(evidence[2]["snippet"].as_str().unwrap().chars().count(), 251);
     assert_eq!(evidence[0]["knowledge_id"], "k1");
     assert_eq!(evidence[0]["title"], "烧水指南");
     assert!(evidence[0].get("knowledge_base_id").is_none());
     // PR-Daemon #1976 F1: `kind` stays, for agent24d's record of the hits.
     assert_eq!(v["kind"], "knowledge.search");
     assert_eq!(evidence[0]["use"], "clue");
-    // About 600 Chinese characters and short ASCII keys: well under 1000 tokens.
-    assert!(compact.chars().count() < 1200, "{}", compact.chars().count());
+    // About 1100 tokens of passages and a few hundred of keys and notice:
+    // the whole turn stays within 2–3.5k (0.6.86: 2087 with 200-character cuts).
+    assert!(tokens(&compact) < 1600, "{}", tokens(&compact));
     assert!(full.chars().count() > 6000);
     assert!(crate::compact_evidence_for_tests(r#"{"evidence":[]}"#).is_none());
 }
@@ -812,4 +816,36 @@ async fn a_failed_first_search_or_a_plan_run_goes_on_without_it() {
             assert!(first.iter().all(|m| m.role != "tool"), "a failed search put nothing in");
         }
     }
+}
+
+/// About what a local tokenizer makes of `text`: a CJK character one token,
+/// anything else a third.
+fn tokens(text: &str) -> usize {
+    text.chars()
+        .map(|c| if (c as u32) >= 0x2E80 { 3 } else { 1 })
+        .sum::<usize>()
+        .div_ceil(3)
+}
+
+/// 0.6.87 (General): 200 characters cut 「boil … for at least one minute」 off
+/// EPA's passage and the model answered the knowledge bases had nothing. An
+/// English passage of 500 characters goes in whole.
+#[test]
+fn an_english_passage_of_a_few_hundred_characters_goes_in_whole() {
+    let epa = format!(
+        "DRINKING WATER WARNING. {} Bring all water to a full rolling boil for at least one minute.",
+        "BOIL YOUR WATER BEFORE USING. DO NOT DRINK THE WATER WITHOUT BOILING IT FIRST. ".repeat(5)
+    );
+    assert!(epa.len() > 400);
+    let full = serde_json::json!({
+        "kind": "knowledge.search",
+        "evidence": [
+            { "use": "clue", "knowledge_id": "holiday", "chunk_id": "c0", "content_tag": "t", "snippet": "节假日安排通知".repeat(40) },
+            { "use": "clue", "knowledge_id": "epa", "chunk_id": "c1", "content_tag": "t", "snippet": epa },
+        ]
+    })
+    .to_string();
+    let compact = crate::compact_evidence_for_tests(&full).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
+    assert_eq!(v["evidence"][1]["snippet"].as_str().unwrap(), epa);
 }
