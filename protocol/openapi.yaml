@@ -5877,6 +5877,8 @@ components:
       additionalProperties: false
       required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason, migration_pending, last_migration_error]
       properties:
+        registered: { type: boolean }
+        instance_id: { type: [string, "null"] }
         crashes: { type: integer, minimum: 0 }
         hangs: { type: integer, minimum: 0 }
         circuit_open: { type: boolean }

@@ -1129,6 +1129,8 @@ mod tests {
                                 // IC-3a debug-only switch to the launcher-stdin
                                 // path before the pinned iDoris is 0.6.0.
                                     | "AGENT24_DEV_IDORIS_LAUNCHER"
+                                    | "AGENT24_DEV_ALLOW_UNSIGNED_IDORIS"
+                                    | "AGENT24_IDORIS_S2_BIN"
                             )
                         {
                             found.push(name);

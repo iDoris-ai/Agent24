@@ -7,6 +7,7 @@
 mod discovery;
 mod identity;
 mod logs;
+mod register;
 #[cfg(test)]
 mod tests;
 
@@ -186,6 +187,8 @@ pub struct StartConfig {
     /// Cancel even while start, input refresh or restart backoff is pending.
     pub shutdown: CancellationToken,
     pub lock: &'static IdorisLock,
+    registration: Option<register::Handle>,
+    register_socket: Option<PathBuf>,
 }
 impl StartConfig {
     pub fn new(
@@ -204,6 +207,8 @@ impl StartConfig {
             timings: Timings::default(),
             shutdown: CancellationToken::new(),
             lock: IdorisLock::embedded(),
+            registration: None,
+            register_socket: None,
         })
     }
 }
@@ -218,14 +223,18 @@ pub struct StopReport {
 /// Dropping the handle requests shutdown; explicit stop also awaits reaping.
 /// The gateway must subscribe to accepting_requests before serving traffic.
 pub struct Supervisor {
+    #[cfg(test)]
+    initial_admin: Arc<Zeroizing<String>>,
     status: watch::Receiver<RuntimeStatus>,
     accepting: watch::Receiver<bool>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<StopReport, SupervisorError>>>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RuntimeStatus {
+    pub registered: bool,
+    pub instance_id: Option<String>,
     pub ports: Option<Ports>,
     pub circuit_open: bool,
     pub crashes: u64,
@@ -264,34 +273,71 @@ impl Supervisor {
         }
         config.data = config.data.canonical()?;
         let lease = Lease::acquire(&config.data.state)?;
-        lease
-            .recover(
-                &config.timings,
-                &config.shutdown,
-                &config.installed.binary(),
-            )
-            .await?;
+        let registration = if launcher_enabled(&config) {
+            match discovery::path(&config.data).and_then(|path| {
+                register::Server::start(path, config.lock).map_err(SupervisorError::Io)
+            }) {
+                Ok(server) => {
+                    config.register_socket = Some(server.socket_path().to_path_buf());
+                    config.registration = Some(server.handle());
+                    Some(server)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "iDoris registration unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let config = Arc::new(config);
+        let adopted = if registration.is_some() {
+            try_adopt(&config, &lease, &mut refresh).await?
+        } else {
+            None
+        };
+        if adopted.is_none() {
+            lease
+                .recover(
+                    &config.timings,
+                    &config.shutdown,
+                    &config.installed.binary(),
+                )
+                .await?;
+        }
         let mut policy = RestartPolicy {
             open: false,
             attempts: VecDeque::new(),
         };
-        let process = launch(
-            &config,
-            &lease,
-            &mut refresh,
-            &mut policy,
-            Instant::now(),
-            None,
-        )
-        .await?;
+        let process = if let Some(process) = adopted {
+            process
+        } else {
+            launch(
+                &config,
+                &lease,
+                &mut refresh,
+                &mut policy,
+                Instant::now(),
+                None,
+            )
+            .await?
+        };
         let (accepting, receiver) = watch::channel(true);
         let (status, status_receiver) = watch::channel(RuntimeStatus {
             ports: Some(process.ports),
+            registered: config
+                .registration
+                .as_ref()
+                .and_then(|r| r.session())
+                .is_some_and(|r| Some(&r.instance_id) == process.instance_id.as_ref()),
+            instance_id: process.instance_id.clone(),
             ..RuntimeStatus::default()
         });
         let shutdown = config.shutdown.clone();
+        #[cfg(test)]
+        let initial_admin = process._admin.clone();
         let task = tokio::spawn(async move {
+            let _registration = registration;
             supervise(
                 process,
                 config,
@@ -304,6 +350,8 @@ impl Supervisor {
             .await
         });
         Ok(Self {
+            #[cfg(test)]
+            initial_admin,
             accepting: receiver,
             status: status_receiver,
             shutdown,
@@ -407,6 +455,10 @@ where
         .build()
         .map_err(|_| SupervisorError::Configuration)?;
     let mut failures = 0;
+    let mut registration_status = config.registration.as_ref().map(|r| r.subscribe());
+    if let Some(receiver) = &mut registration_status {
+        receiver.mark_changed();
+    }
     loop {
         let status = tokio::select! {
             biased;
@@ -414,9 +466,24 @@ where
                 accepting.send_replace(false);
                 let drain_timed_out = timeout(config.timings.drain, drain()).await.is_err();
                 let forced = process.stop().await?;
+                status_signal.send_modify(|s| s.registered = false);
                 lease.clear()?;
                 return Ok(StopReport { forced, drain_timed_out });
             }
+            changed = async {
+                match &mut registration_status {
+                    Some(receiver) => receiver.changed().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if changed.is_err() { registration_status = None; }
+                status_signal.send_modify(|s| {
+                    let session = config.registration.as_ref().and_then(|r| r.session());
+                    s.registered = session.as_ref().is_some_and(|r| Some(&r.instance_id) == process.instance_id.as_ref());
+                    s.instance_id = process.instance_id.clone();
+                });
+                continue;
+            },
             status = process.child.wait() => match status {
                 Ok(status) => Some(status),
                 Err(error) => {
@@ -452,7 +519,10 @@ where
             },
         };
         accepting.send_replace(false);
-        status_signal.send_modify(|s| s.ports = None);
+        status_signal.send_modify(|s| {
+            s.ports = None;
+            s.registered = false;
+        });
         // Snapshot surviving workers at the reap itself, before the PGID
         // could be recycled; finish() then kills them with the group.
         if let Some(status) = status {
@@ -461,7 +531,13 @@ where
                 .output
                 .event(&format!("exited code={:?}", status.code()));
             process.finish().await?;
-            if status.success() || status.code() == Some(4) {
+            let expected = process.instance_id.as_deref().is_some_and(|id| {
+                config
+                    .registration
+                    .as_ref()
+                    .is_some_and(|r| r.take_expected_exit(id))
+            });
+            if expected_exit(status.code(), expected) {
                 lease.clear()?;
                 return Ok(StopReport::default());
             }
@@ -502,6 +578,12 @@ where
         failures = 0;
         status_signal.send_modify(|s| {
             s.ports = Some(process.ports);
+            s.instance_id = process.instance_id.clone();
+            s.registered = config
+                .registration
+                .as_ref()
+                .and_then(|r| r.session())
+                .is_some_and(|r| Some(&r.instance_id) == process.instance_id.as_ref());
             s.circuit_open = false;
         });
         accepting.send_replace(true);
@@ -514,6 +596,11 @@ fn restart_backoff(delay: Duration, timings: &Timings) -> Duration {
     }
     let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 101);
     (delay + jitter).min(Duration::from_secs(30))
+}
+
+fn expected_exit(code: Option<i32>, bye: bool) -> bool {
+    // Exit 5 still counts as an engine crash after graceful bye (§2.7.5).
+    matches!(code, Some(0 | 4)) || (bye && code != Some(5))
 }
 
 fn retry_exit(code: Option<i32>, launcher: bool) -> bool {
@@ -579,11 +666,170 @@ fn exit_error(status: ExitStatus) -> SupervisorError {
     }
 }
 
+enum ProcessHandle {
+    Spawned(Child),
+    Orphan { record: ProcessRecord, exited: bool },
+}
+impl ProcessHandle {
+    fn id(&self) -> Option<u32> {
+        match self {
+            Self::Spawned(child) => child.id(),
+            Self::Orphan { record, .. } => Some(record.pid),
+        }
+    }
+    fn take_stdin(&mut self) -> Option<tokio::process::ChildStdin> {
+        match self {
+            Self::Spawned(child) => child.stdin.take(),
+            Self::Orphan { .. } => None,
+        }
+    }
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        use std::os::unix::process::ExitStatusExt;
+        match self {
+            Self::Spawned(child) => child.try_wait(),
+            Self::Orphan { record, exited } => {
+                if !*exited {
+                    *exited = !record.alive().map_err(io::Error::other)?;
+                }
+                // An orphan is not our child, so its exit status cannot be reaped.
+                Ok(exited.then(|| ExitStatus::from_raw(libc::SIGKILL)))
+            }
+        }
+    }
+    async fn wait(&mut self) -> io::Result<ExitStatus> {
+        match self {
+            Self::Spawned(child) => child.wait().await,
+            orphan => loop {
+                if let Some(status) = orphan.try_wait()? {
+                    return Ok(status);
+                }
+                sleep(Duration::from_millis(100)).await;
+            },
+        }
+    }
+    #[cfg(test)]
+    fn start_kill(&mut self) -> io::Result<()> {
+        match self {
+            Self::Spawned(child) => child.start_kill(),
+            Self::Orphan { .. } => Err(io::Error::other("not a child")),
+        }
+    }
+}
+
+async fn try_adopt<F, Fut>(
+    config: &Arc<StartConfig>,
+    lease: &Lease,
+    refresh: &mut F,
+) -> Result<Option<ManagedProcess>, SupervisorError>
+where
+    F: FnMut() -> Fut + Send,
+    Fut: Future<Output = Result<LaunchInputs, SupervisorError>> + Send,
+{
+    let path = discovery::path(&config.data)?;
+    let Ok(discovered) = discovery::read_any(&path) else {
+        return Ok(None);
+    };
+    let Some(record) = lease.adoptable(&config.installed.binary(), discovered.pid) else {
+        return Ok(None);
+    };
+    #[cfg(target_os = "macos")]
+    if (record.start_time / 1000).abs_diff(discovered.started_at_ms) > 5000 {
+        return Ok(None);
+    }
+    let inputs = tokio::select! {
+        _ = config.shutdown.cancelled() => return Err(SupervisorError::Stopped),
+        value = refresh() => value?,
+    };
+    if let Some(launch) = &discovered.launch
+        && (launch["db_path"].as_str() != config.data.db.to_str()
+            || launch["state_dir"].as_str() != config.data.state.to_str()
+            || launch["components_dir"].as_str() != config.components.path().to_str()
+            || launch["allocated_budget_bytes"]
+                .as_u64()
+                .is_some_and(|n| n != inputs.budget.allocated_bytes))
+    {
+        return Ok(None);
+    }
+    let Some(registration) = &config.registration else {
+        return Ok(None);
+    };
+    lease.write(&record)?;
+    let mut updates = registration.subscribe();
+    let adopted = async {
+        let registered = timeout(Duration::from_secs(20), async {
+            loop {
+                if registration.session().is_some_and(|s| {
+                    s.instance_id == discovered.instance_id && s.pid == discovered.pid
+                }) {
+                    break;
+                }
+                if updates.changed().await.is_err() {
+                    return false;
+                }
+            }
+            true
+        })
+        .await
+        .unwrap_or(false);
+        if !registered {
+            return Ok(None);
+        }
+        let token = mint_token()?;
+        if registration
+            .set_admin_token(&discovered.instance_id, token.clone())
+            .await
+            .is_err()
+        {
+            return Ok(None);
+        }
+        let token = Arc::new(token);
+        let output = logs::Output::new(
+            &config.log_dir,
+            token.clone(),
+            inputs.omlx_key.map(Arc::new),
+            config.diagnostic_output,
+        )?;
+        let mut process = ManagedProcess {
+            ports: Ports {
+                data: discovered.data_port,
+                admin: discovered.admin_port,
+            },
+            discovery: Some(path),
+            instance_id: Some(discovered.instance_id),
+            child: ProcessHandle::Orphan {
+                record,
+                exited: false,
+            },
+            group: Some(Pid::from_raw(discovered.pid as i32)),
+            members: Vec::new(),
+            adopted: false,
+            config: config.clone(),
+            output,
+            _admin: token,
+        };
+        if process
+            .ready(Instant::now() + config.timings.ready)
+            .await
+            .is_err()
+        {
+            process.output.finish().await;
+            return Ok(None);
+        }
+        process.remember_members()?;
+        process.output.event("adopted");
+        Ok::<_, SupervisorError>(Some(process))
+    };
+    tokio::select! {
+        _ = config.shutdown.cancelled() => Err(SupervisorError::Stopped),
+        result = adopted => result,
+    }
+}
+
 struct ManagedProcess {
     ports: Ports,
-    discovery: Option<(PathBuf, Zeroizing<String>)>,
+    discovery: Option<PathBuf>,
     instance_id: Option<String>,
-    child: Child,
+    child: ProcessHandle,
     group: Option<Pid>,
     members: Vec<ProcessRecord>,
     // Set once the leader's reap was observed and its survivors snapshotted.
@@ -613,7 +859,7 @@ impl ManagedProcess {
         )?;
         let mut command = serve_command(&config, &inputs.budget, output.omlx_key())?;
         let discovery = if launcher_enabled(&config) {
-            Some((discovery::path(&config.data)?, mint_token()?))
+            Some(discovery::path(&config.data)?)
         } else {
             None
         };
@@ -627,7 +873,7 @@ impl ManagedProcess {
             ports: config.ports,
             discovery,
             instance_id: None,
-            child,
+            child: ProcessHandle::Spawned(child),
             group: Some(Pid::from_raw(pid as i32)),
             members: Vec::new(),
             adopted: false,
@@ -638,11 +884,14 @@ impl ManagedProcess {
         let result = async {
             let mut stdin = process
                 .child
-                .stdin
-                .take()
+                .take_stdin()
                 .ok_or(SupervisorError::TokenHandoff)?;
             let frame = match &process.discovery {
-                Some((path, nonce)) => discovery::frame(&process._admin, path, nonce)?,
+                Some(path) => discovery::frame(
+                    &process._admin,
+                    path,
+                    process.config.register_socket.as_deref(),
+                )?,
                 None => Zeroizing::new(process._admin.to_string()),
             };
             let handoff = write_token(
@@ -766,12 +1015,9 @@ impl ManagedProcess {
             .build()
             .map_err(|_| SupervisorError::Configuration)?;
         loop {
-            if let Some((path, nonce)) = &self.discovery {
-                match discovery::read(
-                    path,
-                    self.child.id().ok_or(SupervisorError::Stopped)?,
-                    nonce,
-                ) {
+            if let Some(path) = &self.discovery {
+                match discovery::read_any(path) {
+                    Ok(record) if Some(record.pid) != self.child.id() => {}
                     Ok(record) => {
                         self.ports = Ports {
                             data: record.data_port,
@@ -950,6 +1196,21 @@ async fn listeners_owned(
     group: Option<Pid>,
 ) -> Result<bool, SupervisorError> {
     let group = group.ok_or(SupervisorError::InstanceConflict)?;
+    if launcher_enabled(config) {
+        return match agent24_os_proc::owns_listening_ports(
+            group.as_raw(),
+            &[ports.data, ports.admin],
+        ) {
+            Ok(owned) => Ok(owned),
+            Err(error)
+                if error.kind() == io::ErrorKind::Unsupported
+                    && (cfg!(test) || !cfg!(target_os = "macos")) =>
+            {
+                Ok(true)
+            }
+            Err(_) => Ok(false),
+        };
+    }
     for port in [ports.data, ports.admin] {
         let found = identity::listeners(port, config.timings.health_request).await;
         if !judge_listeners(found, group, |pid| {
@@ -1020,6 +1281,12 @@ fn killpg_outcome(
 }
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
+        // Explicit stop already ran on every graceful path. A drop without it means
+        // agent24d is going away abnormally: leave the launcher generation for the
+        // next agent24d to adopt; its orphan timeout reaps it if nobody does.
+        if launcher_enabled(&self.config) {
+            return;
+        }
         let _ = self.signal_owned_group(Signal::SIGKILL);
     }
 }
@@ -1079,7 +1346,10 @@ fn serve_command(
     if launcher_enabled(config) {
         // A pipe would close with agent24d and make the surviving iDoris panic
         // on its next log write (iDoris #621), so its output goes to /dev/null.
-        command.stdout(Stdio::null()).stderr(Stdio::null());
+        command
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(false);
         agent24_os_proc::independent_session(command.as_std_mut());
     } else {
         command.process_group(0);

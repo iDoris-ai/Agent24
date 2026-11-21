@@ -1,4 +1,4 @@
-//! S1 launcher discovery. Registration and orphan adoption belong to S2.
+//! Launcher discovery and its private on-disk instance proof.
 use super::*;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 
@@ -7,19 +7,22 @@ struct LauncherFrame<'a> {
     v: u8,
     admin_token: &'a str,
     discovery_path: &'a Path,
-    instance_nonce: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    register_socket: Option<&'a Path>,
+    orphan_timeout_s: u32,
 }
 
 pub(super) fn frame(
     token: &str,
     path: &Path,
-    nonce: &str,
+    register_socket: Option<&Path>,
 ) -> Result<Zeroizing<String>, SupervisorError> {
     let frame = LauncherFrame {
         v: 1,
         admin_token: token,
         discovery_path: path,
-        instance_nonce: nonce,
+        register_socket,
+        orphan_timeout_s: if register_socket.is_some() { 900 } else { 0 },
     };
     let value =
         Zeroizing::new(serde_json::to_string(&frame).map_err(|_| SupervisorError::Configuration)?);
@@ -49,9 +52,26 @@ pub(super) struct Discovery {
     pub instance_id: String,
     pub data_port: u16,
     pub admin_port: u16,
+    #[serde(default)]
+    pub started_at_ms: u64,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub contract_version: String,
+    #[serde(default)]
+    pub launch: Option<serde_json::Value>,
 }
 
+#[cfg(test)]
 pub(super) fn read(path: &Path, pid: u32, nonce: &str) -> Result<Discovery, SupervisorError> {
+    let record = read_any(path)?;
+    if record.pid != pid || record.instance_nonce.as_str() != nonce {
+        return Err(SupervisorError::StaleDiscovery);
+    }
+    Ok(record)
+}
+
+pub(super) fn read_any(path: &Path) -> Result<Discovery, SupervisorError> {
     let file = fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -64,15 +84,12 @@ pub(super) fn read(path: &Path, pid: u32, nonce: &str) -> Result<Discovery, Supe
         return Err(SupervisorError::Contract);
     }
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take(16385).read_to_end(&mut bytes)?;
-    if bytes.len() > 16384 {
+    file.take(4097).read_to_end(&mut bytes)?;
+    if bytes.len() > 4096 {
         return Err(SupervisorError::Contract);
     }
     let record: Discovery =
         serde_json::from_slice(&bytes).map_err(|_| SupervisorError::Contract)?;
-    if record.pid != pid || record.instance_nonce.as_str() != nonce {
-        return Err(SupervisorError::StaleDiscovery);
-    }
     if record.schema != 1
         || record.service != "idoris"
         || record.instance_id.is_empty()
@@ -96,11 +113,16 @@ mod tests {
         let token = "a".repeat(64);
         let nonce = "b".repeat(64);
         let value: serde_json::Value =
-            serde_json::from_str(&frame(&token, &path, &nonce).unwrap()).unwrap();
+            serde_json::from_str(&frame(&token, &path, Some(Path::new("/register.sock"))).unwrap())
+                .unwrap();
         assert_eq!(
             value,
-            serde_json::json!({"v":1,"admin_token":token,"discovery_path":path,"instance_nonce":nonce})
+            serde_json::json!({"v":1,"admin_token":token,"discovery_path":path,"register_socket":"/register.sock","orphan_timeout_s":900})
         );
+        let fallback: serde_json::Value =
+            serde_json::from_str(&frame(&token, &path, None).unwrap()).unwrap();
+        assert!(fallback.get("register_socket").is_none());
+        assert_eq!(fallback["orphan_timeout_s"], 0);
         fs::write(&path, serde_json::json!({"schema":1,"service":"idoris","pid":42,"instance_nonce":nonce,"instance_id":"s1","data_port":1234,"admin_port":1235}).to_string()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(read(&path, 42, &nonce).is_ok());

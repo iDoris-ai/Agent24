@@ -2638,6 +2638,8 @@ export interface components {
             idoris_budget_bytes: number;
         };
         IdorisStatus: {
+            registered?: boolean;
+            instance_id?: string | null;
             crashes?: number;
             hangs?: number;
             circuit_open?: boolean;
