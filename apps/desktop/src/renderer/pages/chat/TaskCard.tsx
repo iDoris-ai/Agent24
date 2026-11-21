@@ -100,7 +100,9 @@ export function approvalText(
       const real = index === null ? undefined : originals?.get(index)
       return t('task.ask.patchEdit', {
         n: index === null ? '?' : String(index + 1),
-        from: clip(real ?? str(e['expect'])),
+        // M1 (c): the paragraph as the document has it; until read, the
+        // model's opening words (`anchor`, or an older `expect`).
+        from: clip(real ?? (str(e['anchor']) || str(e['expect']))),
         to: clip(str(e['text'])),
       })
     })

@@ -985,25 +985,27 @@ fn real_contracts_keep_tabs_and_breaks_when_a_character_is_added() {
     );
 }
 
-/// M1 (0.6.75): the model's `expect` without 「第三条 」 or half of it still
-/// names that paragraph; another paragraph's text does not.
+/// M1 (c), General 11-21: an anchor is the paragraph's opening words, its
+/// numbering, spaces and punctuation aside; nothing else is accepted.
 #[test]
-fn expect_is_the_paragraph_without_numbering_or_a_long_enough_part_of_it() {
+fn an_anchor_is_the_opening_of_the_paragraph_at_its_index() {
     let para = "第三条 押金为两个月租金，合同期满无违约时全额退还。";
     for ok in [
-        para,
+        "押金为两个月",
+        "第三条 押金为两个月",
+        "第三条押金为两个月租金，",
+        " 押金为 两个月 ",
         "押金为两个月租金，合同期满无违约时全额退还。",
-        "押金为两个月租金，合同期满无违约时全额退还",
-        "  第三条押金为两个月租金，合同期满无违约时全额退还 ",
-        "押金为两个月租金",
     ] {
-        assert!(super::expect_matches(para, ok), "{ok}");
+        assert!(super::anchor_matches(para, ok), "{ok}");
     }
-    for wrong in ["乙方：张三", "押金", "第四条 租金每月 8,500 元。", ""] {
-        assert!(!super::expect_matches(para, wrong), "{wrong}");
+    // Not its opening: another paragraph's words, the middle of this one, nothing.
+    for wrong in ["乙方：张三", "合同期满无违约", "租金为两个月", "", "。，"] {
+        assert!(!super::anchor_matches(para, wrong), "{wrong}");
     }
-    assert!(super::expect_matches("（一）租金", "租金"));
-    assert!(super::expect_matches("1. Scope", "Scope"));
-    assert!(super::expect_matches("一、总则", "总则"));
-    assert!(super::expect_matches("", ""));
+    // General's case: the index is 乙方's line, the anchor 第三条's opening.
+    assert!(!super::anchor_matches("乙方：张三", "押金为两个月"));
+    assert!(super::anchor_matches("（一）租金每月 8,500 元", "租金每月"));
+    assert!(super::anchor_matches("1. Scope of work", "Scope of"));
+    assert!(super::anchor_matches("一、总则", "总则"));
 }

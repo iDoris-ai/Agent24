@@ -46,7 +46,7 @@ describe('D2b document intents in a conversation about a document', () => {
 
 const HINT = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
   + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
-  + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写，tracked=true 写成修订；document_id 可以直接填文件名。回答用户时不要提这些工具名）。'
+  + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 是这一段开头约 8 个字），tracked=true 写成修订；document_id 可以直接填文件名。回答用户时不要提这些工具名）。'
 
 describe('docAgentPrompt', () => {
   it('names the current document when there is one, then the tools hint and the user text', () => {
