@@ -21,7 +21,7 @@ let store: ReturnType<typeof createChatHistoryStore>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 type Run = { status: string; started_at?: string; ended_at?: string | null; output?: { text: string } | null; knowledge?: unknown; error?: { code: string; message: string } | null }
 let runs: Record<string, Run>
-let approvals: { id: string; run_id: string; available_decisions: string[] }[]
+let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string }[]
 let proxy: ReturnType<typeof vi.fn>
 let approvalDecide: ReturnType<typeof vi.fn>
 let emit: (event: RunEvent) => void
@@ -148,6 +148,39 @@ describe('task cards (M4 A4)', () => {
     fireEvent.click(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '确认' }))
     await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'approve' }))
     expect(approvalDecide).toHaveBeenCalledTimes(1)
+  })
+
+  // M1 (c), PM 11-21: a patch aimed at the wrong paragraph goes back to the
+  // model before the user is asked; one aimed right waits for the user.
+  it.each([
+    ['押金为两个月', 5, false],
+    ['押金为两个月', 2, true],
+  ])('a patch with anchor %s at index %i is sent back: %s', async (anchorText, index, sentBack) => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: `documents.patch: {"document_id":"doc_1","edits":[{"anchor":"${anchorText}","index":${index},"text":"新文字"}]}`,
+    }]
+    const request = vi.fn(async () => ({ ok: true, data: { paragraphs: [
+      { index: 2, text: '乙方：张三', in_table: false },
+      { index: 5, text: '第三条 押金为两个月租金，合同期满无违约时全额退还。', in_table: false },
+    ] } }))
+    ;(window.agent24 as unknown as { documents: unknown }).documents = { request }
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    if (sentBack) {
+      await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', expect.objectContaining({ type: 'deny' })))
+      const reason = (approvalDecide.mock.calls[0] as unknown as [string, { reason: string }])[1].reason
+      expect(reason).toContain('乙方：张三')
+      expect(within(c).queryByRole('button', { name: '确认' })).toBeNull()
+      expect(within(c).queryByText(/documents\.patch: \{/)).toBeNull()
+    } else {
+      await waitFor(() => expect(within(c).getByText(/第 6 段：「第三条 押金为两个月租金/)).toBeInTheDocument())
+      await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
+      expect(approvalDecide).not.toHaveBeenCalled()
+    }
   })
 
   it.each([
@@ -501,15 +534,16 @@ describe('approvalText (D2b)', () => {
     expect(approvalText({ summary: 'documents.list: {"limit":10}' }, t)).toBe('task.ask.list')
     expect(approvalText({ summary: 'documents.compose: {"parts":[{"document_id":"a.pdf","pages":"1"}],"title":"A1"}' }, t))
       .toBe('task.ask.compose{"title":"A1","parts":"task.ask.part{\\"doc\\":\\"a.pdf\\",\\"pages\\":\\"1\\"}"}')
-    expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('shell_exec: {"argv":["ls"]}')
+    // M3/PM 11-21: never raw JSON; the summary goes under 「详情」.
+    expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('task.ask.tool{"tool":"执行命令"}')
   })
   it('says what a fill or a patch will write (E1b/D5a)', () => {
     expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","values":{"甲方":"明远","租金":"8,500"}}' }, t))
       .toBe('task.ask.fill{"doc":"模板.docx","values":"甲方=明远，租金=8,500"}')
     expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x","tracked":true}]}' }, t))
-      .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}\ntask.ask.patchEdit{"n":"4","from":"","to":"x"}')
+      .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}\ntask.ask.patchUnread{"n":"4","to":"x"}')
     expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}]}' }, t))
-      .toBe('task.ask.patch{"doc":"a.docx","n":"1"}\ntask.ask.patchEdit{"n":"4","from":"","to":"x"}')
+      .toBe('task.ask.patch{"doc":"a.docx","n":"1"}\ntask.ask.patchUnread{"n":"4","to":"x"}')
   })
   it('shows the paragraph the document has at that index, not the model\'s expect (M1, 0.6.75)', () => {
     const summary = 'documents.patch: {"document_id":"合同.docx","edits":[{"index":5,"text":"押金为两个月租金。","expect":"押金为两个月租金"}]}'
@@ -542,6 +576,9 @@ describe('approvalText (D2b)', () => {
     // The run that would have put 第三条's text over 乙方's line.
     const summary = 'documents.patch: {"document_id":"合同.docx","edits":[{"index":2,"text":"第三条 押金为两个月租金。","expect":"乙方：张三","tracked":true}]}'
     expect(approvalText({ summary }, t))
+      .toBe('task.ask.patchTracked{"doc":"合同.docx","n":"1"}\ntask.ask.patchUnread{"n":"3","to":"第三条 押金为两个月租金。"}')
+    // Read: the paragraph as the document has it, not the model's expect.
+    expect(approvalText({ summary }, t, new Map([[2, '乙方：张三']])))
       .toBe('task.ask.patchTracked{"doc":"合同.docx","n":"1"}\ntask.ask.patchEdit{"n":"3","from":"乙方：张三","to":"第三条 押金为两个月租金。"}')
   })
 })
