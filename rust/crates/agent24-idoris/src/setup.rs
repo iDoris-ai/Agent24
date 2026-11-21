@@ -57,6 +57,10 @@ pub enum SetupCode {
     AuthRequired,
     AuthFailed,
     NotOmlx,
+    NotOpenaiCompatible,
+    InvalidId,
+    IdConflict,
+    SetupFailed,
     ModelNotFound,
     InvalidEndpoint,
     InvalidRole,
@@ -72,6 +76,10 @@ impl SetupCode {
             Self::AuthRequired => "auth_required",
             Self::AuthFailed => "auth_failed",
             Self::NotOmlx => "not_omlx",
+            Self::NotOpenaiCompatible => "not_openai_compatible",
+            Self::InvalidId => "invalid_id",
+            Self::IdConflict => "id_conflict",
+            Self::SetupFailed => "setup_failed",
             Self::ModelNotFound => "model_not_found",
             Self::InvalidEndpoint => "invalid_endpoint",
             Self::InvalidRole => "invalid_role",
@@ -133,6 +141,7 @@ pub struct SetupOutcome {
 
 /// Create a fresh single-card OpenAI-compatible component generation. Values
 /// are validated by the host before reaching this writer.
+// Remove this v0.5.0 writer when the embedded lock is bumped to v0.6.0.
 pub fn write_openai_compat_card(
     instance_root: &Path,
     endpoint: &str,
@@ -170,6 +179,197 @@ pub fn write_openai_compat_card(
         .collect(),
         auth_required: false,
     })
+}
+
+/// Shared gate for setup features introduced in iDoris v0.6.0.
+pub(crate) fn upstream_setup_enabled(lock: &crate::IdorisLock) -> bool {
+    semver::Version::parse(lock.tag.trim_start_matches('v'))
+        .is_ok_and(|version| version >= semver::Version::new(0, 6, 0))
+        || (cfg!(debug_assertions) && std::env::var("AGENT24_DEV_IDORIS_V6").as_deref() == Ok("1"))
+}
+
+/// Generate a loopback OpenAI-compatible card using iDoris's upstream contract.
+pub async fn run_setup_upstream(
+    installed: &InstalledVersion,
+    instance_root: &Path,
+    endpoint: &str,
+    bindings: &[(Role, String)],
+    id: &str,
+    cancel: &CancellationToken,
+) -> Result<SetupOutcome, SetupError> {
+    run_setup_upstream_with_timeout(
+        installed,
+        instance_root,
+        endpoint,
+        bindings,
+        id,
+        cancel,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn run_setup_upstream_with_timeout(
+    installed: &InstalledVersion,
+    instance_root: &Path,
+    endpoint: &str,
+    bindings: &[(Role, String)],
+    id: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<SetupOutcome, SetupError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    if cancel.is_cancelled() {
+        return Err(SetupError::Cancelled);
+    }
+    let mut url =
+        url::Url::parse(endpoint).map_err(|_| SetupError::Rejected(SetupCode::InvalidEndpoint))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SetupError::Rejected(SetupCode::InvalidEndpoint));
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    // Validate the origin after dropping OpenAI API suffixes such as /v1.
+    let origin = url.origin().ascii_serialization();
+    let origin = if url.host_str() == Some("localhost") {
+        origin.replacen("://localhost", "://127.0.0.1", 1)
+    } else {
+        origin
+    };
+    Endpoint::parse(&origin).map_err(|_| SetupError::Rejected(SetupCode::InvalidEndpoint))?;
+    let expected: BTreeMap<_, _> = bindings.iter().cloned().collect();
+    if expected.len() != bindings.len()
+        || !expected.contains_key(&Role::Daily)
+        || !expected.contains_key(&Role::Deep)
+        || bindings
+            .iter()
+            .any(|(_, model)| model.is_empty() || model.chars().any(char::is_control))
+    {
+        return Err(SetupError::InvalidBindings);
+    }
+    let components = components_root(instance_root)?;
+    let generation = tempfile::Builder::new()
+        .prefix("gen-")
+        .tempdir_in(&components)
+        .map_err(|_| SetupError::Io)?;
+    let out_dir = generation
+        .path()
+        .canonicalize()
+        .map_err(|_| SetupError::Io)?;
+    let mut cmd = Command::new(
+        installed
+            .binary()
+            .canonicalize()
+            .map_err(|_| SetupError::Io)?,
+    );
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(&components)
+        .args([
+            "setup",
+            "upstream",
+            "--kind",
+            "openai_compat",
+            "--endpoint",
+            &origin,
+            "--out-dir",
+        ])
+        .arg(&out_dir);
+    for (role, model) in &expected {
+        cmd.arg("--bind").arg(format!("{}={model}", role.as_str()));
+    }
+    cmd.args(["--id", id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|_| SetupError::Io)?;
+    let process_group = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw);
+    let stdout = child.stdout.take().ok_or(SetupError::Io)?;
+    let stderr = child.stderr.take().ok_or(SetupError::Io)?;
+    let operation = async {
+        let wait = async { child.wait().await.map_err(|_| SetupError::Io) };
+        let (stdout, _, status) =
+            tokio::try_join!(read_bounded(stdout), read_bounded(stderr), wait)?;
+        Ok::<_, SetupError>((stdout, status))
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(SetupError::Cancelled),
+        result = tokio::time::timeout(timeout, operation) => result.unwrap_or(Err(SetupError::TimedOut)),
+    };
+    if result.is_err() {
+        if let Some(pid) = process_group {
+            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+        }
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let (stdout, status) = result?;
+    if stdout
+        .strip_suffix(b"\n")
+        .unwrap_or(&stdout)
+        .contains(&b'\n')
+    {
+        return Err(SetupError::InvalidResponse);
+    }
+    let reply: UpstreamReply =
+        serde_json::from_slice(&stdout).map_err(|_| SetupError::InvalidResponse)?;
+    match reply {
+        UpstreamReply::Error { code } if status.code() == Some(1) => {
+            let code = serde_json::from_value(serde_json::Value::String(code))
+                .unwrap_or(SetupCode::SetupFailed);
+            Err(SetupError::Rejected(code))
+        }
+        UpstreamReply::Ok {
+            card_file,
+            models,
+            bindings,
+            id: returned_id,
+        } if status.success() => {
+            if returned_id != id
+                || bindings != expected
+                || bindings.values().any(|model| !models.contains(model))
+            {
+                return Err(SetupError::InvalidResponse);
+            }
+            let card = out_dir
+                .join(card_file)
+                .canonicalize()
+                .map_err(|_| SetupError::UnsafePath)?;
+            if !card.starts_with(&out_dir) || !card.is_file() {
+                return Err(SetupError::UnsafePath);
+            }
+            let _ = generation.keep();
+            Ok(SetupOutcome {
+                components_dir: out_dir,
+                bindings,
+                auth_required: false,
+            })
+        }
+        _ => Err(SetupError::InvalidResponse),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum UpstreamReply {
+    Ok {
+        card_file: PathBuf,
+        models: Vec<String>,
+        bindings: BTreeMap<Role, String>,
+        id: String,
+    },
+    Error {
+        code: String,
+    },
 }
 
 /// A daily binding must be selected from the probe; deep is opt-in. Missing
