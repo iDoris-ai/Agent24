@@ -25,8 +25,8 @@ const TEXT_MAX: usize = 100_000;
 
 #[derive(Debug, Serialize)]
 pub struct Paragraph {
-    index: usize,
-    text: String,
+    pub(crate) index: usize,
+    pub(crate) text: String,
     in_table: bool,
 }
 
@@ -34,7 +34,7 @@ pub struct Paragraph {
 pub struct Paragraphs {
     document_id: String,
     revision: i64,
-    paragraphs: Vec<Paragraph>,
+    pub(crate) paragraphs: Vec<Paragraph>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -45,13 +45,13 @@ pub struct EditBody {
     #[serde(default)]
     tracked: bool,
     #[serde(default)]
-    pub(crate) expect: Option<String>,
+    expect: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchRequest {
-    pub(crate) edits: Vec<EditBody>,
+    edits: Vec<EditBody>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]

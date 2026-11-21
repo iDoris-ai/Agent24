@@ -397,6 +397,38 @@ describe('ChatPage with Knowledge', () => {
     expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1' } }))
   })
 
+  // M1 (General/PM 11-21): the line under the answer is the daemon's record
+  // of the run's document writes, never the answer's words.
+  it.each([
+    ['nothing made', { attempted: true, jobs: [] }, /这次没有改动文档/],
+    ['a document made', { attempted: true, jobs: ['job_1'] }, /已生成：《合同-链接与脚注（修改）》/],
+  ])('a reply whose run asked for a document write says what came of it: %s', async (_case, documents, line) => {
+    const request = vi.fn(async (req: { op: string }) => req.op === 'job'
+      ? { ok: true, data: { job_id: 'job_1', status: 'succeeded', result: { document_id: 'doc_new' } } }
+      : { ok: true, data: { document_id: 'doc_new', title: '合同-链接与脚注（修改）' } })
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: aside(mockBackendProxy),
+        knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) },
+        documents: { request },
+      },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r_patch' } }
+      // 0.6.82: the model said it saved a document whatever came of it.
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '已保存为新文档《合同-修订版.docx》' }, documents } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('已保存为新文档《合同-修订版.docx》')).toBeInTheDocument(), { timeout: 3000 })
+    await waitFor(() => expect(screen.getByText(line)).toBeInTheDocument(), { timeout: 3000 })
+  })
+
   // M3 (0.6.73): a stopped turn read 「回答失败：run_cancelled」 under 「未发送」.
   it('a stopped turn says so in words, with the code only under 详情, and was sent', async () => {
     Object.defineProperty(window, 'agent24', {

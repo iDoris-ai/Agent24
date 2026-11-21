@@ -984,3 +984,49 @@ fn real_contracts_keep_tabs_and_breaks_when_a_character_is_added() {
         "no refused paragraph in the real contracts"
     );
 }
+
+/// M1 (c), General/PM 11-21: an anchor is the paragraph's opening words;
+/// its numbering may be left out but, written, must be the paragraph's.
+#[test]
+fn an_anchor_is_the_opening_of_the_paragraph_at_its_index() {
+    let para = "第三条 押金为两个月租金，合同期满无违约时全额退还。";
+    for ok in [
+        // 0.6.75: the numbering left out.
+        "押金为两个月",
+        "第三条 押金为两个月",
+        "第三条押金为两个月租金，",
+        " 押金为 两个月 ",
+        "押金为两个月租金，合同期满无违约时全额退还。",
+    ] {
+        assert!(super::anchor_matches(para, ok), "{ok}");
+    }
+    for wrong in [
+        // The numbering written wrong.
+        "第四条 押金为两个月",
+        // Another paragraph's words, the middle of this one.
+        "乙方：张三",
+        "合同期满无违约",
+        "租金为两个月",
+        // Fewer than six words once numbering is aside: no anchor.
+        "第三条 押金",
+        "押金为",
+        "",
+        "。，",
+    ] {
+        assert!(!super::anchor_matches(para, wrong), "{wrong}");
+    }
+    // General's case: the index is 乙方's line, the anchor 第三条's opening.
+    assert!(!super::anchor_matches("乙方：张三", "押金为两个月"));
+    assert!(super::anchor_matches(
+        "（一）租金每月 8,500 元",
+        "租金每月 8,500"
+    ));
+    assert!(!super::anchor_matches(
+        "（一）租金每月 8,500 元",
+        "（二）租金每月 8,500"
+    ));
+    assert!(super::anchor_matches("1. Scope of work", "Scope of"));
+    // A paragraph shorter than six words is named by all of them.
+    assert!(super::anchor_matches("一、总则", "总则"));
+    assert!(super::anchor_matches("乙方：张三", "乙方：张三"));
+}

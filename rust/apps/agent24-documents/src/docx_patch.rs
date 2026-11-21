@@ -657,6 +657,54 @@ fn scan_paragraphs(xml: &str) -> Result<Vec<Para>, PatchError> {
     Ok(paras)
 }
 
+/// The words of a paragraph without its numbering, spaces and closing
+/// punctuation: 「第三条 押金为两个月租金。」 → 「押金为两个月租金」.
+pub(crate) fn comparable(text: &str) -> String {
+    let mut s: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let numeral = |c: char| c.is_ascii_digit() || "一二三四五六七八九十百零〇".contains(c);
+    // 第X条/章/节/款
+    if s.first() == Some(&'第') {
+        let n = s[1..].iter().take_while(|c| numeral(**c)).count();
+        if n > 0 && s.get(1 + n).is_some_and(|c| "条章节款编".contains(*c)) {
+            s.drain(..2 + n);
+        }
+    }
+    // （一） (1)
+    if s.first().is_some_and(|c| *c == '（' || *c == '(') {
+        let n = s[1..].iter().take_while(|c| numeral(**c)).count();
+        if n > 0 && s.get(1 + n).is_some_and(|c| *c == '）' || *c == ')') {
+            s.drain(..2 + n);
+        }
+    }
+    // 一、 1. 1、 1．
+    let n = s.iter().take_while(|c| numeral(**c)).count();
+    if n > 0 && s.get(n).is_some_and(|c| "、.．".contains(*c)) {
+        s.drain(..=n);
+    }
+    while s.last().is_some_and(|c| "。.．；;，,！!".contains(*c)) {
+        s.pop();
+    }
+    s.into_iter().collect()
+}
+
+/// Characters an anchor must have once numbering is set aside (fewer is no
+/// anchor), unless the paragraph itself is shorter.
+const ANCHOR_MIN_CHARS: usize = 6;
+
+/// M1 (c), General/PM 11-21: an Agent's edit names the paragraph it rewrites
+/// by its opening words (`anchor`). Spaces and punctuation never count. The
+/// numbering may be left out (0.6.75's model wrote no 「第三条」) but, when
+/// written, must be the paragraph's: 「第四条…」 does not open 「第三条…」. Fewer
+/// than [`ANCHOR_MIN_CHARS`] words besides numbering is no anchor. No
+/// similarity: the words must be the paragraph's opening.
+pub fn anchor_matches(paragraph: &str, anchor: &str) -> bool {
+    let words = |t: &str| -> String { t.chars().filter(|c| c.is_alphanumeric()).collect() };
+    let (whole, body) = (words(paragraph), words(&comparable(paragraph)));
+    let (asked, asked_body) = (words(anchor), words(&comparable(anchor)));
+    let enough = ANCHOR_MIN_CHARS.min(body.chars().count()).max(1);
+    asked_body.chars().count() >= enough && (whole.starts_with(&asked) || body.starts_with(&asked))
+}
+
 /// The text of a paragraph's own `w:t` (not inside a nested paragraph).
 fn paragraph_text(para: &str) -> String {
     let Ok(all) = tags(para) else {

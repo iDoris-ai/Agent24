@@ -412,16 +412,76 @@ async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome 
 }
 
 /// E1b: some paragraphs edited into a new document (write; approved per call).
+/// An Agent's edit (M1 (c), General 11-21): the paragraph's index, its new
+/// text, and `anchor`, the paragraph's opening words as the model read them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentEdit {
+    index: usize,
+    text: String,
+    #[serde(default)]
+    tracked: bool,
+    anchor: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPatch {
+    edits: Vec<AgentEdit>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Characters of a paragraph's opening said back when its anchor is wrong.
+const OPENING_CHARS: usize = 24;
+
+/// E1b, as an Agent asks it. The text an edit replaces is the paragraph the
+/// document has at its index, never the model's retelling of it (0.6.75: it
+/// left 「第三条」 out and the approved edit failed). The model's `anchor` must be
+/// that paragraph's opening (`docx_patch::anchor_matches`): one that is not
+/// (0.6.72: 第三条's words aimed at 乙方's line) writes nothing, and the answer
+/// says how the paragraph really begins so the model can try again. The HTTP
+/// route and the CLI keep their own `expect`.
 async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let (id, rest) = split_document(arguments)?;
-    let req: crate::patch::PatchRequest = parse(rest)?;
-    // M1 (0.6.72): asked for 「第 3 段」, a model wrote 第三条's new text over
-    // paragraph 2. From an Agent every edit says the text it replaces, so a
-    // wrong index is refused, not written (the HTTP route and CLI keep it optional).
-    if req.edits.iter().any(|e| e.expect.is_none()) {
-        return Err(Envelope::error(INVALID_INPUT, false));
-    }
+    let asked: AgentPatch = parse(rest)?;
     let storage = ready(state).await?;
+    let paras = crate::patch::paragraphs_of(&storage, id.clone())
+        .await
+        .map_err(|e| refused(&e))?;
+    let mut edits = Vec::with_capacity(asked.edits.len());
+    for edit in asked.edits {
+        let Some(para) = paras.paragraphs.iter().find(|p| p.index == edit.index) else {
+            return Err(Envelope::error(INVALID_INPUT, false));
+        };
+        if !crate::docx_patch::anchor_matches(&para.text, &edit.anchor) {
+            let opening: String = para.text.chars().take(OPENING_CHARS).collect();
+            return completed::<Value>(Ok(serde_json::json!({
+                "written": false,
+                "reason": "anchor_mismatch",
+                "index": edit.index,
+                "paragraph_starts_with": opening,
+                "message": format!(
+                    "【未完成】本次没有改写，也没有生成任何文档：第 {} 段（index {}）开头是「{opening}」，和 anchor「{}」对不上。请先告诉用户这次没改成，不要说已保存或已完成；然后用 documents.paragraphs 确认段号，照抄那一段开头至少 12 个字作为 anchor，重新调用 documents.patch。",
+                    edit.index + 1,
+                    edit.index,
+                    edit.anchor
+                ),
+            })));
+        }
+        edits.push(serde_json::json!({
+            "index": edit.index,
+            "text": edit.text,
+            "tracked": edit.tracked,
+            "expect": para.text,
+        }));
+    }
+    let mut body = serde_json::json!({ "edits": edits });
+    if let Some(title) = asked.title {
+        body["title"] = Value::String(title);
+    }
+    let req: crate::patch::PatchRequest =
+        serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
     completed(
         crate::patch::patch_run(&storage, id, req)
             .await
@@ -1312,26 +1372,67 @@ mod tests {
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
     }
 
-    /// M1 (0.6.72): from an Agent, an edit that does not say the text it
-    /// replaces is refused before anything is read; with it, it goes on.
+    /// M1 (c), General 11-21: an Agent's edit names its paragraph by index and
+    /// opening words. Without an anchor it is invalid; with another
+    /// paragraph's opening (0.6.72: 第三条's words at 乙方's line) nothing is
+    /// written and the answer says how that paragraph begins; with its own
+    /// opening, numbering left out (0.6.75), the new document is made.
     #[tokio::test]
-    async fn an_agent_patch_must_say_the_text_each_edit_replaces() {
+    async fn an_agent_patch_names_its_paragraph_by_its_opening_words() {
         let (_dir, state) = opened().await;
-        let id = add_document(&state, 1, "'合同.docx'").await;
-        let without = json!({ "document_id": id, "edits": [{ "index": 2, "text": "押金", "tracked": true }] });
-        let body = call_in(&state, "patch", &[&id], without).await;
+        let storage = state.storage().await.unwrap();
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let sha = storage.blobs.put_bytes(template).unwrap().sha256;
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6Y00078";
+        let docx = crate::office::DOCX;
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                        VALUES ('{id}', '合同.docx', '{docx}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                template.len()
+            ),
+        )
+        .await;
+        let paras: Vec<_> = crate::docx_patch::list_paragraphs(template)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.text.trim().chars().count() >= 8)
+            .collect();
+        let (this, other) = (&paras[0], &paras[1]);
+        let opening = |t: &str| t.trim().chars().take(16).collect::<String>();
+        let edit = |anchor: Option<String>| {
+            let mut e = json!({ "index": this.index, "text": "新的文字", "tracked": true });
+            if let Some(a) = anchor {
+                e["anchor"] = Value::String(a);
+            }
+            json!({ "document_id": id, "edits": [e] })
+        };
+        let body = call_in(&state, "patch", &[id], edit(None)).await;
+        assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+        // Another paragraph's opening: not written, and told how it begins.
+        let body = call_in(&state, "patch", &[id], edit(Some(opening(&other.text)))).await;
+        let answer = payload(&body);
+        assert_eq!(answer["written"], false, "{answer}");
+        assert_eq!(answer["reason"], "anchor_mismatch");
         assert!(
-            String::from_utf8_lossy(&body).contains("invalid_input"),
+            this.text
+                .starts_with(answer["paragraph_starts_with"].as_str().unwrap())
+        );
+        let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(uploads, 0);
+        // Its own opening: the new document is made.
+        let body = call_in(&state, "patch", &[id], edit(Some(opening(&this.text)))).await;
+        assert_eq!(
+            payload(&body)["kind"],
+            "import",
             "{}",
             String::from_utf8_lossy(&body)
-        );
-        let with = json!({ "document_id": id, "edits": [{ "index": 2, "text": "押金", "expect": "乙方：张三" }] });
-        let body = call_in(&state, "patch", &[&id], with).await;
-        let answer = String::from_utf8_lossy(&body).into_owned();
-        // Past the check, to the service (the blob is no DOCX here).
-        assert!(
-            !answer.contains("invalid_input") && answer.contains("\"error\""),
-            "{answer}"
         );
     }
 

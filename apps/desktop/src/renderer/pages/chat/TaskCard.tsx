@@ -8,7 +8,7 @@
 // conversation's file, docs/ui/ASSISTANT-A.md). Answers get no card.
 
 import { withoutToolNames } from './user-facing'
-import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
@@ -16,6 +16,9 @@ import { cancelRun, createRun, decideApproval, listPendingApprovals, type Approv
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { skillForConversation } from './session-skill'
+import { namedDocument } from './doc-intent-run'
+import { mismatchedEdit } from './patch-anchor'
+import { DocumentsOutcome } from './DocumentsOutcome'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
 
@@ -59,12 +62,54 @@ function pendingOf(list: readonly Approval[], runId: string, type: string): Appr
 
 /** What the approval asks, in words (D2b: documents tools by name and what
  *  they make; anything else as the daemon's summary, cut short). */
-export function approvalText(a: Pick<Approval, 'summary'>, t: (key: string, vars?: Record<string, string>) => string): string {
+/** A JSON string value as written in `src` after `"key":`, unescaped; cut
+ * short where the summary was (the daemon truncates it). */
+function stringAfter(src: string, key: string): string | undefined {
+  const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)`).exec(src)
+  if (!m) return undefined
+  m[1] = m[1].replace(/…? \[truncated \d+ bytes\]$/, '…')
+  try { return JSON.parse(`"${m[1].replace(/\\$/, '')}"`) as string } catch { return m[1] }
+}
+
+/** M1 (0.6.78): the daemon cuts an approval's summary at about 200 bytes
+ * (`summarize_input`, 「… [truncated N bytes]」), so a patch with real text never
+ * parses and the card showed raw JSON. Its document and edits are read off
+ * what is there: each edit's index, and as much of its text as made it. */
+export function patchArgsOf(json: string): { document_id: string; edits: Array<Record<string, unknown>> } | null {
+  const doc = stringAfter(json, 'document_id')
+  if (doc === undefined) return null
+  const start = json.indexOf('"edits":[')
+  const edits = start < 0
+    ? []
+    : json.slice(start + 9).split(/\},\s*\{/).flatMap((part) => {
+      const index = /"index":(\d+)/.exec(part)
+      if (!index) return []
+      const edit: Record<string, unknown> = { index: Number(index[1]) }
+      for (const key of ['text', 'anchor', 'expect']) {
+        const v = stringAfter(part, key)
+        if (v !== undefined) edit[key] = v
+      }
+      if (/"tracked":true/.test(part)) edit['tracked'] = true
+      return [edit]
+    })
+  return { document_id: doc, edits }
+}
+
+export function approvalText(
+  a: Pick<Approval, 'summary'>,
+  t: (key: string, vars?: Record<string, string>) => string,
+  /** M1 (0.6.75): a patch's paragraphs as the document has them, by index.
+   * The card shows these, not the model's `expect`. */
+  originals: ReadonlyMap<number, string> | null = null,
+): string {
   const summary = typeof a.summary === 'string' ? a.summary : ''
   const cut = summary.indexOf(': ')
   const tool = cut > 0 ? summary.slice(0, cut) : summary
   let args: Record<string, unknown> = {}
-  try { args = cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {} } catch { /* the summary as it is */ }
+  try { args = cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {} } catch {
+    // A patch's summary is cut short with its text: read what is there.
+    if (tool === 'documents.patch') args = patchArgsOf(summary.slice(cut + 2)) ?? {}
+  }
   const str = (v: unknown) => (typeof v === 'string' ? v : '')
   if (tool === 'documents.list') return t('task.ask.list')
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
@@ -88,14 +133,41 @@ export function approvalText(a: Pick<Approval, 'summary'>, t: (key: string, vars
     // M1 (0.6.72): the card said only 「改写 1 段」 while a model was about to
     // write 第三条's text over 乙方's line. Each edit shows what it replaces.
     const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s)
-    const shown = edits.slice(0, 5).map(e => t('task.ask.patchEdit', {
-      n: typeof e['index'] === 'number' ? String(e['index'] + 1) : '?',
-      from: clip(str(e['expect'])),
-      to: clip(str(e['text'])),
-    }))
+    const shown = edits.slice(0, 5).map(e => {
+      const index = typeof e['index'] === 'number' ? e['index'] : null
+      const real = index === null ? undefined : originals?.get(index)
+      // M1 (c), PM 11-21: the paragraph as the document has it, never the
+      // model's retelling; until it is read, the card says so.
+      if (real === undefined) return t('task.ask.patchUnread', { n: index === null ? '?' : String(index + 1), to: clip(str(e['text'])) })
+      return t('task.ask.patchEdit', {
+        n: index === null ? '?' : String(index + 1),
+        from: clip(real),
+        to: clip(str(e['text'])),
+      })
+    })
     return [head, ...shown, ...(edits.length > 5 ? ['…'] : [])].join('\n')
   }
-  return summary.length > 160 ? `${summary.slice(0, 160)}…` : summary
+  // M3/PM 11-21: never raw JSON on the card; the summary is under 「详情」.
+  return t('task.ask.tool', { tool: withoutToolNames(tool) || tool })
+}
+
+/** M1 (0.6.75): the paragraphs a pending patch rewrites, read from the
+ * document itself (its id, or the title the model named), so the card's
+ * 「原文」 is the paragraph at that index and never only what the model says
+ * it is. Null while not read or when it cannot be. */
+export async function patchOriginals(api: Window['agent24']['documents'] | undefined, summary: unknown): Promise<Map<number, string> | null> {
+  if (!api || typeof summary !== 'string' || !summary.startsWith('documents.patch: ')) return null
+  const doc = patchArgsOf(summary.slice('documents.patch: '.length))?.document_id ?? ''
+  if (!doc) return null
+  let id = doc
+  if (!/^doc_/.test(doc)) {
+    const named = await namedDocument(api, doc.replace(/^《|》$/g, '')).catch(() => null)
+    if (!named || typeof named === 'string') return null
+    id = named.id
+  }
+  const res = await api.request({ op: 'paragraphs', documentId: id }).catch(() => null)
+  if (!res || !res.ok) return null
+  return new Map(res.data.paragraphs.map((p) => [p.index, p.text]))
 }
 
 /** The tasks of the conversation the page shows. */
@@ -166,6 +238,39 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     const timer = setInterval(() => void look(), 2000)
     return () => { live = false; clearInterval(timer) }
   }, [waiting, task.run_id])
+  const [originals, setOriginals] = useState<Map<number, string> | null>(null)
+  /** A patch's paragraphs are still being read: it cannot be confirmed yet. */
+  const [reading, setReading] = useState(false)
+  /** M1 (c), PM 11-21: the patch was aimed at the wrong paragraph and was
+   * sent back to the model, which reads again; the user is not asked. */
+  const [sentBack, setSentBack] = useState<{ index: number; opening: string } | null>(null)
+  const askingSummary = asking?.summary
+  const askingId = asking?.id
+  // `t` is a new function each render: read through a ref, not a dependency.
+  const tRef = useRef(t)
+  tRef.current = t
+  useEffect(() => {
+    setOriginals(null)
+    setSentBack(null)
+    const isPatch = typeof askingSummary === 'string' && askingSummary.startsWith('documents.patch: ')
+    setReading(isPatch)
+    if (!isPatch) return
+    let live = true
+    void patchOriginals(window.agent24?.documents, askingSummary).then(async m => {
+      if (!live) return
+      setOriginals(m)
+      const edits = patchArgsOf(String(askingSummary).slice('documents.patch: '.length))?.edits ?? []
+      const wrong = m ? mismatchedEdit(m, edits) : null
+      if (wrong && askingId) {
+        setSentBack(wrong)
+        const reason = tRef.current('task.anchorSentBack', { n: String(wrong.index + 1), index: String(wrong.index), opening: wrong.opening })
+        await decideApproval(askingId, { type: 'deny', reason }).catch(() => {})
+        askRunAgain(task.run_id)
+      }
+      setReading(false)
+    }, () => { if (live) setReading(false) })
+    return () => { live = false }
+  }, [askingSummary, askingId, task.run_id])
   const decide = (decision: Decision) => act(async () => {
     const approval = pendingOf(await listPendingApprovals(), task.run_id, decision.type)
     if (!approval) throw new Error(t('task.noApproval'))
@@ -182,12 +287,17 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     <div className={`task-card${active ? ' active' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
-      {waiting && asking && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string)}</span>}
+      {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals)}</span>}
+      {waiting && asking && !sentBack && typeof asking.summary === 'string' && (
+        <details className="message-detail"><summary>{t('fail.detail')}</summary>{asking.summary}</details>
+      )}
+      {sentBack && <span className="task-card-knowledge" role="note">{t('task.anchorNote', { n: String(sentBack.index + 1) })}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
       {failed && <span className="task-card-error" role="alert">{failed}</span>}
       {status === 'completed' && view?.output && (
         <div className="task-card-output">
           {withoutToolNames(view.output)}
+          <DocumentsOutcome documents={view.documents} />
           {checked && view.knowledge && <div className="task-card-knowledge">{checked.kind === 'read' ? t('knowledge.via') : t(`knowledge.${checked.kind}`)}</div>}
           {checked && checked.unread.length > 0 && (
             <div className="task-card-knowledge" role="note">{t('knowledge.unread', { ids: checked.unread.join(', ') })}</div>
@@ -195,8 +305,8 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
         </div>
       )}
       <span className="task-card-actions">
-        {waiting && offers?.approve && !denying && (
-          <button type="button" className="btn" disabled={busy} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
+        {waiting && offers?.approve && !denying && !sentBack && (
+          <button type="button" className="btn" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
         )}
         {waiting && offers?.deny && !denying && (
           <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
