@@ -1234,7 +1234,9 @@ impl IdorisHost {
             },
             move || async move {
                 if let Some(host) = host.upgrade() {
-                    host.starting_gateway();
+                    // Every stop() caller has already set the slot (stopped, failed or
+                    // starting); draining only waits for in-flight requests.
+                    host.retain_draining_lease();
                     loop {
                         let pending = host
                             .draining

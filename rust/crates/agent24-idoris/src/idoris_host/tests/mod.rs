@@ -19,15 +19,21 @@ use sha2::{Digest, Sha256};
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 struct MemoryKeychain {
     locked: AtomicBool,
+    /// Reads left before the keychain locks itself.
+    reads_left: AtomicUsize,
 }
 impl Keychain for MemoryKeychain {
     fn get(&self, _: &str) -> Result<Zeroizing<String>, KeychainError> {
-        if self.locked.load(Ordering::SeqCst) {
+        let exhausted = self
+            .reads_left
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_err();
+        if exhausted || self.locked.load(Ordering::SeqCst) {
             Err(KeychainError::KeychainLocked)
         } else {
             Ok(Zeroizing::new(format!("idk_{}", "a".repeat(64))))
@@ -243,6 +249,7 @@ impl Fixture {
         });
         let keychain = Arc::new(MemoryKeychain {
             locked: AtomicBool::new(false),
+            reads_left: AtomicUsize::new(usize::MAX),
         });
         let router = Arc::new(ModelRouter::idoris_unavailable("test"));
         let managed =
@@ -733,6 +740,7 @@ async fn real_v040_install_existing_start_running_stop() {
     .unwrap();
     let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(MemoryKeychain {
         locked: AtomicBool::new(false),
+        reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
     })));
     let router = Arc::new(ModelRouter::idoris_unavailable("smoke"));
     let managed =
@@ -1358,4 +1366,33 @@ async fn start_verification_works_offline() {
         .await
         .map(|_| ())
         .unwrap_or_else(|code| panic!("offline start must work, got {code:?}"));
+}
+
+/// The supervisor's drain runs inside stop(); it must not overwrite the reason set before it.
+#[tokio::test]
+async fn failure_after_spawn_and_explicit_stop_keep_their_slot_reason() {
+    let f = Fixture::new().await;
+    f.install().await;
+    // Locked before preparation: nothing spawns and the slot must not stay starting.
+    f.keychain.reads_left.store(0, Ordering::SeqCst);
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Failed));
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("failed"), "{reason}");
+    // The first read prepares the launch; the next one, after readiness, fails.
+    f.keychain.reads_left.store(1, Ordering::SeqCst);
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    let done = f.complete(&op).await;
+    assert_eq!(done.result, Some(Outcome::Failed), "{:?}", done.error_code);
+    assert_eq!(f.host.status().await.state, State::Failed);
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("failed"), "{reason}");
+    f.keychain.reads_left.store(usize::MAX, Ordering::SeqCst);
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
+    let op = f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("stopped"), "{reason}");
+    f.assert_clean();
 }
