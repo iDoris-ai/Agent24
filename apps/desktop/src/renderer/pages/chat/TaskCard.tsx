@@ -60,6 +60,39 @@ function pendingOf(list: readonly Approval[], runId: string, type: string): Appr
 
 /** What the approval asks, in words (D2b: documents tools by name and what
  *  they make; anything else as the daemon's summary, cut short). */
+/** A JSON string value as written in `src` after `"key":`, unescaped; cut
+ * short where the summary was (the daemon truncates it). */
+function stringAfter(src: string, key: string): string | undefined {
+  const m = new RegExp(`"${key}":"((?:[^"\\\\]|\\\\.)*)`).exec(src)
+  if (!m) return undefined
+  m[1] = m[1].replace(/…? \[truncated \d+ bytes\]$/, '…')
+  try { return JSON.parse(`"${m[1].replace(/\\$/, '')}"`) as string } catch { return m[1] }
+}
+
+/** M1 (0.6.78): the daemon cuts an approval's summary at about 200 bytes
+ * (`summarize_input`, 「… [truncated N bytes]」), so a patch with real text never
+ * parses and the card showed raw JSON. Its document and edits are read off
+ * what is there: each edit's index, and as much of its text as made it. */
+export function patchArgsOf(json: string): { document_id: string; edits: Array<Record<string, unknown>> } | null {
+  const doc = stringAfter(json, 'document_id')
+  if (doc === undefined) return null
+  const start = json.indexOf('"edits":[')
+  const edits = start < 0
+    ? []
+    : json.slice(start + 9).split(/\},\s*\{/).flatMap((part) => {
+      const index = /"index":(\d+)/.exec(part)
+      if (!index) return []
+      const edit: Record<string, unknown> = { index: Number(index[1]) }
+      for (const key of ['text', 'anchor', 'expect']) {
+        const v = stringAfter(part, key)
+        if (v !== undefined) edit[key] = v
+      }
+      if (/"tracked":true/.test(part)) edit['tracked'] = true
+      return [edit]
+    })
+  return { document_id: doc, edits }
+}
+
 export function approvalText(
   a: Pick<Approval, 'summary'>,
   t: (key: string, vars?: Record<string, string>) => string,
@@ -71,7 +104,10 @@ export function approvalText(
   const cut = summary.indexOf(': ')
   const tool = cut > 0 ? summary.slice(0, cut) : summary
   let args: Record<string, unknown> = {}
-  try { args = cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {} } catch { /* the summary as it is */ }
+  try { args = cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {} } catch {
+    // A patch's summary is cut short with its text: read what is there.
+    if (tool === 'documents.patch') args = patchArgsOf(summary.slice(cut + 2)) ?? {}
+  }
   const str = (v: unknown) => (typeof v === 'string' ? v : '')
   if (tool === 'documents.list') return t('task.ask.list')
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
@@ -117,8 +153,7 @@ export function approvalText(
  * it is. Null while not read or when it cannot be. */
 export async function patchOriginals(api: Window['agent24']['documents'] | undefined, summary: unknown): Promise<Map<number, string> | null> {
   if (!api || typeof summary !== 'string' || !summary.startsWith('documents.patch: ')) return null
-  let doc = ''
-  try { doc = String((JSON.parse(summary.slice('documents.patch: '.length)) as { document_id?: unknown }).document_id ?? '') } catch { return null }
+  const doc = patchArgsOf(summary.slice('documents.patch: '.length))?.document_id ?? ''
   if (!doc) return null
   let id = doc
   if (!/^doc_/.test(doc)) {

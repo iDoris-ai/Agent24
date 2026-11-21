@@ -517,6 +517,18 @@ describe('approvalText (D2b)', () => {
     expect(approvalText({ summary }, t, originals))
       .toBe('task.ask.patch{"doc":"合同.docx","n":"1"}\ntask.ask.patchEdit{"n":"6","from":"第三条 押金为两个月租金，合同期满无违约时全额退还。","to":"押金为两个月租金。"}')
   })
+  // M1 (0.6.78): the daemon cuts the summary at about 200 bytes; the card
+  // showed raw JSON and read no paragraph.
+  it('reads a patch off a summary the daemon cut short', async () => {
+    const summary = 'documents.patch: {"document_id":"合同-链接与脚注.docx","edits":[{"expect":"原有原文内容","index":2,"text":"经双方协商一致，本合同项下权利义务自双方签字盖章之日起生效，具有… [truncated 85 bytes]'
+    const originals = new Map([[2, '乙方：张三']])
+    expect(approvalText({ summary }, t, originals))
+      .toBe('task.ask.patch{"doc":"合同-链接与脚注.docx","n":"1"}\ntask.ask.patchEdit{"n":"3","from":"乙方：张三","to":"经双方协商一致，本合同项下权利义务自双方签字盖章之日起生效，具有…"}')
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: [{ document_id: 'doc_9', title: '合同-链接与脚注.docx', head_revision: 1, created_at: '' }] } }
+      : { ok: true, data: { paragraphs: [{ index: 2, text: '乙方：张三', in_table: false }] } })
+    expect((await patchOriginals({ request } as never, summary))?.get(2)).toBe('乙方：张三')
+  })
   it('patchOriginals reads the paragraphs of the document the model named by title', async () => {
     const request = vi.fn(async (req: { op: string }) => req.op === 'list'
       ? { ok: true, data: { documents: [{ document_id: 'doc_9', title: '合同.docx', head_revision: 1, created_at: '' }] } }
