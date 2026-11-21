@@ -384,28 +384,66 @@ async fn get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
 async fn compose(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let req: crate::compose::ComposeRequest = parse(arguments)?;
     let storage = ready(state).await?;
-    completed(
-        crate::compose::run(&storage, req)
-            .await
-            .map(|(_, job)| submitted(job.0)),
-    )
+    let (_, job) = crate::compose::run(&storage, req)
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(settled(&storage, job.0).await))
 }
 
-/// M1 (0.6.89, General): after an approved patch went through, the model
-/// called documents.patch again, twice, and another card came up for the same
-/// edits. A write's answer says it is done and not to be called again; the
-/// import job is still all of it (`job_id` stays where the run's record reads
-/// it, `agent24d` runs.rs).
-fn submitted(job: crate::jobs::Job) -> Value {
-    let mut v = serde_json::to_value(&job).unwrap_or(Value::Null);
+/// How long a write waits for its import before it answers.
+const SETTLE_WAIT: Duration = Duration::from_secs(20);
+
+/// M1 (0.6.89, General/PM): after an approved patch went through, the model
+/// was told only that a job was queued, called documents.patch again, twice,
+/// and another card came up for the same edits. A write now waits (up to
+/// [`SETTLE_WAIT`]) for its import and says what came of it: 「已完成：已生成
+/// 《X》……不要再调用」, or that it failed, or, still going, that it is under way
+/// and not to be asked again. The job is still all there (`job_id` stays where
+/// agent24d's run record reads it).
+async fn settled(storage: &Arc<Storage>, job: crate::jobs::Job) -> Value {
+    let id = job.job_id.clone();
+    let mut last = job;
+    let deadline = tokio::time::Instant::now() + SETTLE_WAIT;
+    while (last.status == "queued" || last.status == "running")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        match jobs::get(storage, &id).await {
+            Ok(next) => last = next,
+            Err(_) => break,
+        }
+    }
+    let made = if last.status == "succeeded" {
+        let doc = last
+            .result
+            .as_ref()
+            .and_then(|r| r.get("document_id"))
+            .and_then(|d| d.as_str())
+            .map(str::to_owned);
+        match doc {
+            Some(d) => documents::get(storage, &d)
+                .await
+                .ok()
+                .map(|detail| detail.document.title),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let note = match (last.status.as_str(), &made) {
+        ("succeeded", Some(title)) => format!(
+            "已完成：已生成新文档《{title}》。这一步已经完成，不要再调用同一个写入工具，直接告诉用户已生成《{title}》。"
+        ),
+        ("succeeded", None) => "已完成：新文档已生成。这一步已经完成，不要再调用同一个写入工具，直接告诉用户结果。".to_owned(),
+        ("queued" | "running", _) => "已提交，新文档正在生成。这一步已经完成：不要再调用同一个写入工具，直接告诉用户正在生成。".to_owned(),
+        _ => "没能生成新文档（导入失败）。如实告诉用户没有生成，不要说已完成。".to_owned(),
+    };
+    let mut v = serde_json::to_value(&last).unwrap_or(Value::Null);
     if let Value::Object(map) = &mut v {
-        map.insert(
-            "note".to_owned(),
-            Value::String(
-                "已提交，新文档正在生成。这一步已经完成：不要再调用同一个写入工具，直接告诉用户结果。"
-                    .to_owned(),
-            ),
-        );
+        map.insert("note".to_owned(), Value::String(note));
+        if let Some(title) = made {
+            map.insert("title".to_owned(), Value::String(title));
+        }
     }
     v
 }
@@ -501,11 +539,10 @@ async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     }
     let req: crate::patch::PatchRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    completed(
-        crate::patch::patch_run(&storage, id, req)
-            .await
-            .map(|(_, job)| submitted(job.0)),
-    )
+    let (_, job) = crate::patch::patch_run(&storage, id, req)
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(settled(&storage, job.0).await))
 }
 
 /// D5a: a template's `{{fields}}` (read).
@@ -525,11 +562,10 @@ async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     rest.remove("title");
     let req: crate::patch::FillRequest = parse(rest)?;
     let storage = ready(state).await?;
-    completed(
-        crate::patch::fill_run(&storage, id, req)
-            .await
-            .map(|(_, job)| submitted(job.0)),
-    )
+    let (_, job) = crate::patch::fill_run(&storage, id, req)
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(settled(&storage, job.0).await))
 }
 
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -1453,14 +1489,17 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&body)
         );
-        // M1 (0.6.89): the answer says it is done, not to be called again.
-        assert!(payload(&body)["job_id"].is_string());
+        // M1 (0.6.89, PM): the answer waits for the import and says what was
+        // made, done, and not to be called again.
+        let answer = payload(&body);
+        assert!(answer["job_id"].is_string());
+        assert_eq!(answer["status"], "succeeded", "{answer}");
+        let note = answer["note"].as_str().unwrap();
         assert!(
-            payload(&body)["note"]
-                .as_str()
-                .unwrap()
-                .contains("不要再调用")
+            note.starts_with("已完成：已生成新文档《") && note.contains("不要再调用"),
+            "{note}"
         );
+        assert!(answer["title"].is_string());
     }
 
     #[tokio::test]
