@@ -183,3 +183,5 @@
 - [ ] FU-147 · C · src=PR-Daemon #1986（Low） · 2026-11-21 · `withoutToolNames` 也会改代码里的普通文字：`fn shell_exec(cmd…)` 会变成 `fn 执行命令`（参数被吞，反引号不配对），`knowledge_base_dir` 会变成「知识库操作」。改法：代码块和行内代码里不替换；名字要整词匹配。
 - [ ] FU-148 · C · src=PR-Daemon #1986（Low） · 2026-11-21 · `get_run` 现在每次 `GET /runs/{id}` 都会把这个 run 的全部消息读一遍，卡片还会轮询这个接口。改法：documents 结果在 run 结束时算一次存起来，或者只在 completed 时计算。
 - [ ] FU-149 · C · src=PR-Daemon #1986（Low） · 2026-11-21 · `TaskCard.tsx`：读段落原文失败时卡片一直显示「正在读取原文…」，确认按钮却是可点的。不是写入漏洞，Rust 会重新核对每个 anchor（tools.rs:457）。改法：读取失败时显示「没能读到原文」。
+- [ ] FU-150 · C · src=M1 0.6.89 真机（General 11-21） · 2026-11-21 · 服务模式下，`POST /api/v1/approvals/{id}` 是 Elevated（route_policy），卡片替用户「拒绝」改写时，daemon 仍会弹在场确认框。App 托管模式已经不弹（#1987：拒绝不再弹 App 自己的确认框）。改法：daemon 对 `deny` 这一决定降为 Everyday，拒绝只会让工具不执行，属于更保守的方向；route_policy 要按决定类型分级，并补测试。判据：服务模式下卡片自动拒绝时不弹任何框。
+- [ ] FU-151 · B · src=M1 0.6.89 真机（General 11-21） · 2026-11-21 · 真实合同（《示范-山东健身合同2025.docx》293 段）的 documents.paragraphs 结果约 40KB，整段放进上下文后，第二次调模型时 oMLX 冲到 7.9G 被 hard abort。8G 机器上改写真实合同会失败。改法：Agent 用的 paragraphs 不返回空段落，每段只给段号加前若干字，支持按段号范围或关键词只取一部分，总量设上限并提示还有多少。判据：293 段的合同，第二次调模型的 prompt 在 3.5k 以内，改写能完成。
