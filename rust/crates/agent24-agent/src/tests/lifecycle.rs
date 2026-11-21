@@ -761,18 +761,19 @@ fn what_the_first_search_puts_in_is_three_short_passages() {
     let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
     let evidence = v["evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 3);
-    // 0.6.87: about 450 tokens a passage, about 900 in all.
-    assert_eq!(evidence[0]["snippet"].as_str().unwrap().chars().count(), 451);
-    assert_eq!(evidence[1]["snippet"].as_str().unwrap().chars().count(), 451);
+    // PM 11-21: by rank, the first whole (600 here), the next two shorter.
+    assert_eq!(evidence[0]["snippet"].as_str().unwrap().chars().count(), 600);
+    assert_eq!(evidence[1]["snippet"].as_str().unwrap().chars().count(), 251);
+    assert_eq!(evidence[2]["snippet"].as_str().unwrap().chars().count(), 251);
     assert_eq!(evidence[0]["knowledge_id"], "k1");
     assert_eq!(evidence[0]["title"], "烧水指南");
     assert!(evidence[0].get("knowledge_base_id").is_none());
     // PR-Daemon #1976 F1: `kind` stays, for agent24d's record of the hits.
     assert_eq!(v["kind"], "knowledge.search");
     assert_eq!(evidence[0]["use"], "clue");
-    // About 900 tokens of passages and a few hundred of keys and notice:
-    // the whole turn stays near 3k (0.6.86: 2087 with 200-character cuts).
-    assert!(tokens(&compact) < 1300, "{}", tokens(&compact));
+    // About 1100 tokens of passages and a few hundred of keys and notice:
+    // the whole turn stays within 2–3.5k (0.6.86: 2087 with 200-character cuts).
+    assert!(tokens(&compact) < 1600, "{}", tokens(&compact));
     assert!(full.chars().count() > 6000);
     assert!(crate::compact_evidence_for_tests(r#"{"evidence":[]}"#).is_none());
 }
