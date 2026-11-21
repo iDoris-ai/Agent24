@@ -984,3 +984,26 @@ fn real_contracts_keep_tabs_and_breaks_when_a_character_is_added() {
         "no refused paragraph in the real contracts"
     );
 }
+
+/// M1 (0.6.75): the model's `expect` without 「第三条 」 or half of it still
+/// names that paragraph; another paragraph's text does not.
+#[test]
+fn expect_is_the_paragraph_without_numbering_or_a_long_enough_part_of_it() {
+    let para = "第三条 押金为两个月租金，合同期满无违约时全额退还。";
+    for ok in [
+        para,
+        "押金为两个月租金，合同期满无违约时全额退还。",
+        "押金为两个月租金，合同期满无违约时全额退还",
+        "  第三条押金为两个月租金，合同期满无违约时全额退还 ",
+        "押金为两个月租金",
+    ] {
+        assert!(super::expect_matches(para, ok), "{ok}");
+    }
+    for wrong in ["乙方：张三", "押金", "第四条 租金每月 8,500 元。", ""] {
+        assert!(!super::expect_matches(para, wrong), "{wrong}");
+    }
+    assert!(super::expect_matches("（一）租金", "租金"));
+    assert!(super::expect_matches("1. Scope", "Scope"));
+    assert!(super::expect_matches("一、总则", "总则"));
+    assert!(super::expect_matches("", ""));
+}

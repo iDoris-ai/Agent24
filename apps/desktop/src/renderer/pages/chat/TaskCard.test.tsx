@@ -7,7 +7,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
-import { HandOver, TaskCards, approvalText, elapsed, resetHandOversForTests } from './TaskCard'
+import { HandOver, TaskCards, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
@@ -510,6 +510,21 @@ describe('approvalText (D2b)', () => {
       .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}\ntask.ask.patchEdit{"n":"4","from":"","to":"x"}')
     expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}]}' }, t))
       .toBe('task.ask.patch{"doc":"a.docx","n":"1"}\ntask.ask.patchEdit{"n":"4","from":"","to":"x"}')
+  })
+  it('shows the paragraph the document has at that index, not the model\'s expect (M1, 0.6.75)', () => {
+    const summary = 'documents.patch: {"document_id":"合同.docx","edits":[{"index":5,"text":"押金为两个月租金。","expect":"押金为两个月租金"}]}'
+    const originals = new Map([[5, '第三条 押金为两个月租金，合同期满无违约时全额退还。']])
+    expect(approvalText({ summary }, t, originals))
+      .toBe('task.ask.patch{"doc":"合同.docx","n":"1"}\ntask.ask.patchEdit{"n":"6","from":"第三条 押金为两个月租金，合同期满无违约时全额退还。","to":"押金为两个月租金。"}')
+  })
+  it('patchOriginals reads the paragraphs of the document the model named by title', async () => {
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: [{ document_id: 'doc_9', title: '合同.docx', head_revision: 1, created_at: '' }] } }
+      : { ok: true, data: { paragraphs: [{ index: 5, text: '第三条 押金…', in_table: false }] } })
+    const got = await patchOriginals({ request } as never, 'documents.patch: {"document_id":"《合同.docx》","edits":[]}')
+    expect(got?.get(5)).toBe('第三条 押金…')
+    expect(request).toHaveBeenCalledWith({ op: 'paragraphs', documentId: 'doc_9' })
+    expect(await patchOriginals({ request } as never, 'documents.fill: {}')).toBeNull()
   })
   it('shows what each rewritten paragraph says now and will say (M1, 0.6.72)', () => {
     // The run that would have put 第三条's text over 乙方's line.
