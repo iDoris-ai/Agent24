@@ -387,8 +387,27 @@ async fn compose(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     completed(
         crate::compose::run(&storage, req)
             .await
-            .map(|(_, job)| job.0),
+            .map(|(_, job)| submitted(job.0)),
     )
+}
+
+/// M1 (0.6.89, General): after an approved patch went through, the model
+/// called documents.patch again, twice, and another card came up for the same
+/// edits. A write's answer says it is done and not to be called again; the
+/// import job is still all of it (`job_id` stays where the run's record reads
+/// it, `agent24d` runs.rs).
+fn submitted(job: crate::jobs::Job) -> Value {
+    let mut v = serde_json::to_value(&job).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut v {
+        map.insert(
+            "note".to_owned(),
+            Value::String(
+                "已提交，新文档正在生成。这一步已经完成：不要再调用同一个写入工具，直接告诉用户结果。"
+                    .to_owned(),
+            ),
+        );
+    }
+    v
 }
 
 /// E1b/D5a: the request without `document_id`, and that id.
@@ -485,7 +504,7 @@ async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     completed(
         crate::patch::patch_run(&storage, id, req)
             .await
-            .map(|(_, job)| job.0),
+            .map(|(_, job)| submitted(job.0)),
     )
 }
 
@@ -509,7 +528,7 @@ async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     completed(
         crate::patch::fill_run(&storage, id, req)
             .await
-            .map(|(_, job)| job.0),
+            .map(|(_, job)| submitted(job.0)),
     )
 }
 
@@ -1433,6 +1452,14 @@ mod tests {
             "import",
             "{}",
             String::from_utf8_lossy(&body)
+        );
+        // M1 (0.6.89): the answer says it is done, not to be called again.
+        assert!(payload(&body)["job_id"].is_string());
+        assert!(
+            payload(&body)["note"]
+                .as_str()
+                .unwrap()
+                .contains("不要再调用")
         );
     }
 
