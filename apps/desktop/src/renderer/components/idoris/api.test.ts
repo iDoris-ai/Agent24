@@ -15,6 +15,10 @@ const operation = {
 const invalidResponse = new IdorisError('invalid_response')
 
 describe('iDoris response validation', () => {
+  it('accepts degraded recovery snapshots and keeps separate failure counters', () => {
+    const recovery = { ...status, state: 'degraded', crashes: 6, hangs: 2, circuit_open: true }
+    expect(parseStatus(recovery)).toEqual(recovery)
+  })
   it('accepts complete valid snapshots', () => {
     expect(parseStatus(status)).toEqual(status)
     expect(parseOperation(operation)).toEqual(operation)

@@ -5801,9 +5801,12 @@ components:
       additionalProperties: false
       required: [state, version, data_port, admin_port, roles, last_error, current_operation, verification, budget_suggestion, budget_unavailable_reason, migration_pending, last_migration_error]
       properties:
+        crashes: { type: integer, minimum: 0 }
+        hangs: { type: integer, minimum: 0 }
+        circuit_open: { type: boolean }
         state:
           type: string
-          enum: [not_installed, not_configured, stopped, starting, running, failed, instance_conflict]
+          enum: [not_installed, not_configured, stopped, starting, degraded, running, failed, instance_conflict]
         version: { type: [string, "null"] }
         data_port: { type: [integer, "null"], minimum: 1, maximum: 65535 }
         admin_port: { type: [integer, "null"], minimum: 1, maximum: 65535 }

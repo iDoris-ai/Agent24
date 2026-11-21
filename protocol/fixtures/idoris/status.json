@@ -20,5 +20,8 @@
   },
   "budget_unavailable_reason": null,
   "migration_pending": false,
-  "last_migration_error": null
+  "last_migration_error": null,
+  "crashes": 0,
+  "hangs": 0,
+  "circuit_open": false
 }

@@ -34,10 +34,83 @@ struct Identity {
     contract_version: String,
     instance_id: String,
     dev_no_key_enabled: bool,
+    #[serde(default)]
+    phase: Option<String>,
+    #[serde(default)]
+    ready: Option<bool>,
+    #[serde(default)]
+    upstreams: Vec<UpstreamHealth>,
+}
+#[derive(Deserialize)]
+struct UpstreamHealth {
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+impl Identity {
+    fn model_ready(&self) -> Result<bool, ModelError> {
+        match self.phase.as_deref() {
+            None if self.ready.is_none() => Ok(true), // Legacy health without readiness fields.
+            Some("ready") if self.ready == Some(true) => Ok(true),
+            Some("starting") => Ok(false),
+            Some("degraded") if self.upstreams.iter().any(|u| u.state == "restarting") => Ok(false),
+            _ => Err(ModelError::Unavailable(format!(
+                "idoris_unavailable: {}",
+                self.upstreams
+                    .iter()
+                    .find_map(|u| u.reason.as_deref())
+                    .unwrap_or("not_ready")
+            ))),
+        }
+    }
 }
 
 fn invalid(message: &str) -> ModelError {
     ModelError::Provider(message.into())
+}
+
+fn transport_error(error: reqwest::Error) -> ModelError {
+    use std::error::Error;
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    let mut connection_lost = hung_up(&error);
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            connection_lost |= io.kind() == std::io::ErrorKind::ConnectionRefused;
+        }
+        source = cause.source();
+    }
+    ModelError::Unavailable(
+        if connection_lost {
+            "idoris_connection_lost"
+        } else {
+            "iDoris unavailable"
+        }
+        .into(),
+    )
+}
+
+async fn read_gateway_json<T: serde::de::DeserializeOwned>(
+    mut response: reqwest::Response,
+    cap: usize,
+    cancel: &CancellationToken,
+) -> Result<T, ModelError> {
+    let mut body = Vec::new();
+    loop {
+        let chunk = tokio::select! {
+            _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+            chunk = response.chunk() => chunk.map_err(transport_error)?,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if body.len() + chunk.len() > cap {
+            return Err(invalid("iDoris response exceeds size limit"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&body).map_err(|_| invalid("invalid iDoris response"))
 }
 
 /// iDoris `correlation.rs` rejects a trace id that is blank (`trim` empty),
@@ -59,6 +132,9 @@ fn correlation_trace_id(raw: &str) -> Option<&str> {
 fn response_error(error: ModelError) -> ModelError {
     match error {
         ModelError::Cancelled => ModelError::Cancelled,
+        ModelError::Unavailable(reason) if reason == "idoris_connection_lost" => {
+            ModelError::Unavailable(reason)
+        }
         ModelError::Unavailable(_) => ModelError::Unavailable("iDoris unavailable".into()),
         _ => invalid("invalid iDoris response"),
     }
@@ -196,7 +272,7 @@ impl IdorisGateway {
             biased;
             () = cancel.cancelled() => return Err(ModelError::Cancelled),
             response = request.send() =>
-                response.map_err(|_| ModelError::Unavailable("iDoris unavailable".into()))?,
+                response.map_err(transport_error)?,
         };
         let status = response.status();
         if !status.is_success() {
@@ -260,6 +336,10 @@ impl IdorisGateway {
     }
 
     pub async fn check_health(&self, cancel: &CancellationToken) -> Result<(), ModelError> {
+        self.health_identity(cancel).await.map(|_| ())
+    }
+
+    async fn health_identity(&self, cancel: &CancellationToken) -> Result<Identity, ModelError> {
         let response = self
             .send(
                 self.client
@@ -269,7 +349,7 @@ impl IdorisGateway {
                 "",
             )
             .await?;
-        let identity: Identity = read_json_capped(response, 4096, cancel, "iDoris")
+        let identity: Identity = read_gateway_json(response, 4096, cancel)
             .await
             .map_err(response_error)?;
         if identity.service == "idoris" && !contract_version_accepted(&identity.contract_version) {
@@ -287,7 +367,28 @@ impl IdorisGateway {
         {
             return Err(invalid("iDoris identity or security mode mismatch"));
         }
-        Ok(())
+        Ok(identity)
+    }
+
+    async fn wait_model_ready(&self, cancel: &CancellationToken) -> Result<(), ModelError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        loop {
+            let identity = tokio::time::timeout_at(deadline, self.health_identity(cancel))
+                .await
+                .map_err(|_| {
+                    ModelError::Unavailable(
+                        "idoris_unavailable: readiness_timeout; retry_after=5".into(),
+                    )
+                })??;
+            if identity.model_ready()? {
+                return Ok(());
+            }
+            tokio::select! {
+                _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => return Err(ModelError::Unavailable("idoris_unavailable: readiness_timeout; retry_after=5".into())),
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {},
+            }
+        }
     }
 
     /// Perform a real daily chat and return only validated inference evidence.
@@ -331,6 +432,7 @@ impl IdorisGateway {
         cancel: &CancellationToken,
         request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
+        self.wait_model_ready(cancel).await?;
         tokio::time::timeout(
             self.request_timeout,
             self.complete_inner(profile, req, cancel, request_id),
@@ -346,7 +448,6 @@ impl IdorisGateway {
         cancel: &CancellationToken,
         request_id: Option<&str>,
     ) -> Result<Served, ModelError> {
-        self.check_health(cancel).await?;
         let (complexity, role) = match profile.complexity {
             Complexity::Simple => ("simple", "idoris/daily"),
             Complexity::Complex => ("complex", "idoris/deep"),
@@ -437,7 +538,7 @@ impl IdorisGateway {
         } else {
             None
         };
-        let parsed = read_json_capped(response, MAX_CHAT_RESPONSE_BYTES, cancel, "iDoris")
+        let parsed = read_gateway_json(response, MAX_CHAT_RESPONSE_BYTES, cancel)
             .await
             .map_err(response_error)?;
         let response = completion_response(parsed, "iDoris").map_err(response_error)?;
@@ -477,10 +578,9 @@ impl IdorisGateway {
         struct Inventory {
             data: Vec<OaModelEntry>,
         }
-        let parsed: Inventory =
-            read_json_capped(response, MAX_MODELS_RESPONSE_BYTES, cancel, "iDoris")
-                .await
-                .map_err(response_error)?;
+        let parsed: Inventory = read_gateway_json(response, MAX_MODELS_RESPONSE_BYTES, cancel)
+            .await
+            .map_err(response_error)?;
         Ok(parsed
             .data
             .into_iter()
@@ -953,5 +1053,46 @@ mod tests {
         assert!(
             matches!(result,Err(ModelError::Unavailable(message)) if message=="iDoris request timed out")
         );
+    }
+}
+
+#[cfg(test)]
+mod ic3a_readiness_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[test]
+    fn field_presence_drives_readiness_and_unknown_codes_are_not_parse_errors() {
+        let base = serde_json::json!({"service":"idoris","version":"0.5.0","contract_version":"1.2.0","instance_id":"s1","dev_no_key_enabled":false});
+        let identity: Identity = serde_json::from_value(base.clone()).unwrap();
+        assert!(identity.model_ready().unwrap());
+        for (phase, ready, upstreams, expected) in [
+            ("ready", true, serde_json::json!([]), Some(true)),
+            ("starting", false, serde_json::json!([]), Some(false)),
+            (
+                "degraded",
+                false,
+                serde_json::json!([{"state":"restarting"}]),
+                Some(false),
+            ),
+            (
+                "degraded",
+                false,
+                serde_json::json!([{"state":"absent","reason":"engine_not_found"}]),
+                None,
+            ),
+            (
+                "future_phase",
+                false,
+                serde_json::json!([{"state":"future_state","reason":"future_reason"}]),
+                None,
+            ),
+        ] {
+            let mut body = base.clone();
+            body["phase"] = phase.into();
+            body["ready"] = ready.into();
+            body["upstreams"] = upstreams;
+            let identity: Identity = serde_json::from_value(body).unwrap();
+            assert_eq!(identity.model_ready().ok(), expected);
+        }
     }
 }
