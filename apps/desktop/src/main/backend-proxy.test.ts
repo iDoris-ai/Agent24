@@ -386,3 +386,15 @@ describe('withKnowledgeBinding (decision 2026-10-30-main-chat-knowledge-path)', 
     expect(findAllowedRoute('POST', '/api/v1/sessions')).toBeTruthy()
   })
 })
+
+describe('group chat proxy boundary', () => {
+  it('allows group reads and refuses all Elevated writes', () => {
+    const root = '/api/v1/comm/groupchat'
+    for (const suffix of ['', '/g/members', '/g/invites', '/g/messages?limit=200', '/g/messages/l']) {
+      expect(isAllowedProxyRoute('GET', root + suffix), suffix).toBe(true)
+    }
+    for (const suffix of ['', '/g/messages', '/g/messages/l/retry', '/invites/i/accept']) {
+      expect(isAllowedProxyRoute('POST', root + suffix), suffix).toBe(false)
+    }
+  })
+})

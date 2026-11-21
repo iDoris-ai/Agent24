@@ -53,9 +53,14 @@ export const MAX_MESSAGE_BYTES = 16 * 1024
 export const BACKUP_PASSWORD_MIN = 8
 export const BACKUP_PASSWORD_MAX = 1024
 
-export function isSafeMessage(value: unknown): value is string {
+export function isSafeMessage(value: unknown, maxBytes = MAX_MESSAGE_BYTES): value is string {
   return typeof value === 'string' && value.trim().length > 0 && !value.includes('\0') &&
-    Buffer.byteLength(value, 'utf8') <= MAX_MESSAGE_BYTES
+    Buffer.byteLength(value, 'utf8') <= maxBytes
+}
+
+/** Hyphae group, invitation and logical message identifiers. */
+export function isGroupChatId(value: unknown): value is string {
+  return typeof value === 'string' && /^[0-9a-f]{32}$/.test(value)
 }
 
 /** The one backup-password rule (mirrors the daemon and OpenAPI): at least 8
