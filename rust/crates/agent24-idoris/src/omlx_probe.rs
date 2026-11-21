@@ -1,4 +1,5 @@
 //! Loopback oMLX discovery and ephemeral credentials. No setup invocation.
+// Delete this v0.5.0 probe at the v0.6.0 lock bump.
 
 use base64::{Engine, engine::general_purpose};
 use reqwest::header::{AUTHORIZATION, HeaderValue};

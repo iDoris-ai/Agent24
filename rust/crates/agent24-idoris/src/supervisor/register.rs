@@ -52,6 +52,8 @@ struct Shared {
     changed: watch::Sender<Option<SessionInfo>>,
     admission: tokio::sync::Mutex<()>,
     lock: &'static crate::IdorisLock,
+    #[cfg(test)]
+    port_ownership: Mutex<Option<bool>>,
 }
 #[derive(Clone)]
 pub(super) struct Handle(Arc<Shared>);
@@ -152,6 +154,8 @@ impl Server {
             changed,
             admission: tokio::sync::Mutex::new(()),
             lock,
+            #[cfg(test)]
+            port_ownership: Mutex::new(None),
         }));
         let cancel = CancellationToken::new();
         let task_cancel = cancel.clone();
@@ -528,15 +532,19 @@ async fn handshake(
         if u32::try_from(peer.pid).ok() != Some(registration.pid) {
             return Err("identity_rejected");
         }
-        match agent24_os_proc::owns_listening_ports(
+        let ownership = agent24_os_proc::owns_listening_ports(
             peer.pid,
             &[registration.data_port, registration.admin_port],
-        ) {
-            Ok(true) => {}
-            Err(error)
-                if error.kind() == io::ErrorKind::Unsupported
-                    && (cfg!(test) || !cfg!(target_os = "macos")) => {}
-            _ => return Err("identity_rejected"),
+        );
+        #[cfg(test)]
+        let ownership = handle
+            .0
+            .port_ownership
+            .lock()
+            .map_err(|_| "internal")?
+            .map_or(ownership, Ok);
+        if !super::ownership_verdict(ownership, cfg!(test)) {
+            return Err("identity_rejected");
         }
         let info = SessionInfo {
             instance_id: registration.instance_id,
@@ -581,6 +589,7 @@ async fn handshake(
         if let Some(old) = state.current.take() {
             old.cancel.cancel();
         }
+        state.expected.remove(&info.instance_id);
         state.current = Some(Session {
             info: info.clone(),
             id: id.clone(),

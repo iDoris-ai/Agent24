@@ -56,6 +56,9 @@ impl Identity {
             None if self.ready.is_none() => Ok(true), // Legacy health without readiness fields.
             Some("ready") if self.ready == Some(true) => Ok(true),
             Some("starting") => Ok(false),
+            // Degraded with a working upstream still serves; a request routed to a
+            // failed card gets iDoris's own 503 with the reason.
+            Some("degraded") if self.upstreams.iter().any(|u| u.state == "ready") => Ok(true),
             Some("degraded") if self.upstreams.iter().any(|u| u.state == "restarting") => Ok(false),
             _ => Err(ModelError::Unavailable(format!(
                 "idoris_unavailable: {}",
@@ -319,6 +322,12 @@ impl IdorisGateway {
                         return Err(ModelError::Unavailable(
                             "no local model available in iDoris (local_only_unavailable)".into(),
                         ));
+                    }
+                    // A degraded iDoris names the failed upstream's reason (e.g. engine_not_found).
+                    (503, Some("local_only_unavailable"), Some(reason)) => {
+                        return Err(ModelError::Unavailable(format!(
+                            "idoris_unavailable: {reason}"
+                        )));
                     }
                     // Terminal: iDoris's own upstream credential or access was
                     // refused. Retrying or switching provider cannot fix it.
@@ -1113,6 +1122,12 @@ mod ic3a_readiness_tests {
                 false,
                 serde_json::json!([{"state":"absent","reason":"engine_not_found"}]),
                 None,
+            ),
+            (
+                "degraded",
+                false,
+                serde_json::json!([{"state":"absent","reason":"engine_not_found"},{"state":"ready"}]),
+                Some(true),
             ),
             (
                 "future_phase",
