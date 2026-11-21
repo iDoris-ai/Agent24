@@ -6,9 +6,9 @@ import CommunicationPage from './Communication'
 import {
   getCommStatus, listCommContacts, listCommIdentities, listCommRelays,
   startCommDaemon, stopCommDaemon, unlockComm, installComm,
-  addCommContact, sendCommMessage, listCommHistory, getCommConversationHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
+  addCommContact, renameCommContact, removeCommContact, sendCommMessage, listCommHistory, getCommConversationHistory, exportCommIdentity, pickCommBackup, restoreCommIdentity,
   revealCommExport, setCommRelay, probeCommRelay,
-  CommApiError, type CommDaemonStatus,
+  CommApiError, type CommDaemonStatus, type CommHistoryItem,
 } from './api'
 import { listComponents, type ComponentView } from '../../components/componentApi'
 
@@ -33,7 +33,7 @@ vi.mock('./api', async (importActual) => {
     CommApiError: actual.CommApiError,
     getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
     startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
-    addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), getCommConversationHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
+    addCommContact: vi.fn(), renameCommContact: vi.fn(), removeCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), getCommConversationHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),
     revealCommExport: vi.fn().mockResolvedValue(undefined),
     setCommRelay: vi.fn(), probeCommRelay: vi.fn(),
   }
@@ -91,6 +91,50 @@ afterEach(() => {
   hyphaeBox.component = { ...readyHyphae }
 })
 
+describe('contact editing', () => {
+  beforeEach(() => { setLocale('zh'); success() })
+
+  it('saves an inline rename with Enter, refreshes names, and cancels with Escape', async () => {
+    renderSettingsPage()
+    fireEvent.click(await screen.findByLabelText('联系人操作 bob'))
+    fireEvent.click(screen.getByRole('button', { name: '改名' }))
+    const input = screen.getByRole('textbox', { name: '新昵称' })
+    fireEvent.change(input, { target: { value: 'Robert' } })
+    fireEvent.keyDown(input, { key: 'Escape' })
+    expect(screen.queryByRole('textbox', { name: '新昵称' })).toBeNull()
+    expect(renameCommContact).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByLabelText('联系人操作 bob'))
+    fireEvent.click(screen.getByRole('button', { name: '改名' }))
+    const second = screen.getByRole('textbox', { name: '新昵称' })
+    fireEvent.change(second, { target: { value: 'Robert' } })
+    vi.mocked(renameCommContact).mockResolvedValue({ old_nickname: 'bob', nickname: 'Robert', npub: contact.npub, role: 'friend' })
+    vi.mocked(listCommContacts).mockResolvedValue([{ ...contact, nickname: 'Robert' }])
+    fireEvent.keyDown(second, { key: 'Enter' })
+    await waitFor(() => expect(renameCommContact).toHaveBeenCalledWith('bob', 'Robert'))
+    expect(await screen.findByLabelText('联系人操作 Robert')).toBeTruthy()
+  })
+
+  it('keeps the selected chat and history after deletion and displays its address', async () => {
+    const peer = 'npub140q9dxxcn4kan7s75j87vhrwn7mn7s7ncy5q2zutrcg6q2rqylmqxvda2x'
+    vi.mocked(listCommContacts).mockResolvedValue([{ ...contact, npub: peer }])
+    const item: CommHistoryItem = { id: 'm1', from: peer, to: identity.npub, direction: 'in', content: 'saved history', at: '2026-11-20T10:00:00Z' }
+    vi.mocked(listCommHistory).mockResolvedValue([item])
+    vi.mocked(getCommConversationHistory).mockResolvedValue([item])
+    rtlRender(<CommunicationPage />)
+    fireEvent.click(await screen.findByRole('button', { name: /bob.*saved history/i }))
+    fireEvent.click(screen.getByLabelText('联系人操作 bob'))
+    vi.mocked(removeCommContact).mockResolvedValue({ removed: ['bob'], npub: peer })
+    vi.mocked(listCommContacts).mockResolvedValue([])
+    fireEvent.click(screen.getByRole('button', { name: '删除联系人' }))
+    await waitFor(() => expect(removeCommContact).toHaveBeenCalledWith('bob'))
+    await waitFor(() => expect(screen.queryByLabelText('联系人操作 bob')).toBeNull())
+    expect(screen.getByRole('button', { name: /npub140q9dxx…xvda2x.*saved history/i })).toBeTruthy()
+    expect(document.querySelector('.comm-message-bubble')?.textContent).toContain('saved history')
+    expect(screen.getByRole('textbox', { name: '输入消息' })).not.toBeDisabled()
+    expect(document.querySelector('.comm-chat-header strong')?.textContent).toBe('npub140q9dxx…xvda2x')
+  })
+})
+
 describe('CommunicationPage', () => {
   beforeEach(() => { setLocale('zh') })
 
@@ -106,7 +150,7 @@ describe('CommunicationPage', () => {
       { id: 'new', from: 'npub1bob', to: 'npub1alice', direction: 'in', content: 'Bob 回复', at: '2026-02-03T12:00:00Z' },
     ])
     rtlRender(<CommunicationPage />)
-    const bob = await screen.findByRole('button', { name: /bob/i })
+    const bob = await within(screen.getByRole('complementary', { name: '会话列表' })).findByRole('button', { name: /bob/i })
     const strangerRow = await screen.findByRole('button', { name: /npub1strange…000000/i })
     expect(bob.compareDocumentPosition(strangerRow) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     await waitFor(() => expect(getCommConversationHistory).toHaveBeenCalledWith('bob'))
@@ -123,7 +167,7 @@ describe('CommunicationPage', () => {
     vi.mocked(listCommHistory).mockResolvedValue([{ id: 'in', from: 'npub1bob', content: 'hi', at: '2026-02-03T12:00:00Z' }])
     vi.mocked(sendCommMessage).mockRejectedValueOnce(new Error('offline'))
     rtlRender(<CommunicationPage />)
-    fireEvent.click(await screen.findByRole('button', { name: /bob/i }))
+    fireEvent.click(await within(screen.getByRole('complementary', { name: '会话列表' })).findByRole('button', { name: /bob/i }))
     const input = screen.getByRole('textbox', { name: '输入消息' })
     fireEvent.change(input, { target: { value: 'hello' } })
     fireEvent.keyDown(input, { key: 'Enter' })
@@ -143,7 +187,7 @@ describe('CommunicationPage', () => {
     vi.mocked(listCommHistory).mockResolvedValue([{ id: 'in', from: 'npub1bob', content: 'hi', at: '2026-02-03T12:00:00Z' }])
     vi.mocked(sendCommMessage).mockResolvedValue({ published_to: 1 })
     rtlRender(<CommunicationPage />)
-    fireEvent.click(await screen.findByRole('button', { name: /bob/i }))
+    fireEvent.click(await within(screen.getByRole('complementary', { name: '会话列表' })).findByRole('button', { name: /bob/i }))
     const input = screen.getByRole('textbox', { name: '输入消息' })
     fireEvent.change(input, { target: { value: 'nihao' } })
     // Enter that confirms a pinyin candidate must not send the half-typed text.
@@ -613,6 +657,7 @@ describe('CommunicationPage usability', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Add contact' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('contact write failed')
     expect(screen.getByRole('form')).toContainElement(screen.getByRole('alert'))
+    vi.mocked(listCommContacts).mockResolvedValue([contact, { nickname: 'carol', npub: 'npub1carol', role: '' }])
     fireEvent.click(screen.getByRole('button', { name: 'Add contact' }))
     await waitFor(() => expect(screen.queryByRole('button', { name: '← Back to chats' })).toBeNull())
     expect(screen.getByLabelText('Write a message')).toBeEnabled()

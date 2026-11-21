@@ -100,6 +100,8 @@ describe('A1 findAllowedRoute', () => {
     for (const route of ['contact', 'send', 'identity/export', 'identity/import', 'import', 'unlock']) {
       expect(isAllowedProxyRoute('POST', `/api/v1/comm/${route}`), route).toBe(false)
     }
+    expect(isAllowedProxyRoute('PATCH', '/api/v1/comm/contact/bob')).toBe(false)
+    expect(isAllowedProxyRoute('DELETE', '/api/v1/comm/contact/bob')).toBe(false)
     expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history/conversation?with=bob')).toBe(true)

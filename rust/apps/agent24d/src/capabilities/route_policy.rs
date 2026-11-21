@@ -165,6 +165,8 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/comm/unlock", Operation::CommWrite, AssuranceLevel::Elevated),
     row("GET", "/api/v1/comm/contact", Operation::CommRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/comm/contact", Operation::CommWrite, AssuranceLevel::Elevated),
+    row("PATCH", "/api/v1/comm/contact/{name}", Operation::CommWrite, AssuranceLevel::Elevated),
+    row("DELETE", "/api/v1/comm/contact/{name}", Operation::CommWrite, AssuranceLevel::Elevated),
     row("GET", "/api/v1/comm/relay", Operation::CommRead, AssuranceLevel::Everyday),
     row("PUT", "/api/v1/comm/relay", Operation::CommWrite, AssuranceLevel::Elevated),
     row("POST", "/api/v1/comm/relay/probe", Operation::CommWrite, AssuranceLevel::Elevated),

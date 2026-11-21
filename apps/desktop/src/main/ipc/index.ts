@@ -1073,6 +1073,22 @@ export function registerIpcHandlers(options: {
       })
     }),
   )
+  const isContactTarget = (value: unknown): value is string =>
+    typeof value === 'string' && (value.startsWith('npub1') ? isValidNpub(value) : isSafeName(value, 512))
+  handle(IpcChannels.CommContactRename, (event, name: unknown, nickname: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!isContactTarget(name) || !isSafeName(nickname, 128)) return invalidRequest('invalid contact name or nickname')
+      if (!await confirmNative(event, mt('comm.contactRename', { name: clip(name, 128), nickname: clip(nickname, 128) }), '')) return cancelled()
+      return proxyToBackend({ method: 'PATCH', path: `/api/v1/comm/contact/${encodeURIComponent(name)}`, body: { nickname } })
+    }),
+  )
+  handle(IpcChannels.CommContactRemove, (event, name: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!isContactTarget(name)) return invalidRequest('invalid contact name')
+      if (!await confirmNative(event, mt('comm.contactRemove', { name: clip(name, 128) }), mt('comm.contactRemoveDetail'))) return cancelled()
+      return proxyToBackend({ method: 'DELETE', path: `/api/v1/comm/contact/${encodeURIComponent(name)}` })
+    }),
+  )
   handle(IpcChannels.CommSend, (_event, to: unknown, content: unknown): Promise<BackendProxyResponse> => {
     if (!(typeof to === 'string' && to.startsWith('npub1') ? isValidNpub(to) : isSafeName(to))) return Promise.resolve(invalidRequest('invalid recipient'))
     if (!isSafeMessage(content)) return Promise.resolve(invalidRequest('invalid message'))

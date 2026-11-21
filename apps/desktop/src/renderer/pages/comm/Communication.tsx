@@ -4,7 +4,7 @@ import {
   createCommIdentity, importCommHome, setCommRelay, probeCommRelay,
   getCommStatus,
   installComm,
-  addCommContact,
+  addCommContact, renameCommContact, removeCommContact,
   exportCommIdentity,
   getCommStatus as pollCommStatus,
   listCommContacts,
@@ -165,6 +165,39 @@ function DaemonStatusView({ status, phase, fresh }: { status: CommDaemonStatus |
   )
 }
 
+function ContactActions({ contact, disabled, onRename, onRemove }: {
+  contact: CommContact
+  disabled: boolean
+  onRename: (name: string, nickname: string) => Promise<boolean>
+  onRemove: (name: string) => Promise<boolean>
+}) {
+  const t = useT(communicationMessages)
+  const [mode, setMode] = useState<'closed' | 'menu' | 'rename'>('closed')
+  const [draft, setDraft] = useState(contact.nickname)
+  const save = async () => {
+    if (disabled || !draft.trim()) return
+    if (await onRename(contact.nickname, draft.trim())) setMode('closed')
+  }
+  if (mode === 'rename') return <form className="comm-contact-edit" onSubmit={(event) => { event.preventDefault(); void save() }}>
+    <input autoFocus aria-label={t('contact.newNickname')} value={draft} disabled={disabled}
+      onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => {
+        if (event.nativeEvent.isComposing || event.keyCode === 229) return
+        if (event.key === 'Escape') { event.preventDefault(); setMode('closed') }
+        if (event.key === 'Enter') { event.preventDefault(); void save() }
+      }} />
+    <button type="submit" disabled={disabled || !draft.trim()}>{t('contact.save')}</button>
+    <button type="button" disabled={disabled} onClick={() => setMode('closed')}>{t('contact.cancel')}</button>
+  </form>
+  return <div className="comm-contact-actions">
+    <button type="button" aria-label={t('contact.actions', { name: contact.nickname })} aria-expanded={mode === 'menu'} disabled={disabled}
+      onClick={() => setMode(mode === 'menu' ? 'closed' : 'menu')}>⋯</button>
+    {mode === 'menu' && <div className="comm-contact-menu">
+      <button type="button" disabled={disabled} onClick={() => { setDraft(contact.nickname); setMode('rename') }}>{t('contact.rename')}</button>
+      <button type="button" disabled={disabled} title={t('contact.removeDetail')} onClick={() => { setMode('closed'); void onRemove(contact.nickname) }}>{t('contact.remove')}</button>
+    </div>}
+  </div>
+}
+
 export default function CommunicationPage() {
   const t = useT(communicationMessages)
   const [identities, setIdentities] = useState<CommIdentity[] | null>(null)
@@ -242,8 +275,7 @@ export default function CommunicationPage() {
     if (results[0].status === 'fulfilled') setIdentities(results[0].value)
     else fail('error.identities', results[0].reason)
     if (results[1].status === 'fulfilled') {
-      const refreshedContacts = results[1].value
-      setContacts((current) => [...refreshedContacts, ...(current ?? []).filter((contact) => !refreshedContacts.some((item) => item.npub === contact.npub))])
+      setContacts(results[1].value)
     }
     else fail('error.contacts', results[1].reason)
     if (results[2].status === 'fulfilled') {
@@ -588,6 +620,25 @@ export default function CommunicationPage() {
     }
   }
 
+  const editContact = async (name: string, nickname?: string): Promise<boolean> => {
+    if (pending) return false
+    setPending('contact')
+    setActionError(null)
+    try {
+      if (nickname === undefined) await removeCommContact(name)
+      else await renameCommContact(name, nickname)
+      await refresh()
+      return true
+    } catch (error) {
+      if (mounted.current && !(error instanceof CommApiError && error.code === 'cancelled')) setActionError(errorText(error))
+      return false
+    } finally {
+      if (mounted.current) setPending(null)
+    }
+  }
+  const contactActions = (contact: CommContact) => <ContactActions key={contact.nickname} contact={contact} disabled={pending !== null}
+    onRename={(name, nickname) => editContact(name, nickname)} onRemove={(name) => editContact(name)} />
+
   const submitContact = async () => {
     if (pending) return
     const npubValue = contactNpub.trim()
@@ -744,6 +795,7 @@ export default function CommunicationPage() {
             {(() => {
               const me = identities?.find((item) => item.default)
               const peers = new Map<string, CommHistoryItem[]>((contacts ?? []).map((contact) => [contact.npub, []]))
+              if (selectedPeer && !peers.has(selectedPeer)) peers.set(selectedPeer, [])
               for (const item of history ?? []) {
                 const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
                 if (!peer) continue
@@ -772,7 +824,7 @@ export default function CommunicationPage() {
           </div>
         </aside>
         <div className="comm-chat-main">
-          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div>{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
+          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div>{contacts?.filter((c) => c.npub === selectedPeer).map(contactActions)}{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
           <div className="comm-message-stream" ref={streamRef} onScroll={(event) => { const el = event.currentTarget; streamWasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}>
             {selectedPeer ? (() => {
               const me = identities?.find((item) => item.default)
@@ -828,7 +880,7 @@ export default function CommunicationPage() {
         {contacts === null ? <p className="comm-muted">{t('empty.data')}</p> : contacts.length === 0 ? <p className="comm-muted">{t('empty.contacts')}</p> : (
           <div className="comm-table-wrap"><table><thead><tr><th>{t('table.nickname')}</th><th>{t('table.publicKey')}</th><th>{t('table.role')}</th></tr></thead><tbody>
             {contacts.map((contact) => <tr key={`${contact.nickname}:${contact.npub}`}>
-              <td>{contact.nickname}</td><td className="comm-key">{contact.npub}</td><td>{contact.role || '—'}</td>
+              <td><div className="comm-contact-name"><span>{contact.nickname}</span>{contactActions(contact)}</div></td><td className="comm-key">{contact.npub}</td><td>{contact.role || '—'}</td>
             </tr>)}
           </tbody></table></div>
         )}

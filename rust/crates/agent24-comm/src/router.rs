@@ -23,7 +23,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path as AxumPath, Query, State};
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
@@ -172,6 +172,10 @@ pub fn router(state: CommState) -> Router {
         .route("/identity/import", post(import_identity))
         .route("/unlock", post(unlock))
         .route("/contact", get(list_contact).post(add_contact))
+        .route(
+            "/contact/{name}",
+            patch(rename_contact).delete(remove_contact),
+        )
         .route("/relay", get(list_relay).put(set_relay))
         .route("/relay/probe", post(probe_relay))
         .route("/import", post(import))
@@ -1157,6 +1161,80 @@ async fn add_contact(State(state): State<CommState>, Json(req): Json<ContactAddR
         .await
         .map_err(map_runner_error)?;
     envelope_response(envelope)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContactRenameReq {
+    nickname: String,
+}
+
+fn validate_contact_target(name: &str) -> Result<(), CommError> {
+    invalid_if_bad_name("name", name)?;
+    if name.starts_with("npub1") && !is_valid_npub(name) {
+        return Err(CommError::Invalid(
+            "name is not a well-formed npub".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn rename_contact(
+    State(state): State<CommState>,
+    AxumPath(name): AxumPath<String>,
+    payload: Result<Json<ContactRenameReq>, JsonRejection>,
+) -> CommResult {
+    let Json(req) =
+        payload.map_err(|_| CommError::Invalid("invalid contact rename request".to_owned()))?;
+    validate_contact_target(&name)?;
+    invalid_if_bad_name("nickname", &req.nickname)?;
+    check_nickname_len(&req.nickname)?;
+    edit_contact(
+        &state,
+        vec![
+            "contact".into(),
+            "rename".into(),
+            "--".into(),
+            name.into(),
+            req.nickname.into(),
+        ],
+    )
+    .await
+}
+
+async fn remove_contact(
+    State(state): State<CommState>,
+    AxumPath(name): AxumPath<String>,
+) -> CommResult {
+    validate_contact_target(&name)?;
+    edit_contact(
+        &state,
+        vec!["contact".into(), "remove".into(), "--".into(), name.into()],
+    )
+    .await
+}
+
+async fn edit_contact(state: &CommState, args: Vec<OsString>) -> CommResult {
+    let (runner, ..) = state.require_ready()?;
+    // Contacts only change the address book. Hyphae needs no secret-key password.
+    // `--` keeps names beginning with a dash positional; the runner sets JSON via env.
+    let envelope = runner
+        .run_keystore_write(Invocation {
+            args,
+            password: None,
+            timeout: None,
+        })
+        .await
+        .map_err(map_runner_error)?;
+    match envelope {
+        Envelope::Failed {
+            error,
+            message,
+            data,
+            ..
+        } if error == "nickname_exists" => Err(CommError::Conflict(message, data)),
+        other => envelope_response(other),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -3120,6 +3198,108 @@ echo '{{"ok":false,"error":"other_error","message":"unexpected: '"$all"'"}}' >&2
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body["error"], "invalid");
+    }
+
+    #[tokio::test]
+    async fn contact_edit_uses_positional_args_without_password_and_keeps_remove_data() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"#!/bin/sh
+printf '%s\n' "$@" > "$HOME/argv"
+echo '{"ok":true,"data":{"removed":["bob","alias"],"npub":"npub1peer"}}'
+"#;
+        let state = ready_state_with_script(tmp.path(), script).await;
+        let app = router(state);
+        let (status, _) = call(
+            app.clone(),
+            "PATCH",
+            "/contact/bob%20old",
+            Some(json!({"nickname":"new name"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("hyphae-home/argv")).unwrap(),
+            "contact\nrename\n--\nbob old\nnew name\n"
+        );
+        let npub = crate::export::testkit::npub();
+        let (status, body) = call(app, "DELETE", &format!("/contact/{npub}"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            json!({"ok":true,"data":{"removed":["bob","alias"],"npub":"npub1peer"}})
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("hyphae-home/argv")).unwrap(),
+            format!("contact\nremove\n--\n{npub}\n")
+        );
+    }
+
+    #[tokio::test]
+    async fn contact_edit_rejects_invalid_arguments_before_running_hyphae() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = ready_state_with_script(
+            tmp.path(),
+            "#!/bin/sh\nprintf ran > \"$HOME/ran\"\necho '{\"ok\":true,\"data\":{}}'\n",
+        )
+        .await;
+        let app = router(state);
+        for nickname in ["", "   ", "a\nb", "a\u{200b}b", &"x".repeat(129)] {
+            let (status, _) = call(
+                app.clone(),
+                "PATCH",
+                "/contact/bob",
+                Some(json!({"nickname":nickname})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{nickname:?}");
+        }
+        for method in ["PATCH", "DELETE"] {
+            for target in ["%20", "a%0Ab", "npub1broken"] {
+                let (status, _) = call(
+                    app.clone(),
+                    method,
+                    &format!("/contact/{target}"),
+                    Some(json!({"nickname":"new"})),
+                )
+                .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {target}");
+            }
+        }
+        for body in [
+            json!({}),
+            json!({"nickname":true}),
+            json!({"nickname":"new","extra":1}),
+        ] {
+            let (status, body) = call(app.clone(), "PATCH", "/contact/bob", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(body["error"], "invalid");
+        }
+        assert!(!tmp.path().join("hyphae-home/ran").exists());
+    }
+
+    #[tokio::test]
+    async fn contact_edit_maps_nickname_conflict_and_user_errors() {
+        for (error, expected, code) in [
+            ("nickname_exists", StatusCode::CONFLICT, "conflict"),
+            ("user_error", StatusCode::BAD_REQUEST, "invalid"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let script = format!(
+                "#!/bin/sh\necho '{{\"ok\":false,\"error\":\"{error}\",\"message\":\"cannot edit\"}}' >&2\nexit 1\n"
+            );
+            let app = router(ready_state_with_script(tmp.path(), &script).await);
+            for method in ["PATCH", "DELETE"] {
+                let (status, body) = call(
+                    app.clone(),
+                    method,
+                    "/contact/bob",
+                    Some(json!({"nickname":"new"})),
+                )
+                .await;
+                assert_eq!(status, expected, "{body}");
+                assert_eq!(body["error"], code);
+            }
+        }
     }
 
     // ---- contact: npub validated before Hyphae ever runs -------------------

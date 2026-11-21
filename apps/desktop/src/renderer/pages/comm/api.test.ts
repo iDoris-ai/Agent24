@@ -2,7 +2,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
-  addCommContact,
+  addCommContact, renameCommContact, removeCommContact,
   COMM_HTTP_TIMEOUT_MS,
   exportCommIdentity,
   listCommHistory,
@@ -201,6 +201,24 @@ describe('COMM typed backend API', () => {
 
 
 describe('COMM contact, send, history and export wrappers', () => {
+  it('renames and removes only through dedicated IPC and validates their result envelopes', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not carry contact edits') })
+    const renamed = { old_nickname: 'bob', nickname: 'Robert', npub: 'npub1bob', role: 'friend' }
+    const removed = { removed: ['Robert'], npub: 'npub1bob' }
+    const commContactRename = vi.fn(async () => successful(renamed))
+    const commContactRemove = vi.fn().mockResolvedValueOnce(successful(removed))
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'c' } } })
+      .mockResolvedValueOnce(successful({ removed: 'wrong shape', npub: 'npub1bob' }))
+    window.agent24 = { ...window.agent24, commContactRename, commContactRemove }
+    await expect(renameCommContact('bob', 'Robert')).resolves.toEqual(renamed)
+    await expect(removeCommContact('Robert')).resolves.toEqual(removed)
+    await expect(removeCommContact('Robert')).rejects.toMatchObject({ code: 'cancelled' })
+    await expect(removeCommContact('Robert')).rejects.toBeInstanceOf(CommApiError)
+    expect(commContactRename).toHaveBeenCalledWith('bob', 'Robert')
+    expect(commContactRemove).toHaveBeenCalledWith('Robert')
+    expect(proxy).not.toHaveBeenCalled()
+  })
+
   it('sends contact add and send through dedicated IPC, never the generic proxy', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not carry Elevated comm writes') })
     const commContactAdd = vi.fn(async () => successful({}))

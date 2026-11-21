@@ -337,6 +337,17 @@ export const addCommContact = (nickname: string, npub: string, role: string) =>
   viaIpc(() => window.agent24.commContactAdd(nickname, npub, role),
     (value): value is RecordValue => isRecord(value) || value === null)
 
+export const renameCommContact = (name: string, nickname: string) =>
+  viaIpc(() => window.agent24.commContactRename(name, nickname),
+    (value): value is CommContact & { old_nickname: string } =>
+      isRecord(value) && typeof value['old_nickname'] === 'string' &&
+      typeof value['nickname'] === 'string' && typeof value['npub'] === 'string' && typeof value['role'] === 'string')
+
+export const removeCommContact = (name: string) =>
+  viaIpc(() => window.agent24.commContactRemove(name),
+    (value): value is { removed: string[]; npub: string } =>
+      isRecord(value) && Array.isArray(value['removed']) && value['removed'].every(string) && typeof value['npub'] === 'string')
+
 export interface CommSendResult {
   published_to: number
 }

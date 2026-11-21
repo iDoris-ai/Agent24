@@ -100,3 +100,12 @@
 
 .comm-copy-feedback { display: block; color: var(--success, #7fd18f); }
 .comm-copy-feedback.failed { color: var(--danger, #e57373); }
+
+.comm-contact-name, .comm-contact-edit { display: flex; align-items: center; gap: 6px; }
+.comm-contact-edit input { min-width: 80px; max-width: 180px; }
+.comm-contact-actions { position: relative; }
+.comm-contact-actions > button { padding: 2px 8px; }
+.comm-contact-menu { position: absolute; right: 0; top: 100%; z-index: 5; display: grid; min-width: 130px; padding: 4px; background: var(--surface); border: 1px solid var(--border, #ddd); border-radius: 8px; box-shadow: 0 4px 12px #0002; }
+.comm-contact-menu button { white-space: nowrap; text-align: left; }
+
+.comm-contact-name .comm-contact-menu { position: static; }
