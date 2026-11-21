@@ -183,6 +183,32 @@ async fn only_a_run_that_names_a_knowledge_binding_is_offered_a_tool_that_needs_
     );
 }
 
+/// M1 (0.6.73): 「记住…」 is saved by personal memory, not by a tool; the model
+/// is offered none on that turn (it called fs_write). Any other turn still is.
+#[tokio::test]
+async fn a_remember_turn_is_offered_no_tools() {
+    let provider = Arc::new(ToolNamesProvider {
+        offered: StdMutex::new(vec![]),
+    });
+    let tools = ToolRegistry::new().with(Arc::new(ReadingTool(
+        agent24_tools::ToolResultSource::unknown("reader"),
+    )));
+    let (manager, store, _kv) =
+        manager_with_memory_and_tools(provider.clone(), Arc::new(UnusedSummarizer), tools).await;
+    for prompt in ["记住：我最喜欢的水果是芒果。", "把这句话改得礼貌一点"] {
+        let run = manager
+            .start_run(RunCreate {
+                prompt: prompt.into(),
+                ..create()
+            })
+            .await
+            .unwrap();
+        wait_terminal(&store, &run.id).await;
+    }
+    let offered = provider.offered.lock().unwrap().clone();
+    assert_eq!(offered, vec![Vec::<String>::new(), vec!["reader".to_owned()]]);
+}
+
 /// Notes, on its first call, what `before_execute` had recorded by then.
 struct FirstStepProvider {
     noted: Arc<StdMutex<Option<String>>>,
