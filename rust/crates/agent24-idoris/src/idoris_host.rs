@@ -1040,6 +1040,14 @@ impl IdorisHost {
         self.retain_draining_lease();
         self.router.block_idoris("failed");
     }
+    /// A cancelled start is a user stop, not a failure.
+    fn end_gateway(&self, error: &Code) {
+        if matches!(error, Code::Cancelled) {
+            self.block_gateway();
+        } else {
+            self.fail_gateway();
+        }
+    }
     /// One write: the slot never shows "stopped" between a running and a starting gateway.
     fn starting_gateway(&self) {
         self.retain_draining_lease();
@@ -1163,8 +1171,10 @@ impl IdorisHost {
         ),
         Code,
     > {
-        // Preparation is read-only; cancellation can drop it before any spawn.
-        let (config, inputs) = tokio::select! {
+        // Both callers marked the slot starting; a failure before readiness must clear it.
+        let prepared = async {
+            // Preparation is read-only; cancellation can drop it before any spawn.
+            let (config, inputs) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Code::Cancelled),
             result = async {
@@ -1174,6 +1184,16 @@ impl IdorisHost {
                 let inputs = match override_inputs { Some(inputs) => inputs, None => self.runtime.inputs(record).await? };
                 Ok::<_, Code>((config, inputs))
             } => result?,
+            };
+            Ok::<_, Code>((config, inputs))
+        }
+        .await;
+        let (config, inputs) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.end_gateway(&e);
+                return Err(e);
+            }
         };
         let runtime = self.runtime.clone();
         let refresh_record = record.clone();
@@ -1237,7 +1257,14 @@ impl IdorisHost {
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
                 .unwrap_or_else(|| Code::from(error))
-        })?;
+        });
+        let supervisor = match supervisor {
+            Ok(supervisor) => supervisor,
+            Err(e) => {
+                self.end_gateway(&e);
+                return Err(e);
+            }
+        };
         let ready = supervisor.accepting_requests();
         self.phase(id, Phase::Connecting).await;
         let connected = async {
@@ -1269,7 +1296,7 @@ impl IdorisHost {
         }
         .await;
         if let Err(e) = connected {
-            self.fail_gateway();
+            self.end_gateway(&e);
             supervisor.stop().await.map_err(Code::from)?;
             return Err(e);
         }

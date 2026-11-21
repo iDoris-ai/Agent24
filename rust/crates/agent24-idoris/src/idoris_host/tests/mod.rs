@@ -445,8 +445,34 @@ async fn l4_and_contract_failures_are_mapped_and_reaped() {
         let op = f.host.submit(Action::Start, None).await.unwrap();
         assert_eq!(f.complete(&op).await.error_code, Some(code));
         assert_eq!(f.host.status().await.state, state);
+        if state == State::Failed {
+            let reason = router_gateway(&f.router).err().unwrap().to_string();
+            assert!(reason.contains("failed"), "{reason}");
+        }
         f.assert_clean();
     }
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_readiness_reports_stopped() {
+    let f = Fixture::new().await;
+    f.install().await;
+    f.scenario(json!({"mode":"no_read"}));
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    // The fixture never becomes ready; cancel once its process has been spawned.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !f.host.root.join("data/state/managed-process.json").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host.cancel(&op.operation_id).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Cancelled));
+    assert_eq!(f.host.status().await.state, State::Stopped);
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("stopped"), "{reason}");
+    f.assert_clean();
 }
 
 #[tokio::test]
