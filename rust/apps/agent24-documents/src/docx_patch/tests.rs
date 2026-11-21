@@ -945,4 +945,42 @@ fn real_contracts_keep_tabs_and_breaks_when_a_character_is_added() {
         }
     }
     assert!(edited_total > 50, "{edited_total}");
+    // A paragraph the whitelist refuses (a picture, a field, a page break, ...)
+    // is refused with a character more too, and says what it holds.
+    let mut refused_total = 0;
+    for (name, docx) in REAL_CONTRACTS {
+        let xml = entry(docx, "word/document.xml");
+        let spans = scan_paragraphs(&xml).unwrap();
+        for p in list_paragraphs(docx).unwrap() {
+            let Some(what) = not_plain_text(&xml[spans[p.index].start..spans[p.index].end]) else {
+                continue;
+            };
+            refused_total += 1;
+            for tracked in [false, true] {
+                let edit = ParaEdit {
+                    index: p.index,
+                    text: format!("{}。", p.text),
+                    tracked,
+                    expect: Some(p.text.clone()),
+                };
+                match apply(docx, &[edit], "A", NOW) {
+                    Err(PatchError::Invalid(why)) => {
+                        assert!(
+                            why.contains(&what) && why.contains("edit it in Word or WPS"),
+                            "{name} paragraph {}: {why}",
+                            p.index
+                        );
+                    }
+                    other => panic!(
+                        "{name} paragraph {} ({what}) not refused: {other:?}",
+                        p.index
+                    ),
+                }
+            }
+        }
+    }
+    assert!(
+        refused_total > 0,
+        "no refused paragraph in the real contracts"
+    );
 }
