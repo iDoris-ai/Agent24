@@ -3637,7 +3637,10 @@ async fn cmd_daemon(action: DaemonAction) -> Result<(), String> {
                     // daemon that stalls mid-response must not hang `status`
                     // (review of SHUT-1c, round 2).
                     if state.auth_mode.is_capabilities() {
-                        println!("  shutdown report unavailable: {HOST_AUTHORITY_UNAVAILABLE}");
+                        // C1 (General 11-20): the shutdown report needs the
+                        // host's own token, which the app keeps; nothing is
+                        // wrong, so nothing alarming is printed.
+                        println!("  (started by the Agent24 app or its background service)");
                     } else {
                         match client()
                             .get(format!("{base}/api/v1/shutdown"))

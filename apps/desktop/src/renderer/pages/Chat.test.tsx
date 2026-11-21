@@ -1123,4 +1123,16 @@ describe('ChatPage: Enter while composing', () => {
     await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
     expect(mockBackendProxy.mock.calls[0][0].body.messages.at(-1).content).toBe('What does the knowledge base say about boiling water?')
   })
+
+  it('Loop 4: sends what the box holds when Enter comes before the last keys were rendered', async () => {
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'ok' } } })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/) as HTMLTextAreaElement
+    fireEvent.change(textarea, { target: { value: 'How long should water be' } })
+    // The rest typed, but its change not rendered yet: the DOM is ahead of the state.
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!.call(textarea, 'How long should water be boiled to make it safe to drink?')
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
+    expect(mockBackendProxy.mock.calls[0][0].body.messages.at(-1).content).toBe('How long should water be boiled to make it safe to drink?')
+  })
 })

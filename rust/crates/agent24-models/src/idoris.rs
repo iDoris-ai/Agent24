@@ -18,6 +18,7 @@ pub struct IdorisGateway {
     key: HeaderValue,
     client: reqwest::Client,
     request_timeout: Duration,
+    embedding_enabled: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -192,6 +193,24 @@ async fn error_fields(
 }
 
 impl IdorisGateway {
+    pub fn set_embedding_enabled(&self, enabled: bool) {
+        self.embedding_enabled
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn embedding_available(&self) -> Result<(), ModelError> {
+        if self
+            .embedding_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            Ok(())
+        } else {
+            Err(ModelError::Unavailable(
+                "missing embedding model bge-m3".into(),
+            ))
+        }
+    }
+
     /// Development switch. `None` when `AGENT24_DEV_IDORIS_URL` is unset.
     /// A set URL with a missing or rejected key is `Some(Err)` so the slot
     /// blocks instead of opening a second, direct model path.
@@ -243,6 +262,7 @@ impl IdorisGateway {
             key,
             client,
             request_timeout: Duration::from_secs(120),
+            embedding_enabled: std::sync::atomic::AtomicBool::new(true),
         })
     }
 
@@ -687,6 +707,7 @@ mod tests {
                 .build()
                 .unwrap(),
             request_timeout: Duration::from_secs(1),
+            embedding_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         (gateway, received, server)
     }
@@ -821,6 +842,7 @@ mod tests {
             key: HeaderValue::from_static("Bearer idk_secret_fixture_key"),
             client: base_client_builder().no_proxy().build().unwrap(),
             request_timeout: Duration::from_secs(5),
+            embedding_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         let request = gateway.client.get(&url);
         gateway
@@ -908,6 +930,7 @@ mod tests {
             key: HeaderValue::from_static("Bearer idk_fixture"),
             client: base_client_builder().no_proxy().build().unwrap(),
             request_timeout: Duration::from_secs(120),
+            embedding_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         let cancel = CancellationToken::new();
         let request = gateway.client.get(&url);
@@ -986,6 +1009,7 @@ mod tests {
             key: HeaderValue::from_static("Bearer idk_fixture"),
             client: base_client_builder().no_proxy().build().unwrap(),
             request_timeout: Duration::from_secs(120),
+            embedding_enabled: std::sync::atomic::AtomicBool::new(true),
         };
         let cancel = CancellationToken::new();
         let request = gateway.client.get(&url);

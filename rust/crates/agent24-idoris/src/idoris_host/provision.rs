@@ -973,8 +973,15 @@ impl IdorisHost {
             bindings.push((Role::Deep, deep));
         }
         const EMBED_MODEL: &str = "bge-m3-mlx-fp16";
-        if !compat && models.iter().any(|model| model == EMBED_MODEL) {
-            bindings.push((Role::Embed, EMBED_MODEL.to_owned()));
+        let embed = models.iter().find(|model| {
+            if compat {
+                model.to_ascii_lowercase().contains("bge-m3")
+            } else {
+                model.as_str() == EMBED_MODEL
+            }
+        });
+        if let Some(embed) = embed {
+            bindings.push((Role::Embed, embed.clone()));
         }
         let mut pending = PendingConnect {
             previous: previous.clone(),
@@ -1007,6 +1014,7 @@ impl IdorisHost {
                 crate::setup::write_openai_compat_card(
                     &self.root.join("instances/managed"), endpoint.as_str(),
                     &request.daily_model, request.deep_model.as_deref().unwrap_or(&request.daily_model),
+                    embed.map(String::as_str),
                 )
             } else {
                 let probe = crate::omlx_probe::ProbeResult {
@@ -1101,7 +1109,7 @@ impl IdorisHost {
                 source: self.secrets.as_ref(),
                 failure: SyncMutex::new(None),
             };
-            let gateway = ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
+            let mut gateway = ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
                 .await
                 .map_err(|_| {
                     if cancel.is_cancelled() {
@@ -1115,6 +1123,7 @@ impl IdorisHost {
                             .unwrap_or(Code::VerifyFailed)
                     }
                 })?;
+            gateway.embedding_enabled = pending.candidate.roles.contains(&Role::Embed);
             let verification = self
                 .router
                 .verify_connection(&gateway, false, cancel)
@@ -1342,7 +1351,7 @@ impl IdorisHost {
 
 /// oMLX lists every model it serves; the daily role needs a chat model, not an
 /// embedding, speech, OCR or image one. Same exclusions as the desktop picker.
-fn is_chat_model_id(id: &str) -> bool {
+pub fn is_chat_model_id(id: &str) -> bool {
     const NON_CHAT: [&str; 13] = [
         "flux",
         "ocr",

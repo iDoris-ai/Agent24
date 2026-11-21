@@ -549,6 +549,30 @@ pub(super) async fn register_startup_tools(
         StdArc<dyn agent24_tools::ModuleToolAuthorization>,
     > = std::collections::HashMap::new();
     let mut card_sources = std::collections::HashMap::new();
+    // Loop 4 (option b): the bundled documents module's reads are `Read`.
+    let host_reads = {
+        let package = catalogue
+            .iter()
+            .find(|e| e.name == crate::first_party_reads::MODULE)
+            .and_then(|e| match &e.build {
+                crate::domain::Build::Package(p) => p
+                    .manifest
+                    .spawn()
+                    .map(|spawn| (p.dir.clone(), spawn.clone())),
+                _ => None,
+            });
+        let bundled = crate::first_party_reads::bundled_program();
+        crate::first_party_reads::host_reads(
+            package.as_ref().map(|(dir, spawn)| (dir.as_path(), spawn)),
+            bundled.as_deref(),
+        )
+    };
+    if !host_reads.is_empty() {
+        tracing::info!(
+            module = crate::first_party_reads::MODULE,
+            "the bundled module's reads are first-party reads"
+        );
+    }
     for (_, registered) in module_registry.iter() {
         let module = registered.module().to_owned();
         let declaration = registered.declaration();
@@ -566,6 +590,7 @@ pub(super) async fn register_startup_tools(
             takes_grants: entry.is_some_and(|entry| {
                 matches!(&entry.build, crate::domain::Build::Package(p) if p.manifest.takes_grants())
             }),
+            host_read: host_reads.contains(&(module.clone(), operation.clone())),
         };
         let authorization = crate::module_tool_runtime::tool_authorization(
             &source,
@@ -604,6 +629,7 @@ pub(super) async fn register_startup_tools(
         &advert_view_dyn,
         &module_tool_runtime_dyn,
         &store,
+        &host_reads,
     );
     // H9: register the read-only explorer subagent. It runs against a registry
     // that holds ONLY read builtins and NOT itself, so the sub-run cannot write,

@@ -295,9 +295,23 @@ pub struct ToolCardSource {
     pub resource_kinds: Vec<String>,
     /// The module speaks the grants protocol (§2.6); no card otherwise.
     pub takes_grants: bool,
+    /// Loop 4: the host knows this tool as a read of its own first-party
+    /// module ([`crate::first_party_reads`]): `Read`, not `External`.
+    pub host_read: bool,
 }
 
 impl ToolCardSource {
+    /// `External` for every module tool (ADR-K1-02 §2.1.1 item 6), but a
+    /// first-party read the host itself knows ([`Self::host_read`]).
+    #[must_use]
+    pub fn risk(&self) -> agent24_protocol::RiskClass {
+        if self.host_read {
+            agent24_protocol::RiskClass::Read
+        } else {
+            agent24_protocol::RiskClass::External
+        }
+    }
+
     /// What the tool's dispatch is gated with: this card's fingerprint and
     /// version, the running package's identity read per lookup (§2.2).
     pub fn gate_request(&self) -> agent24_policy::consent_gate::ConsentGateRequest {
@@ -306,7 +320,7 @@ impl ToolCardSource {
             op: self.summary.op.clone(),
             module_version: self.summary.module_version.clone(),
             current_scope_fingerprint: self.summary.scope_fingerprint(),
-            risk: agent24_protocol::RiskClass::External,
+            risk: self.risk(),
             org_restricted: false,
             source_restricted: false,
             // The host has no verified reversible-draft semantics for this
@@ -665,4 +679,183 @@ pub async fn decide(
         Ok(view) => Json(view).into_response(),
         Err(err) => storage_error("decide", err),
     }
+}
+
+// ── A1 (Loop 4): one confirmation for several tools of one module ──
+
+/// A batch holds at most this many tools.
+pub const MAX_BATCH_TOOLS: usize = 32;
+
+/// One tool of a batch: its card's values, repeated.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchTool {
+    tool: String,
+    fingerprint: String,
+    module_version: String,
+    artifact: String,
+}
+
+/// `POST …/modules/{module}/tools`: grants only, one expiry and one set of
+/// resources for every tool, each tool's card values as on its own route.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRequest {
+    tools: Vec<BatchTool>,
+    #[serde(default)]
+    resources: Vec<String>,
+    expires_at: Option<String>,
+}
+
+pub(crate) fn parse_batch_request(body: &[u8]) -> Option<BatchRequest> {
+    let request: BatchRequest = serde_json::from_slice(body).ok()?;
+    request.well_formed().then_some(request)
+}
+
+impl BatchRequest {
+    /// 1 to [`MAX_BATCH_TOOLS`] tools, each named once.
+    fn well_formed(&self) -> bool {
+        let names: std::collections::HashSet<&str> =
+            self.tools.iter().map(|t| t.tool.as_str()).collect();
+        (1..=MAX_BATCH_TOOLS).contains(&self.tools.len()) && names.len() == self.tools.len()
+    }
+    pub(crate) fn tool_names(&self) -> impl Iterator<Item = &str> {
+        self.tools.iter().map(|t| t.tool.as_str())
+    }
+    pub(crate) fn expires_at(&self) -> Option<&str> {
+        self.expires_at.as_deref()
+    }
+    pub(crate) fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
+    pub(crate) fn resource_kinds(&self) -> Option<Vec<String>> {
+        self.as_decision(&self.tools[0]).resource_kinds()
+    }
+    /// The single-tool decision this batch makes for `tool`.
+    fn as_decision(&self, tool: &BatchTool) -> DecisionRequest {
+        DecisionRequest {
+            decision: Decision::Granted,
+            fingerprint: tool.fingerprint.clone(),
+            module_version: tool.module_version.clone(),
+            artifact: tool.artifact.clone(),
+            resources: self.resources.clone(),
+            expires_at: self.expires_at.clone(),
+        }
+    }
+}
+
+/// A1: grants several tools of `module` at once, so one confirmation (the
+/// presence box, in service mode) covers them, listing every tool. Each tool
+/// is checked exactly as [`decide`] checks it, all before any is written: a
+/// tool not of this module, not taking grants, a card that changed or a
+/// resource of a kind it does not declare refuses the whole batch. The scope
+/// never leaves `module`: the path names it, and every tool is looked up
+/// under it.
+pub async fn decide_tools(
+    Path(module): Path<String>,
+    State(state): State<AppState>,
+    body: Result<Json<BatchRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Some(settings) = &state.module_grants else {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "grants_closed",
+            "this daemon takes no module tool decisions (A24_MODULE_TOOL_GRANTS is not 1, \
+             or the daemon is ephemeral)",
+        );
+    };
+    let request = match body {
+        Ok(Json(request)) => request,
+        Err(why) => {
+            return error_response(why.status(), "invalid_request", &why.body_text());
+        }
+    };
+    if !request.well_formed() {
+        return error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid_decision",
+            &format!("1 to {MAX_BATCH_TOOLS} tools, each named once"),
+        );
+    }
+    let Some(cards) = &state.module_tool_cards else {
+        return no_such_tool(&module, &request.tools[0].tool);
+    };
+    let now = Utc::now();
+    let mut checked = Vec::with_capacity(request.tools.len());
+    for tool in &request.tools {
+        let Some(found) = cards.tools.get(&(module.clone(), tool.tool.clone())) else {
+            return no_such_tool(&module, &tool.tool);
+        };
+        if !found.takes_grants {
+            return protocol_too_old(&module);
+        }
+        let decision = request.as_decision(tool);
+        let expires_at =
+            match checked_expiry(&decision, &found.resource_kinds, settings.max_days, now) {
+                Ok(expires_at) => expires_at,
+                Err(why) => {
+                    return error_response(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "invalid_decision",
+                        &format!("{:?}: {why}", tool.tool),
+                    );
+                }
+            };
+        checked.push((tool, found, expires_at));
+    }
+    let _control = state.os_control.lock().await;
+    match crate::os_config::OsConfig::load(&settings.os_config) {
+        Ok(config) if config.is_enabled(&module) => {}
+        Ok(_) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "module_disabled",
+                &format!("{module:?} is disabled; enable it before deciding on its tools"),
+            );
+        }
+        Err(why) => {
+            tracing::error!(module, error = %why, "os.json unreadable for a module tool decision");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                "whether the module is enabled could not be read",
+            );
+        }
+    }
+    let Some(artifact) = (cards.artifact)(&module) else {
+        return no_package_identity(&module);
+    };
+    for (tool, found, _) in &checked {
+        let summary = &found.summary;
+        if tool.fingerprint != summary.scope_fingerprint()
+            || tool.module_version != summary.module_version
+            || tool.artifact != artifact
+        {
+            return error_response(
+                StatusCode::CONFLICT,
+                "card_changed",
+                &format!(
+                    "{module:?}.{:?} is no longer what the card showed; fetch it again",
+                    tool.tool
+                ),
+            );
+        }
+    }
+    let decided_at = now.to_rfc3339();
+    let mut views = Vec::with_capacity(checked.len());
+    for (_, found, expires_at) in &checked {
+        let scope = agent24_store::GrantScope {
+            resources: request.resources.clone(),
+            artifact: Some(artifact.clone()),
+        };
+        match state
+            .store
+            .grant_module_consent_scoped(&found.summary, &scope, &decided_at, expires_at)
+            .await
+        {
+            Ok(record) => views.push(view(record, "granted")),
+            Err(err) => return storage_error("decide", err),
+        }
+    }
+    Json(serde_json::json!({ "authorizations": views })).into_response()
 }

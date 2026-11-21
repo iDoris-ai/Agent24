@@ -14,6 +14,9 @@ exemptions:
   - operationId: revokeModuleToolConsent
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令"
+  - operationId: grantModuleTools
+    category: planned-tui-2
+    fallback: "raw-http，TUI-2 增加对应 agent24 子命令（A1：桌面的 Agent 文档访问使用）"
   - operationId: invokeAttachedModuleCommand
     category: planned-tui-2
     fallback: "raw-http，TUI-2 增加对应 agent24 子命令（桌面壳目前使用）"

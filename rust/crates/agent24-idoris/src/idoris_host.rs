@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 mod provision;
 pub use provision::{
     Candidates, ConnectConsent, ConnectRequest, InstallRequest, Provisioner, SystemProvisioner,
-    upstream_models,
+    is_chat_model_id, upstream_models,
 };
 
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.
@@ -777,6 +777,19 @@ impl IdorisHost {
         status
     }
 
+    /// The chat model iDoris was connected with for the `daily` role, if it
+    /// is connected: what a model-less chat is answered by (Loop 4: the
+    /// desktop topbar names it rather than saying no model is ready).
+    pub async fn daily_model(&self) -> Option<String> {
+        let i = self.inner.lock().await;
+        i.installation
+            .as_ref()
+            .filter(|r| !r.roles.is_empty())
+            .and_then(|r| r.connection.as_ref())
+            .map(|c| c.daily_model.clone())
+            .filter(|m| !m.is_empty())
+    }
+
     /// Read an iDoris data endpoint through the running managed instance. The
     /// key remains in the keychain and is never exposed to the daemon caller.
     pub async fn read_data_json(&self, path: &str) -> Option<serde_json::Value> {
@@ -1028,7 +1041,10 @@ impl IdorisHost {
         };
         ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
             .await
-            .map(|gateway| (config, gateway))
+            .map(|mut gateway| {
+                gateway.embedding_enabled = record.roles.contains(&crate::setup::Role::Embed);
+                (config, gateway)
+            })
             .map_err(|_| {
                 if cancel.is_cancelled() {
                     Code::Cancelled

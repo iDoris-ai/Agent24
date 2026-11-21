@@ -139,23 +139,38 @@ impl EmbeddingClient {
         Ok(out)
     }
 
-    fn endpoint(&self) -> Result<(Route, String, Option<Zeroizing<String>>), ModelError> {
-        match &self.backend {
-            Backend::Fixed {
-                route,
-                base_url,
-                api_key,
-            } => Ok((*route, base_url.clone(), api_key.clone())),
-            Backend::Router(router) => {
-                let gateway = router.idoris_gateway()?;
-                let key = gateway.data_key()?.to_owned();
-                Ok((Route::Idoris, gateway.origin(), Some(Zeroizing::new(key))))
-            }
+    /// Checks the live gateway without sending an inference request.
+    pub fn check_available(&self) -> Result<(), ModelError> {
+        if let Backend::Router(router) = &self.backend {
+            router.idoris_gateway()?.embedding_available()?;
         }
+        Ok(())
     }
 
     async fn embed_batch(&self, input: &[&str]) -> Result<Vec<Vec<f32>>, ModelError> {
-        let (route, base_url, api_key) = self.endpoint()?;
+        let gateway = match &self.backend {
+            Backend::Router(router) => Some(router.idoris_gateway()?),
+            Backend::Fixed { .. } => None,
+        };
+        let (route, base_url, api_key) = match (&self.backend, &gateway) {
+            (_, Some(gateway)) => {
+                gateway.embedding_available()?;
+                (
+                    Route::Idoris,
+                    gateway.origin(),
+                    Some(Zeroizing::new(gateway.data_key()?.to_owned())),
+                )
+            }
+            (
+                Backend::Fixed {
+                    route,
+                    base_url,
+                    api_key,
+                },
+                _,
+            ) => (*route, base_url.clone(), api_key.clone()),
+            _ => unreachable!("router gateway was acquired above"),
+        };
         let input_value = if input.len() == 1 {
             serde_json::Value::String(input[0].to_owned())
         } else {
@@ -187,6 +202,17 @@ impl EmbeddingClient {
         if !response.status().is_success() {
             let status = response.status();
             let fields = embed_error_fields(response).await;
+            if status == reqwest::StatusCode::FORBIDDEN
+                && [fields.reason_code.as_deref(), fields.error_type.as_deref()]
+                    .contains(&Some("VIRTUAL_KEY_ROLE_FORBIDDEN"))
+            {
+                if let Some(gateway) = &gateway {
+                    gateway.set_embedding_enabled(false);
+                }
+                return Err(ModelError::Unavailable(
+                    "missing embedding model bge-m3 (VIRTUAL_KEY_ROLE_FORBIDDEN)".into(),
+                ));
+            }
             return Err(ModelError::Provider(embed_http_error(status, &fields)));
         }
         if route == Route::Idoris && locality_header(&response)? != Some("loopback") {
@@ -296,6 +322,7 @@ async fn embed_error_fields(mut response: reqwest::Response) -> EmbedErrorFields
         reason_code: short_code(
             value
                 .pointer("/error/reason_code")
+                .or_else(|| value.pointer("/error/code"))
                 .or_else(|| value.get("reason_code")),
         ),
     }
@@ -694,6 +721,65 @@ mod tests {
             )
             .unwrap(),
         );
+    }
+
+    #[tokio::test]
+    async fn missing_embed_binding_sends_nothing_and_reconnect_recovers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Arc::new(ModelRouter::with_defaults(vec![]));
+        publish(&router, &url);
+        router
+            .idoris_gateway()
+            .unwrap()
+            .set_embedding_enabled(false);
+        let client = EmbeddingClient::from_router(Arc::clone(&router)).unwrap();
+        for _ in 0..3 {
+            assert!(
+                matches!(client.embed(&["q"]).await, Err(ModelError::Unavailable(message)) if message.contains("bge-m3"))
+            );
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), listener.accept())
+                .await
+                .is_err()
+        );
+        let (url, server) = serve(vec![Scripted {
+            status: "200 OK",
+            extra_headers: "x-idoris-served-locality: loopback\r\n",
+            body: embed_json(&[axis(0)], &[0]),
+        }])
+        .await;
+        publish(&router, &url);
+        client.check_available().unwrap();
+        assert_eq!(client.embed(&["q"]).await.unwrap()[0][0], 1.0);
+        assert_eq!(server.await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn forbidden_embed_role_blocks_further_requests_until_reconnect() {
+        for field in ["code", "reason_code", "type"] {
+            let (url, server) = serve(vec![Scripted {
+                status: "403 Forbidden",
+                extra_headers: "",
+                body: serde_json::json!({"error":{field:"VIRTUAL_KEY_ROLE_FORBIDDEN"}}).to_string(),
+            }])
+            .await;
+            let router = Arc::new(ModelRouter::with_defaults(vec![]));
+            publish(&router, &url);
+            let client = EmbeddingClient::from_router(Arc::clone(&router)).unwrap();
+            assert!(matches!(
+                client.embed(&["q"]).await,
+                Err(ModelError::Unavailable(_))
+            ));
+            assert_eq!(server.await.unwrap().len(), 1);
+            // The server is gone: another HTTP call would produce a transport error.
+            assert!(
+                matches!(client.embed(&["q"]).await, Err(ModelError::Unavailable(message)) if message.contains("bge-m3"))
+            );
+            publish(&router, &url);
+            client.check_available().unwrap();
+        }
     }
 
     #[tokio::test]

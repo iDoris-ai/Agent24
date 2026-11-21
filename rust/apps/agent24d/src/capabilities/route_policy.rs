@@ -96,6 +96,8 @@ const POLICIES: &[RoutePolicy] = &[
     row("DELETE", "/api/v1/module-consents/modules/{module}", Operation::ConsentRevoke, AssuranceLevel::Everyday),
     row("DELETE", "/api/v1/module-consents/modules/{module}/tools/{tool}", Operation::ConsentRevoke, AssuranceLevel::Everyday),
     row("POST", "/api/v1/module-consents/modules/{module}/tools/{tool}", Operation::ApprovalDecision, AssuranceLevel::Elevated),
+    // A1 (Loop 4): several tools of one module granted with one confirmation.
+    row("POST", "/api/v1/module-consents/modules/{module}/tools", Operation::ApprovalDecision, AssuranceLevel::Elevated),
     row("GET", "/api/v1/module-consents/modules/{module}/tools/{tool}/card", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/tool-overrides", Operation::ConfigRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/standing-grants", Operation::ConfigRead, AssuranceLevel::Everyday),

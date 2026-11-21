@@ -16,7 +16,7 @@ impl IdentityVerifier for UnsignedIdentity {
 
     fn verify(
         &self,
-        _pid: i32,
+        pid: i32,
         audit_token: Option<agent24_os_proc::AuditToken>,
     ) -> Result<VerifiedIdentity, EnrollErrorCode> {
         let identifier = std::env::var("AGENT24_TEST_ENROLL_IDENTIFIER")
@@ -27,7 +27,13 @@ impl IdentityVerifier for UnsignedIdentity {
             kind: IdentityKind::MacosSecCode,
             identifier,
             team_id: "HYAP444FN9".into(),
-            executable: std::env::current_exe().map_err(|_| EnrollErrorCode::IdentityRejected)?,
+            // Loop 4 (#1941): the peer's own program, as the real verifier
+            // reports it, so the box tells the CLI from the app on a dev build
+            // too (it used to be this daemon's own path: "another program").
+            executable: agent24_os_proc::executable_path(pid)
+                .and_then(|path| path.canonicalize())
+                .or_else(|_| std::env::current_exe())
+                .map_err(|_| EnrollErrorCode::IdentityRejected)?,
             audit_token,
         })
     }
