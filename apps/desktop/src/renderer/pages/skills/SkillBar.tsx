@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState } from 'react'
 import { useT } from '../../i18n'
 import { notifySkillsChanged } from '../chat/session-skill'
 import { skillBarMessages } from './SkillBar.i18n'
+import { getSkillList } from './skill-list'
 import {
   parseComponents,
   parseSkillDetail,
@@ -15,7 +16,7 @@ type Proxy = Window['agent24']['backendProxy']
 
 /** Throws when the list itself cannot be read: that is not "no skills". */
 async function loadRows(proxy: Proxy): Promise<SkillBarRow[]> {
-  const listRes = await proxy({ method: 'GET', path: '/api/v1/skills' })
+  const listRes = await getSkillList(proxy)
   if (!listRes.ok) throw new Error('skill list unavailable')
   const list = parseSkillList(listRes.data)
   const details = new Map<string, NonNullable<ReturnType<typeof parseSkillDetail>>>()
