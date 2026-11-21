@@ -324,6 +324,82 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
 
+  /module-consents/modules/{module}/tools:
+    parameters:
+      - name: module
+        in: path
+        required: true
+        schema:
+          type: string
+    post:
+      operationId: grantModuleTools
+      x-milestone: Loop4-A1
+      tags: [tools]
+      summary: Grant several tools of one module at once
+      description: >-
+        One confirmation for several tools of the module in the path (A1).
+        Each tool is checked as on its own route (its card current, its
+        resource kinds declared) before any grant is written; one that fails
+        refuses the whole batch. Grants only.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ModuleToolBatchGrant"
+      responses:
+        "200":
+          description: The grants as written
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModuleAuthorizationList"
+        "401":
+          description: Missing or invalid host token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: Host authority required; or `grants_closed`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: A tool that is not one of this module's
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "`protocol_too_old`, `no_package_identity`, `card_changed` or `module_disabled`"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: >-
+            `invalid_request`: not a batch. `invalid_decision`: no tool, more
+            than 32, a tool named twice, or a tool's expiry or resources as
+            the single route refuses them
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Whether the module is enabled could not be read
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Authorization storage is temporarily unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /module-consents/modules/{module}/tools/{tool}/card:
     parameters:
       - name: module
@@ -9023,6 +9099,30 @@ components:
         fingerprint: { type: string }
         module_version: { type: string }
         artifact: { type: string }
+        resources:
+          type: array
+          maxItems: 256
+          items: { type: string }
+        expires_at: { type: string, format: date-time }
+
+    ModuleToolBatchGrant:
+      type: object
+      required: [tools, expires_at]
+      additionalProperties: false
+      properties:
+        tools:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            type: object
+            required: [tool, fingerprint, module_version, artifact]
+            additionalProperties: false
+            properties:
+              tool: { type: string }
+              fingerprint: { type: string }
+              module_version: { type: string }
+              artifact: { type: string }
         resources:
           type: array
           maxItems: 256

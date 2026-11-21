@@ -129,6 +129,9 @@ async function syncUnlocked(deps: DocAgentAccessDeps): Promise<DocAgentAccessRes
       .filter((a) => a.module === MODULE && a.status === 'granted')
       .map((a) => String(a.tool)),
   )
+  // A1 (Loop 4): the cards first, then every tool that needs a grant in one
+  // request, so service mode asks once (listing the tools), not once a tool.
+  const due: Array<{ tool: string; card: NonNullable<ReturnType<typeof cardFields>>; key: string }> = []
   for (const tool of DOC_AGENT_TOOLS) {
     const cardRes = await deps.send({ method: 'GET', path: toolPath(tool, '/card') })
     if (!cardRes.ok) return { enabled: true, until: data.until, ok: false, code: responseCode(cardRes) }
@@ -136,6 +139,27 @@ async function syncUnlocked(deps: DocAgentAccessDeps): Promise<DocAgentAccessRes
     if (card === null) return { enabled: true, until: data.until, ok: false, code: 'invalid_card' }
     const key = grantKey(card.fingerprint, card.artifact, ids)
     if (data.granted[tool] === key && current.has(tool)) continue
+    due.push({ tool, card, key })
+  }
+  if (due.length === 0) return { enabled: true, until: data.until, ok: true }
+  const resources = ids.map((id) => `doc:${id}`)
+  const batch = await deps.send({
+    method: 'POST',
+    path: `/api/v1/module-consents/modules/${MODULE}/tools`,
+    body: {
+      tools: due.map(({ tool, card }) => ({ tool, fingerprint: card.fingerprint, module_version: card.module_version, artifact: card.artifact })),
+      resources,
+      expires_at: data.until,
+    },
+  })
+  if (batch.ok) {
+    for (const { tool, key } of due) data.granted[tool] = key
+    writeFile(dir, data)
+    return { enabled: true, until: data.until, ok: true }
+  }
+  // A daemon without the batch route (older than A1): one tool at a time, as before.
+  if (batch.status !== 404 && batch.status !== 405) return { enabled: true, until: data.until, ok: false, code: responseCode(batch) }
+  for (const { tool, card, key } of due) {
     const post = await deps.send({
       method: 'POST',
       path: toolPath(tool),
@@ -144,7 +168,7 @@ async function syncUnlocked(deps: DocAgentAccessDeps): Promise<DocAgentAccessRes
         fingerprint: card.fingerprint,
         module_version: card.module_version,
         artifact: card.artifact,
-        resources: ids.map((id) => `doc:${id}`),
+        resources,
         expires_at: data.until,
       },
     })

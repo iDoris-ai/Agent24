@@ -23,6 +23,7 @@ function cardPath(tool: string): string {
 function grantPath(tool: string): string {
   return `/api/v1/module-consents/modules/documents/tools/${tool}`
 }
+const BATCH = '/api/v1/module-consents/modules/documents/tools'
 
 describe('doc-agent-access', () => {
   let dir = ''
@@ -30,6 +31,7 @@ describe('doc-agent-access', () => {
   let send: ReturnType<typeof vi.fn>
   let held: Set<string | undefined>
   let cardOk = true
+  let batchRoute = true
 
   const deps = (): DocAgentAccessDeps => ({
     dataDir: () => dir,
@@ -42,6 +44,7 @@ describe('doc-agent-access', () => {
     dir = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-agent-access-'))
     ids = ['doc_b', 'doc_a']
     cardOk = true
+    batchRoute = true
     held = new Set()
     send = vi.fn(async (req: { method: string; path: string; body?: unknown }) => {
       if (req.method === 'GET' && String(req.path).endsWith('/card')) {
@@ -50,6 +53,11 @@ describe('doc-agent-access', () => {
       }
       if (req.method === 'GET' && req.path === '/api/v1/module-consents') {
         return { ok: true, status: 200, data: { authorizations: [...held].map((tool) => ({ module: 'documents', tool, status: 'granted' })) } }
+      }
+      if (req.method === 'POST' && req.path === BATCH) {
+        if (!batchRoute) return { ok: false, status: 404, data: { error: { code: 'not_found' } } }
+        for (const t of (req.body as { tools: Array<{ tool: string }> }).tools) held.add(t.tool)
+        return { ok: true, status: 200, data: {} }
       }
       if (req.method === 'POST') { held.add(String(req.path).split('/').pop()); return { ok: true, status: 200, data: {} } }
       if (req.method === 'DELETE') return { ok: true, status: 200, data: {} }
@@ -67,30 +75,42 @@ describe('doc-agent-access', () => {
     expect(send).not.toHaveBeenCalled()
   })
 
-  it('enable GETs a card and POSTs a 30-day grant for each tool', async () => {
+  it('A1: enable GETs every card, then grants every tool in one POST (one confirmation), 30 days', async () => {
     const result = await enable(deps())
     expect(result).toEqual({ enabled: true, until: UNTIL, ok: true })
     expect(state(deps())).toEqual({ enabled: true, until: UNTIL })
     const gets = send.mock.calls.filter(([req]) => req.method === 'GET' && String(req.path).endsWith('/card'))
     const posts = send.mock.calls.filter(([req]) => req.method === 'POST')
     expect(gets.map(([req]) => req.path)).toEqual(DOC_AGENT_TOOLS.map(cardPath))
-    expect(posts.map(([req]) => req.path)).toEqual(DOC_AGENT_TOOLS.map(grantPath))
-    for (const [req] of posts) {
-      expect(req.body).toEqual({
-        decision: 'granted',
-        fingerprint: CARD.fingerprint,
-        module_version: CARD.module_version,
-        artifact: CARD.artifact,
-        resources: ['doc:doc_b', 'doc:doc_a'],
-        expires_at: UNTIL,
-      })
-    }
+    expect(posts.map(([req]) => req.path)).toEqual([BATCH])
+    expect(posts[0]![0].body).toEqual({
+      tools: DOC_AGENT_TOOLS.map((tool) => ({ tool, fingerprint: CARD.fingerprint, module_version: CARD.module_version, artifact: CARD.artifact })),
+      resources: ['doc:doc_b', 'doc:doc_a'],
+      expires_at: UNTIL,
+    })
     const saved = JSON.parse(fs.readFileSync(path.join(dir, ACCESS_FILE), 'utf8')) as { until: string; granted: Record<string, string> }
     expect(saved.until).toBe(UNTIL)
     const key = `${CARD.fingerprint}|${CARD.artifact}|doc_a,doc_b`
     expect(saved.granted).toEqual(Object.fromEntries(DOC_AGENT_TOOLS.map((tool) => [tool, key])))
     // E1b/D5a: the DOCX tools too.
     expect(DOC_AGENT_TOOLS).toEqual(['list', 'get', 'compose', 'paragraphs', 'patch', 'fields', 'fill'])
+  })
+
+  it('A1: a daemon without the batch route gets one grant a tool, as before', async () => {
+    batchRoute = false
+    expect(await enable(deps())).toEqual({ enabled: true, until: UNTIL, ok: true })
+    const posts = send.mock.calls.filter(([req]) => req.method === 'POST').map(([req]) => req.path)
+    expect(posts).toEqual([BATCH, ...DOC_AGENT_TOOLS.map(grantPath)])
+  })
+
+  it('A1: a refused batch (the user said no) is not followed by one box a tool', async () => {
+    send.mockImplementationOnce(async () => ({ ok: true, status: 200, data: CARD }))
+    const base = send.getMockImplementation()!
+    send.mockImplementation(async (req: { method: string; path: string }) =>
+      req.method === 'POST' && req.path === BATCH ? { ok: false, status: 403, data: { error: { code: 'presence_denied' } } } : base(req))
+    const result = await enable(deps())
+    expect(result).toMatchObject({ ok: false, code: 'presence_denied' })
+    expect(send.mock.calls.filter(([req]) => req.method === 'POST')).toHaveLength(1)
   })
 
   it('skips POST on a later sync until the document set changes', async () => {
@@ -104,16 +124,16 @@ describe('doc-agent-access', () => {
     held.delete('compose')
     send.mockClear()
     await sync(deps())
-    expect(send.mock.calls.filter(([req]) => req.method === 'POST').map(([req]) => req.path)).toEqual([grantPath('compose')])
+    expect(send.mock.calls.filter(([req]) => req.method === 'POST').map(([req]) => req.path)).toEqual([BATCH])
+    expect((send.mock.calls.find(([req]) => req.method === 'POST')![0].body as { tools: Array<{ tool: string }> }).tools.map((t) => t.tool)).toEqual(['compose'])
 
     ids = ['doc_b', 'doc_a', 'doc_c']
     send.mockClear()
     expect(await sync(deps())).toEqual({ enabled: true, until: UNTIL, ok: true })
     const posts = send.mock.calls.filter(([req]) => req.method === 'POST')
-    expect(posts).toHaveLength(DOC_AGENT_TOOLS.length)
-    for (const [req] of posts) {
-      expect((req.body as { resources: string[] }).resources).toEqual(['doc:doc_b', 'doc:doc_a', 'doc:doc_c'])
-    }
+    expect(posts).toHaveLength(1)
+    expect((posts[0]![0].body as { tools: unknown[] }).tools).toHaveLength(DOC_AGENT_TOOLS.length)
+    expect((posts[0]![0].body as { resources: string[] }).resources).toEqual(['doc:doc_b', 'doc:doc_a', 'doc:doc_c'])
   })
 
   it('returns ok:false and does not write a key when the card fails', async () => {

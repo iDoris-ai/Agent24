@@ -107,6 +107,11 @@ pub fn apply(
         {
             return Err(PatchError::Stale(edit.index));
         }
+        // PR-Daemon #1954 (PM): the same text written back changes nothing:
+        // the paragraph is left byte for byte as it was, whatever it holds.
+        if paragraph_text(&xml[p.start..p.end]) == edit.text {
+            continue;
+        }
         // PR-Daemon #1930 B2: a paragraph is rewritten as one run, so one
         // holding more than text would lose it: refused, and said what.
         if let Some(what) = not_plain_text(&xml[p.start..p.end]) {
@@ -121,6 +126,9 @@ pub fn apply(
     let mut cursor = 0;
     for edit in &sorted {
         let p = &paras[edit.index];
+        if paragraph_text(&xml[p.start..p.end]) == edit.text {
+            continue;
+        }
         out.push_str(&xml[cursor..p.start]);
         let rewritten = rewrite_paragraph(&xml[p.start..p.end], edit, author, now_iso, next_id);
         if edit.tracked {
@@ -417,6 +425,15 @@ fn splice_parts(
 ) -> Result<Vec<u8>, PatchError> {
     let zip_err = |e: zip::result::ZipError| PatchError::NotDocx(e.to_string());
     let io_err = |e: std::io::Error| PatchError::NotDocx(e.to_string());
+    // A part that does not parse would leave a DOCX that Word and WPS cannot
+    // open: refused here, before anything is written (PR-Daemon #1954 L2).
+    for (name, content) in parts {
+        if let Err(e) = roxmltree::Document::parse(content) {
+            return Err(PatchError::Invalid(format!(
+                "the edited {name} would not be valid XML ({e}); nothing was written"
+            )));
+        }
+    }
     let mut archive = ZipArchive::new(Cursor::new(docx)).map_err(zip_err)?;
     let mut writer = ZipWriter::new(Cursor::new(Vec::with_capacity(docx.len() + 4096)));
     for i in 0..archive.len() {
@@ -646,19 +663,37 @@ fn paragraph_text(para: &str) -> String {
         return String::new();
     };
     let mut text = String::new();
-    let mut depth_p = 0usize;
     let mut open_t: Option<usize> = None;
+    // PR-Daemon #1954 B1' (PM: by the tree, not by depth): the open elements
+    // from the paragraph down. A w:t, w:tab or w:br is text only as a child
+    // of a w:r of this paragraph (not of a nested one, a text box's): never
+    // a tab stop in w:pPr/w:tabs, never anything in w:rPr.
+    let mut stack: Vec<&str> = Vec::new();
+    let own_run = |stack: &[&str]| {
+        stack.last() == Some(&"w:r") && stack.iter().filter(|n| **n == "w:p").count() <= 1
+    };
     for tag in all {
-        match (tag.kind, tag.name) {
-            (TagKind::Open, "w:p") => depth_p += 1,
-            (TagKind::Close, "w:p") => depth_p = depth_p.saturating_sub(1),
-            (TagKind::Open, "w:t") if depth_p <= 1 => open_t = Some(tag.end),
-            (TagKind::Close, "w:t") => {
-                if let Some(from) = open_t.take() {
+        match tag.kind {
+            TagKind::Open => {
+                if tag.name == "w:t" && own_run(&stack) {
+                    open_t = Some(tag.end);
+                }
+                stack.push(tag.name);
+            }
+            TagKind::Close => {
+                stack.pop();
+                if tag.name == "w:t"
+                    && let Some(from) = open_t.take()
+                {
                     text.push_str(&decode(&para[from..tag.start]));
                 }
             }
-            _ => {}
+            TagKind::Empty if own_run(&stack) => match tag.name {
+                "w:tab" => text.push('\t'),
+                "w:br" if !is_page_or_column_break(&para[tag.start..tag.end]) => text.push('\n'),
+                _ => {}
+            },
+            TagKind::Empty => {}
         }
     }
     text
@@ -726,8 +761,15 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
     let mut before = String::new();
     let mut after = String::new();
     let mut seen_content = false;
+    // The paragraph's own text runs, as written: a tracked rewrite deletes
+    // these very runs (General 11-21: tabs and breaks must come back when the
+    // change is rejected), not a flattened copy of their text.
+    let mut old_runs = String::new();
     for (name, start, end) in &kids {
         let slice = &para[*start..*end];
+        if *name == "w:r" && !slice.contains("<w:commentReference") {
+            old_runs.push_str(&as_deleted(slice));
+        }
         if *name == "w:pPr" {
             ppr.push_str(slice);
         } else if is_marker(name) {
@@ -743,11 +785,26 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
         }
     }
     let rpr = first_rpr(para).unwrap_or_default();
-    let new_run = |tag: &str, text: &str| {
-        format!(
-            "<w:r>{rpr}<w:{tag} xml:space=\"preserve\">{}</w:{tag}></w:r>",
-            escape_text(text)
-        )
+    // A tab and a line break in the new text are written as Word writes them.
+    let new_run = |text: &str| {
+        let mut inner = String::new();
+        for (i, line) in text.split('\n').enumerate() {
+            if i > 0 {
+                inner.push_str("<w:br/>");
+            }
+            for (j, piece) in line.split('\t').enumerate() {
+                if j > 0 {
+                    inner.push_str("<w:tab/>");
+                }
+                if !piece.is_empty() {
+                    inner.push_str(&format!(
+                        "<w:t xml:space=\"preserve\">{}</w:t>",
+                        escape_text(piece)
+                    ));
+                }
+            }
+        }
+        format!("<w:r>{rpr}{inner}</w:r>")
     };
     let body = if edit.tracked {
         let attrs = format!(
@@ -756,21 +813,69 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
             escape_attr(date)
         );
         format!(
-            "<w:del w:id=\"{id}\" {attrs}>{}</w:del><w:ins w:id=\"{}\" {attrs}>{}</w:ins>",
-            new_run("delText", &paragraph_text(para)),
+            "<w:del w:id=\"{id}\" {attrs}>{old_runs}</w:del><w:ins w:id=\"{}\" {attrs}>{}</w:ins>",
             id + 1,
-            new_run("t", &edit.text)
+            new_run(&edit.text)
         )
     } else {
-        new_run("t", &edit.text)
+        new_run(&edit.text)
     };
     format!("{open_tag}{ppr}{before}{body}{after}</w:p>")
+}
+
+/// A text run as a deleted one: its `w:t` become `w:delText`; its
+/// properties, tabs and line breaks stay as they are.
+fn as_deleted(run: &str) -> String {
+    // By tag name, not by a fixed spelling: `<w:t` may be followed by any XML
+    // whitespace before its attributes (PR-Daemon #1954 L2), never `<w:tab`.
+    let boundary = |c: Option<char>| matches!(c, Some(' ' | '\t' | '\n' | '\r' | '>' | '/'));
+    let mut out = String::with_capacity(run.len() + 16);
+    let mut rest = run;
+    while let Some(at) = rest
+        .find("<w:t")
+        .into_iter()
+        .chain(rest.find("</w:t"))
+        .min()
+    {
+        let (close, len) = if rest[at..].starts_with("</w:t") {
+            (true, 5)
+        } else {
+            (false, 4)
+        };
+        out.push_str(&rest[..at]);
+        if boundary(rest[at + len..].chars().next()) {
+            out.push_str(if close { "</w:delText" } else { "<w:delText" });
+        } else {
+            out.push_str(&rest[at..at + len]);
+        }
+        rest = &rest[at + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A `w:br` element that breaks the page or the column, its `w:type` read as
+/// an attribute in either quote style (PR-Daemon #1954 L3).
+fn is_page_or_column_break(element: &str) -> bool {
+    let Some(at) = element.find("w:type") else {
+        return false;
+    };
+    let rest = element[at + "w:type".len()..].trim_start();
+    let Some(rest) = rest.strip_prefix('=') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return false;
+    };
+    let value = rest[1..].split(quote).next().unwrap_or("");
+    matches!(value, "page" | "column")
 }
 
 /// PR-Daemon #1930 B2: what in `para` a rewrite as one run would lose, named
 /// for the user; None for a paragraph of text runs (and bookmarks, comment
 /// ranges and a run holding only a comment reference, which are kept).
-fn not_plain_text(para: &str) -> Option<&'static str> {
+fn not_plain_text(para: &str) -> Option<String> {
     const KINDS: &[(&str, &str)] = &[
         ("<w:drawing", "a picture (w:drawing)"),
         ("<w:pict", "a picture (w:pict)"),
@@ -795,7 +900,7 @@ fn not_plain_text(para: &str) -> Option<&'static str> {
                 Some(b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
             )
         }) {
-            return Some(what);
+            return Some((*what).to_owned());
         }
     }
     // A comment reference sharing its run with text: the text would stay behind.
@@ -805,7 +910,38 @@ fn not_plain_text(para: &str) -> Option<&'static str> {
             && run.contains("<w:commentReference")
             && (run.contains("<w:t>") || run.contains("<w:t "))
         {
-            return Some("a comment reference in a run with text");
+            return Some("a comment reference in a run with text".to_owned());
+        }
+    }
+    // PR-Daemon #1930 B2 (Loop 4): a whitelist, not only the list above. A
+    // paragraph holds only what a rewrite keeps or rebuilds — its properties,
+    // plain text runs, proofing marks, bookmarks and comment ranges; a run
+    // only its properties, text, a lone comment reference and a cached page
+    // break. Anything else (a formula m:oMath, a pending w:ins/w:del, w:sym,
+    // a break, a tab, w:ruby, a permission range, w:contentPart, ...) would be
+    // lost: refused, and named.
+    for (name, start, end) in children(para) {
+        match name {
+            "w:pPr" | "w:proofErr" => {}
+            name if is_marker(name) => {}
+            "w:r" => {
+                for (inner, s, e) in children(&para[start..end]) {
+                    let element = &para[start..end][s..e];
+                    match inner {
+                        "w:rPr"
+                        | "w:t"
+                        | "w:tab"
+                        | "w:commentReference"
+                        | "w:lastRenderedPageBreak" => {}
+                        // A line break is text layout; a page or column break
+                        // is the document's pagination, which a rewrite drops.
+                        "w:br" if !is_page_or_column_break(element) => {}
+                        "w:br" => return Some("a page or column break (w:br)".to_owned()),
+                        other => return Some(format!("{other} in a run")),
+                    }
+                }
+            }
+            other => return Some(other.to_owned()),
         }
     }
     None

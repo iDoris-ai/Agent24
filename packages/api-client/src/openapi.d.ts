@@ -93,6 +93,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/module-consents/modules/{module}/tools": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Grant several tools of one module at once
+         * @description One confirmation for several tools of the module in the path (A1). Each tool is checked as on its own route (its card current, its resource kinds declared) before any grant is written; one that fails refuses the whole batch. Grants only.
+         */
+        post: operations["grantModuleTools"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/module-consents/modules/{module}/tools/{tool}/card": {
         parameters: {
             query?: never;
@@ -4390,6 +4412,17 @@ export interface components {
             /** Format: date-time */
             expires_at: string;
         };
+        ModuleToolBatchGrant: {
+            tools: {
+                tool: string;
+                fingerprint: string;
+                module_version: string;
+                artifact: string;
+            }[];
+            resources?: string[];
+            /** Format: date-time */
+            expires_at: string;
+        };
         ModuleAuthorizationRevocation: {
             module: string;
             tool: string | null;
@@ -5115,6 +5148,95 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ModuleAuthorizationRevocation"];
+                };
+            };
+            /** @description Authorization storage is temporarily unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+        };
+    };
+    grantModuleTools: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                module: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ModuleToolBatchGrant"];
+            };
+        };
+        responses: {
+            /** @description The grants as written */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModuleAuthorizationList"];
+                };
+            };
+            /** @description Missing or invalid host token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Host authority required; or `grants_closed` */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description A tool that is not one of this module's */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `protocol_too_old`, `no_package_identity`, `card_changed` or `module_disabled` */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `invalid_request`: not a batch. `invalid_decision`: no tool, more than 32, a tool named twice, or a tool's expiry or resources as the single route refuses them */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description Whether the module is enabled could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
                 };
             };
             /** @description Authorization storage is temporarily unavailable */

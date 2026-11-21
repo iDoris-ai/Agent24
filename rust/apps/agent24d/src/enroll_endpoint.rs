@@ -832,7 +832,7 @@ async fn serve_presence(
                         "method": req.method,
                         "path": req.path,
                         "summary": req.summary,
-                        "requester": {"identifier": req.requester.identifier, "pid": req.requester.pid},
+                        "requester": {"identifier": req.requester.identifier, "pid": req.requester.pid, "kind": req.requester.kind.as_str()},
                         "expires_at": req.expires_at,
                     }),
                     Event::Cancel { challenge_id } => serde_json::json!({

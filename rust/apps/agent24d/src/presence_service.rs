@@ -414,6 +414,7 @@ mod tests {
             requester: RequesterIdentity {
                 identifier: "ai.auraai.agent24".into(),
                 pid: 42,
+                kind: crate::capabilities::presence::RequesterKind::CommandLine,
             },
             expires_at: unix_now() + ttl,
         }

@@ -261,7 +261,13 @@ pub(crate) enum DocumentsAction {
     },
 }
 
-const NO_DAEMON: &str = "no running daemon: start one with `agent24 daemon start` (a daemon the desktop started is reachable only from the desktop)";
+const NO_DAEMON: &str =
+    "no running daemon: open the Agent24 app, or start one with `agent24 daemon start`";
+/// C1: the app (or a service) is running, but would not take this CLI.
+const ENROLL_FAILED: &str =
+    "a daemon is running (the Agent24 app or its service), but this CLI could not enrol with it";
+const DELEGATION_REFUSED: &str =
+    "writing to documents needs a one-time confirmation on this Mac's screen, which was not given";
 /// A request body reaches the OS only up to the kernel's 1 MiB
 /// (`agent24-domain` `MAX_BODY_BYTES`), an extract's schema near that at
 /// most; with room for the base and token, a bound so stdin cannot grow us.
@@ -666,12 +672,85 @@ fn invalid(message: String) -> Response {
 /// `backend_not_ready` for no daemon (the desktop's code for it), 503
 /// `backend_incompatible` for a daemon on another protocol (CORE-4): nothing
 /// is sent to it.
-async fn daemon() -> Result<HttpTransport, Response> {
-    let ep = super::attach_only()
-        .await
-        .map_err(|why| Response::fail(503, "backend_incompatible", &why))?
-        .ok_or_else(|| Response::fail(503, "backend_not_ready", NO_DAEMON))?;
-    HttpTransport::new(&ep.base, Some(ep.token().to_owned())).map_err(invalid)
+/// C1 (Loop 4): the daemon reached and, in capabilities mode (the one the
+/// desktop starts, or the service), this CLI enrolled with it on its socket,
+/// as `os consent` does (CORE-2 S4). The endpoint is kept: the enrolled token
+/// lives as long as its connection, and a module delegation is elevated on
+/// that same connection. No daemon is told apart from one that refused this
+/// CLI's enrolment.
+async fn daemon() -> Result<(HttpTransport, super::Endpoint), Response> {
+    let Some(state) = agent24_protocol::state_file::read_live() else {
+        return Err(Response::fail(503, "backend_not_ready", NO_DAEMON));
+    };
+    let ep = match super::attach_discovered_with(&state, true).await {
+        super::DiscoveredAttach::Ready(ep) => ep,
+        super::DiscoveredAttach::Unreachable => {
+            return Err(Response::fail(503, "backend_not_ready", NO_DAEMON));
+        }
+        super::DiscoveredAttach::Incompatible(why) => {
+            return Err(Response::fail(503, "backend_incompatible", &why));
+        }
+        super::DiscoveredAttach::EnrollFailed(err) => {
+            return Err(Response::fail(
+                503,
+                "enroll_failed",
+                &format!("{ENROLL_FAILED}: {} ({})", err.message, err.code),
+            ));
+        }
+    };
+    let transport = HttpTransport::new(&ep.base, Some(ep.token().to_owned())).map_err(invalid)?;
+    Ok((transport, ep))
+}
+
+/// A write the module refused for want of delegation (403
+/// `module_delegation_required`): never bypassed, only asked for.
+fn needs_delegation(res: &Response) -> bool {
+    matches!(res, Response::Err { status: 403, .. })
+        && res.code() == Some("module_delegation_required")
+}
+
+/// C1: the delegation a first-party client needs before writing to the
+/// documents module, as the desktop's `sendModuleWrite` asks for it: the
+/// elevated `POST /api/v1/os/documents/delegation`, confirmed on the Mac's
+/// screen. A refusal or no answer is said, and nothing is retried.
+async fn delegate(ep: &super::Endpoint) -> Result<(), Response> {
+    if !ep.token().is_empty() && ep.session.is_none() {
+        // Legacy mode has no delegation to ask for.
+        return Ok(());
+    }
+    let sent = super::send_elevating(
+        ep,
+        reqwest::Method::POST,
+        "/api/v1/os/documents/delegation",
+        None,
+        std::time::Duration::from_secs(10),
+        false,
+    )
+    .await;
+    match sent {
+        Ok(res) if res.status.is_success() => Ok(()),
+        Ok(res) => {
+            let status = res.status.as_u16();
+            let body: Value = res.json_value().await;
+            let code = body["error"]["code"]
+                .as_str()
+                .unwrap_or("delegation_refused")
+                .to_owned();
+            Err(Response::fail(
+                status,
+                &code,
+                &format!(
+                    "{DELEGATION_REFUSED} ({})",
+                    body["error"]["message"].as_str().unwrap_or("not confirmed")
+                ),
+            ))
+        }
+        Err(e) => Err(Response::fail(
+            403,
+            "delegation_refused",
+            &format!("{DELEGATION_REFUSED} ({})", e.parts().1),
+        )),
+    }
 }
 
 /// Where to send and what: from stdin (the desktop) or from the argument and
@@ -687,7 +766,22 @@ async fn setup(
         return Ok((transport, input.path));
     }
     let path = path.ok_or_else(|| invalid("a file to import is required".to_owned()))?;
-    Ok((daemon().await?, path))
+    let (transport, ep) = daemon().await?;
+    // The enrolment (and any delegation) lasts as long as this connection:
+    // kept open until this one-shot command exits.
+    if needs_delegation_for_import(&transport).await {
+        delegate(&ep).await?;
+    }
+    std::mem::forget(ep);
+    Ok((transport, path))
+}
+
+/// Whether this daemon would refuse an import for want of delegation: asked
+/// with a request that changes nothing (an empty upload is refused as
+/// invalid once delegation is in place).
+async fn needs_delegation_for_import(transport: &HttpTransport) -> bool {
+    let probe = json!({"op": "cancelJob", "jobId": "job_00000000000000000000000000"});
+    needs_delegation(&call(&probe, transport).await)
 }
 
 /// `request`: the operation from stdin with the daemon (the desktop), or
@@ -725,10 +819,19 @@ async fn against_daemon(req: &Value) -> Response {
     if route(req).is_none() {
         return refused();
     }
-    match daemon().await {
-        Ok(transport) => call(req, &transport).await,
-        Err(res) => res,
+    let (transport, ep) = match daemon().await {
+        Ok(found) => found,
+        Err(res) => return res,
+    };
+    let mut res = call(req, &transport).await;
+    if needs_delegation(&res) {
+        res = match delegate(&ep).await {
+            Ok(()) => call(req, &transport).await,
+            Err(refused) => refused,
+        };
     }
+    super::finish(ep).await;
+    res
 }
 
 async fn import(path: Option<PathBuf>, json: bool, host_stdin: bool) -> Result<(), String> {
@@ -1137,5 +1240,25 @@ mod tests {
         );
         assert!(fill_request("doc_x".into(), &["no-equals".into()], None).is_err());
         assert!(fill_request("doc_x".into(), &["=x".into()], None).is_err());
+    }
+
+    #[test]
+    fn only_a_403_module_delegation_required_asks_for_delegation() {
+        assert!(needs_delegation(&Response::fail(
+            403,
+            "module_delegation_required",
+            "x"
+        )));
+        for other in [
+            Response::fail(403, "presence_denied", "x"),
+            Response::fail(401, "module_delegation_required", "x"),
+            Response::fail(404, "not_found", "x"),
+            Response::Ok {
+                status: 200,
+                data: json!({}),
+            },
+        ] {
+            assert!(!needs_delegation(&other));
+        }
     }
 }

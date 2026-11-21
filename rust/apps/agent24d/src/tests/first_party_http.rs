@@ -1989,3 +1989,24 @@ async fn skill_activation_oversized_body_is_invalid_request_on_both_paths() {
     assert_eq!(via_handler.status(), StatusCode::BAD_REQUEST);
     assert_eq!(error_code(via_handler).await, "invalid_request");
 }
+
+/// C1 (Loop 4): the token an enrolled CLI gets (FirstPartyShell, daily)
+/// never reaches the desktop-only routes: the inbound admission writes and
+/// the Knowledge host's binding and credential (Comm identity export and
+/// import: `key_backup_is_product_host_only_in_capabilities_mode`).
+#[tokio::test]
+async fn an_enrolled_shell_never_reaches_host_only_routes() {
+    let (state, token) = setup().await;
+    for (method, path) in [
+        ("PUT", "/api/v1/inbound/allowlist"),
+        ("PUT", "/api/v1/inbound/policy"),
+        ("PUT", "/api/v1/host/knowledge/bindings/b1"),
+        ("PUT", "/api/v1/host/knowledge/bindings/b1/credential"),
+    ] {
+        let response = build_router(state.clone())
+            .oneshot(request(&token.secret, method, path, "{}", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+}

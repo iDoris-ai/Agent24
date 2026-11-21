@@ -317,6 +317,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
                 .post(crate::consent_routes::decide),
         )
         .route(
+            "/api/v1/module-consents/modules/{module}/tools",
+            axum::routing::post(crate::consent_routes::decide_tools),
+        )
+        .route(
             "/api/v1/module-consents/modules/{module}/tools/{tool}/card",
             get(crate::consent_routes::card),
         )

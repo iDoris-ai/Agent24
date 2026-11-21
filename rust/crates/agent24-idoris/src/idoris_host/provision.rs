@@ -1338,7 +1338,7 @@ impl IdorisHost {
 
 /// oMLX lists every model it serves; the daily role needs a chat model, not an
 /// embedding, speech, OCR or image one. Same exclusions as the desktop picker.
-fn is_chat_model_id(id: &str) -> bool {
+pub fn is_chat_model_id(id: &str) -> bool {
     const NON_CHAT: [&str; 13] = [
         "flux",
         "ocr",

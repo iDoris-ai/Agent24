@@ -56,8 +56,39 @@ pub async fn get_models(State(state): State<AppState>) -> Response {
     // first. `None` when this router was never built with one (tests, a
     // hand-built router) — a client seeing `null` here must say "unknown",
     // never fall back to guessing itself.
-    Json(serde_json::json!({ "models": models, "default_model": state.router.default_model() }))
-        .into_response()
+    // Loop 4: with chat answered by iDoris (#1945) and no default saved here,
+    // the default is the model iDoris was connected with for `daily`, not
+    // `null` (which the topbar shows as 「模型服务未就绪」 while chat works).
+    let default_model = match state.router.default_model() {
+        Some(model) => Some(model),
+        None if state.router.idoris_gateway().is_ok() => {
+            let daily = match &state.idoris_host {
+                Some(host) => host.daily_model().await,
+                None => None,
+            };
+            idoris_default(&models, daily)
+        }
+        None => None,
+    };
+    Json(serde_json::json!({ "models": models, "default_model": default_model })).into_response()
+}
+
+/// The default to show while chat goes through iDoris and nothing is saved:
+/// the model iDoris was connected with for `daily`, or, when the install
+/// receipt does not say (an instance connected by an older daemon: General
+/// 11-21 on 0.6.66), the first model iDoris itself lists.
+fn idoris_default(models: &[Model], daily: Option<String>) -> Option<String> {
+    daily.or_else(|| {
+        models
+            .iter()
+            // PR-Daemon #1954 L5: a chat model only, never an embedding or
+            // OCR model iDoris happens to list first; none, then null.
+            .find(|m| {
+                m.provider.starts_with("idoris")
+                    && agent24_idoris::idoris_host::is_chat_model_id(&m.id)
+            })
+            .map(|m| m.id.clone())
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -1720,6 +1751,30 @@ mod tests {
     /// is built with `with_defaults` (never `from_env`), so this pins the
     /// OTHER half of the contract: a router with no configured default
     /// reports an explicit `null`, not a missing key.
+    #[test]
+    fn the_idoris_default_is_its_daily_model_else_the_first_model_it_lists() {
+        let model = |id: &str, provider: &str| Model {
+            id: id.into(),
+            provider: provider.into(),
+            tier: "local".into(),
+            loaded: true,
+        };
+        let listed = [
+            model("other", "omlx"),
+            model("bge-m3-mlx-fp16", "idoris-local"),
+            model("Qwen3-8B-4bit", "idoris-local"),
+        ];
+        assert_eq!(
+            super::idoris_default(&listed, Some("daily".into())).as_deref(),
+            Some("daily")
+        );
+        assert_eq!(
+            super::idoris_default(&listed, None).as_deref(),
+            Some("Qwen3-8B-4bit")
+        );
+        assert_eq!(super::idoris_default(&listed[..2], None), None);
+    }
+
     #[tokio::test]
     async fn get_models_includes_the_daemons_default_model_field() {
         let state = state_with_stub().await;

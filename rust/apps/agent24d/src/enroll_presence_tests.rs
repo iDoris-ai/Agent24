@@ -510,6 +510,7 @@ async fn an_answer_from_a_peer_that_changed_since_hello_is_refused() {
                         requester: RequesterIdentity {
                             identifier: "agent24".into(),
                             pid: 1,
+                            kind: crate::capabilities::presence::RequesterKind::CommandLine,
                         },
                         expires_at: crate::capabilities::unix_now() + 60,
                     },

@@ -10,10 +10,11 @@ type Parts = Extract<DocumentsRequest, { op: 'compose' }>['parts']
 type Job = Extract<DocumentsResponse<'compose'>, { ok: true }>['data']
 type Sleep = (ms: number) => Promise<unknown>
 
-/** `all`, or pages and ranges like `1-3,5`, as the OS takes them. */
+/** `all`, or pages and ranges like `1-3,5` or `2-`, as the OS takes them. */
 export function pagesOk(spec: string): boolean {
   const n = '[1-9][0-9]{0,5}'
-  return spec === 'all' || new RegExp(`^${n}(-${n})?(,${n}(-${n})?)*$`).test(spec)
+  // `2-`: to the last page (Loop 4).
+  return spec === 'all' || new RegExp(`^${n}(-(${n})?)?(,${n}(-(${n})?)?)*$`).test(spec)
 }
 
 export type ComposeOutcome = { ok: true; documentId: string | null } | { ok: false; message: string; engineMissing?: true }

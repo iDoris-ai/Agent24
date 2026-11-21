@@ -399,7 +399,7 @@ pub async fn get_next(
             "challenge_id": c.challenge_id,
             "operation": c.operation,
             "summary": c.summary,
-            "requester": {"identifier": c.requester.identifier, "pid": c.requester.pid},
+            "requester": {"identifier": c.requester.identifier, "pid": c.requester.pid, "kind": c.requester.kind.as_str()},
             "expires_at": c.expires_at,
         }))
         .into_response(),
@@ -478,6 +478,7 @@ mod tests {
             requester: RequesterIdentity {
                 identifier: "agent24".to_owned(),
                 pid: 4242,
+                kind: crate::capabilities::presence::RequesterKind::CommandLine,
             },
             expires_at: unix_now() + ttl,
         }
@@ -901,6 +902,8 @@ mod tests {
         assert_eq!(body["summary"], "Register module agentear");
         assert_eq!(body["requester"]["identifier"], "agent24");
         assert_eq!(body["requester"]["pid"], 4242);
+        // Loop 4: the desktop words who asks from this, in the user's language.
+        assert_eq!(body["requester"]["kind"], "cli");
         assert!(body["expires_at"].as_u64().unwrap() > unix_now());
 
         let uri = "/api/v1/presence/challenges/h1";

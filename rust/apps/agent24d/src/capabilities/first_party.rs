@@ -783,9 +783,13 @@ impl EnrollAuthority for FirstPartyAuthority {
         let details = self
             .target_summary(id, &target)
             .ok_or(EnrollErrorCode::NotElevatedOperation)?;
+        let kind = super::presence::RequesterKind::of_executable(&peer.identity.executable);
         let summary = format!(
-            "{} (pid {}) wants to: {}",
-            peer.identity.identifier, peer.pid, details
+            "{} ({}, pid {}) wants to: {}",
+            peer.identity.identifier,
+            kind.label(),
+            peer.pid,
+            details
         );
         // The desktop clips this whole string, not just `details`: refuse
         // before anything is sent to `pending` or shown, so no tail is hidden.
@@ -801,6 +805,7 @@ impl EnrollAuthority for FirstPartyAuthority {
             requester: RequesterIdentity {
                 identifier: peer.identity.identifier.clone(),
                 pid: peer.pid,
+                kind,
             },
             expires_at,
         };
@@ -867,13 +872,14 @@ pub(crate) const SUMMARY_MAX_UTF16: usize = 500;
 /// K-B3b: the routes whose summary `crate::elevation_summaries` derives.
 /// Every one is an Elevated row of the route policy; the level table itself
 /// is unchanged (`derived_routes_are_the_elevated_rows_they_summarise`).
-pub(crate) const DERIVED_ROUTES: [(&str, &str); 11] = [
+pub(crate) const DERIVED_ROUTES: [(&str, &str); 12] = [
     ("POST", "/api/v1/approvals/{id}"),
     ("POST", "/api/v1/module-approvals/{id}"),
     (
         "POST",
         "/api/v1/module-consents/modules/{module}/tools/{tool}",
     ),
+    ("POST", "/api/v1/module-consents/modules/{module}/tools"),
     ("POST", "/api/v1/schedules"),
     ("PATCH", "/api/v1/schedules/{id}"),
     ("DELETE", "/api/v1/schedules/{id}"),
@@ -1739,8 +1745,10 @@ mod tests {
             .unwrap();
         let calls = capture.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
+        // Loop 4: the kind of program asking is named, from its executable.
+        assert!(calls[0].summary.contains("pid "), "{}", calls[0].summary);
         for detail in [
-            "允许桌面写入 probe 模块的数据",
+            "允许发起方写入 probe 模块的数据",
             "'probe'",
             "version: 2.3",
             "namespace: /api/v1/probe",
@@ -2114,5 +2122,45 @@ mod tests {
             resolve_target(&r).unwrap_err(),
             EnrollErrorCode::UnknownRoute
         );
+    }
+}
+
+#[cfg(test)]
+mod requester_kind_tests {
+    /// Loop 4 (PM 11-20): who asks is told from the executable the daemon
+    /// verified: the app, the command line, or another program.
+    #[test]
+    fn the_requester_kind_comes_from_the_verified_executable() {
+        use crate::capabilities::presence::RequesterKind;
+        use std::path::Path;
+        for (path, kind) in [
+            (
+                "/Applications/Agent24.app/Contents/MacOS/Agent24",
+                RequesterKind::Desktop,
+            ),
+            (
+                "/Applications/Agent24.app/Contents/Resources/backend/agent24",
+                RequesterKind::CommandLine,
+            ),
+            (
+                "/Applications/Agent24.app/Contents/Resources/backend/agent24-dev-unsigned",
+                RequesterKind::CommandLine,
+            ),
+            ("/usr/local/bin/agent24", RequesterKind::CommandLine),
+            (
+                "/Applications/Agent24.app/Contents/Resources/backend/agent24d",
+                RequesterKind::Other,
+            ),
+            ("/tmp/Agent24", RequesterKind::Other),
+            ("/usr/bin/python3", RequesterKind::Other),
+        ] {
+            assert_eq!(
+                RequesterKind::of_executable(Path::new(path)),
+                kind,
+                "{path}"
+            );
+        }
+        assert_eq!(RequesterKind::CommandLine.as_str(), "cli");
+        assert!(RequesterKind::CommandLine.label().contains("command line"));
     }
 }
