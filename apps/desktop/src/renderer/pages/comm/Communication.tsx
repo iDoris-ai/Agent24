@@ -29,7 +29,7 @@ import { translate, useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import './communication.css'
 import { ErrorNotice } from '../../ui'
-import { getDefaultRelays } from './relayDefaults'
+import { RELAY_SELF_HOST_GUIDE_URL, getDefaultRelays } from './relayDefaults'
 import { parseRelayList } from '../../../shared/relay-list'
 import { listComponents, type ComponentView } from '../../components/componentApi'
 import { filterHumanCommMessages } from './history-filter'
@@ -870,6 +870,7 @@ export default function CommunicationPage() {
             </button>
           </div>
         </form>
+        <p className="comm-muted"><a href={RELAY_SELF_HOST_GUIDE_URL} target="_blank" rel="noreferrer">{t('relay.selfHost')}</a></p>
       </section>
 
       <section className="comm-card">
