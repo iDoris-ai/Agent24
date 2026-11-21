@@ -6,11 +6,12 @@ import { settingsMessages } from '../Settings.i18n'
 import { isChatModelId } from './chatModels'
 import ModelSourcePanel from '../../components/idoris/ModelSourcePanel'
 
-const IDORIS_STATE: Record<IdorisStatus['state'], 'state.not_installed' | 'state.not_configured' | 'state.stopped' | 'state.starting' | 'state.running' | 'state.failed' | 'state.instance_conflict'> = {
+const IDORIS_STATE: Record<IdorisStatus['state'], 'state.not_installed' | 'state.not_configured' | 'state.stopped' | 'state.starting' | 'state.recovering' | 'state.running' | 'state.failed' | 'state.instance_conflict'> = {
   not_installed: 'state.not_installed',
   not_configured: 'state.not_configured',
   stopped: 'state.stopped',
   starting: 'state.starting',
+  degraded: 'state.recovering',
   running: 'state.running',
   failed: 'state.failed',
   instance_conflict: 'state.instance_conflict',

@@ -1102,6 +1102,10 @@ impl IdorisHost {
                     }),
                 )
                 .await?;
+            if let Some(ports) = supervisor.runtime_status().borrow().ports {
+                pending.candidate.data_port = ports.data;
+                pending.candidate.admin_port = ports.admin;
+            }
             new_supervisor = Some(supervisor);
             self.phase(id, Phase::VerifyingConnection).await;
             let config = ManagedConfig {

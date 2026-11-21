@@ -459,6 +459,7 @@ fn from_idoris(
         IdorisState::NotConfigured => (S::Installed, Some("not_configured")),
         IdorisState::Stopped => (S::Stopped, None),
         IdorisState::Starting => (S::Starting, None),
+        IdorisState::Degraded => (S::Degraded, Some("idoris_recovering")),
         IdorisState::Running => (S::Ready, None),
         // `ContractMismatch` comes from the supervisor's `/health` check as a whole: a wrong
         // contract version, but also a wrong `service`, an empty `instance_id` or dev-no-key.
