@@ -1180,7 +1180,7 @@ impl IdorisHost {
         if let Err(error) = result {
             self.phase(id, Phase::RollingBack).await;
             let stopped = if let Some(supervisor) = new_supervisor {
-                self.block_gateway();
+                self.fail_gateway();
                 supervisor.stop().await.map_err(Code::from).map(|_| ())
             } else {
                 Ok(())

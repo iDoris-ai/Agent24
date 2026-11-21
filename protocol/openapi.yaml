@@ -56,8 +56,9 @@ tags:
   - name: chat
     description: >-
       One-shot LLM chat completion. HTTP 503 idoris_unavailable may report
-      stopped (start the managed service), readiness_timeout, connection_lost,
-      or circuit_open (retry later). A stopped service fails immediately;
+      stopped (start the managed service), failed (start, restart or reconnect
+      failed; see the iDoris status), readiness_timeout, connection_lost, or
+      circuit_open (retry later). A stopped service fails immediately;
       starting or restarting waits up to 30 seconds for readiness.
   - name: sessions
     description: Conversation sessions — the container runs belong to.

@@ -1026,14 +1026,23 @@ impl IdorisHost {
             tracing::warn!("cannot persist iDoris operation phase");
         }
     }
-    fn block_gateway(&self) {
+    fn retain_draining_lease(&self) {
         if let Some(lease) = self.router.published_lease() {
             *self.draining.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
         }
+    }
+    fn block_gateway(&self) {
+        self.retain_draining_lease();
         self.router.block_idoris("stopped");
     }
+    /// A start, restart or reconnect failed: requests fail fast, but not as "stopped".
+    fn fail_gateway(&self) {
+        self.retain_draining_lease();
+        self.router.block_idoris("failed");
+    }
+    /// One write: the slot never shows "stopped" between a running and a starting gateway.
     fn starting_gateway(&self) {
-        self.block_gateway();
+        self.retain_draining_lease();
         self.router.starting_idoris();
     }
     async fn prepare_gateway(
@@ -1260,7 +1269,7 @@ impl IdorisHost {
         }
         .await;
         if let Err(e) = connected {
-            self.block_gateway();
+            self.fail_gateway();
             supervisor.stop().await.map_err(Code::from)?;
             return Err(e);
         }
@@ -1306,7 +1315,11 @@ impl IdorisHost {
                                 .take()
                                 .or(error)
                                 .or(i.last_error);
-                            host.block_gateway();
+                            if error.is_some() {
+                                host.fail_gateway();
+                            } else {
+                                host.block_gateway();
+                            }
                             i.last_error = error;
                             i.state = match error {
                                 Some(Code::InstanceConflict) => State::InstanceConflict,
@@ -1373,7 +1386,7 @@ impl IdorisHost {
                         }
                         i.state = State::Running;
                     } else {
-                        host.block_gateway();
+                        host.fail_gateway();
                         i.last_error = result.err();
                         i.state = State::Failed;
                         if let Some(s) = &i.supervisor {

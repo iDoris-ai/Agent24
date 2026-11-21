@@ -833,6 +833,9 @@ async fn start_during_supervisor_restart_is_busy_and_stop_wins_readiness_updates
     })
     .await
     .unwrap();
+    // Requests arriving during the restart must wait, not fail as "stopped".
+    let restarting = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(restarting.contains("starting"), "{restarting}");
     assert!(matches!(
         f.host.submit(Action::Start, None).await,
         Err(Code::Busy)
