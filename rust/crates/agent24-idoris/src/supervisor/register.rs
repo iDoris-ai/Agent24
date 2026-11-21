@@ -543,10 +543,8 @@ async fn handshake(
             .lock()
             .map_err(|_| "internal")?
             .map_or(ownership, Ok);
-        match ownership {
-            Ok(true) => {}
-            Err(error) if error.kind() == io::ErrorKind::Unsupported && cfg!(test) => {}
-            _ => return Err("identity_rejected"),
+        if !super::ownership_verdict(ownership, cfg!(test)) {
+            return Err("identity_rejected");
         }
         let info = SessionInfo {
             instance_id: registration.instance_id,

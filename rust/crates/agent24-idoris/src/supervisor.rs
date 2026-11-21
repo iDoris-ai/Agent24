@@ -1193,6 +1193,15 @@ async fn wait_group_gone(group: Pid) -> io::Result<()> {
     Ok(())
 }
 
+/// G1: an unsupported ownership probe counts as owned only where the caller allows it
+/// (tests); production fails closed.
+pub(crate) fn ownership_verdict(result: io::Result<bool>, allow_unsupported: bool) -> bool {
+    match result {
+        Ok(owned) => owned,
+        Err(error) => error.kind() == io::ErrorKind::Unsupported && allow_unsupported,
+    }
+}
+
 /// F3/N1: loopback has no peer identity, so a 200 from a port proves
 /// nothing. Before the Admin token leaves this process, every visible
 /// LISTEN socket on both ports must be held by this generation's group.
@@ -1207,11 +1216,7 @@ async fn listeners_owned(
             agent24_os_proc::owns_listening_ports(group.as_raw(), &[ports.data, ports.admin]);
         #[cfg(test)]
         let ownership = config.port_ownership.map_or(ownership, Ok);
-        return match ownership {
-            Ok(owned) => Ok(owned),
-            Err(error) if error.kind() == io::ErrorKind::Unsupported && cfg!(test) => Ok(true),
-            Err(_) => Ok(false),
-        };
+        return Ok(ownership_verdict(ownership, cfg!(test)));
     }
     for port in [ports.data, ports.admin] {
         let found = identity::listeners(port, config.timings.health_request).await;

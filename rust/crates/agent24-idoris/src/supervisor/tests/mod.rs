@@ -1715,13 +1715,26 @@ async fn ic3b_drop_kills_launcher_without_register_socket() {
     check_drop(true, false, false).await;
 }
 
+/// Child process for `ic3b_adoption_requires_launch`; never runs on its own.
+#[test]
+#[ignore]
+fn ic3b_sleeper() {
+    std::thread::sleep(Duration::from_secs(60));
+}
+
 #[tokio::test]
 async fn ic3b_adoption_requires_launch() {
     let fixture = Fixture::new(serde_json::json!({}));
-    fs::copy("/bin/sleep", fixture.root.join("release/idoris")).unwrap();
+    // macOS kills a system binary copied off the system volume; the linker-signed
+    // test executable runs from anywhere.
+    fs::copy(
+        std::env::current_exe().unwrap(),
+        fixture.root.join("release/idoris"),
+    )
+    .unwrap();
     let config = Arc::new(fixture.config().await);
     let mut child = Command::new(config.installed.binary())
-        .arg("60")
+        .args(["--ignored", "--exact", "supervisor::tests::ic3b_sleeper"])
         .process_group(0)
         .kill_on_drop(true)
         .spawn()
@@ -1754,4 +1767,14 @@ async fn ic3b_adoption_requires_launch() {
         });
     }
     child.kill().await.unwrap();
+}
+
+#[test]
+fn ic3b_unsupported_ownership_fails_closed_outside_tests() {
+    let unsupported = || Err(io::Error::from(io::ErrorKind::Unsupported));
+    assert!(!ownership_verdict(unsupported(), false));
+    assert!(ownership_verdict(unsupported(), true));
+    assert!(ownership_verdict(Ok(true), false));
+    assert!(!ownership_verdict(Ok(false), true));
+    assert!(!ownership_verdict(Err(io::Error::other("x")), true));
 }
