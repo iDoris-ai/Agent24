@@ -336,6 +336,7 @@ fn recalled_context_survives_approval_wait_and_daemon_restart() {
             let run = state
                 .runs
                 .start_run(RunCreate {
+                    knowledge_query: None,
                     idoris_headroom_confirmed: false,
                     workspace_id: None,
                     session_id: Some(RECALL_SESSION.into()),
@@ -480,6 +481,7 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
             let control = state
                 .runs
                 .start_run(RunCreate {
+                    knowledge_query: None,
                     idoris_headroom_confirmed: false,
                     workspace_id: None,
                     session_id: None,
@@ -535,6 +537,7 @@ fn failed_recall_snapshot_persist_fails_closed_across_daemon_restart() {
             let run = state
                 .runs
                 .start_run(RunCreate {
+                    knowledge_query: None,
                     idoris_headroom_confirmed: false,
                     workspace_id: None,
                     session_id: Some(RECALL_SESSION.into()),
@@ -749,6 +752,7 @@ async fn malicious_recall_content_does_not_alter_system_rules_or_tool_authorizat
     let run = state
         .runs
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: None,
@@ -868,6 +872,7 @@ fn resume_reconstructs_the_prior_turns_history_not_only_the_recall_and_prompt() 
             let run = state
                 .runs
                 .start_run(RunCreate {
+                    knowledge_query: None,
                     idoris_headroom_confirmed: false,
                     workspace_id: None,
                     session_id: Some(HISTORY_SESSION.into()),
@@ -1012,6 +1017,7 @@ fn forgotten_memory_is_not_resurrected_by_resume_after_an_approval_pends() {
             let run = state
                 .runs
                 .start_run(RunCreate {
+                    knowledge_query: None,
                     idoris_headroom_confirmed: false,
                     workspace_id: None,
                     session_id: None,
@@ -1147,6 +1153,7 @@ async fn forgetting_memory_while_still_parked_in_process_prunes_on_the_next_mode
     let run = state
         .runs
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: None,

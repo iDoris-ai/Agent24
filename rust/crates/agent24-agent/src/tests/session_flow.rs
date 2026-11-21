@@ -7,6 +7,7 @@ async fn run_in_session(
 ) -> Run {
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some(session_id.to_owned()),
             workspace_id: None,
@@ -363,6 +364,7 @@ async fn run_scheduled(
     let run = manager
         .start_run_with_schedule(
             RunCreate {
+                knowledge_query: None,
                 idoris_headroom_confirmed: false,
                 session_id: session_id.map(str::to_owned),
                 workspace_id: None,
@@ -817,6 +819,7 @@ async fn a_run_that_never_parks_sheds_its_copy_of_prior_context_once_terminal() 
 
     let run1 = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_shed".to_owned()),
             workspace_id: None,
@@ -840,6 +843,7 @@ async fn a_run_that_never_parks_sheds_its_copy_of_prior_context_once_terminal() 
 
     let run2 = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_shed".to_owned()),
             workspace_id: None,
@@ -899,6 +903,7 @@ async fn concurrent_runs_in_one_session_keep_both_turns() {
     for prompt in ["alpha", "beta"] {
         let run = manager
             .start_run(RunCreate {
+                knowledge_query: None,
                 idoris_headroom_confirmed: false,
                 session_id: Some("sess_race".to_owned()),
                 workspace_id: None,
@@ -1051,6 +1056,7 @@ async fn cancel_during_the_memory_write_still_cancels_the_run() {
     seed_session(&store, "sess_cancel").await;
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_cancel".to_owned()),
             workspace_id: None,
@@ -1128,6 +1134,7 @@ async fn cancel_while_waiting_on_another_runs_session_lock_is_prompt() {
     // Run A: proceed until it is inside compaction, holding the lock.
     let run_a = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_lockwait".to_owned()),
             workspace_id: None,
@@ -1146,6 +1153,7 @@ async fn cancel_while_waiting_on_another_runs_session_lock_is_prompt() {
     // Run B: blocks in session_context() waiting for A's lock.
     let run_b = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_lockwait".to_owned()),
             workspace_id: None,
@@ -1243,6 +1251,7 @@ async fn an_ordinary_run_is_user_input_and_an_inbound_run_is_unknown_and_blocked
     let started = manager
         .start_run_inbound(
             RunCreate {
+                knowledge_query: None,
                 idoris_headroom_confirmed: false,
                 session_id: Some("sess_inbound".to_owned()),
                 workspace_id: None,

@@ -69,6 +69,7 @@ fn policy(max_recent: usize) -> CompactionPolicy {
 async fn run_completed(manager: &Arc<RunManager>, store: &Store, session: &str, prompt: &str) {
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some(session.to_owned()),

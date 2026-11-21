@@ -148,6 +148,7 @@ impl RunManager {
         } else {
             now_iso8601()
         };
+        let knowledge_query = create.knowledge_query.clone();
         let run = Run {
             id: format!("run_{}", ulid()),
             session_id: create.session_id.clone(),
@@ -203,6 +204,13 @@ impl RunManager {
                 self.cancels.lock().await.remove(&run.id);
                 return Err(AgentError::Store(StoreError::SkillPointerConflict));
             }
+        }
+        // Inbound runs are not the account owner asking: no search first.
+        if let Some(query) = knowledge_query.filter(|_| inbound.is_none()) {
+            self.knowledge_queries
+                .lock()
+                .await
+                .insert(run.id.clone(), query);
         }
         if let Some(origin) = &inbound {
             // Before spawn, so execute cannot finish (and try to mark done)

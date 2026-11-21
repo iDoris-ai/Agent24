@@ -127,6 +127,7 @@ async fn approved_shell_exec_actually_executes() {
 
 fn create_plan() -> RunCreate {
     RunCreate {
+        knowledge_query: None,
         idoris_headroom_confirmed: false,
         session_id: None,
         workspace_id: None,

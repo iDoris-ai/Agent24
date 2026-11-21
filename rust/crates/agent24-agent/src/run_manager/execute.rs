@@ -33,6 +33,7 @@ impl RunManager {
         // non-Ordinary user-input tag are the durable signal. A lookup error
         // is external, so the tag cannot fall through to Ordinary.
         let mapped_inbound = self.inbound_origins.lock().await.remove(&run_id).is_some();
+        let knowledge_query = self.knowledge_queries.lock().await.remove(&run_id);
         let inbound_external = mapped_inbound || self.persisted_external_prompt(&run_id).await;
         // Cancelled before starting? queued → cancelled directly.
         if cancel.is_cancelled() {
@@ -496,6 +497,12 @@ impl RunManager {
         }
         // H8: a fresh plan-mode run starts read-only; a Normal run never is.
         let plan_mode = matches!(run.input.mode, RunMode::Plan);
+        if !self
+            .search_knowledge_first(&run, knowledge_query.as_deref(), &mut snapshot, &cancel)
+            .await
+        {
+            return;
+        }
         self.run_loop(run, snapshot, plan_mode, cancel, idoris_headroom_confirmed)
             .await;
         // M3 growth control, chosen approach: reclaim the prior-context copy
@@ -711,6 +718,50 @@ impl RunManager {
     /// way (fresh: prior context + prompt; resumed: reconstructed thread + the
     /// settled parked call), then hands it here. Bounded by MAX_ITERATIONS;
     /// usage accumulates across iterations.
+    /// M1 retrieval first (David 2026-11-21, a detail of decision 2026-10-30
+    /// A): a 4-bit model answered 「烧开水要多久」 from what it knew, 3 searches
+    /// in 5 even when told to. A fresh run that names a Knowledge binding and
+    /// a `knowledge_query` searches once before the model is asked, through
+    /// the same tool and record as a search the model asks for. Hits go in as
+    /// that search's call and result; no hit, a failure or a refusal leaves
+    /// the thread as it was, so the answer still comes. False only when the
+    /// thread could not be persisted (the run has then ended).
+    async fn search_knowledge_first(
+        &self,
+        run: &Run,
+        query: Option<&str>,
+        messages: &mut Vec<Msg>,
+        cancel: &CancellationToken,
+    ) -> bool {
+        const SEARCH: &str = "knowledge_search";
+        let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else {
+            return true;
+        };
+        if run.input.knowledge_binding_id.is_none()
+            || retain::explicit_remember(query).is_some()
+            || self.tools.tool_risk_class(SEARCH).is_none()
+        {
+            return true;
+        }
+        let call = agent24_models::ToolCallRequest {
+            id: format!("call_kbfirst_{}", agent24_core::util::ulid()),
+            name: SEARCH.to_owned(),
+            arguments: serde_json::json!({ "query": query }).to_string(),
+        };
+        let Ok(answer) = self.run_tool_call(run, &call, cancel, false).await else {
+            return true;
+        };
+        if !has_evidence(&answer.content) {
+            return true;
+        }
+        let asked = Msg::assistant(None, vec![call.clone()]);
+        if !self.persist_for_next_send(&run.id, &asked).await {
+            return false;
+        }
+        messages.push(asked);
+        self.answer_tool_call(run, messages, &call, answer).await
+    }
+
     pub(crate) async fn run_loop(
         &self,
         run: Run,
@@ -1015,4 +1066,18 @@ impl RunManager {
         )
         .await;
     }
+}
+
+/// A knowledge search's result with at least one passage (`evidence`, as
+/// `agent24_knowledge::tool::evidence::render_search` writes it). Anything
+/// else (none, an error text, a refusal) is no evidence.
+fn has_evidence(content: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|v| {
+            v.get("evidence")
+                .and_then(|e| e.as_array())
+                .map(|e| !e.is_empty())
+        })
+        .unwrap_or(false)
 }
