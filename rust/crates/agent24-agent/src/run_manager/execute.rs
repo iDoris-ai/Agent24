@@ -733,7 +733,7 @@ impl RunManager {
         messages: &mut Vec<Msg>,
         cancel: &CancellationToken,
     ) -> bool {
-        const SEARCH: &str = "knowledge_search";
+        const SEARCH: &str = FIRST_SEARCH;
         let Some(query) = query.map(str::trim).filter(|q| !q.is_empty()) else {
             return true;
         };
@@ -744,7 +744,7 @@ impl RunManager {
             return true;
         }
         let call = agent24_models::ToolCallRequest {
-            id: format!("call_kbfirst_{}", agent24_core::util::ulid()),
+            id: format!("{FIRST_CALL_PREFIX}{}", agent24_core::util::ulid()),
             name: SEARCH.to_owned(),
             arguments: serde_json::json!({ "query": query, "max_results": FIRST_HITS }).to_string(),
         };
@@ -773,6 +773,11 @@ impl RunManager {
     ) {
         let run_id = run.id.clone();
         let mut usage_total = zero_usage();
+        let searched_first = messages.iter().any(|m| {
+            m.tool_calls
+                .iter()
+                .any(|c| c.id.starts_with(FIRST_CALL_PREFIX))
+        });
 
         for _ in 0..MAX_ITERATIONS {
             if !self.persisted_origins_allow_send(&run_id).await {
@@ -808,6 +813,12 @@ impl RunManager {
             } else {
                 self.tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
                     .await
+                    .into_iter()
+                    // PM (0.6.75): a turn searched first is not offered the
+                    // search again; its long description and schema are left
+                    // out of a prompt an 8 GB Mac can barely hold.
+                    .filter(|spec| !(searched_first && spec.name == FIRST_SEARCH))
+                    .collect()
             };
             let request = CompletionRequest {
                 messages: send_messages,
@@ -864,6 +875,15 @@ impl RunManager {
                     return;
                 }
             };
+            // PM (0.6.75): what each model call cost, to see a turn stays in
+            // what the local model can hold (0.6.72: about 3–3.5k).
+            tracing::info!(
+                run_id = %run_id,
+                prompt_tokens = res.usage.prompt_tokens,
+                completion_tokens = res.usage.completion_tokens,
+                searched_first,
+                "model call"
+            );
             usage_total = add_usage(usage_total, &res.usage);
 
             if res.message.role != "assistant" {
@@ -1069,6 +1089,10 @@ impl RunManager {
     }
 }
 
+/// The tool a turn is searched with first.
+const FIRST_SEARCH: &str = "knowledge_search";
+/// The id prefix of that call, which marks a turn searched first.
+const FIRST_CALL_PREFIX: &str = "call_kbfirst_";
 /// Passages the search first asks for.
 const FIRST_HITS: u64 = 3;
 /// Characters of a passage that go in.
