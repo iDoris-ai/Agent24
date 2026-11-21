@@ -72,6 +72,7 @@ pub struct AppState {
     /// D2 router: every model call goes through tier routing + health/cooldown,
     /// so a downed local provider backs off and a LocalOnly task never leaks.
     pub router: Arc<ModelRouter>,
+    pub assistant_admission: Arc<crate::model_callback::ModelAdmission>,
     pub idoris_host: Option<Arc<agent24_idoris::idoris_host::IdorisHost>>,
     pub idoris_unavailable: bool,
     /// Where the Hyphae daemon supervisor lives, once `serve` has one (`/api/v1/components`).
@@ -338,12 +339,14 @@ impl AppState {
                 grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
                     scheduler: scheduler.clone(),
                     models: None,
+                    assistant: None,
                     approval_broker: module_approval_broker.clone(),
                     events: events.clone(),
                 }),
             },
         ));
         Self {
+            assistant_admission: crate::model_callback::ModelAdmission::new(usize::MAX, 1),
             os_signature: os_signature_policy(),
             risk_overrides,
             token: Arc::new(token),

@@ -73,7 +73,7 @@ AgentEar 双击说话，附着 Agent24 后现在走 `_a24/model/complete`（ME4-
 | 已有一个助手调用在进行 | `busy` |
 | 模型不可用（iDoris 未就绪、503 等） | `unavailable`，message 带 iDoris 给的 reason |
 | 超过 90 秒 | `timeout` |
-| 等待用户在桌面审批 | `awaiting_approval`（新增；如果封闭集合不便扩展，用 `unavailable` + `data.reason = "awaiting_approval"`，实现时二选一并写进本节） |
+| 等待用户在桌面审批 | `unavailable` + `data.reason = "awaiting_approval"`（保留通用 RPC 封闭集合） |
 | 会话或记忆存储失败 | `internal`，不带内部路径或 stderr |
 
 ## 不做（FU）

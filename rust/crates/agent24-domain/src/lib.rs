@@ -164,6 +164,8 @@ pub enum Capability {
     Events,
     /// Ask the kernel's model router for completions.
     Models,
+    /// Converse with the kernel assistant, including personal context.
+    Assistant,
     /// Register/inspect schedules.
     Scheduler,
     /// Consult the approval/risk policy engine.
@@ -182,6 +184,7 @@ pub enum Capability {
 pub const ALL_CAPABILITIES: &[Capability] = &[
     Capability::Events,
     Capability::Models,
+    Capability::Assistant,
     Capability::Scheduler,
     Capability::Policy,
     Capability::Memory,
@@ -232,6 +235,7 @@ impl Capability {
         match self {
             Capability::Events => "events",
             Capability::Models => "models",
+            Capability::Assistant => "assistant",
             Capability::Scheduler => "scheduler",
             Capability::Policy => "policy",
             Capability::Memory => "memory",
@@ -1789,6 +1793,7 @@ impl_kind: in_process_crate
         let every_variant: Vec<Capability> = [
             Capability::Events,
             Capability::Models,
+            Capability::Assistant,
             Capability::Scheduler,
             Capability::Policy,
             Capability::Memory,
@@ -1801,6 +1806,7 @@ impl_kind: in_process_crate
             match c {
                 Capability::Events
                 | Capability::Models
+                | Capability::Assistant
                 | Capability::Scheduler
                 | Capability::Policy
                 | Capability::Memory

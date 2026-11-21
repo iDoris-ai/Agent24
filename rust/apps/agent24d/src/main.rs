@@ -86,6 +86,7 @@ mod host_bootstrap {
         }
     }
 }
+mod assistant_callback;
 mod default_model;
 mod lifecycle;
 mod mcp;

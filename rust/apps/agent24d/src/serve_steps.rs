@@ -1437,6 +1437,9 @@ pub(super) async fn mount_domain_os(
             // awaits the writer's join (its own doc comment explains why
             // that ordering matters).
             models: Some(model_deps.clone()),
+            assistant: Some(crate::assistant_callback::AssistantCallbackDeps::from(
+                state,
+            )),
         },
         Some(&state.store),
     )
@@ -1644,6 +1647,9 @@ pub(super) async fn publish_mount_and_attach(
             grants: Arc::new(crate::attach_grant::DaemonAttachGrantBuilder {
                 scheduler: state.scheduler.clone(),
                 models: Some(model_deps),
+                assistant: Some(crate::assistant_callback::AssistantCallbackDeps::from(
+                    &*state,
+                )),
                 approval_broker: state.module_approval_broker.clone(),
                 events: state.events.clone(),
             }),

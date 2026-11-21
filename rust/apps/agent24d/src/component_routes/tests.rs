@@ -1196,6 +1196,7 @@ async fn admission_builder(with_models: bool) -> crate::attach_grant::DaemonAtta
     let store = agent24_store::Store::open_memory().await.unwrap();
     let events = crate::events::EventsHub::default();
     crate::attach_grant::DaemonAttachGrantBuilder {
+        assistant: None,
         scheduler: agent24_scheduler::Scheduler::new(
             store.clone(),
             Arc::new(NoopTrigger),
