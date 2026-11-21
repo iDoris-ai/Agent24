@@ -26,19 +26,25 @@ pub enum ModelError {
 /// A gateway built by [`IdorisSlot::open_gateway`], still unpublished.
 pub struct PreparedGateway {
     inner: Box<dyn Any + Send + Sync>,
+    /// Whether the host bound an embedding model for this gateway.
+    pub embedding_enabled: bool,
 }
 
 impl PreparedGateway {
     pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
         Self {
             inner: Box::new(value),
+            embedding_enabled: true,
         }
     }
 
     pub fn downcast<T: Send + Sync + 'static>(self) -> Result<T, Self> {
         match self.inner.downcast::<T>() {
             Ok(value) => Ok(*value),
-            Err(inner) => Err(Self { inner }),
+            Err(inner) => Err(Self {
+                inner,
+                embedding_enabled: self.embedding_enabled,
+            }),
         }
     }
 
@@ -79,6 +85,7 @@ pub struct ConnectionCheck {
 #[async_trait]
 pub trait IdorisSlot: Send + Sync {
     fn block_idoris(&self, reason: &str);
+    fn starting_idoris(&self);
     fn replace_idoris(&self, gateway: PreparedGateway) -> Result<(), ModelError>;
     fn published_lease(&self) -> Option<GatewayLease>;
     async fn open_gateway(
@@ -142,7 +149,7 @@ fn error(message: &str) -> ModelError {
 impl ManagedIdoris {
     pub fn new(router: Arc<dyn IdorisSlot>, path: PathBuf) -> std::io::Result<Self> {
         if path.try_exists()? {
-            router.block_idoris("managed iDoris is waiting for supervisor readiness and Keychain");
+            router.starting_idoris();
         }
         Ok(Self {
             router,

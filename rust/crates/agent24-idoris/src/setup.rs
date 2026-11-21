@@ -138,16 +138,26 @@ pub fn write_openai_compat_card(
     endpoint: &str,
     daily: &str,
     deep: &str,
+    embed: Option<&str>,
 ) -> Result<SetupOutcome, SetupError> {
     let components = components_root(instance_root)?;
     let generation = tempfile::Builder::new()
         .prefix("gen-")
         .tempdir_in(&components)
         .map_err(|_| SetupError::Io)?;
+    let capabilities = if embed.is_some() {
+        "chat, embedding"
+    } else {
+        "chat"
+    };
+    let embed_line = embed
+        .map(|id| format!("    embed: \"{id}\"\n"))
+        .unwrap_or_default();
     let card = format!(
-        "provider:\n  id: lmstudio\n  family: local\n  tier: local\n  capabilities: [chat]\n  privacy_class: local_only\n  cost: {{ input_per_m: 0, output_per_m: 0 }}\n  locality: loopback\nform: http_service\nendpoint: \"{endpoint}\"\nversion_pin: \"lmstudio@0\"\nprivacy_class: local_only\nallowed_egress: [loopback]\nfallback_policy: fail_closed\nfail_closed: true\nload_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}\nextensions:\n  _degradation: \"Removing these bindings disables role aliases on this backend.\"\n  idoris_role_models:\n    daily: \"{daily}\"\n    deep: \"{deep}\"\n"
+        "provider:\n  id: lmstudio\n  family: local\n  tier: local\n  capabilities: [{capabilities}]\n  privacy_class: local_only\n  cost: {{ input_per_m: 0, output_per_m: 0 }}\n  locality: loopback\nform: http_service\nendpoint: \"{endpoint}\"\nversion_pin: \"lmstudio@0\"\nprivacy_class: local_only\nallowed_egress: [loopback]\nfallback_policy: fail_closed\nfail_closed: true\nload_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}\nextensions:\n  _degradation: \"Removing these bindings disables role aliases on this backend.\"\n  idoris_role_models:\n    daily: \"{daily}\"\n    deep: \"{deep}\"\n"
     );
-    std::fs::write(generation.path().join("lmstudio.yaml"), card).map_err(|_| SetupError::Io)?;
+    std::fs::write(generation.path().join("lmstudio.yaml"), card + &embed_line)
+        .map_err(|_| SetupError::Io)?;
     let path = generation.keep();
     Ok(SetupOutcome {
         components_dir: path,
@@ -156,6 +166,7 @@ pub fn write_openai_compat_card(
             (Role::Deep, deep.to_owned()),
         ]
         .into_iter()
+        .chain(embed.map(|id| (Role::Embed, id.to_owned())))
         .collect(),
         auth_required: false,
     })

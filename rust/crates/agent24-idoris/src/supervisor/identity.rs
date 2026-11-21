@@ -268,6 +268,34 @@ impl Lease {
             Err(error) => Err(error),
         }
     }
+    pub fn adoptable(&self, executable: &Path, pid: u32) -> Option<ProcessRecord> {
+        let record = match OpenOptions::new()
+            .read(true)
+            .custom_flags(nix::libc::O_NOFOLLOW)
+            .open(&self.record)
+        {
+            Ok(file) => {
+                let mut body = Vec::new();
+                file.take(4097).read_to_end(&mut body).ok()?;
+                if body.len() > 4096 {
+                    return None;
+                }
+                serde_json::from_slice::<ProcessRecord>(&body).ok()?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                ProcessRecord::capture(pid).ok()?
+            }
+            Err(_) => return None,
+        };
+        if record.pid != pid
+            || record.executable != fs::canonicalize(executable).ok()?
+            || !record.alive().ok()?
+        {
+            return None;
+        }
+        record.verify_current().ok()?;
+        Some(record)
+    }
     pub async fn recover(
         &self,
         timings: &Timings,

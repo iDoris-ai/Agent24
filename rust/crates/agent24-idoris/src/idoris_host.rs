@@ -125,6 +125,7 @@ pub enum State {
     NotConfigured,
     Stopped,
     Starting,
+    Degraded,
     Running,
     Failed,
     InstanceConflict,
@@ -227,6 +228,16 @@ impl From<SupervisorError> for Code {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub registered: bool,
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default)]
+    pub crashes: u64,
+    #[serde(default)]
+    pub hangs: u64,
+    #[serde(default)]
+    pub circuit_open: bool,
     pub state: State,
     pub version: Option<String>,
     pub data_port: Option<u16>,
@@ -681,7 +692,7 @@ impl IdorisHost {
             Some(_) => State::Stopped,
         };
         if installation.is_some() {
-            router.block_idoris("managed iDoris stopped");
+            router.block_idoris("stopped");
         }
         Ok(Arc::new(Self {
             install_root: root.clone(),
@@ -732,7 +743,17 @@ impl IdorisHost {
     pub async fn status(&self) -> Status {
         let i = self.inner.lock().await;
         let r = i.installation.as_ref();
+        let recovery = i
+            .supervisor
+            .as_ref()
+            .map(|s| s.runtime_status().borrow().clone())
+            .unwrap_or_default();
         let mut status = Status {
+            registered: recovery.registered,
+            instance_id: recovery.instance_id,
+            crashes: recovery.crashes,
+            hangs: recovery.hangs,
+            circuit_open: recovery.circuit_open,
             state: i.state,
             version: r.map(|r| r.version.clone()),
             data_port: r.map(|r| r.data_port),
@@ -1009,7 +1030,11 @@ impl IdorisHost {
         if let Some(lease) = self.router.published_lease() {
             *self.draining.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
         }
-        self.router.block_idoris("managed iDoris not ready");
+        self.router.block_idoris("stopped");
+    }
+    fn starting_gateway(&self) {
+        self.block_gateway();
+        self.router.starting_idoris();
     }
     async fn prepare_gateway(
         &self,
@@ -1026,7 +1051,10 @@ impl IdorisHost {
         };
         ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
             .await
-            .map(|gateway| (config, gateway))
+            .map(|mut gateway| {
+                gateway.embedding_enabled = record.roles.contains(&crate::setup::Role::Embed);
+                (config, gateway)
+            })
             .map_err(|_| {
                 if cancel.is_cancelled() {
                     Code::Cancelled
@@ -1088,6 +1116,7 @@ impl IdorisHost {
             return Ok(());
         }
         self.phase(id, Phase::Starting).await;
+        self.starting_gateway();
         let record = {
             let mut i = self.inner.lock().await;
             i.state = State::Starting;
@@ -1176,7 +1205,7 @@ impl IdorisHost {
             },
             move || async move {
                 if let Some(host) = host.upgrade() {
-                    host.block_gateway();
+                    host.starting_gateway();
                     loop {
                         let pending = host
                             .draining
@@ -1213,8 +1242,18 @@ impl IdorisHost {
                         Code::StartFailed
                     }
                 })?;
+            let mut record = record.clone();
+            let ports = supervisor.runtime_status().borrow().ports;
+            if let Some(ports) = ports {
+                record.data_port = ports.data;
+                record.admin_port = ports.admin;
+                if let Some(saved) = &mut self.inner.lock().await.installation {
+                    saved.data_port = ports.data;
+                    saved.admin_port = ports.admin;
+                }
+            }
             if publish {
-                self.connect_gateway(record, cancel).await
+                self.connect_gateway(&record, cancel).await
             } else {
                 Ok(())
             }
@@ -1230,7 +1269,7 @@ impl IdorisHost {
     fn monitor(
         self: &Arc<Self>,
         mut signal: watch::Receiver<bool>,
-        record: Installation,
+        mut record: Installation,
         generation: String,
         cancel: CancellationToken,
         refresh_failure: Arc<SyncMutex<Option<Code>>>,
@@ -1278,6 +1317,14 @@ impl IdorisHost {
                         return;
                     }
                 }
+                let runtime_status = host
+                    .inner
+                    .lock()
+                    .await
+                    .supervisor
+                    .as_ref()
+                    .map(|s| s.runtime_status().borrow().clone())
+                    .unwrap_or_default();
                 if !*signal.borrow_and_update() {
                     let mut i = host.inner.lock().await;
                     if !i.closing
@@ -1285,12 +1332,23 @@ impl IdorisHost {
                         && i.generation.as_deref() == Some(&generation)
                         && i.supervisor.is_some()
                     {
-                        host.block_gateway();
-                        i.state = State::Starting;
+                        host.starting_gateway();
+                        if runtime_status.circuit_open {
+                            host.router.block_idoris("idoris_unavailable: circuit_open");
+                        }
+                        i.state = if runtime_status.circuit_open {
+                            State::Degraded
+                        } else {
+                            State::Starting
+                        };
                     }
                 } else {
                     if cancel.is_cancelled() {
                         return;
+                    }
+                    if let Some(ports) = runtime_status.ports {
+                        record.data_port = ports.data;
+                        record.admin_port = ports.admin;
                     }
                     let prepared = host.prepare_gateway(&record, &cancel).await;
                     let mut i = host.inner.lock().await;
@@ -1309,6 +1367,10 @@ impl IdorisHost {
                         Ok(())
                     });
                     if result.is_ok() {
+                        if let Some(saved) = &mut i.installation {
+                            saved.data_port = record.data_port;
+                            saved.admin_port = record.admin_port;
+                        }
                         i.state = State::Running;
                     } else {
                         host.block_gateway();
@@ -1342,6 +1404,9 @@ impl IdorisHost {
                 None => Err(Code::Cancelled),
             };
             i = self.inner.lock().await;
+        }
+        if action == Action::Stop {
+            self.router.block_idoris("stopped");
         }
         i.last_error = result.err();
         i.state = match result {

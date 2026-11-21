@@ -23,7 +23,7 @@ if mode == 'exit':
 frame = sys.stdin.buffer.read()
 key = os.environ.get('IDORIS_OMLX_API_KEY', '')
 report = {
-    'pid': os.getpid(), 'group': os.getpgrp(),
+    'pid': os.getpid(), 'group': os.getpgrp(), 'session': os.getsid(0),
     'argv': sys.argv[1:], 'length': len(frame),
     'valid_frame': re.fullmatch(b'[0-9a-f]{64}\n', frame) is not None,
     'token_hash': hashlib.sha256(frame).hexdigest(),
@@ -109,6 +109,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             payload = b'{}'
         else:
             assert self.path == '/health'
+            if (state / 'hang-health').exists():
+                time.sleep(60)
             status = scenario.get('http_status', 200)
             payload = json.dumps(health).encode()
         self.send_response(status)

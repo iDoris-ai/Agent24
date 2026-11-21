@@ -267,6 +267,7 @@ dependencies = [
  "flate2",
  "fs2",
  "futures",
+ "hmac 0.12.1",
  "http",
  "jsonschema",
  "keyring",
@@ -411,6 +412,7 @@ version = "0.1.0"
 dependencies = [
  "core-foundation 0.10.1",
  "libc",
+ "libproc",
  "rustix 0.38.44",
  "security-framework 3.7.0",
  "serde_json",

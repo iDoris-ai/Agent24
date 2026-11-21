@@ -10,6 +10,7 @@ rustix = { version = "0.38", features = ["process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 libc = "0.2"
+libproc = "0.14"
 security-framework = "3.7"
 core-foundation = "0.10"
 

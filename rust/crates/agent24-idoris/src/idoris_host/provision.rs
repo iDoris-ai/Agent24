@@ -973,8 +973,15 @@ impl IdorisHost {
             bindings.push((Role::Deep, deep));
         }
         const EMBED_MODEL: &str = "bge-m3-mlx-fp16";
-        if !compat && models.iter().any(|model| model == EMBED_MODEL) {
-            bindings.push((Role::Embed, EMBED_MODEL.to_owned()));
+        let embed = models.iter().find(|model| {
+            if compat {
+                model.to_ascii_lowercase().contains("bge-m3")
+            } else {
+                model.as_str() == EMBED_MODEL
+            }
+        });
+        if let Some(embed) = embed {
+            bindings.push((Role::Embed, embed.clone()));
         }
         let mut pending = PendingConnect {
             previous: previous.clone(),
@@ -1007,6 +1014,7 @@ impl IdorisHost {
                 crate::setup::write_openai_compat_card(
                     &self.root.join("instances/managed"), endpoint.as_str(),
                     &request.daily_model, request.deep_model.as_deref().unwrap_or(&request.daily_model),
+                    embed.map(String::as_str),
                 )
             } else {
                 let probe = crate::omlx_probe::ProbeResult {
@@ -1063,7 +1071,7 @@ impl IdorisHost {
                     .map_err(keychain_code)?;
             }
             // Old configuration remains on disk while the replacement is tested.
-            self.block_gateway();
+            self.starting_gateway();
             let old = self.inner.lock().await.supervisor.take();
             if let Some(old) = old {
                 old.stop().await.map_err(Code::from)?;
@@ -1083,6 +1091,10 @@ impl IdorisHost {
                     }),
                 )
                 .await?;
+            if let Some(ports) = supervisor.runtime_status().borrow().ports {
+                pending.candidate.data_port = ports.data;
+                pending.candidate.admin_port = ports.admin;
+            }
             new_supervisor = Some(supervisor);
             self.phase(id, Phase::VerifyingConnection).await;
             let config = ManagedConfig {
@@ -1097,7 +1109,7 @@ impl IdorisHost {
                 source: self.secrets.as_ref(),
                 failure: SyncMutex::new(None),
             };
-            let gateway = ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
+            let mut gateway = ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
                 .await
                 .map_err(|_| {
                     if cancel.is_cancelled() {
@@ -1111,6 +1123,7 @@ impl IdorisHost {
                             .unwrap_or(Code::VerifyFailed)
                     }
                 })?;
+            gateway.embedding_enabled = pending.candidate.roles.contains(&Role::Embed);
             let verification = self
                 .router
                 .verify_connection(&gateway, false, cancel)
