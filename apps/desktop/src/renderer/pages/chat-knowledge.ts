@@ -11,7 +11,7 @@ import type { RunKnowledge } from './knowledge-grounding'
  * searching (0/3 on 0.6.72; 9/10 with this said in the turn, 5/10 as a system
  * message, 2/5 in the tool description). Said in front of a plain question. */
 export const KNOWLEDGE_HINT = '（知识库已开启：回答事实、数据、做法类问题前，先用 knowledge_search 在知识库里查，'
-  + '依据查到的内容回答并注明出处；查不到再说明并按常识回答。闲聊、改写或翻译用户给的文字不用查。）'
+  + '依据查到的内容回答并注明出处；查不到再说明并按常识回答。闲聊、改写或翻译用户给的文字不用查。回答里不要提工具名。）'
 
 /** 「记住…」 is kept as the user said it: personal memory takes only a turn that
  * starts with it (agent24-agent retain.rs), so nothing goes in front. */
