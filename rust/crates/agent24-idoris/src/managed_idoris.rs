@@ -26,19 +26,25 @@ pub enum ModelError {
 /// A gateway built by [`IdorisSlot::open_gateway`], still unpublished.
 pub struct PreparedGateway {
     inner: Box<dyn Any + Send + Sync>,
+    /// Whether the host bound an embedding model for this gateway.
+    pub embedding_enabled: bool,
 }
 
 impl PreparedGateway {
     pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
         Self {
             inner: Box::new(value),
+            embedding_enabled: true,
         }
     }
 
     pub fn downcast<T: Send + Sync + 'static>(self) -> Result<T, Self> {
         match self.inner.downcast::<T>() {
             Ok(value) => Ok(*value),
-            Err(inner) => Err(Self { inner }),
+            Err(inner) => Err(Self {
+                inner,
+                embedding_enabled: self.embedding_enabled,
+            }),
         }
     }
 

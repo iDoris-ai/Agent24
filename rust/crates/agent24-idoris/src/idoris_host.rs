@@ -1013,7 +1013,10 @@ impl IdorisHost {
         };
         ManagedIdoris::prepare(&config, &secrets, cancel, self.router.as_ref())
             .await
-            .map(|gateway| (config, gateway))
+            .map(|mut gateway| {
+                gateway.embedding_enabled = record.roles.contains(&crate::setup::Role::Embed);
+                (config, gateway)
+            })
             .map_err(|_| {
                 if cancel.is_cancelled() {
                     Code::Cancelled

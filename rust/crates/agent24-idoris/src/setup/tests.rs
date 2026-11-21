@@ -383,3 +383,34 @@ async fn rejects_unready_identity_invalid_key_and_symlinked_files() {
         Err(SetupError::UnsafePath)
     ));
 }
+
+#[test]
+fn compat_card_embedding_is_optional_and_singular() {
+    for embed in [None, Some("text-embedding-bge-m3")] {
+        let dir = tempfile::tempdir().unwrap();
+        let outcome = write_openai_compat_card(
+            &dir.path().join("instances/test"),
+            "http://127.0.0.1:1234",
+            "chat",
+            "chat",
+            embed,
+        )
+        .unwrap();
+        let card = fs::read_to_string(outcome.components_dir.join("lmstudio.yaml")).unwrap();
+        assert_eq!(
+            outcome.bindings.get(&Role::Embed).map(String::as_str),
+            embed
+        );
+        assert_eq!(
+            card.contains("capabilities: [chat, embedding]"),
+            embed.is_some()
+        );
+        assert_eq!(card.contains("capabilities: [chat]"), embed.is_none());
+        assert!(!card.contains("embeddings"));
+        assert!(card.contains("mode: resident"));
+        assert_eq!(
+            card.contains("    embed: \"text-embedding-bge-m3\""),
+            embed.is_some()
+        );
+    }
+}

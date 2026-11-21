@@ -2091,84 +2091,135 @@ async fn receipt_fields_added_in_c1_are_omitted_when_unset() {
 #[tokio::test]
 async fn openai_compat_connect_single_card_roles() {
     use axum::{Json, Router, routing::get};
-    let x = ConnectedFixture::new().await;
-    x.installed().await;
-    let original =
-        x.f.host
-            .connect(x.request(), Some("original-omlx"))
+    for embed in [None, Some("text-embedding-BGE-M3")] {
+        let x = ConnectedFixture::new().await;
+        x.installed().await;
+        let original =
+            x.f.host
+                .connect(x.request(), Some("original-omlx"))
+                .await
+                .unwrap();
+        assert_eq!(
+            x.f.complete(&original).await.result,
+            Some(Outcome::Succeeded)
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new().route(
+                    "/v1/models",
+                    get(move |headers: axum::http::HeaderMap| async move {
+                        assert!(!headers.contains_key("authorization"));
+                        let mut data = vec![json!({"id":"real-model"}), json!({"id":"next-model"})];
+                        if let Some(embed) = embed {
+                            data.push(json!({"id":embed}));
+                        }
+                        Json(json!({"data":data}))
+                    }),
+                ),
+            )
             .await
             .unwrap();
-    assert_eq!(
-        x.f.complete(&original).await.result,
-        Some(Outcome::Succeeded)
-    );
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let server = tokio::spawn(async move {
-        axum::serve(listener, Router::new().route("/v1/models", get(|headers: axum::http::HeaderMap| async move {
-            assert!(!headers.contains_key("authorization"));
-            Json(json!({"data":[{"id":"real-model"},{"id":"next-model"},{"id":"bge-m3-mlx-fp16"}]}))
-        }))).await.unwrap();
-    });
-    let mut request = x.request();
-    request.source = "openai_compat".into();
-    request.replace = true;
-    request.endpoint = endpoint;
-    let op =
-        x.f.host
-            .connect(request, Some("compat-connect"))
+        });
+        let mut request = x.request();
+        request.source = "openai_compat".into();
+        request.replace = true;
+        request.endpoint = endpoint;
+        let op =
+            x.f.host
+                .connect(request, Some("compat-connect"))
+                .await
+                .unwrap();
+        let completed = x.f.complete(&op).await;
+        assert_eq!(
+            completed.result,
+            Some(Outcome::Succeeded),
+            "{:?}",
+            completed.error_code
+        );
+        let record = x.f.host.inner.lock().await.installation.clone().unwrap();
+        let mut roles = vec![Role::Daily, Role::Deep];
+        let mut allowed = vec!["daily", "deep"];
+        if embed.is_some() {
+            roles.push(Role::Embed);
+            allowed.push("embed");
+        }
+        assert_eq!(record.roles, roles);
+        assert_eq!(
+            x.f.router
+                .idoris_gateway()
+                .unwrap()
+                .embedding_available()
+                .is_ok(),
+            embed.is_some()
+        );
+        let dir = record.components_dir.unwrap();
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
+        let card = fs::read_to_string(dir.join("lmstudio.yaml")).unwrap();
+        assert!(card.contains("id: lmstudio"));
+        assert!(card.contains("daily: \"real-model\""));
+        assert!(card.contains("deep: \"real-model\""));
+        assert_eq!(card.contains("embed:"), embed.is_some());
+        assert_eq!(
+            card.contains("capabilities: [chat, embedding]"),
+            embed.is_some()
+        );
+        assert!(!card.contains("embeddings"));
+        assert_eq!(x.keys()[1]["allowed_roles"], json!(allowed));
+        // No upstream credential may be read on connect, replace or later restart.
+        x.provision.gate.store(true, Ordering::SeqCst);
+        x.f.host.replace_daily_model("next-model").await.unwrap();
+        let replaced = x.f.host.inner.lock().await.installation.clone().unwrap();
+        assert_eq!(replaced.roles, roles);
+        assert_eq!(
+            x.f.router
+                .idoris_gateway()
+                .unwrap()
+                .embedding_available()
+                .is_ok(),
+            embed.is_some()
+        );
+        assert_eq!(x.keys()[2]["allowed_roles"], json!(allowed));
+        let selection = replaced.connection.as_ref().unwrap();
+        assert_eq!(selection.source, "openai_compat");
+        assert_eq!(selection.daily_model, "next-model");
+        assert_eq!(selection.deep_model.as_deref(), Some("real-model"));
+        assert_eq!(x.keys()[0]["status"], "revoked");
+        assert_eq!(x.keys()[1]["status"], "revoked");
+        assert_eq!(
+            x.f.host.replace_daily_model("missing").await,
+            Err(Code::ModelNotFound)
+        );
+        assert_eq!(
+            x.f.host
+                .inner
+                .lock()
+                .await
+                .installation
+                .as_ref()
+                .unwrap()
+                .key_id,
+            replaced.key_id
+        );
+        let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
+        wait_operation(&x.f.host, &stop.operation_id).await.unwrap();
+        let start = x.f.host.submit(Action::Start, None).await.unwrap();
+        wait_operation(&x.f.host, &start.operation_id)
             .await
             .unwrap();
-    let completed = x.f.complete(&op).await;
-    assert_eq!(
-        completed.result,
-        Some(Outcome::Succeeded),
-        "{:?}",
-        completed.error_code
-    );
-    let record = x.f.host.inner.lock().await.installation.clone().unwrap();
-    assert_eq!(record.roles, vec![Role::Daily, Role::Deep]);
-    let dir = record.components_dir.unwrap();
-    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-    let card = fs::read_to_string(dir.join("lmstudio.yaml")).unwrap();
-    assert!(card.contains("id: lmstudio"));
-    assert!(card.contains("daily: \"real-model\""));
-    assert!(card.contains("deep: \"real-model\""));
-    assert!(!card.contains("embed:"));
-    assert_eq!(x.keys()[1]["allowed_roles"], json!(["daily", "deep"]));
-    // No upstream credential may be read on connect, replace or later restart.
-    x.provision.gate.store(true, Ordering::SeqCst);
-    x.f.host.replace_daily_model("next-model").await.unwrap();
-    let replaced = x.f.host.inner.lock().await.installation.clone().unwrap();
-    let selection = replaced.connection.as_ref().unwrap();
-    assert_eq!(selection.source, "openai_compat");
-    assert_eq!(selection.daily_model, "next-model");
-    assert_eq!(selection.deep_model.as_deref(), Some("real-model"));
-    assert_eq!(x.keys()[0]["status"], "revoked");
-    assert_eq!(x.keys()[1]["status"], "revoked");
-    assert_eq!(
-        x.f.host.replace_daily_model("missing").await,
-        Err(Code::ModelNotFound)
-    );
-    assert_eq!(
-        x.f.host
-            .inner
-            .lock()
-            .await
-            .installation
-            .as_ref()
-            .unwrap()
-            .key_id,
-        replaced.key_id
-    );
-    let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
-    wait_operation(&x.f.host, &stop.operation_id).await.unwrap();
-    let start = x.f.host.submit(Action::Start, None).await.unwrap();
-    wait_operation(&x.f.host, &start.operation_id)
-        .await
-        .unwrap();
-    x.assert_safe();
-    server.abort();
+        assert_eq!(
+            x.f.router
+                .idoris_gateway()
+                .unwrap()
+                .embedding_available()
+                .is_ok(),
+            embed.is_some()
+        );
+        x.assert_safe();
+        server.abort();
+    }
 }
 
 #[tokio::test]
