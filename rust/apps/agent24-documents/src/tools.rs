@@ -459,13 +459,113 @@ fn split_document(
 }
 
 /// E1b: a DOCX's paragraphs, by index (read).
+/// What an Agent may narrow `paragraphs` to.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ParagraphsArgs {
+    #[serde(default)]
+    from: Option<usize>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Characters of a paragraph an Agent is shown: enough to copy a 12-character
+/// anchor from, and to tell paragraphs apart.
+const PREVIEW_CHARS: usize = 40;
+/// Characters of previews in one answer, and paragraphs at most.
+const PREVIEW_BUDGET: usize = 3000;
+const PREVIEW_MAX_COUNT: usize = 200;
+/// PM 11-21: a narrowed ask (a range or a word) that comes to this many
+/// paragraphs or fewer, within [`PREVIEW_BUDGET`], is answered with them
+/// whole: the model rewrites from what it sees, and half a clause gives half
+/// a rewrite.
+const WHOLE_MAX_COUNT: usize = 10;
+
+/// FU-151 (0.6.89, General): 《示范-山东健身合同2025》's 293 paragraphs came to
+/// about 40 KB, and with them in its context the 4-bit model on an 8 GB Mac
+/// was stopped at prefill. An Agent is shown the paragraphs that have text,
+/// each as its index and first [`PREVIEW_CHARS`] characters, from `from` on
+/// or only those containing `query`, up to [`PREVIEW_BUDGET`] characters;
+/// `total` and `next_from` say what is left. The HTTP route and the CLI keep
+/// the whole list.
 async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let (id, rest) = split_document(arguments)?;
-    if !rest.is_empty() {
-        return Err(Envelope::error(INVALID_INPUT, false));
-    }
+    let args: ParagraphsArgs = parse(rest)?;
     let storage = ready(state).await?;
-    completed(crate::patch::paragraphs_of(&storage, id).await)
+    let all = crate::patch::paragraphs_of(&storage, id.clone())
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(preview_paragraphs(&id, &all.paragraphs, &args)))
+}
+
+fn preview_paragraphs(id: &str, all: &[crate::patch::Paragraph], args: &ParagraphsArgs) -> Value {
+    let query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_lowercase);
+    let wanted: Vec<&crate::patch::Paragraph> = all
+        .iter()
+        .filter(|p| !p.text.trim().is_empty())
+        .filter(|p| {
+            query
+                .as_ref()
+                .is_none_or(|q| p.text.to_lowercase().contains(q))
+        })
+        .collect();
+    let from = args.from.unwrap_or(0);
+    let count = args
+        .count
+        .unwrap_or(PREVIEW_MAX_COUNT)
+        .min(PREVIEW_MAX_COUNT);
+    let narrowed = args.from.is_some() || args.count.is_some() || query.is_some();
+    let after: Vec<&&crate::patch::Paragraph> = wanted.iter().filter(|p| p.index >= from).collect();
+    let picked = &after[..after.len().min(count)];
+    let whole_size: usize = picked.iter().map(|p| p.text.chars().count()).sum();
+    if narrowed && picked.len() <= WHOLE_MAX_COUNT && whole_size <= PREVIEW_BUDGET {
+        let shown: Vec<Value> = picked
+            .iter()
+            .map(|p| serde_json::json!({ "index": p.index, "text": p.text, "in_table": p.in_table, "whole": true }))
+            .collect();
+        let mut out = serde_json::json!({
+            "document_id": id,
+            "total": wanted.len(),
+            "paragraphs": shown,
+            "note": "这些段落是全文（whole: true），改写时照这里的原文写新文字，anchor 照抄开头。",
+        });
+        if let Some(p) = after.get(picked.len()) {
+            out["next_from"] = Value::from(p.index);
+        }
+        return out;
+    }
+    let mut spent = 0;
+    let mut shown = Vec::new();
+    let mut next_from = None;
+    for p in wanted.iter().filter(|p| p.index >= from) {
+        if shown.len() >= count || spent >= PREVIEW_BUDGET {
+            next_from = Some(p.index);
+            break;
+        }
+        let mut text: String = p.text.chars().take(PREVIEW_CHARS).collect();
+        if text.chars().count() < p.text.chars().count() {
+            text.push('…');
+        }
+        spent += text.chars().count();
+        shown.push(serde_json::json!({ "index": p.index, "text": text, "in_table": p.in_table }));
+    }
+    let mut out = serde_json::json!({
+        "document_id": id,
+        "total": wanted.len(),
+        "paragraphs": shown,
+        "note": "这是目录：每段只给段号和开头，空段落不列。要改写某几段，先用 from 和 count（例如 from=段号, count=1）或 query（关键词）取这几段的全文，再照全文改写；取其余段落也用 from。",
+    });
+    if let Some(n) = next_from {
+        out["next_from"] = Value::from(n);
+    }
+    out
 }
 
 /// E1b: some paragraphs edited into a new document (write; approved per call).
@@ -1500,6 +1600,105 @@ mod tests {
             "{note}"
         );
         assert!(answer["title"].is_string());
+    }
+
+    /// FU-151 (0.6.89): 293 paragraphs of a real contract came to 40 KB in an
+    /// Agent's context. It is shown the ones with text, 40 characters each,
+    /// within 3000 characters, and told how to ask for the rest.
+    #[test]
+    fn an_agent_is_shown_a_long_documents_paragraphs_in_parts() {
+        let all: Vec<crate::patch::Paragraph> = (0..293)
+            .map(|i| crate::patch::Paragraph {
+                index: i,
+                text: if i % 3 == 0 {
+                    String::new()
+                } else {
+                    format!("第{i}条 {}", "合同条款内容".repeat(20))
+                },
+                in_table: false,
+            })
+            .collect();
+        let first = preview_paragraphs("doc_1", &all, &ParagraphsArgs::default());
+        let shown = first["paragraphs"].as_array().unwrap();
+        let chars: usize = shown
+            .iter()
+            .map(|p| p["text"].as_str().unwrap().chars().count())
+            .sum();
+        assert!(chars <= 3000 + 41, "{chars}");
+        assert_eq!(first["total"], 195);
+        assert!(
+            shown.iter().all(|p| p["index"].as_u64().unwrap() % 3 != 0),
+            "no empty paragraph"
+        );
+        assert!(shown[0]["text"].as_str().unwrap().ends_with('…'));
+        assert_eq!(shown[0]["text"].as_str().unwrap().chars().count(), 41);
+        let next = first["next_from"].as_u64().unwrap() as usize;
+        // The rest, from where it stopped.
+        let more = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(next),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            more["paragraphs"][0]["index"].as_u64().unwrap() as usize,
+            next
+        );
+        // A word picks the paragraphs that have it, whole (PM 11-21).
+        let found = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                query: Some("第250条".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["paragraphs"][0]["index"], 250);
+        assert_eq!(found["paragraphs"][0]["whole"], true);
+        assert_eq!(
+            found["paragraphs"][0]["text"].as_str().unwrap(),
+            all[250].text
+        );
+        assert!(found.get("next_from").is_none());
+        // One paragraph by its index: whole too.
+        let one = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(4),
+                count: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(one["paragraphs"][0]["index"], 4);
+        assert_eq!(one["paragraphs"][0]["text"].as_str().unwrap(), all[4].text);
+        assert_eq!(one["next_from"], 5);
+        // A range too wide for whole text is a table of contents again.
+        let wide = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(0),
+                count: Some(50),
+                ..Default::default()
+            },
+        );
+        assert!(wide["paragraphs"][0].get("whole").is_none());
+        assert!(
+            wide["paragraphs"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with('…')
+        );
+        // The whole of it serialized stays small: no more 40 KB.
+        assert!(
+            first.to_string().len() < 12_000,
+            "{}",
+            first.to_string().len()
+        );
     }
 
     #[tokio::test]

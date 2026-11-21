@@ -27,7 +27,7 @@ const TEXT_MAX: usize = 100_000;
 pub struct Paragraph {
     pub(crate) index: usize,
     pub(crate) text: String,
-    in_table: bool,
+    pub(crate) in_table: bool,
 }
 
 #[derive(Debug, Serialize)]
