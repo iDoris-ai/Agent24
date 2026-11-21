@@ -139,6 +139,7 @@ impl Fixture {
         // F8 reproductions saw load average 51 with XProtect scanning). Tests
         // about the deadline itself set their own short bound.
         config.timings.ready = Duration::from_secs(20);
+        config.timings.half_open = Duration::from_millis(50);
         config.timings.poll = Duration::from_millis(10);
         config.timings.terminate = Duration::from_millis(70);
         config.timings.restart_delays = [
@@ -191,6 +192,8 @@ async fn stdin_frame_environment_readiness_stop_and_log_redaction() {
     assert_eq!(report["valid_frame"], true);
     assert_eq!(report["token_in_env"], false);
     assert_eq!(report["pid"], report["group"]);
+    // v0.5.0 keeps process_group(0); only launcher generations call setsid.
+    assert_ne!(report["pid"], report["session"]);
     assert_eq!(report["budget"], "0");
     let allowed = [
         "PATH",
@@ -352,18 +355,20 @@ fn restart_delays_limit_window_and_stability_reset() {
     assert_eq!(timings.poll, Duration::from_millis(250));
     let initial = Instant::now();
     let mut policy = RestartPolicy {
+        open: false,
         attempts: VecDeque::new(),
     };
-    for delay in [1, 2, 4] {
+    for delay in [1, 2, 4, 8, 16, 60] {
         assert_eq!(
             policy.delay(initial, initial, &timings).unwrap(),
             Duration::from_secs(delay)
         );
     }
-    assert!(matches!(
-        policy.delay(initial, initial, &timings),
-        Err(SupervisorError::RestartLimit)
-    ));
+    assert_eq!(
+        policy.delay(initial, initial, &timings).unwrap(),
+        Duration::from_secs(60)
+    );
+    policy.open = false; // A successful generation closes the circuit.
     assert_eq!(
         policy
             .delay(initial + Duration::from_secs(300), initial, &timings)
@@ -395,16 +400,18 @@ async fn crash_restarts_three_times_with_fresh_inputs_and_tokens() {
     .await
     .unwrap();
     let accepting = supervisor.accepting_requests();
-    assert!(matches!(
-        timeout(Duration::from_secs(8), supervisor.wait())
-            .await
-            .unwrap(),
-        Err(SupervisorError::RestartLimit)
-    ));
+    timeout(Duration::from_secs(20), async {
+        while fixture.attempts().len() < 7 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    supervisor.stop().await.unwrap();
     assert!(!*accepting.borrow());
     let attempts = fixture.attempts();
-    assert_eq!(attempts.len(), 4);
-    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    assert_eq!(attempts.len(), 7);
+    assert_eq!(calls.load(Ordering::SeqCst), 7);
     let hashes: std::collections::BTreeSet<_> = attempts
         .iter()
         .map(|item| item["token_hash"].as_str().unwrap())
@@ -413,8 +420,8 @@ async fn crash_restarts_three_times_with_fresh_inputs_and_tokens() {
         .iter()
         .map(|item| item["key_hash"].as_str().unwrap())
         .collect();
-    assert_eq!(hashes.len(), 4);
-    assert_eq!(keys.len(), 4);
+    assert_eq!(hashes.len(), 7);
+    assert_eq!(keys.len(), 7);
     for (number, item) in attempts.iter().enumerate() {
         assert_eq!(item["budget"], number.to_string());
     }
@@ -686,7 +693,8 @@ async fn crash_before_first_health_uses_the_same_restart_limit() {
     let fixture = Fixture::new(serde_json::json!({"mode": "crash_before_ready"}));
     let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
     assert!(matches!(result, Err(SupervisorError::RestartLimit)));
-    assert_eq!(fixture.attempts().len(), 4);
+    // The sixth failure opens the circuit; the initial start then gives up.
+    assert_eq!(fixture.attempts().len(), 6);
     assert!(!fixture.record().exists());
 }
 
@@ -1366,4 +1374,254 @@ fn s1_4_health_contract_uses_only_lock_threshold() {
             );
         }
     }
+}
+
+#[test]
+fn ic3a_sixth_failure_opens_circuit_without_giving_up() {
+    let timings = Timings::default();
+    let now = Instant::now();
+    let mut policy = RestartPolicy {
+        open: false,
+        attempts: VecDeque::new(),
+    };
+    for expected in [1, 2, 4, 8, 16, 60, 60] {
+        assert_eq!(
+            policy.delay(now, now, &timings).unwrap(),
+            Duration::from_secs(expected)
+        );
+    }
+    assert_eq!(
+        policy
+            .delay(now + Duration::from_secs(600), now, &timings)
+            .unwrap(),
+        Duration::from_secs(60)
+    );
+}
+
+#[test]
+fn ic3a_exit_classification() {
+    for launcher in [false, true] {
+        assert!(!retry_exit(Some(0), launcher));
+        assert!(!retry_exit(Some(3), launcher));
+        assert!(!retry_exit(Some(4), launcher));
+        assert!(retry_exit(Some(5), launcher));
+        assert!(retry_exit(None, launcher));
+    }
+    assert!(!retry_exit(Some(1), false)); // v0.5.0 keeps its configuration failure behavior.
+    assert!(retry_exit(Some(1), true)); // Frozen launcher contract: startup failure retries.
+}
+
+#[tokio::test]
+#[ignore = "requires AGENT24_IDORIS_S1_BIN; real unsigned S1 binary"]
+async fn ic3a_real_s1_launcher() {
+    let binary = PathBuf::from(std::env::var_os("AGENT24_IDORIS_S1_BIN").unwrap());
+    assert!(std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref() == Ok("1"));
+    let fixture = Fixture::new(serde_json::json!({"mode":"normal"}));
+    let mut config = fixture.config().await;
+    config.installed =
+        InstalledVersion::fixture(binary.parent().unwrap().to_path_buf(), &FIXTURE_FILES).unwrap();
+    let path = discovery::path(&config.data).unwrap();
+    config.data = config.data.canonical().unwrap();
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    let mut process = ManagedProcess::start(Arc::new(config), inputs().await.unwrap(), &lease)
+        .await
+        .unwrap();
+    println!("S1: launcher spawned; discovery accepted (0600, owner, child pid, nonce)");
+    let ports = process.ports;
+    let record: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let response = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/health", ports.data))
+        .send()
+        .await
+        .unwrap();
+    let health: serde_json::Value =
+        serde_json::from_slice(&response.bytes().await.unwrap()).unwrap();
+    assert_eq!(health["instance_id"], record["instance_id"]);
+    assert!(health.get("instance_nonce").is_none());
+    println!(
+        "S1: /health instance_id matches; phase={}, ready={}",
+        health["phase"], health["ready"]
+    );
+    let config = process.config.clone();
+    process.signal_owned_group(Signal::SIGKILL).unwrap();
+    assert!(!process.child.wait().await.unwrap().success());
+    process.adopt_survivors().unwrap();
+    process.finish().await.unwrap();
+    lease.clear().unwrap();
+    assert!(path.exists());
+    let mut process = ManagedProcess::start(config, inputs().await.unwrap(), &lease)
+        .await
+        .unwrap();
+    assert_ne!(
+        process.instance_id.as_deref(),
+        record["instance_id"].as_str()
+    );
+    println!("S1: SIGKILL stale discovery replaced; new generation verified");
+    assert!(!process.stop().await.unwrap());
+    let status = process.child.try_wait().unwrap().unwrap();
+    assert_eq!(status.code(), Some(0));
+    lease.clear().unwrap();
+    assert!(!path.exists());
+    println!("S1: SIGTERM exit code=0; discovery removed");
+}
+
+#[tokio::test]
+async fn ic3a_hung_health_restarts_and_counts_separately() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut config = fixture.config().await;
+    config.timings.liveness = Duration::from_millis(30);
+    config.timings.health_request = Duration::from_millis(500);
+    let supervisor = Supervisor::start(config, inputs, || async {})
+        .await
+        .unwrap();
+    let status = supervisor.runtime_status();
+    fs::write(fixture.root.join("state/hang-health"), "hang").unwrap();
+    timeout(Duration::from_secs(5), async {
+        while status.borrow().hangs == 0 {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    fs::remove_file(fixture.root.join("state/hang-health")).unwrap();
+    timeout(Duration::from_secs(20), async {
+        while fixture.attempts().len() < 2 || status.borrow().ports.is_none() {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(status.borrow().crashes, 0);
+    assert_eq!(status.borrow().hangs, 1);
+    supervisor.stop().await.unwrap();
+}
+
+#[tokio::test]
+async fn ic3a_orphan_expiry_stops_without_crash_accounting() {
+    let fixture = Fixture::new(
+        serde_json::json!({"mode":"exit_after_ready", "code":4, "wait_for_exit":true, "after":0.0}),
+    );
+    let supervisor = Supervisor::start(fixture.config().await, inputs, || async {})
+        .await
+        .unwrap();
+    let status = supervisor.runtime_status();
+    fixture.release_exit();
+    timeout(Duration::from_secs(5), supervisor.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.borrow().crashes, 0);
+    assert_eq!(fixture.attempts().len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires AGENT24_IDORIS_S2_BIN and both launcher/unsigned debug switches"]
+async fn ic3b_real_s2_register_and_adopt() {
+    let binary = PathBuf::from(std::env::var_os("AGENT24_IDORIS_S2_BIN").unwrap());
+    assert_eq!(
+        std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::env::var("AGENT24_DEV_ALLOW_UNSIGNED_IDORIS").as_deref(),
+        Ok("1")
+    );
+    // Keep canonical paths below HOME: macOS /tmp and /var are symlinks.
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("ic3b-")
+        .tempdir_in(repository)
+        .unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    assert!(root.starts_with(fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap()));
+    fs::create_dir_all(root.join("components")).unwrap();
+    let config = || {
+        let installed =
+            InstalledVersion::fixture(binary.parent().unwrap().to_path_buf(), &FIXTURE_FILES)
+                .unwrap();
+        let components = ComponentsDir::new(&root, &root.join("components")).unwrap();
+        let mut config = StartConfig::new(
+            installed,
+            components,
+            DataPaths {
+                db: root.join("idoris.sqlite3"),
+                state: root.join("state"),
+            },
+        )
+        .unwrap();
+        config.log_dir = root.join("logs");
+        config
+    };
+    let mut first = Supervisor::start(config(), inputs, || async {})
+        .await
+        .unwrap();
+    let path = root.join("run/idoris.json");
+    let discovered = discovery::read_any(&path).unwrap();
+    let pid = discovered.pid;
+    println!(
+        "S2 discovery: version={}, contract={}",
+        discovered.version, discovered.contract_version
+    );
+    struct Cleanup(u32);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(self.0 as i32), Signal::SIGKILL);
+        }
+    }
+    let cleanup = Cleanup(pid);
+    timeout(Duration::from_secs(10), async {
+        let mut updates = first.runtime_status();
+        while !updates.borrow_and_update().registered {
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let instance = first.runtime_status().borrow().instance_id.clone().unwrap();
+    let old_token = first.initial_admin.clone();
+    println!("S2: registered pid={pid}");
+    // Abort the host task to simulate agent24d death, rather than graceful stop.
+    let task = first.task.take().unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drop(first);
+    let adopted = Supervisor::start(config(), inputs, || async {})
+        .await
+        .unwrap();
+    assert_eq!(discovery::read_any(&path).unwrap().pid, pid);
+    let status = adopted.runtime_status().borrow().clone();
+    assert!(status.registered);
+    assert_eq!(status.instance_id.as_deref(), Some(instance.as_str()));
+    assert_ne!(adopted.initial_admin.as_str(), old_token.as_str());
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/admin/api/v1/status",
+        status.ports.unwrap().admin
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(old_token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(adopted.initial_admin.as_str())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    println!("S2: same pid adopted; old Admin token rejected; rotated token works");
+    adopted.stop().await.unwrap();
+    std::mem::forget(cleanup);
 }

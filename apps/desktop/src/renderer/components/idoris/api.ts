@@ -65,8 +65,11 @@ export function parseStatus(value: unknown): IdorisStatus {
   const v = object(value)
   const source = v.source ?? (v.connection == null ? undefined : object(v.connection).source)
   return {
+    ...(v.crashes === undefined ? {} : { crashes: bytes(v.crashes) }),
+    ...(v.hangs === undefined ? {} : { hangs: bytes(v.hangs) }),
+    ...(v.circuit_open === undefined ? {} : { circuit_open: bool(v.circuit_open) }),
     ...(source === undefined ? {} : { source: choice(source, ['omlx', 'openai_compat']) }),
-    state: choice(v.state, ['not_installed', 'not_configured', 'stopped', 'starting', 'running', 'failed', 'instance_conflict']),
+    state: choice(v.state, ['not_installed', 'not_configured', 'stopped', 'starting', 'degraded', 'running', 'failed', 'instance_conflict']),
     version: v.version === null ? null : text(v.version), data_port: port(v.data_port), admin_port: port(v.admin_port),
     roles: array(v.roles).map(role => choice(role, ['daily', 'deep', 'embed'])),
     last_error: v.last_error === null ? null : choice(v.last_error, codes),

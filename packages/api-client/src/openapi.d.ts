@@ -2651,8 +2651,13 @@ export interface components {
             idoris_budget_bytes: number;
         };
         IdorisStatus: {
+            registered?: boolean;
+            instance_id?: string | null;
+            crashes?: number;
+            hangs?: number;
+            circuit_open?: boolean;
             /** @enum {string} */
-            state: "not_installed" | "not_configured" | "stopped" | "starting" | "running" | "failed" | "instance_conflict";
+            state: "not_installed" | "not_configured" | "stopped" | "starting" | "degraded" | "running" | "failed" | "instance_conflict";
             version: string | null;
             data_port: number | null;
             admin_port: number | null;
