@@ -415,6 +415,26 @@ fn signing_information(
     Ok((identifier, team, executable))
 }
 
+/// Start a child in an independent session. Do not also set process_group(0):
+/// a process group leader cannot call setsid.
+#[cfg(unix)]
+#[allow(unsafe_code)]
+pub fn independent_session(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+    // SAFETY: only the async-signal-safe setsid syscall runs between fork/exec.
+    unsafe {
+        command.pre_exec(|| {
+            #[cfg(target_os = "macos")]
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            #[cfg(not(target_os = "macos"))]
+            rustix::process::setsid()?;
+            Ok(())
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

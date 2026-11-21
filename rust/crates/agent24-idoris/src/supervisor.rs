@@ -4,6 +4,7 @@
 //! uses IDORIS_OMLX_API_KEY for serve, and exposes contract_version in /health.
 //! No readiness or error classification is inferred from diagnostic output.
 
+mod discovery;
 mod identity;
 mod logs;
 #[cfg(test)]
@@ -42,6 +43,8 @@ pub enum SupervisorError {
     InstanceConflict,
     #[error("iDoris exited unsuccessfully ({code:?})")]
     Failed { code: Option<i32> },
+    #[error("iDoris discovery belongs to an earlier generation")]
+    StaleDiscovery,
     #[error("iDoris authentication failed")]
     Authentication,
     #[error("invalid launcher configuration")]
@@ -139,6 +142,8 @@ impl Default for Ports {
 /// Production defaults implement design §6 and the frozen §13.1 response.
 #[derive(Clone, Debug)]
 pub struct Timings {
+    pub half_open: Duration,
+    pub liveness: Duration,
     pub token_write: Duration,
     pub health_request: Duration,
     pub ready: Duration,
@@ -151,6 +156,8 @@ pub struct Timings {
 impl Default for Timings {
     fn default() -> Self {
         Self {
+            half_open: Duration::from_secs(60),
+            liveness: Duration::from_secs(5),
             token_write: Duration::from_secs(10),
             health_request: Duration::from_secs(2),
             ready: Duration::from_secs(30),
@@ -211,10 +218,20 @@ pub struct StopReport {
 /// Dropping the handle requests shutdown; explicit stop also awaits reaping.
 /// The gateway must subscribe to accepting_requests before serving traffic.
 pub struct Supervisor {
+    status: watch::Receiver<RuntimeStatus>,
     accepting: watch::Receiver<bool>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<StopReport, SupervisorError>>>,
 }
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RuntimeStatus {
+    pub ports: Option<Ports>,
+    pub circuit_open: bool,
+    pub crashes: u64,
+    pub hangs: u64,
+}
+
 impl Supervisor {
     /// Reap a recorded orphan without launching a replacement. The lease and
     /// kernel PID/start-time/executable/UID checks are shared with start().
@@ -256,21 +273,47 @@ impl Supervisor {
             .await?;
         let config = Arc::new(config);
         let mut policy = RestartPolicy {
+            open: false,
             attempts: VecDeque::new(),
         };
-        let process = launch(&config, &lease, &mut refresh, &mut policy, Instant::now()).await?;
+        let process = launch(
+            &config,
+            &lease,
+            &mut refresh,
+            &mut policy,
+            Instant::now(),
+            None,
+        )
+        .await?;
         let (accepting, receiver) = watch::channel(true);
+        let (status, status_receiver) = watch::channel(RuntimeStatus {
+            ports: Some(process.ports),
+            ..RuntimeStatus::default()
+        });
         let shutdown = config.shutdown.clone();
         let task = tokio::spawn(async move {
-            supervise(process, config, lease, refresh, drain, accepting, policy).await
+            supervise(
+                process,
+                config,
+                lease,
+                refresh,
+                drain,
+                Signals { accepting, status },
+                policy,
+            )
+            .await
         });
         Ok(Self {
             accepting: receiver,
+            status: status_receiver,
             shutdown,
             task: Some(task),
         })
     }
 
+    pub fn runtime_status(&self) -> watch::Receiver<RuntimeStatus> {
+        self.status.clone()
+    }
     pub fn accepting_requests(&self) -> watch::Receiver<bool> {
         self.accepting.clone()
     }
@@ -298,6 +341,7 @@ impl Drop for Supervisor {
 }
 
 struct RestartPolicy {
+    open: bool,
     attempts: VecDeque<Instant>,
 }
 impl RestartPolicy {
@@ -307,7 +351,7 @@ impl RestartPolicy {
         stable_since: Instant,
         timings: &Timings,
     ) -> Result<Duration, SupervisorError> {
-        if now.duration_since(stable_since) >= timings.restart_window {
+        if !self.open && now.duration_since(stable_since) >= timings.restart_window {
             self.attempts.clear();
         }
         while self
@@ -317,13 +361,20 @@ impl RestartPolicy {
         {
             self.attempts.pop_front();
         }
-        let delay = *timings
-            .restart_delays
-            .get(self.attempts.len())
-            .ok_or(SupervisorError::RestartLimit)?;
+        let failures = self.attempts.len();
         self.attempts.push_back(now);
-        Ok(delay)
+        self.open |= failures >= 5;
+        if self.open {
+            return Ok(timings.half_open);
+        }
+        let base = timings.restart_delays[0].saturating_mul(1 << failures);
+        Ok(base.min(Duration::from_secs(30)))
     }
+}
+
+struct Signals {
+    accepting: watch::Sender<bool>,
+    status: watch::Sender<RuntimeStatus>,
 }
 
 async fn supervise<F, Fut, D, Drain>(
@@ -332,7 +383,7 @@ async fn supervise<F, Fut, D, Drain>(
     lease: Lease,
     mut refresh: F,
     drain: D,
-    accepting: watch::Sender<bool>,
+    signals: Signals,
     mut policy: RestartPolicy,
 ) -> Result<StopReport, SupervisorError>
 where
@@ -341,7 +392,21 @@ where
     D: FnOnce() -> Drain + Send,
     Drain: Future<Output = ()> + Send,
 {
+    let Signals {
+        accepting,
+        status: status_signal,
+    } = &signals;
     let mut stable_since = Instant::now();
+    let mut probes = tokio::time::interval(config.timings.liveness);
+    probes.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    probes.tick().await;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(config.timings.health_request)
+        .build()
+        .map_err(|_| SupervisorError::Configuration)?;
+    let mut failures = 0;
     loop {
         let status = tokio::select! {
             biased;
@@ -353,49 +418,106 @@ where
                 return Ok(StopReport { forced, drain_timed_out });
             }
             status = process.child.wait() => match status {
-                Ok(status) => status,
+                Ok(status) => Some(status),
                 Err(error) => {
                     accepting.send_replace(false);
                     return Err(error.into());
                 }
             },
+            _ = probes.tick() => {
+                let url = format!("http://127.0.0.1:{}/health", process.ports.data);
+                let alive = tokio::select! {
+                    _ = config.shutdown.cancelled() => continue,
+                    result = async {
+                        let mut response = client.get(url).send().await.ok()?;
+                        if !response.status().is_success() { return None; }
+                        let mut body = Vec::new();
+                        while let Some(chunk) = response.chunk().await.ok()? {
+                            if body.len() + chunk.len() > 16384 { return None; }
+                            body.extend_from_slice(&chunk);
+                        }
+                        validate_health(&body, config.lock).ok()?;
+                        let health: Health = serde_json::from_slice(&body).ok()?;
+                        if process.instance_id.as_ref().is_some_and(|id| *id != health.instance_id) { return None; }
+                        Some(())
+                    } => result.is_some(),
+                };
+                failures = if alive { 0 } else { failures + 1 };
+                if failures < 3 { continue; }
+                accepting.send_replace(false);
+                status_signal.send_modify(|s| { s.ports = None; s.hangs += 1; });
+                process.output.event("hung: three failed health probes");
+                process.stop().await?;
+                None
+            },
         };
         accepting.send_replace(false);
+        status_signal.send_modify(|s| s.ports = None);
         // Snapshot surviving workers at the reap itself, before the PGID
         // could be recycled; finish() then kills them with the group.
-        process.adopt_survivors()?;
-        process
-            .output
-            .event(&format!("exited code={:?}", status.code()));
-        process.finish().await?;
+        if let Some(status) = status {
+            process.adopt_survivors()?;
+            process
+                .output
+                .event(&format!("exited code={:?}", status.code()));
+            process.finish().await?;
+            if status.success() || status.code() == Some(4) {
+                lease.clear()?;
+                return Ok(StopReport::default());
+            }
+            if !retry_exit(status.code(), launcher_enabled(&config)) {
+                lease.clear()?;
+                return Err(exit_error(status));
+            }
+            status_signal.send_modify(|s| s.crashes += 1);
+        }
         lease.clear()?;
         if config.shutdown.is_cancelled() {
             return Ok(StopReport::default());
         }
-        if status.success() {
-            return Ok(StopReport::default());
-        }
-        // v0.5.0 shares exit 1 between config/auth/budget/other failures. There
-        // is no structured discriminator. Fail closed rather than retry any
-        // of these. Only abnormal signal exits are provable crashes.
-        if status.code().is_some() {
-            return Err(exit_error(status));
-        }
         let delay = policy.delay(Instant::now(), stable_since, &config.timings)?;
+        status_signal.send_modify(|s| s.circuit_open = policy.open);
+        accepting.send_replace(false);
         tokio::select! {
             biased;
             _ = config.shutdown.cancelled() => return Ok(StopReport::default()),
-            _ = sleep(delay) => {},
+            _ = sleep(restart_backoff(delay, &config.timings)) => {},
         }
-        // Only confirmed signal crashes retry, including during readiness.
-        // Reset the stability clock before attempting a new generation.
-        process = match launch(&config, &lease, &mut refresh, &mut policy, Instant::now()).await {
+        // Retry crashes with a fresh generation; orphan expiry stops normally.
+        process = match launch(
+            &config,
+            &lease,
+            &mut refresh,
+            &mut policy,
+            Instant::now(),
+            Some(&signals),
+        )
+        .await
+        {
             Err(SupervisorError::Stopped) => return Ok(StopReport::default()),
             other => other?,
         };
         stable_since = Instant::now();
+        policy.open = false;
+        failures = 0;
+        status_signal.send_modify(|s| {
+            s.ports = Some(process.ports);
+            s.circuit_open = false;
+        });
         accepting.send_replace(true);
     }
+}
+
+fn restart_backoff(delay: Duration, timings: &Timings) -> Duration {
+    if delay == timings.half_open {
+        return delay;
+    }
+    let jitter = Duration::from_millis(u64::from(uuid::Uuid::new_v4().as_bytes()[0]) % 101);
+    (delay + jitter).min(Duration::from_secs(30))
+}
+
+fn retry_exit(code: Option<i32>, launcher: bool) -> bool {
+    matches!(code, None | Some(5)) || (launcher && code == Some(1))
 }
 
 async fn launch<F, Fut>(
@@ -404,6 +526,7 @@ async fn launch<F, Fut>(
     refresh: &mut F,
     policy: &mut RestartPolicy,
     stable_since: Instant,
+    signals: Option<&Signals>,
 ) -> Result<ManagedProcess, SupervisorError>
 where
     F: FnMut() -> Fut + Send,
@@ -416,14 +539,31 @@ where
             value = refresh() => value?,
         };
         match ManagedProcess::start(config.clone(), inputs, lease).await {
-            Err(SupervisorError::Failed { code: None }) if !config.shutdown.is_cancelled() => {
+            Err(SupervisorError::Failed { code })
+                if retry_exit(code, launcher_enabled(config))
+                    && !config.shutdown.is_cancelled() =>
+            {
                 let delay = policy.delay(Instant::now(), stable_since, &config.timings)?;
+                // Before the first start no handle exists to publish the circuit,
+                // so a crash loop must surface as an error instead of waiting forever.
+                if signals.is_none() && policy.open {
+                    return Err(SupervisorError::RestartLimit);
+                }
+                if let Some(signals) = signals {
+                    signals.status.send_modify(|s| {
+                        s.crashes += 1;
+                        s.circuit_open = policy.open;
+                    });
+                    signals.accepting.send_replace(false);
+                }
                 tokio::select! {
                     biased;
                     _ = config.shutdown.cancelled() => return Err(SupervisorError::Stopped),
-                    _ = sleep(delay) => {},
+                    _ = sleep(restart_backoff(delay, &config.timings)) => {},
                 }
             }
+            Err(SupervisorError::Failed { code: Some(4) }) => return Err(SupervisorError::Stopped),
+            _ if config.shutdown.is_cancelled() => return Err(SupervisorError::Stopped),
             other => return other,
         }
     }
@@ -440,6 +580,9 @@ fn exit_error(status: ExitStatus) -> SupervisorError {
 }
 
 struct ManagedProcess {
+    ports: Ports,
+    discovery: Option<(PathBuf, Zeroizing<String>)>,
+    instance_id: Option<String>,
     child: Child,
     group: Option<Pid>,
     members: Vec<ProcessRecord>,
@@ -469,6 +612,11 @@ impl ManagedProcess {
             config.diagnostic_output,
         )?;
         let mut command = serve_command(&config, &inputs.budget, output.omlx_key())?;
+        let discovery = if launcher_enabled(&config) {
+            Some((discovery::path(&config.data)?, mint_token()?))
+        } else {
+            None
+        };
         let mut child = command.spawn()?;
         let spawned = Instant::now();
         let pid = child
@@ -476,6 +624,9 @@ impl ManagedProcess {
             .ok_or_else(|| io::Error::other("missing child PID"))?;
         output.attach(child.stdout.take(), child.stderr.take());
         let mut process = Self {
+            ports: config.ports,
+            discovery,
+            instance_id: None,
             child,
             group: Some(Pid::from_raw(pid as i32)),
             members: Vec::new(),
@@ -490,9 +641,13 @@ impl ManagedProcess {
                 .stdin
                 .take()
                 .ok_or(SupervisorError::TokenHandoff)?;
+            let frame = match &process.discovery {
+                Some((path, nonce)) => discovery::frame(&process._admin, path, nonce)?,
+                None => Zeroizing::new(process._admin.to_string()),
+            };
             let handoff = write_token(
                 &mut stdin,
-                &process._admin,
+                &frame,
                 spawned + process.config.timings.token_write,
                 &process.config.shutdown,
             )
@@ -610,9 +765,30 @@ impl ManagedProcess {
             .timeout(self.config.timings.health_request)
             .build()
             .map_err(|_| SupervisorError::Configuration)?;
-        let url = format!("http://127.0.0.1:{}/health", self.config.ports.data);
         loop {
+            if let Some((path, nonce)) = &self.discovery {
+                match discovery::read(
+                    path,
+                    self.child.id().ok_or(SupervisorError::Stopped)?,
+                    nonce,
+                ) {
+                    Ok(record) => {
+                        self.ports = Ports {
+                            data: record.data_port,
+                            admin: record.admin_port,
+                        };
+                        self.instance_id = Some(record.instance_id);
+                    }
+                    Err(SupervisorError::StaleDiscovery) => {}
+                    Err(SupervisorError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            let url = format!("http://127.0.0.1:{}/health", self.ports.data);
             let check = async {
+                if self.discovery.is_some() && self.instance_id.is_none() {
+                    return Ok(false);
+                }
                 if let Ok(mut response) = client.get(&url).send().await {
                     if matches!(response.status().as_u16(), 401 | 403) {
                         return Err(SupervisorError::Authentication);
@@ -630,13 +806,20 @@ impl ManagedProcess {
                             body.extend_from_slice(&chunk);
                         }
                         validate_health(&body, self.config.lock)?;
-                        if !listeners_owned(&self.config, self.group).await? {
+                        let health: Health =
+                            serde_json::from_slice(&body).map_err(|_| SupervisorError::Contract)?;
+                        if self
+                            .instance_id
+                            .as_ref()
+                            .is_some_and(|id| *id != health.instance_id)
+                        {
+                            return Err(SupervisorError::Contract);
+                        }
+                        if !listeners_owned(&self.config, self.ports, self.group).await? {
                             return Ok(false);
                         }
-                        let admin_url = format!(
-                            "http://127.0.0.1:{}/admin/api/v1/status",
-                            self.config.ports.admin
-                        );
+                        let admin_url =
+                            format!("http://127.0.0.1:{}/admin/api/v1/status", self.ports.admin);
                         if let Ok(response) = client
                             .get(admin_url)
                             .bearer_auth(self._admin.as_str())
@@ -763,10 +946,11 @@ async fn wait_group_gone(group: Pid) -> io::Result<()> {
 /// LISTEN socket on both ports must be held by this generation's group.
 async fn listeners_owned(
     config: &StartConfig,
+    ports: Ports,
     group: Option<Pid>,
 ) -> Result<bool, SupervisorError> {
     let group = group.ok_or(SupervisorError::InstanceConflict)?;
-    for port in [config.ports.data, config.ports.admin] {
+    for port in [ports.data, ports.admin] {
         let found = identity::listeners(port, config.timings.health_request).await;
         if !judge_listeners(found, group, |pid| {
             nix::unistd::getpgid(Some(Pid::from_raw(i32::try_from(pid).ok()?))).ok()
@@ -849,6 +1033,13 @@ fn signal_group(group: Pid, signal: Signal) -> io::Result<()> {
     Ok(())
 }
 
+fn launcher_enabled(config: &StartConfig) -> bool {
+    semver::Version::parse(config.lock.tag.trim_start_matches('v'))
+        .is_ok_and(|v| v >= semver::Version::new(0, 6, 0))
+        || (cfg!(debug_assertions)
+            && std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref() == Ok("1"))
+}
+
 fn serve_command(
     config: &StartConfig,
     budget: &Budget,
@@ -871,12 +1062,28 @@ fn serve_command(
     command
         .env_clear()
         .current_dir(&directory)
-        .args(["serve", "--admin-token-stdin"])
-        .process_group(0)
+        .args([
+            "serve",
+            if launcher_enabled(config) {
+                "--launcher-stdin"
+            } else {
+                "--admin-token-stdin"
+            },
+        ])
         .kill_on_drop(true)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // Only the launcher generation survives agent24d in its own session; v0.5.0
+    // has no adopt path, so a surviving instance would block the next start.
+    if launcher_enabled(config) {
+        // A pipe would close with agent24d and make the surviving iDoris panic
+        // on its next log write (iDoris #621), so its output goes to /dev/null.
+        command.stdout(Stdio::null()).stderr(Stdio::null());
+        agent24_os_proc::independent_session(command.as_std_mut());
+    } else {
+        command.process_group(0);
+    }
     // Fixed PATH prevents parent PATH injection into any runtime subprocess.
     command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     for name in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
@@ -897,8 +1104,22 @@ fn serve_command(
             "IDORIS_ALLOCATED_BUDGET_BYTES",
             budget.allocated_bytes.to_string(),
         )
-        .env("IDORIS_PORT", config.ports.data.to_string())
-        .env("IDORIS_ADMIN_PORT", config.ports.admin.to_string())
+        .env(
+            "IDORIS_PORT",
+            if launcher_enabled(config) {
+                "0".into()
+            } else {
+                config.ports.data.to_string()
+            },
+        )
+        .env(
+            "IDORIS_ADMIN_PORT",
+            if launcher_enabled(config) {
+                "0".into()
+            } else {
+                config.ports.admin.to_string()
+            },
+        )
         .env("IDORIS_BIND_HOST", "127.0.0.1")
         .env("IDORIS_DEPLOY_MODE", "personal");
     if let Some(key) = key {

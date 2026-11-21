@@ -131,6 +131,9 @@ pub async fn status(State(state): State<AppState>) -> Response {
     let status = match state.idoris_host {
         Some(host) => host.status().await,
         None => Status {
+            crashes: 0,
+            hangs: 0,
+            circuit_open: false,
             state: if state.idoris_unavailable {
                 LifecycleState::Failed
             } else {
