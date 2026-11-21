@@ -224,6 +224,8 @@ impl ModelProvider for SeenProvider {
 struct KnowledgeSearchStub {
     reply: String,
     calls: std::sync::atomic::AtomicUsize,
+    /// Fails instead of answering (an outage, a timeout).
+    fail: bool,
 }
 
 #[async_trait]
@@ -254,6 +256,9 @@ impl agent24_tools::Tool for KnowledgeSearchStub {
         assert_eq!(input.get("query").and_then(|q| q.as_str()), Some("烧开水要多久"));
         assert_eq!(input.get("max_results").and_then(|q| q.as_u64()), Some(3));
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.fail {
+            return Err(agent24_tools::ToolError::Failed("knowledge unreachable".into()));
+        }
         Ok(self.reply.clone())
     }
 }
@@ -279,6 +284,7 @@ async fn a_knowledge_query_is_searched_before_the_model_and_only_hits_go_in() {
         let stub = Arc::new(KnowledgeSearchStub {
             reply: reply.to_owned(),
             calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
         });
         let tools = ToolRegistry::new().with(stub.clone());
         let (manager, _sink, store) = manager_with_tools(provider.clone(), tools).await;
@@ -751,7 +757,7 @@ fn what_the_first_search_puts_in_is_three_short_passages() {
         "evidence": hits
     })
     .to_string();
-    let compact = crate::run_manager::compact_evidence_for_tests(&full).unwrap();
+    let compact = crate::compact_evidence_for_tests(&full).unwrap();
     let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
     let evidence = v["evidence"].as_array().unwrap();
     assert_eq!(evidence.len(), 3);
@@ -759,7 +765,51 @@ fn what_the_first_search_puts_in_is_three_short_passages() {
     assert_eq!(evidence[0]["knowledge_id"], "k1");
     assert_eq!(evidence[0]["title"], "烧水指南");
     assert!(evidence[0].get("knowledge_base_id").is_none());
-    assert!(compact.chars().count() < 1000, "{}", compact.chars().count());
+    // PR-Daemon #1976 F1: `kind` stays, for agent24d's record of the hits.
+    assert_eq!(v["kind"], "knowledge.search");
+    assert_eq!(evidence[0]["use"], "clue");
+    // About 600 Chinese characters and short ASCII keys: well under 1000 tokens.
+    assert!(compact.chars().count() < 1200, "{}", compact.chars().count());
     assert!(full.chars().count() > 6000);
-    assert!(crate::run_manager::compact_evidence_for_tests(r#"{"evidence":[]}"#).is_none());
+    assert!(crate::compact_evidence_for_tests(r#"{"evidence":[]}"#).is_none());
+}
+
+/// PR-Daemon #1976: a search first that fails leaves the thread as it was and
+/// the answer still comes; a plan-mode run is not searched first at all.
+#[tokio::test]
+async fn a_failed_first_search_or_a_plan_run_goes_on_without_it() {
+    const HIT: &str = r#"{"kind":"knowledge.search","evidence":[{"rank":1,"snippet":"x"}]}"#;
+    for (fail, mode, searched) in [
+        (true, agent24_protocol::RunMode::Normal, 1),
+        (false, agent24_protocol::RunMode::Plan, 0),
+    ] {
+        let provider = Arc::new(SeenProvider {
+            seen: StdMutex::new(vec![]),
+            tools: StdMutex::new(vec![]),
+        });
+        let stub = Arc::new(KnowledgeSearchStub {
+            reply: HIT.to_owned(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail,
+        });
+        let (manager, _sink, store) =
+            manager_with_tools(provider.clone(), ToolRegistry::new().with(stub.clone())).await;
+        let run = manager
+            .start_run(RunCreate {
+                prompt: "烧开水要多久".into(),
+                knowledge_binding_id: Some("b1".into()),
+                knowledge_query: Some("烧开水要多久".into()),
+                mode,
+                ..create()
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(stub.calls.load(std::sync::atomic::Ordering::SeqCst), searched, "{mode:?}");
+        if matches!(mode, agent24_protocol::RunMode::Normal) {
+            assert_eq!(done.status, RunStatus::Completed);
+            let first = provider.seen.lock().unwrap()[0].clone();
+            assert!(first.iter().all(|m| m.role != "tool"), "a failed search put nothing in");
+        }
+    }
 }

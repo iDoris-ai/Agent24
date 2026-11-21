@@ -26,7 +26,7 @@ export function knowledgePrompt(text: string): string {
 /** Asked to write something new (「写一篇八百字散文」「帮我起草一段介绍」): the
  * knowledge bases have nothing to add, so nothing is searched first (General,
  * 0.6.75). The model can still search if it wants to. */
-const WRITE = /^(请|麻烦)?(你)?(帮我)?(写|起草|创作|编写|编一|作一)|写(一|个|篇|段|首|封)|作文|散文|诗歌|小说|文案/
+const WRITE = /^(请|麻烦)?(你)?(帮我|给我)?(写|起草|创作|编写|编一|作一)|^(请|麻烦)?(你)?(帮我|给我)?[^，。？?]{0,6}写(一|个|篇|段|首|封)/
 
 /** What the daemon searches first (RunCreate `knowledge_query`): the user's
  * own words; none on a 「记住…」 turn or when asked to write something new. */

@@ -504,7 +504,8 @@ export default function ChatPage() {
         runScope.current = scope
       }
       const last = request.messages[request.messages.length - 1]
-      const asked = knowledge?.active === true && plain && last?.role === 'user'
+      // PR-Daemon #1976: 「系统已先查过」 only on a turn that is searched first.
+      const asked = knowledge?.active === true && plain && last?.role === 'user' && knowledgeQuery(last.content) !== null
         ? { ...request, messages: [...request.messages.slice(0, -1), { ...last, content: knowledgePrompt(last.content) }] }
         : request
       // M1 retrieval first: a plain turn (no document, no document tool, not
