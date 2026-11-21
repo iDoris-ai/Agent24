@@ -691,18 +691,10 @@ fn health_uses_lock_minimum_minor_and_allows_newer_minor() {
 #[tokio::test]
 async fn crash_before_first_health_uses_the_same_restart_limit() {
     let fixture = Fixture::new(serde_json::json!({"mode": "crash_before_ready"}));
-    let config = fixture.config().await;
-    let shutdown = config.shutdown.clone();
-    let task = tokio::spawn(Supervisor::start(config, inputs, || async {}));
-    timeout(Duration::from_secs(20), async {
-        while fixture.attempts().len() < 7 {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap();
-    shutdown.cancel();
-    assert!(matches!(task.await.unwrap(), Err(SupervisorError::Stopped)));
+    let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
+    assert!(matches!(result, Err(SupervisorError::RestartLimit)));
+    // The sixth failure opens the circuit; the initial start then gives up.
+    assert_eq!(fixture.attempts().len(), 6);
     assert!(!fixture.record().exists());
 }
 

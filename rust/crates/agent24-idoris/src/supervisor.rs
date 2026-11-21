@@ -60,6 +60,8 @@ pub enum SupervisorError {
     TokenHandoff,
     #[error("iDoris shutdown was requested")]
     Stopped,
+    #[error("iDoris restart limit reached")]
+    RestartLimit,
     #[error("iDoris supervisor I/O failed: {0}")]
     Io(#[from] io::Error),
     #[error("installed iDoris verification failed: {0}")]
@@ -629,6 +631,11 @@ where
                     && !config.shutdown.is_cancelled() =>
             {
                 let delay = policy.delay(Instant::now(), stable_since, &config.timings)?;
+                // Before the first start no handle exists to publish the circuit,
+                // so a crash loop must surface as an error instead of waiting forever.
+                if signals.is_none() && policy.open {
+                    return Err(SupervisorError::RestartLimit);
+                }
                 if let Some(signals) = signals {
                     signals.status.send_modify(|s| {
                         s.crashes += 1;
