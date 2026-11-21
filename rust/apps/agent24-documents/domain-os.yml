@@ -73,13 +73,16 @@ tools:
   # E1b/D5a (Loop 3): DOCX paragraphs and template fields. The writes make a
   # NEW document; each call is approved by the user.
   - operation: paragraphs
-    description: "List a DOCX document's paragraphs (index, text, whether in a table). document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List a DOCX document's paragraphs that have text: each paragraph's index and its first 40 characters (whether in a table). A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. document_id is its id from documents.list, or its file name/title. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
       required: [document_id]
       properties:
         document_id: { type: string }
+        from: { type: integer, minimum: 0, description: "the paragraph index to start from (default 0)" }
+        count: { type: integer, minimum: 1, maximum: 200, description: "at most this many paragraphs" }
+        query: { type: string, description: "only paragraphs containing this text" }
     risk: read
     output_privacy: local_only
     timeout_ms: 30000
