@@ -39,6 +39,7 @@ struct Fixture {
     data: u16,
     admin: TcpListener,
     instance: String,
+    pid: u32,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -72,12 +73,13 @@ impl Fixture {
             data,
             admin,
             instance,
+            pid: std::process::id(),
         };
         fixture.write_discovery();
         fixture
     }
     fn write_discovery(&self) {
-        std::fs::write(&self.path,json!({"schema":1,"service":"idoris","pid":std::process::id(),"instance_nonce":KEY,"instance_id":self.instance,"data_port":self.data,"admin_port":self.admin.local_addr().unwrap().port(),"started_at_ms":1763625330123u64,"version":"0.6.0","contract_version":"1.3.0"}).to_string()).unwrap();
+        std::fs::write(&self.path,json!({"schema":1,"service":"idoris","pid":self.pid,"instance_nonce":KEY,"instance_id":self.instance,"data_port":self.data,"admin_port":self.admin.local_addr().unwrap().port(),"started_at_ms":1763625330123u64,"version":"0.6.0","contract_version":"1.3.0"}).to_string()).unwrap();
         std::fs::set_permissions(&self.path, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
     async fn connect(&self, path: &Path) -> (Client, Value) {
@@ -89,7 +91,7 @@ impl Fixture {
         };
         let challenge = client.line().await;
         assert_eq!(challenge["op"], "challenge");
-        let mut frame = json!({"v":1,"op":"register","nonce":challenge["nonce"],"instance_id":self.instance,"pid":std::process::id(),"version":"0.6.0","contract_version":"1.3.0","data_port":self.data,"admin_port":self.admin.local_addr().unwrap().port(),"started_at_ms":1763625330123u64,"phase":"ready","resume":false,"proof":""});
+        let mut frame = json!({"v":1,"op":"register","nonce":challenge["nonce"],"instance_id":self.instance,"pid":self.pid,"version":"0.6.0","contract_version":"1.3.0","data_port":self.data,"admin_port":self.admin.local_addr().unwrap().port(),"started_at_ms":1763625330123u64,"phase":"ready","resume":false,"proof":""});
         let registration: Register = serde_json::from_value(frame.clone()).unwrap();
         frame["proof"] = proof(
             &decode_hex::<32>(KEY).unwrap(),
@@ -311,4 +313,67 @@ fn socket_path_limit() {
         .kind(),
         io::ErrorKind::InvalidInput
     );
+}
+
+#[tokio::test]
+async fn ic3b_register_rejects_peer_pid_mismatch() {
+    let mut fixture = Fixture::new().await;
+    fixture.pid += 1;
+    fixture.write_discovery();
+    let (mut client, frame) = fixture.connect(fixture.server.socket_path()).await;
+    client.send(&frame).await;
+    assert_eq!(client.line().await["code"], "identity_rejected");
+    assert!(fixture.server.handle().session().is_none());
+}
+
+#[tokio::test]
+async fn ic3b_register_rejects_health_instance_mismatch() {
+    let mut fixture = Fixture::new().await;
+    fixture.instance = uuid::Uuid::new_v4().to_string();
+    fixture.write_discovery();
+    let (mut client, frame) = fixture.connect(fixture.server.socket_path()).await;
+    client.send(&frame).await;
+    assert_eq!(client.line().await["code"], "identity_rejected");
+    assert!(fixture.server.handle().session().is_none());
+}
+
+#[tokio::test]
+async fn ic3b_register_rejects_unowned_ports() {
+    let fixture = Fixture::new().await;
+    *fixture.server.handle.0.port_ownership.lock().unwrap() = Some(false);
+    let (mut client, frame) = fixture.connect(fixture.server.socket_path()).await;
+    client.send(&frame).await;
+    assert_eq!(client.line().await["code"], "identity_rejected");
+    assert!(fixture.server.handle().session().is_none());
+}
+
+#[tokio::test]
+async fn ic3b_reconnect_clears_expected_exit() {
+    let fixture = Fixture::new().await;
+    let mut client = fixture.registered().await;
+    let handle = fixture.server.handle();
+    let mut changed = handle.subscribe();
+    client
+        .send(&json!({"v":1,"op":"bye","reason":"shutdown"}))
+        .await;
+    timeout(Duration::from_secs(2), async {
+        while changed.borrow_and_update().is_some() {
+            changed.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        handle
+            .0
+            .state
+            .lock()
+            .unwrap()
+            .expected
+            .contains(&fixture.instance)
+    );
+    let client = fixture.registered().await;
+    drop(client);
+    let bye = handle.take_expected_exit(&fixture.instance);
+    assert!(!super::super::expected_exit(Some(1), bye));
 }
