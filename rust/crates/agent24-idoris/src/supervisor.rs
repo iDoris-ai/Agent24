@@ -189,6 +189,8 @@ pub struct StartConfig {
     pub lock: &'static IdorisLock,
     registration: Option<register::Handle>,
     register_socket: Option<PathBuf>,
+    #[cfg(test)]
+    port_ownership: Option<bool>,
 }
 impl StartConfig {
     pub fn new(
@@ -209,6 +211,8 @@ impl StartConfig {
             lock: IdorisLock::embedded(),
             registration: None,
             register_socket: None,
+            #[cfg(test)]
+            port_ownership: None,
         })
     }
 }
@@ -729,6 +733,9 @@ where
     let Ok(discovered) = discovery::read_any(&path) else {
         return Ok(None);
     };
+    let Some(launch) = &discovered.launch else {
+        return Ok(None);
+    };
     let Some(record) = lease.adoptable(&config.installed.binary(), discovered.pid) else {
         return Ok(None);
     };
@@ -740,13 +747,12 @@ where
         _ = config.shutdown.cancelled() => return Err(SupervisorError::Stopped),
         value = refresh() => value?,
     };
-    if let Some(launch) = &discovered.launch
-        && (launch["db_path"].as_str() != config.data.db.to_str()
-            || launch["state_dir"].as_str() != config.data.state.to_str()
-            || launch["components_dir"].as_str() != config.components.path().to_str()
-            || launch["allocated_budget_bytes"]
-                .as_u64()
-                .is_some_and(|n| n != inputs.budget.allocated_bytes))
+    if launch["db_path"].as_str() != config.data.db.to_str()
+        || launch["state_dir"].as_str() != config.data.state.to_str()
+        || launch["components_dir"].as_str() != config.components.path().to_str()
+        || launch["allocated_budget_bytes"]
+            .as_u64()
+            .is_some_and(|n| n != inputs.budget.allocated_bytes)
     {
         return Ok(None);
     }
@@ -1187,6 +1193,15 @@ async fn wait_group_gone(group: Pid) -> io::Result<()> {
     Ok(())
 }
 
+/// G1: an unsupported ownership probe counts as owned only where the caller allows it
+/// (tests); production fails closed.
+pub(crate) fn ownership_verdict(result: io::Result<bool>, allow_unsupported: bool) -> bool {
+    match result {
+        Ok(owned) => owned,
+        Err(error) => error.kind() == io::ErrorKind::Unsupported && allow_unsupported,
+    }
+}
+
 /// F3/N1: loopback has no peer identity, so a 200 from a port proves
 /// nothing. Before the Admin token leaves this process, every visible
 /// LISTEN socket on both ports must be held by this generation's group.
@@ -1197,19 +1212,11 @@ async fn listeners_owned(
 ) -> Result<bool, SupervisorError> {
     let group = group.ok_or(SupervisorError::InstanceConflict)?;
     if launcher_enabled(config) {
-        return match agent24_os_proc::owns_listening_ports(
-            group.as_raw(),
-            &[ports.data, ports.admin],
-        ) {
-            Ok(owned) => Ok(owned),
-            Err(error)
-                if error.kind() == io::ErrorKind::Unsupported
-                    && (cfg!(test) || !cfg!(target_os = "macos")) =>
-            {
-                Ok(true)
-            }
-            Err(_) => Ok(false),
-        };
+        let ownership =
+            agent24_os_proc::owns_listening_ports(group.as_raw(), &[ports.data, ports.admin]);
+        #[cfg(test)]
+        let ownership = config.port_ownership.map_or(ownership, Ok);
+        return Ok(ownership_verdict(ownership, cfg!(test)));
     }
     for port in [ports.data, ports.admin] {
         let found = identity::listeners(port, config.timings.health_request).await;
@@ -1282,9 +1289,10 @@ fn killpg_outcome(
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
         // Explicit stop already ran on every graceful path. A drop without it means
-        // agent24d is going away abnormally: leave the launcher generation for the
-        // next agent24d to adopt; its orphan timeout reaps it if nobody does.
-        if launcher_enabled(&self.config) {
+        // agent24d is going away abnormally. Only a launcher with a registration
+        // socket has an armed orphan timer, so leave that generation for adoption.
+        // Without the timer, kill it to avoid leaving an unmanaged process.
+        if launcher_enabled(&self.config) && self.config.register_socket.is_some() {
             return;
         }
         let _ = self.signal_owned_group(Signal::SIGKILL);
