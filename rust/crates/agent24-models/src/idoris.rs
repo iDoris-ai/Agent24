@@ -430,7 +430,13 @@ impl IdorisGateway {
             progress: None,
         };
         let served = self
-            .complete(TaskProfile::default(), &request, cancel, None)
+            .complete(
+                TaskProfile::default(),
+                &request,
+                cancel,
+                None,
+                &uuid::Uuid::new_v4().to_string(),
+            )
             .await?;
         let evidence = served
             .idoris
@@ -451,11 +457,12 @@ impl IdorisGateway {
         req: &CompletionRequest,
         cancel: &CancellationToken,
         request_id: Option<&str>,
+        inference_id: &str,
     ) -> Result<Served, ModelError> {
         self.wait_model_ready(cancel).await?;
         tokio::time::timeout(
             self.request_timeout,
-            self.complete_inner(profile, req, cancel, request_id),
+            self.complete_inner(profile, req, cancel, request_id, inference_id),
         )
         .await
         .map_err(|_| ModelError::Unavailable("iDoris request timed out".into()))?
@@ -467,6 +474,7 @@ impl IdorisGateway {
         req: &CompletionRequest,
         cancel: &CancellationToken,
         request_id: Option<&str>,
+        inference_id: &str,
     ) -> Result<Served, ModelError> {
         let (complexity, role) = match profile.complexity {
             Complexity::Simple => ("simple", "idoris/daily"),
@@ -476,14 +484,15 @@ impl IdorisGateway {
         let body = gateway_body(req, role);
         // Request-Id is iDoris's idempotency key: the same id with a different
         // payload is 409 `request_id_conflict`. One admitted kernel id may bind
-        // many calls, so it travels on Trace-Id and every call mints its own key.
+        // many calls, so it travels on Trace-Id. The router mints a separate key
+        // for each call and reuses it when retrying that same payload.
         let mut call = self
             .client
             .post(self.endpoint("/v1/chat/completions"))
             .header(AUTHORIZATION, self.key.clone())
             .header("X-iDoris-Privacy", "local_only")
             .header("X-iDoris-Complexity", complexity)
-            .header("X-iDoris-Request-Id", uuid::Uuid::new_v4().to_string());
+            .header("X-iDoris-Request-Id", inference_id);
         if let Some(trace_id) = request_id.and_then(correlation_trace_id) {
             call = call.header("X-iDoris-Trace-Id", trace_id);
         }
@@ -736,6 +745,7 @@ mod tests {
                 &request,
                 &cancel,
                 None,
+                &uuid::Uuid::new_v4().to_string(),
             )
             .await
     }
