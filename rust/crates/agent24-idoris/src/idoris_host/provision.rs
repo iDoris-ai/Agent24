@@ -1011,11 +1011,22 @@ impl IdorisHost {
             self.phase(id, Phase::Setup).await;
             let key = key.map(ApiKey::into_secret);
             let setup_result = if compat {
-                crate::setup::write_openai_compat_card(
-                    &self.root.join("instances/managed"), endpoint.as_str(),
-                    &request.daily_model, request.deep_model.as_deref().unwrap_or(&request.daily_model),
-                    embed.map(String::as_str),
-                )
+                if crate::setup::upstream_setup_enabled(IdorisLock::embedded()) {
+                    let mut upstream_bindings = bindings.clone();
+                    if !upstream_bindings.iter().any(|(role, _)| *role == Role::Deep) {
+                        upstream_bindings.push((Role::Deep, request.daily_model.clone()));
+                    }
+                    crate::setup::run_setup_upstream(
+                        &installed, &self.root.join("instances/managed"), endpoint.as_str(),
+                        &upstream_bindings, "lmstudio", cancel,
+                    ).await
+                } else {
+                    crate::setup::write_openai_compat_card(
+                        &self.root.join("instances/managed"), endpoint.as_str(),
+                        &request.daily_model, request.deep_model.as_deref().unwrap_or(&request.daily_model),
+                        embed.map(String::as_str),
+                    )
+                }
             } else {
                 let probe = crate::omlx_probe::ProbeResult {
                     endpoint: endpoint.clone(), identity: ServiceIdentity::Omlx,
