@@ -3,8 +3,8 @@ import type { BackendProxyRequest } from '../../../shared/ipc-types'
 
 export type ModelSource = NonNullable<components['schemas']['IdorisConnectRequest']['source']>
 export type IdorisStatus = components['schemas']['IdorisStatus'] & { source?: ModelSource }
-export type IdorisOperation = Omit<components['schemas']['IdorisOperation'], 'error_code'> & { error_code: string | null }
-export type IdorisCandidates = components['schemas']['IdorisCandidates']
+export type IdorisOperation = Omit<components['schemas']['IdorisOperation'], 'error_code' | 'setup_code'> & { error_code: string | null; setup_code?: string; setup_endpoint?: string }
+export type IdorisCandidates = components['schemas']['IdorisCandidates'] & { setup?: ReturnType<typeof parseOmlxSetup> }
 export type ConnectRequest = components['schemas']['IdorisConnectRequest']
 
 export class IdorisError extends Error {
@@ -87,14 +87,29 @@ export function parseOperation(value: unknown): IdorisOperation {
     result: v.result === null ? null : choice(v.result, ['succeeded', 'failed', 'cancelled']),
     error_code: v.error_code === null ? null : text(v.error_code),
     cancellable: bool(v.cancellable),
+    ...(v.setup_endpoint === undefined ? {} : { setup_endpoint: text(v.setup_endpoint) }),
+    ...(v.setup_code === undefined ? {} : { setup_code: text(v.setup_code) }),
     ...(v.download_progress === undefined ? {} : { download_progress: parseProgress(v.download_progress) }),
     ...(v.verification === undefined ? {} : { verification: parseVerification(v.verification) }),
+  }
+}
+function parseOmlxSetup(value: unknown) {
+  const v = object(value)
+  const engine = object(v.engine)
+  return {
+    endpoint: text(v.endpoint), mode: choice(v.mode, ['adopt', 'managed']),
+    engine: {
+      engine_kind: choice(engine.engine_kind, ['omlx']), installed: bool(engine.installed),
+      executable: engine.executable === null ? null : text(engine.executable),
+      ...(engine.version === undefined ? {} : { version: text(engine.version) }),
+    },
   }
 }
 function parseCandidates(value: unknown): IdorisCandidates {
   const v = object(value)
   return {
     key_from_local_settings: bool(v.key_from_local_settings),
+    ...(v.setup === undefined ? {} : { setup: parseOmlxSetup(v.setup) }),
     candidates: array(v.candidates).map(value => {
       const c = object(value)
       return { endpoint: text(c.endpoint), identity: choice(c.identity, ['omlx', 'unknown_service']), authentication: choice(c.authentication, ['ready', 'auth_required', 'auth_rejected', 'unreachable', 'unknown_service', 'invalid_response']), models: array(c.models).map(text) }

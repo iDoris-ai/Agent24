@@ -11,6 +11,8 @@ export const modelSourceMessages = defineMessages({
     invalid_response: 'The service returned an invalid response. Try again.',
     backend_not_ready: 'The daemon is unavailable. Reconnect and try again.',
     model_not_found: 'Model not found. Read the models again and choose an available one.',
+    engineInstalled: 'oMLX installed', engineMissing: 'oMLX not installed',
+    engine_not_installed: 'Install oMLX and try again.', port_in_use: 'The service port is in use.', model_not_installed: 'Install the selected model in oMLX and try again.',
     hint: 'Chat goes through iDoris; this configures its upstream. LM Studio does not yet support vector recall.',
   },
   zh: {
@@ -22,6 +24,8 @@ export const modelSourceMessages = defineMessages({
     noBudget: '无法获取内存预算，请刷新 iDoris 状态后重试。',
     invalid_response: '服务响应无效，请重试。', backend_not_ready: 'daemon 暂不可用，请重新连接后重试。',
     model_not_found: '模型不存在，请重新读取模型并选择可用模型。',
+    engineInstalled: 'oMLX 已安装', engineMissing: 'oMLX 未安装',
+    engine_not_installed: '请安装 oMLX 后重试。', port_in_use: '服务端口已被占用。', model_not_installed: '请在 oMLX 中安装所选模型后重试。',
     hint: '对话只经 iDoris；这里配置的是 iDoris 的上游。LM Studio 暂不支持向量召回。',
   },
   th: {
@@ -33,6 +37,8 @@ export const modelSourceMessages = defineMessages({
     noBudget: 'ไม่มีงบหน่วยความจำ โปรดรีเฟรชสถานะ iDoris แล้วลองใหม่',
     invalid_response: 'บริการตอบกลับไม่ถูกต้อง โปรดลองใหม่', backend_not_ready: 'daemon ไม่พร้อมใช้งาน โปรดเชื่อมต่อใหม่แล้วลองอีกครั้ง',
     model_not_found: 'ไม่พบโมเดล โปรดอ่านรายการอีกครั้งแล้วเลือกโมเดลที่พร้อมใช้งาน',
+    engineInstalled: 'ติดตั้ง oMLX แล้ว', engineMissing: 'ยังไม่ได้ติดตั้ง oMLX',
+    engine_not_installed: 'โปรดติดตั้ง oMLX แล้วลองอีกครั้ง', port_in_use: 'พอร์ตบริการถูกใช้งานอยู่', model_not_installed: 'โปรดติดตั้งโมเดลที่เลือกใน oMLX แล้วลองอีกครั้ง',
     hint: 'แชตผ่าน iDoris เท่านั้น ที่นี่ใช้ตั้งค่าบริการต้นทางของ iDoris ขณะนี้ LM Studio ยังไม่รองรับการค้นคืนแบบเวกเตอร์',
   },
 })

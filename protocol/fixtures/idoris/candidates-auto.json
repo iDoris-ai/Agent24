@@ -1,0 +1,9 @@
+{
+  "candidates": [{"endpoint": "", "identity": "omlx", "authentication": "ready", "models": ["chat-model"]}],
+  "key_from_local_settings": false,
+  "setup": {
+    "endpoint": "http://127.0.0.1:43210/",
+    "mode": "adopt",
+    "engine": {"engine_kind": "omlx", "installed": true, "executable": "/Applications/oMLX.app/omlx"}
+  }
+}

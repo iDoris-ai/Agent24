@@ -134,3 +134,35 @@ describe('模型来源', () => {
     expect(proxy.mock.calls.filter(([request]) => request.path.endsWith('/connect'))).toHaveLength(1)
   })
 })
+
+it('connects from offline models and displays the iDoris discovery result', async () => {
+  candidates = [{ ...candidate, endpoint: '' }]
+  proxy.mockImplementation(async (request: BackendProxyRequest) => {
+    if (request.path.endsWith('/status')) return { ok: true, status: 200, data: status }
+    if (request.path.endsWith('/candidates')) return { ok: true, status: 200, data: {
+      candidates, key_from_local_settings: false,
+      ...(proxy.mock.calls.some(([r]) => r.path.endsWith('/operations/op')) ? {
+        setup: { endpoint: 'http://127.0.0.1/', mode: 'adopt', engine: { engine_kind: 'omlx', installed: true, executable: null } },
+      } : {}),
+    } }
+    if (request.path.endsWith('/connect')) return { ok: true, status: 202, data: operation }
+    if (request.path.endsWith('/operations/op')) return { ok: true, status: 200, data: result }
+    throw new Error(`Unexpected route: ${request.path}`)
+  })
+  await ready()
+  fireEvent.click(screen.getByRole('button', { name: '应用' }))
+  await waitFor(() => expect(proxy).toHaveBeenCalledWith(expect.objectContaining({
+    path: '/api/v1/idoris/connect', body: expect.objectContaining({ endpoint: '', daily_model: 'Qwen-chat' }),
+  })))
+  expect(await screen.findByTestId('omlx-setup', {}, { timeout: 3000 })).toHaveTextContent('http://127.0.0.1/ · adopt · oMLX 已安装')
+})
+
+it('shows the discovered endpoint when automatic setup requires authentication', async () => {
+  candidates = [{ ...candidate, endpoint: '' }]
+  result = { ...operation, phase: 'completed', result: 'failed', error_code: 'setup_failed',
+    setup_code: 'auth_required', setup_endpoint: 'http://127.0.0.1:19283' }
+  await ready()
+  fireEvent.click(screen.getByRole('button', { name: '应用' }))
+  expect(await screen.findByRole('alert', {}, { timeout: 3000 })).toHaveTextContent('http://127.0.0.1:19283')
+  expect(screen.queryByText('已切换')).not.toBeInTheDocument()
+})

@@ -42,6 +42,8 @@ pub const SHUTDOWN_BUDGET: Duration =
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Installation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omlx_setup: Option<crate::setup::OmlxSetup>,
     #[serde(default)]
     pub connection: Option<ConnectRequest>,
     pub version: String,
@@ -290,6 +292,8 @@ pub struct Operation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_code: Option<crate::setup::SetupCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download_progress: Option<crate::download::DownloadProgress>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verification: Option<VerificationReceipt>,
@@ -309,6 +313,8 @@ pub struct OperationView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     setup_code: &'a Option<crate::setup::SetupCode>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    setup_endpoint: &'a Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     download_progress: &'a Option<crate::download::DownloadProgress>,
     #[serde(skip_serializing_if = "Option::is_none")]
     verification: &'a Option<VerificationReceipt>,
@@ -323,6 +329,7 @@ impl Operation {
             error_code: &self.error_code,
             cancellable: self.cancellable,
             setup_code: &self.setup_code,
+            setup_endpoint: &self.setup_endpoint,
             download_progress: &self.download_progress,
             verification: &self.verification,
         }
@@ -528,7 +535,7 @@ impl Runtime for SystemRuntime {
                 .clone();
             provisioner.upstream_key().await?.map(ApiKey::into_secret)
         };
-        {
+        if !crate::setup::upstream_setup_enabled(IdorisLock::embedded()) {
             let url = r.omlx_url.as_deref().ok_or(Code::NotConfigured)?;
             let endpoint = Endpoint::parse(url).map_err(|_| Code::NotConfigured)?;
             let api_key = key
@@ -949,6 +956,7 @@ impl IdorisHost {
             idempotency_key: key,
             request_fingerprint: None,
             setup_code: None,
+            setup_endpoint: None,
             download_progress: None,
             verification: None,
         };
