@@ -7,6 +7,7 @@
 // events, and again when the window comes back (the tasks are in the
 // conversation's file, docs/ui/ASSISTANT-A.md). Answers get no card.
 
+import { withoutToolNames } from './user-facing'
 import { useEffect, useMemo, useState, useSyncExternalStore } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
@@ -225,7 +226,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       {failed && <span className="task-card-error" role="alert">{failed}</span>}
       {status === 'completed' && view?.output && (
         <div className="task-card-output">
-          {view.output}
+          {withoutToolNames(view.output)}
           {checked && view.knowledge && <div className="task-card-knowledge">{checked.kind === 'read' ? t('knowledge.via') : t(`knowledge.${checked.kind}`)}</div>}
           {checked && checked.unread.length > 0 && (
             <div className="task-card-knowledge" role="note">{t('knowledge.unread', { ids: checked.unread.join(', ') })}</div>
