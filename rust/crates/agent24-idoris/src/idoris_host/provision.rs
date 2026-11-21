@@ -1071,7 +1071,7 @@ impl IdorisHost {
                     .map_err(keychain_code)?;
             }
             // Old configuration remains on disk while the replacement is tested.
-            self.block_gateway();
+            self.starting_gateway();
             let old = self.inner.lock().await.supervisor.take();
             if let Some(old) = old {
                 old.stop().await.map_err(Code::from)?;
