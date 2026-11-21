@@ -90,6 +90,34 @@ describe('docxBytes', () => {
     expect(out).toContain('第一条 租赁')
     expect(out.indexOf('第一条')).toBeLessThan(out.indexOf('Article 6'))
   })
+
+  // N1 (Loop 5): headings carry Word's built-in Heading1–3, which the styles
+  // part defines with their outline level (what the navigation pane reads).
+  it('writes a heading with its Heading style and defines Heading1–3 with outline levels', () => {
+    const bytes = docxBytes([
+      { text: 'Lease Contract', pageBreakBefore: false, level: 1 },
+      { text: 'Chapter 1', pageBreakBefore: true, level: 2 },
+      { text: 'Article 1 The deposit.', pageBreakBefore: false },
+    ])
+    const text = bytes.toString('utf8')
+    expect(text).toContain('<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr>')
+    expect(text).toContain('<w:p><w:pPr><w:pStyle w:val="Heading2"/><w:pageBreakBefore/></w:pPr>')
+    expect(text).toContain('<w:p><w:r><w:rPr><w:rFonts w:eastAsia="Noto Sans SC"/></w:rPr><w:t xml:space="preserve">Article 1')
+    for (const part of ['word/styles.xml', 'word/_rels/document.xml.rels', '/word/styles.xml']) expect(text).toContain(part)
+    for (const level of [1, 2, 3]) {
+      expect(text).toContain(`w:styleId="Heading${level}"><w:name w:val="heading ${level}"/>`)
+      expect(text).toContain(`<w:outlineLvl w:val="${level - 1}"/>`)
+    }
+  })
+
+  it.skipIf(process.platform !== 'darwin')('the headings open as headings (macOS textutil to HTML)', () => {
+    const dir = tempDir()
+    const file = path.join(dir, 'h.docx')
+    fs.writeFileSync(file, docxBytes([{ text: 'Lease Contract', pageBreakBefore: false, level: 1 }, { text: 'Body text.', pageBreakBefore: false }]))
+    const out = execFileSync('/usr/bin/textutil', ['-convert', 'html', '-stdout', file]).toString()
+    expect(out).toContain('Lease Contract')
+    expect(out).toContain('Body text.')
+  })
 })
 
 describe('safeTitle (General 11-18)', () => {

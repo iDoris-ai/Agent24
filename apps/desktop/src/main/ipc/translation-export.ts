@@ -12,7 +12,7 @@ function invalid(message: string): TranslationExportResult {
   return { ok: false, code: 'invalid_request', message }
 }
 
-type Paragraph = { text: string; pageBreakBefore: boolean }
+type Paragraph = { text: string; pageBreakBefore: boolean; level?: 1 | 2 | 3 }
 
 /** One `{ title, paragraphs, lang }` object, or a result that says why it was refused. */
 function requestOf(raw: unknown): { title: string; paragraphs: Paragraph[]; lang: 'en' | 'zh' } | TranslationExportResult {
@@ -25,11 +25,12 @@ function requestOf(raw: unknown): { title: string; paragraphs: Paragraph[]; lang
   const paragraphs: Paragraph[] = []
   let bytes = 0
   for (const p of rec.paragraphs as unknown[]) {
-    const q = p as { text?: unknown; pageBreakBefore?: unknown } | null
+    const q = p as { text?: unknown; pageBreakBefore?: unknown; level?: unknown } | null
     if (!q || typeof q.text !== 'string' || typeof q.pageBreakBefore !== 'boolean') return invalid('each paragraph is { text, pageBreakBefore }')
+    if (q.level !== undefined && q.level !== 1 && q.level !== 2 && q.level !== 3) return invalid('a heading level is 1, 2 or 3')
     bytes += Buffer.byteLength(q.text)
     if (bytes > MAX_TEXT_BYTES) return invalid('the text is larger than 5 MB')
-    paragraphs.push({ text: q.text, pageBreakBefore: q.pageBreakBefore })
+    paragraphs.push(q.level === undefined ? { text: q.text, pageBreakBefore: q.pageBreakBefore } : { text: q.text, pageBreakBefore: q.pageBreakBefore, level: q.level })
   }
   return { title: rec.title, paragraphs, lang: rec.lang }
 }
