@@ -99,6 +99,7 @@ async fn assert_quota_rejection(rows: i64) {
 
     let first = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("quota-session".to_owned()),
@@ -141,6 +142,7 @@ async fn assert_quota_rejection(rows: i64) {
 
     let second = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("quota-session".to_owned()),
@@ -225,6 +227,7 @@ async fn lock_timeout_keeps_run_completed_and_reports_failed_memory_write() {
 
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("timeout-lock-session".to_owned()),
@@ -294,6 +297,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
 
     let first = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-ack-session".to_owned()),
@@ -364,6 +368,7 @@ async fn committed_turn_waits_for_ack_after_deadline_and_is_available_next_round
     );
     let second = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-ack-session".to_owned()),
@@ -433,6 +438,7 @@ async fn summarizer_timeout_keeps_durable_originals_without_write_failed_event()
 
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("timeout-summary-session".to_owned()),
@@ -596,6 +602,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
     // B reaches the provider and pauses after obtaining its read-side session lock.
     let b = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-cancel-race".into()),
@@ -614,6 +621,7 @@ async fn cancel_during_sqlite_commit_does_not_release_session_lock_before_commit
     armed.store(true, Ordering::SeqCst);
     let a = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("commit-cancel-race".into()),

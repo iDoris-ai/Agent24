@@ -6862,6 +6862,16 @@ components:
             labelled `Unknown` + `LocalOnly`. Inbound events and scheduled
             self-wake runs cannot carry one (`skill_not_admitted`), and neither
             can a workspace-bound run in v1. Omit/null for a run without a skill.
+        knowledge_query:
+          type: [string, "null"]
+          description: >-
+            M1 retrieval first (David 2026-11-21): with a Knowledge binding, the
+            run searches the bound knowledge bases with this text once before
+            its first model call, through the same `knowledge_search` tool and
+            record as a search the model asks for. Hits go in as that search's
+            call and result; no hit, a failure or a refusal leaves the run as it
+            was. Ignored without a binding, on a turn that asks to remember
+            something, and on inbound runs. Omit/null for no search first.
 
     ToolCallStatus:
       type: string
