@@ -2,8 +2,8 @@
 //!
 //! Each attempt gets a fresh `instances/<id>/components/gen-<random>` directory.
 //! Generations are never overwritten: no `--force` or default model selection.
-//! The selected endpoint carries the IL-04 probe result, so model membership is
-//! checked before executing iDoris. The caller serializes instance operations.
+//! v0.5.0 uses the IL-04 probe; v0.6.0 delegates discovery to setup --auto.
+//! The caller serializes instance operations.
 //!
 //! Contract source: iDoris tag v0.5.0, crates/idoris-router/src/{cli,setup_omlx}.rs
 //! and docs/interfaces/iDoris-Agent24-边界与接口规范.md (L2). The released
@@ -53,10 +53,17 @@ impl TryFrom<&str> for Role {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SetupCode {
+    EngineNotInstalled,
+    PortInUse,
+    ModelNotInstalled,
     Unreachable,
     AuthRequired,
     AuthFailed,
     NotOmlx,
+    NotOpenaiCompatible,
+    InvalidId,
+    IdConflict,
+    SetupFailed,
     ModelNotFound,
     InvalidEndpoint,
     InvalidRole,
@@ -68,10 +75,17 @@ pub enum SetupCode {
 impl SetupCode {
     pub fn code(self) -> &'static str {
         match self {
+            Self::EngineNotInstalled => "engine_not_installed",
+            Self::PortInUse => "port_in_use",
+            Self::ModelNotInstalled => "model_not_installed",
             Self::Unreachable => "unreachable",
             Self::AuthRequired => "auth_required",
             Self::AuthFailed => "auth_failed",
             Self::NotOmlx => "not_omlx",
+            Self::NotOpenaiCompatible => "not_openai_compatible",
+            Self::InvalidId => "invalid_id",
+            Self::IdConflict => "id_conflict",
+            Self::SetupFailed => "setup_failed",
             Self::ModelNotFound => "model_not_found",
             Self::InvalidEndpoint => "invalid_endpoint",
             Self::InvalidRole => "invalid_role",
@@ -89,6 +103,8 @@ pub enum SetupError {
     Rejected(SetupCode),
     #[error("iDoris budget or explicit core reservation is unavailable")]
     BudgetUnavailable,
+    #[error("oMLX authentication required at {endpoint}")]
+    AuthRequired { endpoint: String },
     #[error("setup requires a ready oMLX probe and unique daily/deep bindings including daily")]
     InvalidBindings,
     #[error("setup path is outside the managed instance")]
@@ -129,10 +145,34 @@ pub struct SetupOutcome {
     pub components_dir: PathBuf,
     pub bindings: BTreeMap<Role, String>,
     pub auth_required: bool,
+    pub omlx: Option<OmlxSetup>,
+}
+
+/// The discovery result belongs to iDoris; Agent24 only displays it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct OmlxSetup {
+    pub endpoint: String,
+    pub mode: OmlxMode,
+    pub engine: Engine,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OmlxMode {
+    Adopt,
+    Managed,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Engine {
+    pub engine_kind: String,
+    pub installed: bool,
+    pub executable: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// Create a fresh single-card OpenAI-compatible component generation. Values
 /// are validated by the host before reaching this writer.
+// Remove this v0.5.0 writer when the embedded lock is bumped to v0.6.0.
 pub fn write_openai_compat_card(
     instance_root: &Path,
     endpoint: &str,
@@ -169,7 +209,195 @@ pub fn write_openai_compat_card(
         .chain(embed.map(|id| (Role::Embed, id.to_owned())))
         .collect(),
         auth_required: false,
+        omlx: None,
     })
+}
+
+/// Shared gate for setup features introduced in iDoris v0.6.0.
+pub(crate) fn upstream_setup_enabled(lock: &crate::IdorisLock) -> bool {
+    semver::Version::parse(lock.tag.trim_start_matches('v'))
+        .is_ok_and(|version| version >= semver::Version::new(0, 6, 0))
+        || (cfg!(debug_assertions) && std::env::var("AGENT24_DEV_IDORIS_V6").as_deref() == Ok("1"))
+}
+
+/// Generate a loopback OpenAI-compatible card using iDoris's upstream contract.
+pub async fn run_setup_upstream(
+    installed: &InstalledVersion,
+    instance_root: &Path,
+    endpoint: &str,
+    bindings: &[(Role, String)],
+    id: &str,
+    cancel: &CancellationToken,
+) -> Result<SetupOutcome, SetupError> {
+    run_setup_upstream_with_timeout(
+        installed,
+        instance_root,
+        endpoint,
+        bindings,
+        id,
+        cancel,
+        Duration::from_secs(30),
+    )
+    .await
+}
+
+async fn run_setup_upstream_with_timeout(
+    installed: &InstalledVersion,
+    instance_root: &Path,
+    endpoint: &str,
+    bindings: &[(Role, String)],
+    id: &str,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<SetupOutcome, SetupError> {
+    use std::process::Stdio;
+    use tokio::process::Command;
+
+    if cancel.is_cancelled() {
+        return Err(SetupError::Cancelled);
+    }
+    let mut url =
+        url::Url::parse(endpoint).map_err(|_| SetupError::Rejected(SetupCode::InvalidEndpoint))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(SetupError::Rejected(SetupCode::InvalidEndpoint));
+    }
+    url.set_path("");
+    url.set_query(None);
+    url.set_fragment(None);
+    // Validate the origin after dropping OpenAI API suffixes such as /v1.
+    let origin = url.origin().ascii_serialization();
+    let origin = if url.host_str() == Some("localhost") {
+        origin.replacen("://localhost", "://127.0.0.1", 1)
+    } else {
+        origin
+    };
+    Endpoint::parse(&origin).map_err(|_| SetupError::Rejected(SetupCode::InvalidEndpoint))?;
+    let expected: BTreeMap<_, _> = bindings.iter().cloned().collect();
+    if expected.len() != bindings.len()
+        || !expected.contains_key(&Role::Daily)
+        || !expected.contains_key(&Role::Deep)
+        || bindings
+            .iter()
+            .any(|(_, model)| model.is_empty() || model.chars().any(char::is_control))
+    {
+        return Err(SetupError::InvalidBindings);
+    }
+    let components = components_root(instance_root)?;
+    let generation = tempfile::Builder::new()
+        .prefix("gen-")
+        .tempdir_in(&components)
+        .map_err(|_| SetupError::Io)?;
+    let out_dir = generation
+        .path()
+        .canonicalize()
+        .map_err(|_| SetupError::Io)?;
+    let mut cmd = Command::new(
+        installed
+            .binary()
+            .canonicalize()
+            .map_err(|_| SetupError::Io)?,
+    );
+    cmd.env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(&components)
+        .args([
+            "setup",
+            "upstream",
+            "--kind",
+            "openai_compat",
+            "--endpoint",
+            &origin,
+            "--out-dir",
+        ])
+        .arg(&out_dir);
+    for (role, model) in &expected {
+        cmd.arg("--bind").arg(format!("{}={model}", role.as_str()));
+    }
+    cmd.args(["--id", id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .kill_on_drop(true);
+    let mut child = cmd.spawn().map_err(|_| SetupError::Io)?;
+    let process_group = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(rustix::process::Pid::from_raw);
+    let stdout = child.stdout.take().ok_or(SetupError::Io)?;
+    let stderr = child.stderr.take().ok_or(SetupError::Io)?;
+    let operation = async {
+        let wait = async { child.wait().await.map_err(|_| SetupError::Io) };
+        let (stdout, _, status) =
+            tokio::try_join!(read_bounded(stdout), read_bounded(stderr), wait)?;
+        Ok::<_, SetupError>((stdout, status))
+    };
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(SetupError::Cancelled),
+        result = tokio::time::timeout(timeout, operation) => result.unwrap_or(Err(SetupError::TimedOut)),
+    };
+    // Descendants can close the pipes and outlive even a successful child.
+    // Stop them before validating or retaining the generation directory.
+    if let Some(pid) = process_group {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    if result.is_err() {
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+    }
+    let (stdout, status) = result?;
+    let reply: UpstreamReply =
+        serde_json::from_slice(&stdout).map_err(|_| SetupError::InvalidResponse)?;
+    match reply {
+        UpstreamReply::Error { code } if status.code() == Some(1) => {
+            let code = serde_json::from_value(serde_json::Value::String(code))
+                .unwrap_or(SetupCode::SetupFailed);
+            Err(SetupError::Rejected(code))
+        }
+        UpstreamReply::Ok {
+            card_file,
+            models,
+            bindings,
+            id: returned_id,
+        } if status.success() => {
+            if returned_id != id
+                || bindings != expected
+                || bindings.values().any(|model| !models.contains(model))
+            {
+                return Err(SetupError::InvalidResponse);
+            }
+            let card = out_dir
+                .join(card_file)
+                .canonicalize()
+                .map_err(|_| SetupError::UnsafePath)?;
+            if !card.starts_with(&out_dir) || !card.is_file() {
+                return Err(SetupError::UnsafePath);
+            }
+            let _ = generation.keep();
+            Ok(SetupOutcome {
+                components_dir: out_dir,
+                bindings,
+                auth_required: false,
+                omlx: None,
+            })
+        }
+        _ => Err(SetupError::InvalidResponse),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum UpstreamReply {
+    Ok {
+        card_file: PathBuf,
+        models: Vec<String>,
+        bindings: BTreeMap<Role, String>,
+        id: String,
+    },
+    Error {
+        code: String,
+    },
 }
 
 /// A daily binding must be selected from the probe; deep is opt-in. Missing
@@ -213,6 +441,72 @@ async fn run_setup_with_timeout(
     cancel: &CancellationToken,
     timeout: Duration,
 ) -> Result<SetupOutcome, SetupError> {
+    run_omlx_setup(
+        installed,
+        instance,
+        Some(probe),
+        None,
+        key,
+        bindings,
+        budget,
+        cancel,
+        timeout,
+    )
+    .await
+}
+
+/// v0.6.0 delegates endpoint discovery and model validation to iDoris.
+pub async fn run_setup_auto(
+    installed: &InstalledVersion,
+    instance: &Path,
+    key: Option<Zeroizing<String>>,
+    bindings: &[(Role, String)],
+    budget: Option<SetupBudget>,
+    cancel: &CancellationToken,
+) -> Result<SetupOutcome, SetupError> {
+    let first = run_omlx_setup(
+        installed,
+        instance,
+        None,
+        None,
+        None,
+        bindings,
+        budget,
+        cancel,
+        Duration::from_secs(30),
+    )
+    .await;
+    match first {
+        Err(SetupError::AuthRequired { endpoint }) if key.is_some() => {
+            run_omlx_setup(
+                installed,
+                instance,
+                None,
+                Some(&endpoint),
+                key,
+                bindings,
+                budget,
+                cancel,
+                Duration::from_secs(30),
+            )
+            .await
+        }
+        result => result,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_omlx_setup(
+    installed: &InstalledVersion,
+    instance: &Path,
+    probe: Option<&ProbeResult>,
+    discovered_endpoint: Option<&str>,
+    key: Option<Zeroizing<String>>,
+    bindings: &[(Role, String)],
+    budget: Option<SetupBudget>,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<SetupOutcome, SetupError> {
     use std::process::Stdio;
     use tokio::{io::AsyncWriteExt, process::Command};
 
@@ -220,18 +514,24 @@ async fn run_setup_with_timeout(
     if cancel.is_cancelled() {
         return Err(SetupError::Cancelled);
     }
-    let ProbeStatus::Ready { models } = &probe.status else {
-        return Err(SetupError::InvalidBindings);
-    };
     let expected: BTreeMap<_, _> = bindings.iter().cloned().collect();
-    if probe.identity != ServiceIdentity::Omlx
-        || !expected.contains_key(&Role::Daily)
+    if !expected.contains_key(&Role::Daily)
         || expected.len() != bindings.len()
-        || bindings.iter().any(|(_, model)| {
-            model.is_empty() || model.chars().any(char::is_control) || !models.contains(model)
-        })
+        || bindings
+            .iter()
+            .any(|(_, model)| model.is_empty() || model.chars().any(char::is_control))
     {
         return Err(SetupError::InvalidBindings);
+    }
+    if let Some(probe) = probe {
+        let ProbeStatus::Ready { models } = &probe.status else {
+            return Err(SetupError::InvalidBindings);
+        };
+        if probe.identity != ServiceIdentity::Omlx
+            || bindings.iter().any(|(_, model)| !models.contains(model))
+        {
+            return Err(SetupError::InvalidBindings);
+        }
     }
     if key.as_ref().is_some_and(|key| {
         key.is_empty()
@@ -259,16 +559,28 @@ async fn run_setup_with_timeout(
         .env("PATH", "/usr/bin:/bin")
         .env("IDORIS_ALLOCATED_BUDGET_BYTES", budget.bytes().to_string())
         .current_dir(&components)
-        .args([
-            "setup",
-            "omlx",
-            "--endpoint",
-            probe.endpoint.as_str(),
-            "--out-dir",
-        ])
-        .arg(&out_dir)
-        .args(["--load-mode", "resident"])
-        .stdin(Stdio::piped())
+        .args(["setup", "omlx"]);
+    if let Some(probe) = probe {
+        cmd.args(["--endpoint", probe.endpoint.as_str(), "--out-dir"])
+            .arg(&out_dir)
+            .args(["--load-mode", "resident"]);
+    } else {
+        cmd.arg("--out-dir").arg(&out_dir);
+        if let Some(endpoint) = discovered_endpoint {
+            cmd.args(["--endpoint", endpoint]);
+        } else {
+            cmd.arg("--auto");
+        }
+        // iDoris reads the local model directory and discovers the installed engine.
+        if let Some(home) = std::env::var_os("HOME") {
+            cmd.env("HOME", home);
+        }
+        cmd.env(
+            "PATH",
+            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+        );
+    }
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0)
@@ -310,12 +622,12 @@ async fn run_setup_with_timeout(
         _ = cancel.cancelled() => Err(SetupError::Cancelled),
         result = tokio::time::timeout(timeout, operation) => result.unwrap_or(Err(SetupError::TimedOut)),
     };
+    // Descendants can close the pipes and outlive even a successful child.
+    // Stop them before validating or retaining the generation directory.
+    if let Some(pid) = process_group {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
     if result.is_err() {
-        // Kill the group as well as the direct child: a pipe-owning descendant
-        // must not survive a cancelled or oversized setup attempt.
-        if let Some(pid) = process_group {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
@@ -323,7 +635,14 @@ async fn run_setup_with_timeout(
     // Raw output and upstream messages never become diagnostics or log text.
     let reply: Reply = serde_json::from_slice(&stdout).map_err(|_| SetupError::InvalidResponse)?;
     match reply {
-        Reply::Error { code } if !status.success() => Err(SetupError::Rejected(code)),
+        Reply::Error {
+            code: SetupCode::AuthRequired,
+            endpoint: Some(endpoint),
+        } if !status.success() && probe.is_none() => {
+            Endpoint::parse(&endpoint).map_err(|_| SetupError::InvalidResponse)?;
+            Err(SetupError::AuthRequired { endpoint })
+        }
+        Reply::Error { code, .. } if !status.success() => Err(SetupError::Rejected(code)),
         Reply::Ok {
             endpoint,
             auth,
@@ -331,8 +650,10 @@ async fn run_setup_with_timeout(
             bindings,
             components_dir,
             next,
+            mode,
+            engine,
         } if status.success() => {
-            if Endpoint::parse(&endpoint).ok().as_ref() != Some(&probe.endpoint)
+            if probe.is_some_and(|p| Endpoint::parse(&endpoint).ok().as_ref() != Some(&p.endpoint))
                 || bindings != expected
                 || bindings.values().any(|model| !models.contains(model))
                 || !matches!(auth.as_str(), "none" | "required")
@@ -340,6 +661,20 @@ async fn run_setup_with_timeout(
             {
                 return Err(SetupError::InvalidResponse);
             }
+            let omlx = if probe.is_none() {
+                let mode = mode.ok_or(SetupError::InvalidResponse)?;
+                let engine = engine
+                    .filter(|e| e.engine_kind == "omlx")
+                    .ok_or(SetupError::InvalidResponse)?;
+                Endpoint::parse(&endpoint).map_err(|_| SetupError::InvalidResponse)?;
+                Some(OmlxSetup {
+                    endpoint,
+                    mode,
+                    engine: *engine,
+                })
+            } else {
+                None
+            };
             let returned = Path::new(&components_dir)
                 .canonicalize()
                 .map_err(|_| SetupError::UnsafePath)?;
@@ -379,6 +714,7 @@ async fn run_setup_with_timeout(
                 components_dir: returned,
                 bindings,
                 auth_required: auth == "required",
+                omlx,
             })
         }
         _ => Err(SetupError::InvalidResponse),
@@ -457,9 +793,15 @@ enum Reply {
         bindings: BTreeMap<Role, String>,
         components_dir: String,
         next: Next,
+        #[serde(default)]
+        mode: Option<OmlxMode>,
+        #[serde(default)]
+        engine: Option<Box<Engine>>,
     },
     Error {
         code: SetupCode,
+        #[serde(default)]
+        endpoint: Option<String>,
     },
 }
 #[derive(Deserialize)]

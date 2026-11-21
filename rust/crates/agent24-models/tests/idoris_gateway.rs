@@ -257,7 +257,12 @@ async fn configured_gateway_is_the_only_http_target() {
                     }
                     other => panic!("{other:?}"),
                 },
-                "allocation-exceeded" | "allocation-reason-only" | "wrong-busy-type" => assert!(
+                // A degraded iDoris's failed-card reason reaches the caller.
+                "allocation-exceeded" => assert!(
+                    matches!(&result, Err(agent24_models::ModelError::Unavailable(m)) if m == "idoris_unavailable: future_allocation_reason"),
+                    "{result:?}"
+                ),
+                "allocation-reason-only" | "wrong-busy-type" => assert!(
                     matches!(result, Err(agent24_models::ModelError::Unavailable(_))),
                     "{result:?}"
                 ),

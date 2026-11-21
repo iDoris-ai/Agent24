@@ -1131,6 +1131,8 @@ mod tests {
                                     | "AGENT24_DEV_IDORIS_LAUNCHER"
                                     | "AGENT24_DEV_ALLOW_UNSIGNED_IDORIS"
                                     | "AGENT24_IDORIS_S2_BIN"
+                                // Debug-only v0.6 setup switch, never persisted in a LaunchAgent.
+                                    | "AGENT24_DEV_IDORIS_V6"
                             )
                         {
                             found.push(name);

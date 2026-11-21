@@ -62,6 +62,8 @@ pub struct Candidate {
 pub struct Candidates {
     pub candidates: Vec<Candidate>,
     pub key_from_local_settings: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<crate::setup::OmlxSetup>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -476,6 +478,35 @@ impl IdorisHost {
         operation_lock(&self.root.join("transactions")).map_err(install_code)
     }
     pub async fn candidates(&self, confirmed: Option<&str>) -> Result<Candidates, Code> {
+        if crate::setup::upstream_setup_enabled(IdorisLock::embedded()) {
+            let models = self.local_omlx_models().await?;
+            let setup = self
+                .inner
+                .lock()
+                .await
+                .installation
+                .as_ref()
+                .and_then(|r| r.omlx_setup.clone());
+            // Compatibility envelope for the desktop: this is an offline model
+            // selection, not an Agent24 endpoint probe or an iDoris candidate API.
+            return Ok(Candidates {
+                candidates: vec![Candidate {
+                    endpoint: setup
+                        .as_ref()
+                        .map(|s| s.endpoint.clone())
+                        .unwrap_or_default(),
+                    identity: "omlx",
+                    authentication: "ready",
+                    models: models
+                        .into_iter()
+                        .filter(|m| matches!(m.kind.as_str(), "chat" | "vision"))
+                        .map(|m| m.omlx_id)
+                        .collect(),
+                }],
+                key_from_local_settings: self.provisioner.upstream_key().await?.is_some(),
+                setup,
+            });
+        }
         let endpoint = confirmed
             .map(Endpoint::parse)
             .transpose()
@@ -488,6 +519,7 @@ impl IdorisHost {
             .probe(endpoint.as_ref(), key.as_ref())
             .await;
         Ok(Candidates {
+            setup: None,
             key_from_local_settings: key.is_some(),
             candidates: results
                 .into_iter()
@@ -514,6 +546,13 @@ impl IdorisHost {
                 .collect(),
         })
     }
+    async fn local_omlx_models(&self) -> Result<Vec<LocalModel>, Code> {
+        let value = self
+            .read_model_cli(&["models", "local", "--json"])
+            .await
+            .ok_or(Code::OmlxUnreachable)?;
+        parse_local_models(value).map_err(|_| Code::OmlxUnreachable)
+    }
     pub async fn install(
         self: &Arc<Self>,
         request: InstallRequest,
@@ -527,17 +566,21 @@ impl IdorisHost {
         request: ConnectRequest,
         key: Option<&str>,
     ) -> Result<Operation, Code> {
-        let endpoint = if request.source == "openai_compat" {
-            if request.save_omlx_key {
-                return Err(Code::InvalidRequest);
-            }
-            Endpoint::parse_openai_compat(&request.endpoint)
-        } else {
-            Endpoint::parse(&request.endpoint)
-        }
-        .map_err(|_| Code::InvalidRequest)?;
+        let auto = request.source == "omlx"
+            && crate::setup::upstream_setup_enabled(IdorisLock::embedded());
         let mut request = request;
-        request.endpoint = endpoint.as_str().into();
+        if !auto {
+            let endpoint = if request.source == "openai_compat" {
+                if request.save_omlx_key {
+                    return Err(Code::InvalidRequest);
+                }
+                Endpoint::parse_openai_compat(&request.endpoint)
+            } else {
+                Endpoint::parse(&request.endpoint)
+            }
+            .map_err(|_| Code::InvalidRequest)?;
+            request.endpoint = endpoint.as_str().into();
+        }
         if request.source == "openai_compat" && request.deep_model.is_none() {
             request.deep_model = Some(request.daily_model.clone());
         }
@@ -635,6 +678,7 @@ impl IdorisHost {
             idempotency_key: key.into(),
             request_fingerprint: Some(fingerprint),
             setup_code: None,
+            setup_endpoint: None,
             download_progress: None,
             verification: None,
         };
@@ -839,6 +883,7 @@ impl IdorisHost {
         self.provisioner.prepare_state(&self.root).await?;
         check_cancel(cancel)?;
         let record = old.unwrap_or(Installation {
+            omlx_setup: None,
             connection: None,
             version: IdorisLock::embedded().tag.trim_start_matches('v').into(),
             release_dir: installed.directory().into(),
@@ -891,7 +936,13 @@ impl IdorisHost {
             .installation
             .clone()
             .ok_or(Code::NotInstalled)?;
-        let endpoint = Endpoint::parse(&request.endpoint).map_err(|_| Code::InvalidRequest)?;
+        let auto = request.source == "omlx"
+            && crate::setup::upstream_setup_enabled(IdorisLock::embedded());
+        let endpoint = if auto {
+            None
+        } else {
+            Some(Endpoint::parse(&request.endpoint).map_err(|_| Code::InvalidRequest)?)
+        };
         let (installed, budget, key) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Code::Cancelled),
@@ -903,7 +954,7 @@ impl IdorisHost {
             .await?;
         let key = if request.source == "openai_compat" {
             None
-        } else if previous.omlx_url.as_deref() == Some(endpoint.as_str())
+        } else if (auto || previous.omlx_url.as_deref() == Some(request.endpoint.as_str()))
             && let Some(key_id) = &previous.omlx_key_id
         {
             let store = self.omlx_keys.clone();
@@ -927,17 +978,24 @@ impl IdorisHost {
         let models = if compat {
             tokio::select! {
                 biased; _ = cancel.cancelled() => return Err(Code::Cancelled),
-                result = upstream_models(endpoint.as_str()) => result?,
+                result = upstream_models(&request.endpoint) => result?,
             }
+        } else if auto {
+            self.local_omlx_models()
+                .await?
+                .into_iter()
+                .map(|m| m.omlx_id)
+                .collect()
         } else {
+            let endpoint = endpoint.as_ref().ok_or(Code::InvalidRequest)?;
             let probe_client = self.provisioner.omlx_probe()?;
             let probes = tokio::select! {
                 biased; _ = cancel.cancelled() => return Err(Code::Cancelled),
-                results = probe_client.probe(Some(&endpoint), key.as_ref()) => results,
+                results = probe_client.probe(Some(endpoint), key.as_ref()) => results,
             };
             let probe = probes
                 .into_iter()
-                .find(|p| p.endpoint == endpoint)
+                .find(|p| p.endpoint == *endpoint)
                 .ok_or(Code::OmlxUnreachable)?;
             if probe.identity != ServiceIdentity::Omlx
                 && !matches!(probe.status, ProbeStatus::Unreachable)
@@ -1011,12 +1069,27 @@ impl IdorisHost {
             self.phase(id, Phase::Setup).await;
             let key = key.map(ApiKey::into_secret);
             let setup_result = if compat {
-                crate::setup::write_openai_compat_card(
-                    &self.root.join("instances/managed"), endpoint.as_str(),
-                    &request.daily_model, request.deep_model.as_deref().unwrap_or(&request.daily_model),
-                    embed.map(String::as_str),
-                )
+                if crate::setup::upstream_setup_enabled(IdorisLock::embedded()) {
+                    let mut upstream_bindings = bindings.clone();
+                    if !upstream_bindings.iter().any(|(role, _)| *role == Role::Deep) {
+                        upstream_bindings.push((Role::Deep, request.daily_model.clone()));
+                    }
+                    crate::setup::run_setup_upstream(
+                        &installed, &self.root.join("instances/managed"), &request.endpoint,
+                        &upstream_bindings, "lmstudio", cancel,
+                    ).await
+                } else {
+                    crate::setup::write_openai_compat_card(
+                        &self.root.join("instances/managed"), &request.endpoint,
+                        &request.daily_model, request.deep_model.as_deref().unwrap_or(&request.daily_model),
+                        embed.map(String::as_str),
+                    )
+                }
+            } else if auto {
+                crate::setup::run_setup_auto(&installed, &self.root.join("instances/managed"),
+                    key.clone(), &bindings, Some(budget), cancel).await
             } else {
+                let endpoint = endpoint.as_ref().ok_or(Code::InvalidRequest)?;
                 let probe = crate::omlx_probe::ProbeResult {
                     endpoint: endpoint.clone(), identity: ServiceIdentity::Omlx,
                     status: ProbeStatus::Ready { models: models.clone() },
@@ -1027,10 +1100,15 @@ impl IdorisHost {
             let setup = match setup_result {
                 Ok(setup) => setup,
                 Err(error) => {
-                    if let SetupError::Rejected(code) = error
-                        && let Some(op) = self.inner.lock().await.operations.get_mut(id)
-                    {
-                        op.setup_code = Some(code);
+                    if let Some(op) = self.inner.lock().await.operations.get_mut(id) {
+                        match &error {
+                            SetupError::Rejected(code) => op.setup_code = Some(*code),
+                            SetupError::AuthRequired { endpoint } => {
+                                op.setup_code = Some(crate::setup::SetupCode::AuthRequired);
+                                op.setup_endpoint = Some(endpoint.clone());
+                            }
+                            _ => {}
+                        }
                     }
                     return Err(if matches!(error, SetupError::Cancelled) {
                         Code::Cancelled
@@ -1039,6 +1117,13 @@ impl IdorisHost {
                     });
                 }
             };
+            if let Some(result) = &setup.omlx {
+                pending.candidate.omlx_url = Some(result.endpoint.clone());
+                if let Some(connection) = &mut pending.candidate.connection {
+                    connection.endpoint = result.endpoint.clone();
+                }
+            }
+            pending.candidate.omlx_setup = setup.omlx;
             pending.candidate.components_dir = Some(setup.components_dir);
             write_json(&self.root.join("pending-connect.json"), &pending)?;
             check_cancel(cancel)?;
@@ -1180,7 +1265,7 @@ impl IdorisHost {
         if let Err(error) = result {
             self.phase(id, Phase::RollingBack).await;
             let stopped = if let Some(supervisor) = new_supervisor {
-                self.block_gateway();
+                self.end_gateway(&error);
                 supervisor.stop().await.map_err(Code::from).map(|_| ())
             } else {
                 Ok(())
@@ -1385,4 +1470,17 @@ mod chat_model_filter_tests {
         }
         assert!(super::is_chat_model_id("Qwen3-8B-4bit"));
     }
+}
+
+#[derive(Deserialize)]
+struct LocalModel {
+    omlx_id: String,
+    kind: String,
+}
+fn parse_local_models(value: serde_json::Value) -> Result<Vec<LocalModel>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct LocalModels {
+        models: Vec<LocalModel>,
+    }
+    serde_json::from_value::<LocalModels>(value).map(|list| list.models)
 }

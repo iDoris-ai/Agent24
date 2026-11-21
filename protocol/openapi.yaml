@@ -56,8 +56,9 @@ tags:
   - name: chat
     description: >-
       One-shot LLM chat completion. HTTP 503 idoris_unavailable may report
-      stopped (start the managed service), readiness_timeout, connection_lost,
-      or circuit_open (retry later). A stopped service fails immediately;
+      stopped (start the managed service), failed (start, restart or reconnect
+      failed; see the iDoris status), readiness_timeout, connection_lost, or
+      circuit_open (retry later). A stopped service fails immediately;
       starting or restarting waits up to 30 seconds for readiness.
   - name: sessions
     description: Conversation sessions — the container runs belong to.
@@ -5801,7 +5802,7 @@ components:
         source: { type: string, enum: [omlx, openai_compat], description: Defaults to omlx when omitted. }
         endpoint:
           type: string
-          description: Loopback origin (openai_compat requires HTTP and 127.0.0.1, localhost or [::1]), without credentials, path, query or fragment.
+          description: Ignored for omlx with iDoris v0.6.0 (--auto); may be empty. Otherwise a loopback origin (openai_compat requires HTTP and 127.0.0.1, localhost or [::1]), without credentials, path, query or fragment.
         daily_model: { type: string, minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:/-]+$" }
         deep_model: { type: [string, "null"], minLength: 1, maxLength: 128, pattern: "^[A-Za-z0-9._:/-]+$" }
         save_omlx_key: { type: boolean, default: false }
@@ -5814,11 +5815,29 @@ components:
           anyOf:
             - $ref: "#/components/schemas/IdorisConnectConsent"
             - type: "null"
+    IdorisOmlxSetup:
+      type: object
+      additionalProperties: false
+      required: [endpoint, mode, engine]
+      properties:
+        endpoint: { type: string }
+        mode: { type: string, enum: [adopt, managed] }
+        engine:
+          type: object
+          additionalProperties: false
+          required: [engine_kind, installed, executable]
+          properties:
+            engine_kind: { type: string, enum: [omlx] }
+            installed: { type: boolean }
+            executable: { type: [string, "null"] }
+            version: { type: string }
     IdorisCandidates:
       type: object
       additionalProperties: false
       required: [candidates, key_from_local_settings]
       properties:
+        setup:
+          $ref: "#/components/schemas/IdorisOmlxSetup"
         key_from_local_settings: { type: boolean }
         candidates:
           type: array
@@ -5936,9 +5955,12 @@ components:
           $ref: "#/components/schemas/IdorisDownloadProgress"
         verification:
           $ref: "#/components/schemas/IdorisVerification"
+        setup_endpoint:
+          type: string
+          description: Loopback endpoint reported by iDoris when authentication is required.
         setup_code:
           type: string
-          enum: [unreachable, auth_required, auth_failed, not_omlx, model_not_found, invalid_endpoint, invalid_role, out_dir_not_empty, validation_failed, write_failed, invalid_api_key_input]
+          enum: [unreachable, auth_required, auth_failed, not_omlx, model_not_found, invalid_endpoint, invalid_role, out_dir_not_empty, validation_failed, write_failed, invalid_api_key_input, engine_not_installed, port_in_use, model_not_installed]
     CommInstallResult:
       type: object
       additionalProperties: false
