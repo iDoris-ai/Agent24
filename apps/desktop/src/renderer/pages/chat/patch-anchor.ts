@@ -10,14 +10,15 @@ function withoutNumbering(text: string): string {
   const numerals = (from: number) => { let n = 0; while (from + n < s.length && NUMERAL.test(s[from + n])) n++; return n }
   if (s[0] === '第') {
     const n = numerals(1)
-    if (n > 0 && '条章节款编'.includes(s[1 + n] ?? '')) s = s.slice(2 + n)
+    // PR-Daemon #1979: past the end is no 条 (`''.includes('')` is true).
+    if (n > 0 && s[1 + n] !== undefined && '条章节款编'.includes(s[1 + n])) s = s.slice(2 + n)
   }
   if (s[0] === '（' || s[0] === '(') {
     const n = numerals(1)
     if (n > 0 && (s[1 + n] === '）' || s[1 + n] === ')')) s = s.slice(2 + n)
   }
   const n = numerals(0)
-  if (n > 0 && '、.．'.includes(s[n] ?? '')) s = s.slice(n + 1)
+  if (n > 0 && s[n] !== undefined && '、.．'.includes(s[n])) s = s.slice(n + 1)
   return s.join('')
 }
 

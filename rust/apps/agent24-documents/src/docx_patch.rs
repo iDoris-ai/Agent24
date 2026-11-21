@@ -660,7 +660,11 @@ fn scan_paragraphs(xml: &str) -> Result<Vec<Para>, PatchError> {
 /// The words of a paragraph without its numbering, spaces and closing
 /// punctuation: 「第三条 押金为两个月租金。」 → 「押金为两个月租金」.
 pub(crate) fn comparable(text: &str) -> String {
-    let mut s: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    // U+FEFF (a byte-order mark) counts as space, as JavaScript's \s has it.
+    let mut s: Vec<char> = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '\u{feff}')
+        .collect();
     let numeral = |c: char| c.is_ascii_digit() || "一二三四五六七八九十百零〇".contains(c);
     // 第X条/章/节/款
     if s.first() == Some(&'第') {
