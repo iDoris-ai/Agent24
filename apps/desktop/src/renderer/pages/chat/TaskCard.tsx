@@ -315,7 +315,9 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
           <span className="task-card-knowledge" role="note">{t('task.decideInTui')}</span>
         )}
         {active && (
-          <button type="button" className="btn" disabled={busy} onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
+          // General 0.6.89: 「停止」 never waits on another action of the card
+          // (a confirm still open made it grey): stopping is always offered.
+          <button type="button" className="btn" onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
         )}
       </span>
       {waiting && denying && (
