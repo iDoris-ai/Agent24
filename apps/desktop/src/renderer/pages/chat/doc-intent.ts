@@ -101,6 +101,16 @@ export function asksTranslation(text: string, inDocument: boolean): boolean {
   return TRANSLATE_WORDS.test(text) || (aboutDocument(text, inDocument) && TRANSLATE_MORE.test(text))
 }
 
+/** Whether a turn is the D4 translation of a document: asked to translate,
+ * not to summarise or check, not a split or merge, and about a document (this
+ * conversation's, or one named in 《》「」“”). */
+export function translatesDocument(text: string, inDocument: boolean): boolean {
+  return asksTranslation(text, inDocument)
+    && !/总结|摘要|检查|审查|核对/.test(text)
+    && parseDocIntent(text) === null
+    && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
+}
+
 /** Whether a turn goes to the Agent with the documents tools. */
 export function wantsDocTool(text: string, inDocument: boolean): boolean {
   if (DOC_TOOL_WORDS.test(text)) return true

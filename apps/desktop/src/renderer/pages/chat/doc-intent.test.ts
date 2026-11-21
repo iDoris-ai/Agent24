@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksTranslation, docAgentPrompt, findByTitle, parseDocIntent, subjectOf, wantsDocTool } from './doc-intent'
+import { asksTranslation, docAgentPrompt, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -120,6 +120,7 @@ describe('M1: the acceptance sentences reach the documents tools or the translat
   it('rewrite a paragraph', () => expect(wantsDocTool('把第 3 段改得正式一点', true)).toBe(true))
   it('translate and export Word', () => {
     expect(asksTranslation('把这份翻成英文并导出 Word', true)).toBe(true)
+    expect(translatesDocument('把这份翻成英文并导出 Word', true)).toBe(true)
     expect(wantsDocTool('把这份翻成英文并导出 Word', true)).toBe(false)
   })
   it('a knowledge question is neither', () => {
@@ -139,10 +140,32 @@ describe('M1: everyday sentences without a document stay ordinary chat', () => {
     '这封邮件润色一下',
     '把“你好”翻成英文',
     '填这个表要注意什么',
+    // General/PM 11-21: everyday questions with 填/改/翻译 in them.
+    '帮我翻译一下这句话',
+    '这个表怎么填比较好',
+    '翻译成英文是什么意思',
+    '这段代码怎么改成异步的',
   ]) {
     it(text, () => {
       expect(wantsDocTool(text, false)).toBe(false)
-      expect(asksTranslation(text, false)).toBe(false)
+      expect(translatesDocument(text, false)).toBe(false)
+      expect(parseDocIntent(text)).toBeNull()
+    })
+  }
+})
+
+describe('M1: the four questions PR-Daemon #1915 found taken as splits stay questions', () => {
+  // #1915 review ①: asked in a conversation about the document, so with it.
+  for (const text of [
+    '这份文档第2页的关键信息帮我提取一下',
+    '提取第2页的文件内容',
+    '第3页导出的金额是多少，文档里写了吗',
+    '总结一下这份文件第4页，单独列出金额',
+  ]) {
+    it(text, () => {
+      expect(parseDocIntent(text)).toBeNull()
+      expect(wantsDocTool(text, true)).toBe(false)
+      expect(translatesDocument(text, true)).toBe(false)
     })
   }
 })

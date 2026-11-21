@@ -13,7 +13,7 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { asksTranslation, docAgentPrompt, parseDocIntent, subjectOf, wantsDocTool } from './chat/doc-intent'
+import { docAgentPrompt, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -277,7 +277,7 @@ export default function ChatPage() {
       }
     }
     // D4: 「把这份翻译成英文」「翻译《X》」 — same translation as the document page.
-    if (asksTranslation(text, doc !== null) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+    if (translatesDocument(text, doc !== null) && window.agent24.documents) {
       const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
       if (doc || named) {
         const api = window.agent24.documents
