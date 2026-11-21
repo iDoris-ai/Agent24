@@ -12,7 +12,7 @@ import type { RunKnowledge } from './knowledge-grounding'
  * first. A plain turn names its words as the run's `knowledge_query`, which
  * the daemon searches before the model is asked; this says what came of it. */
 export const KNOWLEDGE_HINT = '（知识库已开启：系统已先用这句话在知识库里查过，查到的内容在检索结果里。'
-  + '和问题相关就依据它回答并注明出处；不相关或没有检索结果，就按常识回答，不要硬套。需要更多内容可以再查。）'
+  + '和问题相关就依据它回答并注明出处；不相关或没有检索结果，就按常识回答，不要硬套。）'
 
 /** 「记住…」 is kept as the user said it: personal memory takes only a turn that
  * starts with it (agent24-agent retain.rs), so nothing goes in front. */

@@ -217,6 +217,7 @@ impl agent24_tools::Tool for KnowledgeSearchStub {
         _cancel: &CancellationToken,
     ) -> Result<String, agent24_tools::ToolError> {
         assert_eq!(input.get("query").and_then(|q| q.as_str()), Some("烧开水要多久"));
+        assert_eq!(input.get("max_results").and_then(|q| q.as_u64()), Some(3));
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(self.reply.clone())
     }
@@ -265,7 +266,9 @@ async fn a_knowledge_query_is_searched_before_the_model_and_only_hits_go_in() {
         let result = first.iter().find(|m| m.role == "tool");
         assert_eq!(result.is_some(), goes_in, "{query} {binding:?} {reply}");
         if goes_in {
-            assert_eq!(result.unwrap().content.as_deref(), Some(HIT));
+            let got: serde_json::Value =
+                serde_json::from_str(result.unwrap().content.as_deref().unwrap()).unwrap();
+            assert_eq!(got["evidence"][0]["snippet"], "水烧开约需 5 分钟");
             let asked = first.iter().find(|m| !m.tool_calls.is_empty()).unwrap();
             assert_eq!(asked.tool_calls[0].name, "knowledge_search");
         }
@@ -651,4 +654,40 @@ async fn endless_tool_requests_hit_max_iterations() {
     let calls = store.list_tool_calls(&run.id).await.unwrap();
     assert_eq!(calls.len(), MAX_ITERATIONS);
     assert!(calls.iter().all(|c| c.status == ToolCallStatus::Failed));
+}
+
+/// 0.6.75 (General): ten passages with every field took a 169-token turn to
+/// 5207 and the 4-bit model was stopped at prefill. What the search first
+/// puts in is three passages, each cut to 200 characters, citing fields only.
+#[test]
+fn what_the_first_search_puts_in_is_three_short_passages() {
+    let long = "水".repeat(600);
+    let hits: Vec<serde_json::Value> = (1..=10)
+        .map(|rank| {
+            serde_json::json!({
+                "rank": rank, "use": "clue", "possibly_stale": false,
+                "knowledge_base_id": "kb", "knowledge_id": format!("k{rank}"),
+                "chunk_id": format!("c{rank}"), "content_tag": "t",
+                "snippet": long, "snippet_truncated": true,
+                "display": {"title": "烧水指南", "file_name": "a.pdf"}
+            })
+        })
+        .collect();
+    let full = serde_json::json!({
+        "notice": "x".repeat(300), "kind": "knowledge.search",
+        "completeness": "complete", "scope_narrowed": false, "failures": [],
+        "evidence": hits
+    })
+    .to_string();
+    let compact = crate::run_manager::compact_evidence_for_tests(&full).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&compact).unwrap();
+    let evidence = v["evidence"].as_array().unwrap();
+    assert_eq!(evidence.len(), 3);
+    assert_eq!(evidence[0]["snippet"].as_str().unwrap().chars().count(), 201);
+    assert_eq!(evidence[0]["knowledge_id"], "k1");
+    assert_eq!(evidence[0]["title"], "烧水指南");
+    assert!(evidence[0].get("knowledge_base_id").is_none());
+    assert!(compact.chars().count() < 1000, "{}", compact.chars().count());
+    assert!(full.chars().count() > 6000);
+    assert!(crate::run_manager::compact_evidence_for_tests(r#"{"evidence":[]}"#).is_none());
 }

@@ -17,6 +17,8 @@ use crate::{EventSink, SessionMemory};
 mod approval;
 mod construct;
 mod execute;
+#[cfg(test)]
+pub(crate) use execute::compact_evidence_for_tests;
 mod session;
 mod start;
 mod turn;

@@ -118,8 +118,10 @@ const CURSOR_MAX: usize = 1024;
 const RESULTS_MAX: PositiveInt = PositiveInt::MIN.saturating_add(49);
 /// Hits a search returns when the model names no limit. Fifty hits of
 /// document text overflow a 16K-token local model's context, so the turn
-/// fails; the model can still ask for up to [`RESULTS_MAX`].
-const RESULTS_DEFAULT: PositiveInt = PositiveInt::MIN.saturating_add(9);
+/// fails; the model can still ask for up to [`RESULTS_MAX`]. Four, not ten
+/// (M1, 0.6.75): ten passages took a turn past 5000 tokens and the 4-bit
+/// model on an 8 GB Mac was stopped at prefill by oMLX's memory limit.
+const RESULTS_DEFAULT: PositiveInt = PositiveInt::MIN.saturating_add(3);
 /// Pages a citation read follows for one chunk before it settles for the
 /// first page as current text.
 const PAGES_MAX: usize = 8;
