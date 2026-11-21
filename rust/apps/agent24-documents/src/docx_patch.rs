@@ -103,7 +103,7 @@ pub fn apply(
             return Err(PatchError::IndexOutOfRange(edit.index));
         };
         if let Some(expect) = &edit.expect
-            && paragraph_text(&xml[p.start..p.end]) != *expect
+            && !expect_matches(&paragraph_text(&xml[p.start..p.end]), expect)
         {
             return Err(PatchError::Stale(edit.index));
         }
@@ -658,6 +658,58 @@ fn scan_paragraphs(xml: &str) -> Result<Vec<Para>, PatchError> {
 }
 
 /// The text of a paragraph's own `w:t` (not inside a nested paragraph).
+/// Characters of `expect` that, found in the paragraph, are enough to say it
+/// is that paragraph.
+const EXPECT_MIN_CHARS: usize = 8;
+
+/// The words of a paragraph without its numbering, spaces and closing
+/// punctuation: 「第三条 押金为两个月租金。」 → 「押金为两个月租金」.
+fn comparable(text: &str) -> String {
+    let mut s: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    let numeral = |c: char| c.is_ascii_digit() || "一二三四五六七八九十百零〇".contains(c);
+    // 第X条/章/节/款
+    if s.first() == Some(&'第') {
+        let n = s[1..].iter().take_while(|c| numeral(**c)).count();
+        if n > 0 && s.get(1 + n).is_some_and(|c| "条章节款编".contains(*c)) {
+            s.drain(..2 + n);
+        }
+    }
+    // （一） (1)
+    if s.first().is_some_and(|c| *c == '（' || *c == '(') {
+        let n = s[1..].iter().take_while(|c| numeral(**c)).count();
+        if n > 0 && s.get(1 + n).is_some_and(|c| *c == '）' || *c == ')') {
+            s.drain(..2 + n);
+        }
+    }
+    // 一、 1. 1、 1．
+    let n = s.iter().take_while(|c| numeral(**c)).count();
+    if n > 0 && s.get(n).is_some_and(|c| "、.．".contains(*c)) {
+        s.drain(..=n);
+    }
+    while s.last().is_some_and(|c| "。.．；;，,！!".contains(*c)) {
+        s.pop();
+    }
+    s.into_iter().collect()
+}
+
+/// M1 (0.6.75): a 4-bit model gives as `expect` the paragraph without its
+/// 「第三条 」, or half of it, and the edit was refused after the user had
+/// approved it. `expect` only has to show the edit is aimed at this
+/// paragraph: the same words once numbering, spaces and closing punctuation
+/// are set aside, or a run of them at least [`EXPECT_MIN_CHARS`] long (or the
+/// whole paragraph when it is shorter). Text from another paragraph still
+/// does not match (the index mix-up of 0.6.72).
+fn expect_matches(actual: &str, expect: &str) -> bool {
+    if actual == expect {
+        return true;
+    }
+    let (a, e) = (comparable(actual), comparable(expect));
+    if e.is_empty() {
+        return a.is_empty();
+    }
+    a == e || (a.contains(&e) && e.chars().count() >= EXPECT_MIN_CHARS.min(a.chars().count()))
+}
+
 fn paragraph_text(para: &str) -> String {
     let Ok(all) = tags(para) else {
         return String::new();
