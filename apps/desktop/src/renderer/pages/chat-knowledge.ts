@@ -6,6 +6,7 @@
 // conversation gets a real one first.
 
 import type { RunKnowledge } from './knowledge-grounding'
+import { runDocumentsOf, type RunDocuments } from './chat/DocumentsOutcome'
 
 /** M1 (Loop 5): a 4-bit model answers 「烧开水要多久」 from what it knows, never
  * searching (0/3 on 0.6.72; 9/10 with this said in the turn, 5/10 as a system
@@ -31,7 +32,7 @@ type Proxy = Window['agent24']['backendProxy']
 /** `knowledge`: what the run's Knowledge tools did, as the daemon tells it
  * (null when the run had no binding). */
 export type KnowledgeTurn =
-  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null; runId: string }
+  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null; runId: string; documents: RunDocuments | null }
   | { kind: 'failed'; code: string; message: string }
   /** M4 A4: the turn stopped waiting, the run goes on: it is the
    *  conversation's task from now on, its card shows how it does. */
@@ -88,14 +89,14 @@ export async function askWithKnowledge(
     await sleep(POLL_MS)
     const res = await deps.proxy({ method: 'GET', path: `/api/v1/runs/${encodeURIComponent(runId)}` })
     if (!res.ok) continue
-    const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null; knowledge?: RunKnowledge | null }
+    const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null; knowledge?: RunKnowledge | null; documents?: unknown }
     if (typeof run.status === 'string') last = run.status
     const approval = run.status === 'awaiting_approval'
     if (approval !== waiting) {
       waiting = approval
       deps.onAwaitingApproval?.(approval)
     }
-    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null, runId }
+    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null, runId, documents: runDocumentsOf(run.documents) }
     if (run.status === 'failed' || run.status === 'cancelled') return failure(run, `run_${run.status}`)
   }
   // M4 A4: a run still going on is left to go on, as the conversation's

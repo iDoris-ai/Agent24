@@ -6,7 +6,7 @@ import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession, knowledgePrompt } from './chat-knowledge'
 import { failureKind, withoutToolNames } from './chat/user-facing'
-import { documentUnchanged } from './chat/patch-outcome'
+import { DocumentsOutcome, type RunDocuments } from './chat/DocumentsOutcome'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
@@ -62,6 +62,8 @@ interface AssistantMessage {
   runId?: string
   /** M3: a failure's internal code, shown only under 「详情」. */
   detail?: string
+  /** M1: what the run's document writes came to, from the daemon's record. */
+  documents?: RunDocuments | null
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -631,7 +633,7 @@ export default function ChatPage() {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })
         const knowledge = withKnowledge ? grounding(turn.text, turn.knowledge) : undefined
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId }])
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
@@ -757,9 +759,7 @@ export default function ChatPage() {
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
               )}
-              {m.role === 'assistant' && documentUnchanged(m.runId) && (
-                <div role="note" style={{ fontSize: 12, color: 'var(--danger, #c0392b)', marginTop: 2 }}>{t('task.documentUnchanged')}</div>
-              )}
+              {m.role === 'assistant' && m.documents && <DocumentsOutcome documents={m.documents} />}
               {m.role === 'assistant' && m.knowledgeDown && (
                 <div role="note" style={{ fontSize: 12, color: 'var(--danger, #c0392b)', marginTop: 2 }}>{t(`knowledge.down.${m.knowledgeDown}`)}</div>
               )}

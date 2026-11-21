@@ -10,6 +10,7 @@
 import { useEffect, useSyncExternalStore } from 'react'
 import type { RunEvent } from '../../../shared/ipc-types'
 import type { RunKnowledge } from '../knowledge-grounding'
+import { runDocumentsOf, type RunDocuments } from './DocumentsOutcome'
 
 /** The daemon's run status, or `missing` when it has no such run. A run not
  *  asked yet, or whose answer did not come, is not in the map. */
@@ -25,6 +26,8 @@ export interface RunView {
    *  without a binding): shown only after `grounding` checked it. */
   output: string | null
   knowledge: RunKnowledge | null
+  /** M1: what a completed run's document writes came to (null: none asked). */
+  documents?: RunDocuments | null
 }
 
 /** At most this many runs are asked at once; the others wait their turn. */
@@ -67,7 +70,7 @@ const proxy = () => (typeof window === 'undefined' ? undefined : window.agent24?
 
 const same = (a: RunView | undefined, b: RunView) =>
   !!a && a.status === b.status && a.started_at === b.started_at && a.ended_at === b.ended_at && a.error === b.error
-  && a.output === b.output && JSON.stringify(a.knowledge) === JSON.stringify(b.knowledge)
+  && a.output === b.output && JSON.stringify(a.knowledge) === JSON.stringify(b.knowledge) && JSON.stringify(a.documents ?? null) === JSON.stringify(b.documents ?? null)
 
 function publish(runId: string, view: RunView): void {
   if (same(views.get(runId), view)) return
@@ -114,7 +117,7 @@ async function answer(runId: string): Promise<void> {
     const res = await backend({ method: 'GET', path: `/api/v1/runs/${encodeURIComponent(runId)}` }).catch(() => null)
     const run = (res?.data ?? null) as {
       status?: unknown; started_at?: unknown; created_at?: unknown; ended_at?: unknown
-      error?: { message?: unknown } | null; output?: { text?: unknown } | null; knowledge?: RunKnowledge | null
+      error?: { message?: unknown } | null; output?: { text?: unknown } | null; knowledge?: RunKnowledge | null; documents?: unknown
     } | null
     const status = run?.status
     if (res?.ok && typeof status === 'string') {
@@ -127,6 +130,7 @@ async function answer(runId: string): Promise<void> {
         error: text(run?.error?.message),
         output: status === 'completed' && typeof run?.output?.text === 'string' ? run.output.text : null,
         knowledge: status === 'completed' ? run?.knowledge ?? null : null,
+        documents: status === 'completed' ? runDocumentsOf(run?.documents) : null,
       })
       if (status === 'awaiting_approval' && lastEvent.get(runId) === 'approval.resolved') askLater(runId)
     } else if (res?.status === 404) {
