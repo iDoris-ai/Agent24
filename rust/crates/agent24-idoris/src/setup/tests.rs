@@ -869,11 +869,20 @@ async fn real_v6_auto_and_local_models_contract() {
             .all(|m| !m.omlx_id.is_empty() && !m.kind.is_empty())
     );
     let key = crate::omlx_probe::read_settings_key().unwrap();
-    let model = local
-        .models
-        .into_iter()
-        .find(|m| matches!(m.kind.as_str(), "chat" | "vision"))
-        .unwrap();
+    let mut bindings = vec![(
+        Role::Daily,
+        local
+            .models
+            .iter()
+            .find(|m| matches!(m.kind.as_str(), "chat" | "vision"))
+            .unwrap()
+            .omlx_id
+            .clone(),
+    )];
+    let embed = local.models.iter().any(|m| m.omlx_id == "bge-m3-mlx-fp16");
+    if embed {
+        bindings.push((Role::Embed, "bge-m3-mlx-fp16".into()));
+    }
     let installed = InstalledVersion::from_test_directory(
         PathBuf::from(&binary).parent().unwrap().to_path_buf(),
         "idoris",
@@ -882,7 +891,7 @@ async fn real_v6_auto_and_local_models_contract() {
         &installed,
         &dir.path().join("instances/real"),
         Some(key.into_secret()),
-        &[(Role::Daily, model.omlx_id)],
+        &bindings,
         Some(SetupBudget(0)),
         &CancellationToken::new(),
     )
@@ -890,4 +899,9 @@ async fn real_v6_auto_and_local_models_contract() {
     .unwrap();
     assert!(result.auth_required);
     assert!(result.omlx.is_some());
+    // The embed binding goes to iDoris's resident companion card (S7).
+    assert_eq!(
+        result.components_dir.join("omlx-embed.yaml").is_file(),
+        embed
+    );
 }
