@@ -852,3 +852,97 @@ fn real_contracts_read_and_write_back_unchanged() {
         assert!(*count > 0, "no {needle} in the real contracts: {seen:?}");
     }
 }
+
+/// General 11-21: the write path, not only the no-op. On the real contracts
+/// every paragraph that can be rewritten gets one character more (「。」),
+/// plain and tracked: its tabs and line breaks stay as many and where they
+/// were (its text reads back as the old text plus 「。」), every other
+/// paragraph is byte for byte as it was, and document.xml parses.
+#[test]
+fn real_contracts_keep_tabs_and_breaks_when_a_character_is_added() {
+    let count = |p: &str, tag: &str| {
+        children(p)
+            .into_iter()
+            .filter(|(n, _, _)| *n == "w:r")
+            .map(|(_, s, e)| {
+                children(&p[s..e])
+                    .into_iter()
+                    .filter(|(n, _, _)| *n == tag)
+                    .count()
+            })
+            .sum::<usize>()
+    };
+    let mut edited_total = 0;
+    for (name, docx) in REAL_CONTRACTS {
+        let xml = entry(docx, "word/document.xml");
+        let spans = scan_paragraphs(&xml).unwrap();
+        let paras = list_paragraphs(docx).unwrap();
+        let editable: Vec<&ParaInfo> = paras
+            .iter()
+            .filter(|p| !p.text.trim().is_empty())
+            .filter(|p| not_plain_text(&xml[spans[p.index].start..spans[p.index].end]).is_none())
+            .collect();
+        edited_total += editable.len();
+        for tracked in [false, true] {
+            for chunk in editable.chunks(MAX_EDITS) {
+                let edits: Vec<ParaEdit> = chunk
+                    .iter()
+                    .map(|p| ParaEdit {
+                        index: p.index,
+                        text: format!("{}。", p.text),
+                        tracked,
+                        expect: Some(p.text.clone()),
+                    })
+                    .collect();
+                let out = apply(docx, &edits, "A", NOW).unwrap();
+                let new_xml = entry(&out, "word/document.xml");
+                roxmltree::Document::parse(&new_xml).unwrap_or_else(|e| panic!("{name}: {e}"));
+                let new_spans = scan_paragraphs(&new_xml).unwrap();
+                assert_eq!(new_spans.len(), spans.len(), "{name}");
+                let edited: std::collections::HashSet<usize> =
+                    chunk.iter().map(|p| p.index).collect();
+                for (i, (old, new)) in spans.iter().zip(&new_spans).enumerate() {
+                    let (o, n) = (&xml[old.start..old.end], &new_xml[new.start..new.end]);
+                    if !edited.contains(&i) {
+                        assert_eq!(o, n, "{name} paragraph {i} changed though not edited");
+                        continue;
+                    }
+                    let inserted = if tracked {
+                        &n[n.find("<w:ins ").unwrap()..n.find("</w:ins>").unwrap()]
+                    } else {
+                        n
+                    };
+                    let inserted = format!(
+                        "<w:p>{}</w:p>",
+                        inserted
+                            .trim_start_matches(|c| c != '>')
+                            .trim_start_matches('>')
+                    );
+                    let wanted = format!("{}。", paras[i].text);
+                    if tracked {
+                        assert_eq!(
+                            paragraph_text(&inserted),
+                            wanted,
+                            "{name} paragraph {i} tracked"
+                        );
+                    } else {
+                        assert_eq!(paragraph_text(n), wanted, "{name} paragraph {i}");
+                    }
+                    for tag in ["w:tab", "w:br"] {
+                        let new_count = if tracked {
+                            count(&inserted, tag)
+                        } else {
+                            count(n, tag)
+                        };
+                        assert_eq!(
+                            new_count,
+                            count(o, tag),
+                            "{name} paragraph {i} {tag} tracked={tracked}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(edited_total > 50, "{edited_total}");
+}
