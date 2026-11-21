@@ -1603,7 +1603,7 @@ async fn inputs_reads_the_injected_upstream_key() {
     let root = dir.path().to_owned();
     let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(MemoryKeychain {
         locked: AtomicBool::new(false),
-        reads_left: std::sync::atomic::AtomicUsize::new(usize::MAX),
+        reads_left: std::sync::Mutex::new(usize::MAX),
     })));
     let runtime = Arc::new(SystemRuntime::new(secrets.clone()));
     let router = Arc::new(ModelRouter::idoris_unavailable("inputs"));
