@@ -745,12 +745,22 @@ impl RunManager {
                     .await;
                 return;
             };
+            // M1 (0.6.73): on 「记住：我最喜欢的水果是芒果」 a 4-bit model also
+            // called fs_write to save it to a file. Personal memory takes the
+            // turn itself (retain.rs) after the answer; the model only says so,
+            // so a remember turn is offered no tools.
+            let tools = if self.memory.is_some()
+                && retain::explicit_remember(&run.input.prompt).is_some()
+            {
+                Vec::new()
+            } else {
+                self.tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
+                    .await
+            };
             let request = CompletionRequest {
                 messages: send_messages,
                 model: run.input.model_override.clone(),
-                tools: self
-                    .tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
-                    .await,
+                tools,
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,
