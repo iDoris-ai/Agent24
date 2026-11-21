@@ -4,7 +4,7 @@ import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
-import { askWithKnowledge, createChatSession } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, knowledgePrompt } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
@@ -386,7 +386,9 @@ export default function ChatPage() {
       const last = request.messages[request.messages.length - 1]
       if (about && body && body.text.trim() && last?.role === 'user') last.content = withDocument(about, body, last.content)
     }
-    await requestReply(messages.length, request)
+    // M1: a turn sent as the user said it (no document) may get the Knowledge hint.
+    const said = request.messages[request.messages.length - 1]
+    await requestReply(messages.length, request, said?.role === 'user' && said.content === text.trim())
   }
 
   // Issue #1517: start a fresh conversation. Disabled while a reply is in
@@ -462,7 +464,7 @@ export default function ChatPage() {
     setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
   }
 
-  const requestReply = async (index: number, request: ChatRequest) => {
+  const requestReply = async (index: number, request: ChatRequest, plain = false) => {
     // An archived conversation is read-only (UI-06 D7): nothing is sent, a
     // retry neither, until it is restored.
     if (requestInFlight.current || archivedRef.current) return
@@ -498,7 +500,11 @@ export default function ChatPage() {
         runSession.current = null
         runScope.current = scope
       }
-      await replyWithKnowledge(index, request, knowledge?.active === true)
+      const last = request.messages[request.messages.length - 1]
+      const asked = knowledge?.active === true && plain && last?.role === 'user'
+        ? { ...request, messages: [...request.messages.slice(0, -1), { ...last, content: knowledgePrompt(last.content) }] }
+        : request
+      await replyWithKnowledge(index, asked, knowledge?.active === true)
       return
     }
     // On but not in effect (no binding, e.g. a daemon started from the CLI):

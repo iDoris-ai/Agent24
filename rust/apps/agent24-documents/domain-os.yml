@@ -86,7 +86,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: patch
-    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs; tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives that paragraph's current text as expect); tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
     input_schema:
       type: object
       additionalProperties: false
@@ -100,12 +100,12 @@ tools:
           items:
             type: object
             additionalProperties: false
-            required: [index, text]
+            required: [index, text, expect]
             properties:
               index: { type: integer, minimum: 0 }
               text: { type: string }
               tracked: { type: boolean }
-              expect: { type: string, description: "the paragraph's current text; the edit is refused if it changed" }
+              expect: { type: string, description: "the current text of paragraph `index`, copied from documents.paragraphs; the edit is refused if it is not that paragraph's text" }
         title: { type: string, description: "title of the new document" }
     risk: write_local
     output_privacy: local_only
