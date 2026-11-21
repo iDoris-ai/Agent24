@@ -28,9 +28,12 @@ fn not_our_gateway() -> HostError {
 }
 
 fn built_gateway(gateway: PreparedGateway) -> Result<IdorisGateway, HostError> {
-    gateway
+    let enabled = gateway.embedding_enabled;
+    let built = gateway
         .downcast::<IdorisGateway>()
-        .map_err(|_| not_our_gateway())
+        .map_err(|_| not_our_gateway())?;
+    built.set_embedding_enabled(enabled);
+    Ok(built)
 }
 
 fn built_gateway_ref(gateway: &PreparedGateway) -> Result<&IdorisGateway, HostError> {
@@ -43,6 +46,10 @@ fn built_gateway_ref(gateway: &PreparedGateway) -> Result<&IdorisGateway, HostEr
 impl IdorisSlot for ModelRouter {
     fn block_idoris(&self, reason: &str) {
         ModelRouter::block_idoris(self, reason);
+    }
+
+    fn starting_idoris(&self) {
+        ModelRouter::starting_idoris(self);
     }
 
     fn replace_idoris(&self, gateway: PreparedGateway) -> Result<(), HostError> {

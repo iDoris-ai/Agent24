@@ -819,6 +819,16 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                     ..Default::default()
                 });
             let details = match &err {
+                ModelError::Unavailable(reason) if reason.starts_with("idoris_unavailable") => {
+                    Some(serde_json::Map::from_iter([(
+                        "retry_after".into(),
+                        serde_json::json!(if reason.contains("circuit_open") {
+                            60
+                        } else {
+                            5
+                        }),
+                    )]))
+                }
                 ModelError::IdorisHeadroomConfirmationRequired { role, remediation } => {
                     Some(serde_json::Map::from_iter([
                         ("role".into(), serde_json::json!(role)),
@@ -828,6 +838,9 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
                 _ => None,
             };
             let (status, code, message) = match err {
+                ModelError::Unavailable(msg) if msg.starts_with("idoris_unavailable") => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "idoris_unavailable", msg)
+                }
                 ModelError::Unavailable(msg) => (
                     StatusCode::SERVICE_UNAVAILABLE,
                     "provider_unavailable",
@@ -1001,6 +1014,38 @@ mod tests {
 
     fn router(state: AppState) -> axum::Router {
         crate::server::build_router_with_modules(state, axum::Router::new())
+    }
+
+    #[tokio::test]
+    async fn ic3a_chat_reports_service_recovery_as_503() {
+        use http_body_util::BodyExt;
+        for (reason, retry_after) in [("idoris_unavailable: circuit_open", 60), ("stopped", 5)] {
+            let mut state = state_with_stub().await;
+            state.router = std::sync::Arc::new(ModelRouter::idoris_unavailable(reason));
+            let response = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                router(state).oneshot(
+                    Request::post("/api/v1/chat")
+                        .header("authorization", "Bearer testtoken")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"messages":[{"role":"user","content":"test"}]}"#,
+                        ))
+                        .unwrap(),
+                ),
+            )
+            .await
+            .expect("unavailable services fail immediately")
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "idoris_unavailable");
+            assert_eq!(body["error"]["details"]["retry_after"], retry_after);
+            if reason == "stopped" {
+                assert_eq!(body["error"]["message"], "idoris_unavailable: stopped");
+            }
+        }
     }
 
     #[tokio::test]

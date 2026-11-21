@@ -123,7 +123,22 @@ pub struct Served {
     pub response: CompletionResponse,
 }
 
-type GatewaySnapshot = Option<Result<Arc<crate::IdorisGateway>, String>>;
+#[derive(Clone)]
+enum IdorisBlocked {
+    Starting,
+    Unavailable(String),
+}
+
+impl IdorisBlocked {
+    fn reason(&self) -> &str {
+        match self {
+            Self::Starting => "managed iDoris starting",
+            Self::Unavailable(reason) => reason,
+        }
+    }
+}
+
+type GatewaySnapshot = Option<Result<Arc<crate::IdorisGateway>, IdorisBlocked>>;
 
 /// Chat and embeddings have one exit. Shown when that exit is not published.
 pub(crate) fn idoris_not_connected() -> &'static str {
@@ -324,7 +339,14 @@ impl ModelRouter {
     }
 
     pub fn block_idoris(&self, reason: &str) {
-        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) = Some(Err(reason.into()));
+        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) =
+            Some(Err(IdorisBlocked::Unavailable(reason.into())));
+    }
+
+    /// Wait only while the managed service is starting or restarting.
+    pub fn starting_idoris(&self) {
+        *self.idoris.write().unwrap_or_else(|p| p.into_inner()) =
+            Some(Err(IdorisBlocked::Starting));
     }
 
     /// The caller validates health before publishing. Readers retain their own Arc.
@@ -342,7 +364,49 @@ impl ModelRouter {
     pub fn idoris_gateway(&self) -> Result<Arc<crate::IdorisGateway>, ModelError> {
         self.gateway_snapshot()
             .ok_or_else(|| ModelError::Unavailable(idoris_not_connected().into()))?
-            .map_err(ModelError::Provider)
+            .map_err(|blocked| ModelError::Provider(blocked.reason().into()))
+    }
+
+    async fn wait_idoris(
+        &self,
+        cancel: &CancellationToken,
+        limit: Duration,
+        probe: bool,
+    ) -> Result<Arc<crate::IdorisGateway>, ModelError> {
+        let wait = async {
+            loop {
+                match self.gateway_snapshot() {
+                    Some(Ok(gateway)) => {
+                        if !probe || gateway.check_health(cancel).await.is_ok() {
+                            return Ok(gateway);
+                        }
+                    }
+                    Some(Err(IdorisBlocked::Unavailable(reason)))
+                        if reason.contains("circuit_open") =>
+                    {
+                        return Err(ModelError::Unavailable(
+                            "idoris_unavailable: circuit_open; retry_after=60".into(),
+                        ));
+                    }
+                    Some(Err(IdorisBlocked::Starting)) => {}
+                    Some(Err(IdorisBlocked::Unavailable(reason))) => {
+                        return Err(ModelError::Unavailable(format!(
+                            "idoris_unavailable: {reason}"
+                        )));
+                    }
+                    None => return Err(ModelError::Unavailable("idoris_unavailable".into())),
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return Err(ModelError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {},
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(ModelError::Cancelled),
+            result = tokio::time::timeout(limit, wait) => result.unwrap_or_else(|_| Err(ModelError::Unavailable("idoris_unavailable: readiness_timeout; retry_after=5".into()))),
+        }
     }
 
     /// Build from `(provider, tier)` pairs. Cooldown grows exponentially from
@@ -624,12 +688,26 @@ impl ModelRouter {
         resources: Vec<EgressResource>,
         authorization_generation: u64,
     ) -> Result<Served, ModelError> {
-        if let Some(gateway) = self.gateway_snapshot() {
-            return gateway
-                .as_ref()
-                .map_err(|e| ModelError::Provider(e.clone()))?
-                .complete(profile, req, cancel, request_id)
+        if self.gateway_snapshot().is_some() {
+            let inference_id = uuid::Uuid::new_v4().to_string();
+            let gateway = self
+                .wait_idoris(cancel, Duration::from_secs(30), false)
+                .await?;
+            let result = gateway
+                .complete(profile, req, cancel, request_id, &inference_id)
                 .await;
+            if matches!(&result, Err(ModelError::Unavailable(reason)) if reason == "idoris_connection_lost")
+            {
+                let gateway = self
+                    .wait_idoris(cancel, Duration::from_secs(30), true)
+                    .await?;
+                return gateway.complete(profile, req, cancel, request_id, &inference_id).await.map_err(|error| {
+                    if matches!(&error, ModelError::Unavailable(reason) if reason == "idoris_connection_lost") {
+                        ModelError::Unavailable("idoris_unavailable: connection_lost; retry_after=5".into())
+                    } else { error }
+                });
+            }
+            return result;
         }
         if self.idoris_only {
             return Err(ModelError::Unavailable(idoris_not_connected().into()));
@@ -754,7 +832,7 @@ impl ModelRouter {
         if let Some(gateway) = self.gateway_snapshot() {
             let result = match &gateway {
                 Ok(gateway) => gateway.models(cancel).await,
-                Err(error) => Err(ModelError::Provider(error.clone())),
+                Err(error) => Err(ModelError::Provider(error.reason().into())),
             };
             return match result {
                 Ok(models) => ModelInventory {
@@ -2550,5 +2628,159 @@ mod tests {
             .await;
         assert!(inventory.failures.is_empty(), "{:?}", inventory.failures);
         assert_eq!(remote.listings(), 1);
+    }
+}
+
+#[cfg(test)]
+mod ic3a_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+    #[tokio::test]
+    async fn slot_wait_is_bounded_and_circuit_fails_immediately() {
+        let router = ModelRouter::idoris_unavailable("stopped");
+        router.starting_idoris();
+        let error = router
+            .wait_idoris(&CancellationToken::new(), Duration::from_millis(15), false)
+            .await
+            .err()
+            .unwrap();
+        assert!(
+            matches!(error, ModelError::Unavailable(reason) if reason.contains("readiness_timeout"))
+        );
+        router.block_idoris("idoris_unavailable: circuit_open");
+        let error = tokio::time::timeout(
+            Duration::from_millis(100),
+            router.wait_idoris(&CancellationToken::new(), Duration::from_secs(30), false),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert!(
+            matches!(error, ModelError::Unavailable(reason) if reason.contains("circuit_open"))
+        );
+    }
+
+    #[tokio::test]
+    async fn waiting_request_observes_replacement_and_cancellation() {
+        let router = Arc::new(ModelRouter::idoris_unavailable("stopped"));
+        router.starting_idoris();
+        let waiting = router.clone();
+        let task = tokio::spawn(async move {
+            waiting
+                .wait_idoris(&CancellationToken::new(), Duration::from_secs(1), false)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(!task.is_finished(), "restarting must wait for a gateway");
+        router.replace_idoris(
+            crate::IdorisGateway::from_credentials(
+                "http://127.0.0.1:9999",
+                zeroize::Zeroizing::new("idk_key".into()),
+            )
+            .unwrap(),
+        );
+        assert!(task.await.unwrap().is_ok());
+        router.starting_idoris();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(
+            router
+                .wait_idoris(&cancel, Duration::from_secs(30), false)
+                .await,
+            Err(ModelError::Cancelled)
+        ));
+    }
+    #[tokio::test]
+    async fn nonstream_connection_close_retries_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for recover in [true, false] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let chats = Arc::new(AtomicUsize::new(0));
+            let seen = chats.clone();
+            let request_ids = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let captured = request_ids.clone();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buf = [0; 4096];
+                    loop {
+                        let n = socket.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        bytes.extend_from_slice(&buf[..n]);
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let size = headers
+                                .lines()
+                                .find_map(|l| {
+                                    l.to_ascii_lowercase()
+                                        .strip_prefix("content-length: ")
+                                        .and_then(|s| s.parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + size {
+                                break;
+                            }
+                        }
+                    }
+                    let health = bytes.starts_with(b"GET /health ");
+                    let body = if health {
+                        serde_json::json!({"service":"idoris","version":"0.5.0","contract_version":"1.2.0","instance_id":"fixture","dev_no_key_enabled":false}).to_string()
+                    } else {
+                        let headers = String::from_utf8_lossy(&bytes).to_ascii_lowercase();
+                        let id = headers
+                            .lines()
+                            .find_map(|line| line.strip_prefix("x-idoris-request-id: "))
+                            .unwrap()
+                            .to_owned();
+                        captured.lock().unwrap().push(id);
+                        let call = seen.fetch_add(1, Ordering::SeqCst);
+                        if call == 0 || !recover {
+                            continue;
+                        }
+                        serde_json::json!({"model":"fixture","choices":[{"message":{"role":"assistant","content":"recovered"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}).to_string()
+                    };
+                    let reply = format!(
+                        "HTTP/1.1 200 OK\r\nx-idoris-served-locality: loopback\r\nx-idoris-record-id: recovered\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(reply.as_bytes()).await.unwrap();
+                }
+            });
+            let router =
+                ModelRouter::from_idoris(&url, zeroize::Zeroizing::new("idk_retry".into()))
+                    .unwrap();
+            let request = CompletionRequest {
+                messages: vec![crate::Msg::user("test")],
+                model: None,
+                tools: vec![],
+                response_format: None,
+                max_tokens: None,
+                temperature: None,
+                disable_thinking: false,
+                idoris_headroom_confirmed: false,
+                progress: None,
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                router.complete(TaskProfile::default(), &request, &CancellationToken::new()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), recover);
+            assert_eq!(chats.load(Ordering::SeqCst), 2);
+            let ids = request_ids.lock().unwrap();
+            assert!(!ids[0].is_empty());
+            assert_eq!(
+                ids[0], ids[1],
+                "retry must reuse the inference idempotency key"
+            );
+            server.abort();
+        }
     }
 }

@@ -1,5 +1,7 @@
 {
   "state": "running",
+  "registered": false,
+  "instance_id": null,
   "version": "0.4.0",
   "data_port": 8740,
   "admin_port": 8741,
@@ -20,5 +22,8 @@
   },
   "budget_unavailable_reason": null,
   "migration_pending": false,
-  "last_migration_error": null
+  "last_migration_error": null,
+  "crashes": 0,
+  "hangs": 0,
+  "circuit_open": false
 }

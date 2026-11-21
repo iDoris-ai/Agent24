@@ -106,6 +106,21 @@ impl Runtime for FixtureRuntime {
             data: r.data_port,
             admin: r.admin_port,
         };
+        // Bootstrap's production ports may belong to the owner's live iDoris.
+        // Keep fixture listeners isolated; the host must use supervisor endpoints.
+        if r.data_port == 9011 && r.admin_port == 9012 {
+            fn free_port() -> u16 {
+                std::net::TcpListener::bind("127.0.0.1:0")
+                    .unwrap()
+                    .local_addr()
+                    .unwrap()
+                    .port()
+            }
+            config.ports = Ports {
+                data: free_port(),
+                admin: free_port(),
+            };
+        }
         config.log_dir = root.join("logs");
         config.shutdown = cancel;
         // Readiness is a liveness bound, not a speed assertion: a freshly written fixture
@@ -362,6 +377,31 @@ async fn state_machine_idempotency_busy_and_stop() {
         Some(Outcome::Succeeded)
     );
     assert!(router_gateway(&f.router).is_err());
+    let request = agent24_models::CompletionRequest {
+        messages: vec![agent24_models::Msg::user("test")],
+        model: None,
+        tools: vec![],
+        response_format: None,
+        max_tokens: None,
+        temperature: None,
+        disable_thinking: false,
+        idoris_headroom_confirmed: false,
+        progress: None,
+    };
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        f.router.complete(
+            agent24_models::router::TaskProfile::default(),
+            &request,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("explicit stop must fail immediately")
+    .unwrap_err();
+    assert!(
+        matches!(error, agent24_models::ModelError::Unavailable(reason) if reason == "idoris_unavailable: stopped")
+    );
     let attempts = fs::read_to_string(f.host.root.join("data/state/attempts.jsonl")).unwrap();
     assert_eq!(attempts.lines().count(), 1);
     f.assert_clean();

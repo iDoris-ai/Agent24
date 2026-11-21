@@ -18,10 +18,11 @@ tracing = "0.1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 http = "1"
 sha2 = "0.10"
+hmac = "0.12"
 semver = "1"
 url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
-tokio = { version = "1", features = ["macros", "rt", "time", "process", "io-util", "sync"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "process", "io-util", "sync", "net"] }
 tokio-util = "0.7"
 fs2 = "0.4"
 tempfile = "3"
