@@ -13,7 +13,7 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
+import { asksTranslation, docAgentPrompt, parseDocIntent, subjectOf, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -223,8 +223,7 @@ export default function ChatPage() {
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    const wantsDocTool = /拆|合并|合成|split|merge|combine|模板|填写|填好|填入|生成初稿|修订|改写|template|fill/i.test(text)
-    if (wantsDocTool && window.agent24.documents?.agentAccess) {
+    if (wantsDocTool(text, doc !== null) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -278,7 +277,7 @@ export default function ChatPage() {
       }
     }
     // D4: 「把这份翻译成英文」「翻译《X》」 — same translation as the document page.
-    if (/翻译|译成|translate/i.test(text) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+    if (asksTranslation(text, doc !== null) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
       const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
       if (doc || named) {
         const api = window.agent24.documents
