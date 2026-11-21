@@ -415,6 +415,12 @@ async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome 
 async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let (id, rest) = split_document(arguments)?;
     let req: crate::patch::PatchRequest = parse(rest)?;
+    // M1 (0.6.72): asked for 「第 3 段」, a model wrote 第三条's new text over
+    // paragraph 2. From an Agent every edit says the text it replaces, so a
+    // wrong index is refused, not written (the HTTP route and CLI keep it optional).
+    if req.edits.iter().any(|e| e.expect.is_none()) {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
     let storage = ready(state).await?;
     completed(
         crate::patch::patch_run(&storage, id, req)
@@ -1304,6 +1310,29 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    /// M1 (0.6.72): from an Agent, an edit that does not say the text it
+    /// replaces is refused before anything is read; with it, it goes on.
+    #[tokio::test]
+    async fn an_agent_patch_must_say_the_text_each_edit_replaces() {
+        let (_dir, state) = opened().await;
+        let id = add_document(&state, 1, "'合同.docx'").await;
+        let without = json!({ "document_id": id, "edits": [{ "index": 2, "text": "押金", "tracked": true }] });
+        let body = call_in(&state, "patch", &[&id], without).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("invalid_input"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let with = json!({ "document_id": id, "edits": [{ "index": 2, "text": "押金", "expect": "乙方：张三" }] });
+        let body = call_in(&state, "patch", &[&id], with).await;
+        let answer = String::from_utf8_lossy(&body).into_owned();
+        // Past the check, to the service (the blob is no DOCX here).
+        assert!(
+            !answer.contains("invalid_input") && answer.contains("\"error\""),
+            "{answer}"
+        );
     }
 
     #[tokio::test]

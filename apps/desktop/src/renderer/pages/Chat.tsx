@@ -4,7 +4,7 @@ import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
-import { askWithKnowledge, createChatSession } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, knowledgePrompt } from './chat-knowledge'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
@@ -13,7 +13,7 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
+import { docAgentPrompt, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -223,8 +223,7 @@ export default function ChatPage() {
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    const wantsDocTool = /拆|合并|合成|split|merge|combine|模板|填写|填好|填入|生成初稿|修订|改写|template|fill/i.test(text)
-    if (wantsDocTool && window.agent24.documents?.agentAccess) {
+    if (wantsDocTool(text, doc !== null) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -278,7 +277,7 @@ export default function ChatPage() {
       }
     }
     // D4: 「把这份翻译成英文」「翻译《X》」 — same translation as the document page.
-    if (/翻译|译成|translate/i.test(text) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+    if (translatesDocument(text, doc !== null) && window.agent24.documents) {
       const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
       if (doc || named) {
         const api = window.agent24.documents
@@ -387,7 +386,9 @@ export default function ChatPage() {
       const last = request.messages[request.messages.length - 1]
       if (about && body && body.text.trim() && last?.role === 'user') last.content = withDocument(about, body, last.content)
     }
-    await requestReply(messages.length, request)
+    // M1: a turn sent as the user said it (no document) may get the Knowledge hint.
+    const said = request.messages[request.messages.length - 1]
+    await requestReply(messages.length, request, said?.role === 'user' && said.content === text.trim())
   }
 
   // Issue #1517: start a fresh conversation. Disabled while a reply is in
@@ -463,7 +464,7 @@ export default function ChatPage() {
     setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
   }
 
-  const requestReply = async (index: number, request: ChatRequest) => {
+  const requestReply = async (index: number, request: ChatRequest, plain = false) => {
     // An archived conversation is read-only (UI-06 D7): nothing is sent, a
     // retry neither, until it is restored.
     if (requestInFlight.current || archivedRef.current) return
@@ -499,7 +500,11 @@ export default function ChatPage() {
         runSession.current = null
         runScope.current = scope
       }
-      await replyWithKnowledge(index, request, knowledge?.active === true)
+      const last = request.messages[request.messages.length - 1]
+      const asked = knowledge?.active === true && plain && last?.role === 'user'
+        ? { ...request, messages: [...request.messages.slice(0, -1), { ...last, content: knowledgePrompt(last.content) }] }
+        : request
+      await replyWithKnowledge(index, asked, knowledge?.active === true)
       return
     }
     // On but not in effect (no binding, e.g. a daemon started from the CLI):

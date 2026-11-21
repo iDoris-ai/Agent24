@@ -553,6 +553,8 @@ button { cursor: pointer; font-family: var(--font); }
 .task-card-status { font-weight: 600; }
 .task-card-time { color: var(--muted); font-variant-numeric: tabular-nums; }
 .task-card-error { color: var(--danger, #c0392b); }
+/* M1: a patch lists each paragraph on its own line. */
+.task-card-ask { white-space: pre-line; }
 .task-card-actions { display: flex; gap: 6px; margin-left: auto; }
 .task-card-output { flex-basis: 100%; white-space: pre-wrap; }
 .task-card-knowledge { font-size: 11px; color: var(--muted); margin-top: 2px; }

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { askWithKnowledge, createChatSession, MAX_WAIT_MS } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, KNOWLEDGE_HINT, knowledgePrompt, MAX_WAIT_MS } from './chat-knowledge'
 
 type Req = { method: string; path: string; body?: unknown }
 const ok = (data: unknown) => ({ ok: true, status: 200, data })
@@ -69,5 +69,16 @@ describe('chat-knowledge', () => {
     const turn = await askWithKnowledge('q', 's', { proxy: slow.proxy, sleep: async (ms) => { t += ms }, now: () => t * (MAX_WAIT_MS / 3000) })
     expect(turn).toEqual({ kind: 'ongoing', runId: 'run_1', status })
     expect(slow.calls.some(c => c.path.endsWith('/cancel'))).toBe(false)
+  })
+})
+
+describe('knowledgePrompt (M1, 0.6.72: 「烧开水要多久」 never searched)', () => {
+  it('says to search the knowledge bases first, in front of a plain question', () => {
+    expect(knowledgePrompt('烧开水要多久')).toBe(`${KNOWLEDGE_HINT}\n烧开水要多久`)
+  })
+  it('leaves 「记住…」 as said, so personal memory still takes it', () => {
+    for (const text of ['记住我家的猫叫豆豆，今年三岁。', '记住：我每周三下午去游泳', '请帮我记一下明天交报告', '你记着我不吃香菜']) {
+      expect(knowledgePrompt(text)).toBe(text)
+    }
   })
 })

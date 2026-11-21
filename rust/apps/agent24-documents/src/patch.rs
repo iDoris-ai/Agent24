@@ -45,13 +45,13 @@ pub struct EditBody {
     #[serde(default)]
     tracked: bool,
     #[serde(default)]
-    expect: Option<String>,
+    pub(crate) expect: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PatchRequest {
-    edits: Vec<EditBody>,
+    pub(crate) edits: Vec<EditBody>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]

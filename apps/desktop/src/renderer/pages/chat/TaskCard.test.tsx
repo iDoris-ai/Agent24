@@ -507,8 +507,14 @@ describe('approvalText (D2b)', () => {
     expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","values":{"甲方":"明远","租金":"8,500"}}' }, t))
       .toBe('task.ask.fill{"doc":"模板.docx","values":"甲方=明远，租金=8,500"}')
     expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x","tracked":true}]}' }, t))
-      .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}')
+      .toBe('task.ask.patchTracked{"doc":"a.docx","n":"1"}\ntask.ask.patchEdit{"n":"4","from":"","to":"x"}')
     expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}]}' }, t))
-      .toBe('task.ask.patch{"doc":"a.docx","n":"1"}')
+      .toBe('task.ask.patch{"doc":"a.docx","n":"1"}\ntask.ask.patchEdit{"n":"4","from":"","to":"x"}')
+  })
+  it('shows what each rewritten paragraph says now and will say (M1, 0.6.72)', () => {
+    // The run that would have put 第三条's text over 乙方's line.
+    const summary = 'documents.patch: {"document_id":"合同.docx","edits":[{"index":2,"text":"第三条 押金为两个月租金。","expect":"乙方：张三","tracked":true}]}'
+    expect(approvalText({ summary }, t))
+      .toBe('task.ask.patchTracked{"doc":"合同.docx","n":"1"}\ntask.ask.patchEdit{"n":"3","from":"乙方：张三","to":"第三条 押金为两个月租金。"}')
   })
 })

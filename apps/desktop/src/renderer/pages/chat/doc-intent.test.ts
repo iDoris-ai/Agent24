@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { docAgentPrompt, findByTitle, parseDocIntent, subjectOf } from './doc-intent'
+import { asksTranslation, docAgentPrompt, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -44,7 +44,7 @@ describe('D2b document intents in a conversation about a document', () => {
   })
 })
 
-const HINT = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；'
+const HINT = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
   + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
   + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写，tracked=true 写成修订；document_id 可以直接填文件名）。'
 
@@ -110,4 +110,62 @@ describe('parseDocIntent: questions about a page are not splits (PR-Daemon #1909
   ])('%s → split %s', (text, pages) => {
     expect(parseDocIntent(text)).toEqual({ kind: 'split', pages })
   })
+})
+
+describe('M1: the acceptance sentences reach the documents tools or the translation', () => {
+  // Loop 5 M1 acceptance, as said in a conversation about a document.
+  it('split', () => expect(wantsDocTool('把这份 PDF 拆成第 1 页一份、其余一份', true)).toBe(true))
+  it('merge', () => expect(wantsDocTool('把这两份合成一份', true)).toBe(true))
+  it('fill a template', () => expect(wantsDocTool('用这些信息填这份录用通知书', true)).toBe(true))
+  it('rewrite a paragraph', () => expect(wantsDocTool('把第 3 段改得正式一点', true)).toBe(true))
+  it('translate and export Word', () => {
+    expect(asksTranslation('把这份翻成英文并导出 Word', true)).toBe(true)
+    expect(translatesDocument('把这份翻成英文并导出 Word', true)).toBe(true)
+    expect(wantsDocTool('把这份翻成英文并导出 Word', true)).toBe(false)
+  })
+  it('a knowledge question is neither', () => {
+    expect(wantsDocTool('烧开水要多久', false)).toBe(false)
+    expect(asksTranslation('烧开水要多久', false)).toBe(false)
+  })
+  it('a document named in 《》 counts as one outside its conversation', () => {
+    expect(wantsDocTool('把《合同.docx》第 3 段改得正式一点', false)).toBe(true)
+    expect(wantsDocTool('用这些信息填《录用通知书.docx》', false)).toBe(true)
+  })
+})
+
+describe('M1: everyday sentences without a document stay ordinary chat', () => {
+  for (const text of [
+    '把这句话改成更礼貌的说法',
+    '帮我把这段话改得口语一点',
+    '这封邮件润色一下',
+    '把“你好”翻成英文',
+    '填这个表要注意什么',
+    // General/PM 11-21: everyday questions with 填/改/翻译 in them.
+    '帮我翻译一下这句话',
+    '这个表怎么填比较好',
+    '翻译成英文是什么意思',
+    '这段代码怎么改成异步的',
+  ]) {
+    it(text, () => {
+      expect(wantsDocTool(text, false)).toBe(false)
+      expect(translatesDocument(text, false)).toBe(false)
+      expect(parseDocIntent(text)).toBeNull()
+    })
+  }
+})
+
+describe('M1: the four questions PR-Daemon #1915 found taken as splits stay questions', () => {
+  // #1915 review ①: asked in a conversation about the document, so with it.
+  for (const text of [
+    '这份文档第2页的关键信息帮我提取一下',
+    '提取第2页的文件内容',
+    '第3页导出的金额是多少，文档里写了吗',
+    '总结一下这份文件第4页，单独列出金额',
+  ]) {
+    it(text, () => {
+      expect(parseDocIntent(text)).toBeNull()
+      expect(wantsDocTool(text, true)).toBe(false)
+      expect(translatesDocument(text, true)).toBe(false)
+    })
+  }
 })

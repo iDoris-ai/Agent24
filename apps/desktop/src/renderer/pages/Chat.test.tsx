@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { KNOWLEDGE_HINT } from './chat-knowledge'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from './Chat'
 import { setLocale } from '../i18n'
@@ -393,7 +394,7 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText('from the knowledge base')).toBeInTheDocument(), { timeout: 3000 })
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
     expect(screen.queryByText(/本次没有读到/)).not.toBeInTheDocument()
-    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's1' } }))
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1' } }))
   })
 
   it('runs the first Knowledge turn of a new conversation in a new session', async () => {
@@ -405,7 +406,7 @@ describe('ChatPage with Knowledge', () => {
     let sessions = 0
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       const text = req.path.endsWith('r-first') ? 'answer one' : 'answer two'
       return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge: { searched: true, read_chunks: [] } } }
     })
@@ -421,7 +422,7 @@ describe('ChatPage with Knowledge', () => {
     fireEvent.change(textarea, { target: { value: 'second' } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(screen.getByText('answer two')).toBeInTheDocument(), { timeout: 3000 })
-    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's2' } }))
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's2' } }))
   })
 
   // Mutation: pass skill_id only while creating the run session (the first round) and the second expectation goes red.
@@ -437,7 +438,7 @@ describe('ChatPage with Knowledge', () => {
     ] } })
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       const text = req.path.endsWith('r-first') ? 'answer one' : 'answer two'
       return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge: { searched: true, read_chunks: [] } } }
     })
@@ -459,8 +460,8 @@ describe('ChatPage with Knowledge', () => {
 
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
     expect(runs.map((req) => req.body)).toEqual([
-      { prompt: 'first', session_id: 's1', skill_id: 'live' },
-      { prompt: 'second', session_id: 's1', skill_id: 'live' },
+      { prompt: `${KNOWLEDGE_HINT}\nfirst`, session_id: 's1', skill_id: 'live' },
+      { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', skill_id: 'live' },
     ])
   })
 
@@ -483,7 +484,7 @@ describe('ChatPage with Knowledge', () => {
     skillListing.respond = () => skillList(['live'])
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       return { ok: true, status: 200, data: { status: 'completed', output: { text: `ans ${req.path.slice('/api/v1/runs/r-'.length)}` }, knowledge: null } }
     })
     render(<ChatPage />)
@@ -569,7 +570,7 @@ describe('ChatPage with Knowledge', () => {
     skillListing.respond = () => skillList(['live'])
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       if (req.path.startsWith('/api/v1/runs/')) return { ok: true, status: 200, data: { status: 'completed', output: { text: `ans ${req.path.slice('/api/v1/runs/r-'.length)}` }, knowledge: null } }
       return { ok: true, status: 200, data: { message: { content: 'plain reply' } } }
     })
@@ -828,7 +829,7 @@ describe('ChatPage with Knowledge on another server', () => {
     for (const text of ['one', 'two', 'three']) {
       fireEvent.change(textarea, { target: { value: text } })
       fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
-      await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ prompt: text }) })), { timeout: 3000 })
+      await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ prompt: `${KNOWLEDGE_HINT}\n${text}` }) })), { timeout: 3000 })
       await waitFor(() => expect(screen.queryByText(/思考中|thinking/i)).toBeNull(), { timeout: 3000 })
     }
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
@@ -894,8 +895,8 @@ describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
     await waitFor(() => expect(screen.getByText('loaded with knowledge')).toBeInTheDocument(), { timeout: 3000 })
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
     expect(runs.map((req) => req.body)).toEqual([
-      { prompt: 'q', session_id: 's1' },
-      { prompt: 'q', session_id: 's1', idoris_headroom_confirmed: true },
+      { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1' },
+      { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1', idoris_headroom_confirmed: true },
     ])
     expect(sessions).toBe(1)
   })

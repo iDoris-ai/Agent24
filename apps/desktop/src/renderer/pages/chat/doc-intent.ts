@@ -80,9 +80,48 @@ export function subjectOf(text: string, intent: DocIntent): string | null {
   return intent.kind === 'merge' && first === intent.other ? null : first
 }
 
-/** Prefix the user turn so the Agent uses documents tools (D2b 正式版). */
+/** Words that by themselves send a turn to the documents tools (D2b, E1b, D5a). */
+const DOC_TOOL_WORDS = /拆|合并|合成|split|merge|combine|模板|填写|填好|填入|生成初稿|修订|改写|template|fill/i
+/** M1 (Loop 5): how people also ask to fill or rewrite 「填这份录用通知书」「把第 3 段改得
+ * 正式一点」. Everyday words too (「把这句话改成更礼貌的说法」), so they count only
+ * in a conversation about a document or with a document named in 《》. */
+const DOC_EDIT_WORDS = /填(?:这|进|上|到|一下|《)|改得|改成|改为|润色|正式一点|更正式/
+const TRANSLATE_WORDS = /翻译|译成|translate/i
+/** M1: 「翻成英文」「译为中文」, everyday words too (「把“你好”翻成英文」): only
+ * about a document, as DOC_EDIT_WORDS. */
+const TRANSLATE_MORE = /译为|翻成|翻为/
+
+/** In a conversation about a document (`inDocument`), or naming one in 《》. */
+function aboutDocument(text: string, inDocument: boolean): boolean {
+  return inDocument || /《[^》]{1,200}》/.test(text)
+}
+
+/** Whether a turn asks to translate a document (D4). */
+export function asksTranslation(text: string, inDocument: boolean): boolean {
+  return TRANSLATE_WORDS.test(text) || (aboutDocument(text, inDocument) && TRANSLATE_MORE.test(text))
+}
+
+/** Whether a turn is the D4 translation of a document: asked to translate,
+ * not to summarise or check, not a split or merge, and about a document (this
+ * conversation's, or one named in 《》「」“”). */
+export function translatesDocument(text: string, inDocument: boolean): boolean {
+  return asksTranslation(text, inDocument)
+    && !/总结|摘要|检查|审查|核对/.test(text)
+    && parseDocIntent(text) === null
+    && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
+}
+
+/** Whether a turn goes to the Agent with the documents tools. */
+export function wantsDocTool(text: string, inDocument: boolean): boolean {
+  if (DOC_TOOL_WORDS.test(text)) return true
+  return aboutDocument(text, inDocument) && !asksTranslation(text, inDocument) && DOC_EDIT_WORDS.test(text)
+}
+
+/** Prefix the user turn so the Agent uses documents tools (D2b 正式版). M1: a
+ * split is N calls of compose with one part each; one call with several parts
+ * is a merge (a 4-bit model packed a split into one call, 9 runs in 15). */
 export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
-  const hint = '需要处理文档时请使用 documents 工具（documents.list 查找、documents.compose 拆分或合并生成新文档；'
+  const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
     + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写，tracked=true 写成修订；document_id 可以直接填文件名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''

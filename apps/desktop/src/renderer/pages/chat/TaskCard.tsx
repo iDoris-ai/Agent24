@@ -83,7 +83,16 @@ export function approvalText(a: Pick<Approval, 'summary'>, t: (key: string, vars
   }
   if (tool === 'documents.patch' && Array.isArray(args['edits'])) {
     const edits = args['edits'] as Array<Record<string, unknown>>
-    return t(edits.some(e => e['tracked'] === true) ? 'task.ask.patchTracked' : 'task.ask.patch', { doc: str(args['document_id']), n: String(edits.length) })
+    const head = t(edits.some(e => e['tracked'] === true) ? 'task.ask.patchTracked' : 'task.ask.patch', { doc: str(args['document_id']), n: String(edits.length) })
+    // M1 (0.6.72): the card said only 「改写 1 段」 while a model was about to
+    // write 第三条's text over 乙方's line. Each edit shows what it replaces.
+    const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s)
+    const shown = edits.slice(0, 5).map(e => t('task.ask.patchEdit', {
+      n: typeof e['index'] === 'number' ? String(e['index'] + 1) : '?',
+      from: clip(str(e['expect'])),
+      to: clip(str(e['text'])),
+    }))
+    return [head, ...shown, ...(edits.length > 5 ? ['…'] : [])].join('\n')
   }
   return summary.length > 160 ? `${summary.slice(0, 160)}…` : summary
 }

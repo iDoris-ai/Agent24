@@ -7,6 +7,21 @@
 
 import type { RunKnowledge } from './knowledge-grounding'
 
+/** M1 (Loop 5): a 4-bit model answers 「烧开水要多久」 from what it knows, never
+ * searching (0/3 on 0.6.72; 9/10 with this said in the turn, 5/10 as a system
+ * message, 2/5 in the tool description). Said in front of a plain question. */
+export const KNOWLEDGE_HINT = '（知识库已开启：回答事实、数据、做法类问题前，先用 knowledge_search 在知识库里查，'
+  + '依据查到的内容回答并注明出处；查不到再说明并按常识回答。闲聊、改写或翻译用户给的文字不用查。）'
+
+/** 「记住…」 is kept as the user said it: personal memory takes only a turn that
+ * starts with it (agent24-agent retain.rs), so nothing goes in front. */
+const REMEMBER = /^\s*(请你|麻烦你|你帮我|请帮我|帮我|请|麻烦|你)?\s*(记一下|记住|记好|记着)/
+
+/** The run's prompt for a plain turn with Knowledge in effect. */
+export function knowledgePrompt(text: string): string {
+  return REMEMBER.test(text) ? text : `${KNOWLEDGE_HINT}\n${text}`
+}
+
 export const POLL_MS = 1_000
 /** As long as `/api/v1/chat` may take for one reply (backend-proxy.ts). */
 export const MAX_WAIT_MS = 10 * 60_000
