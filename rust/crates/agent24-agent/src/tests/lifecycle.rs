@@ -185,6 +185,41 @@ async fn only_a_run_that_names_a_knowledge_binding_is_offered_a_tool_that_needs_
     );
 }
 
+/// Records the messages and the tool names of each model call.
+struct SeenProvider {
+    seen: StdMutex<Vec<Vec<Msg>>>,
+    tools: StdMutex<Vec<Vec<String>>>,
+}
+
+#[async_trait]
+impl ModelProvider for SeenProvider {
+    fn name(&self) -> &str {
+        "seen"
+    }
+    async fn complete(
+        &self,
+        req: &CompletionRequest,
+        _cancel: &CancellationToken,
+    ) -> Result<CompletionResponse, ModelError> {
+        self.seen.lock().unwrap().push(req.messages.clone());
+        self.tools
+            .lock()
+            .unwrap()
+            .push(req.tools.iter().map(|t| t.name.clone()).collect());
+        Ok(CompletionResponse {
+            message: Msg::assistant(Some("pong".to_owned()), vec![]),
+            usage: usage_one(),
+            model_id: None,
+        })
+    }
+    async fn models(
+        &self,
+        _cancel: &CancellationToken,
+    ) -> Result<Vec<agent24_protocol::Model>, ModelError> {
+        Ok(vec![])
+    }
+}
+
 /// Stands in for agent24d's `knowledge_search`: answers `reply`, counts calls.
 struct KnowledgeSearchStub {
     reply: String,
@@ -237,8 +272,9 @@ async fn a_knowledge_query_is_searched_before_the_model_and_only_hits_go_in() {
         (HIT, None, "烧开水要多久", 0, false),
         (HIT, Some("b1"), "记住我喜欢芒果", 0, false),
     ] {
-        let provider = Arc::new(RecordingProvider {
+        let provider = Arc::new(SeenProvider {
             seen: StdMutex::new(vec![]),
+            tools: StdMutex::new(vec![]),
         });
         let stub = Arc::new(KnowledgeSearchStub {
             reply: reply.to_owned(),
@@ -263,6 +299,16 @@ async fn a_knowledge_query_is_searched_before_the_model_and_only_hits_go_in() {
             "{query} {binding:?}"
         );
         let first = provider.seen.lock().unwrap()[0].clone();
+        // PM (0.6.75): a turn searched first is not offered the search again.
+        let offered = provider.tools.lock().unwrap()[0].clone();
+        // A 「记住…」 turn is left out: with #1972 it is offered no tools at all.
+        if !query.starts_with("记住") {
+            assert_eq!(
+                offered.contains(&"knowledge_search".to_owned()),
+                binding.is_some() && !goes_in,
+                "{query} {binding:?} {reply}"
+            );
+        }
         let result = first.iter().find(|m| m.role == "tool");
         assert_eq!(result.is_some(), goes_in, "{query} {binding:?} {reply}");
         if goes_in {
