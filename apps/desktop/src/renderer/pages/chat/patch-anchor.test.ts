@@ -1,17 +1,16 @@
+import fs from 'node:fs'
+import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { anchorMatches, mismatchedEdit } from './patch-anchor'
 
-// The same cases as docx_patch's `an_anchor_is_the_opening_of_the_paragraph_at_its_index`.
+// The cases docx_patch's `an_anchor_is_the_opening_of_the_paragraph_at_its_index`
+// reads: one table for both sides of the rule.
+const CASES = JSON.parse(fs.readFileSync(path.resolve(__dirname, '../../../../../../rust/apps/agent24-documents/tests/fixtures/anchor-cases.json'), 'utf8')) as Array<{ paragraph: string; anchor: string; ok: boolean }>
+
 describe('anchorMatches (M1 (c), as the documents module checks it)', () => {
-  const para = '第三条 押金为两个月租金，合同期满无违约时全额退还。'
-  it('takes the opening, numbering left out or written right', () => {
-    for (const ok of ['押金为两个月', '第三条 押金为两个月', '第三条押金为两个月租金，', ' 押金为 两个月 ']) expect(anchorMatches(para, ok)).toBe(true)
-    expect(anchorMatches('一、总则', '总则')).toBe(true)
-    expect(anchorMatches('（一）租金每月 8,500 元', '租金每月 8,500')).toBe(true)
-  })
-  it('refuses wrong numbering, other words and fewer than six', () => {
-    for (const wrong of ['第四条 押金为两个月', '乙方：张三', '合同期满无违约', '第三条 押金', '押金为', '', '。，']) expect(anchorMatches(para, wrong)).toBe(false)
-    expect(anchorMatches('乙方：张三', '押金为两个月')).toBe(false)
+  it('reads the shared case table', () => expect(CASES.length).toBeGreaterThanOrEqual(25))
+  it.each(CASES.map((c) => [c.paragraph, c.anchor, c.ok] as const))('%j opened by %j: %s', (paragraph, anchor, ok) => {
+    expect(anchorMatches(paragraph, anchor)).toBe(ok)
   })
 })
 
