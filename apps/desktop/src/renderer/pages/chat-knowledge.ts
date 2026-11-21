@@ -8,11 +8,12 @@
 import type { RunKnowledge } from './knowledge-grounding'
 import { runDocumentsOf, type RunDocuments } from './chat/DocumentsOutcome'
 
-/** M1 (Loop 5): a 4-bit model answers 「烧开水要多久」 from what it knows, never
- * searching (0/3 on 0.6.72; 9/10 with this said in the turn, 5/10 as a system
- * message, 2/5 in the tool description). Said in front of a plain question. */
-export const KNOWLEDGE_HINT = '（知识库已开启：回答事实、数据、做法类问题前，先用 knowledge_search 在知识库里查，'
-  + '依据查到的内容回答并注明出处；查不到再说明并按常识回答。闲聊、改写或翻译用户给的文字不用查。回答里不要提工具名。）'
+/** M1 (Loop 5): a 4-bit model answered 「烧开水要多久」 from what it knew (0/3 on
+ * 0.6.72, 3/5 with a hint to search on 0.6.73). David 2026-11-21: retrieval
+ * first. A plain turn names its words as the run's `knowledge_query`, which
+ * the daemon searches before the model is asked; this says what came of it. */
+export const KNOWLEDGE_HINT = '（知识库已开启：系统已先用这句话在知识库里查过，查到的内容在检索结果里。'
+  + '和问题相关就依据它回答并注明出处；不相关或没有检索结果，就按常识回答，不要硬套。回答里不要提工具名。）'
 
 /** 「记住…」 is kept as the user said it: personal memory takes only a turn that
  * starts with it (agent24-agent retain.rs), so nothing goes in front. */
@@ -21,6 +22,18 @@ const REMEMBER = /^\s*(请你|麻烦你|你帮我|请帮我|帮我|请|麻烦|�
 /** The run's prompt for a plain turn with Knowledge in effect. */
 export function knowledgePrompt(text: string): string {
   return REMEMBER.test(text) ? text : `${KNOWLEDGE_HINT}\n${text}`
+}
+
+/** Asked to write something new (「写一篇八百字散文」「帮我起草一段介绍」): the
+ * knowledge bases have nothing to add, so nothing is searched first (General,
+ * 0.6.75). The model can still search if it wants to. */
+const WRITE = /^(请|麻烦)?(你)?(帮我|给我)?(写|起草|创作|编写|编一|作一)|^(请|麻烦)?(你)?(帮我|给我)?[^，。？?]{0,6}写(一|个|篇|段|首|封)/
+
+/** What the daemon searches first (RunCreate `knowledge_query`): the user's
+ * own words; none on a 「记住…」 turn or when asked to write something new. */
+export function knowledgeQuery(text: string): string | null {
+  const q = text.trim()
+  return q.length === 0 || REMEMBER.test(q) || WRITE.test(q) ? null : q
 }
 
 export const POLL_MS = 1_000
@@ -71,13 +84,16 @@ export async function askWithKnowledge(
   deps: TurnDeps,
   headroomConfirmed = false,
   skillId: string | null = null,
+  query: string | null = null,
 ): Promise<KnowledgeTurn> {
   const sleep = deps.sleep ?? sleepFor
   const now = deps.now ?? Date.now
-  const body: { prompt: string; session_id: string; idoris_headroom_confirmed?: boolean; skill_id?: string } =
+  const body: { prompt: string; session_id: string; idoris_headroom_confirmed?: boolean; skill_id?: string; knowledge_query?: string } =
     headroomConfirmed ? { prompt, session_id: sessionId, idoris_headroom_confirmed: true } : { prompt, session_id: sessionId }
   // Every round of this conversation names the skill again. The daemon does not remember it.
   if (skillId) body.skill_id = skillId
+  // M1 retrieval first (David 2026-11-21): searched before the model is asked.
+  if (query) body.knowledge_query = query
   const created = await deps.proxy({ method: 'POST', path: '/api/v1/runs', body })
   const runId = (created.data as { id?: unknown } | null)?.id
   if (!created.ok || typeof runId !== 'string') return failure(created.data, 'run_not_started')

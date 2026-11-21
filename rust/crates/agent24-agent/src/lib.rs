@@ -32,7 +32,7 @@ pub use memory_outcome::{
 };
 pub use messages::normalize_for_provider;
 pub use router_helpers::{RouterRewriter, RouterSummarizer};
-pub use run_manager::{InboundOrigin, InboundRunStart, RunManager};
+pub use run_manager::{InboundOrigin, InboundRunStart, RunManager, compact_evidence_for_tests};
 pub use session_memory::{EmbedBackfill, RECALL_END_MARKER, RECALL_PREFIX, SessionMemory};
 pub use skill_inject::{SkillAdmissionError, SkillProvider, SkillProviderSource};
 pub use source_policy::{MAX_ITERATIONS, MAX_TOOL_CALLS_PER_TURN, merge_source_policy};

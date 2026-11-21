@@ -4,7 +4,7 @@ import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
-import { askWithKnowledge, createChatSession, knowledgePrompt } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, knowledgePrompt, knowledgeQuery } from './chat-knowledge'
 import { failureKind, withoutToolNames } from './chat/user-facing'
 import { DocumentsOutcome, type RunDocuments } from './chat/DocumentsOutcome'
 import { grounding, type Grounding } from './knowledge-grounding'
@@ -507,10 +507,14 @@ export default function ChatPage() {
         runScope.current = scope
       }
       const last = request.messages[request.messages.length - 1]
-      const asked = knowledge?.active === true && plain && last?.role === 'user'
+      // PR-Daemon #1976: 「系统已先查过」 only on a turn that is searched first.
+      const asked = knowledge?.active === true && plain && last?.role === 'user' && knowledgeQuery(last.content) !== null
         ? { ...request, messages: [...request.messages.slice(0, -1), { ...last, content: knowledgePrompt(last.content) }] }
         : request
-      await replyWithKnowledge(index, asked, knowledge?.active === true)
+      // M1 retrieval first: a plain turn (no document, no document tool, not
+      // 「记住…」) is searched with the user's words before the model is asked.
+      const query = knowledge?.active === true && plain && last?.role === 'user' ? knowledgeQuery(last.content) : null
+      await replyWithKnowledge(index, asked, knowledge?.active === true, query)
       return
     }
     // On but not in effect (no binding, e.g. a daemon started from the CLI):
@@ -586,7 +590,7 @@ export default function ChatPage() {
   // The turn as a run: only the new prompt goes. The run sees earlier turns
   // only through its session's memory (agent24-agent `session_context`): none
   // while memory is off, and never the turns that went to /api/v1/chat.
-  const replyWithKnowledge = async (index: number, request: ChatRequest, withKnowledge: boolean) => {
+  const replyWithKnowledge = async (index: number, request: ChatRequest, withKnowledge: boolean, query: string | null = null) => {
     const prompt = request.messages[request.messages.length - 1]?.content ?? ''
     const sentAt = performance.now()
     const conversation = sessionId
@@ -606,7 +610,7 @@ export default function ChatPage() {
               setAwaitingApproval(waiting)
               if (runId && promotionDue({ status: waiting ? 'awaiting_approval' : 'running', replyEnded: false })) void promoteRun(conversation, runId)
             },
-          }, request.idoris_headroom_confirmed === true, skillForConversation(conversation))
+          }, request.idoris_headroom_confirmed === true, skillForConversation(conversation), query)
       }
       let turn = await ask()
       // The daemon ties a session to one activation of the binding; after a

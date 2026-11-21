@@ -61,6 +61,7 @@ async fn start_inbound(
     let started = manager
         .start_run_inbound(
             RunCreate {
+                knowledge_query: None,
                 idoris_headroom_confirmed: false,
                 session_id: Some(session_id.to_owned()),
                 workspace_id: None,
@@ -360,6 +361,7 @@ async fn a_resume_whose_source_refusal_cannot_enter_running_releases_the_slot() 
 
 fn inbound_create(session_id: &str) -> RunCreate {
     RunCreate {
+        knowledge_query: None,
         idoris_headroom_confirmed: false,
         session_id: Some(session_id.to_owned()),
         workspace_id: None,
@@ -687,6 +689,7 @@ async fn prompt_origin_lookup_failure_is_not_user_said() {
     seed_session(&store, "sess_origin_fail").await;
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_origin_fail".to_owned()),
             workspace_id: None,

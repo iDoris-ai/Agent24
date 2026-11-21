@@ -126,6 +126,7 @@ impl RunManager {
             shutdown,
             cancels: Mutex::new(HashMap::new()),
             inbound_origins: Mutex::new(HashMap::new()),
+            knowledge_queries: Mutex::new(HashMap::new()),
             #[cfg(any(test, feature = "test-support"))]
             inbound_start_faults: AtomicU32::new(0),
         })

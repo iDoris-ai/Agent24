@@ -192,6 +192,7 @@ async fn run_prompt(
         .map_err(|e| format!("connecting event stream: {e}"))?;
 
     let create = RunCreate {
+        knowledge_query: None,
         idoris_headroom_confirmed: false,
         session_id: Some(session_id.to_owned()),
         prompt,

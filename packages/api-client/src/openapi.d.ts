@@ -3197,6 +3197,8 @@ export interface components {
             knowledge_binding_id?: string | null;
             /** @description A skill to run under (SL-5). Only the id: the server reads the skill's current activation pointer when the run is admitted and pins that revision, so there is no version field. A skill with no pointer (installed, never activated) is refused with `skill_not_active`; it never falls back to the latest revision. Imported skill text is labelled `Unknown` + `LocalOnly`. Inbound events and scheduled self-wake runs cannot carry one (`skill_not_admitted`), and neither can a workspace-bound run in v1. Omit/null for a run without a skill. */
             skill_id?: string | null;
+            /** @description M1 retrieval first (David 2026-11-21): with a Knowledge binding, the run searches the bound knowledge bases with this text once before its first model call, through the same `knowledge_search` tool and record as a search the model asks for. Hits go in as that search's call and result; no hit, a failure or a refusal leaves the run as it was. Ignored without a binding, on a turn that asks to remember something, and on inbound runs. Omit/null for no search first. */
+            knowledge_query?: string | null;
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";

@@ -394,7 +394,7 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText('from the knowledge base')).toBeInTheDocument(), { timeout: 3000 })
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
     expect(screen.queryByText(/本次没有读到/)).not.toBeInTheDocument()
-    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1' } }))
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', knowledge_query: 'second' } }))
   })
 
   // M1 (General/PM 11-21): the line under the answer is the daemon's record
@@ -476,7 +476,7 @@ describe('ChatPage with Knowledge', () => {
     fireEvent.change(textarea, { target: { value: 'second' } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(screen.getByText('answer two')).toBeInTheDocument(), { timeout: 3000 })
-    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's2' } }))
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's2', knowledge_query: 'second' } }))
   })
 
   // Mutation: pass skill_id only while creating the run session (the first round) and the second expectation goes red.
@@ -514,8 +514,8 @@ describe('ChatPage with Knowledge', () => {
 
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
     expect(runs.map((req) => req.body)).toEqual([
-      { prompt: `${KNOWLEDGE_HINT}\nfirst`, session_id: 's1', skill_id: 'live' },
-      { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', skill_id: 'live' },
+      { prompt: `${KNOWLEDGE_HINT}\nfirst`, session_id: 's1', skill_id: 'live', knowledge_query: 'first' },
+      { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', skill_id: 'live', knowledge_query: 'second' },
     ])
   })
 
@@ -949,7 +949,7 @@ describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
     await waitFor(() => expect(screen.getByText('loaded with knowledge')).toBeInTheDocument(), { timeout: 3000 })
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
     expect(runs.map((req) => req.body)).toEqual([
-      { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1' },
+      { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1', knowledge_query: 'q' },
       { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1', idoris_headroom_confirmed: true },
     ])
     expect(sessions).toBe(1)

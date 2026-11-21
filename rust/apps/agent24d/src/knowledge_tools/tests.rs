@@ -395,3 +395,32 @@ fn a_completed_searchs_hits_count_as_read() {
     ];
     assert_eq!(run_knowledge_with(&done, &other).read_chunks, vec![]);
 }
+
+/// PR-Daemon #1976 F1: what the search first puts in (compacted) still counts
+/// its hits as the run's, so an answer citing them is grounded (K3).
+#[test]
+fn the_first_searchs_compacted_hits_count_as_read() {
+    let full = json!({
+        "notice": "n", "kind": "knowledge.search", "completeness": "complete",
+        "scope_narrowed": false, "failures": [],
+        "evidence": [
+            { "rank": 1, "use": "clue", "knowledge_base_id": "kb", "knowledge_id": "doc-1",
+              "chunk_id": "chk-1", "content_tag": "t", "snippet": "水".repeat(600),
+              "snippet_truncated": true, "possibly_stale": false },
+        ],
+    })
+    .to_string();
+    let compact = agent24_agent::compact_evidence_for_tests(&full).unwrap();
+    let done = [stored(
+        SEARCH,
+        ToolCallStatus::Completed,
+        json!({ "query": "q", "max_results": 3 }),
+    )];
+    assert_eq!(
+        run_knowledge_with(&done, &[compact]).read_chunks,
+        vec![ReadChunk {
+            knowledge_id: "doc-1".into(),
+            chunk_id: "chk-1".into()
+        }]
+    );
+}

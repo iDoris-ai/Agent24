@@ -321,6 +321,7 @@ impl InboundService {
             )));
         };
         let create = RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some(format!("sess_{}", ulid())),
             workspace_id: None,
