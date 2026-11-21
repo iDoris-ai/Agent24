@@ -1402,7 +1402,7 @@ mod tests {
             .filter(|p| p.text.trim().chars().count() >= 8)
             .collect();
         let (this, other) = (&paras[0], &paras[1]);
-        let opening = |t: &str| t.trim().chars().take(8).collect::<String>();
+        let opening = |t: &str| t.trim().chars().take(16).collect::<String>();
         let edit = |anchor: Option<String>| {
             let mut e = json!({ "index": this.index, "text": "新的文字", "tracked": true });
             if let Some(a) = anchor {

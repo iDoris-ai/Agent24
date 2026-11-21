@@ -688,20 +688,22 @@ pub(crate) fn comparable(text: &str) -> String {
     s.into_iter().collect()
 }
 
-/// M1 (c), General 11-21: an Agent's edit names the paragraph it rewrites by
-/// its opening words (`anchor`, about eight characters), checked against the
-/// paragraph at its index with spaces, punctuation and the paragraph's own
-/// numbering (第三条, 一、, 1., （一）) set aside: 0.6.75's model left
-/// 「第三条」 out. No similarity: the words must be the paragraph's opening.
+/// Characters an anchor must have once numbering is set aside (fewer is no
+/// anchor), unless the paragraph itself is shorter.
+const ANCHOR_MIN_CHARS: usize = 6;
+
+/// M1 (c), General/PM 11-21: an Agent's edit names the paragraph it rewrites
+/// by its opening words (`anchor`). Spaces and punctuation never count. The
+/// numbering may be left out (0.6.75's model wrote no 「第三条」) but, when
+/// written, must be the paragraph's: 「第四条…」 does not open 「第三条…」. Fewer
+/// than [`ANCHOR_MIN_CHARS`] words besides numbering is no anchor. No
+/// similarity: the words must be the paragraph's opening.
 pub fn anchor_matches(paragraph: &str, anchor: &str) -> bool {
-    let words = |t: &str| -> String {
-        comparable(t)
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .collect()
-    };
-    let (p, a) = (words(paragraph), words(anchor));
-    !a.is_empty() && p.starts_with(&a)
+    let words = |t: &str| -> String { t.chars().filter(|c| c.is_alphanumeric()).collect() };
+    let (whole, body) = (words(paragraph), words(&comparable(paragraph)));
+    let (asked, asked_body) = (words(anchor), words(&comparable(anchor)));
+    let enough = ANCHOR_MIN_CHARS.min(body.chars().count()).max(1);
+    asked_body.chars().count() >= enough && (whole.starts_with(&asked) || body.starts_with(&asked))
 }
 
 fn paragraph_text(para: &str) -> String {
