@@ -657,7 +657,6 @@ fn scan_paragraphs(xml: &str) -> Result<Vec<Para>, PatchError> {
     Ok(paras)
 }
 
-/// The text of a paragraph's own `w:t` (not inside a nested paragraph).
 /// The words of a paragraph without its numbering, spaces and closing
 /// punctuation: 「第三条 押金为两个月租金。」 → 「押金为两个月租金」.
 pub(crate) fn comparable(text: &str) -> String {
@@ -706,6 +705,7 @@ pub fn anchor_matches(paragraph: &str, anchor: &str) -> bool {
     asked_body.chars().count() >= enough && (whole.starts_with(&asked) || body.starts_with(&asked))
 }
 
+/// The text of a paragraph's own `w:t` (not inside a nested paragraph).
 fn paragraph_text(para: &str) -> String {
     let Ok(all) = tags(para) else {
         return String::new();

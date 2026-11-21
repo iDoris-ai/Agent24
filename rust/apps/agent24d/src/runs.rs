@@ -647,6 +647,34 @@ mod documents_tests {
         );
         // fill and a later write operation are writes too.
         assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));
+    }
+
+    /// PR-Daemon #1979 Low: every documents operation the module declares is
+    /// classed by its own risk: a read the module declares `read` is in
+    /// `DOCUMENT_READS`, every other one is a write. A new read-only operation
+    /// left out of the list turns this red instead of a red line under answers.
+    #[test]
+    fn every_declared_documents_operation_is_classed_by_its_risk() {
+        let manifest = include_str!("../../agent24-documents/domain-os.yml");
+        let mut op = None;
+        let mut seen = 0;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix("- operation:") {
+                op = Some(name.trim().to_owned());
+            } else if let Some(risk) = line.strip_prefix("risk:")
+                && let Some(name) = op.take()
+            {
+                let read = risk.trim() == "read";
+                assert_eq!(
+                    !is_document_write(&format!("documents.{name}")),
+                    read,
+                    "documents.{name} is declared {risk}"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 7, "{seen}");
         assert!(!is_document_write("documents.get") && !is_document_write("knowledge_search"));
     }
 }
