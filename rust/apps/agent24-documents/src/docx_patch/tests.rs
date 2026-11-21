@@ -776,52 +776,79 @@ fn tab_stops_in_properties_are_not_read_as_tabs() {
     assert_eq!(not_plain_text(&new_para), None);
 }
 
-const REALISTIC: &[u8] = include_bytes!("../../tests/fixtures/contract-realistic.docx");
+/// PM 11-21: public model contracts saved by Microsoft Word, from the
+/// SAMR model contract library (htsfwb.samr.gov.cn, government public texts):
+/// 黑龙江省家居装饰装修工程施工合同（试行）（2025 版）— tab stops, run tabs
+/// (signature lines), underlines, tables, headers and footers; 山东省体育
+/// 健身服务合同（2025 版）— tab stops, automatic numbering (numPr), tables,
+/// headers and footers. Plus the LibreOffice-saved one made for this.
+const REAL_CONTRACTS: [(&str, &[u8]); 3] = [
+    (
+        "samr-heilongjiang-decoration-2025",
+        include_bytes!("../../tests/fixtures/samr-heilongjiang-decoration-2025.docx"),
+    ),
+    (
+        "samr-shandong-fitness-2025",
+        include_bytes!("../../tests/fixtures/samr-shandong-fitness-2025.docx"),
+    ),
+    (
+        "contract-realistic",
+        include_bytes!("../../tests/fixtures/contract-realistic.docx"),
+    ),
+];
 
-/// PM 11-21: a contract as an office suite saves it (LibreOffice-written:
-/// tab stops in pPr/tabs, signature lines of tab + underline, automatic
-/// numbering numPr, headers and footers, a table). Every paragraph reads
-/// with as many \t as its runs have w:tab, and written back as read (plain
-/// or tracked) leaves document.xml byte for byte as it was.
+/// Every paragraph of each real contract reads with as many \t as its runs
+/// have w:tab, and written back as read (plain, and tracked) leaves
+/// document.xml byte for byte as it was.
 #[test]
-fn a_realistic_contract_reads_and_writes_back_unchanged() {
-    let xml = entry(REALISTIC, "word/document.xml");
-    for needle in ["<w:tabs>", "<w:numPr>", "<w:tab/>", "<w:u ", "<w:tbl>"] {
-        assert!(xml.contains(needle), "fixture lost {needle}");
-    }
-    let paras = list_paragraphs(REALISTIC).unwrap();
-    let spans = scan_paragraphs(&xml).unwrap();
-    assert!(paras.len() > 10);
-    let mut with_tabs = 0;
-    for (p, span) in paras.iter().zip(&spans) {
-        let para = &xml[span.start..span.end];
-        // Run tabs only: a tab stop's <w:tab w:val=…/> is not text.
-        let run_tabs = para.matches("<w:tab/>").count();
-        assert_eq!(
-            p.text.matches('\t').count(),
-            run_tabs,
-            "paragraph {}: {:?}",
-            p.index,
-            p.text
-        );
-        if para.contains("<w:tabs>") {
-            with_tabs += 1;
-        }
-        for tracked in [false, true] {
-            let edit = ParaEdit {
-                index: p.index,
-                text: p.text.clone(),
-                tracked,
-                expect: Some(p.text.clone()),
-            };
-            let out = apply(REALISTIC, &[edit], "A", NOW).unwrap();
+fn real_contracts_read_and_write_back_unchanged() {
+    let mut seen = std::collections::BTreeMap::new();
+    for (name, docx) in REAL_CONTRACTS {
+        let xml = entry(docx, "word/document.xml");
+        let paras = list_paragraphs(docx).unwrap();
+        let spans = scan_paragraphs(&xml).unwrap();
+        for (p, span) in paras.iter().zip(&spans) {
+            let para = &xml[span.start..span.end];
+            let run_tabs = children(para)
+                .into_iter()
+                .filter(|(n, _, _)| *n == "w:r")
+                .map(|(_, s, e)| para[s..e].matches("<w:tab/>").count())
+                .sum::<usize>();
             assert_eq!(
-                entry(&out, "word/document.xml"),
-                xml,
-                "paragraph {} tracked={tracked}",
-                p.index
+                p.text.matches('\t').count(),
+                run_tabs,
+                "{name} paragraph {}: {:?}",
+                p.index,
+                p.text
             );
         }
+        // Every paragraph written back as read, at most MAX_EDITS a patch.
+        for tracked in [false, true] {
+            for chunk in paras.chunks(MAX_EDITS) {
+                let edits: Vec<ParaEdit> = chunk
+                    .iter()
+                    .map(|p| ParaEdit {
+                        index: p.index,
+                        text: p.text.clone(),
+                        tracked,
+                        expect: Some(p.text.clone()),
+                    })
+                    .collect();
+                let out = apply(docx, &edits, "A", NOW).unwrap();
+                assert_eq!(
+                    entry(&out, "word/document.xml"),
+                    xml,
+                    "{name} paragraphs {}.. tracked={tracked}",
+                    chunk[0].index
+                );
+            }
+        }
+        for needle in ["<w:tabs>", "<w:tab/>", "<w:numPr>", "<w:tbl>", "<w:u "] {
+            *seen.entry(needle).or_insert(0) += xml.matches(needle).count();
+        }
     }
-    assert!(with_tabs >= 3, "{with_tabs} paragraphs with tab stops");
+    // Across them, every structure the reviews asked for is there.
+    for (needle, count) in &seen {
+        assert!(*count > 0, "no {needle} in the real contracts: {seen:?}");
+    }
 }
