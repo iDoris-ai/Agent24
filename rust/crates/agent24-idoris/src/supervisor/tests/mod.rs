@@ -1625,3 +1625,133 @@ async fn ic3b_real_s2_register_and_adopt() {
     adopted.stop().await.unwrap();
     std::mem::forget(cleanup);
 }
+
+fn launcher_lock() -> &'static IdorisLock {
+    static LOCK: std::sync::OnceLock<IdorisLock> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| IdorisLock {
+        tag: "v0.6.0".into(),
+        ..IdorisLock::embedded().clone()
+    })
+}
+
+#[tokio::test]
+async fn ic3b_supervisor_rejects_unowned_ports() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut config = fixture.config().await;
+    config.lock = launcher_lock();
+    config.port_ownership = Some(false);
+    assert!(
+        !listeners_owned(&config, config.ports, Some(Pid::this()))
+            .await
+            .unwrap()
+    );
+}
+
+async fn check_drop(launcher: bool, register_socket: bool, survives: bool) {
+    use std::os::unix::process::ExitStatusExt;
+    let fixture = Fixture::new(serde_json::json!({}));
+    let mut config = fixture.config().await;
+    if launcher {
+        config.lock = launcher_lock();
+    }
+    if register_socket {
+        config.register_socket = Some(fixture.root.join("register.sock"));
+    }
+    let token = Arc::new(Zeroizing::new("a".repeat(64)));
+    let output = logs::Output::new(&config.log_dir, token.clone(), None, false).unwrap();
+    let mut child = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    let process = ManagedProcess {
+        ports: config.ports,
+        discovery: None,
+        instance_id: None,
+        group: Some(Pid::from_raw(record.pid as i32)),
+        child: ProcessHandle::Orphan {
+            record,
+            exited: false,
+        },
+        members: Vec::new(),
+        adopted: false,
+        config: Arc::new(config),
+        output,
+        _admin: token,
+    };
+    drop(process);
+    let exited = timeout(Duration::from_millis(200), child.wait()).await;
+    if survives {
+        let alive = exited.is_err();
+        if alive {
+            child.kill().await.unwrap();
+        }
+        assert!(alive, "Drop killed a launcher with an armed orphan timer");
+    } else {
+        assert_eq!(
+            exited
+                .expect("Drop left the process alive")
+                .unwrap()
+                .signal(),
+            Some(libc::SIGKILL)
+        );
+    }
+}
+
+#[tokio::test]
+async fn ic3b_drop_kills_non_launcher() {
+    check_drop(false, true, false).await;
+}
+
+#[tokio::test]
+async fn ic3b_drop_preserves_registered_launcher() {
+    check_drop(true, true, true).await;
+}
+
+#[tokio::test]
+async fn ic3b_drop_kills_launcher_without_register_socket() {
+    check_drop(true, false, false).await;
+}
+
+#[tokio::test]
+async fn ic3b_adoption_requires_launch() {
+    let fixture = Fixture::new(serde_json::json!({}));
+    fs::copy("/bin/sleep", fixture.root.join("release/idoris")).unwrap();
+    let config = Arc::new(fixture.config().await);
+    let mut child = Command::new(config.installed.binary())
+        .arg("60")
+        .process_group(0)
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
+    let lease = Lease::acquire(&config.data.state).unwrap();
+    lease.write(&record).unwrap();
+    assert!(
+        lease
+            .adoptable(&config.installed.binary(), record.pid)
+            .is_some()
+    );
+    let path = discovery::path(&config.data).unwrap();
+    let mut discovery = serde_json::json!({"schema":1,"service":"idoris","pid":record.pid,"instance_nonce":"a".repeat(64),"instance_id":"missing-launch","data_port":1234,"admin_port":1235,"started_at_ms":record.start_time / 1000});
+    for has_launch in [false, true] {
+        if has_launch {
+            discovery["launch"] = serde_json::json!({});
+        }
+        fs::write(&path, discovery.to_string()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        // A present launch reaches refresh; a missing launch must fail closed first.
+        let result = try_adopt(&config, &lease, &mut || async {
+            Err(SupervisorError::Configuration)
+        })
+        .await;
+        assert!(if has_launch {
+            matches!(result, Err(SupervisorError::Configuration))
+        } else {
+            matches!(result, Ok(None))
+        });
+    }
+    child.kill().await.unwrap();
+}
