@@ -1,5 +1,6 @@
 pub(crate) fn create() -> RunCreate {
     RunCreate {
+        knowledge_query: None,
         idoris_headroom_confirmed: false,
         session_id: None,
         workspace_id: None,
@@ -70,6 +71,7 @@ async fn unknown_session_is_rejected() {
     let (manager, _sink, _store) = manager_with(Arc::new(FixedProvider)).await;
     let err = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("sess_nope".to_owned()),
             workspace_id: None,
@@ -181,6 +183,93 @@ async fn only_a_run_that_names_a_knowledge_binding_is_offered_a_tool_that_needs_
         names(manager.tool_specs_for(true, true).await),
         vec!["kb_read", "propose_plan"]
     );
+}
+
+/// Stands in for agent24d's `knowledge_search`: answers `reply`, counts calls.
+struct KnowledgeSearchStub {
+    reply: String,
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl agent24_tools::Tool for KnowledgeSearchStub {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+    fn info(&self) -> agent24_protocol::ToolInfo {
+        agent24_protocol::ToolInfo::new(
+            "knowledge_search",
+            "builtin",
+            "searches Knowledge",
+            agent24_protocol::RiskClass::Read,
+        )
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn needs_knowledge_binding(&self) -> bool {
+        true
+    }
+    async fn call(
+        &self,
+        _ctx: &agent24_tools::ToolContext,
+        input: &serde_json::Map<String, serde_json::Value>,
+        _cancel: &CancellationToken,
+    ) -> Result<String, agent24_tools::ToolError> {
+        assert_eq!(input.get("query").and_then(|q| q.as_str()), Some("烧开水要多久"));
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(self.reply.clone())
+    }
+}
+
+/// M1 retrieval first (David 2026-11-21): a run with a binding and a
+/// `knowledge_query` searches once before the model is asked; the hits reach
+/// the model as that search's call and result. No hit leaves the thread as it
+/// was; so do no binding and a 「记住…」 query (no search at all).
+#[tokio::test]
+async fn a_knowledge_query_is_searched_before_the_model_and_only_hits_go_in() {
+    const HIT: &str = r#"{"kind":"knowledge.search","evidence":[{"rank":1,"snippet":"水烧开约需 5 分钟"}]}"#;
+    const NONE: &str = r#"{"kind":"knowledge.search","evidence":[]}"#;
+    for (reply, binding, query, searched, goes_in) in [
+        (HIT, Some("b1"), "烧开水要多久", 1, true),
+        (NONE, Some("b1"), "烧开水要多久", 1, false),
+        (HIT, None, "烧开水要多久", 0, false),
+        (HIT, Some("b1"), "记住我喜欢芒果", 0, false),
+    ] {
+        let provider = Arc::new(RecordingProvider {
+            seen: StdMutex::new(vec![]),
+        });
+        let stub = Arc::new(KnowledgeSearchStub {
+            reply: reply.to_owned(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let tools = ToolRegistry::new().with(stub.clone());
+        let (manager, _sink, store) = manager_with_tools(provider.clone(), tools).await;
+        let run = manager
+            .start_run(RunCreate {
+                prompt: format!("（知识库已开启）\n{query}"),
+                knowledge_binding_id: binding.map(str::to_owned),
+                knowledge_query: Some(query.to_owned()),
+                ..create()
+            })
+            .await
+            .unwrap();
+        let done = wait_terminal(&store, &run.id).await;
+        assert_eq!(done.status, RunStatus::Completed, "{query} {binding:?}");
+        assert_eq!(
+            stub.calls.load(std::sync::atomic::Ordering::SeqCst),
+            searched,
+            "{query} {binding:?}"
+        );
+        let first = provider.seen.lock().unwrap()[0].clone();
+        let result = first.iter().find(|m| m.role == "tool");
+        assert_eq!(result.is_some(), goes_in, "{query} {binding:?} {reply}");
+        if goes_in {
+            assert_eq!(result.unwrap().content.as_deref(), Some(HIT));
+            let asked = first.iter().find(|m| !m.tool_calls.is_empty()).unwrap();
+            assert_eq!(asked.tool_calls[0].name, "knowledge_search");
+        }
+    }
 }
 
 /// Notes, on its first call, what `before_execute` had recorded by then.

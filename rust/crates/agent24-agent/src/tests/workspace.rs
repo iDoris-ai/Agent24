@@ -47,6 +47,7 @@ async fn workspace_run_admission_and_terminal_release_are_active() {
         .unwrap();
     let first = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("bound".into()),
             workspace_id: Some(workspace_id.clone()),
@@ -71,6 +72,7 @@ async fn workspace_run_admission_and_terminal_release_are_active() {
 
     let second = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("bound".into()),
             workspace_id: Some(workspace_id),
@@ -89,6 +91,7 @@ async fn workspace_run_admission_and_terminal_release_are_active() {
 
     let error = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("bound".into()),
             workspace_id: None,
@@ -131,6 +134,7 @@ async fn workspace_bound_tool_call_never_downgrades_without_authority_service() 
         .unwrap();
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("bound-tool".into()),
             workspace_id: Some(workspace_id),
@@ -705,6 +709,7 @@ async fn workspace_admission_error_cleans_cancel_token() {
     assert!(matches!(
         manager
             .start_run(RunCreate {
+                knowledge_query: None,
                 idoris_headroom_confirmed: false,
                 session_id: Some("bound".into()),
                 workspace_id: Some(workspace_id),
@@ -823,6 +828,7 @@ async fn cancelling_workspace_run_releases_exact_lease() {
         .unwrap();
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("bound".into()),
             workspace_id: Some(workspace_id),

@@ -785,6 +785,7 @@
         );
         let first = runs
             .start_run(agent24_protocol::RunCreate {
+                knowledge_query: None,
                 idoris_headroom_confirmed: false,
                 session_id: Some(session_id.into()),
                 prompt: "检查一下".into(),

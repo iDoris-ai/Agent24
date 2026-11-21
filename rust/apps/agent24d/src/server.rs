@@ -106,6 +106,7 @@ impl agent24_scheduler::RunTrigger for KernelTrigger {
                     model_override,
                 } = action;
                 let create = agent24_protocol::RunCreate {
+                    knowledge_query: None,
                     idoris_headroom_confirmed: false,
                     session_id: session_id.clone(),
                     workspace_id: None,
