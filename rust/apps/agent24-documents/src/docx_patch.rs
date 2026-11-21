@@ -107,6 +107,11 @@ pub fn apply(
         {
             return Err(PatchError::Stale(edit.index));
         }
+        // PR-Daemon #1954 (PM): the same text written back changes nothing:
+        // the paragraph is left byte for byte as it was, whatever it holds.
+        if paragraph_text(&xml[p.start..p.end]) == edit.text {
+            continue;
+        }
         // PR-Daemon #1930 B2: a paragraph is rewritten as one run, so one
         // holding more than text would lose it: refused, and said what.
         if let Some(what) = not_plain_text(&xml[p.start..p.end]) {
@@ -121,6 +126,9 @@ pub fn apply(
     let mut cursor = 0;
     for edit in &sorted {
         let p = &paras[edit.index];
+        if paragraph_text(&xml[p.start..p.end]) == edit.text {
+            continue;
+        }
         out.push_str(&xml[cursor..p.start]);
         let rewritten = rewrite_paragraph(&xml[p.start..p.end], edit, author, now_iso, next_id);
         if edit.tracked {
@@ -655,27 +663,37 @@ fn paragraph_text(para: &str) -> String {
         return String::new();
     };
     let mut text = String::new();
-    let mut depth_p = 0usize;
     let mut open_t: Option<usize> = None;
+    // PR-Daemon #1954 B1' (PM: by the tree, not by depth): the open elements
+    // from the paragraph down. A w:t, w:tab or w:br is text only as a child
+    // of a w:r of this paragraph (not of a nested one, a text box's): never
+    // a tab stop in w:pPr/w:tabs, never anything in w:rPr.
+    let mut stack: Vec<&str> = Vec::new();
+    let own_run = |stack: &[&str]| {
+        stack.last() == Some(&"w:r") && stack.iter().filter(|n| **n == "w:p").count() <= 1
+    };
     for tag in all {
-        match (tag.kind, tag.name) {
-            (TagKind::Open, "w:p") => depth_p += 1,
-            (TagKind::Close, "w:p") => depth_p = depth_p.saturating_sub(1),
-            (TagKind::Open, "w:t") if depth_p <= 1 => open_t = Some(tag.end),
-            (TagKind::Close, "w:t") => {
-                if let Some(from) = open_t.take() {
+        match tag.kind {
+            TagKind::Open => {
+                if tag.name == "w:t" && own_run(&stack) {
+                    open_t = Some(tag.end);
+                }
+                stack.push(tag.name);
+            }
+            TagKind::Close => {
+                stack.pop();
+                if tag.name == "w:t"
+                    && let Some(from) = open_t.take()
+                {
                     text.push_str(&decode(&para[from..tag.start]));
                 }
             }
-            // PR-Daemon #1954 B1: a tab and a line break are text too, as the
-            // writer writes them (\t, \n), so read → write back keeps them.
-            (TagKind::Empty | TagKind::Open, "w:tab") if depth_p <= 1 => text.push('\t'),
-            (TagKind::Empty | TagKind::Open, "w:br")
-                if depth_p <= 1 && !is_page_or_column_break(&para[tag.start..tag.end]) =>
-            {
-                text.push('\n');
-            }
-            _ => {}
+            TagKind::Empty if own_run(&stack) => match tag.name {
+                "w:tab" => text.push('\t'),
+                "w:br" if !is_page_or_column_break(&para[tag.start..tag.end]) => text.push('\n'),
+                _ => {}
+            },
+            TagKind::Empty => {}
         }
     }
     text
