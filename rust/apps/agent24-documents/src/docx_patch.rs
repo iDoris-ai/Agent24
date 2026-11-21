@@ -657,7 +657,19 @@ fn paragraph_text(para: &str) -> String {
     let mut text = String::new();
     let mut depth_p = 0usize;
     let mut open_t: Option<usize> = None;
+    // PR-Daemon #1954 B1': a tab or a break counts only as a run's content,
+    // never inside properties (`w:pPr/w:tabs/w:tab` are tab stops).
+    let mut in_run = 0usize;
+    let mut in_props = 0usize;
     for tag in all {
+        match (tag.kind, tag.name) {
+            (TagKind::Open, "w:r") => in_run += 1,
+            (TagKind::Close, "w:r") => in_run = in_run.saturating_sub(1),
+            (TagKind::Open, "w:pPr" | "w:rPr") => in_props += 1,
+            (TagKind::Close, "w:pPr" | "w:rPr") => in_props = in_props.saturating_sub(1),
+            _ => {}
+        }
+        let counts = in_run > 0 && in_props == 0;
         match (tag.kind, tag.name) {
             (TagKind::Open, "w:p") => depth_p += 1,
             (TagKind::Close, "w:p") => depth_p = depth_p.saturating_sub(1),
@@ -669,9 +681,11 @@ fn paragraph_text(para: &str) -> String {
             }
             // PR-Daemon #1954 B1: a tab and a line break are text too, as the
             // writer writes them (\t, \n), so read → write back keeps them.
-            (TagKind::Empty | TagKind::Open, "w:tab") if depth_p <= 1 => text.push('\t'),
+            (TagKind::Empty | TagKind::Open, "w:tab") if depth_p <= 1 && counts => text.push('\t'),
             (TagKind::Empty | TagKind::Open, "w:br")
-                if depth_p <= 1 && !is_page_or_column_break(&para[tag.start..tag.end]) =>
+                if depth_p <= 1
+                    && counts
+                    && !is_page_or_column_break(&para[tag.start..tag.end]) =>
             {
                 text.push('\n');
             }

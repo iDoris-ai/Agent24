@@ -716,3 +716,62 @@ fn a_tracked_rewrite_writes_xml_that_parses_and_broken_xml_is_refused() {
         Err(PatchError::Invalid(_))
     ));
 }
+
+/// PR-Daemon #1954 B1': tab stops in the paragraph's properties
+/// (`w:pPr/w:tabs/w:tab`) are not text; a read → write back adds no tab.
+#[test]
+fn tab_stops_in_properties_are_not_read_as_tabs() {
+    assert_eq!(
+        paragraph_text(
+            r#"<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/></w:tabs></w:pPr><w:r><w:rPr><w:b/></w:rPr><w:t>a</w:t><w:tab/><w:t>b</w:t></w:r></w:p>"#
+        ),
+        "a\tb"
+    );
+    let index = list_paragraphs(FIXTURE)
+        .unwrap()
+        .iter()
+        .find(|p| p.text.chars().count() > 4 && !p.in_table)
+        .unwrap()
+        .index;
+    // The paragraph gets tab stops in its properties, and no tab in its text.
+    let xml = entry(FIXTURE, "word/document.xml");
+    let paras = scan_paragraphs(&xml).unwrap();
+    let para = &xml[paras[index].start..paras[index].end];
+    let stops =
+        r#"<w:tabs><w:tab w:val="left" w:pos="720"/><w:tab w:val="right" w:pos="9000"/></w:tabs>"#;
+    let new_para = match para.find("<w:pPr>") {
+        Some(at) => format!("{}{stops}{}", &para[..at + 7], &para[at + 7..]),
+        None => {
+            let open_end = para.find('>').unwrap() + 1;
+            format!(
+                "{}<w:pPr>{stops}</w:pPr>{}",
+                &para[..open_end],
+                &para[open_end..]
+            )
+        }
+    };
+    let new_xml = format!(
+        "{}{new_para}{}",
+        &xml[..paras[index].start],
+        &xml[paras[index].end..]
+    );
+    let parts = std::collections::BTreeMap::from([("word/document.xml".to_owned(), new_xml)]);
+    let docx = splice_parts(FIXTURE, &parts, NOW).unwrap();
+    let text = list_paragraphs(&docx).unwrap()[index].text.clone();
+    assert!(!text.contains('\t'), "{text:?}");
+    let edit = ParaEdit {
+        index,
+        text: text.clone(),
+        tracked: false,
+        expect: Some(text.clone()),
+    };
+    let out = apply(&docx, &[edit], "A", NOW).unwrap();
+    let out_xml = entry(&out, "word/document.xml");
+    let out_paras = scan_paragraphs(&out_xml).unwrap();
+    let out_para = &out_xml[out_paras[index].start..out_paras[index].end];
+    let count = |p: &str| p.matches("<w:tab ").count() + p.matches("<w:tab/>").count();
+    assert_eq!(count(out_para), count(&new_para), "{out_para}");
+    assert_eq!(list_paragraphs(&out).unwrap()[index].text, text);
+    // Not refused for them either: properties are not checked as content.
+    assert_eq!(not_plain_text(&new_para), None);
+}
