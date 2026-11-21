@@ -54,7 +54,11 @@ tags:
   - name: timings
     description: Model-call timing rows and summaries.
   - name: chat
-    description: One-shot LLM chat completion.
+    description: >-
+      One-shot LLM chat completion. HTTP 503 idoris_unavailable may report
+      stopped (start the managed service), readiness_timeout, connection_lost,
+      or circuit_open (retry later). A stopped service fails immediately;
+      starting or restarting waits up to 30 seconds for readiness.
   - name: sessions
     description: Conversation sessions — the container runs belong to.
   - name: runs

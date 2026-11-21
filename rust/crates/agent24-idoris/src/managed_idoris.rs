@@ -85,6 +85,7 @@ pub struct ConnectionCheck {
 #[async_trait]
 pub trait IdorisSlot: Send + Sync {
     fn block_idoris(&self, reason: &str);
+    fn starting_idoris(&self);
     fn replace_idoris(&self, gateway: PreparedGateway) -> Result<(), ModelError>;
     fn published_lease(&self) -> Option<GatewayLease>;
     async fn open_gateway(
@@ -148,7 +149,7 @@ fn error(message: &str) -> ModelError {
 impl ManagedIdoris {
     pub fn new(router: Arc<dyn IdorisSlot>, path: PathBuf) -> std::io::Result<Self> {
         if path.try_exists()? {
-            router.block_idoris("managed iDoris is waiting for supervisor readiness and Keychain");
+            router.starting_idoris();
         }
         Ok(Self {
             router,

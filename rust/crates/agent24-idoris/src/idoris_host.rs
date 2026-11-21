@@ -699,7 +699,7 @@ impl IdorisHost {
             Some(_) => State::Stopped,
         };
         if installation.is_some() {
-            router.block_idoris("managed iDoris stopped");
+            router.block_idoris("stopped");
         }
         Ok(Arc::new(Self {
             install_root: root.clone(),
@@ -1038,7 +1038,11 @@ impl IdorisHost {
         if let Some(lease) = self.router.published_lease() {
             *self.draining.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
         }
-        self.router.block_idoris("managed iDoris not ready");
+        self.router.block_idoris("stopped");
+    }
+    fn starting_gateway(&self) {
+        self.block_gateway();
+        self.router.starting_idoris();
     }
     async fn prepare_gateway(
         &self,
@@ -1120,6 +1124,7 @@ impl IdorisHost {
             return Ok(());
         }
         self.phase(id, Phase::Starting).await;
+        self.starting_gateway();
         let record = {
             let mut i = self.inner.lock().await;
             i.state = State::Starting;
@@ -1208,7 +1213,7 @@ impl IdorisHost {
             },
             move || async move {
                 if let Some(host) = host.upgrade() {
-                    host.block_gateway();
+                    host.starting_gateway();
                     loop {
                         let pending = host
                             .draining
@@ -1335,7 +1340,7 @@ impl IdorisHost {
                         && i.generation.as_deref() == Some(&generation)
                         && i.supervisor.is_some()
                     {
-                        host.block_gateway();
+                        host.starting_gateway();
                         if runtime_status.circuit_open {
                             host.router.block_idoris("idoris_unavailable: circuit_open");
                         }
@@ -1407,6 +1412,9 @@ impl IdorisHost {
                 None => Err(Code::Cancelled),
             };
             i = self.inner.lock().await;
+        }
+        if action == Action::Stop {
+            self.router.block_idoris("stopped");
         }
         i.last_error = result.err();
         i.state = match result {

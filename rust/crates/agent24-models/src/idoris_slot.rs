@@ -50,6 +50,10 @@ impl IdorisSlot for ModelRouter {
         ModelRouter::block_idoris(self, reason);
     }
 
+    fn starting_idoris(&self) {
+        ModelRouter::starting_idoris(self);
+    }
+
     fn replace_idoris(&self, gateway: PreparedGateway) -> Result<(), HostError> {
         ModelRouter::replace_idoris(self, built_gateway(gateway)?);
         Ok(())
