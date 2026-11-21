@@ -775,3 +775,53 @@ fn tab_stops_in_properties_are_not_read_as_tabs() {
     // Not refused for them either: properties are not checked as content.
     assert_eq!(not_plain_text(&new_para), None);
 }
+
+const REALISTIC: &[u8] = include_bytes!("../../tests/fixtures/contract-realistic.docx");
+
+/// PM 11-21: a contract as an office suite saves it (LibreOffice-written:
+/// tab stops in pPr/tabs, signature lines of tab + underline, automatic
+/// numbering numPr, headers and footers, a table). Every paragraph reads
+/// with as many \t as its runs have w:tab, and written back as read (plain
+/// or tracked) leaves document.xml byte for byte as it was.
+#[test]
+fn a_realistic_contract_reads_and_writes_back_unchanged() {
+    let xml = entry(REALISTIC, "word/document.xml");
+    for needle in ["<w:tabs>", "<w:numPr>", "<w:tab/>", "<w:u ", "<w:tbl>"] {
+        assert!(xml.contains(needle), "fixture lost {needle}");
+    }
+    let paras = list_paragraphs(REALISTIC).unwrap();
+    let spans = scan_paragraphs(&xml).unwrap();
+    assert!(paras.len() > 10);
+    let mut with_tabs = 0;
+    for (p, span) in paras.iter().zip(&spans) {
+        let para = &xml[span.start..span.end];
+        // Run tabs only: a tab stop's <w:tab w:val=…/> is not text.
+        let run_tabs = para.matches("<w:tab/>").count();
+        assert_eq!(
+            p.text.matches('\t').count(),
+            run_tabs,
+            "paragraph {}: {:?}",
+            p.index,
+            p.text
+        );
+        if para.contains("<w:tabs>") {
+            with_tabs += 1;
+        }
+        for tracked in [false, true] {
+            let edit = ParaEdit {
+                index: p.index,
+                text: p.text.clone(),
+                tracked,
+                expect: Some(p.text.clone()),
+            };
+            let out = apply(REALISTIC, &[edit], "A", NOW).unwrap();
+            assert_eq!(
+                entry(&out, "word/document.xml"),
+                xml,
+                "paragraph {} tracked={tracked}",
+                p.index
+            );
+        }
+    }
+    assert!(with_tabs >= 3, "{with_tabs} paragraphs with tab stops");
+}
