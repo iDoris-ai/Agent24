@@ -802,18 +802,28 @@ impl RunManager {
                     .await;
                 return;
             };
-            let request = CompletionRequest {
-                messages: send_messages,
-                model: run.input.model_override.clone(),
-                tools: self
-                    .tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
+            // M1 (0.6.73): on 「记住：我最喜欢的水果是芒果」 a 4-bit model also
+            // called fs_write to save it to a file. Personal memory takes the
+            // turn itself (retain.rs) after the answer; the model only says so,
+            // so a remember turn is offered no tools.
+            let tools = if self.memory.is_some()
+                && retain::explicit_remember(&run.input.prompt).is_some()
+            {
+                Vec::new()
+            } else {
+                self.tool_specs_for(plan_mode, run.input.knowledge_binding_id.is_some())
                     .await
                     .into_iter()
                     // PM (0.6.75): a turn searched first is not offered the
                     // search again; its long description and schema are left
                     // out of a prompt an 8 GB Mac can barely hold.
                     .filter(|spec| !(searched_first && spec.name == FIRST_SEARCH))
-                    .collect(),
+                    .collect()
+            };
+            let request = CompletionRequest {
+                messages: send_messages,
+                model: run.input.model_override.clone(),
+                tools,
                 response_format: None,
                 max_tokens: None,
                 disable_thinking: false,

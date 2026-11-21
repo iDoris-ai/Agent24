@@ -397,6 +397,28 @@ describe('ChatPage with Knowledge', () => {
     expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', knowledge_query: 'second' } }))
   })
 
+  // M3 (0.6.73): a stopped turn read 「回答失败：run_cancelled」 under 「未发送」.
+  it('a stopped turn says so in words, with the code only under 详情, and was sent', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'cancelled', error: { code: 'run_cancelled', message: 'run_cancelled' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('已停止这次回答。')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.queryByText(/回答失败/)).toBeNull()
+    expect(screen.queryByText('未发送')).toBeNull()
+    expect(screen.getByText('详情').closest('details')?.textContent).toContain('run_cancelled')
+  })
+
   it('runs the first Knowledge turn of a new conversation in a new session', async () => {
     Object.defineProperty(window, 'agent24', {
       value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },

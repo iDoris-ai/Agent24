@@ -5,6 +5,7 @@ import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession, knowledgePrompt, knowledgeQuery } from './chat-knowledge'
+import { failureKind, withoutToolNames } from './chat/user-facing'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
@@ -58,6 +59,8 @@ interface AssistantMessage {
   knowledgeDown?: KnowledgeDown
   /** The run that answered, when the turn went to /runs (Knowledge). */
   runId?: string
+  /** M3: a failure's internal code, shown only under 「详情」. */
+  detail?: string
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -640,7 +643,7 @@ export default function ChatPage() {
           forgetPromotion(conversation, turn.runId)
           await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(turn.runId)}/cancel` }).catch(() => {})
           setDelivery(index, { kind: 'notSent' })
-          setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: 'run_timeout' }) }])
+          setMessages(prev => [...prev, { role: 'assistant', content: t('fail.timeout'), detail: 'run_timeout' }])
           return
         }
         setDelivery(index, { kind: 'sent' })
@@ -649,12 +652,15 @@ export default function ChatPage() {
         runSession.current = null
         setMessages(prev => [...prev, { role: 'assistant', content: t('task.ongoing') }])
       } else {
-        setDelivery(index, { kind: 'notSent' })
-        setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: turn.message }) }])
+        // M3: the user's words, the code under 「详情」. A turn the user
+        // stopped was sent: it is not 「未发送」 (General, 0.6.73).
+        const kind = failureKind(turn.code)
+        setDelivery(index, { kind: kind === 'cancelled' ? 'sent' : 'notSent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: t(`fail.${kind}`), detail: turn.code === turn.message ? turn.code : `${turn.code}: ${turn.message}` }])
       }
     } catch (e) {
       setDelivery(index, { kind: 'notSent' })
-      setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: String(e) }) }])
+      setMessages(prev => [...prev, { role: 'assistant', content: t('fail.other'), detail: String(e) }])
     } finally {
       setAwaitingApproval(false)
       requestInFlight.current = false
@@ -722,7 +728,10 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.role === 'assistant' ? <Markdown text={m.content} /> : m.content}
+              {m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
+              {m.role === 'assistant' && m.detail && (
+                <details className="message-detail"><summary>{t('fail.detail')}</summary>{m.detail}</details>
+              )}
               {m.role === 'user' && m.delivery.kind === 'headroom' && (
                 <div role="group" aria-label={t('headroom.explanation')} style={{ marginTop: 8 }}>
                   <p role="status">{t('headroom.explanation')}</p>
