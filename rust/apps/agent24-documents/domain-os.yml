@@ -105,7 +105,7 @@ tools:
               index: { type: integer, minimum: 0 }
               text: { type: string, description: "the paragraph's new text" }
               tracked: { type: boolean }
-              anchor: { type: string, description: "the first 12 or so characters of paragraph `index` as documents.paragraphs shows it (its numbering may be left out, but if written it must be right); the edit is not made if that paragraph does not begin with them" }
+              anchor: { type: string, description: "at least 12 characters copied exactly from the start of paragraph `index` as documents.paragraphs shows it (its numbering may be left out, but if written it must be right); the edit is not made if that paragraph does not begin with them" }
         title: { type: string, description: "title of the new document" }
     risk: write_local
     output_privacy: local_only

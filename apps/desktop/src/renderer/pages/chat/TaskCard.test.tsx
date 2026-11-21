@@ -8,6 +8,7 @@ import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
 import { HandOver, TaskCards, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
+import { documentUnchanged, resetPatchOutcomesForTests } from './patch-outcome'
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
@@ -73,6 +74,7 @@ beforeEach(() => {
   })
   resetHistoryStore()
   resetRunStatusesForTests()
+  resetPatchOutcomesForTests()
   resetHandOversForTests()
 })
 afterEach(() => { vi.restoreAllMocks(); fs.rmSync(dir, { recursive: true, force: true }) })
@@ -176,10 +178,13 @@ describe('task cards (M4 A4)', () => {
       expect(reason).toContain('乙方：张三')
       expect(within(c).queryByRole('button', { name: '确认' })).toBeNull()
       expect(within(c).queryByText(/documents\.patch: \{/)).toBeNull()
+      // The answer will carry 「这次没有改动文档」 whatever the model says.
+      expect(documentUnchanged('run_1')).toBe(true)
     } else {
       await waitFor(() => expect(within(c).getByText(/第 6 段：「第三条 押金为两个月租金/)).toBeInTheDocument())
       await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
       expect(approvalDecide).not.toHaveBeenCalled()
+      expect(documentUnchanged('run_1')).toBe(false)
     }
   })
 

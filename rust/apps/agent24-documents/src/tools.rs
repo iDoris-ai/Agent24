@@ -462,7 +462,7 @@ async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
                 "index": edit.index,
                 "paragraph_starts_with": opening,
                 "message": format!(
-                    "没有改写：第 {} 段（index {}）开头是「{opening}」，和 anchor「{}」对不上。请用 documents.paragraphs 确认要改的是哪一段，再用那一段的 index 和开头重试。",
+                    "【未完成】本次没有改写，也没有生成任何文档：第 {} 段（index {}）开头是「{opening}」，和 anchor「{}」对不上。请先告诉用户这次没改成，不要说已保存或已完成；然后用 documents.paragraphs 确认段号，照抄那一段开头至少 12 个字作为 anchor，重新调用 documents.patch。",
                     edit.index + 1,
                     edit.index,
                     edit.anchor

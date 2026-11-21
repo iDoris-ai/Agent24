@@ -6,6 +6,7 @@ import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession, knowledgePrompt } from './chat-knowledge'
 import { failureKind, withoutToolNames } from './chat/user-facing'
+import { documentUnchanged } from './chat/patch-outcome'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
@@ -755,6 +756,9 @@ export default function ChatPage() {
               )}
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
+              )}
+              {m.role === 'assistant' && documentUnchanged(m.runId) && (
+                <div role="note" style={{ fontSize: 12, color: 'var(--danger, #c0392b)', marginTop: 2 }}>{t('task.documentUnchanged')}</div>
               )}
               {m.role === 'assistant' && m.knowledgeDown && (
                 <div role="note" style={{ fontSize: 12, color: 'var(--danger, #c0392b)', marginTop: 2 }}>{t(`knowledge.down.${m.knowledgeDown}`)}</div>

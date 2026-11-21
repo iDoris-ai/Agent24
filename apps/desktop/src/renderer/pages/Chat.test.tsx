@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { KNOWLEDGE_HINT } from './chat-knowledge'
+import { noteSentBack } from './chat/patch-outcome'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from './Chat'
 import { setLocale } from '../i18n'
@@ -395,6 +396,28 @@ describe('ChatPage with Knowledge', () => {
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
     expect(screen.queryByText(/本次没有读到/)).not.toBeInTheDocument()
     expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1' } }))
+  })
+
+  // M1 (0.6.82): the card sent the run's patch back, the model answered
+  // 「已保存为新文档」 anyway: the reply carries the page's own line.
+  it('a reply of a run whose patch was sent back says the document was not changed', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    noteSentBack('r_patch')
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r_patch' } }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '已保存为新文档《合同-修订版.docx》' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('已保存为新文档《合同-修订版.docx》')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.getByText(/这次没有改动文档/)).toBeInTheDocument()
   })
 
   // M3 (0.6.73): a stopped turn read 「回答失败：run_cancelled」 under 「未发送」.

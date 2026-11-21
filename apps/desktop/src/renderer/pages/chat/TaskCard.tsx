@@ -18,6 +18,7 @@ import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from '
 import { skillForConversation } from './session-skill'
 import { namedDocument } from './doc-intent-run'
 import { mismatchedEdit } from './patch-anchor'
+import { documentUnchanged, noteApproved, noteSentBack } from './patch-outcome'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
 
@@ -47,6 +48,8 @@ const DENY_INPUT = {
 
 /** What the card can decide of the run's pending approval. */
 interface Offers { approve: boolean; deny: boolean }
+/** Same weight as K2's 「没有检索知识库」 line. */
+const UNCHANGED = { color: 'var(--danger, #c0392b)' } as const
 const NO_OFFERS: Offers = { approve: false, deny: false }
 function offersOf(list: readonly Approval[], runId: string): Offers {
   const approval = list.find(a => a.run_id === runId)
@@ -262,6 +265,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       const wrong = m ? mismatchedEdit(m, edits) : null
       if (wrong && askingId) {
         setSentBack(wrong)
+        noteSentBack(task.run_id)
         const reason = tRef.current('task.anchorSentBack', { n: String(wrong.index + 1), index: String(wrong.index), opening: wrong.opening })
         await decideApproval(askingId, { type: 'deny', reason }).catch(() => {})
         askRunAgain(task.run_id)
@@ -296,6 +300,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       {status === 'completed' && view?.output && (
         <div className="task-card-output">
           {withoutToolNames(view.output)}
+          {documentUnchanged(task.run_id) && <div className="task-card-knowledge" role="note" style={UNCHANGED}>{t('task.documentUnchanged')}</div>}
           {checked && view.knowledge && <div className="task-card-knowledge">{checked.kind === 'read' ? t('knowledge.via') : t(`knowledge.${checked.kind}`)}</div>}
           {checked && checked.unread.length > 0 && (
             <div className="task-card-knowledge" role="note">{t('knowledge.unread', { ids: checked.unread.join(', ') })}</div>
@@ -304,7 +309,10 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       )}
       <span className="task-card-actions">
         {waiting && offers?.approve && !denying && !sentBack && (
-          <button type="button" className="btn" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
+          <button type="button" className="btn" disabled={busy || reading} onClick={() => {
+            if (typeof asking?.summary === 'string' && asking.summary.startsWith('documents.patch: ')) noteApproved(task.run_id)
+            void decide({ type: 'approve' })
+          }}>{t('task.confirm')}</button>
         )}
         {waiting && offers?.deny && !denying && (
           <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
