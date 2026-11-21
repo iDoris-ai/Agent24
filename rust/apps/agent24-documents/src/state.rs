@@ -118,6 +118,9 @@ struct Inner {
     calls: Arc<Calls>,
     /// The model extractions ask: the kernel's, once it has offered one.
     model: OnceLock<Arc<dyn Model>>,
+    /// M1 (General 11-21): the documents each run has already had a patch of
+    /// go through, with what was made: (run, document) → title.
+    patched: Mutex<std::collections::HashMap<(String, String), String>>,
     reopen_interval: Duration,
     current: Mutex<Opened>,
     /// When the last reopen started. Held by the reopen task until the reopen
@@ -145,6 +148,25 @@ struct Hooks {
 }
 
 impl AppState {
+    /// What a patch of `document` in `run` already made, if one went through.
+    pub(crate) fn patched_in(&self, run: &str, document: &str) -> Option<String> {
+        self.0
+            .patched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&(run.to_owned(), document.to_owned()))
+            .cloned()
+    }
+
+    /// A patch of `document` in `run` went through and made `title`.
+    pub(crate) fn note_patched(&self, run: &str, document: &str, title: &str) {
+        self.0
+            .patched
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert((run.to_owned(), document.to_owned()), title.to_owned());
+    }
+
     /// Open storage under `data_dir`; a failure is kept, not returned.
     pub async fn open(data_dir: &Path) -> Self {
         Self::open_with(data_dir, REOPEN_INTERVAL).await
@@ -194,6 +216,7 @@ impl AppState {
             layers,
             calls: Arc::default(),
             model: OnceLock::new(),
+            patched: Mutex::default(),
             reopen_interval,
             current: Mutex::new(current),
             last_attempt: Arc::new(tokio::sync::Mutex::new(Instant::now())),
@@ -218,6 +241,7 @@ impl AppState {
             layers: Layers::new(None),
             calls: Arc::default(),
             model: OnceLock::new(),
+            patched: Mutex::default(),
             reopen_interval,
             current: Mutex::new(Err(cause)),
             last_attempt: Arc::new(tokio::sync::Mutex::new(Instant::now())),

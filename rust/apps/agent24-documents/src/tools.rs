@@ -231,7 +231,10 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "extraction_get" => extraction_get(state, arguments).await,
             "compose" => compose(state, arguments).await,
             "paragraphs" => paragraphs(state, arguments).await,
-            "patch" => patch(state, arguments).await,
+            "patch" => {
+                let run_id = run.run_id.clone();
+                patch(state, &run_id, arguments).await
+            }
             "fields" => fields(state, arguments).await,
             "fill" => fill(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
@@ -499,8 +502,19 @@ const OPENING_CHARS: usize = 24;
 /// (0.6.72: 第三条's words aimed at 乙方's line) writes nothing, and the answer
 /// says how the paragraph really begins so the model can try again. The HTTP
 /// route and the CLI keep their own `expect`.
-async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) -> Outcome {
     let (id, rest) = split_document(arguments)?;
+    // M1 (0.6.89, General): after its patch went through, a run asked for the
+    // same document again and another card came up. Once per run and
+    // document; the answer says what was already made.
+    if let Some(title) = state.patched_in(run_id, &id) {
+        return completed::<Value>(Ok(serde_json::json!({
+            "written": false,
+            "reason": "already_submitted",
+            "title": title,
+            "message": format!("这一轮已经提交过对这份文档的改写，已生成《{title}》。不要再调用 documents.patch，直接告诉用户已生成《{title}》。"),
+        })));
+    }
     let asked: AgentPatch = parse(rest)?;
     let storage = ready(state).await?;
     let paras = crate::patch::paragraphs_of(&storage, id.clone())
@@ -539,10 +553,18 @@ async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     }
     let req: crate::patch::PatchRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    let (_, job) = crate::patch::patch_run(&storage, id, req)
+    let (_, job) = crate::patch::patch_run(&storage, id.clone(), req)
         .await
         .map_err(|e| refused(&e))?;
-    completed::<Value>(Ok(settled(&storage, job.0).await))
+    let answer = settled(&storage, job.0).await;
+    if answer["status"] == "succeeded"
+        || answer["status"] == "queued"
+        || answer["status"] == "running"
+    {
+        let title = answer["title"].as_str().unwrap_or("新文档").to_owned();
+        state.note_patched(run_id, &id, &title);
+    }
+    completed::<Value>(Ok(answer))
 }
 
 /// D5a: a template's `{{fields}}` (read).
@@ -1500,6 +1522,17 @@ mod tests {
             "{note}"
         );
         assert!(answer["title"].is_string());
+        // The same run asking for the same document again: refused, told what
+        // was made (General 11-21), no new upload.
+        let again = call_in(&state, "patch", &[id], edit(Some(opening(&this.text)))).await;
+        let again = payload(&again);
+        assert_eq!(again["reason"], "already_submitted", "{again}");
+        assert_eq!(again["title"], answer["title"]);
+        let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(uploads, 1);
     }
 
     #[tokio::test]
