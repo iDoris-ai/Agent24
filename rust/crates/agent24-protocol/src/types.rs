@@ -502,6 +502,12 @@ pub struct RunCreate {
     /// Omit/null for a run without a skill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_id: Option<String>,
+    /// M1 retrieval first (David 2026-11-21): with a Knowledge binding, the
+    /// run searches the bound knowledge bases with this text before its first
+    /// model call; hits go in as that search's result, none leaves the run
+    /// as it was. Ignored without a binding and on a 「记住…」 turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub knowledge_query: Option<String>,
 }
 
 /// K1-6b.5c-2 (ADR-K1-02 §2.4): a run as a peer bridge (the MCP server, the

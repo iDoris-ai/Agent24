@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { askWithKnowledge, createChatSession, KNOWLEDGE_HINT, knowledgePrompt, MAX_WAIT_MS } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, KNOWLEDGE_HINT, knowledgePrompt, knowledgeQuery, MAX_WAIT_MS } from './chat-knowledge'
 
 type Req = { method: string; path: string; body?: unknown }
 const ok = (data: unknown) => ({ ok: true, status: 200, data })
@@ -80,5 +80,24 @@ describe('knowledgePrompt (M1, 0.6.72: 「烧开水要多久」 never searched)'
     for (const text of ['记住我家的猫叫豆豆，今年三岁。', '记住：我每周三下午去游泳', '请帮我记一下明天交报告', '你记着我不吃香菜']) {
       expect(knowledgePrompt(text)).toBe(text)
     }
+  })
+})
+
+describe('knowledgeQuery (M1 retrieval first, David 2026-11-21)', () => {
+  it('is the user\'s own words, and none on a 「记住…」 turn', () => {
+    expect(knowledgeQuery(' 烧开水要多久 ')).toBe('烧开水要多久')
+    expect(knowledgeQuery('记住：我最喜欢的水果是芒果。')).toBeNull()
+    expect(knowledgeQuery('   ')).toBeNull()
+  })
+  it('none when asked to write something new (General, 0.6.75)', () => {
+    for (const text of ['写一篇八百字散文', '帮我写一段公司介绍', '请帮我起草一封邮件', '给我写首诗']) expect(knowledgeQuery(text)).toBeNull()
+    for (const text of ['烧开水要多久', '高血压每天吃多少盐', '这份合同的押金是多少']) expect(knowledgeQuery(text)).toBe(text)
+  })
+  it('goes on the run as knowledge_query', async () => {
+    const proxy = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 201, data: { id: 'r1' } })
+      .mockResolvedValue({ ok: true, status: 200, data: { status: 'completed', output: { text: 'ok' } } })
+    await askWithKnowledge('p', 's1', { proxy, sleep: async () => {} }, false, null, '烧开水要多久')
+    expect(proxy.mock.calls[0][0].body).toEqual({ prompt: 'p', session_id: 's1', knowledge_query: '烧开水要多久' })
   })
 })
