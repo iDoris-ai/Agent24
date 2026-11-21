@@ -659,7 +659,10 @@ export default function ChatPage() {
         // M3: the user's words, the code under 「详情」. A turn the user
         // stopped was sent: it is not 「未发送」 (General, 0.6.73).
         const kind = failureKind(turn.code)
-        setDelivery(index, { kind: kind === 'cancelled' ? 'sent' : 'notSent' })
+        // General 0.6.93: a turn the daemon took and ran was sent, whatever
+        // came of it (the model unavailable, a timeout, stopped); only one
+        // that never started is 「未发送」.
+        setDelivery(index, { kind: kind === 'notStarted' ? 'notSent' : 'sent' })
         setMessages(prev => [...prev, { role: 'assistant', content: t(`fail.${kind}`), detail: turn.code === turn.message ? turn.code : `${turn.code}: ${turn.message}` }])
       }
     } catch (e) {

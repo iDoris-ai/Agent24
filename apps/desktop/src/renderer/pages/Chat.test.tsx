@@ -429,6 +429,34 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText(line)).toBeInTheDocument(), { timeout: 3000 })
   })
 
+  // General 0.6.93: a turn that ran and failed (the local model stopped at
+  // prefill) was sent; only one that never started reads 「未发送」.
+  it.each([
+    ['provider_unavailable', '本地模型暂时不可用', false],
+    ['run_not_started', '这次回答没能开始', true],
+  ])('a run that fails with %s: 「未发送」 shown %s', async (code, line, notSent) => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        return code === 'run_not_started'
+          ? { ok: false, status: 503, data: { error: { code, message: code } } }
+          : { ok: true, status: 201, data: { id: 'r1' } }
+      }
+      return { ok: true, status: 200, data: { status: 'failed', error: { code, message: 'oMLX memory guard aborted' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText(new RegExp(line))).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.queryByText('未发送') !== null).toBe(notSent)
+  })
+
   // M3 (0.6.73): a stopped turn read 「回答失败：run_cancelled」 under 「未发送」.
   it('a stopped turn says so in words, with the code only under 详情, and was sent', async () => {
     Object.defineProperty(window, 'agent24', {
