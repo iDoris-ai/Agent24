@@ -377,6 +377,31 @@ async fn state_machine_idempotency_busy_and_stop() {
         Some(Outcome::Succeeded)
     );
     assert!(router_gateway(&f.router).is_err());
+    let request = agent24_models::CompletionRequest {
+        messages: vec![agent24_models::Msg::user("test")],
+        model: None,
+        tools: vec![],
+        response_format: None,
+        max_tokens: None,
+        temperature: None,
+        disable_thinking: false,
+        idoris_headroom_confirmed: false,
+        progress: None,
+    };
+    let error = tokio::time::timeout(
+        Duration::from_millis(500),
+        f.router.complete(
+            agent24_models::router::TaskProfile::default(),
+            &request,
+            &CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("explicit stop must fail immediately")
+    .unwrap_err();
+    assert!(
+        matches!(error, agent24_models::ModelError::Unavailable(reason) if reason == "idoris_unavailable: stopped")
+    );
     let attempts = fs::read_to_string(f.host.root.join("data/state/attempts.jsonl")).unwrap();
     assert_eq!(attempts.lines().count(), 1);
     f.assert_clean();

@@ -1019,27 +1019,33 @@ mod tests {
     #[tokio::test]
     async fn ic3a_chat_reports_service_recovery_as_503() {
         use http_body_util::BodyExt;
-        let mut state = state_with_stub().await;
-        state.router = std::sync::Arc::new(ModelRouter::idoris_unavailable(
-            "idoris_unavailable: circuit_open",
-        ));
-        let response = router(state)
-            .oneshot(
-                Request::post("/api/v1/chat")
-                    .header("authorization", "Bearer testtoken")
-                    .header("content-type", "application/json")
-                    .body(Body::from(
-                        r#"{"messages":[{"role":"user","content":"test"}]}"#,
-                    ))
-                    .unwrap(),
+        for (reason, retry_after) in [("idoris_unavailable: circuit_open", 60), ("stopped", 5)] {
+            let mut state = state_with_stub().await;
+            state.router = std::sync::Arc::new(ModelRouter::idoris_unavailable(reason));
+            let response = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                router(state).oneshot(
+                    Request::post("/api/v1/chat")
+                        .header("authorization", "Bearer testtoken")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            r#"{"messages":[{"role":"user","content":"test"}]}"#,
+                        ))
+                        .unwrap(),
+                ),
             )
             .await
+            .expect("unavailable services fail immediately")
             .unwrap();
-        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let bytes = response.into_body().collect().await.unwrap().to_bytes();
-        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(body["error"]["code"], "idoris_unavailable");
-        assert_eq!(body["error"]["details"]["retry_after"], 60);
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["code"], "idoris_unavailable");
+            assert_eq!(body["error"]["details"]["retry_after"], retry_after);
+            if reason == "stopped" {
+                assert_eq!(body["error"]["message"], "idoris_unavailable: stopped");
+            }
+        }
     }
 
     #[tokio::test]
