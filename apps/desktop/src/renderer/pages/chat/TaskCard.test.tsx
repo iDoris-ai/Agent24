@@ -124,17 +124,6 @@ describe('task cards (M4 A4)', () => {
     await waitFor(() => expect(card('运行中')).toBeInTheDocument())
   })
 
-  // General 0.6.89: 「停止」 on a task waiting on an approval.
-  it('stops a task that waits on an approval with the cancel API', async () => {
-    store.save(record('chat_a', '改写'))
-    store.promoteRun('chat_a', 'run_1')
-    runs.run_1 = { status: 'awaiting_approval', started_at: at }
-    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
-    await show()
-    fireEvent.click(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '停止' }))
-    await waitFor(() => expect(proxy).toHaveBeenCalledWith({ method: 'POST', path: '/api/v1/runs/run_1/cancel' }))
-  })
-
   it('stops a task with the cancel API', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')

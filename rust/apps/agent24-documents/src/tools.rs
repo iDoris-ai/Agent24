@@ -420,6 +420,11 @@ const PREVIEW_CHARS: usize = 40;
 /// Characters of previews in one answer, and paragraphs at most.
 const PREVIEW_BUDGET: usize = 3000;
 const PREVIEW_MAX_COUNT: usize = 200;
+/// PM 11-21: a narrowed ask (a range or a word) that comes to this many
+/// paragraphs or fewer, within [`PREVIEW_BUDGET`], is answered with them
+/// whole: the model rewrites from what it sees, and half a clause gives half
+/// a rewrite.
+const WHOLE_MAX_COUNT: usize = 10;
 
 /// FU-151 (0.6.89, General): 《示范-山东健身合同2025》's 293 paragraphs came to
 /// about 40 KB, and with them in its context the 4-bit model on an 8 GB Mac
@@ -459,6 +464,26 @@ fn preview_paragraphs(id: &str, all: &[crate::patch::Paragraph], args: &Paragrap
         .count
         .unwrap_or(PREVIEW_MAX_COUNT)
         .min(PREVIEW_MAX_COUNT);
+    let narrowed = args.from.is_some() || args.count.is_some() || query.is_some();
+    let after: Vec<&&crate::patch::Paragraph> = wanted.iter().filter(|p| p.index >= from).collect();
+    let picked = &after[..after.len().min(count)];
+    let whole_size: usize = picked.iter().map(|p| p.text.chars().count()).sum();
+    if narrowed && picked.len() <= WHOLE_MAX_COUNT && whole_size <= PREVIEW_BUDGET {
+        let shown: Vec<Value> = picked
+            .iter()
+            .map(|p| serde_json::json!({ "index": p.index, "text": p.text, "in_table": p.in_table, "whole": true }))
+            .collect();
+        let mut out = serde_json::json!({
+            "document_id": id,
+            "total": wanted.len(),
+            "paragraphs": shown,
+            "note": "这些段落是全文（whole: true），改写时照这里的原文写新文字，anchor 照抄开头。",
+        });
+        if let Some(p) = after.get(picked.len()) {
+            out["next_from"] = Value::from(p.index);
+        }
+        return out;
+    }
     let mut spent = 0;
     let mut shown = Vec::new();
     let mut next_from = None;
@@ -478,7 +503,7 @@ fn preview_paragraphs(id: &str, all: &[crate::patch::Paragraph], args: &Paragrap
         "document_id": id,
         "total": wanted.len(),
         "paragraphs": shown,
-        "note": "每段只给段号和开头；空段落不列。用 from（从哪个段号起）、query（关键词）取其余段落；改写时 anchor 照抄这里的开头。",
+        "note": "这是目录：每段只给段号和开头，空段落不列。要改写某几段，先用 from 和 count（例如 from=段号, count=1）或 query（关键词）取这几段的全文，再照全文改写；取其余段落也用 from。",
     });
     if let Some(n) = next_from {
         out["next_from"] = Value::from(n);
@@ -1555,7 +1580,7 @@ mod tests {
             more["paragraphs"][0]["index"].as_u64().unwrap() as usize,
             next
         );
-        // A word picks the paragraphs that have it.
+        // A word picks the paragraphs that have it, whole (PM 11-21).
         let found = preview_paragraphs(
             "doc_1",
             &all,
@@ -1566,7 +1591,42 @@ mod tests {
         );
         assert_eq!(found["total"], 1);
         assert_eq!(found["paragraphs"][0]["index"], 250);
+        assert_eq!(found["paragraphs"][0]["whole"], true);
+        assert_eq!(
+            found["paragraphs"][0]["text"].as_str().unwrap(),
+            all[250].text
+        );
         assert!(found.get("next_from").is_none());
+        // One paragraph by its index: whole too.
+        let one = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(4),
+                count: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(one["paragraphs"][0]["index"], 4);
+        assert_eq!(one["paragraphs"][0]["text"].as_str().unwrap(), all[4].text);
+        assert_eq!(one["next_from"], 5);
+        // A range too wide for whole text is a table of contents again.
+        let wide = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(0),
+                count: Some(50),
+                ..Default::default()
+            },
+        );
+        assert!(wide["paragraphs"][0].get("whole").is_none());
+        assert!(
+            wide["paragraphs"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with('…')
+        );
         // The whole of it serialized stays small: no more 40 KB.
         assert!(
             first.to_string().len() < 12_000,
