@@ -3123,6 +3123,20 @@ export interface components {
              *     answer may name sources the run never read.
              */
             knowledge?: components["schemas"]["RunKnowledge"] | null;
+            /**
+             * @description Only on `GET /api/v1/runs/{id}`. Absent when the run asked for no
+             *     document write. M1 (11-21): what the run's document writes came
+             *     to, told from its stored tool calls and results, never from the
+             *     answer's text, so a client can say 「这次没有改动文档」 or name what
+             *     was made whatever the answer claims.
+             */
+            documents?: components["schemas"]["RunDocuments"];
+        };
+        RunDocuments: {
+            /** @description The run asked for a documents write (compose, fill, patch, or any documents operation that is not a read). */
+            attempted: boolean;
+            /** @description Import jobs of the writes that went through; empty when every one was refused, denied or failed. */
+            jobs: string[];
         };
         RunKnowledge: {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */

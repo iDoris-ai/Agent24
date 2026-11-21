@@ -322,11 +322,85 @@ struct RunDetail {
     run: Run,
     /// Null when the run has no Knowledge binding.
     knowledge: Option<RunKnowledge>,
+    /// M1 (General/PM 11-21): what the run's document writes came to, told
+    /// from its stored tool calls and results, never from the answer's text.
+    /// Absent when the run asked for no document write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    documents: Option<RunDocuments>,
+}
+
+/// A run's document writes (compose, fill, patch, and any later documents
+/// operation that is not a read): whether one was asked for, and the import
+/// jobs of those that went through. A refusal, a denial, an error, a patch
+/// whose anchor did not match: asked for, no job.
+#[derive(Serialize, Debug, PartialEq)]
+struct RunDocuments {
+    attempted: bool,
+    jobs: Vec<String>,
+}
+
+/// The documents operations that only read.
+const DOCUMENT_READS: &[&str] = &[
+    "list",
+    "get",
+    "paragraphs",
+    "fields",
+    "read_range",
+    "find",
+    "extract",
+    "job_get",
+];
+
+fn is_document_write(tool: &str) -> bool {
+    tool.strip_prefix("documents.")
+        .is_some_and(|op| !DOCUMENT_READS.contains(&op))
+}
+
+fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments> {
+    let mut names = std::collections::HashMap::new();
+    for m in messages.iter().filter(|m| m.role == "assistant") {
+        for call in m.tool_calls.as_array().into_iter().flatten() {
+            if let (Some(id), Some(name)) = (
+                call.get("id").and_then(|v| v.as_str()),
+                call.get("name").and_then(|v| v.as_str()),
+            ) {
+                names.insert(id.to_owned(), name.to_owned());
+            }
+        }
+    }
+    let mut attempted = false;
+    let mut jobs = Vec::new();
+    for m in messages.iter().filter(|m| m.role == "tool") {
+        let Some(name) = m.tool_call_id.as_ref().and_then(|id| names.get(id)) else {
+            continue;
+        };
+        if !is_document_write(name) {
+            continue;
+        }
+        attempted = true;
+        let job = m
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("completed"))
+            .and_then(|v| {
+                v.get("payload")
+                    .and_then(|p| p.get("job_id"))
+                    .and_then(|j| j.as_str())
+                    .map(str::to_owned)
+            });
+        jobs.extend(job);
+    }
+    attempted.then_some(RunDocuments { attempted, jobs })
 }
 
 pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.store.get_run(&id).await {
         Ok(Some(run)) => {
+            let documents = match state.store.list_run_messages(&run.id).await {
+                Ok(messages) => run_documents(&messages),
+                Err(err) => return map_store_error(err),
+            };
             let knowledge = match run.input.knowledge_binding_id {
                 None => None,
                 Some(_) => match state.store.list_tool_calls(&run.id).await {
@@ -346,7 +420,12 @@ pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> R
                     Err(err) => return map_store_error(err),
                 },
             };
-            Json(RunDetail { run, knowledge }).into_response()
+            Json(RunDetail {
+                run,
+                knowledge,
+                documents,
+            })
+            .into_response()
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "not_found", &format!("run {id}")),
         Err(err) => map_store_error(err),
@@ -475,5 +554,99 @@ mod skill_run_tests {
         // Old clients omit the field and still deserialize.
         let (status, value) = post_run(&state, json!({"prompt": "hi"})).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{value}");
+    }
+}
+
+#[cfg(test)]
+mod documents_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn msg(
+        role: &str,
+        content: Option<&str>,
+        calls: serde_json::Value,
+        id: Option<&str>,
+    ) -> agent24_store::RunMessage {
+        agent24_store::RunMessage {
+            run_id: "r".into(),
+            seq: 0,
+            role: role.into(),
+            content: content.map(str::to_owned),
+            tool_calls: calls,
+            tool_call_id: id.map(str::to_owned),
+            created_at: String::new(),
+        }
+    }
+
+    /// M1 (General/PM 11-21): told from the tool results, never the answer.
+    #[test]
+    fn a_runs_document_writes_are_told_from_their_results() {
+        let ask = |id: &str, name: &str| {
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": id, "name": name, "arguments": "{}" }]),
+                None,
+            )
+        };
+        let job = r#"{"kind":"completed","payload":{"job_id":"job_1","kind":"import","status":"queued"}}"#;
+        let refused =
+            r#"{"kind":"completed","payload":{"written":false,"reason":"anchor_mismatch"}}"#;
+        // Only reads: nothing to say.
+        let reads = [
+            ask("a", "documents.paragraphs"),
+            msg("tool", Some("{}"), json!([]), Some("a")),
+        ];
+        assert_eq!(run_documents(&reads), None);
+        // A patch the card sent back, then the answer 「已保存」: asked, no job.
+        let denied = [
+            ask("b", "documents.patch"),
+            msg(
+                "tool",
+                Some("denied by policy: denied by user: 【未完成】…"),
+                json!([]),
+                Some("b"),
+            ),
+            msg("assistant", Some("已保存为新文档《x》"), json!([]), None),
+        ];
+        assert_eq!(
+            run_documents(&denied),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![]
+            })
+        );
+        // The module's own refusal and an error: asked, no job.
+        let refusals = [
+            ask("c", "documents.patch"),
+            msg("tool", Some(refused), json!([]), Some("c")),
+            ask("d", "documents.compose"),
+            msg("tool", Some("tool error: failed: {}"), json!([]), Some("d")),
+        ];
+        assert_eq!(
+            run_documents(&refusals),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![]
+            })
+        );
+        // Sent back, then retried right: the job.
+        let retried = [
+            ask("e", "documents.patch"),
+            msg("tool", Some(refused), json!([]), Some("e")),
+            ask("f", "documents.patch"),
+            msg("tool", Some(job), json!([]), Some("f")),
+        ];
+        assert_eq!(
+            run_documents(&retried),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_1".into()]
+            })
+        );
+        // fill and a later write operation are writes too.
+        assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));
+        assert!(!is_document_write("documents.get") && !is_document_write("knowledge_search"));
     }
 }
