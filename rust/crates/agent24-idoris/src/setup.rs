@@ -337,21 +337,16 @@ async fn run_setup_upstream_with_timeout(
         _ = cancel.cancelled() => Err(SetupError::Cancelled),
         result = tokio::time::timeout(timeout, operation) => result.unwrap_or(Err(SetupError::TimedOut)),
     };
+    // Descendants can close the pipes and outlive even a successful child.
+    // Stop them before validating or retaining the generation directory.
+    if let Some(pid) = process_group {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
     if result.is_err() {
-        if let Some(pid) = process_group {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
     let (stdout, status) = result?;
-    if stdout
-        .strip_suffix(b"\n")
-        .unwrap_or(&stdout)
-        .contains(&b'\n')
-    {
-        return Err(SetupError::InvalidResponse);
-    }
     let reply: UpstreamReply =
         serde_json::from_slice(&stdout).map_err(|_| SetupError::InvalidResponse)?;
     match reply {
@@ -627,12 +622,12 @@ async fn run_omlx_setup(
         _ = cancel.cancelled() => Err(SetupError::Cancelled),
         result = tokio::time::timeout(timeout, operation) => result.unwrap_or(Err(SetupError::TimedOut)),
     };
+    // Descendants can close the pipes and outlive even a successful child.
+    // Stop them before validating or retaining the generation directory.
+    if let Some(pid) = process_group {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
     if result.is_err() {
-        // Kill the group as well as the direct child: a pipe-owning descendant
-        // must not survive a cancelled or oversized setup attempt.
-        if let Some(pid) = process_group {
-            let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
-        }
         let _ = child.kill().await;
         let _ = child.wait().await;
     }

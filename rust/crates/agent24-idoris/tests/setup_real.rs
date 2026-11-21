@@ -142,7 +142,7 @@ async fn real_upstream_setup(embed: bool) {
     assert!(outcome.components_dir.join("lmstudio.yaml").is_file());
 }
 
-/// AGENT24_IDORIS_V6_BIN=/Users/jason/Dev/auraai/a24-idoris-builds/m-2e7184d/x/idoris
+/// Run manually with AGENT24_IDORIS_V6_BIN set.
 #[tokio::test]
 #[ignore = "requires AGENT24_IDORIS_V6_BIN; in-process OpenAI server, chat-only"]
 async fn real_v6_setup_upstream_chat() {
@@ -150,7 +150,7 @@ async fn real_v6_setup_upstream_chat() {
 }
 
 #[tokio::test]
-#[ignore = "requires newer AGENT24_IDORIS_V6_BIN supporting --bind embed; m-2e7184d rejects it"]
+#[ignore = "requires AGENT24_IDORIS_V6_BIN supporting --bind embed (S7 build 14ff0b4 or later)"]
 async fn real_v6_setup_upstream_embed() {
     real_upstream_setup(true).await;
 }

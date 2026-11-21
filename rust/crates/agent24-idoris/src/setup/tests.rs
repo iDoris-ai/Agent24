@@ -567,14 +567,68 @@ async fn upstream_errors_and_process_limits() {
 #[tokio::test]
 async fn upstream_rejects_escaped_card_and_mismatched_reply() {
     for body in [
-        UPSTREAM_OK.replace("%s/lmstudio.yaml", "/etc/hosts"),
+        UPSTREAM_OK
+            .replace("%s/lmstudio.yaml", "%s")
+            .replace("\"$out\" \"$models\"", "\"/etc/hosts\" \"$models\""),
+        format!("ln -s /etc/hosts \"$out/escaped.yaml\"\n{UPSTREAM_OK}")
+            .replace("%s/lmstudio.yaml", "%s/escaped.yaml"),
+    ] {
+        let f = UpstreamFixture::new(&body);
+        let error = f.run(false, Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(error, SetupError::UnsafePath), "{error:?}");
+    }
+    for body in [
         UPSTREAM_OK.replace("\"id\":\"lmstudio\"", "\"id\":\"other\""),
         UPSTREAM_OK.replace("\"deep\":\"chat\"", "\"deep\":\"other\""),
         format!("{UPSTREAM_OK}\necho '{{}}'"),
     ] {
         let f = UpstreamFixture::new(&body);
-        assert!(f.run(false, Duration::from_secs(5)).await.is_err());
+        let error = f.run(false, Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(error, SetupError::InvalidResponse), "{error:?}");
     }
+}
+
+#[tokio::test]
+async fn exited_setup_kills_lingering_descendants() {
+    let mut survivors = Vec::new();
+    for upstream in [false, true] {
+        for valid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("late-write");
+            // Close inherited pipes so setup can return while this descendant lives.
+            let descendant = format!(
+                "(sleep 0.3; mkdir -p \"$out\"; touch \"$out/late-write\" '{}') </dev/null >/dev/null 2>&1 &",
+                marker.display()
+            );
+            let reply = match (upstream, valid) {
+                (true, true) => UPSTREAM_OK,
+                (false, true) => OK,
+                (_, false) => "echo '{}'",
+            };
+            let body = format!("{descendant}\n{reply}");
+            let result = if upstream {
+                UpstreamFixture::new(&body)
+                    .run(false, Duration::from_secs(5))
+                    .await
+            } else {
+                Fixture::new(&body).run(Duration::from_secs(5)).await
+            };
+            if valid {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, SetupError::InvalidResponse), "{error:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if marker.exists() {
+                survivors.push((upstream, valid));
+            }
+        }
+    }
+    assert!(
+        survivors.is_empty(),
+        "(upstream, valid) survivors: {survivors:?}"
+    );
 }
 
 #[test]
