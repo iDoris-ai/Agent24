@@ -103,7 +103,7 @@ pub fn apply(
             return Err(PatchError::IndexOutOfRange(edit.index));
         };
         if let Some(expect) = &edit.expect
-            && !expect_matches(&paragraph_text(&xml[p.start..p.end]), expect)
+            && paragraph_text(&xml[p.start..p.end]) != *expect
         {
             return Err(PatchError::Stale(edit.index));
         }
@@ -658,13 +658,9 @@ fn scan_paragraphs(xml: &str) -> Result<Vec<Para>, PatchError> {
 }
 
 /// The text of a paragraph's own `w:t` (not inside a nested paragraph).
-/// Characters of `expect` that, found in the paragraph, are enough to say it
-/// is that paragraph.
-const EXPECT_MIN_CHARS: usize = 8;
-
 /// The words of a paragraph without its numbering, spaces and closing
 /// punctuation: 「第三条 押金为两个月租金。」 → 「押金为两个月租金」.
-fn comparable(text: &str) -> String {
+pub(crate) fn comparable(text: &str) -> String {
     let mut s: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
     let numeral = |c: char| c.is_ascii_digit() || "一二三四五六七八九十百零〇".contains(c);
     // 第X条/章/节/款
@@ -692,22 +688,20 @@ fn comparable(text: &str) -> String {
     s.into_iter().collect()
 }
 
-/// M1 (0.6.75): a 4-bit model gives as `expect` the paragraph without its
-/// 「第三条 」, or half of it, and the edit was refused after the user had
-/// approved it. `expect` only has to show the edit is aimed at this
-/// paragraph: the same words once numbering, spaces and closing punctuation
-/// are set aside, or a run of them at least [`EXPECT_MIN_CHARS`] long (or the
-/// whole paragraph when it is shorter). Text from another paragraph still
-/// does not match (the index mix-up of 0.6.72).
-fn expect_matches(actual: &str, expect: &str) -> bool {
-    if actual == expect {
-        return true;
-    }
-    let (a, e) = (comparable(actual), comparable(expect));
-    if e.is_empty() {
-        return a.is_empty();
-    }
-    a == e || (a.contains(&e) && e.chars().count() >= EXPECT_MIN_CHARS.min(a.chars().count()))
+/// M1 (c), General 11-21: an Agent's edit names the paragraph it rewrites by
+/// its opening words (`anchor`, about eight characters), checked against the
+/// paragraph at its index with spaces, punctuation and the paragraph's own
+/// numbering (第三条, 一、, 1., （一）) set aside: 0.6.75's model left
+/// 「第三条」 out. No similarity: the words must be the paragraph's opening.
+pub fn anchor_matches(paragraph: &str, anchor: &str) -> bool {
+    let words = |t: &str| -> String {
+        comparable(t)
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect()
+    };
+    let (p, a) = (words(paragraph), words(anchor));
+    !a.is_empty() && p.starts_with(&a)
 }
 
 fn paragraph_text(para: &str) -> String {
