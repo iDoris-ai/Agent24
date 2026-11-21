@@ -1126,6 +1126,8 @@ mod tests {
                                 // a LaunchAgent plist (the key is a secret).
                                     | "AGENT24_DEV_IDORIS_URL"
                                     | "AGENT24_DEV_IDORIS_KEY"
+                                // Debug-only v0.6 setup switch, never persisted in a LaunchAgent.
+                                    | "AGENT24_DEV_IDORIS_V6"
                             )
                         {
                             found.push(name);
