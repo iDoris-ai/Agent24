@@ -189,6 +189,75 @@ pub fn start_time(pid: i32) -> io::Result<ProcStart> {
     })
 }
 
+/// Whether this process holds a TCP LISTEN socket on every requested port.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+pub fn owns_listening_ports(pid: i32, ports: &[u16]) -> io::Result<bool> {
+    use libproc::libproc::net_info::{SocketFDInfo, SocketInfoKind, TcpSIState};
+    let mut fds = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        process_info(pid)?.pbi_nfiles as usize
+    ];
+    // SAFETY: the vector is initialized and writable for the supplied size.
+    let bytes = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            fds.as_mut_ptr().cast(),
+            std::mem::size_of_val(fds.as_slice()) as i32,
+        )
+    };
+    if bytes <= 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut listening = Vec::new();
+    for fd in fds
+        .iter()
+        .take(bytes as usize / std::mem::size_of::<libc::proc_fdinfo>())
+    {
+        if fd.proc_fdtype != libc::PROX_FDTYPE_SOCKET as u32 {
+            continue;
+        }
+        let mut socket = SocketFDInfo::default();
+        // SAFETY: SocketFDInfo is the C ABI structure for PROC_PIDFDSOCKETINFO;
+        // the kernel may write exactly its size into this initialized buffer.
+        let bytes = unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd.proc_fd,
+                3, // PROC_PIDFDSOCKETINFO
+                (&mut socket as *mut SocketFDInfo).cast(),
+                std::mem::size_of::<SocketFDInfo>() as i32,
+            )
+        };
+        if bytes != std::mem::size_of::<SocketFDInfo>() as i32 {
+            // A descriptor can close between the list and the lookup.
+            continue;
+        }
+        if socket.psi.soi_kind != SocketInfoKind::Tcp as i32 {
+            continue;
+        }
+        // SAFETY: soi_kind identifies the active TCP union member.
+        let tcp = unsafe { socket.psi.soi_proto.pri_tcp };
+        if tcp.tcpsi_state == TcpSIState::Listen as i32 {
+            listening.push(u16::from_be(tcp.tcpsi_ini.insi_lport as u16));
+        }
+    }
+    Ok(ports.iter().all(|port| listening.contains(port)))
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn owns_listening_ports(_pid: i32, _ports: &[u16]) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "port ownership unavailable",
+    ))
+}
+
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn process_info(pid: i32) -> io::Result<libc::proc_bsdinfo> {
@@ -439,6 +508,52 @@ pub fn independent_session(command: &mut std::process::Command) {
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_ownership_requires_all_ports_and_listen_state() {
+        use std::net::{TcpListener, TcpStream};
+        let pid = std::process::id() as i32;
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let second = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ports = [
+            first.local_addr().unwrap().port(),
+            second.local_addr().unwrap().port(),
+        ];
+        assert!(owns_listening_ports(pid, &ports).unwrap());
+        let _client = TcpStream::connect(second.local_addr().unwrap()).unwrap();
+        let (_accepted, _) = second.accept().unwrap();
+        drop(second);
+        assert!(!owns_listening_ports(pid, &ports).unwrap());
+        assert!(owns_listening_ports(pid, &ports[..1]).unwrap());
+        drop(first);
+        assert!(!owns_listening_ports(pid, &ports[..1]).unwrap());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn listener_in_another_process_is_not_owned() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Rust's listener is close-on-exec, so this child cannot own its port.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("0.1")
+            .spawn()
+            .unwrap();
+        let result = owns_listening_ports(child.id() as i32, &[port]);
+        child.wait().unwrap();
+        assert!(!result.unwrap());
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn listener_ownership_is_unsupported() {
+        assert_eq!(
+            owns_listening_ports(std::process::id() as i32, &[1234])
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
     #[test]
     fn current_process_has_stable_kernel_identity() {
         let pid = std::process::id() as i32;

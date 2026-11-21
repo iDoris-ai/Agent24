@@ -1521,3 +1521,115 @@ async fn ic3a_orphan_expiry_stops_without_crash_accounting() {
     assert_eq!(status.borrow().crashes, 0);
     assert_eq!(fixture.attempts().len(), 1);
 }
+
+#[tokio::test]
+#[ignore = "requires AGENT24_IDORIS_S2_BIN and both launcher/unsigned debug switches"]
+async fn ic3b_real_s2_register_and_adopt() {
+    let binary = PathBuf::from(std::env::var_os("AGENT24_IDORIS_S2_BIN").unwrap());
+    assert_eq!(
+        std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref(),
+        Ok("1")
+    );
+    assert_eq!(
+        std::env::var("AGENT24_DEV_ALLOW_UNSIGNED_IDORIS").as_deref(),
+        Ok("1")
+    );
+    // Keep canonical paths below HOME: macOS /tmp and /var are symlinks.
+    let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(3)
+        .unwrap();
+    let temp = tempfile::Builder::new()
+        .prefix("ic3b-")
+        .tempdir_in(repository)
+        .unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    assert!(root.starts_with(fs::canonicalize(std::env::var_os("HOME").unwrap()).unwrap()));
+    fs::create_dir_all(root.join("components")).unwrap();
+    let config = || {
+        let installed =
+            InstalledVersion::fixture(binary.parent().unwrap().to_path_buf(), &FIXTURE_FILES)
+                .unwrap();
+        let components = ComponentsDir::new(&root, &root.join("components")).unwrap();
+        let mut config = StartConfig::new(
+            installed,
+            components,
+            DataPaths {
+                db: root.join("idoris.sqlite3"),
+                state: root.join("state"),
+            },
+        )
+        .unwrap();
+        config.log_dir = root.join("logs");
+        config
+    };
+    let mut first = Supervisor::start(config(), inputs, || async {})
+        .await
+        .unwrap();
+    let path = root.join("run/idoris.json");
+    let discovered = discovery::read_any(&path).unwrap();
+    let pid = discovered.pid;
+    println!(
+        "S2 discovery: version={}, contract={}",
+        discovered.version, discovered.contract_version
+    );
+    struct Cleanup(u32);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = nix::sys::signal::kill(Pid::from_raw(self.0 as i32), Signal::SIGKILL);
+        }
+    }
+    let cleanup = Cleanup(pid);
+    timeout(Duration::from_secs(10), async {
+        let mut updates = first.runtime_status();
+        while !updates.borrow_and_update().registered {
+            updates.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let instance = first.runtime_status().borrow().instance_id.clone().unwrap();
+    let old_token = first.initial_admin.clone();
+    println!("S2: registered pid={pid}");
+    // Abort the host task to simulate agent24d death, rather than graceful stop.
+    let task = first.task.take().unwrap();
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    drop(first);
+    let adopted = Supervisor::start(config(), inputs, || async {})
+        .await
+        .unwrap();
+    assert_eq!(discovery::read_any(&path).unwrap().pid, pid);
+    let status = adopted.runtime_status().borrow().clone();
+    assert!(status.registered);
+    assert_eq!(status.instance_id.as_deref(), Some(instance.as_str()));
+    assert_ne!(adopted.initial_admin.as_str(), old_token.as_str());
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/admin/api/v1/status",
+        status.ports.unwrap().admin
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(old_token.as_str())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    assert_eq!(
+        client
+            .get(&url)
+            .bearer_auth(adopted.initial_admin.as_str())
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    println!("S2: same pid adopted; old Admin token rejected; rotated token works");
+    adopted.stop().await.unwrap();
+    std::mem::forget(cleanup);
+}

@@ -229,6 +229,10 @@ impl From<SupervisorError> for Code {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Status {
     #[serde(default)]
+    pub registered: bool,
+    #[serde(default)]
+    pub instance_id: Option<String>,
+    #[serde(default)]
     pub crashes: u64,
     #[serde(default)]
     pub hangs: u64,
@@ -742,9 +746,11 @@ impl IdorisHost {
         let recovery = i
             .supervisor
             .as_ref()
-            .map(|s| *s.runtime_status().borrow())
+            .map(|s| s.runtime_status().borrow().clone())
             .unwrap_or_default();
         let mut status = Status {
+            registered: recovery.registered,
+            instance_id: recovery.instance_id,
             crashes: recovery.crashes,
             hangs: recovery.hangs,
             circuit_open: recovery.circuit_open,
@@ -1312,7 +1318,7 @@ impl IdorisHost {
                     .await
                     .supervisor
                     .as_ref()
-                    .map(|s| *s.runtime_status().borrow())
+                    .map(|s| s.runtime_status().borrow().clone())
                     .unwrap_or_default();
                 if !*signal.borrow_and_update() {
                     let mut i = host.inner.lock().await;

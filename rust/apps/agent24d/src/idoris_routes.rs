@@ -131,6 +131,8 @@ pub async fn status(State(state): State<AppState>) -> Response {
     let status = match state.idoris_host {
         Some(host) => host.status().await,
         None => Status {
+            registered: false,
+            instance_id: None,
             crashes: 0,
             hangs: 0,
             circuit_open: false,
