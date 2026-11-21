@@ -150,6 +150,30 @@ describe('task cards (M4 A4)', () => {
     expect(approvalDecide).toHaveBeenCalledTimes(1)
   })
 
+  // PR-Daemon #1987 Medium 1: two patch approvals in one run. 「确认」 goes to
+  // the one the card shows; when that one was decided meanwhile the card says
+  // so and does not approve the other one in its place.
+  it('decides the approval the card shows, never another one of the same run', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [
+      { id: 'ap_A', run_id: 'run_1', available_decisions: ['approve', 'deny'] },
+      { id: 'ap_B', run_id: 'run_1', available_decisions: ['approve', 'deny'] },
+    ]
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    // A was decided elsewhere; only B is pending now.
+    approvals = [{ id: 'ap_B', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
+    approvalDecide.mockImplementation(async (id: string) => id === 'ap_A'
+      ? { ok: false, status: 409, data: { error: { code: 'conflict', message: 'not pending' } } }
+      : { ok: true, status: 200, data: {} })
+    fireEvent.click(await within(c).findByRole('button', { name: '确认' }))
+    await waitFor(() => expect(within(c).getByRole('alert').textContent).toContain('这条已处理'))
+    expect(approvalDecide).toHaveBeenCalledTimes(1)
+    expect(approvalDecide).toHaveBeenCalledWith('ap_A', { type: 'approve' })
+  })
+
   // M1 (c), PM 11-21: a patch aimed at the wrong paragraph goes back to the
   // model before the user is asked; one aimed right waits for the user.
   it.each([
@@ -285,18 +309,20 @@ describe('task cards (M4 A4)', () => {
     expect(approvalDecide).not.toHaveBeenCalled()
   })
 
-  it('says so when there is nothing to confirm any more', async () => {
+  it('says so when the approval it shows was decided elsewhere', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
     runs.run_1 = { status: 'awaiting_approval', started_at: at }
     approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
     await show()
     const button = await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '确认' })
-    // Decided elsewhere (the approvals page) meanwhile.
+    // Decided elsewhere (the approvals page) meanwhile: the daemon says the
+    // one the card shows is not pending (409); the card says so.
     approvals = []
+    approvalDecide.mockResolvedValue({ ok: false, status: 409, data: { error: { code: 'conflict', message: 'not pending' } } })
     fireEvent.click(button)
-    expect(await screen.findByRole('alert')).toHaveTextContent('现在没有要确认的事')
-    expect(approvalDecide).not.toHaveBeenCalled()
+    expect(await screen.findByRole('alert')).toHaveTextContent('这条已处理')
+    expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'approve' })
   })
 
   it('shows a completed task\'s answer with only the sources its run read (Knowledge\'s review)', async () => {
@@ -610,6 +636,8 @@ describe('approvalText (D2b)', () => {
     const cut = approvalArgs({ summary })
     expect(cut.complete).toBe(false)
     expect(approvalText({ summary }, t)).toContain('task.ask.atLeast')
+    // PR-Daemon #1987 Low 2: a patch payload without its edits is not whole.
+    expect(approvalArgs({ summary, payload: { document_id: '合同.docx' } }).complete).toBe(false)
   })
 
   it('patchOriginals reads the paragraphs of the document the model named by title', async () => {

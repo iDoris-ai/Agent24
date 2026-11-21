@@ -189,7 +189,16 @@ export const listPendingApprovals = (): Promise<Approval[]> =>
 
 /** Resolves `true` once the decision was sent, `false` if the user declined
  *  the native confirmation dialog (nothing was sent). */
-export const decideApproval = async (id: string, decision: Decision): Promise<boolean> => {
+/** The approval asked for was decided already (409). */
+export class AlreadyDecided extends Error {}
+
+export const decideApproval = async (
+  id: string,
+  decision: Decision,
+  /** `throw`: an approval already decided is an error the caller shows
+   *  (「这条已处理」), not a quiet success (PR-Daemon #1987 Medium 1). */
+  opts: { alreadyDecided?: 'ignore' | 'throw' } = {},
+): Promise<boolean> => {
   // Fail-closed at the API boundary: SPEC-002 requires a non-empty reason for
   // deny, and the daemon 400s an empty one. Enforce here so no caller (not
   // just the current UI) can send an invalid deny.
@@ -200,7 +209,9 @@ export const decideApproval = async (id: string, decision: Decision): Promise<bo
   // The main process asks the user in a native dialog before it sends.
   const res = await window.agent24.approvalDecide(id, decision as ApprovalDecisionInput)
   if ((res.data as { error?: { code?: string } } | null)?.error?.code === 'cancelled') return false
-  // 409 (already resolved) is not fatal — a concurrent resolution won
+  // 409 (already resolved) is not fatal — a concurrent resolution won —
+  // unless the caller decided a specific one and must say it was not this.
+  if (!res.ok && res.status === 409 && opts.alreadyDecided === 'throw') throw new AlreadyDecided(errorMessage(res))
   if (!res.ok && res.status !== 409) throw new Error(errorMessage(res))
   return true
 }
