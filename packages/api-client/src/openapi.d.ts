@@ -2587,7 +2587,7 @@ export interface components {
              * @enum {string}
              */
             source?: "omlx" | "openai_compat";
-            /** @description Loopback origin (openai_compat requires HTTP and 127.0.0.1, localhost or [::1]), without credentials, path, query or fragment. */
+            /** @description Ignored for omlx with iDoris v0.6.0 (--auto); may be empty. Otherwise a loopback origin (openai_compat requires HTTP and 127.0.0.1, localhost or [::1]), without credentials, path, query or fragment. */
             endpoint: string;
             daily_model: string;
             deep_model?: string | null;
@@ -2599,7 +2599,20 @@ export interface components {
             core_reserved_bytes?: number | null;
             consent?: components["schemas"]["IdorisConnectConsent"] | null;
         };
+        IdorisOmlxSetup: {
+            endpoint: string;
+            /** @enum {string} */
+            mode: "adopt" | "managed";
+            engine: {
+                /** @enum {string} */
+                engine_kind: "omlx";
+                installed: boolean;
+                executable: string | null;
+                version?: string;
+            };
+        };
         IdorisCandidates: {
+            setup?: components["schemas"]["IdorisOmlxSetup"];
             key_from_local_settings: boolean;
             candidates: {
                 endpoint: string;
@@ -2671,8 +2684,10 @@ export interface components {
             cancellable: boolean;
             download_progress?: components["schemas"]["IdorisDownloadProgress"];
             verification?: components["schemas"]["IdorisVerification"];
+            /** @description Loopback endpoint reported by iDoris when authentication is required. */
+            setup_endpoint?: string;
             /** @enum {string} */
-            setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input";
+            setup_code?: "unreachable" | "auth_required" | "auth_failed" | "not_omlx" | "model_not_found" | "invalid_endpoint" | "invalid_role" | "out_dir_not_empty" | "validation_failed" | "write_failed" | "invalid_api_key_input" | "engine_not_installed" | "port_in_use" | "model_not_installed";
         };
         CommInstallResult: {
             /** @example v0.30.0 */

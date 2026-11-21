@@ -1,5 +1,6 @@
 # Assert the real CLI contract and credential boundary before simulating setup.
 test "$1" = setup && test "$2" = omlx
+test "$3" = --endpoint && test "$4" = http://127.0.0.1:8088/ && test "$5" = --out-dir
 out=''
 key_flag=0
 bind_count=0

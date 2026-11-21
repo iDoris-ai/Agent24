@@ -211,6 +211,7 @@
             "source":"openai_compat", "endpoint":"http://127.0.0.1:3456/", "daily_model":"old-model", "deep_model":"deep-model", "core_reserved_bytes":0
         })).unwrap();
         idoris.record_installation(Installation {
+        omlx_setup: None,
             connection: Some(connection),
             version: agent24_idoris::IdorisLock::embedded().tag.trim_start_matches('v').into(),
             release_dir: dir.path().join("missing-release"),

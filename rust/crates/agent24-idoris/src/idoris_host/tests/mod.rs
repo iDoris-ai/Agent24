@@ -232,6 +232,7 @@ impl Fixture {
         }
         fs::write(root.join("components/scenario.json"), "{}").unwrap();
         let record = Installation {
+            omlx_setup: None,
             connection: None,
             version: "0.5.0".into(),
             release_dir: root.join("release"),
@@ -762,6 +763,7 @@ async fn real_v040_install_existing_start_running_stop() {
     )
     .unwrap();
     host.record_installation(Installation {
+        omlx_setup: None,
         connection: None,
         version: "0.5.0".into(),
         release_dir: installed.directory().into(),
@@ -893,6 +895,18 @@ fn lifecycle_wire_fixtures_match_serde_and_openapi() {
     let openapi: serde_json::Value =
         serde_yaml::from_str(&fs::read_to_string(root.join("protocol/openapi.yaml")).unwrap())
             .unwrap();
+    let candidates: serde_json::Value = serde_json::from_slice(
+        &fs::read(root.join("protocol/fixtures/idoris/candidates-auto.json")).unwrap(),
+    )
+    .unwrap();
+    let validator = jsonschema::options()
+        .offline()
+        .build(&json!({
+            "$ref": "#/components/schemas/IdorisCandidates", "components": openapi["components"]
+        }))
+        .unwrap();
+    assert!(validator.is_valid(&candidates));
+    serde_json::from_value::<crate::setup::OmlxSetup>(candidates["setup"].clone()).unwrap();
     for (file, schema) in [
         ("status", "IdorisStatus"),
         ("operation", "IdorisOperation"),

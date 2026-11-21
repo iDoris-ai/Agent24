@@ -88,6 +88,9 @@ async fn all_frozen_error_codes_are_typed_and_retained() {
         "validation_failed",
         "write_failed",
         "invalid_api_key_input",
+        "engine_not_installed",
+        "port_in_use",
+        "model_not_installed",
     ] {
         let f = Fixture::new(&format!(
             "printf '%s\\n' '{{\"status\":\"error\",\"code\":\"{code}\",\"message\":\"stdin-secret\"}}'\nexit 1"
@@ -564,14 +567,68 @@ async fn upstream_errors_and_process_limits() {
 #[tokio::test]
 async fn upstream_rejects_escaped_card_and_mismatched_reply() {
     for body in [
-        UPSTREAM_OK.replace("%s/lmstudio.yaml", "/etc/hosts"),
+        UPSTREAM_OK
+            .replace("%s/lmstudio.yaml", "%s")
+            .replace("\"$out\" \"$models\"", "\"/etc/hosts\" \"$models\""),
+        format!("ln -s /etc/hosts \"$out/escaped.yaml\"\n{UPSTREAM_OK}")
+            .replace("%s/lmstudio.yaml", "%s/escaped.yaml"),
+    ] {
+        let f = UpstreamFixture::new(&body);
+        let error = f.run(false, Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(error, SetupError::UnsafePath), "{error:?}");
+    }
+    for body in [
         UPSTREAM_OK.replace("\"id\":\"lmstudio\"", "\"id\":\"other\""),
         UPSTREAM_OK.replace("\"deep\":\"chat\"", "\"deep\":\"other\""),
         format!("{UPSTREAM_OK}\necho '{{}}'"),
     ] {
         let f = UpstreamFixture::new(&body);
-        assert!(f.run(false, Duration::from_secs(5)).await.is_err());
+        let error = f.run(false, Duration::from_secs(5)).await.unwrap_err();
+        assert!(matches!(error, SetupError::InvalidResponse), "{error:?}");
     }
+}
+
+#[tokio::test]
+async fn exited_setup_kills_lingering_descendants() {
+    let mut survivors = Vec::new();
+    for upstream in [false, true] {
+        for valid in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let marker = dir.path().join("late-write");
+            // Close inherited pipes so setup can return while this descendant lives.
+            let descendant = format!(
+                "(sleep 0.3; mkdir -p \"$out\"; touch \"$out/late-write\" '{}') </dev/null >/dev/null 2>&1 &",
+                marker.display()
+            );
+            let reply = match (upstream, valid) {
+                (true, true) => UPSTREAM_OK,
+                (false, true) => OK,
+                (_, false) => "echo '{}'",
+            };
+            let body = format!("{descendant}\n{reply}");
+            let result = if upstream {
+                UpstreamFixture::new(&body)
+                    .run(false, Duration::from_secs(5))
+                    .await
+            } else {
+                Fixture::new(&body).run(Duration::from_secs(5)).await
+            };
+            if valid {
+                result.unwrap();
+            } else {
+                let error = result.unwrap_err();
+                assert!(matches!(error, SetupError::InvalidResponse), "{error:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            if marker.exists() {
+                survivors.push((upstream, valid));
+            }
+        }
+    }
+    assert!(
+        survivors.is_empty(),
+        "(upstream, valid) survivors: {survivors:?}"
+    );
 }
 
 #[test]
@@ -634,4 +691,271 @@ async fn upstream_cancellation_and_non_loopback_endpoint() {
     };
     let (result, ()) = tokio::join!(run, stop);
     assert!(matches!(result, Err(SetupError::Cancelled)));
+}
+
+#[tokio::test]
+async fn auto_setup_delegates_discovery_and_keeps_keys_on_stdin() {
+    for with_key in [false, true] {
+        for embed in [false, true] {
+            let f = Fixture::new("");
+            let with_deep = with_key || embed;
+            let mut bindings = vec![(Role::Daily, "chat".into())];
+            if with_deep {
+                bindings.push((Role::Deep, "chat".into()));
+            }
+            if embed {
+                bindings.push((Role::Embed, "bge-m3-mlx-fp16".into()));
+            }
+            let expected =
+                serde_json::to_string(&bindings.iter().cloned().collect::<BTreeMap<_, _>>())
+                    .unwrap();
+            let script = format!(
+                r#"#!/bin/sh
+set -eu
+test "$1" = setup && test "$2" = omlx && test "$3" = --out-dir
+out="$4"
+shift 4
+if [ "$1" = --auto ]; then
+    shift
+    for arg in "$@"; do test "$arg" != --api-key-stdin; done
+    if IFS= read -r extra; then exit 92; fi
+    if [ {with_key} = true ]; then
+        printf '%s' "$out" > "attempt-dir"
+        printf '%s\n' '{{"status":"error","code":"auth_required","endpoint":"http://127.0.0.1/"}}'
+        exit 1
+    fi
+else
+    test "$1" = --endpoint && test "$2" = http://127.0.0.1/
+    shift 2
+    test "$(cat attempt-dir)" != "$out"
+fi
+for value in $(env); do case "$value" in *stdin-secret*) exit 93 ;; esac; done
+for binding in daily=chat {deep_binding} {embed_binding}; do
+    test "$1" = --bind && test "$2" = "$binding"
+    shift 2
+done
+if [ {with_key} = true ]; then
+    test "$1" = --api-key-stdin
+    shift
+    IFS= read -r key
+    test "$key" = stdin-secret
+fi
+test "$#" = 0
+if IFS= read -r extra; then exit 92; fi
+test "$IDORIS_ALLOCATED_BUDGET_BYTES" = 0
+test -n "$HOME"
+printf generated > "$out/omlx.yaml"
+printf generated > "$out/subscription.yaml"
+printf '%s\n' '{{"status":"ok","endpoint":"http://127.0.0.1/","auth":"{auth}","models":["chat","bge-m3-mlx-fp16"],"bindings":{expected},"components_dir":"'"$out"'","next":{{"env":{{"IDORIS_COMPONENTS_DIR":"'"$out"'"}}}},"mode":"adopt","engine":{{"engine_kind":"omlx","installed":true,"executable":"/Applications/oMLX.app/omlx","version":"test"}}}}'
+"#,
+                embed_binding = if embed { "embed=bge-m3-mlx-fp16" } else { "" },
+                deep_binding = if with_deep { "deep=chat" } else { "" },
+                auth = if with_key { "required" } else { "none" }
+            );
+            fs::write(f.installed.binary(), &script).unwrap();
+            let result = run_setup_auto(
+                &f.installed,
+                &f.root(),
+                with_key.then(|| Zeroizing::new("stdin-secret".into())),
+                &bindings,
+                Some(SetupBudget(0)),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.bindings, bindings.into_iter().collect());
+            assert_eq!(result.auth_required, with_key);
+            let discovery = result.omlx.unwrap();
+            assert_eq!(discovery.endpoint, "http://127.0.0.1/");
+            assert!(matches!(discovery.mode, OmlxMode::Adopt));
+            assert!(discovery.engine.installed);
+            assert_eq!(discovery.engine.version.as_deref(), Some("test"));
+            if !with_key && !embed {
+                for field in ["mode", "engine"] {
+                    fs::write(
+                        f.installed.binary(),
+                        script.replace(&format!("\"{field}\":"), &format!("\"unused_{field}\":")),
+                    )
+                    .unwrap();
+                    assert!(matches!(
+                        run_setup_auto(
+                            &f.installed,
+                            &f.root(),
+                            None,
+                            &[(Role::Daily, "chat".into())],
+                            Some(SetupBudget(0)),
+                            &CancellationToken::new()
+                        )
+                        .await,
+                        Err(SetupError::InvalidResponse)
+                    ));
+                }
+                fs::write(
+                    f.installed.binary(),
+                    script
+                        .replace("\"adopt\"", "\"managed\"")
+                        .replace("\"installed\":true", "\"installed\":false")
+                        .replace(",\"version\":\"test\"", ""),
+                )
+                .unwrap();
+                let managed = run_setup_auto(
+                    &f.installed,
+                    &f.root(),
+                    None,
+                    &[(Role::Daily, "chat".into())],
+                    Some(SetupBudget(0)),
+                    &CancellationToken::new(),
+                )
+                .await
+                .unwrap()
+                .omlx
+                .unwrap();
+                assert!(matches!(managed.mode, OmlxMode::Managed));
+                assert!(!managed.engine.installed);
+                assert!(managed.engine.version.is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn auto_without_key_surfaces_auth_endpoint() {
+    let f = Fixture::new("");
+    fs::write(
+        f.installed.binary(),
+        r#"#!/bin/sh
+set -eu
+for arg in "$@"; do test "$arg" != --api-key-stdin; done
+if IFS= read -r key; then exit 92; fi
+printf '%s\n' '{"status":"error","code":"auth_required","endpoint":"http://127.0.0.1:19283"}'
+exit 1
+"#,
+    )
+    .unwrap();
+    let error = run_setup_auto(
+        &f.installed,
+        &f.root(),
+        None,
+        &[(Role::Daily, "chat".into())],
+        Some(SetupBudget(0)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, SetupError::AuthRequired { endpoint }
+        if endpoint == "http://127.0.0.1:19283"));
+}
+
+#[test]
+fn auto_reply_requires_typed_mode_and_engine_fields() {
+    let engine: Engine = serde_json::from_value(serde_json::json!({
+        "engine_kind": "omlx", "installed": false, "executable": null
+    }))
+    .unwrap();
+    assert!(!engine.installed);
+    assert!(engine.version.is_none());
+    assert!(serde_json::from_str::<OmlxMode>("\"managed\"").is_ok());
+    assert!(serde_json::from_str::<OmlxMode>("\"future\"").is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires AGENT24_IDORIS_V6_BIN and local oMLX installation"]
+async fn real_v6_auto_and_local_models_contract() {
+    let Some(binary) = std::env::var_os("AGENT24_IDORIS_V6_BIN") else {
+        eprintln!("skip: AGENT24_IDORIS_V6_BIN is unset");
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let output = tokio::process::Command::new(&binary)
+        .args(["setup", "omlx", "--auto", "--out-dir"])
+        .arg(dir.path().join("discovery"))
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(30), output)
+        .await
+        .unwrap()
+        .unwrap();
+    let reply: Reply = serde_json::from_slice(&output.stdout).unwrap();
+    match reply {
+        Reply::Error {
+            code: SetupCode::Unreachable | SetupCode::EngineNotInstalled,
+            ..
+        } => {
+            eprintln!("skip: no reachable oMLX");
+            return;
+        }
+        Reply::Error {
+            code: SetupCode::AuthRequired,
+            endpoint: Some(_),
+        } => {
+            assert!(!output.status.success());
+        }
+        Reply::Ok { .. } => {
+            eprintln!("skip: oMLX does not require a key");
+            return;
+        }
+        _ => panic!("unexpected setup contract"),
+    }
+    let output = tokio::process::Command::new(&binary)
+        .args(["models", "local", "--json"])
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    #[derive(Deserialize)]
+    struct Models {
+        models: Vec<Model>,
+    }
+    #[derive(Deserialize)]
+    struct Model {
+        omlx_id: String,
+        kind: String,
+    }
+    let local: Models = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        local
+            .models
+            .iter()
+            .all(|m| !m.omlx_id.is_empty() && !m.kind.is_empty())
+    );
+    let key = crate::omlx_probe::read_settings_key().unwrap();
+    let mut bindings = vec![(
+        Role::Daily,
+        local
+            .models
+            .iter()
+            .find(|m| matches!(m.kind.as_str(), "chat" | "vision"))
+            .unwrap()
+            .omlx_id
+            .clone(),
+    )];
+    let embed = local.models.iter().any(|m| m.omlx_id == "bge-m3-mlx-fp16");
+    if embed {
+        bindings.push((Role::Embed, "bge-m3-mlx-fp16".into()));
+    }
+    let installed = InstalledVersion::from_test_directory(
+        PathBuf::from(&binary).parent().unwrap().to_path_buf(),
+        "idoris",
+    );
+    let result = run_setup_auto(
+        &installed,
+        &dir.path().join("instances/real"),
+        Some(key.into_secret()),
+        &bindings,
+        Some(SetupBudget(0)),
+        &CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    assert!(result.auth_required);
+    assert!(result.omlx.is_some());
+    // The embed binding goes to iDoris's resident companion card (S7).
+    assert_eq!(
+        result.components_dir.join("omlx-embed.yaml").is_file(),
+        embed
+    );
 }

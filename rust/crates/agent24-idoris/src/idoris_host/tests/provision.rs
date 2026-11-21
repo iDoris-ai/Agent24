@@ -555,6 +555,7 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     assert_eq!(x.f.host.daily_model().await, None);
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
+            setup: None,
             candidates: vec![Candidate {
                 endpoint: x.endpoint.clone(),
                 identity: "omlx",
@@ -587,6 +588,7 @@ async fn bootstrap_authenticates_local_settings_key_before_connect() {
     let x = ConnectedFixture::new().await;
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
+            setup: None,
             candidates: vec![Candidate {
                 endpoint: x.endpoint.clone(),
                 identity: "omlx",
@@ -609,6 +611,7 @@ async fn bootstrap_rejects_untrusted_key_required_listener_before_connect() {
     let result =
         x.f.host
             .bootstrap_core_with_candidates(Candidates {
+                setup: None,
                 candidates: vec![Candidate {
                     endpoint: x.endpoint.clone(),
                     identity: "omlx",
@@ -637,6 +640,7 @@ async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
     let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
     let candidates = || Candidates {
+        setup: None,
         candidates: vec![Candidate {
             endpoint: x.endpoint.clone(),
             identity: "omlx",
@@ -1619,6 +1623,7 @@ async fn inputs_reads_the_injected_upstream_key() {
         )
         .unwrap();
     let mut record = Installation {
+        omlx_setup: None,
         connection: None,
         version: "0.5.0".into(),
         release_dir: dir.path().join("release"),
@@ -2282,6 +2287,7 @@ async fn bootstrap_uses_installed_recommendation_instead_of_first_candidate() {
     x.scenario(json!({"recommendation":{"model_id":"real-model", "installed":true}}));
     x.f.host
         .bootstrap_core_with_candidates(Candidates {
+            setup: None,
             candidates: vec![Candidate {
                 endpoint: x.endpoint.clone(),
                 identity: "omlx",
@@ -2317,4 +2323,78 @@ fn bootstrap_recommendation_requires_installed_candidate() {
         .as_deref(),
         Some("second-chat")
     );
+}
+
+#[tokio::test]
+async fn gated_auto_connect_uses_local_models_and_no_agent24_probe() {
+    const CHILD: &str = "AGENT24_IC5B_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        // Isolate the debug gate from other tests; never mutate process-wide env.
+        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "gated_auto_connect_uses_local_models_and_no_agent24_probe",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("AGENT24_DEV_IDORIS_V6", "1")
+            .kill_on_drop(true)
+            .output();
+        let output = tokio::time::timeout(Duration::from_secs(180), output)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.provision.owner_trusted.store(false, Ordering::SeqCst);
+    x.scenario(json!({"auto_endpoint": x.endpoint}));
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert!(discovery.setup.is_none());
+    assert!(discovery.key_from_local_settings);
+    assert_eq!(discovery.candidates.len(), 1);
+    assert_eq!(discovery.candidates[0].endpoint, "");
+    assert_eq!(discovery.candidates[0].models, ["real-model"]);
+    x.provision.no_key.store(true, Ordering::SeqCst);
+    assert!(
+        !x.f.host
+            .candidates(None)
+            .await
+            .unwrap()
+            .key_from_local_settings
+    );
+    let operation =
+        x.f.host
+            .connect(x.request(), Some("auto-without-key"))
+            .await
+            .unwrap();
+    let done = x.f.complete(&operation).await;
+    assert_eq!(done.setup_code, Some(crate::setup::SetupCode::AuthRequired));
+    assert_eq!(done.setup_endpoint.as_deref(), Some(x.endpoint.as_str()));
+    let view = serde_json::to_value(done.view()).unwrap();
+    assert_eq!(view["setup_endpoint"], x.endpoint);
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.provision.owner_trusted.store(false, Ordering::SeqCst);
+    x.scenario(json!({"auto_endpoint": x.endpoint}));
+    // No selected endpoint is needed for bootstrap; only iDoris discovers it.
+    x.f.host.bootstrap_core().await.unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    let result = discovery.setup.unwrap();
+    assert_eq!(result.endpoint, x.endpoint);
+    assert!(matches!(result.mode, crate::setup::OmlxMode::Adopt));
+    assert!(result.engine.installed);
+    assert_eq!(
+        x.keys()[0]["allowed_roles"],
+        json!(["daily", "deep", "embed"])
+    );
+    assert_eq!(x.authorized_requests.load(Ordering::SeqCst), 0);
+    x.f.host.shutdown().await.unwrap();
 }

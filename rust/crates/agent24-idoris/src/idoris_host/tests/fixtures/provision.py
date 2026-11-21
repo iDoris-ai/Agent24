@@ -8,12 +8,30 @@ if sys.argv[1] == 'recommend':
         sys.exit(1)
     print(json.dumps(settings.get('recommendation', {})))
     sys.exit(0)
+if sys.argv[1:4] == ['models', 'local', '--json']:
+    print(json.dumps({'models': [
+        {'omlx_id': 'real-model', 'kind': 'chat', 'size_bytes': 42, 'catalog_id': None},
+        {'omlx_id': 'bge-m3-mlx-fp16', 'kind': 'embedding', 'size_bytes': 42, 'catalog_id': None},
+        {'omlx_id': 'not-chat', 'kind': 'unknown', 'size_bytes': None, 'catalog_id': None}
+    ]}))
+    sys.exit(0)
 if sys.argv[1] == 'setup':
     args = sys.argv[1:]
-    assert args[args.index('--load-mode') + 1] == 'resident'
-    endpoint = args[args.index('--endpoint') + 1]
+    auto = '--auto' in args
+    if auto:
+        assert '--endpoint' not in args and '--load-mode' not in args
+        endpoint = settings['auto_endpoint']
+    else:
+        if 'auto_endpoint' not in settings:
+            assert args[args.index('--load-mode') + 1] == 'resident'
+        endpoint = args[args.index('--endpoint') + 1]
     out = Path(args[args.index('--out-dir') + 1])
     secret_input = sys.stdin.buffer.read()
+    if auto:
+        assert '--api-key-stdin' not in args and secret_input == b''
+        print(json.dumps({'status': 'error', 'code': 'auth_required', 'endpoint': endpoint}))
+        sys.exit(1)
+    assert '--api-key-stdin' in args
     assert secret_input == b'sk-upstream-sensitive\n'
     assert 'IDORIS_OMLX_API_KEY' not in os.environ
     assert not any('sk-' in arg for arg in args)
@@ -26,7 +44,8 @@ if sys.argv[1] == 'setup':
     (out / 'scenario.json').write_text(json.dumps(settings.get('serve', {})))
     print(json.dumps({'status': 'ok', 'endpoint': endpoint, 'auth': 'required',
         'models': list(bindings.values()), 'bindings': bindings, 'components_dir': str(out),
-        'next': {'env': {'IDORIS_COMPONENTS_DIR': str(out)}, 'needs_env': ['IDORIS_OMLX_API_KEY']}}))
+        'next': {'env': {'IDORIS_COMPONENTS_DIR': str(out)}, 'needs_env': ['IDORIS_OMLX_API_KEY']},
+        **({'mode': 'adopt', 'engine': {'engine_kind': 'omlx', 'installed': True, 'executable': None}} if 'auto_endpoint' in settings else {})}))
     sys.exit(0)
 if sys.argv[1] == 'key':
     metadata_path = fixture_root / 'fake-keys.json'
