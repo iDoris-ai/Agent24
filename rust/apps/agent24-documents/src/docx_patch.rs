@@ -417,6 +417,15 @@ fn splice_parts(
 ) -> Result<Vec<u8>, PatchError> {
     let zip_err = |e: zip::result::ZipError| PatchError::NotDocx(e.to_string());
     let io_err = |e: std::io::Error| PatchError::NotDocx(e.to_string());
+    // A part that does not parse would leave a DOCX that Word and WPS cannot
+    // open: refused here, before anything is written (PR-Daemon #1954 L2).
+    for (name, content) in parts {
+        if let Err(e) = roxmltree::Document::parse(content) {
+            return Err(PatchError::Invalid(format!(
+                "the edited {name} would not be valid XML ({e}); nothing was written"
+            )));
+        }
+    }
     let mut archive = ZipArchive::new(Cursor::new(docx)).map_err(zip_err)?;
     let mut writer = ZipWriter::new(Cursor::new(Vec::with_capacity(docx.len() + 4096)));
     for i in 0..archive.len() {
@@ -658,6 +667,14 @@ fn paragraph_text(para: &str) -> String {
                     text.push_str(&decode(&para[from..tag.start]));
                 }
             }
+            // PR-Daemon #1954 B1: a tab and a line break are text too, as the
+            // writer writes them (\t, \n), so read → write back keeps them.
+            (TagKind::Empty | TagKind::Open, "w:tab") if depth_p <= 1 => text.push('\t'),
+            (TagKind::Empty | TagKind::Open, "w:br")
+                if depth_p <= 1 && !is_page_or_column_break(&para[tag.start..tag.end]) =>
+            {
+                text.push('\n');
+            }
             _ => {}
         }
     }
@@ -791,9 +808,50 @@ fn rewrite_paragraph(para: &str, edit: &ParaEdit, author: &str, date: &str, id: 
 /// A text run as a deleted one: its `w:t` become `w:delText`; its
 /// properties, tabs and line breaks stay as they are.
 fn as_deleted(run: &str) -> String {
-    run.replace("<w:t>", "<w:delText>")
-        .replace("<w:t ", "<w:delText ")
-        .replace("</w:t>", "</w:delText>")
+    // By tag name, not by a fixed spelling: `<w:t` may be followed by any XML
+    // whitespace before its attributes (PR-Daemon #1954 L2), never `<w:tab`.
+    let boundary = |c: Option<char>| matches!(c, Some(' ' | '\t' | '\n' | '\r' | '>' | '/'));
+    let mut out = String::with_capacity(run.len() + 16);
+    let mut rest = run;
+    while let Some(at) = rest
+        .find("<w:t")
+        .into_iter()
+        .chain(rest.find("</w:t"))
+        .min()
+    {
+        let (close, len) = if rest[at..].starts_with("</w:t") {
+            (true, 5)
+        } else {
+            (false, 4)
+        };
+        out.push_str(&rest[..at]);
+        if boundary(rest[at + len..].chars().next()) {
+            out.push_str(if close { "</w:delText" } else { "<w:delText" });
+        } else {
+            out.push_str(&rest[at..at + len]);
+        }
+        rest = &rest[at + len..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A `w:br` element that breaks the page or the column, its `w:type` read as
+/// an attribute in either quote style (PR-Daemon #1954 L3).
+fn is_page_or_column_break(element: &str) -> bool {
+    let Some(at) = element.find("w:type") else {
+        return false;
+    };
+    let rest = element[at + "w:type".len()..].trim_start();
+    let Some(rest) = rest.strip_prefix('=') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    let Some(quote) = rest.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+        return false;
+    };
+    let value = rest[1..].split(quote).next().unwrap_or("");
+    matches!(value, "page" | "column")
 }
 
 /// PR-Daemon #1930 B2: what in `para` a rewrite as one run would lose, named
@@ -859,9 +917,7 @@ fn not_plain_text(para: &str) -> Option<String> {
                         | "w:lastRenderedPageBreak" => {}
                         // A line break is text layout; a page or column break
                         // is the document's pagination, which a rewrite drops.
-                        "w:br"
-                            if !element.contains("w:type=\"page\"")
-                                && !element.contains("w:type=\"column\"") => {}
+                        "w:br" if !is_page_or_column_break(element) => {}
                         "w:br" => return Some("a page or column break (w:br)".to_owned()),
                         other => return Some(format!("{other} in a run")),
                     }

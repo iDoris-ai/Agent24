@@ -31,7 +31,7 @@ use zeroize::Zeroizing;
 mod provision;
 pub use provision::{
     Candidates, ConnectConsent, ConnectRequest, InstallRequest, Provisioner, SystemProvisioner,
-    upstream_models,
+    is_chat_model_id, upstream_models,
 };
 
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.

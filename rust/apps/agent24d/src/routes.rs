@@ -81,7 +81,12 @@ fn idoris_default(models: &[Model], daily: Option<String>) -> Option<String> {
     daily.or_else(|| {
         models
             .iter()
-            .find(|m| m.provider.starts_with("idoris"))
+            // PR-Daemon #1954 L5: a chat model only, never an embedding or
+            // OCR model iDoris happens to list first; none, then null.
+            .find(|m| {
+                m.provider.starts_with("idoris")
+                    && agent24_idoris::idoris_host::is_chat_model_id(&m.id)
+            })
             .map(|m| m.id.clone())
     })
 }
@@ -1756,6 +1761,7 @@ mod tests {
         };
         let listed = [
             model("other", "omlx"),
+            model("bge-m3-mlx-fp16", "idoris-local"),
             model("Qwen3-8B-4bit", "idoris-local"),
         ];
         assert_eq!(
@@ -1766,7 +1772,7 @@ mod tests {
             super::idoris_default(&listed, None).as_deref(),
             Some("Qwen3-8B-4bit")
         );
-        assert_eq!(super::idoris_default(&listed[..1], None), None);
+        assert_eq!(super::idoris_default(&listed[..2], None), None);
     }
 
     #[tokio::test]
