@@ -357,20 +357,27 @@ fn is_document_write(tool: &str) -> bool {
 }
 
 fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments> {
+    // PR-Daemon #1986 Low 1: a model may reuse a tool_call id across turns, so
+    // each result is paired with the call of that id seen most recently before
+    // it, in thread order, never with a later one.
     let mut names = std::collections::HashMap::new();
-    for m in messages.iter().filter(|m| m.role == "assistant") {
-        for call in m.tool_calls.as_array().into_iter().flatten() {
-            if let (Some(id), Some(name)) = (
-                call.get("id").and_then(|v| v.as_str()),
-                call.get("name").and_then(|v| v.as_str()),
-            ) {
-                names.insert(id.to_owned(), name.to_owned());
-            }
-        }
-    }
     let mut attempted = false;
     let mut jobs = Vec::new();
-    for m in messages.iter().filter(|m| m.role == "tool") {
+    for m in messages {
+        if m.role == "assistant" {
+            for call in m.tool_calls.as_array().into_iter().flatten() {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(|v| v.as_str()),
+                    call.get("name").and_then(|v| v.as_str()),
+                ) {
+                    names.insert(id.to_owned(), name.to_owned());
+                }
+            }
+            continue;
+        }
+        if m.role != "tool" {
+            continue;
+        }
         let Some(name) = m.tool_call_id.as_ref().and_then(|id| names.get(id)) else {
             continue;
         };
@@ -643,6 +650,34 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec!["job_1".into()]
+            })
+        );
+        // PR-Daemon #1986 Low 1: the same call id reused, a read then a write:
+        // each result goes with the call just before it.
+        let reused = [
+            ask("x", "documents.patch"),
+            msg("tool", Some(job), json!([]), Some("x")),
+            ask("x", "documents.paragraphs"),
+            msg("tool", Some("{}"), json!([]), Some("x")),
+        ];
+        assert_eq!(
+            run_documents(&reused),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_1".into()]
+            })
+        );
+        let reused_back = [
+            ask("y", "documents.paragraphs"),
+            msg("tool", Some("{}"), json!([]), Some("y")),
+            ask("y", "documents.patch"),
+            msg("tool", Some(refused), json!([]), Some("y")),
+        ];
+        assert_eq!(
+            run_documents(&reused_back),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![]
             })
         );
         // fill and a later write operation are writes too.

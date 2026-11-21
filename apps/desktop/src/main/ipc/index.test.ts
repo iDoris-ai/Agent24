@@ -459,6 +459,15 @@ describe('A1 backendProxy allowlist', () => {
       expect(opts.detail).toContain('/tmp/real')
       expect(opts.detail).toContain('Note from the page (for reference only): harmless readme tweak')
     })
+    // M1 (0.6.89): the card sends a wrongly aimed patch back by denying it;
+    // a deny refuses, so no box of its own asks the user to confirm it.
+    it('a deny goes through without a box of its own', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'deny', reason: '没有改写：第 3 段开头对不上' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(res.ok).toBe(true)
+      expect(seen).toHaveLength(1)
+      expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'deny', reason: '没有改写：第 3 段开头对不上' })
+    })
     it('approve_for_target (offered by the daemon) goes through: one dialog, one POST', async () => {
       showMessageBox.mockResolvedValue({ response: 0 })
       const res = await call(IpcChannels.ApprovalDecide, 'ap_tgt', { type: 'approve_for_target' })

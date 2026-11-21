@@ -95,21 +95,35 @@ export function patchArgsOf(json: string): { document_id: string; edits: Array<R
   return { document_id: doc, edits }
 }
 
+/** PR-Daemon #1986 A: what the approval asks, from its full `payload` (the
+ * tool's whole input, as the daemon stores and lists it), never only the
+ * summary the daemon cuts at about 200 bytes: cut, a patch of 3 tracked edits
+ * read as 「改写 1 段」, and an `"index":12` cut to `1` was auto-denied. `complete`
+ * is false only when the payload is missing and the summary was cut. */
+export function approvalArgs(a: Pick<Approval, 'summary'> & { payload?: unknown }): { tool: string; args: Record<string, unknown>; complete: boolean } {
+  const summary = typeof a.summary === 'string' ? a.summary : ''
+  const cut = summary.indexOf(': ')
+  const tool = cut > 0 ? summary.slice(0, cut) : summary
+  const payload = a.payload
+  if (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length > 0) {
+    return { tool, args: payload as Record<string, unknown>, complete: true }
+  }
+  try {
+    return { tool, args: cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {}, complete: true }
+  } catch {
+    // A summary cut short with its text: read what is there, and say so.
+    return { tool, args: tool === 'documents.patch' ? patchArgsOf(summary.slice(cut + 2)) ?? {} : {}, complete: false }
+  }
+}
+
 export function approvalText(
-  a: Pick<Approval, 'summary'>,
+  a: Pick<Approval, 'summary'> & { payload?: unknown },
   t: (key: string, vars?: Record<string, string>) => string,
   /** M1 (0.6.75): a patch's paragraphs as the document has them, by index.
    * The card shows these, not the model's `expect`. */
   originals: ReadonlyMap<number, string> | null = null,
 ): string {
-  const summary = typeof a.summary === 'string' ? a.summary : ''
-  const cut = summary.indexOf(': ')
-  const tool = cut > 0 ? summary.slice(0, cut) : summary
-  let args: Record<string, unknown> = {}
-  try { args = cut > 0 ? JSON.parse(summary.slice(cut + 2)) as Record<string, unknown> : {} } catch {
-    // A patch's summary is cut short with its text: read what is there.
-    if (tool === 'documents.patch') args = patchArgsOf(summary.slice(cut + 2)) ?? {}
-  }
+  const { tool, args, complete } = approvalArgs(a)
   const str = (v: unknown) => (typeof v === 'string' ? v : '')
   if (tool === 'documents.list') return t('task.ask.list')
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
@@ -129,7 +143,7 @@ export function approvalText(
   }
   if (tool === 'documents.patch' && Array.isArray(args['edits'])) {
     const edits = args['edits'] as Array<Record<string, unknown>>
-    const head = t(edits.some(e => e['tracked'] === true) ? 'task.ask.patchTracked' : 'task.ask.patch', { doc: str(args['document_id']), n: String(edits.length) })
+    const head = t(edits.some(e => e['tracked'] === true) ? 'task.ask.patchTracked' : 'task.ask.patch', { doc: str(args['document_id']), n: complete ? String(edits.length) : t('task.ask.atLeast', { n: String(edits.length) }) })
     // M1 (0.6.72): the card said only 「改写 1 段」 while a model was about to
     // write 第三条's text over 乙方's line. Each edit shows what it replaces.
     const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s)
@@ -155,9 +169,11 @@ export function approvalText(
  * document itself (its id, or the title the model named), so the card's
  * 「原文」 is the paragraph at that index and never only what the model says
  * it is. Null while not read or when it cannot be. */
-export async function patchOriginals(api: Window['agent24']['documents'] | undefined, summary: unknown): Promise<Map<number, string> | null> {
-  if (!api || typeof summary !== 'string' || !summary.startsWith('documents.patch: ')) return null
-  const doc = patchArgsOf(summary.slice('documents.patch: '.length))?.document_id ?? ''
+export async function patchOriginals(api: Window['agent24']['documents'] | undefined, approval: (Pick<Approval, 'summary'> & { payload?: unknown }) | null | undefined): Promise<Map<number, string> | null> {
+  if (!api || !approval) return null
+  const { tool, args } = approvalArgs(approval)
+  if (tool !== 'documents.patch') return null
+  const doc = typeof args['document_id'] === 'string' ? args['document_id'] : ''
   if (!doc) return null
   let id = doc
   if (!/^doc_/.test(doc)) {
@@ -246,6 +262,12 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
   const [sentBack, setSentBack] = useState<{ index: number; opening: string } | null>(null)
   const askingSummary = asking?.summary
   const askingId = asking?.id
+  // Keyed on the approval's id: its payload does not change while it waits.
+  const askingRef = useRef(asking)
+  askingRef.current = asking
+  /** The patch's edits could not all be read (no payload, summary cut): it
+   * is not offered for approval (PR-Daemon #1986 A). */
+  const askingIncomplete = asking ? !approvalArgs(asking).complete && approvalArgs(asking).tool === 'documents.patch' : false
   // `t` is a new function each render: read through a ref, not a dependency.
   const tRef = useRef(t)
   tRef.current = t
@@ -256,11 +278,14 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     setReading(isPatch)
     if (!isPatch) return
     let live = true
-    void patchOriginals(window.agent24?.documents, askingSummary).then(async m => {
+    const approval = askingRef.current
+    void patchOriginals(window.agent24?.documents, approval).then(async m => {
       if (!live) return
       setOriginals(m)
-      const edits = patchArgsOf(String(askingSummary).slice('documents.patch: '.length))?.edits ?? []
-      const wrong = m ? mismatchedEdit(m, edits) : null
+      const { args, complete }: { args: Record<string, unknown>; complete: boolean } = approval ? approvalArgs(approval) : { args: {}, complete: false }
+      const edits = Array.isArray(args['edits']) ? args['edits'] as Array<Record<string, unknown>> : []
+      // Only a whole patch is checked: a cut one is not offered at all.
+      const wrong = m && complete ? mismatchedEdit(m, edits) : null
       if (wrong && askingId) {
         setSentBack(wrong)
         const reason = tRef.current('task.anchorSentBack', { n: String(wrong.index + 1), index: String(wrong.index), opening: wrong.opening })
@@ -305,7 +330,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
         </div>
       )}
       <span className="task-card-actions">
-        {waiting && offers?.approve && !denying && !sentBack && (
+        {waiting && offers?.approve && !denying && !sentBack && !askingIncomplete && (
           <button type="button" className="btn" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
         )}
         {waiting && offers?.deny && !denying && (

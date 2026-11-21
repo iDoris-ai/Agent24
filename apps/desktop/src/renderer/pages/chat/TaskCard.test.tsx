@@ -7,7 +7,7 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
-import { HandOver, TaskCards, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
+import { HandOver, TaskCards, approvalArgs, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
@@ -181,6 +181,37 @@ describe('task cards (M4 A4)', () => {
       await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
       expect(approvalDecide).not.toHaveBeenCalled()
     }
+  })
+
+  // PR-Daemon #1986 A: a patch whose edits cannot all be read (no payload,
+  // summary cut) is not offered for approval; with its payload it is.
+  it.each([
+    ['without a payload', false],
+    ['with its payload', true],
+  ])('a cut patch summary %s: confirm offered %s', async (_case, withPayload) => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    const payload = { document_id: 'doc_1', edits: [12, 13, 14].map(index => ({ anchor: '押金为两个月租金，合同', index, text: '新的条款文字，较长一些。', tracked: true })) }
+    const full = `documents.patch: ${JSON.stringify(payload)}`
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: `${full.slice(0, 200)}… [truncated ${full.length - 200} bytes]`,
+      ...(withPayload ? { payload } : {}),
+    } as never]
+    const request = vi.fn(async () => ({ ok: true, data: { paragraphs: [12, 13, 14].map(index => ({ index, text: '押金为两个月租金，合同期满无违约时全额退还。', in_table: false })) } }))
+    ;(window.agent24 as unknown as { documents: unknown }).documents = { request }
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    await waitFor(() => expect(within(c).getByRole('button', { name: '拒绝' })).toBeInTheDocument())
+    if (withPayload) {
+      await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
+      expect(within(c).getByText(/3 段/)).toBeInTheDocument()
+    } else {
+      await new Promise(r => setTimeout(r, 50))
+      expect(within(c).queryByRole('button', { name: '确认' })).toBeNull()
+    }
+    expect(approvalDecide).not.toHaveBeenCalled()
   })
 
   it.each([
@@ -557,20 +588,38 @@ describe('approvalText (D2b)', () => {
     const summary = 'documents.patch: {"document_id":"合同-链接与脚注.docx","edits":[{"expect":"原有原文内容","index":2,"text":"经双方协商一致，本合同项下权利义务自双方签字盖章之日起生效，具有… [truncated 85 bytes]'
     const originals = new Map([[2, '乙方：张三']])
     expect(approvalText({ summary }, t, originals))
-      .toBe('task.ask.patch{"doc":"合同-链接与脚注.docx","n":"1"}\ntask.ask.patchEdit{"n":"3","from":"乙方：张三","to":"经双方协商一致，本合同项下权利义务自双方签字盖章之日起生效，具有…"}')
+      .toBe('task.ask.patch{"doc":"合同-链接与脚注.docx","n":"task.ask.atLeast{\\"n\\":\\"1\\"}"}\ntask.ask.patchEdit{"n":"3","from":"乙方：张三","to":"经双方协商一致，本合同项下权利义务自双方签字盖章之日起生效，具有…"}')
     const request = vi.fn(async (req: { op: string }) => req.op === 'list'
       ? { ok: true, data: { documents: [{ document_id: 'doc_9', title: '合同-链接与脚注.docx', head_revision: 1, created_at: '' }] } }
       : { ok: true, data: { paragraphs: [{ index: 2, text: '乙方：张三', in_table: false }] } })
-    expect((await patchOriginals({ request } as never, summary))?.get(2)).toBe('乙方：张三')
+    expect((await patchOriginals({ request } as never, { summary }))?.get(2)).toBe('乙方：张三')
   })
+  // PR-Daemon #1986 A: the summary is cut at about 200 bytes; the card reads
+  // the approval's full payload. Three tracked edits, index 12, CJK anchors.
+  it('reads a patch from the approval payload, not the cut summary', () => {
+    const edits = [12, 13, 14].map(index => ({ anchor: '第十二条 押金为两个月租金，合同', index, text: '押金金额为两个月的租金，租赁期满且无违约行为时全额返还。', tracked: true }))
+    const payload = { document_id: '合同.docx', edits }
+    const full = `documents.patch: ${JSON.stringify(payload)}`
+    const summary = `${full.slice(0, 200)}… [truncated ${full.length - 200} bytes]`
+    const originals = new Map([[12, 'a'], [13, 'b'], [14, 'c']])
+    const text = approvalText({ summary, payload }, t, originals)
+    expect(text.split('\n')[0]).toBe('task.ask.patchTracked{"doc":"合同.docx","n":"3"}')
+    expect(text.split('\n').slice(1).map(l => JSON.parse(l.slice('task.ask.patchEdit'.length)).n)).toEqual(['13', '14', '15'])
+    expect(approvalArgs({ summary, payload }).complete).toBe(true)
+    // Without the payload: what is there, said as 「at least」, and not complete.
+    const cut = approvalArgs({ summary })
+    expect(cut.complete).toBe(false)
+    expect(approvalText({ summary }, t)).toContain('task.ask.atLeast')
+  })
+
   it('patchOriginals reads the paragraphs of the document the model named by title', async () => {
     const request = vi.fn(async (req: { op: string }) => req.op === 'list'
       ? { ok: true, data: { documents: [{ document_id: 'doc_9', title: '合同.docx', head_revision: 1, created_at: '' }] } }
       : { ok: true, data: { paragraphs: [{ index: 5, text: '第三条 押金…', in_table: false }] } })
-    const got = await patchOriginals({ request } as never, 'documents.patch: {"document_id":"《合同.docx》","edits":[]}')
+    const got = await patchOriginals({ request } as never, { summary: 'documents.patch: {"document_id":"《合同.docx》","edits":[]}' })
     expect(got?.get(5)).toBe('第三条 押金…')
     expect(request).toHaveBeenCalledWith({ op: 'paragraphs', documentId: 'doc_9' })
-    expect(await patchOriginals({ request } as never, 'documents.fill: {}')).toBeNull()
+    expect(await patchOriginals({ request } as never, { summary: 'documents.fill: {}' })).toBeNull()
   })
   it('shows what each rewritten paragraph says now and will say (M1, 0.6.72)', () => {
     // The run that would have put 第三条's text over 乙方's line.

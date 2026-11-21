@@ -1227,7 +1227,10 @@ export function registerIpcHandlers(options: {
         mt('approval.warning'),
       ].filter(Boolean).join('\n')
       // In service mode the daemon's presence box asks again (M5 B3); the switch is in elevated-request.ts.
-      if (approvalConfirmShown(daemonElevation() !== null)) {
+      // M1 (0.6.89, General): a deny takes nothing anyone has not already
+      // refused; it is how the card sends back a patch aimed at the wrong
+      // paragraph without the user, so it is sent without a box of its own.
+      if (d.type !== 'deny' && approvalConfirmShown(daemonElevation() !== null)) {
         const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
         if (!ok) return cancelled()
       }
