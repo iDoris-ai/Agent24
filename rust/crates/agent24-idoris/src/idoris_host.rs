@@ -1026,14 +1026,31 @@ impl IdorisHost {
             tracing::warn!("cannot persist iDoris operation phase");
         }
     }
-    fn block_gateway(&self) {
+    fn retain_draining_lease(&self) {
         if let Some(lease) = self.router.published_lease() {
             *self.draining.lock().unwrap_or_else(|e| e.into_inner()) = Some(lease);
         }
+    }
+    fn block_gateway(&self) {
+        self.retain_draining_lease();
         self.router.block_idoris("stopped");
     }
+    /// A start, restart or reconnect failed: requests fail fast, but not as "stopped".
+    fn fail_gateway(&self) {
+        self.retain_draining_lease();
+        self.router.block_idoris("failed");
+    }
+    /// A cancelled start is a user stop, not a failure.
+    fn end_gateway(&self, error: &Code) {
+        if matches!(error, Code::Cancelled) {
+            self.block_gateway();
+        } else {
+            self.fail_gateway();
+        }
+    }
+    /// One write: the slot never shows "stopped" between a running and a starting gateway.
     fn starting_gateway(&self) {
-        self.block_gateway();
+        self.retain_draining_lease();
         self.router.starting_idoris();
     }
     async fn prepare_gateway(
@@ -1154,8 +1171,10 @@ impl IdorisHost {
         ),
         Code,
     > {
-        // Preparation is read-only; cancellation can drop it before any spawn.
-        let (config, inputs) = tokio::select! {
+        // Both callers marked the slot starting; a failure before readiness must clear it.
+        let prepared = async {
+            // Preparation is read-only; cancellation can drop it before any spawn.
+            let (config, inputs) = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(Code::Cancelled),
             result = async {
@@ -1165,6 +1184,16 @@ impl IdorisHost {
                 let inputs = match override_inputs { Some(inputs) => inputs, None => self.runtime.inputs(record).await? };
                 Ok::<_, Code>((config, inputs))
             } => result?,
+            };
+            Ok::<_, Code>((config, inputs))
+        }
+        .await;
+        let (config, inputs) = match prepared {
+            Ok(prepared) => prepared,
+            Err(e) => {
+                self.end_gateway(&e);
+                return Err(e);
+            }
         };
         let runtime = self.runtime.clone();
         let refresh_record = record.clone();
@@ -1205,7 +1234,12 @@ impl IdorisHost {
             },
             move || async move {
                 if let Some(host) = host.upgrade() {
-                    host.starting_gateway();
+                    // Every stop() caller has already set the slot (stopped, failed or
+                    // starting); draining only waits for in-flight requests. A gateway the
+                    // monitor republished in the meantime is withdrawn first.
+                    if host.router.published_lease().is_some() {
+                        host.block_gateway();
+                    }
                     loop {
                         let pending = host
                             .draining
@@ -1228,7 +1262,14 @@ impl IdorisHost {
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
                 .unwrap_or_else(|| Code::from(error))
-        })?;
+        });
+        let supervisor = match supervisor {
+            Ok(supervisor) => supervisor,
+            Err(e) => {
+                self.end_gateway(&e);
+                return Err(e);
+            }
+        };
         let ready = supervisor.accepting_requests();
         self.phase(id, Phase::Connecting).await;
         let connected = async {
@@ -1260,7 +1301,7 @@ impl IdorisHost {
         }
         .await;
         if let Err(e) = connected {
-            self.block_gateway();
+            self.end_gateway(&e);
             supervisor.stop().await.map_err(Code::from)?;
             return Err(e);
         }
@@ -1306,7 +1347,11 @@ impl IdorisHost {
                                 .take()
                                 .or(error)
                                 .or(i.last_error);
-                            host.block_gateway();
+                            if error.is_some() {
+                                host.fail_gateway();
+                            } else {
+                                host.block_gateway();
+                            }
                             i.last_error = error;
                             i.state = match error {
                                 Some(Code::InstanceConflict) => State::InstanceConflict,
@@ -1373,7 +1418,7 @@ impl IdorisHost {
                         }
                         i.state = State::Running;
                     } else {
-                        host.block_gateway();
+                        host.fail_gateway();
                         i.last_error = result.err();
                         i.state = State::Failed;
                         if let Some(s) = &i.supervisor {

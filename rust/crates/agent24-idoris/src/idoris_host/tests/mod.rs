@@ -24,10 +24,22 @@ use std::{
 
 struct MemoryKeychain {
     locked: AtomicBool,
+    /// Reads left before the keychain locks itself.
+    reads_left: std::sync::Mutex<usize>,
 }
 impl Keychain for MemoryKeychain {
     fn get(&self, _: &str) -> Result<Zeroizing<String>, KeychainError> {
-        if self.locked.load(Ordering::SeqCst) {
+        let exhausted = {
+            let mut left = self.reads_left.lock().unwrap();
+            match left.checked_sub(1) {
+                Some(n) => {
+                    *left = n;
+                    false
+                }
+                None => true,
+            }
+        };
+        if exhausted || self.locked.load(Ordering::SeqCst) {
             Err(KeychainError::KeychainLocked)
         } else {
             Ok(Zeroizing::new(format!("idk_{}", "a".repeat(64))))
@@ -243,6 +255,7 @@ impl Fixture {
         });
         let keychain = Arc::new(MemoryKeychain {
             locked: AtomicBool::new(false),
+            reads_left: std::sync::Mutex::new(usize::MAX),
         });
         let router = Arc::new(ModelRouter::idoris_unavailable("test"));
         let managed =
@@ -445,8 +458,34 @@ async fn l4_and_contract_failures_are_mapped_and_reaped() {
         let op = f.host.submit(Action::Start, None).await.unwrap();
         assert_eq!(f.complete(&op).await.error_code, Some(code));
         assert_eq!(f.host.status().await.state, state);
+        if state == State::Failed {
+            let reason = router_gateway(&f.router).err().unwrap().to_string();
+            assert!(reason.contains("failed"), "{reason}");
+        }
         f.assert_clean();
     }
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_for_readiness_reports_stopped() {
+    let f = Fixture::new().await;
+    f.install().await;
+    f.scenario(json!({"mode":"no_read"}));
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    // The fixture never becomes ready; cancel once its process has been spawned.
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while !f.host.root.join("data/state/managed-process.json").exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.host.cancel(&op.operation_id).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Cancelled));
+    assert_eq!(f.host.status().await.state, State::Stopped);
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("stopped"), "{reason}");
+    f.assert_clean();
 }
 
 #[tokio::test]
@@ -707,6 +746,7 @@ async fn real_v040_install_existing_start_running_stop() {
     .unwrap();
     let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(MemoryKeychain {
         locked: AtomicBool::new(false),
+        reads_left: std::sync::Mutex::new(usize::MAX),
     })));
     let router = Arc::new(ModelRouter::idoris_unavailable("smoke"));
     let managed =
@@ -833,6 +873,9 @@ async fn start_during_supervisor_restart_is_busy_and_stop_wins_readiness_updates
     })
     .await
     .unwrap();
+    // Requests arriving during the restart must wait, not fail as "stopped".
+    let restarting = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(restarting.contains("starting"), "{restarting}");
     assert!(matches!(
         f.host.submit(Action::Start, None).await,
         Err(Code::Busy)
@@ -1329,4 +1372,33 @@ async fn start_verification_works_offline() {
         .await
         .map(|_| ())
         .unwrap_or_else(|code| panic!("offline start must work, got {code:?}"));
+}
+
+/// The supervisor's drain runs inside stop(); it must not overwrite the reason set before it.
+#[tokio::test]
+async fn failure_after_spawn_and_explicit_stop_keep_their_slot_reason() {
+    let f = Fixture::new().await;
+    f.install().await;
+    // Locked before preparation: nothing spawns and the slot must not stay starting.
+    *f.keychain.reads_left.lock().unwrap() = 0;
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Failed));
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("failed"), "{reason}");
+    // The first read prepares the launch; the next one, after readiness, fails.
+    *f.keychain.reads_left.lock().unwrap() = 1;
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    let done = f.complete(&op).await;
+    assert_eq!(done.result, Some(Outcome::Failed), "{:?}", done.error_code);
+    assert_eq!(f.host.status().await.state, State::Failed);
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("failed"), "{reason}");
+    *f.keychain.reads_left.lock().unwrap() = usize::MAX;
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
+    let op = f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
+    let reason = router_gateway(&f.router).err().unwrap().to_string();
+    assert!(reason.contains("stopped"), "{reason}");
+    f.assert_clean();
 }
