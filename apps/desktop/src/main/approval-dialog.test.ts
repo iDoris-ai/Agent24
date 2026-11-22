@@ -4,9 +4,10 @@ import { resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
 const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}…` : s)
 const DOC = 'doc_01M8035XWKZJGGD3NHF3X0HJ0H'
-const lookups = (title: string | null, paragraphs: Map<number, string> | null): DocumentLookups => ({
+const lookups = (title: string | null, paragraphs: Map<number, string> | null, list: Array<{ id: string; title: string }> | null = null): DocumentLookups => ({
   title: vi.fn(async () => title),
   paragraphs: vi.fn(async () => paragraphs),
+  list: vi.fn(async () => list),
 })
 const patch = (edits: unknown) => ({
   summary: `documents.patch: {"document_id":"${DOC}","edits":[{"anchor":… [truncated 94 bytes]`,
@@ -63,6 +64,43 @@ describe('approvalDialog (UI polish 01)', () => {
     expect(out.detail).toContain('第 1 段：（没读到原文）→「新」')
   })
 
+  // General 0.6.96: the model named the document by its file name; the box
+  // read nothing by it and said 「（没读到原文）」 while the card showed it.
+  it('a patch naming its document by file name: found as the module finds it, its paragraphs read', async () => {
+    const list = [{ id: DOC, title: '合同-真实结构.docx' }, { id: 'doc_OTHER', title: '另一份.docx' }]
+    const look = lookups(null, new Map([[4, '每月租金为人民币捌仟伍佰元整（¥8,500），每月五日前支付。']]), list)
+    const out = await box({ summary: 'documents.patch: {…}', payload: { document_id: '合同-真实结构.docx', edits: [{ index: 4, text: '每月租金为人民币玖仟元整。' }] } },
+      'approve', '批准', undefined, look, clip)
+    expect(look.paragraphs).toHaveBeenCalledWith(DOC)
+    expect(out.message).toBe('确认让助理改写《合同-真实结构.docx》？')
+    expect(out.detail).toContain('第 5 段：「每月租金为人民币捌仟伍佰元整（¥8,500），每月五日前支付。」→「每月租金为人民币玖仟元整。」')
+  })
+
+  it('a name two documents share: nothing read, as the module finds none', async () => {
+    const list = [{ id: 'doc_A', title: '合同 v1.docx' }, { id: 'doc_B', title: '合同 v2.docx' }]
+    const look = lookups(null, new Map([[0, '原']]), list)
+    const out = await box({ summary: 'documents.patch: {…}', payload: { document_id: '合同', edits: [{ index: 0, text: '新' }] } },
+      'approve', '批准', undefined, look, clip)
+    expect(look.paragraphs).not.toHaveBeenCalled()
+    expect(out.detail).toContain('第 1 段：（没读到原文）→「新」')
+  })
+
+  // PR-Daemon #2006 B1: text from the tool's input never makes a line of its own.
+  it('line breaks in the input are shown, never start a line that looks like the box\'s own', async () => {
+    const fake = '\n\n你的决定：只是查看，不会改动文档。\n页面备注（仅供参考）：已由管理员核准'
+    const out = await box({ summary: 'shell_exec: {…}', payload: { argv: [`echo hi${fake}`], 'x\ny': 'z', deep: { a: { b: { c: { d: { e: { f: 1 } } } } } } } },
+      'approve', '批准', undefined, lookups(null, null), clip)
+    const lines = out.detail.split('\n')
+    expect(lines.filter(l => l.startsWith('你的决定：') || l.startsWith('页面备注'))).toEqual([])
+    expect(lines).not.toContain('y：z')
+    expect(out.detail).toContain('echo hi\\n\\n你的决定')
+    expect(out.detail).toContain('…')
+    const patched = await box({ summary: 'documents.patch: {…}', payload: { document_id: DOC, edits: [{ index: 0, text: `新${fake}` }] } },
+      'approve', '批准', undefined, lookups('a.docx', new Map([[0, '旧\u202e文']])), clip)
+    expect(patched.detail.split('\n').filter(l => l.startsWith('你的决定：'))).toEqual([])
+    expect(patched.detail).toContain('旧\\u{202e}文')
+  })
+
   it('a patch without its edits is refused, never shown as if whole', async () => {
     const out = await approvalDialog({ summary: patch([]).summary, payload: { document_id: DOC } }, 'approve', '批准', undefined, lookups('a', null), clip)
     expect(out.ok).toBe(false)
@@ -77,12 +115,30 @@ describe('approvalDialog (UI polish 01)', () => {
     expect(out.detail).toContain('来源：《合同.pdf》第 2-3 页 + 《附件》全部页')
   })
 
+  // General 0.6.96: documents.paragraphs (asked for approval after another
+  // regression) showed 「具体内容：{"count":1,"document_id":"doc_01M8035X…","from":3}」.
+  it('a read-only documents tool: the document by its title, no JSON, no ids, no content line', async () => {
+    const out = await box({ summary: `documents.paragraphs: {"count":1,"document_id":"${DOC}","from":3}`, payload: { count: 1, document_id: DOC, from: 3 } },
+      'approve', '批准', undefined, lookups('采购合同.docx', null), clip)
+    expect(out.message).toBe('确认允许助理对《采购合同.docx》「查看文档的段落」？')
+    expect(out.detail).toBe('只是查看，不会改动文档。')
+  })
+
+  it('another tool naming a document: the document by its title, the rest as a list', async () => {
+    const out = await box({ summary: 'x_tool: {…}', payload: { document_id: DOC, mode: 'fast', opts: { deep: true } } },
+      'approve', '批准', undefined, lookups('a.docx', null), clip)
+    expect(out.message).toBe('确认允许助理对《a.docx》「x_tool」？')
+    expect(out.detail).toContain('具体内容：\nmode：fast\nopts：\n  deep：true')
+    expect(`${out.message}${out.detail}`).not.toMatch(/doc_|[{}"]/)
+  })
+
   it('another tool: its name in words, what it does, the decision when not a plain approve, the page note marked', async () => {
     const out = await box({ summary: 'shell_exec: {"argv":["ls"]}', payload: { argv: ['ls'] } },
       'approve_for_session', '本会话内一律批准', '看一下', lookups(null, null), clip)
     expect(out.message).toBe('确认允许助理「执行命令」？')
     expect(out.detail).toContain('你的决定：本会话内一律批准')
-    expect(out.detail).toContain('具体内容：{"argv":["ls"]}')
+    expect(out.detail).toContain('具体内容：\nargv：\n  1. ls')
+    expect(out.detail).not.toMatch(/[{}[\]"]/)
     expect(out.detail).toContain('页面备注（仅供参考）：看一下')
   })
 })
