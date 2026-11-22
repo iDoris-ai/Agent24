@@ -333,7 +333,11 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
   const label = t(labelOf(status))
   // A completed run's answer, with only what its record backs (as replies
   // are, Chat.tsx): the answer may name sources the run never read.
-  const checked = status === 'completed' && view?.output ? grounding(view.output, view.knowledge) : null
+  const grounded = status === 'completed' && view?.output ? grounding(view.output, view.knowledge) : null
+  // UI polish 05 (FU-153 on the card): a document instruction is not searched
+  // first (as in the bubble, #1997), so 「没有检索知识库」 says nothing there.
+  // Unread sources still show.
+  const checked = grounded?.kind === 'notSearched' && view?.documents?.attempted === true && grounded.unread.length === 0 ? null : grounded
   return (
     <div className={`task-card${active ? ' active' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>

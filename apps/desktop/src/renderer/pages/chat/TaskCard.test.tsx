@@ -11,6 +11,7 @@ import { HandOver, TaskCards, approvalArgs, approvalText, elapsed, patchOriginal
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
 import { setLocale } from '../../i18n'
+import { chatMessages } from '../Chat.i18n'
 import ChatPage from '../Chat'
 
 // M4 A4: a conversation's tasks as cards, against main's real store and a
@@ -386,6 +387,23 @@ describe('task cards (M4 A4)', () => {
     fireEvent.click(button)
     expect(await screen.findByRole('alert')).toHaveTextContent('这条已处理')
     expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'approve' })
+  })
+
+  // UI polish 05 (FU-153 on the card): a document instruction is not searched
+  // first, so its card does not say 「没有检索知识库」; a plain question's still does.
+  it.each([
+    ['a document write', { attempted: true, jobs: [] }, false],
+    ['a plain question', undefined, true],
+  ])('「没有检索知识库」 on a completed card: %s', async (_name, documents, said) => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = {
+      status: 'completed', started_at: at, ended_at: at, output: { text: '好的。' },
+      knowledge: { searched: false, read_chunks: [] }, ...(documents ? { documents } : {}),
+    }
+    await show()
+    await waitFor(() => expect(card('已完成')).toHaveTextContent('好的。'))
+    expect(card('已完成').textContent?.includes(chatMessages.zh['knowledge.notSearched'])).toBe(said)
   })
 
   it('shows a completed task\'s answer with only the sources its run read (Knowledge\'s review)', async () => {
