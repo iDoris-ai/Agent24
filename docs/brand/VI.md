@@ -1,6 +1,6 @@
 # Agent24 视觉识别系统（VI）v0.1 提案
 
-> 状态：v0.1 已定（2026-11-22）：App 图标改用「昼夜环」；菌丝绿只做辅助色（隐私语义 / 菌丝图形），不作第二品牌色。预览页：[`vi-preview.html`](vi-preview.html)（浏览器直接打开）。
+> 状态：v0.2（2026-11-23）：主标由「昼夜环」改为「菌丝节点」（昼夜环像 iOS 指南针，David 否决）；菌丝绿只做辅助色（隐私语义 / 菌丝图形），不作第二品牌色。预览页：[`vi-preview.html`](vi-preview.html)（浏览器直接打开）。
 > 本稿只定规范，不改产品代码；落地见 §9。
 
 ## 1. 依据：定位与目标
@@ -35,24 +35,26 @@
 
 ## 3. 标志
 
-### 3.1 主标「昼夜环」
-- 由 24 段刻度组成的表盘（一天 24 小时）：0 / 6 / 12 / 18 时为长主刻度，其余为短刻度；顶部 1 段点亮为琥珀色并加粗 = 「此刻，它在为你工作」。24 段等长会像「加载中」转圈，所以用表盘式。
-- 环心一个实心圆点 = 本地 daemon（本体）；环 = 各种外壳围绕它。
-- 刻度间隙象征菌丝节点，可延伸成 Hyphae 网络图形（§6）。
+### 3.1 主标「菌丝节点」
+- 琥珀核心 = 你本机的 Agent（本体，一直在）；核心里写「24」= 全天候。
+- 三条菌丝连到三个节点 = 它的外壳（桌面、手机、终端）和其他 Agent（Hyphae 通信）。呼应母品牌 Mycelium 的菌丝意象，可延伸成 Hyphae 网络图形（§6）。
+- 核心带一圈很淡的琥珀光晕（只在 App 图标上），对应「守夜的灯」。
 - 文字标：`Agent24`，「24」使用等宽数字字形，与 Agent 同字重，不加粗不变色。
+- 历史：v0.1 的「昼夜环」（24 段刻度表盘）看起来像指南针 / 钟表，已废弃。
 
 ### 3.2 变体
 | 变体 | 用途 |
 |---|---|
-| 横版组合（环 + 字标） | 官网、README 头图、安装器 |
-| 单环 | App 图标、托盘、favicon |
-| 托盘模板图（单色） | macOS 菜单栏，用 Template Image 跟随系统明暗。16pt 放不下 24 段，用简化版：细圆环 + 顶部加粗一段 + 中心点 |
+| App 图标（核心带「24」） | Dock、Finder、关于页；64px 及以上 |
+| 小尺寸版（不带数字，线和节点加粗） | 32px 及以下的 App 图标、侧栏主标、favicon：数字在这个尺寸会糊 |
+| 横版组合（主标 + 字标） | 官网、README 头图、安装器 |
+| 托盘模板图（单色） | macOS 菜单栏，用 Template Image 跟随系统明暗；核心 + 三条菌丝 + 三个节点，不带数字 |
 | 像素版（16×16 / 32×32） | Pet0、TUI 启动画面、像素风场景 |
-| 字符版 `◖A24◗` / `( • )` | TUI / CLI 纯文本 |
+| 字符版 `( • )` | TUI / CLI 纯文本 |
 
 ### 3.3 规则
-- 安全区：四周留出环直径的 1/4。最小尺寸：单环 16px，横版 96px 宽。
-- 禁止：改刻度数、点亮多段、加渐变 / 外发光、拉伸、改成蘑菇形状（蘑菇是 MushroomDAO 的标，见 TRADEMARK）。
+- 安全区：四周留出主标宽度的 1/4。最小尺寸：主标 16px，横版 96px 宽。
+- 禁止：增减菌丝或节点数、把节点也涂成琥珀色（琥珀只有核心一处）、在小尺寸版里塞数字、拉伸、改成蘑菇形状（蘑菇是 MushroomDAO 的标，见 TRADEMARK）。
 
 ### 3.4 iDoris 角色
 iDoris 像素少女保留为**角色（mascot）**，不是 logo。用于：欢迎页、空状态、Pet0、主动提醒。Logo 负责「可靠」，角色负责「亲近」，两者不互相替代。
@@ -62,7 +64,7 @@ iDoris 像素少女保留为**角色（mascot）**，不是 logo。用于：欢�
 ### 4.1 品牌色
 | 名称 | HEX | 用途 |
 |---|---|---|
-| 守夜琥珀 Lamp Amber | `#E8C547` | 主强调、点亮刻度、主按钮、焦点（沿用现值） |
+| 守夜琥珀 Lamp Amber | `#E8C547` | 主强调、主标核心、主按钮、焦点（沿用现值） |
 | 琥珀深 Amber Deep | `#B89A10` | 浅色模式下的强调色（沿用现值，保证对比度） |
 | 夜墨 Night Ink | `#0A0A0A` | 深色背景（默认） |
 | 纸白 Paper | `#F4F4EF` | 浅色背景，带一点暖 |
@@ -100,7 +102,7 @@ CSS token：`--local` `--remote` `--approve`，拒绝用既有的 `--danger`。`
 - **刻度**：24 等分短线，用作进度、时间轴、加载（替代转圈 spinner：一格一格点亮）。
 - **菌丝线**：1px 有机曲线连接节点，只用于 Hyphae 通信、记忆关联、知识图谱。
 - **像素**：只服务 iDoris 与 Pet0，不进入功能界面的图标。
-- 图标：线性 1.5px 描边、圆角端点、24px 网格（Lucide 风格即可），与刻度同粗。
+- 图标：线性 1.5px 描边、圆角端点、24px 网格（Lucide 风格即可）。
 - 圆角：控件 8px、卡片 12px、弹层 14px。阴影只在浅色模式用，深色模式用 1px 边框表达层级。
 
 ## 7. 动效
@@ -116,9 +118,10 @@ CSS token：`--local` `--remote` `--approve`，拒绝用既有的 `--danger`。`
 ## 9. 落地（建议分片，每片 ≤300 行）
 1. `VI-01` ✅ 在 `apps/desktop/src/renderer/styles.css` 的 `:root` 与 `.app.light` 新增 `--local / --remote / --approve / --font-mono / --radius-card`，并把散落的硬编码成功 / 错误色改用 `--success / --danger`。
 2. `VI-02` 隐私徽标组件：聊天回合、Runs 列表显示 本地 / 远端。
-3. `VI-03` ✅ 昼夜环资产：`docs/brand/{mark-dark,mark-light,app-icon,tray-template}.svg`，由 `docs/brand/src/gen-svg.py` 生成，`docs/brand/src/render.sh` 导出 `apps/desktop/assets/` 下的 `icon.png / icon.icns / logo-square-1024.png / trayTemplate{,@2x}.png`。侧栏改用 `BrandMark` 组件（跟随主题色），托盘在 macOS 显示模板图标。像素版留给 Pet0，未做。
-4. `VI-04` TUI 色板对齐（ratatui 用同一组 HEX 的 256 色近似）。
+3. `VI-03` ✅ 标志资产（当时是昼夜环，已被 VI-05 替换）：`docs/brand/{mark-dark,mark-light,app-icon,tray-template}.svg`，由 `docs/brand/src/gen-svg.py` 生成，`docs/brand/src/render.sh` 导出 `apps/desktop/assets/` 下的 `icon.png / icon.icns / logo-square-1024.png / trayTemplate{,@2x}.png`。侧栏改用 `BrandMark` 组件（跟随主题色），托盘在 macOS 显示模板图标。像素版留给 Pet0，未做。
+4. `VI-05` ✅ 主标换成菌丝节点：同一组文件重新生成，新增 `app-icon-small.svg`（32px 及以下用）；`BrandMark` 组件改画菌丝节点。
+5. TUI 色板对齐（ratatui 用同一组 HEX 的 256 色近似）。
 
 ## 10. 已定
-- App 图标用「昼夜环」，iDoris 保留为角色。小尺寸下要避免像加载转圈：点亮段加粗，出 SVG 时再验证 16/32px。
+- App 图标用「菌丝节点」（核心里写 24），iDoris 保留为角色。32px 及以下不带数字。
 - 菌丝绿只做辅助色，不进营销主视觉。

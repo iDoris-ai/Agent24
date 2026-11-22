@@ -1007,7 +1007,7 @@ app.whenReady().then(async () => {
   })
 
   // ── System tray (M2 base; F1b: live daemon status + start/stop/restart) ────
-  // macOS: the VI 昼夜环 as a Template Image (assets/trayTemplate{,@2x}.png,
+  // macOS: the VI 菌丝节点 mark as a Template Image (assets/trayTemplate{,@2x}.png,
   // made by docs/brand/src/render.sh) next to the status title; the system
   // recolours it for light / dark menu bars. Elsewhere still empty until a
   // Windows / Linux icon is made.
