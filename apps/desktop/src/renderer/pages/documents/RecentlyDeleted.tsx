@@ -30,7 +30,10 @@ export default function RecentlyDeleted({ version, onRestored }: { version: numb
     setError(null)
     const res = await api.request({ op: 'restore', documentId: d.document_id }).catch(() => null)
     setBusy(null)
-    if (!res || !res.ok) setError(t('trash.restoreFailed', { title: d.title, error: res ? describeError(res) : '' }))
+    // Past its 7 days (the module answers not found): it cannot be restored,
+    // and is never said to be erased; its bytes stay until a blob GC (FU-177).
+    if (res && !res.ok && res.error.code === 'not_found') setError(t('trash.expired', { title: d.title }))
+    else if (!res || !res.ok) setError(t('trash.restoreFailed', { title: d.title, error: res ? describeError(res) : '' }))
     else onRestored()
     setReread((n) => n + 1)
   }
