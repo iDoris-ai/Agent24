@@ -241,8 +241,11 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
+    // L6-F2: `delete` writes in one transaction (`trash::delete`): dropped
+    // at the deadline it rolls back or has committed; a retry of a committed
+    // one answers not_found (already deleted), never a second delete.
     // Dropping `work` at the deadline is safe: every operation but `extract`
-    // only reads (a pool wait, a query, a blob; `extraction_get` one
+    // (and `delete`, above) only reads (a pool wait, a query, a blob; `extraction_get` one
     // read-only transaction, rolled back when dropped). Storage they find
     // unavailable may be reopened first, which writes (migrations,
     // `jobs::recover`, the header's `user_version`), and `read_range` /
