@@ -302,4 +302,13 @@ describe('L6-F2: deleting a whole document, and what is not', () => {
   ])('chat, a question or a split: %s', (text) => {
     expect(asksDeleteDocument(text, false)).toBe(false)
   })
+  // PR-Daemon #2028 ①: not to delete, many documents, or a part of one.
+  it.each([
+    '先别删掉这份', '不用删了', '不要删除这份文档', '删除所有文件', '把这些文件全部删除',
+    '删掉最后一页', '删掉前两页', '删除最后两页', '删掉页眉', '删掉表格', '把封面删了', '把多余的空行删了', '移除密码', '删掉签名',
+  ])('%s is not deleting one whole document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(false)
+    expect(asksDeleteDocument(text, false)).toBe(false)
+    expect(docAgentPrompt(null, text)).not.toContain('documents.delete')
+  })
 })

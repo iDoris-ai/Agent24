@@ -44,7 +44,7 @@ describe('approvalDialog (UI polish 01)', () => {
 
   it('a delete whose document cannot be read says so, never a guess', async () => {
     const out = await box({ summary: `documents.delete: {"document_id":"${DOC}"}`, payload: { document_id: DOC } }, 'approve', '批准', undefined, lookups(null, null), clip)
-    expect(out.message).toBe('确认让助理删除《这份文档》？')
+    expect(out.message).toBe('确认让助理删除这份文档？')
     expect(out.detail).toContain('没读到这份文档')
   })
 

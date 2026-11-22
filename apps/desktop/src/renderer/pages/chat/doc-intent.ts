@@ -116,13 +116,15 @@ const DELETE_VERB = /删除|删掉|删了|删去|移除/
 /** …a document (in a conversation about one, any 「删了」 is about it)… */
 const DOC_NOUN = /《[^》]{1,200}》|[这那该此]一?[份篇]|[这那该此]一?个(?:文件|文档)|上一份|文件|文档|PDF|pdf|docx?/
 /** …not a part of one: a paragraph, a sentence, a page is a rewrite or a split. */
-const DOC_PART = /第\s*[\d一二两三四五六七八九十百]+\s*[段句行条页章节款项处]|[这那]一?[段句行条页处]|句话|段话|里的|中的|里面|部分|内容|文字|字号|标点|空格|批注|修订|水印/
+const DOC_PART = /第\s*[\d一二两三四五六七八九十百]+\s*[段句行条页章节款项处]|[这那]一?[段句行条页处]|句话|段话|里的|中的|里面|部分|内容|文字|字号|标点|空格|批注|修订|水印|最后|[前后]\s*[\d一二两三四五六七八九十]*\s*[页段行]|封面|页眉|页脚|表格|图片|空行|签名|密码|目录|附件/
+/** PR-Daemon #2028 ①: 「先别删」「不用删了」 say not to; 「删除所有文件」 is not one document. */
+const DELETE_NOT = /不要|别|不用|无需|不必|取消|所有|全部|都/
 const DELETE_QUESTION = /怎么|如何|能不能|可以吗|还能|吗|呢|[？?]/
 
 /** Whether a turn asks to delete a whole document (「把这份删了」「删除上一份拆出来的文件」).
  * 「删掉第 3 段」「删掉这句话」 are rewrites and 「怎么删除文档？」 a question: not this. */
 export function asksDeleteDocument(text: string, inDocument: boolean): boolean {
-  return DELETE_VERB.test(text) && (inDocument || DOC_NOUN.test(text)) && !DOC_PART.test(text) && !DELETE_QUESTION.test(text)
+  return DELETE_VERB.test(text) && !DELETE_NOT.test(text) && (inDocument || DOC_NOUN.test(text)) && !DOC_PART.test(text) && !DELETE_QUESTION.test(text)
 }
 
 /** Whether a turn goes to the Agent with the documents tools. */

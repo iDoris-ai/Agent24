@@ -193,15 +193,18 @@ export async function approvalDialog(
     // by main; the kernel lets only an id through (FU-136), so no name lookup.
     const ref = str(args['document_id'])
     const facts = isDocId(ref) ? await lookups.detail(ref).catch(() => null) : null
-    message = say('approval.title.delete', { doc: facts?.title || mt('approval.someDocument') })
+    message = facts ? say('approval.title.delete', { doc: facts.title }) : mt('approval.title.deleteUnread')
     if (!facts) lines.push(mt('approval.delete.unread'))
     else {
       const at = localTime(facts.importedAt)
       const pages = facts.pages === null ? mt('approval.delete.pagesUnknown') : mt('approval.delete.pages', { n: facts.pages })
       lines.push(mt('approval.delete.facts', { pages, at }))
-      const library = (await lookups.list().catch(() => null)) ?? []
-      const same = library.filter(d => d.id !== ref && plainTitle(d.title) === plainTitle(facts.title)).length
-      if (same > 0) lines.push(mt('approval.delete.sameTitle', { n: same, at }))
+      // PR-Daemon #2028 L1: a library not read whole is said so, never
+      // taken for 「no other document has this title」.
+      const library = await lookups.list().catch(() => null)
+      const same = library ? library.filter(d => d.id !== ref && plainTitle(d.title) === plainTitle(facts.title)).length : 0
+      if (!library) lines.push(mt('approval.delete.sameUnknown'))
+      else if (same > 0) lines.push(mt('approval.delete.sameTitle', { n: same, at }))
     }
     lines.push(mt('approval.delete.restorable'))
   } else if (tool === 'documents.fill') {
