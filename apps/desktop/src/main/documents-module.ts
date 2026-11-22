@@ -397,6 +397,31 @@ export function modulesToReplaceWhileStopped<T>(items: readonly T[], outcomes: r
   return items.filter((_, i) => outcomes[i] === 'install_failed')
 }
 
+/** General 0.6.96: an upgrade that brings a store migration could not replace
+ *  the carried modules before the daemon started: the CLI opens the store
+ *  without migrating it and refuses one behind its schema. The old documents
+ *  program then ran, and its reads, no longer the bundled bytes, asked for
+ *  approval each time. In App-managed mode, once the daemon is up (it has
+ *  migrated the store), stop it, replace the modules that failed, and start it
+ *  again. Service mode replaces them through its own stop (above). */
+export async function replaceAfterDaemonStart<T extends { spec: BundledOsSpec; deps: BundledModuleDeps }>(
+  failed: readonly T[],
+  host: {
+    /** The daemon this app runs is up (or the wait gave up). */
+    ready: () => Promise<void>
+    /** Stops this app's daemon, runs `work`, starts it again. */
+    whileStopped: <R>(work: () => Promise<R>) => Promise<R>
+    /** A daemon this app does not run (service mode, or one started by hand). */
+    external: () => boolean
+  },
+  ensure: (items: readonly T[]) => Promise<BundledModuleOutcome[]> = ensureBundledOsModules,
+): Promise<BundledModuleOutcome[] | null> {
+  if (failed.length === 0) return null
+  await host.ready()
+  if (host.external()) return null
+  return host.whileStopped(() => ensure(failed))
+}
+
 /** `A24_OS_PACKAGES` when set (as the CLI and daemon read it), else `<dataDir>/packages`. */
 export function packagesRootFor(env: NodeJS.ProcessEnv, dataDir: string | null): string | null {
   const over = env['A24_OS_PACKAGES']
