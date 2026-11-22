@@ -6785,7 +6785,7 @@ components:
 
     RunDocuments:
       type: object
-      required: [attempted, jobs]
+      required: [attempted, jobs, failed]
       properties:
         attempted:
           type: boolean
@@ -6795,6 +6795,11 @@ components:
           items:
             type: string
           description: Import jobs of the writes that went through; empty when every one was refused, denied or failed.
+        failed:
+          type: array
+          items:
+            type: string
+          description: The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a later write of the run did make is not listed.
 
     RunKnowledge:
       type: object

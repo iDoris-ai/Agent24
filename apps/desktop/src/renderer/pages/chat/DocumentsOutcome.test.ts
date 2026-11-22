@@ -3,7 +3,8 @@ import { jobOutcome, runDocumentsOf } from './DocumentsOutcome'
 
 describe('runDocumentsOf', () => {
   it('reads the daemon\'s record, nothing else', () => {
-    expect(runDocumentsOf({ attempted: true, jobs: ['job_1', 2] })).toEqual({ attempted: true, jobs: ['job_1'] })
+    expect(runDocumentsOf({ attempted: true, jobs: ['job_1', 2] })).toEqual({ attempted: true, jobs: ['job_1'], failed: [] })
+    expect(runDocumentsOf({ attempted: true, jobs: ['job_1'], failed: ['doc_01B', 3] })).toEqual({ attempted: true, jobs: ['job_1'], failed: ['doc_01B'] })
     expect(runDocumentsOf(undefined)).toBeNull()
     expect(runDocumentsOf({ attempted: false, jobs: [] })).toBeNull()
   })

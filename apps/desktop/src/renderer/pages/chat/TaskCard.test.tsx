@@ -250,6 +250,26 @@ describe('task cards (M4 A4)', () => {
     }
   })
 
+  // General 0.6.94: the card said 「以修订方式改写 doc_01M8035X… 的 1 段」.
+  it('names the document of a patch by its title, not its id', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: 'documents.patch: {"document_id":"doc_01M8035X","edits":[{"anchor":"第三条 押金为两个月租金","index":5,"text":"新文字","tracked":true}]}',
+    }]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'get'
+      ? { ok: true, data: { document_id: 'doc_01M8035X', title: '合同-真实结构.docx' } }
+      : { ok: true, data: { paragraphs: [{ index: 5, text: '第三条 押金为两个月租金，合同期满无违约时全额退还。', in_table: false }] } })
+    ;(window.agent24 as unknown as { documents: unknown }).documents = { request }
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    // The line that asks (the raw summary stays under 「详情」).
+    await waitFor(() => expect(c.querySelector('.task-card-ask')?.textContent).toContain('合同-真实结构.docx'))
+    expect(c.querySelector('.task-card-ask')?.textContent).not.toContain('doc_01M8035X')
+  })
+
   // PR-Daemon #1986 A: a patch whose edits cannot all be read (no payload,
   // summary cut) is not offered for approval; with its payload it is.
   it.each([
@@ -679,6 +699,11 @@ describe('approvalText (D2b)', () => {
     const cut = approvalArgs({ summary })
     expect(cut.complete).toBe(false)
     expect(approvalText({ summary }, t)).toContain('task.ask.atLeast')
+    // General 0.6.94: a document id is named by its title when it is known.
+    const byId = { summary: 'documents.patch: x', payload: { document_id: 'doc_01M8035X', edits: [{ index: 12, anchor: 'a', text: 'b', tracked: true }] } }
+    expect(approvalText(byId, t, null, new Map([['doc_01M8035X', '合同-真实结构.docx']])).split('\n')[0])
+      .toBe('task.ask.patchTracked{"doc":"合同-真实结构.docx","n":"1"}')
+    expect(approvalText(byId, t).split('\n')[0]).toBe('task.ask.patchTracked{"doc":"doc_01M8035X","n":"1"}')
     // PR-Daemon #1987 Low 2: a patch payload without its edits is not whole.
     expect(approvalArgs({ summary, payload: { document_id: '合同.docx' } }).complete).toBe(false)
   })

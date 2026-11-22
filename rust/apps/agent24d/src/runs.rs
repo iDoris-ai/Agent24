@@ -337,6 +337,11 @@ struct RunDetail {
 struct RunDocuments {
     attempted: bool,
     jobs: Vec<String>,
+    /// General 0.6.94: the documents a write was asked for and none went
+    /// through (each as the call named it: a document id, a file name, or a
+    /// new document's title), so a run that made A and failed on B says both.
+    /// A document a later write did make is not here.
+    failed: Vec<String>,
 }
 
 /// The documents operations that only read.
@@ -363,6 +368,8 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
     let mut names = std::collections::HashMap::new();
     let mut attempted = false;
     let mut jobs = Vec::new();
+    let mut made = std::collections::HashSet::new();
+    let mut tried: Vec<String> = Vec::new();
     for m in messages {
         if m.role == "assistant" {
             for call in m.tool_calls.as_array().into_iter().flatten() {
@@ -370,7 +377,7 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
                     call.get("id").and_then(|v| v.as_str()),
                     call.get("name").and_then(|v| v.as_str()),
                 ) {
-                    names.insert(id.to_owned(), name.to_owned());
+                    names.insert(id.to_owned(), (name.to_owned(), write_target(call)));
                 }
             }
             continue;
@@ -378,7 +385,7 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         if m.role != "tool" {
             continue;
         }
-        let Some(name) = m.tool_call_id.as_ref().and_then(|id| names.get(id)) else {
+        let Some((name, target)) = m.tool_call_id.as_ref().and_then(|id| names.get(id)) else {
             continue;
         };
         if !is_document_write(name) {
@@ -396,9 +403,40 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
                     .and_then(|j| j.as_str())
                     .map(str::to_owned)
             });
-        jobs.extend(job);
+        match job {
+            Some(job) => {
+                jobs.push(job);
+                made.insert(target.clone());
+            }
+            None if !tried.contains(target) => tried.push(target.clone()),
+            None => {}
+        }
     }
-    attempted.then_some(RunDocuments { attempted, jobs })
+    let failed = tried
+        .into_iter()
+        .filter(|t| !t.is_empty() && !made.contains(t))
+        .collect();
+    attempted.then_some(RunDocuments {
+        attempted,
+        jobs,
+        failed,
+    })
+}
+
+/// The document a write call was aimed at, as the call named it: its
+/// `document_id` (an id or a file name), else the new document's `title`.
+fn write_target(call: &serde_json::Value) -> String {
+    let arguments = call.get("arguments");
+    let parsed = match arguments {
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s).unwrap_or_default(),
+        Some(v) => v.clone(),
+        None => serde_json::Value::Null,
+    };
+    ["document_id", "title"]
+        .iter()
+        .find_map(|k| parsed.get(k).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_owned()
 }
 
 pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> Response {
@@ -621,7 +659,8 @@ mod documents_tests {
             run_documents(&denied),
             Some(RunDocuments {
                 attempted: true,
-                jobs: vec![]
+                jobs: vec![],
+                failed: vec![]
             })
         );
         // The module's own refusal and an error: asked, no job.
@@ -635,7 +674,8 @@ mod documents_tests {
             run_documents(&refusals),
             Some(RunDocuments {
                 attempted: true,
-                jobs: vec![]
+                jobs: vec![],
+                failed: vec![]
             })
         );
         // Sent back, then retried right: the job.
@@ -649,7 +689,8 @@ mod documents_tests {
             run_documents(&retried),
             Some(RunDocuments {
                 attempted: true,
-                jobs: vec!["job_1".into()]
+                jobs: vec!["job_1".into()],
+                failed: vec![]
             })
         );
         // PR-Daemon #1986 Low 1: the same call id reused, a read then a write:
@@ -664,7 +705,8 @@ mod documents_tests {
             run_documents(&reused),
             Some(RunDocuments {
                 attempted: true,
-                jobs: vec!["job_1".into()]
+                jobs: vec!["job_1".into()],
+                failed: vec![]
             })
         );
         let reused_back = [
@@ -677,8 +719,60 @@ mod documents_tests {
             run_documents(&reused_back),
             Some(RunDocuments {
                 attempted: true,
-                jobs: vec![]
+                jobs: vec![],
+                failed: vec![]
             })
+        );
+        // General 0.6.94: two documents in one run, A made, B refused by the
+        // module (a pending revision): both told. A's earlier refusal is not
+        // a failure once A was made.
+        let to = |id: &str, doc: &str| {
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": id, "name": "documents.patch",
+                         "arguments": format!("{{\"document_id\": \"{doc}\", \"edits\": []}}") }]),
+                None,
+            )
+        };
+        let two = [
+            to("g", "doc_A"),
+            msg("tool", Some(refused), json!([]), Some("g")),
+            to("h", "doc_A"),
+            msg("tool", Some(job), json!([]), Some("h")),
+            to("i", "doc_B"),
+            msg(
+                "tool",
+                Some(
+                    r#"{"kind":"completed","payload":{"written":false,"reason":"invalid_request"}}"#,
+                ),
+                json!([]),
+                Some("i"),
+            ),
+            to("j", "doc_B"),
+            msg("tool", Some("tool error: failed: {}"), json!([]), Some("j")),
+        ];
+        assert_eq!(
+            run_documents(&two),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_1".into()],
+                failed: vec!["doc_B".into()]
+            })
+        );
+        // A compose names its new document by title.
+        let compose = [
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "k", "name": "documents.compose", "arguments": { "title": "周报" } }]),
+                None,
+            ),
+            msg("tool", Some("tool error: failed: {}"), json!([]), Some("k")),
+        ];
+        assert_eq!(
+            run_documents(&compose).map(|d| d.failed),
+            Some(vec!["周报".to_owned()])
         );
         // fill and a later write operation are writes too.
         assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));

@@ -653,9 +653,23 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
     }
     let req: crate::patch::PatchRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    let (_, job) = crate::patch::patch_run(&storage, id.clone(), req)
-        .await
-        .map_err(|e| refused(&e))?;
+    let (_, job) = match crate::patch::patch_run(&storage, id.clone(), req).await {
+        Ok(made) => made,
+        // General 0.6.94: a paragraph the rewrite would damage (a pending
+        // revision, a formula, a page break, ...) came back as a bare
+        // `invalid_request`, and the model said the document was made. The
+        // model is told what was refused and why, in words it can pass on.
+        Err(e) if matches!(e.code(), "invalid_request" | "revision_conflict") => {
+            let why = refusal_in_words(&e);
+            return completed::<Value>(Ok(serde_json::json!({
+                "written": false,
+                "reason": e.code(),
+                "detail": e.message(),
+                "message": format!("【未完成】这份文档没有改，也没有生成新文档：{why}。请如实告诉用户这一份没改成和原因，不要说已生成或已完成。"),
+            })));
+        }
+        Err(e) => return Err(refused(&e)),
+    };
     let answer = settled(&storage, job.0).await;
     if answer["status"] == "succeeded"
         || answer["status"] == "queued"
@@ -996,6 +1010,47 @@ async fn admit(
 
 /// A service error under its own code (ADR-DOC-02 §6): the kernel keeps an
 /// unknown code as `module_code`, and keeps `retryable` as given.
+/// Why a patch was refused, in words for the user (General 0.6.94).
+fn refusal_in_words(e: &ApiError) -> String {
+    let m = e.message();
+    if e.code() == "revision_conflict" {
+        return "这一段在读取之后被改过，需要重新读取段落".to_owned();
+    }
+    const KINDS: &[(&str, &str)] = &[
+        ("w:del", "已有未处理的修订（删除痕迹）"),
+        ("w:ins", "已有未处理的修订（插入痕迹）"),
+        ("m:oMath", "公式"),
+        ("picture", "图片"),
+        ("embedded object", "嵌入对象"),
+        ("link", "链接"),
+        ("field", "域（自动编号、页码等）"),
+        ("footnote", "脚注"),
+        ("endnote", "尾注"),
+        ("content control", "内容控件"),
+        ("text box", "文本框"),
+        ("page or column break", "分页符或分栏符"),
+        ("comment reference", "批注"),
+    ];
+    if let Some(rest) = m.strip_prefix("paragraph ")
+        && let Some((index, what)) = rest.split_once(" contains ")
+    {
+        let what = KINDS
+            .iter()
+            .find(|(k, _)| what.contains(k))
+            .map_or("Word 的特殊内容", |(_, zh)| zh);
+        let n = index
+            .parse::<usize>()
+            .map_or_else(|_| index.to_owned(), |i| (i + 1).to_string());
+        return format!(
+            "第 {n} 段里有{what}，自动改写会把它弄丢，所以没有改；这一段请在 Word 或 WPS 里手动修改"
+        );
+    }
+    if m.contains("out of range") || m.contains("no paragraph") {
+        return "段落编号超出了这份文档的范围".to_owned();
+    }
+    "改写请求不符合要求".to_owned()
+}
+
 fn refused(e: &ApiError) -> Envelope {
     Envelope::error(e.code(), e.retryable())
 }
@@ -1547,6 +1602,47 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    #[tokio::test]
+    async fn a_refused_patch_tells_the_model_what_and_why() {
+        // General 0.6.94: 「第二条 押金…」 holds a pending deletion (w:del); the
+        // rewrite was refused as a bare invalid_request and the model said
+        // the document was made. Now: not written, and why, in words.
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let file: &[u8] = include_bytes!("../tests/fixtures/contract-formula-revision-break.docx");
+        let sha = storage.blobs.put_bytes(file).unwrap().sha256;
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6Y00079";
+        let docx = crate::office::DOCX;
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                        VALUES ('{id}', '合同-公式修订分页.docx', '{docx}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                file.len()
+            ),
+        )
+        .await;
+        let body = json!({ "document_id": id, "edits": [{
+            "index": 2, "anchor": "第二条 押金为两个月租金，期满退还。",
+            "text": "第二条 押金金额为两个月租金总额，租赁期满后予以全额返还。", "tracked": true }] });
+        let answer = call_in(&state, "patch", &[id], body).await;
+        let answer = payload(&answer);
+        assert_eq!(answer["written"], false, "{answer}");
+        assert_eq!(answer["reason"], "invalid_request");
+        let message = answer["message"].as_str().unwrap();
+        assert!(
+            message.contains("没有改") && message.contains("第 3 段") && message.contains("修订"),
+            "{message}"
+        );
+        let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(uploads, 0);
     }
 
     /// M1 (c), General 11-21: an Agent's edit names its paragraph by index and
