@@ -890,8 +890,9 @@ fn resource(op: &str) -> Option<Resource> {
 /// its id. For `get` and `compose`, a `document_id` that is not an id is
 /// looked up among the titles of the documents in `scope`: the one whose
 /// title, without extension, case and 《》, equals it (or else the only one
-/// containing it) stands for it. Anything else is left as it was, and the
-/// service answers not found.
+/// containing it) stands for it. A name nothing answers to is left as it
+/// was, and the service answers not found. FU-136: a name several answer to
+/// is never resolved; the call is answered with them, see [`ambiguous`].
 async fn named_by_title(
     state: &AppState,
     scope: &Scope,
@@ -916,43 +917,75 @@ async fn named_by_title(
         return Ok(());
     }
     let storage = ready(state).await?;
-    let rows: Vec<(String, String)> =
-        sqlx::query_as("SELECT id, title FROM documents WHERE deleted_at IS NULL")
-            .fetch_all(storage.db.pool())
-            .await
-            .map_err(|_| refused(&ApiError::internal("cannot read the titles")))?;
-    let titles: Vec<(String, String)> = rows
+    // Newest first, so the candidates read in the order the library shows.
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, title, created_at FROM documents WHERE deleted_at IS NULL
+         ORDER BY created_at DESC, id DESC",
+    )
+    .fetch_all(storage.db.pool())
+    .await
+    .map_err(|_| refused(&ApiError::internal("cannot read the titles")))?;
+    let titles: Vec<(String, String, String)> = rows
         .into_iter()
-        .filter(|(id, _)| scope.allows_document(id))
-        .map(|(id, title)| (id, plain_title(&title)))
+        .filter(|(id, _, _)| scope.allows_document(id))
         .collect();
     for slot in slots {
-        let wanted = plain_title(slot.as_str().unwrap_or_default());
+        let name = slot.as_str().unwrap_or_default().to_owned();
+        let wanted = plain_title(&name);
         if wanted.is_empty() {
             continue;
         }
-        let only = |hits: Vec<&String>| (hits.len() == 1).then(|| hits[0].clone());
-        let exact = only(
+        let exact: Vec<_> = titles
+            .iter()
+            .filter(|(_, t, _)| plain_title(t) == wanted)
+            .collect();
+        let hits = if exact.is_empty() {
             titles
                 .iter()
-                .filter(|(_, t)| *t == wanted)
-                .map(|(id, _)| id)
-                .collect(),
-        );
-        let found = exact.or_else(|| {
-            only(
-                titles
-                    .iter()
-                    .filter(|(_, t)| t.contains(&wanted))
-                    .map(|(id, _)| id)
-                    .collect(),
-            )
-        });
-        if let Some(id) = found {
-            *slot = Value::String(id);
+                .filter(|(_, t, _)| plain_title(t).contains(&wanted))
+                .collect()
+        } else {
+            exact
+        };
+        match hits.as_slice() {
+            [] => {}
+            [(id, _, _)] => *slot = Value::String(id.clone()),
+            several => return Err(ambiguous(&name, several)),
         }
     }
     Ok(())
+}
+
+/// Candidates listed when a name is ambiguous; the count says the rest.
+const CANDIDATES: usize = 10;
+
+/// FU-136: the answer to a call naming a document several answer to. Not an
+/// error envelope: the kernel hands the model only an error's code, and the
+/// model must hear which documents they are and that the user chooses
+/// (General 0.6.72: it picked two split-off copies over the original).
+/// Nothing was run, so a write has no `job_id` and reads as not made.
+fn ambiguous(name: &str, hits: &[&(String, String, String)]) -> Envelope {
+    let shown = name.trim().trim_matches(|c| matches!(c, '《' | '》'));
+    let candidates: Vec<Value> = hits
+        .iter()
+        .take(CANDIDATES)
+        .map(|(id, title, at)| json!({ "document_id": id, "title": title, "imported_at": at }))
+        .collect();
+    let message = format!(
+        "库里有 {} 份文档都对得上《{shown}》，不能确定是哪一份，这次什么都没有做。\
+         请把 candidates 里的标题和导入时间列给用户，让用户选一份，再用那一份的 document_id 调用；\
+         不要自己挑。",
+        hits.len()
+    );
+    Envelope::Completed {
+        payload: json!({
+            "reason": "ambiguous_title",
+            "message": message,
+            "total": hits.len(),
+            "candidates": candidates,
+        }),
+        replayed: false,
+    }
 }
 
 /// A title or a name for it, compared without case, quotes, surrounding
@@ -1609,6 +1642,57 @@ mod tests {
         assert!(!String::from_utf8_lossy(&body).contains("completed"));
         let list = payload(&call_in(&state, "list", &scope, json!({})).await);
         assert_eq!(list["documents"].as_array().unwrap().len(), 1, "{list}");
+    }
+
+    /// FU-136 (General 0.6.72): three documents titled 《中文测试合同.pdf》; a
+    /// merge by that name went on with documents the model picked itself.
+    /// A name several documents answer to is now never resolved: the call
+    /// is answered with the candidates and why, and nothing is written.
+    #[tokio::test]
+    async fn a_name_several_documents_answer_to_lists_them_and_runs_nothing() {
+        let (_dir, state) = opened().await;
+        let a = add_document(&state, 1, "'中文测试合同.pdf'").await;
+        let b = add_document(&state, 2, "'中文测试合同.pdf'").await;
+        let c = add_document(&state, 3, "'中文测试合同.pdf'").await;
+        let split = add_document(&state, 4, "'中文测试合同（第 1 页）'").await;
+        let scope = [a.as_str(), b.as_str(), c.as_str(), split.as_str()];
+        for (op, args) in [
+            ("get", json!({ "document_id": "《中文测试合同.pdf》" })),
+            ("paragraphs", json!({ "document_id": "中文测试合同" })),
+            (
+                "compose",
+                json!({ "parts": [{ "document_id": "中文测试合同.pdf" }, { "document_id": split }] }),
+            ),
+        ] {
+            let answer = payload(&call_in(&state, op, &scope, args).await);
+            assert_eq!(answer["reason"], "ambiguous_title", "{op}: {answer}");
+            let ids: Vec<&str> = answer["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["document_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids.len(), 3, "{answer}");
+            for id in [&a, &b, &c] {
+                assert!(ids.contains(&id.as_str()), "{answer}");
+            }
+            let message = answer["message"].as_str().unwrap();
+            assert!(
+                message.contains("3 份") && message.contains("不要自己"),
+                "{message}"
+            );
+            assert!(answer.get("job_id").is_none(), "{answer}");
+        }
+        // Only in part (「合同」): every document containing it is a candidate.
+        let answer =
+            payload(&call_in(&state, "get", &scope, json!({ "document_id": "测试合同" })).await);
+        assert_eq!(answer["reason"], "ambiguous_title", "{answer}");
+        assert_eq!(answer["candidates"].as_array().unwrap().len(), 4);
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(state.storage().await.unwrap().db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, 0);
     }
 
     #[test]
