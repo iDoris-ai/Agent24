@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksTranslation, docAgentPrompt, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -167,5 +167,47 @@ describe('M1: the four questions PR-Daemon #1915 found taken as splits stay ques
       expect(wantsDocTool(text, true)).toBe(false)
       expect(translatesDocument(text, true)).toBe(false)
     })
+  }
+})
+
+describe('F3: one sentence asks for fields of the document', () => {
+  it.each([
+    ['把这份合同的甲方、乙方、金额、期限抽出来', ['甲方', '乙方', '金额', '期限']],
+    ['这张发票的开票日期和总金额是多少，列出来', ['开票日期', '总金额']],
+    ['从这份通知里找出截止日期和要交的材料', ['截止日期', '要交的材料']],
+    ['把《租赁合同.pdf》的租金、押金抽出来', ['租金', '押金']],
+  ])('%s', (text, fields) => {
+    expect(extractionFields(text, true)).toEqual(fields)
+    expect(parseDocIntent(text)).toBeNull()
+  })
+
+  it('names a document in 《》 outside its conversation', () => {
+    expect(extractionFields('把《租赁合同.pdf》的租金、押金抽出来', false)).toEqual(['租金', '押金'])
+  })
+
+  it('asks to extract without fields the rules can read', () => {
+    expect(extractionFields('把关键信息都抽出来', true)).toEqual(['关键信息'])
+    expect(extractionFields('抽取一下', true)).toEqual([])
+  })
+})
+
+describe('F3: ordinary questions and other tasks are not extractions', () => {
+  for (const [text, inDocument] of [
+    ['这个字段怎么填', true],
+    ['甲方是谁？', true],
+    ['付款期限是多少', true],
+    ['这份合同有什么风险', true],
+    ['找出原因', true],
+    ['把第3页拆出来', true],
+    ['把这份合同翻译成英文', true],
+    ['总结一下这份文件第4页，单独列出金额', true],
+    ['这份文档第2页的关键信息帮我提取一下', true],
+    ['把第 3 段改得正式一点', true],
+    ['列出来几个周末去处', false],
+    ['帮我找出这段代码的日期处理问题', false],
+    ['今天天气怎么样', false],
+    ['你好', false],
+  ] as const) {
+    it(text, () => expect(extractionFields(text, inDocument)).toBeNull())
   }
 })

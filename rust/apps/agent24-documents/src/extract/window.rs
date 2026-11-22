@@ -12,7 +12,9 @@ use crate::text_layer::{Block, TextLayer};
 
 /// One window's blocks, as sent, at most: with the instruction, 20 fields
 /// and the answer's schema, a request stays far inside the kernel's 256 KiB.
-pub const BUDGET: usize = 24 * 1024;
+/// F3 (Loop 6): 7 KiB, not 24, so that with a few fields a request of
+/// Chinese text stays inside the balanced oMLX budget, about 3.5k tokens.
+pub const BUDGET: usize = 7 * 1024;
 /// Fields in one call, at most.
 pub const BATCH: usize = 20;
 

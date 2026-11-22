@@ -154,3 +154,32 @@ export function findByTitle<T extends { document_id: string; title: string; crea
   const best = partial.filter((d) => d.title.length === shortest)
   return best.length === 1 ? { match: best[0] } : { candidates: partial }
 }
+
+/** F3 (Loop 6): 「把这份合同的甲方、乙方、金额、期限抽出来」「…是多少，列出来」
+ * 「从这份通知里找出截止日期和要交的材料」. 找出 alone is everyday too
+ * (「找出原因」), so it counts only with what a document states. */
+const EXTRACT_VERB = /抽出来|抽取|提取出来|摘出来|列出来/
+const FIND_VERB = /找出来?/
+const FIND_WHAT = /日期|时间|期限|金额|价格|费用|总价|总额|名称|编号|号码|地址|电话|材料|联系人|甲方|乙方/
+/** A question about the document (「这个字段怎么填」) or another task. */
+const NOT_EXTRACTION = /怎么|如何|为什么|什么意思|填|改写|改成|改得|翻译|译成|总结|摘要|检查|审查/
+/** 「这份合同的」「这张发票的」「这份通知里」 before the fields. */
+const DOC_PREFIX = /^(?:请|帮我)?\s*(?:把|将|从|在)?\s*(?:这|该|本|此|那)[份张个篇封]?[\u4e00-\u9fa5A-Za-z0-9]{0,8}?(?:里面?的?|中的?|上的?|的)/
+const FIELD_TAIL = /(?:分别|都)?(?:是)?(?:多少|什么|哪些|哪天|几号|哪一天)?[？?]?$/
+
+/** The field names a turn asks to extract from its document: null when it
+ * asks for something else; [] when it asks to extract but names no field
+ * the rules can read (the model is then asked only for the names). */
+export function extractionFields(text: string, inDocument: boolean): string[] | null {
+  if (!aboutDocument(text, inDocument) || NOT_EXTRACTION.test(text) || parseDocIntent(text) !== null) return null
+  const said = text.replace(/《[^》]{1,200}》/g, '这份')
+  const verb = EXTRACT_VERB.exec(said) ?? (FIND_WHAT.test(said) ? FIND_VERB.exec(said) : null)
+  if (!verb) return null
+  const clauses = (s: string) => s.split(/[，。,；;！!\n]/).map((c) => c.trim()).filter(Boolean)
+  const before = clauses(said.slice(0, verb.index))
+  const after = clauses(said.slice(verb.index + verb[0].length))[0]?.replace(/^(?:来|一下|吧|给我)+/, '') ?? ''
+  let list = after.length > 1 ? after : (before[before.length - 1] ?? '')
+  list = list.replace(DOC_PREFIX, '').replace(/(?:帮我|给我|请)?(?:都)?$/, '').replace(FIELD_TAIL, '').replace(/等(?:信息|内容|字段)?$|这些(?:信息|内容|字段)?$/, '')
+  const names = list.split(/以及|还有|[、，,和与及跟/]/).map((n) => n.replace(/^(?:把|将|的)+/, '').trim()).filter((n) => n.length > 0 && n.length <= 30)
+  return [...new Set(names)].slice(0, 20)
+}
