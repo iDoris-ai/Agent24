@@ -29,7 +29,7 @@ import { revokeKernelConsent } from './kernel-consent/kernelConsentApi'
 import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './capabilities/providers'
 import { CapabilitiesContext, NavPrefsContext } from './capabilities/types'
 import { capabilitiesMessages } from './capabilities/capabilities.i18n'
-import logoSidebar from './assets/logo-sidebar.png'
+import { BrandMark } from './components/BrandMark'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
 import { QuickSwitch } from './components/QuickSwitch'
@@ -179,7 +179,7 @@ function AppShell(): JSX.Element {
       {/* ── Sidebar ── */}
       <aside className={`sidebar${sidebarOpen ? '' : ' collapsed'}`}>
         <div className="sidebar-logo">
-          <img className="sidebar-logo-img" src={logoSidebar} alt="" />
+          <BrandMark className="sidebar-logo-img" />
           <div className="sidebar-logo-text">
             Agent24
             <span>v{version || '…'}</span>

@@ -1017,9 +1017,11 @@ app.whenReady().then(async () => {
   })
 
   // ── System tray (M2 base; F1b: live daemon status + start/stop/restart) ────
-  // Empty image + setTitle works on macOS (menu-bar text); M3 will add a
-  // proper multi-resolution icon asset for Windows/Linux.
-  tray = new Tray(nativeImage.createEmpty())
+  // macOS: the VI 昼夜环 as a Template Image (assets/trayTemplate{,@2x}.png,
+  // made by docs/brand/src/render.sh) next to the status title; the system
+  // recolours it for light / dark menu bars. Elsewhere still empty until a
+  // Windows / Linux icon is made.
+  tray = new Tray(trayIcon())
   tray.on('double-click', () => showOrCreateWindow())
   refreshTray()
   // Poll so the menu-bar title/tooltip and menu track the daemon as it starts,
@@ -1127,6 +1129,13 @@ async function quitStoppingService(): Promise<void> {
   } finally {
     quittingService = false
   }
+}
+
+function trayIcon(): Electron.NativeImage {
+  if (process.platform !== 'darwin') return nativeImage.createEmpty()
+  const icon = nativeImage.createFromPath(path.join(__dirname, '../../assets/trayTemplate.png'))
+  icon.setTemplateImage(true)
+  return icon
 }
 
 // Rebuild the tray title, tooltip, and context menu from the live daemon status
