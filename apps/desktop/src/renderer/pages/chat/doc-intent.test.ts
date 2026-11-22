@@ -185,6 +185,9 @@ describe('F3: one sentence asks for fields of the document', () => {
     ['把合同金额抽取出来', ['合同金额']],
     ['把金额、日期抽出来，谢谢', ['金额', '日期']],
     ['列出来甲方和乙方', ['甲方', '乙方']],
+    ['请把发票号码、开票日期、金额抽出来', ['发票号码', '开票日期', '金额']],
+    ['甲方和乙方分别是谁，列出来', ['甲方', '乙方']],
+    ['把租金、押金、开户银行抽出来', ['租金', '押金', '开户银行']],
   ])('PR-Daemon #2019: %s', (text, fields) => {
     expect(extractionFields(text, true)).toEqual(fields)
   })
@@ -212,6 +215,21 @@ describe('F3: an extraction followed by something more goes to the model', () =>
       expect(extractionFields(ask + then, true)).toBeNull()
       expect(extractionFields(ask, true)).not.toBeNull()
     })
+  }
+  // Round 3: the verb first, then something more.
+  const finds = ['找出截止日期', '找出金额', '找出合同里的金额', '列出来金额', '找出电话号码'] as const
+  const more = ['并设个提醒', '并核对是否正确', '后告诉老板', '以便安排', '发给我', '加起来', '写错了没有', '并计算总和'] as const
+  for (const ask of finds) {
+    for (const then of more) {
+      it(ask + then, () => expect(extractionFields(ask + then, true)).toBeNull())
+    }
+    it(`${ask} alone is an extraction`, () => expect(extractionFields(ask, true)).not.toBeNull())
+  }
+  // Round 3: what is judged, not stated, is not a field.
+  for (const text of ['把合同的漏洞列出来', '把所有不合理的条款列出来', '列出来这份合同里的优缺点', '列出来三个改进建议',
+    '把这份文件的结构列出来', '把合同的亮点列出来', '把作者的观点列出来', '列出来这份文件里提到的人',
+    '找出与上一版不同的金额', '列出来甲方和乙方的区别']) {
+    it(text, () => expect(extractionFields(text, true)).toBeNull())
   }
   for (const text of ['把这份合同里需要注意的地方列出来', '把这份合同的第三部分抽出来', '把里面需要我签字的地方列出来']) {
     it(text, () => expect(extractionFields(text, true)).toBeNull())
