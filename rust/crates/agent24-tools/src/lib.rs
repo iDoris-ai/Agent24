@@ -2832,6 +2832,57 @@ mod tests {
         );
     }
 
+    /// General (L6-F2): the pre-card check changes nothing for a tool that
+    /// declares no pattern, nor for a value that matches one: such a call
+    /// goes on to the grant and the card as before (here the fixture's grant
+    /// lookup refuses it, as it did before this check existed).
+    #[tokio::test]
+    async fn a_module_argument_with_no_pattern_or_a_matching_one_goes_on_as_before() {
+        for (schema, value) in [
+            (
+                serde_json::json!({ "type": "object", "properties": { "document_id": { "type": "string" } } }),
+                "《中文测试合同.pdf》",
+            ),
+            (
+                serde_json::json!({ "type": "object", "properties": { "document_id": { "type": "string", "pattern": "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$" } } }),
+                "doc_01K74Z3QJ8V5N2W9RTX6Y00001",
+            ),
+        ] {
+            let store = Store::open_memory().await.unwrap();
+            let tool = ModuleTool::new(
+                "documents",
+                "get",
+                "a module tool",
+                schema,
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                RiskClass::External,
+                Arc::new(DenyAdvertView),
+                Arc::new(DenyModuleToolAuthorization),
+                Arc::new(ModuleFixtureRuntime),
+                store,
+                "agent24-tools-test",
+            )
+            .unwrap();
+            let registry = ToolRegistry::new()
+                .with(Arc::new(tool))
+                .with_gate(Arc::new(ExplodingGate));
+            let input = serde_json::json!({ "document_id": value });
+            let out = registry
+                .dispatch(
+                    "documents.get",
+                    &ctx(),
+                    input.as_object().unwrap(),
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(
+                matches!(&out, Err(ToolError::Failed(m)) if m.contains("permission_denied")),
+                "{value}: {out:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn module_tool_risk_override_cannot_relax_declared_risk() {
         let reg = ToolRegistry::new()

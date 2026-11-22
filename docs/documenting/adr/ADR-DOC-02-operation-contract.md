@@ -49,7 +49,7 @@
 2. **持久化顺序**：blob 写到 `blobs/tmp/`（与目标同一文件系统）→ fsync 文件 → rename 到内容地址 → fsync 分片目录（分片目录是新建的还要 fsync 它的父目录）→ 然后才开 DB 事务写引用行。同一 hash 已存在就跳过写入。
    - SQLite 显式设置 `journal_mode=WAL` + `synchronous=FULL`，不依赖驱动默认值。理由：`NORMAL` 在系统崩溃或断电时可能丢掉最后几次已提交的事务，用户看到“已保存”的 revision 会消失；提交频率低，`FULL` 的代价可以忽略。
 3. **scratch workspace 永远不是已保存 revision 的家**，DOC-1 不使用它（ADR-DOC-01 D7）。临时文件只有经 `import` 或 `revision.commit` 复制进 blob 区、校验过 sha256，才算保存。TTL 内没有提升的视为丢弃。
-4. **删除与 GC（已定；2026-11-22 David 修订）**：~~DOC-1 不提供删除。~~ 删除是**软删除**：只在 `documents.deleted_at` 记下删除时间，行、revision 和 blob 都不动（revision 不可删、文档行不可删的约束不变）。已删除的文档在列表、`/documents/{id}/…` 读取、Agent 工具和按标题查找里都看不到；7 天内可以在文档页「最近删除」或 CLI `documents restore` 恢复，满 7 天后不能再恢复、也不再列出。没有被引用的 blob 保留 7 天后才 GC（GC 尚未实现，FU-177；实现时，只被删除满 7 天的文档引用的 blob 算作没有被引用）。`uploads/` 不参与这个 GC（§5.6）。
+4. **删除与 GC（已定；2026-11-22 David 修订）**：~~DOC-1 不提供删除。~~ 删除是**软删除**：只在 `documents.deleted_at` 记下删除时间，行、revision 和 blob 都不动（revision 不可删、文档行不可删的约束不变）。已删除的文档在列表、`/documents/{id}/…` 读取、Agent 工具和按标题查找里都看不到；7 天内可以在文档页「最近删除」或 CLI `documents restore` 恢复；满 7 天后「已过恢复期，无法恢复」、也不再列出，但字节仍在磁盘上，不能称为「已彻底删除 / 已清除」。没有被引用的 blob 保留 7 天后才 GC（GC 尚未实现，FU-177；实现时，只被删除满 7 天的文档引用的 blob 算作没有被引用）。`uploads/` 不参与这个 GC（§5.6）。
 5. 存储布局不对外暴露（ADR-DOC-01 D1）。
 
 ## 3. 标识与溯源锚点
