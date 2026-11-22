@@ -5,8 +5,9 @@
 //! `/documents/{id}/…` route but `restore` ([`hide_deleted`]), not in a tool's
 //! title lookup and not reachable by any tool (`tools::admit`). For
 //! [`RESTORE_DAYS`] it is listed by `GET /recently-deleted` and can be
-//! restored; after that it is gone for the user. Reclaiming its bytes needs a
-//! blob GC, which DOC-1 does not have yet (FU-177).
+//! restored; after that it is past its restore period and cannot be restored,
+//! but it is NOT erased: its bytes stay on disk until a blob GC, which DOC-1
+//! does not have yet (FU-177). Nothing may call it purged or erased.
 
 use axum::Json;
 use axum::extract::rejection::PathRejection;
