@@ -2125,6 +2125,16 @@ impl ToolRegistry {
                 "{name} needs the argument {missing:?}; call it again with it"
             )));
         }
+        // L6-F2 (FU-136): likewise a module call whose argument is not in the
+        // form its schema's `pattern` asks (`documents.delete` given a file
+        // name, not an id): no card names a document the call cannot mean.
+        if declared.source == "module"
+            && let Some((key, said)) = off_pattern(&tool.parameters(), input)
+        {
+            return Err(ToolError::Invalid(format!(
+                "{name}: the argument {key:?} is not in the form it needs ({said}); call it again with such a value"
+            )));
+        }
         let effective = self.effective_risk(&declared);
         let info = ToolInfo::new(
             declared.name,
@@ -2401,11 +2411,57 @@ fn missing_required(schema: &Value, input: &Map<String, Value>) -> Option<String
         .map(str::to_owned)
 }
 
+/// The first string argument that does not match the `pattern` its schema
+/// declares, and what the schema says of it (its description, else the
+/// pattern). A pattern that does not compile within a small size is ignored:
+/// the call then goes on to its card as before.
+fn off_pattern(schema: &Value, input: &Map<String, Value>) -> Option<(String, String)> {
+    schema
+        .get("properties")?
+        .as_object()?
+        .iter()
+        .find_map(|(key, property)| {
+            let pattern = property.get("pattern")?.as_str()?;
+            let value = input.get(key)?.as_str()?;
+            let matches = regex::RegexBuilder::new(pattern)
+                .size_limit(1 << 16)
+                .build()
+                .ok()?
+                .is_match(value);
+            let said = property
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or(pattern);
+            (!matches).then(|| (key.clone(), said.to_owned()))
+        })
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn an_argument_off_its_pattern_is_named_with_what_it_should_be() {
+        let schema = serde_json::json!({ "properties": {
+            "document_id": { "type": "string", "pattern": "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", "description": "its id" },
+            "title": { "type": "string" },
+            "odd": { "type": "string", "pattern": "(" },
+        }});
+        let input = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let off = off_pattern(
+            &schema,
+            &input(serde_json::json!({ "document_id": "中文测试合同.pdf", "title": "x" })),
+        );
+        assert_eq!(off, Some(("document_id".to_owned(), "its id".to_owned())));
+        let id = serde_json::json!({ "document_id": "doc_01K74Z3QJ8V5N2W9RTX6Y00001", "odd": "x" });
+        assert_eq!(off_pattern(&schema, &input(id)), None);
+        assert_eq!(
+            off_pattern(&schema, &input(serde_json::json!({ "title": "x" }))),
+            None
+        );
+    }
 
     /// Every gate at its fail-closed default.
     struct DenyAdvertView;
@@ -2734,6 +2790,46 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    /// L6-F2 (FU-136): `documents.delete` with a file name never reaches a
+    /// card; the model is told what the argument must be.
+    #[tokio::test]
+    async fn a_module_argument_off_its_pattern_is_refused_before_the_gate() {
+        let store = Store::open_memory().await.unwrap();
+        let tool = ModuleTool::new(
+            "documents",
+            "delete",
+            "delete one document",
+            serde_json::json!({ "type": "object", "required": ["document_id"], "properties": {
+                "document_id": { "type": "string", "pattern": "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", "description": "its id, never its file name" }
+            }}),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            RiskClass::External,
+            Arc::new(DenyAdvertView),
+            Arc::new(DenyModuleToolAuthorization),
+            Arc::new(ModuleFixtureRuntime),
+            store,
+            "agent24-tools-test",
+        )
+        .unwrap();
+        let registry = ToolRegistry::new()
+            .with(Arc::new(tool))
+            .with_gate(Arc::new(ExplodingGate));
+        let input = serde_json::json!({ "document_id": "《中文测试合同.pdf》" });
+        let out = registry
+            .dispatch(
+                "documents.delete",
+                &ctx(),
+                input.as_object().unwrap(),
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(
+            matches!(&out, Err(ToolError::Invalid(m)) if m.contains("document_id") && m.contains("never its file name")),
+            "{out:?}"
+        );
     }
 
     #[tokio::test]

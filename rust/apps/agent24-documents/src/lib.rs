@@ -298,7 +298,8 @@ mod tests {
                 "paragraphs",
                 "patch",
                 "fields",
-                "fill"
+                "fill",
+                "delete"
             ]
         );
     }

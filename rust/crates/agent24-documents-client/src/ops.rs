@@ -158,6 +158,13 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             get(with_query(format!("{BASE}/documents"), &query))
         }
         "get" => get(format!("{BASE}/documents/{}", k.id("documentId", "doc_")?)),
+        // L6-F2: soft delete, restore within 7 days, and what can be restored.
+        op @ ("delete" | "restore") => {
+            let document = k.id("documentId", "doc_")?;
+            let path = format!("{BASE}/documents/{document}/{op}");
+            (Method::Post, path, None, Vec::new(), Answer::Json)
+        }
+        "recentlyDeleted" => get(format!("{BASE}/recently-deleted")),
         "readText" => {
             let document = k.id("documentId", "doc_")?;
             let revision = k.number("revision")?;

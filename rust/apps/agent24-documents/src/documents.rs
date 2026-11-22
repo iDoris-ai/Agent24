@@ -52,6 +52,10 @@ pub struct DocumentDetail {
     #[serde(flatten)]
     pub document: Document,
     pub head: RevisionSummary,
+    /// L6-F2: a PDF head's page count, read from its page tree, for the
+    /// delete card; absent for other formats or when it cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
 }
 
 /// `DocumentList`.
@@ -269,6 +273,7 @@ impl HeadRow {
         Ok(DocumentDetail {
             document: self.document,
             head,
+            pages: None,
         })
     }
 }
@@ -299,10 +304,26 @@ pub(crate) async fn get(storage: &Storage, id: &str) -> Result<DocumentDetail, A
     .await;
     let found = row.and_then(|row| row.map(HeadRow::checked).transpose());
     match found {
-        Ok(Some(detail)) => Ok(detail),
+        Ok(Some(mut detail)) => {
+            detail.pages = pdf_pages(storage, &detail.head).await;
+            Ok(detail)
+        }
         Ok(None) => Err(ApiError::not_found("no such document")),
         Err(e) => Err(storage.db_failure(e).await),
     }
+}
+
+/// The page count of a PDF revision, from its metadata (not its pages).
+async fn pdf_pages(storage: &Storage, head: &RevisionSummary) -> Option<u32> {
+    if head.media_type != "application/pdf" {
+        return None;
+    }
+    let path = storage.blobs.path_of(&head.content_sha256).ok()?;
+    tokio::task::spawn_blocking(move || lopdf::Document::load_metadata(path).ok())
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.page_count)
 }
 
 #[cfg(test)]

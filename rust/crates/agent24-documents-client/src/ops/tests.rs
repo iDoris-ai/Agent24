@@ -47,6 +47,18 @@ fn each_allowed_operation_maps_to_its_fixed_route() {
             get(format!("/api/v1/documents/documents/{DOC}")),
         ),
         (
+            json!({"op": "delete", "documentId": DOC}),
+            post(format!("/api/v1/documents/documents/{DOC}/delete")),
+        ),
+        (
+            json!({"op": "restore", "documentId": DOC}),
+            post(format!("/api/v1/documents/documents/{DOC}/restore")),
+        ),
+        (
+            json!({"op": "recentlyDeleted"}),
+            get("/api/v1/documents/recently-deleted".into()),
+        ),
+        (
             json!({"op": "readText", "documentId": DOC, "revision": 2}),
             get(format!(
                 "/api/v1/documents/documents/{DOC}/revisions/2/text"

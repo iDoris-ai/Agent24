@@ -441,7 +441,12 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         {
             alias.insert(target.clone(), resolved.to_owned());
         }
-        if !write {
+        // L6-F2: a delete that went through makes no document and changed
+        // what it was asked to; it is not a write that came to nothing.
+        let deleted = payload
+            .as_ref()
+            .is_some_and(|p| p.get("deleted") == Some(&serde_json::Value::Bool(true)));
+        if !write || deleted {
             continue;
         }
         attempted = true;
@@ -886,6 +891,28 @@ mod documents_tests {
         );
         // fill and a later write operation are writes too.
         assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));
+        // L6-F2: a delete that went through is not 「没有改动」; a denied one is.
+        let delete = |id: &str, result: &str| {
+            vec![
+                msg(
+                    "assistant",
+                    None,
+                    json!([{ "id": id, "name": "documents.delete", "arguments": { "document_id": "doc_A" } }]),
+                    None,
+                ),
+                msg("tool", Some(result), json!([]), Some(id)),
+            ]
+        };
+        let done = delete(
+            "d1",
+            r#"{"kind":"completed","payload":{"deleted":true,"document_id":"doc_A"}}"#,
+        );
+        assert_eq!(run_documents(&done), None);
+        let denied = delete("d2", "tool error: denied: the user said no");
+        assert_eq!(
+            run_documents(&denied).map(|d| d.failed),
+            Some(vec!["doc_A".to_owned()])
+        );
     }
 
     /// PR-Daemon #1979 Low: every documents operation the module declares is
