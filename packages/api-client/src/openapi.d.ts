@@ -3162,6 +3162,22 @@ export interface components {
              *     answer may name sources the run never read.
              */
             knowledge?: components["schemas"]["RunKnowledge"] | null;
+            /**
+             * @description Only on `GET /api/v1/runs/{id}`. Absent when the run asked for no
+             *     document write. M1 (11-21): what the run's document writes came
+             *     to, told from its stored tool calls and results, never from the
+             *     answer's text, so a client can say 「这次没有改动文档」 or name what
+             *     was made whatever the answer claims.
+             */
+            documents?: components["schemas"]["RunDocuments"];
+        };
+        RunDocuments: {
+            /** @description The run asked for a documents write (compose, fill, patch, or any documents operation that is not a read). */
+            attempted: boolean;
+            /** @description Import jobs of the writes that went through; empty when every one was refused, denied or failed. */
+            jobs: string[];
+            /** @description The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid. */
+            failed?: string[];
         };
         RunKnowledge: {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */
@@ -3222,6 +3238,8 @@ export interface components {
             knowledge_binding_id?: string | null;
             /** @description A skill to run under (SL-5). Only the id: the server reads the skill's current activation pointer when the run is admitted and pins that revision, so there is no version field. A skill with no pointer (installed, never activated) is refused with `skill_not_active`; it never falls back to the latest revision. Imported skill text is labelled `Unknown` + `LocalOnly`. Inbound events and scheduled self-wake runs cannot carry one (`skill_not_admitted`), and neither can a workspace-bound run in v1. Omit/null for a run without a skill. */
             skill_id?: string | null;
+            /** @description M1 retrieval first (David 2026-11-21): with a Knowledge binding, the run searches the bound knowledge bases with this text once before its first model call, through the same `knowledge_search` tool and record as a search the model asks for. Hits go in as that search's call and result; no hit, a failure or a refusal leaves the run as it was. Ignored without a binding, on a turn that asks to remember something, and on inbound runs. Omit/null for no search first. */
+            knowledge_query?: string | null;
         };
         /** @enum {string} */
         ToolCallStatus: "running" | "completed" | "failed" | "denied";

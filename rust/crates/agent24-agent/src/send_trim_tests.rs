@@ -239,6 +239,7 @@ async fn send_copy_keeps_user_prompt_shaped_like_recall() {
     let shaped = block(&[&facts[0]]);
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
@@ -286,6 +287,7 @@ async fn send_copy_keeps_session_history_shaped_like_recall() {
         .unwrap();
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("trim-hist".into()),
             workspace_id: None,
@@ -320,6 +322,7 @@ async fn send_copy_trims_revoked_ids_from_real_host_recall() {
     let facts = live_assertions(&kv, &["I am allergic to peanuts"]).await;
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,

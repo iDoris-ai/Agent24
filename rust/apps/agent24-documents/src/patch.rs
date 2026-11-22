@@ -25,16 +25,16 @@ const TEXT_MAX: usize = 100_000;
 
 #[derive(Debug, Serialize)]
 pub struct Paragraph {
-    index: usize,
-    text: String,
-    in_table: bool,
+    pub(crate) index: usize,
+    pub(crate) text: String,
+    pub(crate) in_table: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Paragraphs {
     document_id: String,
     revision: i64,
-    paragraphs: Vec<Paragraph>,
+    pub(crate) paragraphs: Vec<Paragraph>,
 }
 
 #[derive(Debug, Deserialize)]

@@ -66,6 +66,7 @@ async fn present_prompt_without_recall_or_pause_still_forms_a_provider_request()
     let (manager, _, store) = manager_with(provider.clone()).await;
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: None,
             workspace_id: None,
@@ -208,6 +209,7 @@ async fn pause_notice_completes_the_run_and_keeps_snapshot_rows() {
     kv.set_memory_enabled("test-owner", false).await.unwrap();
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("gate-pause".into()),
             workspace_id: None,
@@ -268,6 +270,7 @@ async fn paused_remember_run_completes_and_provider_gets_notice() {
     kv.set_memory_enabled("test-owner", false).await.unwrap();
     let run = manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             session_id: Some("gate-pause-ok".into()),
             workspace_id: None,

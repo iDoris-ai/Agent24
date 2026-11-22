@@ -9,6 +9,26 @@ export type TargetLang = 'en' | 'zh'
 export interface Para {
   text: string
   pageBreakBefore: boolean
+  /** N1: a heading's level, read off the original (headingLevel). */
+  level?: 1 | 2 | 3
+}
+
+/** Ends like a sentence, so it is no heading. */
+const SENTENCE_END = /[。！？；，、.!?;,：:]$/
+
+/** N1 (Loop 5): the heading level of an original paragraph, from its text
+ * only (a PDF's text layer says nothing of size or weight): the document's
+ * first line when short, 「第一章/第一节」 as 2, 「一、」 as 2, 「（一）」 and
+ * 「1.1」 as 3, each only when short and not ending like a sentence. An
+ * article 「第一条 …」 is body text. */
+export function headingLevel(text: string, first: boolean): 1 | 2 | 3 | undefined {
+  const t = text.trim()
+  if (t.length === 0 || t.length > 40 || SENTENCE_END.test(t)) return undefined
+  if (/^第[一二三四五六七八九十百零\d]+[章节编部]/.test(t)) return 2
+  if (/^[一二三四五六七八九十]+、/.test(t)) return 2
+  if (/^[（(][一二三四五六七八九十\d]+[)）]/.test(t) || /^\d+\.\d+(\.\d+)?\s/.test(t)) return 3
+  if (first && t.length <= 30 && !/^第[一二三四五六七八九十百零\d]+条/.test(t)) return 1
+  return undefined
 }
 
 export interface TranslateDeps {
@@ -70,7 +90,8 @@ export function paragraphsOf(blocks: readonly { page?: number; text: string }[])
       && block.page > prevPage
     const joined = joinWrapped(lines)
     for (let i = 0; i < joined.length; i++) {
-      out.push({ text: joined[i], pageBreakBefore: i === 0 && newPage })
+      const level = headingLevel(joined[i], out.length === 0)
+      out.push({ text: joined[i], pageBreakBefore: i === 0 && newPage, ...(level ? { level } : {}) })
     }
     prevPage = block.page
   }
@@ -197,12 +218,12 @@ export async function translateParagraphs(deps: TranslateDeps, paras: readonly P
       for (let j = 0; j < batch.length; j++) {
         const clean = cleanTranslation(parsed[j], lang)
         const text = lang === 'en' ? articleNumerals(clean) : clean
-        out.push({ text: text || batch[j].text, pageBreakBefore: batch[j].pageBreakBefore })
+        out.push({ ...batch[j], text: text || batch[j].text })
       }
     } else {
       for (const para of batch) {
         const one = cleanTranslation(await translateOne(deps.ask, para.text, lang), lang) || para.text
-        out.push({ text: lang === 'en' ? articleNumerals(one) : one, pageBreakBefore: para.pageBreakBefore })
+        out.push({ ...para, text: lang === 'en' ? articleNumerals(one) : one })
       }
     }
     deps.onProgress?.(i + 1, total)
@@ -222,7 +243,8 @@ function escapeHtml(value: string): string {
 export function translationHtml(title: string, paras: readonly Para[], lang: TargetLang): string {
   const body = paras.map((para) => {
     const style = para.pageBreakBefore ? ' style="page-break-before: always"' : ''
-    return `<p${style}>${escapeHtml(para.text)}</p>`
+    const tag = para.level ? `h${para.level}` : 'p'
+    return `<${tag}${style}>${escapeHtml(para.text)}</${tag}>`
   }).join('\n')
   return [
     '<!DOCTYPE html>',

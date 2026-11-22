@@ -1,0 +1,142 @@
+[
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "押金为两个月",
+  "ok": true
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "第三条 押金为两个月",
+  "ok": true
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "第三条押金为两个月租金，",
+  "ok": true
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": " 押金为 两个月 ",
+  "ok": true
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "押金为两个月租金，合同期满无违约时全额退还。",
+  "ok": true
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "第四条 押金为两个月",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "乙方：张三",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "合同期满无违约",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "租金为两个月",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "第三条 押金",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "押金为",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "",
+  "ok": false
+ },
+ {
+  "paragraph": "第三条 押金为两个月租金，合同期满无违约时全额退还。",
+  "anchor": "。，",
+  "ok": false
+ },
+ {
+  "paragraph": "乙方：张三",
+  "anchor": "押金为两个月",
+  "ok": false
+ },
+ {
+  "paragraph": "乙方：张三",
+  "anchor": "乙方：张三",
+  "ok": true
+ },
+ {
+  "paragraph": "（一）租金每月 8,500 元",
+  "anchor": "租金每月 8,500",
+  "ok": true
+ },
+ {
+  "paragraph": "（一）租金每月 8,500 元",
+  "anchor": "（二）租金每月 8,500",
+  "ok": false
+ },
+ {
+  "paragraph": "1. Scope of work",
+  "anchor": "Scope of",
+  "ok": true
+ },
+ {
+  "paragraph": "一、总则",
+  "anchor": "总则",
+  "ok": true
+ },
+ {
+  "paragraph": "8500",
+  "anchor": "8500",
+  "ok": true
+ },
+ {
+  "paragraph": "8500",
+  "anchor": "8600",
+  "ok": false
+ },
+ {
+  "paragraph": "2024",
+  "anchor": "2024",
+  "ok": true
+ },
+ {
+  "paragraph": "2024",
+  "anchor": "",
+  "ok": false
+ },
+ {
+  "paragraph": "一",
+  "anchor": "一",
+  "ok": true
+ },
+ {
+  "paragraph": "第三",
+  "anchor": "第三",
+  "ok": true
+ },
+ {
+  "paragraph": "第",
+  "anchor": "第",
+  "ok": true
+ },
+ {
+  "paragraph": "﻿第三条 押金为两个月租金",
+  "anchor": "押金为两个月",
+  "ok": true
+ },
+ {
+  "paragraph": "﻿第三条 押金为两个月租金",
+  "anchor": "第四条 押金为两个月",
+  "ok": false
+ }
+]

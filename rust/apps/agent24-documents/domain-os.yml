@@ -45,7 +45,9 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: compose
-    description: "Make a NEW PDF document from pages of PDF documents in the library: split (one part, some pages) or merge (several parts). The originals are never changed. Returns the import job; the new document is its result."
+    # M1 (Loop 5): a 4-bit model put both halves of a split into one call, which merges them
+    # back; saying that each call makes exactly one document took that from 5/8 to 0/8 runs.
+    description: "Make ONE new PDF document from pages of PDF documents in the library; each call makes exactly one document. Merge (several documents into one): one call with several parts. Split (one document into N documents): call this tool N times, each call with ONE part; never put the pieces of a split into one call, that merges them back. The originals are never changed. Returns the import job; the new document is its result."
     input_schema:
       type: object
       additionalProperties: false
@@ -71,20 +73,23 @@ tools:
   # E1b/D5a (Loop 3): DOCX paragraphs and template fields. The writes make a
   # NEW document; each call is approved by the user.
   - operation: paragraphs
-    description: "List a DOCX document's paragraphs (index, text, whether in a table). document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List a DOCX document's paragraphs that have text: each paragraph's index and its first 40 characters (whether in a table). A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
       required: [document_id]
       properties:
         document_id: { type: string }
+        from: { type: integer, minimum: 0, description: "the paragraph index to start from (default 0)" }
+        count: { type: integer, minimum: 1, maximum: 200, description: "at most this many paragraphs" }
+        query: { type: string, description: "only paragraphs containing this text" }
     risk: read
     output_privacy: local_only
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: patch
-    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs; tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
     input_schema:
       type: object
       additionalProperties: false
@@ -98,12 +103,12 @@ tools:
           items:
             type: object
             additionalProperties: false
-            required: [index, text]
+            required: [index, text, anchor]
             properties:
               index: { type: integer, minimum: 0 }
-              text: { type: string }
+              text: { type: string, description: "the paragraph's new text" }
               tracked: { type: boolean }
-              expect: { type: string, description: "the paragraph's current text; the edit is refused if it changed" }
+              anchor: { type: string, description: "at least 12 characters copied exactly from the start of paragraph `index` as documents.paragraphs shows it (its numbering may be left out, but if written it must be right); the edit is not made if that paragraph does not begin with them" }
         title: { type: string, description: "title of the new document" }
     risk: write_local
     output_privacy: local_only

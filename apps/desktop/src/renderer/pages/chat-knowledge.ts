@@ -6,6 +6,35 @@
 // conversation gets a real one first.
 
 import type { RunKnowledge } from './knowledge-grounding'
+import { runDocumentsOf, type RunDocuments } from './chat/DocumentsOutcome'
+
+/** M1 (Loop 5): a 4-bit model answered 「烧开水要多久」 from what it knew (0/3 on
+ * 0.6.72, 3/5 with a hint to search on 0.6.73). David 2026-11-21: retrieval
+ * first. A plain turn names its words as the run's `knowledge_query`, which
+ * the daemon searches before the model is asked; this says what came of it. */
+export const KNOWLEDGE_HINT = '（知识库已开启：系统已先用这句话在知识库里查过，查到的内容在检索结果里。'
+  + '和问题相关就依据它回答并注明出处；不相关或没有检索结果，就按常识回答，不要硬套。回答里不要提工具名。）'
+
+/** 「记住…」 is kept as the user said it: personal memory takes only a turn that
+ * starts with it (agent24-agent retain.rs), so nothing goes in front. */
+const REMEMBER = /^\s*(请你|麻烦你|你帮我|请帮我|帮我|请|麻烦|你)?\s*(记一下|记住|记好|记着)/
+
+/** The run's prompt for a plain turn with Knowledge in effect. */
+export function knowledgePrompt(text: string): string {
+  return REMEMBER.test(text) ? text : `${KNOWLEDGE_HINT}\n${text}`
+}
+
+/** Asked to write something new (「写一篇八百字散文」「帮我起草一段介绍」): the
+ * knowledge bases have nothing to add, so nothing is searched first (General,
+ * 0.6.75). The model can still search if it wants to. */
+const WRITE = /^(请|麻烦)?(你)?(帮我|给我)?(写|起草|创作|编写|编一|作一)/
+
+/** What the daemon searches first (RunCreate `knowledge_query`): the user's
+ * own words; none on a 「记住…」 turn or when asked to write something new. */
+export function knowledgeQuery(text: string): string | null {
+  const q = text.trim()
+  return q.length === 0 || REMEMBER.test(q) || WRITE.test(q) ? null : q
+}
 
 export const POLL_MS = 1_000
 /** As long as `/api/v1/chat` may take for one reply (backend-proxy.ts). */
@@ -16,7 +45,7 @@ type Proxy = Window['agent24']['backendProxy']
 /** `knowledge`: what the run's Knowledge tools did, as the daemon tells it
  * (null when the run had no binding). */
 export type KnowledgeTurn =
-  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null; runId: string }
+  | { kind: 'answer'; text: string; knowledge: RunKnowledge | null; runId: string; documents: RunDocuments | null }
   | { kind: 'failed'; code: string; message: string }
   /** M4 A4: the turn stopped waiting, the run goes on: it is the
    *  conversation's task from now on, its card shows how it does. */
@@ -55,13 +84,16 @@ export async function askWithKnowledge(
   deps: TurnDeps,
   headroomConfirmed = false,
   skillId: string | null = null,
+  query: string | null = null,
 ): Promise<KnowledgeTurn> {
   const sleep = deps.sleep ?? sleepFor
   const now = deps.now ?? Date.now
-  const body: { prompt: string; session_id: string; idoris_headroom_confirmed?: boolean; skill_id?: string } =
+  const body: { prompt: string; session_id: string; idoris_headroom_confirmed?: boolean; skill_id?: string; knowledge_query?: string } =
     headroomConfirmed ? { prompt, session_id: sessionId, idoris_headroom_confirmed: true } : { prompt, session_id: sessionId }
   // Every round of this conversation names the skill again. The daemon does not remember it.
   if (skillId) body.skill_id = skillId
+  // M1 retrieval first (David 2026-11-21): searched before the model is asked.
+  if (query) body.knowledge_query = query
   const created = await deps.proxy({ method: 'POST', path: '/api/v1/runs', body })
   const runId = (created.data as { id?: unknown } | null)?.id
   if (!created.ok || typeof runId !== 'string') return failure(created.data, 'run_not_started')
@@ -73,14 +105,14 @@ export async function askWithKnowledge(
     await sleep(POLL_MS)
     const res = await deps.proxy({ method: 'GET', path: `/api/v1/runs/${encodeURIComponent(runId)}` })
     if (!res.ok) continue
-    const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null; knowledge?: RunKnowledge | null }
+    const run = res.data as { status?: string; output?: { text?: string } | null; error?: { code?: string; message?: string } | null; knowledge?: RunKnowledge | null; documents?: unknown }
     if (typeof run.status === 'string') last = run.status
     const approval = run.status === 'awaiting_approval'
     if (approval !== waiting) {
       waiting = approval
       deps.onAwaitingApproval?.(approval)
     }
-    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null, runId }
+    if (run.status === 'completed') return { kind: 'answer', text: run.output?.text ?? '', knowledge: run.knowledge ?? null, runId, documents: runDocumentsOf(run.documents) }
     if (run.status === 'failed' || run.status === 'cancelled') return failure(run, `run_${run.status}`)
   }
   // M4 A4: a run still going on is left to go on, as the conversation's

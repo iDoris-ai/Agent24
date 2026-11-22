@@ -231,7 +231,10 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "extraction_get" => extraction_get(state, arguments).await,
             "compose" => compose(state, arguments).await,
             "paragraphs" => paragraphs(state, arguments).await,
-            "patch" => patch(state, arguments).await,
+            "patch" => {
+                let run_id = run.run_id.clone();
+                patch(state, &run_id, arguments).await
+            }
             "fields" => fields(state, arguments).await,
             "fill" => fill(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
@@ -384,11 +387,68 @@ async fn get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
 async fn compose(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let req: crate::compose::ComposeRequest = parse(arguments)?;
     let storage = ready(state).await?;
-    completed(
-        crate::compose::run(&storage, req)
-            .await
-            .map(|(_, job)| job.0),
-    )
+    let (_, job) = crate::compose::run(&storage, req)
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(settled(&storage, job.0).await))
+}
+
+/// How long a write waits for its import before it answers.
+const SETTLE_WAIT: Duration = Duration::from_secs(20);
+
+/// M1 (0.6.89, General/PM): after an approved patch went through, the model
+/// was told only that a job was queued, called documents.patch again, twice,
+/// and another card came up for the same edits. A write now waits (up to
+/// [`SETTLE_WAIT`]) for its import and says what came of it: 「已完成：已生成
+/// 《X》……不要再调用」, or that it failed, or, still going, that it is under way
+/// and not to be asked again. The job is still all there (`job_id` stays where
+/// agent24d's run record reads it).
+async fn settled(storage: &Arc<Storage>, job: crate::jobs::Job) -> Value {
+    let id = job.job_id.clone();
+    let mut last = job;
+    let deadline = tokio::time::Instant::now() + SETTLE_WAIT;
+    while (last.status == "queued" || last.status == "running")
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        match jobs::get(storage, &id).await {
+            Ok(next) => last = next,
+            Err(_) => break,
+        }
+    }
+    let made = if last.status == "succeeded" {
+        let doc = last
+            .result
+            .as_ref()
+            .and_then(|r| r.get("document_id"))
+            .and_then(|d| d.as_str())
+            .map(str::to_owned);
+        match doc {
+            Some(d) => documents::get(storage, &d)
+                .await
+                .ok()
+                .map(|detail| detail.document.title),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let note = match (last.status.as_str(), &made) {
+        ("succeeded", Some(title)) => format!(
+            "已完成：已生成新文档《{title}》。这一步已经完成，不要再调用同一个写入工具，直接告诉用户已生成《{title}》。"
+        ),
+        ("succeeded", None) => "已完成：新文档已生成。这一步已经完成，不要再调用同一个写入工具，直接告诉用户结果。".to_owned(),
+        ("queued" | "running", _) => "已提交，新文档正在生成。这一步已经完成：不要再调用同一个写入工具，直接告诉用户正在生成。".to_owned(),
+        _ => "没能生成新文档（导入失败）。如实告诉用户没有生成，不要说已完成。".to_owned(),
+    };
+    let mut v = serde_json::to_value(&last).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut v {
+        map.insert("note".to_owned(), Value::String(note));
+        if let Some(title) = made {
+            map.insert("title".to_owned(), Value::String(title));
+        }
+    }
+    v
 }
 
 /// E1b/D5a: the request without `document_id`, and that id.
@@ -402,25 +462,243 @@ fn split_document(
 }
 
 /// E1b: a DOCX's paragraphs, by index (read).
+/// What an Agent may narrow `paragraphs` to.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ParagraphsArgs {
+    #[serde(default)]
+    from: Option<usize>,
+    #[serde(default)]
+    count: Option<usize>,
+    #[serde(default)]
+    query: Option<String>,
+}
+
+/// Characters of a paragraph an Agent is shown: enough to copy a 12-character
+/// anchor from, and to tell paragraphs apart.
+const PREVIEW_CHARS: usize = 40;
+/// Characters of previews in one answer, and paragraphs at most.
+const PREVIEW_BUDGET: usize = 3000;
+const PREVIEW_MAX_COUNT: usize = 200;
+/// PM 11-21: a narrowed ask (a range or a word) that comes to this many
+/// paragraphs or fewer, within [`PREVIEW_BUDGET`], is answered with them
+/// whole: the model rewrites from what it sees, and half a clause gives half
+/// a rewrite.
+const WHOLE_MAX_COUNT: usize = 10;
+
+/// FU-151 (0.6.89, General): 《示范-山东健身合同2025》's 293 paragraphs came to
+/// about 40 KB, and with them in its context the 4-bit model on an 8 GB Mac
+/// was stopped at prefill. An Agent is shown the paragraphs that have text,
+/// each as its index and first [`PREVIEW_CHARS`] characters, from `from` on
+/// or only those containing `query`, up to [`PREVIEW_BUDGET`] characters;
+/// `total` and `next_from` say what is left. The HTTP route and the CLI keep
+/// the whole list.
 async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let (id, rest) = split_document(arguments)?;
-    if !rest.is_empty() {
-        return Err(Envelope::error(INVALID_INPUT, false));
-    }
+    let args: ParagraphsArgs = parse(rest)?;
     let storage = ready(state).await?;
-    completed(crate::patch::paragraphs_of(&storage, id).await)
+    let all = crate::patch::paragraphs_of(&storage, id.clone())
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(preview_paragraphs(&id, &all.paragraphs, &args)))
+}
+
+fn preview_paragraphs(id: &str, all: &[crate::patch::Paragraph], args: &ParagraphsArgs) -> Value {
+    let query = args
+        .query
+        .as_deref()
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_lowercase);
+    let wanted: Vec<&crate::patch::Paragraph> = all
+        .iter()
+        .filter(|p| !p.text.trim().is_empty())
+        .filter(|p| {
+            query
+                .as_ref()
+                .is_none_or(|q| p.text.to_lowercase().contains(q))
+        })
+        .collect();
+    let from = args.from.unwrap_or(0);
+    let count = args
+        .count
+        .unwrap_or(PREVIEW_MAX_COUNT)
+        .min(PREVIEW_MAX_COUNT);
+    let narrowed = args.from.is_some() || args.count.is_some() || query.is_some();
+    let after: Vec<&&crate::patch::Paragraph> = wanted.iter().filter(|p| p.index >= from).collect();
+    let picked = &after[..after.len().min(count)];
+    let whole_size: usize = picked.iter().map(|p| p.text.chars().count()).sum();
+    if narrowed && picked.len() <= WHOLE_MAX_COUNT && whole_size <= PREVIEW_BUDGET {
+        let shown: Vec<Value> = picked
+            .iter()
+            .map(|p| serde_json::json!({ "index": p.index, "text": p.text, "in_table": p.in_table, "whole": true }))
+            .collect();
+        let mut out = serde_json::json!({
+            "document_id": id,
+            "total": wanted.len(),
+            "paragraphs": shown,
+            "note": "这些段落是全文（whole: true），改写时照这里的原文写新文字，anchor 照抄开头。",
+        });
+        if let Some(p) = after.get(picked.len()) {
+            out["next_from"] = Value::from(p.index);
+        }
+        return out;
+    }
+    let mut spent = 0;
+    let mut shown = Vec::new();
+    let mut next_from = None;
+    for p in wanted.iter().filter(|p| p.index >= from) {
+        if shown.len() >= count || spent >= PREVIEW_BUDGET {
+            next_from = Some(p.index);
+            break;
+        }
+        let mut text: String = p.text.chars().take(PREVIEW_CHARS).collect();
+        if text.chars().count() < p.text.chars().count() {
+            text.push('…');
+        }
+        spent += text.chars().count();
+        shown.push(serde_json::json!({ "index": p.index, "text": text, "in_table": p.in_table }));
+    }
+    let mut out = serde_json::json!({
+        "document_id": id,
+        "total": wanted.len(),
+        "paragraphs": shown,
+        "note": "这是目录：每段只给段号和开头，空段落不列。要改写某几段，先用 from 和 count（例如 from=段号, count=1）或 query（关键词）取这几段的全文，再照全文改写；取其余段落也用 from。",
+    });
+    if let Some(n) = next_from {
+        out["next_from"] = Value::from(n);
+    }
+    out
 }
 
 /// E1b: some paragraphs edited into a new document (write; approved per call).
-async fn patch(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+/// An Agent's edit (M1 (c), General 11-21): the paragraph's index, its new
+/// text, and `anchor`, the paragraph's opening words as the model read them.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentEdit {
+    index: usize,
+    text: String,
+    #[serde(default)]
+    tracked: bool,
+    anchor: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AgentPatch {
+    edits: Vec<AgentEdit>,
+    #[serde(default)]
+    title: Option<String>,
+}
+
+/// Characters of a paragraph's opening said back when its anchor is wrong.
+const OPENING_CHARS: usize = 24;
+
+/// E1b, as an Agent asks it. The text an edit replaces is the paragraph the
+/// document has at its index, never the model's retelling of it (0.6.75: it
+/// left 「第三条」 out and the approved edit failed). The model's `anchor` must be
+/// that paragraph's opening (`docx_patch::anchor_matches`): one that is not
+/// (0.6.72: 第三条's words aimed at 乙方's line) writes nothing, and the answer
+/// says how the paragraph really begins so the model can try again. The HTTP
+/// route and the CLI keep their own `expect`.
+async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) -> Outcome {
     let (id, rest) = split_document(arguments)?;
-    let req: crate::patch::PatchRequest = parse(rest)?;
+    // M1 (0.6.89, General): after its patch went through, a run asked for the
+    // same document again and another card came up. Once per run and
+    // document; the answer says what was already made.
+    if let Some(title) = state.patched_in(run_id, &id) {
+        return completed::<Value>(Ok(serde_json::json!({
+            "written": false,
+            "source_document_id": id,
+            "reason": "already_submitted",
+            "title": title,
+            "message": format!("这一轮已经提交过对这份文档的改写，已生成《{title}》。不要再调用 documents.patch，直接告诉用户已生成《{title}》。"),
+        })));
+    }
+    let asked: AgentPatch = parse(rest)?;
     let storage = ready(state).await?;
-    completed(
-        crate::patch::patch_run(&storage, id, req)
-            .await
-            .map(|(_, job)| job.0),
-    )
+    let paras = crate::patch::paragraphs_of(&storage, id.clone())
+        .await
+        .map_err(|e| refused(&e))?;
+    let mut edits = Vec::with_capacity(asked.edits.len());
+    for edit in asked.edits {
+        let Some(para) = paras.paragraphs.iter().find(|p| p.index == edit.index) else {
+            return Err(Envelope::error(INVALID_INPUT, false));
+        };
+        if !crate::docx_patch::anchor_matches(&para.text, &edit.anchor) {
+            let opening: String = para.text.chars().take(OPENING_CHARS).collect();
+            return completed::<Value>(Ok(serde_json::json!({
+                "written": false,
+                "source_document_id": id,
+                "reason": "anchor_mismatch",
+                "index": edit.index,
+                "paragraph_starts_with": opening,
+                "message": format!(
+                    "【未完成】本次没有改写，也没有生成任何文档：第 {} 段（index {}）开头是「{opening}」，和 anchor「{}」对不上。请先告诉用户这次没改成，不要说已保存或已完成；然后用 documents.paragraphs 确认段号，照抄那一段开头至少 12 个字作为 anchor，重新调用 documents.patch。",
+                    edit.index + 1,
+                    edit.index,
+                    edit.anchor
+                ),
+            })));
+        }
+        edits.push(serde_json::json!({
+            "index": edit.index,
+            "text": edit.text,
+            "tracked": edit.tracked,
+            "expect": para.text,
+        }));
+    }
+    let mut body = serde_json::json!({ "edits": edits });
+    if let Some(title) = asked.title {
+        body["title"] = Value::String(title);
+    }
+    let req: crate::patch::PatchRequest =
+        serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
+    let (_, job) = match crate::patch::patch_run(&storage, id.clone(), req).await {
+        Ok(made) => made,
+        // General 0.6.94: a paragraph the rewrite would damage (a pending
+        // revision, a formula, a page break, ...) came back as a bare
+        // `invalid_request`, and the model said the document was made. The
+        // model is told what was refused and why, in words it can pass on.
+        Err(e) if matches!(e.code(), "invalid_request" | "revision_conflict") => {
+            let why = refusal_in_words(&e);
+            // PR-Daemon #1994 B2: a paragraph changed since it was read is the
+            // one refusal the model can mend itself: told to read again and
+            // retry once, as `anchor_mismatch` is.
+            let message = if e.code() == "revision_conflict" {
+                format!(
+                    "【未完成】这份文档没有改，也没有生成新文档：{why}。请先告诉用户这次没改成，不要说已生成或已完成；然后用 documents.paragraphs 重新读取这几段，照新的原文重新调用一次 documents.patch。"
+                )
+            } else {
+                format!(
+                    "【未完成】这份文档没有改，也没有生成新文档：{why}。请如实告诉用户这一份没改成和原因，不要说已生成或已完成。"
+                )
+            };
+            return completed::<Value>(Ok(serde_json::json!({
+                "written": false,
+                "source_document_id": id,
+                "reason": e.code(),
+                "detail": e.message(),
+                "message": message,
+            })));
+        }
+        Err(e) => return Err(refused(&e)),
+    };
+    let mut answer = settled(&storage, job.0).await;
+    // PR-Daemon #1994 B1: which document this write was of, whatever the
+    // call named it; the run's record compares writes by it.
+    if let Value::Object(map) = &mut answer {
+        map.insert("source_document_id".to_owned(), Value::String(id.clone()));
+    }
+    if answer["status"] == "succeeded"
+        || answer["status"] == "queued"
+        || answer["status"] == "running"
+    {
+        let title = answer["title"].as_str().unwrap_or("新文档").to_owned();
+        state.note_patched(run_id, &id, &title);
+    }
+    completed::<Value>(Ok(answer))
 }
 
 /// D5a: a template's `{{fields}}` (read).
@@ -440,11 +718,10 @@ async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     rest.remove("title");
     let req: crate::patch::FillRequest = parse(rest)?;
     let storage = ready(state).await?;
-    completed(
-        crate::patch::fill_run(&storage, id, req)
-            .await
-            .map(|(_, job)| job.0),
-    )
+    let (_, job) = crate::patch::fill_run(&storage, id, req)
+        .await
+        .map_err(|e| refused(&e))?;
+    completed::<Value>(Ok(settled(&storage, job.0).await))
 }
 
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -749,6 +1026,49 @@ async fn admit(
         Some(doc) if scope.allows_document(&doc) => Ok(()),
         _ => Err(refused(&ApiError::not_found(absent))),
     }
+}
+
+/// Why a patch was refused, in words for the user (General 0.6.94).
+fn refusal_in_words(e: &ApiError) -> String {
+    let m = e.message();
+    if e.code() == "revision_conflict" {
+        return "这一段在读取之后被改过，需要重新读取段落".to_owned();
+    }
+    const KINDS: &[(&str, &str)] = &[
+        ("w:del", "已有未处理的修订（删除痕迹）"),
+        ("w:ins", "已有未处理的修订（插入痕迹）"),
+        ("m:oMath", "公式"),
+        ("picture", "图片"),
+        ("embedded object", "嵌入对象"),
+        ("link", "链接"),
+        ("field", "域（自动编号、页码等）"),
+        ("footnote", "脚注"),
+        ("endnote", "尾注"),
+        ("content control", "内容控件"),
+        ("text box", "文本框"),
+        ("page or column break", "分页符或分栏符"),
+        ("comment reference", "批注"),
+        ("w:sym", "特殊符号"),
+        ("w:ruby", "注音"),
+    ];
+    if let Some(rest) = m.strip_prefix("paragraph ")
+        && let Some((index, what)) = rest.split_once(" contains ")
+    {
+        let what = KINDS
+            .iter()
+            .find(|(k, _)| what.contains(k))
+            .map_or("Word 的特殊内容", |(_, zh)| zh);
+        let n = index
+            .parse::<usize>()
+            .map_or_else(|_| index.to_owned(), |i| (i + 1).to_string());
+        return format!(
+            "第 {n} 段里有{what}，自动改写会把它弄丢，所以没有改；这一段请在 Word 或 WPS 里手动修改"
+        );
+    }
+    if m.contains("out of range") || m.contains("no paragraph") {
+        return "段落编号超出了这份文档的范围".to_owned();
+    }
+    "改写请求不符合要求".to_owned()
 }
 
 /// A service error under its own code (ADR-DOC-02 §6): the kernel keeps an
@@ -1304,6 +1624,252 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    /// PR-Daemon #1994 L2/B2: each refusal in words, the fallback included,
+    /// and a stale paragraph told to be read again.
+    #[test]
+    fn a_refusal_is_said_in_words() {
+        let say = |m: &str| refusal_in_words(&ApiError::invalid_request(m.to_owned()));
+        assert!(say("paragraph 4 contains a picture (w:drawing), which rewriting it would lose; edit it in Word or WPS").starts_with("第 5 段里有图片"));
+        assert!(
+            say("paragraph 0 contains m:oMath, which rewriting it would lose").contains("公式")
+        );
+        assert!(
+            say("paragraph 2 contains w:fooBar in a run, which rewriting it would lose")
+                .contains("第 3 段里有Word 的特殊内容")
+        );
+        assert_eq!(
+            say("there is no paragraph 99"),
+            "段落编号超出了这份文档的范围"
+        );
+        assert_eq!(say("something else"), "改写请求不符合要求");
+    }
+
+    #[tokio::test]
+    async fn a_refused_patch_tells_the_model_what_and_why() {
+        // General 0.6.94: 「第二条 押金…」 holds a pending deletion (w:del); the
+        // rewrite was refused as a bare invalid_request and the model said
+        // the document was made. Now: not written, and why, in words.
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let file: &[u8] = include_bytes!("../tests/fixtures/contract-formula-revision-break.docx");
+        let sha = storage.blobs.put_bytes(file).unwrap().sha256;
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6Y00079";
+        let docx = crate::office::DOCX;
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                        VALUES ('{id}', '合同-公式修订分页.docx', '{docx}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                file.len()
+            ),
+        )
+        .await;
+        let body = json!({ "document_id": id, "edits": [{
+            "index": 2, "anchor": "第二条 押金为两个月租金，期满退还。",
+            "text": "第二条 押金金额为两个月租金总额，租赁期满后予以全额返还。", "tracked": true }] });
+        let answer = call_in(&state, "patch", &[id], body).await;
+        let answer = payload(&answer);
+        assert_eq!(answer["written"], false, "{answer}");
+        assert_eq!(answer["reason"], "invalid_request");
+        let message = answer["message"].as_str().unwrap();
+        assert!(
+            message.contains("没有改") && message.contains("第 3 段") && message.contains("修订"),
+            "{message}"
+        );
+        let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(uploads, 0);
+    }
+
+    /// M1 (c), General 11-21: an Agent's edit names its paragraph by index and
+    /// opening words. Without an anchor it is invalid; with another
+    /// paragraph's opening (0.6.72: 第三条's words at 乙方's line) nothing is
+    /// written and the answer says how that paragraph begins; with its own
+    /// opening, numbering left out (0.6.75), the new document is made.
+    #[tokio::test]
+    async fn an_agent_patch_names_its_paragraph_by_its_opening_words() {
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let sha = storage.blobs.put_bytes(template).unwrap().sha256;
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6Y00078";
+        let docx = crate::office::DOCX;
+        exec(
+            &state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision, created_at, updated_at)
+                        VALUES ('{id}', '合同.docx', '{docx}', 1, '2026-10-01T00:00:00.000Z', '2026-10-01T00:00:00.000Z');
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                template.len()
+            ),
+        )
+        .await;
+        let paras: Vec<_> = crate::docx_patch::list_paragraphs(template)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.text.trim().chars().count() >= 8)
+            .collect();
+        let (this, other) = (&paras[0], &paras[1]);
+        let opening = |t: &str| t.trim().chars().take(16).collect::<String>();
+        let edit = |anchor: Option<String>| {
+            let mut e = json!({ "index": this.index, "text": "新的文字", "tracked": true });
+            if let Some(a) = anchor {
+                e["anchor"] = Value::String(a);
+            }
+            json!({ "document_id": id, "edits": [e] })
+        };
+        let body = call_in(&state, "patch", &[id], edit(None)).await;
+        assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+        // Another paragraph's opening: not written, and told how it begins.
+        let body = call_in(&state, "patch", &[id], edit(Some(opening(&other.text)))).await;
+        let answer = payload(&body);
+        assert_eq!(answer["written"], false, "{answer}");
+        assert_eq!(answer["reason"], "anchor_mismatch");
+        assert!(
+            this.text
+                .starts_with(answer["paragraph_starts_with"].as_str().unwrap())
+        );
+        let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(uploads, 0);
+        // Its own opening: the new document is made.
+        let body = call_in(&state, "patch", &[id], edit(Some(opening(&this.text)))).await;
+        assert_eq!(
+            payload(&body)["kind"],
+            "import",
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        // M1 (0.6.89, PM): the answer waits for the import and says what was
+        // made, done, and not to be called again.
+        let answer = payload(&body);
+        assert!(answer["job_id"].is_string());
+        assert_eq!(answer["status"], "succeeded", "{answer}");
+        let note = answer["note"].as_str().unwrap();
+        assert!(
+            note.starts_with("已完成：已生成新文档《") && note.contains("不要再调用"),
+            "{note}"
+        );
+        assert!(answer["title"].is_string());
+        // The same run asking for the same document again: refused, told what
+        // was made (General 11-21), no new upload.
+        let again = call_in(&state, "patch", &[id], edit(Some(opening(&this.text)))).await;
+        let again = payload(&again);
+        assert_eq!(again["reason"], "already_submitted", "{again}");
+        assert_eq!(again["title"], answer["title"]);
+        let uploads: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM uploads")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(uploads, 1);
+    }
+
+    /// FU-151 (0.6.89): 293 paragraphs of a real contract came to 40 KB in an
+    /// Agent's context. It is shown the ones with text, 40 characters each,
+    /// within 3000 characters, and told how to ask for the rest.
+    #[test]
+    fn an_agent_is_shown_a_long_documents_paragraphs_in_parts() {
+        let all: Vec<crate::patch::Paragraph> = (0..293)
+            .map(|i| crate::patch::Paragraph {
+                index: i,
+                text: if i % 3 == 0 {
+                    String::new()
+                } else {
+                    format!("第{i}条 {}", "合同条款内容".repeat(20))
+                },
+                in_table: false,
+            })
+            .collect();
+        let first = preview_paragraphs("doc_1", &all, &ParagraphsArgs::default());
+        let shown = first["paragraphs"].as_array().unwrap();
+        let chars: usize = shown
+            .iter()
+            .map(|p| p["text"].as_str().unwrap().chars().count())
+            .sum();
+        assert!(chars <= 3000 + 41, "{chars}");
+        assert_eq!(first["total"], 195);
+        assert!(
+            shown.iter().all(|p| p["index"].as_u64().unwrap() % 3 != 0),
+            "no empty paragraph"
+        );
+        assert!(shown[0]["text"].as_str().unwrap().ends_with('…'));
+        assert_eq!(shown[0]["text"].as_str().unwrap().chars().count(), 41);
+        let next = first["next_from"].as_u64().unwrap() as usize;
+        // The rest, from where it stopped.
+        let more = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(next),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            more["paragraphs"][0]["index"].as_u64().unwrap() as usize,
+            next
+        );
+        // A word picks the paragraphs that have it, whole (PM 11-21).
+        let found = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                query: Some("第250条".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(found["total"], 1);
+        assert_eq!(found["paragraphs"][0]["index"], 250);
+        assert_eq!(found["paragraphs"][0]["whole"], true);
+        assert_eq!(
+            found["paragraphs"][0]["text"].as_str().unwrap(),
+            all[250].text
+        );
+        assert!(found.get("next_from").is_none());
+        // One paragraph by its index: whole too.
+        let one = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(4),
+                count: Some(1),
+                ..Default::default()
+            },
+        );
+        assert_eq!(one["paragraphs"][0]["index"], 4);
+        assert_eq!(one["paragraphs"][0]["text"].as_str().unwrap(), all[4].text);
+        assert_eq!(one["next_from"], 5);
+        // A range too wide for whole text is a table of contents again.
+        let wide = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                from: Some(0),
+                count: Some(50),
+                ..Default::default()
+            },
+        );
+        assert!(wide["paragraphs"][0].get("whole").is_none());
+        assert!(
+            wide["paragraphs"][0]["text"]
+                .as_str()
+                .unwrap()
+                .ends_with('…')
+        );
+        // The whole of it serialized stays small: no more 40 KB.
+        assert!(
+            first.to_string().len() < 12_000,
+            "{}",
+            first.to_string().len()
+        );
     }
 
     #[tokio::test]

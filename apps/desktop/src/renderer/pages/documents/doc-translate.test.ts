@@ -3,6 +3,7 @@ import {
   BATCH_CHARS,
   articleNumerals,
   cleanTranslation,
+  headingLevel,
   joinWrapped,
   paragraphsOf,
   translateParagraphs,
@@ -133,5 +134,32 @@ describe('cleanTranslation (General 11-18)', () => {
   it('drops invisible and replacement characters and Chinese full stops in English', () => {
     expect(cleanTranslation('borne by Party B.。\uFFFD\u200B', 'en')).toBe('borne by Party B.')
     expect(cleanTranslation('由乙方承担。', 'zh')).toBe('由乙方承担。')
+  })
+})
+
+describe('N1: headings of the original become Heading1–3', () => {
+  it('reads a heading level off a short line that ends no sentence', () => {
+    expect(headingLevel('房屋租赁合同', true)).toBe(1)
+    expect(headingLevel('房屋租赁合同', false)).toBeUndefined()
+    expect(headingLevel('第一章 总则', false)).toBe(2)
+    expect(headingLevel('一、租赁物', false)).toBe(2)
+    expect(headingLevel('（一）租金', false)).toBe(3)
+    expect(headingLevel('1.1 Scope ', false)).toBe(3)
+    // Body text: an article, a sentence, a long line.
+    expect(headingLevel('第一条 押金为两个月租金。', false)).toBeUndefined()
+    expect(headingLevel('第一条 租赁物', true)).toBeUndefined()
+    expect(headingLevel('一、甲方应按时交付房屋，乙方应按时支付租金并承担相应费用，不得拖欠。', false)).toBeUndefined()
+    expect(headingLevel('甲方：', true)).toBeUndefined()
+  })
+  it('a contract read as paragraphs carries its levels through the translation into the HTML', async () => {
+    const paras = paragraphsOf([{ page: 1, text: '房屋租赁合同\n第一章 总则\n（一）租金\n第一条 押金为两个月租金。' }])
+    expect(paras.map((p) => p.level)).toEqual([1, 2, 3, undefined])
+    const out = await translateParagraphs(asks(['["Lease Contract","Chapter 1 General","(1) Rent","Article 1 The deposit is two months\' rent."]']), paras, 'en')
+    expect(out.map((p) => p.level)).toEqual([1, 2, 3, undefined])
+    const html = translationHtml('t', out, 'en')
+    expect(html).toContain('<h1>Lease Contract</h1>')
+    expect(html).toContain('<h2>Chapter 1 General</h2>')
+    expect(html).toContain('<h3>(1) Rent</h3>')
+    expect(html).toContain("<p>Article 1 The deposit is two months' rent.</p>")
   })
 })

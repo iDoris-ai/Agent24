@@ -39,6 +39,7 @@ import {
   documentsModuleOnDisk,
   ensureBundledOsModules,
   modulesToReplaceWhileStopped,
+  replaceAfterDaemonStart,
   execCli,
   installBundledDocumentsModule,
   packagesRootFor,
@@ -615,7 +616,16 @@ app.whenReady().then(async () => {
   void bundledModulesReady.then(async (outcomes) => {
     const carried = [{ spec: DOCUMENTS_OS, deps: documentsDeps }, { spec: SIN90_OS, deps: sin90Deps }]
     const failed = modulesToReplaceWhileStopped(carried, outcomes)
-    if (failed.length === 0 || !launchAgentPlistExists()) return
+    if (failed.length === 0) return
+    if (!launchAgentPlistExists()) {
+      const again = await replaceAfterDaemonStart(failed, {
+        ready: () => daemonReady(60_000),
+        whileStopped: (work) => backendManager.whileStopped(work),
+        external: () => backendManager.isExternalDaemon(),
+      }).catch((error: unknown) => { console.warn('[bundled-modules] replacing after the daemon started failed:', error); return null })
+      if (again) console.log('[bundled-modules] replaced after the daemon migrated the store:', again.join(', '))
+      return
+    }
     moduleNeedsServiceStop = () => ensureBundledOsModules(failed).finally(() => { moduleNeedsServiceStop = null })
     // Enrolled, and the presence connection up: the shutdown asks the box through it.
     for (let i = 0; i < 90 && !(serviceDaemonOf(backendManager) && presenceConnection?.ready === true); i++) await new Promise((r) => setTimeout(r, 1000))

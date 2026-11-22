@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { parseSkillList, selectableSkillIds } from '../skills/model'
+import { getSkillList } from '../skills/skill-list'
 import {
   SKILLS_CHANGED_EVENT,
   setConversationSkill,
@@ -36,7 +37,7 @@ export function SkillPicker({ conversation, hasMessages, busy, onStartWithSkill 
     const proxy = window.agent24?.backendProxy
     if (!proxy) return
     const ticket = ++latest.current
-    void Promise.resolve(proxy({ method: 'GET', path: '/api/v1/skills' })).then((res) => {
+    void getSkillList(proxy).then((res) => {
       if (ticket !== latest.current) return
       if (!res.ok) { setFailed(true); return }
       const ids = selectableSkillIds(parseSkillList(res.data))

@@ -6839,6 +6839,32 @@ components:
             run has no Knowledge binding. What the run's Knowledge tools did,
             told from its stored tool calls, never from the answer's text: an
             answer may name sources the run never read.
+        documents:
+          $ref: "#/components/schemas/RunDocuments"
+          description: |
+            Only on `GET /api/v1/runs/{id}`. Absent when the run asked for no
+            document write. M1 (11-21): what the run's document writes came
+            to, told from its stored tool calls and results, never from the
+            answer's text, so a client can say 「这次没有改动文档」 or name what
+            was made whatever the answer claims.
+
+    RunDocuments:
+      type: object
+      required: [attempted, jobs]
+      properties:
+        attempted:
+          type: boolean
+          description: The run asked for a documents write (compose, fill, patch, or any documents operation that is not a read).
+        jobs:
+          type: array
+          items:
+            type: string
+          description: Import jobs of the writes that went through; empty when every one was refused, denied or failed.
+        failed:
+          type: array
+          items:
+            type: string
+          description: The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid.
 
     RunKnowledge:
       type: object
@@ -6949,6 +6975,16 @@ components:
             labelled `Unknown` + `LocalOnly`. Inbound events and scheduled
             self-wake runs cannot carry one (`skill_not_admitted`), and neither
             can a workspace-bound run in v1. Omit/null for a run without a skill.
+        knowledge_query:
+          type: [string, "null"]
+          description: >-
+            M1 retrieval first (David 2026-11-21): with a Knowledge binding, the
+            run searches the bound knowledge bases with this text once before
+            its first model call, through the same `knowledge_search` tool and
+            record as a search the model asks for. Hits go in as that search's
+            call and result; no hit, a failure or a refusal leaves the run as it
+            was. Ignored without a binding, on a turn that asks to remember
+            something, and on inbound runs. Omit/null for no search first.
 
     ToolCallStatus:
       type: string

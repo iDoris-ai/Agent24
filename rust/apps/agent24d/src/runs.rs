@@ -347,11 +347,155 @@ struct RunDetail {
     run: Run,
     /// Null when the run has no Knowledge binding.
     knowledge: Option<RunKnowledge>,
+    /// M1 (General/PM 11-21): what the run's document writes came to, told
+    /// from its stored tool calls and results, never from the answer's text.
+    /// Absent when the run asked for no document write.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    documents: Option<RunDocuments>,
+}
+
+/// A run's document writes (compose, fill, patch, and any later documents
+/// operation that is not a read): whether one was asked for, and the import
+/// jobs of those that went through. A refusal, a denial, an error, a patch
+/// whose anchor did not match: asked for, no job.
+#[derive(Serialize, Debug, PartialEq)]
+struct RunDocuments {
+    attempted: bool,
+    jobs: Vec<String>,
+    /// General 0.6.94: the documents a write was asked for and none went
+    /// through (each as the call named it: a document id, a file name, or a
+    /// new document's title), so a run that made A and failed on B says both.
+    /// A document a later write did make is not here.
+    failed: Vec<String>,
+}
+
+/// The documents operations that only read.
+const DOCUMENT_READS: &[&str] = &[
+    "list",
+    "get",
+    "paragraphs",
+    "fields",
+    "read_range",
+    "find",
+    "extract",
+    "job_get",
+];
+
+fn is_document_write(tool: &str) -> bool {
+    tool.strip_prefix("documents.")
+        .is_some_and(|op| !DOCUMENT_READS.contains(&op))
+}
+
+fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments> {
+    // PR-Daemon #1986 Low 1: a model may reuse a tool_call id across turns, so
+    // each result is paired with the call of that id seen most recently before
+    // it, in thread order, never with a later one.
+    let mut names = std::collections::HashMap::new();
+    let mut attempted = false;
+    let mut jobs = Vec::new();
+    let mut made: Vec<String> = Vec::new();
+    let mut tried: Vec<String> = Vec::new();
+    // PR-Daemon #1994 B1: a document named by its file name in one call and
+    // by its id in another is one document. What the module answered (the
+    // `document_id` of a read, the `source_document_id` of a write) says
+    // which document a name stood for; both sides are compared by that.
+    let mut alias: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for m in messages {
+        if m.role == "assistant" {
+            for call in m.tool_calls.as_array().into_iter().flatten() {
+                if let (Some(id), Some(name)) = (
+                    call.get("id").and_then(|v| v.as_str()),
+                    call.get("name").and_then(|v| v.as_str()),
+                ) {
+                    names.insert(id.to_owned(), (name.to_owned(), write_target(call)));
+                }
+            }
+            continue;
+        }
+        if m.role != "tool" {
+            continue;
+        }
+        let Some((name, target)) = m.tool_call_id.as_ref().and_then(|id| names.get(id)) else {
+            continue;
+        };
+        if !name.starts_with("documents.") {
+            continue;
+        }
+        let payload = m
+            .content
+            .as_deref()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+            .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("completed"))
+            .and_then(|v| v.get("payload").cloned());
+        let write = is_document_write(name);
+        let resolved = payload.as_ref().and_then(|p| {
+            p.get(if write {
+                "source_document_id"
+            } else {
+                "document_id"
+            })
+            .and_then(|d| d.as_str())
+        });
+        if let Some(resolved) = resolved
+            && !target.is_empty()
+        {
+            alias.insert(target.clone(), resolved.to_owned());
+        }
+        if !write {
+            continue;
+        }
+        attempted = true;
+        let job = payload
+            .as_ref()
+            .and_then(|p| p.get("job_id"))
+            .and_then(|j| j.as_str())
+            .map(str::to_owned);
+        match job {
+            Some(job) => {
+                jobs.push(job);
+                made.push(target.clone());
+            }
+            None => tried.push(target.clone()),
+        }
+    }
+    let key = |t: &String| alias.get(t).cloned().unwrap_or_else(|| t.clone());
+    let made: std::collections::HashSet<String> = made.iter().map(key).collect();
+    let mut failed: Vec<String> = Vec::new();
+    for t in tried.iter().filter(|t| !t.is_empty()).map(key) {
+        if !made.contains(&t) && !failed.contains(&t) {
+            failed.push(t);
+        }
+    }
+    attempted.then_some(RunDocuments {
+        attempted,
+        jobs,
+        failed,
+    })
+}
+
+/// The document a write call was aimed at, as the call named it: its
+/// `document_id` (an id or a file name), else the new document's `title`.
+fn write_target(call: &serde_json::Value) -> String {
+    let arguments = call.get("arguments");
+    let parsed = match arguments {
+        Some(serde_json::Value::String(s)) => serde_json::from_str(s).unwrap_or_default(),
+        Some(v) => v.clone(),
+        None => serde_json::Value::Null,
+    };
+    ["document_id", "title"]
+        .iter()
+        .find_map(|k| parsed.get(k).and_then(|v| v.as_str()))
+        .unwrap_or("")
+        .to_owned()
 }
 
 pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> Response {
     match state.store.get_run(&id).await {
         Ok(Some(run)) => {
+            let documents = match state.store.list_run_messages(&run.id).await {
+                Ok(messages) => run_documents(&messages),
+                Err(err) => return map_store_error(err),
+            };
             let knowledge = match run.input.knowledge_binding_id {
                 None => None,
                 Some(_) => match state.store.list_tool_calls(&run.id).await {
@@ -371,7 +515,12 @@ pub async fn get_run(State(state): State<AppState>, Path(id): Path<String>) -> R
                     Err(err) => return map_store_error(err),
                 },
             };
-            Json(RunDetail { run, knowledge }).into_response()
+            Json(RunDetail {
+                run,
+                knowledge,
+                documents,
+            })
+            .into_response()
         }
         Ok(None) => error_response(StatusCode::NOT_FOUND, "not_found", &format!("run {id}")),
         Err(err) => map_store_error(err),
@@ -500,5 +649,271 @@ mod skill_run_tests {
         // Old clients omit the field and still deserialize.
         let (status, value) = post_run(&state, json!({"prompt": "hi"})).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{value}");
+    }
+}
+
+#[cfg(test)]
+mod documents_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn msg(
+        role: &str,
+        content: Option<&str>,
+        calls: serde_json::Value,
+        id: Option<&str>,
+    ) -> agent24_store::RunMessage {
+        agent24_store::RunMessage {
+            run_id: "r".into(),
+            seq: 0,
+            role: role.into(),
+            content: content.map(str::to_owned),
+            tool_calls: calls,
+            tool_call_id: id.map(str::to_owned),
+            created_at: String::new(),
+        }
+    }
+
+    /// M1 (General/PM 11-21): told from the tool results, never the answer.
+    #[test]
+    fn a_runs_document_writes_are_told_from_their_results() {
+        let ask = |id: &str, name: &str| {
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": id, "name": name, "arguments": "{}" }]),
+                None,
+            )
+        };
+        let job = r#"{"kind":"completed","payload":{"job_id":"job_1","kind":"import","status":"queued"}}"#;
+        let refused =
+            r#"{"kind":"completed","payload":{"written":false,"reason":"anchor_mismatch"}}"#;
+        // Only reads: nothing to say.
+        let reads = [
+            ask("a", "documents.paragraphs"),
+            msg("tool", Some("{}"), json!([]), Some("a")),
+        ];
+        assert_eq!(run_documents(&reads), None);
+        // A patch the card sent back, then the answer 「已保存」: asked, no job.
+        let denied = [
+            ask("b", "documents.patch"),
+            msg(
+                "tool",
+                Some("denied by policy: denied by user: 【未完成】…"),
+                json!([]),
+                Some("b"),
+            ),
+            msg("assistant", Some("已保存为新文档《x》"), json!([]), None),
+        ];
+        assert_eq!(
+            run_documents(&denied),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![],
+                failed: vec![]
+            })
+        );
+        // The module's own refusal and an error: asked, no job.
+        let refusals = [
+            ask("c", "documents.patch"),
+            msg("tool", Some(refused), json!([]), Some("c")),
+            ask("d", "documents.compose"),
+            msg("tool", Some("tool error: failed: {}"), json!([]), Some("d")),
+        ];
+        assert_eq!(
+            run_documents(&refusals),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![],
+                failed: vec![]
+            })
+        );
+        // Sent back, then retried right: the job.
+        let retried = [
+            ask("e", "documents.patch"),
+            msg("tool", Some(refused), json!([]), Some("e")),
+            ask("f", "documents.patch"),
+            msg("tool", Some(job), json!([]), Some("f")),
+        ];
+        assert_eq!(
+            run_documents(&retried),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_1".into()],
+                failed: vec![]
+            })
+        );
+        // PR-Daemon #1986 Low 1: the same call id reused, a read then a write:
+        // each result goes with the call just before it.
+        let reused = [
+            ask("x", "documents.patch"),
+            msg("tool", Some(job), json!([]), Some("x")),
+            ask("x", "documents.paragraphs"),
+            msg("tool", Some("{}"), json!([]), Some("x")),
+        ];
+        assert_eq!(
+            run_documents(&reused),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_1".into()],
+                failed: vec![]
+            })
+        );
+        let reused_back = [
+            ask("y", "documents.paragraphs"),
+            msg("tool", Some("{}"), json!([]), Some("y")),
+            ask("y", "documents.patch"),
+            msg("tool", Some(refused), json!([]), Some("y")),
+        ];
+        assert_eq!(
+            run_documents(&reused_back),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![],
+                failed: vec![]
+            })
+        );
+        // General 0.6.94: two documents in one run, A made, B refused by the
+        // module (a pending revision): both told. A's earlier refusal is not
+        // a failure once A was made.
+        let to = |id: &str, doc: &str| {
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": id, "name": "documents.patch",
+                         "arguments": format!("{{\"document_id\": \"{doc}\", \"edits\": []}}") }]),
+                None,
+            )
+        };
+        let two = [
+            to("g", "doc_A"),
+            msg("tool", Some(refused), json!([]), Some("g")),
+            to("h", "doc_A"),
+            msg("tool", Some(job), json!([]), Some("h")),
+            to("i", "doc_B"),
+            msg(
+                "tool",
+                Some(
+                    r#"{"kind":"completed","payload":{"written":false,"reason":"invalid_request"}}"#,
+                ),
+                json!([]),
+                Some("i"),
+            ),
+            to("j", "doc_B"),
+            msg("tool", Some("tool error: failed: {}"), json!([]), Some("j")),
+        ];
+        assert_eq!(
+            run_documents(&two),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_1".into()],
+                failed: vec!["doc_B".into()]
+            })
+        );
+        // PR-Daemon #1994 B1: refused under its file name, made under its id:
+        // one document, made. The module's answers say which id a name is.
+        let named = [
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "p", "name": "documents.paragraphs", "arguments": { "document_id": "合同.docx" } }]),
+                None,
+            ),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"document_id":"doc_X","paragraphs":[]}}"#),
+                json!([]),
+                Some("p"),
+            ),
+            to("q", "合同.docx"),
+            msg(
+                "tool",
+                Some("denied by policy: denied by user: 【未完成】…"),
+                json!([]),
+                Some("q"),
+            ),
+            to("r", "doc_X"),
+            msg(
+                "tool",
+                Some(
+                    r#"{"kind":"completed","payload":{"job_id":"job_9","source_document_id":"doc_X"}}"#,
+                ),
+                json!([]),
+                Some("r"),
+            ),
+        ];
+        assert_eq!(
+            run_documents(&named),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_9".into()],
+                failed: vec![]
+            })
+        );
+        // The same the other way: the write's own answer names the document.
+        let named_write = [
+            to("s", "合同.docx"),
+            msg(
+                "tool",
+                Some(
+                    r#"{"kind":"completed","payload":{"written":false,"source_document_id":"doc_X"}}"#,
+                ),
+                json!([]),
+                Some("s"),
+            ),
+            to("t", "doc_X"),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"job_id":"job_9"}}"#),
+                json!([]),
+                Some("t"),
+            ),
+        ];
+        assert_eq!(run_documents(&named_write).map(|d| d.failed), Some(vec![]));
+        // A compose names its new document by title.
+        let compose = [
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "k", "name": "documents.compose", "arguments": { "title": "周报" } }]),
+                None,
+            ),
+            msg("tool", Some("tool error: failed: {}"), json!([]), Some("k")),
+        ];
+        assert_eq!(
+            run_documents(&compose).map(|d| d.failed),
+            Some(vec!["周报".to_owned()])
+        );
+        // fill and a later write operation are writes too.
+        assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));
+    }
+
+    /// PR-Daemon #1979 Low: every documents operation the module declares is
+    /// classed by its own risk: a read the module declares `read` is in
+    /// `DOCUMENT_READS`, every other one is a write. A new read-only operation
+    /// left out of the list turns this red instead of a red line under answers.
+    #[test]
+    fn every_declared_documents_operation_is_classed_by_its_risk() {
+        let manifest = include_str!("../../agent24-documents/domain-os.yml");
+        let mut op = None;
+        let mut seen = 0;
+        for line in manifest.lines() {
+            let line = line.trim();
+            if let Some(name) = line.strip_prefix("- operation:") {
+                op = Some(name.trim().to_owned());
+            } else if let Some(risk) = line.strip_prefix("risk:")
+                && let Some(name) = op.take()
+            {
+                let read = risk.trim() == "read";
+                assert_eq!(
+                    !is_document_write(&format!("documents.{name}")),
+                    read,
+                    "documents.{name} is declared {risk}"
+                );
+                seen += 1;
+            }
+        }
+        assert!(seen >= 7, "{seen}");
+        assert!(!is_document_write("documents.get") && !is_document_write("knowledge_search"));
     }
 }

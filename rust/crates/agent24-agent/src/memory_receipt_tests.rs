@@ -140,6 +140,7 @@ async fn run(rig: &Rig, session: &str, prompt: &str) -> Run {
     let started = rig
         .manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some(session.to_owned()),
@@ -388,6 +389,7 @@ async fn a_failed_legacy_import_fails_the_run_typed_and_a_retry_recovers_the_his
     let second = r
         .manager
         .start_run(RunCreate {
+            knowledge_query: None,
             idoris_headroom_confirmed: false,
             workspace_id: None,
             session_id: Some("s-legacy".to_owned()),

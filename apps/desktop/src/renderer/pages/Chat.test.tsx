@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { KNOWLEDGE_HINT } from './chat-knowledge'
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react'
 import ChatPage from './Chat'
 import { setLocale } from '../i18n'
@@ -179,7 +180,7 @@ describe('ChatPage', () => {
       expect(screen.getByText('Hello from AI!')).toBeInTheDocument()
     })
     // Server-reported latency_ms wins over the frontend's own timing too.
-    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 本地 · 总计 842 ms')).toBeInTheDocument()
+    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 本地 · 用时 0.8 秒')).toBeInTheDocument()
     expect(screen.queryByText(/首字/)).not.toBeInTheDocument()
   })
 
@@ -199,7 +200,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
     await waitFor(() => expect(screen.getByText('Done.')).toBeInTheDocument())
-    expect(screen.getByText(/^总计 \d+(,\d{3})* ms$/)).toBeInTheDocument()
+    expect(screen.getByText(/^用时 \d+(\.\d)? 秒$/)).toBeInTheDocument()
   })
 
   it('does not attach a latency suffix to the error fallback message', async () => {
@@ -213,7 +214,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
     await waitFor(() => expect(screen.getByText(/对话请求失败/)).toBeInTheDocument())
-    expect(screen.queryByText(/总计/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/用时/)).not.toBeInTheDocument()
   })
 
   it('does not blame the model service when the backend daemon never became ready', async () => {
@@ -236,7 +237,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
     await waitFor(() => {
-      expect(screen.getByText(/Agent24 后端服务（agent24d）尚未就绪/)).toBeInTheDocument()
+      expect(screen.getByText(/Agent24 的后台服务没能启动/)).toBeInTheDocument()
     })
     expect(screen.queryByText(/对话请求失败/)).not.toBeInTheDocument()
     expect(screen.queryByText(/11434/)).not.toBeInTheDocument()
@@ -393,7 +394,93 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText('from the knowledge base')).toBeInTheDocument(), { timeout: 3000 })
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
     expect(screen.queryByText(/本次没有读到/)).not.toBeInTheDocument()
-    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's1' } }))
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', knowledge_query: 'second' } }))
+  })
+
+  // M1 (General/PM 11-21): the line under the answer is the daemon's record
+  // of the run's document writes, never the answer's words.
+  it.each([
+    ['nothing made', { attempted: true, jobs: [] }, /这次没有改动文档/],
+    ['a document made', { attempted: true, jobs: ['job_1'] }, /已生成：《合同-链接与脚注（修改）》/],
+    // General 0.6.94: A made, B refused: B is said too, by its title.
+    ['one made, one not', { attempted: true, jobs: ['job_1'], failed: ['doc_B'] }, /没能修改：《合同-公式修订分页.docx》/],
+  ])('a reply whose run asked for a document write says what came of it: %s', async (_case, documents, line) => {
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'job'
+      ? { ok: true, data: { job_id: 'job_1', status: 'succeeded', result: { document_id: 'doc_new' } } }
+      : req.documentId === 'doc_B'
+        ? { ok: true, data: { document_id: 'doc_B', title: '合同-公式修订分页.docx' } }
+        : { ok: true, data: { document_id: 'doc_new', title: '合同-链接与脚注（修改）' } })
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: aside(mockBackendProxy),
+        knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) },
+        documents: { request },
+      },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r_patch' } }
+      // 0.6.82: the model said it saved a document whatever came of it.
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '已保存为新文档《合同-修订版.docx》' }, documents } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('已保存为新文档《合同-修订版.docx》')).toBeInTheDocument(), { timeout: 3000 })
+    await waitFor(() => expect(screen.getByText(line)).toBeInTheDocument(), { timeout: 3000 })
+  })
+
+  // General 0.6.93: a turn that ran and failed (the local model stopped at
+  // prefill) was sent; only one that never started reads 「未发送」.
+  it.each([
+    ['provider_unavailable', '本地模型暂时不可用', false],
+    ['run_not_started', '这次回答没能开始', true],
+  ])('a run that fails with %s: 「未发送」 shown %s', async (code, line, notSent) => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        return code === 'run_not_started'
+          ? { ok: false, status: 503, data: { error: { code, message: code } } }
+          : { ok: true, status: 201, data: { id: 'r1' } }
+      }
+      return { ok: true, status: 200, data: { status: 'failed', error: { code, message: 'oMLX memory guard aborted' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText(new RegExp(line))).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.queryByText('未发送') !== null).toBe(notSent)
+  })
+
+  // M3 (0.6.73): a stopped turn read 「回答失败：run_cancelled」 under 「未发送」.
+  it('a stopped turn says so in words, with the code only under 详情, and was sent', async () => {
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: 'r1' } }
+      return { ok: true, status: 200, data: { status: 'cancelled', error: { code: 'run_cancelled', message: 'run_cancelled' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: 'hello' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('已停止这次回答。')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.queryByText(/回答失败/)).toBeNull()
+    expect(screen.queryByText('未发送')).toBeNull()
+    expect(screen.getByText('详情').closest('details')?.textContent).toContain('run_cancelled')
   })
 
   it('runs the first Knowledge turn of a new conversation in a new session', async () => {
@@ -405,7 +492,7 @@ describe('ChatPage with Knowledge', () => {
     let sessions = 0
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: `s${++sessions}` } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       const text = req.path.endsWith('r-first') ? 'answer one' : 'answer two'
       return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge: { searched: true, read_chunks: [] } } }
     })
@@ -421,7 +508,7 @@ describe('ChatPage with Knowledge', () => {
     fireEvent.change(textarea, { target: { value: 'second' } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(screen.getByText('answer two')).toBeInTheDocument(), { timeout: 3000 })
-    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: 'second', session_id: 's2' } }))
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ method: 'POST', path: '/api/v1/runs', body: { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's2', knowledge_query: 'second' } }))
   })
 
   // Mutation: pass skill_id only while creating the run session (the first round) and the second expectation goes red.
@@ -437,7 +524,7 @@ describe('ChatPage with Knowledge', () => {
     ] } })
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       const text = req.path.endsWith('r-first') ? 'answer one' : 'answer two'
       return { ok: true, status: 200, data: { status: 'completed', output: { text }, knowledge: { searched: true, read_chunks: [] } } }
     })
@@ -459,8 +546,8 @@ describe('ChatPage with Knowledge', () => {
 
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
     expect(runs.map((req) => req.body)).toEqual([
-      { prompt: 'first', session_id: 's1', skill_id: 'live' },
-      { prompt: 'second', session_id: 's1', skill_id: 'live' },
+      { prompt: `${KNOWLEDGE_HINT}\nfirst`, session_id: 's1', skill_id: 'live', knowledge_query: 'first' },
+      { prompt: `${KNOWLEDGE_HINT}\nsecond`, session_id: 's1', skill_id: 'live', knowledge_query: 'second' },
     ])
   })
 
@@ -483,7 +570,7 @@ describe('ChatPage with Knowledge', () => {
     skillListing.respond = () => skillList(['live'])
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       return { ok: true, status: 200, data: { status: 'completed', output: { text: `ans ${req.path.slice('/api/v1/runs/r-'.length)}` }, knowledge: null } }
     })
     render(<ChatPage />)
@@ -569,7 +656,7 @@ describe('ChatPage with Knowledge', () => {
     skillListing.respond = () => skillList(['live'])
     mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
       if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
-      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt}` } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') return { ok: true, status: 201, data: { id: `r-${req.body?.prompt?.split('\n').pop()}` } }
       if (req.path.startsWith('/api/v1/runs/')) return { ok: true, status: 200, data: { status: 'completed', output: { text: `ans ${req.path.slice('/api/v1/runs/r-'.length)}` }, knowledge: null } }
       return { ok: true, status: 200, data: { message: { content: 'plain reply' } } }
     })
@@ -740,7 +827,7 @@ describe('ChatPage with Knowledge when the run outlasts the wait', () => {
 describe('ChatPage with Knowledge when the answer names sources the run did not read', () => {
   beforeEach(() => { setLocale('zh') })
 
-  const answerWith = async (text: string, knowledge: unknown) => {
+  const answerWith = async (text: string, knowledge: unknown, prompt = 'Can the tap water be drunk during the boil water notice?') => {
     Object.defineProperty(window, 'agent24', {
       value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
@@ -753,23 +840,31 @@ describe('ChatPage with Knowledge when the answer names sources the run did not 
     })
     render(<ChatPage />)
     const textarea = screen.getByPlaceholderText(/输入消息/)
-    fireEvent.change(textarea, { target: { value: 'Can the tap water be drunk during the boil water notice?' } })
+    fireEvent.change(textarea, { target: { value: prompt } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(screen.getByText(text)).toBeInTheDocument(), { timeout: 3000 })
   }
+
+  // UI polish 03 (David): a turn the system does not search first (writing,
+  // 「记住…」, a document's rewrite or split) is not told it was not searched.
+  it.each(['帮我写一段产品介绍', '记住我喜欢喝茶'])('no 「没有检索知识库」 under %s, which is not searched first', async (prompt) => {
+    await answerWith('好的。', { searched: false, read_chunks: [] }, prompt)
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/v1/runs', body: expect.not.objectContaining({ knowledge_query: expect.anything() }) }))
+    expect(screen.queryByText(chatMessages.zh['knowledge.notSearched'])).not.toBeInTheDocument()
+  })
 
   it('says the answer did not search Knowledge when the run called no tool, and marks its sources', async () => {
     const made = 'b512455b-6df2-4419-8df1-72126627085c#22b86b23-4bce-4898-9e43-9c62411f54c9'
     await answerWith(`煮沸至少 1 分钟。来源：s01-02-zh-water-2025.pdf，${made}`, { searched: false, read_chunks: [] })
     expect(screen.queryByText(chatMessages.zh['knowledge.via'])).not.toBeInTheDocument()
     expect(screen.getByText(chatMessages.zh['knowledge.notSearched'])).toBeInTheDocument()
-    expect(screen.getByText(`⚠️ 以下来源本次没有读到，不能当作来源：${made}`)).toBeInTheDocument()
+    expect(screen.getByText(`⚠️ 回答里提到的这些来源本次没有读到，不能当作依据：${made}`)).toBeInTheDocument()
   })
 
   it('marks only the sources that are not among the chunks the run read back', async () => {
     await answerWith('答案。来源：doc-7#chk-71；doc-9#chk-99', { searched: true, read_chunks: [{ knowledge_id: 'doc-7', chunk_id: 'chk-71' }] })
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
-    expect(screen.getByText('⚠️ 以下来源本次没有读到，不能当作来源：doc-9#chk-99')).toBeInTheDocument()
+    expect(screen.getByText('⚠️ 回答里提到的这些来源本次没有读到，不能当作依据：doc-9#chk-99')).toBeInTheDocument()
   })
 })
 
@@ -828,7 +923,7 @@ describe('ChatPage with Knowledge on another server', () => {
     for (const text of ['one', 'two', 'three']) {
       fireEvent.change(textarea, { target: { value: text } })
       fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
-      await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ prompt: text }) })), { timeout: 3000 })
+      await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ body: expect.objectContaining({ prompt: `${KNOWLEDGE_HINT}\n${text}` }) })), { timeout: 3000 })
       await waitFor(() => expect(screen.queryByText(/思考中|thinking/i)).toBeNull(), { timeout: 3000 })
     }
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
@@ -894,8 +989,8 @@ describe('ChatPage with Knowledge when iDoris needs reserved memory', () => {
     await waitFor(() => expect(screen.getByText('loaded with knowledge')).toBeInTheDocument(), { timeout: 3000 })
     const runs = mockBackendProxy.mock.calls.map(([req]) => req).filter((req) => req.method === 'POST' && req.path === '/api/v1/runs')
     expect(runs.map((req) => req.body)).toEqual([
-      { prompt: 'q', session_id: 's1' },
-      { prompt: 'q', session_id: 's1', idoris_headroom_confirmed: true },
+      { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1', knowledge_query: 'q' },
+      { prompt: `${KNOWLEDGE_HINT}\nq`, session_id: 's1', idoris_headroom_confirmed: true },
     ])
     expect(sessions).toBe(1)
   })

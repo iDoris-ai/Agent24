@@ -6,7 +6,13 @@
 //
 // A DOCX is a zip of three XML parts, stored without compression.
 
-export interface DocxParagraph { text: string; pageBreakBefore: boolean }
+export interface DocxParagraph {
+  text: string
+  pageBreakBefore: boolean
+  /** N1 (Loop 5): a heading of level 1–3, written with Word's built-in
+   * 「标题 1–3」 (Heading1–3) style so WPS and Word list it in the navigation pane. */
+  level?: 1 | 2 | 3
+}
 
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256)
@@ -89,7 +95,29 @@ const CONTENT_TYPES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n
   + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
   + '<Default Extension="xml" ContentType="application/xml"/>'
   + '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/>'
+  + '<Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/>'
   + '</Types>'
+
+const DOCUMENT_RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+  + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+  + '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+  + '</Relationships>'
+
+/** N1: Normal plus Heading1–3, with their outline levels (what the navigation
+ * pane reads) and the ids and names Word and WPS know as built in. */
+function headingStyle(level: 1 | 2 | 3): string {
+  const size = { 1: 36, 2: 30, 3: 26 }[level]
+  return `<w:style w:type="paragraph" w:styleId="Heading${level}"><w:name w:val="heading ${level}"/>`
+    + '<w:basedOn w:val="Normal"/><w:next w:val="Normal"/><w:uiPriority w:val="9"/><w:qFormat/>'
+    + `<w:pPr><w:keepNext/><w:spacing w:before="240" w:after="120"/><w:outlineLvl w:val="${level - 1}"/></w:pPr>`
+    + `<w:rPr><w:b/><w:sz w:val="${size}"/><w:szCs w:val="${size}"/></w:rPr></w:style>`
+}
+
+const STYLES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+  + '<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+  + '<w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/><w:qFormat/></w:style>'
+  + headingStyle(1) + headingStyle(2) + headingStyle(3)
+  + '</w:styles>'
 
 const RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
   + '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
@@ -99,7 +127,9 @@ const RELS = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
 /** The paragraphs, in order, a page break where the original page changed. */
 export function docxBytes(paragraphs: readonly DocxParagraph[]): Buffer {
   const body = paragraphs.map((p) => {
-    const pPr = p.pageBreakBefore ? '<w:pPr><w:pageBreakBefore/></w:pPr>' : ''
+    const style = p.level ? `<w:pStyle w:val="Heading${p.level}"/>` : ''
+    const brk = p.pageBreakBefore ? '<w:pageBreakBefore/>' : ''
+    const pPr = style || brk ? `<w:pPr>${style}${brk}</w:pPr>` : ''
     return `<w:p>${pPr}<w:r><w:rPr><w:rFonts w:eastAsia="Noto Sans SC"/></w:rPr><w:t xml:space="preserve">${xmlText(p.text)}</w:t></w:r></w:p>`
   }).join('')
   const document = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
@@ -111,5 +141,7 @@ export function docxBytes(paragraphs: readonly DocxParagraph[]): Buffer {
     { name: '[Content_Types].xml', data: Buffer.from(CONTENT_TYPES, 'utf8') },
     { name: '_rels/.rels', data: Buffer.from(RELS, 'utf8') },
     { name: 'word/document.xml', data: Buffer.from(document, 'utf8') },
+    { name: 'word/_rels/document.xml.rels', data: Buffer.from(DOCUMENT_RELS, 'utf8') },
+    { name: 'word/styles.xml', data: Buffer.from(STYLES, 'utf8') },
   ])
 }

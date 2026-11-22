@@ -196,6 +196,11 @@ beforeAll(async () => {
           id: 'ap_long', kind: 'exec', summary: 'S'.repeat(500), run_id: 'r',
           payload: { cmd: 'P'.repeat(2000) }, status: 'pending',
         }))
+      } else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_cut') {
+        res.end(JSON.stringify({
+          id: 'ap_cut', kind: 'module', summary: 'documents.patch: {"document_id":"doc_1","edits":[{"index":2… [truncated 94 bytes]',
+          run_id: 'r', payload: { document_id: 'doc_1' }, status: 'pending', available_decisions: ['approve', 'deny'],
+        }))
       } else if (req.method === 'GET' && req.url === '/api/v1/approvals/ap_done') {
         res.end(JSON.stringify({ id: 'ap_done', kind: 'exec', summary: 's', status: 'approved' }))
       } else if (req.method === 'GET' && req.url?.startsWith('/api/v1/approvals/ap_missing')) {
@@ -452,12 +457,20 @@ describe('A1 backendProxy allowlist', () => {
       showMessageBox.mockResolvedValue({ response: 0 })
       await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'approve', reason: 'harmless readme tweak' })
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
-      expect(opts.message).toContain('ap_1')
-      expect(opts.detail).toContain('REAL: rm -rf /tmp/real')
-      expect(opts.detail).toContain('run_real')
-      expect(opts.detail).toContain('exec')
-      expect(opts.detail).toContain('/tmp/real')
+      // UI polish 01: what it does, from the record's payload; no approval or run id.
+      expect(opts.message).toBe('Let the assistant do this: REAL?')
+      expect(opts.detail).toContain('What it does: {"argv":["rm","-rf","/tmp/real"]}')
+      expect(`${opts.message}${opts.detail}`).not.toMatch(/ap_1|run_real/)
       expect(opts.detail).toContain('Note from the page (for reference only): harmless readme tweak')
+    })
+    // M1 (0.6.89): the card sends a wrongly aimed patch back by denying it;
+    // a deny refuses, so no box of its own asks the user to confirm it.
+    it('a deny goes through without a box of its own', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_1', { type: 'deny', reason: '没有改写：第 3 段开头对不上' })
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(res.ok).toBe(true)
+      expect(seen).toHaveLength(1)
+      expect(JSON.parse(seen[0]!.body)).toEqual({ type: 'deny', reason: '没有改写：第 3 段开头对不上' })
     })
     it('approve_for_target (offered by the daemon) goes through: one dialog, one POST', async () => {
       showMessageBox.mockResolvedValue({ response: 0 })
@@ -477,8 +490,19 @@ describe('A1 backendProxy allowlist', () => {
       showMessageBox.mockResolvedValue({ response: 1 })
       await call(IpcChannels.ApprovalDecide, 'ap_long', { type: 'approve' })
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { detail: string }
-      expect(opts.detail).toContain('(truncated, 500 characters in total)')
       expect(opts.detail).toMatch(/\(truncated, \d{4} characters in total\)/)
+    })
+    it('a patch whose edits the record lacks is refused before any dialog (UI polish 01)', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_cut', { type: 'approve' })
+      expect(res).toMatchObject({ ok: false, status: 409 })
+      expect(res.data.error.code).toBe('approval_incomplete')
+      expect(showMessageBox).not.toHaveBeenCalled()
+      expect(seen).toHaveLength(0)
+    })
+    it('the same patch can still be denied', async () => {
+      const res = await call(IpcChannels.ApprovalDecide, 'ap_cut', { type: 'deny' })
+      expect(res.ok).toBe(true)
+      expect(seen).toHaveLength(1)
     })
     it('daemon 404 -> refused without any dialog or POST', async () => {
       const res = await call(IpcChannels.ApprovalDecide, 'ap_missing', { type: 'approve' })

@@ -1,5 +1,5 @@
-// Chat page's per-reply latency suffix ("Qwen3.6-35B-A3B · 本地 · 首字 412 ms
-// · 总计 1,834 ms") — split out of Chat.tsx so it's trivial to unit test
+// Chat page's per-reply latency suffix ("Qwen3.6-35B-A3B · 本地 · 首字 0.4 秒
+// · 用时 1.8 秒") — split out of Chat.tsx so it's trivial to unit test
 // without React, same reasoning as voice/display.ts.
 //
 // Review M3: `/api/v1/chat` (agent24-protocol's `ChatResponse`) now reports
@@ -10,9 +10,8 @@
 // `null` and the suffix shows no model name at all — Chat.tsx must NOT
 // substitute a guess (e.g. the topbar's daemon-default model) in its place;
 // that would show a model that may not be the one that actually answered.
-// `firstTokenMs` stays `null` today (no streaming yet), so only `总计` shows.
+// `firstTokenMs` stays `null` today (no streaming yet), so only `用时` shows.
 
-import { formatMs } from '../../shared/format-latency'
 import { translate } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 
@@ -27,6 +26,17 @@ export interface ReplyLatency {
   totalMs: number
 }
 
+/** UI polish 02 (David): a time as people say it, never 「132,315 ms」:
+ *  under 10 s to a tenth, then whole seconds, from a minute on 「2 分 12 秒」. */
+export function formatDuration(ms: number): string {
+  const n = Number.isFinite(ms) ? Math.max(0, ms) : 0
+  if (n < 9_950) return translate(chatMessages, 'latency.seconds', { s: (n / 1000).toFixed(1) })
+  const s = Math.round(n / 1000)
+  return s < 60
+    ? translate(chatMessages, 'latency.seconds', { s: String(s) })
+    : translate(chatMessages, 'latency.minutes', { m: String(Math.floor(s / 60)), s: String(s % 60) })
+}
+
 /** The one line shown under an assistant reply. Never throws on a `null`
  *  modelName/tier — it just omits that segment. */
 export function formatReplySuffix(latency: ReplyLatency): string {
@@ -34,9 +44,9 @@ export function formatReplySuffix(latency: ReplyLatency): string {
   if (latency.modelName) parts.push(latency.modelName)
   if (latency.tier) parts.push(translate(chatMessages, `latency.${latency.tier}`))
   if (latency.firstTokenMs !== null && latency.firstTokenMs !== latency.totalMs) {
-    parts.push(translate(chatMessages, 'latency.firstToken', { time: formatMs(latency.firstTokenMs) }))
+    parts.push(translate(chatMessages, 'latency.firstToken', { time: formatDuration(latency.firstTokenMs) }))
   }
-  parts.push(translate(chatMessages, 'latency.total', { time: formatMs(latency.totalMs) }))
+  parts.push(translate(chatMessages, 'latency.total', { time: formatDuration(latency.totalMs) }))
   return parts.join(' · ')
 }
 

@@ -17,6 +17,7 @@ use crate::{EventSink, SessionMemory};
 mod approval;
 mod construct;
 mod execute;
+pub use execute::compact_evidence_for_tests;
 mod session;
 mod start;
 mod turn;
@@ -70,6 +71,9 @@ pub struct RunManager {
     /// `start_run` never inserts here. Process-local: a restart does not
     /// resume `execute` (orphan sweep cancels the run).
     pub(crate) inbound_origins: Mutex<HashMap<String, String>>,
+    /// M1 retrieval first: a run's `knowledge_query`, read once by `execute`
+    /// for its first model call. Process-local like `inbound_origins`.
+    pub(crate) knowledge_queries: Mutex<HashMap<String, String>>,
     /// One-shot failures for [`crate::RunManager::start_run_inbound`]. Tests call
     /// [`crate::RunManager::fail_next_inbound_start`] so a stored explicit row can
     /// land `start_failed` without a SQL trigger. Compiled only for this

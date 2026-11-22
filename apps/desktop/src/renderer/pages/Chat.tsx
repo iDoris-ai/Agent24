@@ -4,7 +4,9 @@ import logoWelcome from '../assets/logo-welcome.png'
 import { useT } from '../i18n'
 import { chatMessages } from './Chat.i18n'
 import type { components } from '@agent24/api-client'
-import { askWithKnowledge, createChatSession } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, knowledgePrompt, knowledgeQuery } from './chat-knowledge'
+import { failureKind, withoutToolNames } from './chat/user-facing'
+import { DocumentsOutcome, type RunDocuments } from './chat/DocumentsOutcome'
 import { grounding, type Grounding } from './knowledge-grounding'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
@@ -13,7 +15,7 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { docAgentPrompt, parseDocIntent, subjectOf } from './chat/doc-intent'
+import { docAgentPrompt, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -58,6 +60,10 @@ interface AssistantMessage {
   knowledgeDown?: KnowledgeDown
   /** The run that answered, when the turn went to /runs (Knowledge). */
   runId?: string
+  /** M3: a failure's internal code, shown only under 「详情」. */
+  detail?: string
+  /** M1: what the run's document writes came to, from the daemon's record. */
+  documents?: RunDocuments | null
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -223,8 +229,7 @@ export default function ChatPage() {
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    const wantsDocTool = /拆|合并|合成|split|merge|combine|模板|填写|填好|填入|生成初稿|修订|改写|template|fill/i.test(text)
-    if (wantsDocTool && window.agent24.documents?.agentAccess) {
+    if (wantsDocTool(text, doc !== null) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -278,7 +283,7 @@ export default function ChatPage() {
       }
     }
     // D4: 「把这份翻译成英文」「翻译《X》」 — same translation as the document page.
-    if (/翻译|译成|translate/i.test(text) && !/总结|摘要|检查|审查|核对/.test(text) && parseDocIntent(text) === null && window.agent24.documents) {
+    if (translatesDocument(text, doc !== null) && window.agent24.documents) {
       const named = doc ? null : /[《「“"]([^》」”"]{1,200})[》」”"]/.exec(text)?.[1]?.trim() ?? null
       if (doc || named) {
         const api = window.agent24.documents
@@ -387,7 +392,9 @@ export default function ChatPage() {
       const last = request.messages[request.messages.length - 1]
       if (about && body && body.text.trim() && last?.role === 'user') last.content = withDocument(about, body, last.content)
     }
-    await requestReply(messages.length, request)
+    // M1: a turn sent as the user said it (no document) may get the Knowledge hint.
+    const said = request.messages[request.messages.length - 1]
+    await requestReply(messages.length, request, said?.role === 'user' && said.content === text.trim())
   }
 
   // Issue #1517: start a fresh conversation. Disabled while a reply is in
@@ -463,7 +470,7 @@ export default function ChatPage() {
     setMessages(prev => prev.map((m, i) => i === index && m.role === 'user' ? { ...m, delivery } : m))
   }
 
-  const requestReply = async (index: number, request: ChatRequest) => {
+  const requestReply = async (index: number, request: ChatRequest, plain = false) => {
     // An archived conversation is read-only (UI-06 D7): nothing is sent, a
     // retry neither, until it is restored.
     if (requestInFlight.current || archivedRef.current) return
@@ -499,7 +506,15 @@ export default function ChatPage() {
         runSession.current = null
         runScope.current = scope
       }
-      await replyWithKnowledge(index, request, knowledge?.active === true)
+      const last = request.messages[request.messages.length - 1]
+      // PR-Daemon #1976: 「系统已先查过」 only on a turn that is searched first.
+      const asked = knowledge?.active === true && plain && last?.role === 'user' && knowledgeQuery(last.content) !== null
+        ? { ...request, messages: [...request.messages.slice(0, -1), { ...last, content: knowledgePrompt(last.content) }] }
+        : request
+      // M1 retrieval first: a plain turn (no document, no document tool, not
+      // 「记住…」) is searched with the user's words before the model is asked.
+      const query = knowledge?.active === true && plain && last?.role === 'user' ? knowledgeQuery(last.content) : null
+      await replyWithKnowledge(index, asked, knowledge?.active === true, query)
       return
     }
     // On but not in effect (no binding, e.g. a daemon started from the CLI):
@@ -575,7 +590,7 @@ export default function ChatPage() {
   // The turn as a run: only the new prompt goes. The run sees earlier turns
   // only through its session's memory (agent24-agent `session_context`): none
   // while memory is off, and never the turns that went to /api/v1/chat.
-  const replyWithKnowledge = async (index: number, request: ChatRequest, withKnowledge: boolean) => {
+  const replyWithKnowledge = async (index: number, request: ChatRequest, withKnowledge: boolean, query: string | null = null) => {
     const prompt = request.messages[request.messages.length - 1]?.content ?? ''
     const sentAt = performance.now()
     const conversation = sessionId
@@ -595,7 +610,7 @@ export default function ChatPage() {
               setAwaitingApproval(waiting)
               if (runId && promotionDue({ status: waiting ? 'awaiting_approval' : 'running', replyEnded: false })) void promoteRun(conversation, runId)
             },
-          }, request.idoris_headroom_confirmed === true, skillForConversation(conversation))
+          }, request.idoris_headroom_confirmed === true, skillForConversation(conversation), query)
       }
       let turn = await ask()
       // The daemon ties a session to one activation of the binding; after a
@@ -621,8 +636,12 @@ export default function ChatPage() {
       if (turn.kind === 'answer') {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })
-        const knowledge = withKnowledge ? grounding(turn.text, turn.knowledge) : undefined
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId }])
+        const checked = withKnowledge ? grounding(turn.text, turn.knowledge) : undefined
+        // UI polish 03 (David): 「没有检索知识库」 only under a turn the system
+        // searches first; writing, 「记住…」 and a document's rewrite or split
+        // are not, so the line said nothing there. Unread sources still show.
+        const knowledge = checked?.kind === 'notSearched' && query === null && checked.unread.length === 0 ? undefined : checked
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
@@ -632,7 +651,7 @@ export default function ChatPage() {
           forgetPromotion(conversation, turn.runId)
           await proxy({ method: 'POST', path: `/api/v1/runs/${encodeURIComponent(turn.runId)}/cancel` }).catch(() => {})
           setDelivery(index, { kind: 'notSent' })
-          setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: 'run_timeout' }) }])
+          setMessages(prev => [...prev, { role: 'assistant', content: t('fail.timeout'), detail: 'run_timeout' }])
           return
         }
         setDelivery(index, { kind: 'sent' })
@@ -641,12 +660,18 @@ export default function ChatPage() {
         runSession.current = null
         setMessages(prev => [...prev, { role: 'assistant', content: t('task.ongoing') }])
       } else {
-        setDelivery(index, { kind: 'notSent' })
-        setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: turn.message }) }])
+        // M3: the user's words, the code under 「详情」. A turn the user
+        // stopped was sent: it is not 「未发送」 (General, 0.6.73).
+        const kind = failureKind(turn.code)
+        // General 0.6.93: a turn the daemon took and ran was sent, whatever
+        // came of it (the model unavailable, a timeout, stopped); only one
+        // that never started is 「未发送」.
+        setDelivery(index, { kind: kind === 'notStarted' ? 'notSent' : 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: t(`fail.${kind}`), detail: turn.code === turn.message ? turn.code : `${turn.code}: ${turn.message}` }])
       }
     } catch (e) {
       setDelivery(index, { kind: 'notSent' })
-      setMessages(prev => [...prev, { role: 'assistant', content: t(withKnowledge ? 'knowledge.failed' : 'run.failed', { error: String(e) }) }])
+      setMessages(prev => [...prev, { role: 'assistant', content: t('fail.other'), detail: String(e) }])
     } finally {
       setAwaitingApproval(false)
       requestInFlight.current = false
@@ -714,7 +739,10 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.role === 'assistant' ? <Markdown text={m.content} /> : m.content}
+              {m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
+              {m.role === 'assistant' && m.detail && (
+                <details className="message-detail"><summary>{t('fail.detail')}</summary>{m.detail}</details>
+              )}
               {m.role === 'user' && m.delivery.kind === 'headroom' && (
                 <div role="group" aria-label={t('headroom.explanation')} style={{ marginTop: 8 }}>
                   <p role="status">{t('headroom.explanation')}</p>
@@ -742,6 +770,7 @@ export default function ChatPage() {
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
               )}
+              {m.role === 'assistant' && m.documents && <DocumentsOutcome documents={m.documents} />}
               {m.role === 'assistant' && m.knowledgeDown && (
                 <div role="note" style={{ fontSize: 12, color: 'var(--danger, #c0392b)', marginTop: 2 }}>{t(`knowledge.down.${m.knowledgeDown}`)}</div>
               )}

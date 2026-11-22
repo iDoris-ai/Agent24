@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { askWithKnowledge, createChatSession, MAX_WAIT_MS } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, KNOWLEDGE_HINT, knowledgePrompt, knowledgeQuery, MAX_WAIT_MS } from './chat-knowledge'
 
 type Req = { method: string; path: string; body?: unknown }
 const ok = (data: unknown) => ({ ok: true, status: 200, data })
@@ -28,7 +28,7 @@ describe('chat-knowledge', () => {
     const knowledge = { searched: true, read_chunks: [{ knowledge_id: 'doc-7', chunk_id: 'chk-71' }] }
     const { calls, proxy } = proxyWith([{ status: 'running' }, { status: 'completed', output: { text: '答案 [来源]' }, knowledge }])
     const turn = await askWithKnowledge('报销流程？', 'sess_1', { proxy, sleep: async () => {} })
-    expect(turn).toEqual({ kind: 'answer', text: '答案 [来源]', knowledge, runId: 'run_1' })
+    expect(turn).toEqual({ kind: 'answer', text: '答案 [来源]', knowledge, runId: 'run_1', documents: null })
     expect(calls[0]).toEqual({ method: 'POST', path: '/api/v1/runs', body: { prompt: '报销流程？', session_id: 'sess_1' } })
     expect(calls.filter((c) => c.method === 'GET').every((c) => c.path === '/api/v1/runs/run_1')).toBe(true)
   })
@@ -69,5 +69,35 @@ describe('chat-knowledge', () => {
     const turn = await askWithKnowledge('q', 's', { proxy: slow.proxy, sleep: async (ms) => { t += ms }, now: () => t * (MAX_WAIT_MS / 3000) })
     expect(turn).toEqual({ kind: 'ongoing', runId: 'run_1', status })
     expect(slow.calls.some(c => c.path.endsWith('/cancel'))).toBe(false)
+  })
+})
+
+describe('knowledgePrompt (M1, 0.6.72: 「烧开水要多久」 never searched)', () => {
+  it('says to search the knowledge bases first, in front of a plain question', () => {
+    expect(knowledgePrompt('烧开水要多久')).toBe(`${KNOWLEDGE_HINT}\n烧开水要多久`)
+  })
+  it('leaves 「记住…」 as said, so personal memory still takes it', () => {
+    for (const text of ['记住我家的猫叫豆豆，今年三岁。', '记住：我每周三下午去游泳', '请帮我记一下明天交报告', '你记着我不吃香菜']) {
+      expect(knowledgePrompt(text)).toBe(text)
+    }
+  })
+})
+
+describe('knowledgeQuery (M1 retrieval first, David 2026-11-21)', () => {
+  it('is the user\'s own words, and none on a 「记住…」 turn', () => {
+    expect(knowledgeQuery(' 烧开水要多久 ')).toBe('烧开水要多久')
+    expect(knowledgeQuery('记住：我最喜欢的水果是芒果。')).toBeNull()
+    expect(knowledgeQuery('   ')).toBeNull()
+  })
+  it('none when asked to write something new (General, 0.6.75)', () => {
+    for (const text of ['写一篇八百字散文', '帮我写一段公司介绍', '请帮我起草一封邮件', '给我写首诗']) expect(knowledgeQuery(text)).toBeNull()
+    for (const text of ['烧开水要多久', '高血压每天吃多少盐', '这份合同的押金是多少', '红楼梦这本小说的作者是谁', '这首诗是谁写的', '散文和小说有什么区别', '合同里写一个月押金对吗']) expect(knowledgeQuery(text)).toBe(text)
+  })
+  it('goes on the run as knowledge_query', async () => {
+    const proxy = vi.fn()
+      .mockResolvedValueOnce({ ok: true, status: 201, data: { id: 'r1' } })
+      .mockResolvedValue({ ok: true, status: 200, data: { status: 'completed', output: { text: 'ok' } } })
+    await askWithKnowledge('p', 's1', { proxy, sleep: async () => {} }, false, null, '烧开水要多久')
+    expect(proxy.mock.calls[0][0].body).toEqual({ prompt: 'p', session_id: 's1', knowledge_query: '烧开水要多久' })
   })
 })

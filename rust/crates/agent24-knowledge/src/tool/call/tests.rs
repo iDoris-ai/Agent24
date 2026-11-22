@@ -127,7 +127,7 @@ fn search_arguments_are_parsed_strictly() {
     let bare = parse_search(&input(json!({ "query": "差旅" }))).unwrap();
     // Naming no limit asks for the tool's default, well under the cap of 50:
     // fifty hits overflowed a 16K-token model's context.
-    assert!(bare.knowledge_base_ids.is_none() && bare.max_results.get() == 10);
+    assert!(bare.knowledge_base_ids.is_none() && bare.max_results.get() == 4);
     for bad in [
         json!({}),
         json!({ "query": "" }),

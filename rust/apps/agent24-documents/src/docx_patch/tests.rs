@@ -984,3 +984,28 @@ fn real_contracts_keep_tabs_and_breaks_when_a_character_is_added() {
         "no refused paragraph in the real contracts"
     );
 }
+
+/// M1 (c), General/PM 11-21: an anchor is the paragraph's opening words;
+/// its numbering may be left out but, written, must be the paragraph's. The
+/// cases are the desktop's too (`patch-anchor.test.ts` reads the same file).
+#[test]
+fn an_anchor_is_the_opening_of_the_paragraph_at_its_index() {
+    #[derive(serde::Deserialize)]
+    struct Case {
+        paragraph: String,
+        anchor: String,
+        ok: bool,
+    }
+    let cases: Vec<Case> =
+        serde_json::from_str(include_str!("../../tests/fixtures/anchor-cases.json")).unwrap();
+    assert!(cases.len() >= 25);
+    for c in cases {
+        assert_eq!(
+            super::anchor_matches(&c.paragraph, &c.anchor),
+            c.ok,
+            "{:?} / {:?}",
+            c.paragraph,
+            c.anchor
+        );
+    }
+}

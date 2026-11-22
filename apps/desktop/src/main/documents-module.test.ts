@@ -21,6 +21,7 @@ import {
   type BundledModuleDeps,
   type CliResult,
   modulesToReplaceWhileStopped,
+  replaceAfterDaemonStart,
 } from './documents-module'
 
 let root: string
@@ -637,5 +638,32 @@ describe('modulesToReplaceWhileStopped', () => {
     expect(modulesToReplaceWhileStopped(carried, ['install_failed', 'install_failed'])).toEqual(['documents', 'sin90'])
     expect(modulesToReplaceWhileStopped(carried, ['up_to_date', 'install_failed'])).toEqual(['sin90'])
     expect(modulesToReplaceWhileStopped(carried, ['upgraded', 'up_to_date'])).toEqual([])
+  })
+})
+
+// General 0.6.96: an upgrade bringing a store migration (0039) could not
+// replace the documents module before the daemon started (the CLI refuses a
+// store behind its schema); its reads then asked for approval each time.
+describe('replaceAfterDaemonStart', () => {
+  const item = { spec: {} as never, deps: {} as never }
+  it('App-managed: once the daemon is up, replaces what failed with it stopped', async () => {
+    const order: string[] = []
+    const ensure = vi.fn(async () => { order.push('ensure'); return ['upgraded' as const] })
+    const out = await replaceAfterDaemonStart([item], {
+      ready: async () => { order.push('ready') },
+      whileStopped: async (work) => { order.push('stop'); const r = await work(); order.push('start'); return r },
+      external: () => false,
+    }, ensure)
+    expect(out).toEqual(['upgraded'])
+    expect(order).toEqual(['ready', 'stop', 'ensure', 'start'])
+    expect(ensure).toHaveBeenCalledWith([item])
+  })
+  it('does nothing when nothing failed, or the daemon is not this app\'s', async () => {
+    const whileStopped = vi.fn()
+    const ensure = vi.fn()
+    expect(await replaceAfterDaemonStart([], { ready: async () => {}, whileStopped, external: () => false }, ensure)).toBeNull()
+    expect(await replaceAfterDaemonStart([item], { ready: async () => {}, whileStopped, external: () => true }, ensure)).toBeNull()
+    expect(whileStopped).not.toHaveBeenCalled()
+    expect(ensure).not.toHaveBeenCalled()
   })
 })
