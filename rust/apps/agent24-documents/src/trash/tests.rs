@@ -152,6 +152,33 @@ async fn past_seven_days_a_deleted_document_can_no_longer_be_restored() {
     assert_eq!(revisions, "2");
 }
 
+/// The delete card says how many pages a PDF has: `GET /documents/{id}`
+/// reads them from the head's page tree; a blob that is no PDF has none.
+#[tokio::test]
+async fn a_pdf_document_says_how_many_pages_it_has() {
+    let (_dir, state) = opened().await;
+    let storage = state.storage().await.unwrap();
+    let pdf: &[u8] = include_bytes!("../../tests/fixtures/pdfkit/render/rot0.pdf");
+    let sha = storage.blobs.put_bytes(pdf).unwrap().sha256;
+    let id = "doc_01K74Z3QJ8V5N2W9RTX6YB4M03";
+    exec(
+        &state,
+        &format!(
+            "BEGIN;
+             INSERT INTO documents (id, title, media_type, head_revision) VALUES ('{id}', 'p.pdf', 'application/pdf', 1);
+             INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                    VALUES ('{id}', 1, '{sha}', {}, 'application/pdf', 'import');
+             COMMIT;",
+            pdf.len()
+        ),
+    )
+    .await;
+    let (_, detail) = send(&state, Method::GET, &format!("/documents/{id}")).await;
+    assert_eq!(detail["pages"], 1, "{detail}");
+    let (_, detail) = send(&state, Method::GET, &format!("/documents/{DOC}")).await;
+    assert!(detail.get("pages").is_none(), "{detail}");
+}
+
 /// PR-Daemon #2025 ①②③: a deleted document stays hidden through an escaped
 /// id, a composition naming it in its body, and its jobs and extractions.
 #[tokio::test]

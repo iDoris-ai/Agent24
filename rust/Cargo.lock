@@ -593,6 +593,7 @@ dependencies = [
  "cap-std",
  "chrono",
  "libc",
+ "regex",
  "reqwest",
  "rustix 1.1.4",
  "serde",

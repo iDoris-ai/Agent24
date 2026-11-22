@@ -146,3 +146,20 @@ tools:
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
+  # L6-F2 (Loop 6): delete one whole document (soft: it can be restored for
+  # 7 days on the documents page). Each call is approved by the user. The
+  # pattern takes an id only, so the kernel refuses a file name before any
+  # card and the card always names exactly one document (FU-136).
+  - operation: delete
+    description: "Delete ONE whole document from the user's library; it can be restored from the documents page for 7 days. Use it only when the user asks to delete or remove a whole document or file. Removing a paragraph or a sentence INSIDE a document is a rewrite (documents.patch), never this. document_id must be the document's id (doc_...): first look it up with documents.get by its file name; if several documents have that name, list them for the user and ask which one, never choose one yourself."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string, pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", description: "the document's id from documents.get or documents.list, never its file name" }
+    risk: write_local
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]

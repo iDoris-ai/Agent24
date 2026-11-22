@@ -213,3 +213,5 @@
 - [ ] FU-177 · C · src=L6-F2（11-22） · 2026-11-22 · documents 模块没有 blob GC（ADR-DOC-02 §2.4 只写了规则）。F2 的软删除满 7 天后只是「已过恢复期，无法恢复」（不再列出、不能恢复），revision、文本层和 blob 的字节仍在磁盘上；界面和文档不得写成「已彻底删除 / 已清除」，GC 做完之前那是假话。改法：按 §2.4 做一次 GC：只被「删除满 7 天的文档」引用、且自身超过 7 天的 blob 才删；revisions/text_layers 的行仍不删。判据：删一份文档 8 天后，它独占的 blob 文件不在了，其他文档照常读。
 - [ ] FU-178 · C · src=L6-F2 计划（PM 11-22） · 2026-11-22 · 文档批量删除；「最近删除」里「立即彻底删除」（依赖 FU-177 的 GC）。
 - [ ] FU-179 · C · src=PR-Daemon #2025（Low） · 2026-11-22 · 删除文档时不取消它排队或运行中的 job（转换、填写、抽取），这些 job 可能在删除后才产出新文档。改法：删除时把该文档 queued/running 的 job 置为 cancelling。判据：删除一份正在转换的 DOCX，之后不会冒出它的 PDF。
+- [ ] FU-180 · C · src=PR-Daemon #2026（Low） · 2026-11-22 · `GET /documents/{id}` 每次都为 PDF 读元数据算 pages（lopdf `load_metadata`），只有删除审批卡需要；protocol/openapi.yaml 的 DocumentDetail 也没写 `pages`，回收站三条路由不在协议文件里。改法：pages 按需（查询参数）或按 content_sha256 缓存；协议文件补上 `pages` 与三条路由。
+- [ ] FU-181 · C · src=PR-Daemon #2026 第 2 轮（Low） · 2026-11-22 · 同一轮里删了 B（成功）又删 A（被拒）时，回答下方只写红字「这次没有改动文档」和「没有改动《A》」，看不出 B 已删除：页面按 jobs 为空判「未改动」。改法：RunDocuments 加 deleted 列表，DocumentsOutcome 写「已删除《B》（7 天内可恢复）」。

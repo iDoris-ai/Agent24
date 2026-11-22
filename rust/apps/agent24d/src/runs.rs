@@ -395,6 +395,7 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
     let mut jobs = Vec::new();
     let mut made: Vec<String> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    let mut deleted_any = false;
     // PR-Daemon #1994 B1: a document named by its file name in one call and
     // by its id in another is one document. What the module answered (the
     // `document_id` of a read, the `source_document_id` of a write) says
@@ -444,6 +445,40 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         if !write {
             continue;
         }
+        // L6-F2: a delete that went through makes no document and changed
+        // what it was asked to; it is not a write that came to nothing, and
+        // it settles earlier tries at that document (refused by the user,
+        // then approved). PR-Daemon #2026 ①.
+        if payload
+            .as_ref()
+            .is_some_and(|p| p.get("deleted") == Some(&serde_json::Value::Bool(true)))
+        {
+            if let Some(id) = payload
+                .as_ref()
+                .and_then(|p| p.get("document_id"))
+                .and_then(|d| d.as_str())
+                && !target.is_empty()
+            {
+                alias.insert(target.clone(), id.to_owned());
+            }
+            made.push(target.clone());
+            deleted_any = true;
+            continue;
+        }
+        // A delete the kernel refused before any card (a file name for its
+        // id, `off_pattern`) asked nothing of the user: the model is told
+        // to call again with the id, so it is not a try that failed.
+        // Only the two pre-card refusals (`missing_required`, `off_pattern`);
+        // an approved call refused later (`unknown tool`) still counts.
+        if name == "documents.delete"
+            && m.content.as_deref().is_some_and(|c| {
+                c.starts_with("tool error: invalid: ")
+                    && (c.contains(" needs the argument ")
+                        || c.contains(" is not in the form it needs "))
+            })
+        {
+            continue;
+        }
         attempted = true;
         let job = payload
             .as_ref()
@@ -465,6 +500,15 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         if !made.contains(&t) && !failed.contains(&t) {
             failed.push(t);
         }
+    }
+    // PR-Daemon #2026 round 2: every try was a delete that a later delete of
+    // the same document settled (refused, then approved): nothing reads as
+    // unchanged. A try with no target (never settled) keeps it as before.
+    let unsettled = tried
+        .iter()
+        .any(|t| t.is_empty() || !made.contains(&key(t)));
+    if deleted_any && jobs.is_empty() && !unsettled {
+        return None;
     }
     attempted.then_some(RunDocuments {
         attempted,
@@ -886,6 +930,68 @@ mod documents_tests {
         );
         // fill and a later write operation are writes too.
         assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));
+        // L6-F2: a delete that went through is not 「没有改动」; a denied one is.
+        let delete = |id: &str, result: &str| {
+            vec![
+                msg(
+                    "assistant",
+                    None,
+                    json!([{ "id": id, "name": "documents.delete", "arguments": { "document_id": "doc_A" } }]),
+                    None,
+                ),
+                msg("tool", Some(result), json!([]), Some(id)),
+            ]
+        };
+        let done = delete(
+            "d1",
+            r#"{"kind":"completed","payload":{"deleted":true,"document_id":"doc_A"}}"#,
+        );
+        assert_eq!(run_documents(&done), None);
+        let denied = delete("d2", "denied by user: 不删");
+        assert_eq!(
+            run_documents(&denied).map(|d| d.failed),
+            Some(vec!["doc_A".to_owned()])
+        );
+        // PR-Daemon #2026 ①: a file name refused before any card, then the id
+        // (with or without a get between), or a refusal then an approval of
+        // the same id: the delete went through, nothing reads as unchanged.
+        let refused = delete(
+            "d3",
+            "tool error: invalid: documents.delete: the argument \"document_id\" is not in the form it needs (its id); call it again with such a value",
+        );
+        let mut by_name = refused.clone();
+        by_name[0].tool_calls = json!([{ "id": "d3", "name": "documents.delete", "arguments": { "document_id": "合同.pdf" } }]);
+        let get = vec![
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "g", "name": "documents.get", "arguments": { "document_id": "合同.pdf" } }]),
+                None,
+            ),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"document_id":"doc_A"}}"#),
+                json!([]),
+                Some("g"),
+            ),
+        ];
+        for between in [vec![], get] {
+            let thread: Vec<_> = by_name
+                .iter()
+                .chain(between.iter())
+                .chain(done.iter())
+                .cloned()
+                .collect();
+            assert_eq!(run_documents(&thread), None);
+        }
+        let again: Vec<_> = denied.iter().chain(done.iter()).cloned().collect();
+        assert_eq!(run_documents(&again), None);
+        // An approved delete the kernel could not run afterwards still counts.
+        let lost = delete("d4", "tool error: invalid: unknown tool: documents.delete");
+        assert_eq!(
+            run_documents(&lost).map(|d| d.failed),
+            Some(vec!["doc_A".to_owned()])
+        );
     }
 
     /// PR-Daemon #1979 Low: every documents operation the module declares is

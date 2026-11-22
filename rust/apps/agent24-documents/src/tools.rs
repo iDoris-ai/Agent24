@@ -237,11 +237,15 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             }
             "fields" => fields(state, arguments).await,
             "fill" => fill(state, arguments).await,
+            "delete" => delete(state, run, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
+    // L6-F2: `delete` writes in one transaction (`trash::delete`): dropped
+    // at the deadline it rolls back or has committed; a retry of a committed
+    // one answers not_found (already deleted), never a second delete.
     // Dropping `work` at the deadline is safe: every operation but `extract`
-    // only reads (a pool wait, a query, a blob; `extraction_get` one
+    // (and `delete`, above) only reads (a pool wait, a query, a blob; `extraction_get` one
     // read-only transaction, rolled back when dropped). Storage they find
     // unavailable may be reopened first, which writes (migrations,
     // `jobs::recover`, the header's `user_version`), and `read_range` /
@@ -380,6 +384,37 @@ async fn get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: GetArgs = parse(arguments)?;
     let storage = ready(state).await?;
     completed(documents::get(&storage, &args.document_id).await)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteArgs {
+    document_id: String,
+}
+
+/// L6-F2: the document deleted (soft, restorable for 7 days) after the user
+/// approved this call. It takes an id only: the manifest's pattern has the
+/// kernel refuse a file name before any card (FU-136), so the card always
+/// names one document.
+async fn delete(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+    let args: DeleteArgs = parse(arguments)?;
+    let storage = ready(state).await?;
+    let gone = crate::trash::delete(&storage, &args.document_id, &Origin::Run(run))
+        .await
+        .map_err(|e| refused(&e))?;
+    let message = format!(
+        "已删除《{}》。{} 天内可以在文档页的「最近删除」里恢复。已完成，不要再调用。",
+        gone.title,
+        crate::trash::RESTORE_DAYS
+    );
+    let mut payload = serde_json::to_value(&gone)
+        .map_err(|_| refused(&ApiError::internal("cannot serialize the answer")))?;
+    payload["deleted"] = json!(true);
+    payload["message"] = json!(message);
+    Ok(Envelope::Completed {
+        payload,
+        replayed: false,
+    })
 }
 
 /// D2b: split or merge PDFs already here into a new document; the answer is
@@ -875,9 +910,8 @@ enum Resource {
 
 fn resource(op: &str) -> Option<Resource> {
     match op {
-        "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill" => {
-            Some(Resource::Document)
-        }
+        "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill"
+        | "delete" => Some(Resource::Document),
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
@@ -1693,6 +1727,29 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(jobs, 0);
+    }
+
+    /// L6-F2: the Agent deletes one document by its id; the `oplog` says
+    /// which run deleted it, and a second call finds nothing to delete.
+    #[tokio::test]
+    async fn the_agent_deletes_one_document_by_its_id() {
+        let (_dir, state) = opened().await;
+        let doc = add_document(&state, 1, "'合同.pdf'").await;
+        let gone = payload(&call(&state, "delete", json!({ "document_id": doc })).await);
+        assert_eq!(gone["deleted"], true, "{gone}");
+        assert_eq!(gone["title"], "合同.pdf");
+        assert!(gone["message"].as_str().unwrap().contains("最近删除"));
+        for op in ["delete", "get"] {
+            let body = call_in(&state, op, &[&doc], json!({ "document_id": doc })).await;
+            assert_module_error(&body, "not_found", false);
+        }
+        let storage = state.storage().await.unwrap();
+        let row: (String, String) =
+            sqlx::query_as("SELECT origin, run_id FROM oplog WHERE op = 'delete'")
+                .fetch_one(storage.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(row, ("run".into(), "run-1".into()));
     }
 
     #[test]

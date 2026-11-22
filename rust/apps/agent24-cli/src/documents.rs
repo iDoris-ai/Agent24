@@ -185,6 +185,29 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Delete a document (L6-F2): it leaves the list and every read, and can
+    /// be restored for 7 days (`documents restore`)
+    Delete {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a document deleted less than 7 days ago
+    Restore {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the documents deleted less than 7 days ago, which can be restored
+    Deleted {
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
     /// List a DOCX document's paragraphs, by index (for `documents patch`)
     Paragraphs {
         /// The document's id (`doc_…`)
@@ -420,6 +443,15 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             json,
             host_stdin,
         } => request_op(request, json, host_stdin).await,
+        DocumentsAction::Delete { document_id, json } => {
+            operation(json!({"op": "delete", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Restore { document_id, json } => {
+            operation(json!({"op": "restore", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Deleted { json } => {
+            operation(json!({"op": "recentlyDeleted"}), json).await
+        }
         DocumentsAction::Paragraphs { document_id, json } => {
             operation(json!({"op": "paragraphs", "documentId": document_id}), json).await
         }
