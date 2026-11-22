@@ -132,13 +132,13 @@ td{padding:6px 18px 6px 0;color:var(--muted)} td:first-child{color:var(--text)}
 
 <script>
 document.querySelectorAll('svg.mark').forEach(svg=>{
-  const s=+svg.dataset.size, c=s/2, R=s*0.46, r=s*0.31, w=Math.max(1.2,s*0.045);
+  const s=+svg.dataset.size, c=s/2, R=s*0.445, w=Math.max(1.2,s*0.035);
   svg.setAttribute('width',s);svg.setAttribute('height',s);svg.setAttribute('viewBox',`0 0 ${s} ${s}`);
   let h='';
   for(let i=0;i<24;i++){
-    const a=(i/24)*2*Math.PI-Math.PI/2, lit=i===0;
+    const a=(i/24)*2*Math.PI-Math.PI/2, lit=i===0, major=i%6===0, r=R-s*(major?0.156:0.055);
     const x1=c+r*Math.cos(a),y1=c+r*Math.sin(a),x2=c+R*Math.cos(a),y2=c+R*Math.sin(a);
-    h+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${lit?svg.dataset.lit:svg.dataset.tick}" stroke-width="${lit?w*1.6:w}" stroke-linecap="round"/>`;
+    h+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${lit?svg.dataset.lit:svg.dataset.tick}" stroke-width="${lit?w*2:major?w*1.33:w}" stroke-linecap="round"/>`;
   }
   h+=`<circle cx="${c}" cy="${c}" r="${s*0.09}" fill="${svg.dataset.core}"/>`;
   svg.innerHTML=h;
