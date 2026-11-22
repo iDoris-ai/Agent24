@@ -220,7 +220,8 @@ export default function ChatPage() {
     setCurrentTurn(Math.max(0, turns.length - 1))
   }, [messages, turns])
 
-  const send = async (text: string) => {
+  /** `answer`: the model answers, never the extraction (the card's 「让助手回答」). */
+  const send = async (text: string, answer = false) => {
     if (!text.trim() || requestInFlight.current || awaitingConfirmation || archivedRef.current) return
     const userMsg: Message = { role: 'user', content: text.trim(), delivery: { kind: 'sending' } }
     const request: ChatRequest = {
@@ -235,7 +236,7 @@ export default function ChatPage() {
     const doc = documentOf(sessionId)
     // F3: 「把这份合同的甲方、乙方、金额、期限抽出来」 — the documents OS's extract
     // job reads the document; the model at most names the fields.
-    const asked = extractionFields(text, doc !== null)
+    const asked = answer ? null : extractionFields(text, doc !== null)
     const extractFrom = asked === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? null
     if (asked !== null && extractFrom !== null && window.agent24.documents) {
       const api = window.agent24.documents
@@ -253,7 +254,7 @@ export default function ChatPage() {
         else {
           const card = await extractFields(api, subject.id, names)
           reply = 'error' in card
-            ? { role: 'assistant', content: `没能完成抽取：${card.error}`, ...(card.detail ? { detail: card.detail } : {}) }
+            ? { role: 'assistant', content: card.pending ? card.error : `没能完成抽取：${card.error}`, ...(card.detail ? { detail: card.detail } : {}) }
             : { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + extractText(card), extraction: card }
         }
       } catch (e) {
@@ -779,7 +780,10 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.role === 'assistant' && m.extraction ? <ExtractCard card={m.extraction} />
+              {m.role === 'assistant' && m.extraction ? <ExtractCard card={m.extraction} onAnswer={loading || archived ? undefined : () => {
+                const asked = messages.slice(0, i).reverse().find(p => p.role === 'user')
+                if (asked) void send(asked.content, true)
+              }} />
                 : m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
               {m.role === 'assistant' && m.detail && (
                 <details className="message-detail"><summary>{t('fail.detail')}</summary>{m.detail}</details>
