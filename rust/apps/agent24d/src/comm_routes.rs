@@ -2240,6 +2240,18 @@ mod hy1_regression_tests {
         // (method, template, concrete uri, json body)
         let hits = [
             (
+                "PATCH",
+                "/contact/{name}",
+                "/api/v1/comm/contact/bob".to_string(),
+                Some(r#"{"nickname":"Robert"}"#),
+            ),
+            (
+                "DELETE",
+                "/contact/{name}",
+                "/api/v1/comm/contact/bob".to_string(),
+                None,
+            ),
+            (
                 "POST",
                 "/outbox/{event_id}/retry",
                 "/api/v1/comm/outbox/evt-1/retry".to_string(),

@@ -131,6 +131,7 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm, own password window, save dialog)
   //   POST /api/v1/comm/identity/import  (CommImportPick + CommIdentityImport: native open dialog, own password window)
   //   POST /api/v1/comm/contact          (CommContactAdd)
+  //   PATCH/DELETE /api/v1/comm/contact/{name} (CommContactRename/Remove)
   //   POST /api/v1/comm/send             (CommSend)
   //   POST /api/v1/comm/import           (CommHomeImport: native folder picker + confirm, own password window)
   //   PUT  /api/v1/comm/relay            (CommRelaySet: validated ws(s):// list, native confirm when it changes)

@@ -611,6 +611,10 @@ enum CommContactAction {
         #[arg(long)]
         role: Option<String>,
     },
+    /// Rename a contact by nickname or npub
+    Rename { name: String, new: String },
+    /// Remove a contact; chat history and friend relations are kept
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -2735,6 +2739,16 @@ fn comm_request(
                 reqwest::Method::POST,
                 "/api/v1/comm/contact".to_owned(),
                 Some(serde_json::json!({"nickname": nickname, "npub": npub, "role": role})),
+            ),
+            CommContactAction::Rename { name, new } => (
+                reqwest::Method::PATCH,
+                format!("/api/v1/comm/contact/{}", qs_encode(&name)),
+                Some(serde_json::json!({"nickname": new})),
+            ),
+            CommContactAction::Remove { name } => (
+                reqwest::Method::DELETE,
+                format!("/api/v1/comm/contact/{}", qs_encode(&name)),
+                None,
             ),
         },
         CommAction::Relay { action } => match action {

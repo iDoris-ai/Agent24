@@ -25,6 +25,8 @@ export function ConversationList({ contacts, groups, history, conversationHistor
   const t = useT(communicationMessages)
   const me = identities.find(item => item.default)
   const peers = new Map<string, CommHistoryItem[]>(contacts.map(contact => [contact.npub, []]))
+  // A removed contact's open conversation stays listed (its history is kept).
+  if (selection?.kind === 'peer' && !peers.has(selection.id)) peers.set(selection.id, [])
   for (const item of history) {
     const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? item.to || item.from : item.from
     if (peer) peers.set(peer, [...(peers.get(peer) ?? []), item])
