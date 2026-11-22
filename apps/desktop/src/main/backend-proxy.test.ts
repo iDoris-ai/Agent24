@@ -100,6 +100,8 @@ describe('A1 findAllowedRoute', () => {
     for (const route of ['contact', 'send', 'identity/export', 'identity/import', 'import', 'unlock']) {
       expect(isAllowedProxyRoute('POST', `/api/v1/comm/${route}`), route).toBe(false)
     }
+    expect(isAllowedProxyRoute('PATCH', '/api/v1/comm/contact/bob')).toBe(false)
+    expect(isAllowedProxyRoute('DELETE', '/api/v1/comm/contact/bob')).toBe(false)
     expect(isAllowedProxyRoute('PUT', '/api/v1/comm/relay')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history?limit=20')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/comm/history/conversation?with=bob')).toBe(true)
@@ -384,5 +386,17 @@ describe('withKnowledgeBinding (decision 2026-10-30-main-chat-knowledge-path)', 
 
   it('lets the renderer create a session for the main chat', () => {
     expect(findAllowedRoute('POST', '/api/v1/sessions')).toBeTruthy()
+  })
+})
+
+describe('group chat proxy boundary', () => {
+  it('allows group reads and refuses all Elevated writes', () => {
+    const root = '/api/v1/comm/groupchat'
+    for (const suffix of ['', '/g/members', '/g/invites', '/g/messages?limit=200', '/g/messages/l']) {
+      expect(isAllowedProxyRoute('GET', root + suffix), suffix).toBe(true)
+    }
+    for (const suffix of ['', '/g/messages', '/g/messages/l/retry', '/invites/i/accept']) {
+      expect(isAllowedProxyRoute('POST', root + suffix), suffix).toBe(false)
+    }
   })
 })

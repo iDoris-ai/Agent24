@@ -4094,6 +4094,71 @@ paths:
         "504":
           $ref: "#/components/responses/CommTimeout"
 
+  /comm/contact/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        description: Existing contact nickname or npub
+        schema: { type: string, minLength: 1 }
+    patch:
+      operationId: renameCommContact
+      tags: [comm]
+      summary: Rename a contact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [nickname]
+              properties:
+                nickname: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+    delete:
+      operationId: removeCommContact
+      tags: [comm]
+      summary: Remove a contact
+      description: Removes only the address book entry; chat history and friend relations are kept. An npub removes all its nicknames.
+      responses:
+        "200":
+          description: Hyphae envelope `{ok:true,data}`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CommOk"
+        "400":
+          $ref: "#/components/responses/CommInvalid"
+        "409":
+          $ref: "#/components/responses/CommConflict"
+        "423":
+          $ref: "#/components/responses/CommLocked"
+        "502":
+          $ref: "#/components/responses/CommBadGateway"
+        "503":
+          $ref: "#/components/responses/CommUnavailable"
+        "504":
+          $ref: "#/components/responses/CommTimeout"
+
   /comm/relay:
     get:
       operationId: listCommRelays

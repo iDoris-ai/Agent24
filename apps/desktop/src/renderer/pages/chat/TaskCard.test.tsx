@@ -7,10 +7,10 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
-import { HandOver, TaskCards, approvalArgs, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
+import { HandOver, TaskCards, approvalArgs, approvalDetail, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
-import { setLocale } from '../../i18n'
+import { setLocale, translate } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import ChatPage from '../Chat'
 
@@ -22,7 +22,7 @@ let store: ReturnType<typeof createChatHistoryStore>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 type Run = { status: string; started_at?: string; ended_at?: string | null; output?: { text: string } | null; knowledge?: unknown; error?: { code: string; message: string } | null }
 let runs: Record<string, Run>
-let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string }[]
+let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string; payload?: unknown }[]
 let proxy: ReturnType<typeof vi.fn>
 let approvalDecide: ReturnType<typeof vi.fn>
 let emit: (event: RunEvent) => void
@@ -251,6 +251,22 @@ describe('task cards (M4 A4)', () => {
     }
   })
 
+  // UI polish 09: 「详情」 lists the payload, not the daemon's JSON summary.
+  it('「详情」 lists what the step will get, key by key', async () => {
+    store.save(record('chat_a', '命令'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: 'shell_exec: {"argv":["rm","-rf","/tmp/x"]}', payload: { argv: ['rm', '-rf', '/tmp/x'] },
+    }]
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    await waitFor(() => expect(c.querySelector('.message-detail')?.textContent).toContain('3. "/tmp/x"'))
+    expect(c.querySelector('.message-detail')?.textContent).toContain('操作：执行命令')
+    expect(c.querySelector('.message-detail')?.textContent).not.toContain('{"argv"')
+  })
+
   // General 0.6.94: the card said 「以修订方式改写 doc_01M8035X… 的 1 段」.
   it('names the document of a patch by its title, not its id', async () => {
     store.save(record('chat_a', '改写'))
@@ -315,6 +331,18 @@ describe('task cards (M4 A4)', () => {
     expect(await within(await waitFor(() => card('等你确认'))).findByRole('button', { name: '拒绝' })).toBeInTheDocument()
     expect(within(card('等你确认')).queryByRole('button', { name: '确认' })).toBeNull()
     expect(approvalDecide).not.toHaveBeenCalled()
+  })
+
+  // FU-152 (0.6.93): confirmed, the run is still awaiting_approval for a
+  // moment while no approval of it is pending; the card says it goes on.
+  it('says it goes on, not 「不能在这里确认」, in the moment after a confirm', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = []
+    await show()
+    expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('正在继续…')
+    expect(card('等你确认')).not.toHaveTextContent('不能在这里确认')
   })
 
   it('points to the terminal for an approval it can neither confirm nor deny', async () => {
@@ -405,6 +433,23 @@ describe('task cards (M4 A4)', () => {
     await waitFor(() => expect(card('已完成').textContent?.includes('ANSWER-TEXT')).toBe(!answered))
     expect(card('已完成').textContent?.includes('这次没有改动文档')).toBe(!answered)
     expect(card('已完成').textContent?.includes(chatMessages.zh['knowledge.nothingRead'])).toBe(!answered)
+  })
+
+  // UI polish 05 (FU-153 on the card): a document instruction is not searched
+  // first, so its card does not say 「没有检索知识库」; a plain question's still does.
+  it.each([
+    ['a document write', { attempted: true, jobs: [] }, false],
+    ['a plain question', undefined, true],
+  ])('「没有检索知识库」 on a completed card: %s', async (_name, documents, said) => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = {
+      status: 'completed', started_at: at, ended_at: at, output: { text: '好的。' },
+      knowledge: { searched: false, read_chunks: [] }, ...(documents ? { documents } : {}),
+    }
+    await show()
+    await waitFor(() => expect(card('已完成')).toHaveTextContent('好的。'))
+    expect(card('已完成').textContent?.includes(chatMessages.zh['knowledge.notSearched'])).toBe(said)
   })
 
   it('shows a completed task\'s answer with only the sources its run read (Knowledge\'s review)', async () => {
@@ -667,6 +712,65 @@ describe('elapsed', () => {
   })
 })
 
+// UI polish 09: 「详情」 is the only place a card shows a step's whole input
+// before it is confirmed; it reads as a list, every value whole, never JSON.
+describe('approvalDetail', () => {
+  beforeEach(() => { setLocale('zh') })
+  const t = (key: string, vars?: Record<string, string>) => translate(chatMessages, key as never, vars)
+
+  it('lists the payload key by key, nested arrays and objects in full, nothing cut', () => {
+    const long = '新'.repeat(500)
+    const text = approvalDetail({
+      summary: 'documents.patch: {"document_id":"doc_1","edits":[{"index":2… [truncated 94 bytes]',
+      payload: { document_id: 'doc_1', edits: [{ index: 2, text: long, tracked: true }, { index: 4, text: '乙' }] },
+    }, t)
+    expect(text).toBe([
+      '操作：改写段落',
+      'document_id："doc_1"',
+      'edits：',
+      '  1.',
+      '    index：2',
+      `    text："${long}"`,
+      '    tracked：true',
+      '  2.',
+      '    index：4',
+      '    text："乙"',
+    ].join('\n'))
+    expect(text).not.toMatch(/\[object|truncated/)
+  })
+
+  it('arrays of plain values; empty, null and a string differ from a number', () => {
+    expect(approvalDetail({ summary: 'shell_exec: {…}', payload: { argv: ['ls', '-la'], env: {}, none: null, n: 12, s: '12' } }, t))
+      .toBe(['操作：执行命令', 'argv：', '  1. "ls"', '  2. "-la"', 'env：（空）', 'none：null', 'n：12', 's："12"'].join('\n'))
+  })
+
+  // PR-Daemon #2004 B1: one edit whose text lays out a second one read the
+  // same as two edits; a value's line breaks are shown, never laid out.
+  it('one edit with a line-broken text never reads as two edits', () => {
+    const one = approvalDetail({ summary: 'documents.patch: {…}', payload: { edits: [{ index: 1, text: 'A\n  2.\n    index：12\n    text："B"' }] } }, t)
+    const two = approvalDetail({ summary: 'documents.patch: {…}', payload: { edits: [{ index: 1, text: 'A' }, { index: 12, text: 'B' }] } }, t)
+    expect(one).not.toBe(two)
+    expect(one.split('\n')).toHaveLength(5)
+    expect(approvalDetail({ summary: 'x: {}', payload: { 'a\nb': '\u202e' } }, t)).toBe('操作：x\n"a\\nb"："\\u202e"')
+  })
+
+  // PR-Daemon #2004 B2: ten thousand levels deep does not throw; it says so.
+  it('a payload nested very deep is folded, not thrown on', () => {
+    let deep: Record<string, unknown> = { end: 1 }
+    for (let i = 0; i < 10_000; i++) deep = { a: deep }
+    const text = approvalDetail({ summary: 'x: {}', payload: deep }, t)
+    expect(text).toContain('……（更深的内容已折叠）')
+    expect(text.split('\n').length).toBeLessThan(20)
+  })
+
+  it('no payload (an older daemon), or a patch without its edits: the summary as the daemon wrote it', () => {
+    const summary = 'documents.patch: {"document_id":"doc_1","edits":[{"index":2… [truncated 94 bytes]'
+    expect(approvalDetail({ summary }, t)).toBe(summary)
+    expect(approvalDetail({ summary, payload: {} }, t)).toBe(summary)
+    expect(approvalDetail({ summary, payload: { document_id: 'doc_1' } }, t)).toBe(summary)
+  })
+})
+
 describe('approvalText (D2b)', () => {
   const t = (key: string, vars?: Record<string, string>) => `${key}${vars ? JSON.stringify(vars) : ''}`
   it('says what a documents tool will do', () => {
@@ -675,6 +779,9 @@ describe('approvalText (D2b)', () => {
       .toBe('task.ask.compose{"title":"A1","parts":"task.ask.part{\\"doc\\":\\"a.pdf\\",\\"pages\\":\\"1\\"}"}')
     // M3/PM 11-21: never raw JSON; the summary goes under 「详情」.
     expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('task.ask.tool{"tool":"执行命令"}')
+    // UI polish 08: a part with no pages is the whole document, never 「第 all 页」.
+    expect(approvalText({ summary: 'documents.compose: {"parts":[{"document_id":"a.pdf"}],"title":"A1"}' }, t))
+      .toBe('task.ask.compose{"title":"A1","parts":"task.ask.partAll{\\"doc\\":\\"a.pdf\\"}"}')
   })
   it('says what a fill or a patch will write (E1b/D5a)', () => {
     expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","values":{"甲方":"明远","租金":"8,500"}}' }, t))

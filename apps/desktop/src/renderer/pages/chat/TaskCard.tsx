@@ -114,6 +114,50 @@ export function approvalArgs(a: Pick<Approval, 'summary'> & { payload?: unknown 
   }
 }
 
+/** PR-Daemon #2004 B2: how deep and how long 「详情」 goes before it says the
+ *  rest is folded; a payload nested ten thousand deep no longer throws. */
+const DETAIL_MAX_DEPTH = 8
+const DETAIL_MAX_LINES = 400
+/** PR-Daemon #2004 B1: a value never lays out lines of its own: a string is
+ *  shown as a JSON string (its line breaks as `\n`, quoted, so 12 and "12"
+ *  differ), and characters that reorder text are escaped too. */
+const REORDER = /[\u2028\u2029\u202a-\u202e\u2066-\u2069]/g
+const escaped = (s: string) => JSON.stringify(s).replace(REORDER, c => `\\u${c.charCodeAt(0).toString(16)}`)
+const shownValue = (v: unknown) => (typeof v === 'string' ? escaped(v) : String(v))
+const shownKey = (k: string) => (/^[\p{L}\p{N}_.-]+$/u.test(k) ? k : escaped(k))
+
+/** UI polish 09: 「详情」 under the card's line, the step's whole input as a
+ *  list, key by key, nested arrays and objects in full, nothing cut. With no
+ *  payload (an older daemon) the summary as the daemon wrote it. */
+export function approvalDetail(
+  a: Pick<Approval, 'summary'> & { payload?: unknown },
+  t: (key: string, vars?: Record<string, string>) => string,
+): string {
+  const summary = typeof a.summary === 'string' ? a.summary : ''
+  const payload = a.payload
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length === 0) return summary
+  const cut = summary.indexOf(': ')
+  const tool = cut > 0 ? summary.slice(0, cut) : summary
+  // PR-Daemon #2004 Low: a patch without its edits is not whole (as in
+  // `approvalArgs`): the summary, not a list that looks complete.
+  if (tool === 'documents.patch' && !Array.isArray((payload as Record<string, unknown>)['edits'])) return summary
+  const lines: string[] = []
+  const walk = (v: unknown, pad: string, head: string, depth: number) => {
+    if (lines.length >= DETAIL_MAX_LINES) return
+    if (v === null || typeof v !== 'object') lines.push(`${head}${shownValue(v)}`)
+    else if (Object.keys(v).length === 0) lines.push(`${head}${t('task.detail.empty')}`)
+    else if (depth >= DETAIL_MAX_DEPTH) lines.push(`${head}${t('task.detail.folded')}`)
+    else {
+      lines.push(head.trimEnd())
+      const entries = Array.isArray(v) ? v.map((x, i) => [`${i + 1}. `, x] as const) : Object.entries(v as Record<string, unknown>).map(([k, x]) => [`${shownKey(k)}：`, x] as const)
+      for (const [label, x] of entries) walk(x, `${pad}  `, `${pad}  ${label}`, depth + 1)
+    }
+  }
+  for (const [k, x] of Object.entries(payload as Record<string, unknown>)) walk(x, '', `${shownKey(k)}：`, 1)
+  if (lines.length >= DETAIL_MAX_LINES) lines.push(t('task.detail.folded'))
+  return [t('task.detail.tool', { tool: withoutToolNames(tool) || tool }), ...lines].join('\n')
+}
+
 export function approvalText(
   a: Pick<Approval, 'summary'> & { payload?: unknown },
   t: (key: string, vars?: Record<string, string>) => string,
@@ -130,7 +174,10 @@ export function approvalText(
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
   if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
     const parts = (args['parts'] as Array<Record<string, unknown>>)
-      .map(p => t('task.ask.part', { doc: str(p['document_id']), pages: str(p['pages']) || 'all' }))
+      // UI polish 08: no pages is the whole document, said so (not 「第 all 页」).
+      .map(p => (str(p['pages'])
+        ? t('task.ask.part', { doc: str(p['document_id']), pages: str(p['pages']) })
+        : t('task.ask.partAll', { doc: str(p['document_id']) })))
       .join(' + ')
     return t('task.ask.compose', { title: str(args['title']), parts })
   }
@@ -187,8 +234,7 @@ export async function patchOriginals(api: Window['agent24']['documents'] | undef
   return new Map(res.data.paragraphs.map((p) => [p.index, p.text]))
 }
 
-/** The tasks of the conversation the page shows. */
-/** `answered`: runs whose answer the conversation already shows (UI polish
+/** The tasks of the conversation the page shows. `answered`: runs whose answer the conversation already shows (UI polish
  *  07): their cards say only where they stand, not the answer again. */
 export function TaskCards({ conversation, answered }: { conversation: string; answered?: ReadonlySet<string> }) {
   const t = useT(chatMessages)
@@ -335,14 +381,19 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
   const label = t(labelOf(status))
   // A completed run's answer, with only what its record backs (as replies
   // are, Chat.tsx): the answer may name sources the run never read.
-  const checked = status === 'completed' && view?.output ? grounding(view.output, view.knowledge) : null
+  const grounded = status === 'completed' && view?.output ? grounding(view.output, view.knowledge) : null
+  // UI polish 05 (FU-153 on the card): a document instruction is not searched
+  // first (as in the bubble, #1997), so 「没有检索知识库」 says nothing there.
+  // Unread sources still show.
+  const checked = grounded?.kind === 'notSearched' && view?.documents?.attempted === true && grounded.unread.length === 0 ? null : grounded
   return (
     <div className={`task-card${active ? ' active' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
       {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals, titles)}</span>}
       {waiting && asking && !sentBack && typeof asking.summary === 'string' && (
-        <details className="message-detail"><summary>{t('fail.detail')}</summary>{asking.summary}</details>
+        <details className="message-detail"><summary>{t('fail.detail')}</summary>
+          <div className="message-detail-list">{approvalDetail(asking, t as (key: string, vars?: Record<string, string>) => string)}</div></details>
       )}
       {sentBack && <span className="task-card-knowledge" role="note">{t('task.anchorNote', { n: String(sentBack.index + 1) })}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
@@ -365,7 +416,9 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
           <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
         )}
         {waiting && offers !== null && !offers.approve && !offers.deny && (
-          <span className="task-card-knowledge" role="note">{t('task.decideInTui')}</span>
+          // FU-152: no approval of the run pending (just confirmed, the run
+          // not yet past the state): it goes on, nothing to decide here.
+          <span className="task-card-knowledge" role="note">{t(asking ? 'task.decideInTui' : 'task.proceeding')}</span>
         )}
         {active && (
           // General 0.6.89: 「停止」 never waits on another action of the card

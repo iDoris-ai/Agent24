@@ -2,7 +2,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import {
   CommApiError,
-  addCommContact,
+  listCommGroups, listCommGroupMessages, getCommGroupMessageStatus, createCommGroup,
+  acceptCommGroupInvite, sendCommGroupMessage, retryCommGroupMessage,
+  addCommContact, renameCommContact, removeCommContact,
   COMM_HTTP_TIMEOUT_MS,
   exportCommIdentity,
   listCommHistory,
@@ -201,6 +203,24 @@ describe('COMM typed backend API', () => {
 
 
 describe('COMM contact, send, history and export wrappers', () => {
+  it('renames and removes only through dedicated IPC and validates their result envelopes', async () => {
+    const proxy = setProxy(() => { throw new Error('generic proxy must not carry contact edits') })
+    const renamed = { old_nickname: 'bob', nickname: 'Robert', npub: 'npub1bob', role: 'friend' }
+    const removed = { removed: ['Robert'], npub: 'npub1bob' }
+    const commContactRename = vi.fn(async () => successful(renamed))
+    const commContactRemove = vi.fn().mockResolvedValueOnce(successful(removed))
+      .mockResolvedValueOnce({ ok: false, status: 499, data: { error: { code: 'cancelled', message: 'c' } } })
+      .mockResolvedValueOnce(successful({ removed: 'wrong shape', npub: 'npub1bob' }))
+    window.agent24 = { ...window.agent24, commContactRename, commContactRemove }
+    await expect(renameCommContact('bob', 'Robert')).resolves.toEqual(renamed)
+    await expect(removeCommContact('Robert')).resolves.toEqual(removed)
+    await expect(removeCommContact('Robert')).rejects.toMatchObject({ code: 'cancelled' })
+    await expect(removeCommContact('Robert')).rejects.toBeInstanceOf(CommApiError)
+    expect(commContactRename).toHaveBeenCalledWith('bob', 'Robert')
+    expect(commContactRemove).toHaveBeenCalledWith('Robert')
+    expect(proxy).not.toHaveBeenCalled()
+  })
+
   it('sends contact add and send through dedicated IPC, never the generic proxy', async () => {
     const proxy = setProxy(() => { throw new Error('generic proxy must not carry Elevated comm writes') })
     const commContactAdd = vi.fn(async () => successful({}))
@@ -319,5 +339,35 @@ describe('COMM restore wrappers', () => {
     await expect(restoreCommIdentity('t1', 'alice', false)).rejects.toMatchObject({ code: 'cancelled' })
     expect(commIdentityImport.mock.calls.every((c) => c.length === 3)).toBe(true)
     expect(proxy).not.toHaveBeenCalled()
+  })
+})
+
+
+describe('COMM group response guards', () => {
+  const g = 'a'.repeat(32)
+  const id = 'b'.repeat(32)
+  it.each([
+    () => listCommGroups(), () => listCommGroupMessages(g), () => getCommGroupMessageStatus(g, id),
+  ])('refuses malformed group reads', async read => {
+    setProxy(() => successful({ groups: [{}], messages: [{ content: 'ciphertext' }], recipients: [] }))
+    await expect(read()).rejects.toBeInstanceOf(CommApiError)
+  })
+  it('rejects HTTP 502 partial reports instead of treating them as successful sends or retries', async () => {
+    const proxy = setProxy(() => { throw new Error('Elevated group write reached proxy') })
+    const partial = { ok: false, status: 502, data: { ok: false, error: 'partial', data: { group_id: g, logical_id: id } } }
+    Object.assign(window.agent24, { commGroupSend: async () => partial, commGroupRetry: async () => partial })
+    await expect(sendCommGroupMessage(g, 'hello', id)).rejects.toMatchObject({ status: 502 })
+    await expect(retryCommGroupMessage(g, id)).rejects.toMatchObject({ status: 502 })
+    expect(proxy).not.toHaveBeenCalled()
+  })
+  it('refuses malformed write responses', async () => {
+    setProxy(() => successful({}))
+    Object.assign(window.agent24, {
+      commGroupCreate: async () => successful({}), commGroupAccept: async () => successful({ group_id: g, state: 'wrong' }),
+      commGroupSend: async () => successful({ group_id: g }), commGroupRetry: async () => successful({ group_id: g }),
+    })
+    for (const action of [() => createCommGroup('group', ['npub1bob']), () => acceptCommGroupInvite(id), () => sendCommGroupMessage(g, 'hi', id), () => retryCommGroupMessage(g, id)]) {
+      await expect(action()).rejects.toBeInstanceOf(CommApiError)
+    }
   })
 })
