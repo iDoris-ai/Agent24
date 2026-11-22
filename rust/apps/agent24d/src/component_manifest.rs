@@ -25,6 +25,7 @@ pub(crate) fn capability_id_ok(id: &str) -> bool {
 pub(crate) const REGISTERED_PROVIDERS: &[(&str, &str)] = &[
     ("model-gateway", "idoris"),
     ("nostr-dm", "hyphae"),
+    ("nostr-friend", "hyphae"),
     ("nostr-group", "hyphae"),
     ("nostr-identity", "hyphae"),
     ("nostr-relay", "hyphae"),

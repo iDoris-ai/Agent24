@@ -1289,7 +1289,7 @@ mod hyphae_probe_arm_tests {
         assert_eq!(arm.expectation.name, "hyphae-cli");
         assert_eq!(arm.expectation.major, 1);
         assert_eq!(arm.expectation.min_minor, 0);
-        assert_eq!(arm.expectation.tested, "1.0");
+        assert_eq!(arm.expectation.tested, "1.3");
         assert_eq!(arm.health_interval, HEALTH_INTERVAL);
         assert_eq!(arm.health_timeout, HEALTH_TIMEOUT);
         assert_eq!(arm.contract_timeout, CONTRACT_TIMEOUT);
@@ -1654,7 +1654,7 @@ mod hy1_regression_tests {
             let (status, installed) = request(&app, "POST", "/api/v1/comm/install").await;
             assert_eq!(status, StatusCode::OK, "{installed}");
             assert_eq!(installed["data"]["restart_required"], false);
-            assert_eq!(installed["data"]["installed_version"], "v0.30.1");
+            assert_eq!(installed["data"]["installed_version"], "v0.33.0");
             assert_eq!(
                 tokio::fs::read(runtime.lock.installed_path(dir.path()))
                     .await
@@ -1667,7 +1667,7 @@ mod hy1_regression_tests {
             let (status, process) = request(&app, "GET", "/api/v1/comm/daemon").await;
             assert_eq!(status, StatusCode::OK);
             assert_ne!(process["data"]["process"]["state"], "not_configured");
-            assert_eq!(process["data"]["installed_version"], "v0.30.1");
+            assert_eq!(process["data"]["installed_version"], "v0.33.0");
         }
         if let Some(handle) = runtime.slot.close() {
             handle.shutdown(tokio::time::Instant::now()).await;

@@ -8,6 +8,7 @@ ADR-038 D9 与 ADR-039 的能力 id 登记表。能力 id 的字符集是 `[a-z0
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `model-gateway` | 本地模型网关 | Local model gateway | เกตเวย์โมเดลภายในเครื่อง | idoris | 常驻 HTTP（resident） | `rust/crates/agent24-idoris/idoris.lock.json` | 已接入 | 2026-11-03 |
 | `nostr-dm` | Nostr 私信 | Nostr DM | ข้อความส่วนตัว Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
+| `nostr-friend` | Nostr 好友 | Nostr friends | เพื่อน Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-21 |
 | `nostr-group` | Nostr 群组 | Nostr group | กลุ่ม Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
 | `nostr-identity` | Nostr 身份 | Nostr identity | ตัวตน Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
 | `nostr-relay` | Nostr 中继 | Nostr relay | รีเลย์ Nostr | hyphae | 常驻 CLI（resident） | `rust/crates/agent24-comm/hyphae.lock.json` | 已接入 | 2026-11-03 |
