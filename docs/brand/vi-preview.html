@@ -49,7 +49,7 @@ td{padding:6px 18px 6px 0;color:var(--muted)} td:first-child{color:var(--text)}
 <h2>1 · 标志</h2>
 <div class="row">
   <div class="card" style="display:flex;align-items:center;gap:18px">
-    <svg class="mark" data-size="64" data-lit="#E8C547" data-tick="#3a3a36" data-core="#F0F0E8"></svg>
+    <svg class="mark" data-size="64" data-lit="#E8C547" data-tick="#6a6a60" data-core="#F0F0E8"></svg>
     <div class="wordmark">Agent<b>24</b></div>
   </div>
   <div class="card light" style="display:flex;align-items:center;gap:18px">
@@ -58,14 +58,14 @@ td{padding:6px 18px 6px 0;color:var(--muted)} td:first-child{color:var(--text)}
   </div>
   <div class="card" style="display:flex;align-items:center;gap:22px">
     <div style="width:96px;height:96px;border-radius:22px;background:linear-gradient(#1a1a1a,#0a0a0a);display:grid;place-items:center;border:1px solid #2a2a2a">
-      <svg class="mark" data-size="64" data-lit="#E8C547" data-tick="#3a3a36" data-core="#F0F0E8"></svg>
+      <svg class="mark" data-size="64" data-lit="#E8C547" data-tick="#6a6a60" data-core="#F0F0E8"></svg>
     </div>
-    <svg class="mark" data-size="32" data-lit="#E8C547" data-tick="#3a3a36" data-core="#F0F0E8"></svg>
+    <svg class="mark" data-size="32" data-lit="#E8C547" data-tick="#6a6a60" data-core="#F0F0E8"></svg>
     <svg class="mark" data-size="16" data-lit="#F0F0E8" data-tick="#8A8A84" data-core="#F0F0E8"></svg>
     <span style="color:var(--muted);font-size:12px">App 图标 · 32 · 托盘 16</span>
   </div>
 </div>
-<p class="lead" style="margin-top:12px">24 段刻度 = 一天 24 小时；唯一点亮的一段 = 此刻它在为你工作；中心点 = 本机 daemon（本体），环 = 围绕它的各个外壳。</p>
+<p class="lead" style="margin-top:12px">琥珀核心 = 你本机的 Agent，核心里的 24 = 全天候；三条菌丝连到它的外壳和其他 Agent（Hyphae）。小尺寸不带数字。</p>
 
 <h2>2 · 色彩</h2>
 <div class="row">
@@ -126,21 +126,20 @@ td{padding:6px 18px 6px 0;color:var(--muted)} td:first-child{color:var(--text)}
 
 <h2>6 · 规则</h2>
 <div class="row">
-  <div class="card do" style="flex:1">✓ 一次只点亮一段刻度<br>✓ 外发数据必须标「↗ 远端」<br>✓ iDoris 作角色出现在欢迎页、空状态、Pet0<br>✓ 深色用边框分层，浅色才用阴影</div>
+  <div class="card do" style="flex:1">✓ 琥珀色只用在核心一处<br>✓ 外发数据必须标「↗ 远端」<br>✓ iDoris 作角色出现在欢迎页、空状态、Pet0<br>✓ 深色用边框分层，浅色才用阴影</div>
   <div class="card dont" style="flex:1">✕ 霓虹紫渐变、外发光<br>✕ 把 logo 改成蘑菇（属 MushroomDAO）<br>✕ 「AI 魔法」式文案<br>✕ 像素风进入功能图标</div>
 </div>
 
 <script>
+// 菌丝节点（VI.md §3.1）：琥珀核心 + 三条菌丝 + 三个节点；48px 以上在核心里写 24
 document.querySelectorAll('svg.mark').forEach(svg=>{
-  const s=+svg.dataset.size, c=s/2, R=s*0.445, w=Math.max(1.2,s*0.035);
+  const s=+svg.dataset.size, c=s/2, big=s>=48, R=s*0.36;
   svg.setAttribute('width',s);svg.setAttribute('height',s);svg.setAttribute('viewBox',`0 0 ${s} ${s}`);
-  let h='';
-  for(let i=0;i<24;i++){
-    const a=(i/24)*2*Math.PI-Math.PI/2, lit=i===0, major=i%6===0, r=R-s*(major?0.156:0.055);
-    const x1=c+r*Math.cos(a),y1=c+r*Math.sin(a),x2=c+R*Math.cos(a),y2=c+R*Math.sin(a);
-    h+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${lit?svg.dataset.lit:svg.dataset.tick}" stroke-width="${lit?w*2:major?w*1.33:w}" stroke-linecap="round"/>`;
-  }
-  h+=`<circle cx="${c}" cy="${c}" r="${s*0.09}" fill="${svg.dataset.core}"/>`;
+  const ps=[330,90,210].map(d=>{const a=(d-90)*Math.PI/180;return [c+R*Math.cos(a),c+R*Math.sin(a)]});
+  let h=ps.map(([x,y])=>`<line x1="${c}" y1="${c}" x2="${x}" y2="${y}" stroke="${svg.dataset.tick}" stroke-width="${s*0.055}" stroke-linecap="round"/>`).join('');
+  h+=ps.map(([x,y])=>`<circle cx="${x}" cy="${y}" r="${s*0.078}" fill="${svg.dataset.core}"/>`).join('');
+  h+=`<circle cx="${c}" cy="${c}" r="${s*(big?0.2:0.15)}" fill="${svg.dataset.lit}"/>`;
+  if(big) h+=`<text x="${c}" y="${c+s*0.075}" text-anchor="middle" font-family="Menlo,monospace" font-weight="700" font-size="${s*0.21}" fill="#16160f">24</text>`;
   svg.innerHTML=h;
 });
 </script>
