@@ -180,7 +180,7 @@ describe('ChatPage', () => {
       expect(screen.getByText('Hello from AI!')).toBeInTheDocument()
     })
     // Server-reported latency_ms wins over the frontend's own timing too.
-    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 本地 · 总计 842 ms')).toBeInTheDocument()
+    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 本地 · 用时 0.8 秒')).toBeInTheDocument()
     expect(screen.queryByText(/首字/)).not.toBeInTheDocument()
   })
 
@@ -200,7 +200,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
     await waitFor(() => expect(screen.getByText('Done.')).toBeInTheDocument())
-    expect(screen.getByText(/^总计 \d+(,\d{3})* ms$/)).toBeInTheDocument()
+    expect(screen.getByText(/^用时 \d+(\.\d)? 秒$/)).toBeInTheDocument()
   })
 
   it('does not attach a latency suffix to the error fallback message', async () => {
@@ -214,7 +214,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
     await waitFor(() => expect(screen.getByText(/对话请求失败/)).toBeInTheDocument())
-    expect(screen.queryByText(/总计/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/用时/)).not.toBeInTheDocument()
   })
 
   it('does not blame the model service when the backend daemon never became ready', async () => {
