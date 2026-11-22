@@ -87,7 +87,22 @@ export function changeExcerpts(from: string, to: string): [string, string] {
   return [cut(from), cut(to)]
 }
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
-const isDocId = (ref: string): boolean => /^doc_[0-9A-Za-z]+$/.test(ref)
+/** A document id as the module tells one from a name (agent24-documents
+ *  `is_id`): `doc_` and 26 Crockford base32 characters, the first 0–7.
+ *  Anything else the module looks up by title, so the box does too. */
+const isDocId = (ref: string): boolean => /^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(ref)
+/** The tools whose `document_id` the module looks up by title (`named_by_title`). */
+const NAMED_BY_TITLE = new Set(['documents.get', 'documents.paragraphs', 'documents.patch', 'documents.fields', 'documents.fill', 'documents.compose'])
+
+/** The library's documents from a `documents list` answer, or null when it
+ *  is not the whole library (PR-Daemon #2006 N1): the module matches a name
+ *  against every document, so a match in one page may not be its match. */
+export function wholeLibrary(data: unknown): Array<{ id: string; title: string }> | null {
+  const page = data as { documents?: unknown; next_cursor?: unknown } | null
+  if (!Array.isArray(page?.documents) || (typeof page.next_cursor === 'string' && page.next_cursor !== '')) return null
+  return page.documents.flatMap((d: { document_id?: unknown; title?: unknown }) =>
+    typeof d?.document_id === 'string' && typeof d.title === 'string' ? [{ id: d.document_id, title: d.title }] : [])
+}
 
 /** The tool's name, as the daemon writes it before `: ` in the summary. */
 export function toolOf(summary: unknown): string {
@@ -116,13 +131,15 @@ export function namedDocument(docs: ReadonlyArray<{ id: string; title: string }>
   return only(docs.filter(d => plainTitle(d.title) === wanted)) ?? only(docs.filter(d => plainTitle(d.title).includes(wanted)))
 }
 
-/** A document the model named: its id when main can find it, and its title. */
-async function docOf(ref: string, lookups: DocumentLookups): Promise<{ id: string | null; title: string }> {
+/** A document the model named: its id when main can find it, and its title.
+ *  A name is looked up only for the tools the module looks it up for
+ *  (`byName`, PR-Daemon #2006 N3); for others the box shows it as written. */
+async function docOf(ref: string, lookups: DocumentLookups, byName = true): Promise<{ id: string | null; title: string }> {
   if (isDocId(ref)) return { id: ref, title: (await lookups.title(ref).catch(() => null)) || mt('approval.someDocument') }
-  const found = ref ? namedDocument((await lookups.list().catch(() => null)) ?? [], ref) : null
+  const found = ref && byName ? namedDocument((await lookups.list().catch(() => null)) ?? [], ref) : null
   return found ?? { id: null, title: ref.replace(/^《|》$/g, '') || mt('approval.someDocument') }
 }
-const titleOf = async (ref: string, lookups: DocumentLookups): Promise<string> => (await docOf(ref, lookups)).title
+const titleOf = async (ref: string, lookups: DocumentLookups, byName = true): Promise<string> => (await docOf(ref, lookups, byName)).title
 
 export async function approvalDialog(
   record: ApprovalRecord,
@@ -182,7 +199,7 @@ export async function approvalDialog(
     const action = key ? mt(key) : clip(tool, 60)
     const ref = str(args['document_id'])
     message = ref
-      ? say('approval.title.toolDoc', { action, doc: await titleOf(ref, lookups) })
+      ? say('approval.title.toolDoc', { action, doc: await titleOf(ref, lookups, NAMED_BY_TITLE.has(tool)) })
       : say('approval.title.tool', { action })
     if (READ_ONLY.has(tool)) lines.push(mt('approval.readOnly'))
     else {

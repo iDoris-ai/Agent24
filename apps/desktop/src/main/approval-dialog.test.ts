@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { approvalDialog, type DocumentLookups } from './approval-dialog'
+import { approvalDialog, wholeLibrary, type DocumentLookups } from './approval-dialog'
 import { resetMainLocaleForTest, setMainLocale } from './main-i18n'
 
 const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}…` : s)
@@ -83,6 +83,33 @@ describe('approvalDialog (UI polish 01)', () => {
       'approve', '批准', undefined, look, clip)
     expect(look.paragraphs).not.toHaveBeenCalled()
     expect(out.detail).toContain('第 1 段：（没读到原文）→「新」')
+  })
+
+  // PR-Daemon #2006 N1: the module matches a name against the whole library;
+  // a page of it may hold another document the name also fits.
+  it('a list with more pages is not the library: no name is matched in it', () => {
+    const docs = [{ document_id: DOC, title: 'Contract notes.docx' }]
+    expect(wholeLibrary({ documents: docs, next_cursor: 'c2' })).toBeNull()
+    expect(wholeLibrary({ documents: docs, next_cursor: null })).toEqual([{ id: DOC, title: 'Contract notes.docx' }])
+    expect(wholeLibrary({ documents: docs })).toEqual([{ id: DOC, title: 'Contract notes.docx' }])
+    expect(wholeLibrary(null)).toBeNull()
+  })
+
+  // PR-Daemon #2006 N2: an id the module would not take as one is a name to it.
+  it('a document_id shaped like an id but not one is looked up as a name, as the module does', async () => {
+    const look = lookups('不该读到.docx', new Map([[0, '原']]), [{ id: DOC, title: 'doc_1.docx' }])
+    await box({ summary: 'documents.patch: {…}', payload: { document_id: 'doc_1', edits: [{ index: 0, text: '新' }] } },
+      'approve', '批准', undefined, look, clip)
+    expect(look.title).not.toHaveBeenCalled()
+    expect(look.paragraphs).toHaveBeenCalledWith(DOC)
+  })
+
+  // PR-Daemon #2006 N3: only the documents tools take a name for a document.
+  it('another tool naming a document by name: shown as written, nothing looked up', async () => {
+    const look = lookups(null, null, [{ id: DOC, title: '合同.docx' }])
+    const out = await box({ summary: 'x_tool: {…}', payload: { document_id: '合同', mode: 'fast' } }, 'approve', '批准', undefined, look, clip)
+    expect(look.list).not.toHaveBeenCalled()
+    expect(out.message).toBe('确认允许助理对《合同》「x_tool」？')
   })
 
   // PR-Daemon #2006 B1: text from the tool's input never makes a line of its own.
