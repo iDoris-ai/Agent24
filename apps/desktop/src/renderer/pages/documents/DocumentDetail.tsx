@@ -14,6 +14,7 @@ import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 import DocxTools from './DocxTools'
+import type { DocFocus } from './doc-focus'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -38,8 +39,10 @@ export function readableSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, onAdded, autoCheck = false, autoTranslate = null }: {
+export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, onAdded, autoCheck = false, autoTranslate = null, focus = null }: {
   documentId: string
+  /** F3: open at this page, its block highlighted (a source clicked in a card). */
+  focus?: DocFocus | null
   onClose: () => void
   /** A new document was made here (split, conversion): the list reads itself again. */
   onAdded?: () => void
@@ -383,6 +386,18 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     }
     // `read` and `show` check their refs; only the document matters.
   }, [api, documentId])
+  // F3: the focused block once its text is read, reading on until it is there.
+  const focused = useRef<DocFocus | null>(null)
+  useEffect(() => {
+    if (!focus || !detail || detail.document_id !== focus.documentId || focused.current === focus || loading || checking) return
+    // A page that failed to read stops it here: the page is shown, the error said (#2019 ②).
+    if (!blocks.some((b) => b.block_id === focus.blockId) && more && !error) {
+      void read(generation.current, detail, more)
+      return
+    }
+    focused.current = focus
+    jumpTo(detail, { block_id: focus.blockId, page: focus.page, quote: '' })
+  })
   // D3: opened to be checked (an Office document's PDF): once, when its text is first read.
   const autoChecked = useRef<string | null>(null)
   useEffect(() => {

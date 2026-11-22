@@ -587,3 +587,15 @@ button { cursor: pointer; font-family: var(--font); }
 .md-pre { background: var(--surface2); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 0 0 8px; white-space: pre; }
 .md code { background: var(--surface2); padding: 0 4px; border-radius: 4px; font-size: 0.92em; }
 .md-pre code { background: none; padding: 0; }
+
+/* F3 (Loop 6): 「抽取结果」卡 */
+.extract-card { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+.extract-card-title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.extract-card-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+.extract-card-table th { color: var(--muted); text-align: left; font-weight: normal; }
+.extract-card-table td { border-top: 1px solid var(--border); vertical-align: top; padding: 4px 8px 4px 0; }
+.extract-card-name { white-space: nowrap; }
+.extract-card-muted { color: var(--muted); font-size: 12px; }
+.extract-card-value { margin: 2px 0; }
+.extract-card-answer { font-size: 12px; margin-top: 6px; }
+.extract-card-source { font-size: 12px; padding: 0 4px; margin-left: 4px; }

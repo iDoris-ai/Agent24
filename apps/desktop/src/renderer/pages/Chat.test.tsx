@@ -1231,3 +1231,68 @@ describe('ChatPage: Enter while composing', () => {
     expect(mockBackendProxy.mock.calls[0][0].body.messages.at(-1).content).toBe('How long should water be boiled to make it safe to drink?')
   })
 })
+
+// F3 (Loop 6): one sentence extracts fields with the documents OS's extract
+// job, shown as a card; an ordinary question about a field is not taken.
+describe('ChatPage: one sentence extracts fields (F3)', () => {
+  beforeEach(() => { setLocale('zh') })
+  const request = vi.fn(async (req: { op: string }) => {
+    if (req.op === 'get') return { ok: true, data: { document_id: 'doc_1', title: '合同.pdf', head: { revision: 1, media_type: 'application/pdf' } } }
+    if (req.op === 'extract') return { ok: true, data: { job_id: 'job_1', status: 'succeeded', result: { extraction_id: 'ext_1' } } }
+    if (req.op === 'getExtraction') return { ok: true, data: { next_cursor: null, values: [
+      { key: 'f1', status: 'present', value: '张三', anchors: [{ block_id: 'p1/b2', page: 1, quote: '甲方：张三' }] },
+      { key: 'f2', status: 'missing', missing_reason: 'not_in_document' },
+    ] } }
+    if (req.op === 'readText') return { ok: true, data: { blocks: [{ text: '甲方：张三' }], next_cursor: null } }
+    return { ok: false }
+  })
+  const start = async (text: string) => {
+    const { askAboutDocument, resetDocContextForTests } = await import('./chat/doc-context')
+    resetDocContextForTests()
+    request.mockClear()
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'model answer' } } })
+    askAboutDocument({ id: 'doc_1', title: '合同.pdf', revision: 1 })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: text } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+  }
+
+  it('calls extract first and shows the card, a missing field said so', async () => {
+    await start('把这份合同的甲方、开户银行抽出来')
+    await waitFor(() => expect(screen.getByRole('group', { name: '抽取结果' })).toBeInTheDocument())
+    expect(request.mock.calls.map(([r]) => r.op)).toEqual(['get', 'extract', 'getExtraction'])
+    expect(screen.getByText('张三')).toBeInTheDocument()
+    expect(screen.getByText('文档里没找到')).toBeInTheDocument()
+    expect(mockBackendProxy.mock.calls.some(([req]) => req.path === '/api/v1/chat')).toBe(false)
+    const { pendingDocFocus } = await import('./documents/doc-focus')
+    fireEvent.click(screen.getByRole('button', { name: '第 1 页' }))
+    expect(pendingDocFocus()).toEqual({ documentId: 'doc_1', page: 1, blockId: 'p1/b2' })
+  })
+
+  it('says in Chinese when the module has no model, the code only under 「详情」', async () => {
+    request.mockImplementationOnce(async () => ({ ok: true, data: { document_id: 'doc_1', title: '合同.pdf', head: { revision: 1, media_type: 'application/pdf' } } }))
+    request.mockImplementationOnce(async () => ({ ok: false, status: 503, error: { code: 'engine_unavailable', message: 'the kernel offers this module no model', details: { engine: 'local-model' } } }) as never)
+    await start('把这份合同的甲方抽出来')
+    await waitFor(() => expect(screen.getByText('没能完成抽取：本地模型没有分配给文档模块，暂时不能抽取。')).toBeInTheDocument())
+    const detail = screen.getByText(/the kernel offers this module no model/)
+    expect(detail.closest('details')).not.toBeNull()
+  })
+
+  // PR-Daemon #2019 ⑤: a turn taken for an extraction by mistake can still be answered.
+  it('answers the same words with the model when the card says it was not an extraction', async () => {
+    await start('把这份合同的甲方、开户银行抽出来')
+    fireEvent.click(await screen.findByRole('button', { name: '不是要抽取？让助手回答' }))
+    await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())
+    expect(request.mock.calls.filter(([r]) => r.op === 'extract')).toHaveLength(1)
+    const chat = mockBackendProxy.mock.calls.find(([req]) => req.path === '/api/v1/chat')![0]
+    expect(chat.body.messages.at(-1).content).toContain('把这份合同的甲方、开户银行抽出来')
+  })
+
+  it('leaves 「这个字段怎么填」 to the model', async () => {
+    await start('这个字段怎么填')
+    await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())
+    expect(request.mock.calls.some(([r]) => r.op === 'extract')).toBe(false)
+  })
+})

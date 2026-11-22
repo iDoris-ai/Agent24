@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksTranslation, docAgentPrompt, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -167,5 +167,105 @@ describe('M1: the four questions PR-Daemon #1915 found taken as splits stay ques
       expect(wantsDocTool(text, true)).toBe(false)
       expect(translatesDocument(text, true)).toBe(false)
     })
+  }
+})
+
+describe('F3: one sentence asks for fields of the document', () => {
+  it.each([
+    ['把这份合同的甲方、乙方、金额、期限抽出来', ['甲方', '乙方', '金额', '期限']],
+    ['这张发票的开票日期和总金额是多少，列出来', ['开票日期', '总金额']],
+    ['从这份通知里找出截止日期和要交的材料', ['截止日期', '要交的材料']],
+    ['把《租赁合同.pdf》的租金、押金抽出来', ['租金', '押金']],
+  ])('%s', (text, fields) => {
+    expect(extractionFields(text, true)).toEqual(fields)
+    expect(parseDocIntent(text)).toBeNull()
+  })
+
+  it.each([
+    ['把合同金额抽取出来', ['合同金额']],
+    ['把金额、日期抽出来，谢谢', ['金额', '日期']],
+    ['列出来甲方和乙方', ['甲方', '乙方']],
+    ['请把发票号码、开票日期、金额抽出来', ['发票号码', '开票日期', '金额']],
+    ['甲方和乙方分别是谁，列出来', ['甲方', '乙方']],
+    ['把租金、押金、开户银行抽出来', ['租金', '押金', '开户银行']],
+    ['把发票号码和结算日期抽出来', ['发票号码', '结算日期']],
+  ])('PR-Daemon #2019: %s', (text, fields) => {
+    expect(extractionFields(text, true)).toEqual(fields)
+  })
+
+  it('names a document in 《》 outside its conversation', () => {
+    expect(extractionFields('把《租赁合同.pdf》的租金、押金抽出来', false)).toEqual(['租金', '押金'])
+  })
+
+  it('asks to extract without fields the rules can read', () => {
+    expect(extractionFields('抽取一下', true)).toEqual([])
+  })
+})
+
+// PR-Daemon #2019 ①: whatever is said after the verb asks for more than an
+// extraction, so every pairing of these fields and these follow-ups goes to the model.
+describe('F3: an extraction followed by something more goes to the model', () => {
+  const asks = [
+    ['把重要日期都列出来', '，到时候提醒我'], ['把日期列出来', '记到日历里'], ['把金额都列出来', '算个总数'],
+    ['把联系人抽出来', '存到通讯录'], ['把甲方信息抽出来', '发邮件给老王'], ['把付款日期列出来', '，我好安排资金'],
+    ['把金额列出来', '按大小排序'], ['把截止日期找出来', '加到待办'], ['把材料清单列出来', '打印'],
+    ['把金额抽出来', '换算成美元'], ['把联系人、电话抽出来', '备用'], ['列出来甲方和乙方', '，然后发给我'],
+  ] as const
+  for (const [ask, then] of asks) {
+    it(ask + then, () => {
+      expect(extractionFields(ask + then, true)).toBeNull()
+      expect(extractionFields(ask, true)).not.toBeNull()
+    })
+  }
+  // Round 3: the verb first, then something more.
+  const finds = ['找出截止日期', '找出金额', '找出合同里的金额', '列出来金额', '找出电话号码'] as const
+  const more = ['并设个提醒', '并核对是否正确', '后告诉老板', '以便安排', '发给我', '加起来', '写错了没有', '并计算总和',
+    // Round 4: follow-ups that themselves end in a field word.
+    '并发到我的邮箱', '告诉负责人', '做成清单', '并核对合同金额', '之后算总价', '提醒我交材料', '并发给对方公司'] as const
+  for (const ask of finds) {
+    for (const then of more) {
+      it(ask + then, () => expect(extractionFields(ask + then, true)).toBeNull())
+    }
+    it(`${ask} alone is an extraction`, () => expect(extractionFields(ask, true)).not.toBeNull())
+  }
+  // Round 3: what is judged, not stated, is not a field.
+  for (const text of ['把合同的漏洞列出来', '把所有不合理的条款列出来', '列出来这份合同里的优缺点', '列出来三个改进建议',
+    '把这份文件的结构列出来', '把合同的亮点列出来', '把作者的观点列出来', '列出来这份文件里提到的人',
+    '找出与上一版不同的金额', '列出来甲方和乙方的区别',
+    '列出来你推荐的付款方式', '把对我不利的条件列出来', '把有问题的金额列出来', '找出不合理的费用', '找出前后不一致的金额']) {
+    it(text, () => expect(extractionFields(text, true)).toBeNull())
+  }
+  for (const text of ['把这份合同里需要注意的地方列出来', '把这份合同的第三部分抽出来', '把里面需要我签字的地方列出来']) {
+    it(text, () => expect(extractionFields(text, true)).toBeNull())
+  }
+})
+
+describe('F3: ordinary questions and other tasks are not extractions', () => {
+  for (const [text, inDocument] of [
+    ['这个字段怎么填', true],
+    ['甲方是谁？', true],
+    ['付款期限是多少', true],
+    ['这份合同有什么风险', true],
+    ['找出原因', true],
+    ['把第3页拆出来', true],
+    ['把这份合同翻译成英文', true],
+    ['总结一下这份文件第4页，单独列出金额', true],
+    ['这份文档第2页的关键信息帮我提取一下', true],
+    ['把第 3 段改得正式一点', true],
+    ['列出来几个周末去处', false],
+    ['帮我找出这段代码的日期处理问题', false],
+    ['今天天气怎么样', false],
+    // PR-Daemon #2019 ①: more than an extraction, a question, or no field named.
+    ['把重要日期都列出来提醒我', true],
+    ['把第3条抽出来单独看看', true],
+    ['列出来所有的风险点', true],
+    ['把这份合同里的问题列出来', true],
+    ['你能列出来这份文档的大纲吗', true],
+    ['把《年度报告.pdf》里的数据抽出来做个图', true],
+    ['提取出来的内容有问题吗', true],
+    ['把关键信息都抽出来', true],
+    ['你好', false],
+  ] as const) {
+    it(text, () => expect(extractionFields(text, inDocument)).toBeNull())
   }
 })

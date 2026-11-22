@@ -7,6 +7,7 @@ import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import DocumentDetail from './DocumentDetail'
 import { compose } from './compose'
+import { clearDocFocus, pendingDocFocus, subscribeDocFocus } from './doc-focus'
 import type { TargetLang } from './doc-translate'
 import { getLocale, useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
@@ -113,6 +114,15 @@ export default function DocumentsPage() {
     return () => { live = false }
   }, [api])
   const [open, setOpen] = useState<string | null>(null)
+  // F3: a source clicked in the conversation opens its document at that block.
+  const docFocus = useSyncExternalStore(subscribeDocFocus, pendingDocFocus)
+  const [focus, setFocus] = useState(docFocus)
+  useEffect(() => {
+    if (!docFocus) return
+    clearDocFocus()
+    setFocus(docFocus)
+    setOpen(docFocus.documentId)
+  }, [docFocus])
   // D3: the document opened to be checked straight away (an Office one's PDF).
   const [autoCheck, setAutoCheck] = useState<string | null>(null)
   // D4: the PDF opened to be translated straight away, and into which language.
@@ -322,6 +332,7 @@ export default function DocumentsPage() {
       {open && (
         <DocumentDetail
           documentId={open}
+          focus={focus?.documentId === open ? focus : null}
           autoCheck={autoCheck === open}
           onAdded={() => void reload()}
           autoTranslate={autoTranslate?.id === open ? autoTranslate.lang : null}
@@ -329,6 +340,7 @@ export default function DocumentsPage() {
           onTranslate={(id, lang) => { setAutoCheck(null); setAutoTranslate({ id, lang }); setOpen(id) }}
           onClose={() => {
             setAutoTranslate(null)
+            setFocus(null)
             setOpen(null)
             ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
           }}
@@ -357,7 +369,7 @@ export default function DocumentsPage() {
                   )}
                 </td>
                 <td style={CELL}>
-                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
+                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setFocus(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
                     {d.title}
                   </button>
                 </td>
