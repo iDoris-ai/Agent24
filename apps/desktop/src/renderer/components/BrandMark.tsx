@@ -14,7 +14,7 @@ const TICKS = Array.from({ length: 24 }, (_, i) => {
     x1: C + r * Math.cos(a), y1: C + r * Math.sin(a),
     x2: C + R * Math.cos(a), y2: C + R * Math.sin(a),
     width: lit ? 18 : major ? 12 : 9,
-    stroke: lit ? 'var(--accent)' : 'var(--border-stronger)',
+    stroke: lit ? 'var(--accent)' : 'var(--weak)',
   }
 })
 
