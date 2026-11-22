@@ -48,6 +48,8 @@ function failed(res: Failed): ExtractFailure {
       ? { error: '本地模型没有分配给文档模块，暂时不能抽取。', detail }
       : { error: '这台机器上读不出这份文档的文字，暂时不能抽取。', detail }
   }
+  // Delegation and presence answers already say, in the user's words, what to do (#2019 Low).
+  if (/^(module_delegation|presence)/.test(res.error.code)) return { error: detail }
   return { error: '文档模块没有完成这次抽取。', detail }
 }
 
@@ -94,6 +96,9 @@ export async function extractFields(
     job = next.data
   }
   const extractionId = job.result?.extraction_id
+  if (job.status === 'queued' || job.status === 'running') {
+    return { error: '抽取还在进行（长文档要更久）。稍后再说一次同样的话，会直接用这次的结果。', detail: job.job_id }
+  }
   if (job.status !== 'succeeded' || !extractionId) {
     const detail = job.error ? `${job.error.message}（${job.error.code}）` : job.status
     return { error: job.status === 'cancelled' ? '抽取已取消。' : '本地模型没有完成这次抽取，请稍后再试。', detail }

@@ -90,8 +90,8 @@ about another item, row, fee or date because it looks similar."
     );
     assert_eq!(
         crate::extract::EXTRACTOR_VERSION,
-        "6",
-        "this wording was measured as version 6; a new wording is measured again under a new version"
+        "7",
+        "this wording was measured as version 6 (7 changed only the window); a new wording is measured again under a new version"
     );
     for term in ["`present`", "`conflict`", "`missing`", "`not_in_document`"] {
         assert!(INSTRUCTION.contains(term), "{term}");

@@ -186,7 +186,6 @@ describe('F3: one sentence asks for fields of the document', () => {
   })
 
   it('asks to extract without fields the rules can read', () => {
-    expect(extractionFields('把关键信息都抽出来', true)).toEqual(['关键信息'])
     expect(extractionFields('抽取一下', true)).toEqual([])
   })
 })
@@ -206,6 +205,15 @@ describe('F3: ordinary questions and other tasks are not extractions', () => {
     ['列出来几个周末去处', false],
     ['帮我找出这段代码的日期处理问题', false],
     ['今天天气怎么样', false],
+    // PR-Daemon #2019 ①: more than an extraction, a question, or no field named.
+    ['把重要日期都列出来提醒我', true],
+    ['把第3条抽出来单独看看', true],
+    ['列出来所有的风险点', true],
+    ['把这份合同里的问题列出来', true],
+    ['你能列出来这份文档的大纲吗', true],
+    ['把《年度报告.pdf》里的数据抽出来做个图', true],
+    ['提取出来的内容有问题吗', true],
+    ['把关键信息都抽出来', true],
     ['你好', false],
   ] as const) {
     it(text, () => expect(extractionFields(text, inDocument)).toBeNull())

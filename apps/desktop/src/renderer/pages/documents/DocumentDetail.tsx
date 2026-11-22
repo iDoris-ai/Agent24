@@ -406,8 +406,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
   // F3: the focused block once its text is read, reading on until it is there.
   const focused = useRef<DocFocus | null>(null)
   useEffect(() => {
-    if (!focus || !detail || detail.document_id !== focus.documentId || focused.current === focus || loading) return
-    if (!blocks.some((b) => b.block_id === focus.blockId) && more) {
+    if (!focus || !detail || detail.document_id !== focus.documentId || focused.current === focus || loading || checking) return
+    // A page that failed to read stops it here: the page is shown, the error said (#2019 ②).
+    if (!blocks.some((b) => b.block_id === focus.blockId) && more && !error) {
       void read(generation.current, detail, more)
       return
     }

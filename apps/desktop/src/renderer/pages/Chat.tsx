@@ -258,11 +258,12 @@ export default function ChatPage() {
         }
       } catch (e) {
         reply = { role: 'assistant', content: '没能完成抽取。', detail: e instanceof Error ? e.message : String(e) }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
       }
       setDelivery(index, { kind: 'sent' })
       setMessages(prev => [...prev, reply])
-      requestInFlight.current = false
-      setLoading(false)
       return
     }
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
