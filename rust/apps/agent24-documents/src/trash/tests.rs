@@ -128,9 +128,10 @@ async fn a_deleted_document_is_hidden_until_it_is_restored() {
     assert_eq!(ops, "delete:page,restore:page");
 }
 
-/// Past 7 days a deleted document is no longer listed and cannot be restored.
+/// Past 7 days a deleted document is no longer listed and cannot be
+/// restored; its rows are all still there (not erased, FU-177).
 #[tokio::test]
-async fn past_seven_days_a_deleted_document_is_gone_for_the_user() {
+async fn past_seven_days_a_deleted_document_can_no_longer_be_restored() {
     let (_dir, state) = opened().await;
     exec(
         &state,
