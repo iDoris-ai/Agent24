@@ -80,11 +80,15 @@ function BackendOffline({ failure, reasonOpen, onToggleReason, onRetry }: {
   )
 }
 
+// VI-04: the macOS traffic lights sit over the sidebar's top-left (hiddenInset).
+const isMacPlatform = (): boolean => typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac')
+
 export function App(): JSX.Element {
   return <CapabilitiesProvider><NavPrefsProvider><AppShell /></NavPrefsProvider></CapabilitiesProvider>
 }
 
 function AppShell(): JSX.Element {
+  const isMac = isMacPlatform()
   const { route, navigate } = useCapabilityRoute()
   const { defs, open } = useContext(CapabilitiesContext)
   const { prefs } = useContext(NavPrefsContext)
@@ -170,7 +174,7 @@ function AppShell(): JSX.Element {
   const activeId = selected?.id ?? page ?? ''
 
   return (
-    <div className={`app${darkMode ? '' : ' light'}`}>
+    <div className={`app${darkMode ? '' : ' light'}${isMac ? ' mac' : ''}`}>
       <QuickSwitch />
       {!sidebarOpen && (
         <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
