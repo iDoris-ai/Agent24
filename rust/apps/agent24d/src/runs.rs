@@ -441,12 +441,36 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         {
             alias.insert(target.clone(), resolved.to_owned());
         }
+        if !write {
+            continue;
+        }
         // L6-F2: a delete that went through makes no document and changed
-        // what it was asked to; it is not a write that came to nothing.
-        let deleted = payload
+        // what it was asked to; it is not a write that came to nothing, and
+        // it settles earlier tries at that document (refused by the user,
+        // then approved). PR-Daemon #2026 ①.
+        if payload
             .as_ref()
-            .is_some_and(|p| p.get("deleted") == Some(&serde_json::Value::Bool(true)));
-        if !write || deleted {
+            .is_some_and(|p| p.get("deleted") == Some(&serde_json::Value::Bool(true)))
+        {
+            if let Some(id) = payload
+                .as_ref()
+                .and_then(|p| p.get("document_id"))
+                .and_then(|d| d.as_str())
+                && !target.is_empty()
+            {
+                alias.insert(target.clone(), id.to_owned());
+            }
+            made.push(target.clone());
+            continue;
+        }
+        // A delete the kernel refused before any card (a file name for its
+        // id, `off_pattern`) asked nothing of the user: the model is told
+        // to call again with the id, so it is not a try that failed.
+        if name == "documents.delete"
+            && m.content
+                .as_deref()
+                .is_some_and(|c| c.starts_with("tool error: invalid: "))
+        {
             continue;
         }
         attempted = true;
@@ -913,6 +937,40 @@ mod documents_tests {
             run_documents(&denied).map(|d| d.failed),
             Some(vec!["doc_A".to_owned()])
         );
+        // PR-Daemon #2026 ①: a file name refused before any card, then the id
+        // (with or without a get between), or a refusal then an approval of
+        // the same id: the delete went through, nothing reads as unchanged.
+        let refused = delete(
+            "d3",
+            "tool error: invalid: documents.delete: the argument \"document_id\" is not in the form it needs (its id); call it again with such a value",
+        );
+        let mut by_name = refused.clone();
+        by_name[0].tool_calls = json!([{ "id": "d3", "name": "documents.delete", "arguments": { "document_id": "合同.pdf" } }]);
+        let get = vec![
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "g", "name": "documents.get", "arguments": { "document_id": "合同.pdf" } }]),
+                None,
+            ),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"document_id":"doc_A"}}"#),
+                json!([]),
+                Some("g"),
+            ),
+        ];
+        for between in [vec![], get] {
+            let thread: Vec<_> = by_name
+                .iter()
+                .chain(between.iter())
+                .chain(done.iter())
+                .cloned()
+                .collect();
+            assert_eq!(run_documents(&thread), None);
+        }
+        let again: Vec<_> = denied.iter().chain(done.iter()).cloned().collect();
+        assert_eq!(run_documents(&again).map(|d| d.failed), Some(vec![]));
     }
 
     /// PR-Daemon #1979 Low: every documents operation the module declares is
