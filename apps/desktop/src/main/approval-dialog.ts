@@ -32,6 +32,16 @@ const TOOL_KEYS: Record<string, MainMessageKey> = {
 }
 
 const excerpt = (s: string): string => (s.length > EXCERPT ? `${s.slice(0, EXCERPT)}…` : s)
+/** PR-Daemon #1995 L1: the original and the new text, each cut to the same
+ *  window around the first character where they differ, so a change past the
+ *  60th character is not hidden behind two identical openings. */
+export function changeExcerpts(from: string, to: string): [string, string] {
+  let same = 0
+  while (same < from.length && same < to.length && from[same] === to[same]) same++
+  const start = same < EXCERPT - 20 ? 0 : same - 20
+  const cut = (s: string) => `${start > 0 ? '…' : ''}${s.slice(start, start + EXCERPT)}${s.length > start + EXCERPT ? '…' : ''}`
+  return [cut(from), cut(to)]
+}
 const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 const isDocId = (ref: string): boolean => /^doc_[0-9A-Za-z]+$/.test(ref)
 
@@ -79,10 +89,12 @@ export async function approvalDialog(
       const index = e && typeof e['index'] === 'number' ? e['index'] : null
       const from = index === null ? undefined : originals?.get(index)
       const n = index === null ? '?' : index + 1
-      const to = excerpt(str(e?.['text']))
-      lines.push(from === undefined
-        ? mt('approval.patch.editUnread', { n, to })
-        : mt('approval.patch.edit', { n, from: excerpt(from), to }))
+      const text = str(e?.['text'])
+      if (from === undefined) lines.push(mt('approval.patch.editUnread', { n, to: excerpt(text) }))
+      else {
+        const [was, now] = changeExcerpts(from, text)
+        lines.push(mt('approval.patch.edit', { n, from: was, to: now }))
+      }
     }
     lines.push(mt('approval.unchanged'))
   } else if (tool === 'documents.fill') {
