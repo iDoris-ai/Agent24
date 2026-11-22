@@ -44,6 +44,19 @@ describe('approvalDialog (UI polish 01)', () => {
     expect(out.detail).not.toContain('第 6 段')
   })
 
+  // PR-Daemon #1995 L1: an edit past the 60th character showed the same
+  // opening on both sides; the box shows the text around the first change.
+  it('a change late in a long paragraph: both sides cut around where they first differ', async () => {
+    const head = '本合同由甲乙双方在平等自愿、协商一致的基础上订立，双方应当遵守国家有关法律法规及本合同的全部约定条款内容，未尽事宜另行协商，'
+    expect(head.length).toBeGreaterThan(60)
+    const out = await box(patch([{ index: 0, text: `${head}乙方须在五日内付款。` }]),
+      'approve', '批准', undefined, lookups('a.docx', new Map([[0, `${head}乙方应于十日内付款。`]])), clip)
+    const line = out.detail.split('\n')[1]!
+    expect(line).toContain('乙方应于十日内付款。')
+    expect(line).toContain('乙方须在五日内付款。')
+    expect(line).toMatch(/^第 1 段：「…/)
+  })
+
   it('the document unreadable: 「这份文档」 and 「（没读到原文）」, still the edits', async () => {
     const out = await box(patch([{ index: 0, text: '新' }]), 'approve', '批准', undefined, lookups(null, null), clip)
     expect(out.message).toBe('确认让助理改写《这份文档》？')

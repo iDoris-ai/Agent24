@@ -190,3 +190,5 @@
 - [ ] FU-154 · B · src=M3 / 0.6.93 真机（General、PM 11-21） · 2026-11-21 · oMLX 因内存水位中止请求（memory guard aborted）时，界面只说「本地模型暂时不可用」。改成「电脑内存不够，本地模型这次没能回答，可以关掉一些程序后重试」。memory_guard_tier 保持 balanced，不放宽。判据：模拟 abort 时显示这句。
 - [ ] FU-155 · B · src=0.6.89 排查（开发 11-21） · 2026-11-21 · App 托管模式下，CLI 的 `run cancel` 报 host authority unavailable（`resident()` 拿不到 host 授权），只有 service 模式能用。因此「停止」只能在桌面端验。判据：App 托管模式下 CLI 能取消自己发起的 run，或者给出明确的说明和替代办法。
 - [ ] FU-156 · C · src=M1 0.6.93 真机（General 11-21） · 2026-11-21 · 4bit 模型改写时会选错开头相近的条款（要改「（一）」，改成了「（二）」，index 差 1），或者编出、错开一位的 anchor。卡片显示的是真实原文，用户能发现。和 FU-142 同类。判据：用更强的模型，或者给出条款号匹配后，选对条款。
+- [ ] FU-157 · C · src=PR-Daemon #1995（Low L2） · 2026-11-22 · 审批记录里的改写缺 edits 时，main 对所有非 deny 的决定都回 409，`abort` 也被拒；卡片上本来不提供 abort，只影响别的入口。改法：abort 和 deny 一样放行、不弹框。
+- [ ] FU-158 · C · src=PR-Daemon #1995（Low L3） · 2026-11-22 · 确认框里 fill 的值经 `str()`，非字符串值会显示成「键=」空值。daemon 的 FillRequest 值都是字符串，目前碰不到。
