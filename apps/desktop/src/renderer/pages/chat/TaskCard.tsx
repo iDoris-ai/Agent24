@@ -12,7 +12,7 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
-import { cancelRun, createRun, decideApproval, listPendingApprovals, type Approval, type Decision } from '../agent/api'
+import { AlreadyDecided, cancelRun, createRun, decideApproval, listPendingApprovals, type Approval, type Decision } from '../agent/api'
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { skillForConversation } from './session-skill'
@@ -56,10 +56,6 @@ function offersOf(list: readonly Approval[], runId: string): Offers {
     : NO_OFFERS
 }
 /** The run's pending approval, when it offers this decision. */
-function pendingOf(list: readonly Approval[], runId: string, type: string): Approval | null {
-  return list.find(a => a.run_id === runId && a.available_decisions.includes(type)) ?? null
-}
-
 /** What the approval asks, in words (D2b: documents tools by name and what
  *  they make; anything else as the daemon's summary, cut short). */
 /** A JSON string value as written in `src` after `"key":`, unescaped; cut
@@ -105,7 +101,9 @@ export function approvalArgs(a: Pick<Approval, 'summary'> & { payload?: unknown 
   const cut = summary.indexOf(': ')
   const tool = cut > 0 ? summary.slice(0, cut) : summary
   const payload = a.payload
-  if (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length > 0) {
+  // PR-Daemon #1987 Low 2: a patch payload without its edits is no whole input.
+  if (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length > 0
+    && (tool !== 'documents.patch' || Array.isArray((payload as Record<string, unknown>)['edits']))) {
     return { tool, args: payload as Record<string, unknown>, complete: true }
   }
   try {
@@ -296,10 +294,18 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     }, () => { if (live) setReading(false) })
     return () => { live = false }
   }, [askingSummary, askingId, task.run_id])
+  // PR-Daemon #1987 Medium 1: the decision goes to the approval the card
+  // shows (`asking`), never to another one of the same run picked again from
+  // the list: with two patch approvals in a run, 「确认」 on A approved B. One
+  // that is no longer pending says so; nothing else is decided in its place.
   const decide = (decision: Decision) => act(async () => {
-    const approval = pendingOf(await listPendingApprovals(), task.run_id, decision.type)
-    if (!approval) throw new Error(t('task.noApproval'))
-    await decideApproval(approval.id, decision)
+    const shown = asking
+    if (!shown || !shown.available_decisions.includes(decision.type)) throw new Error(t('task.noApproval'))
+    try {
+      await decideApproval(shown.id, decision, { alreadyDecided: 'throw' })
+    } catch (e) {
+      throw e instanceof AlreadyDecided ? new Error(t('task.alreadyDecided')) : e
+    }
     setDenying(false)
   })
   const [denying, setDenying] = useState(false)
