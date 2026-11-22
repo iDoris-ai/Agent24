@@ -18,7 +18,7 @@ import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from '
 import { skillForConversation } from './session-skill'
 import { namedDocument } from './doc-intent-run'
 import { mismatchedEdit } from './patch-anchor'
-import { DocumentsOutcome } from './DocumentsOutcome'
+import { DocumentsOutcome, documentName } from './DocumentsOutcome'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
 
@@ -120,9 +120,12 @@ export function approvalText(
   /** M1 (0.6.75): a patch's paragraphs as the document has them, by index.
    * The card shows these, not the model's `expect`. */
   originals: ReadonlyMap<number, string> | null = null,
+  /** General 0.6.94: a document id the card names, by its title. */
+  titles: ReadonlyMap<string, string> | null = null,
 ): string {
   const { tool, args, complete } = approvalArgs(a)
-  const str = (v: unknown) => (typeof v === 'string' ? v : '')
+  const text = (v: unknown) => (typeof v === 'string' ? v : '')
+  const str = (v: unknown) => titles?.get(text(v)) ?? text(v)
   if (tool === 'documents.list') return t('task.ask.list')
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
   if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
@@ -150,11 +153,11 @@ export function approvalText(
       const real = index === null ? undefined : originals?.get(index)
       // M1 (c), PM 11-21: the paragraph as the document has it, never the
       // model's retelling; until it is read, the card says so.
-      if (real === undefined) return t('task.ask.patchUnread', { n: index === null ? '?' : String(index + 1), to: clip(str(e['text'])) })
+      if (real === undefined) return t('task.ask.patchUnread', { n: index === null ? '?' : String(index + 1), to: clip(text(e['text'])) })
       return t('task.ask.patchEdit', {
         n: index === null ? '?' : String(index + 1),
         from: clip(real),
-        to: clip(str(e['text'])),
+        to: clip(text(e['text'])),
       })
     })
     return [head, ...shown, ...(edits.length > 5 ? ['…'] : [])].join('\n')
@@ -253,6 +256,9 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     return () => { live = false; clearInterval(timer) }
   }, [waiting, task.run_id])
   const [originals, setOriginals] = useState<Map<number, string> | null>(null)
+  /** General 0.6.94: the card said 「改写 doc_01M8035X… 的 1 段」; the ids
+   * the approval names, by their titles. */
+  const [titles, setTitles] = useState<Map<string, string> | null>(null)
   /** A patch's paragraphs are still being read: it cannot be confirmed yet. */
   const [reading, setReading] = useState(false)
   /** M1 (c), PM 11-21: the patch was aimed at the wrong paragraph and was
@@ -269,6 +275,20 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
   // `t` is a new function each render: read through a ref, not a dependency.
   const tRef = useRef(t)
   tRef.current = t
+  useEffect(() => {
+    setTitles(null)
+    const approval = askingRef.current
+    if (!approval) return
+    const { args } = approvalArgs(approval)
+    const parts = Array.isArray(args['parts']) ? args['parts'] as Array<Record<string, unknown>> : []
+    const ids = [args['document_id'], ...parts.map(p => p['document_id'])]
+      .filter((v): v is string => typeof v === 'string' && /^doc_[0-9A-Z]+$/.test(v))
+    if (ids.length === 0) return
+    let live = true
+    void Promise.all(ids.map(async id => [id, await documentName(window.agent24?.documents, id)] as const))
+      .then(named => { if (live) setTitles(new Map(named)) })
+    return () => { live = false }
+  }, [askingSummary, askingId])
   useEffect(() => {
     setOriginals(null)
     setSentBack(null)
@@ -318,7 +338,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
     <div className={`task-card${active ? ' active' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
-      {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals)}</span>}
+      {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals, titles)}</span>}
       {waiting && asking && !sentBack && typeof asking.summary === 'string' && (
         <details className="message-detail"><summary>{t('fail.detail')}</summary>{asking.summary}</details>
       )}

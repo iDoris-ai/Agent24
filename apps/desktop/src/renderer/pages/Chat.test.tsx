@@ -402,10 +402,14 @@ describe('ChatPage with Knowledge', () => {
   it.each([
     ['nothing made', { attempted: true, jobs: [] }, /这次没有改动文档/],
     ['a document made', { attempted: true, jobs: ['job_1'] }, /已生成：《合同-链接与脚注（修改）》/],
+    // General 0.6.94: A made, B refused: B is said too, by its title.
+    ['one made, one not', { attempted: true, jobs: ['job_1'], failed: ['doc_B'] }, /没能修改：《合同-公式修订分页.docx》/],
   ])('a reply whose run asked for a document write says what came of it: %s', async (_case, documents, line) => {
-    const request = vi.fn(async (req: { op: string }) => req.op === 'job'
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'job'
       ? { ok: true, data: { job_id: 'job_1', status: 'succeeded', result: { document_id: 'doc_new' } } }
-      : { ok: true, data: { document_id: 'doc_new', title: '合同-链接与脚注（修改）' } })
+      : req.documentId === 'doc_B'
+        ? { ok: true, data: { document_id: 'doc_B', title: '合同-公式修订分页.docx' } }
+        : { ok: true, data: { document_id: 'doc_new', title: '合同-链接与脚注（修改）' } })
     Object.defineProperty(window, 'agent24', {
       value: {
         backendProxy: aside(mockBackendProxy),
