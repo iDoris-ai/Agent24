@@ -198,26 +198,57 @@ pub async fn list_recently_deleted(Ready(storage): Ready) -> Result<Json<Deleted
     recently_deleted(&storage).await.map(Json)
 }
 
-/// Every `/documents/{id}` route but `restore` answers a deleted document as
-/// not found, before its handler runs. Storage that cannot be opened is
-/// left to the handler, which answers that itself.
+/// Every route that names a document, a job or an extraction in its path
+/// answers as not found when that document is deleted, before its handler
+/// runs (PR-Daemon #2025 ①③): `/documents/{id}/…` but `restore`,
+/// `/jobs/{id}…` and `/extractions/{id}` (by the document they belong to).
+/// An id is Crockford base32 and never needs escaping, so an escaped one
+/// (`%31`) is refused outright: the handler would decode it to a real id
+/// this check never saw. Storage that cannot be opened is left to the
+/// handler, which answers that itself.
 pub async fn hide_deleted(State(state): State<AppState>, req: Request, next: Next) -> Response {
     let mut segments = req.uri().path().trim_start_matches('/').split('/');
-    let id = match (segments.next(), segments.next(), segments.next()) {
-        (Some("documents"), Some(id), rest) if rest != Some("restore") => id.to_owned(),
+    let (kind, id, rest) = (segments.next(), segments.next(), segments.next());
+    let owner = match (kind, id) {
+        (Some("documents" | "jobs" | "extractions"), Some(id)) if id.contains('%') => {
+            return ApiError::not_found("no such document").into_response();
+        }
+        (Some("documents"), Some(_)) if rest == Some("restore") => return next.run(req).await,
+        (Some("documents"), Some(id)) if is_id(IdKind::Document, id) => {
+            Owner::Document(id.to_owned())
+        }
+        (Some("jobs"), Some(id)) if is_id(IdKind::Job, id) => Owner::Job(id.to_owned()),
+        (Some("extractions"), Some(id)) if is_id(IdKind::Extraction, id) => {
+            Owner::Extraction(id.to_owned())
+        }
         _ => return next.run(req).await,
     };
-    if !is_id(IdKind::Document, &id) {
-        return next.run(req).await;
-    }
     let Ok(storage) = state.storage().await else {
         return next.run(req).await;
     };
-    match is_live(&storage, &id).await {
+    let document = match owner {
+        Owner::Document(id) => Ok(Some(id)),
+        Owner::Job(id) => crate::scope::job_document(&storage, &id).await,
+        Owner::Extraction(id) => crate::scope::extraction_document(&storage, &id).await,
+    };
+    let live = match document {
+        // A job without a document (an import before it made one) or an id
+        // nothing has: the handler answers it as before.
+        Ok(None) => Ok(true),
+        Ok(Some(doc)) => is_live(&storage, &doc).await,
+        Err(e) => Err(e),
+    };
+    match live {
         Ok(true) => next.run(req).await,
         Ok(false) => ApiError::not_found("no such document").into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+enum Owner {
+    Document(String),
+    Job(String),
+    Extraction(String),
 }
 
 #[cfg(test)]

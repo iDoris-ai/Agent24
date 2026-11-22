@@ -103,7 +103,10 @@ async fn inputs(
     let mut out = Vec::with_capacity(parts.len());
     for part in parts {
         let head: Option<i64> =
-            match sqlx::query_scalar("SELECT head_revision FROM documents WHERE id = ?")
+            // L6-F2 (PR-Daemon #2025 ②): a deleted document is no part.
+            match sqlx::query_scalar(
+                "SELECT head_revision FROM documents WHERE id = ? AND deleted_at IS NULL",
+            )
                 .bind(&part.document_id)
                 .fetch_optional(storage.db.pool())
                 .await
