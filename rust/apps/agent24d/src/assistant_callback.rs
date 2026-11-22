@@ -135,6 +135,9 @@ pub(crate) struct AssistantChatHandler {
     pub grant: Option<AssistantGrant>,
 }
 
+/// How long a run the store shows Completed may take to emit RunCompleted.
+const COMPLETION_EVENT_WAIT: Duration = Duration::from_secs(2);
+
 fn timeout() -> RpcError {
     RpcError::application(ErrorKind::Timeout, "assistant call exceeded its deadline")
 }
@@ -309,9 +312,28 @@ impl Handler for AssistantChatHandler {
                             .ok_or_else(internal)?;
                         match run.status {
                             RunStatus::Completed => {
-                                let output = run.output.ok_or_else(internal)?;
+                                // The store says Completed before the run emits
+                                // RunCompleted, and only the event carries
+                                // `memory_persisted`: wait briefly for it.
+                                let done = tokio::time::timeout(COMPLETION_EVENT_WAIT, async {
+                                    loop {
+                                        match events.recv().await {
+                                            Ok((
+                                                _,
+                                                agent24_protocol::EventBody::RunCompleted(done),
+                                            )) if done.run_id == run.id => return Ok(done),
+                                            Ok(_) => continue,
+                                            Err(_) => return Err(internal()),
+                                        }
+                                    }
+                                })
+                                .await
+                                .map_err(|_| internal())??;
+                                if done.memory_persisted == Some(false) {
+                                    return Err(internal());
+                                }
                                 cancel_run.disarm();
-                                break output.text;
+                                break done.output.text;
                             }
                             RunStatus::AwaitingApproval => {
                                 cancel_run.disarm();
@@ -863,7 +885,8 @@ mod tests {
                 .expect("event traffic must not starve status checks")
                 .unwrap();
             match status {
-                RunStatus::Completed => assert_eq!(response.unwrap()["text"], "stored answer"),
+                // No RunCompleted ever arrives, so memory_persisted is unknown: fail closed.
+                RunStatus::Completed => assert!(response.is_err(), "{response:?}"),
                 RunStatus::Failed => {
                     let error = response.unwrap_err();
                     assert_eq!(error.kind, Some(ErrorKind::Unavailable));
@@ -878,6 +901,62 @@ mod tests {
             }
             // Stop the hanging provider even for manually terminal store rows.
             state.shutdown.token().cancel();
+        }
+    }
+
+    /// The store shows Completed before RunCompleted (which alone carries
+    /// `memory_persisted`) is emitted; the answer must wait for that event.
+    /// The event is held back past a poll tick so the store is seen first.
+    #[tokio::test]
+    async fn completed_run_reports_unpersisted_memory_as_internal() {
+        {
+            for persisted in [true, false] {
+                let (state, provider) = fixture(true).await;
+                activate_default(&state);
+                let task = tokio::spawn(handler(&state).call(params()));
+                tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+                    .await
+                    .unwrap();
+                let run = state.store.list_runs(None).await.unwrap().pop().unwrap();
+                // Same order as execute.rs: store Completed, then emit.
+                state
+                    .store
+                    .transition_run(
+                        &run.id,
+                        RunStatus::Completed,
+                        agent24_store::RunPatch {
+                            output: Some(agent24_protocol::RunOutput {
+                                text: "answer".into(),
+                            }),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                state
+                    .events
+                    .broadcast(agent24_protocol::EventBody::RunCompleted(
+                        agent24_protocol::RunCompletedPayload {
+                            run_id: run.id.clone(),
+                            output: agent24_protocol::RunOutputPayload {
+                                text: "answer".into(),
+                            },
+                            usage: Default::default(),
+                            memory_persisted: Some(persisted),
+                        },
+                    ));
+                let response = tokio::time::timeout(Duration::from_secs(5), task)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if persisted {
+                    assert_eq!(response.unwrap()["text"], "answer");
+                } else {
+                    assert!(response.is_err(), "{response:?}");
+                }
+                state.shutdown.token().cancel();
+            }
         }
     }
 
