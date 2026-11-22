@@ -474,10 +474,16 @@ struct ParagraphsArgs {
     query: Option<String>,
 }
 
-/// Characters of a paragraph an Agent is shown: enough to copy a 12-character
-/// anchor from, and to tell paragraphs apart.
-const PREVIEW_CHARS: usize = 40;
-/// Characters of previews in one answer, and paragraphs at most.
+/// Characters of a paragraph's opening in the table of contents: its
+/// number and first words, enough to tell clauses apart. Its whole text is
+/// asked for by index or word before it is rewritten.
+const PREVIEW_CHARS: usize = 24;
+/// FU-164 (General 0.6.98, balanced tier): a 40-character, 3000-character
+/// table of contents in JSON objects took a long contract's second prompt to
+/// 7076 tokens. It is one line per paragraph, `段号 开头`, within this many
+/// characters.
+const TOC_BUDGET: usize = 1200;
+/// Characters of whole paragraphs in one answer.
 const PREVIEW_BUDGET: usize = 3000;
 const PREVIEW_MAX_COUNT: usize = 200;
 /// PM 11-21: a narrowed ask (a range or a word) that comes to this many
@@ -489,8 +495,9 @@ const WHOLE_MAX_COUNT: usize = 10;
 /// FU-151 (0.6.89, General): 《示范-山东健身合同2025》's 293 paragraphs came to
 /// about 40 KB, and with them in its context the 4-bit model on an 8 GB Mac
 /// was stopped at prefill. An Agent is shown the paragraphs that have text,
-/// each as its index and first [`PREVIEW_CHARS`] characters, from `from` on
-/// or only those containing `query`, up to [`PREVIEW_BUDGET`] characters;
+/// as a table of contents, a line `段号 开头` per paragraph of its first
+/// [`PREVIEW_CHARS`] characters, from `from` on or only those containing
+/// `query`, within [`TOC_BUDGET`] characters (FU-164);
 /// `total` and `next_from` say what is left. The HTTP route and the CLI keep
 /// the whole list.
 async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -544,26 +551,22 @@ fn preview_paragraphs(id: &str, all: &[crate::patch::Paragraph], args: &Paragrap
         }
         return out;
     }
-    let mut spent = 0;
-    let mut shown = Vec::new();
+    let mut toc = String::new();
     let mut next_from = None;
-    for p in wanted.iter().filter(|p| p.index >= from) {
-        if shown.len() >= count || spent >= PREVIEW_BUDGET {
+    for (lines, p) in wanted.iter().filter(|p| p.index >= from).enumerate() {
+        let opening: String = p.text.trim().chars().take(PREVIEW_CHARS).collect();
+        let line = format!("{} {opening}\n", p.index);
+        if lines >= count || toc.chars().count() + line.chars().count() > TOC_BUDGET {
             next_from = Some(p.index);
             break;
         }
-        let mut text: String = p.text.chars().take(PREVIEW_CHARS).collect();
-        if text.chars().count() < p.text.chars().count() {
-            text.push('…');
-        }
-        spent += text.chars().count();
-        shown.push(serde_json::json!({ "index": p.index, "text": text, "in_table": p.in_table }));
+        toc.push_str(&line);
     }
     let mut out = serde_json::json!({
         "document_id": id,
         "total": wanted.len(),
-        "paragraphs": shown,
-        "note": "这是目录：每段只给段号和开头，空段落不列。要改写某几段，先用 from 和 count（例如 from=段号, count=1）或 query（关键词）取这几段的全文，再照全文改写；取其余段落也用 from。",
+        "toc": toc,
+        "note": "这是目录：每行是「段号 开头几个字」，空段落不列。要改写某几段，先用 query（条款号或关键词，例如「第五条」「违约责任」）或 from 和 count（例如 from=段号, count=1）取这几段的全文，再照全文改写；目录后面的段落用 next_from 继续取。",
     });
     if let Some(n) = next_from {
         out["next_from"] = Value::from(n);
@@ -1774,8 +1777,39 @@ mod tests {
     }
 
     /// FU-151 (0.6.89): 293 paragraphs of a real contract came to 40 KB in an
-    /// Agent's context. It is shown the ones with text, 40 characters each,
-    /// within 3000 characters, and told how to ask for the rest.
+    /// Agent's context. FU-164 (0.6.98, balanced tier): the 3000-character
+    /// table of contents in JSON objects still took the second prompt to 7076
+    /// tokens. It is one line per paragraph with text, `段号 开头`, within
+    /// 1200 characters, and the Agent is told how to ask for the rest.
+    /// FU-164 on the contract of 0.6.98's run (《示范-山东健身合同2025》, 293
+    /// paragraphs): its table of contents as the model reads it, and the
+    /// clause found by a word, whole.
+    #[test]
+    fn a_real_contracts_table_of_contents_stays_small() {
+        let file: &[u8] = include_bytes!("../tests/fixtures/samr-shandong-fitness-2025.docx");
+        let all: Vec<crate::patch::Paragraph> = crate::docx_patch::list_paragraphs(file)
+            .unwrap()
+            .into_iter()
+            .map(|p| crate::patch::Paragraph {
+                index: p.index,
+                text: p.text,
+                in_table: p.in_table,
+            })
+            .collect();
+        let toc = preview_paragraphs("doc_1", &all, &ParagraphsArgs::default());
+        let size = toc.to_string().chars().count();
+        assert!(size < 1700, "{size}");
+        let found = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                query: Some("违约责任".into()),
+                ..Default::default()
+            },
+        );
+        assert!(found.to_string().chars().count() < 3600, "{found}");
+    }
+
     #[test]
     fn an_agent_is_shown_a_long_documents_paragraphs_in_parts() {
         let all: Vec<crate::patch::Paragraph> = (0..293)
@@ -1790,19 +1824,28 @@ mod tests {
             })
             .collect();
         let first = preview_paragraphs("doc_1", &all, &ParagraphsArgs::default());
-        let shown = first["paragraphs"].as_array().unwrap();
-        let chars: usize = shown
-            .iter()
-            .map(|p| p["text"].as_str().unwrap().chars().count())
-            .sum();
-        assert!(chars <= 3000 + 41, "{chars}");
+        let toc = first["toc"].as_str().unwrap();
+        assert!(toc.chars().count() <= 1200, "{}", toc.chars().count());
         assert_eq!(first["total"], 195);
+        let lines: Vec<&str> = toc.lines().collect();
         assert!(
-            shown.iter().all(|p| p["index"].as_u64().unwrap() % 3 != 0),
+            lines.iter().all(|l| {
+                let n: usize = l.split(' ').next().unwrap().parse().unwrap();
+                !n.is_multiple_of(3)
+            }),
             "no empty paragraph"
         );
-        assert!(shown[0]["text"].as_str().unwrap().ends_with('…'));
-        assert_eq!(shown[0]["text"].as_str().unwrap().chars().count(), 41);
+        assert_eq!(
+            lines[0],
+            format!("1 {}", all[1].text.chars().take(24).collect::<String>())
+        );
+        // The answer as the model reads it stays small: about the budget,
+        // not JSON objects around every line.
+        assert!(
+            first.to_string().chars().count() < 1700,
+            "{}",
+            first.to_string().chars().count()
+        );
         let next = first["next_from"].as_u64().unwrap() as usize;
         // The rest, from where it stopped.
         let more = preview_paragraphs(
@@ -1813,9 +1856,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(
-            more["paragraphs"][0]["index"].as_u64().unwrap() as usize,
-            next
+        assert!(
+            more["toc"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{next} "))
         );
         // A word picks the paragraphs that have it, whole (PM 11-21).
         let found = preview_paragraphs(
@@ -1857,19 +1902,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(wide["paragraphs"][0].get("whole").is_none());
-        assert!(
-            wide["paragraphs"][0]["text"]
-                .as_str()
-                .unwrap()
-                .ends_with('…')
-        );
-        // The whole of it serialized stays small: no more 40 KB.
-        assert!(
-            first.to_string().len() < 12_000,
-            "{}",
-            first.to_string().len()
-        );
+        assert!(wide.get("paragraphs").is_none());
+        let wide_toc = wide["toc"].as_str().unwrap();
+        assert!(wide_toc.lines().count() <= 50 && wide_toc.chars().count() <= 1200);
     }
 
     #[tokio::test]
