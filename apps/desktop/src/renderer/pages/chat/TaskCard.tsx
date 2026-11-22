@@ -130,7 +130,10 @@ export function approvalText(
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
   if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
     const parts = (args['parts'] as Array<Record<string, unknown>>)
-      .map(p => t('task.ask.part', { doc: str(p['document_id']), pages: str(p['pages']) || 'all' }))
+      // UI polish 08: no pages is the whole document, said so (not 「第 all 页」).
+      .map(p => (str(p['pages'])
+        ? t('task.ask.part', { doc: str(p['document_id']), pages: str(p['pages']) })
+        : t('task.ask.partAll', { doc: str(p['document_id']) })))
       .join(' + ')
     return t('task.ask.compose', { title: str(args['title']), parts })
   }
@@ -363,7 +366,9 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
           <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
         )}
         {waiting && offers !== null && !offers.approve && !offers.deny && (
-          <span className="task-card-knowledge" role="note">{t('task.decideInTui')}</span>
+          // FU-152: no approval of the run pending (just confirmed, the run
+          // not yet past the state): it goes on, nothing to decide here.
+          <span className="task-card-knowledge" role="note">{t(asking ? 'task.decideInTui' : 'task.proceeding')}</span>
         )}
         {active && (
           // General 0.6.89: 「停止」 never waits on another action of the card
