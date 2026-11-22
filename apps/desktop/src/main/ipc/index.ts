@@ -29,6 +29,7 @@ import { handleSkillActivate } from '../skill-activate'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
+import { approvalDialog, type DocumentLookups } from '../approval-dialog'
 import { desktopSin90ExportToFile, desktopSin90ImportFromFile, desktopSin90Write, sin90KeyAvailable } from '../sin90-write'
 import { importFile } from '../documents-import'
 import type { ModuleActionResult } from '../documents-module'
@@ -503,6 +504,26 @@ async function confirmNative(event: IpcMainInvokeEvent, message: string, detail:
   } catch {
     return false
   }
+}
+
+/** What the approval box reads of a document, by main itself; slow or failed => null. */
+const readDocument = async <T>(req: unknown, pick: (data: unknown) => T | null): Promise<T | null> => {
+  let timer: NodeJS.Timeout | undefined
+  const late = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), 5_000) })
+  const res = await Promise.race([documentsCall(req, daemonCliEndpoint).catch(() => null), late]).finally(() => clearTimeout(timer))
+  return res && res.ok ? pick(res.data) : null
+}
+const approvalDocumentLookups: DocumentLookups = {
+  title: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const title = (data as { title?: unknown } | null)?.title
+    return typeof title === 'string' && title ? title : null
+  }),
+  paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
+    const list = (data as { paragraphs?: unknown } | null)?.paragraphs
+    if (!Array.isArray(list)) return null
+    return new Map(list.flatMap((p: { index?: unknown; text?: unknown }) =>
+      typeof p?.index === 'number' && typeof p.text === 'string' ? [[p.index, p.text] as [number, string]] : []))
+  }),
 }
 
 /** Shortens text for the native dialog, and says so (with the full length) when it did. */
@@ -1217,21 +1238,19 @@ export function registerIpcHandlers(options: {
         approve: mt('approval.approve'), approve_for_session: mt('approval.approve_for_session'),
         deny: mt('approval.deny'), abort: mt('approval.abort'),
       }
-      const payload = clip(JSON.stringify(a.payload ?? {}), 600)
-      const detail = [
-        mt('approval.kind', { value: clip(String(a.kind ?? '?'), 40) }),
-        mt('approval.summary', { value: clip(String(a.summary ?? ''), 300) }),
-        mt('approval.run', { value: clip(String(a.run_id ?? '?'), 80) }),
-        mt('approval.details', { value: payload }),
-        typeof d.reason === 'string' && d.reason ? mt('approval.note', { value: clip(d.reason, 200) }) : '',
-        mt('approval.warning'),
-      ].filter(Boolean).join('\n')
+      // UI polish 01: the box in the user's words, from the record above and
+      // what main itself reads of the documents it names (approval-dialog.ts).
+      const box = d.type === 'deny' ? null : await approvalDialog(a, d.type, decisionLabels[d.type] ?? d.type,
+        typeof d.reason === 'string' ? d.reason : undefined, approvalDocumentLookups, clip)
+      if (box && !box.ok) {
+        return { ok: false, status: 409, data: { error: { code: 'approval_incomplete', message: mt('err.approvalIncomplete') } } }
+      }
       // In service mode the daemon's presence box asks again (M5 B3); the switch is in elevated-request.ts.
       // M1 (0.6.89, General): a deny takes nothing anyone has not already
       // refused; it is how the card sends back a patch aimed at the wrong
       // paragraph without the user, so it is sent without a box of its own.
-      if (d.type !== 'deny' && approvalConfirmShown(daemonElevation() !== null)) {
-        const ok = await confirmNative(event, mt('approval.message', { id, decision: decisionLabels[d.type as string] ?? d.type }), detail)
+      if (box && approvalConfirmShown(daemonElevation() !== null)) {
+        const ok = await confirmNative(event, box.message, box.detail)
         if (!ok) return cancelled()
       }
       return proxyToBackend({
