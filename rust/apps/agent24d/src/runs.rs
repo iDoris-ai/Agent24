@@ -183,6 +183,16 @@ pub async fn create_session(State(state): State<AppState>, req: Request<Body>) -
             }
         }
     };
+    match new_session(&state.store, create).await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(err) => map_store_error(err),
+    }
+}
+
+pub(crate) async fn new_session(
+    store: &agent24_store::Store,
+    create: SessionCreate,
+) -> Result<Session, StoreError> {
     let now = now_iso8601();
     let session = Session {
         id: format!("sess_{}", ulid()),
@@ -192,10 +202,8 @@ pub async fn create_session(State(state): State<AppState>, req: Request<Body>) -
         created_at: now.clone(),
         updated_at: now,
     };
-    match state.store.insert_session(&session).await {
-        Ok(()) => (StatusCode::CREATED, Json(session)).into_response(),
-        Err(err) => map_store_error(err),
-    }
+    store.insert_session(&session).await?;
+    Ok(session)
 }
 
 pub async fn list_sessions(State(state): State<AppState>) -> Response {
@@ -264,24 +272,41 @@ pub async fn create_run(
             Err(refused) => return refused.into_response(),
         },
     };
-    let pins = &state.knowledge_host;
     let providers = crate::component_routes::ComponentProviders::new(&state);
-    let started = state
-        .runs
-        .start_run_then_with(
-            create,
-            |run| {
-                if let Some(binding) = binding {
-                    pins.pin_run(&run.id, binding);
-                }
-            },
-            Some(&providers),
-        )
-        .await;
-    match started {
+    match start_bound_run(
+        &state.runs,
+        &state.knowledge_host,
+        Some(&providers),
+        create,
+        binding,
+        None,
+    )
+    .await
+    {
         Ok(run) => (StatusCode::ACCEPTED, Json(run)).into_response(),
         Err(err) => map_agent_error(err),
     }
+}
+
+pub(crate) async fn start_bound_run(
+    runs: &std::sync::Arc<agent24_agent::RunManager>,
+    pins: &agent24_knowledge::host::KnowledgeHostRegistry,
+    providers: Option<&dyn agent24_agent::SkillProviderSource>,
+    create: RunCreate,
+    binding: Option<agent24_knowledge::host::RunBinding>,
+    system: Option<String>,
+) -> Result<Run, AgentError> {
+    runs.start_run_then_with_system(
+        create,
+        |run| {
+            if let Some(binding) = binding {
+                pins.pin_run(&run.id, binding);
+            }
+        },
+        providers,
+        system,
+    )
+    .await
 }
 
 pub async fn list_runs(State(state): State<AppState>, req: Request<Body>) -> Response {

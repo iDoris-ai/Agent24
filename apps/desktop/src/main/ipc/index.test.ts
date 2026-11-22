@@ -1667,6 +1667,39 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
   })
 })
 
+describe('contact rename/remove dedicated IPC', () => {
+  it('confirms rename natively and forwards an encoded target and nickname', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call('comm:contact-rename', 'bob / old', 'Robert')
+    expect(seen[0]).toMatchObject({ method: 'PATCH', url: '/api/v1/comm/contact/bob%20%2F%20old', auth: 'Bearer daemon-secret' })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ nickname: 'Robert' })
+  })
+  it('only deletes after native confirmation, which explains that history stays', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    expect((await call('comm:contact-remove', 'bob')).data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+    expect(showMessageBox.mock.calls.at(-1)?.at(-1)).toMatchObject({ detail: expect.stringMatching(/history|聊天记录|ประวัติ/) })
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call('comm:contact-remove', REAL_NPUB)
+    expect(seen[0]).toMatchObject({ method: 'DELETE', url: `/api/v1/comm/contact/${REAL_NPUB}` })
+  })
+  it.each([
+    ['comm:contact-rename', ['', 'Robert']],
+    ['comm:contact-rename', ['bob', '']],
+    ['comm:contact-rename', ['bob', 'x'.repeat(129)]],
+    ['comm:contact-rename', ['bob', 'a\nb']],
+    ['comm:contact-rename', [NPUB, 'Robert']],
+    ['comm:contact-remove', [{}]],
+    ['comm:contact-remove', ['a\nb']],
+    ['comm:contact-remove', [NPUB]],
+  ])('rejects invalid %s arguments before asking or forwarding', async (channel, args) => {
+    showMessageBox.mockClear()
+    expect((await call(channel, ...args)).data.error.code).toBe('invalid_request')
+    expect(seen).toHaveLength(0)
+    expect(showMessageBox).not.toHaveBeenCalled()
+  })
+})
+
 describe('CommContactAdd / CommSend dedicated IPC', () => {
   it('contact add shows a native confirm with the nickname and the FULL npub; cancelling sends nothing', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 1 })
@@ -2542,5 +2575,44 @@ describe('Sin90 exportToFile and importFromFile IPC handlers', () => {
     expect(handlers.get(IpcChannels.Sin90ImportFromFile)).toBeDefined()
     expect(handlers.get('sin90:export-to-file')).toBeDefined()
     expect(handlers.get('sin90:import-from-file')).toBeDefined()
+  })
+})
+
+describe('group chat dedicated IPC', () => {
+  const g = 'a'.repeat(32)
+  const id = 'b'.repeat(32)
+  it('forwards only validated fields to fixed group routes', async () => {
+    await call(IpcChannels.CommGroupCreate, '项目组', [REAL_NPUB])
+    await call(IpcChannels.CommGroupSend, g, 'hello', id)
+    await call(IpcChannels.CommGroupAccept, id)
+    await call(IpcChannels.CommGroupRetry, g, id)
+    expect(seen.map(s => [s.method, s.url, JSON.parse(s.body)])).toEqual([
+      ['POST', '/api/v1/comm/groupchat', { name: '项目组', invitees: [REAL_NPUB] }],
+      ['POST', `/api/v1/comm/groupchat/${g}/messages`, { body: 'hello', logical_id: id }],
+      ['POST', `/api/v1/comm/groupchat/invites/${id}/accept`, {}],
+      ['POST', `/api/v1/comm/groupchat/${g}/messages/${id}/retry`, {}],
+    ])
+  })
+  it.each([
+    ['CommGroupCreate', ['', [REAL_NPUB]]],
+    ['CommGroupCreate', ['x'.repeat(257), [REAL_NPUB]]],
+    ['CommGroupCreate', ['群'.repeat(86), [REAL_NPUB]]],
+    ['CommGroupCreate', ['ok', []]],
+    ['CommGroupCreate', ['ok', [NPUB]]],
+    ['CommGroupCreate', ['ok', Array(101).fill(REAL_NPUB)]],
+    ['CommGroupCreate', ['ok', {}]],
+    ['CommGroupSend', ['../g', 'hello', id]],
+    ['CommGroupSend', [g, '', id]],
+    ['CommGroupSend', [g, 'a\0b', id]],
+    ['CommGroupSend', [g, 'x'.repeat(32769), id]],
+    ['CommGroupSend', [g, 'hi', 'a/b']],
+    ['CommGroupAccept', ['A'.repeat(32)]],
+    ['CommGroupAccept', [null]],
+    ['CommGroupRetry', [g, 'wrong']],
+    ['CommGroupRetry', [null, id]],
+  ] as const)('rejects invalid %s arguments', async (channel, args) => {
+    const result = await call(IpcChannels[channel], ...args)
+    expect(result.status).toBe(400)
+    expect(seen).toHaveLength(0)
   })
 })

@@ -983,6 +983,7 @@
             crate::domain::CallbackDeps {
                 scheduler: st.scheduler.clone(),
                 models: None,
+                assistant: None,
             },
         )
         .await;

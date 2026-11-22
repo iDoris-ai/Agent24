@@ -29,6 +29,7 @@ pub(crate) struct DaemonAttachGrantBuilder {
     /// while this is `None` gets no grant, same outcome as not holding the
     /// capability.
     pub(crate) models: Option<crate::model_callback::ModelCallbackDeps>,
+    pub(crate) assistant: Option<crate::assistant_callback::AssistantCallbackDeps>,
     pub(crate) approval_broker: Arc<crate::module_approval_broker::ModuleApprovalBroker>,
     pub(crate) events: crate::events::EventsHub,
 }
@@ -55,6 +56,8 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
             &granted,
             self.models.as_ref(),
         );
+        let assistant_grant =
+            crate::assistant_callback::assistant_grant(name, &granted, self.assistant.as_ref());
         let mut kernel_grants = Vec::new();
         let mut provides = Vec::new();
         if granted.has(Capability::Events) {
@@ -64,6 +67,10 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
         if model_grant.is_some() {
             kernel_grants.push(Capability::Models.as_str().to_owned());
             provides.push("_a24/model/".to_owned());
+        }
+        if assistant_grant.is_some() {
+            kernel_grants.push("assistant".into());
+            provides.push("_a24/assistant/".into());
         }
         let methods_for = crate::domain::build_methods_for(
             name.to_owned(),
@@ -76,6 +83,7 @@ impl AttachGrantBuilder for DaemonAttachGrantBuilder {
             crate::os_memory::MemoryEntitlement::NONE,
             self.scheduler.clone(),
             model_grant,
+            assistant_grant,
         );
         AttachGrant {
             provides,
@@ -112,7 +120,7 @@ mod tests {
 
     /// The method names `build_methods_for` registers unconditionally. Both
     /// construction paths install this set; it is not an authorization check
-    /// (`build_methods_for` registers all eleven whether or not the capability
+    /// (`build_methods_for` registers all methods whether or not the capability
     /// was granted). Compared as a sorted list against every name actually registered,
     /// so one extra method fails the assertion. The frame assertions below
     /// are the authorization check.
@@ -120,6 +128,7 @@ mod tests {
         "_a24/approval/advise",
         "_a24/approval/gate",
         "_a24/approval/status",
+        "_a24/assistant/chat",
         "_a24/events/emit",
         "_a24/memory/private/recall",
         "_a24/memory/private/recent",
@@ -143,6 +152,7 @@ mod tests {
         let store = agent24_store::Store::open_memory().await.unwrap();
         let events = crate::events::EventsHub::default();
         DaemonAttachGrantBuilder {
+            assistant: None,
             scheduler: agent24_scheduler::Scheduler::new(
                 store.clone(),
                 Arc::new(NoopTrigger),
@@ -211,6 +221,20 @@ mod tests {
                 panic!("unexpected dispatch outcome for {method}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn assistant_without_grant_is_forbidden() {
+        let grant = builder(false).await.build("agentear", &manifest(""));
+        let error = call_granted(
+            &grant,
+            "a1",
+            "_a24/assistant/chat",
+            serde_json::json!({"text":"hello", "conversation_id":"voice-1"}),
+        )
+        .await
+        .unwrap_err();
+        assert_forbidden("assistant", &error);
     }
 
     /// Unauthorized is application `-32000` / `forbidden`. A missing

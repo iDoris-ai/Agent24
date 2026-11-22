@@ -1835,6 +1835,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/comm/contact/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Existing contact nickname or npub */
+                name: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Remove a contact
+         * @description Removes only the address book entry; chat history and friend relations are kept. An npub removes all its nicknames.
+         */
+        delete: operations["removeCommContact"];
+        options?: never;
+        head?: never;
+        /** Rename a contact */
+        patch: operations["renameCommContact"];
+        trace?: never;
+    };
     "/comm/relay": {
         parameters: {
             query?: never;
@@ -8994,6 +9018,70 @@ export interface operations {
                     nickname: string;
                     npub: string;
                     role?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    removeCommContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Existing contact nickname or npub */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hyphae envelope `{ok:true,data}` */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommOk"];
+                };
+            };
+            400: components["responses"]["CommInvalid"];
+            409: components["responses"]["CommConflict"];
+            423: components["responses"]["CommLocked"];
+            502: components["responses"]["CommBadGateway"];
+            503: components["responses"]["CommUnavailable"];
+            504: components["responses"]["CommTimeout"];
+        };
+    };
+    renameCommContact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Existing contact nickname or npub */
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": {
+                    nickname: string;
                 };
             };
         };
