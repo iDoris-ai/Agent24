@@ -97,7 +97,7 @@ describe('group chat main flows', () => {
     expect(screen.queryByRole('button', { name: '加入' })).toBeNull()
   })
   it('sends with a generated logical id and retries a partial failure with the same id', async () => {
-    commGroupSend.mockImplementationOnce(async (_g, _b, id) => ({ ok: false, status: 502, data: { ok: false, error: 'partial', data: report(id, 'failed') } }))
+    commGroupSend.mockImplementationOnce(async (_g, _b, id) => ({ ok: false, status: 502, data: { ok: false, error: 'partial', message: 'hyphae reported a partial result', data: report(id, 'failed') } }))
     render(<CommunicationPage />)
     await selectGroup()
     fireEvent.change(await screen.findByRole('textbox', { name: '输入消息' }), { target: { value: '大家好' } })
@@ -123,6 +123,19 @@ describe('group chat main flows', () => {
     expect(commGroupSend.mock.calls[1]).toEqual([groupId, '没落库', id])
     expect(commGroupRetry).not.toHaveBeenCalled()
     expect(await screen.findByText('已发出')).toBeTruthy()
+  })
+  it('resends (not retry) after a 502 that is not the daemon partial', async () => {
+    commGroupSend.mockImplementationOnce(async () => ({ ok: false, status: 502, data: { ok: false, error: 'proxy_failed', message: 'backend unreachable' } }))
+    render(<CommunicationPage />)
+    await selectGroup()
+    fireEvent.change(await screen.findByRole('textbox', { name: '输入消息' }), { target: { value: '断线' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    expect(await screen.findByText('失败')).toBeTruthy()
+    const id = commGroupSend.mock.calls.at(-1)?.[2]
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(commGroupSend).toHaveBeenCalledTimes(2))
+    expect(commGroupSend.mock.calls[1]).toEqual([groupId, '断线', id])
+    expect(commGroupRetry).not.toHaveBeenCalled()
   })
   it('never polls status for settled or history messages', async () => {
     messages = [{ ...message, sender: me }]

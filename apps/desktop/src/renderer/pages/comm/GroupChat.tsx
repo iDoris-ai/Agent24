@@ -107,17 +107,17 @@ export function GroupChat({ group, contacts, identities, refreshTick, onRefresh 
         setMessages(history); setError(null)
         // Only messages still in flight are polled; a settled one is never read again.
         const ids = outgoingRef.current.filter(message => message.state === 'sending' && message.stored).map(message => message.id)
-        const results: PromiseSettledResult<{ id: string; report: CommGroupReport }>[] = []
         for (let i = 0; i < ids.length; i += STATUS_CONCURRENCY) {
-          results.push(...await Promise.allSettled(ids.slice(i, i + STATUS_CONCURRENCY).map(async id => ({ id, report: await getCommGroupMessageStatus(group.group_id, id) }))))
+          const results = await Promise.allSettled(ids.slice(i, i + STATUS_CONCURRENCY).map(async id => ({ id, report: await getCommGroupMessageStatus(group.group_id, id) })))
           if (!current) return
-        }
-        for (const result of results) {
-          if (result.status !== 'fulfilled') continue
-          const { id, report } = result.value
-          const state = delivery(report)
-          setStates(previous => ({ ...previous, [id]: state }))
-          setOutgoing(previous => previous.map(message => message.id === id && message.state !== 'failed' ? { ...message, state } : message))
+          // Applied per batch, so a reload that starts mid-way keeps what was read.
+          for (const result of results) {
+            if (result.status !== 'fulfilled') continue
+            const { id, report } = result.value
+            const state = delivery(report)
+            setStates(previous => ({ ...previous, [id]: state }))
+            setOutgoing(previous => previous.map(message => message.id === id && message.state !== 'failed' ? { ...message, state } : message))
+          }
         }
       } catch (error) { if (current) setError(errorMessage(error)) }
     }
@@ -155,8 +155,9 @@ export function GroupChat({ group, contacts, identities, refreshTick, onRefresh 
       setStates(previous => ({ ...previous, [id]: state }))
       onRefresh()
     } catch (error) {
-      // A 502 partial means Hyphae stored the message and some recipients failed.
-      const partial = error instanceof CommApiError && error.status === 502
+      // Only the daemon's `partial` (502) means Hyphae stored the message and some
+      // recipients failed; a 502 `network` or `proxy_failed` proves nothing.
+      const partial = error instanceof CommApiError && error.status === 502 && error.code === 'partial'
       setOutgoing(previous => previous.map(item => item.id === id ? { ...item, state: 'failed', stored: stored || partial } : item))
       setError(errorMessage(error))
     } finally { setBusy(false) }
