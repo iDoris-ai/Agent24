@@ -186,6 +186,8 @@ async fn register_heartbeat_rotation_and_bye() {
     assert!(super::super::expected_exit(None, bye));
     assert!(!super::super::expected_exit(None, false));
     assert!(!super::super::expected_exit(Some(5), bye));
+    // A failed drain after bye exits 1 and must count as a failure.
+    assert!(!super::super::expected_exit(Some(1), bye));
     assert!(
         !fixture
             .server

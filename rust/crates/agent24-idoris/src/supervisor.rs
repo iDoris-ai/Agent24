@@ -604,7 +604,9 @@ fn restart_backoff(delay: Duration, timings: &Timings) -> Duration {
 
 fn expected_exit(code: Option<i32>, bye: bool) -> bool {
     // Exit 5 still counts as an engine crash after graceful bye (§2.7.5).
-    matches!(code, Some(0 | 4)) || (bye && code != Some(5))
+    // Exit 1 after bye is a failed drain (iDoris v0.6.0 errata): a failure,
+    // not an expected stop, so it reaches the crash breaker.
+    matches!(code, Some(0 | 4)) || (bye && !matches!(code, Some(1 | 5)))
 }
 
 fn retry_exit(code: Option<i32>, launcher: bool) -> bool {
