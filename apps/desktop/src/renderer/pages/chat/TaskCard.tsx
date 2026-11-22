@@ -114,6 +114,18 @@ export function approvalArgs(a: Pick<Approval, 'summary'> & { payload?: unknown 
   }
 }
 
+/** PR-Daemon #2004 B2: how deep and how long 「详情」 goes before it says the
+ *  rest is folded; a payload nested ten thousand deep no longer throws. */
+const DETAIL_MAX_DEPTH = 8
+const DETAIL_MAX_LINES = 400
+/** PR-Daemon #2004 B1: a value never lays out lines of its own: a string is
+ *  shown as a JSON string (its line breaks as `\n`, quoted, so 12 and "12"
+ *  differ), and characters that reorder text are escaped too. */
+const REORDER = /[\u2028\u2029\u202a-\u202e\u2066-\u2069]/g
+const escaped = (s: string) => JSON.stringify(s).replace(REORDER, c => `\\u${c.charCodeAt(0).toString(16)}`)
+const shownValue = (v: unknown) => (typeof v === 'string' ? escaped(v) : String(v))
+const shownKey = (k: string) => (/^[\p{L}\p{N}_.-]+$/u.test(k) ? k : escaped(k))
+
 /** UI polish 09: 「详情」 under the card's line, the step's whole input as a
  *  list, key by key, nested arrays and objects in full, nothing cut. With no
  *  payload (an older daemon) the summary as the daemon wrote it. */
@@ -124,24 +136,25 @@ export function approvalDetail(
   const summary = typeof a.summary === 'string' ? a.summary : ''
   const payload = a.payload
   if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length === 0) return summary
-  const lines: string[] = []
-  const empty = (v: unknown) => v === null || v === undefined || v === ''
-    || (typeof v === 'object' && Object.keys(v as object).length === 0)
-  const walk = (v: unknown, pad: string, head: string) => {
-    if (empty(v)) lines.push(`${head}${t('task.detail.empty')}`)
-    else if (typeof v !== 'object') lines.push(`${head}${String(v)}`)
-    else {
-      lines.push(head.trimEnd())
-      const entries = Array.isArray(v) ? v.map((x, i) => [`${i + 1}.`, x] as const) : Object.entries(v as Record<string, unknown>).map(([k, x]) => [`${k}：`, x] as const)
-      for (const [label, x] of entries) {
-        const plain = empty(x) || typeof x !== 'object'
-        walk(x, `${pad}  `, `${pad}  ${label}${plain && Array.isArray(v) ? ' ' : ''}`)
-      }
-    }
-  }
-  for (const [k, x] of Object.entries(payload as Record<string, unknown>)) walk(x, '', `${k}：`)
   const cut = summary.indexOf(': ')
   const tool = cut > 0 ? summary.slice(0, cut) : summary
+  // PR-Daemon #2004 Low: a patch without its edits is not whole (as in
+  // `approvalArgs`): the summary, not a list that looks complete.
+  if (tool === 'documents.patch' && !Array.isArray((payload as Record<string, unknown>)['edits'])) return summary
+  const lines: string[] = []
+  const walk = (v: unknown, pad: string, head: string, depth: number) => {
+    if (lines.length >= DETAIL_MAX_LINES) return
+    if (v === null || typeof v !== 'object') lines.push(`${head}${shownValue(v)}`)
+    else if (Object.keys(v).length === 0) lines.push(`${head}${t('task.detail.empty')}`)
+    else if (depth >= DETAIL_MAX_DEPTH) lines.push(`${head}${t('task.detail.folded')}`)
+    else {
+      lines.push(head.trimEnd())
+      const entries = Array.isArray(v) ? v.map((x, i) => [`${i + 1}. `, x] as const) : Object.entries(v as Record<string, unknown>).map(([k, x]) => [`${shownKey(k)}：`, x] as const)
+      for (const [label, x] of entries) walk(x, `${pad}  `, `${pad}  ${label}`, depth + 1)
+    }
+  }
+  for (const [k, x] of Object.entries(payload as Record<string, unknown>)) walk(x, '', `${shownKey(k)}：`, 1)
+  if (lines.length >= DETAIL_MAX_LINES) lines.push(t('task.detail.folded'))
   return [t('task.detail.tool', { tool: withoutToolNames(tool) || tool }), ...lines].join('\n')
 }
 

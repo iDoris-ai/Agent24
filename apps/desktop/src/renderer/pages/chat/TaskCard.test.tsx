@@ -262,7 +262,7 @@ describe('task cards (M4 A4)', () => {
     }]
     await show()
     const c = await waitFor(() => card('等你确认'))
-    await waitFor(() => expect(c.querySelector('.message-detail')?.textContent).toContain('3. /tmp/x'))
+    await waitFor(() => expect(c.querySelector('.message-detail')?.textContent).toContain('3. "/tmp/x"'))
     expect(c.querySelector('.message-detail')?.textContent).toContain('操作：执行命令')
     expect(c.querySelector('.message-detail')?.textContent).not.toContain('{"argv"')
   })
@@ -696,28 +696,48 @@ describe('approvalDetail', () => {
     }, t)
     expect(text).toBe([
       '操作：改写段落',
-      'document_id：doc_1',
+      'document_id："doc_1"',
       'edits：',
       '  1.',
       '    index：2',
-      `    text：${long}`,
+      `    text："${long}"`,
       '    tracked：true',
       '  2.',
       '    index：4',
-      '    text：乙',
+      '    text："乙"',
     ].join('\n'))
-    expect(text).not.toMatch(/[{}]|\[object|truncated/)
+    expect(text).not.toMatch(/\[object|truncated/)
   })
 
-  it('arrays of plain values, empty values', () => {
-    expect(approvalDetail({ summary: 'shell_exec: {…}', payload: { argv: ['ls', '-la'], env: {}, none: null } }, t))
-      .toBe(['操作：执行命令', 'argv：', '  1. ls', '  2. -la', 'env：（空）', 'none：（空）'].join('\n'))
+  it('arrays of plain values; empty, null and a string differ from a number', () => {
+    expect(approvalDetail({ summary: 'shell_exec: {…}', payload: { argv: ['ls', '-la'], env: {}, none: null, n: 12, s: '12' } }, t))
+      .toBe(['操作：执行命令', 'argv：', '  1. "ls"', '  2. "-la"', 'env：（空）', 'none：null', 'n：12', 's："12"'].join('\n'))
   })
 
-  it('no payload (an older daemon): the summary as the daemon wrote it', () => {
+  // PR-Daemon #2004 B1: one edit whose text lays out a second one read the
+  // same as two edits; a value's line breaks are shown, never laid out.
+  it('one edit with a line-broken text never reads as two edits', () => {
+    const one = approvalDetail({ summary: 'documents.patch: {…}', payload: { edits: [{ index: 1, text: 'A\n  2.\n    index：12\n    text："B"' }] } }, t)
+    const two = approvalDetail({ summary: 'documents.patch: {…}', payload: { edits: [{ index: 1, text: 'A' }, { index: 12, text: 'B' }] } }, t)
+    expect(one).not.toBe(two)
+    expect(one.split('\n')).toHaveLength(5)
+    expect(approvalDetail({ summary: 'x: {}', payload: { 'a\nb': '\u202e' } }, t)).toBe('操作：x\n"a\\nb"："\\u202e"')
+  })
+
+  // PR-Daemon #2004 B2: ten thousand levels deep does not throw; it says so.
+  it('a payload nested very deep is folded, not thrown on', () => {
+    let deep: Record<string, unknown> = { end: 1 }
+    for (let i = 0; i < 10_000; i++) deep = { a: deep }
+    const text = approvalDetail({ summary: 'x: {}', payload: deep }, t)
+    expect(text).toContain('……（更深的内容已折叠）')
+    expect(text.split('\n').length).toBeLessThan(20)
+  })
+
+  it('no payload (an older daemon), or a patch without its edits: the summary as the daemon wrote it', () => {
     const summary = 'documents.patch: {"document_id":"doc_1","edits":[{"index":2… [truncated 94 bytes]'
     expect(approvalDetail({ summary }, t)).toBe(summary)
     expect(approvalDetail({ summary, payload: {} }, t)).toBe(summary)
+    expect(approvalDetail({ summary, payload: { document_id: 'doc_1' } }, t)).toBe(summary)
   })
 })
 
