@@ -15,6 +15,8 @@ import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 import DocxTools from './DocxTools'
 import type { DocFocus } from './doc-focus'
+import { extractFields, type ExtractCardData } from './doc-extract'
+import { ExtractCard } from '../chat/ExtractCard'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -73,6 +75,19 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
       setSplitting(null)
       onAdded?.()
     }
+  }
+  // F3: 「抽取字段…」, the second way in: field names typed, comma-separated.
+  const [extracting, setExtracting] = useState<string | null>(null)
+  const [extractBusy, setExtractBusy] = useState(false)
+  const [extracted, setExtracted] = useState<ExtractCardData | { error: string } | null>(null)
+  const runExtract = async (id: string, typed: string) => {
+    const names = [...new Set(typed.split(/[,，、;；\n]+/).map((n) => n.trim()).filter(Boolean))].slice(0, 20)
+    if (names.length === 0) return
+    setExtractBusy(true)
+    setExtracted(null)
+    const out = await extractFields(api, id, names).catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }))
+    setExtractBusy(false)
+    setExtracted(out)
   }
   const api = window.agent24.documents
   // D1: an Office document is stored as-is. Convert it to PDF before preview.
@@ -360,6 +375,8 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     setCheckError(null)
     setReport(null)
     setHighlight(null)
+    setExtracting(null)
+    setExtracted(null)
     setTranslating(false)
     setTrDone(0)
     setTrTotal(0)
@@ -428,6 +445,11 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
               open('assistant', 'other')
             }}>
               {t('detail.ask')}
+            </button>
+          )}
+          {detail && (
+            <button className="btn btn-ghost" onClick={() => { setExtracting(extracting === null ? '' : null); setExtracted(null) }}>
+              {t('extract.button')}
             </button>
           )}
           {detail?.head.media_type === 'application/pdf' && (
@@ -538,6 +560,19 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
           <button className="btn btn-ghost" disabled={splitBusy} onClick={() => setSplitting(null)}>{t('split.cancel')}</button>
         </div>
       )}
+      {detail && extracting !== null && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '8px 0' }}>
+          <input aria-label={t('extract.fields')} placeholder={t('extract.fields')} value={extracting}
+            onChange={(e) => setExtracting(e.target.value)} style={{ flex: 1 }} />
+          <button className="btn btn-primary" disabled={extractBusy || extracting.trim() === ''} onClick={() => void runExtract(detail.document_id, extracting)}>
+            {t('extract.go')}
+          </button>
+        </div>
+      )}
+      {extractBusy && <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>{t('extract.working')}</p>}
+      {extracted && ('error' in extracted
+        ? <p role="alert" style={ALERT}>{t('extract.failed', { error: extracted.error })}</p>
+        : <ExtractCard card={extracted} />)}
       {splitNote && <p role={splitNote.ok ? 'status' : 'alert'} style={{ fontSize: 12, margin: '4px 0' }}>{splitNote.text}</p>}
       {detail && (
         <p style={{ color: 'var(--muted)', fontSize: 12 }}>
