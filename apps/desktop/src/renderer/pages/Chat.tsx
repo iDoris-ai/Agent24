@@ -15,12 +15,14 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { docAgentPrompt, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
+import { ExtractCard } from './chat/ExtractCard'
+import { extractFields, extractText, fieldNamesFromModel, type ExtractCardData } from './documents/doc-extract'
 import {
   forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
@@ -64,6 +66,8 @@ interface AssistantMessage {
   detail?: string
   /** M1: what the run's document writes came to, from the daemon's record. */
   documents?: RunDocuments | null
+  /** F3: the 「抽取结果」 card; the history keeps its text only. */
+  extraction?: ExtractCardData
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -229,6 +233,38 @@ export default function ChatPage() {
     setInput('')
     // F1: a conversation about a document carries its text with each turn.
     const doc = documentOf(sessionId)
+    // F3: 「把这份合同的甲方、乙方、金额、期限抽出来」 — the documents OS's extract
+    // job reads the document; the model at most names the fields.
+    const asked = extractionFields(text, doc !== null)
+    const extractFrom = asked === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? null
+    if (asked !== null && extractFrom !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? await namedDocument(api, extractFrom)
+        const names = asked.length > 0 || typeof subject === 'string'
+          ? asked
+          : await fieldNamesFromModel((p) => askWithProxy(window.agent24.backendProxy, p), text).catch(() => [])
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else if (names.length === 0) reply = { role: 'assistant', content: '请说要抽取哪些字段，例如「把甲方、乙方、金额抽出来」。' }
+        else {
+          const card = await extractFields(api, subject.id, names)
+          reply = 'error' in card
+            ? { role: 'assistant', content: `没能完成抽取：${card.error}` }
+            : { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + extractText(card), extraction: card }
+        }
+      } catch (e) {
+        reply = { role: 'assistant', content: `没能完成抽取：${e instanceof Error ? e.message : String(e)}` }
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      requestInFlight.current = false
+      setLoading(false)
+      return
+    }
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
@@ -742,7 +778,8 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
+              {m.role === 'assistant' && m.extraction ? <ExtractCard card={m.extraction} />
+                : m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
               {m.role === 'assistant' && m.detail && (
                 <details className="message-detail"><summary>{t('fail.detail')}</summary>{m.detail}</details>
               )}
