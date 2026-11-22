@@ -15,7 +15,7 @@ import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 import DocxTools from './DocxTools'
 import type { DocFocus } from './doc-focus'
-import { extractFields, type ExtractCardData } from './doc-extract'
+import { extractFields, type ExtractCardData, type ExtractFailure } from './doc-extract'
 import { ExtractCard } from '../chat/ExtractCard'
 
 const OFFICE_TYPE = new Set([
@@ -79,7 +79,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
   // F3: 「抽取字段…」, the second way in: field names typed, comma-separated.
   const [extracting, setExtracting] = useState<string | null>(null)
   const [extractBusy, setExtractBusy] = useState(false)
-  const [extracted, setExtracted] = useState<ExtractCardData | { error: string } | null>(null)
+  const [extracted, setExtracted] = useState<ExtractCardData | ExtractFailure | null>(null)
   const runExtract = async (id: string, typed: string) => {
     const names = [...new Set(typed.split(/[,，、;；\n]+/).map((n) => n.trim()).filter(Boolean))].slice(0, 20)
     if (names.length === 0) return
