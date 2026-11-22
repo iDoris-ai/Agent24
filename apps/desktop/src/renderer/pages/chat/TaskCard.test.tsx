@@ -7,10 +7,10 @@ import { act, fireEvent, render, screen, waitFor, within } from '@testing-librar
 import { createChatHistoryStore } from '../../../main/chat-history'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, type ChatHistoryRecord } from '../../../shared/chat-history'
 import type { RunEvent } from '../../../shared/ipc-types'
-import { HandOver, TaskCards, approvalArgs, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
+import { HandOver, TaskCards, approvalArgs, approvalDetail, approvalText, elapsed, patchOriginals, resetHandOversForTests } from './TaskCard'
 import { TASKS_NOT_STOPPED, clearConversations, deleteConversation, refreshHistory, resetHistoryStore, registerChatPage, saveConversation, setActiveConversation, setChatBusy } from './history'
 import { resetRunStatusesForTests } from './run-status'
-import { setLocale } from '../../i18n'
+import { setLocale, translate } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import ChatPage from '../Chat'
 
@@ -22,7 +22,7 @@ let store: ReturnType<typeof createChatHistoryStore>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 type Run = { status: string; started_at?: string; ended_at?: string | null; output?: { text: string } | null; knowledge?: unknown; error?: { code: string; message: string } | null }
 let runs: Record<string, Run>
-let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string }[]
+let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string; payload?: unknown }[]
 let proxy: ReturnType<typeof vi.fn>
 let approvalDecide: ReturnType<typeof vi.fn>
 let emit: (event: RunEvent) => void
@@ -249,6 +249,22 @@ describe('task cards (M4 A4)', () => {
       await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
       expect(approvalDecide).not.toHaveBeenCalled()
     }
+  })
+
+  // UI polish 09: 「详情」 lists the payload, not the daemon's JSON summary.
+  it('「详情」 lists what the step will get, key by key', async () => {
+    store.save(record('chat_a', '命令'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: 'shell_exec: {"argv":["rm","-rf","/tmp/x"]}', payload: { argv: ['rm', '-rf', '/tmp/x'] },
+    }]
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    await waitFor(() => expect(c.querySelector('.message-detail')?.textContent).toContain('3. /tmp/x'))
+    expect(c.querySelector('.message-detail')?.textContent).toContain('操作：执行命令')
+    expect(c.querySelector('.message-detail')?.textContent).not.toContain('{"argv"')
   })
 
   // General 0.6.94: the card said 「以修订方式改写 doc_01M8035X… 的 1 段」.
@@ -663,6 +679,45 @@ describe('deleting a conversation stops its tasks still going on (M4 A6, PR-Daem
 describe('elapsed', () => {
   it.each([[0, '00:00'], [65_000, '01:05'], [3_725_000, '1:02:05'], [-5, '00:00']])('%i ms is %s', (ms, text) => {
     expect(elapsed(ms)).toBe(text)
+  })
+})
+
+// UI polish 09: 「详情」 is the only place a card shows a step's whole input
+// before it is confirmed; it reads as a list, every value whole, never JSON.
+describe('approvalDetail', () => {
+  beforeEach(() => { setLocale('zh') })
+  const t = (key: string, vars?: Record<string, string>) => translate(chatMessages, key as never, vars)
+
+  it('lists the payload key by key, nested arrays and objects in full, nothing cut', () => {
+    const long = '新'.repeat(500)
+    const text = approvalDetail({
+      summary: 'documents.patch: {"document_id":"doc_1","edits":[{"index":2… [truncated 94 bytes]',
+      payload: { document_id: 'doc_1', edits: [{ index: 2, text: long, tracked: true }, { index: 4, text: '乙' }] },
+    }, t)
+    expect(text).toBe([
+      '操作：改写段落',
+      'document_id：doc_1',
+      'edits：',
+      '  1.',
+      '    index：2',
+      `    text：${long}`,
+      '    tracked：true',
+      '  2.',
+      '    index：4',
+      '    text：乙',
+    ].join('\n'))
+    expect(text).not.toMatch(/[{}]|\[object|truncated/)
+  })
+
+  it('arrays of plain values, empty values', () => {
+    expect(approvalDetail({ summary: 'shell_exec: {…}', payload: { argv: ['ls', '-la'], env: {}, none: null } }, t))
+      .toBe(['操作：执行命令', 'argv：', '  1. ls', '  2. -la', 'env：（空）', 'none：（空）'].join('\n'))
+  })
+
+  it('no payload (an older daemon): the summary as the daemon wrote it', () => {
+    const summary = 'documents.patch: {"document_id":"doc_1","edits":[{"index":2… [truncated 94 bytes]'
+    expect(approvalDetail({ summary }, t)).toBe(summary)
+    expect(approvalDetail({ summary, payload: {} }, t)).toBe(summary)
   })
 })
 

@@ -114,6 +114,37 @@ export function approvalArgs(a: Pick<Approval, 'summary'> & { payload?: unknown 
   }
 }
 
+/** UI polish 09: 「详情」 under the card's line, the step's whole input as a
+ *  list, key by key, nested arrays and objects in full, nothing cut. With no
+ *  payload (an older daemon) the summary as the daemon wrote it. */
+export function approvalDetail(
+  a: Pick<Approval, 'summary'> & { payload?: unknown },
+  t: (key: string, vars?: Record<string, string>) => string,
+): string {
+  const summary = typeof a.summary === 'string' ? a.summary : ''
+  const payload = a.payload
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload) || Object.keys(payload).length === 0) return summary
+  const lines: string[] = []
+  const empty = (v: unknown) => v === null || v === undefined || v === ''
+    || (typeof v === 'object' && Object.keys(v as object).length === 0)
+  const walk = (v: unknown, pad: string, head: string) => {
+    if (empty(v)) lines.push(`${head}${t('task.detail.empty')}`)
+    else if (typeof v !== 'object') lines.push(`${head}${String(v)}`)
+    else {
+      lines.push(head.trimEnd())
+      const entries = Array.isArray(v) ? v.map((x, i) => [`${i + 1}.`, x] as const) : Object.entries(v as Record<string, unknown>).map(([k, x]) => [`${k}：`, x] as const)
+      for (const [label, x] of entries) {
+        const plain = empty(x) || typeof x !== 'object'
+        walk(x, `${pad}  `, `${pad}  ${label}${plain && Array.isArray(v) ? ' ' : ''}`)
+      }
+    }
+  }
+  for (const [k, x] of Object.entries(payload as Record<string, unknown>)) walk(x, '', `${k}：`)
+  const cut = summary.indexOf(': ')
+  const tool = cut > 0 ? summary.slice(0, cut) : summary
+  return [t('task.detail.tool', { tool: withoutToolNames(tool) || tool }), ...lines].join('\n')
+}
+
 export function approvalText(
   a: Pick<Approval, 'summary'> & { payload?: unknown },
   t: (key: string, vars?: Record<string, string>) => string,
@@ -344,7 +375,8 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
       {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals, titles)}</span>}
       {waiting && asking && !sentBack && typeof asking.summary === 'string' && (
-        <details className="message-detail"><summary>{t('fail.detail')}</summary>{asking.summary}</details>
+        <details className="message-detail"><summary>{t('fail.detail')}</summary>
+          <div className="message-detail-list">{approvalDetail(asking, t as (key: string, vars?: Record<string, string>) => string)}</div></details>
       )}
       {sentBack && <span className="task-card-knowledge" role="note">{t('task.anchorNote', { n: String(sentBack.index + 1) })}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
