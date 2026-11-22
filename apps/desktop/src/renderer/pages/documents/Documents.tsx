@@ -6,6 +6,7 @@ import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from '
 import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
 import DocumentDetail from './DocumentDetail'
+import RecentlyDeleted from './RecentlyDeleted'
 import { compose } from './compose'
 import { clearDocFocus, pendingDocFocus, subscribeDocFocus } from './doc-focus'
 import type { TargetLang } from './doc-translate'
@@ -229,6 +230,22 @@ export default function DocumentsPage() {
     setComposing({ working: false, ok: out.ok, message: out.ok ? t('compose.done') : t('compose.failed', { error: out.message }) })
     if (out.ok) { setPicked([]); void reload() }
   }
+  // L6-F2: delete one document (soft: 「最近删除」 below restores it for 7 days).
+  const [trashVersion, setTrashVersion] = useState(0)
+  const [deleteNote, setDeleteNote] = useState<string | null>(null)
+  const remove = async (d: Doc) => {
+    if (!window.confirm(t('delete.confirm', { title: d.title }))) return
+    const res = await api.request({ op: 'delete', documentId: d.document_id }).catch(() => null)
+    if (!res || !res.ok) {
+      setDeleteNote(t('delete.failed', { title: d.title, error: res ? describeError(res) : '' }))
+      return
+    }
+    setDeleteNote(null)
+    if (open === d.document_id) setOpen(null)
+    setPicked((p) => p.filter((x) => x !== d.document_id))
+    setTrashVersion((v) => v + 1)
+    void reload()
+  }
   return (
     <div className="content">
       <div className="page-title" role="heading" aria-level={1} tabIndex={-1} ref={pageTitle}>
@@ -356,6 +373,7 @@ export default function DocumentsPage() {
               <th style={CELL}>{t('list.title')}</th>
               <th style={CELL}>{t('list.format')}</th>
               <th style={CELL}>{t('list.importedAt')}</th>
+              <th style={CELL} />
             </tr>
           </thead>
           <tbody>
@@ -375,6 +393,11 @@ export default function DocumentsPage() {
                 </td>
                 <td style={CELL}>{formatOf(d.media_type)}</td>
                 <td style={CELL}>{new Date(d.created_at).toLocaleString()}</td>
+                <td style={CELL}>
+                  <button className="btn btn-ghost" aria-label={t('delete.label', { title: d.title })} onClick={() => void remove(d)}>
+                    {t('delete.button')}
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
@@ -385,6 +408,8 @@ export default function DocumentsPage() {
           {t('list.loadMore')}
         </button>
       )}
+      {deleteNote && <div role="alert" style={ALERT}>{deleteNote}</div>}
+      <RecentlyDeleted version={trashVersion} onRestored={() => void reload()} />
     </div>
   )
 }

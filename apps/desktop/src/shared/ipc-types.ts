@@ -606,6 +606,10 @@ export type DocumentsRequest =
   | { op: 'content'; documentId: DocSchemas['DocumentIdString'] }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
+  /** L6-F2: soft delete, restore within 7 days, and what can be restored. */
+  | { op: 'delete'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'restore'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'recentlyDeleted' }
 
 /** What each operation returns on success. */
 export interface DocumentsResults {
@@ -630,6 +634,19 @@ export interface DocumentsResults {
   content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
+  delete: DeletedDocument
+  restore: DocSchemas['DocumentDetail']
+  recentlyDeleted: { documents: DeletedDocument[] }
+}
+
+/** L6-F2: a document deleted less than 7 days ago (agent24-documents `trash.rs`). */
+export interface DeletedDocument {
+  document_id: string
+  title: string
+  media_type: string
+  created_at: string
+  deleted_at: string
+  restorable_until: string
 }
 
 /** The error envelope: the OS's or the kernel's, or one main makes for a
