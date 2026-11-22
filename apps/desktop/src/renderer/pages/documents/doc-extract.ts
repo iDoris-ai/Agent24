@@ -37,22 +37,38 @@ function typeOf(name: string): 'date' | 'amount' | 'text' {
   return 'text'
 }
 
+/** A failure: said in plain Chinese; what the OS answered kept for 「详情」. */
+export interface ExtractFailure { error: string; detail?: string }
+type Failed = Parameters<typeof describeError>[0]
+
+function failed(res: Failed): ExtractFailure {
+  const detail = describeError(res)
+  if (res.error.code === 'engine_unavailable') {
+    return res.error.details?.['engine'] === 'local-model'
+      ? { error: '本地模型没有分配给文档模块，暂时不能抽取。', detail }
+      : { error: '这台机器上读不出这份文档的文字，暂时不能抽取。', detail }
+  }
+  return { error: '文档模块没有完成这次抽取。', detail }
+}
+
 /** Extracts `names` from the head revision of `documentId`: the card, or what went wrong. */
 export async function extractFields(
   api: Api,
   documentId: string,
   names: readonly string[],
   sleep: Sleep = (ms) => new Promise((r) => setTimeout(r, ms)),
-): Promise<ExtractCardData | { error: string }> {
+): Promise<ExtractCardData | ExtractFailure> {
   const got = await api.request({ op: 'get', documentId })
-  if (!got.ok) return { error: describeError(got) }
+  if (!got.ok) return failed(got)
   let docId = got.data.document_id
   let revision = got.data.head.revision
   const title = got.data.title ?? ''
   if (OFFICE.test(got.data.head.media_type)) {
     const pdf = await convertedPdf(api, docId, title)
     if (!pdf.ok || !pdf.documentId) {
-      return { error: pdf.ok ? '没能转换成 PDF。' : pdf.engineMissing ? '需要先在文档页下载转换器（约 340 MB，只需一次）。' : pdf.message }
+      return pdf.ok ? { error: '没能转换成 PDF。' }
+        : pdf.engineMissing ? { error: '需要先在文档页下载转换器（约 340 MB，只需一次）。' }
+          : { error: '没能把这份文档转换成 PDF，暂时不能抽取。', detail: pdf.message }
     }
     docId = pdf.documentId
     revision = 1
@@ -68,22 +84,25 @@ export async function extractFields(
   let res = await submit(false)
   // The same fields asked before replay that job: one that failed is run again.
   if (res.ok && (res.data.status === 'failed' || res.data.status === 'cancelled' || res.data.status === 'interrupted')) res = await submit(true)
-  if (!res.ok) return { error: describeError(res) }
+  if (!res.ok) return failed(res)
   let job = res.data
   // A long document is many model calls: wait up to 15 minutes.
   for (let i = 0; i < 600 && (job.status === 'queued' || job.status === 'running'); i++) {
     await sleep(1500)
     const next = await api.request({ op: 'job', jobId: job.job_id })
-    if (!next.ok) return { error: describeError(next) }
+    if (!next.ok) return failed(next)
     job = next.data
   }
   const extractionId = job.result?.extraction_id
-  if (job.status !== 'succeeded' || !extractionId) return { error: job.error?.message ?? `抽取没有完成（${job.status}）` }
+  if (job.status !== 'succeeded' || !extractionId) {
+    const detail = job.error ? `${job.error.message}（${job.error.code}）` : job.status
+    return { error: job.status === 'cancelled' ? '抽取已取消。' : '本地模型没有完成这次抽取，请稍后再试。', detail }
+  }
   const values: Value[] = []
   let cursor: string | undefined
   for (let i = 0; i < 20; i++) {
     const page = await api.request({ op: 'getExtraction', extractionId, ...(cursor ? { cursor } : {}) })
-    if (!page.ok) return { error: describeError(page) }
+    if (!page.ok) return failed(page)
     values.push(...page.data.values)
     if (!page.data.next_cursor) break
     cursor = page.data.next_cursor

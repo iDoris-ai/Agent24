@@ -320,6 +320,24 @@ describe('task cards (M4 A4)', () => {
     expect(approvalDecide).not.toHaveBeenCalled()
   })
 
+  // UI polish 13: the card waiting on the user stands out, 「确认」 is the
+  // primary button, the reason's line is styled by class, not inline.
+  it('a card waiting on the user stands out; 「确认」 is the primary button', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'] }]
+    await show()
+    const waitingCard = await waitFor(() => card('等你确认'))
+    expect(waitingCard).toHaveClass('waiting')
+    expect(await within(waitingCard).findByRole('button', { name: '确认' })).toHaveClass('btn-primary')
+    expect(within(waitingCard).getByRole('button', { name: '拒绝' })).not.toHaveClass('btn-primary')
+    fireEvent.click(within(waitingCard).getByRole('button', { name: '拒绝' }))
+    const input = await within(waitingCard).findByRole('textbox')
+    expect(input).toHaveClass('task-card-deny-input')
+    expect(input.getAttribute('style')).toBeNull()
+  })
+
   it.each([
     [['approve_for_session', 'deny', 'abort']],
     [['approve_for_target', 'deny', 'abort']],
