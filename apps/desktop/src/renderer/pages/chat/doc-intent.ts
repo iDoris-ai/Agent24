@@ -176,7 +176,10 @@ const POLITE = /^(?:来|一下|吧|给我|谢谢|多谢|麻烦了|啊|呀|哦|�
  * 「截止日期并设个提醒」「乙方的区别」) is not a list of fields: the model answers. */
 const FIELD_NOUN = /(?:日期|时间|期限|期|日|金额|总额|税额|余额|金|价格|单价|总价|价|费用|费|税率|名称|姓名|名字|编号|号码|单号|账号|税号|证号|地址|地点|电话|手机|邮箱|联系人|负责人|代表人|收款人|开票人|甲方|乙方|丙方|买方|卖方|单位|公司|银行|账户|数量|面积|材料|清单|附件|方式|条件|期数|(?:甲方|乙方|联系|付款|开票|收款|银行|账户|公司)信息)$/
 /** A comparison is not a field (「与上一版不同的金额」). */
-const COMPARES = /不同|区别|差异|变化|比较|对比|上一版/
+const COMPARES = /不同|区别|差异|变化|比较|对比|上一版|有问题|不合理|不一致|矛盾|错|不利|风险/
+/** Something done after, or a person (「找出截止日期并发到我的邮箱」「…告诉负责人」
+ * 「你推荐的付款方式」): a name with these is a request, not a field (#2019 round 4). */
+const DOES = /并|之后|然后|以后|以便|发(?!票)|告诉|提醒|做成|核对|(?<![结计预核])算|你|我/
 
 /** The field names a turn asks to extract from its document: null when it
  * asks for something else; [] when it asks to extract but names no field
@@ -207,6 +210,6 @@ export function extractionFields(text: string, inDocument: boolean): string[] | 
   }
   list = list.replace(DOC_PREFIX, '').replace(/(?:帮我|给我|请)?(?:都)?$/, '').replace(FIELD_TAIL, '').replace(/等(?:信息|内容|字段)?$|这些(?:信息|内容|字段)?$/, '')
   const names = list.split(/以及|还有|[、，,和与及跟/]/).map((n) => n.replace(/^(?:请|帮我|麻烦)?(?:把|将|的)*/, '').trim()).filter((n) => n.length > 0 && n.length <= 30)
-  if (names.some((n) => !FIELD_NOUN.test(n) || COMPARES.test(n))) return null
+  if (names.some((n) => !FIELD_NOUN.test(n) || COMPARES.test(n) || DOES.test(n))) return null
   return [...new Set(names)].slice(0, 20)
 }
