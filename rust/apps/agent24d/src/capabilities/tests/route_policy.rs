@@ -82,6 +82,14 @@ fn section_3_rows_match_operation_and_level() {
     // 97: A1 (Loop 4) adds the batch module consent row.
     assert_eq!(fixed.len(), 97);
     assert_eq!(module.len(), 2);
+    for method in ["PATCH", "DELETE"] {
+        fixed.push(DesignRow {
+            method: method.into(),
+            path: "/comm/contact/{name}".into(),
+            operation: "CommWrite".into(),
+            level: AssuranceLevel::Elevated,
+        });
+    }
     // Slice S2 adds the explicit R1 delegation entry point; the frozen §3
     // table predates that route, so keep the original rows as the oracle.
     fixed.push(DesignRow {

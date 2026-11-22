@@ -76,10 +76,11 @@ pub(crate) const KERNEL_OOP_GRANTS: &[Capability] = &[
     Capability::Memory,
     Capability::Scheduler,
     Capability::Models,
+    Capability::Assistant,
 ];
 
-/// A3 P2 (design §1 "本期只用 `events`、`models`"): the only two capabilities
-/// an attached module may be granted. Deliberately narrower than
+/// Attached modules may hold events, models and the kernel assistant.
+/// Deliberately narrower than
 /// [`KERNEL_OOP_GRANTS`] — `memory`/`scheduler`/`approval` have no attach-side
 /// story yet (no partition-allocation pass runs for an attached module, and
 /// `host_commands` — A3's own reverse channel — is not one of
@@ -89,7 +90,11 @@ pub(crate) const KERNEL_OOP_GRANTS: &[Capability] = &[
 /// resolver's intersection with this list is what refuses them, the same
 /// "asking gains nothing" rule every other grant list in this daemon already
 /// documents.
-pub(crate) const ATTACH_OOP_GRANTS: &[Capability] = &[Capability::Events, Capability::Models];
+pub(crate) const ATTACH_OOP_GRANTS: &[Capability] = &[
+    Capability::Events,
+    Capability::Models,
+    Capability::Assistant,
+];
 
 /// Which of the three grant sites is asking. The ceilings differ on purpose:
 /// each list only names capabilities that form can actually hand out.
@@ -426,9 +431,17 @@ mod tests {
                 Capability::Memory,
                 Capability::Scheduler,
                 Capability::Models,
+                Capability::Assistant,
             ]
         );
-        assert_eq!(ATTACH_OOP_GRANTS, &[Capability::Events, Capability::Models]);
+        assert_eq!(
+            ATTACH_OOP_GRANTS,
+            &[
+                Capability::Events,
+                Capability::Models,
+                Capability::Assistant
+            ]
+        );
     }
 
     /// Before/after for each grant site. The expected names are the

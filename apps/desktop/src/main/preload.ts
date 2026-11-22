@@ -134,11 +134,24 @@ const api = {
   commRevealExport: (filePath: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommRevealExport, filePath),
   /** Elevated comm write, validated in main (not on the generic proxy). */
+  commContactRename: (name: string, nickname: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommContactRename, name, nickname),
+  commContactRemove: (name: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommContactRemove, name),
   commContactAdd: (nickname: string, npub: string, role: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommContactAdd, nickname, npub, role),
   /** Elevated comm write, validated in main (not on the generic proxy). */
   commSend: (to: string, content: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommSend, to, content),
+
+  commGroupCreate: (name: string, invitees: string[]): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupCreate, name, invitees),
+  commGroupSend: (groupId: string, body: string, logicalId: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupSend, groupId, body, logicalId),
+  commGroupAccept: (inviteId: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupAccept, inviteId),
+  commGroupRetry: (groupId: string, logicalId: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupRetry, groupId, logicalId),
 
   /** Native open dialog for a `.ncryptsec` backup. Resolves with a file NAME and a single-use ticket (never the path or contents). */
   commImportPick: (): Promise<CommImportPickResult> => ipcRenderer.invoke(IpcChannels.CommImportPick),

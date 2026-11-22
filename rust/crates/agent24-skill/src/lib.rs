@@ -72,6 +72,10 @@ pub const REGISTERED_CAPABILITIES: &[RegisteredCapability] = &[
         name_zh: "Nostr 私信",
     },
     RegisteredCapability {
+        id: "nostr-friend",
+        name_zh: "Nostr 好友",
+    },
+    RegisteredCapability {
         id: "nostr-group",
         name_zh: "Nostr 群组",
     },

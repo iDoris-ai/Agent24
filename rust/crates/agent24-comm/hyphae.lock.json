@@ -8,7 +8,7 @@
         "hyphae"
       ],
       "name": "hyphae-darwin-arm64",
-      "sha256": "7a079c5d43d6179dda0e46f05d0c31d991c0b7ada42a41b862d508a09e67b172"
+      "sha256": "1e94690da8cc4852a00b9ee7ea8aa2eb94a31cfb7be98d7ef0a2a5b769129140"
     },
     "linux-x64": {
       "executables": [
@@ -18,7 +18,7 @@
         "hyphae"
       ],
       "name": "hyphae-linux-amd64",
-      "sha256": "096d9664fb4ab7ebf2bb11204bb78e076cf45b58c140e8a753e5d247f008b838"
+      "sha256": "04d8cf358e714c8c521666e91a86e190667a16b443f0f3c4d75b4e8b380e2033"
     }
   },
   "assurance": [],
@@ -26,12 +26,15 @@
     "major": 1,
     "min_minor": 0,
     "name": "hyphae-cli",
-    "tested": "1.0"
+    "tested": "1.3"
   },
   "id": "hyphae",
   "provides": [
     {
       "id": "nostr-dm"
+    },
+    {
+      "id": "nostr-friend"
     },
     {
       "id": "nostr-group"
@@ -45,11 +48,11 @@
   ],
   "release_url_base": "https://github.com/iDoris-ai/Hyphae/releases/download",
   "reproducible": {
-    "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid= -X main.version=v0.30.1' -o hyphae ./cmd/hyphae",
+    "recipe": "GOTOOLCHAIN=go1.26.4 CGO_ENABLED=0 GOOS=<os> GOARCH=<arch> go build -trimpath -buildvcs=false -ldflags='-buildid= -X main.version=v0.33.0' -o hyphae ./cmd/hyphae",
     "toolchain": "go1.26.4",
     "unsigned_sha256": {
-      "darwin-arm64": "8a06c75e5f72ebd2f838fa5281bafd2072dd80166734f55083ca4fbc72884c59",
-      "linux-x64": "096d9664fb4ab7ebf2bb11204bb78e076cf45b58c140e8a753e5d247f008b838"
+      "darwin-arm64": "12b395dbc31ac7a5c6e497ade93c42620ab303a74f631c65e577e62c64518b33",
+      "linux-x64": "04d8cf358e714c8c521666e91a86e190667a16b443f0f3c4d75b4e8b380e2033"
     }
   },
   "requires": {
@@ -64,9 +67,9 @@
     "notarized": true
   },
   "source": {
-    "commit": "068e2d2e5a657bbf87204b3892451e8a280ac3a7",
+    "commit": "9566d636b1f19429029f3ce8139251e1f2a3163b",
     "repo": "https://github.com/iDoris-ai/Hyphae"
   },
   "stop_grace_ms": 15000,
-  "version": "v0.30.1"
+  "version": "v0.33.0"
 }

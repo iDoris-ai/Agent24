@@ -232,11 +232,27 @@ pub async fn bind_run(
     session_id: Option<&str>,
 ) -> Result<RunBinding, Refused> {
     let host = host_capability(state, authorization).ok_or(Refused::NotHost)?;
+    bind_run_for_host(
+        &state.store,
+        &state.knowledge_host,
+        host,
+        binding_id,
+        session_id,
+    )
+    .await
+}
+
+pub(crate) async fn bind_run_for_host(
+    store: &agent24_store::Store,
+    knowledge_host: &agent24_knowledge::host::KnowledgeHostRegistry,
+    host: String,
+    binding_id: &str,
+    session_id: Option<&str>,
+) -> Result<RunBinding, Refused> {
     if !valid_binding_id(binding_id) {
         return Err(Refused::Malformed);
     }
-    let generation = state
-        .knowledge_host
+    let generation = knowledge_host
         .generation(&host, binding_id)
         .ok_or(Refused::Inactive)?;
     let binding = RunBinding {
@@ -247,17 +263,13 @@ pub async fn bind_run(
     if let Some(session_id) = session_id {
         // Read before the pin is taken; a run that adds such results has
         // pinned the session before it executes.
-        let took_knowledge = state
-            .store
+        let took_knowledge = store
             .session_tool_result_origins(session_id)
             .await
             .map_err(|_| Refused::SourcesUnavailable)?
             .iter()
             .any(|origin| agent24_knowledge::host::KNOWLEDGE_ORIGINS.contains(&origin.as_str()));
-        if !state
-            .knowledge_host
-            .pin_session(session_id, &binding, took_knowledge)
-        {
+        if !knowledge_host.pin_session(session_id, &binding, took_knowledge) {
             return Err(Refused::SessionRebound);
         }
     }

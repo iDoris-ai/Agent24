@@ -16,7 +16,7 @@ import { sendModuleWrite } from '../module-delegation'
 import type { KnowledgeController } from '../knowledge-settings'
 import { OMLX_DEFAULT_PORT, omlxListenPortOccupied } from '../omlx-kept'
 import { parsePort } from '../omlx-validate'
-import { backupFileStem, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
+import { backupFileStem, isGroupChatId, isSafeBackupPassword, isSafeMessage, isSafeName, isValidNpub, normalizeRelayUrl, parseRelayList } from '../comm-validate'
 import { readBackupFile } from '../backup-file'
 import {
   promptBackupPassword as openBackupPasswordWindow,
@@ -1094,11 +1094,45 @@ export function registerIpcHandlers(options: {
       })
     }),
   )
+  const isContactTarget = (value: unknown): value is string =>
+    typeof value === 'string' && (value.startsWith('npub1') ? isValidNpub(value) : isSafeName(value, 512))
+  handle(IpcChannels.CommContactRename, (event, name: unknown, nickname: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!isContactTarget(name) || !isSafeName(nickname, 128)) return invalidRequest('invalid contact name or nickname')
+      if (!await confirmNative(event, mt('comm.contactRename', { name: clip(name, 128), nickname: clip(nickname, 128) }), '')) return cancelled()
+      return proxyToBackend({ method: 'PATCH', path: `/api/v1/comm/contact/${encodeURIComponent(name)}`, body: { nickname } })
+    }),
+  )
+  handle(IpcChannels.CommContactRemove, (event, name: unknown): Promise<BackendProxyResponse> =>
+    exclusive(async () => {
+      if (!isContactTarget(name)) return invalidRequest('invalid contact name')
+      if (!await confirmNative(event, mt('comm.contactRemove', { name: clip(name, 128) }), mt('comm.contactRemoveDetail'))) return cancelled()
+      return proxyToBackend({ method: 'DELETE', path: `/api/v1/comm/contact/${encodeURIComponent(name)}` })
+    }),
+  )
   handle(IpcChannels.CommSend, (_event, to: unknown, content: unknown): Promise<BackendProxyResponse> => {
     if (!(typeof to === 'string' && to.startsWith('npub1') ? isValidNpub(to) : isSafeName(to))) return Promise.resolve(invalidRequest('invalid recipient'))
     if (!isSafeMessage(content)) return Promise.resolve(invalidRequest('invalid message'))
     // The daemon allows 5 s per relay + 10 s (8 relays max).
     return proxyToBackend({ method: 'POST', path: '/api/v1/comm/send', body: { to, content, encrypt: true } }, 90_000)
+  })
+
+  handle(IpcChannels.CommGroupCreate, (_event, name: unknown, invitees: unknown): Promise<BackendProxyResponse> => {
+    if (!isSafeName(name, 256) || Buffer.byteLength(name, 'utf8') > 256) return Promise.resolve(invalidRequest('invalid group name'))
+    if (!Array.isArray(invitees) || invitees.length < 1 || invitees.length > 100 || !invitees.every(isValidNpub)) return Promise.resolve(invalidRequest('invalid invitees'))
+    return proxyToBackend({ method: 'POST', path: '/api/v1/comm/groupchat', body: { name, invitees } }, 90_000)
+  })
+  handle(IpcChannels.CommGroupSend, (_event, groupId: unknown, body: unknown, logicalId: unknown): Promise<BackendProxyResponse> => {
+    if (!isGroupChatId(groupId) || !isGroupChatId(logicalId) || !isSafeMessage(body, 32 * 1024)) return Promise.resolve(invalidRequest('invalid group message'))
+    return proxyToBackend({ method: 'POST', path: `/api/v1/comm/groupchat/${groupId}/messages`, body: { body, logical_id: logicalId } }, 90_000)
+  })
+  handle(IpcChannels.CommGroupAccept, (_event, inviteId: unknown): Promise<BackendProxyResponse> => {
+    if (!isGroupChatId(inviteId)) return Promise.resolve(invalidRequest('invalid invite id'))
+    return proxyToBackend({ method: 'POST', path: `/api/v1/comm/groupchat/invites/${inviteId}/accept`, body: {} }, 90_000)
+  })
+  handle(IpcChannels.CommGroupRetry, (_event, groupId: unknown, logicalId: unknown): Promise<BackendProxyResponse> => {
+    if (!isGroupChatId(groupId) || !isGroupChatId(logicalId)) return Promise.resolve(invalidRequest('invalid group message id'))
+    return proxyToBackend({ method: 'POST', path: `/api/v1/comm/groupchat/${groupId}/messages/${logicalId}/retry`, body: {} }, 90_000)
   })
 
   // The other elevated comm routes that used to ride the generic proxy (L4):

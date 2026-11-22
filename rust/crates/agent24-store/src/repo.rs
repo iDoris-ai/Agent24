@@ -245,6 +245,27 @@ impl Store {
         Ok(())
     }
 
+    /// Persistent assistant conversation identity; callers serialize per module.
+    pub async fn assistant_session(
+        &self,
+        module: &str,
+        conversation: &str,
+    ) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("SELECT session_id FROM assistant_sessions WHERE module_name = ? AND conversation_id = ?")
+            .bind(module).bind(conversation).fetch_optional(self.pool()).await?)
+    }
+
+    pub async fn link_assistant_session(
+        &self,
+        module: &str,
+        conversation: &str,
+        session: &str,
+    ) -> Result<()> {
+        sqlx::query("INSERT INTO assistant_sessions (module_name, conversation_id, session_id) VALUES (?, ?, ?)")
+            .bind(module).bind(conversation).bind(session).execute(self.pool()).await?;
+        Ok(())
+    }
+
     pub async fn get_session(&self, id: &str) -> Result<Option<Session>> {
         let row = sqlx::query("SELECT * FROM sessions WHERE id = ?")
             .bind(id)

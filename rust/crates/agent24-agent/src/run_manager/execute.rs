@@ -21,11 +21,23 @@ use crate::{
 };
 
 impl RunManager {
+    #[cfg(test)]
     pub(crate) async fn execute(
         &self,
         run_id: String,
         cancel: CancellationToken,
         idoris_headroom_confirmed: bool,
+    ) {
+        self.execute_with_system(run_id, cancel, idoris_headroom_confirmed, None)
+            .await;
+    }
+
+    pub(crate) async fn execute_with_system(
+        &self,
+        run_id: String,
+        cancel: CancellationToken,
+        idoris_headroom_confirmed: bool,
+        system: Option<String>,
     ) {
         // Taken once, before any return, so a cancelled start does not leave
         // the id in the map. The map is only a hint: `execute` also runs for a
@@ -169,6 +181,11 @@ impl RunManager {
         let prior_context_len = prior_context.len();
         let mut snapshot = Vec::with_capacity(prior_context_len + 3);
         let mut rows = Vec::with_capacity(prior_context_len + 3);
+        if let Some(system) = system {
+            let message = Msg::system(system);
+            rows.push(originated(&message, MessageOrigin::HostSystem));
+            snapshot.push(message);
+        }
         let mut recalled_ids = None;
         let mut recalled_tags = Vec::new();
         if let Some((recalled, hits)) = recall {
