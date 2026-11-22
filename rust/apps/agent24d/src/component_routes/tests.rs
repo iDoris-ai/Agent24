@@ -183,7 +183,13 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
         .collect();
     assert_eq!(
         provided,
-        ["nostr-dm", "nostr-group", "nostr-identity", "nostr-relay"]
+        [
+            "nostr-dm",
+            "nostr-friend",
+            "nostr-group",
+            "nostr-identity",
+            "nostr-relay"
+        ]
     );
     let od = find(&body, "open-design");
     assert_eq!(

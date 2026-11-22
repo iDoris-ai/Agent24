@@ -31,6 +31,7 @@ vi.mock('./api', async (importActual) => {
   const actual = await importActual<typeof import('./api')>()
   return {
     CommApiError: actual.CommApiError,
+    listCommGroups: vi.fn().mockResolvedValue([]),
     getCommStatus: vi.fn(), listCommContacts: vi.fn(), listCommIdentities: vi.fn(), listCommRelays: vi.fn(),
     startCommDaemon: vi.fn(), stopCommDaemon: vi.fn(), unlockComm: vi.fn(), installComm: vi.fn(),
     addCommContact: vi.fn(), sendCommMessage: vi.fn(), listCommHistory: vi.fn(), getCommConversationHistory: vi.fn(), exportCommIdentity: vi.fn(), pickCommBackup: vi.fn(), restoreCommIdentity: vi.fn(),

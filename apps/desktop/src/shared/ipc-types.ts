@@ -77,6 +77,10 @@ export const IpcChannels = {
   // validated in main; presence binding is pending CORE-7c/CORE-2d.
   CommContactAdd: 'comm:contact-add',
   CommSend: 'comm:send',
+  CommGroupCreate: 'comm:group-create',
+  CommGroupSend: 'comm:group-send',
+  CommGroupAccept: 'comm:group-accept',
+  CommGroupRetry: 'comm:group-retry',
   // Restore from an encrypted backup: main picks the file (native open dialog)
   // and collects the password (its own window); the page only names the identity.
   CommImportPick: 'comm:import-pick',
