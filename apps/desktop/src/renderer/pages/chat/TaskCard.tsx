@@ -142,8 +142,9 @@ export function approvalDetail(
   // `approvalArgs`): the summary, not a list that looks complete.
   if (tool === 'documents.patch' && !Array.isArray((payload as Record<string, unknown>)['edits'])) return summary
   const lines: string[] = []
+  let folded = false
   const walk = (v: unknown, pad: string, head: string, depth: number) => {
-    if (lines.length >= DETAIL_MAX_LINES) return
+    if (lines.length >= DETAIL_MAX_LINES) { folded = true; return }
     if (v === null || typeof v !== 'object') lines.push(`${head}${shownValue(v)}`)
     else if (Object.keys(v).length === 0) lines.push(`${head}${t('task.detail.empty')}`)
     else if (depth >= DETAIL_MAX_DEPTH) lines.push(`${head}${t('task.detail.folded')}`)
@@ -154,7 +155,7 @@ export function approvalDetail(
     }
   }
   for (const [k, x] of Object.entries(payload as Record<string, unknown>)) walk(x, '', `${shownKey(k)}：`, 1)
-  if (lines.length >= DETAIL_MAX_LINES) lines.push(t('task.detail.folded'))
+  if (folded) lines.push(t('task.detail.folded'))
   return [t('task.detail.tool', { tool: withoutToolNames(tool) || tool }), ...lines].join('\n')
 }
 
@@ -287,9 +288,13 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
   // D2b: which approval it waits on, asked again while it waits: a run that
   // goes on to its next tool call waits on a new one without leaving the state.
   const [asking, setAsking] = useState<Approval | null>(null)
+  // PR-Daemon #2003 L1: the list could not be read: whether one waits is not
+  // known, so the card does not say it goes on.
+  const [unread, setUnread] = useState(false)
   useEffect(() => {
     setOffers(null)
     setAsking(null)
+    setUnread(false)
     if (!waiting) return
     let live = true
     const look = () => listPendingApprovals()
@@ -297,8 +302,9 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
         if (!live) return
         setOffers(offersOf(list, task.run_id))
         setAsking(list.find(a => a.run_id === task.run_id) ?? null)
+        setUnread(false)
       })
-      .catch(() => { if (live) setOffers(NO_OFFERS) })
+      .catch(() => { if (live) { setOffers(NO_OFFERS); setUnread(true) } })
     void look()
     const timer = setInterval(() => void look(), 2000)
     return () => { live = false; clearInterval(timer) }
@@ -418,7 +424,7 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
         {waiting && offers !== null && !offers.approve && !offers.deny && (
           // FU-152: no approval of the run pending (just confirmed, the run
           // not yet past the state): it goes on, nothing to decide here.
-          <span className="task-card-knowledge" role="note">{t(asking ? 'task.decideInTui' : 'task.proceeding')}</span>
+          <span className="task-card-knowledge" role="note">{t(asking || unread ? 'task.decideInTui' : 'task.proceeding')}</span>
         )}
         {active && (
           // General 0.6.89: 「停止」 never waits on another action of the card
