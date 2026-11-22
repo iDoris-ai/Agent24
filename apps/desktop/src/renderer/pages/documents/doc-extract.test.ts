@@ -52,7 +52,9 @@ describe('F3 extractFields', () => {
     const { api, calls } = fakeApi('application/vnd.openxmlformats-officedocument.wordprocessingml.document', [])
     const card = await extractFields(api, 'doc_a', ['甲方'], async () => {})
     expect(calls.find((c) => c.op === 'extract')).toMatchObject({ documentId: 'doc_pdf', revision: 1 })
-    expect(card).toMatchObject({ documentId: 'doc_pdf', rows: [{ name: '甲方', values: [] }] })
+    expect(card).toMatchObject({ documentId: 'doc_pdf', converted: true, rows: [{ name: '甲方', values: [] }] })
+    // The PDF converted before is used again: no new document in the library.
+    expect(calls.some((c) => c.op === 'convert')).toBe(false)
   })
 
   it('runs again a replayed job that had failed', async () => {

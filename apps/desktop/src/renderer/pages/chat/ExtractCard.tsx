@@ -11,7 +11,7 @@ export function ExtractCard({ card }: { card: ExtractCardData }) {
   const { open } = useContext(CapabilitiesContext)
   return (
     <div role="group" aria-label="抽取结果" className="extract-card" style={{ border: '1px solid var(--border)', borderRadius: 8, padding: '8px 12px', marginTop: 8 }}>
-      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>抽取结果 · 《{card.title}》</div>
+      <div style={{ fontWeight: 600, fontSize: 13, marginBottom: 4 }}>抽取结果 · 《{card.title}》{card.converted ? '（按转换出的 PDF）' : ''}</div>
       <table style={{ borderCollapse: 'collapse', fontSize: 13, width: '100%' }}>
         <thead>
           <tr style={{ color: 'var(--muted)', textAlign: 'left' }}><th>字段</th><th>值</th><th>出处</th></tr>
@@ -30,7 +30,7 @@ export function ExtractCard({ card }: { card: ExtractCardData }) {
                 {r.sources.map((s, i) => (
                   <button key={`${s.block_id}-${i}`} type="button" className="btn btn-ghost" title={s.quote} style={{ fontSize: 12, padding: '0 4px' }}
                     onClick={() => { focusDocument({ documentId: card.documentId, page: s.page, blockId: s.block_id }); open('documents', 'other') }}>
-                    {s.page !== undefined ? `第 ${s.page} 页` : '原文'}
+                    {s.page !== undefined ? `${card.converted ? '转换后' : ''}第 ${s.page} 页` : '原文'}
                   </button>
                 ))}
               </td>

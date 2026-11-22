@@ -25,6 +25,8 @@ export interface ExtractCardData {
   /** The document the sources are in (an Office document's PDF). */
   documentId: string
   title: string
+  /** An Office document read as the PDF it was converted to: sources are that PDF's pages. */
+  converted?: boolean
   rows: ExtractRow[]
 }
 
@@ -96,7 +98,7 @@ export async function extractFields(
     }
     return { name: f.description, values: [], sources: [] }
   })
-  return { documentId: docId, title, rows }
+  return { documentId: docId, title, ...(docId !== got.data.document_id ? { converted: true } : {}), rows }
 }
 
 /** The card as plain text: what the conversation history keeps. */
@@ -104,7 +106,7 @@ export function extractText(card: ExtractCardData): string {
   const lines = card.rows.map((r) => {
     if (r.values.length === 0) return `- ${r.name}：文档里没找到`
     const pages = [...new Set(r.sources.flatMap((s) => (s.page === undefined ? [] : [s.page])))]
-    const where = pages.length ? `（第 ${pages.join('、')} 页）` : ''
+    const where = pages.length ? `（${card.converted ? '转换后' : ''}第 ${pages.join('、')} 页）` : ''
     return `- ${r.name}：${r.values.join(' / ')}${r.values.length > 1 ? '（文档里写法不一致）' : ''}${where}`
   })
   return [`从《${card.title}》抽取：`, ...lines].join('\n')
