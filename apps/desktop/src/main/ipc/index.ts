@@ -518,6 +518,12 @@ const approvalDocumentLookups: DocumentLookups = {
     const title = (data as { title?: unknown } | null)?.title
     return typeof title === 'string' && title ? title : null
   }),
+  list: () => readDocument({ op: 'list', limit: 200 }, (data) => {
+    const docs = (data as { documents?: unknown } | null)?.documents
+    if (!Array.isArray(docs)) return null
+    return docs.flatMap((d: { document_id?: unknown; title?: unknown }) =>
+      typeof d?.document_id === 'string' && typeof d.title === 'string' ? [{ id: d.document_id, title: d.title }] : [])
+  }),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs
     if (!Array.isArray(list)) return null
