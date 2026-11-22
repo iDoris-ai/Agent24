@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>Agent24 VI 预览 v0.1</title>
+<style>
+:root{
+  --amber:#E8C547;--amber-deep:#B89A10;--ink:#0A0A0A;--paper:#F4F4EF;--hyphae:#7FB77E;
+  --local:#7FB77E;--remote:#6FA8DC;--approve:#E8C547;--danger:#E07A6A;
+  --bg:#0A0A0A;--surface:#141414;--surface2:#1A1A1A;--border:#262626;--text:#F0F0E8;--muted:#8A8A84;
+  --font:-apple-system,BlinkMacSystemFont,'PingFang SC','Segoe UI',sans-serif;
+  --mono:'SF Mono','JetBrains Mono',Menlo,monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);line-height:1.55;padding:48px 56px 96px}
+h1{font-size:28px;font-weight:600;letter-spacing:-.3px}
+h2{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.12em;margin:56px 0 16px}
+.lead{color:var(--muted);margin-top:6px}
+.row{display:flex;gap:20px;flex-wrap:wrap;align-items:stretch}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:24px}
+.light{background:var(--paper);color:#1A1A16;border-color:#DDDDD8}
+.wordmark{font-size:34px;font-weight:600;letter-spacing:-.6px}
+.wordmark b{font-family:var(--mono);font-weight:600;font-variant-numeric:tabular-nums}
+.sw{width:150px;border-radius:12px;overflow:hidden;border:1px solid var(--border)}
+.sw div:first-child{height:84px}
+.sw p{padding:10px 12px;font-size:12px;background:var(--surface)}
+.sw code{font-family:var(--mono);color:var(--muted)}
+.badge{display:inline-flex;align-items:center;gap:6px;font-size:12px;padding:3px 10px;border-radius:999px;border:1px solid;font-family:var(--font)}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.breath{animation:breath 4s ease-in-out infinite}
+@keyframes breath{0%,100%{opacity:.55}50%{opacity:1}}
+@media (prefers-reduced-motion:reduce){.breath{animation:none}}
+.btn{font:inherit;font-size:13px;border-radius:8px;padding:7px 14px;border:1px solid var(--border);background:var(--surface2);color:var(--text)}
+.btn.primary{background:var(--amber);color:#1A1A16;border-color:var(--amber);font-weight:600}
+.msg{background:var(--surface2);border-radius:12px;padding:14px 16px;max-width:520px}
+.meta{display:flex;gap:10px;align-items:center;margin-top:10px;font-size:12px;color:var(--muted)}
+.tui{font-family:var(--mono);font-size:13px;background:#000;border-radius:12px;padding:18px 20px;white-space:pre;line-height:1.5}
+.do,.dont{font-size:13px}
+.dont{color:var(--danger)} .do{color:var(--local)}
+table{border-collapse:collapse;font-size:13px}
+td{padding:6px 18px 6px 0;color:var(--muted)} td:first-child{color:var(--text)}
+</style>
+</head>
+<body>
+
+<h1>Agent24 视觉识别 · v0.1 提案</h1>
+<p class="lead">守夜的灯 —— 一直在你身边、只听你的、本地运行的 AI 伙伴。Always on. Always yours.</p>
+
+<h2>1 · 标志</h2>
+<div class="row">
+  <div class="card" style="display:flex;align-items:center;gap:18px">
+    <svg class="mark" data-size="64" data-lit="#E8C547" data-tick="#3a3a36" data-core="#F0F0E8"></svg>
+    <div class="wordmark">Agent<b>24</b></div>
+  </div>
+  <div class="card light" style="display:flex;align-items:center;gap:18px">
+    <svg class="mark" data-size="64" data-lit="#B89A10" data-tick="#cfcfc8" data-core="#1A1A16"></svg>
+    <div class="wordmark">Agent<b>24</b></div>
+  </div>
+  <div class="card" style="display:flex;align-items:center;gap:22px">
+    <div style="width:96px;height:96px;border-radius:22px;background:linear-gradient(#1a1a1a,#0a0a0a);display:grid;place-items:center;border:1px solid #2a2a2a">
+      <svg class="mark" data-size="64" data-lit="#E8C547" data-tick="#3a3a36" data-core="#F0F0E8"></svg>
+    </div>
+    <svg class="mark" data-size="32" data-lit="#E8C547" data-tick="#3a3a36" data-core="#F0F0E8"></svg>
+    <svg class="mark" data-size="16" data-lit="#F0F0E8" data-tick="#8A8A84" data-core="#F0F0E8"></svg>
+    <span style="color:var(--muted);font-size:12px">App 图标 · 32 · 托盘 16</span>
+  </div>
+</div>
+<p class="lead" style="margin-top:12px">24 段刻度 = 一天 24 小时；唯一点亮的一段 = 此刻它在为你工作；中心点 = 本机 daemon（本体），环 = 围绕它的各个外壳。</p>
+
+<h2>2 · 色彩</h2>
+<div class="row">
+  <div class="sw"><div style="background:#E8C547"></div><p>守夜琥珀<br><code>#E8C547</code></p></div>
+  <div class="sw"><div style="background:#B89A10"></div><p>琥珀深（浅色模式）<br><code>#B89A10</code></p></div>
+  <div class="sw"><div style="background:#0A0A0A"></div><p>夜墨<br><code>#0A0A0A</code></p></div>
+  <div class="sw"><div style="background:#F4F4EF"></div><p>纸白<br><code>#F4F4EF</code></p></div>
+  <div class="sw"><div style="background:#7FB77E"></div><p>菌丝绿<br><code>#7FB77E</code></p></div>
+</div>
+<div style="margin-top:14px;height:10px;border-radius:6px;display:flex;overflow:hidden;max-width:790px">
+  <div style="flex:85;background:#1A1A1A"></div><div style="flex:10;background:#E8C547"></div><div style="flex:5;background:#7FB77E"></div>
+</div>
+<p class="lead" style="font-size:12px">比例：中性 85% · 琥珀 ≤10% · 语义色 ≤5% —— 琥珀稀缺，才像一盏灯。</p>
+
+<h2>3 · 隐私语义（核心差异点）</h2>
+<div class="row" style="gap:12px">
+  <span class="badge" style="color:var(--local);border-color:#7FB77E55">● 本地处理</span>
+  <span class="badge" style="color:var(--remote);border-color:#6FA8DC55">↗ 发往远端</span>
+  <span class="badge" style="color:var(--approve);border-color:#E8C54755">◐ 等你确认</span>
+  <span class="badge" style="color:var(--danger);border-color:#E07A6A55">⊘ 已拒绝</span>
+</div>
+<p class="lead" style="font-size:12px">颜色 + 图形双编码；任何数据外发都必须显示「↗ 远端」。</p>
+
+<h2>4 · 界面示例</h2>
+<div class="row">
+  <div class="card" style="flex:1;min-width:420px">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:16px;font-size:12px;color:var(--muted)">
+      <span class="breath" style="width:8px;height:8px;border-radius:50%;background:var(--amber)"></span>
+      常驻中 · <span class="mono">已运行 3d 07:42</span>
+    </div>
+    <div class="msg">已整理今天的 3 份发票，合计 <span class="mono">¥1,284.50</span>。原文出处已附在每一项后。</div>
+    <div class="meta">
+      <span class="badge" style="color:var(--local);border-color:#7FB77E55">● 本地 · qwen3-8b</span>
+      <span class="mono">1.8s</span><span class="mono">412 tok</span>
+    </div>
+    <div class="msg" style="margin-top:18px">要把摘要发到你的 Hyphae 小组吗？</div>
+    <div class="meta">
+      <span class="badge" style="color:var(--approve);border-color:#E8C54755">◐ 等你确认</span>
+      <button class="btn">不发</button><button class="btn primary">发送</button>
+    </div>
+  </div>
+  <div class="tui" style="min-width:380px"><span style="color:#E8C547">( • )</span> agent24 · tui            <span style="color:#8A8A84">v0.6</span>
+<span style="color:#8A8A84">────────────────────────────────────</span>
+<span style="color:#7FB77E">●</span> run 1f3a  整理发票      <span style="color:#7FB77E">local</span>   1.8s
+<span style="color:#6FA8DC">↗</span> run 1f3b  网页摘要      <span style="color:#6FA8DC">remote</span>  4.2s
+<span style="color:#E8C547">◐</span> appr 07   发送到小组    <span style="color:#E8C547">pending</span>
+<span style="color:#E07A6A">⊘</span> run 1f39  上传通讯录    <span style="color:#E07A6A">denied</span>
+<span style="color:#8A8A84">────────────────────────────────────</span>
+<span style="color:#E8C547">▮</span><span style="color:#3a3a36">▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮▮</span> <span style="color:#8A8A84">刻度式进度</span></div>
+</div>
+
+<h2>5 · 字体</h2>
+<table>
+  <tr><td style="font-size:22px;font-weight:600">一直在，只听你的</td><td>界面 · 系统字体 SF Pro / PingFang SC</td></tr>
+  <tr><td class="mono" style="font-size:17px">03:42:17 · 412 tok · 1f3a</td><td>数字与代码 · SF Mono，tabular-nums</td></tr>
+  <tr><td>12 / 13 / 15 / 17 / 22 / 28 / 36</td><td>字号阶，正文 13–15，行高 1.55</td></tr>
+</table>
+
+<h2>6 · 规则</h2>
+<div class="row">
+  <div class="card do" style="flex:1">✓ 一次只点亮一段刻度<br>✓ 外发数据必须标「↗ 远端」<br>✓ iDoris 作角色出现在欢迎页、空状态、Pet0<br>✓ 深色用边框分层，浅色才用阴影</div>
+  <div class="card dont" style="flex:1">✕ 霓虹紫渐变、外发光<br>✕ 把 logo 改成蘑菇（属 MushroomDAO）<br>✕ 「AI 魔法」式文案<br>✕ 像素风进入功能图标</div>
+</div>
+
+<script>
+document.querySelectorAll('svg.mark').forEach(svg=>{
+  const s=+svg.dataset.size, c=s/2, R=s*0.46, r=s*0.31, w=Math.max(1.2,s*0.045);
+  svg.setAttribute('width',s);svg.setAttribute('height',s);svg.setAttribute('viewBox',`0 0 ${s} ${s}`);
+  let h='';
+  for(let i=0;i<24;i++){
+    const a=(i/24)*2*Math.PI-Math.PI/2, lit=i===0;
+    const x1=c+r*Math.cos(a),y1=c+r*Math.sin(a),x2=c+R*Math.cos(a),y2=c+R*Math.sin(a);
+    h+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${lit?svg.dataset.lit:svg.dataset.tick}" stroke-width="${lit?w*1.6:w}" stroke-linecap="round"/>`;
+  }
+  h+=`<circle cx="${c}" cy="${c}" r="${s*0.09}" fill="${svg.dataset.core}"/>`;
+  svg.innerHTML=h;
+});
+</script>
+</body>
+</html>
