@@ -2553,3 +2553,42 @@ describe('Sin90 exportToFile and importFromFile IPC handlers', () => {
     expect(handlers.get('sin90:import-from-file')).toBeDefined()
   })
 })
+
+describe('group chat dedicated IPC', () => {
+  const g = 'a'.repeat(32)
+  const id = 'b'.repeat(32)
+  it('forwards only validated fields to fixed group routes', async () => {
+    await call(IpcChannels.CommGroupCreate, '项目组', [REAL_NPUB])
+    await call(IpcChannels.CommGroupSend, g, 'hello', id)
+    await call(IpcChannels.CommGroupAccept, id)
+    await call(IpcChannels.CommGroupRetry, g, id)
+    expect(seen.map(s => [s.method, s.url, JSON.parse(s.body)])).toEqual([
+      ['POST', '/api/v1/comm/groupchat', { name: '项目组', invitees: [REAL_NPUB] }],
+      ['POST', `/api/v1/comm/groupchat/${g}/messages`, { body: 'hello', logical_id: id }],
+      ['POST', `/api/v1/comm/groupchat/invites/${id}/accept`, {}],
+      ['POST', `/api/v1/comm/groupchat/${g}/messages/${id}/retry`, {}],
+    ])
+  })
+  it.each([
+    ['CommGroupCreate', ['', [REAL_NPUB]]],
+    ['CommGroupCreate', ['x'.repeat(257), [REAL_NPUB]]],
+    ['CommGroupCreate', ['群'.repeat(86), [REAL_NPUB]]],
+    ['CommGroupCreate', ['ok', []]],
+    ['CommGroupCreate', ['ok', [NPUB]]],
+    ['CommGroupCreate', ['ok', Array(101).fill(REAL_NPUB)]],
+    ['CommGroupCreate', ['ok', {}]],
+    ['CommGroupSend', ['../g', 'hello', id]],
+    ['CommGroupSend', [g, '', id]],
+    ['CommGroupSend', [g, 'a\0b', id]],
+    ['CommGroupSend', [g, 'x'.repeat(32769), id]],
+    ['CommGroupSend', [g, 'hi', 'a/b']],
+    ['CommGroupAccept', ['A'.repeat(32)]],
+    ['CommGroupAccept', [null]],
+    ['CommGroupRetry', [g, 'wrong']],
+    ['CommGroupRetry', [null, id]],
+  ] as const)('rejects invalid %s arguments', async (channel, args) => {
+    const result = await call(IpcChannels[channel], ...args)
+    expect(result.status).toBe(400)
+    expect(seen).toHaveLength(0)
+  })
+})

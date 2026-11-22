@@ -79,6 +79,10 @@ export const IpcChannels = {
   CommContactRename: 'comm:contact-rename',
   CommContactRemove: 'comm:contact-remove',
   CommSend: 'comm:send',
+  CommGroupCreate: 'comm:group-create',
+  CommGroupSend: 'comm:group-send',
+  CommGroupAccept: 'comm:group-accept',
+  CommGroupRetry: 'comm:group-retry',
   // Restore from an encrypted backup: main picks the file (native open dialog)
   // and collects the password (its own window); the page only names the identity.
   CommImportPick: 'comm:import-pick',

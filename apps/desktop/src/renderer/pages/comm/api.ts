@@ -489,3 +489,72 @@ export const restoreCommIdentity = (ticket: string, nickname: string, makeDefaul
       nickname: typeof data['nickname'] === 'string' ? data['nickname'] : null,
       npub: typeof data['npub'] === 'string' ? data['npub'] : null,
     }))
+
+export type CommGroup = components['schemas']['CommGroup']
+export type CommGroupMember = components['schemas']['CommGroupMember']
+export type CommGroupInvite = components['schemas']['CommGroupInvite']
+export type CommGroupMessage = components['schemas']['CommGroupMessage']
+export type CommGroupReport = components['schemas']['CommGroupSendReport']
+type CommGroupRecipient = components['schemas']['CommGroupRecipient']
+type CommGroupCreated = components['schemas']['CommGroupCreateResponse']['data']
+type CommGroupAccepted = components['schemas']['CommGroupAcceptResponse']['data']
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value)
+}
+function isGroup(value: unknown): value is CommGroup {
+  return isRecord(value) && string(value['group_id']) && string(value['name']) &&
+    string(value['state']) && string(value['creator_npub']) && finiteNumber(value['updated_at']) &&
+    Array.isArray(value['members']) && value['members'].every(string)
+}
+function isGroupMember(value: unknown): value is CommGroupMember {
+  return isRecord(value) && string(value['npub']) && string(value['state']) && typeof value['is_creator'] === 'boolean'
+}
+function isGroupInvite(value: unknown): value is CommGroupInvite {
+  return isRecord(value) && string(value['invite_id']) && string(value['invitee_npub']) &&
+    string(value['group_id']) && string(value['state'])
+}
+function isGroupMessage(value: unknown): value is CommGroupMessage {
+  return isRecord(value) && string(value['id']) && string(value['event_id']) && string(value['group_id']) &&
+    string(value['sender']) && string(value['content']) && string(value['plaintext']) &&
+    finiteNumber(value['created_at']) && typeof value['is_encrypted'] === 'boolean'
+}
+function isGroupRecipient(value: unknown): value is CommGroupRecipient {
+  return isRecord(value) && string(value['recipient_npub']) && string(value['event_id']) && string(value['queue_id']) &&
+    string(value['state']) && ['prepared', 'queued', 'relay_accepted', 'failed'].includes(value['state']) &&
+    finiteNumber(value['relay_acks']) && finiteNumber(value['relay_count']) && finiteNumber(value['attempts']) && finiteNumber(value['max_retries'])
+}
+function isGroupReport(value: unknown): value is CommGroupReport {
+  return isRecord(value) && string(value['group_id']) && string(value['logical_id']) &&
+    finiteNumber(value['queued']) && finiteNumber(value['failed']) &&
+    (value['created_at'] === undefined || finiteNumber(value['created_at'])) &&
+    (value['state'] === undefined || string(value['state'])) &&
+    (value['accepted'] === undefined || finiteNumber(value['accepted'])) &&
+    (value['partial'] === undefined || typeof value['partial'] === 'boolean') &&
+    Array.isArray(value['recipients']) && value['recipients'].every(isGroupRecipient)
+}
+
+export const listCommGroups = (): Promise<CommGroup[]> =>
+  request('GET', '/api/v1/comm/groupchat', (value): value is { groups: CommGroup[] } =>
+    isRecord(value) && Array.isArray(value['groups']) && value['groups'].every(isGroup)).then(data => data.groups)
+export const listCommGroupMembers = (groupId: string): Promise<CommGroupMember[]> =>
+  request('GET', `/api/v1/comm/groupchat/${encodeURIComponent(groupId)}/members`, (value): value is { members: CommGroupMember[] } =>
+    isRecord(value) && Array.isArray(value['members']) && value['members'].every(isGroupMember)).then(data => data.members)
+export const listCommGroupInvites = (groupId: string): Promise<CommGroupInvite[]> =>
+  request('GET', `/api/v1/comm/groupchat/${encodeURIComponent(groupId)}/invites`, (value): value is { invites: CommGroupInvite[] } =>
+    isRecord(value) && Array.isArray(value['invites']) && value['invites'].every(isGroupInvite)).then(data => data.invites)
+export const listCommGroupMessages = (groupId: string): Promise<CommGroupMessage[]> =>
+  request('GET', `/api/v1/comm/groupchat/${encodeURIComponent(groupId)}/messages?limit=200`, (value): value is { messages: CommGroupMessage[] } =>
+    isRecord(value) && Array.isArray(value['messages']) && value['messages'].every(isGroupMessage)).then(data => data.messages)
+export const getCommGroupMessageStatus = (groupId: string, logicalId: string): Promise<CommGroupReport> =>
+  request('GET', `/api/v1/comm/groupchat/${encodeURIComponent(groupId)}/messages/${encodeURIComponent(logicalId)}`, isGroupReport)
+export const createCommGroup = (name: string, invitees: string[]): Promise<CommGroupCreated> =>
+  viaIpc(() => window.agent24.commGroupCreate(name, invitees), (value): value is CommGroupCreated =>
+    isRecord(value) && string(value['group_id']))
+export const acceptCommGroupInvite = (inviteId: string): Promise<CommGroupAccepted> =>
+  viaIpc(() => window.agent24.commGroupAccept(inviteId), (value): value is CommGroupAccepted =>
+    isRecord(value) && string(value['group_id']) && (value['state'] === 'pending' || value['state'] === 'active'))
+export const sendCommGroupMessage = (groupId: string, body: string, logicalId: string): Promise<CommGroupReport> =>
+  viaIpc(() => window.agent24.commGroupSend(groupId, body, logicalId), isGroupReport)
+export const retryCommGroupMessage = (groupId: string, logicalId: string): Promise<CommGroupReport> =>
+  viaIpc(() => window.agent24.commGroupRetry(groupId, logicalId), isGroupReport)

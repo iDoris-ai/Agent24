@@ -25,6 +25,7 @@ function setup({ installed = true, identities = [identity], configured = true, c
       else if (!installed) return { ok: false, status: 409, data: { ok: false, error: 'not_configured', message: 'no Hyphae binary is configured' } }
       else if (path.endsWith('/identity')) data = identities
       else if (path.endsWith('/contact')) data = []
+      else if (path.endsWith('/groupchat')) data = { groups: [] }
       else data = { relays: relayList, source: configured ? 'config' : 'default', configured }
     } else if (path.endsWith('/identity')) data = identity
     else if (method === 'PUT') data = { relays: ['wss://relay.aastar.io'], source: 'config', configured: true }

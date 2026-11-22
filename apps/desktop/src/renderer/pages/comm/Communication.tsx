@@ -8,6 +8,8 @@ import {
   exportCommIdentity,
   getCommStatus as pollCommStatus,
   listCommContacts,
+  listCommGroups,
+  type CommGroup,
   listCommHistory,
   getCommConversationHistory,
   listCommIdentities,
@@ -33,6 +35,7 @@ import { RELAY_SELF_HOST_GUIDE_URL, getDefaultRelays } from './relayDefaults'
 import { parseRelayList } from '../../../shared/relay-list'
 import { listComponents, type ComponentView } from '../../components/componentApi'
 import { filterHumanCommMessages } from './history-filter'
+import { ConversationList, CreateGroup, GroupChat, type ConversationSelection } from './GroupChat'
 
 type HyphaePhase =
   | { kind: 'loading' }
@@ -239,7 +242,21 @@ export default function CommunicationPage() {
   const [history, setHistory] = useState<CommHistoryItem[] | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [contactSearch, setContactSearch] = useState('')
-  const [selectedPeer, setSelectedPeer] = useState<string | null>(null)
+  const [selection, setSelection] = useState<ConversationSelection>(null)
+  const selectedPeer = selection?.kind === 'peer' ? selection.id : null
+  const setSelectedPeer = useCallback((peer: string | null) => setSelection(peer ? { kind: 'peer', id: peer } : null), [])
+  const [groups, setGroups] = useState<CommGroup[]>([])
+  const selectedGroup = selection?.kind === 'group' ? groups.find(group => group.group_id === selection.id) : undefined
+  const [groupError, setGroupError] = useState<string | null>(null)
+  const [groupRefreshTick, setGroupRefreshTick] = useState(0)
+  const [addOpen, setAddOpen] = useState(false)
+  const [createGroupOpen, setCreateGroupOpen] = useState(false)
+  const loadGroups = useCallback(async () => {
+    try {
+      const items = await listCommGroups()
+      if (mounted.current) { setGroups(items); setGroupError(null); setGroupRefreshTick(tick => tick + 1) }
+    } catch (error) { if (mounted.current) setGroupError(messageOf(error)) }
+  }, [])
   const [conversationHistory, setConversationHistory] = useState<CommHistoryItem[] | null>(null)
   const [localOutgoing, setLocalOutgoing] = useState<LocalOutgoing[]>([])
   const streamRef = useRef<HTMLDivElement>(null)
@@ -260,6 +277,7 @@ export default function CommunicationPage() {
     setRefreshing(true)
     setLoadError(null)
     setLoadErrorDetails(null)
+    void loadGroups()
     const results = await Promise.allSettled([
       listCommIdentities(), listCommContacts(), listCommRelays(), getCommStatus(),
     ])
@@ -302,7 +320,7 @@ export default function CommunicationPage() {
       setHyphaePhase({ kind: 'error' })
     }
     setRefreshing(false)
-  }, [])
+  }, [loadGroups])
 
   const loadHistory = useCallback(async () => {
     try {
@@ -310,7 +328,8 @@ export default function CommunicationPage() {
       if (mounted.current) {
         const filtered = filterHumanCommMessages(items)
         setHistory(filtered)
-        setSelectedPeer((current) => current ?? recentPeer(filtered))
+        const peer = recentPeer(filtered)
+        setSelection(current => current ?? (peer ? { kind: 'peer', id: peer } : null))
       }
     } catch {
       // The list is a convenience; the status cards already report real failures.
@@ -345,13 +364,14 @@ export default function CommunicationPage() {
     const poll = () => {
       if (document.visibilityState !== 'visible') return
       void loadHistory()
+      void loadGroups()
       if (selectedPeer) void loadConversation(selectedPeer)
     }
     const timer = setInterval(poll, 10_000)
     const onVisibility = poll
     document.addEventListener('visibilitychange', onVisibility)
     return () => { clearInterval(timer); document.removeEventListener('visibilitychange', onVisibility) }
-  }, [loadHistory, loadConversation, selectedPeer])
+  }, [loadHistory, loadConversation, loadGroups, selectedPeer])
 
   useEffect(() => {
     mounted.current = true
@@ -789,42 +809,25 @@ export default function CommunicationPage() {
       {!settingsOpen && <section className="comm-chat-shell" aria-label={t('chat.title')}>
         {actionError && setupState === 'ready' && <div role="alert" className="comm-alert comm-chat-action-alert">{t('error.action', { message: actionError })}</div>}
         <aside className="comm-chat-sidebar" aria-label={t('chat.conversations')}>
-          <div className="comm-chat-sidebar-head"><h1>{t('chat.title')}</h1><button type="button" aria-label={t('contact.add')} disabled={setupOnly} onClick={() => { setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>+</button></div>
+          <div className="comm-chat-sidebar-head"><h1>{t('chat.title')}</h1><div className="comm-add-menu">
+            <button type="button" aria-label={t('group.newConversation')} aria-expanded={addOpen} disabled={setupOnly} onClick={() => setAddOpen(open => !open)}>+</button>
+            {addOpen && <div className="comm-add-popover" onKeyDown={event => { if (event.key === 'Escape') setAddOpen(false) }}>
+              <button type="button" onClick={() => { setAddOpen(false); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('contact.add')}</button>
+              <button type="button" onClick={() => { setAddOpen(false); setCreateGroupOpen(true) }}>{t('group.new')}</button>
+            </div>}
+          </div></div>
+          {createGroupOpen && <CreateGroup contacts={contacts ?? []} onClose={() => setCreateGroupOpen(false)} onCreated={id => { setSelection({ kind: 'group', id }); setCreateGroupOpen(false); void loadGroups() }} />}
           <input aria-label={t('chat.search')} placeholder={t('chat.search')} value={contactSearch} onChange={(event) => setContactSearch(event.target.value)} />
-          <div className="comm-conversation-list">
-            {(() => {
-              const me = identities?.find((item) => item.default)
-              const peers = new Map<string, CommHistoryItem[]>((contacts ?? []).map((contact) => [contact.npub, []]))
-              if (selectedPeer && !peers.has(selectedPeer)) peers.set(selectedPeer, [])
-              for (const item of history ?? []) {
-                const peer = item.direction === 'out' || item.from === me?.npub || item.from === me?.nickname ? (item.to || item.from) : item.from
-                if (!peer) continue
-                peers.set(peer, [...(peers.get(peer) ?? []), item])
-              }
-              const rows = [...peers.entries()].map(([peer, items]) => {
-                const latest = peer === selectedPeer && conversationHistory?.length ? conversationHistory.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) : null
-                const recent = items.length ? items.reduce((a, b) => Date.parse(a.at) > Date.parse(b.at) ? a : b) : null
-                const last = latest && (!recent || Date.parse(latest.at) > Date.parse(recent.at)) ? latest : recent
-                return { peer, items, last: last ?? { id: `empty-${peer}`, from: peer, content: '', at: '', direction: 'in' as const }}
-              })
-                .filter(({ peer, last }) => `${contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)} ${last.content}`.toLowerCase().includes(contactSearch.toLowerCase()))
-                .sort((a, b) => Date.parse(b.last.at) - Date.parse(a.last.at))
-              return rows.map(({ peer, last }) => {
-                const name = contacts?.find((c) => c.npub === peer)?.nickname ?? shortNpub(peer)
-                return <button type="button" key={peer} className={`comm-conversation${selectedPeer === peer ? ' selected' : ''}`} onClick={() => setSelectedPeer(peer)}>
-                  <span className="comm-avatar">{name.slice(0, 1).toUpperCase()}</span><span className="comm-conversation-copy"><strong>{name}<time>{last.at ? new Date(last.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}</time></strong><small>{last.content}</small></span>
-                </button>
-              })
-            })()}
-            {(!history?.length) && <p className="comm-chat-empty">{t('chat.empty')}</p>}
-          </div>
+          {groupError && <p role="alert" className="comm-alert">{t('group.loadFailed', { message: groupError })}</p>}
+          <div className="comm-conversation-list"><ConversationList contacts={contacts ?? []} groups={groups} history={history ?? []} conversationHistory={conversationHistory} identities={identities ?? []} selection={selection} search={contactSearch} onSelect={setSelection} /></div>
           <div className="comm-my-address"><span className={daemon?.process.state === 'running' && daemon.relay_probe?.connected !== false ? 'online-dot' : 'offline-dot'} />
             <div><strong>{t('chat.myAddress')}</strong><small>{shortNpub(identities?.find((item) => item.default)?.npub ?? '')} · {daemon?.process.state === 'running' && daemon.relay_probe?.connected !== false ? t('chat.connected') : t('chat.disconnected')}</small>{copyFeedback && <small role={copyFeedback === t('identity.copyFailed') ? 'alert' : 'status'} className={copyFeedback === t('identity.copyFailed') ? 'comm-copy-feedback failed' : 'comm-copy-feedback'}>{copyFeedback}</small>}</div>
             <button type="button" disabled={!identities?.find((item) => item.default)} onClick={() => { const me = identities?.find((item) => item.default); if (me) void copyNpub(me.npub) }}>{t('identity.copy')}</button>
           </div>
         </aside>
         <div className="comm-chat-main">
-          <header className="comm-chat-header"><span className="comm-avatar">{(contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div><strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong><small>{selectedPeer ? t('chat.encrypted') : ''}</small></div>{contacts?.filter((c) => c.npub === selectedPeer).map(contactActions)}{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
+          <header className="comm-chat-header"><span className="comm-avatar">{(selectedGroup?.name ?? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? (selectedPeer ? shortNpub(selectedPeer) : '•')).slice(0, 1).toUpperCase()}</span><div>{selectedGroup ? <h2>{selectedGroup.name}</h2> : <strong>{selectedPeer ? contacts?.find((c) => c.npub === selectedPeer)?.nickname ?? shortNpub(selectedPeer) : t('chat.select')}</strong>}<small>{selectedGroup ? t('group.label') : selectedPeer ? t('chat.encrypted') : ''}</small></div>{!selectedGroup && contacts?.filter((c) => c.npub === selectedPeer).map(contactActions)}{selectedPeer && !contacts?.some((c) => c.npub === selectedPeer) && <button type="button" onClick={() => { setContactNpub(selectedPeer); setContactError(null); setSettingsOpen(true); setTimeout(() => contactNameRef.current?.focus(), 0) }}>{t('message.addContact')}</button>}<button type="button" onClick={() => void refresh()} disabled={refreshing || pending !== null}>{refreshing ? t('action.refreshing') : t('action.refresh')}</button>{!setupOnly && <button type="button" onClick={() => setSettingsOpen((open) => !open)}>{t('chat.settings')}</button>}</header>
+          {selectedGroup ? <GroupChat key={selectedGroup.group_id} group={selectedGroup} contacts={contacts ?? []} identities={identities ?? []} refreshTick={groupRefreshTick} onRefresh={() => void loadGroups()} /> : <>
           <div className="comm-message-stream" ref={streamRef} onScroll={(event) => { const el = event.currentTarget; streamWasAtBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 100 }}>
             {selectedPeer ? (() => {
               const me = identities?.find((item) => item.default)
@@ -847,6 +850,7 @@ export default function CommunicationPage() {
             })() : <p className="comm-chat-empty">{t('chat.empty')}</p>}
           </div>
           <form className="comm-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage() }}><textarea aria-label={t('chat.input')} value={messageText} onChange={(event) => setMessageText(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void submitMessage() } }} placeholder={t('chat.input')} disabled={!selectedPeer} /><button type="submit" disabled={!selectedPeer || !messageText.trim() || pending === 'send'}>{pending === 'send' ? t('message.sending') : t('message.send')}</button></form>
+          </>}
         </div>
       </section>}
 

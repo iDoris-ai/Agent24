@@ -144,6 +144,15 @@ const api = {
   commSend: (to: string, content: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommSend, to, content),
 
+  commGroupCreate: (name: string, invitees: string[]): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupCreate, name, invitees),
+  commGroupSend: (groupId: string, body: string, logicalId: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupSend, groupId, body, logicalId),
+  commGroupAccept: (inviteId: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupAccept, inviteId),
+  commGroupRetry: (groupId: string, logicalId: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommGroupRetry, groupId, logicalId),
+
   /** Native open dialog for a `.ncryptsec` backup. Resolves with a file NAME and a single-use ticket (never the path or contents). */
   commImportPick: (): Promise<CommImportPickResult> => ipcRenderer.invoke(IpcChannels.CommImportPick),
   /** Restore the picked backup under `nickname`. Main asks for the backup password in its own window; the page never sees it. */
