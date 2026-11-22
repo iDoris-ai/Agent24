@@ -317,6 +317,18 @@ describe('task cards (M4 A4)', () => {
     expect(approvalDecide).not.toHaveBeenCalled()
   })
 
+  // FU-152 (0.6.93): confirmed, the run is still awaiting_approval for a
+  // moment while no approval of it is pending; the card says it goes on.
+  it('says it goes on, not 「不能在这里确认」, in the moment after a confirm', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = []
+    await show()
+    expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('正在继续…')
+    expect(card('等你确认')).not.toHaveTextContent('不能在这里确认')
+  })
+
   it('points to the terminal for an approval it can neither confirm nor deny', async () => {
     store.save(record('chat_a', '周报'))
     store.promoteRun('chat_a', 'run_1')
@@ -674,6 +686,9 @@ describe('approvalText (D2b)', () => {
       .toBe('task.ask.compose{"title":"A1","parts":"task.ask.part{\\"doc\\":\\"a.pdf\\",\\"pages\\":\\"1\\"}"}')
     // M3/PM 11-21: never raw JSON; the summary goes under 「详情」.
     expect(approvalText({ summary: 'shell_exec: {"argv":["ls"]}' }, t)).toBe('task.ask.tool{"tool":"执行命令"}')
+    // UI polish 08: a part with no pages is the whole document, never 「第 all 页」.
+    expect(approvalText({ summary: 'documents.compose: {"parts":[{"document_id":"a.pdf"}],"title":"A1"}' }, t))
+      .toBe('task.ask.compose{"title":"A1","parts":"task.ask.partAll{\\"doc\\":\\"a.pdf\\"}"}')
   })
   it('says what a fill or a patch will write (E1b/D5a)', () => {
     expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","values":{"甲方":"明远","租金":"8,500"}}' }, t))
