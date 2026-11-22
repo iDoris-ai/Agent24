@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -268,4 +268,38 @@ describe('F3: ordinary questions and other tasks are not extractions', () => {
   ] as const) {
     it(text, () => expect(extractionFields(text, inDocument)).toBeNull())
   }
+})
+
+describe('L6-F2: deleting a whole document, and what is not', () => {
+  it.each([
+    ['把这份删了', true],
+    ['删除这个文件', true],
+    ['删掉这份文档吧', true],
+  ])('in a document conversation, %s asks to delete it', (text, inDocument) => {
+    expect(asksDeleteDocument(text, inDocument)).toBe(true)
+    expect(wantsDocTool(text, inDocument)).toBe(true)
+    expect(docAgentPrompt(null, text)).toContain('documents.delete')
+  })
+  it.each(['删除上一份拆出来的文件', '把《中文测试合同.pdf》删了', '帮我把那份 PDF 删除'])('%s names a document to delete', (text) => {
+    expect(asksDeleteDocument(text, false)).toBe(true)
+    expect(wantsDocTool(text, false)).toBe(true)
+  })
+  // The plan's counter-examples: a part of a document is a rewrite, never a delete.
+  it.each([
+    ['删掉第 3 段', true],
+    ['删掉这句话', true],
+    ['把这份里的第 3 段删掉', true],
+    ['把第三条删除', true],
+    ['把《合同.docx》里的这一行删掉', false],
+    ['删除第 2 页', true],
+  ])('%s is not deleting the document', (text, inDocument) => {
+    expect(asksDeleteDocument(text, inDocument)).toBe(false)
+    expect(docAgentPrompt(null, text)).not.toContain('documents.delete')
+  })
+  it.each([
+    '今天心情不错', '我把那个 app 删了，好用的推荐一个', '删了吧，不聊这个了', '怎么删除文档？', '删除的文件还能恢复吗',
+    '把这份 PDF 拆成第 1 页一份、其余一份',
+  ])('chat, a question or a split: %s', (text) => {
+    expect(asksDeleteDocument(text, false)).toBe(false)
+  })
 })

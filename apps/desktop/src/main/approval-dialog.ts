@@ -16,6 +16,8 @@ export interface DocumentLookups {
   paragraphs: (id: string) => Promise<ReadonlyMap<number, string> | null>
   /** The library's documents, to find one the model named by its file name. */
   list: () => Promise<ReadonlyArray<{ id: string; title: string }> | null>
+  /** L6-F2: what the delete box says of a document: title, pages (PDF), import time. */
+  detail: (id: string) => Promise<{ title: string; pages: number | null; importedAt: string } | null>
 }
 
 export type ApprovalDialog =
@@ -141,6 +143,14 @@ async function docOf(ref: string, lookups: DocumentLookups, byName = true): Prom
 }
 const titleOf = async (ref: string, lookups: DocumentLookups, byName = true): Promise<string> => (await docOf(ref, lookups, byName)).title
 
+/** An import time as the user's clock shows it: 2026-11-21 14:05. */
+export function localTime(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
+}
+
 export async function approvalDialog(
   record: ApprovalRecord,
   decision: string,
@@ -178,6 +188,22 @@ export async function approvalDialog(
       }
     }
     lines.push(mt('approval.unchanged'))
+  } else if (tool === 'documents.delete') {
+    // L6-F2: which one document goes: its title, pages and import time, read
+    // by main; the kernel lets only an id through (FU-136), so no name lookup.
+    const ref = str(args['document_id'])
+    const facts = isDocId(ref) ? await lookups.detail(ref).catch(() => null) : null
+    message = say('approval.title.delete', { doc: facts?.title || mt('approval.someDocument') })
+    if (!facts) lines.push(mt('approval.delete.unread'))
+    else {
+      const at = localTime(facts.importedAt)
+      const pages = facts.pages === null ? mt('approval.delete.pagesUnknown') : mt('approval.delete.pages', { n: facts.pages })
+      lines.push(mt('approval.delete.facts', { pages, at }))
+      const library = (await lookups.list().catch(() => null)) ?? []
+      const same = library.filter(d => d.id !== ref && plainTitle(d.title) === plainTitle(facts.title)).length
+      if (same > 0) lines.push(mt('approval.delete.sameTitle', { n: same, at }))
+    }
+    lines.push(mt('approval.delete.restorable'))
   } else if (tool === 'documents.fill') {
     message = say('approval.title.fill', { doc: await titleOf(str(args['document_id']), lookups) })
     const values = args['values'] && typeof args['values'] === 'object'

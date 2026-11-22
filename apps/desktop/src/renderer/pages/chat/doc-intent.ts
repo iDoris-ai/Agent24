@@ -111,21 +111,39 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
     && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
 }
 
+/** L6-F2: asked to delete or remove… */
+const DELETE_VERB = /删除|删掉|删了|删去|移除/
+/** …a document (in a conversation about one, any 「删了」 is about it)… */
+const DOC_NOUN = /《[^》]{1,200}》|[这那该此]一?[份篇]|[这那该此]一?个(?:文件|文档)|上一份|文件|文档|PDF|pdf|docx?/
+/** …not a part of one: a paragraph, a sentence, a page is a rewrite or a split. */
+const DOC_PART = /第\s*[\d一二两三四五六七八九十百]+\s*[段句行条页章节款项处]|[这那]一?[段句行条页处]|句话|段话|里的|中的|里面|部分|内容|文字|字号|标点|空格|批注|修订|水印/
+const DELETE_QUESTION = /怎么|如何|能不能|可以吗|还能|吗|呢|[？?]/
+
+/** Whether a turn asks to delete a whole document (「把这份删了」「删除上一份拆出来的文件」).
+ * 「删掉第 3 段」「删掉这句话」 are rewrites and 「怎么删除文档？」 a question: not this. */
+export function asksDeleteDocument(text: string, inDocument: boolean): boolean {
+  return DELETE_VERB.test(text) && (inDocument || DOC_NOUN.test(text)) && !DOC_PART.test(text) && !DELETE_QUESTION.test(text)
+}
+
 /** Whether a turn goes to the Agent with the documents tools. */
 export function wantsDocTool(text: string, inDocument: boolean): boolean {
-  if (DOC_TOOL_WORDS.test(text)) return true
+  if (DOC_TOOL_WORDS.test(text) || asksDeleteDocument(text, inDocument)) return true
   return aboutDocument(text, inDocument) && !asksTranslation(text, inDocument) && DOC_EDIT_WORDS.test(text)
 }
 
 /** Prefix the user turn so the Agent uses documents tools (D2b 正式版). M1: a
  * split is N calls of compose with one part each; one call with several parts
  * is a merge (a 4-bit model packed a split into one call, 9 runs in 15). */
+/** L6-F2: only on a turn that asks to delete a whole document. */
+const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id：当前对话的文档直接用它的 document_id，'
+  + '按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
+
 export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
     + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
-  return `${head}${hint}\n${text}`
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(

@@ -519,6 +519,11 @@ const approvalDocumentLookups: DocumentLookups = {
     return typeof title === 'string' && title ? title : null
   }),
   list: () => readDocument({ op: 'list', limit: 200 }, wholeLibrary),
+  detail: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const d = data as { title?: unknown; created_at?: unknown; pages?: unknown } | null
+    if (typeof d?.title !== 'string' || !d.title || typeof d.created_at !== 'string') return null
+    return { title: d.title, pages: typeof d.pages === 'number' ? d.pages : null, importedAt: d.created_at }
+  }),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs
     if (!Array.isArray(list)) return null

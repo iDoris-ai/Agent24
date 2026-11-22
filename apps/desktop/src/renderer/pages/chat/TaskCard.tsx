@@ -19,6 +19,7 @@ import { skillForConversation } from './session-skill'
 import { namedDocument } from './doc-intent-run'
 import { mismatchedEdit } from './patch-anchor'
 import { DocumentsOutcome, documentName } from './DocumentsOutcome'
+import { deleteTarget } from './delete-card'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
 
@@ -175,6 +176,8 @@ export function approvalText(
       .join(' + ')
     return t('task.ask.compose', { title: str(args['title']), parts })
   }
+  // L6-F2: the one document deleted, as the library has it (`deleteTarget`).
+  if (tool === 'documents.delete') return t('task.ask.delete', { doc: str(args['document_id']) })
   if (tool === 'documents.paragraphs') return t('task.ask.paragraphs', { doc: str(args['document_id']) })
   if (tool === 'documents.fields') return t('task.ask.fields', { doc: str(args['document_id']) })
   if (tool === 'documents.fill' && args['values'] && typeof args['values'] === 'object') {
@@ -326,13 +329,15 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
     setTitles(null)
     const approval = askingRef.current
     if (!approval) return
-    const { args } = approvalArgs(approval)
+    const { tool, args } = approvalArgs(approval)
     const parts = Array.isArray(args['parts']) ? args['parts'] as Array<Record<string, unknown>> : []
     const ids = [args['document_id'], ...parts.map(p => p['document_id'])]
       .filter((v): v is string => typeof v === 'string' && /^doc_[0-9A-Z]+$/.test(v))
     if (ids.length === 0) return
     let live = true
-    void Promise.all(ids.map(async id => [id, await documentName(window.agent24?.documents, id)] as const))
+    const api = window.agent24?.documents
+    const name = (id: string) => (tool === 'documents.delete' ? deleteTarget(api, id, tRef.current as (key: string, vars?: Record<string, string>) => string) : documentName(api, id))
+    void Promise.all(ids.map(async id => [id, await name(id)] as const))
       .then(named => { if (live) setTitles(new Map(named)) })
     return () => { live = false }
   }, [askingSummary, askingId])
