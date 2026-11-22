@@ -73,7 +73,7 @@ tools:
   # E1b/D5a (Loop 3): DOCX paragraphs and template fields. The writes make a
   # NEW document; each call is approved by the user.
   - operation: paragraphs
-    description: "List a DOCX document's paragraphs that have text: each paragraph's index and its first 40 characters (whether in a table). A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List a DOCX document's paragraphs that have text as a table of contents (toc): one line per paragraph, its index and first words. A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
