@@ -35,6 +35,7 @@ pub mod state;
 pub mod text_layer;
 pub mod timestamp;
 pub mod tools;
+pub mod trash;
 pub mod uploads;
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -178,6 +179,16 @@ pub fn router(state: AppState) -> Router {
         .route("/capabilities", get(get_capabilities))
         .route("/documents", get(documents::list_documents))
         .route("/documents/{document_id}", get(documents::get_document))
+        // L6-F2: soft delete, restore within 7 days, and what can be restored.
+        .route(
+            "/documents/{document_id}/delete",
+            post(trash::delete_document),
+        )
+        .route(
+            "/documents/{document_id}/restore",
+            post(trash::restore_document),
+        )
+        .route("/recently-deleted", get(trash::list_recently_deleted))
         .route(
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),
@@ -224,6 +235,10 @@ pub fn router(state: AppState) -> Router {
         // segment after the namespace canonicalises to `_a24`.
         .route("/_a24/tools/{op}", post(tools::call_tool))
         .route("/_a24/authorization/revoked", post(authorization::revoked))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            trash::hide_deleted,
+        ))
         .with_state(state)
 }
 

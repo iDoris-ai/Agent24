@@ -49,7 +49,7 @@
 2. **持久化顺序**：blob 写到 `blobs/tmp/`（与目标同一文件系统）→ fsync 文件 → rename 到内容地址 → fsync 分片目录（分片目录是新建的还要 fsync 它的父目录）→ 然后才开 DB 事务写引用行。同一 hash 已存在就跳过写入。
    - SQLite 显式设置 `journal_mode=WAL` + `synchronous=FULL`，不依赖驱动默认值。理由：`NORMAL` 在系统崩溃或断电时可能丢掉最后几次已提交的事务，用户看到“已保存”的 revision 会消失；提交频率低，`FULL` 的代价可以忽略。
 3. **scratch workspace 永远不是已保存 revision 的家**，DOC-1 不使用它（ADR-DOC-01 D7）。临时文件只有经 `import` 或 `revision.commit` 复制进 blob 区、校验过 sha256，才算保存。TTL 内没有提升的视为丢弃。
-4. **删除与 GC（已定）**：DOC-1 不提供删除。没有被引用的 blob 保留 7 天后才 GC。`uploads/` 不参与这个 GC（§5.6）。
+4. **删除与 GC（已定；2026-11-22 David 修订）**：~~DOC-1 不提供删除。~~ 删除是**软删除**：只在 `documents.deleted_at` 记下删除时间，行、revision 和 blob 都不动（revision 不可删、文档行不可删的约束不变）。已删除的文档在列表、`/documents/{id}/…` 读取、Agent 工具和按标题查找里都看不到；7 天内可以在文档页「最近删除」或 CLI `documents restore` 恢复，满 7 天后不能再恢复、也不再列出。没有被引用的 blob 保留 7 天后才 GC（GC 尚未实现，FU-177；实现时，只被删除满 7 天的文档引用的 blob 算作没有被引用）。`uploads/` 不参与这个 GC（§5.6）。
 5. 存储布局不对外暴露（ADR-DOC-01 D1）。
 
 ## 3. 标识与溯源锚点
@@ -372,7 +372,7 @@
 | # | 问题 | 建议 / 决定 | 决定人 |
 |---|---|---|---|
 | Q1 | #690：DOC-1 存储方案 | **已定（David，2026-10-07）**：方案 A；B 以后可以作为额外来源（§2） | David |
-| Q2 | 删除与 GC 宽限期 | **已定（David，2026-10-07）**：DOC-1 不提供删除；未被引用的 blob 保留 7 天后 GC | David |
+| Q2 | 删除与 GC 宽限期 | **已定（David，2026-10-07）**：DOC-1 不提供删除；未被引用的 blob 保留 7 天后 GC。**修订（David，2026-11-22，Loop 6 F2）**：改为软删除 + 7 天内可恢复 + 到期 GC（§2 第 4 条） | David |
 | Q3 | 资料库的备份 / 迁出格式、静态加密、磁盘配额 | DOC-1 不做，记为发布前事项 | David / jason |
 | Q4 | agent 能否导入文件 | **已定（David，2026-10-07）**：DOC-1 不能，只从页面经原生文件对话框导入；以后可在审批下开放 | David |
 | Q5 | agent 能否在用户确认后 commit | **已定（David，2026-10-07）**：DOC-1 没有 commit 工具，agent 只读和提议；review / commit 只在页面、diff 可见时进行；对话内确认提交以后可在审批下加入 | David |
@@ -397,3 +397,6 @@
 - `GET text` 同时给 `block` 和 `cursor` 是 400（游标已带位置）。
 - 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。规范化：`rerun` 为 false 时先省略再哈希（§5，DOC-1-06b，2026-10-18）。
 - 抽取的业务键去掉 `model_id`：内核路由器在调用时才选模型，事先问不到；实际模型记在结果里，换模型用 rerun（§5.4，#863）。
+
+## 修订记录
+- **2026-11-22（David，Loop 6 F2「删除文档」）**：§2 第 4 条与 Q2 由「DOC-1 不提供删除」改为「软删除 + 7 天内可恢复 + 到期 GC」。页面（`POST /documents/{id}/delete`、`/restore`、`GET /recently-deleted`）和 Agent 工具 `documents.delete` 都能删除；Agent 的每次删除都要用户在审批卡上确认，工具只收文档 id，按名字对上多份时不替用户挑（FU-136）。S04「不能删除唯一原件」在单用户阶段由「软删除 + 7 天恢复」满足。blob 的真正回收（GC）尚未实现，见 FU-177。
