@@ -39,13 +39,6 @@ export function elapsed(ms: number): string {
   return h > 0 ? `${h}:${two(Math.floor((s % 3600) / 60))}:${two(s % 60)}` : `${two(Math.floor(s / 60))}:${two(s % 60)}`
 }
 
-// The reason's line, as on the approvals page it replaces (inline, like there).
-const DENY_FORM = { display: 'flex', gap: 6, alignItems: 'center', flexBasis: '100%' } as const
-const DENY_INPUT = {
-  flex: 1, fontSize: 12, padding: '4px 8px', background: 'var(--surface2)', color: 'var(--text)',
-  border: '1px solid var(--border)', borderRadius: 4,
-} as const
-
 /** What the card can decide of the run's pending approval. */
 interface Offers { approve: boolean; deny: boolean }
 const NO_OFFERS: Offers = { approve: false, deny: false }
@@ -393,7 +386,7 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
   // Unread sources still show.
   const checked = grounded?.kind === 'notSearched' && view?.documents?.attempted === true && grounded.unread.length === 0 ? null : grounded
   return (
-    <div className={`task-card${active ? ' active' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
+    <div className={`task-card${active ? ' active' : ''}${waiting && !sentBack ? ' waiting' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
       {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals, titles)}</span>}
@@ -416,10 +409,10 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
       )}
       <span className="task-card-actions">
         {waiting && offers?.approve && !denying && !sentBack && !askingIncomplete && (
-          <button type="button" className="btn" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
+          <button type="button" className="btn btn-primary task-card-button" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
         )}
         {waiting && offers?.deny && !denying && (
-          <button type="button" className="btn" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
+          <button type="button" className="btn btn-ghost task-card-button" disabled={busy} onClick={() => setDenying(true)}>{t('task.deny')}</button>
         )}
         {waiting && offers !== null && !offers.approve && !offers.deny && (
           // FU-152: no approval of the run pending (just confirmed, the run
@@ -429,17 +422,17 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
         {active && (
           // General 0.6.89: 「停止」 never waits on another action of the card
           // (a confirm still open made it grey): stopping is always offered.
-          <button type="button" className="btn" onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
+          <button type="button" className="btn btn-ghost task-card-button" onClick={() => void act(() => cancelRun(task.run_id))}>{t('task.stop')}</button>
         )}
       </span>
       {waiting && denying && (
         // Loop 3 FU: a reason is welcome, not required; 「拒绝」 with none sends
         // a plain one, rather than a button that silently does nothing.
-        <form style={DENY_FORM} onSubmit={e => { e.preventDefault(); void decide({ type: 'deny', reason: reason.trim() || t('task.denyDefault') }) }}>
-          <input style={DENY_INPUT} aria-label={t('task.denyReason')} placeholder={t('task.denyReason')} value={reason}
+        <form className="task-card-deny" onSubmit={e => { e.preventDefault(); void decide({ type: 'deny', reason: reason.trim() || t('task.denyDefault') }) }}>
+          <input className="task-card-deny-input" aria-label={t('task.denyReason')} placeholder={t('task.denyReason')} value={reason}
             onChange={e => setReason(e.target.value)} disabled={busy} autoFocus />
-          <button type="submit" className="btn" disabled={busy}>{t('task.denySend')}</button>
-          <button type="button" className="btn" disabled={busy} onClick={() => setDenying(false)}>{t('task.denyCancel')}</button>
+          <button type="submit" className="btn btn-primary task-card-button" disabled={busy}>{t('task.denySend')}</button>
+          <button type="button" className="btn btn-ghost task-card-button" disabled={busy} onClick={() => setDenying(false)}>{t('task.denyCancel')}</button>
         </form>
       )}
     </div>
