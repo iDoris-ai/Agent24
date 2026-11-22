@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useT } from '../../i18n'
 import { communicationMessages } from './Communication.i18n'
 import {
-  acceptCommGroupInvite, createCommGroup, getCommGroupMessageStatus, listCommGroupInvites,
+  CommApiError, acceptCommGroupInvite, createCommGroup, getCommGroupMessageStatus, listCommGroupInvites,
   listCommGroupMembers, listCommGroupMessages, retryCommGroupMessage, sendCommGroupMessage,
   type CommContact, type CommGroup, type CommGroupMember, type CommGroupMessage, type CommGroupReport,
   type CommHistoryItem, type CommIdentity,
@@ -65,7 +65,11 @@ export function CreateGroup({ contacts, onCreated, onClose }: { contacts: CommCo
 }
 
 type Delivery = 'sending' | 'sent' | 'failed'
-type Outgoing = { id: string; body: string; at: number; state: Delivery }
+// `stored`: Hyphae has recorded this logical id (a report came back, or a
+// 502 partial), so a retry goes to `retry`; otherwise the send is repeated.
+type Outgoing = { id: string; body: string; at: number; state: Delivery; stored: boolean }
+/** At most this many status reads per refresh; each one is a Hyphae process. */
+const STATUS_CONCURRENCY = 4
 function delivery(report: CommGroupReport): Delivery {
   if (report.partial || report.failed > 0 || report.state === 'failed' || report.recipients.some(r => r.state === 'failed')) return 'failed'
   return report.queued === 0 && report.recipients.length > 0 && report.recipients.every(r => r.state === 'relay_accepted') ? 'sent' : 'sending'
@@ -101,9 +105,13 @@ export function GroupChat({ group, contacts, identities, refreshTick, onRefresh 
         const history = await listCommGroupMessages(group.group_id)
         if (!current) return
         setMessages(history); setError(null)
-        const ids = new Set([...history.filter(message => message.sender === me).map(message => message.id), ...outgoingRef.current.filter(message => message.state !== 'failed').map(message => message.id)])
-        const results = await Promise.allSettled([...ids].map(async id => ({ id, report: await getCommGroupMessageStatus(group.group_id, id) })))
-        if (!current) return
+        // Only messages still in flight are polled; a settled one is never read again.
+        const ids = outgoingRef.current.filter(message => message.state === 'sending' && message.stored).map(message => message.id)
+        const results: PromiseSettledResult<{ id: string; report: CommGroupReport }>[] = []
+        for (let i = 0; i < ids.length; i += STATUS_CONCURRENCY) {
+          results.push(...await Promise.allSettled(ids.slice(i, i + STATUS_CONCURRENCY).map(async id => ({ id, report: await getCommGroupMessageStatus(group.group_id, id) }))))
+          if (!current) return
+        }
         for (const result of results) {
           if (result.status !== 'fulfilled') continue
           const { id, report } = result.value
@@ -138,15 +146,18 @@ export function GroupChat({ group, contacts, identities, refreshTick, onRefresh 
     const id = retry?.id ?? crypto.randomUUID().replaceAll('-', '')
     const at = retry?.at ?? Date.now() / 1000
     setBusy(true); setError(null); if (!retry) setBody('')
-    setOutgoing(previous => [...previous.filter(item => item.id !== id), { id, at, body: text, state: 'sending' }])
+    const stored = retry?.stored ?? false
+    setOutgoing(previous => [...previous.filter(item => item.id !== id), { id, at, body: text, state: 'sending', stored }])
     try {
-      const report = retry ? await retryCommGroupMessage(group.group_id, id) : await sendCommGroupMessage(group.group_id, text, id)
+      const report = stored ? await retryCommGroupMessage(group.group_id, id) : await sendCommGroupMessage(group.group_id, text, id)
       const state = delivery(report)
-      setOutgoing(previous => previous.map(item => item.id === id ? { ...item, state } : item))
+      setOutgoing(previous => previous.map(item => item.id === id ? { ...item, state, stored: true } : item))
       setStates(previous => ({ ...previous, [id]: state }))
       onRefresh()
     } catch (error) {
-      setOutgoing(previous => previous.map(item => item.id === id ? { ...item, state: 'failed' } : item))
+      // A 502 partial means Hyphae stored the message and some recipients failed.
+      const partial = error instanceof CommApiError && error.status === 502
+      setOutgoing(previous => previous.map(item => item.id === id ? { ...item, state: 'failed', stored: stored || partial } : item))
       setError(errorMessage(error))
     } finally { setBusy(false) }
   }
@@ -158,9 +169,9 @@ export function GroupChat({ group, contacts, identities, refreshTick, onRefresh 
         {group.creator_npub === me ? <><p>{t('group.progress')}</p>{members.map(member => <p key={member.npub}>{displayName(member.npub)} · {member.state === 'pending' ? t('group.waiting') : member.state === 'accepted' || member.state === 'active' ? t('group.accepted') : member.state}</p>)}</> : <><p>{t('group.invited', { name: displayName(group.creator_npub), group: group.name })}</p><button type="button" disabled={busy} onClick={() => void join()}>{t('group.join')}</button></>}
       </section> : rows.length ? rows.map(row => {
         const local = outgoing.find(item => item.id === row.id)
-        const state = local?.state ?? states[row.id] ?? 'sending'
+        const state = local?.state ?? states[row.id]
         const mine = row.sender === me
-        return <div className={`comm-message-row${mine ? ' mine' : ''}`} key={row.id}><div className={`comm-message-bubble${mine && state === 'failed' ? ' failed' : ''}`}><strong>{displayName(row.sender)}</strong><div>{plaintext(row.body)}</div><small><time>{new Date(row.at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>{mine && <> · <span>{t(state === 'sent' ? 'group.sent' : state === 'failed' ? 'group.failed' : 'group.sending')}</span></>}</small>{mine && state === 'failed' && <button type="button" disabled={busy} onClick={() => void send(local ?? { id: row.id, body: row.body, at: row.at, state: 'failed' })}>{t('chat.retry')}</button>}</div></div>
+        return <div className={`comm-message-row${mine ? ' mine' : ''}`} key={row.id}><div className={`comm-message-bubble${mine && state === 'failed' ? ' failed' : ''}`}><strong>{displayName(row.sender)}</strong><div>{plaintext(row.body)}</div><small><time>{new Date(row.at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</time>{mine && state && <> · <span>{t(state === 'sent' ? 'group.sent' : state === 'failed' ? 'group.failed' : 'group.sending')}</span></>}</small>{mine && state === 'failed' && <button type="button" disabled={busy} onClick={() => void send(local ?? { id: row.id, body: row.body, at: row.at, state: 'failed', stored: true })}>{t('chat.retry')}</button>}</div></div>
       }) : <p className="comm-chat-empty">{t('chat.empty')}</p>}
     </div>
     {group.state === 'active' && <form className="comm-composer" onSubmit={event => { event.preventDefault(); void send() }}><textarea aria-label={t('chat.input')} placeholder={t('chat.input')} value={body} onChange={event => setBody(event.target.value)} onKeyDown={event => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} /><button type="submit" disabled={busy || !body.trim()}>{t('message.send')}</button></form>}

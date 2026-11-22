@@ -110,6 +110,31 @@ describe('group chat main flows', () => {
     expect(await screen.findByText('已发出')).toBeTruthy()
     expect(screen.queryByText(/已送达|已读/)).toBeNull()
   })
+  it('resends (not retry) a message Hyphae never stored, with the same logical id', async () => {
+    commGroupSend.mockImplementationOnce(async () => ({ ok: false, status: 400, data: { ok: false, error: 'invalid', message: 'group not active' } }))
+    render(<CommunicationPage />)
+    await selectGroup()
+    fireEvent.change(await screen.findByRole('textbox', { name: '输入消息' }), { target: { value: '没落库' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    expect(await screen.findByText('失败')).toBeTruthy()
+    const id = commGroupSend.mock.calls.at(-1)?.[2]
+    fireEvent.click(screen.getByRole('button', { name: '重试' }))
+    await waitFor(() => expect(commGroupSend).toHaveBeenCalledTimes(2))
+    expect(commGroupSend.mock.calls[1]).toEqual([groupId, '没落库', id])
+    expect(commGroupRetry).not.toHaveBeenCalled()
+    expect(await screen.findByText('已发出')).toBeTruthy()
+  })
+  it('never polls status for settled or history messages', async () => {
+    messages = [{ ...message, sender: me }]
+    render(<CommunicationPage />)
+    await selectGroup()
+    expect(await screen.findByText('群消息')).toBeTruthy()
+    fireEvent.change(screen.getByRole('textbox', { name: '输入消息' }), { target: { value: '一条' } })
+    fireEvent.click(screen.getByRole('button', { name: '发送' }))
+    expect(await screen.findByText('已发出')).toBeTruthy()
+    const statusReads = backendProxy.mock.calls.filter(([req]) => req.path.includes(`/groupchat/${groupId}/messages/`))
+    expect(statusReads).toHaveLength(0)
+  })
   it('keeps queued messages sending until polling observes relay acceptance', async () => {
     relayState = 'queued'
     commGroupSend.mockImplementationOnce(async (_g, _b, id) => envelope(report(id, 'queued')))
