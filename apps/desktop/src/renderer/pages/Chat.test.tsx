@@ -823,7 +823,7 @@ describe('ChatPage with Knowledge when the run outlasts the wait', () => {
 describe('ChatPage with Knowledge when the answer names sources the run did not read', () => {
   beforeEach(() => { setLocale('zh') })
 
-  const answerWith = async (text: string, knowledge: unknown) => {
+  const answerWith = async (text: string, knowledge: unknown, prompt = 'Can the tap water be drunk during the boil water notice?') => {
     Object.defineProperty(window, 'agent24', {
       value: { backendProxy: aside(mockBackendProxy), knowledge: { status: vi.fn().mockResolvedValue({ enabled: true, active: true, endpoint: 'https://a.example/api/v1', knowledgeBaseIds: ['kb'] }) } },
       writable: true,
@@ -836,10 +836,18 @@ describe('ChatPage with Knowledge when the answer names sources the run did not 
     })
     render(<ChatPage />)
     const textarea = screen.getByPlaceholderText(/输入消息/)
-    fireEvent.change(textarea, { target: { value: 'Can the tap water be drunk during the boil water notice?' } })
+    fireEvent.change(textarea, { target: { value: prompt } })
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(screen.getByText(text)).toBeInTheDocument(), { timeout: 3000 })
   }
+
+  // UI polish 03 (David): a turn the system does not search first (writing,
+  // 「记住…」, a document's rewrite or split) is not told it was not searched.
+  it.each(['帮我写一段产品介绍', '记住我喜欢喝茶'])('no 「没有检索知识库」 under %s, which is not searched first', async (prompt) => {
+    await answerWith('好的。', { searched: false, read_chunks: [] }, prompt)
+    expect(mockBackendProxy).toHaveBeenCalledWith(expect.objectContaining({ path: '/api/v1/runs', body: expect.not.objectContaining({ knowledge_query: expect.anything() }) }))
+    expect(screen.queryByText(chatMessages.zh['knowledge.notSearched'])).not.toBeInTheDocument()
+  })
 
   it('says the answer did not search Knowledge when the run called no tool, and marks its sources', async () => {
     const made = 'b512455b-6df2-4419-8df1-72126627085c#22b86b23-4bce-4898-9e43-9c62411f54c9'
