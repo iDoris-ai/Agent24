@@ -237,7 +237,7 @@ describe('ChatPage', () => {
     fireEvent.keyDown(screen.getByPlaceholderText(/输入消息/), { key: 'Enter', shiftKey: false })
 
     await waitFor(() => {
-      expect(screen.getByText(/Agent24 后端服务（agent24d）尚未就绪/)).toBeInTheDocument()
+      expect(screen.getByText(/Agent24 的后台服务没能启动/)).toBeInTheDocument()
     })
     expect(screen.queryByText(/对话请求失败/)).not.toBeInTheDocument()
     expect(screen.queryByText(/11434/)).not.toBeInTheDocument()
@@ -846,13 +846,13 @@ describe('ChatPage with Knowledge when the answer names sources the run did not 
     await answerWith(`煮沸至少 1 分钟。来源：s01-02-zh-water-2025.pdf，${made}`, { searched: false, read_chunks: [] })
     expect(screen.queryByText(chatMessages.zh['knowledge.via'])).not.toBeInTheDocument()
     expect(screen.getByText(chatMessages.zh['knowledge.notSearched'])).toBeInTheDocument()
-    expect(screen.getByText(`⚠️ 以下来源本次没有读到，不能当作来源：${made}`)).toBeInTheDocument()
+    expect(screen.getByText(`⚠️ 回答里提到的这些来源本次没有读到，不能当作依据：${made}`)).toBeInTheDocument()
   })
 
   it('marks only the sources that are not among the chunks the run read back', async () => {
     await answerWith('答案。来源：doc-7#chk-71；doc-9#chk-99', { searched: true, read_chunks: [{ knowledge_id: 'doc-7', chunk_id: 'chk-71' }] })
     expect(screen.getByText(chatMessages.zh['knowledge.via'])).toBeInTheDocument()
-    expect(screen.getByText('⚠️ 以下来源本次没有读到，不能当作来源：doc-9#chk-99')).toBeInTheDocument()
+    expect(screen.getByText('⚠️ 回答里提到的这些来源本次没有读到，不能当作依据：doc-9#chk-99')).toBeInTheDocument()
   })
 })
 

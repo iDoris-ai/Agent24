@@ -302,7 +302,7 @@ describe('task cards (M4 A4)', () => {
     runs.run_1 = { status: 'awaiting_approval', started_at: at }
     approvals = [{ id: 'ap_1', run_id: 'run_1', available_decisions: ['approve_for_session', 'abort'] }]
     await show()
-    expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('agent24 tui')
+    expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('不能在这里确认')
     expect(within(card('等你确认')).queryByRole('button', { name: '确认' })).toBeNull()
     expect(within(card('等你确认')).queryByRole('button', { name: '拒绝' })).toBeNull()
     expect(within(card('等你确认')).getByRole('button', { name: '停止' })).toBeInTheDocument()
@@ -378,7 +378,7 @@ describe('task cards (M4 A4)', () => {
     }
     await show()
     await waitFor(() => expect(card('已完成')).toHaveTextContent('流程见'))
-    expect(within(card('已完成')).getByText('经知识库检索回答（agent 模式）')).toBeInTheDocument()
+    expect(within(card('已完成')).getByText('经知识库检索回答')).toBeInTheDocument()
     expect(within(card('已完成')).getByRole('note')).toHaveTextContent('doc-9#chk-99')
     expect(within(card('已完成')).getByRole('note')).not.toHaveTextContent('doc-7#chk-71')
   })
