@@ -1,6 +1,6 @@
 //! v1 REST handlers beyond health (B3: chat / models / usage).
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use agent24_models::router::TaskProfile;
 use agent24_models::{CompletionRequest, ModelError};
@@ -566,6 +566,39 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         }
     };
 
+    let run_id = format!("run_{}", agent24_core::util::ulid());
+    let cancel = state.shutdown.child_token();
+    chat_response(ChatContext::from(&state), chat, run_id, cancel, None).await
+}
+
+#[derive(Clone)]
+pub(crate) struct ChatContext {
+    runs: Arc<agent24_agent::RunManager>,
+    router: Arc<agent24_models::router::ModelRouter>,
+    events: crate::events::EventsHub,
+    usage: Arc<UsageCounters>,
+    timings: Arc<dyn crate::timing_recorder::TimingSink>,
+}
+
+impl From<&AppState> for ChatContext {
+    fn from(state: &AppState) -> Self {
+        Self {
+            runs: state.runs.clone(),
+            router: state.router.clone(),
+            events: state.events.clone(),
+            usage: state.usage.clone(),
+            timings: state.timings.clone(),
+        }
+    }
+}
+
+pub(crate) async fn chat_response(
+    state: ChatContext,
+    chat: ChatRequest,
+    run_id: String,
+    cancel: tokio_util::sync::CancellationToken,
+    system: Option<String>,
+) -> Response {
     // M1-T12: the latest user turn is what SessionMemory recall/retain both
     // key on (same as a run's `run.input.prompt`) — found before the run_id
     // exists so a session-less request pays none of this.
@@ -579,7 +612,6 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
     // SAME id tags `memory.recalled`/`memory.write_skipped` as tags
     // `run.started` — a transient run, session_id null unless the caller
     // opted into memory (SPEC-002 §2).
-    let run_id = format!("run_{}", agent24_core::util::ulid());
     let base_messages: Vec<agent24_models::Msg> = chat
         .messages
         .iter()
@@ -634,6 +666,15 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
         }
         _ => base_messages,
     };
+    let messages = if let Some(system) = system {
+        agent24_agent::normalize_for_provider(
+            &std::iter::once(agent24_models::Msg::system(system))
+                .chain(messages)
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        messages
+    };
     let request = CompletionRequest {
         // /chat is the plain conversational surface — no tools offered here;
         // tool-using work goes through /runs (the agent loop)
@@ -657,7 +698,6 @@ pub async fn post_chat(State(state): State<AppState>, req: Request<Body>) -> Res
 
     // Child of the daemon shutdown token — shutdown cancels in-flight provider
     // calls; run-level cancellation joins this in C2
-    let cancel = state.shutdown.child_token();
     // ME4-desktop-model-ui: timed the same way `_a24/model/complete` is
     // (model_callback.rs's `call_start`) — the desktop chat page reads this
     // back only indirectly today (via `GET /api/v1/timings`, not this

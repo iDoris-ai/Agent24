@@ -122,10 +122,16 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('GET', '/api/v1/comm/contact'),
   r('GET', '/api/v1/comm/history'),
   r('GET', '/api/v1/comm/history/conversation'),
+  r('GET', '/api/v1/comm/groupchat'),
+  r('GET', '/api/v1/comm/groupchat/{group_id}/members'),
+  r('GET', '/api/v1/comm/groupchat/{group_id}/invites'),
+  r('GET', '/api/v1/comm/groupchat/{group_id}/messages'),
+  r('GET', '/api/v1/comm/groupchat/{group_id}/messages/{logical_id}'),
   // NOT here on purpose, each has its own validated IPC in main:
   //   POST /api/v1/comm/identity/export  (CommIdentityExport: native confirm, own password window, save dialog)
   //   POST /api/v1/comm/identity/import  (CommImportPick + CommIdentityImport: native open dialog, own password window)
   //   POST /api/v1/comm/contact          (CommContactAdd)
+  //   PATCH/DELETE /api/v1/comm/contact/{name} (CommContactRename/Remove)
   //   POST /api/v1/comm/send             (CommSend)
   //   POST /api/v1/comm/import           (CommHomeImport: native folder picker + confirm, own password window)
   //   PUT  /api/v1/comm/relay            (CommRelaySet: validated ws(s):// list, native confirm when it changes)

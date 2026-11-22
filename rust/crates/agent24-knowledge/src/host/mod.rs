@@ -475,6 +475,24 @@ impl KnowledgeHostRegistry {
         entry.active.then_some(entry.activated_seq)
     }
 
+    /// Kernel assistant uses the desktop's active default binding. Ambiguous
+    /// host ownership is refused rather than choosing another host's context.
+    pub fn active_assistant_binding(&self) -> Result<Option<RunBinding>, KnowledgeRefusal> {
+        let entries = self.entries.lock().map_err(|_| KnowledgeRefusal::Unbound)?;
+        let mut active = entries
+            .iter()
+            .filter(|((_, binding), entry)| binding == "default" && entry.active);
+        let selected = active.next().map(|((host, binding), entry)| RunBinding {
+            host: host.clone(),
+            binding: binding.clone(),
+            generation: entry.activated_seq,
+        });
+        if active.next().is_some() {
+            return Err(KnowledgeRefusal::Unbound);
+        }
+        Ok(selected)
+    }
+
     /// Pins `run_id` to what it was bound to at creation.
     pub fn pin_run(&self, run_id: &str, binding: RunBinding) {
         let Ok(mut runs) = self.runs.lock() else {

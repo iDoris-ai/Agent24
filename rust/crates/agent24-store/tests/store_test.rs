@@ -77,6 +77,59 @@ async fn session_roundtrip() {
 }
 
 #[tokio::test]
+async fn assistant_session_mapping_is_scoped_to_module_and_unique() {
+    let store = Store::open_memory().await.unwrap();
+    for id in ["sess_a", "sess_b"] {
+        store
+            .insert_session(&Session {
+                id: id.to_owned(),
+                title: "t".to_owned(),
+                channel: "assistant".to_owned(),
+                workspace_id: None,
+                created_at: TS.to_owned(),
+                updated_at: TS.to_owned(),
+            })
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store.assistant_session("agentear", "c1").await.unwrap(),
+        None
+    );
+    store
+        .link_assistant_session("agentear", "c1", "sess_a")
+        .await
+        .unwrap();
+    store
+        .link_assistant_session("other", "c1", "sess_b")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .assistant_session("agentear", "c1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sess_a")
+    );
+    assert_eq!(
+        store
+            .assistant_session("other", "c1")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("sess_b")
+    );
+    // One conversation maps to one session: a second link is refused.
+    assert!(
+        store
+            .link_assistant_session("agentear", "c1", "sess_b")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn run_lifecycle_happy_path() {
     let store = Store::open_memory().await.unwrap();
     store.insert_run(&run("run_1")).await.unwrap();
