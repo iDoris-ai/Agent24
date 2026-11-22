@@ -139,6 +139,9 @@ export default function ChatPage() {
   const messagesRef = useRef<HTMLDivElement>(null)
   const promptRefs = useRef(new Map<number, HTMLDivElement>())
   const turns = useMemo(() => buildTurns(messages), [messages])
+  // UI polish 07: runs whose answer is in the conversation; their task
+  // cards do not show it a second time.
+  const answeredRuns = useMemo(() => new Set(messages.flatMap(m => (m.role === 'assistant' && m.runId ? [m.runId] : []))), [messages])
   const [currentTurn, setCurrentTurn] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const draft = useKnowledgeDraft()
@@ -797,7 +800,7 @@ export default function ChatPage() {
             </div>
           </div>
         )}
-        <TaskCards conversation={sessionId} />
+        <TaskCards conversation={sessionId} answered={answeredRuns} />
         <div ref={bottomRef} />
       </div>
 
