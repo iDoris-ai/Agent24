@@ -232,6 +232,13 @@ describe('CommunicationPage', () => {
     expect(stopCommDaemon).not.toHaveBeenCalled()
   })
 
+  it('links the relay section to the self-host guide in the system browser', async () => {
+    success()
+    renderSettingsPage()
+    const link = await screen.findByRole('link', { name: '自建 relay（部署指南）' })
+    expect(link).toHaveAttribute('href', 'https://github.com/iDoris-ai/agent-speaker-relay/blob/agent-speaker/RELAY-DEPLOY.md')
+    expect(link).toHaveAttribute('target', '_blank')
+  })
   it('not_configured on every read: shows the guide as a neutral status, not a Refresh-failed alert', async () => {
     const nc = () => new CommApiError('Not configured', 409, 'not_configured')
     vi.mocked(listCommIdentities).mockRejectedValue(nc())
