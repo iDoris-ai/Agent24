@@ -459,7 +459,7 @@ describe('A1 backendProxy allowlist', () => {
       const opts = showMessageBox.mock.calls[0]!.at(-1) as { message: string; detail: string }
       // UI polish 01: what it does, from the record's payload; no approval or run id.
       expect(opts.message).toBe('Let the assistant do this: REAL?')
-      expect(opts.detail).toContain('What it does: {"argv":["rm","-rf","/tmp/real"]}')
+      expect(opts.detail).toContain('What it does:\nargv:\n  1. rm\n  2. -rf\n  3. /tmp/real')
       expect(`${opts.message}${opts.detail}`).not.toMatch(/ap_1|run_real/)
       expect(opts.detail).toContain('Note from the page (for reference only): harmless readme tweak')
     })

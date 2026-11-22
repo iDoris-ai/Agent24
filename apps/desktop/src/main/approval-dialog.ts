@@ -31,6 +31,32 @@ const TOOL_KEYS: Record<string, MainMessageKey> = {
   shell_exec: 'approval.tool.exec', fs_write: 'approval.tool.write', http_fetch: 'approval.tool.fetch',
 }
 
+/** UI polish 10 (General 0.6.96): read-only documents tools: nothing to show
+ *  past the document they read, and they change nothing. */
+const READ_ONLY = new Set(['documents.list', 'documents.get', 'documents.paragraphs', 'documents.fields'])
+
+/** A tool's input as lines, key by key, nested arrays and objects indented;
+ *  never JSON (the native box has no 「详情」 to fold it into). */
+export function inputLines(input: Record<string, unknown>): string[] {
+  const lines: string[] = []
+  const walk = (v: unknown, pad: string, head: string) => {
+    if (v === null || v === undefined || v === '' || (typeof v === 'object' && Object.keys(v as object).length === 0)) {
+      lines.push(`${head}${mt('approval.listEmpty')}`)
+    } else if (typeof v !== 'object') lines.push(`${head}${String(v)}`)
+    else if (Array.isArray(v) && v.every(x => x === null || typeof x !== 'object')) {
+      lines.push(head.trimEnd())
+      v.forEach((x, i) => lines.push(`${pad}  ${i + 1}. ${String(x)}`))
+    } else {
+      lines.push(head.trimEnd())
+      const entries = Array.isArray(v) ? v.map((x, i) => [`${i + 1}.`, x] as const)
+        : Object.entries(v as Record<string, unknown>).map(([k, x]) => [mt('approval.listKey', { key: k }), x] as const)
+      for (const [label, x] of entries) walk(x, `${pad}  `, `${pad}  ${label}${Array.isArray(v) ? ' ' : ''}`)
+    }
+  }
+  for (const [k, v] of Object.entries(input)) walk(v, '', mt('approval.listKey', { key: k }))
+  return lines
+}
+
 const excerpt = (s: string): string => (s.length > EXCERPT ? `${s.slice(0, EXCERPT)}…` : s)
 /** PR-Daemon #1995 L1: the original and the new text, each cut to the same
  *  window around the first character where they differ, so a change past the
@@ -112,12 +138,24 @@ export async function approvalDialog(
     }))
     lines.push(mt('approval.compose.from', { parts: clip(parts.join(' + '), 400) }), mt('approval.unchanged'))
   } else {
+    // UI polish 10: the document by its title; the rest as a list, never
+    // JSON; a read-only documents tool says only that it changes nothing.
     const key = TOOL_KEYS[tool]
-    message = mt('approval.title.tool', { action: key ? mt(key) : clip(tool, 60) })
-    const cut = str(record.summary).indexOf(': ')
-    const said = Object.keys(args).length > 0 ? JSON.stringify(args) : cut > 0 ? str(record.summary).slice(cut + 2) : ''
-    if (said) lines.push(mt('approval.content', { value: clip(said, 600) }))
-    lines.push(mt('approval.warning'))
+    const action = key ? mt(key) : clip(tool, 60)
+    const ref = str(args['document_id'])
+    message = ref
+      ? mt('approval.title.toolDoc', { action, doc: await titleOf(ref, lookups) })
+      : mt('approval.title.tool', { action })
+    if (READ_ONLY.has(tool)) lines.push(mt('approval.readOnly'))
+    else {
+      const rest = Object.fromEntries(Object.entries(args).filter(([k]) => !(ref && k === 'document_id')))
+      const cut = str(record.summary).indexOf(': ')
+      // No payload (an older daemon): the daemon's summary is all there is.
+      const said = Object.keys(rest).length > 0 ? inputLines(rest).join('\n')
+        : Object.keys(args).length === 0 && cut > 0 ? str(record.summary).slice(cut + 2) : ''
+      if (said) lines.push(mt('approval.content', { value: clip(said, 600) }))
+      lines.push(mt('approval.warning'))
+    }
   }
   if (decision !== 'approve') lines.unshift(mt('approval.decision', { decision: decisionLabel }))
   if (reason) lines.push(mt('approval.note', { value: clip(reason, 200) }))

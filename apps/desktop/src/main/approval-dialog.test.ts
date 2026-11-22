@@ -77,12 +77,30 @@ describe('approvalDialog (UI polish 01)', () => {
     expect(out.detail).toContain('来源：《合同.pdf》第 2-3 页 + 《附件》全部页')
   })
 
+  // General 0.6.96: documents.paragraphs (asked for approval after another
+  // regression) showed 「具体内容：{"count":1,"document_id":"doc_01M8035X…","from":3}」.
+  it('a read-only documents tool: the document by its title, no JSON, no ids, no content line', async () => {
+    const out = await box({ summary: `documents.paragraphs: {"count":1,"document_id":"${DOC}","from":3}`, payload: { count: 1, document_id: DOC, from: 3 } },
+      'approve', '批准', undefined, lookups('采购合同.docx', null), clip)
+    expect(out.message).toBe('确认允许助理对《采购合同.docx》「查看文档的段落」？')
+    expect(out.detail).toBe('只是查看，不会改动文档。')
+  })
+
+  it('another tool naming a document: the document by its title, the rest as a list', async () => {
+    const out = await box({ summary: 'x_tool: {…}', payload: { document_id: DOC, mode: 'fast', opts: { deep: true } } },
+      'approve', '批准', undefined, lookups('a.docx', null), clip)
+    expect(out.message).toBe('确认允许助理对《a.docx》「x_tool」？')
+    expect(out.detail).toContain('具体内容：\nmode：fast\nopts：\n  deep：true')
+    expect(`${out.message}${out.detail}`).not.toMatch(/doc_|[{}"]/)
+  })
+
   it('another tool: its name in words, what it does, the decision when not a plain approve, the page note marked', async () => {
     const out = await box({ summary: 'shell_exec: {"argv":["ls"]}', payload: { argv: ['ls'] } },
       'approve_for_session', '本会话内一律批准', '看一下', lookups(null, null), clip)
     expect(out.message).toBe('确认允许助理「执行命令」？')
     expect(out.detail).toContain('你的决定：本会话内一律批准')
-    expect(out.detail).toContain('具体内容：{"argv":["ls"]}')
+    expect(out.detail).toContain('具体内容：\nargv：\n  1. ls')
+    expect(out.detail).not.toMatch(/[{}[\]"]/)
     expect(out.detail).toContain('页面备注（仅供参考）：看一下')
   })
 })
