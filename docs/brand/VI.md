@@ -36,7 +36,7 @@
 ## 3. 标志
 
 ### 3.1 主标「昼夜环」
-- 由 24 段刻度组成的圆环（一天 24 小时），其中 1 段点亮为琥珀色 = 「此刻，它在为你工作」。
+- 由 24 段刻度组成的表盘（一天 24 小时）：0 / 6 / 12 / 18 时为长主刻度，其余为短刻度；顶部 1 段点亮为琥珀色并加粗 = 「此刻，它在为你工作」。24 段等长会像「加载中」转圈，所以用表盘式。
 - 环心一个实心圆点 = 本地 daemon（本体）；环 = 各种外壳围绕它。
 - 刻度间隙象征菌丝节点，可延伸成 Hyphae 网络图形（§6）。
 - 文字标：`Agent24`，「24」使用等宽数字字形，与 Agent 同字重，不加粗不变色。
@@ -46,7 +46,7 @@
 |---|---|
 | 横版组合（环 + 字标） | 官网、README 头图、安装器 |
 | 单环 | App 图标、托盘、favicon |
-| 托盘模板图（单色） | macOS 菜单栏，用 Template Image 跟随系统明暗 |
+| 托盘模板图（单色） | macOS 菜单栏，用 Template Image 跟随系统明暗。16pt 放不下 24 段，用简化版：细圆环 + 顶部加粗一段 + 中心点 |
 | 像素版（16×16 / 32×32） | Pet0、TUI 启动画面、像素风场景 |
 | 字符版 `◖A24◗` / `( • )` | TUI / CLI 纯文本 |
 
@@ -116,7 +116,7 @@ CSS token：`--local` `--remote` `--approve`，拒绝用既有的 `--danger`。`
 ## 9. 落地（建议分片，每片 ≤300 行）
 1. `VI-01` ✅ 在 `apps/desktop/src/renderer/styles.css` 的 `:root` 与 `.app.light` 新增 `--local / --remote / --approve / --font-mono / --radius-card`，并把散落的硬编码成功 / 错误色改用 `--success / --danger`。
 2. `VI-02` 隐私徽标组件：聊天回合、Runs 列表显示 本地 / 远端。
-3. `VI-03` 新 logo 资产（SVG 主标、托盘 Template、像素版、icns）；替换 sidebar 与托盘。
+3. `VI-03` ✅ 昼夜环资产：`docs/brand/{mark-dark,mark-light,app-icon,tray-template}.svg`，由 `docs/brand/src/gen-svg.py` 生成，`docs/brand/src/render.sh` 导出 `apps/desktop/assets/` 下的 `icon.png / icon.icns / logo-square-1024.png / trayTemplate{,@2x}.png`。侧栏改用 `BrandMark` 组件（跟随主题色），托盘在 macOS 显示模板图标。像素版留给 Pet0，未做。
 4. `VI-04` TUI 色板对齐（ratatui 用同一组 HEX 的 256 色近似）。
 
 ## 10. 已定
