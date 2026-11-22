@@ -76,6 +76,8 @@ export const IpcChannels = {
   // Elevated comm writes that used to ride the generic proxy. Strictly
   // validated in main; presence binding is pending CORE-7c/CORE-2d.
   CommContactAdd: 'comm:contact-add',
+  CommContactRename: 'comm:contact-rename',
+  CommContactRemove: 'comm:contact-remove',
   CommSend: 'comm:send',
   CommGroupCreate: 'comm:group-create',
   CommGroupSend: 'comm:group-send',

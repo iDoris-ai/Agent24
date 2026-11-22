@@ -1643,6 +1643,39 @@ describe('L4: whole-home import, relay list and unlock (dedicated IPC)', () => {
   })
 })
 
+describe('contact rename/remove dedicated IPC', () => {
+  it('confirms rename natively and forwards an encoded target and nickname', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call('comm:contact-rename', 'bob / old', 'Robert')
+    expect(seen[0]).toMatchObject({ method: 'PATCH', url: '/api/v1/comm/contact/bob%20%2F%20old', auth: 'Bearer daemon-secret' })
+    expect(JSON.parse(seen[0]!.body)).toEqual({ nickname: 'Robert' })
+  })
+  it('only deletes after native confirmation, which explains that history stays', async () => {
+    showMessageBox.mockResolvedValueOnce({ response: 1 })
+    expect((await call('comm:contact-remove', 'bob')).data.error.code).toBe('cancelled')
+    expect(seen).toHaveLength(0)
+    expect(showMessageBox.mock.calls.at(-1)?.at(-1)).toMatchObject({ detail: expect.stringMatching(/history|聊天记录|ประวัติ/) })
+    showMessageBox.mockResolvedValueOnce({ response: 0 })
+    await call('comm:contact-remove', REAL_NPUB)
+    expect(seen[0]).toMatchObject({ method: 'DELETE', url: `/api/v1/comm/contact/${REAL_NPUB}` })
+  })
+  it.each([
+    ['comm:contact-rename', ['', 'Robert']],
+    ['comm:contact-rename', ['bob', '']],
+    ['comm:contact-rename', ['bob', 'x'.repeat(129)]],
+    ['comm:contact-rename', ['bob', 'a\nb']],
+    ['comm:contact-rename', [NPUB, 'Robert']],
+    ['comm:contact-remove', [{}]],
+    ['comm:contact-remove', ['a\nb']],
+    ['comm:contact-remove', [NPUB]],
+  ])('rejects invalid %s arguments before asking or forwarding', async (channel, args) => {
+    showMessageBox.mockClear()
+    expect((await call(channel, ...args)).data.error.code).toBe('invalid_request')
+    expect(seen).toHaveLength(0)
+    expect(showMessageBox).not.toHaveBeenCalled()
+  })
+})
+
 describe('CommContactAdd / CommSend dedicated IPC', () => {
   it('contact add shows a native confirm with the nickname and the FULL npub; cancelling sends nothing', async () => {
     showMessageBox.mockResolvedValueOnce({ response: 1 })

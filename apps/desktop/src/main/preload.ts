@@ -134,6 +134,10 @@ const api = {
   commRevealExport: (filePath: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommRevealExport, filePath),
   /** Elevated comm write, validated in main (not on the generic proxy). */
+  commContactRename: (name: string, nickname: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommContactRename, name, nickname),
+  commContactRemove: (name: string): Promise<BackendProxyResponse> =>
+    ipcRenderer.invoke(IpcChannels.CommContactRemove, name),
   commContactAdd: (nickname: string, npub: string, role: string): Promise<BackendProxyResponse> =>
     ipcRenderer.invoke(IpcChannels.CommContactAdd, nickname, npub, role),
   /** Elevated comm write, validated in main (not on the generic proxy). */

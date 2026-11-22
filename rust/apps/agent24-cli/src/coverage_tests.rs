@@ -99,6 +99,30 @@ mod tests {
         };
     }
     comm_case!(
+        contact_rename,
+        &["contact", "rename", "a/b", "new name"],
+        "PATCH /api/v1/comm/contact/a%2Fb HTTP/1.1",
+        Some(json!({"nickname":"new name"}))
+    );
+    comm_case!(
+        contact_remove,
+        &["contact", "remove", "a b"],
+        "DELETE /api/v1/comm/contact/a%20b HTTP/1.1",
+        None
+    );
+    #[test]
+    fn contact_edit_requires_all_positionals() {
+        for args in [
+            vec!["contact", "rename", "bob"],
+            vec!["contact", "remove"],
+            vec!["contact", "remove", "bob", "extra"],
+        ] {
+            let mut argv = vec!["agent24", "comm"];
+            argv.extend(args);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+    }
+    comm_case!(
         history,
         &["history", "--as", "a b", "--limit", "12"],
         "GET /api/v1/comm/history?as=a%20b&limit=12 HTTP/1.1",
