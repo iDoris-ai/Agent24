@@ -6785,7 +6785,7 @@ components:
 
     RunDocuments:
       type: object
-      required: [attempted, jobs, failed]
+      required: [attempted, jobs]
       properties:
         attempted:
           type: boolean
@@ -6799,7 +6799,7 @@ components:
           type: array
           items:
             type: string
-          description: The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a later write of the run did make is not listed.
+          description: The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid.
 
     RunKnowledge:
       type: object

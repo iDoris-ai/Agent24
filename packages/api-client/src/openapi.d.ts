@@ -3152,8 +3152,8 @@ export interface components {
             attempted: boolean;
             /** @description Import jobs of the writes that went through; empty when every one was refused, denied or failed. */
             jobs: string[];
-            /** @description The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a later write of the run did make is not listed. */
-            failed: string[];
+            /** @description The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid. */
+            failed?: string[];
         };
         RunKnowledge: {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */

@@ -368,8 +368,13 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
     let mut names = std::collections::HashMap::new();
     let mut attempted = false;
     let mut jobs = Vec::new();
-    let mut made = std::collections::HashSet::new();
+    let mut made: Vec<String> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    // PR-Daemon #1994 B1: a document named by its file name in one call and
+    // by its id in another is one document. What the module answered (the
+    // `document_id` of a read, the `source_document_id` of a write) says
+    // which document a name stood for; both sides are compared by that.
+    let mut alias: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for m in messages {
         if m.role == "assistant" {
             for call in m.tool_calls.as_array().into_iter().flatten() {
@@ -388,34 +393,54 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         let Some((name, target)) = m.tool_call_id.as_ref().and_then(|id| names.get(id)) else {
             continue;
         };
-        if !is_document_write(name) {
+        if !name.starts_with("documents.") {
             continue;
         }
-        attempted = true;
-        let job = m
+        let payload = m
             .content
             .as_deref()
             .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
             .filter(|v| v.get("kind").and_then(|k| k.as_str()) == Some("completed"))
-            .and_then(|v| {
-                v.get("payload")
-                    .and_then(|p| p.get("job_id"))
-                    .and_then(|j| j.as_str())
-                    .map(str::to_owned)
-            });
+            .and_then(|v| v.get("payload").cloned());
+        let write = is_document_write(name);
+        let resolved = payload.as_ref().and_then(|p| {
+            p.get(if write {
+                "source_document_id"
+            } else {
+                "document_id"
+            })
+            .and_then(|d| d.as_str())
+        });
+        if let Some(resolved) = resolved
+            && !target.is_empty()
+        {
+            alias.insert(target.clone(), resolved.to_owned());
+        }
+        if !write {
+            continue;
+        }
+        attempted = true;
+        let job = payload
+            .as_ref()
+            .and_then(|p| p.get("job_id"))
+            .and_then(|j| j.as_str())
+            .map(str::to_owned);
         match job {
             Some(job) => {
                 jobs.push(job);
-                made.insert(target.clone());
+                made.push(target.clone());
             }
-            None if !tried.contains(target) => tried.push(target.clone()),
-            None => {}
+            None => tried.push(target.clone()),
         }
     }
-    let failed = tried
-        .into_iter()
-        .filter(|t| !t.is_empty() && !made.contains(t))
-        .collect();
+    let key = |t: &String| alias.get(t).cloned().unwrap_or_else(|| t.clone());
+    let made: std::collections::HashSet<String> = made.iter().map(key).collect();
+    let mut failed: Vec<String> = Vec::new();
+    for t in tried.iter().filter(|t| !t.is_empty()).map(key) {
+        if !made.contains(&t) && !failed.contains(&t) {
+            failed.push(t);
+        }
+    }
     attempted.then_some(RunDocuments {
         attempted,
         jobs,
@@ -760,6 +785,66 @@ mod documents_tests {
                 failed: vec!["doc_B".into()]
             })
         );
+        // PR-Daemon #1994 B1: refused under its file name, made under its id:
+        // one document, made. The module's answers say which id a name is.
+        let named = [
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "p", "name": "documents.paragraphs", "arguments": { "document_id": "合同.docx" } }]),
+                None,
+            ),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"document_id":"doc_X","paragraphs":[]}}"#),
+                json!([]),
+                Some("p"),
+            ),
+            to("q", "合同.docx"),
+            msg(
+                "tool",
+                Some("denied by policy: denied by user: 【未完成】…"),
+                json!([]),
+                Some("q"),
+            ),
+            to("r", "doc_X"),
+            msg(
+                "tool",
+                Some(
+                    r#"{"kind":"completed","payload":{"job_id":"job_9","source_document_id":"doc_X"}}"#,
+                ),
+                json!([]),
+                Some("r"),
+            ),
+        ];
+        assert_eq!(
+            run_documents(&named),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec!["job_9".into()],
+                failed: vec![]
+            })
+        );
+        // The same the other way: the write's own answer names the document.
+        let named_write = [
+            to("s", "合同.docx"),
+            msg(
+                "tool",
+                Some(
+                    r#"{"kind":"completed","payload":{"written":false,"source_document_id":"doc_X"}}"#,
+                ),
+                json!([]),
+                Some("s"),
+            ),
+            to("t", "doc_X"),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"job_id":"job_9"}}"#),
+                json!([]),
+                Some("t"),
+            ),
+        ];
+        assert_eq!(run_documents(&named_write).map(|d| d.failed), Some(vec![]));
         // A compose names its new document by title.
         let compose = [
             msg(

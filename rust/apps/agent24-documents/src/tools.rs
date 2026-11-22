@@ -610,6 +610,7 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
     if let Some(title) = state.patched_in(run_id, &id) {
         return completed::<Value>(Ok(serde_json::json!({
             "written": false,
+            "source_document_id": id,
             "reason": "already_submitted",
             "title": title,
             "message": format!("这一轮已经提交过对这份文档的改写，已生成《{title}》。不要再调用 documents.patch，直接告诉用户已生成《{title}》。"),
@@ -629,6 +630,7 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
             let opening: String = para.text.chars().take(OPENING_CHARS).collect();
             return completed::<Value>(Ok(serde_json::json!({
                 "written": false,
+                "source_document_id": id,
                 "reason": "anchor_mismatch",
                 "index": edit.index,
                 "paragraph_starts_with": opening,
@@ -661,16 +663,34 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
         // model is told what was refused and why, in words it can pass on.
         Err(e) if matches!(e.code(), "invalid_request" | "revision_conflict") => {
             let why = refusal_in_words(&e);
+            // PR-Daemon #1994 B2: a paragraph changed since it was read is the
+            // one refusal the model can mend itself: told to read again and
+            // retry once, as `anchor_mismatch` is.
+            let message = if e.code() == "revision_conflict" {
+                format!(
+                    "【未完成】这份文档没有改，也没有生成新文档：{why}。请先告诉用户这次没改成，不要说已生成或已完成；然后用 documents.paragraphs 重新读取这几段，照新的原文重新调用一次 documents.patch。"
+                )
+            } else {
+                format!(
+                    "【未完成】这份文档没有改，也没有生成新文档：{why}。请如实告诉用户这一份没改成和原因，不要说已生成或已完成。"
+                )
+            };
             return completed::<Value>(Ok(serde_json::json!({
                 "written": false,
+                "source_document_id": id,
                 "reason": e.code(),
                 "detail": e.message(),
-                "message": format!("【未完成】这份文档没有改，也没有生成新文档：{why}。请如实告诉用户这一份没改成和原因，不要说已生成或已完成。"),
+                "message": message,
             })));
         }
         Err(e) => return Err(refused(&e)),
     };
-    let answer = settled(&storage, job.0).await;
+    let mut answer = settled(&storage, job.0).await;
+    // PR-Daemon #1994 B1: which document this write was of, whatever the
+    // call named it; the run's record compares writes by it.
+    if let Value::Object(map) = &mut answer {
+        map.insert("source_document_id".to_owned(), Value::String(id.clone()));
+    }
     if answer["status"] == "succeeded"
         || answer["status"] == "queued"
         || answer["status"] == "running"
@@ -1008,8 +1028,6 @@ async fn admit(
     }
 }
 
-/// A service error under its own code (ADR-DOC-02 §6): the kernel keeps an
-/// unknown code as `module_code`, and keeps `retryable` as given.
 /// Why a patch was refused, in words for the user (General 0.6.94).
 fn refusal_in_words(e: &ApiError) -> String {
     let m = e.message();
@@ -1030,6 +1048,8 @@ fn refusal_in_words(e: &ApiError) -> String {
         ("text box", "文本框"),
         ("page or column break", "分页符或分栏符"),
         ("comment reference", "批注"),
+        ("w:sym", "特殊符号"),
+        ("w:ruby", "注音"),
     ];
     if let Some(rest) = m.strip_prefix("paragraph ")
         && let Some((index, what)) = rest.split_once(" contains ")
@@ -1051,6 +1071,8 @@ fn refusal_in_words(e: &ApiError) -> String {
     "改写请求不符合要求".to_owned()
 }
 
+/// A service error under its own code (ADR-DOC-02 §6): the kernel keeps an
+/// unknown code as `module_code`, and keeps `retryable` as given.
 fn refused(e: &ApiError) -> Envelope {
     Envelope::error(e.code(), e.retryable())
 }
@@ -1602,6 +1624,26 @@ mod tests {
         )
         .await;
         assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
+    }
+
+    /// PR-Daemon #1994 L2/B2: each refusal in words, the fallback included,
+    /// and a stale paragraph told to be read again.
+    #[test]
+    fn a_refusal_is_said_in_words() {
+        let say = |m: &str| refusal_in_words(&ApiError::invalid_request(m.to_owned()));
+        assert!(say("paragraph 4 contains a picture (w:drawing), which rewriting it would lose; edit it in Word or WPS").starts_with("第 5 段里有图片"));
+        assert!(
+            say("paragraph 0 contains m:oMath, which rewriting it would lose").contains("公式")
+        );
+        assert!(
+            say("paragraph 2 contains w:fooBar in a run, which rewriting it would lose")
+                .contains("第 3 段里有Word 的特殊内容")
+        );
+        assert_eq!(
+            say("there is no paragraph 99"),
+            "段落编号超出了这份文档的范围"
+        );
+        assert_eq!(say("something else"), "改写请求不符合要求");
     }
 
     #[tokio::test]
