@@ -636,7 +636,11 @@ export default function ChatPage() {
       if (turn.kind === 'answer') {
         const suffix: ReplyLatency = { modelName: null, tier: null, firstTokenMs: null, totalMs: performance.now() - sentAt }
         setDelivery(index, { kind: 'sent' })
-        const knowledge = withKnowledge ? grounding(turn.text, turn.knowledge) : undefined
+        const checked = withKnowledge ? grounding(turn.text, turn.knowledge) : undefined
+        // UI polish 03 (David): 「没有检索知识库」 only under a turn the system
+        // searches first; writing, 「记住…」 and a document's rewrite or split
+        // are not, so the line said nothing there. Unread sources still show.
+        const knowledge = checked?.kind === 'notSearched' && query === null && checked.unread.length === 0 ? undefined : checked
         setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
