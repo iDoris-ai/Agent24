@@ -571,7 +571,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
       )}
       {extractBusy && <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>{t('extract.working')}</p>}
       {extracted && ('error' in extracted
-        ? <p role="alert" style={ALERT}>{t('extract.failed', { error: extracted.error })}</p>
+        ? <p role="alert" style={ALERT} title={extracted.detail}>{t('extract.failed', { error: extracted.error })}</p>
         : <ExtractCard card={extracted} />)}
       {splitNote && <p role={splitNote.ok ? 'status' : 'alert'} style={{ fontSize: 12, margin: '4px 0' }}>{splitNote.text}</p>}
       {detail && (
