@@ -204,3 +204,4 @@
 - [ ] FU-168 · C · src=PR-Daemon #2010 Low 4 · 2026-11-22 · tests/fixtures/anchor-cases.json（Rust 和 TS 共用的 anchor 用例）只有中文和英文，要补泰文（没有空格分词、带声调符号）、全角数字、混排等用例。
 - [ ] FU-169 · C · src=L6-F3 #2019（General 11-22） · 2026-11-22 · DOCX 等 Office 文档的详情页没有「在对话里问这份文档」按钮，对话里抽取 DOCX 只能用《文件名》点名，或者用文档页的「抽取字段…」按钮。改法：Office 文档也给这个按钮，对话里按转换出的 PDF 读。
 - [ ] FU-170 · C · src=L6-F3 计划 · 2026-11-22 · 抽取结果能保存成表格或导出 CSV。
+- [ ] FU-171 · C · src=L6-F3 0.6.101 真机（General 11-22） · 2026-11-22 · 「文档」页没有内核能力授权入口（KernelConsentCard 只在 CapabilityPage 和「模块管理」页点「启用」时出现）。只影响 dev 包和非我们签名的构建（正式签名包免卡）。现在的绕路：工具 → 模块管理 → documents 停用再启用 → 授权卡 → 同意 → 重启 App；这条授权只管 30 天（kernel_consent::expires_at，David 11-22 点的到 2026-12-22），到期要再点一次。改法：DocumentsPage 在 kernel_consent=missing 时渲染同一张卡，并提示重启后生效（授权呈现类）。
