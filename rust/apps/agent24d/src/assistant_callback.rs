@@ -106,6 +106,30 @@ pub(crate) fn assistant_grant(
     })
 }
 
+struct CancelRunOnDrop {
+    runs: Arc<agent24_agent::RunManager>,
+    id: Option<String>,
+}
+
+impl CancelRunOnDrop {
+    fn disarm(&mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for CancelRunOnDrop {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let runs = self.runs.clone();
+            tokio::spawn(async move {
+                if let Err(error) = runs.cancel_run(&id).await {
+                    tracing::warn!(run_id = %id, %error, "assistant run cancellation failed");
+                }
+            });
+        }
+    }
+}
+
 pub(crate) struct AssistantChatHandler {
     pub generation: Arc<Generation>,
     pub grant: Option<AssistantGrant>,
@@ -187,7 +211,6 @@ impl Handler for AssistantChatHandler {
             })?;
             let cancel = state.shutdown.child_token();
             let _cancel_on_drop = cancel.clone().drop_guard();
-            let mut active_run = None;
             let work = async {
                 let session_id = match state
                     .store
@@ -257,19 +280,26 @@ impl Handler for AssistantChatHandler {
                     )
                     .await
                     .map_err(|_| internal())?;
-                    active_run = Some(run.id.clone());
+                    let mut cancel_run = CancelRunOnDrop {
+                        runs: state.runs.clone(),
+                        id: Some(run.id.clone()),
+                    };
+                    let mut poll = tokio::time::interval(Duration::from_millis(100));
                     let text = loop {
                         tokio::select! {
                             event = events.recv() => {
-                                let (_, event) = event.map_err(|_| internal())?;
-                                if let agent24_protocol::EventBody::RunCompleted(done) = event
-                                    && done.run_id == run.id {
-                                    if done.memory_persisted == Some(false) { return Err(internal()); }
-                                    break done.output.text;
+                                match event {
+                                    Ok((_, agent24_protocol::EventBody::RunCompleted(done)))
+                                        if done.run_id == run.id => {
+                                        if done.memory_persisted == Some(false) { return Err(internal()); }
+                                        cancel_run.disarm();
+                                        break done.output.text;
+                                    }
+                                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(internal()),
                                 }
-                                continue;
                             }
-                            () = tokio::time::sleep(Duration::from_millis(50)) => {}
+                            _ = poll.tick() => {}
                         }
                         let run = state
                             .store
@@ -278,9 +308,13 @@ impl Handler for AssistantChatHandler {
                             .map_err(|_| internal())?
                             .ok_or_else(internal)?;
                         match run.status {
-                            RunStatus::Completed => continue,
+                            RunStatus::Completed => {
+                                let output = run.output.ok_or_else(internal)?;
+                                cancel_run.disarm();
+                                break output.text;
+                            }
                             RunStatus::AwaitingApproval => {
-                                active_run = None;
+                                cancel_run.disarm();
                                 return Err(RpcError::application(
                                     ErrorKind::Unavailable,
                                     "请在 Agent24 桌面确认",
@@ -319,7 +353,6 @@ impl Handler for AssistantChatHandler {
                             _ => {}
                         }
                     };
-                    active_run = None;
                     (text, run.id)
                 } else {
                     let run_id = format!("run_{}", agent24_core::util::ulid());
@@ -358,15 +391,9 @@ impl Handler for AssistantChatHandler {
                     json!({"text":truncate(text), "session_id":session_id, "run_id":run_id, "request_id":p.request_id}),
                 )
             };
-            let result = tokio::time::timeout(TIMEOUT, work).await;
-            if let Some(run_id) = active_run {
-                state
-                    .runs
-                    .cancel_run(&run_id)
-                    .await
-                    .map_err(|_| internal())?;
-            }
-            result.map_err(|_| timeout())?
+            tokio::time::timeout(TIMEOUT, work)
+                .await
+                .map_err(|_| timeout())?
         })
     }
 }
@@ -495,6 +522,42 @@ mod tests {
             h.call(params()).await.unwrap_err().kind,
             Some(ErrorKind::Forbidden)
         );
+    }
+
+    #[tokio::test]
+    async fn assistant_without_manifest_grant_is_forbidden_with_deps() {
+        use agent24_attach::attach_registry::AttachGrantBuilder;
+        let (state, provider) = fixture(false).await;
+        let manifest = agent24_domain::DomainOsManifest::from_yaml("name: agentear\nversion: '1'\nroute_namespace: /api/v1/agentear\nevent_module: agentear\ndata_dir: ~/.agent24/os/agentear/\nimpl_kind: attached_process\nkernel_capabilities: []\n").unwrap();
+        let builder = crate::attach_grant::DaemonAttachGrantBuilder {
+            scheduler: state.scheduler.clone(),
+            models: None,
+            assistant: Some(AssistantCallbackDeps::from(&state)),
+            approval_broker: state.module_approval_broker.clone(),
+            events: state.events.clone(),
+        };
+        let error = attached_call(&builder.build("agentear", &manifest), params())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, Some(ErrorKind::Forbidden));
+        assert!(provider.seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_assistant_grant_forbids_the_next_call() {
+        let (state, provider) = fixture(false).await;
+        let mut h = handler(&state);
+        let module = "kc-assistant-revoke";
+        h.grant.as_mut().unwrap().module = module.into();
+        let until = chrono::Utc::now() + chrono::Duration::days(30);
+        crate::kernel_consent::track(module, ["assistant"], until);
+        assert!(h.call(params()).await.is_ok());
+        crate::kernel_consent::track(module, std::iter::empty::<&str>(), until);
+        assert_eq!(
+            h.call(params()).await.unwrap_err().kind,
+            Some(ErrorKind::Forbidden)
+        );
+        assert_eq!(provider.seen.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -662,6 +725,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aborting_knowledge_call_cancels_run_and_releases_admission() {
+        let (state, provider) = fixture(true).await;
+        activate_default(&state);
+        let task = tokio::spawn(handler(&state).call(params()));
+        tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+            .await
+            .unwrap();
+        let run = state.store.list_runs(None).await.unwrap().pop().unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if state.store.get_run(&run.id).await.unwrap().unwrap().status
+                    == RunStatus::Cancelled
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborted call must cancel its bound run");
+        assert!(state.assistant_admission.try_admit("agentear").is_some());
+    }
+
+    #[tokio::test]
     async fn knowledge_timeout_cancels_run() {
         let (state, provider) = fixture(true).await;
         activate_default(&state);
@@ -707,12 +796,89 @@ mod tests {
         let error = task.await.unwrap().unwrap_err();
         assert_eq!(error.kind, Some(ErrorKind::Unavailable));
         assert_eq!(error.data.unwrap()["reason"], "awaiting_approval");
+        tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(
             state.store.get_run(&run.id).await.unwrap().unwrap().status,
             RunStatus::AwaitingApproval
         );
         assert!(state.assistant_admission.try_admit("agentear").is_some());
         state.runs.cancel_run(&run.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn knowledge_status_survives_event_flood_and_lag_without_completion_event() {
+        for status in [
+            RunStatus::AwaitingApproval,
+            RunStatus::Failed,
+            RunStatus::Completed,
+        ] {
+            let (state, provider) = fixture(true).await;
+            activate_default(&state);
+            let task = tokio::spawn(handler(&state).call(params()));
+            tokio::time::timeout(Duration::from_secs(5), provider.entered.notified())
+                .await
+                .unwrap();
+            let run = state.store.list_runs(None).await.unwrap().pop().unwrap();
+            let event =
+                agent24_protocol::EventBody::RunCancelled(agent24_protocol::RunCancelledPayload {
+                    run_id: "unrelated".into(),
+                });
+            // Overflow the receiver before yielding, then keep events arriving
+            // faster than the old 50 ms sleep. No RunCompleted is emitted.
+            for _ in 0..5000 {
+                state.events.broadcast(event.clone());
+            }
+            let hub = state.events.clone();
+            let flood = tokio::spawn(async move {
+                loop {
+                    hub.broadcast(event.clone());
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            });
+            state
+                .store
+                .transition_run(
+                    &run.id,
+                    status,
+                    agent24_store::RunPatch {
+                        output: (status == RunStatus::Completed).then(|| {
+                            agent24_protocol::RunOutput {
+                                text: "stored answer".into(),
+                            }
+                        }),
+                        error: (status == RunStatus::Failed).then(|| agent24_protocol::ErrorBody {
+                            code: "provider_unavailable".into(),
+                            message: "provider offline".into(),
+                            hint: None,
+                            details: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(Duration::from_secs(5), task).await;
+            flood.abort();
+            let response = result
+                .expect("event traffic must not starve status checks")
+                .unwrap();
+            match status {
+                RunStatus::Completed => assert_eq!(response.unwrap()["text"], "stored answer"),
+                RunStatus::Failed => {
+                    let error = response.unwrap_err();
+                    assert_eq!(error.kind, Some(ErrorKind::Unavailable));
+                    assert_eq!(error.message, "provider offline");
+                }
+                RunStatus::AwaitingApproval => {
+                    let error = response.unwrap_err();
+                    assert_eq!(error.kind, Some(ErrorKind::Unavailable));
+                    assert_eq!(error.data.unwrap()["reason"], "awaiting_approval");
+                }
+                _ => unreachable!(),
+            }
+            // Stop the hanging provider even for manually terminal store rows.
+            state.shutdown.token().cancel();
+        }
     }
 
     #[tokio::test]
