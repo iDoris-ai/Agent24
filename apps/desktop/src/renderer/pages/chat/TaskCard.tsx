@@ -234,8 +234,9 @@ export async function patchOriginals(api: Window['agent24']['documents'] | undef
   return new Map(res.data.paragraphs.map((p) => [p.index, p.text]))
 }
 
-/** The tasks of the conversation the page shows. */
-export function TaskCards({ conversation }: { conversation: string }) {
+/** The tasks of the conversation the page shows. `answered`: runs whose answer the conversation already shows (UI polish
+ *  07): their cards say only where they stand, not the answer again. */
+export function TaskCards({ conversation, answered }: { conversation: string; answered?: ReadonlySet<string> }) {
   const t = useT(chatMessages)
   const { items } = useSyncExternalStore(subscribeHistory, getHistoryState)
   const tasks = items.find(item => item.id === conversation)?.tasks
@@ -244,12 +245,12 @@ export function TaskCards({ conversation }: { conversation: string }) {
   if (!tasks || tasks.length === 0) return null
   return (
     <div className="task-cards" role="list" aria-label={t('task.list')}>
-      {tasks.map(task => <TaskCard key={task.run_id} task={task} view={views.get(task.run_id)} />)}
+      {tasks.map(task => <TaskCard key={task.run_id} task={task} view={views.get(task.run_id)} answered={answered?.has(task.run_id) === true} />)}
     </div>
   )
 }
 
-function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefined }) {
+function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunView | undefined; answered: boolean }) {
   const t = useT(chatMessages)
   const status = view?.status
   const active = status !== undefined && ACTIVE.has(status)
@@ -397,7 +398,7 @@ function TaskCard({ task, view }: { task: ChatHistoryRun; view: RunView | undefi
       {sentBack && <span className="task-card-knowledge" role="note">{t('task.anchorNote', { n: String(sentBack.index + 1) })}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
       {failed && <span className="task-card-error" role="alert">{failed}</span>}
-      {status === 'completed' && view?.output && (
+      {status === 'completed' && view?.output && !answered && (
         <div className="task-card-output">
           {withoutToolNames(view.output)}
           <DocumentsOutcome documents={view.documents} />

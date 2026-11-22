@@ -417,6 +417,24 @@ describe('task cards (M4 A4)', () => {
     expect(approvalDecide).toHaveBeenCalledWith('ap_1', { type: 'approve' })
   })
 
+  // UI polish 07 (David): an answer the conversation already shows (the turn
+  // waited on an approval, then answered in time) is not repeated on its card;
+  // one only the card has (over 10 minutes, still waiting) is shown there.
+  it.each([[true], [false]])('a completed card repeats no answer the conversation shows (answered: %s)', async (answered) => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = {
+      status: 'completed', started_at: at, ended_at: at, output: { text: 'ANSWER-TEXT' },
+      knowledge: { searched: true, read_chunks: [] }, ...{ documents: { attempted: true, jobs: [] } },
+    }
+    await refreshHistory()
+    render(<TaskCards conversation="chat_a" answered={new Set(answered ? ['run_1'] : [])} />)
+    await waitFor(() => expect(card('已完成')).toBeInTheDocument())
+    await waitFor(() => expect(card('已完成').textContent?.includes('ANSWER-TEXT')).toBe(!answered))
+    expect(card('已完成').textContent?.includes('这次没有改动文档')).toBe(!answered)
+    expect(card('已完成').textContent?.includes(chatMessages.zh['knowledge.nothingRead'])).toBe(!answered)
+  })
+
   // UI polish 05 (FU-153 on the card): a document instruction is not searched
   // first, so its card does not say 「没有检索知识库」; a plain question's still does.
   it.each([
