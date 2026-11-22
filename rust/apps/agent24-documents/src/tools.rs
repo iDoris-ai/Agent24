@@ -919,7 +919,8 @@ async fn named_by_title(
     let storage = ready(state).await?;
     // Newest first, so the candidates read in the order the library shows.
     let rows: Vec<(String, String, String)> = sqlx::query_as(
-        "SELECT id, title, created_at FROM documents ORDER BY created_at DESC, id DESC",
+        "SELECT id, title, created_at FROM documents WHERE deleted_at IS NULL
+         ORDER BY created_at DESC, id DESC",
     )
     .fetch_all(storage.db.pool())
     .await
@@ -1036,7 +1037,9 @@ async fn admit(
                 let Some(Value::String(id)) = part.get("document_id") else {
                     return Err(Envelope::error(INVALID_INPUT, false));
                 };
-                if is_id(IdKind::Document, id) && !scope.allows_document(id) {
+                if is_id(IdKind::Document, id)
+                    && !(scope.allows_document(id) && live(state, id).await?)
+                {
                     return Err(refused(&ApiError::not_found("no such document")));
                 }
             }
@@ -1059,9 +1062,18 @@ async fn admit(
         _ => Ok(Some(id.to_owned())),
     };
     match owner.map_err(|e| refused(&e))? {
-        Some(doc) if scope.allows_document(&doc) => Ok(()),
+        Some(doc) if scope.allows_document(&doc) && live(state, &doc).await? => Ok(()),
         _ => Err(refused(&ApiError::not_found(absent))),
     }
+}
+
+/// L6-F2: a deleted document, and its jobs and extractions, read as absent
+/// to every tool, whatever its grant still names.
+async fn live(state: &AppState, id: &str) -> Result<bool, Envelope> {
+    let storage = ready(state).await?;
+    crate::trash::is_live(&storage, id)
+        .await
+        .map_err(|e| refused(&e))
 }
 
 /// Why a patch was refused, in words for the user (General 0.6.94).
@@ -1595,6 +1607,41 @@ mod tests {
         let body =
             String::from_utf8_lossy(&call_in(&state, "compose", &scope, args).await).into_owned();
         assert!(!body.contains("not_found"), "{body}");
+    }
+
+    /// L6-F2: a deleted document is gone for every tool, by id or by name,
+    /// its jobs too, though its grant still names it.
+    #[tokio::test]
+    async fn a_deleted_document_is_absent_to_every_tool() {
+        let (_dir, state) = opened().await;
+        add_failed_job(&state, "'x'").await;
+        let other = add_document(&state, 2, "'发票.pdf'").await;
+        let scope = [DOC, other.as_str()];
+        let storage = state.storage().await.unwrap();
+        crate::trash::delete(&storage, DOC, &Origin::Page)
+            .await
+            .unwrap();
+        for (op, args) in [
+            ("get", json!({ "document_id": DOC })),
+            ("paragraphs", json!({ "document_id": DOC })),
+            ("read_range", json!({ "document_id": DOC, "revision": 1 })),
+            ("job_get", json!({ "job_id": JOB })),
+            ("compose", json!({ "parts": [{ "document_id": DOC }] })),
+        ] {
+            let body = call_in(&state, op, &scope, args).await;
+            assert_module_error(&body, "not_found", false);
+        }
+        // By its name: not resolved, so not that document.
+        let body = call_in(
+            &state,
+            "get",
+            &scope,
+            json!({ "document_id": "the job's document" }),
+        )
+        .await;
+        assert!(!String::from_utf8_lossy(&body).contains("completed"));
+        let list = payload(&call_in(&state, "list", &scope, json!({})).await);
+        assert_eq!(list["documents"].as_array().unwrap().len(), 1, "{list}");
     }
 
     /// FU-136 (General 0.6.72): three documents titled 《中文测试合同.pdf》; a

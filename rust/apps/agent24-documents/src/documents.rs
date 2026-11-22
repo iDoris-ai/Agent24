@@ -177,7 +177,8 @@ pub(crate) async fn list(
     // `?4` is NULL for REST (`only` absent); a tool scope binds its ids.
     let rows: Vec<Document> = match sqlx::query_as(
         "SELECT id, title, media_type, head_revision, created_at, updated_at FROM documents
-         WHERE (?1 IS NULL OR (created_at, id) < (?1, ?2))
+         WHERE deleted_at IS NULL
+           AND (?1 IS NULL OR (created_at, id) < (?1, ?2))
            AND (?4 IS NULL OR id IN (SELECT value FROM json_each(?4)))
          ORDER BY created_at DESC, id DESC LIMIT ?3",
     )
@@ -291,7 +292,7 @@ pub(crate) async fn get(storage: &Storage, id: &str) -> Result<DocumentDetail, A
                 r.revision, r.content_sha256, r.size, r.media_type AS head_media_type
          FROM documents d
          LEFT JOIN revisions r ON r.document_id = d.id AND r.revision = d.head_revision
-         WHERE d.id = ?",
+         WHERE d.id = ? AND d.deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(storage.db.pool())
