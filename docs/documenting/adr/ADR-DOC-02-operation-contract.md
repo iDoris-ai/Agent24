@@ -399,4 +399,4 @@
 - 抽取的业务键去掉 `model_id`：内核路由器在调用时才选模型，事先问不到；实际模型记在结果里，换模型用 rerun（§5.4，#863）。
 
 ## 修订记录
-- **2026-11-22（David，Loop 6 F2「删除文档」）**：§2 第 4 条与 Q2 由「DOC-1 不提供删除」改为「软删除 + 7 天内可恢复 + 到期 GC」。页面（`POST /documents/{id}/delete`、`/restore`、`GET /recently-deleted`）和 Agent 工具 `documents.delete` 都能删除；Agent 的每次删除都要用户在审批卡上确认，工具只收文档 id，按名字对上多份时不替用户挑（FU-136）。S04「不能删除唯一原件」在单用户阶段由「软删除 + 7 天恢复」满足。blob 的真正回收（GC）尚未实现，见 FU-177。
+- **2026-11-22（David，Loop 6 F2「删除文档」）**：§2 第 4 条与 Q2 由「DOC-1 不提供删除」改为「软删除 + 7 天内可恢复 + 到期 GC」。页面（`POST /documents/{id}/delete`、`/restore`、`GET /recently-deleted`，#2025）和 Agent 工具 `documents.delete`（后续片 #2026；CLI `documents delete/restore/deleted` 同在 #2026，文档页「删除」「最近删除」在 #2027）都能删除；Agent 的每次删除都要用户在审批卡上确认，工具只收文档 id，按名字对上多份时不替用户挑（FU-136）。S04「不能删除唯一原件」在单用户阶段由「软删除 + 7 天恢复」满足。blob 的真正回收（GC）尚未实现，见 FU-177。

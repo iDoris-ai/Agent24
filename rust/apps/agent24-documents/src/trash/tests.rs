@@ -178,3 +178,66 @@ async fn a_pdf_document_says_how_many_pages_it_has() {
     let (_, detail) = send(&state, Method::GET, &format!("/documents/{DOC}")).await;
     assert!(detail.get("pages").is_none(), "{detail}");
 }
+
+/// PR-Daemon #2025 ①②③: a deleted document stays hidden through an escaped
+/// id, a composition naming it in its body, and its jobs and extractions.
+#[tokio::test]
+async fn a_deleted_document_is_hidden_on_every_route_that_names_it() {
+    let (_dir, state) = opened().await;
+    let job = "job_01K75A0B1C2D3E4F5G6H7J8K9M";
+    let ext = "ext_01K75A0B1C2D3E4F5G6H7J8K9M";
+    let sha = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    exec(
+        &state,
+        &format!(
+            "INSERT INTO jobs (id, kind, status, origin, document_id, revision)
+                    VALUES ('{job}', 'probe', 'failed', '{{\"kind\":\"page\"}}', '{DOC}', 1);
+             INSERT INTO text_layers (text_layer_sha256, content_sha256, engine_id, engine_version, config_sha256)
+                    VALUES ('{}', '{SHA}', 'e', '1', '{}');
+             INSERT INTO extractions (id, document_id, revision, schema_sha256, extractor_version, model_id, text_layer_sha256)
+                    VALUES ('{ext}', '{DOC}', 1, '{}', '7', 'm', '{}');",
+            sha('a'),
+            sha('b'),
+            sha('c'),
+            sha('a')
+        ),
+    )
+    .await;
+    // Before: the job's and extraction's routes reach their handlers.
+    for path in [format!("/jobs/{job}"), format!("/extractions/{ext}")] {
+        let (status, body) = send(&state, Method::GET, &path).await;
+        assert_ne!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+    send(&state, Method::POST, &format!("/documents/{DOC}/delete")).await;
+    let escaped = format!(
+        "{}%{:02X}",
+        &DOC[..DOC.len() - 1],
+        DOC.as_bytes()[DOC.len() - 1]
+    );
+    for (method, path) in [
+        (Method::GET, format!("/documents/{escaped}/paragraphs")),
+        (Method::GET, format!("/documents/{escaped}/content")),
+        (
+            Method::GET,
+            format!("/documents/{escaped}/revisions/1/text"),
+        ),
+        (Method::GET, format!("/jobs/{job}")),
+        (Method::POST, format!("/jobs/{job}/retry")),
+        (Method::GET, format!("/extractions/{ext}")),
+    ] {
+        let (status, body) = send(&state, method, &path).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}: {body}");
+    }
+    let res = crate::router(state.clone())
+        .oneshot(
+            Request::post("/compositions")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(
+                    "{{\"parts\":[{{\"document_id\":\"{DOC}\"}}]}}"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
