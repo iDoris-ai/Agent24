@@ -22,7 +22,7 @@ let store: ReturnType<typeof createChatHistoryStore>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
 type Run = { status: string; started_at?: string; ended_at?: string | null; output?: { text: string } | null; knowledge?: unknown; error?: { code: string; message: string } | null }
 let runs: Record<string, Run>
-let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string; payload?: unknown }[]
+let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string; payload?: unknown }[] | null
 let proxy: ReturnType<typeof vi.fn>
 let approvalDecide: ReturnType<typeof vi.fn>
 let emit: (event: RunEvent) => void
@@ -51,7 +51,9 @@ beforeEach(() => {
     }
     const cancel = /^\/api\/v1\/runs\/([^/]+)\/cancel$/.exec(req.path)
     if (cancel) { runs[cancel[1]] = { ...runs[cancel[1]], status: 'cancelled', ended_at: at }; return { ok: true, status: 200, data: {} } }
-    if (req.path === '/api/v1/approvals?status=pending') return { ok: true, status: 200, data: { approvals } }
+    if (req.path === '/api/v1/approvals?status=pending') {
+      return approvals ? { ok: true, status: 200, data: { approvals } } : { ok: false, status: 503, data: { error: { code: 'unavailable', message: 'down' } } }
+    }
     const listed = /^\/api\/v1\/runs\?status=(\w+)$/.exec(req.path)
     if (listed) return { ok: true, status: 200, data: { runs: Object.entries(runs).filter(([, r]) => r.status === listed[1]).map(([id, r]) => ({ id, ...r })) } }
     const id = decodeURIComponent(req.path.replace('/api/v1/runs/', ''))
@@ -343,6 +345,18 @@ describe('task cards (M4 A4)', () => {
     await show()
     expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('正在继续…')
     expect(card('等你确认')).not.toHaveTextContent('不能在这里确认')
+  })
+
+  // PR-Daemon #2003 L1: the list of approvals could not be read; whether one
+  // waits is not known, so the card does not say it goes on.
+  it('the pending approvals could not be read: not 「正在继续…」', async () => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at }
+    approvals = null
+    await show()
+    expect(await within(await waitFor(() => card('等你确认'))).findByRole('note')).toHaveTextContent('不能在这里确认')
+    expect(card('等你确认')).not.toHaveTextContent('正在继续')
   })
 
   it('points to the terminal for an approval it can neither confirm nor deny', async () => {
@@ -759,8 +773,17 @@ describe('approvalDetail', () => {
     let deep: Record<string, unknown> = { end: 1 }
     for (let i = 0; i < 10_000; i++) deep = { a: deep }
     const text = approvalDetail({ summary: 'x: {}', payload: deep }, t)
-    expect(text).toContain('……（更深的内容已折叠）')
+    expect(text).toContain('……（其余内容已折叠）')
     expect(text.split('\n').length).toBeLessThan(20)
+  })
+
+  // PR-Daemon #2004 follow-up: the fold is said only when something was left out.
+  it('says 「其余内容已折叠」 only when lines were left out', () => {
+    const items = (n: number) => approvalDetail({ summary: 'x: {}', payload: { arr: Array.from({ length: n }, (_, i) => i) } }, t)
+    expect(items(399)).not.toContain('已折叠')
+    expect(items(400)).toContain('……（其余内容已折叠）')
+    const tail = approvalDetail({ summary: 'x: {}', payload: { arr: Array.from({ length: 1000 }, (_, i) => i), tail: 'END' } }, t)
+    expect(tail).toContain('其余内容已折叠')
   })
 
   it('no payload (an older daemon), or a patch without its edits: the summary as the daemon wrote it', () => {

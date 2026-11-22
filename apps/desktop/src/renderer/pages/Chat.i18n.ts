@@ -178,7 +178,7 @@ export const chatMessages = defineMessages({
     'task.ask.patchUnread': '第 {n} 段：正在读取原文…→「{to}」',
     'task.ask.atLeast': '至少 {n}',
     'task.ask.tool': '使用「{tool}」',
-    'task.detail.tool': '操作：{tool}', 'task.detail.empty': '（空）', 'task.detail.folded': '……（更深的内容已折叠）',
+    'task.detail.tool': '操作：{tool}', 'task.detail.empty': '（空）', 'task.detail.folded': '……（其余内容已折叠）',
     'task.anchorSentBack': '【未完成】本次没有改写，也没有生成任何文档：第 {n} 段（index {index}）开头是「{opening}」，和给的 anchor 对不上。请先告诉用户这次没改成，不要说已保存或已完成；然后用 documents.paragraphs 确认段号，照抄那一段开头至少 12 个字作为 anchor，重新调用 documents.patch。',
     'task.documentUnchanged': '⚠️ 这次没有改动文档：没有生成新文档。',
     'task.documentMade': '已生成：《{title}》（在文档页）',
