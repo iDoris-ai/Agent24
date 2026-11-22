@@ -1271,6 +1271,15 @@ describe('ChatPage: one sentence extracts fields (F3)', () => {
     expect(pendingDocFocus()).toEqual({ documentId: 'doc_1', page: 1, blockId: 'p1/b2' })
   })
 
+  it('says in Chinese when the module has no model, the code only under 「详情」', async () => {
+    request.mockImplementationOnce(async () => ({ ok: true, data: { document_id: 'doc_1', title: '合同.pdf', head: { revision: 1, media_type: 'application/pdf' } } }))
+    request.mockImplementationOnce(async () => ({ ok: false, status: 503, error: { code: 'engine_unavailable', message: 'the kernel offers this module no model', details: { engine: 'local-model' } } }) as never)
+    await start('把这份合同的甲方抽出来')
+    await waitFor(() => expect(screen.getByText('没能完成抽取：本地模型没有分配给文档模块，暂时不能抽取。')).toBeInTheDocument())
+    const detail = screen.getByText(/the kernel offers this module no model/)
+    expect(detail.closest('details')).not.toBeNull()
+  })
+
   it('leaves 「这个字段怎么填」 to the model', async () => {
     await start('这个字段怎么填')
     await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())

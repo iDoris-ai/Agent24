@@ -253,11 +253,11 @@ export default function ChatPage() {
         else {
           const card = await extractFields(api, subject.id, names)
           reply = 'error' in card
-            ? { role: 'assistant', content: `没能完成抽取：${card.error}` }
+            ? { role: 'assistant', content: `没能完成抽取：${card.error}`, ...(card.detail ? { detail: card.detail } : {}) }
             : { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + extractText(card), extraction: card }
         }
       } catch (e) {
-        reply = { role: 'assistant', content: `没能完成抽取：${e instanceof Error ? e.message : String(e)}` }
+        reply = { role: 'assistant', content: '没能完成抽取。', detail: e instanceof Error ? e.message : String(e) }
       }
       setDelivery(index, { kind: 'sent' })
       setMessages(prev => [...prev, reply])
