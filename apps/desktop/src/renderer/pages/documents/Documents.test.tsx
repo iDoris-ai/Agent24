@@ -949,6 +949,31 @@ describe('DocumentsPage: a document and its text', () => {
     expect(pendingDocFocus()).toBeNull()
   })
 
+  // F3: the document page's 「抽取字段…」, field names comma-separated.
+  it('extracts the typed fields and shows them with their sources', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [() => ok(text([block('b1', '甲方：张三', 1)]))])
+    const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+    m.request.mockImplementation((req: { op: string }) => {
+      if (req.op === 'get') return ok(detail(1))
+      if (req.op === 'extract') return ok({ ...job('succeeded'), kind: 'extract', result: { extraction_id: 'ext_1' } })
+      if (req.op === 'getExtraction') return ok({ next_cursor: null, values: [
+        { key: 'f1', status: 'present', value: '张三', anchors: [{ block_id: 'b1', page: 1, quote: '甲方：张三' }] },
+        { key: 'f2', status: 'missing', missing_reason: 'not_in_document' },
+      ] })
+      return base(req)
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    fireEvent.click(await screen.findByRole('button', { name: '抽取字段…' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /字段名/ }), { target: { value: '甲方，开户银行' } })
+    fireEvent.click(screen.getByRole('button', { name: '抽取' }))
+    await waitFor(() => expect(screen.getByRole('group', { name: '抽取结果' })).toBeInTheDocument())
+    const asked = m.request.mock.calls.find(([r]) => r.op === 'extract')![0]
+    expect(asked.schema.fields.map((f: { description: string }) => f.description)).toEqual(['甲方', '开户银行'])
+    expect(within(screen.getByRole('group', { name: '抽取结果' })).getByText('文档里没找到')).toBeInTheDocument()
+  })
+
   // PR-Daemon #2019 ②: a page of text that fails to read is not asked for again and again.
   it('stops reading on for the focused block when a page fails, and keeps the page shown', async () => {
     const m = mount({ lists: [page([1])] })
