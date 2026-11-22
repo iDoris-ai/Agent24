@@ -88,6 +88,7 @@ pub struct CallbackDeps {
     /// is `None` gets no grant, same outcome as not holding the capability
     /// (invariant #134).
     pub models: Option<crate::model_callback::ModelCallbackDeps>,
+    pub assistant: Option<crate::assistant_callback::AssistantCallbackDeps>,
 }
 
 // Single definition lives in `attached` so attach validation and mount
@@ -1845,6 +1846,7 @@ pub(crate) fn build_methods_for(
     // `None` into `forbidden` (same shape as the approval/events/scheduler
     // methods above — capability gating lives inside `call()`).
     model_grant: Option<crate::model_callback::ModelGrant>,
+    assistant_grant: Option<crate::assistant_callback::AssistantGrant>,
 ) -> agent24_os_proto::supervisor::MethodsFor {
     // ME4-1.4.1 (design §6.4, v2 M3): ONE token bucket per MOUNT — built
     // here, outside the closure below, exactly like `memory_entitlement`
@@ -2008,10 +2010,15 @@ pub(crate) fn build_methods_for(
                         limiter: scheduler_limiter.clone(),
                     }),
                 )
-                // ME4-4.2.2b2 (design §2.4): registered UNCONDITIONALLY, same
-                // rule as every method above — `model_grant` is `None` for a
-                // module that does not hold `Capability::Models`, and the
-                // handler itself turns that into `forbidden` (§4.4).
+                // Both callbacks are registered even without grants; their
+                // handlers return forbidden when capability admission refused.
+                .with(
+                    "_a24/assistant/chat",
+                    Arc::new(crate::assistant_callback::AssistantChatHandler {
+                        generation: generation.clone(),
+                        grant: assistant_grant.clone(),
+                    }),
+                )
                 .with(
                     "_a24/model/complete",
                     Arc::new(crate::model_callback::ModelCompleteHandler {
@@ -2204,11 +2211,14 @@ async fn mount_package(
     // handle (`lend()` failed, or ephemeral has no admission) must not
     // appear here — the same rule the in-process path already applies via
     // `scoped.is_some()`. Same rule for `models` via `model_grant.is_some()`.
+    let assistant_grant =
+        crate::assistant_callback::assistant_grant(&name, &granted, deps.assistant.as_ref());
     let granted_names: Vec<String> = granted
         .iter()
         .map(|c| c.as_str().to_owned())
         .filter(|c| c != Capability::Memory.as_str() || memory_grant.is_some())
         .filter(|c| c != Capability::Models.as_str() || model_grant.is_some())
+        .filter(|c| c != Capability::Assistant.as_str() || assistant_grant.is_some())
         .collect();
     // T7b/ME-3e: additive, not if/else (design doc §"现状" 1) — a module
     // granted ONLY `approval` (not `events`) must still get a non-empty
@@ -2234,6 +2244,9 @@ async fn mount_package(
     if model_grant.is_some() {
         provides.push("_a24/model/".to_owned());
     }
+    if assistant_grant.is_some() {
+        provides.push("_a24/assistant/".into());
+    }
     let offer = agent24_os_proto::initialize::Offer { provides };
     let methods_for: agent24_os_proto::supervisor::MethodsFor = build_methods_for(
         name.clone(),
@@ -2243,6 +2256,7 @@ async fn mount_package(
         memory_entitlement.clone(),
         deps.scheduler.clone(),
         model_grant,
+        assistant_grant,
     );
 
     let current =
@@ -2488,6 +2502,7 @@ pub(crate) mod tests {
                 Arc::new(|_body: EventBody| {}),
             ),
             models: None,
+            assistant: None,
         }
     }
 
@@ -7653,6 +7668,7 @@ while f.readline():
             crate::os_memory::MemoryEntitlement::NONE,
             deps.scheduler.clone(),
             None,
+            None,
         );
 
         async fn call_list(
@@ -7791,6 +7807,7 @@ while f.readline():
             crate::os_memory::MemoryEntitlement::NONE,
             deps.scheduler.clone(),
             Some(model_grant),
+            None,
         );
 
         // Generation 1: exhaust the 30-call burst. No provider is configured
@@ -7865,6 +7882,7 @@ while f.readline():
             crate::os_memory::MemoryEntitlement::NONE,
             deps.scheduler.clone(),
             model_grant_other,
+            None,
         );
         let gen_other = agent24_os_proto::drain::Generation::serving_at(
             "/tmp/me4s2b2-does-not-need-to-exist".into(),

@@ -22,7 +22,7 @@ impl RunManager {
         schedule_id: Option<String>,
     ) -> Result<Run, AgentError> {
         self.ready_run(
-            self.start_run_inner(create, schedule_id, |_| {}, None, None)
+            self.start_run_inner(create, schedule_id, |_| {}, None, None, None)
                 .await?,
         )
     }
@@ -47,8 +47,20 @@ impl RunManager {
         before_execute: impl FnOnce(&Run),
         providers: Option<&dyn SkillProviderSource>,
     ) -> Result<Run, AgentError> {
+        self.start_run_then_with_system(create, before_execute, providers, None)
+            .await
+    }
+
+    /// Kernel-owned system instruction, persisted with the first-call snapshot.
+    pub async fn start_run_then_with_system(
+        self: &Arc<Self>,
+        create: RunCreate,
+        before_execute: impl FnOnce(&Run),
+        providers: Option<&dyn SkillProviderSource>,
+        system: Option<String>,
+    ) -> Result<Run, AgentError> {
         self.ready_run(
-            self.start_run_inner(create, None, before_execute, None, providers)
+            self.start_run_inner(create, None, before_execute, None, providers, system)
                 .await?,
         )
     }
@@ -72,7 +84,7 @@ impl RunManager {
             )));
         }
         match self
-            .start_run_inner(create, None, |_| {}, Some(origin), None)
+            .start_run_inner(create, None, |_| {}, Some(origin), None, None)
             .await?
         {
             RunStart::Ready(run) => Ok(InboundRunStart::Started(run)),
@@ -100,6 +112,7 @@ impl RunManager {
         before_execute: impl FnOnce(&Run),
         inbound: Option<InboundOrigin>,
         providers: Option<&dyn SkillProviderSource>,
+        system: Option<String>,
     ) -> Result<RunStart, AgentError> {
         // Skill admission comes first and writes nothing. Inbound runs,
         // self-wake runs and workspace-bound runs cannot carry a skill.
@@ -240,7 +253,12 @@ impl RunManager {
                 let run_id = run_id.clone();
                 async move {
                     manager
-                        .execute(run_id, token, create.idoris_headroom_confirmed)
+                        .execute_with_system(
+                            run_id,
+                            token,
+                            create.idoris_headroom_confirmed,
+                            system,
+                        )
                         .await
                 }
             });
