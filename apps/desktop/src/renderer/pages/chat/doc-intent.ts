@@ -166,20 +166,30 @@ const NOT_EXTRACTION = /怎么|如何|为什么|什么意思|填|改写|改成|�
 /** 「这份合同的」「这张发票的」「这份通知里」 before the fields. */
 const DOC_PREFIX = /^(?:请|帮我)?\s*(?:把|将|从|在)?\s*(?:这|该|本|此|那)[份张个篇封]?[\u4e00-\u9fa5A-Za-z0-9]{0,8}?(?:里面?的?|中的?|上的?|的)/
 const FIELD_TAIL = /(?:分别|都)?(?:是)?(?:多少|什么|哪些|哪天|几号|哪一天)?[？?]?$/
+/** A question, not a request (「你能列出来这份文档的大纲吗」, PR-Daemon #2019 ①). */
+const ASKS = /(?:吗|呢)[？?]?$|[？?]$/
+/** What is done with the fields after (「…列出来提醒我」「…抽出来做个图」): more than
+ * an extraction, so the model answers it (#2019 ①). */
+const THEN_DOES = /^(?:单独|看看|看一下|提醒|做|画|生成|发给|告诉|整理|帮|给|让|然后|再|并|方便)/
+/** Not fields but open-ended asks (「把问题列出来」「列出来所有的风险点」), or a
+ * clause by its number (「把第3条抽出来」): the model answers them (#2019 ①). */
+const NOT_A_FIELD = /^(?:所有的?|全部的?)?(?:问题|风险点?|大纲|要点|重点|内容|数据|信息|关键信息|细节|条款)$|^第.{1,6}[条款段页章节]$/
 
 /** The field names a turn asks to extract from its document: null when it
  * asks for something else; [] when it asks to extract but names no field
  * the rules can read (the model is then asked only for the names). */
 export function extractionFields(text: string, inDocument: boolean): string[] | null {
-  if (!aboutDocument(text, inDocument) || NOT_EXTRACTION.test(text) || parseDocIntent(text) !== null) return null
+  if (!aboutDocument(text, inDocument) || NOT_EXTRACTION.test(text) || ASKS.test(text.trim()) || parseDocIntent(text) !== null) return null
   const said = text.replace(/《[^》]{1,200}》/g, '这份')
   const verb = EXTRACT_VERB.exec(said) ?? (FIND_WHAT.test(said) ? FIND_VERB.exec(said) : null)
   if (!verb) return null
   const clauses = (s: string) => s.split(/[，。,；;！!\n]/).map((c) => c.trim()).filter(Boolean)
   const before = clauses(said.slice(0, verb.index))
   const after = clauses(said.slice(verb.index + verb[0].length))[0]?.replace(/^(?:来|一下|吧|给我)+/, '') ?? ''
+  if (THEN_DOES.test(after)) return null
   let list = after.length > 1 ? after : (before[before.length - 1] ?? '')
   list = list.replace(DOC_PREFIX, '').replace(/(?:帮我|给我|请)?(?:都)?$/, '').replace(FIELD_TAIL, '').replace(/等(?:信息|内容|字段)?$|这些(?:信息|内容|字段)?$/, '')
   const names = list.split(/以及|还有|[、，,和与及跟/]/).map((n) => n.replace(/^(?:把|将|的)+/, '').trim()).filter((n) => n.length > 0 && n.length <= 30)
+  if (names.some((n) => NOT_A_FIELD.test(n))) return null
   return [...new Set(names)].slice(0, 20)
 }

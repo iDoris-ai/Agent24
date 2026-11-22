@@ -51,9 +51,9 @@ impl Window {
     }
 }
 
-/// The windows of `layer` within `budget` bytes each. A block is at most
-/// 16 KiB of text (§3.1), so with its JSON it fits a window of 24 KiB
-/// unless its text is escaped many times over.
+/// The windows of `layer` within `budget` bytes each. A block over the
+/// budget (a block is at most 16 KiB of text, §3.1) is a window by itself:
+/// that one request is over the balanced local budget.
 #[must_use]
 pub fn windows(layer: &TextLayer, budget: usize) -> Vec<Window> {
     let size = |i: usize| cost(&layer.blocks[i]);

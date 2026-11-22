@@ -21,7 +21,8 @@ pub mod window;
 /// call answers freely first, held to the schema only when that is not an
 /// answer, and a window of part of the document is told so (2026-10-17).
 /// 6: that window is told to answer what its blocks state (2026-10-17).
-pub const EXTRACTOR_VERSION: &str = "6";
+/// 7: windows of 7 KiB, not 24, for the balanced local budget (F3, 2026-11-22).
+pub const EXTRACTOR_VERSION: &str = "7";
 
 /// A requested field (`DocumentsExtractField`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

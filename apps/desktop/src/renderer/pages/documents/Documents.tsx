@@ -340,6 +340,7 @@ export default function DocumentsPage() {
           onTranslate={(id, lang) => { setAutoCheck(null); setAutoTranslate({ id, lang }); setOpen(id) }}
           onClose={() => {
             setAutoTranslate(null)
+            setFocus(null)
             setOpen(null)
             ;(opener.current?.isConnected ? opener.current : pageTitle.current)?.focus()
           }}
@@ -368,7 +369,7 @@ export default function DocumentsPage() {
                   )}
                 </td>
                 <td style={CELL}>
-                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
+                  <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setFocus(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
                     {d.title}
                   </button>
                 </td>

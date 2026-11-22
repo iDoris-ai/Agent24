@@ -949,6 +949,24 @@ describe('DocumentsPage: a document and its text', () => {
     expect(pendingDocFocus()).toBeNull()
   })
 
+  // PR-Daemon #2019 ②: a page of text that fails to read is not asked for again and again.
+  it('stops reading on for the focused block when a page fails, and keeps the page shown', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [
+      () => ok(text([block('b1', '第一段', 1)], 'cc01')),
+      () => err(400, 'invalid_request', '游标失效'),
+      () => ok(text([block('b9', '不该读到', 3)])),
+    ])
+    rendering(m, { 1: png('UDE='), 2: png('UDI=') })
+    const { focusDocument } = await import('./doc-focus')
+    focusDocument({ documentId: doc(1).document_id, page: 2, blockId: 'b2' })
+    render(<DocumentsPage />)
+    expect(await screen.findByRole('img', { name: '第 2 页原图' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('游标失效'))
+    await tick(100)
+    expect(reads(m)).toHaveLength(2)
+  })
+
   it('a page rendered for a document no longer open is dropped', async () => {
     const m = mount({ lists: [page([1, 2])] })
     let late: () => void = () => {}
