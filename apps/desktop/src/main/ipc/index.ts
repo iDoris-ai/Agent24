@@ -29,7 +29,7 @@ import { handleSkillActivate } from '../skill-activate'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
-import { approvalDialog, type DocumentLookups } from '../approval-dialog'
+import { approvalDialog, wholeLibrary, type DocumentLookups } from '../approval-dialog'
 import { desktopSin90ExportToFile, desktopSin90ImportFromFile, desktopSin90Write, sin90KeyAvailable } from '../sin90-write'
 import { importFile } from '../documents-import'
 import type { ModuleActionResult } from '../documents-module'
@@ -518,12 +518,7 @@ const approvalDocumentLookups: DocumentLookups = {
     const title = (data as { title?: unknown } | null)?.title
     return typeof title === 'string' && title ? title : null
   }),
-  list: () => readDocument({ op: 'list', limit: 200 }, (data) => {
-    const docs = (data as { documents?: unknown } | null)?.documents
-    if (!Array.isArray(docs)) return null
-    return docs.flatMap((d: { document_id?: unknown; title?: unknown }) =>
-      typeof d?.document_id === 'string' && typeof d.title === 'string' ? [{ id: d.document_id, title: d.title }] : [])
-  }),
+  list: () => readDocument({ op: 'list', limit: 200 }, wholeLibrary),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs
     if (!Array.isArray(list)) return null
