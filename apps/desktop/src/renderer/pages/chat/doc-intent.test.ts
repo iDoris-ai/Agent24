@@ -181,6 +181,14 @@ describe('F3: one sentence asks for fields of the document', () => {
     expect(parseDocIntent(text)).toBeNull()
   })
 
+  it.each([
+    ['把合同金额抽取出来', ['合同金额']],
+    ['把金额、日期抽出来，谢谢', ['金额', '日期']],
+    ['列出来甲方和乙方', ['甲方', '乙方']],
+  ])('PR-Daemon #2019: %s', (text, fields) => {
+    expect(extractionFields(text, true)).toEqual(fields)
+  })
+
   it('names a document in 《》 outside its conversation', () => {
     expect(extractionFields('把《租赁合同.pdf》的租金、押金抽出来', false)).toEqual(['租金', '押金'])
   })
@@ -188,6 +196,26 @@ describe('F3: one sentence asks for fields of the document', () => {
   it('asks to extract without fields the rules can read', () => {
     expect(extractionFields('抽取一下', true)).toEqual([])
   })
+})
+
+// PR-Daemon #2019 ①: whatever is said after the verb asks for more than an
+// extraction, so every pairing of these fields and these follow-ups goes to the model.
+describe('F3: an extraction followed by something more goes to the model', () => {
+  const asks = [
+    ['把重要日期都列出来', '，到时候提醒我'], ['把日期列出来', '记到日历里'], ['把金额都列出来', '算个总数'],
+    ['把联系人抽出来', '存到通讯录'], ['把甲方信息抽出来', '发邮件给老王'], ['把付款日期列出来', '，我好安排资金'],
+    ['把金额列出来', '按大小排序'], ['把截止日期找出来', '加到待办'], ['把材料清单列出来', '打印'],
+    ['把金额抽出来', '换算成美元'], ['把联系人、电话抽出来', '备用'], ['列出来甲方和乙方', '，然后发给我'],
+  ] as const
+  for (const [ask, then] of asks) {
+    it(ask + then, () => {
+      expect(extractionFields(ask + then, true)).toBeNull()
+      expect(extractionFields(ask, true)).not.toBeNull()
+    })
+  }
+  for (const text of ['把这份合同里需要注意的地方列出来', '把这份合同的第三部分抽出来', '把里面需要我签字的地方列出来']) {
+    it(text, () => expect(extractionFields(text, true)).toBeNull())
+  }
 })
 
 describe('F3: ordinary questions and other tasks are not extractions', () => {

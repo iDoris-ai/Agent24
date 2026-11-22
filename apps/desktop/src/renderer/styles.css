@@ -596,4 +596,6 @@ button { cursor: pointer; font-family: var(--font); }
 .extract-card-table td { border-top: 1px solid var(--border); vertical-align: top; padding: 4px 8px 4px 0; }
 .extract-card-name { white-space: nowrap; }
 .extract-card-muted { color: var(--muted); font-size: 12px; }
-.extract-card-source { font-size: 12px; padding: 0 4px; }
+.extract-card-value { margin: 2px 0; }
+.extract-card-answer { font-size: 12px; margin-top: 6px; }
+.extract-card-source { font-size: 12px; padding: 0 4px; margin-left: 4px; }

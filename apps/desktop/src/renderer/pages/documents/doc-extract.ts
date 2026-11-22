@@ -17,9 +17,9 @@ const OFFICE = /officedocument/
 
 export interface ExtractRow {
   name: string
-  /** The value as written; several when the document states different ones. */
-  values: string[]
-  sources: Source[]
+  /** Each value as written, with the blocks it was read from: several when
+   * the document states different ones (a conflict, never resolved here). */
+  found: Array<{ value: string; sources: Source[] }>
 }
 export interface ExtractCardData {
   /** The document the sources are in (an Office document's PDF). */
@@ -38,7 +38,12 @@ function typeOf(name: string): 'date' | 'amount' | 'text' {
 }
 
 /** A failure: said in plain Chinese; what the OS answered kept for 「详情」. */
-export interface ExtractFailure { error: string; detail?: string }
+export interface ExtractFailure {
+  error: string
+  detail?: string
+  /** Not a failure: the job is still running. */
+  pending?: true
+}
 type Failed = Parameters<typeof describeError>[0]
 
 function failed(res: Failed): ExtractFailure {
@@ -97,7 +102,7 @@ export async function extractFields(
   }
   const extractionId = job.result?.extraction_id
   if (job.status === 'queued' || job.status === 'running') {
-    return { error: '抽取还在进行（长文档要更久）。稍后再说一次同样的话，会直接用这次的结果。', detail: job.job_id }
+    return { error: '抽取还在进行，长文档要更久，请过几分钟再试。', detail: job.job_id, pending: true }
   }
   if (job.status !== 'succeeded' || !extractionId) {
     const detail = job.error ? `${job.error.message}（${job.error.code}）` : job.status
@@ -115,23 +120,26 @@ export async function extractFields(
   const rows = fields.map((f): ExtractRow => {
     const v = values.find((x) => x.key === f.key)
     const src = (anchors?: readonly Anchor[]): Source[] => (anchors ?? []).map((a) => ({ block_id: a.block_id, page: a.page, quote: a.quote }))
-    if (v?.status === 'present') return { name: f.description, values: [v.value ?? ''], sources: src(v.anchors) }
+    if (v?.status === 'present') return { name: f.description, found: [{ value: v.value ?? '', sources: src(v.anchors) }] }
     if (v?.status === 'conflict') {
       const c = v.candidates ?? []
-      return { name: f.description, values: c.map((x) => x.value), sources: c.flatMap((x) => src(x.anchors)) }
+      return { name: f.description, found: c.map((x) => ({ value: x.value, sources: src(x.anchors) })) }
     }
-    return { name: f.description, values: [], sources: [] }
+    return { name: f.description, found: [] }
   })
   return { documentId: docId, title, ...(docId !== got.data.document_id ? { converted: true } : {}), rows }
 }
 
 /** The card as plain text: what the conversation history keeps. */
 export function extractText(card: ExtractCardData): string {
+  const pages = (sources: Source[]) => {
+    const n = [...new Set(sources.flatMap((x) => (x.page === undefined ? [] : [x.page])))]
+    return n.length ? `（${card.converted ? '转换后' : ''}第 ${n.join('、')} 页）` : ''
+  }
   const lines = card.rows.map((r) => {
-    if (r.values.length === 0) return `- ${r.name}：文档里没找到`
-    const pages = [...new Set(r.sources.flatMap((s) => (s.page === undefined ? [] : [s.page])))]
-    const where = pages.length ? `（${card.converted ? '转换后' : ''}第 ${pages.join('、')} 页）` : ''
-    return `- ${r.name}：${r.values.join(' / ')}${r.values.length > 1 ? '（文档里写法不一致）' : ''}${where}`
+    if (r.found.length === 0) return `- ${r.name}：文档里没找到`
+    if (r.found.length === 1) return `- ${r.name}：${r.found[0].value}${pages(r.found[0].sources)}`
+    return `- ${r.name}：文档里有 ${r.found.length} 种写法，未替你选：${r.found.map((f) => `${f.value}${pages(f.sources)}`).join('；')}`
   })
   return [`从《${card.title}》抽取：`, ...lines].join('\n')
 }

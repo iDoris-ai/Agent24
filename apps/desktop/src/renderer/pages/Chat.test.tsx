@@ -1280,6 +1280,16 @@ describe('ChatPage: one sentence extracts fields (F3)', () => {
     expect(detail.closest('details')).not.toBeNull()
   })
 
+  // PR-Daemon #2019 ⑤: a turn taken for an extraction by mistake can still be answered.
+  it('answers the same words with the model when the card says it was not an extraction', async () => {
+    await start('把这份合同的甲方、开户银行抽出来')
+    fireEvent.click(await screen.findByRole('button', { name: '不是要抽取？让助手回答' }))
+    await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())
+    expect(request.mock.calls.filter(([r]) => r.op === 'extract')).toHaveLength(1)
+    const chat = mockBackendProxy.mock.calls.find(([req]) => req.path === '/api/v1/chat')![0]
+    expect(chat.body.messages.at(-1).content).toContain('把这份合同的甲方、开户银行抽出来')
+  })
+
   it('leaves 「这个字段怎么填」 to the model', async () => {
     await start('这个字段怎么填')
     await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())

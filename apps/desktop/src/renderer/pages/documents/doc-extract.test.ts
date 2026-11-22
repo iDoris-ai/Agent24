@@ -40,19 +40,19 @@ describe('F3 extractFields', () => {
       ] },
     })
     expect(card).toEqual({ documentId: 'doc_a', title: '合同.pdf', rows: [
-      { name: '甲方', values: ['张三'], sources: [anchor('p1/b2', 1, '甲方：张三')] },
-      { name: '开户银行', values: [], sources: [] },
-      { name: '金额', values: ['5000 元', '6000 元'], sources: [anchor('p2/b1', 2, '5000 元'), anchor('p3/b4', 3, '6000 元')] },
+      { name: '甲方', found: [{ value: '张三', sources: [anchor('p1/b2', 1, '甲方：张三')] }] },
+      { name: '开户银行', found: [] },
+      { name: '金额', found: [{ value: '5000 元', sources: [anchor('p2/b1', 2, '5000 元')] }, { value: '6000 元', sources: [anchor('p3/b4', 3, '6000 元')] }] },
     ] })
     if ('error' in card) throw new Error('no card')
-    expect(extractText(card)).toBe('从《合同.pdf》抽取：\n- 甲方：张三（第 1 页）\n- 开户银行：文档里没找到\n- 金额：5000 元 / 6000 元（文档里写法不一致）（第 2、3 页）')
+    expect(extractText(card)).toBe('从《合同.pdf》抽取：\n- 甲方：张三（第 1 页）\n- 开户银行：文档里没找到\n- 金额：文档里有 2 种写法，未替你选：5000 元（第 2 页）；6000 元（第 3 页）')
   })
 
   it('extracts a Word document as the PDF it was converted to', async () => {
     const { api, calls } = fakeApi('application/vnd.openxmlformats-officedocument.wordprocessingml.document', [])
     const card = await extractFields(api, 'doc_a', ['甲方'], async () => {})
     expect(calls.find((c) => c.op === 'extract')).toMatchObject({ documentId: 'doc_pdf', revision: 1 })
-    expect(card).toMatchObject({ documentId: 'doc_pdf', converted: true, rows: [{ name: '甲方', values: [] }] })
+    expect(card).toMatchObject({ documentId: 'doc_pdf', converted: true, rows: [{ name: '甲方', found: [] }] })
     // The PDF converted before is used again: no new document in the library.
     expect(calls.some((c) => c.op === 'convert')).toBe(false)
   })
