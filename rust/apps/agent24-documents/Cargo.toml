@@ -29,6 +29,7 @@ roxmltree = "0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "time", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+similar = "2"
 
 [dev-dependencies]
 # The kernel's own manifest validator, so the test proves the daemon would accept domain-os.yml.
