@@ -236,5 +236,7 @@ pub fn compare(left: &[Unit], right: &[Unit]) -> Comparison {
     }
 }
 
+pub mod route;
+
 #[cfg(test)]
 mod tests;
