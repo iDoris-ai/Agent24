@@ -110,7 +110,7 @@ export async function restoreVersion(api: Api, card: RestoreCardData): Promise<s
   if (!res.ok) {
     return res.error.code === 'revision_conflict'
       ? `《${card.title}》在这期间有了新的版本，这次没有恢复。请再说一次「回到上一个版本」。`
-      : `没能恢复，文档没有改动：${res.error.message}`
+      : `没能恢复，文档没有改动（${res.error.code}）。`
   }
   return res.data.committed
     ? `已恢复：第 ${card.from} 版的内容现在是《${res.data.title}》的第 ${res.data.revision} 版（当前版本），之前的版本都还在。`
