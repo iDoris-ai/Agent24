@@ -298,6 +298,7 @@ fn a_run_answered_without_the_tools_read_nothing() {
             search_refused: false,
             found_passages: 0,
             found_titles: vec![],
+            found: vec![],
         }
     );
     // Calls that did not complete, or other tools, read nothing either.
@@ -322,6 +323,7 @@ fn a_run_answered_without_the_tools_read_nothing() {
             search_refused: true,
             found_passages: 0,
             found_titles: vec![],
+            found: vec![],
         }
     );
 }
@@ -354,6 +356,7 @@ fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
             search_refused: false,
             found_passages: 0,
             found_titles: vec![],
+            found: vec![],
         }
     );
     // A search alone is a search, with nothing read back.
@@ -393,6 +396,7 @@ fn a_completed_searchs_hits_count_as_read() {
             search_refused: false,
             found_passages: 2,
             found_titles: vec![],
+            found: vec![],
         }
     );
     let failed = [stored(
@@ -499,4 +503,57 @@ fn found_passages_and_titles_come_from_the_completed_search_answers() {
         json!({ "query": "q" }),
     )];
     assert_eq!(run_knowledge_with(&failed, &answers).found_passages, 0);
+}
+
+/// L7-K1: each hit's library, document, chunk and title, from the same answers;
+/// never the passage text; each chunk once; at most eight; a hit with no
+/// library id (a malformed entry) is not listed.
+#[test]
+fn found_hits_name_the_library_and_carry_no_passage_text() {
+    let done = [stored(
+        SEARCH,
+        ToolCallStatus::Completed,
+        json!({ "query": "q" }),
+    )];
+    let mut evidence = vec![
+        json!({ "knowledge_base_id": "kb-a", "knowledge_id": "d1", "chunk_id": "c1", "title": "制度.pdf", "snippet": "秘密正文" }),
+        json!({ "knowledge_base_id": "kb-b", "knowledge_id": "d2", "chunk_id": "c2", "display": { "file_name": "项目.docx" } }),
+        json!({ "knowledge_base_id": "kb-a", "knowledge_id": "d1", "chunk_id": "c1", "title": "制度.pdf" }),
+        json!({ "knowledge_id": "d9", "chunk_id": "c9", "title": "no library" }),
+    ];
+    for i in 0..10 {
+        evidence.push(json!({ "knowledge_base_id": "kb-a", "knowledge_id": format!("x{i}"), "chunk_id": "c", "title": "t" }));
+    }
+    let answers = [json!({ "kind": "knowledge.search", "evidence": evidence }).to_string()];
+    let k = run_knowledge_with(&done, &answers);
+    assert_eq!(k.found.len(), 8);
+    assert_eq!(
+        k.found[..2],
+        [
+            FoundHit {
+                knowledge_base_id: "kb-a".into(),
+                knowledge_id: "d1".into(),
+                chunk_id: "c1".into(),
+                title: "制度.pdf".into()
+            },
+            FoundHit {
+                knowledge_base_id: "kb-b".into(),
+                knowledge_id: "d2".into(),
+                chunk_id: "c2".into(),
+                title: "项目.docx".into()
+            },
+        ]
+    );
+    assert!(
+        !serde_json::to_string(&k.found)
+            .unwrap()
+            .contains("秘密正文")
+    );
+    assert!(k.found.iter().all(|h| h.knowledge_id != "d9"));
+    let failed = [stored(
+        SEARCH,
+        ToolCallStatus::Failed,
+        json!({ "query": "q" }),
+    )];
+    assert!(run_knowledge_with(&failed, &answers).found.is_empty());
 }
