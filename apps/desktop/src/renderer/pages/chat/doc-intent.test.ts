@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -336,34 +336,5 @@ describe('L6-F2: deleting a whole document, and what is not', () => {
     expect(asksDeleteDocument(text, true)).toBe(false)
     expect(asksDeleteDocument(text, false)).toBe(false)
     expect(docAgentPrompt(null, text)).not.toContain('documents.delete')
-  })
-})
-
-describe('L7-K0 (FU-184): taking a numbered part out of a document is a rewrite', () => {
-  it.each([
-    ['把《合同-真实结构.docx》里的第 3 段删掉', false],
-    ['把《合同.docx》第3段删除', false],
-    ['删除第 2 段', true],
-    ['第三条去掉', true],
-    ['把第 5 句删了吧', true],
-  ])('%s → documents tools', (text, inDocument) => {
-    expect(asksDeleteParagraph(text, inDocument)).toBe(true)
-    expect(wantsDocTool(text, inDocument)).toBe(true)
-    // A rewrite, never the whole-document delete card.
-    expect(asksDeleteDocument(text, inDocument)).toBe(false)
-    expect(docAgentPrompt(null, text)).toContain('documents.patch')
-  })
-  it.each([
-    // Everyday questions and talk about something else stay with the knowledge bases.
-    ['烧开水要多久', false],
-    ['第 3 条建议删掉哪个比较好', false],
-    ['第 3 段怎么删', true],
-    ['《合同.docx》里第 3 段删掉会怎样？', false],
-    ['把第 3 个杯子洗了', false],
-    ['删除一份文件需要多久', false],
-    ['这份合同的违约金是多少', true],
-    ['把《合同.pdf》删了', false],
-  ])('%s → not a paragraph delete', (text, inDocument) => {
-    expect(asksDeleteParagraph(text, inDocument)).toBe(false)
   })
 })

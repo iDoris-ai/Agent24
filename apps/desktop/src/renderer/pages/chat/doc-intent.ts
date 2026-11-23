@@ -145,33 +145,15 @@ export function asksDeleteDocument(text: string, inDocument: boolean): boolean {
   return OBJECT_FIRST.test(said) || VERB_FIRST.test(said) || (inDocument && BARE.test(said))
 }
 
-/** L7-K0 (FU-184): 「把《X》里的第 3 段删掉」「删除第二段」「第 3 条去掉」: a verb
- * that takes a part away and a numbered part (段/条/句), with only a few
- * words between. It is a rewrite of the document (documents.patch), not a
- * delete of it and not a question for the knowledge bases. Everyday too
- * (「第 3 条建议删掉」 in a chat about anything), so only about a document. */
-const PART = '第\\s*[0-9一二三四五六七八九十百零两]+\\s*(?:段|条|句|个段落)'
-const TAKE_AWAY = '(?:删除|删掉|删了|删去|删|去掉|去除|移除|拿掉)'
-const DELETE_PART = new RegExp(`${TAKE_AWAY}[^，。！？,.!?]{0,4}${PART}|${PART}[^，。！？,.!?]{0,6}${TAKE_AWAY}`)
-/** Not a question about it (「第 3 段怎么删」), not a wish about someone else's. */
-const PART_QUESTION = /怎么|如何|能不能|可以吗|吗|呢|[？?]|为什么/
-
-/** Whether a turn asks to take one numbered part out of a document. */
-export function asksDeleteParagraph(text: string, inDocument: boolean): boolean {
-  return aboutDocument(text, inDocument) && !PART_QUESTION.test(text) && DELETE_PART.test(text)
-}
-
 /** Whether a turn goes to the Agent with the documents tools. */
 export function wantsDocTool(text: string, inDocument: boolean): boolean {
-  if (DOC_TOOL_WORDS.test(text) || asksDeleteDocument(text, inDocument) || asksDeleteParagraph(text, inDocument)) return true
+  if (DOC_TOOL_WORDS.test(text) || asksDeleteDocument(text, inDocument)) return true
   return aboutDocument(text, inDocument) && !asksTranslation(text, inDocument) && DOC_EDIT_WORDS.test(text)
 }
 
 /** Prefix the user turn so the Agent uses documents tools (D2b 正式版). M1: a
  * split is N calls of compose with one part each; one call with several parts
  * is a merge (a 4-bit model packed a split into one call, 9 runs in 15). */
-/** L7-K0: only on a turn that takes a numbered part out of a document. */
-const PARAGRAPH_HINT = '（删掉文档里的某一段是改写，用 documents.patch，不是删除整份文档；先用 documents.paragraphs 核对那一段，不要用 documents.delete。）'
 /** L6-F2: only on a turn that asks to delete a whole document. */
 const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id，不要自己编，也不要向用户要：当前对话的文档直接用它的 document_id，'
   + '「上一份」「刚才拆出来的」先用 documents.list 按导入时间找，按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
@@ -183,7 +165,7 @@ export function docAgentPrompt(doc: { id: string; title: string } | null, text: 
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
   // L6-F5: only a turn the App judged to save into the original says so.
   const save = asksSaveToOriginal(text) ? SAVE_HINT : ''
-  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}\n${text}`
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${save}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(
