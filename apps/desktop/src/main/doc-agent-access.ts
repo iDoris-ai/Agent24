@@ -5,7 +5,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 
 // E1b/D5a: paragraphs/fields read; patch/fill write a new DOCX, approved per call.
-export const DOC_AGENT_TOOLS = ['list', 'get', 'compose', 'paragraphs', 'patch', 'fields', 'fill'] as const
+// L6-F2: delete removes one document (restorable for 7 days), approved per call.
+export const DOC_AGENT_TOOLS = ['list', 'get', 'compose', 'paragraphs', 'patch', 'fields', 'fill', 'delete'] as const
 export const ACCESS_DAYS = 30
 export const ACCESS_FILE = 'doc-agent-access.json'
 const MAX_RESOURCES = 256

@@ -8,6 +8,7 @@ const lookups = (title: string | null, paragraphs: Map<number, string> | null, l
   title: vi.fn(async () => title),
   paragraphs: vi.fn(async () => paragraphs),
   list: vi.fn(async () => list),
+  detail: vi.fn(async () => null),
 })
 const patch = (edits: unknown) => ({
   summary: `documents.patch: {"document_id":"${DOC}","edits":[{"anchor":… [truncated 94 bytes]`,
@@ -22,6 +23,30 @@ const box = async (...a: Parameters<typeof approvalDialog>) => {
 describe('approvalDialog (UI polish 01)', () => {
   beforeEach(() => setMainLocale('zh'))
   afterEach(() => resetMainLocaleForTest())
+
+  // L6-F2: the delete box names one document: title, pages, import time; a
+  // same-titled one in the library is pointed out; restorable for 7 days.
+  it('a delete: title, pages and import time, and the other documents of that title', async () => {
+    const look = lookups(null, null, [{ id: DOC, title: '中文测试合同.pdf' }, { id: 'doc_01M8035XWKZJGGD3NHF3X0HJ0J', title: '《中文测试合同》' }, { id: 'doc_01M8035XWKZJGGD3NHF3X0HJ0K', title: '发票.pdf' }])
+    look.detail = vi.fn(async () => ({ title: '中文测试合同.pdf', pages: 3, importedAt: '2026-11-21T06:05:00.000Z' }))
+    const out = await box({ summary: `documents.delete: {"document_id":"${DOC}"}`, payload: { document_id: DOC } }, 'approve', '批准', undefined, look, clip)
+    expect(out.message).toBe('确认让助理删除《中文测试合同.pdf》？')
+    const at = new Date('2026-11-21T06:05:00.000Z')
+    const two = (n: number) => String(n).padStart(2, '0')
+    const local = `2026-11-${two(at.getDate())} ${two(at.getHours())}:05`
+    expect(out.detail.split('\n')).toEqual([
+      `共 3 页 · 导入于 ${local}`,
+      `注意：库里还有 1 份同名文档；只删这一份（导入于 ${local}）。`,
+      '删除后 7 天内可以在文档页「最近删除」里恢复。',
+    ])
+    expect(out.detail).not.toContain('doc_')
+  })
+
+  it('a delete whose document cannot be read says so, never a guess', async () => {
+    const out = await box({ summary: `documents.delete: {"document_id":"${DOC}"}`, payload: { document_id: DOC } }, 'approve', '批准', undefined, lookups(null, null), clip)
+    expect(out.message).toBe('确认让助理删除这份文档？')
+    expect(out.detail).toContain('没读到这份文档')
+  })
 
   it('a patch: the document by its title, each paragraph as the document has it, no ids or JSON', async () => {
     const paras = new Map([[2, '甲方应于合同签订后十日内付款。']])

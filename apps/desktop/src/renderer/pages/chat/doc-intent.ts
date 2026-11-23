@@ -111,21 +111,57 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
     && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
 }
 
+/** L6-F2 (PR-Daemon #2028 round 2): a delete of a whole document needs
+ * positive evidence, never 「a delete verb and none of some words」: the
+ * sentence is the verb with one whole document as its object (「把这份删了」
+ * 「删除上一份拆出来的文件」「把《X》删了」), or, in a conversation about a
+ * document, the bare verb (「删了吧」). Anything else is not a delete: a miss
+ * costs the user a rewording, a false hit proposes a delete. */
+const VERB = '(?:删除|删掉|删了|删去|移除)'
+/** One whole document. 《…》 is replaced by 《》 first, so a title never counts. */
+const NOUN = '(?:文件|文档|PDF|pdf|合同|Word|word)'
+const MADE = '(?:拆出来的|生成的|合并的|改写的|填好的|翻译的)'
+/** PR-Daemon #2028 round 3: closed words only, never 「any N characters」. */
+const ONE_DOC = `(?:《》|[这那该此]?一?份\\s*${NOUN}?|[这那该此]个?\\s*${NOUN}|整份${NOUN}?|上一份${MADE}?(?:那份)?\\s*${NOUN}?|刚才(?:${MADE}|那份)(?:那份|那个)?\\s*${NOUN}?)`
+const POLITE_HEAD = '(?:请|麻烦|帮我|你)*\\s*'
+/** Only particles, or a reason that it is not needed; never a clause that
+ * narrows or takes back the delete (「删了吧，只保留第3页」). */
+const TAIL = '(?:吧|掉|了|一下|给我|谢谢|啊|呀)*\\s*(?:[，,](?:它|这份)?(?:都|已经)?(?:过期了|没用了|用不上了|作废了|重复了))?[。！!~～]*'
+const OBJECT_FIRST = new RegExp(`^${POLITE_HEAD}(?:把|将)\\s*${ONE_DOC}\\s*(?:给)?${VERB}${TAIL}$`)
+const VERB_FIRST = new RegExp(`^${POLITE_HEAD}${VERB}\\s*(?:掉)?\\s*${ONE_DOC}${TAIL}$`)
+const BARE = new RegExp(`^(?:那就|好|嗯|行|那)?[，,]?\\s*${POLITE_HEAD}(?:把它|它)?\\s*${VERB}(?:它)?${TAIL}$`)
+/** 「不删了」「先别删」「甭删」: told not to, just before the verb. */
+const NOT_DELETE = /(?:不|别|甭|不要|不用|先别|先不|无需|不必)\s*(?:删|移除)|算了|不对|开玩笑/
+/** Several documents, or a question. */
+const SEVERAL = /所有|全部|这些|那些|[这那]?[两三四五六七八九十几]份|[两三四五六七八九十几]个文件|都\s*(?:删|移除)|和|还有|以及|跟/
+const DELETE_QUESTION = /怎么|如何|能不能|可以吗|还能|吗|呢|[？?]/
+
+/** Whether a turn asks to delete one whole document. */
+export function asksDeleteDocument(text: string, inDocument: boolean): boolean {
+  const said = text.trim().replace(/《[^》]{1,200}》/g, '《》')
+  if (NOT_DELETE.test(said) || SEVERAL.test(said) || DELETE_QUESTION.test(said)) return false
+  return OBJECT_FIRST.test(said) || VERB_FIRST.test(said) || (inDocument && BARE.test(said))
+}
+
 /** Whether a turn goes to the Agent with the documents tools. */
 export function wantsDocTool(text: string, inDocument: boolean): boolean {
-  if (DOC_TOOL_WORDS.test(text)) return true
+  if (DOC_TOOL_WORDS.test(text) || asksDeleteDocument(text, inDocument)) return true
   return aboutDocument(text, inDocument) && !asksTranslation(text, inDocument) && DOC_EDIT_WORDS.test(text)
 }
 
 /** Prefix the user turn so the Agent uses documents tools (D2b 正式版). M1: a
  * split is N calls of compose with one part each; one call with several parts
  * is a merge (a 4-bit model packed a split into one call, 9 runs in 15). */
+/** L6-F2: only on a turn that asks to delete a whole document. */
+const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id：当前对话的文档直接用它的 document_id，'
+  + '按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
+
 export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
     + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
-  return `${head}${hint}\n${text}`
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(

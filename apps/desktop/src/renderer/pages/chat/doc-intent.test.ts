@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -268,4 +268,73 @@ describe('F3: ordinary questions and other tasks are not extractions', () => {
   ] as const) {
     it(text, () => expect(extractionFields(text, inDocument)).toBeNull())
   }
+})
+
+describe('L6-F2: deleting a whole document, and what is not', () => {
+  it.each([
+    ['把这份删了', true],
+    ['删除这个文件', true],
+    ['删掉这份文档吧', true],
+  ])('in a document conversation, %s asks to delete it', (text, inDocument) => {
+    expect(asksDeleteDocument(text, inDocument)).toBe(true)
+    expect(wantsDocTool(text, inDocument)).toBe(true)
+    expect(docAgentPrompt(null, text)).toContain('documents.delete')
+  })
+  it.each(['删除上一份拆出来的文件', '把《中文测试合同.pdf》删了', '帮我把那份 PDF 删除'])('%s names a document to delete', (text) => {
+    expect(asksDeleteDocument(text, false)).toBe(true)
+    expect(wantsDocTool(text, false)).toBe(true)
+  })
+  // The plan's counter-examples: a part of a document is a rewrite, never a delete.
+  it.each([
+    ['删掉第 3 段', true],
+    ['删掉这句话', true],
+    ['把这份里的第 3 段删掉', true],
+    ['把第三条删除', true],
+    ['把《合同.docx》里的这一行删掉', false],
+    ['删除第 2 页', true],
+  ])('%s is not deleting the document', (text, inDocument) => {
+    expect(asksDeleteDocument(text, inDocument)).toBe(false)
+    expect(docAgentPrompt(null, text)).not.toContain('documents.delete')
+  })
+  it.each([
+    '今天心情不错', '我把那个 app 删了，好用的推荐一个', '删了吧，不聊这个了', '怎么删除文档？', '删除的文件还能恢复吗',
+    '把这份 PDF 拆成第 1 页一份、其余一份',
+  ])('chat, a question or a split: %s', (text) => {
+    expect(asksDeleteDocument(text, false)).toBe(false)
+  })
+  // PR-Daemon #2028 round 2: a title is not words of the sentence.
+  it.each(['把《都市报告》删了', '把《不要的草稿》删了', '把《别人的合同》删掉', '删除《年度汇总（所有部门）》', '删掉这份吧，都过期了', '删了吧'])('%s deletes the one document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(true)
+  })
+  // PR-Daemon #2028 round 3: every way to name the document × a part of it is
+  // not a delete of the document; neither is a delete narrowed or taken back.
+  const objects = ['这份', '这个文件', '上一份', '上一份拆出来的文件', '刚才拆出来的', '刚才生成的', '《》']
+  const parts = ['的第3页', '里的页码', '的封面', '的水印', '中的末页', '的第2页']
+  it.each(objects.flatMap((o) => parts.flatMap((p) => [`删掉${o.replace('《》', '《合同》')}${p}`, `把${o.replace('《》', '《合同》')}${p}删了`])))('round 3: %s', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(false)
+    expect(asksDeleteDocument(text, false)).toBe(false)
+  })
+  it.each([
+    '把上一份和刚才生成的都删了', '删掉这份，还有那份', '删了吧，只保留第3页', '删了，第3页别动', '删了吧，不过要保留封面',
+    '删了吧，不聊这个了', '删掉这份，第3页留着', '删了吧，算了', '把这份删了，不对',
+  ])('round 3: %s is not deleting one whole document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(false)
+  })
+  it.each([
+    '不删了', '先不删了', '甭删了', '算了不删了', '删掉末页', '删掉首页', '删掉空白页', '删掉页码', '删掉第3到5页', '删掉前面两页',
+    '删掉这两页', '删掉附录', '删掉标题', '删掉脚注', '删掉插图', '删掉公章', '删除超链接', '把日期删了', '删掉第二章', '删掉错别字',
+    '这几份文件删了', '删除这两份文件', '删掉PDF的末页', '删掉这个文件的页码',
+  ])('round 2: %s is not deleting one whole document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(false)
+    expect(asksDeleteDocument(text, false)).toBe(false)
+  })
+  // PR-Daemon #2028 ①: not to delete, many documents, or a part of one.
+  it.each([
+    '先别删掉这份', '不用删了', '不要删除这份文档', '删除所有文件', '把这些文件全部删除',
+    '删掉最后一页', '删掉前两页', '删除最后两页', '删掉页眉', '删掉表格', '把封面删了', '把多余的空行删了', '移除密码', '删掉签名',
+  ])('%s is not deleting one whole document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(false)
+    expect(asksDeleteDocument(text, false)).toBe(false)
+    expect(docAgentPrompt(null, text)).not.toContain('documents.delete')
+  })
 })
