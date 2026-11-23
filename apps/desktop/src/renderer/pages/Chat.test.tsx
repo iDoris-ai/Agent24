@@ -513,6 +513,32 @@ describe('ChatPage with Knowledge', () => {
     expect(runs).toEqual([])
   })
 
+  // General 11-23 (real Mac): 「回到上一个版本」 with no document named in
+  // the turn takes the one the conversation last named.
+  it('restores the document the conversation last named when the turn names none', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { document_id: A, head_revision: 2, revisions: [
+        { revision: 2, created_at: '2026-11-23T02:00:00.000Z' }, { revision: 1, created_at: '2026-11-20T01:00:00.000Z' }] } })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async () => ({ ok: true, status: 200, data: {} }))
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把《合同.docx》第 3 段改正式一点' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText(/把《合同.docx》第 3 段改正式一点/)).toBeInTheDocument(), { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '回到上一个版本' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByRole('group', { name: '恢复版本' }, { timeout: 3000 })
+    expect(screen.getByText(/《合同.docx》现在是第 2 版。要把第 1 版/)).toBeInTheDocument()
+  })
+
   // General 0.6.93: a turn that ran and failed (the local model stopped at
   // prefill) was sent; only one that never started reads 「未发送」.
   it.each([

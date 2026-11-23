@@ -246,7 +246,16 @@ export default function ChatPage() {
     // L6-F5: 「回到上一个版本」 — the App finds the version and offers it on a
     // card; it is restored only when the user clicks, never by the model.
     const restoreAsk = answer ? null : asksRestoreVersion(text)
-    const restoreOf = restoreAsk === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? null
+    // No document bound and none named: the one the conversation last named
+    // (the user's 「…《合同.docx》…存到原文件」 a turn ago), newest first.
+    const lastNamed = (): string | null => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const found = /《([^》]{1,200})》/.exec(messages[i]!.content)?.[1]?.trim()
+        if (found) return found
+      }
+      return null
+    }
+    const restoreOf = restoreAsk === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? lastNamed()
     if (restoreAsk !== null && restoreOf !== null && window.agent24.documents) {
       const api = window.agent24.documents
       requestInFlight.current = true
