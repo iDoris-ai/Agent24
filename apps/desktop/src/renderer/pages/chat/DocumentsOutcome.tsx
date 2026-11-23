@@ -9,7 +9,9 @@ import { useEffect, useState } from 'react'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 
-export interface RunDocuments { attempted: boolean; jobs: string[]; failed: string[] }
+/** L6-F5: `revisions`, the writes saved as a document's next version. */
+export interface RunDocuments { attempted: boolean; jobs: string[]; failed: string[]; revisions?: SavedRevision[] }
+export interface SavedRevision { document_id: string; title: string; revision: number }
 
 type Made = { kind: 'made'; title: string } | { kind: 'failed' } | { kind: 'pending' }
 
@@ -20,7 +22,28 @@ export function runDocumentsOf(v: unknown): RunDocuments | null {
   const d = v as { attempted?: unknown; jobs?: unknown; failed?: unknown } | null | undefined
   if (!d || d.attempted !== true || !Array.isArray(d.jobs)) return null
   const strings = (a: unknown) => (Array.isArray(a) ? a : []).filter((j): j is string => typeof j === 'string')
-  return { attempted: true, jobs: strings(d.jobs), failed: strings(d.failed) }
+  const revisions = (Array.isArray((d as { revisions?: unknown }).revisions) ? (d as { revisions: unknown[] }).revisions : [])
+    .flatMap((r) => {
+      const x = r as Partial<SavedRevision> | null
+      return x && typeof x.document_id === 'string' && typeof x.title === 'string' && typeof x.revision === 'number'
+        ? [{ document_id: x.document_id, title: x.title, revision: x.revision }] : []
+    })
+  return { attempted: true, jobs: strings(d.jobs), failed: strings(d.failed), ...(revisions.length > 0 ? { revisions } : {}) }
+}
+
+/** L6-F5: a document's current version, by its id or the name the model gave; null when unread. */
+export async function headOf(api: Window['agent24']['documents'] | undefined, ref: string): Promise<number | null> {
+  if (!api) return null
+  let id = ref
+  if (!/^doc_[0-9A-Z]+$/.test(ref)) {
+    const listed = await api.request({ op: 'list', limit: 200 }).catch(() => null)
+    const want = ref.trim().toLowerCase().replace(/\.[a-z0-9]{1,5}$/, '')
+    const hits = listed && listed.ok ? listed.data.documents.filter((d) => d.title.toLowerCase().replace(/\.[a-z0-9]{1,5}$/, '') === want) : []
+    if (hits.length !== 1) return null
+    id = hits[0]!.document_id
+  }
+  const doc = await api.request({ op: 'get', documentId: id }).catch(() => null)
+  return doc && doc.ok && typeof doc.data.head_revision === 'number' ? doc.data.head_revision : null
 }
 
 /** A document a call named, by its title when the name is a document id. */
@@ -78,10 +101,12 @@ export function DocumentsOutcome({ documents }: { documents: RunDocuments | null
     return () => { live = false }
   }, [jobs])
   if (!documents?.attempted) return null
-  const unchanged = documents.jobs.length === 0 || (made !== null && made.every((m) => m.kind === 'failed'))
+  const saved = documents.revisions ?? []
+  const unchanged = saved.length === 0 && (documents.jobs.length === 0 || (made !== null && made.every((m) => m.kind === 'failed')))
   if (unchanged) return <div role="note" style={{ ...LINE, color: 'var(--danger, #c0392b)' }}>{t('task.documentUnchanged')}</div>
   return (
     <div role="note" style={{ ...LINE, color: 'var(--muted)' }}>
+      {saved.map((r, i) => <div key={`s${i}`}>{t('task.documentSaved', { title: r.title || t('task.documentUntitled'), v: String(r.revision) })}</div>)}
       {(made ?? documents.jobs.map(() => ({ kind: 'pending' as const }))).map((m, i) => (
         <div key={i}>
           {m.kind === 'made' ? t('task.documentMade', { title: m.title || t('task.documentUntitled') })
