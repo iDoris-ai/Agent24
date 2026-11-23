@@ -125,3 +125,38 @@ async fn bad_arguments_are_refused() {
     .await;
     assert!(String::from_utf8_lossy(&body).contains("invalid_input"));
 }
+
+#[tokio::test]
+async fn a_revision_below_one_is_refused_not_a_single_version() {
+    let (_d, state) = setup().await;
+    for bad in [
+        json!({"document_id": W1, "to_revision": 0}),
+        json!({"document_id": W1, "from_revision": -3}),
+    ] {
+        let body = call(&state, "compare", bad).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("invalid_request"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_document_in_the_trash_is_said_to_be_deleted() {
+    let (_d, state) = setup().await;
+    exec(
+        &state,
+        &format!("UPDATE documents SET deleted_at = '2026-11-23T00:00:00.000Z' WHERE id = '{W2}'"),
+    )
+    .await;
+    let p = payload(
+        &call(
+            &state,
+            "compare",
+            json!({"document_id": W1, "other_document_id": W2}),
+        )
+        .await,
+    );
+    assert_eq!(p["reason"], "deleted");
+}

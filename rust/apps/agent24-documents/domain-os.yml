@@ -99,8 +99,8 @@ tools:
       properties:
         document_id: { type: string }
         other_document_id: { type: string, description: "the second document, to compare two documents" }
-        from_revision: { type: integer, minimum: 1, description: "with one document: the older version (default: the one before to_revision)" }
-        to_revision: { type: integer, minimum: 1, description: "with one document: the newer version (default: the current one)" }
+        from_revision: { type: integer, minimum: 1, description: "the older version (default: the one before to_revision); with other_document_id, the version of document_id" }
+        to_revision: { type: integer, minimum: 1, description: "the newer version (default: the current one); with other_document_id, the version of other_document_id" }
     risk: read
     output_privacy: local_only
     timeout_ms: 30000
