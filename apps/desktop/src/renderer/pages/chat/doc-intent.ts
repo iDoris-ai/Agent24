@@ -153,12 +153,17 @@ export function asksDeleteDocument(text: string, inDocument: boolean): boolean {
 const PART = '第\\s*[0-9一二三四五六七八九十百零两]+\\s*(?:段|条|句|个段落)'
 const TAKE_AWAY = '(?:删除|删掉|删了|删去|删|去掉|去除|移除|拿掉)'
 const DELETE_PART = new RegExp(`${TAKE_AWAY}[^，。！？,.!?]{0,4}${PART}|${PART}[^，。！？,.!?]{0,6}${TAKE_AWAY}`)
-/** Not a question about it (「第 3 段怎么删」), not a wish about someone else's. */
-const PART_QUESTION = /怎么|如何|能不能|可以吗|吗|呢|[？?]|为什么/
+/** A question about it (「第 3 段怎么删」「要不要删」「会不会影响」), not a request. */
+const PART_QUESTION = /怎么|如何|能不能|可以吗|吗|呢|[？?]|为什么|要不要|该不该|会不会|是否|会怎样|的话|哪个/
+/** Told not to (「不要删第 3 段」「不要把第 3 段删掉」「别删」「第 3 段不用删」), on top of
+ * NOT_DELETE (a refusal just before the verb): a miss costs a rewording, a
+ * false hit proposes the opposite of what was said. 「别」 counts only before a
+ * verb (not 「区别」「特别」). */
+const PART_NEGATED = /不要|不用|不必|无需|不想|先不|甭|不删|不能|别(?=\s*(?:把|删|去|移|拿|动))/
 
 /** Whether a turn asks to take one numbered part out of a document. */
 export function asksDeleteParagraph(text: string, inDocument: boolean): boolean {
-  return aboutDocument(text, inDocument) && !PART_QUESTION.test(text) && DELETE_PART.test(text)
+  return aboutDocument(text, inDocument) && !NOT_DELETE.test(text) && !PART_NEGATED.test(text) && !PART_QUESTION.test(text) && DELETE_PART.test(text)
 }
 
 /** Whether a turn goes to the Agent with the documents tools. */
@@ -171,7 +176,7 @@ export function wantsDocTool(text: string, inDocument: boolean): boolean {
  * split is N calls of compose with one part each; one call with several parts
  * is a merge (a 4-bit model packed a split into one call, 9 runs in 15). */
 /** L7-K0: only on a turn that takes a numbered part out of a document. */
-const PARAGRAPH_HINT = '（删掉文档里的某一段是改写，用 documents.patch，不是删除整份文档；先用 documents.paragraphs 核对那一段，不要用 documents.delete。）'
+const PARAGRAPH_HINT = '（删掉文档里的某一段是改写，用 documents.patch，不是删除整份文档；先用 documents.paragraphs 核对那一段，不要用 documents.delete；删除就是把该段 text 置空（留一个空段），不要编替代文字。）'
 /** L6-F2: only on a turn that asks to delete a whole document. */
 const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id，不要自己编，也不要向用户要：当前对话的文档直接用它的 document_id，'
   + '「上一份」「刚才拆出来的」先用 documents.list 按导入时间找，按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
