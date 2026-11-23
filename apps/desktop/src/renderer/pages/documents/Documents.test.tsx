@@ -974,6 +974,35 @@ describe('DocumentsPage: a document and its text', () => {
     expect(within(screen.getByRole('group', { name: '抽取结果' })).getByText('文档里没找到')).toBeInTheDocument()
   })
 
+  // PR-Daemon #2020 (Medium): switching documents while an extraction runs
+  // leaves the new one idle, and the first one's result never lands in it.
+  it('an extraction still running when another document is opened stays with its own document', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+    let finish: () => void = () => {}
+    m.request.mockImplementation((req: { op: string; documentId?: string }) => {
+      if (req.op === 'get') return ok(detail(req.documentId === doc(2).document_id ? 2 : 1))
+      if (req.op === 'readText') return ok(text([]))
+      if (req.op === 'extract') return new Promise<Res>((resolve) => { finish = () => resolve({ ok: true, status: 200, data: { ...job('succeeded'), kind: 'extract', result: { extraction_id: 'ext_1' } } }) })
+      if (req.op === 'getExtraction') return ok({ next_cursor: null, values: [{ key: 'f1', status: 'present', value: '张三', anchors: [] }] })
+      return base(req)
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    fireEvent.click(await screen.findByRole('button', { name: '抽取字段…' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /字段名/ }), { target: { value: '甲方' } })
+    fireEvent.click(screen.getByRole('button', { name: '抽取' }))
+    expect(await screen.findByText('正在抽取…长文档要几分钟')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    await waitFor(() => expect(screen.getByRole('region', { name: '文档详情' })).toHaveTextContent('通告 2'))
+    expect(screen.queryByText('正在抽取…长文档要几分钟')).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: '抽取字段…' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /字段名/ }), { target: { value: '乙方' } })
+    expect(screen.getByRole('button', { name: '抽取' })).toBeEnabled()
+    await act(async () => { finish(); await vi.advanceTimersByTimeAsync(3000) })
+    expect(screen.queryByRole('group', { name: '抽取结果' })).toBeNull()
+  })
+
   // PR-Daemon #2019 ②: a page of text that fails to read is not asked for again and again.
   it('stops reading on for the focused block when a page fails, and keeps the page shown', async () => {
     const m = mount({ lists: [page([1])] })
