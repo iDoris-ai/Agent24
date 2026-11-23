@@ -235,3 +235,4 @@
 - [ ] FU-199 · C · src=PR-Daemon #2041 · 2026-11-24 · compare/route.rs 头注释「只读」对 PDF/图片不成立（缺文本层会建层存储）；补 PDF/图片成功对比测试（BlockRef::Block）。非 DOCX 一律归 layer，两个 xlsx 对比会报误导性 422：调用前查 pdfkit::FORMATS，给明确的 unsupported_format。
 - [ ] FU-200 · C · src=PR-Daemon #2041 · 2026-11-24 · compare 分页只按条数，可超 512 KiB 响应预算：加字节预算；另补「已软删除文档 → 404」测试。
 - [ ] FU-201 · C · src=L6-S05 0.6.110 真机（General 11-24） · 2026-11-24 · CLI 的 `documents compare` 弹「允许发起方写入 documents 模块的数据（delegate）」：daemon 对 FirstPartyShell 的非 GET 模块路由一律要 delegation（middleware.rs，按 HTTP 方法判断，不看是否只读），compare 和 find 是只读 POST，也被算作写。桌面（ProductHost）不受影响。改法：给只读 POST 的白名单或改读委托。判据：CLI 跑 compare/find 不弹写入委托框。
+- [ ] FU-202 · C · src=L6-S05 0.6.111 真机（General 11-24） · 2026-11-24 · 文档页勾两份 PDF 时，「合并所选」和「对比所选的两份」同时出现，顶部一排按钮和状态文字挤在一起换行；手滑点到「合并所选」会立刻生成一份合并 PDF。改法：顶部按钮区允许换行并分组；合并前加确认。判据：两份 PDF 勾选时按钮不挤；合并要先确认。
