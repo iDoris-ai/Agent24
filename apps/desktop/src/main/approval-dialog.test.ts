@@ -31,7 +31,7 @@ describe('approvalDialog (UI polish 01)', () => {
     const saved = await box({ summary: 'documents.patch: …', payload: { document_id: DOC, save_to: 'original', edits: [{ index: 0, text: '新文' }] } },
       'approve', '批准', undefined, look, clip)
     expect(saved.detail).toContain('改写 1 段，保存到原文件，成为它的新版本 v3。')
-    expect(saved.detail).toContain('原文件之前的版本都会保留，可以在文档页恢复。')
+    expect(saved.detail).toContain('原文件之前的版本都会保留，可以在对话里说「回到上一个版本」恢复。')
     expect(saved.detail).not.toContain('原文档不会被改动')
     const plain = await box({ summary: 'documents.patch: …', payload: { document_id: DOC, edits: [{ index: 0, text: '新文' }] } },
       'approve', '批准', undefined, look, clip)
