@@ -3189,6 +3189,16 @@ export interface components {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */
             searched: boolean;
             /**
+             * @description L7-K0 (FU-183). The run asked a `knowledge_search` and none
+             *     completed: each was refused by policy or failed. A client says
+             *     「检索没能进行」, never 「知识库里没有」.
+             */
+            search_refused: boolean;
+            /** @description Passages the completed searches of the run returned, each (document, chunk) once. 0 with searched true means none found. */
+            found_passages: number;
+            /** @description Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on. */
+            found_titles: string[];
+            /**
              * @description Each chunk a completed `knowledge_read` named, in the order first
              *     read. Such a read completes only with that chunk of that
              *     document, so the run read these back, as a citation or as
