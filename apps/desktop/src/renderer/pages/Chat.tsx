@@ -9,6 +9,7 @@ import { failureKind, withoutToolNames } from './chat/user-facing'
 import { DocumentsOutcome, type RunDocuments } from './chat/DocumentsOutcome'
 import { grounding, knowledgeFacts, type Grounding, type KnowledgeFacts as Facts } from './knowledge-grounding'
 import KnowledgeFactsRow from './chat/KnowledgeFacts'
+import KnowledgeCitationCard from './chat/KnowledgeCitationCard'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
 import { activeTurn, buildTurns } from './chat/turns'
@@ -63,6 +64,8 @@ interface AssistantMessage {
   knowledge?: Grounding
   /** L7-K0: what the run's searches found, from its record. */
   facts?: Facts | null
+  /** L7-K1: where the run's searches found passages, library by library. */
+  cited?: NonNullable<Parameters<typeof KnowledgeCitationCard>[0]['found']>
   /** Answered without Knowledge although its switch is On: main had no
    *  binding for a run, so the turn went to `/api/v1/chat`. */
   knowledgeInactive?: boolean
@@ -775,7 +778,7 @@ export default function ChatPage() {
         const facts = withKnowledge ? knowledgeFacts(turn.knowledge) : null
         // A refused search says so itself; 「没有检索知识库」 beside it would say it twice.
         const knowledge = checked?.kind === 'notSearched' && (query === null || facts?.kind === 'refused') && checked.unread.length === 0 ? undefined : checked
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents, facts }])
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents, facts, cited: withKnowledge ? turn.knowledge?.found : undefined }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
@@ -915,6 +918,7 @@ export default function ChatPage() {
                 </div>
               )}
               {m.role === 'assistant' && m.facts && <KnowledgeFactsRow facts={m.facts} />}
+              {m.role === 'assistant' && m.cited && m.cited.length > 0 && <KnowledgeCitationCard found={m.cited} />}
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
               )}

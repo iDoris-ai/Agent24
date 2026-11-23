@@ -1,0 +1,40 @@
+import { defineMessages } from '../../i18n'
+
+export const citationMessages = defineMessages({
+  en: {
+    title: 'Retrieved from your knowledge bases',
+    library: 'Knowledge base {n}',
+    plain: 'Knowledge base',
+    place: 'passage {n}',
+    untitled: '(untitled)',
+    open: 'Open the knowledge page',
+    copy: 'Copy sources',
+    copied: 'Copied',
+    copyHeader: 'Sources (knowledge base · document · passage)',
+    note: 'These are what the search found, not which passage the answer used. Open the knowledge page to read the original and copy the wording yourself.',
+  },
+  zh: {
+    title: '从你的知识库检索到',
+    library: '知识库 {n}',
+    plain: '知识库',
+    place: '第 {n} 段命中',
+    untitled: '（无标题）',
+    open: '到知识页查看原文',
+    copy: '复制出处',
+    copied: '已复制',
+    copyHeader: '出处（知识库 · 文档 · 位置）',
+    note: '以上是检索到的内容，不表示回答用了哪一段。要看原文、复制原话，请到知识页自己查看。',
+  },
+  th: {
+    title: 'ที่ค้นพบจากคลังความรู้ของคุณ',
+    library: 'คลังความรู้ {n}',
+    plain: 'คลังความรู้',
+    place: 'ส่วนที่พบ {n}',
+    untitled: '(ไม่มีชื่อ)',
+    open: 'เปิดหน้าคลังความรู้',
+    copy: 'คัดลอกแหล่งที่มา',
+    copied: 'คัดลอกแล้ว',
+    copyHeader: 'แหล่งที่มา (คลังความรู้ · เอกสาร · ตำแหน่ง)',
+    note: 'นี่คือสิ่งที่การค้นหาพบ ไม่ได้บอกว่าคำตอบใช้ส่วนไหน เปิดหน้าคลังความรู้เพื่ออ่านต้นฉบับและคัดลอกเอง',
+  },
+})

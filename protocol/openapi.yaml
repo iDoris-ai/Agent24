@@ -6898,6 +6898,23 @@ components:
           maxItems: 5
           items: { type: string }
           description: "Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on."
+        found:
+          type: array
+          maxItems: 8
+          description: |
+            L7-K1. Where the passages of the completed searches sit, each
+            (document, chunk) once, the first eight: ids and a title, never
+            the passage text (a snippet is a clue, not a quotation). A client
+            names the library from `knowledge_base_id` and reads the text
+            back itself, through the same scope check as a model's read.
+          items:
+            type: object
+            required: [knowledge_base_id, knowledge_id, chunk_id, title]
+            properties:
+              knowledge_base_id: { type: string }
+              knowledge_id: { type: string }
+              chunk_id: { type: string }
+              title: { type: string }
         read_chunks:
           type: array
           description: |

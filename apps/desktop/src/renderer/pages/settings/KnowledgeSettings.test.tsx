@@ -35,6 +35,16 @@ describe('KnowledgeSettings', () => {
     expect(await screen.findByText('Saved.')).toBeInTheDocument()
   })
 
+  it('L7-K1: keeps library names on this machine only; configure never sees them', async () => {
+    localStorage.removeItem('a24.knowledge.libraryNames')
+    render(<KnowledgeSettings />)
+    await screen.findByDisplayValue('https://kb.example/api/v1')
+    fireEvent.change(screen.getByLabelText('Library names (optional)'), { target: { value: 'kb-a=制度库' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+    await waitFor(() => expect(configure).toHaveBeenCalledWith({ endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'] }))
+    expect(localStorage.getItem('a24.knowledge.libraryNames')).toBe('kb-a=制度库')
+  })
+
   it('sends a new key once and clears the field', async () => {
     render(<KnowledgeSettings />)
     await screen.findByDisplayValue('https://kb.example/api/v1')
