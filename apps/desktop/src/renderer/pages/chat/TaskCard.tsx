@@ -14,7 +14,8 @@ import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
 import { AlreadyDecided, cancelRun, createRun, decideApproval, getRun, listPendingApprovals, type Approval, type Decision } from '../agent/api'
 import { savesToOriginal } from './doc-version'
-import { grounding } from '../knowledge-grounding'
+import { grounding, knowledgeFacts } from '../knowledge-grounding'
+import KnowledgeFactsRow from './KnowledgeFacts'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { skillForConversation } from './session-skill'
 import { namedDocument } from './doc-intent-run'
@@ -438,7 +439,8 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
   // UI polish 05 (FU-153 on the card): a document instruction is not searched
   // first (as in the bubble, #1997), so 「没有检索知识库」 says nothing there.
   // Unread sources still show.
-  const checked = grounded?.kind === 'notSearched' && view?.documents?.attempted === true && grounded.unread.length === 0 ? null : grounded
+  const facts = status === 'completed' && view?.output ? knowledgeFacts(view.knowledge) : null
+  const checked = grounded?.kind === 'notSearched' && (view?.documents?.attempted === true || facts?.kind === 'refused') && grounded.unread.length === 0 ? null : grounded
   return (
     <div className={`task-card${active ? ' active' : ''}${waiting && !sentBack ? ' waiting' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
@@ -457,6 +459,7 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
         <div className="task-card-output">
           {withoutToolNames(view.output)}
           <DocumentsOutcome documents={view.documents} />
+          <KnowledgeFactsRow facts={facts} />
           {checked && view.knowledge && <div className="task-card-knowledge">{checked.kind === 'read' ? t('knowledge.via') : t(`knowledge.${checked.kind}`)}</div>}
           {checked && checked.unread.length > 0 && (
             <div className="task-card-knowledge" role="note">{t('knowledge.unread', { ids: checked.unread.join(', ') })}</div>
