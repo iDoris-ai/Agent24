@@ -24,6 +24,7 @@
         "documents.patch",
         "documents.fields",
         "documents.fill",
+        "documents.compare",
         "documents.delete"
       ]
     }

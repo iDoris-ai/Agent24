@@ -221,6 +221,9 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         // (K1-06a §4.1): an operation `admit` has no row for never runs.
         named_by_title(state, scope, op, &mut arguments).await?;
         admit(state, scope, op, &arguments).await?;
+        if op == "compare" {
+            admit_other(state, scope, &arguments).await?;
+        }
         match op {
             "extract" => extract(state, run, accepted, claim_holds, arguments).await,
             "list" => list(state, scope, arguments).await,
@@ -235,6 +238,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "fields" => fields(state, arguments).await,
             "fill" => fill(state, run, arguments).await,
             "delete" => delete(state, run, arguments).await,
+            "compare" => compare(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -841,6 +845,31 @@ async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outc
     }
 }
 
+/// `compare`'s second document is in the scope too, or the call reads as
+/// naming a document that is not here (K1-06a §2.4).
+async fn admit_other(
+    state: &AppState,
+    scope: &Scope,
+    arguments: &Map<String, Value>,
+) -> Result<(), Envelope> {
+    let id = match arguments.get("other_document_id") {
+        None => return Ok(()),
+        Some(Value::String(id)) => id,
+        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
+    };
+    if is_id(IdKind::Document, id) && !(scope.allows_document(id) && live(state, id).await?) {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    Ok(())
+}
+
+/// L6-S05: two documents, or two versions of one, compared (read).
+async fn compare(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let args: crate::compare::tool::Args = parse(arguments)?;
+    let storage = ready(state).await?;
+    completed(crate::compare::tool::call(state, &storage, args).await)
+}
+
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: JobGetArgs = parse(arguments)?;
     let storage = ready(state).await?;
@@ -990,7 +1019,7 @@ enum Resource {
 fn resource(op: &str) -> Option<Resource> {
     match op {
         "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill"
-        | "delete" => Some(Resource::Document),
+        | "delete" | "compare" => Some(Resource::Document),
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
@@ -1016,6 +1045,12 @@ async fn named_by_title(
         "get" | "paragraphs" | "patch" | "fields" | "fill" => {
             arguments.get_mut("document_id").into_iter().collect()
         }
+        // L6-S05: both documents may be named by title.
+        "compare" => arguments
+            .iter_mut()
+            .filter(|(k, _)| matches!(k.as_str(), "document_id" | "other_document_id"))
+            .map(|(_, v)| v)
+            .collect(),
         "compose" => match arguments.get_mut("parts") {
             Some(Value::Array(parts)) => parts
                 .iter_mut()
@@ -1292,6 +1327,7 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    mod compare;
     mod extract;
     mod extraction;
     mod read;

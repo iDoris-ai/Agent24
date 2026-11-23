@@ -11,6 +11,7 @@ const TOOL_WORDS: Record<string, string> = {
   'documents.paragraphs': '查看段落',
   'documents.patch': '改写段落',
   'documents.fields': '查看模板字段',
+  'documents.compare': '对比文档',
   'documents.fill': '填写模板',
   knowledge_search: '检索知识库',
   knowledge_read: '读取知识库原文',
