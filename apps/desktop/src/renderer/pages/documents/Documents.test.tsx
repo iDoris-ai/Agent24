@@ -1044,3 +1044,57 @@ describe('DocumentsPage: OS events (hints only)', () => {
     expect(m.event).toBeNull()
   })
 })
+
+// L6-F2: delete from the page, see it under 「最近删除」, restore it.
+it('deletes a document after confirming, lists it as recently deleted, and restores it', async () => {
+  setLocale('zh')
+  const m = mount({ lists: [page([1, 2]), page([2]), page([1, 2])] })
+  let deleted: unknown[] = []
+  const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+  m.request.mockImplementation((req: { op: string; documentId?: string }) => {
+    if (req.op === 'delete') {
+      deleted = [{ ...doc(1), deleted_at: '2026-11-22T09:00:00.000Z', restorable_until: '2026-11-29T09:00:00.000Z' }]
+      return ok(deleted[0])
+    }
+    if (req.op === 'recentlyDeleted') return ok({ documents: deleted })
+    if (req.op === 'restore') {
+      deleted = []
+      return ok({ ...doc(1), head: { revision: 1 } })
+    }
+    return base(req)
+  })
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+  render(<DocumentsPage />)
+  fireEvent.click(await screen.findByRole('button', { name: '删除《通告 1》' }))
+  // Not confirmed: nothing is sent.
+  expect(confirm).toHaveBeenCalledWith(expect.stringContaining('7 天内可以在下方「最近删除」里恢复'))
+  expect(m.request).not.toHaveBeenCalledWith({ op: 'delete', documentId: doc(1).document_id })
+  confirm.mockReturnValue(true)
+  fireEvent.click(screen.getByRole('button', { name: '删除《通告 1》' }))
+  await waitFor(() => expect(m.request).toHaveBeenCalledWith({ op: 'delete', documentId: doc(1).document_id }))
+  const trash = await screen.findByRole('region', { name: '最近删除（7 天内可恢复）' })
+  expect(within(trash).getByText('通告 1')).toBeInTheDocument()
+  await waitFor(() => expect(screen.queryByRole('button', { name: '删除《通告 1》' })).toBeNull())
+  fireEvent.click(within(trash).getByRole('button', { name: '恢复' }))
+  await waitFor(() => expect(m.request).toHaveBeenCalledWith({ op: 'restore', documentId: doc(1).document_id }))
+  expect(await screen.findByRole('button', { name: '删除《通告 1》' })).toBeInTheDocument()
+  await waitFor(() => expect(screen.queryByRole('region', { name: '最近删除（7 天内可恢复）' })).toBeNull())
+  confirm.mockRestore()
+})
+
+// General (L6-F2): past 7 days it is never called erased, only past its restore period.
+it('a restore past the 7 days says it is past its restore period, never that it was erased', async () => {
+  setLocale('zh')
+  const m = mount({ lists: [page([2])] })
+  const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+  m.request.mockImplementation((req: { op: string }) => {
+    if (req.op === 'recentlyDeleted') return ok({ documents: [{ ...doc(1), deleted_at: '2026-11-15T09:00:00.000Z', restorable_until: '2026-11-22T09:00:00.000Z' }] })
+    if (req.op === 'restore') return err(404, 'not_found', 'no recently deleted document')
+    return base(req)
+  })
+  render(<DocumentsPage />)
+  const trash = await screen.findByRole('region', { name: '最近删除（7 天内可恢复）' })
+  fireEvent.click(within(trash).getByRole('button', { name: '恢复' }))
+  expect(await screen.findByText('《通告 1》已过恢复期，无法恢复。')).toBeInTheDocument()
+  expect(document.body.textContent).not.toMatch(/彻底删除|已清除/)
+})
