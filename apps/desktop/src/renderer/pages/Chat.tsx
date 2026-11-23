@@ -7,7 +7,8 @@ import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession, knowledgePrompt, knowledgeQuery } from './chat-knowledge'
 import { failureKind, withoutToolNames } from './chat/user-facing'
 import { DocumentsOutcome, type RunDocuments } from './chat/DocumentsOutcome'
-import { grounding, type Grounding } from './knowledge-grounding'
+import { grounding, knowledgeFacts, type Grounding, type KnowledgeFacts as Facts } from './knowledge-grounding'
+import KnowledgeFactsRow from './chat/KnowledgeFacts'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
 import { activeTurn, buildTurns } from './chat/turns'
@@ -60,6 +61,8 @@ interface AssistantMessage {
   /** Answered as a run with the Knowledge tools (chat-knowledge.ts): what
    *  the run read, which the labels under the reply say. */
   knowledge?: Grounding
+  /** L7-K0: what the run's searches found, from its record. */
+  facts?: Facts | null
   /** Answered without Knowledge although its switch is On: main had no
    *  binding for a run, so the turn went to `/api/v1/chat`. */
   knowledgeInactive?: boolean
@@ -769,8 +772,10 @@ export default function ChatPage() {
         // UI polish 03 (David): 「没有检索知识库」 only under a turn the system
         // searches first; writing, 「记住…」 and a document's rewrite or split
         // are not, so the line said nothing there. Unread sources still show.
-        const knowledge = checked?.kind === 'notSearched' && query === null && checked.unread.length === 0 ? undefined : checked
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents }])
+        const facts = withKnowledge ? knowledgeFacts(turn.knowledge) : null
+        // A refused search says so itself; 「没有检索知识库」 beside it would say it twice.
+        const knowledge = checked?.kind === 'notSearched' && (query === null || facts?.kind === 'refused') && checked.unread.length === 0 ? undefined : checked
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents, facts }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
@@ -909,6 +914,7 @@ export default function ChatPage() {
                   {m.knowledge.kind === 'read' ? t('knowledge.via') : t(`knowledge.${m.knowledge.kind}`)}
                 </div>
               )}
+              {m.role === 'assistant' && m.facts && <KnowledgeFactsRow facts={m.facts} />}
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
               )}
