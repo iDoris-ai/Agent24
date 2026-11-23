@@ -524,6 +524,10 @@ const approvalDocumentLookups: DocumentLookups = {
     if (typeof d?.title !== 'string' || !d.title || typeof d.created_at !== 'string') return null
     return { title: d.title, pages: typeof d.pages === 'number' ? d.pages : null, importedAt: d.created_at }
   }),
+  head: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const head = (data as { head_revision?: unknown } | null)?.head_revision
+    return typeof head === 'number' && head >= 1 ? head : null
+  }),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs
     if (!Array.isArray(list)) return null

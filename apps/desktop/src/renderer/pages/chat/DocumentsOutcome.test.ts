@@ -7,6 +7,9 @@ describe('runDocumentsOf', () => {
     expect(runDocumentsOf({ attempted: true, jobs: ['job_1'], failed: ['doc_01B', 3] })).toEqual({ attempted: true, jobs: ['job_1'], failed: ['doc_01B'] })
     expect(runDocumentsOf(undefined)).toBeNull()
     expect(runDocumentsOf({ attempted: false, jobs: [] })).toBeNull()
+    // L6-F5: a save into the original, no job.
+    expect(runDocumentsOf({ attempted: true, jobs: [], failed: [], revisions: [{ document_id: 'doc_1', title: '合同.docx', revision: 2 }, { revision: 'x' }] }))
+      .toEqual({ attempted: true, jobs: [], failed: [], revisions: [{ document_id: 'doc_1', title: '合同.docx', revision: 2 }] })
   })
 })
 
