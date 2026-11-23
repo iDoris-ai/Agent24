@@ -104,8 +104,32 @@ fn a_moved_paragraph_is_unaligned_never_changed() {
     let c = compare(&a, &b);
     assert!(!c.identical);
     assert_eq!(c.summary.changed, 0);
-    assert!(c.summary.unaligned >= 2);
+    assert_eq!(c.summary.unaligned, 2);
     assert!(c.changes.iter().all(|x| x.kind == Kind::Unaligned));
+}
+
+#[test]
+fn a_deleted_duplicate_is_removed_not_unaligned() {
+    // PR-Daemon #2047: one of two equal paragraphs deleted must count as a
+    // deletion; only one pair is a move.
+    let a = paras(&[ART1, ART1, RENT, ART3]);
+    let b = paras(&[RENT, ART3, ART1]);
+    let c = compare(&a, &b);
+    assert_eq!(c.summary.removed, 1);
+    assert_eq!(c.summary.unaligned, 2);
+    assert_eq!(c.summary.total, 3);
+    assert_eq!(c.summary.added, 0);
+}
+
+#[test]
+fn an_added_duplicate_is_added_not_unaligned() {
+    let a = paras(&[ART1, RENT]);
+    let b = paras(&[RENT, ART1, ART1]);
+    let c = compare(&a, &b);
+    assert_eq!(c.summary.added, 1);
+    assert_eq!(c.summary.unaligned, 2);
+    assert_eq!(c.summary.total, 3);
+    assert_eq!(c.summary.removed, 0);
 }
 
 #[test]
