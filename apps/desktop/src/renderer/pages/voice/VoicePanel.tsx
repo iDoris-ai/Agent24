@@ -38,6 +38,7 @@ import { formatMs } from '../../../shared/format-latency'
 import { MAX_EVENTS_IN_MEMORY, pushCapped } from '../../../shared/agentearSequencer'
 import { translate, useLocale, useT } from '../../i18n'
 import { voicePanelMessages } from './VoicePanel.i18n'
+import { PrivacyBadge } from '../../components/PrivacyBadge'
 
 /** Mirrors main/model-call-log.ts's own cap — the main process never sends
  *  more than this many anyway, but a defensive local cap keeps this
@@ -139,8 +140,9 @@ function labelFor(table: Record<string, string>, raw: unknown, unknownLabel: str
  * `_a24/model/complete` calls — which model, local/remote, how long it took
  * (shared `formatMs` rule: "1,234 ms" once >= 1000, never rounded to
  * seconds), and a failure marker when the call itself didn't succeed.
- * Exported for its unit test. */
-export function formatModelCall(call: ModelCallEnvelope): string {
+ * Exported for its unit test. `badged`: the caller shows local/remote as a
+ * PrivacyBadge, so the line leaves that word out (unknown still says so). */
+export function formatModelCall(call: ModelCallEnvelope, badged = false): string {
   const model = call.model_id ?? translate(voicePanelMessages, 'model.unknown')
   const tierLabels: Record<string, string> = {
     local: translate(voicePanelMessages, 'model.local'),
@@ -148,7 +150,8 @@ export function formatModelCall(call: ModelCallEnvelope): string {
   }
   const tier = call.tier ? (tierLabels[call.tier] ?? call.tier) : translate(voicePanelMessages, 'model.locationUnknown')
   const status = call.ok ? '' : ` · ${translate(voicePanelMessages, 'model.failed')}`
-  return `${model} · ${tier} · ${formatMs(call.latency_ms)}${status}`
+  const shown = badged && (call.tier === 'local' || call.tier === 'remote') ? [] : [tier]
+  return [model, ...shown, formatMs(call.latency_ms)].join(' · ') + status
 }
 
 function EventRow({ envelope }: { envelope: AgentEarEventEnvelope }): JSX.Element {
@@ -562,8 +565,9 @@ function VoicePanelInner(): JSX.Element {
         <div style={{ marginBottom: 12 }}>
           <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 2 }}>{t('model.recent')}</div>
           {[...modelCalls].reverse().map((c, i) => (
-            <div key={i} style={{ fontSize: 11, color: 'var(--muted)' }}>
-              {formatModelCall(c)}
+            <div key={i} className="reply-meta">
+              <PrivacyBadge tier={c.tier} />
+              <span>{formatModelCall(c, true)}</span>
             </div>
           ))}
         </div>
