@@ -43,3 +43,29 @@ export function grounding(text: string, knowledge: RunKnowledge | null): Groundi
   if (!knowledge?.searched) return { kind: 'notSearched', unread }
   return { kind: read.size > 0 ? 'read' : 'nothingRead', unread }
 }
+
+/** L7-K0: what a run's searches came to, as the daemon's record says it
+ * (`GET /runs/{id}` `knowledge`), for the line under an answer. Never says
+ * which passage the answer used: only what was found. null: no search to
+ * speak of (none asked, or only passages read back). */
+export type KnowledgeFacts =
+  | { kind: 'refused' }
+  | { kind: 'none' }
+  | { kind: 'found'; passages: number; titles: string[] }
+
+/** The record's L7-K0 fields, optional so a daemon without them reads as
+ * 「nothing to say」 (they arrive with the daemon's `search_refused`). */
+type RunKnowledgeFacts = RunKnowledge & { search_refused?: boolean; found_passages?: number; found_titles?: string[] }
+
+export function knowledgeFacts(knowledge: RunKnowledgeFacts | null | undefined): KnowledgeFacts | null {
+  if (!knowledge) return null
+  if (knowledge.search_refused === true) return { kind: 'refused' }
+  if (!knowledge.searched) return null
+  const passages = typeof knowledge.found_passages === 'number' ? knowledge.found_passages : 0
+  if (passages > 0) {
+    const titles = (Array.isArray(knowledge.found_titles) ? knowledge.found_titles : []).filter((t) => typeof t === 'string' && t !== '')
+    return { kind: 'found', passages, titles }
+  }
+  // A read with no search is not 「找不到」.
+  return knowledge.read_chunks.length === 0 ? { kind: 'none' } : null
+}
