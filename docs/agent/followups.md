@@ -220,8 +220,18 @@
 - [ ] FU-184 · C · src=L6-F2 0.6.105 真机（General 11-23） · 2026-11-23 · 「把《合同-真实结构.docx》里的第 3 段删掉」走了知识库检索，没有走改写（patch）：删段落不在 DOC_EDIT_WORDS 里。归 M1 分流。判据：这句进入文档工具并弹改写卡（不是删除卡）。
 - [ ] FU-185 · C · src=L6-F2 0.6.107 真机（General 11-23） · 2026-11-23 · 用户在删除审批卡上拒绝后，模型回答里露出 doc_ id（「请确认文档 ID 是否正确（当前为 doc_01M7YT…）」）。改法：删除被拒的回执告诉模型「用户不想删，不要再删，也不要提 ID」；App 兜底去掉回答里的 doc_ id。判据：拒绝后回答不含 doc_。
 - [ ] FU-186 · C · src=L6-F2 0.6.107 真机（General 11-23） · 2026-11-23 · 「刚才删掉的那份文档里写了什么？」走了知识库检索，答了不相关的内容（没调 documents，也没泄露已删内容）。和 FU-175 同类，归 M1：对话里指代刚删除或点名的文档时要带上文档上下文。判据：回答说明该文档在「最近删除」、可恢复。
+- [ ] FU-187 · C · src=L6-F5 #2034 PR-Daemon（11-23） · 2026-11-24 · `a_save_that_wrote_nothing_is_not_a_saved_version` 补断言 `attempted` 与 `failed == ["doc_X"]`；缺 `revision` / `document_id`、同一文档一轮存两次（两个版本都列出）的测试仍缺。Low。
+- [ ] FU-188 · C · src=L6-F5 #2034 PR-Daemon（11-23） · 2026-11-24 · `tools.rs` 的 `saved_version` 在 `committed:false`（内容与 head 相同、什么都没写）时仍调 `note_patched`（基线代码）：另开跟进，核对它记的「已改写」是否会让后续提示误导模型。Low。
+- [ ] FU-189 · C · src=L6-F5 0.6.108 真机（General 11-23） · 2026-11-24 · 同名文档（《合同-真实结构》的 docx 与它转出的 pdf 去扩展名后同名）按名字找改写目标时，候选只列 doc_ 编号，和 F2 的候选选择卡不一致。判据：候选写出标题与类型，可点选。
+- [ ] FU-190 · C · src=L6-F5 0.6.108 真机（General 11-23） · 2026-11-24 · DOCX 在文档页没有「在对话里问」入口（只有转成 PDF 后的 PDF 有），计划里「打开《合同.docx》对话」的说法对不上，验收改用助理页点名。判据：给 DOCX 加入口，或改计划措辞。
+- [ ] FU-191 · C · src=L6-F5 #2035/#2037 PR-Daemon（11-23） · 2026-11-24 · Low 合集：任务卡 `saveCheck` 初始 null 时换审批有一帧画出「确认」，应渲染期算出需检查并要求显式 ok；恢复分支 try/finally 无 catch、点恢复后无会话代数保护；恢复意图「我不想回到上一个版本」「能回到上一个版本吗」会出卡、不认「第十二版」；`savesToOriginal` 扫整段 prompt；审批授权判断应由 daemon 按 run 标志强制（TUI 等入口不受 mark 约束）；`headOf` 与主进程解析不一致（库超 200 份时可能读到另一份的版本号）、读不到时卡上永远是「正在读取版本号」；patch/fill 摘要被截断且无 payload 时卡上写「另存为新文档」；#2037 的 trackedOriginal、卡上 fill 版本号、headOf 翻页、读版本失败路径缺测试。
+- [ ] FU-196 · C · src=L6-F5 0.6.109 真机（General 11-24） · 2026-11-24 · 本地模型一次抽取超过 60 秒时，调用方报「iDoris unavailable (HTTP 504)」，界面一直显示「思考中…」没有错误提示，约 1 分钟后自动重试才成功。判据：超时有可见提示，或重试期间显示「正在重试」。不是 F5 引入的。
 - [ ] FU-192 · C · src=L6-S05 · 2026-11-24 · 跨格式对比（DOCX 对 PDF）不支持：compare 返回明确的 unsupported_format。判据：两份格式不同的文档对比时得到明确说明，不是空结果。
 - [ ] FU-193 · C · src=L6-S05 · 2026-11-24 · 对比里数字和文字改动不分开标注；也不导出对比报告、不比字体版式、不支持三份以上同时对比、不保证扫描件 PDF 的 OCR 质量。
 - [ ] FU-194 · C · src=L6-S05 · 2026-11-24 · 对齐只到段：整段挪位并改写、拆段合段对不上时，两边各列为 unaligned，不硬配。判据：此类改动不被当成「改」。
 - [ ] FU-195 · C · src=L6-S05 · 2026-11-24 · PDF 的块是版面块，不一定是一段；compare 按块比，同一段被版面拆成不同块时可能多报。判据：对同一份 PDF 的两个版本，只改一个数字时只出一处改动。
 - [ ] FU-197 · C · src=L6-S05 · 2026-11-24 · 对比视图里 Word 的改动只写「第 N 段」，不能点开跳到那一段（文档页只能按 PDF 的页/块定位）；旧版本的页/块定位也没验过（F5 遗留）。判据：点 Word 改动能滚到对应段。
+- [ ] FU-198 · B · src=PR-Daemon #2041 · 2026-11-24 · compare 的 diff 在 async worker 上内联、无规模上限：核心 Replace 段做 n×m 次字符 ratio()，实测 600 段 1.75 秒、二次增长。改法：`blocking(move || diff(..))` + 单侧 unit 上限（超了 422 too_large）。判据：超大文档对比不卡住其它请求，且有明确报错。
+- [ ] FU-199 · C · src=PR-Daemon #2041 · 2026-11-24 · compare/route.rs 头注释「只读」对 PDF/图片不成立（缺文本层会建层存储）；补 PDF/图片成功对比测试（BlockRef::Block）。非 DOCX 一律归 layer，两个 xlsx 对比会报误导性 422：调用前查 pdfkit::FORMATS，给明确的 unsupported_format。
+- [ ] FU-200 · C · src=PR-Daemon #2041 · 2026-11-24 · compare 分页只按条数，可超 512 KiB 响应预算：加字节预算；另补「已软删除文档 → 404」测试。
+- [ ] FU-201 · C · src=L6-S05 0.6.110 真机（General 11-24） · 2026-11-24 · CLI 的 `documents compare` 弹「允许发起方写入 documents 模块的数据（delegate）」：daemon 对 FirstPartyShell 的非 GET 模块路由一律要 delegation（middleware.rs，按 HTTP 方法判断，不看是否只读），compare 和 find 是只读 POST，也被算作写。桌面（ProductHost）不受影响。改法：给只读 POST 的白名单或改读委托。判据：CLI 跑 compare/find 不弹写入委托框。

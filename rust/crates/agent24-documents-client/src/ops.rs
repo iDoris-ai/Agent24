@@ -178,6 +178,33 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let path = format!("{BASE}/documents/{document}/revisions/{revision}/restore");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
+        // L6-S05: two documents, or two versions of one, compared by text.
+        "compare" => {
+            let side = |key: &str| -> Option<Value> {
+                let k = Keys(k.0.get(key)?.as_object()?);
+                let mut out = json!({"document_id": k.id("documentId", "doc_")?});
+                if let Some(r) = k.optional("revision", |v| safe_u64(v).filter(|n| *n >= 1))? {
+                    out["revision"] = json!(r);
+                }
+                Some(out)
+            };
+            let mut body = json!({"left": side("left")?, "right": side("right")?});
+            if let Some(limit) =
+                k.optional("limit", |v| safe_u64(v).filter(|n| (1..=500).contains(n)))?
+            {
+                body["limit"] = json!(limit);
+            }
+            if let Some(offset) = k.optional("offset", safe_u64)? {
+                body["offset"] = json!(offset);
+            }
+            (
+                Method::Post,
+                format!("{BASE}/documents/compare"),
+                Some(body),
+                Vec::new(),
+                Answer::Json,
+            )
+        }
         "readText" => {
             let document = k.id("documentId", "doc_")?;
             let revision = k.number("revision")?;
