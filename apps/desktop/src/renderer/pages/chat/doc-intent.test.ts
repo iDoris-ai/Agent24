@@ -302,6 +302,18 @@ describe('L6-F2: deleting a whole document, and what is not', () => {
   ])('chat, a question or a split: %s', (text) => {
     expect(asksDeleteDocument(text, false)).toBe(false)
   })
+  // PR-Daemon #2028 round 2: a title is not words of the sentence.
+  it.each(['把《都市报告》删了', '把《不要的草稿》删了', '把《别人的合同》删掉', '删除《年度汇总（所有部门）》', '删掉这份吧，都过期了', '删了吧'])('%s deletes the one document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(true)
+  })
+  it.each([
+    '不删了', '先不删了', '甭删了', '算了不删了', '删掉末页', '删掉首页', '删掉空白页', '删掉页码', '删掉第3到5页', '删掉前面两页',
+    '删掉这两页', '删掉附录', '删掉标题', '删掉脚注', '删掉插图', '删掉公章', '删除超链接', '把日期删了', '删掉第二章', '删掉错别字',
+    '这几份文件删了', '删除这两份文件', '删掉PDF的末页', '删掉这个文件的页码',
+  ])('round 2: %s is not deleting one whole document', (text) => {
+    expect(asksDeleteDocument(text, true)).toBe(false)
+    expect(asksDeleteDocument(text, false)).toBe(false)
+  })
   // PR-Daemon #2028 ①: not to delete, many documents, or a part of one.
   it.each([
     '先别删掉这份', '不用删了', '不要删除这份文档', '删除所有文件', '把这些文件全部删除',

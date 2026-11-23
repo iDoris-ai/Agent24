@@ -111,20 +111,31 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
     && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
 }
 
-/** L6-F2: asked to delete or remove… */
-const DELETE_VERB = /删除|删掉|删了|删去|移除/
-/** …a document (in a conversation about one, any 「删了」 is about it)… */
-const DOC_NOUN = /《[^》]{1,200}》|[这那该此]一?[份篇]|[这那该此]一?个(?:文件|文档)|上一份|文件|文档|PDF|pdf|docx?/
-/** …not a part of one: a paragraph, a sentence, a page is a rewrite or a split. */
-const DOC_PART = /第\s*[\d一二两三四五六七八九十百]+\s*[段句行条页章节款项处]|[这那]一?[段句行条页处]|句话|段话|里的|中的|里面|部分|内容|文字|字号|标点|空格|批注|修订|水印|最后|[前后]\s*[\d一二两三四五六七八九十]*\s*[页段行]|封面|页眉|页脚|表格|图片|空行|签名|密码|目录|附件/
-/** PR-Daemon #2028 ①: 「先别删」「不用删了」 say not to; 「删除所有文件」 is not one document. */
-const DELETE_NOT = /不要|别|不用|无需|不必|取消|所有|全部|都/
+/** L6-F2 (PR-Daemon #2028 round 2): a delete of a whole document needs
+ * positive evidence, never 「a delete verb and none of some words」: the
+ * sentence is the verb with one whole document as its object (「把这份删了」
+ * 「删除上一份拆出来的文件」「把《X》删了」), or, in a conversation about a
+ * document, the bare verb (「删了吧」). Anything else is not a delete: a miss
+ * costs the user a rewording, a false hit proposes a delete. */
+const VERB = '(?:删除|删掉|删了|删去|移除)'
+/** One whole document. 《…》 is replaced by 《》 first, so a title never counts. */
+const ONE_DOC = '(?:《》|[这那该此]?一?份\\s*(?:文件|文档|PDF|pdf|合同|Word|word)?|[这那该此]个?\\s*(?:文件|文档|PDF|pdf)|整份(?:文件|文档)?|上一份[^，。,！!？?删]{0,12}|刚才(?:那份|生成的|拆出来的|合并的)[^，。,！!？?删]{0,12})'
+const POLITE_HEAD = '(?:请|麻烦|帮我|你)*\\s*'
+const TAIL = '(?:吧|掉|了|一下|给我)*\\s*(?:[，,。！!~～][^删]{0,20})?[。！!~～]*'
+const OBJECT_FIRST = new RegExp(`^${POLITE_HEAD}(?:把|将)\\s*${ONE_DOC}\\s*(?:给)?${VERB}${TAIL}$`)
+const VERB_FIRST = new RegExp(`^${POLITE_HEAD}${VERB}\\s*(?:掉)?\\s*${ONE_DOC}${TAIL}$`)
+const BARE = new RegExp(`^(?:那就|好|嗯|行|那)?[，,]?\\s*${POLITE_HEAD}(?:把它|它)?\\s*${VERB}(?:它)?${TAIL}$`)
+/** 「不删了」「先别删」「甭删」: told not to, just before the verb. */
+const NOT_DELETE = /(?:不|别|甭|不要|不用|先别|先不|无需|不必)\s*(?:删|移除)/
+/** Several documents, or a question. */
+const SEVERAL = /所有|全部|这些|那些|[这那]?[两三四五六七八九十几]份|[两三四五六七八九十几]个文件/
 const DELETE_QUESTION = /怎么|如何|能不能|可以吗|还能|吗|呢|[？?]/
 
-/** Whether a turn asks to delete a whole document (「把这份删了」「删除上一份拆出来的文件」).
- * 「删掉第 3 段」「删掉这句话」 are rewrites and 「怎么删除文档？」 a question: not this. */
+/** Whether a turn asks to delete one whole document. */
 export function asksDeleteDocument(text: string, inDocument: boolean): boolean {
-  return DELETE_VERB.test(text) && !DELETE_NOT.test(text) && (inDocument || DOC_NOUN.test(text)) && !DOC_PART.test(text) && !DELETE_QUESTION.test(text)
+  const said = text.trim().replace(/《[^》]{1,200}》/g, '《》')
+  if (NOT_DELETE.test(said) || SEVERAL.test(said) || DELETE_QUESTION.test(said)) return false
+  return OBJECT_FIRST.test(said) || VERB_FIRST.test(said) || (inDocument && BARE.test(said))
 }
 
 /** Whether a turn goes to the Agent with the documents tools. */

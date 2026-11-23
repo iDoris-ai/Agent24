@@ -20,7 +20,9 @@ describe('L6-F2: the delete card names one document from the library', () => {
     const said = await deleteTarget(api({ title: '中文测试合同.pdf', created_at: '2026-11-21T06:05:00.000Z', pages: 3 }, docs), DOC, t)
     expect(said).toContain('task.ask.deleteTarget{"title":"中文测试合同.pdf","pages":"task.ask.deletePages{\\"n\\":\\"3\\"}"')
     expect(said).toContain(localTime('2026-11-21T06:05:00.000Z'))
-    expect(localTime('2026-11-21T06:05:00.000Z')).toMatch(/^2026-11-2\d \d\d:05$/)
+    const d = new Date('2026-11-21T06:05:00.000Z')
+    const two = (n: number) => String(n).padStart(2, '0')
+    expect(localTime(d.toISOString())).toBe(`${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`)
     expect(said).toContain('task.ask.deleteSame{"n":"1"}')
   })
   it('a library not read whole leaves the same-title check unfinished, not 「none」', async () => {
