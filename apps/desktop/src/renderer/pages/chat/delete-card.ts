@@ -25,14 +25,15 @@ export function localTime(iso: unknown): string {
 export async function deleteTarget(api: Api, id: string, t: T): Promise<string> {
   const res = api ? await api.request({ op: 'get', documentId: id }).catch(() => null) : null
   if (!res || !res.ok) return t('task.ask.deleteUnread')
-  const doc = res.data as { title: string; created_at: string; pages?: unknown }
+  const doc = res.data as { title?: unknown; created_at?: unknown; pages?: unknown } | null
+  if (typeof doc?.title !== 'string' || !doc.title) return t('task.ask.deleteUnread')
   const pages = typeof doc.pages === 'number' ? t('task.ask.deletePages', { n: String(doc.pages) }) : t('task.ask.deletePagesUnknown')
   const at = localTime(doc.created_at)
   const list = await api!.request({ op: 'list', limit: 200 }).catch(() => null)
   // PR-Daemon #2028 L1: not read, or not the whole library, is said so; it is
   // never taken for 「no other document has this title」.
   const whole = list && list.ok && !list.data.next_cursor
-  const same = whole ? list.data.documents.filter((d) => d.document_id !== id && plainTitle(d.title) === plainTitle(doc.title)).length : 0
+  const same = whole ? list.data.documents.filter((d) => d.document_id !== id && plainTitle(d.title) === plainTitle(doc.title as string)).length : 0
   const note = !whole ? t('task.ask.deleteSameUnknown') : same > 0 ? t('task.ask.deleteSame', { n: String(same) }) : ''
-  return t('task.ask.deleteTarget', { title: doc.title, pages, at }) + note
+  return t('task.ask.deleteTarget', { title: doc.title as string, pages, at }) + note
 }

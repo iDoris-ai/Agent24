@@ -22,6 +22,7 @@ describe('L6-F2: the delete card names one document from the library', () => {
     expect(said).toContain(localTime('2026-11-21T06:05:00.000Z'))
     const d = new Date('2026-11-21T06:05:00.000Z')
     const two = (n: number) => String(n).padStart(2, '0')
+    expect(localTime(d.toISOString())).toMatch(/^\d{4}-\d\d-\d\d \d\d:\d\d$/)
     expect(localTime(d.toISOString())).toBe(`${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`)
     expect(said).toContain('task.ask.deleteSame{"n":"1"}')
   })

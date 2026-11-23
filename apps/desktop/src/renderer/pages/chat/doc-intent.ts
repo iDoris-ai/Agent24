@@ -119,16 +119,21 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
  * costs the user a rewording, a false hit proposes a delete. */
 const VERB = '(?:删除|删掉|删了|删去|移除)'
 /** One whole document. 《…》 is replaced by 《》 first, so a title never counts. */
-const ONE_DOC = '(?:《》|[这那该此]?一?份\\s*(?:文件|文档|PDF|pdf|合同|Word|word)?|[这那该此]个?\\s*(?:文件|文档|PDF|pdf)|整份(?:文件|文档)?|上一份[^，。,！!？?删]{0,12}|刚才(?:那份|生成的|拆出来的|合并的)[^，。,！!？?删]{0,12})'
+const NOUN = '(?:文件|文档|PDF|pdf|合同|Word|word)'
+const MADE = '(?:拆出来的|生成的|合并的|改写的|填好的|翻译的)'
+/** PR-Daemon #2028 round 3: closed words only, never 「any N characters」. */
+const ONE_DOC = `(?:《》|[这那该此]?一?份\\s*${NOUN}?|[这那该此]个?\\s*${NOUN}|整份${NOUN}?|上一份${MADE}?(?:那份)?\\s*${NOUN}?|刚才(?:${MADE}|那份)(?:那份|那个)?\\s*${NOUN}?)`
 const POLITE_HEAD = '(?:请|麻烦|帮我|你)*\\s*'
-const TAIL = '(?:吧|掉|了|一下|给我)*\\s*(?:[，,。！!~～][^删]{0,20})?[。！!~～]*'
+/** Only particles, or a reason that it is not needed; never a clause that
+ * narrows or takes back the delete (「删了吧，只保留第3页」). */
+const TAIL = '(?:吧|掉|了|一下|给我|谢谢|啊|呀)*\\s*(?:[，,](?:它|这份)?(?:都|已经)?(?:过期了|没用了|用不上了|作废了|重复了))?[。！!~～]*'
 const OBJECT_FIRST = new RegExp(`^${POLITE_HEAD}(?:把|将)\\s*${ONE_DOC}\\s*(?:给)?${VERB}${TAIL}$`)
 const VERB_FIRST = new RegExp(`^${POLITE_HEAD}${VERB}\\s*(?:掉)?\\s*${ONE_DOC}${TAIL}$`)
 const BARE = new RegExp(`^(?:那就|好|嗯|行|那)?[，,]?\\s*${POLITE_HEAD}(?:把它|它)?\\s*${VERB}(?:它)?${TAIL}$`)
 /** 「不删了」「先别删」「甭删」: told not to, just before the verb. */
-const NOT_DELETE = /(?:不|别|甭|不要|不用|先别|先不|无需|不必)\s*(?:删|移除)/
+const NOT_DELETE = /(?:不|别|甭|不要|不用|先别|先不|无需|不必)\s*(?:删|移除)|算了|不对|开玩笑/
 /** Several documents, or a question. */
-const SEVERAL = /所有|全部|这些|那些|[这那]?[两三四五六七八九十几]份|[两三四五六七八九十几]个文件/
+const SEVERAL = /所有|全部|这些|那些|[这那]?[两三四五六七八九十几]份|[两三四五六七八九十几]个文件|都\s*(?:删|移除)|和|还有|以及|跟/
 const DELETE_QUESTION = /怎么|如何|能不能|可以吗|还能|吗|呢|[？?]/
 
 /** Whether a turn asks to delete one whole document. */
