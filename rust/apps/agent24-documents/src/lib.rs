@@ -308,6 +308,7 @@ mod tests {
                 "get",
                 "compose",
                 "paragraphs",
+                "compare",
                 "patch",
                 "fields",
                 "fill",
