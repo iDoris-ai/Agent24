@@ -24,3 +24,27 @@ export function pendingDocFocus(): DocFocus | null {
 export function clearDocFocus(): void {
   pending = null
 }
+
+// L6-S05: a line of a comparison summary in the conversation opens the
+// comparison view on the documents page, at that change.
+export interface CompareFocus {
+  left: { documentId: string; revision?: number; label: string }
+  right: { documentId: string; revision?: number; label: string }
+  focusId?: string
+}
+
+let pendingCompare: CompareFocus | null = null
+
+export function openCompare(focus: CompareFocus): void {
+  pendingCompare = focus
+  for (const l of listeners) l()
+}
+
+export function pendingCompareFocus(): CompareFocus | null {
+  return pendingCompare
+}
+
+/** The documents page has taken it. */
+export function clearCompareFocus(): void {
+  pendingCompare = null
+}
