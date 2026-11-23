@@ -750,7 +750,8 @@ describe('VoicePanel — recent model calls (ME4-desktop-model-ui)', () => {
     mount()
     render(<VoicePanel />)
     await waitFor(() => {
-      expect(screen.getByText('Qwen3-8B-4bit · 远端 · 1,500 ms')).toBeInTheDocument()
+      expect(screen.getByText('Qwen3-8B-4bit · 1,500 ms')).toBeInTheDocument()
+      expect(screen.getByText('远端').closest('.privacy-badge')).toHaveClass('privacy-badge-remote')
     })
   })
 

@@ -180,7 +180,8 @@ describe('ChatPage', () => {
       expect(screen.getByText('Hello from AI!')).toBeInTheDocument()
     })
     // Server-reported latency_ms wins over the frontend's own timing too.
-    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 本地 · 用时 0.8 秒')).toBeInTheDocument()
+    expect(screen.getByText('Qwen3.6-35B-A3B-MLX-8bit · 用时 0.8 秒')).toBeInTheDocument()
+    expect(screen.getByText('本地').closest('.privacy-badge')).toHaveClass('privacy-badge-local')
     expect(screen.queryByText(/首字/)).not.toBeInTheDocument()
   })
 
