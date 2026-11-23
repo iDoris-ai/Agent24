@@ -12,13 +12,14 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
-import { AlreadyDecided, cancelRun, createRun, decideApproval, listPendingApprovals, type Approval, type Decision } from '../agent/api'
+import { AlreadyDecided, cancelRun, createRun, decideApproval, getRun, listPendingApprovals, type Approval, type Decision } from '../agent/api'
+import { savesToOriginal } from './doc-version'
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { skillForConversation } from './session-skill'
 import { namedDocument } from './doc-intent-run'
 import { mismatchedEdit } from './patch-anchor'
-import { DocumentsOutcome, documentName } from './DocumentsOutcome'
+import { DocumentsOutcome, documentName, headOf } from './DocumentsOutcome'
 import { deleteTarget } from './delete-card'
 import { askRunAgain, useRunViews, type RunView } from './run-status'
 import type { ChatHistoryRun } from '../../../shared/chat-history'
@@ -161,10 +162,15 @@ export function approvalText(
   originals: ReadonlyMap<number, string> | null = null,
   /** General 0.6.94: a document id the card names, by its title. */
   titles: ReadonlyMap<string, string> | null = null,
+  /** L6-F5: the version a save into the original makes, once read. */
+  nextVersion: number | null = null,
 ): string {
   const { tool, args, complete } = approvalArgs(a)
   const text = (v: unknown) => (typeof v === 'string' ? v : '')
   const str = (v: unknown) => titles?.get(text(v)) ?? text(v)
+  // L6-F5: 「保存为新版本 vN」 or, as before, a new document.
+  const original = args['save_to'] === 'original'
+  const v = nextVersion === null ? t('task.versionReading') : `v${nextVersion}`
   if (tool === 'documents.list') return t('task.ask.list')
   if (tool === 'documents.get') return t('task.ask.get', { doc: str(args['document_id']) })
   if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
@@ -184,11 +190,13 @@ export function approvalText(
     const values = Object.entries(args['values'] as Record<string, unknown>)
       .map(([k, v]) => `${k}=${str(v)}`)
       .join('，')
-    return t('task.ask.fill', { doc: str(args['document_id']), values: values.length > 300 ? `${values.slice(0, 300)}…` : values })
+    return t(original ? 'task.ask.fillOriginal' : 'task.ask.fill', { doc: str(args['document_id']), values: values.length > 300 ? `${values.slice(0, 300)}…` : values, ...(original ? { v } : {}) })
   }
   if (tool === 'documents.patch' && Array.isArray(args['edits'])) {
     const edits = args['edits'] as Array<Record<string, unknown>>
-    const head = t(edits.some(e => e['tracked'] === true) ? 'task.ask.patchTracked' : 'task.ask.patch', { doc: str(args['document_id']), n: complete ? String(edits.length) : t('task.ask.atLeast', { n: String(edits.length) }) })
+    const tracked = edits.some(e => e['tracked'] === true)
+    const key = original ? (tracked ? 'task.ask.patchTrackedOriginal' : 'task.ask.patchOriginal') : tracked ? 'task.ask.patchTracked' : 'task.ask.patch'
+    const head = t(key, { doc: str(args['document_id']), n: complete ? String(edits.length) : t('task.ask.atLeast', { n: String(edits.length) }), ...(original ? { v } : {}) })
     // M1 (0.6.72): the card said only 「改写 1 段」 while a model was about to
     // write 第三条's text over 乙方's line. Each edit shows what it replaces.
     const clip = (s: string) => (s.length > 60 ? `${s.slice(0, 60)}…` : s)
@@ -366,6 +374,42 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
     }, () => { if (live) setReading(false) })
     return () => { live = false }
   }, [askingSummary, askingId, task.run_id])
+  /** L6-F5: the version a save into the original makes (its head + 1). */
+  const [nextVersion, setNextVersion] = useState<number | null>(null)
+  useEffect(() => {
+    setNextVersion(null)
+    const approval = askingRef.current
+    if (!approval) return
+    const { args } = approvalArgs(approval)
+    const id = args['document_id']
+    if (args['save_to'] !== 'original' || typeof id !== 'string') return
+    let live = true
+    void headOf(window.agent24?.documents, id).then(head => { if (live && head !== null) setNextVersion(head + 1) })
+    return () => { live = false }
+  }, [askingSummary, askingId])
+  /** L6-F5 (General 11-23): a patch or fill asking to save into the
+   * original is offered only on a run the App judged so (its prompt carries
+   * SAVE_MARK). Any other is sent back to the model before the user is asked:
+   * 'checking' while its run is read, 'unread' when it cannot be (no 确认),
+   * 'sentBack' once denied. */
+  const [saveCheck, setSaveCheck] = useState<'checking' | 'unread' | 'sentBack' | null>(null)
+  useEffect(() => {
+    setSaveCheck(null)
+    const approval = askingRef.current
+    if (!approval || !askingId) return
+    const { tool, args } = approvalArgs(approval)
+    if ((tool !== 'documents.patch' && tool !== 'documents.fill') || args['save_to'] !== 'original') return
+    let live = true
+    setSaveCheck('checking')
+    void getRun(task.run_id).then(async run => {
+      if (!live) return
+      if (savesToOriginal(run.input.prompt)) { setSaveCheck(null); return }
+      setSaveCheck('sentBack')
+      await decideApproval(askingId, { type: 'deny', reason: tRef.current('task.saveSentBack') }).catch(() => {})
+      askRunAgain(task.run_id)
+    }, () => { if (live) setSaveCheck('unread') })
+    return () => { live = false }
+  }, [askingSummary, askingId, task.run_id])
   // PR-Daemon #1987 Medium 1: the decision goes to the approval the card
   // shows (`asking`), never to another one of the same run picked again from
   // the list: with two patch approvals in a run, 「确认」 on A approved B. One
@@ -394,12 +438,14 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
     <div className={`task-card${active ? ' active' : ''}${waiting && !sentBack ? ' waiting' : ''}`} role="listitem" aria-label={t('task.card', { status: label })}>
       <span className="task-card-status">{label}</span>
       {status !== 'missing' && !Number.isNaN(from) && <span className="task-card-time">{elapsed(to - from)}</span>}
-      {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals, titles)}</span>}
+      {waiting && asking && !sentBack && <span className="task-card-ask">{approvalText(asking, t as (key: string, vars?: Record<string, string>) => string, originals, titles, nextVersion)}</span>}
       {waiting && asking && !sentBack && typeof asking.summary === 'string' && (
         <details className="message-detail"><summary>{t('fail.detail')}</summary>
           <div className="message-detail-list">{approvalDetail(asking, t as (key: string, vars?: Record<string, string>) => string)}</div></details>
       )}
       {sentBack && <span className="task-card-knowledge" role="note">{t('task.anchorNote', { n: String(sentBack.index + 1) })}</span>}
+      {saveCheck === 'sentBack' && <span className="task-card-knowledge" role="note">{t('task.saveNote')}</span>}
+      {saveCheck === 'unread' && <span className="task-card-knowledge" role="note">{t('task.saveUnread')}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
       {failed && <span className="task-card-error" role="alert">{failed}</span>}
       {status === 'completed' && view?.output && !answered && (
@@ -413,7 +459,7 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
         </div>
       )}
       <span className="task-card-actions">
-        {waiting && offers?.approve && !denying && !sentBack && !askingIncomplete && (
+        {waiting && offers?.approve && !denying && !sentBack && !askingIncomplete && saveCheck === null && (
           <button type="button" className="btn btn-primary task-card-button" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
         )}
         {waiting && offers?.deny && !denying && (
