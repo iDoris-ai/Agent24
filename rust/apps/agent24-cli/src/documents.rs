@@ -208,6 +208,29 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         json: bool,
     },
+    /// List a document's versions, newest first, and which is current (L6-F5)
+    Versions {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an old version current again: its content is saved as a new
+    /// version, and every version is kept (L6-F5)
+    Revert {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// The version to bring back (from `documents versions`)
+        revision: u64,
+        /// The current version as `documents versions` showed it; if the
+        /// document has moved on since, nothing is written
+        #[arg(long)]
+        expect: u64,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
     /// List a DOCX document's paragraphs, by index (for `documents patch`)
     Paragraphs {
         /// The document's id (`doc_…`)
@@ -230,6 +253,13 @@ pub(crate) enum DocumentsAction {
         /// The new document's title
         #[arg(long)]
         title: Option<String>,
+        /// Save into the original as its next version (L6-F5), over version
+        /// `--expect`, the current one when it was read; else a new document
+        #[arg(long, requires = "expect")]
+        save_to_original: bool,
+        /// With `--save-to-original`: the current version, as read
+        #[arg(long, requires = "save_to_original")]
+        expect: Option<u64>,
         /// Print the result as one JSON line
         #[arg(long)]
         json: bool,
@@ -254,6 +284,13 @@ pub(crate) enum DocumentsAction {
         /// The new document's title
         #[arg(long)]
         title: Option<String>,
+        /// Save into the template as its next version (L6-F5), over version
+        /// `--expect`; else a new document
+        #[arg(long, requires = "expect")]
+        save_to_original: bool,
+        /// With `--save-to-original`: the current version, as read
+        #[arg(long, requires = "save_to_original")]
+        expect: Option<u64>,
         /// Print the result as one JSON line
         #[arg(long)]
         json: bool,
@@ -452,6 +489,19 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
         DocumentsAction::Deleted { json } => {
             operation(json!({"op": "recentlyDeleted"}), json).await
         }
+        DocumentsAction::Versions { document_id, json } => {
+            operation(json!({"op": "revisions", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Revert {
+            document_id,
+            revision,
+            expect,
+            json,
+        } => {
+            let req = json!({"op": "restoreRevision", "documentId": document_id,
+                             "revision": revision, "expectRevision": expect});
+            operation(req, json).await
+        }
         DocumentsAction::Paragraphs { document_id, json } => {
             operation(json!({"op": "paragraphs", "documentId": document_id}), json).await
         }
@@ -460,9 +510,11 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             edits,
             tracked,
             title,
+            expect,
             json,
+            ..
         } => match patch_request(document_id, &edits, tracked, title) {
-            Ok(req) => operation(req, json).await,
+            Ok(req) => operation(to_original(req, expect), json).await,
             Err(res) => report(&res, json),
         },
         DocumentsAction::Fields { document_id, json } => {
@@ -472,9 +524,11 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             document_id,
             values,
             title,
+            expect,
             json,
+            ..
         } => match fill_request(document_id, &values, title) {
-            Ok(req) => operation(req, json).await,
+            Ok(req) => operation(to_original(req, expect), json).await,
             Err(res) => report(&res, json),
         },
         DocumentsAction::Save {
@@ -491,6 +545,15 @@ fn pair<'a>(raw: &'a str, what: &str) -> Result<(&'a str, &'a str), Response> {
         .filter(|(k, _)| !k.trim().is_empty())
         .map(|(k, v)| (k.trim(), v))
         .ok_or_else(|| invalid(format!("{what} must be KEY=VALUE, not {raw:?}")))
+}
+
+/// L6-F5: `--save-to-original --expect N` (clap makes them go together).
+fn to_original(mut req: Value, expect: Option<u64>) -> Value {
+    if let Some(n) = expect {
+        req["saveTo"] = json!("new_revision");
+        req["expectRevision"] = json!(n);
+    }
+    req
 }
 
 /// The `patch` operation of `--edit INDEX=TEXT`s.
@@ -1272,6 +1335,37 @@ mod tests {
         );
         assert!(fill_request("doc_x".into(), &["no-equals".into()], None).is_err());
         assert!(fill_request("doc_x".into(), &["=x".into()], None).is_err());
+    }
+
+    /// L6-F5: versions, revert over the version seen, and patch / fill saved
+    /// into the original only with the version they read.
+    #[test]
+    fn versions_revert_and_saving_into_the_original_go_with_the_version_read() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: DocumentsAction,
+        }
+        let parse =
+            |args: &[&str]| Cli::try_parse_from(["documents"].iter().chain(args)).map(|_| ());
+        assert!(parse(&["versions", "doc_x"]).is_ok());
+        assert!(parse(&["revert", "doc_x", "1", "--expect", "2"]).is_ok());
+        assert!(parse(&["revert", "doc_x", "1"]).is_err());
+        let patch = ["patch", "doc_x", "--edit", "3=新"];
+        assert!(parse(&[&patch[..], &["--save-to-original", "--expect", "2"]].concat()).is_ok());
+        assert!(parse(&[&patch[..], &["--save-to-original"]].concat()).is_err());
+        assert!(parse(&[&patch[..], &["--expect", "2"]].concat()).is_err());
+        let req = patch_request("doc_x".into(), &["3=新".into()], false, None).unwrap();
+        assert_eq!(
+            to_original(req.clone(), Some(2)),
+            json!({"op": "patch", "documentId": "doc_x", "edits": [{"index": 3, "text": "新"}],
+                   "saveTo": "new_revision", "expectRevision": 2})
+        );
+        assert_eq!(to_original(req.clone(), None), req);
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6YB4MCD";
+        let real = patch_request(id.into(), &["3=新".into()], false, None).unwrap();
+        assert!(route(&to_original(real, Some(2))).is_some());
     }
 
     #[test]
