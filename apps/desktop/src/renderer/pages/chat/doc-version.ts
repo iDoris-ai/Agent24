@@ -13,7 +13,7 @@ import { localTime } from './delete-card'
 /** Written into the prompt of a turn the App judged to save into the original. */
 export const SAVE_MARK = '【App 判定：用户要求存到原文件】'
 
-const ORIGINAL = '(?:原文件|原文档|原来的文件|原来的文档|原件)'
+const ORIGINAL = '(?:原文件(?!夹)|原文档|原来的文件(?!夹)|原来的文档|原件)'
 const SAVE_ASKED = [
   // 「存到原文件」「存回原文件」「直接存原文件」「保存到原文件」「就存在原来的文件里」
   new RegExp(`(?:存|保存|写)(?:回|到|进|在)?\\s*${ORIGINAL}`),
@@ -23,16 +23,17 @@ const SAVE_ASKED = [
   // 「存成这份文档的新版本」「保存为新版本」
   /(?:存|保存)(?:成|为)(?:这份文档的|这份文件的|原文件的|它的)?新(?:的)?版本/,
 ]
-/** 「不要改原文件」「别存到原文件」「原文件不要动」. */
-const SAVE_REFUSED = [
-  new RegExp(`(?:不要|别|不用|不必|无需|勿|不)\\s*(?:直接)?\\s*(?:改|修改|存|保存|动|覆盖|写)[^，。,；;]{0,3}${ORIGINAL}`),
-  new RegExp(`${ORIGINAL}[^，。,；;]{0,4}(?:不要|别|不能|不用)`),
-]
+/** A clause that says no, or only asks: 「我不想覆盖原文件」「能存到原文件吗？」. */
+const NEGATED = /不|别|没|禁止|勿|无需|莫|吗|还是|能否|是否|\?|？/
 
-/** Whether the user's words ask to save into the original file. */
+/** Whether the user's words ask to save into the original file. PR-Daemon
+ * #2035 B1: each clause is judged by itself, and a clause with any negation
+ * or question mark never asks (a refusal must fail toward 「不存」). */
 export function asksSaveToOriginal(text: string): boolean {
   const said = text.replace(/《[^》]{1,200}》/g, '《》')
-  return !SAVE_REFUSED.some((r) => r.test(said)) && SAVE_ASKED.some((r) => r.test(said))
+  return said
+    .split(/[，。,；;！!\n]/)
+    .some((clause) => !NEGATED.test(clause) && SAVE_ASKED.some((r) => r.test(clause)))
 }
 
 /** Added to the prompt of a turn that asks it (doc-intent `docAgentPrompt`). */
