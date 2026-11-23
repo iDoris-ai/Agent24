@@ -383,7 +383,11 @@ struct SavedRevision {
 /// L6-F5: a patch or fill the module saved as the document's next version.
 fn saved_revision(payload: Option<&serde_json::Value>) -> Option<SavedRevision> {
     let p = payload?;
-    if p.get("saved_as").and_then(|v| v.as_str()) != Some("new_revision") {
+    // `committed: false` is content equal to the head: the module wrote
+    // nothing (and told the model so), so it is no saved version.
+    if p.get("saved_as").and_then(|v| v.as_str()) != Some("new_revision")
+        || p.get("committed").and_then(|v| v.as_bool()) != Some(true)
+    {
         return None;
     }
     Some(SavedRevision {
@@ -1087,6 +1091,28 @@ mod documents_tests {
         // Without one, the field is left out, as an older daemon's answer.
         let none = serde_json::to_value(run_documents(&[to("c", "doc_Y")])).ok();
         assert!(none.is_some_and(|v| v.get("revisions").is_none()));
+    }
+
+    /// PR-Daemon #2034 Medium: a save whose content equals the head wrote
+    /// nothing (`committed: false`); it is no saved version, and the run
+    /// still reads as unchanged.
+    #[test]
+    fn a_save_that_wrote_nothing_is_not_a_saved_version() {
+        let same = r#"{"kind":"completed","payload":{"document_id":"doc_X","title":"合同.docx","revision":1,"previous_revision":1,"committed":false,"saved_as":"new_revision","source_document_id":"doc_X"}}"#;
+        let run = [
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "a", "name": "documents.fill", "arguments": { "document_id": "doc_X" } }]),
+                None,
+            ),
+            msg("tool", Some(same), json!([]), Some("a")),
+        ];
+        let got = run_documents(&run);
+        assert!(
+            got.as_ref()
+                .is_some_and(|d| d.revisions.is_empty() && d.jobs.is_empty())
+        );
     }
 
     /// PR-Daemon #1979 Low: every documents operation the module declares is
