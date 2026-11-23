@@ -180,6 +180,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
         .route("/documents", get(documents::list_documents))
+        .route("/documents/compare", post(compare::route::compare))
         .route("/documents/{document_id}", get(documents::get_document))
         // L6-F2: soft delete, restore within 7 days, and what can be restored.
         .route(

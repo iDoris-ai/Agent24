@@ -231,6 +231,30 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Compare two documents, or two versions of one, by their text (L6-S05).
+    /// `compare <A> <B>` is two documents' current versions;
+    /// `compare <ID> --from N --to M` is one document's versions N and M
+    Compare {
+        /// The first document's id (`doc_…`)
+        left: String,
+        /// The second document's id; not with --from/--to
+        right: Option<String>,
+        /// With one document: the version to compare from
+        #[arg(long)]
+        from: Option<u64>,
+        /// With one document: the version to compare to (default: current)
+        #[arg(long)]
+        to: Option<u64>,
+        /// Changes per page (1–500)
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Skip this many changes (the `next_offset` of the page before)
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
     /// List a DOCX document's paragraphs, by index (for `documents patch`)
     Paragraphs {
         /// The document's id (`doc_…`)
@@ -502,6 +526,18 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
                              "revision": revision, "expectRevision": expect});
             operation(req, json).await
         }
+        DocumentsAction::Compare {
+            left,
+            right,
+            from,
+            to,
+            limit,
+            offset,
+            json,
+        } => match compare_request(left, right, from, to, limit, offset) {
+            Ok(req) => operation(req, json).await,
+            Err(res) => report(&res, json),
+        },
         DocumentsAction::Paragraphs { document_id, json } => {
             operation(json!({"op": "paragraphs", "documentId": document_id}), json).await
         }
@@ -575,6 +611,35 @@ fn patch_request(
     }
     let mut req = json!({"op": "patch", "documentId": document_id, "edits": out});
     put(&mut req, "title", title);
+    Ok(req)
+}
+
+/// The `compare` operation of the two ways to say what is compared.
+fn compare_request(
+    left: String,
+    right: Option<String>,
+    from: Option<u64>,
+    to: Option<u64>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<Value, Response> {
+    let (l, r) = match (right, from, to) {
+        (Some(right), None, None) => (json!({"documentId": left}), json!({"documentId": right})),
+        (None, Some(from), to) => {
+            let mut r = json!({"documentId": left});
+            put(&mut r, "revision", to);
+            (json!({"documentId": left, "revision": from}), r)
+        }
+        _ => {
+            return Err(invalid(
+                "give two documents (`compare A B`), or one document with --from (and --to)"
+                    .to_owned(),
+            ));
+        }
+    };
+    let mut req = json!({"op": "compare", "left": l, "right": r});
+    put(&mut req, "limit", limit);
+    put(&mut req, "offset", offset);
     Ok(req)
 }
 
@@ -1007,6 +1072,32 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
+
+    #[test]
+    fn compare_takes_two_documents_or_one_with_versions() {
+        let (a, b) = ("doc_a".to_owned(), "doc_b".to_owned());
+        assert_eq!(
+            compare_request(a.clone(), Some(b), None, None, Some(5), None).unwrap(),
+            json!({"op": "compare", "left": {"documentId": "doc_a"},
+                   "right": {"documentId": "doc_b"}, "limit": 5})
+        );
+        assert_eq!(
+            compare_request(a.clone(), None, Some(1), Some(2), None, Some(3)).unwrap(),
+            json!({"op": "compare", "left": {"documentId": "doc_a", "revision": 1},
+                   "right": {"documentId": "doc_a", "revision": 2}, "offset": 3})
+        );
+        assert_eq!(
+            compare_request(a.clone(), None, Some(1), None, None, None).unwrap()["right"],
+            json!({"documentId": "doc_a"})
+        );
+        for (right, from, to) in [
+            (None, None, None),
+            (None, None, Some(2)),
+            (Some("doc_b".to_owned()), Some(1), None),
+        ] {
+            assert!(compare_request(a.clone(), right, from, to, None, None).is_err());
+        }
+    }
 
     #[test]
     fn host_input_is_one_object_with_base_token_and_path() {
