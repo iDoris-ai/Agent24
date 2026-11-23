@@ -33,6 +33,10 @@ describe('L6-F5: saved into the original only when the user says so', () => {
       '把这份存成 Word',
       '这个版本号是多少',
       '新版本的合同什么时候生效',
+      // PR-Daemon #2035 B1: a refusal or a question fails toward 「不存」.
+      '我不想覆盖原文件', '不能覆盖原文件，另存一份', '我不想把结果存到原文件', '不想直接存到原文件里',
+      '不可以保存到原文件', '禁止覆盖原文件', '不希望覆盖原文件', '别把结果存到原文件', '不要把它存到原文件',
+      '不需要存到原文件', '没让你存到原文件', '能存到原文件吗？', '存到原文件夹', '我不要保存为新版本',
     ]) expect(asksSaveToOriginal(s), s).toBe(false)
   })
 

@@ -377,8 +377,13 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
     setSaveCheck(null)
     const approval = askingRef.current
     if (!approval || !askingId) return
-    const { tool, args } = approvalArgs(approval)
-    if ((tool !== 'documents.patch' && tool !== 'documents.fill') || args['save_to'] !== 'original') return
+    const { tool, args, complete } = approvalArgs(approval)
+    if (tool !== 'documents.patch' && tool !== 'documents.fill') return
+    // PR-Daemon #2035 B2: a cut summary may have lost `save_to`; it is not
+    // offered, as a patch that is cut is not. Any `save_to` that is not the
+    // default new document needs the mark, not only the exact 'original'.
+    if (!complete) { setSaveCheck('unread'); return }
+    if (args['save_to'] === undefined || args['save_to'] === 'new_document') return
     let live = true
     setSaveCheck('checking')
     void getRun(task.run_id).then(async run => {

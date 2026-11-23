@@ -285,6 +285,22 @@ describe('task cards (M4 A4)', () => {
     }
   })
 
+  // PR-Daemon #2035 B2: a fill whose summary is cut (and may have lost
+  // `save_to`) is not offered either.
+  it('a fill whose summary is cut is not offered', async () => {
+    store.save(record('chat_a', '填写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at, input: { prompt: '填模板' } } as Run
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: 'documents.fill: {"document_id":"doc_1","values":{"甲方":"上海明远","租金":"8,500"},"sav',
+    }]
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    await waitFor(() => expect(within(c).queryByRole('button', { name: '确认' })).toBeNull())
+    expect(approvalDecide).not.toHaveBeenCalled()
+  })
+
   // UI polish 09: 「详情」 lists the payload, not the daemon's JSON summary.
   it('「详情」 lists what the step will get, key by key', async () => {
     store.save(record('chat_a', '命令'))
