@@ -348,8 +348,10 @@ const api = {
     /** D4: write the translated HTML to a DOCX in Downloads and import its PDF. */
     revealDownload: (name: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.DocumentsRevealDownload, name),
     /** D5a: a library document saved to Downloads; `docxName` is the file's name. */
-    saveDownload: (documentId: string, title: string): Promise<TranslationExportResult> =>
-      ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title),
+    saveDownload: (documentId: string, title: string, revision?: number): Promise<TranslationExportResult> =>
+      revision === undefined
+        ? ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title)
+        : ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title, revision),
     exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean; level?: 1 | 2 | 3 }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
       ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {

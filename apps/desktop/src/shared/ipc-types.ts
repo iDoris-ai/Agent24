@@ -603,13 +603,17 @@ export type DocumentsRequest =
   /** D5a: the template with its fields filled, as a new document. */
   | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
   /** D5a: the head revision's file (base64), to be saved. */
-  | { op: 'content'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'content'; documentId: DocSchemas['DocumentIdString']; revision?: number }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
   /** L6-F2: soft delete, restore within 7 days, and what can be restored. */
   | { op: 'delete'; documentId: DocSchemas['DocumentIdString'] }
   | { op: 'restore'; documentId: DocSchemas['DocumentIdString'] }
   | { op: 'recentlyDeleted' }
+  /** L6-F5: a document's versions, and an old one made current again over
+   * the version the user saw (`expectRevision`). */
+  | { op: 'revisions'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'restoreRevision'; documentId: DocSchemas['DocumentIdString']; revision: number; expectRevision: number }
 
 /** What each operation returns on success. */
 export interface DocumentsResults {
@@ -637,6 +641,24 @@ export interface DocumentsResults {
   delete: DeletedDocument
   restore: DocSchemas['DocumentDetail']
   recentlyDeleted: { documents: DeletedDocument[] }
+  revisions: DocumentVersions
+  restoreRevision: SavedVersion
+}
+
+/** L6-F5: a document's versions, newest first (agent24-documents `versions.rs`). */
+export interface DocumentVersions {
+  document_id: string
+  head_revision: number
+  revisions: Array<{ revision: number; content_sha256: string; size: number; media_type: string; origin: 'import' | 'commit'; created_at: string }>
+}
+
+/** L6-F5: a version saved; `committed` false when nothing was written. */
+export interface SavedVersion {
+  document_id: string
+  title: string
+  revision: number
+  previous_revision: number
+  committed: boolean
 }
 
 /** L6-F2: a document deleted less than 7 days ago (agent24-documents `trash.rs`). */
