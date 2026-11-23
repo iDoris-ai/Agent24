@@ -12,7 +12,9 @@ use crate::text_layer::{Block, TextLayer};
 
 /// One window's blocks, as sent, at most: with the instruction, 20 fields
 /// and the answer's schema, a request stays far inside the kernel's 256 KiB.
-pub const BUDGET: usize = 24 * 1024;
+/// F3 (Loop 6): 7 KiB, not 24, so that with a few fields a request of
+/// Chinese text stays inside the balanced oMLX budget, about 3.5k tokens.
+pub const BUDGET: usize = 7 * 1024;
 /// Fields in one call, at most.
 pub const BATCH: usize = 20;
 
@@ -49,9 +51,9 @@ impl Window {
     }
 }
 
-/// The windows of `layer` within `budget` bytes each. A block is at most
-/// 16 KiB of text (§3.1), so with its JSON it fits a window of 24 KiB
-/// unless its text is escaped many times over.
+/// The windows of `layer` within `budget` bytes each. A block over the
+/// budget (a block is at most 16 KiB of text, §3.1) is a window by itself:
+/// that one request is over the balanced local budget.
 #[must_use]
 pub fn windows(layer: &TextLayer, budget: usize) -> Vec<Window> {
     let size = |i: usize| cost(&layer.blocks[i]);

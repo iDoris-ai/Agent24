@@ -18,7 +18,7 @@ export interface ExportDeps {
    * is not installed). */
   importAndConvert: (docxPath: string, pdfTitle: string) => Promise<{ ok: boolean; code?: string; message?: string }>
   /** D5a: a library document's current file (the `content` op), base64. */
-  fetchContent?: (documentId: string) => Promise<{ ok: true; data: string; mediaType: string } | { ok: false; code?: string; message?: string }>
+  fetchContent?: (documentId: string, revision?: number) => Promise<{ ok: true; data: string; mediaType: string } | { ok: false; code?: string; message?: string }>
 }
 
 export interface ExportResult {
@@ -113,9 +113,10 @@ const EXT_OF: Record<string, string> = {
 /** D5a: a library document (a filled template, a patched DOCX) saved as a
  * file of the Downloads folder, under its title; a name already there gets
  * 「 (2)」. */
-export async function saveToDownloads(deps: ExportDeps, documentId: string, title: string): Promise<ExportResult> {
+export async function saveToDownloads(deps: ExportDeps, documentId: string, title: string, revision?: number): Promise<ExportResult> {
   if (!deps.fetchContent) return { ok: false, code: 'export_failed', message: 'saving is not available' }
-  const got = await deps.fetchContent(documentId)
+  // L6-F5: an old version's file, when `revision` is given.
+  const got = await deps.fetchContent(documentId, revision)
   if (!got.ok) return { ok: false, code: got.code ?? 'export_failed', message: got.message ?? 'the file could not be read' }
   try {
     const downloads = deps.downloadsDir()

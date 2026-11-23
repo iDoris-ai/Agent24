@@ -3178,6 +3178,12 @@ export interface components {
             jobs: string[];
             /** @description The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid. */
             failed?: string[];
+            /** @description L6-F5. The writes saved as a document's next version (no import job), each with the document, its title and the new version. Absent when there are none. */
+            revisions?: {
+                document_id: string;
+                title: string;
+                revision: number;
+            }[];
         };
         RunKnowledge: {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */

@@ -603,9 +603,20 @@ export type DocumentsRequest =
   /** D5a: the template with its fields filled, as a new document. */
   | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
   /** D5a: the head revision's file (base64), to be saved. */
-  | { op: 'content'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'content'; documentId: DocSchemas['DocumentIdString']; revision?: number }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
+  /** L6-F2: soft delete, restore within 7 days, and what can be restored. */
+  | { op: 'delete'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'restore'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'recentlyDeleted' }
+  /** L6-F5: a document's versions, and an old one made current again over
+   * the version the user saw (`expectRevision`). */
+  | { op: 'revisions'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'restoreRevision'; documentId: DocSchemas['DocumentIdString']; revision: number; expectRevision: number }
+  /** L6-S05: two documents, or two versions of one, compared by their text
+   * (no `revision` = the current version). */
+  | { op: 'compare'; left: CompareTarget; right: CompareTarget; limit?: number; offset?: number }
 
 /** What each operation returns on success. */
 export interface DocumentsResults {
@@ -630,6 +641,62 @@ export interface DocumentsResults {
   content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
+  delete: DeletedDocument
+  restore: DocSchemas['DocumentDetail']
+  recentlyDeleted: { documents: DeletedDocument[] }
+  revisions: DocumentVersions
+  restoreRevision: SavedVersion
+  compare: DocumentComparison
+}
+
+export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }
+
+/** L6-S05: where a change is in its document (agent24-documents `compare.rs`). */
+export type CompareBlockRef = { paragraph_index: number } | { block_id: string; page: number }
+export interface CompareSide { block_ref: CompareBlockRef; text: string }
+export interface DocumentChange {
+  id: string
+  kind: 'added' | 'removed' | 'changed' | 'unaligned'
+  left: CompareSide | null
+  right: CompareSide | null
+  spans: Array<{ op: 'equal' | 'insert' | 'delete'; text: string }>
+}
+/** `summary` counts every change; `changes` is one page of them. */
+export interface DocumentComparison {
+  left: { document_id: string; revision: number; media_type: string }
+  right: { document_id: string; revision: number; media_type: string }
+  identical: boolean
+  only_text: boolean
+  summary: { total: number; added: number; removed: number; changed: number; unaligned: number }
+  changes: DocumentChange[]
+  truncated: boolean
+  next_offset: number | null
+}
+
+/** L6-F5: a document's versions, newest first (agent24-documents `versions.rs`). */
+export interface DocumentVersions {
+  document_id: string
+  head_revision: number
+  revisions: Array<{ revision: number; content_sha256: string; size: number; media_type: string; origin: 'import' | 'commit'; created_at: string }>
+}
+
+/** L6-F5: a version saved; `committed` false when nothing was written. */
+export interface SavedVersion {
+  document_id: string
+  title: string
+  revision: number
+  previous_revision: number
+  committed: boolean
+}
+
+/** L6-F2: a document deleted less than 7 days ago (agent24-documents `trash.rs`). */
+export interface DeletedDocument {
+  document_id: string
+  title: string
+  media_type: string
+  created_at: string
+  deleted_at: string
+  restorable_until: string
 }
 
 /** The error envelope: the OS's or the kernel's, or one main makes for a

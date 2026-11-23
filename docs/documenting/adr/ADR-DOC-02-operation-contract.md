@@ -49,13 +49,13 @@
 2. **持久化顺序**：blob 写到 `blobs/tmp/`（与目标同一文件系统）→ fsync 文件 → rename 到内容地址 → fsync 分片目录（分片目录是新建的还要 fsync 它的父目录）→ 然后才开 DB 事务写引用行。同一 hash 已存在就跳过写入。
    - SQLite 显式设置 `journal_mode=WAL` + `synchronous=FULL`，不依赖驱动默认值。理由：`NORMAL` 在系统崩溃或断电时可能丢掉最后几次已提交的事务，用户看到“已保存”的 revision 会消失；提交频率低，`FULL` 的代价可以忽略。
 3. **scratch workspace 永远不是已保存 revision 的家**，DOC-1 不使用它（ADR-DOC-01 D7）。临时文件只有经 `import` 或 `revision.commit` 复制进 blob 区、校验过 sha256，才算保存。TTL 内没有提升的视为丢弃。
-4. **删除与 GC（已定）**：DOC-1 不提供删除。没有被引用的 blob 保留 7 天后才 GC。`uploads/` 不参与这个 GC（§5.6）。
+4. **删除与 GC（已定；2026-11-22 David 修订）**：~~DOC-1 不提供删除。~~ 删除是**软删除**：只在 `documents.deleted_at` 记下删除时间，行、revision 和 blob 都不动（revision 不可删、文档行不可删的约束不变）。已删除的文档在列表、`/documents/{id}/…` 读取、Agent 工具和按标题查找里都看不到；7 天内可以在文档页「最近删除」或 CLI `documents restore` 恢复；满 7 天后「已过恢复期，无法恢复」、也不再列出，但字节仍在磁盘上，不能称为「已彻底删除 / 已清除」。没有被引用的 blob 保留 7 天后才 GC（GC 尚未实现，FU-177；实现时，只被删除满 7 天的文档引用的 blob 算作没有被引用）。`uploads/` 不参与这个 GC（§5.6）。
 5. 存储布局不对外暴露（ADR-DOC-01 D1）。
 
 ## 3. 标识与溯源锚点
 
 - **`document_id`**：`doc_` + ULID，由 OS 生成，不由路径、文件名或内容推导。同一份字节导入两次就是两个文档（blob 去重）。
-- **`revision`**：每个文档从 1 开始连续编号，原件是 r1；之后**只有** `revision.commit` 产生 `head + 1`。revision 行不可变。**`content_sha256`** 是该 revision 文件字节的 `sha256:<hex>`。
+- **`revision`**：每个文档从 1 开始连续编号，原件是 r1；之后**只有** `revision.commit` 产生 `head + 1`（L6-F5 起：「存为本文档新版本」的改写、填模板和恢复旧版本，见 §5 末「F5 修订」）。revision 行不可变。**`content_sha256`** 是该 revision 文件字节的 `sha256:<hex>`。
 - **文本层**：引擎从某个 revision 解析出的块和文本，存成不可变 blob（`text_layer_sha256`），并记录 `(content_sha256, engine id, version, config)`。**只要有锚点或抽取结果引用就钉住，永不淘汰**，引擎升级也不改写；没有引用的派生缓存（如页面渲染）可以淘汰重建。
 
 **锚点**（README §8 / §11.4 逐值溯源）：
@@ -222,10 +222,16 @@
 
 - 「工具」列：内核要求操作名不含点（`agent24-domain/src/tool.rs:112-120`），全名按第一个点切出模块名（DOC-1-06b，2026-10-18）。
 - 工具不用 `pending` 信封（内核会收成 `result_unknown`）。`documents.extract` 只提交或重放，立即返回 `completed{payload:{status, job_id}}`，不等待抽取完成，不带抽取值，也不带 `extraction_id`。`extraction_id` 只在任务成功、提交事务时生成（`agent24-documents/src/extract/job.rs:216-231` 生成 id，`:247-267` 与 `succeeded` 同一事务）；`GET /jobs/{id}` 只有 `succeeded` 才带 `result.extraction_id`（`jobs.rs:113-117`）。agent 用 `documents.job_get` 查进度，成功后把 `result.extraction_id` 交给 `documents.extraction_get`（`GET /extractions/{id}`，`agent24-documents/src/lib.rs:184-187`）按工具字节预算分页读回。重放沿用 §5：业务键命中 `succeeded` 返回原 job；命中 `failed` 或 `interrupted` 把同一个 job 重新排队（`extract/handler.rs:203-218,253-255`），等于重跑；同一业务键但请求正文的规范化哈希不同，返回 422 `idempotency_key_reused`（`handler.rs:102-103,199-200`）。工具路径发给服务层的请求正文是 `{revision, schema}`，不含工具专有字段。REST 对规范化后的请求体算 `request_sha256`（`extract/handler.rs:102-103`）：`rerun` 为 false 时从正文里删掉，不补上，再做 JCS 哈希。不带 `rerun` 的旧请求哈希不变；显式 `rerun: false` 与省略落到同一哈希。字段仍是 `revision`、`schema`、`rerun`（省略时收成 false，`:48-53`），规范化后的哈希不同返回 422（`:199-200`）。以前若有显式发 `rerun: false` 存下的 job，这个业务键此后会一直 422：`claim()` 在返回 422 前什么都不写（`extract/handler.rs:199-200`），哈希只在键不存在时插入（`:236-244`）。目前没有客户端显式发 `rerun: false`，所以没有存量（DOC-1-06b，2026-10-18）（验收 harness 的普通抽取只发 `{revision, schema}`，`packages/documents-accept/src/extract-checks.ts:24`；OpenAPI 允许省略，`protocol/openapi.yaml:4290-4308`）。`documents.extract` 不支持 `rerun:true`：它需要 `Idempotency-Key`（`protocol/openapi.yaml:2214-2218`），内核工具请求不带额外请求头（`agent24d/src/module_tool_runtime.rs:101`）（DOC-1-06b，2026-10-18）。
-- DOC-1 的 agent 只能读、查、抽取、提议修改、导出已提交的 revision。**导入只在页面经原生文件对话框完成（Q4）；review 和 commit 只在页面、在可见 diff 上由用户完成（Q5，README §11.6）**。以后若开放 agent 导入或对话内确认提交，按 `WriteLocal` 走审批，需修订本 ADR。
+- DOC-1 的 agent 只能读、查、抽取、提议修改、导出已提交的 revision。**导入只在页面经原生文件对话框完成（Q4）；review 和 commit 只在页面、在可见 diff 上由用户完成（Q5，README §11.6）**。以后若开放 agent 导入或对话内确认提交，按 `WriteLocal` 走审批，需修订本 ADR。（L6-F5 已修订：见 §5 末「F5 修订」和 Q5。）
 - **之后的阶段**（只定方向）：DOC-2 `search`（required）、`ask / summarize / compare / translate`（按 §9.1 逐次分类）；DOC-3 `draft.create`、`revision.restore`（用目标 revision 的内容生成 change set 再走 commit）；DOC-4 `preflight`、`package.assemble`（绑定已批准的 revision）、`delivery.prepare`（`External`，由 Agent24 执行）。
 
 ## 5. 唯一提交点与幂等
+
+> **F5 修订（David，2026-11-22 定：对话里默认另存为新文档，用户说「存到原文件」时才存成原文件的新版本）。** 下面 1–4 条的 change set（propose / review / commit）流程 DOC-1 仍未实现。F5 先用轻量的提交：
+> - `POST /documents/{id}/patches` 和 `POST /documents/{id}/fill` 加 `save_to`：`new_document`（默认，行为同以前，答 202 import job）或 `new_revision`。`new_revision` 必须带 `expect_revision`（调用方读到的 head），答 201 `{document_id, title, revision, previous_revision, committed}`。
+> - `POST /documents/{id}/revisions/{rev}/restore {expect_revision}`：把 r`rev` 的字节**再提交一次**成为新 revision；历史不改写，所有 revision 都保留。内容和 head 相同时不写，答 200 `committed: false`。`GET /documents/{id}/revisions` 列出全部 revision（新的在前）；`GET /documents/{id}/content?revision=N` 取某个 revision 的文件。
+> - 提交（`versions::commit`）：先按 §2.2 把字节写进 blob；再在一个 `BEGIN IMMEDIATE` 事务里查 head，**head ≠ expect_revision 就返回 409 `revision_conflict`（`details.current_revision`），什么都不写**；插入 `revision = head + 1`（origin `commit`，格式必须与文档相同）、`UPDATE documents SET head_revision = ? WHERE id = ? AND head_revision = ?`、写一行 oplog（`patch` / `fill` / `restore_revision`，记 page 或 run）。已删除的文档不能提交、列出或恢复。
+> - 锚点和抽取结果仍不跨 revision 迁移（§3）。没有提交键：同一请求重发会再写一个 revision 或因 head 已前移得到 409；对话里的写入每次都经审批，页面上的恢复由用户点击。
 
 1. **只有 `revision.commit` 创建 revision**。`change.review` 只记录逐条决定并返回 `change_set_sha256`；“接受并保存” = 一次 review + **一次** commit；restore 也走 commit。已提交的 change set **冻结**，再 review 返回 `change_set_committed`。
 2. **`change_set_sha256`** = `{ops, decisions}` 经 RFC 8785（JCS）规范化后的 SHA-256；文档和 base 不放进去，由提交键绑定。
@@ -372,10 +378,10 @@
 | # | 问题 | 建议 / 决定 | 决定人 |
 |---|---|---|---|
 | Q1 | #690：DOC-1 存储方案 | **已定（David，2026-10-07）**：方案 A；B 以后可以作为额外来源（§2） | David |
-| Q2 | 删除与 GC 宽限期 | **已定（David，2026-10-07）**：DOC-1 不提供删除；未被引用的 blob 保留 7 天后 GC | David |
+| Q2 | 删除与 GC 宽限期 | **已定（David，2026-10-07）**：DOC-1 不提供删除；未被引用的 blob 保留 7 天后 GC。**修订（David，2026-11-22，Loop 6 F2）**：改为软删除 + 7 天内可恢复 + 到期 GC（§2 第 4 条） | David |
 | Q3 | 资料库的备份 / 迁出格式、静态加密、磁盘配额 | DOC-1 不做，记为发布前事项 | David / jason |
 | Q4 | agent 能否导入文件 | **已定（David，2026-10-07）**：DOC-1 不能，只从页面经原生文件对话框导入；以后可在审批下开放 | David |
-| Q5 | agent 能否在用户确认后 commit | **已定（David，2026-10-07）**：DOC-1 没有 commit 工具，agent 只读和提议；review / commit 只在页面、diff 可见时进行；对话内确认提交以后可在审批下加入 | David |
+| Q5 | agent 能否在用户确认后 commit | **已定（David，2026-10-07）**：DOC-1 没有 commit 工具，agent 只读和提议；review / commit 只在页面、diff 可见时进行；对话内确认提交以后可在审批下加入。**修订（David，2026-11-22，L6-F5）**：对话里默认另存为新文档；只有用户说「存到原文件」（或「直接改原文件」这类意思）时，`documents.patch` / `documents.fill` 才存成原文件的新版本，每次审批，审批卡写明「保存为新版本 vN」；做法见 §5「F5 修订」 | David |
 | Q6 | 偏移单位用 UTF-8 字节（§3） | 接受 | David |
 | Q7 | 内核工具 ADR 需要提供：结构化工具错误码、工具调用的取消信号、按 `/capabilities` 过滤工具通告、`inline_wait_ms` 声明。过滤时 `/capabilities` 不改名，按 DOC-1-06b §3.1 的映射（`job_get`→`job`，`extraction_get`→`job`，只要求存储）（DOC-1-06b，2026-10-18） | 写入 C 的内核 ADR 需求 | jason / Agent24 kernel |
 | Q8 | `partial_parse` / `stale_index` 何时作为结果状态、何时作为错误 | 默认作为结果状态，只在显式要求时报错 | David |
@@ -397,3 +403,6 @@
 - `GET text` 同时给 `block` 和 `cursor` 是 400（游标已带位置）。
 - 抽取的 rerun 键被复用时，比较整个请求体的 JCS 哈希，不同就是 422 `idempotency_key_reused`（与上传、导入一致，§5.4）。规范化：`rerun` 为 false 时先省略再哈希（§5，DOC-1-06b，2026-10-18）。
 - 抽取的业务键去掉 `model_id`：内核路由器在调用时才选模型，事先问不到；实际模型记在结果里，换模型用 rerun（§5.4，#863）。
+
+## 修订记录
+- **2026-11-22（David，Loop 6 F2「删除文档」）**：§2 第 4 条与 Q2 由「DOC-1 不提供删除」改为「软删除 + 7 天内可恢复 + 到期 GC」。页面（`POST /documents/{id}/delete`、`/restore`、`GET /recently-deleted`，#2025）和 Agent 工具 `documents.delete`（后续片 #2026；CLI `documents delete/restore/deleted` 同在 #2026，文档页「删除」「最近删除」在 #2027）都能删除；Agent 的每次删除都要用户在审批卡上确认，工具只收文档 id，按名字对上多份时不替用户挑（FU-136）。S04「不能删除唯一原件」在单用户阶段由「软删除 + 7 天恢复」满足。blob 的真正回收（GC）尚未实现，见 FU-177。

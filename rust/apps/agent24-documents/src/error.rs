@@ -184,6 +184,14 @@ impl ApiError {
         )
     }
 
+    /// 409 with a code from the closed set: the state moved since the
+    /// caller read it (L6-F5: `revision_conflict`, a head that moved).
+    #[must_use]
+    pub fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        debug_assert!(CODES.contains(&code), "{code} is not in the closed set");
+        Self::new(StatusCode::CONFLICT, code, message.into(), false)
+    }
+
     /// 422: the same key was sent before with a different request (§5.4).
     #[must_use]
     pub fn idempotency_key_reused() -> Self {

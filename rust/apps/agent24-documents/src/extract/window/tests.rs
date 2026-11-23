@@ -48,6 +48,9 @@ fn cost(l: &TextLayer, of: &[usize]) -> usize {
     Window(of.to_vec()).bytes(l)
 }
 
+/// The budget these cases were written for, before F3 narrowed it.
+const WIDE: usize = 24 * 1024;
+
 #[test]
 fn a_layer_within_the_budget_is_one_window() {
     let l = layer(&[&[10, 20], &[30]]);
@@ -65,7 +68,7 @@ fn a_window_starting_a_page_carries_the_end_of_the_page_before() {
     // Codex R1's case, a page of 7 KiB + 16 KiB, then one of 4 KiB: the
     // second window has room for the 16 KiB block before it, and carries it.
     let l = layer(&[&[7 * 1024, 16 * 1024], &[4 * 1024]]);
-    let ws = windows(&l, BUDGET);
+    let ws = windows(&l, WIDE);
     assert_eq!(
         ids(&l, &ws),
         [vec!["p1/b1", "p1/b2"], vec!["p1/b2", "p2/b1"]]
@@ -133,11 +136,11 @@ fn every_block_is_read_and_windows_follow_the_text() {
         .collect();
     let pages: Vec<&[usize]> = sizes.iter().map(Vec::as_slice).collect();
     let l = layer(&pages);
-    let ws = windows(&l, BUDGET);
+    let ws = windows(&l, WIDE);
     assert!(ws.len() > 1);
     assert!(
         ws.iter()
-            .all(|w| w.bytes(&l) <= BUDGET && w.0.windows(2).all(|p| p[0] < p[1]))
+            .all(|w| w.bytes(&l) <= WIDE && w.0.windows(2).all(|p| p[0] < p[1]))
     );
     let mut seen: Vec<usize> = ws.iter().flat_map(|w| w.0.clone()).collect();
     seen.sort_unstable();

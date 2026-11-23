@@ -221,6 +221,9 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         // (K1-06a §4.1): an operation `admit` has no row for never runs.
         named_by_title(state, scope, op, &mut arguments).await?;
         admit(state, scope, op, &arguments).await?;
+        if op == "compare" {
+            admit_other(state, scope, &arguments).await?;
+        }
         match op {
             "extract" => extract(state, run, accepted, claim_holds, arguments).await,
             "list" => list(state, scope, arguments).await,
@@ -231,17 +234,19 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "extraction_get" => extraction_get(state, arguments).await,
             "compose" => compose(state, arguments).await,
             "paragraphs" => paragraphs(state, arguments).await,
-            "patch" => {
-                let run_id = run.run_id.clone();
-                patch(state, &run_id, arguments).await
-            }
+            "patch" => patch(state, run, arguments).await,
             "fields" => fields(state, arguments).await,
-            "fill" => fill(state, arguments).await,
+            "fill" => fill(state, run, arguments).await,
+            "delete" => delete(state, run, arguments).await,
+            "compare" => compare(state, accepted, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
+    // L6-F2: `delete` writes in one transaction (`trash::delete`): dropped
+    // at the deadline it rolls back or has committed; a retry of a committed
+    // one answers not_found (already deleted), never a second delete.
     // Dropping `work` at the deadline is safe: every operation but `extract`
-    // only reads (a pool wait, a query, a blob; `extraction_get` one
+    // (and `delete`, above) only reads (a pool wait, a query, a blob; `extraction_get` one
     // read-only transaction, rolled back when dropped). Storage they find
     // unavailable may be reopened first, which writes (migrations,
     // `jobs::recover`, the header's `user_version`), and `read_range` /
@@ -382,6 +387,37 @@ async fn get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     completed(documents::get(&storage, &args.document_id).await)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteArgs {
+    document_id: String,
+}
+
+/// L6-F2: the document deleted (soft, restorable for 7 days) after the user
+/// approved this call. It takes an id only: the manifest's pattern has the
+/// kernel refuse a file name before any card (FU-136), so the card always
+/// names one document.
+async fn delete(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+    let args: DeleteArgs = parse(arguments)?;
+    let storage = ready(state).await?;
+    let gone = crate::trash::delete(&storage, &args.document_id, &Origin::Run(run))
+        .await
+        .map_err(|e| refused(&e))?;
+    let message = format!(
+        "已把《{}》移到文档页的「最近删除」（不是永久删除），{} 天内可以恢复。已完成，不要再调用。",
+        gone.title,
+        crate::trash::RESTORE_DAYS
+    );
+    let mut payload = serde_json::to_value(&gone)
+        .map_err(|_| refused(&ApiError::internal("cannot serialize the answer")))?;
+    payload["deleted"] = json!(true);
+    payload["message"] = json!(message);
+    Ok(Envelope::Completed {
+        payload,
+        replayed: false,
+    })
+}
+
 /// D2b: split or merge PDFs already here into a new document; the answer is
 /// its import job, as `POST /compositions` answers. The parts were admitted.
 async fn compose(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -474,10 +510,16 @@ struct ParagraphsArgs {
     query: Option<String>,
 }
 
-/// Characters of a paragraph an Agent is shown: enough to copy a 12-character
-/// anchor from, and to tell paragraphs apart.
-const PREVIEW_CHARS: usize = 40;
-/// Characters of previews in one answer, and paragraphs at most.
+/// Characters of a paragraph's opening in the table of contents: its
+/// number and first words, enough to tell clauses apart. Its whole text is
+/// asked for by index or word before it is rewritten.
+const PREVIEW_CHARS: usize = 24;
+/// FU-164 (General 0.6.98, balanced tier): a 40-character, 3000-character
+/// table of contents in JSON objects took a long contract's second prompt to
+/// 7076 tokens. It is one line per paragraph, `段号 开头`, within this many
+/// characters.
+const TOC_BUDGET: usize = 1200;
+/// Characters of whole paragraphs in one answer.
 const PREVIEW_BUDGET: usize = 3000;
 const PREVIEW_MAX_COUNT: usize = 200;
 /// PM 11-21: a narrowed ask (a range or a word) that comes to this many
@@ -489,8 +531,9 @@ const WHOLE_MAX_COUNT: usize = 10;
 /// FU-151 (0.6.89, General): 《示范-山东健身合同2025》's 293 paragraphs came to
 /// about 40 KB, and with them in its context the 4-bit model on an 8 GB Mac
 /// was stopped at prefill. An Agent is shown the paragraphs that have text,
-/// each as its index and first [`PREVIEW_CHARS`] characters, from `from` on
-/// or only those containing `query`, up to [`PREVIEW_BUDGET`] characters;
+/// as a table of contents, a line `段号 开头` per paragraph of its first
+/// [`PREVIEW_CHARS`] characters, from `from` on or only those containing
+/// `query`, within [`TOC_BUDGET`] characters (FU-164);
 /// `total` and `next_from` say what is left. The HTTP route and the CLI keep
 /// the whole list.
 async fn paragraphs(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -544,26 +587,22 @@ fn preview_paragraphs(id: &str, all: &[crate::patch::Paragraph], args: &Paragrap
         }
         return out;
     }
-    let mut spent = 0;
-    let mut shown = Vec::new();
+    let mut toc = String::new();
     let mut next_from = None;
-    for p in wanted.iter().filter(|p| p.index >= from) {
-        if shown.len() >= count || spent >= PREVIEW_BUDGET {
+    for (lines, p) in wanted.iter().filter(|p| p.index >= from).enumerate() {
+        let opening: String = p.text.trim().chars().take(PREVIEW_CHARS).collect();
+        let line = format!("{} {opening}\n", p.index);
+        if lines >= count || toc.chars().count() + line.chars().count() > TOC_BUDGET {
             next_from = Some(p.index);
             break;
         }
-        let mut text: String = p.text.chars().take(PREVIEW_CHARS).collect();
-        if text.chars().count() < p.text.chars().count() {
-            text.push('…');
-        }
-        spent += text.chars().count();
-        shown.push(serde_json::json!({ "index": p.index, "text": text, "in_table": p.in_table }));
+        toc.push_str(&line);
     }
     let mut out = serde_json::json!({
         "document_id": id,
         "total": wanted.len(),
-        "paragraphs": shown,
-        "note": "这是目录：每段只给段号和开头，空段落不列。要改写某几段，先用 from 和 count（例如 from=段号, count=1）或 query（关键词）取这几段的全文，再照全文改写；取其余段落也用 from。",
+        "toc": toc,
+        "note": "这是目录：每行是「段号 开头几个字」，空段落不列。要改写某几段，先用 query（条款号或关键词，例如「第五条」「违约责任」）或 from 和 count（例如 from=段号, count=1）取这几段的全文，再照全文改写；目录后面的段落用 next_from 继续取。",
     });
     if let Some(n) = next_from {
         out["next_from"] = Value::from(n);
@@ -590,6 +629,63 @@ struct AgentPatch {
     edits: Vec<AgentEdit>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    save_to: AgentSaveTo,
+}
+
+/// L6-F5: where an Agent's patch or fill goes. `original` is meant only for
+/// a user who said so; the module cannot tell, so the desktop judges the
+/// user's words and sends such a call back before its card (F5 4th part),
+/// and the card says which.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentSaveTo {
+    #[default]
+    NewDocument,
+    Original,
+}
+
+/// The request fields of `save_to`: the original's next version over the
+/// head this call read, so a version saved meanwhile is never written over.
+fn save_fields(body: &mut Value, save_to: AgentSaveTo, head: i64) {
+    if save_to == AgentSaveTo::Original {
+        body["save_to"] = json!("new_revision");
+        body["expect_revision"] = json!(head);
+    }
+}
+
+/// What the model is told of a version saved: done, and not to call again.
+fn saved_version(
+    state: &AppState,
+    run_id: &str,
+    source: &str,
+    c: &crate::versions::Committed,
+) -> Outcome {
+    let message = if c.committed {
+        format!(
+            "已完成：已把改动保存到原文件《{}》，成为它的第 {} 版；之前的版本都保留，可以在文档页恢复。这一步已经完成，不要再调用同一个写入工具，直接告诉用户已保存为第 {} 版。",
+            c.title, c.revision, c.revision
+        )
+    } else {
+        format!(
+            "内容和原文件《{}》现在的版本一样，没有保存新版本。不要再调用同一个写入工具，如实告诉用户没有改动。",
+            c.title
+        )
+    };
+    state.note_patched(
+        run_id,
+        source,
+        &format!("{}（第 {} 版）", c.title, c.revision),
+    );
+    let mut payload = serde_json::to_value(c)
+        .map_err(|_| refused(&ApiError::internal("cannot serialize the answer")))?;
+    payload["saved_as"] = json!("new_revision");
+    payload["source_document_id"] = json!(source);
+    payload["message"] = json!(message);
+    Ok(Envelope::Completed {
+        payload,
+        replayed: false,
+    })
 }
 
 /// Characters of a paragraph's opening said back when its anchor is wrong.
@@ -602,7 +698,8 @@ const OPENING_CHARS: usize = 24;
 /// (0.6.72: 第三条's words aimed at 乙方's line) writes nothing, and the answer
 /// says how the paragraph really begins so the model can try again. The HTTP
 /// route and the CLI keep their own `expect`.
-async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) -> Outcome {
+async fn patch(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+    let run_id = run.run_id.as_str();
     let (id, rest) = split_document(arguments)?;
     // M1 (0.6.89, General): after its patch went through, a run asked for the
     // same document again and another card came up. Once per run and
@@ -650,17 +747,24 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
         }));
     }
     let mut body = serde_json::json!({ "edits": edits });
-    if let Some(title) = asked.title {
+    if let Some(title) = asked
+        .title
+        .filter(|_| asked.save_to == AgentSaveTo::NewDocument)
+    {
         body["title"] = Value::String(title);
     }
+    save_fields(&mut body, asked.save_to, paras.revision);
     let req: crate::patch::PatchRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    let (_, job) = match crate::patch::patch_run(&storage, id.clone(), req).await {
-        Ok(made) => made,
+    let origin = Origin::Run(run.clone());
+    let job = match crate::patch::patch_run(&storage, id.clone(), req, &origin).await {
+        Ok(crate::patch::Saved::Document(job)) => job,
+        Ok(crate::patch::Saved::Revision(c)) => return saved_version(state, run_id, &id, &c),
         // General 0.6.94: a paragraph the rewrite would damage (a pending
         // revision, a formula, a page break, ...) came back as a bare
         // `invalid_request`, and the model said the document was made. The
         // model is told what was refused and why, in words it can pass on.
+        // L6-F5: a version saved since it read is a `revision_conflict` too.
         Err(e) if matches!(e.code(), "invalid_request" | "revision_conflict") => {
             let why = refusal_in_words(&e);
             // PR-Daemon #1994 B2: a paragraph changed since it was read is the
@@ -685,7 +789,7 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
         }
         Err(e) => return Err(refused(&e)),
     };
-    let mut answer = settled(&storage, job.0).await;
+    let mut answer = settled(&storage, job).await;
     // PR-Daemon #1994 B1: which document this write was of, whatever the
     // call named it; the run's record compares writes by it.
     if let Value::Object(map) = &mut answer {
@@ -713,15 +817,63 @@ async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
 /// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
-async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
     rest.remove("title");
-    let req: crate::patch::FillRequest = parse(rest)?;
+    let save_to: AgentSaveTo = match rest.remove("save_to") {
+        Some(v) => serde_json::from_value(v).map_err(|_| Envelope::error(INVALID_INPUT, false))?,
+        None => AgentSaveTo::NewDocument,
+    };
+    let mut body = Value::Object(rest);
     let storage = ready(state).await?;
-    let (_, job) = crate::patch::fill_run(&storage, id, req)
+    if save_to == AgentSaveTo::Original {
+        let head = documents::get(&storage, &id)
+            .await
+            .map_err(|e| refused(&e))?
+            .document
+            .head_revision;
+        save_fields(&mut body, save_to, head);
+    }
+    let req: crate::patch::FillRequest =
+        serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
+    match crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
         .await
-        .map_err(|e| refused(&e))?;
-    completed::<Value>(Ok(settled(&storage, job.0).await))
+        .map_err(|e| refused(&e))?
+    {
+        crate::patch::Saved::Document(job) => completed::<Value>(Ok(settled(&storage, job).await)),
+        crate::patch::Saved::Revision(c) => saved_version(state, &run.run_id, &id, &c),
+    }
+}
+
+/// `compare`'s second document is in the scope too, or the call reads as
+/// naming a document that is not here (K1-06a §2.4).
+async fn admit_other(
+    state: &AppState,
+    scope: &Scope,
+    arguments: &Map<String, Value>,
+) -> Result<(), Envelope> {
+    let id = match arguments.get("other_document_id") {
+        None => return Ok(()),
+        Some(Value::String(id)) => id,
+        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
+    };
+    if !is_id(IdKind::Document, id) {
+        return Ok(());
+    }
+    if !scope.allows_document(id) {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    if !live(state, id).await? {
+        return Err(in_trash(state, id, "no such document").await);
+    }
+    Ok(())
+}
+
+/// L6-S05: two documents, or two versions of one, compared (read).
+async fn compare(state: &AppState, by: Accepted, arguments: Map<String, Value>) -> Outcome {
+    let args: crate::compare::tool::Args = parse(arguments)?;
+    let storage = ready(state).await?;
+    completed(crate::compare::tool::call(state, &storage, args, Requester::Tool(by)).await)
 }
 
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -872,9 +1024,8 @@ enum Resource {
 
 fn resource(op: &str) -> Option<Resource> {
     match op {
-        "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill" => {
-            Some(Resource::Document)
-        }
+        "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill"
+        | "delete" | "compare" => Some(Resource::Document),
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
@@ -887,8 +1038,9 @@ fn resource(op: &str) -> Option<Resource> {
 /// its id. For `get` and `compose`, a `document_id` that is not an id is
 /// looked up among the titles of the documents in `scope`: the one whose
 /// title, without extension, case and 《》, equals it (or else the only one
-/// containing it) stands for it. Anything else is left as it was, and the
-/// service answers not found.
+/// containing it) stands for it. A name nothing answers to is left as it
+/// was, and the service answers not found. FU-136: a name several answer to
+/// is never resolved; the call is answered with them, see [`ambiguous`].
 async fn named_by_title(
     state: &AppState,
     scope: &Scope,
@@ -899,6 +1051,12 @@ async fn named_by_title(
         "get" | "paragraphs" | "patch" | "fields" | "fill" => {
             arguments.get_mut("document_id").into_iter().collect()
         }
+        // L6-S05: both documents may be named by title.
+        "compare" => arguments
+            .iter_mut()
+            .filter(|(k, _)| matches!(k.as_str(), "document_id" | "other_document_id"))
+            .map(|(_, v)| v)
+            .collect(),
         "compose" => match arguments.get_mut("parts") {
             Some(Value::Array(parts)) => parts
                 .iter_mut()
@@ -913,42 +1071,75 @@ async fn named_by_title(
         return Ok(());
     }
     let storage = ready(state).await?;
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT id, title FROM documents")
-        .fetch_all(storage.db.pool())
-        .await
-        .map_err(|_| refused(&ApiError::internal("cannot read the titles")))?;
-    let titles: Vec<(String, String)> = rows
+    // Newest first, so the candidates read in the order the library shows.
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, title, created_at FROM documents WHERE deleted_at IS NULL
+         ORDER BY created_at DESC, id DESC",
+    )
+    .fetch_all(storage.db.pool())
+    .await
+    .map_err(|_| refused(&ApiError::internal("cannot read the titles")))?;
+    let titles: Vec<(String, String, String)> = rows
         .into_iter()
-        .filter(|(id, _)| scope.allows_document(id))
-        .map(|(id, title)| (id, plain_title(&title)))
+        .filter(|(id, _, _)| scope.allows_document(id))
         .collect();
     for slot in slots {
-        let wanted = plain_title(slot.as_str().unwrap_or_default());
+        let name = slot.as_str().unwrap_or_default().to_owned();
+        let wanted = plain_title(&name);
         if wanted.is_empty() {
             continue;
         }
-        let only = |hits: Vec<&String>| (hits.len() == 1).then(|| hits[0].clone());
-        let exact = only(
+        let exact: Vec<_> = titles
+            .iter()
+            .filter(|(_, t, _)| plain_title(t) == wanted)
+            .collect();
+        let hits = if exact.is_empty() {
             titles
                 .iter()
-                .filter(|(_, t)| *t == wanted)
-                .map(|(id, _)| id)
-                .collect(),
-        );
-        let found = exact.or_else(|| {
-            only(
-                titles
-                    .iter()
-                    .filter(|(_, t)| t.contains(&wanted))
-                    .map(|(id, _)| id)
-                    .collect(),
-            )
-        });
-        if let Some(id) = found {
-            *slot = Value::String(id);
+                .filter(|(_, t, _)| plain_title(t).contains(&wanted))
+                .collect()
+        } else {
+            exact
+        };
+        match hits.as_slice() {
+            [] => {}
+            [(id, _, _)] => *slot = Value::String(id.clone()),
+            several => return Err(ambiguous(&name, several)),
         }
     }
     Ok(())
+}
+
+/// Candidates listed when a name is ambiguous; the count says the rest.
+const CANDIDATES: usize = 10;
+
+/// FU-136: the answer to a call naming a document several answer to. Not an
+/// error envelope: the kernel hands the model only an error's code, and the
+/// model must hear which documents they are and that the user chooses
+/// (General 0.6.72: it picked two split-off copies over the original).
+/// Nothing was run, so a write has no `job_id` and reads as not made.
+fn ambiguous(name: &str, hits: &[&(String, String, String)]) -> Envelope {
+    let shown = name.trim().trim_matches(|c| matches!(c, '《' | '》'));
+    let candidates: Vec<Value> = hits
+        .iter()
+        .take(CANDIDATES)
+        .map(|(id, title, at)| json!({ "document_id": id, "title": title, "imported_at": at }))
+        .collect();
+    let message = format!(
+        "库里有 {} 份文档都对得上《{shown}》，不能确定是哪一份，这次什么都没有做。\
+         请把 candidates 里的标题和导入时间列给用户，让用户选一份，再用那一份的 document_id 调用；\
+         不要自己挑。",
+        hits.len()
+    );
+    Envelope::Completed {
+        payload: json!({
+            "reason": "ambiguous_title",
+            "message": message,
+            "total": hits.len(),
+            "candidates": candidates,
+        }),
+        replayed: false,
+    }
 }
 
 /// A title or a name for it, compared without case, quotes, surrounding
@@ -1000,7 +1191,9 @@ async fn admit(
                 let Some(Value::String(id)) = part.get("document_id") else {
                     return Err(Envelope::error(INVALID_INPUT, false));
                 };
-                if is_id(IdKind::Document, id) && !scope.allows_document(id) {
+                if is_id(IdKind::Document, id)
+                    && !(scope.allows_document(id) && live(state, id).await?)
+                {
                     return Err(refused(&ApiError::not_found("no such document")));
                 }
             }
@@ -1023,9 +1216,42 @@ async fn admit(
         _ => Ok(Some(id.to_owned())),
     };
     match owner.map_err(|e| refused(&e))? {
-        Some(doc) if scope.allows_document(&doc) => Ok(()),
+        Some(doc) if scope.allows_document(&doc) && live(state, &doc).await? => Ok(()),
+        Some(doc) if scope.allows_document(&doc) => Err(in_trash(state, &doc, absent).await),
         _ => Err(refused(&ApiError::not_found(absent))),
     }
+}
+
+/// L6-F2 (General, 0.6.105): asked about a document just deleted, the model
+/// told the user it was 「永久移除」. A document of the scope that is in
+/// 「最近删除」 is answered as such (nothing of it is read); one past its 7
+/// days, or not there, stays not found.
+async fn in_trash(state: &AppState, id: &str, absent: &'static str) -> Envelope {
+    let Ok(storage) = ready(state).await else {
+        return refused(&ApiError::not_found(absent));
+    };
+    match crate::trash::restorable_title(&storage, id).await {
+        Ok(Some(title)) => Envelope::Completed {
+            payload: json!({
+                "reason": "deleted",
+                "message": format!(
+                    "《{title}》已被用户删除，现在在文档页的「最近删除」里，{} 天内可以恢复，不是永久删除；删除期间不能读取或修改它。请这样告诉用户。",
+                    crate::trash::RESTORE_DAYS
+                ),
+            }),
+            replayed: false,
+        },
+        _ => refused(&ApiError::not_found(absent)),
+    }
+}
+
+/// L6-F2: a deleted document, and its jobs and extractions, read as absent
+/// to every tool, whatever its grant still names.
+async fn live(state: &AppState, id: &str) -> Result<bool, Envelope> {
+    let storage = ready(state).await?;
+    crate::trash::is_live(&storage, id)
+        .await
+        .map_err(|e| refused(&e))
 }
 
 /// Why a patch was refused, in words for the user (General 0.6.94).
@@ -1107,6 +1333,7 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    mod compare;
     mod extract;
     mod extraction;
     mod read;
@@ -1561,6 +1788,156 @@ mod tests {
         assert!(!body.contains("not_found"), "{body}");
     }
 
+    /// L6-F2: a deleted document is gone for every tool, by id or by name,
+    /// its jobs too, though its grant still names it.
+    #[tokio::test]
+    async fn a_deleted_document_is_absent_to_every_tool() {
+        let (_dir, state) = opened().await;
+        add_failed_job(&state, "'x'").await;
+        let other = add_document(&state, 2, "'发票.pdf'").await;
+        let scope = [DOC, other.as_str()];
+        let storage = state.storage().await.unwrap();
+        crate::trash::delete(&storage, DOC, &Origin::Page)
+            .await
+            .unwrap();
+        // In 「最近删除」: said so (General 0.6.105: the model called it
+        // 「永久移除」), and nothing of the document comes back.
+        for (op, args) in [
+            ("get", json!({ "document_id": DOC })),
+            ("paragraphs", json!({ "document_id": DOC })),
+            ("read_range", json!({ "document_id": DOC, "revision": 1 })),
+            ("job_get", json!({ "job_id": JOB })),
+        ] {
+            let answer = payload(&call_in(&state, op, &scope, args).await);
+            assert_eq!(answer["reason"], "deleted", "{op}: {answer}");
+            let message = answer["message"].as_str().unwrap();
+            assert!(
+                message.contains("最近删除") && message.contains("不是永久删除"),
+                "{message}"
+            );
+            assert_eq!(answer.as_object().unwrap().len(), 2, "{answer}");
+        }
+        let body = call_in(
+            &state,
+            "compose",
+            &scope,
+            json!({ "parts": [{ "document_id": DOC }] }),
+        )
+        .await;
+        assert_module_error(&body, "not_found", false);
+        // Past its 7 days, or outside the scope: not found, as any other.
+        let body = call_in(
+            &state,
+            "get",
+            &[other.as_str()],
+            json!({ "document_id": DOC }),
+        )
+        .await;
+        assert_module_error(&body, "not_found", false);
+        exec(
+            &state,
+            &format!(
+                "UPDATE documents SET deleted_at = '2020-01-01T00:00:00.000Z' WHERE id = '{DOC}'"
+            ),
+        )
+        .await;
+        let body = call_in(&state, "get", &scope, json!({ "document_id": DOC })).await;
+        assert_module_error(&body, "not_found", false);
+        // By its name: not resolved, so not that document.
+        let body = call_in(
+            &state,
+            "get",
+            &scope,
+            json!({ "document_id": "the job's document" }),
+        )
+        .await;
+        assert!(!String::from_utf8_lossy(&body).contains("completed"));
+        let list = payload(&call_in(&state, "list", &scope, json!({})).await);
+        assert_eq!(list["documents"].as_array().unwrap().len(), 1, "{list}");
+    }
+
+    /// FU-136 (General 0.6.72): three documents titled 《中文测试合同.pdf》; a
+    /// merge by that name went on with documents the model picked itself.
+    /// A name several documents answer to is now never resolved: the call
+    /// is answered with the candidates and why, and nothing is written.
+    #[tokio::test]
+    async fn a_name_several_documents_answer_to_lists_them_and_runs_nothing() {
+        let (_dir, state) = opened().await;
+        let a = add_document(&state, 1, "'中文测试合同.pdf'").await;
+        let b = add_document(&state, 2, "'中文测试合同.pdf'").await;
+        let c = add_document(&state, 3, "'中文测试合同.pdf'").await;
+        let split = add_document(&state, 4, "'中文测试合同（第 1 页）'").await;
+        let scope = [a.as_str(), b.as_str(), c.as_str(), split.as_str()];
+        for (op, args) in [
+            ("get", json!({ "document_id": "《中文测试合同.pdf》" })),
+            ("paragraphs", json!({ "document_id": "中文测试合同" })),
+            (
+                "compose",
+                json!({ "parts": [{ "document_id": "中文测试合同.pdf" }, { "document_id": split }] }),
+            ),
+        ] {
+            let answer = payload(&call_in(&state, op, &scope, args).await);
+            assert_eq!(answer["reason"], "ambiguous_title", "{op}: {answer}");
+            let ids: Vec<&str> = answer["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["document_id"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids.len(), 3, "{answer}");
+            for id in [&a, &b, &c] {
+                assert!(ids.contains(&id.as_str()), "{answer}");
+            }
+            let message = answer["message"].as_str().unwrap();
+            assert!(
+                message.contains("3 份") && message.contains("不要自己"),
+                "{message}"
+            );
+            assert!(answer.get("job_id").is_none(), "{answer}");
+        }
+        // Only in part (「合同」): every document containing it is a candidate.
+        let answer =
+            payload(&call_in(&state, "get", &scope, json!({ "document_id": "测试合同" })).await);
+        assert_eq!(answer["reason"], "ambiguous_title", "{answer}");
+        assert_eq!(answer["candidates"].as_array().unwrap().len(), 4);
+        let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs")
+            .fetch_one(state.storage().await.unwrap().db.pool())
+            .await
+            .unwrap();
+        assert_eq!(jobs, 0);
+    }
+
+    /// L6-F2: the Agent deletes one document by its id; the `oplog` says
+    /// which run deleted it, and a second call finds nothing to delete.
+    #[tokio::test]
+    async fn the_agent_deletes_one_document_by_its_id() {
+        let (_dir, state) = opened().await;
+        let doc = add_document(&state, 1, "'合同.pdf'").await;
+        let gone = payload(&call(&state, "delete", json!({ "document_id": doc })).await);
+        assert_eq!(gone["deleted"], true, "{gone}");
+        assert_eq!(gone["title"], "合同.pdf");
+        assert!(gone["message"].as_str().unwrap().contains("最近删除"));
+        assert!(gone["message"].as_str().unwrap().contains("不是永久删除"));
+        // A second delete finds it in 「最近删除」: nothing is deleted twice.
+        for op in ["delete", "get"] {
+            let answer =
+                payload(&call_in(&state, op, &[&doc], json!({ "document_id": doc })).await);
+            assert_eq!(answer["reason"], "deleted", "{op}: {answer}");
+        }
+        let storage = state.storage().await.unwrap();
+        let deletes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oplog WHERE op = 'delete'")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(deletes, 1);
+        let row: (String, String) =
+            sqlx::query_as("SELECT origin, run_id FROM oplog WHERE op = 'delete'")
+                .fetch_one(storage.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(row, ("run".into(), "run-1".into()));
+    }
+
     #[test]
     fn a_title_is_compared_without_case_quotes_or_extension() {
         assert_eq!(plain_title(" 《Report.PDF》 "), "report");
@@ -1773,9 +2150,118 @@ mod tests {
         assert_eq!(uploads, 1);
     }
 
+    /// A DOCX template as document `id`, at version 1.
+    async fn add_template(state: &AppState, id: &str) {
+        let storage = state.storage().await.unwrap();
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let sha = storage.blobs.put_bytes(template).unwrap().sha256;
+        let docx = crate::office::DOCX;
+        exec(
+            state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision)
+                        VALUES ('{id}', '合同.docx', '{docx}', 1);
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                template.len()
+            ),
+        )
+        .await;
+    }
+
+    /// L6-F5: with save_to=original the rewrite is the original's next
+    /// version, over the head the call read; no new document is made, and
+    /// the model is told the version, done.
+    #[tokio::test]
+    async fn an_agent_patch_or_fill_saved_to_the_original_is_its_next_version() {
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let (a, b) = (
+            "doc_01K74Z3QJ8V5N2W9RTX6Y00081",
+            "doc_01K74Z3QJ8V5N2W9RTX6Y00082",
+        );
+        add_template(&state, a).await;
+        add_template(&state, b).await;
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let para = crate::docx_patch::list_paragraphs(template)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.text.trim().chars().count() >= 16)
+            .unwrap();
+        let anchor: String = para.text.trim().chars().take(16).collect();
+        let edit = |save_to: &str| {
+            json!({ "document_id": a, "save_to": save_to,
+                    "edits": [{ "index": para.index, "text": "新的文字", "anchor": anchor }] })
+        };
+        let bad = call_in(&state, "patch", &[a], edit("somewhere")).await;
+        assert!(String::from_utf8_lossy(&bad).contains("invalid_input"));
+        let answer = payload(&call_in(&state, "patch", &[a], edit("original")).await);
+        assert_eq!(answer["saved_as"], "new_revision", "{answer}");
+        assert_eq!(
+            (&answer["revision"], &answer["committed"]),
+            (&json!(2), &json!(true))
+        );
+        assert_eq!(answer["source_document_id"], a);
+        assert!(answer["message"].as_str().unwrap().contains("第 2 版"));
+        let fill =
+            json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" } });
+        let filled = payload(&call_in(&state, "fill", &[b], fill).await);
+        assert_eq!(
+            (&filled["saved_as"], &filled["revision"]),
+            (&json!("new_revision"), &json!(2)),
+            "{filled}"
+        );
+        let count = |sql: &'static str| {
+            let pool = storage.db.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM documents").await, 2);
+        assert_eq!(count("SELECT COUNT(*) FROM uploads").await, 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM oplog WHERE origin = 'run' AND revision = 2").await,
+            2
+        );
+    }
+
     /// FU-151 (0.6.89): 293 paragraphs of a real contract came to 40 KB in an
-    /// Agent's context. It is shown the ones with text, 40 characters each,
-    /// within 3000 characters, and told how to ask for the rest.
+    /// Agent's context. FU-164 (0.6.98, balanced tier): the 3000-character
+    /// table of contents in JSON objects still took the second prompt to 7076
+    /// tokens. It is one line per paragraph with text, `段号 开头`, within
+    /// 1200 characters, and the Agent is told how to ask for the rest.
+    /// FU-164 on the contract of 0.6.98's run (《示范-山东健身合同2025》, 293
+    /// paragraphs): its table of contents as the model reads it, and the
+    /// clause found by a word, whole.
+    #[test]
+    fn a_real_contracts_table_of_contents_stays_small() {
+        let file: &[u8] = include_bytes!("../tests/fixtures/samr-shandong-fitness-2025.docx");
+        let all: Vec<crate::patch::Paragraph> = crate::docx_patch::list_paragraphs(file)
+            .unwrap()
+            .into_iter()
+            .map(|p| crate::patch::Paragraph {
+                index: p.index,
+                text: p.text,
+                in_table: p.in_table,
+            })
+            .collect();
+        let toc = preview_paragraphs("doc_1", &all, &ParagraphsArgs::default());
+        let size = toc.to_string().chars().count();
+        assert!(size < 1700, "{size}");
+        let found = preview_paragraphs(
+            "doc_1",
+            &all,
+            &ParagraphsArgs {
+                query: Some("违约责任".into()),
+                ..Default::default()
+            },
+        );
+        assert!(found.to_string().chars().count() < 3600, "{found}");
+    }
+
     #[test]
     fn an_agent_is_shown_a_long_documents_paragraphs_in_parts() {
         let all: Vec<crate::patch::Paragraph> = (0..293)
@@ -1790,19 +2276,28 @@ mod tests {
             })
             .collect();
         let first = preview_paragraphs("doc_1", &all, &ParagraphsArgs::default());
-        let shown = first["paragraphs"].as_array().unwrap();
-        let chars: usize = shown
-            .iter()
-            .map(|p| p["text"].as_str().unwrap().chars().count())
-            .sum();
-        assert!(chars <= 3000 + 41, "{chars}");
+        let toc = first["toc"].as_str().unwrap();
+        assert!(toc.chars().count() <= 1200, "{}", toc.chars().count());
         assert_eq!(first["total"], 195);
+        let lines: Vec<&str> = toc.lines().collect();
         assert!(
-            shown.iter().all(|p| p["index"].as_u64().unwrap() % 3 != 0),
+            lines.iter().all(|l| {
+                let n: usize = l.split(' ').next().unwrap().parse().unwrap();
+                !n.is_multiple_of(3)
+            }),
             "no empty paragraph"
         );
-        assert!(shown[0]["text"].as_str().unwrap().ends_with('…'));
-        assert_eq!(shown[0]["text"].as_str().unwrap().chars().count(), 41);
+        assert_eq!(
+            lines[0],
+            format!("1 {}", all[1].text.chars().take(24).collect::<String>())
+        );
+        // The answer as the model reads it stays small: about the budget,
+        // not JSON objects around every line.
+        assert!(
+            first.to_string().chars().count() < 1700,
+            "{}",
+            first.to_string().chars().count()
+        );
         let next = first["next_from"].as_u64().unwrap() as usize;
         // The rest, from where it stopped.
         let more = preview_paragraphs(
@@ -1813,9 +2308,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert_eq!(
-            more["paragraphs"][0]["index"].as_u64().unwrap() as usize,
-            next
+        assert!(
+            more["toc"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{next} "))
         );
         // A word picks the paragraphs that have it, whole (PM 11-21).
         let found = preview_paragraphs(
@@ -1857,19 +2354,9 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(wide["paragraphs"][0].get("whole").is_none());
-        assert!(
-            wide["paragraphs"][0]["text"]
-                .as_str()
-                .unwrap()
-                .ends_with('…')
-        );
-        // The whole of it serialized stays small: no more 40 KB.
-        assert!(
-            first.to_string().len() < 12_000,
-            "{}",
-            first.to_string().len()
-        );
+        assert!(wide.get("paragraphs").is_none());
+        let wide_toc = wide["toc"].as_str().unwrap();
+        assert!(wide_toc.lines().count() <= 50 && wide_toc.chars().count() <= 1200);
     }
 
     #[tokio::test]

@@ -185,6 +185,76 @@ pub(crate) enum DocumentsAction {
         #[arg(long)]
         json: bool,
     },
+    /// Delete a document (L6-F2): it leaves the list and every read, and can
+    /// be restored for 7 days (`documents restore`)
+    Delete {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Restore a document deleted less than 7 days ago
+    Restore {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// List the documents deleted less than 7 days ago, which can be restored
+    Deleted {
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// List a document's versions, newest first, and which is current (L6-F5)
+    Versions {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Make an old version current again: its content is saved as a new
+    /// version, and every version is kept (L6-F5)
+    Revert {
+        /// The document's id (`doc_…`)
+        document_id: String,
+        /// The version to bring back (from `documents versions`)
+        revision: u64,
+        /// The current version as `documents versions` showed it; if the
+        /// document has moved on since, nothing is written
+        #[arg(long)]
+        expect: u64,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
+    /// Compare two documents, or two versions of one, by their text (L6-S05).
+    /// `compare <A> <B>` is two documents' current versions;
+    /// `compare <ID> --from N --to M` is one document's versions N and M
+    Compare {
+        /// The first document's id (`doc_…`)
+        left: String,
+        /// The second document's id; not with --from/--to
+        right: Option<String>,
+        /// With one document: the version to compare from
+        #[arg(long)]
+        from: Option<u64>,
+        /// With one document: the version to compare to (default: current)
+        #[arg(long)]
+        to: Option<u64>,
+        /// Changes per page (1–500)
+        #[arg(long)]
+        limit: Option<u64>,
+        /// Skip this many changes (the `next_offset` of the page before)
+        #[arg(long)]
+        offset: Option<u64>,
+        /// Print the result as one JSON line
+        #[arg(long)]
+        json: bool,
+    },
     /// List a DOCX document's paragraphs, by index (for `documents patch`)
     Paragraphs {
         /// The document's id (`doc_…`)
@@ -207,6 +277,13 @@ pub(crate) enum DocumentsAction {
         /// The new document's title
         #[arg(long)]
         title: Option<String>,
+        /// Save into the original as its next version (L6-F5), over version
+        /// `--expect`, the current one when it was read; else a new document
+        #[arg(long, requires = "expect")]
+        save_to_original: bool,
+        /// With `--save-to-original`: the current version, as read
+        #[arg(long, requires = "save_to_original")]
+        expect: Option<u64>,
         /// Print the result as one JSON line
         #[arg(long)]
         json: bool,
@@ -231,6 +308,13 @@ pub(crate) enum DocumentsAction {
         /// The new document's title
         #[arg(long)]
         title: Option<String>,
+        /// Save into the template as its next version (L6-F5), over version
+        /// `--expect`; else a new document
+        #[arg(long, requires = "expect")]
+        save_to_original: bool,
+        /// With `--save-to-original`: the current version, as read
+        #[arg(long, requires = "save_to_original")]
+        expect: Option<u64>,
         /// Print the result as one JSON line
         #[arg(long)]
         json: bool,
@@ -420,6 +504,40 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             json,
             host_stdin,
         } => request_op(request, json, host_stdin).await,
+        DocumentsAction::Delete { document_id, json } => {
+            operation(json!({"op": "delete", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Restore { document_id, json } => {
+            operation(json!({"op": "restore", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Deleted { json } => {
+            operation(json!({"op": "recentlyDeleted"}), json).await
+        }
+        DocumentsAction::Versions { document_id, json } => {
+            operation(json!({"op": "revisions", "documentId": document_id}), json).await
+        }
+        DocumentsAction::Revert {
+            document_id,
+            revision,
+            expect,
+            json,
+        } => {
+            let req = json!({"op": "restoreRevision", "documentId": document_id,
+                             "revision": revision, "expectRevision": expect});
+            operation(req, json).await
+        }
+        DocumentsAction::Compare {
+            left,
+            right,
+            from,
+            to,
+            limit,
+            offset,
+            json,
+        } => match compare_request(left, right, from, to, limit, offset) {
+            Ok(req) => operation(req, json).await,
+            Err(res) => report(&res, json),
+        },
         DocumentsAction::Paragraphs { document_id, json } => {
             operation(json!({"op": "paragraphs", "documentId": document_id}), json).await
         }
@@ -428,9 +546,11 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             edits,
             tracked,
             title,
+            expect,
             json,
+            ..
         } => match patch_request(document_id, &edits, tracked, title) {
-            Ok(req) => operation(req, json).await,
+            Ok(req) => operation(to_original(req, expect), json).await,
             Err(res) => report(&res, json),
         },
         DocumentsAction::Fields { document_id, json } => {
@@ -440,9 +560,11 @@ pub(crate) async fn cmd_documents(action: DocumentsAction) -> Result<(), String>
             document_id,
             values,
             title,
+            expect,
             json,
+            ..
         } => match fill_request(document_id, &values, title) {
-            Ok(req) => operation(req, json).await,
+            Ok(req) => operation(to_original(req, expect), json).await,
             Err(res) => report(&res, json),
         },
         DocumentsAction::Save {
@@ -459,6 +581,15 @@ fn pair<'a>(raw: &'a str, what: &str) -> Result<(&'a str, &'a str), Response> {
         .filter(|(k, _)| !k.trim().is_empty())
         .map(|(k, v)| (k.trim(), v))
         .ok_or_else(|| invalid(format!("{what} must be KEY=VALUE, not {raw:?}")))
+}
+
+/// L6-F5: `--save-to-original --expect N` (clap makes them go together).
+fn to_original(mut req: Value, expect: Option<u64>) -> Value {
+    if let Some(n) = expect {
+        req["saveTo"] = json!("new_revision");
+        req["expectRevision"] = json!(n);
+    }
+    req
 }
 
 /// The `patch` operation of `--edit INDEX=TEXT`s.
@@ -480,6 +611,35 @@ fn patch_request(
     }
     let mut req = json!({"op": "patch", "documentId": document_id, "edits": out});
     put(&mut req, "title", title);
+    Ok(req)
+}
+
+/// The `compare` operation of the two ways to say what is compared.
+fn compare_request(
+    left: String,
+    right: Option<String>,
+    from: Option<u64>,
+    to: Option<u64>,
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<Value, Response> {
+    let (l, r) = match (right, from, to) {
+        (Some(right), None, None) => (json!({"documentId": left}), json!({"documentId": right})),
+        (None, Some(from), to) => {
+            let mut r = json!({"documentId": left});
+            put(&mut r, "revision", to);
+            (json!({"documentId": left, "revision": from}), r)
+        }
+        _ => {
+            return Err(invalid(
+                "give two documents (`compare A B`), or one document with --from (and --to)"
+                    .to_owned(),
+            ));
+        }
+    };
+    let mut req = json!({"op": "compare", "left": l, "right": r});
+    put(&mut req, "limit", limit);
+    put(&mut req, "offset", offset);
     Ok(req)
 }
 
@@ -914,6 +1074,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compare_takes_two_documents_or_one_with_versions() {
+        let (a, b) = ("doc_a".to_owned(), "doc_b".to_owned());
+        assert_eq!(
+            compare_request(a.clone(), Some(b), None, None, Some(5), None).unwrap(),
+            json!({"op": "compare", "left": {"documentId": "doc_a"},
+                   "right": {"documentId": "doc_b"}, "limit": 5})
+        );
+        assert_eq!(
+            compare_request(a.clone(), None, Some(1), Some(2), None, Some(3)).unwrap(),
+            json!({"op": "compare", "left": {"documentId": "doc_a", "revision": 1},
+                   "right": {"documentId": "doc_a", "revision": 2}, "offset": 3})
+        );
+        assert_eq!(
+            compare_request(a.clone(), None, Some(1), None, None, None).unwrap()["right"],
+            json!({"documentId": "doc_a"})
+        );
+        for (right, from, to) in [
+            (None, None, None),
+            (None, None, Some(2)),
+            (Some("doc_b".to_owned()), Some(1), None),
+        ] {
+            assert!(compare_request(a.clone(), right, from, to, None, None).is_err());
+        }
+    }
+
+    #[test]
     fn host_input_is_one_object_with_base_token_and_path() {
         const SHAPE: &str = r#"{"base","token","path"}"#;
         let ok: HostImport = host_input(
@@ -1240,6 +1426,37 @@ mod tests {
         );
         assert!(fill_request("doc_x".into(), &["no-equals".into()], None).is_err());
         assert!(fill_request("doc_x".into(), &["=x".into()], None).is_err());
+    }
+
+    /// L6-F5: versions, revert over the version seen, and patch / fill saved
+    /// into the original only with the version they read.
+    #[test]
+    fn versions_revert_and_saving_into_the_original_go_with_the_version_read() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Cli {
+            #[command(subcommand)]
+            action: DocumentsAction,
+        }
+        let parse =
+            |args: &[&str]| Cli::try_parse_from(["documents"].iter().chain(args)).map(|_| ());
+        assert!(parse(&["versions", "doc_x"]).is_ok());
+        assert!(parse(&["revert", "doc_x", "1", "--expect", "2"]).is_ok());
+        assert!(parse(&["revert", "doc_x", "1"]).is_err());
+        let patch = ["patch", "doc_x", "--edit", "3=新"];
+        assert!(parse(&[&patch[..], &["--save-to-original", "--expect", "2"]].concat()).is_ok());
+        assert!(parse(&[&patch[..], &["--save-to-original"]].concat()).is_err());
+        assert!(parse(&[&patch[..], &["--expect", "2"]].concat()).is_err());
+        let req = patch_request("doc_x".into(), &["3=新".into()], false, None).unwrap();
+        assert_eq!(
+            to_original(req.clone(), Some(2)),
+            json!({"op": "patch", "documentId": "doc_x", "edits": [{"index": 3, "text": "新"}],
+                   "saveTo": "new_revision", "expectRevision": 2})
+        );
+        assert_eq!(to_original(req.clone(), None), req);
+        let id = "doc_01K74Z3QJ8V5N2W9RTX6YB4MCD";
+        let real = patch_request(id.into(), &["3=新".into()], false, None).unwrap();
+        assert!(route(&to_original(real, Some(2))).is_some());
     }
 
     #[test]

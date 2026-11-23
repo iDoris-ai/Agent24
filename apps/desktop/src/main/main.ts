@@ -816,8 +816,9 @@ app.whenReady().then(async () => {
       dataDir: () => tryDataDir(),
       downloadsDir: () => app.getPath('downloads'),
       importAndConvert: importAndConvertTranslation,
-      fetchContent: async (documentId) => {
-        const res = await withDocumentsDelegation(() => documentsCall({ op: 'content', documentId }, daemonCliEndpoint))
+      fetchContent: async (documentId, revision) => {
+        const req = revision === undefined ? { op: 'content', documentId } : { op: 'content', documentId, revision }
+        const res = await withDocumentsDelegation(() => documentsCall(req, daemonCliEndpoint))
         if (!res.ok) return { ok: false, code: res.error.code, message: res.error.message }
         const file = res.data as DocumentsResults['content']
         return { ok: true, data: file.data, mediaType: file.media_type }

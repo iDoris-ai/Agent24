@@ -23,7 +23,9 @@
         "documents.paragraphs",
         "documents.patch",
         "documents.fields",
-        "documents.fill"
+        "documents.fill",
+        "documents.compare",
+        "documents.delete"
       ]
     }
   ],

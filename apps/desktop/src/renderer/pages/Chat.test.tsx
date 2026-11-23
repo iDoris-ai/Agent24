@@ -433,6 +433,156 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText(line)).toBeInTheDocument(), { timeout: 3000 })
   })
 
+  // L6-F2 (General, 0.6.105): the App names the document a delete is for. Two
+  // answer to 《中文测试合同》: a card lists them (title, import time, pages),
+  // the model is not asked; the one picked goes to the model by its id only.
+  it('a delete naming several documents asks which, then sends only the picked id', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const B = 'doc_01M679KMY6D75P0EZACBS95JYB'
+    const docs = [
+      { document_id: A, title: '中文测试合同.pdf', created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: B, title: '中文测试合同.pdf', created_at: '2026-11-21T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYC', title: '发票.pdf', created_at: '2026-11-21T01:00:00.000Z' },
+    ]
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { ...docs.find((d) => d.document_id === req.documentId), pages: req.documentId === B ? 4 : 2 } })
+    const agentAccess = vi.fn().mockResolvedValue({ enabled: true, until: '2026-12-23T00:00:00.000Z', ok: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request, agentAccess } },
+      writable: true,
+      configurable: true,
+    })
+    const prompts: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        prompts.push(req.body?.prompt ?? '')
+        return { ok: true, status: 201, data: { id: 'r_del' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '已删除' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把《中文测试合同.pdf》删了' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const card = await screen.findByRole('group', { name: '选择要删除的文档' }, { timeout: 3000 })
+    expect(screen.getByText(/2 份文档都对得上《中文测试合同.pdf》/)).toBeInTheDocument()
+    expect(within(card).getByText(/共 4 页/)).toBeInTheDocument()
+    expect(card.textContent).not.toContain('doc_')
+    expect(prompts).toEqual([])
+    fireEvent.click(within(card).getAllByRole('button', { name: '删除这一份' })[1]!)
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain(`document_id: ${B}`)
+    expect(prompts[0]).not.toContain(A)
+    expect(prompts[0]).toContain('删除第 2 份')
+  })
+
+  // L6-F5: 「回到上一个版本」 never goes to the model: the App finds the version,
+  // offers it on a card, and restores it over the version shown when clicked.
+  it('restores the version before the current one from a card, never through the model', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : req.op === 'revisions'
+        ? { ok: true, data: { document_id: A, head_revision: 2, revisions: [
+          { revision: 2, created_at: '2026-11-23T02:00:00.000Z' }, { revision: 1, created_at: '2026-11-20T01:00:00.000Z' }] } }
+        : { ok: true, data: { document_id: A, title: '合同.docx', revision: 3, previous_revision: 2, committed: true } })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把《合同.docx》回到上一个版本' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const card = await screen.findByRole('group', { name: '恢复版本' }, { timeout: 3000 })
+    expect(screen.getByText(/现在是第 2 版。要把第 1 版/)).toBeInTheDocument()
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'restoreRevision' }))
+    fireEvent.click(within(card).getByRole('button', { name: '恢复第 1 版' }))
+    await screen.findByText(/已恢复：第 1 版的内容现在是《合同.docx》的第 3 版/, {}, { timeout: 3000 })
+    expect(request).toHaveBeenCalledWith({ op: 'restoreRevision', documentId: A, revision: 1, expectRevision: 2 })
+    expect(screen.queryByRole('button', { name: '恢复第 1 版' })).toBeNull()
+    expect(runs).toEqual([])
+  })
+
+  // L6-S05: 「这一版和上一版改了哪些地方」 never goes to the model: the App picks
+  // the two versions, asks the module, and writes the summary from its changes.
+  it('compares a document with its previous version and answers with a summary and a card', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const side = (n: number, text: string) => ({ block_ref: { paragraph_index: n }, text })
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : req.op === 'revisions'
+        ? { ok: true, data: { document_id: A, head_revision: 2, revisions: [{ revision: 2, created_at: 'x' }, { revision: 1, created_at: 'y' }] } }
+        : { ok: true, data: { left: { document_id: A, revision: 1, media_type: 'd' }, right: { document_id: A, revision: 2, media_type: 'd' }, identical: false, only_text: true, truncated: false, next_offset: null,
+          summary: { total: 1, added: 0, removed: 0, changed: 1, unaligned: 0 },
+          changes: [{ id: 'c1', kind: 'changed', left: side(2, '押金 5 万'), right: side(2, '押金 8 万'), spans: [{ op: 'equal', text: '押金 ' }, { op: 'delete', text: '5' }, { op: 'insert', text: '8' }, { op: 'equal', text: ' 万' }] }] } })
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《合同.docx》这一版和上一版改了哪些地方' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const card = await screen.findByRole('group', { name: '文档对比' }, { timeout: 3000 })
+    expect(screen.getByText(/共 1 处改动：删 0 处、加 0 处、改 1 处、无法对齐 0 处 · 只比较文字/)).toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: /c1 第 3 段 修改：押金 〔5→8〕 万/ })).toBeInTheDocument()
+    expect(request).toHaveBeenCalledWith({ op: 'compare', left: { documentId: A, revision: 1 }, right: { documentId: A, revision: 2 } })
+    expect(runs).toEqual([])
+  })
+
+  // L6-S05: a question about a contract is not a comparison.
+  it('does not take 「合同里写一个月押金对吗」 for a comparison', async () => {
+    const request = vi.fn(async () => ({ ok: true, data: { documents: [], next_cursor: null } }))
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    mockBackendProxy.mockImplementation(async () => ({ ok: true, status: 200, data: {} }))
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '合同里写一个月押金对吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('合同里写一个月押金对吗')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.queryByRole('group', { name: '文档对比' })).toBeNull()
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'compare' }))
+  })
+
+  // General 11-23 (real Mac): 「回到上一个版本」 with no document named in
+  // the turn takes the one the conversation last named.
+  it('restores the document the conversation last named when the turn names none', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { document_id: A, head_revision: 2, revisions: [
+        { revision: 2, created_at: '2026-11-23T02:00:00.000Z' }, { revision: 1, created_at: '2026-11-20T01:00:00.000Z' }] } })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    mockBackendProxy.mockImplementation(async () => ({ ok: true, status: 200, data: {} }))
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把《合同.docx》第 3 段改正式一点' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText(/把《合同.docx》第 3 段改正式一点/)).toBeInTheDocument(), { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '回到上一个版本' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByRole('group', { name: '恢复版本' }, { timeout: 3000 })
+    expect(screen.getByText(/《合同.docx》现在是第 2 版。要把第 1 版/)).toBeInTheDocument()
+  })
+
   // General 0.6.93: a turn that ran and failed (the local model stopped at
   // prefill) was sent; only one that never started reads 「未发送」.
   it.each([
@@ -1229,5 +1379,70 @@ describe('ChatPage: Enter while composing', () => {
     fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
     await waitFor(() => expect(mockBackendProxy).toHaveBeenCalledTimes(1))
     expect(mockBackendProxy.mock.calls[0][0].body.messages.at(-1).content).toBe('How long should water be boiled to make it safe to drink?')
+  })
+})
+
+// F3 (Loop 6): one sentence extracts fields with the documents OS's extract
+// job, shown as a card; an ordinary question about a field is not taken.
+describe('ChatPage: one sentence extracts fields (F3)', () => {
+  beforeEach(() => { setLocale('zh') })
+  const request = vi.fn(async (req: { op: string }) => {
+    if (req.op === 'get') return { ok: true, data: { document_id: 'doc_1', title: '合同.pdf', head: { revision: 1, media_type: 'application/pdf' } } }
+    if (req.op === 'extract') return { ok: true, data: { job_id: 'job_1', status: 'succeeded', result: { extraction_id: 'ext_1' } } }
+    if (req.op === 'getExtraction') return { ok: true, data: { next_cursor: null, values: [
+      { key: 'f1', status: 'present', value: '张三', anchors: [{ block_id: 'p1/b2', page: 1, quote: '甲方：张三' }] },
+      { key: 'f2', status: 'missing', missing_reason: 'not_in_document' },
+    ] } }
+    if (req.op === 'readText') return { ok: true, data: { blocks: [{ text: '甲方：张三' }], next_cursor: null } }
+    return { ok: false }
+  })
+  const start = async (text: string) => {
+    const { askAboutDocument, resetDocContextForTests } = await import('./chat/doc-context')
+    resetDocContextForTests()
+    request.mockClear()
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'model answer' } } })
+    askAboutDocument({ id: 'doc_1', title: '合同.pdf', revision: 1 })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: text } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+  }
+
+  it('calls extract first and shows the card, a missing field said so', async () => {
+    await start('把这份合同的甲方、开户银行抽出来')
+    await waitFor(() => expect(screen.getByRole('group', { name: '抽取结果' })).toBeInTheDocument())
+    expect(request.mock.calls.map(([r]) => r.op)).toEqual(['get', 'extract', 'getExtraction'])
+    expect(screen.getByText('张三')).toBeInTheDocument()
+    expect(screen.getByText('文档里没找到')).toBeInTheDocument()
+    expect(mockBackendProxy.mock.calls.some(([req]) => req.path === '/api/v1/chat')).toBe(false)
+    const { pendingDocFocus } = await import('./documents/doc-focus')
+    fireEvent.click(screen.getByRole('button', { name: '第 1 页' }))
+    expect(pendingDocFocus()).toEqual({ documentId: 'doc_1', page: 1, blockId: 'p1/b2' })
+  })
+
+  it('says in Chinese when the module has no model, the code only under 「详情」', async () => {
+    request.mockImplementationOnce(async () => ({ ok: true, data: { document_id: 'doc_1', title: '合同.pdf', head: { revision: 1, media_type: 'application/pdf' } } }))
+    request.mockImplementationOnce(async () => ({ ok: false, status: 503, error: { code: 'engine_unavailable', message: 'the kernel offers this module no model', details: { engine: 'local-model' } } }) as never)
+    await start('把这份合同的甲方抽出来')
+    await waitFor(() => expect(screen.getByText('没能完成抽取：本地模型没有分配给文档模块，暂时不能抽取。')).toBeInTheDocument())
+    const detail = screen.getByText(/the kernel offers this module no model/)
+    expect(detail.closest('details')).not.toBeNull()
+  })
+
+  // PR-Daemon #2019 ⑤: a turn taken for an extraction by mistake can still be answered.
+  it('answers the same words with the model when the card says it was not an extraction', async () => {
+    await start('把这份合同的甲方、开户银行抽出来')
+    fireEvent.click(await screen.findByRole('button', { name: '不是要抽取？让助手回答' }))
+    await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())
+    expect(request.mock.calls.filter(([r]) => r.op === 'extract')).toHaveLength(1)
+    const chat = mockBackendProxy.mock.calls.find(([req]) => req.path === '/api/v1/chat')![0]
+    expect(chat.body.messages.at(-1).content).toContain('把这份合同的甲方、开户银行抽出来')
+  })
+
+  it('leaves 「这个字段怎么填」 to the model', async () => {
+    await start('这个字段怎么填')
+    await waitFor(() => expect(screen.getByText('model answer')).toBeInTheDocument())
+    expect(request.mock.calls.some(([r]) => r.op === 'extract')).toBe(false)
   })
 })

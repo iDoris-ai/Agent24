@@ -11,6 +11,7 @@
 
 pub mod authorization;
 pub mod blob;
+pub mod compare;
 pub mod compose;
 pub mod db;
 pub mod derived;
@@ -35,7 +36,9 @@ pub mod state;
 pub mod text_layer;
 pub mod timestamp;
 pub mod tools;
+pub mod trash;
 pub mod uploads;
+pub mod versions;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
@@ -177,7 +180,27 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
         .route("/documents", get(documents::list_documents))
+        .route("/documents/compare", post(compare::route::compare))
         .route("/documents/{document_id}", get(documents::get_document))
+        // L6-F2: soft delete, restore within 7 days, and what can be restored.
+        .route(
+            "/documents/{document_id}/delete",
+            post(trash::delete_document),
+        )
+        .route(
+            "/documents/{document_id}/restore",
+            post(trash::restore_document),
+        )
+        .route("/recently-deleted", get(trash::list_recently_deleted))
+        // L6-F5: a document's versions, and an old one made current again.
+        .route(
+            "/documents/{document_id}/revisions",
+            get(versions::list_revisions),
+        )
+        .route(
+            "/documents/{document_id}/revisions/{revision}/restore",
+            post(versions::restore_revision),
+        )
         .route(
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),
@@ -224,6 +247,10 @@ pub fn router(state: AppState) -> Router {
         // segment after the namespace canonicalises to `_a24`.
         .route("/_a24/tools/{op}", post(tools::call_tool))
         .route("/_a24/authorization/revoked", post(authorization::revoked))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            trash::hide_deleted,
+        ))
         .with_state(state)
 }
 
@@ -281,9 +308,11 @@ mod tests {
                 "get",
                 "compose",
                 "paragraphs",
+                "compare",
                 "patch",
                 "fields",
-                "fill"
+                "fill",
+                "delete"
             ]
         );
     }
