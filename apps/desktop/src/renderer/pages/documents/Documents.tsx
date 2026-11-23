@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
+import DocumentCompare from './DocumentCompare'
 import DocumentDetail from './DocumentDetail'
 import RecentlyDeleted from './RecentlyDeleted'
 import { compose } from './compose'
@@ -14,6 +15,7 @@ import { getLocale, useT } from '../../i18n'
 import { documentsMessages } from './Documents.i18n'
 import type { DocAgentAccess, DocumentsModuleStatus } from '../../../shared/ipc-types'
 
+const DOCX_TYPE = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
 type Doc = components['schemas']['Document']
 
 const STATUS_LABELS: Record<string, 'status.queued' | 'status.running' | 'status.cancelling' | 'status.succeeded' | 'status.failed' | 'status.cancelled' | 'status.interrupted'> = {
@@ -222,8 +224,14 @@ export default function DocumentsPage() {
   // D2: PDFs ticked for merging, in the order ticked, and how the last split or merge went.
   const [picked, setPicked] = useState<string[]>([])
   const [composing, setComposing] = useState<{ working: boolean; message: string | null; ok: boolean }>({ working: false, message: null, ok: true })
+  // L6-S05: any two ticked documents of one kind (Word, or PDF/image) can be compared.
+  const [comparing, setComparing] = useState<[Doc, Doc] | null>(null)
+  const pickedDocs = picked.map((id) => docs.find((d) => d.document_id === id)).filter((d) => d !== undefined)
+  const pickedPdfs = pickedDocs.filter((d) => d.media_type === 'application/pdf')
+  const isWord = (d: Doc) => d.media_type === DOCX_TYPE
+  const canCompare = pickedDocs.length === 2 && isWord(pickedDocs[0]!) === isWord(pickedDocs[1]!)
   const merge = async () => {
-    const chosen = picked.map((id) => docs.find((d) => d.document_id === id)).filter((d) => d !== undefined)
+    const chosen = pickedPdfs
     setComposing({ working: true, message: null, ok: true })
     const title = t('merge.title', { names: chosen.map((d) => d.title).join(' + ') }).slice(0, 500)
     const out = await compose(api, chosen.map((d) => ({ documentId: d.document_id })), title)
@@ -327,10 +335,13 @@ export default function DocumentsPage() {
             {t('import.cancel')}
           </button>
         )}
-        {picked.length >= 2 && (
+        {pickedPdfs.length >= 2 && (
           <button className="btn" onClick={() => void merge()} disabled={composing.working}>
-            {t('merge.button', { count: picked.length })}
+            {t('merge.button', { count: pickedPdfs.length })}
           </button>
+        )}
+        {canCompare && (
+          <button className="btn" onClick={() => setComparing([pickedDocs[0]!, pickedDocs[1]!])}>{t('compare.button')}</button>
         )}
         {(composing.working || composing.message) && (
           <span role={composing.ok ? 'status' : 'alert'}>{composing.working ? t('compose.working') : composing.message}</span>
@@ -345,6 +356,11 @@ export default function DocumentsPage() {
         <div role="alert" style={ALERT}>
           {error ?? listError}
         </div>
+      )}
+      {comparing && (
+        <DocumentCompare api={api} onClose={() => setComparing(null)}
+          left={{ documentId: comparing[0].document_id, label: comparing[0].title }}
+          right={{ documentId: comparing[1].document_id, label: comparing[1].title }} />
       )}
       {open && (
         <DocumentDetail
@@ -380,11 +396,9 @@ export default function DocumentsPage() {
             {docs.map((d) => (
               <tr key={d.document_id}>
                 <td style={CELL}>
-                  {d.media_type === 'application/pdf' && (
-                    <input type="checkbox" aria-label={t('merge.select', { title: d.title })}
-                      checked={picked.includes(d.document_id)}
-                      onChange={(e) => setPicked((p) => e.target.checked ? [...p, d.document_id] : p.filter((x) => x !== d.document_id))} />
-                  )}
+                  <input type="checkbox" aria-label={t(d.media_type === 'application/pdf' ? 'merge.select' : 'compare.select', { title: d.title })}
+                    checked={picked.includes(d.document_id)}
+                    onChange={(e) => setPicked((p) => e.target.checked ? [...p, d.document_id] : p.filter((x) => x !== d.document_id))} />
                 </td>
                 <td style={CELL}>
                   <button className="btn btn-ghost" onClick={(e) => { opener.current = e.currentTarget; setAutoTranslate(null); setFocus(null); setOpen(d.document_id) }} aria-pressed={open === d.document_id}>
