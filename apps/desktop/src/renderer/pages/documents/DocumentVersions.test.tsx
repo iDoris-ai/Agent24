@@ -61,4 +61,19 @@ describe('L6-F5: a document\'s versions on its page', () => {
     expect(a.revealDownload).toHaveBeenCalledWith('合同（第 1 版）.docx')
     expect(versionFileTitle('报告.pdf', 2)).toBe('报告（第 2 版）')
   })
+
+  it('compares two picked versions, older on the left', async () => {
+    setLocale('zh')
+    const a = { request: vi.fn(async (req: { op: string }): Promise<unknown> => req.op === 'compare'
+      ? { ok: true, data: { left: { document_id: DOC, revision: 1, media_type: 'd' }, right: { document_id: DOC, revision: 2, media_type: 'd' }, identical: true, only_text: true, truncated: false, next_offset: null, summary: { total: 0, added: 0, removed: 0, changed: 0, unaligned: 0 }, changes: [] } }
+      : list(2)) }
+    render(<DocumentVersions api={a as never} documentId={DOC} title="合同.docx" />)
+    const compareBtn = await screen.findByRole('button', { name: '对比选中的两版' })
+    expect(compareBtn).toBeDisabled()
+    fireEvent.click(screen.getByRole('checkbox', { name: '选中第 2 版' }))
+    fireEvent.click(screen.getByRole('checkbox', { name: '选中第 1 版' }))
+    fireEvent.click(compareBtn)
+    await screen.findByText('没有文字差异 · 只比较文字')
+    expect(a.request).toHaveBeenCalledWith({ op: 'compare', left: { documentId: DOC, revision: 1 }, right: { documentId: DOC, revision: 2 } })
+  })
 })

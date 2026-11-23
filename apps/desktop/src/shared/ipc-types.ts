@@ -614,6 +614,9 @@ export type DocumentsRequest =
    * the version the user saw (`expectRevision`). */
   | { op: 'revisions'; documentId: DocSchemas['DocumentIdString'] }
   | { op: 'restoreRevision'; documentId: DocSchemas['DocumentIdString']; revision: number; expectRevision: number }
+  /** L6-S05: two documents, or two versions of one, compared by their text
+   * (no `revision` = the current version). */
+  | { op: 'compare'; left: CompareTarget; right: CompareTarget; limit?: number; offset?: number }
 
 /** What each operation returns on success. */
 export interface DocumentsResults {
@@ -643,6 +646,31 @@ export interface DocumentsResults {
   recentlyDeleted: { documents: DeletedDocument[] }
   revisions: DocumentVersions
   restoreRevision: SavedVersion
+  compare: DocumentComparison
+}
+
+export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }
+
+/** L6-S05: where a change is in its document (agent24-documents `compare.rs`). */
+export type CompareBlockRef = { paragraph_index: number } | { block_id: string; page: number }
+export interface CompareSide { block_ref: CompareBlockRef; text: string }
+export interface DocumentChange {
+  id: string
+  kind: 'added' | 'removed' | 'changed' | 'unaligned'
+  left: CompareSide | null
+  right: CompareSide | null
+  spans: Array<{ op: 'equal' | 'insert' | 'delete'; text: string }>
+}
+/** `summary` counts every change; `changes` is one page of them. */
+export interface DocumentComparison {
+  left: { document_id: string; revision: number; media_type: string }
+  right: { document_id: string; revision: number; media_type: string }
+  identical: boolean
+  only_text: boolean
+  summary: { total: number; added: number; removed: number; changed: number; unaligned: number }
+  changes: DocumentChange[]
+  truncated: boolean
+  next_offset: number | null
 }
 
 /** L6-F5: a document's versions, newest first (agent24-documents `versions.rs`). */
