@@ -38,7 +38,10 @@ export async function headOf(api: Window['agent24']['documents'] | undefined, re
   if (!/^doc_[0-9A-Z]+$/.test(ref)) {
     const listed = await api.request({ op: 'list', limit: 200 }).catch(() => null)
     const want = ref.trim().toLowerCase().replace(/\.[a-z0-9]{1,5}$/, '')
-    const hits = listed && listed.ok ? listed.data.documents.filter((d) => d.title.toLowerCase().replace(/\.[a-z0-9]{1,5}$/, '') === want) : []
+    const docs = listed && listed.ok ? listed.data.documents : []
+    // The exact title first: 《合同.docx》 and its converted 《合同.pdf》 share a stem.
+    const exact = docs.filter((d) => d.title.trim().toLowerCase() === ref.trim().toLowerCase())
+    const hits = exact.length === 1 ? exact : docs.filter((d) => d.title.toLowerCase().replace(/\.[a-z0-9]{1,5}$/, '') === want)
     if (hits.length !== 1) return null
     id = hits[0]!.document_id
   }
