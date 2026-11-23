@@ -225,3 +225,7 @@
 - [ ] FU-194 · C · src=L6-S05 · 2026-11-24 · 对齐只到段：整段挪位并改写、拆段合段对不上时，两边各列为 unaligned，不硬配。判据：此类改动不被当成「改」。
 - [ ] FU-195 · C · src=L6-S05 · 2026-11-24 · PDF 的块是版面块，不一定是一段；compare 按块比，同一段被版面拆成不同块时可能多报。判据：对同一份 PDF 的两个版本，只改一个数字时只出一处改动。
 - [ ] FU-197 · C · src=L6-S05 · 2026-11-24 · 对比视图里 Word 的改动只写「第 N 段」，不能点开跳到那一段（文档页只能按 PDF 的页/块定位）；旧版本的页/块定位也没验过（F5 遗留）。判据：点 Word 改动能滚到对应段。
+- [ ] FU-198 · B · src=PR-Daemon #2041 · 2026-11-24 · compare 的 diff 在 async worker 上内联、无规模上限：核心 Replace 段做 n×m 次字符 ratio()，实测 600 段 1.75 秒、二次增长。改法：`blocking(move || diff(..))` + 单侧 unit 上限（超了 422 too_large）。判据：超大文档对比不卡住其它请求，且有明确报错。
+- [ ] FU-199 · C · src=PR-Daemon #2041 · 2026-11-24 · compare/route.rs 头注释「只读」对 PDF/图片不成立（缺文本层会建层存储）；补 PDF/图片成功对比测试（BlockRef::Block）。非 DOCX 一律归 layer，两个 xlsx 对比会报误导性 422：调用前查 pdfkit::FORMATS，给明确的 unsupported_format。
+- [ ] FU-200 · C · src=PR-Daemon #2041 · 2026-11-24 · compare 分页只按条数，可超 512 KiB 响应预算：加字节预算；另补「已软删除文档 → 404」测试。
+- [ ] FU-201 · C · src=L6-S05 0.6.110 真机（General 11-24） · 2026-11-24 · CLI 的 `documents compare` 弹「允许发起方写入 documents 模块的数据（delegate）」：daemon 对 FirstPartyShell 的非 GET 模块路由一律要 delegation（middleware.rs，按 HTTP 方法判断，不看是否只读），compare 和 find 是只读 POST，也被算作写。桌面（ProductHost）不受影响。改法：给只读 POST 的白名单或改读委托。判据：CLI 跑 compare/find 不弹写入委托框。
