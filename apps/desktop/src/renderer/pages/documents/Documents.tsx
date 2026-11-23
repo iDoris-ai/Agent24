@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import type { components } from '@agent24/api-client'
 import { canCancel, canRetry, cancelImport, describeError, getImportState, nudge, retryImport, startImport, subscribeImport } from './importStore'
+import ComparePickup from './ComparePickup'
 import DocumentDetail from './DocumentDetail'
 import RecentlyDeleted from './RecentlyDeleted'
 import { compose } from './compose'
@@ -252,6 +253,7 @@ export default function DocumentsPage() {
         {t('title')}
       </div>
       <p style={{ color: 'var(--muted)', fontSize: 12 }}>{t('subtitle')}</p>
+      <ComparePickup api={api} />
       {notInstalled && (
         moduleStatus?.installed ? (
           <div role="status" style={NOTE}>
