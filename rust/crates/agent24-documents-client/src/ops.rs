@@ -165,6 +165,19 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             (Method::Post, path, None, Vec::new(), Answer::Json)
         }
         "recentlyDeleted" => get(format!("{BASE}/recently-deleted")),
+        // L6-F5: a document's versions, and an old one made current again
+        // over the version the caller saw.
+        "revisions" => get(format!(
+            "{BASE}/documents/{}/revisions",
+            k.id("documentId", "doc_")?
+        )),
+        "restoreRevision" => {
+            let document = k.id("documentId", "doc_")?;
+            let revision = k.number("revision")?;
+            let body = json!({"expect_revision": k.number("expectRevision")?});
+            let path = format!("{BASE}/documents/{document}/revisions/{revision}/restore");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
         "readText" => {
             let document = k.id("documentId", "doc_")?;
             let revision = k.number("revision")?;
@@ -334,6 +347,7 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             })? {
                 body["author"] = json!(author);
             }
+            save_to(&k, &mut body)?;
             let path = format!("{BASE}/documents/{document}/patches");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
@@ -363,14 +377,23 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             })? {
                 body["title"] = json!(title);
             }
+            save_to(&k, &mut body)?;
             let path = format!("{BASE}/documents/{document}/fill");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
         // D5a: the head revision's file, to be saved (at most the reply limit).
         "content" => {
             let document = k.id("documentId", "doc_")?;
-            let (method, path, body, headers, _) =
-                get(format!("{BASE}/documents/{document}/content"));
+            // L6-F5: an old version's file.
+            let query: Vec<String> =
+                match k.optional("revision", |v| safe_u64(v).filter(|n| *n >= 1))? {
+                    Some(n) => vec![format!("revision={n}")],
+                    None => Vec::new(),
+                };
+            let (method, path, body, headers, _) = get(with_query(
+                format!("{BASE}/documents/{document}/content"),
+                &query,
+            ));
             (method, path, body, headers, Answer::File)
         }
         // D1: an Office document as a new PDF document.
@@ -411,6 +434,25 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
         body,
     };
     Some((request, answer))
+}
+
+/// L6-F5: `saveTo: "new_revision"` with `expectRevision`, the version the
+/// caller read; both or neither.
+fn save_to(k: &Keys<'_>, body: &mut Value) -> Option<()> {
+    let to = k.optional("saveTo", |v| {
+        v.as_str()
+            .filter(|t| ["new_document", "new_revision"].contains(t))
+    })?;
+    let expect = k.optional("expectRevision", |v| safe_u64(v).filter(|n| *n >= 1))?;
+    match (to, expect) {
+        (None | Some("new_document"), None) => Some(()),
+        (Some("new_revision"), Some(n)) => {
+            body["save_to"] = json!("new_revision");
+            body["expect_revision"] = json!(n);
+            Some(())
+        }
+        _ => None,
+    }
 }
 
 fn post(path: String) -> (Method, String, Option<Value>, Vec<(String, String)>, Answer) {

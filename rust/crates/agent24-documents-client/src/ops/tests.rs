@@ -726,3 +726,67 @@ fn a_file_reply_is_its_bytes_in_base64_with_its_media_type() {
         other => panic!("{other:?}"),
     }
 }
+
+/// L6-F5: versions, restoring one over the version seen, an old version's
+/// file, and a patch or fill saved as the next version.
+#[test]
+fn versions_restore_and_saving_as_a_new_version_map_to_their_routes() {
+    assert_eq!(
+        route_of(&json!({"op": "revisions", "documentId": DOC})),
+        Some((
+            Method::Get,
+            format!("/api/v1/documents/documents/{DOC}/revisions")
+        ))
+    );
+    assert_eq!(
+        route(&json!({"op": "content", "documentId": DOC, "revision": 1})).map(|r| r.path),
+        Some(format!(
+            "/api/v1/documents/documents/{DOC}/content?revision=1"
+        ))
+    );
+    let r = route(
+        &json!({"op": "restoreRevision", "documentId": DOC, "revision": 1, "expectRevision": 2}),
+    )
+    .unwrap();
+    assert_eq!(
+        (r.method, r.path),
+        (
+            Method::Post,
+            format!("/api/v1/documents/documents/{DOC}/revisions/1/restore")
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"expect_revision": 2})
+    );
+    let r = route(
+        &json!({"op": "patch", "documentId": DOC, "saveTo": "new_revision", "expectRevision": 2,
+        "edits": [{"index": 3, "text": "新"}]}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"edits": [{"index": 3, "text": "新"}], "save_to": "new_revision", "expect_revision": 2})
+    );
+    let r = route(
+        &json!({"op": "fill", "documentId": DOC, "saveTo": "new_revision", "expectRevision": 1,
+        "values": {"甲方": "x"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap()["expect_revision"],
+        1
+    );
+    let edits = json!([{"index": 0, "text": "t"}]);
+    for bad in [
+        json!({"op": "restoreRevision", "documentId": DOC, "revision": 1}),
+        json!({"op": "restoreRevision", "documentId": DOC, "revision": 0, "expectRevision": 1}),
+        json!({"op": "content", "documentId": DOC, "revision": 0}),
+        json!({"op": "patch", "documentId": DOC, "edits": edits, "saveTo": "new_revision"}),
+        json!({"op": "patch", "documentId": DOC, "edits": edits, "expectRevision": 1}),
+        json!({"op": "patch", "documentId": DOC, "edits": edits, "saveTo": "original", "expectRevision": 1}),
+        json!({"op": "revisions", "documentId": "nope"}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
