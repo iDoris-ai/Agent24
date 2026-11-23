@@ -15,13 +15,15 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { asksDeleteDocument, docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import { ExtractCard } from './chat/ExtractCard'
+import { DeleteChoice } from './chat/DeleteChoice'
+import { choiceText, deletePrompt, deleteTargetOf, type DeleteCandidate } from './chat/delete-target'
 import { extractFields, extractText, fieldNamesFromModel, type ExtractCardData } from './documents/doc-extract'
 import {
   forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
@@ -68,6 +70,8 @@ interface AssistantMessage {
   documents?: RunDocuments | null
   /** F3: the 「抽取结果」 card; the history keeps its text only. */
   extraction?: ExtractCardData
+  /** L6-F2: the documents a delete turn may mean, to pick one; text only in the history. */
+  deleteChoice?: DeleteCandidate[]
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -221,7 +225,8 @@ export default function ChatPage() {
   }, [messages, turns])
 
   /** `answer`: the model answers, never the extraction (the card's 「让助手回答」). */
-  const send = async (text: string, answer = false) => {
+  /** `chosen`: L6-F2, the document picked on a delete choice card. */
+  const send = async (text: string, answer = false, chosen: { id: string; title: string } | null = null) => {
     if (!text.trim() || requestInFlight.current || awaitingConfirmation || archivedRef.current) return
     const userMsg: Message = { role: 'user', content: text.trim(), delivery: { kind: 'sending' } }
     const request: ChatRequest = {
@@ -270,7 +275,7 @@ export default function ChatPage() {
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    if (wantsDocTool(text, doc !== null) && window.agent24.documents?.agentAccess) {
+    if ((chosen !== null || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -278,7 +283,20 @@ export default function ChatPage() {
       const access = await window.agent24.documents.agentAccess('sync').catch(() => null)
       if (access?.enabled && access.ok !== false) {
         const last = request.messages[request.messages.length - 1]
-        if (last?.role === 'user') last.content = docAgentPrompt(doc, text.trim())
+        // L6-F2: the App names the one document a delete is for, never the model.
+        const target = chosen ? { kind: 'one' as const, ...chosen }
+          : asksDeleteDocument(text, doc !== null) ? await deleteTargetOf(window.agent24.documents, doc, text) : null
+        if (target && target.kind !== 'one') {
+          const index = messages.length
+          setDelivery(index, { kind: 'sent' })
+          setMessages(prev => [...prev, target.kind === 'none'
+            ? { role: 'assistant', content: target.text }
+            : { role: 'assistant', content: choiceText(target.name, target.total, target.candidates.length), deleteChoice: target.candidates }])
+          requestInFlight.current = false
+          setLoading(false)
+          return
+        }
+        if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim())
         await replyWithKnowledge(messages.length, request, false)
         return
       }
@@ -784,6 +802,9 @@ export default function ChatPage() {
                 const asked = messages.slice(0, i).reverse().find(p => p.role === 'user')
                 if (asked) void send(asked.content, true)
               }} />
+                : m.role === 'assistant' && m.deleteChoice ? <><Markdown text={m.content} /><DeleteChoice candidates={m.deleteChoice} onPick={loading || archived ? undefined : (c, n) => {
+                  void send(`删除第 ${n} 份：《${c.title}》（导入于 ${c.importedAt}）`, false, { id: c.id, title: c.title })
+                }} /></>
                 : m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
               {m.role === 'assistant' && m.detail && (
                 <details className="message-detail"><summary>{t('fail.detail')}</summary>{m.detail}</details>

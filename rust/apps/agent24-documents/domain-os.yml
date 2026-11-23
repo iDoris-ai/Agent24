@@ -157,7 +157,7 @@ tools:
       additionalProperties: false
       required: [document_id]
       properties:
-        document_id: { type: string, pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", description: "the document's id from documents.get or documents.list, never its file name" }
+        document_id: { type: string, pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", description: "the document's id (doc_...) as documents.get or documents.list returned it: never its file name, never made up, never asked of the user; look it up yourself first" }
     risk: write_local
     output_privacy: local_only
     timeout_ms: 30000
