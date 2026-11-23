@@ -14,6 +14,7 @@ import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 import DocxTools from './DocxTools'
+import DocumentVersions from './DocumentVersions'
 import type { DocFocus } from './doc-focus'
 import { extractFields, type ExtractCardData, type ExtractFailure } from './doc-extract'
 import { ExtractCard } from '../chat/ExtractCard'
@@ -611,6 +612,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
           {convertNote && <p role={convertNote.ok ? 'status' : 'alert'}>{convertNote.text}</p>}
           {detail.head.media_type === DOCX_TYPE && (
             <DocxTools key={detail.document_id} api={api} documentId={detail.document_id} title={detail.title ?? ''} onAdded={onAdded} />
+          )}
+          {detail.head.media_type === DOCX_TYPE && (
+            <DocumentVersions key={`v${detail.document_id}`} api={api} documentId={detail.document_id} title={detail.title ?? ''} onChanged={onAdded} />
           )}
         </div>
       )}
