@@ -153,8 +153,8 @@ export function wantsDocTool(text: string, inDocument: boolean): boolean {
  * split is N calls of compose with one part each; one call with several parts
  * is a merge (a 4-bit model packed a split into one call, 9 runs in 15). */
 /** L6-F2: only on a turn that asks to delete a whole document. */
-const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id：当前对话的文档直接用它的 document_id，'
-  + '按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
+const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id，不要自己编，也不要向用户要：当前对话的文档直接用它的 document_id，'
+  + '「上一份」「刚才拆出来的」先用 documents.list 按导入时间找，按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
 
 export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'

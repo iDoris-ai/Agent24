@@ -433,6 +433,51 @@ describe('ChatPage with Knowledge', () => {
     await waitFor(() => expect(screen.getByText(line)).toBeInTheDocument(), { timeout: 3000 })
   })
 
+  // L6-F2 (General, 0.6.105): the App names the document a delete is for. Two
+  // answer to 《中文测试合同》: a card lists them (title, import time, pages),
+  // the model is not asked; the one picked goes to the model by its id only.
+  it('a delete naming several documents asks which, then sends only the picked id', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const B = 'doc_01M679KMY6D75P0EZACBS95JYB'
+    const docs = [
+      { document_id: A, title: '中文测试合同.pdf', created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: B, title: '中文测试合同.pdf', created_at: '2026-11-21T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYC', title: '发票.pdf', created_at: '2026-11-21T01:00:00.000Z' },
+    ]
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { ...docs.find((d) => d.document_id === req.documentId), pages: req.documentId === B ? 4 : 2 } })
+    const agentAccess = vi.fn().mockResolvedValue({ enabled: true, until: '2026-12-23T00:00:00.000Z', ok: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request, agentAccess } },
+      writable: true,
+      configurable: true,
+    })
+    const prompts: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        prompts.push(req.body?.prompt ?? '')
+        return { ok: true, status: 201, data: { id: 'r_del' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '已删除' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把《中文测试合同.pdf》删了' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const card = await screen.findByRole('group', { name: '选择要删除的文档' }, { timeout: 3000 })
+    expect(screen.getByText(/2 份文档都对得上《中文测试合同.pdf》/)).toBeInTheDocument()
+    expect(within(card).getByText(/共 4 页/)).toBeInTheDocument()
+    expect(card.textContent).not.toContain('doc_')
+    expect(prompts).toEqual([])
+    fireEvent.click(within(card).getAllByRole('button', { name: '删除这一份' })[1]!)
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain(`document_id: ${B}`)
+    expect(prompts[0]).not.toContain(A)
+    expect(prompts[0]).toContain('删除第 2 份')
+  })
+
   // General 0.6.93: a turn that ran and failed (the local model stopped at
   // prefill) was sent; only one that never started reads 「未发送」.
   it.each([
