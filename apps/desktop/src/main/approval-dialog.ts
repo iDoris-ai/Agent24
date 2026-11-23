@@ -33,13 +33,13 @@ const EXCERPT = 60
 
 const TOOL_KEYS: Record<string, MainMessageKey> = {
   'documents.list': 'approval.tool.list', 'documents.get': 'approval.tool.get',
-  'documents.paragraphs': 'approval.tool.paragraphs', 'documents.fields': 'approval.tool.fields',
+  'documents.paragraphs': 'approval.tool.paragraphs', 'documents.fields': 'approval.tool.fields', 'documents.compare': 'approval.tool.compare',
   shell_exec: 'approval.tool.exec', fs_write: 'approval.tool.write', http_fetch: 'approval.tool.fetch',
 }
 
 /** UI polish 10 (General 0.6.96): read-only documents tools: nothing to show
  *  past the document they read, and they change nothing. */
-const READ_ONLY = new Set(['documents.list', 'documents.get', 'documents.paragraphs', 'documents.fields'])
+const READ_ONLY = new Set(['documents.list', 'documents.get', 'documents.paragraphs', 'documents.fields', 'documents.compare'])
 
 /** PR-Daemon #2006 B1: text the model controls never makes a line of its
  *  own in the box. Line breaks, other control characters and the characters
@@ -96,7 +96,7 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '')
  *  Anything else the module looks up by title, so the box does too. */
 const isDocId = (ref: string): boolean => /^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(ref)
 /** The tools whose `document_id` the module looks up by title (`named_by_title`). */
-const NAMED_BY_TITLE = new Set(['documents.get', 'documents.paragraphs', 'documents.patch', 'documents.fields', 'documents.fill', 'documents.compose'])
+const NAMED_BY_TITLE = new Set(['documents.get', 'documents.paragraphs', 'documents.patch', 'documents.fields', 'documents.fill', 'documents.compose', 'documents.compare'])
 
 /** The library's documents from a `documents list` answer, or null when it
  *  is not the whole library (PR-Daemon #2006 N1): the module matches a name

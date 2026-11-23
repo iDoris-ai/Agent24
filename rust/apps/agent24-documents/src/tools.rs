@@ -238,7 +238,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "fields" => fields(state, arguments).await,
             "fill" => fill(state, run, arguments).await,
             "delete" => delete(state, run, arguments).await,
-            "compare" => compare(state, arguments).await,
+            "compare" => compare(state, accepted, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -857,17 +857,23 @@ async fn admit_other(
         Some(Value::String(id)) => id,
         Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
     };
-    if is_id(IdKind::Document, id) && !(scope.allows_document(id) && live(state, id).await?) {
+    if !is_id(IdKind::Document, id) {
+        return Ok(());
+    }
+    if !scope.allows_document(id) {
         return Err(refused(&ApiError::not_found("no such document")));
+    }
+    if !live(state, id).await? {
+        return Err(in_trash(state, id, "no such document").await);
     }
     Ok(())
 }
 
 /// L6-S05: two documents, or two versions of one, compared (read).
-async fn compare(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+async fn compare(state: &AppState, by: Accepted, arguments: Map<String, Value>) -> Outcome {
     let args: crate::compare::tool::Args = parse(arguments)?;
     let storage = ready(state).await?;
-    completed(crate::compare::tool::call(state, &storage, args).await)
+    completed(crate::compare::tool::call(state, &storage, args, Requester::Tool(by)).await)
 }
 
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {

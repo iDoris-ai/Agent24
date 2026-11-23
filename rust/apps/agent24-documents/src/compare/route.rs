@@ -116,6 +116,7 @@ async fn units(
     state: &AppState,
     storage: &Arc<Storage>,
     r: &crate::read::Revision,
+    by: Requester,
 ) -> Result<Vec<Unit>, ApiError> {
     if r.media_type == DOCX {
         let blobs = storage.clone();
@@ -136,7 +137,7 @@ async fn units(
             })
             .collect());
     }
-    let (_, layer) = crate::read::current_layer(state, storage, r, Requester::Page).await?;
+    let (_, layer) = crate::read::current_layer(state, storage, r, by).await?;
     Ok(layer
         .blocks
         .into_iter()
@@ -156,7 +157,7 @@ pub async fn compare(
     body: Result<Json<CompareRequest>, JsonRejection>,
 ) -> Result<Json<Compared>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
-    run(&state, &storage, req).await.map(Json)
+    run(&state, &storage, req, Requester::Page).await.map(Json)
 }
 
 /// The comparison itself, for `POST /documents/compare` and the
@@ -165,6 +166,7 @@ pub(crate) async fn run(
     state: &AppState,
     storage: &Arc<Storage>,
     req: CompareRequest,
+    by: Requester,
 ) -> Result<Compared, ApiError> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&limit) {
@@ -182,8 +184,8 @@ pub(crate) async fn run(
         ));
     }
     let (lu, ru) = (
-        units(state, storage, &l).await?,
-        units(state, storage, &r).await?,
+        units(state, storage, &l, by.clone()).await?,
+        units(state, storage, &r, by).await?,
     );
     let Comparison {
         identical,

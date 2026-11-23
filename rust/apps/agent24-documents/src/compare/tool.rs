@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 
 use super::route::{CompareRequest, Target, run};
 use super::{BlockRef, Change};
+use crate::engine::Requester;
 use crate::error::ApiError;
 use crate::state::{AppState, Storage};
 
@@ -21,7 +22,8 @@ const CLIP: usize = 120;
 #[serde(deny_unknown_fields)]
 pub struct Args {
     pub document_id: String,
-    /// Absent: `document_id`'s own versions are compared.
+    /// Absent: `document_id`'s own versions are compared (then `from_revision`
+    /// and `to_revision` are its two versions; with this, they pin each document).
     pub other_document_id: Option<String>,
     pub from_revision: Option<i64>,
     pub to_revision: Option<i64>,
@@ -49,7 +51,15 @@ fn shown(c: &Change) -> Value {
     json!({"id": c.id, "kind": c.kind, "left": side(&c.left), "right": side(&c.right)})
 }
 
-pub async fn call(state: &AppState, storage: &Arc<Storage>, args: Args) -> Result<Value, ApiError> {
+pub async fn call(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    args: Args,
+    by: Requester,
+) -> Result<Value, ApiError> {
+    if args.from_revision.is_some_and(|r| r < 1) || args.to_revision.is_some_and(|r| r < 1) {
+        return Err(ApiError::invalid_request("a revision is 1 or more"));
+    }
     let (left, right) = match args.other_document_id {
         Some(other) => (
             Target::new(args.document_id, args.from_revision),
@@ -73,7 +83,7 @@ pub async fn call(state: &AppState, storage: &Arc<Storage>, args: Args) -> Resul
             )
         }
     };
-    let c = run(state, storage, CompareRequest::new(left, right, SHOWN)).await?;
+    let c = run(state, storage, CompareRequest::new(left, right, SHOWN), by).await?;
     let (from_revision, to_revision) = c.revisions();
     Ok(json!({
         "from_revision": from_revision,
