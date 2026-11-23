@@ -231,12 +231,9 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "extraction_get" => extraction_get(state, arguments).await,
             "compose" => compose(state, arguments).await,
             "paragraphs" => paragraphs(state, arguments).await,
-            "patch" => {
-                let run_id = run.run_id.clone();
-                patch(state, &run_id, arguments).await
-            }
+            "patch" => patch(state, run, arguments).await,
             "fields" => fields(state, arguments).await,
-            "fill" => fill(state, arguments).await,
+            "fill" => fill(state, run, arguments).await,
             "delete" => delete(state, run, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
@@ -628,6 +625,62 @@ struct AgentPatch {
     edits: Vec<AgentEdit>,
     #[serde(default)]
     title: Option<String>,
+    #[serde(default)]
+    save_to: AgentSaveTo,
+}
+
+/// L6-F5: where an Agent's patch or fill goes. `original` only when the
+/// user said so (the desktop sends back, before any card, a call that has it
+/// on a turn that did not ask); the card says which.
+#[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum AgentSaveTo {
+    #[default]
+    NewDocument,
+    Original,
+}
+
+/// The request fields of `save_to`: the original's next version over the
+/// head this call read, so a version saved meanwhile is never written over.
+fn save_fields(body: &mut Value, save_to: AgentSaveTo, head: i64) {
+    if save_to == AgentSaveTo::Original {
+        body["save_to"] = json!("new_revision");
+        body["expect_revision"] = json!(head);
+    }
+}
+
+/// What the model is told of a version saved: done, and not to call again.
+fn saved_version(
+    state: &AppState,
+    run_id: &str,
+    source: &str,
+    c: &crate::versions::Committed,
+) -> Outcome {
+    let message = if c.committed {
+        format!(
+            "已完成：已把改动保存到原文件《{}》，成为它的第 {} 版；之前的版本都保留，可以在文档页恢复。这一步已经完成，不要再调用同一个写入工具，直接告诉用户已保存为第 {} 版。",
+            c.title, c.revision, c.revision
+        )
+    } else {
+        format!(
+            "内容和原文件《{}》现在的版本一样，没有保存新版本。不要再调用同一个写入工具，如实告诉用户没有改动。",
+            c.title
+        )
+    };
+    state.note_patched(
+        run_id,
+        source,
+        &format!("{}（第 {} 版）", c.title, c.revision),
+    );
+    let mut payload = serde_json::to_value(c)
+        .map_err(|_| refused(&ApiError::internal("cannot serialize the answer")))?;
+    payload["saved_as"] = json!("new_revision");
+    payload["source_document_id"] = json!(source);
+    payload["message"] = json!(message);
+    Ok(Envelope::Completed {
+        payload,
+        replayed: false,
+    })
 }
 
 /// Characters of a paragraph's opening said back when its anchor is wrong.
@@ -640,7 +693,8 @@ const OPENING_CHARS: usize = 24;
 /// (0.6.72: 第三条's words aimed at 乙方's line) writes nothing, and the answer
 /// says how the paragraph really begins so the model can try again. The HTTP
 /// route and the CLI keep their own `expect`.
-async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) -> Outcome {
+async fn patch(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+    let run_id = run.run_id.as_str();
     let (id, rest) = split_document(arguments)?;
     // M1 (0.6.89, General): after its patch went through, a run asked for the
     // same document again and another card came up. Once per run and
@@ -688,17 +742,24 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
         }));
     }
     let mut body = serde_json::json!({ "edits": edits });
-    if let Some(title) = asked.title {
+    if let Some(title) = asked
+        .title
+        .filter(|_| asked.save_to == AgentSaveTo::NewDocument)
+    {
         body["title"] = Value::String(title);
     }
+    save_fields(&mut body, asked.save_to, paras.revision);
     let req: crate::patch::PatchRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    let (_, job) = match crate::patch::patch_run(&storage, id.clone(), req).await {
-        Ok(made) => made,
+    let origin = Origin::Run(run.clone());
+    let job = match crate::patch::patch_run(&storage, id.clone(), req, &origin).await {
+        Ok(crate::patch::Saved::Document(job)) => job,
+        Ok(crate::patch::Saved::Revision(c)) => return saved_version(state, run_id, &id, &c),
         // General 0.6.94: a paragraph the rewrite would damage (a pending
         // revision, a formula, a page break, ...) came back as a bare
         // `invalid_request`, and the model said the document was made. The
         // model is told what was refused and why, in words it can pass on.
+        // L6-F5: a version saved since it read is a `revision_conflict` too.
         Err(e) if matches!(e.code(), "invalid_request" | "revision_conflict") => {
             let why = refusal_in_words(&e);
             // PR-Daemon #1994 B2: a paragraph changed since it was read is the
@@ -723,7 +784,7 @@ async fn patch(state: &AppState, run_id: &str, arguments: Map<String, Value>) ->
         }
         Err(e) => return Err(refused(&e)),
     };
-    let mut answer = settled(&storage, job.0).await;
+    let mut answer = settled(&storage, job).await;
     // PR-Daemon #1994 B1: which document this write was of, whatever the
     // call named it; the run's record compares writes by it.
     if let Value::Object(map) = &mut answer {
@@ -751,15 +812,32 @@ async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
 /// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
-async fn fill(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
     rest.remove("title");
-    let req: crate::patch::FillRequest = parse(rest)?;
+    let save_to: AgentSaveTo = match rest.remove("save_to") {
+        Some(v) => serde_json::from_value(v).map_err(|_| Envelope::error(INVALID_INPUT, false))?,
+        None => AgentSaveTo::NewDocument,
+    };
+    let mut body = Value::Object(rest);
     let storage = ready(state).await?;
-    let (_, job) = crate::patch::fill_run(&storage, id, req)
+    if save_to == AgentSaveTo::Original {
+        let head = documents::get(&storage, &id)
+            .await
+            .map_err(|e| refused(&e))?
+            .document
+            .head_revision;
+        save_fields(&mut body, save_to, head);
+    }
+    let req: crate::patch::FillRequest =
+        serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
+    match crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
         .await
-        .map_err(|e| refused(&e))?;
-    completed::<Value>(Ok(settled(&storage, job.0).await))
+        .map_err(|e| refused(&e))?
+    {
+        crate::patch::Saved::Document(job) => completed::<Value>(Ok(settled(&storage, job).await)),
+        crate::patch::Saved::Revision(c) => saved_version(state, &run.run_id, &id, &c),
+    }
 }
 
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -2027,6 +2105,84 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(uploads, 1);
+    }
+
+    /// A DOCX template as document `id`, at version 1.
+    async fn add_template(state: &AppState, id: &str) {
+        let storage = state.storage().await.unwrap();
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let sha = storage.blobs.put_bytes(template).unwrap().sha256;
+        let docx = crate::office::DOCX;
+        exec(
+            state,
+            &format!(
+                "INSERT INTO documents (id, title, media_type, head_revision)
+                        VALUES ('{id}', '合同.docx', '{docx}', 1);
+                 INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                        VALUES ('{id}', 1, '{sha}', {}, '{docx}', 'import');",
+                template.len()
+            ),
+        )
+        .await;
+    }
+
+    /// L6-F5: with save_to=original the rewrite is the original's next
+    /// version, over the head the call read; no new document is made, and
+    /// the model is told the version, done.
+    #[tokio::test]
+    async fn an_agent_patch_or_fill_saved_to_the_original_is_its_next_version() {
+        let (_dir, state) = opened().await;
+        let storage = state.storage().await.unwrap();
+        let (a, b) = (
+            "doc_01K74Z3QJ8V5N2W9RTX6Y00081",
+            "doc_01K74Z3QJ8V5N2W9RTX6Y00082",
+        );
+        add_template(&state, a).await;
+        add_template(&state, b).await;
+        let template: &[u8] = include_bytes!("../tests/fixtures/template-lease.docx");
+        let para = crate::docx_patch::list_paragraphs(template)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.text.trim().chars().count() >= 16)
+            .unwrap();
+        let anchor: String = para.text.trim().chars().take(16).collect();
+        let edit = |save_to: &str| {
+            json!({ "document_id": a, "save_to": save_to,
+                    "edits": [{ "index": para.index, "text": "新的文字", "anchor": anchor }] })
+        };
+        let bad = call_in(&state, "patch", &[a], edit("somewhere")).await;
+        assert!(String::from_utf8_lossy(&bad).contains("invalid_input"));
+        let answer = payload(&call_in(&state, "patch", &[a], edit("original")).await);
+        assert_eq!(answer["saved_as"], "new_revision", "{answer}");
+        assert_eq!(
+            (&answer["revision"], &answer["committed"]),
+            (&json!(2), &json!(true))
+        );
+        assert_eq!(answer["source_document_id"], a);
+        assert!(answer["message"].as_str().unwrap().contains("第 2 版"));
+        let fill =
+            json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" } });
+        let filled = payload(&call_in(&state, "fill", &[b], fill).await);
+        assert_eq!(
+            (&filled["saved_as"], &filled["revision"]),
+            (&json!("new_revision"), &json!(2)),
+            "{filled}"
+        );
+        let count = |sql: &'static str| {
+            let pool = storage.db.pool().clone();
+            async move {
+                sqlx::query_scalar::<_, i64>(sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(count("SELECT COUNT(*) FROM documents").await, 2);
+        assert_eq!(count("SELECT COUNT(*) FROM uploads").await, 0);
+        assert_eq!(
+            count("SELECT COUNT(*) FROM oplog WHERE origin = 'run' AND revision = 2").await,
+            2
+        );
     }
 
     /// FU-151 (0.6.89): 293 paragraphs of a real contract came to 40 KB in an
