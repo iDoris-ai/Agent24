@@ -63,7 +63,7 @@ export default function DocumentVersions({ api, documentId, title, onChanged }: 
     const res = await api.request({ op: 'revisions', documentId }).catch(() => null)
     if (res && res.ok) { setVersions(res.data); setUnread(false) } else setUnread(true)
   }
-  useEffect(() => { void load() }, [api, documentId]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => { void load() }, [api, documentId])
 
   const restore = async (from: number, head: number) => {
     setBusy(true)
