@@ -1,3 +1,5 @@
+import { SAVE_HINT, asksSaveToOriginal } from './doc-version'
+
 // D2b（轻量版）: in a conversation about a document (F1, doc-context.ts), a
 // plain sentence asks to split pages out of it or to merge it with another
 // document, and the page does it with the documents OS's compose, without
@@ -161,7 +163,9 @@ export function docAgentPrompt(doc: { id: string; title: string } | null, text: 
     + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
-  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}\n${text}`
+  // L6-F5: only a turn the App judged to save into the original says so.
+  const save = asksSaveToOriginal(text) ? SAVE_HINT : ''
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${save}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(

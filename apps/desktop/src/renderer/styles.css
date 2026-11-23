@@ -599,3 +599,11 @@ button { cursor: pointer; font-family: var(--font); }
 .extract-card-value { margin: 2px 0; }
 .extract-card-answer { font-size: 12px; margin-top: 6px; }
 .extract-card-source { font-size: 12px; padding: 0 4px; margin-left: 4px; }
+
+/* L6-S05: the comparison view. */
+.compare-list { list-style: none; padding: 0; margin: 8px 0; }
+.compare-change { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.compare-del { color: var(--danger); text-decoration: line-through; }
+.compare-ins { color: var(--success); text-decoration: none; background: var(--accent-dim); }
+.compare-note, .compare-where { color: var(--muted); font-size: 12px; }
+.compare-wheres { display: flex; gap: 8px; align-items: center; margin-top: 2px; }

@@ -23,6 +23,8 @@ import { bindPendingDocument, documentOf, documentText, pendingDocument, subscri
 import { HandOver, TaskCards } from './chat/TaskCard'
 import { ExtractCard } from './chat/ExtractCard'
 import { DeleteChoice } from './chat/DeleteChoice'
+import { RestoreCard } from './chat/RestoreCard'
+import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
 import { choiceText, deletePrompt, deleteTargetOf, type DeleteCandidate } from './chat/delete-target'
 import { extractFields, extractText, fieldNamesFromModel, type ExtractCardData } from './documents/doc-extract'
 import {
@@ -72,6 +74,8 @@ interface AssistantMessage {
   extraction?: ExtractCardData
   /** L6-F2: the documents a delete turn may mean, to pick one; text only in the history. */
   deleteChoice?: DeleteCandidate[]
+  /** L6-F5: the version a 「回到上一个版本」 turn may restore; text only in the history. */
+  restore?: RestoreCardData
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -239,6 +243,40 @@ export default function ChatPage() {
     setInput('')
     // F1: a conversation about a document carries its text with each turn.
     const doc = documentOf(sessionId)
+    // L6-F5: 「回到上一个版本」 — the App finds the version and offers it on a
+    // card; it is restored only when the user clicks, never by the model.
+    const restoreAsk = answer ? null : asksRestoreVersion(text)
+    // No document bound and none named: the one the conversation last named
+    // (the user's 「…《合同.docx》…存到原文件」 a turn ago), newest first.
+    const lastNamed = (): string | null => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const found = /《([^》]{1,200})》/.exec(messages[i]!.content)?.[1]?.trim()
+        if (found) return found
+      }
+      return null
+    }
+    const restoreOf = restoreAsk === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? lastNamed()
+    if (restoreAsk !== null && restoreOf !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? await namedDocument(api, restoreOf).catch(() => "没能读取文档列表，这次没有恢复。")
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else {
+          const found = await restoreCardOf(api, subject, restoreAsk)
+          reply = { role: 'assistant', content: found.text, ...(found.card ? { restore: found.card } : {}) }
+        }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
     // F3: 「把这份合同的甲方、乙方、金额、期限抽出来」 — the documents OS's extract
     // job reads the document; the model at most names the fields.
     const asked = answer ? null : extractionFields(text, doc !== null)
@@ -802,6 +840,11 @@ export default function ChatPage() {
                 const asked = messages.slice(0, i).reverse().find(p => p.role === 'user')
                 if (asked) void send(asked.content, true)
               }} />
+                : m.role === 'assistant' && m.restore ? <><Markdown text={m.content} /><RestoreCard card={m.restore} onRestore={loading || archived ? undefined : () => {
+                  const card = m.restore!
+                  setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' ? { ...p, restore: undefined } : p)))
+                  void restoreVersion(window.agent24.documents, card).then(said => setMessages(prev => [...prev, { role: 'assistant', content: said }]))
+                }} /></>
                 : m.role === 'assistant' && m.deleteChoice ? <><Markdown text={m.content} /><DeleteChoice candidates={m.deleteChoice} onPick={loading || archived ? undefined : (c, n) => {
                   void send(`删除第 ${n} 份：《${c.title}》（导入于 ${c.importedAt}）`, false, { id: c.id, title: c.title })
                 }} /></>
