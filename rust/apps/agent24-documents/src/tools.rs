@@ -629,9 +629,10 @@ struct AgentPatch {
     save_to: AgentSaveTo,
 }
 
-/// L6-F5: where an Agent's patch or fill goes. `original` only when the
-/// user said so (the desktop sends back, before any card, a call that has it
-/// on a turn that did not ask); the card says which.
+/// L6-F5: where an Agent's patch or fill goes. `original` is meant only for
+/// a user who said so; the module cannot tell, so the desktop judges the
+/// user's words and sends such a call back before its card (F5 4th part),
+/// and the card says which.
 #[derive(Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 enum AgentSaveTo {
