@@ -880,6 +880,13 @@ describe('approvalText (D2b)', () => {
     expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}]}' }, t))
       .toBe('task.ask.patch{"doc":"a.docx","n":"1"}\ntask.ask.patchUnread{"n":"4","to":"x"}')
   })
+  // L6-F5: a save into the original says so, with the version it makes.
+  it('says a fill or a patch saved into the original makes its new version', () => {
+    expect(approvalText({ summary: 'documents.patch: {"document_id":"a.docx","edits":[{"index":3,"text":"x"}],"save_to":"original"}' }, t, null, null, 3))
+      .toBe('task.ask.patchOriginal{"doc":"a.docx","n":"1","v":"v3"}\ntask.ask.patchUnread{"n":"4","to":"x"}')
+    expect(approvalText({ summary: 'documents.fill: {"document_id":"模板.docx","save_to":"original","values":{"甲方":"明远"}}' }, t))
+      .toBe('task.ask.fillOriginal{"doc":"模板.docx","values":"甲方=明远","v":"task.versionReading"}')
+  })
   it('shows the paragraph the document has at that index, not the model\'s expect (M1, 0.6.75)', () => {
     const summary = 'documents.patch: {"document_id":"合同.docx","edits":[{"index":5,"text":"押金为两个月租金。","expect":"押金为两个月租金"}]}'
     const originals = new Map([[5, '第三条 押金为两个月租金，合同期满无违约时全额退还。']])

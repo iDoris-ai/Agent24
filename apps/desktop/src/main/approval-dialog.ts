@@ -18,6 +18,8 @@ export interface DocumentLookups {
   list: () => Promise<ReadonlyArray<{ id: string; title: string }> | null>
   /** L6-F2: what the delete box says of a document: title, pages (PDF), import time. */
   detail: (id: string) => Promise<{ title: string; pages: number | null; importedAt: string } | null>
+  /** L6-F5: a document's current version, for the one a save makes. */
+  head?: (id: string) => Promise<number | null>
 }
 
 export type ApprovalDialog =
@@ -151,6 +153,12 @@ export function localTime(iso: string): string {
   return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ${two(d.getHours())}:${two(d.getMinutes())}`
 }
 
+/** L6-F5: 「v3」, the version a save into document `id` makes, or 「（版本号没读到）」. */
+async function nextVersion(id: string | null, lookups: DocumentLookups): Promise<string> {
+  const head = id && lookups.head ? await lookups.head(id).catch(() => null) : null
+  return head === null ? mt('approval.versionUnknown') : `v${head + 1}`
+}
+
 export async function approvalDialog(
   record: ApprovalRecord,
   decision: string,
@@ -174,7 +182,11 @@ export async function approvalDialog(
     const originals = named.id ? await lookups.paragraphs(named.id).catch(() => null) : null
     message = say('approval.title.patch', { doc: named.title })
     const tracked = edits.some(e => e && e['tracked'] === true)
-    lines.push(mt(tracked ? 'approval.patch.tracked' : 'approval.patch.plain', { n: edits.length }))
+    // L6-F5: saved into the original as its next version, said so with the number.
+    const original = args['save_to'] === 'original'
+    if (original) {
+      lines.push(mt(tracked ? 'approval.patch.trackedOriginal' : 'approval.patch.plainOriginal', { n: edits.length, v: await nextVersion(named.id, lookups) }))
+    } else lines.push(mt(tracked ? 'approval.patch.tracked' : 'approval.patch.plain', { n: edits.length }))
     if (edits.length > SHOWN_EDITS) lines.push(mt('approval.patch.more', { n: edits.length, shown: SHOWN_EDITS }))
     for (const e of edits.slice(0, SHOWN_EDITS)) {
       const index = e && typeof e['index'] === 'number' ? e['index'] : null
@@ -187,7 +199,7 @@ export async function approvalDialog(
         lines.push(say('approval.patch.edit', { n, from: was, to: now }))
       }
     }
-    lines.push(mt('approval.unchanged'))
+    lines.push(mt(original ? 'approval.versionsKept' : 'approval.unchanged'))
   } else if (tool === 'documents.delete') {
     // L6-F2: which one document goes: its title, pages and import time, read
     // by main; the kernel lets only an id through (FU-136), so no name lookup.
@@ -208,11 +220,15 @@ export async function approvalDialog(
     }
     lines.push(mt('approval.delete.restorable'))
   } else if (tool === 'documents.fill') {
-    message = say('approval.title.fill', { doc: await titleOf(str(args['document_id']), lookups) })
+    const named = await docOf(str(args['document_id']), lookups)
+    const original = args['save_to'] === 'original'
+    message = say(original ? 'approval.title.fillOriginal' : 'approval.title.fill', { doc: named.title })
     const values = args['values'] && typeof args['values'] === 'object'
       ? Object.entries(args['values'] as Record<string, unknown>).map(([k, v]) => `${k}=${str(v)}`).join('，')
       : ''
-    lines.push(say('approval.fill.values', { values: clip(values, 300) }), mt('approval.unchanged'))
+    lines.push(say('approval.fill.values', { values: clip(values, 300) }))
+    if (original) lines.push(mt('approval.fill.original', { v: await nextVersion(named.id, lookups) }), mt('approval.versionsKept'))
+    else lines.push(mt('approval.unchanged'))
   } else if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
     message = say('approval.title.compose', { title: clip(str(args['title']), 120) || mt('approval.newDocument') })
     const parts = await Promise.all((args['parts'] as Array<Record<string, unknown>>).map(async p => {
