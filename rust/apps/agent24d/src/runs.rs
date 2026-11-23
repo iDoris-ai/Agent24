@@ -406,6 +406,7 @@ const DOCUMENT_READS: &[&str] = &[
     "list",
     "get",
     "paragraphs",
+    "compare",
     "fields",
     "read_range",
     "find",

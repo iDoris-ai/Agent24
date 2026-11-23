@@ -89,6 +89,23 @@ tools:
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
+  # L6-S05: two documents, or two versions of one, compared by their text.
+  - operation: compare
+    description: "Compare two documents, or two versions of one document, by their text only (formatting is not compared). Give document_id and other_document_id (ids from documents.list, or file names/titles) for two documents; give only document_id (optionally from_revision and to_revision) for one document's versions, default the last two. The answer lists the first changes (id, kind added/removed/changed/unaligned, where, text) and a summary of all of them. Report only what is in changes; never add a change yourself; for the rest tell the user to open the comparison view on the documents page. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+        other_document_id: { type: string, description: "the second document, to compare two documents" }
+        from_revision: { type: integer, minimum: 1, description: "the older version (default: the one before to_revision); with other_document_id, the version of document_id" }
+        to_revision: { type: integer, minimum: 1, description: "the newer version (default: the current one); with other_document_id, the version of other_document_id" }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
   - operation: patch
     description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. By default the original is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the original's next version instead."
     input_schema:

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import {
   ACCESS_DAYS,
   ACCESS_FILE,
@@ -93,7 +94,7 @@ describe('doc-agent-access', () => {
     const key = `${CARD.fingerprint}|${CARD.artifact}|doc_a,doc_b`
     expect(saved.granted).toEqual(Object.fromEntries(DOC_AGENT_TOOLS.map((tool) => [tool, key])))
     // E1b/D5a: the DOCX tools too.
-    expect(DOC_AGENT_TOOLS).toEqual(['list', 'get', 'compose', 'paragraphs', 'patch', 'fields', 'fill', 'delete'])
+    expect(DOC_AGENT_TOOLS).toEqual(['list', 'get', 'compose', 'paragraphs', 'compare', 'patch', 'fields', 'fill', 'delete'])
   })
 
   it('A1: a daemon without the batch route gets one grant a tool, as before', async () => {
@@ -183,5 +184,16 @@ describe('disable when the daemon does not end the grants', () => {
     expect(await disable(d)).toEqual({ enabled: false, until: null, ok: true })
     expect(state(d).enabled).toBe(false)
     fs.rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+// L6-S05 (real Mac, 0.6.110): a tool the module declares but this list lacks
+// can never be granted by 「允许 Agent 使用文档」, so the model's call is refused.
+describe('the tools the Agent is granted', () => {
+  it('cover every tool domain-os.yml declares', () => {
+    const yml = fs.readFileSync(fileURLToPath(new URL('../../../../rust/apps/agent24-documents/domain-os.yml', import.meta.url)), 'utf8')
+    const declared = [...yml.matchAll(/^ {2}- operation: (\w+)/gm)].map((m) => m[1]!)
+    expect(declared.length).toBeGreaterThan(8)
+    expect([...DOC_AGENT_TOOLS].sort()).toEqual([...declared].sort())
   })
 })
