@@ -11,6 +11,7 @@
 
 pub mod authorization;
 pub mod blob;
+pub mod compare;
 pub mod compose;
 pub mod db;
 pub mod derived;
