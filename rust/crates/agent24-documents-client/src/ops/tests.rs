@@ -790,3 +790,31 @@ fn versions_restore_and_saving_as_a_new_version_map_to_their_routes() {
         assert!(route(&bad).is_none(), "{bad}");
     }
 }
+
+#[test]
+fn compare_maps_to_its_route_and_checks_both_sides() {
+    let r = route(&json!({"op": "compare",
+        "left": {"documentId": DOC, "revision": 1}, "right": {"documentId": DOC},
+        "limit": 50, "offset": 100}))
+    .unwrap();
+    assert_eq!(
+        (r.method, r.path),
+        (
+            Method::Post,
+            "/api/v1/documents/documents/compare".to_owned()
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"left": {"document_id": DOC, "revision": 1}, "right": {"document_id": DOC},
+               "limit": 50, "offset": 100})
+    );
+    for bad in [
+        json!({"op": "compare", "left": {"documentId": DOC}}),
+        json!({"op": "compare", "left": {"documentId": "x"}, "right": {"documentId": DOC}}),
+        json!({"op": "compare", "left": {"documentId": DOC, "revision": 0}, "right": {"documentId": DOC}}),
+        json!({"op": "compare", "left": {"documentId": DOC}, "right": {"documentId": DOC}, "limit": 0}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
