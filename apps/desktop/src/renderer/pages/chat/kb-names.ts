@@ -12,14 +12,16 @@ const STRIP = /[\u0000-\u001f\u007f-\u009f؜‎‏‪-‮⁦-⁩]/gu
 
 export type KbNames = Record<string, string>
 
-/** 「id=名称」 per line. */
+/** 「id=名称」 or 「id 名称」 per line. */
 export function parseKbNames(text: string): KbNames {
   const out: KbNames = {}
   for (const line of text.split('\n')) {
-    const at = line.indexOf('=')
+    // 「id=名称」 or 「id 名称」: an id has no blank in it, so the first one ends it.
+    const eq = line.indexOf('=')
+    const at = eq >= 0 ? eq : line.search(/\s/)
     if (at < 0) continue
     const id = line.slice(0, at).trim()
-    const name = [...line.slice(at + 1).replace(STRIP, '').trim()].slice(0, MAX).join('')
+    const name = [...line.slice(at + 1).replace(STRIP, '').replace(/\s+/g, ' ').trim()].slice(0, MAX).join('')
     if (id !== '' && name !== '') out[id] = name
   }
   return out

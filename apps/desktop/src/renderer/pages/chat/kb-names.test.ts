@@ -6,6 +6,10 @@ describe('L7-K1: library names the user gave', () => {
     expect(parseKbNames('kb-a=制度库\n\n kb-b = 项目库 \nnonsense\n=无ID\nkb-a=制度库2')).toEqual({ 'kb-a': '制度库2', 'kb-b': '项目库' })
     expect(formatKbNames({ 'kb-a': '制度库' })).toBe('kb-a=制度库')
   })
+  it('accepts 「ID 名称」 with a blank, keeps spaces and punctuation inside a name, drops an empty name', () => {
+    expect(parseKbNames('kb-x 制度库\nkb-y 项目 库（2025）&<b>\nkb-z =\nkb-w    ')).toEqual({ 'kb-x': '制度库', 'kb-y': '项目 库（2025）&<b>' })
+    expect(parseKbNames('kb-a 一\nkb-a 二')).toEqual({ 'kb-a': '二' })
+  })
   it('labels a bound library by its name, or 「知识库 N」 by binding order; never shows an id', () => {
     const bound = ['kb-a', 'kb-b']
     expect(libraryLabel('kb-a', bound, { 'kb-a': '制度库' }, '知识库 {n}')).toBe('制度库')
