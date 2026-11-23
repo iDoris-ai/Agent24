@@ -67,6 +67,25 @@ pub(crate) async fn is_live(storage: &Storage, id: &str) -> Result<bool, ApiErro
     }
 }
 
+/// The title of `id` when it is deleted and can still be restored.
+pub(crate) async fn restorable_title(
+    storage: &Storage,
+    id: &str,
+) -> Result<Option<String>, ApiError> {
+    let sql = format!(
+        "SELECT title FROM documents WHERE id = ?
+         AND deleted_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-{RESTORE_DAYS} days')"
+    );
+    match sqlx::query_scalar(&sql)
+        .bind(id)
+        .fetch_optional(storage.db.pool())
+        .await
+    {
+        Ok(title) => Ok(title),
+        Err(e) => Err(storage.db_failure(e).await),
+    }
+}
+
 /// Marks `id` deleted, with its `oplog` row, in one transaction. A document
 /// that is not here, or already deleted, is not found.
 pub(crate) async fn delete(

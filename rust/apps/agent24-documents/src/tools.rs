@@ -403,7 +403,7 @@ async fn delete(state: &AppState, run: Run, arguments: Map<String, Value>) -> Ou
         .await
         .map_err(|e| refused(&e))?;
     let message = format!(
-        "已删除《{}》。{} 天内可以在文档页的「最近删除」里恢复。已完成，不要再调用。",
+        "已把《{}》移到文档页的「最近删除」（不是永久删除），{} 天内可以恢复。已完成，不要再调用。",
         gone.title,
         crate::trash::RESTORE_DAYS
     );
@@ -1097,7 +1097,31 @@ async fn admit(
     };
     match owner.map_err(|e| refused(&e))? {
         Some(doc) if scope.allows_document(&doc) && live(state, &doc).await? => Ok(()),
+        Some(doc) if scope.allows_document(&doc) => Err(in_trash(state, &doc, absent).await),
         _ => Err(refused(&ApiError::not_found(absent))),
+    }
+}
+
+/// L6-F2 (General, 0.6.105): asked about a document just deleted, the model
+/// told the user it was 「永久移除」. A document of the scope that is in
+/// 「最近删除」 is answered as such (nothing of it is read); one past its 7
+/// days, or not there, stays not found.
+async fn in_trash(state: &AppState, id: &str, absent: &'static str) -> Envelope {
+    let Ok(storage) = ready(state).await else {
+        return refused(&ApiError::not_found(absent));
+    };
+    match crate::trash::restorable_title(&storage, id).await {
+        Ok(Some(title)) => Envelope::Completed {
+            payload: json!({
+                "reason": "deleted",
+                "message": format!(
+                    "《{title}》已被用户删除，现在在文档页的「最近删除」里，{} 天内可以恢复，不是永久删除；删除期间不能读取或修改它。请这样告诉用户。",
+                    crate::trash::RESTORE_DAYS
+                ),
+            }),
+            replayed: false,
+        },
+        _ => refused(&ApiError::not_found(absent)),
     }
 }
 
@@ -1655,16 +1679,49 @@ mod tests {
         crate::trash::delete(&storage, DOC, &Origin::Page)
             .await
             .unwrap();
+        // In 「最近删除」: said so (General 0.6.105: the model called it
+        // 「永久移除」), and nothing of the document comes back.
         for (op, args) in [
             ("get", json!({ "document_id": DOC })),
             ("paragraphs", json!({ "document_id": DOC })),
             ("read_range", json!({ "document_id": DOC, "revision": 1 })),
             ("job_get", json!({ "job_id": JOB })),
-            ("compose", json!({ "parts": [{ "document_id": DOC }] })),
         ] {
-            let body = call_in(&state, op, &scope, args).await;
-            assert_module_error(&body, "not_found", false);
+            let answer = payload(&call_in(&state, op, &scope, args).await);
+            assert_eq!(answer["reason"], "deleted", "{op}: {answer}");
+            let message = answer["message"].as_str().unwrap();
+            assert!(
+                message.contains("最近删除") && message.contains("不是永久删除"),
+                "{message}"
+            );
+            assert_eq!(answer.as_object().unwrap().len(), 2, "{answer}");
         }
+        let body = call_in(
+            &state,
+            "compose",
+            &scope,
+            json!({ "parts": [{ "document_id": DOC }] }),
+        )
+        .await;
+        assert_module_error(&body, "not_found", false);
+        // Past its 7 days, or outside the scope: not found, as any other.
+        let body = call_in(
+            &state,
+            "get",
+            &[other.as_str()],
+            json!({ "document_id": DOC }),
+        )
+        .await;
+        assert_module_error(&body, "not_found", false);
+        exec(
+            &state,
+            &format!(
+                "UPDATE documents SET deleted_at = '2020-01-01T00:00:00.000Z' WHERE id = '{DOC}'"
+            ),
+        )
+        .await;
+        let body = call_in(&state, "get", &scope, json!({ "document_id": DOC })).await;
+        assert_module_error(&body, "not_found", false);
         // By its name: not resolved, so not that document.
         let body = call_in(
             &state,
@@ -1739,11 +1796,19 @@ mod tests {
         assert_eq!(gone["deleted"], true, "{gone}");
         assert_eq!(gone["title"], "合同.pdf");
         assert!(gone["message"].as_str().unwrap().contains("最近删除"));
+        assert!(gone["message"].as_str().unwrap().contains("不是永久删除"));
+        // A second delete finds it in 「最近删除」: nothing is deleted twice.
         for op in ["delete", "get"] {
-            let body = call_in(&state, op, &[&doc], json!({ "document_id": doc })).await;
-            assert_module_error(&body, "not_found", false);
+            let answer =
+                payload(&call_in(&state, op, &[&doc], json!({ "document_id": doc })).await);
+            assert_eq!(answer["reason"], "deleted", "{op}: {answer}");
         }
         let storage = state.storage().await.unwrap();
+        let deletes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM oplog WHERE op = 'delete'")
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(deletes, 1);
         let row: (String, String) =
             sqlx::query_as("SELECT origin, run_id FROM oplog WHERE op = 'delete'")
                 .fetch_one(storage.db.pool())
