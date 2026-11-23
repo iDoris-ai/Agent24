@@ -26,6 +26,15 @@ pub struct Target {
     revision: Option<i64>,
 }
 
+impl Target {
+    pub(crate) fn new(document_id: String, revision: Option<i64>) -> Self {
+        Self {
+            document_id,
+            revision,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompareRequest {
@@ -36,17 +45,35 @@ pub struct CompareRequest {
     offset: Option<usize>,
 }
 
+impl CompareRequest {
+    pub(crate) fn new(left: Target, right: Target, limit: usize) -> Self {
+        Self {
+            left,
+            right,
+            limit: Some(limit),
+            offset: None,
+        }
+    }
+}
+
 #[derive(Serialize)]
 pub struct Compared {
     left: Resolved,
     right: Resolved,
-    identical: bool,
+    pub(crate) identical: bool,
     only_text: bool,
-    summary: Summary,
-    changes: Vec<Change>,
+    pub(crate) summary: Summary,
+    pub(crate) changes: Vec<Change>,
     /// `summary.total` is of all changes; `changes` holds a page of them.
-    truncated: bool,
+    pub(crate) truncated: bool,
     next_offset: Option<usize>,
+}
+
+impl Compared {
+    /// The versions compared: left's and right's.
+    pub(crate) fn revisions(&self) -> (i64, i64) {
+        (self.left.revision, self.right.revision)
+    }
 }
 
 #[derive(Serialize)]
@@ -129,14 +156,24 @@ pub async fn compare(
     body: Result<Json<CompareRequest>, JsonRejection>,
 ) -> Result<Json<Compared>, ApiError> {
     let Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    run(&state, &storage, req).await.map(Json)
+}
+
+/// The comparison itself, for `POST /documents/compare` and the
+/// `documents.compare` tool alike.
+pub(crate) async fn run(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    req: CompareRequest,
+) -> Result<Compared, ApiError> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     if !(1..=MAX_LIMIT).contains(&limit) {
         return Err(ApiError::invalid_request("limit is 1 to 500"));
     }
     let offset = req.offset.unwrap_or(0);
     let (l, r) = (
-        resolve(&storage, &req.left).await?,
-        resolve(&storage, &req.right).await?,
+        resolve(storage, &req.left).await?,
+        resolve(storage, &req.right).await?,
     );
     if kind_of(&l.media_type) != kind_of(&r.media_type) {
         return Err(ApiError::unprocessable(
@@ -145,8 +182,8 @@ pub async fn compare(
         ));
     }
     let (lu, ru) = (
-        units(&state, &storage, &l).await?,
-        units(&state, &storage, &r).await?,
+        units(state, storage, &l).await?,
+        units(state, storage, &r).await?,
     );
     let Comparison {
         identical,
@@ -162,7 +199,7 @@ pub async fn compare(
         revision: x.revision,
         media_type: x.media_type,
     };
-    Ok(Json(Compared {
+    Ok(Compared {
         left: resolved(l),
         right: resolved(r),
         identical,
@@ -171,7 +208,7 @@ pub async fn compare(
         changes: page,
         truncated: end < total,
         next_offset: (end < total).then_some(end),
-    }))
+    })
 }
 
 #[cfg(test)]
