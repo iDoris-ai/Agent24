@@ -37,6 +37,7 @@ pub mod timestamp;
 pub mod tools;
 pub mod trash;
 pub mod uploads;
+pub mod versions;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
@@ -189,6 +190,15 @@ pub fn router(state: AppState) -> Router {
             post(trash::restore_document),
         )
         .route("/recently-deleted", get(trash::list_recently_deleted))
+        // L6-F5: a document's versions, and an old one made current again.
+        .route(
+            "/documents/{document_id}/revisions",
+            get(versions::list_revisions),
+        )
+        .route(
+            "/documents/{document_id}/revisions/{revision}/restore",
+            post(versions::restore_revision),
+        )
         .route(
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),

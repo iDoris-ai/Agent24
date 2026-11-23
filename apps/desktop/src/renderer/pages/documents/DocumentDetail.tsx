@@ -83,9 +83,13 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
   const runExtract = async (id: string, typed: string) => {
     const names = [...new Set(typed.split(/[,，、;；\n]+/).map((n) => n.trim()).filter(Boolean))].slice(0, 20)
     if (names.length === 0) return
+    // PR-Daemon #2020: a result for a document no longer open is dropped,
+    // and does not keep the one now open busy (the reset below clears it).
+    const gen = generation.current
     setExtractBusy(true)
     setExtracted(null)
     const out = await extractFields(api, id, names).catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }))
+    if (gen !== generation.current) return
     setExtractBusy(false)
     setExtracted(out)
   }
@@ -377,6 +381,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     setHighlight(null)
     setExtracting(null)
     setExtracted(null)
+    setExtractBusy(false)
     setTranslating(false)
     setTrDone(0)
     setTrTotal(0)
