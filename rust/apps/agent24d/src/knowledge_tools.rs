@@ -160,6 +160,15 @@ pub struct RunKnowledge {
     /// the run did receive that passage from the knowledge base (qwen3-8b
     /// cites search passages without reading them back).
     pub read_chunks: Vec<ReadChunk>,
+    /// L7-K0 (FU-183): the run asked a `knowledge_search` and none completed:
+    /// each was refused (policy) or failed. Said so a client can write 「检索没能
+    /// 进行」 instead of letting it pass for 「知识库里没有」.
+    pub search_refused: bool,
+    /// L7-K0: passages the run's completed searches returned, each
+    /// (document, chunk) once. 0 with `searched` is 「没找到」.
+    pub found_passages: usize,
+    /// L7-K0: the titles of those passages, each once, first five.
+    pub found_titles: Vec<String>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -182,6 +191,9 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
     let mut knowledge = RunKnowledge {
         searched: false,
         read_chunks: Vec::new(),
+        search_refused: false,
+        found_passages: 0,
+        found_titles: Vec::new(),
     };
     for call in calls {
         if call.status != ToolCallStatus::Completed || ![SEARCH, READ].contains(&call.tool.as_str())
@@ -207,22 +219,45 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
             }
         }
     }
-    if calls
+    let search_done = calls
         .iter()
-        .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed)
-    {
-        for chunk in answers.iter().flat_map(|a| search_hits(a)) {
+        .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed);
+    knowledge.search_refused = !search_done
+        && calls.iter().any(|c| {
+            c.tool == SEARCH && matches!(c.status, ToolCallStatus::Denied | ToolCallStatus::Failed)
+        });
+    if search_done {
+        let mut seen: Vec<ReadChunk> = Vec::new();
+        for (chunk, title) in answers.iter().flat_map(|a| search_found(a)) {
+            if let Some(title) = title
+                && !title.is_empty()
+                && knowledge.found_titles.len() < FOUND_TITLES
+                && !knowledge.found_titles.contains(&title)
+            {
+                knowledge.found_titles.push(title);
+            }
+            if !seen.contains(&chunk) {
+                seen.push(ReadChunk {
+                    knowledge_id: chunk.knowledge_id.clone(),
+                    chunk_id: chunk.chunk_id.clone(),
+                });
+            }
             if !knowledge.read_chunks.contains(&chunk) {
                 knowledge.read_chunks.push(chunk);
             }
         }
+        knowledge.found_passages = seen.len();
     }
     knowledge
 }
 
+/// Titles a run's record names, at most.
+const FOUND_TITLES: usize = 5;
+
 /// The chunks a search answer returned (K3): each evidence entry naming both
-/// its document and its chunk.
-fn search_hits(answer: &str) -> Vec<ReadChunk> {
+/// its document and its chunk, with the passage's title: `title` (the search
+/// first's compact entry) or the hit's `display` title or file name.
+fn search_found(answer: &str) -> Vec<(ReadChunk, Option<String>)> {
     let Ok(value) = serde_json::from_str::<Value>(answer) else {
         return Vec::new();
     };
@@ -235,10 +270,19 @@ fn search_hits(answer: &str) -> Vec<ReadChunk> {
         .into_iter()
         .flatten()
         .filter_map(|hit| {
-            Some(ReadChunk {
-                knowledge_id: hit.get("knowledge_id")?.as_str()?.to_owned(),
-                chunk_id: hit.get("chunk_id")?.as_str()?.to_owned(),
-            })
+            let title = hit
+                .get("title")
+                .or_else(|| hit.get("display").and_then(|d| d.get("title")))
+                .or_else(|| hit.get("display").and_then(|d| d.get("file_name")))
+                .and_then(Value::as_str)
+                .map(|t| t.trim().to_owned());
+            Some((
+                ReadChunk {
+                    knowledge_id: hit.get("knowledge_id")?.as_str()?.to_owned(),
+                    chunk_id: hit.get("chunk_id")?.as_str()?.to_owned(),
+                },
+                title,
+            ))
         })
         .collect()
 }

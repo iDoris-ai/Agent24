@@ -3,7 +3,10 @@ import { citedChunks, grounding } from './knowledge-grounding'
 
 const DOC = 'b512455b-6df2-4419-8df1-72126627085c'
 const CHUNK = '22b86b23-4bce-4898-9e43-9c62411f54c9'
+/** The record's L7-K0 fields, nothing found or refused. */
+const base = { search_refused: false, found_passages: 0, found_titles: [] as string[] }
 const read = (...ids: [string, string][]) => ({
+  ...base,
   searched: true,
   read_chunks: ids.map(([knowledge_id, chunk_id]) => ({ knowledge_id, chunk_id })),
 })
@@ -34,7 +37,7 @@ describe('knowledge-grounding', () => {
 
   it('an answer from a run that called no Knowledge tool says so, and none of its sources stand', () => {
     const text = `可以饮用。来源：s01-02-zh-water-2025.pdf，${DOC}#${CHUNK}`
-    expect(grounding(text, { searched: false, read_chunks: [] })).toEqual({ kind: 'notSearched', unread: [`${DOC}#${CHUNK}`] })
+    expect(grounding(text, { ...base, searched: false, read_chunks: [] })).toEqual({ kind: 'notSearched', unread: [`${DOC}#${CHUNK}`] })
     // A run without a binding searched nothing either.
     expect(grounding(text, null)).toEqual({ kind: 'notSearched', unread: [`${DOC}#${CHUNK}`] })
   })
@@ -51,13 +54,13 @@ describe('knowledge-grounding', () => {
   })
 
   it('a search with nothing read back is not an answer from Knowledge', () => {
-    expect(grounding('答案。来源：doc-7#chk-71', { searched: true, read_chunks: [] })).toEqual({ kind: 'nothingRead', unread: ['doc-7#chk-71'] })
+    expect(grounding('答案。来源：doc-7#chk-71', { ...base, searched: true, read_chunks: [] })).toEqual({ kind: 'nothingRead', unread: ['doc-7#chk-71'] })
   })
 })
 
 describe('grounding (K3: a source written the model\'s own way)', () => {
   it('takes `file.pdf#<document id>` as the document the run read, and still marks a made-up one', () => {
-    const knowledge = { searched: true, read_chunks: [{ knowledge_id: '17b1f6d6-c8a6-4c99-bd44-83d2d5ad3c4d', chunk_id: 'a1457516-da54-469f-bf96-a16dd9ef9460' }] }
+    const knowledge = { ...base, searched: true, read_chunks: [{ knowledge_id: '17b1f6d6-c8a6-4c99-bd44-83d2d5ad3c4d', chunk_id: 'a1457516-da54-469f-bf96-a16dd9ef9460' }] }
     const text = 'Boil for 3 minutes.\n来源：s01-02-en-epa-boil-water.pdf#17b1f6d6-c8a6-4c99-bd44-83d2d5ad3c4d\nother.pdf#00000000-0000-0000-0000-000000000000'
     expect(grounding(text, knowledge)).toEqual({ kind: 'read', unread: ['pdf#00000000-0000-0000-0000-000000000000'] })
   })

@@ -6878,11 +6878,26 @@ components:
 
     RunKnowledge:
       type: object
-      required: [searched, read_chunks]
+      required: [searched, read_chunks, search_refused, found_passages, found_titles]
       properties:
         searched:
           type: boolean
           description: Some `knowledge_search` or `knowledge_read` call of the run completed.
+        search_refused:
+          type: boolean
+          description: |
+            L7-K0 (FU-183). The run asked a `knowledge_search` and none
+            completed: each was refused by policy or failed. A client says
+            「检索没能进行」, never 「知识库里没有」.
+        found_passages:
+          type: integer
+          minimum: 0
+          description: "Passages the completed searches of the run returned, each (document, chunk) once. 0 with searched true means none found."
+        found_titles:
+          type: array
+          maxItems: 5
+          items: { type: string }
+          description: "Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on."
         read_chunks:
           type: array
           description: |

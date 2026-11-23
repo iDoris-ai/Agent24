@@ -294,7 +294,10 @@ fn a_run_answered_without_the_tools_read_nothing() {
         run_knowledge(&[]),
         RunKnowledge {
             searched: false,
-            read_chunks: vec![]
+            read_chunks: vec![],
+            search_refused: false,
+            found_passages: 0,
+            found_titles: vec![],
         }
     );
     // Calls that did not complete, or other tools, read nothing either.
@@ -315,7 +318,10 @@ fn a_run_answered_without_the_tools_read_nothing() {
         run_knowledge(&calls),
         RunKnowledge {
             searched: false,
-            read_chunks: vec![]
+            read_chunks: vec![],
+            search_refused: true,
+            found_passages: 0,
+            found_titles: vec![],
         }
     );
 }
@@ -344,7 +350,10 @@ fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
         run_knowledge(&calls),
         RunKnowledge {
             searched: true,
-            read_chunks: vec![chunk("doc-7", "chk-71"), chunk("doc-7", "chk-72")]
+            read_chunks: vec![chunk("doc-7", "chk-71"), chunk("doc-7", "chk-72")],
+            search_refused: false,
+            found_passages: 0,
+            found_titles: vec![],
         }
     );
     // A search alone is a search, with nothing read back.
@@ -380,7 +389,10 @@ fn a_completed_searchs_hits_count_as_read() {
         run_knowledge_with(&done, &answers),
         RunKnowledge {
             searched: true,
-            read_chunks: vec![chunk("doc-1", "chk-1"), chunk("doc-2", "chk-2")]
+            read_chunks: vec![chunk("doc-1", "chk-1"), chunk("doc-2", "chk-2")],
+            search_refused: false,
+            found_passages: 2,
+            found_titles: vec![],
         }
     );
     let failed = [stored(
@@ -423,4 +435,68 @@ fn the_first_searchs_compacted_hits_count_as_read() {
             chunk_id: "chk-1".into()
         }]
     );
+}
+
+/// L7-K0 (FU-183): a search the policy refused is said as refused, not as
+/// 「searched, found nothing」; one that completed with no passage is 「没找到」.
+#[test]
+fn a_refused_search_is_told_apart_from_one_that_found_nothing() {
+    let denied = [stored(
+        SEARCH,
+        ToolCallStatus::Denied,
+        json!({ "query": "q" }),
+    )];
+    let k = run_knowledge_with(&denied, &[]);
+    assert!(k.search_refused && !k.searched && k.found_passages == 0);
+    // The model asked again and it went through: the last word is the answer.
+    let retried = [
+        stored(SEARCH, ToolCallStatus::Denied, json!({ "query": "q" })),
+        stored(SEARCH, ToolCallStatus::Completed, json!({ "query": "q" })),
+    ];
+    assert!(!run_knowledge_with(&retried, &[]).search_refused);
+    // Completed with no passage: searched, none found, not refused.
+    let empty = [stored(
+        SEARCH,
+        ToolCallStatus::Completed,
+        json!({ "query": "q" }),
+    )];
+    let k = run_knowledge_with(&empty, &[]);
+    assert!(k.searched && !k.search_refused && k.found_passages == 0 && k.found_titles.is_empty());
+    // A refused read is not a refused search.
+    let read = [stored(
+        READ,
+        ToolCallStatus::Denied,
+        json!({ "knowledge_id": "d" }),
+    )];
+    assert!(!run_knowledge_with(&read, &[]).search_refused);
+}
+
+/// L7-K0: passages counted once each, titles from the compact entry or the
+/// hit's display, at most five, never empty.
+#[test]
+fn found_passages_and_titles_come_from_the_completed_search_answers() {
+    let done = [stored(
+        SEARCH,
+        ToolCallStatus::Completed,
+        json!({ "query": "q" }),
+    )];
+    let answers = [json!({ "kind": "knowledge.search", "evidence": [
+            { "knowledge_id": "d1", "chunk_id": "c1", "title": "制度.pdf" },
+            { "knowledge_id": "d1", "chunk_id": "c2", "title": "制度.pdf" },
+            { "knowledge_id": "d2", "chunk_id": "c3", "display": { "title": "手册" } },
+            { "knowledge_id": "d3", "chunk_id": "c4", "display": { "file_name": "a.docx" } },
+            { "knowledge_id": "d4", "chunk_id": "c5", "title": "" },
+            { "knowledge_id": "d1", "chunk_id": "c1", "title": "制度.pdf" },
+        ] })
+    .to_string()];
+    let k = run_knowledge_with(&done, &answers);
+    assert_eq!(k.found_passages, 5);
+    assert_eq!(k.found_titles, vec!["制度.pdf", "手册", "a.docx"]);
+    // No completed search: nothing found, whatever an answer says.
+    let failed = [stored(
+        SEARCH,
+        ToolCallStatus::Failed,
+        json!({ "query": "q" }),
+    )];
+    assert_eq!(run_knowledge_with(&failed, &answers).found_passages, 0);
 }
