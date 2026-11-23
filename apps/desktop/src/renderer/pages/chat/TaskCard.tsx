@@ -12,7 +12,8 @@ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'reac
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import { createChatSession } from '../chat-knowledge'
-import { AlreadyDecided, cancelRun, createRun, decideApproval, listPendingApprovals, type Approval, type Decision } from '../agent/api'
+import { AlreadyDecided, cancelRun, createRun, decideApproval, getRun, listPendingApprovals, type Approval, type Decision } from '../agent/api'
+import { savesToOriginal } from './doc-version'
 import { grounding } from '../knowledge-grounding'
 import { forgetPromotion, getHistoryState, promoteRun, subscribeHistory } from './history'
 import { skillForConversation } from './session-skill'
@@ -366,6 +367,34 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
     }, () => { if (live) setReading(false) })
     return () => { live = false }
   }, [askingSummary, askingId, task.run_id])
+  /** L6-F5 (General 11-23): a patch or fill asking to save into the
+   * original is offered only on a run the App judged so (its prompt carries
+   * SAVE_MARK). Any other is sent back to the model before the user is asked:
+   * 'checking' while its run is read, 'unread' when it cannot be (no 确认),
+   * 'sentBack' once denied. */
+  const [saveCheck, setSaveCheck] = useState<'checking' | 'unread' | 'sentBack' | null>(null)
+  useEffect(() => {
+    setSaveCheck(null)
+    const approval = askingRef.current
+    if (!approval || !askingId) return
+    const { tool, args, complete } = approvalArgs(approval)
+    if (tool !== 'documents.patch' && tool !== 'documents.fill') return
+    // PR-Daemon #2035 B2: a cut summary may have lost `save_to`; it is not
+    // offered, as a patch that is cut is not. Any `save_to` that is not the
+    // default new document needs the mark, not only the exact 'original'.
+    if (!complete) { setSaveCheck('unread'); return }
+    if (args['save_to'] === undefined || args['save_to'] === 'new_document') return
+    let live = true
+    setSaveCheck('checking')
+    void getRun(task.run_id).then(async run => {
+      if (!live) return
+      if (savesToOriginal(run.input.prompt)) { setSaveCheck(null); return }
+      setSaveCheck('sentBack')
+      await decideApproval(askingId, { type: 'deny', reason: tRef.current('task.saveSentBack') }).catch(() => {})
+      askRunAgain(task.run_id)
+    }, () => { if (live) setSaveCheck('unread') })
+    return () => { live = false }
+  }, [askingSummary, askingId, task.run_id])
   // PR-Daemon #1987 Medium 1: the decision goes to the approval the card
   // shows (`asking`), never to another one of the same run picked again from
   // the list: with two patch approvals in a run, 「确认」 on A approved B. One
@@ -400,6 +429,8 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
           <div className="message-detail-list">{approvalDetail(asking, t as (key: string, vars?: Record<string, string>) => string)}</div></details>
       )}
       {sentBack && <span className="task-card-knowledge" role="note">{t('task.anchorNote', { n: String(sentBack.index + 1) })}</span>}
+      {saveCheck === 'sentBack' && <span className="task-card-knowledge" role="note">{t('task.saveNote')}</span>}
+      {saveCheck === 'unread' && <span className="task-card-knowledge" role="note">{t('task.saveUnread')}</span>}
       {status === 'failed' && view?.error && <span className="task-card-error">{view.error}</span>}
       {failed && <span className="task-card-error" role="alert">{failed}</span>}
       {status === 'completed' && view?.output && !answered && (
@@ -413,7 +444,7 @@ function TaskCard({ task, view, answered }: { task: ChatHistoryRun; view: RunVie
         </div>
       )}
       <span className="task-card-actions">
-        {waiting && offers?.approve && !denying && !sentBack && !askingIncomplete && (
+        {waiting && offers?.approve && !denying && !sentBack && !askingIncomplete && saveCheck === null && (
           <button type="button" className="btn btn-primary task-card-button" disabled={busy || reading} onClick={() => void decide({ type: 'approve' })}>{t('task.confirm')}</button>
         )}
         {waiting && offers?.deny && !denying && (

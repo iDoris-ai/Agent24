@@ -13,6 +13,7 @@ import { resetRunStatusesForTests } from './run-status'
 import { setLocale, translate } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 import ChatPage from '../Chat'
+import { SAVE_MARK } from './doc-version'
 
 // M4 A4: a conversation's tasks as cards, against main's real store and a
 // daemon the test plays, with its /events.
@@ -20,7 +21,7 @@ import ChatPage from '../Chat'
 let dir: string
 let store: ReturnType<typeof createChatHistoryStore>
 const wrap = <A extends unknown[], R>(f: (...a: A) => R) => vi.fn(async (...a: A) => f(...a))
-type Run = { status: string; started_at?: string; ended_at?: string | null; output?: { text: string } | null; knowledge?: unknown; error?: { code: string; message: string } | null }
+type Run = { status: string; started_at?: string; ended_at?: string | null; output?: { text: string } | null; knowledge?: unknown; error?: { code: string; message: string } | null; input?: { prompt: string } }
 let runs: Record<string, Run>
 let approvals: { id: string; run_id: string; available_decisions: string[]; summary?: string; payload?: unknown }[] | null
 let proxy: ReturnType<typeof vi.fn>
@@ -251,6 +252,53 @@ describe('task cards (M4 A4)', () => {
       await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
       expect(approvalDecide).not.toHaveBeenCalled()
     }
+  })
+
+  // L6-F5 (General 11-23): saving into the original is offered only on a
+  // run the App judged so; any other such card goes back to the model first.
+  it.each([
+    ['把第 6 段改正式一点', true],
+    [`当前对话的文档：《合同.docx》。${SAVE_MARK}（…）\n把第 6 段改正式一点，直接存到原文件里`, false],
+  ])('a patch saving into the original on a run prompted %j is sent back: %s', async (prompt, sentBack) => {
+    store.save(record('chat_a', '改写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at, input: { prompt } } as Run
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: 'documents.patch: {"document_id":"doc_1","edits":[{"anchor":"第三条 押金为两个月","index":5,"text":"新文字"}],"save_to":"original"}',
+    }]
+    const request = vi.fn(async () => ({ ok: true, data: { paragraphs: [
+      { index: 5, text: '第三条 押金为两个月租金，合同期满无违约时全额退还。', in_table: false },
+    ] } }))
+    ;(window.agent24 as unknown as { documents: unknown }).documents = { request }
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    if (sentBack) {
+      await waitFor(() => expect(approvalDecide).toHaveBeenCalledWith('ap_1', expect.objectContaining({ type: 'deny' })))
+      const reason = (approvalDecide.mock.calls[0] as unknown as [string, { reason: string }])[1].reason
+      expect(reason).toContain('save_to')
+      expect(within(c).queryByRole('button', { name: '确认' })).toBeNull()
+      expect(within(c).getByText('你没有要求存到原文件，已让助手改为另存为新文档。')).toBeInTheDocument()
+    } else {
+      await waitFor(() => expect(within(c).getByRole('button', { name: '确认' })).toBeEnabled())
+      expect(approvalDecide).not.toHaveBeenCalled()
+    }
+  })
+
+  // PR-Daemon #2035 B2: a fill whose summary is cut (and may have lost
+  // `save_to`) is not offered either.
+  it('a fill whose summary is cut is not offered', async () => {
+    store.save(record('chat_a', '填写'))
+    store.promoteRun('chat_a', 'run_1')
+    runs.run_1 = { status: 'awaiting_approval', started_at: at, input: { prompt: '填模板' } } as Run
+    approvals = [{
+      id: 'ap_1', run_id: 'run_1', available_decisions: ['approve', 'deny'],
+      summary: 'documents.fill: {"document_id":"doc_1","values":{"甲方":"上海明远","租金":"8,500"},"sav',
+    }]
+    await show()
+    const c = await waitFor(() => card('等你确认'))
+    await waitFor(() => expect(within(c).queryByRole('button', { name: '确认' })).toBeNull())
+    expect(approvalDecide).not.toHaveBeenCalled()
   })
 
   // UI polish 09: 「详情」 lists the payload, not the daemon's JSON summary.
