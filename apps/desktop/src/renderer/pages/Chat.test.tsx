@@ -513,6 +513,50 @@ describe('ChatPage with Knowledge', () => {
     expect(runs).toEqual([])
   })
 
+  // L6-S05: 「这一版和上一版改了哪些地方」 never goes to the model: the App picks
+  // the two versions, asks the module, and writes the summary from its changes.
+  it('compares a document with its previous version and answers with a summary and a card', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const side = (n: number, text: string) => ({ block_ref: { paragraph_index: n }, text })
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : req.op === 'revisions'
+        ? { ok: true, data: { document_id: A, head_revision: 2, revisions: [{ revision: 2, created_at: 'x' }, { revision: 1, created_at: 'y' }] } }
+        : { ok: true, data: { left: { document_id: A, revision: 1, media_type: 'd' }, right: { document_id: A, revision: 2, media_type: 'd' }, identical: false, only_text: true, truncated: false, next_offset: null,
+          summary: { total: 1, added: 0, removed: 0, changed: 1, unaligned: 0 },
+          changes: [{ id: 'c1', kind: 'changed', left: side(2, '押金 5 万'), right: side(2, '押金 8 万'), spans: [{ op: 'equal', text: '押金 ' }, { op: 'delete', text: '5' }, { op: 'insert', text: '8' }, { op: 'equal', text: ' 万' }] }] } })
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《合同.docx》这一版和上一版改了哪些地方' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    const card = await screen.findByRole('group', { name: '文档对比' }, { timeout: 3000 })
+    expect(screen.getByText(/共 1 处改动：删 0 处、加 0 处、改 1 处、无法对齐 0 处 · 只比较文字/)).toBeInTheDocument()
+    expect(within(card).getByRole('button', { name: /c1 第 3 段 修改：押金 〔5→8〕 万/ })).toBeInTheDocument()
+    expect(request).toHaveBeenCalledWith({ op: 'compare', left: { documentId: A, revision: 1 }, right: { documentId: A, revision: 2 } })
+    expect(runs).toEqual([])
+  })
+
+  // L6-S05: a question about a contract is not a comparison.
+  it('does not take 「合同里写一个月押金对吗」 for a comparison', async () => {
+    const request = vi.fn(async () => ({ ok: true, data: { documents: [], next_cursor: null } }))
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    mockBackendProxy.mockImplementation(async () => ({ ok: true, status: 200, data: {} }))
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '合同里写一个月押金对吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getByText('合同里写一个月押金对吗')).toBeInTheDocument(), { timeout: 3000 })
+    expect(screen.queryByRole('group', { name: '文档对比' })).toBeNull()
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'compare' }))
+  })
+
   // General 11-23 (real Mac): 「回到上一个版本」 with no document named in
   // the turn takes the one the conversation last named.
   it('restores the document the conversation last named when the turn names none', async () => {

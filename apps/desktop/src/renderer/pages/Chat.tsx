@@ -24,6 +24,8 @@ import { HandOver, TaskCards } from './chat/TaskCard'
 import { ExtractCard } from './chat/ExtractCard'
 import { DeleteChoice } from './chat/DeleteChoice'
 import { RestoreCard } from './chat/RestoreCard'
+import { CompareCard } from './chat/CompareCard'
+import { asksCompare, runCompare, type CompareCardData } from './chat/doc-compare'
 import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
 import { choiceText, deletePrompt, deleteTargetOf, type DeleteCandidate } from './chat/delete-target'
 import { extractFields, extractText, fieldNamesFromModel, type ExtractCardData } from './documents/doc-extract'
@@ -76,6 +78,8 @@ interface AssistantMessage {
   deleteChoice?: DeleteCandidate[]
   /** L6-F5: the version a 「回到上一个版本」 turn may restore; text only in the history. */
   restore?: RestoreCardData
+  /** L6-S05: the summary of a comparison, a line per change; text only in the history. */
+  compare?: CompareCardData
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -269,6 +273,34 @@ export default function ChatPage() {
           const found = await restoreCardOf(api, subject, restoreAsk)
           reply = { role: 'assistant', content: found.text, ...(found.card ? { restore: found.card } : {}) }
         }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
+    // L6-S05: 「对比一下这两份」「这一版和上一版改了哪些地方」 — the App judges
+    // which two, asks the module, and writes the summary from its changes.
+    const compareAsk = answer ? null : asksCompare(text)
+    if (compareAsk !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      const named: string[] = []
+      // The turn's own titles first, then the conversation's, newest first.
+      for (const said of [text, ...messages.map(m => m.content).reverse()]) {
+        for (const m of [...said.matchAll(/《([^》]{1,200})》/g)]) {
+          const title = m[1]!.trim()
+          if (title && !named.includes(title) && named.length < 2) named.push(title)
+        }
+      }
+      let reply: AssistantMessage
+      try {
+        const out = await runCompare(api, compareAsk, doc ? { id: doc.id, title: doc.title } : null, named)
+        reply = { role: 'assistant', content: out.text, ...(out.card ? { compare: out.card } : {}) }
       } finally {
         requestInFlight.current = false
         setLoading(false)
@@ -840,6 +872,7 @@ export default function ChatPage() {
                 const asked = messages.slice(0, i).reverse().find(p => p.role === 'user')
                 if (asked) void send(asked.content, true)
               }} />
+                : m.role === 'assistant' && m.compare ? <><Markdown text={m.content} /><CompareCard card={m.compare} /></>
                 : m.role === 'assistant' && m.restore ? <><Markdown text={m.content} /><RestoreCard card={m.restore} onRestore={loading || archived ? undefined : () => {
                   const card = m.restore!
                   setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' ? { ...p, restore: undefined } : p)))
