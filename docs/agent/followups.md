@@ -243,3 +243,8 @@
 - [ ] FU-207 · B · src=L7-K1 · 2026-11-24 · 引文一键复制：引用卡只复制出处（库名 · 文档名 · 第 n 段命中），不含引文。要复制引文需新增 run 范围的读路由（复用 call::read + 出站闸门 + content_tag），安全类；第一版按证据裁决只做出处。判据：卡上点「复制引文」取到 knowledge_read 正文，读未绑定库/受限 run 被拒。
 - [ ] FU-208 · C · src=L7-K1 · 2026-11-24 · 库名来源：hit 的 display 只有 title/file_name，现在库名靠设置页用户自填（本机）。要自动带库名，需 WeKnora 侧在 hit 或就绪响应里带库名（改契约/fork）。另：卡上「点开」只能打开知识页，内嵌页没有按文档的深链。
 - [ ] FU-209 · C · src=L7-K1 · 2026-11-24 · 跨库后续：按库加权、按库排除；把引用写进文档正文的一键操作；写进 DOCX 批注（目前只在设计文档里，没有实现）。
+- [ ] FU-210 · **P1** · src=L7-K1 #2053 PR-Daemon Low 1+2 · 2026-11-24 · 设置页库名两处会踩到（下个小包就修）：①`kb-names.ts` 里 `=` 优先于空白，「kb-1 制度=库」被解析成 id=`kb-1 制度`、name=`库`，名称悄悄丢失、设置框回显原样所以看不出（注释「first blank」也与实现不符），改为取 `=` 与第一个空白中靠前的；②`names[id]` 对普通 `{}` 取值，绑定 id 恰为 `constructor`/`toString` 时标签变成函数源码，改用 `Object.hasOwn`。判据：两种写法都有单测，id 为 constructor 时显示「知识库 N」。
+- [ ] FU-211 · C · src=L7-K1 #2053 Low 3 · 2026-11-24 · `found` 封顶 8 条而事实行写「找到 N 段」（`found_passages` 不封顶），卡片最多 8 行且不说明截断。`found_passages > found.length` 时加一行「仅列前 8 段」。
+- [ ] FU-212 · C · src=L7-K1 #2053 Low 4 · 2026-11-24 · `saveKbNames` 在 `configure` 之前落盘，`configure` 失败时名称表已写；已解绑 id 的名称不清理。改为 configure 成功后再存、保存时只留绑定的 id。
+- [ ] FU-213 · C · src=L7-K1 #2053 Low 5+6 · 2026-11-24 · 引用卡的标签按渲染时的绑定表算而非 run 当时的绑定；`status()` 返回前短暂全读「知识库」；多个未绑定库同名成多组分不出。每张卡各调一次 `knowledge.status()`（长对话 N 次 IPC，可由 Chat 统一取一次传 `bound`）。知识问答转后台任务（ongoing → TaskCard）时只有事实行、没有引用卡；`cited` 与 `facts` 一样只在内存里，重开已存对话后卡消失。
+- [ ] FU-214 · C · src=L7-K1 #2053 Nit · 2026-11-24 · 泰语 `libraryNamesHint` 只写了 `ID=ชื่อ`，缺「ID 名称」写法和「知识库 1、2…」退回说明；`Chat.tsx` 的 `cited` 接线缺 Chat 级测试（`withKnowledge` 开/关各一条）。
