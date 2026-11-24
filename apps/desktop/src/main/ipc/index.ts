@@ -42,6 +42,7 @@ import type {
   OsPackageProgress,
   KnowledgeOnboardPreflight,
   KnowledgeOnboardResult,
+  KnowledgeUpload,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -633,6 +634,12 @@ export function registerIpcHandlers(options: {
     preflight: () => Promise<KnowledgeOnboardPreflight>
     run: (input: { localOnly: boolean }) => Promise<KnowledgeOnboardResult>
   }
+  /** L7-K2 A3: uploads into the default knowledge base. Paths stay in main. */
+  knowledgeUpload?: {
+    add: (paths: string[]) => Promise<KnowledgeUpload[]>
+    list: () => KnowledgeUpload[]
+    cancel: (uploadId: string) => Promise<KnowledgeUpload | null>
+  }
   /** QA 0.6.1 §3c: why the service daemon did not enrol this app, if it did not. */
   backendRefusal?: () => BackendRefusalResult | null
   /** M4 A6: the conversation a schedule's runs go to (schedule-conversations.ts). */
@@ -686,6 +693,7 @@ export function registerIpcHandlers(options: {
   const exportTimeout = options.exportTimeoutMs ?? { current: EXPORT_TIMEOUT_MS }
   const knowledge = options.knowledge ?? (() => null)
   const knowledgeOnboard = options.knowledgeOnboard ?? null
+  const knowledgeUpload = options.knowledgeUpload ?? null
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
@@ -881,6 +889,27 @@ export function registerIpcHandlers(options: {
   handle(IpcChannels.KnowledgeOnboardRun, (_event, input: unknown): Promise<KnowledgeOnboardResult> => {
     if (!knowledgeOnboard || !isKnowledgeOnboardRun(input)) return Promise.resolve({ ok: false, code: 'unavailable' })
     return knowledgeOnboard.run(input)
+  })
+  // The dialog stays in main. The renderer gets statuses, never the paths.
+  handle(IpcChannels.KnowledgeUploadPick, async (event): Promise<KnowledgeUpload[]> => {
+    if (!knowledgeUpload) return []
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = { properties: ['openFile', 'multiSelections'] }
+    let picked: Electron.OpenDialogReturnValue
+    try {
+      picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    } catch {
+      return []
+    }
+    if (picked.canceled || picked.filePaths.length === 0) return []
+    return knowledgeUpload.add(picked.filePaths)
+  })
+  handle(IpcChannels.KnowledgeUploadList, (): KnowledgeUpload[] => knowledgeUpload?.list() ?? [])
+  handle(IpcChannels.KnowledgeUploadCancel, (_event, uploadId: unknown): Promise<KnowledgeUpload | null> => {
+    if (!knowledgeUpload || typeof uploadId !== 'string' || uploadId.length < 1 || uploadId.length > 64) {
+      return Promise.resolve(null)
+    }
+    return knowledgeUpload.cancel(uploadId)
   })
 
   // Executable installation is elevated and must never use the generic proxy.

@@ -3,7 +3,7 @@
 // once and saves that one default knowledge base. The activation code and the
 // returned api key never reach the renderer, a log line, or an error message.
 
-import { randomBytes } from 'node:crypto'
+import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { validEndpoint, validKnowledgeBaseIds, type KnowledgeController } from './knowledge-settings'
@@ -83,12 +83,17 @@ export function readActivation(dir: string): Activation | null | 'invalid' {
   return { endpoint, activation_code: code }
 }
 
-function readPending(file: string): string | null {
+/** What the pending key was made for: the endpoint and the activation code, hashed. A new activation gets a new key. */
+function activationTag(activation: Activation): string {
+  return createHash('sha256').update(`${activation.endpoint}\0${activation.activation_code}`).digest('hex')
+}
+
+function readPending(file: string, tag: string): string | null {
   try {
     const st = fs.lstatSync(file)
     if (!st.isFile() || st.size > ACTIVATION_MAX_BYTES) return null
     const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'))
-    if (!isPlain(parsed) || Object.keys(parsed).length !== 1) return null
+    if (!isPlain(parsed) || Object.keys(parsed).length !== 2 || parsed.activation !== tag) return null
     const key = parsed.idempotency_key
     return typeof key === 'string' && IDEMPOTENCY_KEY.test(key) ? key : null
   } catch {
@@ -97,11 +102,11 @@ function readPending(file: string): string | null {
 }
 
 /** Same shape as the login store: exclusive temp file, mode 0600, then rename. */
-async function writePending(file: string, key: string): Promise<void> {
+async function writePending(file: string, key: string, tag: string): Promise<void> {
   const tmp = `${file}.${randomBytes(8).toString('hex')}.tmp`
   await fs.promises.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
   try {
-    await fs.promises.writeFile(tmp, JSON.stringify({ idempotency_key: key }), { mode: 0o600, flag: 'wx' })
+    await fs.promises.writeFile(tmp, JSON.stringify({ idempotency_key: key, activation: tag }), { mode: 0o600, flag: 'wx' })
     await fs.promises.rename(tmp, file)
     await fs.promises.chmod(file, 0o600)
   } catch (err) {
@@ -110,17 +115,30 @@ async function writePending(file: string, key: string): Promise<void> {
   }
 }
 
-/** The key from the first attempt, reused until one run succeeds. Unreadable or unwritable → in memory for this run only. */
-async function idempotencyKey(dir: string): Promise<string> {
+/** The key from the first attempt with this activation, reused until one run succeeds. Unreadable or
+ * unwritable → in memory for this run only. */
+async function idempotencyKey(dir: string, activation: Activation): Promise<string> {
   const file = pendingPath(dir)
-  const existing = readPending(file)
+  const tag = activationTag(activation)
+  const existing = readPending(file, tag)
   if (existing !== null) return existing
   const key = randomBytes(32).toString('base64url')
   try {
-    await writePending(file, key)
+    await writePending(file, key, tag)
     return key
   } catch {
-    return readPending(file) ?? key
+    return readPending(file, tag) ?? key
+  }
+}
+
+/** The pending key and the activation file are spent once the outcome is final (saved, or the user's own setup won). */
+async function spend(dir: string): Promise<void> {
+  for (const file of [pendingPath(dir), activationPath(dir)]) {
+    try {
+      await fs.promises.rm(file, { force: true })
+    } catch {
+      // Best effort: the endpoint is set now, so a later run stops at already_bound before using either file.
+    }
   }
 }
 
@@ -271,7 +289,7 @@ async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promis
   if (activation === null) return { ok: false, code: 'not_activated' }
   if (activation === 'invalid') return { ok: false, code: 'activation_invalid' }
 
-  const key = await idempotencyKey(deps.dir)
+  const key = await idempotencyKey(deps.dir, activation)
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => { setTimeout(resolve, ms) }))
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     const posted = await postInit(deps.fetch, activation, key)
@@ -289,18 +307,16 @@ async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promis
       apiKey: posted.apiKey,
     })
     if (!adopted.saved) {
-      if (adopted.reason === 'bound') return { ok: false, code: 'already_bound' }
+      if (adopted.reason === 'bound') {
+        await spend(deps.dir)
+        return { ok: false, code: 'already_bound' }
+      }
+      // Another change of the settings landed meanwhile and left no endpoint: running again converges.
+      if (adopted.reason === 'overtaken') return { ok: false, code: 'in_progress' }
       return { ok: false, code: adopted.reason === 'invalid' ? 'server_error' : 'not_saved' }
     }
-    // Saved: the pending key and the activation file are spent. A daemon that did not take the binding yet
-    // (not up) takes it later from the saved settings, so this is still a success.
-    for (const file of [pendingPath(deps.dir), activationPath(deps.dir)]) {
-      try {
-        await fs.promises.rm(file, { force: true })
-      } catch {
-        // Best effort: the endpoint is set now, so a later run stops at already_bound before using either file.
-      }
-    }
+    // Saved. A daemon that did not take the binding yet (not up) takes it later from the saved settings.
+    await spend(deps.dir)
     return {
       ok: true, outcome: posted.outcome, knowledgeBaseId: posted.knowledgeBaseId, configMismatch: posted.configMismatch,
       activeNow: adopted.result.ok,

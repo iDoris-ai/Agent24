@@ -254,7 +254,7 @@ export class KnowledgeController {
    * `saved: true` means the settings are on disk; `result` is whether the
    * daemon took them now (a daemon not up yet takes them later). */
   async adopt(input: { endpoint: string; knowledgeBaseIds: string[]; apiKey: string }): Promise<
-    { saved: true; result: SettingsResult } | { saved: false; reason: 'bound' | 'invalid' | 'not_saved' }
+    { saved: true; result: SettingsResult } | { saved: false; reason: 'bound' | 'overtaken' | 'invalid' | 'not_saved' }
   > {
     const { endpoint, knowledgeBaseIds, apiKey } = input
     if (!validEndpoint(endpoint) || !validKnowledgeBaseIds(knowledgeBaseIds) || !/^[\x21-\x7e]{1,16384}$/.test(apiKey)) {
@@ -284,9 +284,12 @@ export class KnowledgeController {
     } catch {
       return { saved: false, reason: 'not_saved' }
     }
-    if (!wrote) return { saved: false, reason: 'bound' }
-    // A later change overtook this one after it was written: that change is in effect, not this one.
-    if (mine !== this.version) return { saved: false, reason: 'bound' }
+    // Nothing written, or a later change overtook this write: bound only when an endpoint is in place now.
+    // Another change with no endpoint (say, the switch) is `overtaken`: onboarding may simply run again.
+    if (!wrote || mine !== this.version) {
+      const bound = this.settings.endpoint !== '' || this.store.load().endpoint !== ''
+      return { saved: false, reason: bound ? 'bound' : 'overtaken' }
+    }
     this.identity++
     this.settings = next
     return { saved: true, result: await this.apply() }
