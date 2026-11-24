@@ -10,9 +10,9 @@ const BUILD_KB = /建(?:立)?(?:一个|个)?知识库/
 // 「建个库」 only with something to put in it. 「建个数据库」 is not that 库.
 const BUILD_SHORT = /建(?:立)?(?:一个|个)库(?!数据)/
 const SHORT_ABOUT = /合同|文档|资料|知识|放进去/
-// A whole answer that stops onboarding, or one that starts with these words. Not a substring: 「合同取消条款审核」
-// is a purpose, not a cancel.
-const CANCEL = /^(?:算了|取消|不开通了|先不用|先不开通|不开通|不用了|不要了)/
+// A whole answer that stops onboarding. Not a substring or a prefix: 「合同取消条款审核」「取消订单的处理流程」
+// are purposes, not a cancel.
+const CANCEL = /^(?:算了|取消|不开通了|先不用|先不开通|不开通|不用了|不要了)(?:吧|了|吧不开通了)?$/
 /** Bare refusals at the purpose and types questions also stop onboarding. */
 const BARE_NO = /^(?:不|不用|不要|不需要|没有|没|不了)$/
 
@@ -99,19 +99,25 @@ export function beginOnboard(text: string): { state: OnboardStep; reply: string 
  * The answer to the privacy question. A consent gate: anything not clearly one or the other is asked again, and
  * a negated server phrase («不能放到服务器», the question's own words) means the material stays local.
  */
+const NO_ANSWERS = new Set([
+  '否', '不是', '不', '不用', '可以', '可以的', '都行', '没关系', '无所谓',
+  '可以放服务器', '可以放到服务器', '可以放在服务器', '可以放到服务器上', '可以放在服务器上',
+  '能放服务器', '能放到服务器', '放服务器也行', '放服务器也可以', '放到服务器也行', '放到服务器也可以',
+])
+
 function localChoice(text: string): 'yes' | 'no' | null {
   if (/[？?]|吗|会不会|安全不|行不行/.test(text)) return null
   const s = text.replace(/[。！!，,、；;：:\s]/g, '')
   if (!s) return null
-  // «不能/不要/不可以/别/不 … 服务器» or «不能上传»: must stay on this computer.
-  if (/(?:不能|不要|不可以|不可|不允许|不准|别|不)(?:放|存|传|上传|放到|放在|存到|传到)?.{0,6}(?:服务器|云端|网上|外面)/.test(s)
-    || /(?:不能|不要|不可以|别)上传/.test(s)) return 'yes'
+  // «不能/不要/没必要/别/不 … 服务器» or «不能上传»: must stay on this computer. Any negator, so that a negated
+  // server phrase can never be read as consent.
+  const negator = '(?:不能|不要|不可以|不可|不允许|不准|不必|不需要|不用|没必要|没有必要|无需|无须|别|不)'
+  if (new RegExp(`${negator}(?:放|存|传|上传|放到|放在|存到|传到)?.{0,6}(?:服务器|云端|网上|外面)`).test(s)
+    || new RegExp(`${negator}上传`).test(s)) return 'yes'
   if (/^(?:是|是的|对|对的|必须|必须的|要|需要)(?:$|[^不].*$)/.test(s) && !/不是|不用|不必|不需要/.test(s)) return 'yes'
   if (/^(?:只在本机|只留在本机|只留在这台电脑上?|只放本地|只能在本机|只能放本地)/.test(s)) return 'yes'
-  if (/^(?:否|不是|不用|不必|不需要|没必要|可以|可以的|可以放|能|能放|都行|没关系|无所谓)(?:放(?:到|在)?服务器(?:上)?(?:也行|也可以)?)?$/.test(s)) {
-    return 'no'
-  }
-  if (/^(?:可以|能)放(?:到|在)?服务器(?:上)?(?:也行|也可以)?$/.test(s)) return 'no'
+  // Consent to the server is a closed list of whole answers; anything else is asked again.
+  if (NO_ANSWERS.has(s)) return 'no'
   return null
 }
 

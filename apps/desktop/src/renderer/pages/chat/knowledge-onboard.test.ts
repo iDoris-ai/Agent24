@@ -138,13 +138,15 @@ describe('onboarding questions', () => {
     '不能放服务器', '不能放到服务器', '不要放服务器', '不可以放服务器', '不放服务器', '别放服务器',
     '资料不能放在服务器上', '要保密不能放服务器', '是，不能放到服务器', '必须只留在这台电脑上、不能放到服务器',
     '只留在这台电脑上', '只留在本机',
+    // #2075 B1′: 没必要 and its synonyms before a server phrase
+    '没必要放服务器', '没必要放到服务器', '没必要放在服务器上', '没必要放服务器也行', '没有必要放服务器', '无需放服务器',
   ])('「%s」 stays on this computer', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toEqual({ localOnly: true })
   })
 
   // A question back is never consent: asked again.
-  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器'])('「%s」 is asked again, never sent', (word) => {
+  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器', '能', '不必', '没必要'])('「%s」 is asked again, never sent', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toBeUndefined()
     expect(done.last?.reply).toBe(AGAIN)
@@ -160,10 +162,10 @@ describe('onboarding questions', () => {
     expect(done.last).toEqual({ state: null, reply: CANCEL, cancelled: true })
   })
 
-  it('a purpose that contains 取消 is a purpose, not a cancel', () => {
-    const done = walk('帮我开通知识库', ['合同取消条款审核'])
+  it.each(['合同取消条款审核', '取消订单的处理流程', '算了下成本用'])('a purpose like 「%s」 is a purpose, not a cancel', (purpose) => {
+    const done = walk('帮我开通知识库', [purpose])
     expect(done.last?.reply).toBe(TYPES)
-    expect(done.last?.state).toMatchObject({ step: 'types', purpose: '合同取消条款审核' })
+    expect(done.last?.state).toMatchObject({ step: 'types', purpose })
   })
 
   it('asks once more when the local answer is unclear, then stops', () => {
