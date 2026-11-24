@@ -106,6 +106,17 @@ impl Collected {
         ));
     }
 
+    /// A group the transport lost (no answer at all): partial like an
+    /// `unavailable`, so what the other groups returned is kept.
+    pub(super) fn lost(&mut self, group: &[String], retryable: bool) {
+        self.failures.extend(failure_for(
+            group,
+            PartialFailureCode::Unavailable,
+            PartialFailureReason::Dependency,
+            retryable,
+        ));
+    }
+
     /// A group's error. `empty_scope` leaves the group out (it is no failure);
     /// `timeout` and `unavailable` make the answer partial; any other error
     /// fails the whole call and what the other groups returned is dropped.
@@ -157,7 +168,7 @@ impl Collected {
             return Err(if self.failures.is_empty() {
                 empty_scope(&first.request_id, first.generation)
             } else {
-                local(LocalReason::Dependency, true)
+                all_failed(&first, &self.failures)
             });
         }
         let max = usize::try_from(first.budget.max_results.get()).unwrap_or(usize::MAX);
@@ -207,6 +218,13 @@ impl Collected {
             budget.max_results = budget.max_results.min(b.max_results);
             budget.max_concurrency = budget.max_concurrency.min(b.max_concurrency);
         }
+        // A knowledge base that failed or was not sent is still in the
+        // effective scope, as in a single request (R3.5).
+        for f in &failures {
+            if !effective.contains(&f.knowledge_base_id) {
+                effective.push(f.knowledge_base_id.clone());
+            }
+        }
         let Ok(knowledge_base_ids) = NonEmpty::try_from(effective) else {
             return Err(local(LocalReason::Incompatible, false));
         };
@@ -229,5 +247,40 @@ impl Collected {
             return Err(local(LocalReason::Incompatible, false));
         }
         Ok((first, response))
+    }
+}
+
+/// R3.7(b), R3.4: every group failed. `timeout` when all of them timed out,
+/// `unavailable` otherwise; retryable only if every failure is, and the reason
+/// is the first one that is not retryable (else the first).
+fn all_failed(first: &SearchRequest, failures: &[PartialFailure]) -> Failure {
+    let retryable = failures.iter().all(|f| f.retryable);
+    let echoes = |mut details: serde_json::Value| {
+        details["request_id"] = serde_json::json!(first.request_id);
+        details["generation"] = serde_json::json!(first.generation);
+        details
+    };
+    let envelope = if failures
+        .iter()
+        .all(|f| f.code == PartialFailureCode::Timeout)
+    {
+        serde_json::json!({ "error": { "code": "timeout", "message": "Knowledge search timed out.",
+            "details": echoes(serde_json::json!({ "retryable": true, "reason": "timeout" })) } })
+    } else {
+        let chosen = failures
+            .iter()
+            .find(|f| !f.retryable)
+            .or(failures.first())
+            .map(|f| f.reason);
+        let reason = match chosen {
+            Some(PartialFailureReason::Timeout) | None => serde_json::json!("dependency"),
+            Some(reason) => serde_json::json!(reason),
+        };
+        serde_json::json!({ "error": { "code": "unavailable", "message": "Knowledge search unavailable.",
+            "details": echoes(serde_json::json!({ "retryable": retryable, "reason": reason })) } })
+    };
+    match serde_json::from_value::<ErrorEnvelope>(envelope) {
+        Ok(envelope) => Failure::Envelope(envelope),
+        Err(_) => local(LocalReason::Dependency, retryable),
     }
 }

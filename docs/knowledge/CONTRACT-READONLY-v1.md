@@ -1,6 +1,6 @@
 # Knowledge 只读接入契约 v1（CONTRACT-READONLY-v1）
 
-> **状态**：v1 r13，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端只发单次 search 与 read，没有 R3.7 的跨 `score_space` 分组合并，也没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
+> **状态**：v1 r13，已随 KB-R1/R2 实施（KB-R1：wire 类型与传输层；KB-R2：主对话的 search 与 read）。§0.3 的草案期已结束，语义变更按该节升主版本。服务端的已知差距见 §13。例外：KB-R2 的客户端 read 只发单次；search 先发一次，只在服务端回 `mixed_score_space` 时才按 `details.groups` 分组合并（R3.7(b)，L7-K1），没有 R8、R9 的就绪探测、能力发现与兼容判定（CONTRACT-STATE §12）；开发者预览用 retrieve key 和样本数据，R1.3 的用户级凭据签发没有实施（#992、KB-C1-03）。
 > **版本**：契约 v1（报文字段 `protocol_version: 1`），文档修订 r13 · **日期**：2026-11-09 · **作者**：David Xu
 > **Issue**：#1011（KB-CT-02a），阶段 #1000；探测依据 iDoris-ai/WeKnora#5。
 > **依据**：任务方案 v2.1（方案全文见 #986 第一条评论）。每条规则后方括号里是来源：决策 `[D1]`–`[D8]`（方案 §1），或任务条目与方案章节（如 `[KB-C1-04]`、`[KB-C1-01b-b]`、`[方案 §4]`）。

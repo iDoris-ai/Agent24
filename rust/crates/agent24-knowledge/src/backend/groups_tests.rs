@@ -31,6 +31,10 @@ impl KnowledgeTransport for Script {
         let request: Value = serde_json::from_slice(&body).unwrap();
         self.sent.lock().unwrap().push(request.clone());
         let (status, mut body) = (self.handler)(&request);
+        // Status 0: the request never got an answer.
+        if status == 0 {
+            return Err(TransportError::Unreachable);
+        }
         let echoes = if body.get("error").is_some() {
             &mut body["error"]["details"]
         } else {
@@ -396,20 +400,94 @@ async fn groups_are_capped_by_the_calls_request_budget() {
     }
 }
 
+/// R3.7(b) and R3.4: every group failed, so the answer is a `timeout` when all
+/// of them timed out and `unavailable` otherwise; it is retryable only if every
+/// failure is, and the reason is the one that is not retryable.
 #[tokio::test]
-async fn when_every_group_fails_the_call_is_a_retryable_dependency_refusal() {
-    let s = setup(
+async fn when_every_group_fails_the_error_is_the_one_the_contract_names() {
+    let wire = |failure: Failure| match failure {
+        Failure::Envelope(e) => serde_json::to_value(&e.error).unwrap(),
+        other => panic!("{other:?}"),
+    };
+    let timeouts = setup(
         &["kb-a", "kb-b"],
         by_group(|_| error(504, "timeout", Some("timeout"), true)),
     );
-    let failure = s.backend.search(RUN, query(10)).await.unwrap_err();
-    assert!(matches!(
-        failure,
-        Failure::Local(Refusal {
-            reason: LocalReason::Dependency,
-            retryable: true
-        })
-    ));
+    let got = wire(timeouts.backend.search(RUN, query(10)).await.unwrap_err());
+    assert_eq!(got["code"], "timeout");
+    assert_eq!(got["details"]["retryable"], json!(true));
+
+    // Both groups hold only FAQ-style content: nothing to retry.
+    let unsupported = setup(
+        &["kb-a", "kb-b"],
+        by_group(|_| error(503, "unavailable", Some("unsupported_kb_type"), false)),
+    );
+    let got = wire(
+        unsupported
+            .backend
+            .search(RUN, query(10))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(got["code"], "unavailable");
+    assert_eq!(got["details"]["retryable"], json!(false));
+    assert_eq!(got["details"]["reason"], "unsupported_kb_type");
+
+    // One retryable, one not: not retryable, and the reason is the latter's.
+    let mixed_kinds = setup(
+        &["kb-a", "kb-b"],
+        by_group(|id| match id {
+            "kb-a" => error(503, "unavailable", Some("dependency"), true),
+            _ => error(503, "unavailable", Some("index_failed"), false),
+        }),
+    );
+    let got = wire(
+        mixed_kinds
+            .backend
+            .search(RUN, query(10))
+            .await
+            .unwrap_err(),
+    );
+    assert_eq!(got["details"]["retryable"], json!(false));
+    assert_eq!(got["details"]["reason"], "index_failed");
+}
+
+/// A group that fails in transport is a partial failure like one that answers
+/// `unavailable`; the other groups' answers are kept.
+#[tokio::test]
+async fn a_group_lost_in_transport_is_partial_not_fatal() {
+    let s = setup(
+        &["kb-a", "kb-b"],
+        by_group(|id| match id {
+            "kb-a" => ok(&["kb-a"], vec![hit("kb-a", "a1")]),
+            _ => (0, Value::Null),
+        }),
+    );
+    let (_, response) = s.backend.search(RUN, query(10)).await.unwrap();
+    assert_eq!(response.hits.len(), 1);
+    assert_eq!(response.completeness, crate::Completeness::Partial);
+    assert_eq!(
+        response.partial_failures.unwrap().as_slice()[0].knowledge_base_id,
+        "kb-b"
+    );
+}
+
+/// A knowledge base that failed or was not sent stays in the effective scope,
+/// as in a single request, so the answer is not flagged as narrowed for it.
+#[tokio::test]
+async fn failed_groups_stay_in_the_effective_scope() {
+    let s = setup(
+        &["kb-a", "kb-b"],
+        by_group(|id| match id {
+            "kb-a" => ok(&["kb-a"], vec![hit("kb-a", "a1")]),
+            _ => error(504, "timeout", Some("timeout"), true),
+        }),
+    );
+    let (_, response) = s.backend.search(RUN, query(10)).await.unwrap();
+    assert_eq!(
+        response.effective_scope.knowledge_base_ids.as_slice(),
+        ["kb-a", "kb-b"]
+    );
 }
 
 #[tokio::test]
