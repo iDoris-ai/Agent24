@@ -59,7 +59,16 @@ impl Identity {
             // Degraded with a working upstream still serves; a request routed to a
             // failed card gets iDoris's own 503 with the reason.
             Some("degraded") if self.upstreams.iter().any(|u| u.state == "ready") => Ok(true),
-            Some("degraded") if self.upstreams.iter().any(|u| u.state == "restarting") => Ok(false),
+            // No upstream ready yet, but one is still coming up (e.g. its first
+            // probe right after the gate opens): wait as for `starting`.
+            Some("degraded")
+                if self
+                    .upstreams
+                    .iter()
+                    .any(|u| matches!(u.state.as_str(), "starting" | "restarting")) =>
+            {
+                Ok(false)
+            }
             _ => Err(ModelError::Unavailable(format!(
                 "idoris_unavailable: {}",
                 self.upstreams
@@ -1122,6 +1131,12 @@ mod ic3a_readiness_tests {
                 false,
                 serde_json::json!([{"state":"absent","reason":"engine_not_found"}]),
                 None,
+            ),
+            (
+                "degraded",
+                false,
+                serde_json::json!([{"state":"failed","reason":"engine_exited"},{"state":"starting"}]),
+                Some(false),
             ),
             (
                 "degraded",
