@@ -3189,6 +3189,38 @@ export interface components {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */
             searched: boolean;
             /**
+             * @description L7-K0 (FU-183). The run asked a `knowledge_search` and none
+             *     completed: each was refused by policy or failed. A client says
+             *     「检索没能进行」, never 「知识库里没有」.
+             */
+            search_refused: boolean;
+            /**
+             * @description L7-K1. Why, when `search_refused` is true: `policy` (the outbound
+             *     check refused it) or `failed` (it ran and failed). A policy
+             *     refusal wins when both happened. Absent when not refused, and
+             *     from an older daemon.
+             * @enum {string}
+             */
+            search_refusal?: "policy" | "failed";
+            /** @description Passages the completed searches of the run returned, each (document, chunk) once. 0 with searched true means none found. */
+            found_passages: number;
+            /** @description Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on. */
+            found_titles: string[];
+            /**
+             * @description L7-K1. Optional so a client that meets an older daemon reads it as
+             *     absent. Where the passages of the completed searches sit, each
+             *     (library, document, chunk) once, the first eight: ids and a title, never
+             *     the passage text (a snippet is a clue, not a quotation). A client
+             *     names the library from `knowledge_base_id` and reads the text
+             *     back itself, through the same scope check as a model's read.
+             */
+            found?: {
+                knowledge_base_id: string;
+                knowledge_id: string;
+                chunk_id: string;
+                title: string;
+            }[];
+            /**
              * @description Each chunk a completed `knowledge_read` named, in the order first
              *     read. Such a read completes only with that chunk of that
              *     document, so the run read these back, as a citation or as

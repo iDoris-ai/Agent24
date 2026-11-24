@@ -6,6 +6,7 @@
 // conversation gets a real one first.
 
 import type { RunKnowledge } from './knowledge-grounding'
+import { asksAcrossLibraries } from './chat/cross-knowledge'
 import { runDocumentsOf, type RunDocuments } from './chat/DocumentsOutcome'
 
 /** M1 (Loop 5): a 4-bit model answered 「烧开水要多久」 from what it knew (0/3 on
@@ -21,8 +22,14 @@ const REMEMBER = /^\s*(请你|麻烦你|你帮我|请帮我|帮我|请|麻烦|�
 
 /** The run's prompt for a plain turn with Knowledge in effect. */
 export function knowledgePrompt(text: string): string {
-  return REMEMBER.test(text) ? text : `${KNOWLEDGE_HINT}\n${text}`
+  if (REMEMBER.test(text)) return text
+  return `${KNOWLEDGE_HINT}\n${asksAcrossLibraries(text) ? `${CROSS_HINT}\n` : ''}${text}`
 }
+
+/** L7-K1: a question across libraries (cross-knowledge.ts). Scope is not
+ * touched: the search already covers every library the user may use. */
+export const CROSS_HINT = '（这句话涉及不止一个知识库：检索结果里每条带 knowledge_base_id，按它分组，'
+  + '分别说明各库怎么说，再对照；每一点都要来自检索结果，哪个库没有就写没有，不要编。）'
 
 /** Asked to write something new (「写一篇八百字散文」「帮我起草一段介绍」): the
  * knowledge bases have nothing to add, so nothing is searched first (General,
