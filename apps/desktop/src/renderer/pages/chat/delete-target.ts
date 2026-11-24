@@ -28,7 +28,7 @@ export async function deleteTargetOf(api: Api, doc: { id: string; title: string 
   const name = /《([^》]{1,200})》/.exec(text)?.[1]?.trim()
   // 「这份」and the like: this conversation's document. A 《name》 that is not
   // this document's own is looked up: the user means that one.
-  if (doc && (!name || plainTitle(doc.title).includes(plainTitle(name)))) return { kind: 'one', id: doc.id, title: doc.title }
+  if (doc && (!name || plainTitle(doc.title) === plainTitle(name))) return { kind: 'one', id: doc.id, title: doc.title }
   if (!name) return null
   const listed = await api.request({ op: 'list', limit: 200 }).catch(() => null)
   if (!listed || !listed.ok) return { kind: 'none', text: '没能读取文档列表，这次没有删除任何文档。' }
