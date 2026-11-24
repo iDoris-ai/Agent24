@@ -37,7 +37,12 @@ interface Slot {
   upload: KnowledgeUpload
   /** Bumped when a cancel starts, so an older poll cannot overwrite it. */
   epoch: number
+  /** Polls spent waiting for the cost of a stopped job to become final; capped at COST_WAIT_POLLS. */
+  costPolls?: number
 }
+
+/** A stopped job's cost is read again for at most this many polls (10 minutes at 2 s), then left «暂未结算». */
+const COST_WAIT_POLLS = 300
 
 interface ParsedJob {
   jobId: string
@@ -181,7 +186,17 @@ async function readBody(response: Response, signal: AbortSignal): Promise<unknow
 function needsPoll(upload: KnowledgeUpload): boolean {
   if (upload.jobId === null) return false
   if (upload.state === 'saved' || upload.state === 'processing') return true
-  return upload.state === 'indexed' && upload.enrichment === 'running'
+  if (upload.state === 'indexed' && upload.enrichment === 'running') return true
+  // A job that has stopped is read again until its cost is final (W5.10: final always follows).
+  return (upload.state === 'indexed' || upload.state === 'cancelled' || upload.state === 'failed') && !upload.costFinal
+}
+
+/** needsPoll, with the wait for a stopped job's final cost bounded (it also stops on dispose, like every poll). */
+function slotNeedsPoll(slot: Slot): boolean {
+  if (!needsPoll(slot.upload)) return false
+  const waitingForCost = slot.upload.state === 'cancelled' || slot.upload.state === 'failed'
+    || (slot.upload.state === 'indexed' && slot.upload.enrichment !== 'running')
+  return !waitingForCost || (slot.costPolls ?? 0) < COST_WAIT_POLLS
 }
 
 function finished(upload: KnowledgeUpload): boolean {
@@ -250,7 +265,7 @@ export function knowledgeUploads(deps: UploadDeps): {
 
   function ensureTimer(): void {
     if (disposed || timer !== null || polling) return
-    if (!slots.some((slot) => needsPoll(slot.upload))) return
+    if (!slots.some((slot) => slotNeedsPoll(slot))) return
     timer = setTimer(() => {
       timer = null
       if (!disposed) void pollOnce()
@@ -325,17 +340,23 @@ export function knowledgeUploads(deps: UploadDeps): {
       markUnreachable(upload)
       return
     }
+    // A 2xx whose body cannot be used (cut off, too large, another request's, not a job): the upload may
+    // have landed, so it is unknown, never failed.
+    if (posted.status >= 200 && posted.status < 300) {
+      const job = posted.kind !== 'unreadable' && isObj(posted.json) && posted.json.request_id === requestId
+        ? parseJob(posted.json.job)
+        : null
+      if (!job) {
+        markUnreachable(upload)
+        return
+      }
+      adopt(upload, job)
+      upload.reason = job.status === 'failed' ? job.failureReason : null
+      return
+    }
     if (posted.kind === 'unreadable') {
       applyOutcome(upload, refusedOrFailed(posted.status, null))
       return
-    }
-    if (posted.status === 200 && isObj(posted.json) && posted.json.request_id === requestId) {
-      const job = parseJob(posted.json.job)
-      if (job) {
-        adopt(upload, job)
-        upload.reason = job.status === 'failed' ? job.failureReason : null
-        return
-      }
     }
     applyOutcome(upload, refusedOrFailed(posted.status, posted.json))
   }
@@ -440,7 +461,10 @@ export function knowledgeUploads(deps: UploadDeps): {
 
   async function pollOne(slot: Slot): Promise<void> {
     const jobId = slot.upload.jobId
-    if (!jobId || !needsPoll(slot.upload)) return
+    if (!jobId || !slotNeedsPoll(slot)) return
+    if (slot.upload.state === 'cancelled' || slot.upload.state === 'failed' || slot.upload.state === 'indexed') {
+      slot.costPolls = (slot.costPolls ?? 0) + 1
+    }
     const epoch = slot.epoch
     const provider = deps.provider()
     const credential = provider?.credential() ?? null
@@ -478,10 +502,10 @@ export function knowledgeUploads(deps: UploadDeps): {
     if (disposed) return
     polling = true
     try {
-      const due = slots.filter((slot) => needsPoll(slot.upload))
+      const due = slots.filter((slot) => slotNeedsPoll(slot))
       for (const slot of due) {
         if (disposed) return
-        if (!slots.includes(slot) || !needsPoll(slot.upload)) continue
+        if (!slots.includes(slot) || !slotNeedsPoll(slot)) continue
         await pollOne(slot)
       }
     } finally {

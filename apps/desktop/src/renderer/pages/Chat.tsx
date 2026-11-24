@@ -29,6 +29,10 @@ import { RestoreCard } from './chat/RestoreCard'
 import { CompareCard } from './chat/CompareCard'
 import { asksCompare, runCompare, type CompareCardData } from './chat/doc-compare'
 import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
+import { KnowledgeUploadCard } from './chat/KnowledgeUploadCard'
+import {
+  asksOnboarding, asksUpload, beginOnboard, nextOnboard, preflightReply, resultReply, type OnboardStep,
+} from './chat/knowledge-onboard'
 import { choiceText, deletePrompt, deleteTargetOf, type DeleteCandidate } from './chat/delete-target'
 import { extractFields, extractText, fieldNamesFromModel, type ExtractCardData } from './documents/doc-extract'
 import {
@@ -86,6 +90,8 @@ interface AssistantMessage {
   restore?: RestoreCardData
   /** L6-S05: the summary of a comparison, a line per change; text only in the history. */
   compare?: CompareCardData
+  /** L7-K2: upload after onboarding or 「上传文档」; the history keeps the text only. */
+  knowledgeUpload?: { uploadIds: string[] }
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -168,6 +174,8 @@ export default function ChatPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const draft = useKnowledgeDraft()
   const requestInFlight = useRef(false)
+  // L7-K2: onboarding in progress for this chat, keyed by session. Not the model.
+  const onboard = useRef(new Map<string, OnboardStep>())
   // Knowledge on: turns go to /runs, in a real session created once.
   const [awaitingApproval, setAwaitingApproval] = useState(false)
   const runSession = useRef<string | null>(null)
@@ -238,6 +246,45 @@ export default function ChatPage() {
     setCurrentTurn(Math.max(0, turns.length - 1))
   }, [messages, turns])
 
+  const ONBOARD_APP_ERROR = '开通没有成功（App 出错），稍后再试。'
+
+  /** A knowledge onboarding or upload turn. Null when this text is not one. */
+  const knowledgeTurn = async (said: string): Promise<AssistantMessage | null> => {
+    const api = window.agent24.knowledge
+    const ongoing = onboard.current.get(sessionId)
+    if (ongoing) {
+      const step = nextOnboard(ongoing, said)
+      if (step.run) {
+        // The flow ends here whatever the run answers: a failed run is not read as the next answer.
+        onboard.current.delete(sessionId)
+        const run = api?.onboardRun
+        if (!run) return { role: 'assistant', content: ONBOARD_APP_ERROR }
+        const result = await run(step.run)
+        return {
+          role: 'assistant',
+          content: resultReply(result, ongoing.types),
+          ...(result.ok ? { knowledgeUpload: { uploadIds: [] } } : {}),
+        }
+      }
+      if (step.state) onboard.current.set(sessionId, step.state)
+      else onboard.current.delete(sessionId)
+      return { role: 'assistant', content: step.reply }
+    }
+    if (asksOnboarding(said)) {
+      const preflight = api?.onboardPreflight
+      if (!preflight || !api?.onboardRun) return { role: 'assistant', content: ONBOARD_APP_ERROR }
+      const blocked = preflightReply(await preflight())
+      if (blocked) return { role: 'assistant', content: blocked }
+      const started = beginOnboard(said)
+      onboard.current.set(sessionId, started.state)
+      return { role: 'assistant', content: started.reply }
+    }
+    if (asksUpload(said)) {
+      return { role: 'assistant', content: '选择要放进知识库的文档：', knowledgeUpload: { uploadIds: [] } }
+    }
+    return null
+  }
+
   /** `answer`: the model answers, never the extraction (the card's 「让助手回答」). */
   /** `chosen`: L6-F2, the document picked on a delete choice card. */
   const send = async (text: string, answer = false, chosen: { id: string; title: string } | null = null) => {
@@ -251,6 +298,28 @@ export default function ChatPage() {
     draft.apply(request)
     setMessages(prev => [...prev, userMsg])
     setInput('')
+    // L7-K2: onboarding and upload stay in the chat and never go to the model.
+    // Not when `answer` is set (the extraction card's 「让助手回答」).
+    if (!answer) {
+      const said = text.trim()
+      if (chosen === null && (onboard.current.has(sessionId) || asksOnboarding(said) || asksUpload(said))) {
+        const index = messages.length
+        requestInFlight.current = true
+        setLoading(true)
+        let reply: AssistantMessage
+        try {
+          reply = await knowledgeTurn(said) ?? { role: 'assistant', content: ONBOARD_APP_ERROR }
+        } catch {
+          reply = { role: 'assistant', content: ONBOARD_APP_ERROR }
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, reply])
+        return
+      }
+    }
     // F1: a conversation about a document carries its text with each turn.
     const doc = documentOf(sessionId)
     // L6-F5: 「回到上一个版本」 — the App finds the version and offers it on a
@@ -888,6 +957,12 @@ export default function ChatPage() {
                 }} /></>
                 : m.role === 'assistant' && m.deleteChoice ? <><Markdown text={m.content} /><DeleteChoice candidates={m.deleteChoice} onPick={loading || archived ? undefined : (c, n) => {
                   void send(`删除第 ${n} 份：《${c.title}》（导入于 ${c.importedAt}）`, false, { id: c.id, title: c.title })
+                }} /></>
+                : m.role === 'assistant' && m.knowledgeUpload ? <><Markdown text={m.content} /><KnowledgeUploadCard uploadIds={m.knowledgeUpload.uploadIds} onPicked={(ids) => {
+                  if (ids.length === 0) return
+                  setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' && p.knowledgeUpload
+                    ? { ...p, knowledgeUpload: { uploadIds: [...p.knowledgeUpload.uploadIds, ...ids] } }
+                    : p)))
                 }} /></>
                 : m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
               {m.role === 'assistant' && m.detail && (

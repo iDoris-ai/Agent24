@@ -335,7 +335,7 @@ describe('knowledge upload (L7-K2 A3)', () => {
     put(h, filePath, text)
     h.queue.ingest.push({ status: 200, body: saved({ status: 'saved', enrichment: 'none' }) })
     h.queue.get.push({ status: 200, body: saved({ status: 'processing', enrichment: 'none' }) })
-    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none' }) })
+    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none', cost: { final: true, items: [item('exact', 0)] } }) })
     const [upload] = await h.uploads.add([filePath])
     const body = h.calls[0].json
     expect(h.calls[0].url).toBe(`${ORIGIN}/api/v1/agent24/knowledge/ingest`)
@@ -382,7 +382,7 @@ describe('knowledge upload (L7-K2 A3)', () => {
     const h = harness()
     put(h, '/tmp/docs/notes.md')
     h.queue.ingest.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'running' }) })
-    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none' }) })
+    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none', cost: { final: true, items: [item('exact', 0)] } }) })
     expect((await h.uploads.add(['/tmp/docs/notes.md']))[0].enrichment).toBe('running')
     expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(true)
     await h.firePoll()
@@ -430,6 +430,28 @@ describe('knowledge upload (L7-K2 A3)', () => {
     expect(upload).toMatchObject({ state: 'unknown', reason: 'unreachable', jobId: null })
     expect(upload.state).not.toBe('failed')
     expect(h.calls).toHaveLength(1)
+  })
+
+  it('a 200 whose body cannot be used is unknown, never failed: the upload may have landed', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md')
+    put(h, '/tmp/docs/b.md')
+    h.queue.ingest.push({ status: 200 }) // empty body: cut off after the status line
+    h.queue.ingest.push({ status: 200, body: { request_id: 'someone-else', job: job() } })
+    const [a, b] = await h.uploads.add(['/tmp/docs/a.md', '/tmp/docs/b.md'])
+    expect(a).toMatchObject({ state: 'unknown', reason: 'unreachable' })
+    expect(b).toMatchObject({ state: 'unknown', reason: 'unreachable' })
+  })
+
+  it('any 2xx is read the same way: 202 with a job is saved, 204 with no body is unknown', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md')
+    put(h, '/tmp/docs/b.md')
+    h.queue.ingest.push({ status: 202, body: saved() })
+    h.queue.ingest.push({ status: 204 })
+    const [a, b] = await h.uploads.add(['/tmp/docs/a.md', '/tmp/docs/b.md'])
+    expect(a).toMatchObject({ state: 'saved' })
+    expect(b).toMatchObject({ state: 'unknown', reason: 'unreachable' })
   })
 
   it('reports a timeout as unknown', async () => {
@@ -545,6 +567,49 @@ describe('knowledge upload (L7-K2 A3)', () => {
       jobId: 'job-1',
     })
     expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+  })
+
+  it('keeps polling a cancelled job until its cost is final (W5.10), then stops', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md', 'a')
+    h.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-a' }) })
+    const [added] = await h.uploads.add(['/tmp/docs/a.md'])
+    h.queue.cancel.push({
+      status: 200,
+      body: (req) => ({
+        request_id: req.request_id, cancel_effect: 'cancelled',
+        job: job({ job_id: 'job-a', status: 'cancelled', cost: { final: false, items: [item('unknown', null)] } }),
+      }),
+    })
+    expect(await h.uploads.cancel(added.uploadId)).toMatchObject({ state: 'cancelled', costFinal: false })
+    h.queue.get.push({
+      status: 200,
+      body: saved({ job_id: 'job-a', status: 'cancelled', cost: { final: true, items: [item('exact', 120)] } }),
+    })
+    await h.firePoll()
+    expect(h.uploads.list()[0]).toMatchObject({ state: 'cancelled', costFinal: true, costZero: false })
+    expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+  })
+
+  it('stops waiting for a final cost after 300 polls, and on dispose', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md', 'a')
+    h.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-a', status: 'cancelled', cost: { final: false, items: [] } }) })
+    await h.uploads.add(['/tmp/docs/a.md'])
+    for (let i = 0; i < 300; i++) {
+      h.queue.get.push({ status: 200, body: saved({ job_id: 'job-a', status: 'cancelled', cost: { final: false, items: [] } }) })
+      await h.firePoll()
+    }
+    expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+    expect(h.uploads.list()[0]).toMatchObject({ state: 'cancelled', costFinal: false })
+
+    const d = harness()
+    put(d, '/tmp/docs/b.md', 'b')
+    d.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-b', status: 'cancelled', cost: { final: false, items: [] } }) })
+    await d.uploads.add(['/tmp/docs/b.md'])
+    expect(d.timers.some((timer) => timer.ms === 2_000)).toBe(true)
+    d.uploads.dispose()
+    expect(d.timers.some((timer) => timer.ms === 2_000)).toBe(false)
   })
 
   it('cancel takes the job and the cost from the answer', async () => {

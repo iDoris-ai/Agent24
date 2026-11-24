@@ -95,6 +95,20 @@ describe('KnowledgeController (M3)', () => {
     expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-SECRET')
   })
 
+  it('L7-K2 adopt: overtaken after its own write is never bound (the switch going Off mid-write)', async () => {
+    for (const ticks of [0, 1, 2, 3, 6, 10]) {
+      fs.rmSync(path.join(dir, 'knowledge-settings.json'), { force: true })
+      await logins.remove(KNOWLEDGE_BINDING)
+      const controller = make()
+      const adopted = controller.adopt({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-default'], apiKey: 'sk-ONBOARD' })
+      for (let i = 0; i < ticks; i++) await new Promise((resolve) => setImmediate(resolve))
+      const off = controller.setEnabled(false)
+      const result = await adopted
+      await off
+      expect(result.saved === true || (result.saved === false && result.reason === 'overtaken'), `ticks=${ticks}`).toBe(true)
+    }
+  })
+
   it('tells listeners after every change, with the new settings already in effect (KB-C2-03)', async () => {
     const controller = make()
     const seen: Array<{ enabled: boolean; endpoint: string }> = []

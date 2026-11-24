@@ -284,9 +284,13 @@ export class KnowledgeController {
     } catch {
       return { saved: false, reason: 'not_saved' }
     }
-    // Nothing written, or a later change overtook this write: bound only when an endpoint is in place now.
-    // Another change with no endpoint (say, the switch) is `overtaken`: onboarding may simply run again.
-    if (!wrote || mine !== this.version) {
+    // This write landed but a later change overtook it: what ends up saved is that change's, maybe a snapshot
+    // taken before this write. Never `bound` from onboarding's own endpoint: `overtaken`, and onboarding keeps
+    // its files to run again.
+    if (wrote && mine !== this.version) return { saved: false, reason: 'overtaken' }
+    // Nothing written: bound when an endpoint is in place now (the user's own); otherwise another change
+    // without one (say, the switch) went first, and onboarding may simply run again.
+    if (!wrote) {
       const bound = this.settings.endpoint !== '' || this.store.load().endpoint !== ''
       return { saved: false, reason: bound ? 'bound' : 'overtaken' }
     }
