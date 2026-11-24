@@ -240,3 +240,5 @@
 - [ ] FU-204 · B · src=L7-K0 · 2026-11-24 · run 带受限来源（召回了受限/未知记忆）时，知识库检索被出站检查拒绝（daemon 没装活的 EgressGate，见 FU-183 查明）；现在只是如实告诉用户「检索没能进行」。要让这类 run 也能查知识库，需给 daemon 装 gate 并按库的端点授权（安全设计，先走证据裁决）。另：首查被拒时没有告诉模型，模型可能说「知识库里没有」；桌面事实行已写明，模型措辞不管。
 - [ ] FU-205 · C · src=PR-Daemon #2047 · 2026-11-24 · `documents.fill` 的 `save_to=original`：`expect_revision` 取执行时的 head，不是审批卡上看到的版本，批准间隔内有人存新版会被覆盖（历史保留、可恢复；与 FU-191 部分重叠）。改法：审批时记下 head 并在执行时校验。
 - [ ] FU-206 · C · src=PR-Daemon #2047 · 2026-11-24 · compare 对 PDF/图片会建并落盘文本层（FU-199），却在 `first_party_reads.rs` 归为免审批只读，而同样建层的 read_range/find 是 External：至少在该文件写明理由。另：单侧 unit 上限（5000，payload_too_large 的 422）的路由级测试未补（需构造超大 docx）。
+- [ ] FU-211 · C · src=PR-Daemon #2052 · 2026-11-24 · compare 的 `MAX_UNITS` 只限条数不限 Replace 组 n×m 的 ratio() 工作量（已在 blocking 线程，不饿死运行时）：可限 Replace 组内打分对数。
+- [ ] FU-212 · C · src=PR-Daemon #2052 · 2026-11-24 · compare 超限 422 复用 `payload_too_large`（闭集里没有别的码），桌面主进程里同名码指 502 超大响应，且 message 是英文：换独立码或补桌面中文映射。
