@@ -3199,6 +3199,20 @@ export interface components {
             /** @description Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on. */
             found_titles: string[];
             /**
+             * @description L7-K1. Optional so a client that meets an older daemon reads it as
+             *     absent. Where the passages of the completed searches sit, each
+             *     (library, document, chunk) once, the first eight: ids and a title, never
+             *     the passage text (a snippet is a clue, not a quotation). A client
+             *     names the library from `knowledge_base_id` and reads the text
+             *     back itself, through the same scope check as a model's read.
+             */
+            found?: {
+                knowledge_base_id: string;
+                knowledge_id: string;
+                chunk_id: string;
+                title: string;
+            }[];
+            /**
              * @description Each chunk a completed `knowledge_read` named, in the order first
              *     read. Such a read completes only with that chunk of that
              *     document, so the run read these back, as a citation or as
