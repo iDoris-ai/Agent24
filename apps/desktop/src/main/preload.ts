@@ -18,6 +18,8 @@ import {
   type DocumentsModuleStatus,
   type OsPackageProgress,
   type KnowledgeConfigureInput,
+  type KnowledgeOnboardPreflight,
+  type KnowledgeOnboardResult,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
   type KnowledgeViewBounds,
@@ -261,6 +263,11 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+    /** L7-K2: mock onboarding. The activation code and the key stay in main. */
+    onboardPreflight: (): Promise<KnowledgeOnboardPreflight> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeOnboardPreflight),
+    onboardRun: (input: { localOnly: boolean }): Promise<KnowledgeOnboardResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeOnboardRun, input),
   },
   // KB-C2-03: where to draw the KnowledgeView; main owns everything else.
   knowledgeView: {

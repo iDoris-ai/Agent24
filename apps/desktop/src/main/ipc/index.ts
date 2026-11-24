@@ -40,6 +40,8 @@ import type {
   CommImportPickResult,
   DocumentsModuleStatus,
   OsPackageProgress,
+  KnowledgeOnboardPreflight,
+  KnowledgeOnboardResult,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -614,11 +616,23 @@ function moduleActionResponse(result: ModuleActionResult, externalDaemon: boolea
   return { ok: false, status, data: { error: { code: result.code, message: `${mt('err.docmodFailed', { reason: clip(result.message, 300) })}${hint}` } } }
 }
 
+/** The renderer may send only `{ localOnly: boolean }`. */
+function isKnowledgeOnboardRun(input: unknown): input is { localOnly: boolean } {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return false
+  const keys = Object.keys(input)
+  return keys.length === 1 && keys[0] === 'localOnly' && typeof (input as { localOnly?: unknown }).localOnly === 'boolean'
+}
+
 export function registerIpcHandlers(options: {
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** L7-K2: mock onboarding, built in main with the userData dir and net.fetch. */
+  knowledgeOnboard?: {
+    preflight: () => Promise<KnowledgeOnboardPreflight>
+    run: (input: { localOnly: boolean }) => Promise<KnowledgeOnboardResult>
+  }
   /** QA 0.6.1 §3c: why the service daemon did not enrol this app, if it did not. */
   backendRefusal?: () => BackendRefusalResult | null
   /** M4 A6: the conversation a schedule's runs go to (schedule-conversations.ts). */
@@ -671,6 +685,7 @@ export function registerIpcHandlers(options: {
   const promptHomeImportPassword = options.promptHomeImportPassword ?? openHomeImportPasswordWindow
   const exportTimeout = options.exportTimeoutMs ?? { current: EXPORT_TIMEOUT_MS }
   const knowledge = options.knowledge ?? (() => null)
+  const knowledgeOnboard = options.knowledgeOnboard ?? null
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
@@ -852,6 +867,20 @@ export function registerIpcHandlers(options: {
       return Promise.resolve({ ok: false, reason: controller ? 'invalid' : 'unavailable' })
     }
     return controller.setEnabled(enabled)
+  })
+  handle(IpcChannels.KnowledgeOnboardPreflight, (): Promise<KnowledgeOnboardPreflight> => (
+    knowledgeOnboard?.preflight() ?? Promise.resolve({
+      activated: false,
+      invalidActivation: false,
+      alreadyBound: false,
+      reachable: null,
+      formats: ['md', 'markdown', 'txt'] as const,
+      maxBytes: 10_485_760,
+    })
+  ))
+  handle(IpcChannels.KnowledgeOnboardRun, (_event, input: unknown): Promise<KnowledgeOnboardResult> => {
+    if (!knowledgeOnboard || !isKnowledgeOnboardRun(input)) return Promise.resolve({ ok: false, code: 'unavailable' })
+    return knowledgeOnboard.run(input)
   })
 
   // Executable installation is elevated and must never use the generic proxy.
