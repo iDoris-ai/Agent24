@@ -249,6 +249,11 @@
 - [ ] FU-209 · C · src=L7-K1 · 2026-11-24 · 跨库后续：按库加权、按库排除；把引用写进文档正文的一键操作；写进 DOCX 批注（目前只在设计文档里，没有实现）。
 - [ ] FU-217 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts 的 `plainTitle` 去扩展名：打开 发票.docx 时说《发票.pdf》会命中打开的那份。改法：比较时带上扩展名或媒体类型。
 - [ ] FU-218 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts：《“”》这类空名，库查找里 `includes('')` 命中所有文档；空名应直接返回 none。
+- [ ] FU-219 · **P1** · src=L7-K1 #2053 PR-Daemon Low 1+2 · 2026-11-24 · 设置页库名两处会踩到（下个小包就修）：①`kb-names.ts` 里 `=` 优先于空白，「kb-1 制度=库」被解析成 id=`kb-1 制度`、name=`库`，名称悄悄丢失、设置框回显原样所以看不出（注释「first blank」也与实现不符），改为取 `=` 与第一个空白中靠前的；②`names[id]` 对普通 `{}` 取值，绑定 id 恰为 `constructor`/`toString` 时标签变成函数源码，改用 `Object.hasOwn`。判据：两种写法都有单测，id 为 constructor 时显示「知识库 N」。
+- [ ] FU-220 · C · src=L7-K1 #2053 Low 3 · 2026-11-24 · `found` 封顶 8 条而事实行写「找到 N 段」（`found_passages` 不封顶），卡片最多 8 行且不说明截断。`found_passages > found.length` 时加一行「仅列前 8 段」。
+- [ ] FU-221 · C · src=L7-K1 #2053 Low 4 · 2026-11-24 · `saveKbNames` 在 `configure` 之前落盘，`configure` 失败时名称表已写；已解绑 id 的名称不清理。改为 configure 成功后再存、保存时只留绑定的 id。
+- [ ] FU-222 · C · src=L7-K1 #2053 Low 5+6 · 2026-11-24 · 引用卡的标签按渲染时的绑定表算而非 run 当时的绑定；`status()` 返回前短暂全读「知识库」；多个未绑定库同名成多组分不出。每张卡各调一次 `knowledge.status()`（长对话 N 次 IPC，可由 Chat 统一取一次传 `bound`）。知识问答转后台任务（ongoing → TaskCard）时只有事实行、没有引用卡；`cited` 与 `facts` 一样只在内存里，重开已存对话后卡消失。
+- [ ] FU-223 · C · src=L7-K1 #2053 Nit · 2026-11-24 · 泰语 `libraryNamesHint` 只写了 `ID=ชื่อ`，缺「ID 名称」写法和「知识库 1、2…」退回说明；`Chat.tsx` 的 `cited` 接线缺 Chat 级测试（`withKnowledge` 开/关各一条）。
 - [ ] FU-224 · C · src=PR-Daemon #2048 · 2026-11-24 · 「删掉第 N 段」现在是把该段 text 置空、留一个空段（documents.patch 不能真的移除段落；编号段仍占号）。真正的段落移除（含区间「删第 2 到 5 段」「把第3段删了，第4段保留」）要模块支持。判据：删后文档里该段不再占位。
 - [ ] FU-225 · C · src=PR-Daemon #2055（APPROVE 的非阻塞） · 2026-11-24 · asksDeleteParagraph 的判断粒度：问句词与撤回词（NOT_DELETE：算了/不对/开玩笑）应在去掉《…》后的整句判，只有 PART_NEGATED（不要/别…）按含删除的那一小句判；现在逗号后的问句（「删掉第3段，会不会影响合同」）不拦，「第3段删掉，算了」与「第 3 段删掉算了」结果不一致。小句切分再补 `；;、：:\n（）()—` 与空白。判据：每种切分各补逗号/无逗号成对测试。
 - [ ] FU-226 · C · src=L7-K3 KB-C3-EVAL · 2026-11-24 · 演示库（bge-m3）中文问英文文档时，原问题检索前 5 段常没有那份英文文档（评估 Q06 EPA、Q09 英国自报税；多查询改写后能补上）。改法先和 Knowledge 线定：检索侧多语言改写或加大 top-k，还是在 Agent 侧补一次改写查询。判据：两题原问题前 5 段命中目标文档。见 docs/knowledge/KB-C3-EVAL-2026-11.md。
