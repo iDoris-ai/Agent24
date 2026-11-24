@@ -24,6 +24,7 @@
 #   Desktop / packages tests: rust/apps/agent24-documents/{tests/fixtures,domain-os.yml},
 #     rust/Cargo.toml, docs/capabilities, docs/adr, docs/documenting/samples, skills/**.
 set -euo pipefail
+echo "CI-01 反面对照：故意失败" >&2; exit 1
 
 rust=false contract_rust=false typecheck=false contract_node=false all=false
 seen=false
