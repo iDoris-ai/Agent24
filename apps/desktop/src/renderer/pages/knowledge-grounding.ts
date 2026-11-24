@@ -49,17 +49,17 @@ export function grounding(text: string, knowledge: RunKnowledge | null): Groundi
  * which passage the answer used: only what was found. null: no search to
  * speak of (none asked, or only passages read back). */
 export type KnowledgeFacts =
-  | { kind: 'refused' }
+  | { kind: 'refused'; reason: 'policy' | 'failed' }
   | { kind: 'none' }
   | { kind: 'found'; passages: number; titles: string[] }
 
 /** The record's L7-K0 fields, optional so a daemon without them reads as
  * 「nothing to say」 (they arrive with the daemon's `search_refused`). */
-type RunKnowledgeFacts = RunKnowledge & { search_refused?: boolean; found_passages?: number; found_titles?: string[] }
+type RunKnowledgeFacts = RunKnowledge & { search_refused?: boolean; search_refusal?: string; found_passages?: number; found_titles?: string[] }
 
 export function knowledgeFacts(knowledge: RunKnowledgeFacts | null | undefined): KnowledgeFacts | null {
   if (!knowledge) return null
-  if (knowledge.search_refused === true) return { kind: 'refused' }
+  if (knowledge.search_refused === true) return { kind: 'refused', reason: knowledge.search_refusal === 'policy' ? 'policy' : 'failed' }
   if (!knowledge.searched) return null
   const passages = typeof knowledge.found_passages === 'number' ? knowledge.found_passages : 0
   if (passages > 0) {

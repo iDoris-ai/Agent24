@@ -3194,6 +3194,14 @@ export interface components {
              *     「检索没能进行」, never 「知识库里没有」.
              */
             search_refused: boolean;
+            /**
+             * @description L7-K1. Why, when `search_refused` is true: `policy` (the outbound
+             *     check refused it) or `failed` (it ran and failed). A policy
+             *     refusal wins when both happened. Absent when not refused, and
+             *     from an older daemon.
+             * @enum {string}
+             */
+            search_refusal?: "policy" | "failed";
             /** @description Passages the completed searches of the run returned, each (document, chunk) once. 0 with searched true means none found. */
             found_passages: number;
             /** @description Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on. */

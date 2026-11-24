@@ -238,13 +238,21 @@
 - [ ] FU-203 · C · src=PR-Daemon #2044 · 2026-11-24 · 授权清单表测只绑了 DOC_AGENT_TOOLS：加一条由 domain-os.yml 驱动的表测，把 first_party_reads.rs 的 DOCUMENTS_READS、approval-dialog.ts 的 READ_ONLY / NAMED_BY_TITLE / TOOL_KEYS 也绑上，新增只读工具漏一张表就变红。
 - [ ] FU-202 · C · src=L6-S05 0.6.111 真机（General 11-24） · 2026-11-24 · 文档页勾两份 PDF 时，「合并所选」和「对比所选的两份」同时出现，顶部一排按钮和状态文字挤在一起换行；手滑点到「合并所选」会立刻生成一份合并 PDF。改法：顶部按钮区允许换行并分组；合并前加确认。判据：两份 PDF 勾选时按钮不挤；合并要先确认。
 - [ ] FU-204 · B · src=L7-K0 · 2026-11-24 · run 带受限来源（召回了受限/未知记忆）时，知识库检索被出站检查拒绝（daemon 没装活的 EgressGate，见 FU-183 查明）；现在只是如实告诉用户「检索没能进行」。要让这类 run 也能查知识库，需给 daemon 装 gate 并按库的端点授权（安全设计，先走证据裁决）。另：首查被拒时没有告诉模型，模型可能说「知识库里没有」；桌面事实行已写明，模型措辞不管。
+- [ ] FU-213 · C · src=PR-Daemon #2047 · 2026-11-24 · `documents.fill` 的 `save_to=original`：`expect_revision` 取执行时的 head，不是审批卡上看到的版本，批准间隔内有人存新版会被覆盖（历史保留、可恢复；与 FU-191 部分重叠）。改法：审批时记下 head 并在执行时校验。
+- [ ] FU-214 · C · src=PR-Daemon #2047 · 2026-11-24 · compare 对 PDF/图片会建并落盘文本层（FU-199），却在 `first_party_reads.rs` 归为免审批只读，而同样建层的 read_range/find 是 External：至少在该文件写明理由。另：单侧 unit 上限（5000，payload_too_large 的 422）的路由级测试未补（需构造超大 docx）。
+- [ ] FU-215 · C · src=PR-Daemon #2052 · 2026-11-24 · compare 的 `MAX_UNITS` 只限条数不限 Replace 组 n×m 的 ratio() 工作量（已在 blocking 线程，不饿死运行时）：可限 Replace 组内打分对数。
+- [ ] FU-216 · C · src=PR-Daemon #2052 · 2026-11-24 · compare 超限 422 复用 `payload_too_large`（闭集里没有别的码），桌面主进程里同名码指 502 超大响应，且 message 是英文：换独立码或补桌面中文映射。
 - [ ] FU-205 · C · src=L7-K0 0.6.113 真机（General 11-24） · 2026-11-24 · 事实行「找到 N 段」在问题与库无关时有误导：问「量子纠缠态的退相干时间是多少」（库里无此主题）仍写「找到 3 段（《…》《…》）」，因为向量检索总返回最近的 K 段、没有相关度阈值。0 段这一态只有单测覆盖，真机造不出。改法：和 Knowledge 线对检索相关度阈值，或事实行在分数很低时写「找到的内容相关度低」。判据：问库里没有的主题，行写「没找到」或标明相关度低。
 - [ ] FU-206 · C · src=L7-K0 0.6.113 真机 · 2026-11-24 · FU-139「已生成」「已保存」行可点开，真机未验（本地 8B 不稳定地发出 patch/compose 调用，没有生成文档就没有这一行）；单测覆盖点击后 pendingDocFocus 与 open('documents')。换大模型或有稳定造法后补验。另：改写卡拒绝按钮偶尔点不上（General 观察，未复现原因）。
 - [ ] FU-207 · B · src=L7-K1 · 2026-11-24 · 引文一键复制：引用卡只复制出处（库名 · 文档名 · 第 n 段命中），不含引文。要复制引文需新增 run 范围的读路由（复用 call::read + 出站闸门 + content_tag），安全类；第一版按证据裁决只做出处。判据：卡上点「复制引文」取到 knowledge_read 正文，读未绑定库/受限 run 被拒。
 - [ ] FU-208 · C · src=L7-K1 · 2026-11-24 · 库名来源：hit 的 display 只有 title/file_name，现在库名靠设置页用户自填（本机）。要自动带库名，需 WeKnora 侧在 hit 或就绪响应里带库名（改契约/fork）。另：卡上「点开」只能打开知识页，内嵌页没有按文档的深链。
 - [ ] FU-209 · C · src=L7-K1 · 2026-11-24 · 跨库后续：按库加权、按库排除；把引用写进文档正文的一键操作；写进 DOCX 批注（目前只在设计文档里，没有实现）。
+- [ ] FU-217 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts 的 `plainTitle` 去扩展名：打开 发票.docx 时说《发票.pdf》会命中打开的那份。改法：比较时带上扩展名或媒体类型。
+- [ ] FU-218 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts：《“”》这类空名，库查找里 `includes('')` 命中所有文档；空名应直接返回 none。
 - [ ] FU-219 · **P1** · src=L7-K1 #2053 PR-Daemon Low 1+2 · 2026-11-24 · 设置页库名两处会踩到（下个小包就修）：①`kb-names.ts` 里 `=` 优先于空白，「kb-1 制度=库」被解析成 id=`kb-1 制度`、name=`库`，名称悄悄丢失、设置框回显原样所以看不出（注释「first blank」也与实现不符），改为取 `=` 与第一个空白中靠前的；②`names[id]` 对普通 `{}` 取值，绑定 id 恰为 `constructor`/`toString` 时标签变成函数源码，改用 `Object.hasOwn`。判据：两种写法都有单测，id 为 constructor 时显示「知识库 N」。
 - [ ] FU-220 · C · src=L7-K1 #2053 Low 3 · 2026-11-24 · `found` 封顶 8 条而事实行写「找到 N 段」（`found_passages` 不封顶），卡片最多 8 行且不说明截断。`found_passages > found.length` 时加一行「仅列前 8 段」。
 - [ ] FU-221 · C · src=L7-K1 #2053 Low 4 · 2026-11-24 · `saveKbNames` 在 `configure` 之前落盘，`configure` 失败时名称表已写；已解绑 id 的名称不清理。改为 configure 成功后再存、保存时只留绑定的 id。
 - [ ] FU-222 · C · src=L7-K1 #2053 Low 5+6 · 2026-11-24 · 引用卡的标签按渲染时的绑定表算而非 run 当时的绑定；`status()` 返回前短暂全读「知识库」；多个未绑定库同名成多组分不出。每张卡各调一次 `knowledge.status()`（长对话 N 次 IPC，可由 Chat 统一取一次传 `bound`）。知识问答转后台任务（ongoing → TaskCard）时只有事实行、没有引用卡；`cited` 与 `facts` 一样只在内存里，重开已存对话后卡消失。
 - [ ] FU-223 · C · src=L7-K1 #2053 Nit · 2026-11-24 · 泰语 `libraryNamesHint` 只写了 `ID=ชื่อ`，缺「ID 名称」写法和「知识库 1、2…」退回说明；`Chat.tsx` 的 `cited` 接线缺 Chat 级测试（`withKnowledge` 开/关各一条）。
+- [ ] FU-224 · C · src=PR-Daemon #2048 · 2026-11-24 · 「删掉第 N 段」现在是把该段 text 置空、留一个空段（documents.patch 不能真的移除段落；编号段仍占号）。真正的段落移除（含区间「删第 2 到 5 段」「把第3段删了，第4段保留」）要模块支持。判据：删后文档里该段不再占位。
+- [ ] FU-225 · C · src=PR-Daemon #2055（APPROVE 的非阻塞） · 2026-11-24 · asksDeleteParagraph 的判断粒度：问句词与撤回词（NOT_DELETE：算了/不对/开玩笑）应在去掉《…》后的整句判，只有 PART_NEGATED（不要/别…）按含删除的那一小句判；现在逗号后的问句（「删掉第3段，会不会影响合同」）不拦，「第3段删掉，算了」与「第 3 段删掉算了」结果不一致。小句切分再补 `；;、：:\n（）()—` 与空白。判据：每种切分各补逗号/无逗号成对测试。

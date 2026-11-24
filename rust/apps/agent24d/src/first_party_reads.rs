@@ -27,6 +27,10 @@ use sha2::{Digest, Sha256};
 
 /// The first-party module, and its tools the host knows to only read.
 pub const MODULE: &str = "documents";
+/// `compare` is here although, for a PDF or image, it builds and stores the
+/// text layer: that is a cache derived from the document, nothing the user
+/// has not already put in the library, and it sends nothing out (unlike
+/// `read_range` / `find`, which stay External).
 pub const DOCUMENTS_READS: &[&str] = &["get", "fields", "list", "paragraphs", "compare"];
 /// The program of the package, relative to its directory.
 const PROGRAM: &str = "bin/agent24-documents";
