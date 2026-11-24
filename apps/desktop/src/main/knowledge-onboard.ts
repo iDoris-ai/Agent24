@@ -6,7 +6,7 @@
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
-import { validEndpoint, type KnowledgeController } from './knowledge-settings'
+import { validEndpoint, validKnowledgeBaseIds, type KnowledgeController } from './knowledge-settings'
 import type { KnowledgeOnboardPreflight, KnowledgeOnboardResult } from '../shared/ipc-types'
 
 export type OnboardPreflight = KnowledgeOnboardPreflight
@@ -159,7 +159,7 @@ function inProgress(json: unknown): boolean {
 function parseSuccess(json: unknown): { knowledgeBaseId: string; outcome: 'created' | 'existing'; apiKey: string; configMismatch: boolean } | null {
   if (!isPlain(json)) return null
   const knowledgeBaseId = json.knowledge_base_id
-  if (typeof knowledgeBaseId !== 'string' || knowledgeBaseId.length < 1 || knowledgeBaseId.length > 256) return null
+  if (typeof knowledgeBaseId !== 'string' || !validKnowledgeBaseIds([knowledgeBaseId])) return null
   if (json.outcome !== 'created' && json.outcome !== 'existing') return null
   if (!isPlain(json.credential) || typeof json.credential.api_key !== 'string' || !API_KEY.test(json.credential.api_key)) return null
   if (json.details !== undefined && !isPlain(json.details)) return null
@@ -281,22 +281,30 @@ async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promis
       continue
     }
     if (posted.kind !== 'ok') return { ok: false, code: posted.kind }
-    const saved = await controller.configure({
+    // One write, judged inside the controller's write queue: a user's own save that landed during the
+    // network call wins, and onboarding then reports already_bound instead of overwriting it.
+    const adopted = await controller.adopt({
       endpoint: activation.endpoint,
       knowledgeBaseIds: [posted.knowledgeBaseId],
       apiKey: posted.apiKey,
     })
-    if (!saved.ok) return { ok: false, code: 'not_saved' }
-    const enabled = await controller.setEnabled(true)
-    if (!enabled.ok) return { ok: false, code: 'not_saved' }
-    // Delete only once the binding is saved. A network failure or a failed save keeps the key,
-    // because the server may already have created the base and the next run continues it.
-    try {
-      await fs.promises.rm(pendingPath(deps.dir), { force: true })
-    } catch {
-      // The binding is saved. A leftover key is unused while the endpoint stays set.
+    if (!adopted.saved) {
+      if (adopted.reason === 'bound') return { ok: false, code: 'already_bound' }
+      return { ok: false, code: adopted.reason === 'invalid' ? 'server_error' : 'not_saved' }
     }
-    return { ok: true, outcome: posted.outcome, knowledgeBaseId: posted.knowledgeBaseId, configMismatch: posted.configMismatch }
+    // Saved: the pending key and the activation file are spent. A daemon that did not take the binding yet
+    // (not up) takes it later from the saved settings, so this is still a success.
+    for (const file of [pendingPath(deps.dir), activationPath(deps.dir)]) {
+      try {
+        await fs.promises.rm(file, { force: true })
+      } catch {
+        // Best effort: the endpoint is set now, so a later run stops at already_bound before using either file.
+      }
+    }
+    return {
+      ok: true, outcome: posted.outcome, knowledgeBaseId: posted.knowledgeBaseId, configMismatch: posted.configMismatch,
+      activeNow: adopted.result.ok,
+    }
   }
   return { ok: false, code: 'in_progress' }
 }
@@ -309,6 +317,8 @@ export function knowledgeOnboarding(deps: OnboardDeps): {
   return {
     preflight: () => preflight(deps),
     run: (input) => {
+      // Local only never reaches the network: it is answered on its own, not folded into a remote run.
+      if (input.localOnly) return Promise.resolve({ ok: false, code: 'local_only_unavailable' })
       inflight ??= execute(deps, input).finally(() => { inflight = null })
       return inflight
     },

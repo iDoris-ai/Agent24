@@ -249,7 +249,8 @@ export interface KnowledgeOnboardPreflight {
 
 /** L7-K2 result. A success names the knowledge base only — never the key or the code. */
 export type KnowledgeOnboardResult =
-  | { ok: true; outcome: 'created' | 'existing'; knowledgeBaseId: string; configMismatch: boolean }
+  /** activeNow: the daemon took the binding now; false when it was not up and takes it later from the saved settings. */
+  | { ok: true; outcome: 'created' | 'existing'; knowledgeBaseId: string; configMismatch: boolean; activeNow: boolean }
   | {
     ok: false
     code:

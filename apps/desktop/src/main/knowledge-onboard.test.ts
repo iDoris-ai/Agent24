@@ -58,8 +58,7 @@ describe('knowledge onboarding (L7-K2)', () => {
   function harness(opts: {
     responses?: Scripted[]
     endpoint?: string
-    configureOk?: boolean
-    enableOk?: boolean
+    adoptAs?: 'ok' | 'inactive' | 'bound' | 'not_saved'
     controller?: boolean
   } = {}): {
     calls: Array<{ url: string; init: RequestInit }>
@@ -83,20 +82,17 @@ describe('knowledge onboarding (L7-K2)', () => {
       if (!response || response.throw) throw new Error('network')
       return new Response(response.body === undefined ? '' : JSON.stringify(response.body), { status: response.status })
     }
-    const configureOk = opts.configureOk !== false
-    const enableOk = opts.enableOk !== false
+    const adoptAs = opts.adoptAs ?? 'ok'
     const controller = {
       status: () => ({ enabled: false, endpoint, knowledgeBaseIds: [] as string[], hasKey: endpoint !== '', active: false }),
-      configure: async (input: { endpoint: unknown; knowledgeBaseIds: unknown; apiKey?: unknown }) => {
+      adopt: async (input: { endpoint: string; knowledgeBaseIds: string[]; apiKey: string }) => {
         configures.push({ endpoint: input.endpoint, knowledgeBaseIds: input.knowledgeBaseIds, apiKey: input.apiKey })
-        if (!configureOk) return { ok: false as const, reason: 'not_saved' as const }
-        endpoint = String(input.endpoint)
-        return { ok: true as const }
-      },
-      setEnabled: async (enabled: boolean) => {
-        enables.push(enabled)
-        if (!enableOk) return { ok: false as const, reason: 'not_saved' as const }
-        return { ok: true as const }
+        if (adoptAs === 'bound' || adoptAs === 'not_saved') return { saved: false as const, reason: adoptAs }
+        endpoint = input.endpoint
+        enables.push(true)
+        return adoptAs === 'inactive'
+          ? { saved: true as const, result: { ok: false as const, reason: 'unavailable' as const } }
+          : { saved: true as const, result: { ok: true as const } }
       },
     }
     const onboarding = knowledgeOnboarding({
@@ -164,7 +160,7 @@ describe('knowledge onboarding (L7-K2)', () => {
       responses: [{ status: 200, body: okInit({ details: { config_mismatch: true } }) }],
     })
     const result = await onboarding.run({ localOnly: false })
-    expect(result).toEqual({ ok: true, outcome: 'created', knowledgeBaseId: KB, configMismatch: true })
+    expect(result).toEqual({ ok: true, outcome: 'created', knowledgeBaseId: KB, configMismatch: true, activeNow: true })
     const text = JSON.stringify(result)
     const sent = bodyOf(calls[0]!.init)
     expect(text).not.toContain(API_KEY)
@@ -207,7 +203,7 @@ describe('knowledge onboarding (L7-K2)', () => {
       ],
     })
     expect(await onboarding.run({ localOnly: false })).toEqual({
-      ok: true, outcome: 'existing', knowledgeBaseId: KB, configMismatch: false,
+      ok: true, outcome: 'existing', knowledgeBaseId: KB, configMismatch: false, activeNow: true,
     })
     expect(calls).toHaveLength(3)
     expect(sleeps).toEqual([2_000, 2_000])
@@ -256,13 +252,16 @@ describe('knowledge onboarding (L7-K2)', () => {
     expect(fs.readFileSync(pending, 'utf8')).not.toContain(API_KEY)
 
     const second = await onboarding.run({ localOnly: false })
-    expect(second).toEqual({ ok: true, outcome: 'created', knowledgeBaseId: KB, configMismatch: false })
+    expect(second).toEqual({ ok: true, outcome: 'created', knowledgeBaseId: KB, configMismatch: false, activeNow: true })
     expect(bodyOf(calls[1]!.init).idempotency_key).toBe(saved.idempotency_key)
     expect(fs.existsSync(pending)).toBe(false)
     expect(JSON.stringify(second)).not.toContain(API_KEY)
     expect(JSON.stringify(second)).not.toContain(CODE)
 
+    // the activation file is spent on success; a new activation starts a fresh run
+    expect(fs.existsSync(path.join(dir, 'knowledge-activation.json'))).toBe(false)
     setEndpoint('')
+    writeActivation(dir, GOOD_FILE)
     expect(await onboarding.run({ localOnly: false })).toMatchObject({ ok: true, outcome: 'existing' })
     expect(bodyOf(calls[2]!.init).idempotency_key).not.toBe(saved.idempotency_key)
   })
@@ -299,18 +298,31 @@ describe('knowledge onboarding (L7-K2)', () => {
     expect(fs.existsSync(path.join(dir, PENDING))).toBe(true)
   })
 
-  it('configure or setEnabled failing is not_saved and keeps the pending key', async () => {
+  it('a failed save is not_saved and keeps the pending key; a user save that landed first is already_bound', async () => {
     writeActivation(dir, GOOD_FILE)
-    const failedSave = harness({ responses: [{ status: 200, body: okInit() }], configureOk: false })
+    const failedSave = harness({ responses: [{ status: 200, body: okInit() }], adoptAs: 'not_saved' })
     expect(await failedSave.onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'not_saved' })
     expect(failedSave.configures).toHaveLength(1)
-    expect(failedSave.enables).toEqual([])
     expect(fs.existsSync(path.join(dir, PENDING))).toBe(true)
 
-    const failedEnable = harness({ responses: [{ status: 200, body: okInit() }], enableOk: false })
-    expect(await failedEnable.onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'not_saved' })
-    expect(failedEnable.enables).toEqual([true])
-    expect(fs.existsSync(path.join(dir, PENDING))).toBe(true)
+    const bound = harness({ responses: [{ status: 200, body: okInit() }], adoptAs: 'bound' })
+    expect(await bound.onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'already_bound' })
+  })
+
+  it('saved while the daemon is not up is a success that is not active yet, and the files are spent', async () => {
+    writeActivation(dir, GOOD_FILE)
+    const h = harness({ responses: [{ status: 200, body: okInit() }], adoptAs: 'inactive' })
+    expect(await h.onboarding.run({ localOnly: false })).toMatchObject({ ok: true, activeNow: false })
+    expect(fs.existsSync(path.join(dir, PENDING))).toBe(false)
+    expect(fs.existsSync(path.join(dir, 'knowledge-activation.json'))).toBe(false)
+  })
+
+  it('a local-only call while a remote run is in flight is answered on its own', async () => {
+    writeActivation(dir, GOOD_FILE)
+    const { onboarding } = harness({ responses: [{ status: 200, body: okInit() }] })
+    const remote = onboarding.run({ localOnly: false })
+    expect(await onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_only_unavailable' })
+    await expect(remote).resolves.toMatchObject({ ok: true })
   })
 
   it('preflight reads /health and reports an existing endpoint', async () => {
