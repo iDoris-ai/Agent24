@@ -88,7 +88,8 @@ describe('KnowledgeController (M3)', () => {
     const controller = make()
     const adopted = controller.adopt({ endpoint: 'https://onboard.example', knowledgeBaseIds: ['kb-default'], apiKey: 'sk-ONBOARD' })
     const user = controller.configure(GOOD)
-    expect(await adopted).toEqual({ saved: false, reason: 'bound' })
+    // nothing was in place when onboarding's turn came: it stands back as overtaken, and a rerun sees the user's
+    expect(await adopted).toEqual({ saved: false, reason: 'overtaken' })
     expect((await user).ok).toBe(true)
     expect(controller.status()).toMatchObject({ endpoint: GOOD.endpoint, knowledgeBaseIds: GOOD.knowledgeBaseIds })
     expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-SECRET')

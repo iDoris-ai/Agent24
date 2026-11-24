@@ -58,7 +58,7 @@ describe('knowledge onboarding (L7-K2)', () => {
   function harness(opts: {
     responses?: Scripted[]
     endpoint?: string
-    adoptAs?: 'ok' | 'inactive' | 'bound' | 'not_saved'
+    adoptAs?: 'ok' | 'inactive' | 'bound' | 'overtaken' | 'not_saved'
     controller?: boolean
   } = {}): {
     calls: Array<{ url: string; init: RequestInit }>
@@ -87,7 +87,7 @@ describe('knowledge onboarding (L7-K2)', () => {
       status: () => ({ enabled: false, endpoint, knowledgeBaseIds: [] as string[], hasKey: endpoint !== '', active: false }),
       adopt: async (input: { endpoint: string; knowledgeBaseIds: string[]; apiKey: string }) => {
         configures.push({ endpoint: input.endpoint, knowledgeBaseIds: input.knowledgeBaseIds, apiKey: input.apiKey })
-        if (adoptAs === 'bound' || adoptAs === 'not_saved') return { saved: false as const, reason: adoptAs }
+        if (adoptAs === 'bound' || adoptAs === 'overtaken' || adoptAs === 'not_saved') return { saved: false as const, reason: adoptAs }
         endpoint = input.endpoint
         enables.push(true)
         return adoptAs === 'inactive'
@@ -307,6 +307,31 @@ describe('knowledge onboarding (L7-K2)', () => {
 
     const bound = harness({ responses: [{ status: 200, body: okInit() }], adoptAs: 'bound' })
     expect(await bound.onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'already_bound' })
+  })
+
+  it('the user\'s own setup winning spends the activation; being overtaken by another change is retryable', async () => {
+    writeActivation(dir, GOOD_FILE)
+    const bound = harness({ responses: [{ status: 200, body: okInit() }], adoptAs: 'bound' })
+    expect(await bound.onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'already_bound' })
+    expect(fs.existsSync(path.join(dir, PENDING))).toBe(false)
+    expect(fs.existsSync(path.join(dir, 'knowledge-activation.json'))).toBe(false)
+
+    writeActivation(dir, GOOD_FILE)
+    const overtaken = harness({ responses: [{ status: 200, body: okInit() }], adoptAs: 'overtaken' })
+    expect(await overtaken.onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'in_progress' })
+    expect(fs.existsSync(path.join(dir, PENDING))).toBe(true)
+  })
+
+  it('a pending key belongs to its activation: a new activation sends a new key', async () => {
+    writeActivation(dir, GOOD_FILE)
+    const h = harness({ responses: [{ status: 0, throw: true }] })
+    await h.onboarding.run({ localOnly: false })
+    await h.onboarding.run({ localOnly: false })
+    const first = bodyOf(h.calls[0]!.init).idempotency_key
+    expect(bodyOf(h.calls[1]!.init).idempotency_key).toBe(first)
+    writeActivation(dir, { ...GOOD_FILE, activation_code: 'another-activation-code' })
+    await h.onboarding.run({ localOnly: false })
+    expect(bodyOf(h.calls[2]!.init).idempotency_key).not.toBe(first)
   })
 
   it('saved while the daemon is not up is a success that is not active yet, and the files are spent', async () => {
