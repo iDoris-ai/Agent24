@@ -282,7 +282,8 @@ describe('uploadLine', () => {
 })
 
 describe('onboarding cancel phrases (#2075 B2″)', () => {
-  const phrases = ['算了，不开通了', '取消开通', '不用了，谢谢', '先不开通了吧', '我不想开通了', '算了不弄了', '取消取消', '算了吧', '取消']
+  const phrases = ['算了，不开通了', '取消开通', '不用了，谢谢', '先不开通了吧', '我不想开通了', '算了不弄了', '取消取消', '算了吧', '取消',
+    '不想开通了', '别开通了', '那算了', '那就算了', '不需要了', '我不要了', '暂时不用', '算了不用了', '算了算了', '取消开通了']
   it.each(phrases)('「%s」 at the first question stops it', (p) => {
     const first = beginOnboard('帮我开通知识库')
     expect(nextOnboard(first.state, p)).toMatchObject({ state: null, cancelled: true })
@@ -290,14 +291,15 @@ describe('onboarding cancel phrases (#2075 B2″)', () => {
   it.each(phrases)('「%s」 at the second question stops it', (p) => {
     expect(nextOnboard({ step: 'types', purpose: '合同审核' }, p)).toMatchObject({ state: null, cancelled: true })
   })
-  it('cancel phrases and a bare 不 never lead to a run', () => {
-    let step: OnboardStep | null = beginOnboard('帮我开通知识库').state
-    for (const said of ['算了，不开通了', '不用了，谢谢', '不']) {
-      if (!step) break
-      const next = nextOnboard(step, said)
-      expect(next.run).toBeUndefined()
-      step = next.state
+  it('at the third question, cancel phrases stop it and a bare 不 never leads to a run', () => {
+    const third: OnboardStep = { step: 'local', purpose: '合同审核', types: '合同' }
+    for (const said of ['算了，不开通了', '不用了，谢谢', '不想开通了']) {
+      expect(nextOnboard(third, said)).toMatchObject({ state: null, cancelled: true })
     }
-    expect(step).toBeNull()
+    const once = nextOnboard(third, '不')
+    expect(once.run).toBeUndefined()
+    const twice = nextOnboard(once.state!, '不')
+    expect(twice.run).toBeUndefined()
+    expect(twice.state).toBeNull()
   })
 })

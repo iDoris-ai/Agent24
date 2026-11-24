@@ -12,7 +12,7 @@ const BUILD_SHORT = /建(?:立)?(?:一个|个)库(?!数据)/
 const SHORT_ABOUT = /合同|文档|资料|知识|放进去/
 // A whole answer that stops onboarding. Not a substring or a prefix: 「合同取消条款审核」「取消订单的处理流程」
 // are purposes, not a cancel.
-const CANCEL = /^(?:算了|取消|先不用了?|先不开通了?|不开通了?|不用了|不要了|我不想开通了|算了不弄了|取消取消)(?:吧|了)?(?:不开通了?|开通|谢谢)?吧?$/
+const CANCEL = /^(?:那就?算了|算了(?:算了|，?不用了)?|取消(?:开通了?)?|先不用了?|先不开通了?|不开通了?|不用了|不要了|我不要了|不需要了|暂时不用|我?不想开通了?|别开通了?|算了不弄了|取消取消)(?:吧|了)?(?:不开通了?|开通|谢谢)?吧?$/
 /** Bare refusals at the purpose and types questions also stop onboarding. */
 const BARE_NO = /^(?:不|不用|不要|不需要|没有|没|不了)$/
 
