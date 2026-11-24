@@ -30,6 +30,20 @@ describe('L6-F2: the App names the document a delete is for', () => {
     expect(await deleteTargetOf(api(lib), { id: 'doc_X', title: 'X.pdf' }, '把这份删了')).toEqual({ kind: 'one', id: 'doc_X', title: 'X.pdf' })
     expect(await deleteTargetOf(api(lib), null, '删除上一份拆出来的文件')).toBeNull()
   })
+  it('a 《B》 named in A\'s conversation is B, not A (PR-Daemon #2047)', async () => {
+    const a = { id: 'doc_A', title: '发票.pdf' }
+    expect(await deleteTargetOf(api(lib), a, '把《房屋租赁合同-测试_其余页面》删了'))
+      .toEqual({ kind: 'one', id: lib[0]!.document_id, title: '房屋租赁合同-测试_其余页面.pdf' })
+    expect(await deleteTargetOf(api(lib), a, '把《房屋租赁》删了')).toMatchObject({ kind: 'choose', total: 2 })
+    expect(await deleteTargetOf(api(lib), a, '把《不存在》删了')).toMatchObject({ kind: 'none' })
+    // naming the open document itself needs no lookup
+    expect(await deleteTargetOf(api(lib), a, '把《发票》删了')).toEqual({ kind: 'one', id: 'doc_A', title: '发票.pdf' })
+  })
+  it('a title that merely contains the name does not win over the exact one (PR-Daemon #2052)', async () => {
+    const l2 = [doc(1, '发票-2024.pdf'), doc(2, '发票.pdf')]
+    expect(await deleteTargetOf(api(l2), { id: l2[0]!.document_id, title: '发票-2024.pdf' }, '把《发票》删了'))
+      .toEqual({ kind: 'one', id: l2[1]!.document_id, title: '发票.pdf' })
+  })
   it('the prompt fixes the id and says not to ask the user for one', () => {
     const p = deletePrompt({ id: 'doc_X', title: 'X.pdf' }, '把这份删了')
     expect(p).toContain('document_id: doc_X')
