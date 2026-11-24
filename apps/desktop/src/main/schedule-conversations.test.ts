@@ -123,10 +123,24 @@ describe('schedule conversations (M4 A5)', () => {
   })
 
   describe('a schedule\'s conversation that fills up (#1719)', () => {
-    /** sch_1's conversation with `n` runs: run_0 … run_{n-1}. */
+    /** sch_1's conversation with `n` runs: run_0 … run_{n-1}.
+     *  One write after the real first record. Appending the rest rewrites
+     *  the file each time and times out at the 1000-run boundary. */
     async function filled(n: number) {
       const first = (await homes().record('sch_1', 'run_0'))!.id
-      for (let i = 1; i < n; i++) history.appendRun(first, `run_${i}`, 'schedule')
+      const file = path.join(dir, 'chat-history', `${first}.json`)
+      const record = JSON.parse(fs.readFileSync(file, 'utf8'))
+      const prototype = record.runs[0]
+      const runs = [
+        prototype,
+        ...Array.from({ length: n - 1 }, (_, i) => ({ ...prototype, run_id: `run_${i + 1}` })),
+      ]
+      // A schedule run of a conversation main started is unseen. Keep that,
+      // and every other field the first record wrote.
+      const unseen = Array.isArray(record.unseen) && record.unseen.includes(prototype.run_id)
+        ? [...record.unseen, ...runs.slice(1).map((run: { run_id: string }) => run.run_id)]
+        : record.unseen
+      fs.writeFileSync(file, JSON.stringify({ ...record, runs, unseen }))
       return first
     }
 

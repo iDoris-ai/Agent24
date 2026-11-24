@@ -66,6 +66,8 @@ export interface CreativeServeWebOptions {
   runtimeExecutable?: string
   pinVersion?: string
   environment?: NodeJS.ProcessEnv
+  /** Directory `resolveOpenDesignCheckout` walks for a sibling dev checkout. Defaults to `process.cwd()`. */
+  cwd?: string
   nodeBinary?: string
   port?: number
   readyTimeoutMs?: number
@@ -490,7 +492,7 @@ export class CreativeServeWeb {
     }
 
     const checkoutDir = explicitCheckout
-      ?? resolveOpenDesignCheckout(process.cwd(), environment, this.options.resourcesPath)
+      ?? resolveOpenDesignCheckout(this.options.cwd ?? process.cwd(), environment, this.options.resourcesPath)
     if (!checkoutDir) {
       this.current = {
         state: 'failed',
