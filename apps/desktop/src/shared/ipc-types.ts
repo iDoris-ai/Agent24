@@ -162,6 +162,10 @@ export const IpcChannels = {
   KnowledgeCheck: 'knowledge:check',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  /** L7-K2: whether mock onboarding can start, and whether the server answers. */
+  KnowledgeOnboardPreflight: 'knowledge:onboard-preflight',
+  /** L7-K2: run mock onboarding. The activation code and the key never come back. */
+  KnowledgeOnboardRun: 'knowledge:onboard-run',
   // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
   // sends only where to draw it; the address, partition and policy are main's.
   KnowledgeViewShow: 'knowledge-view:show',
@@ -228,6 +232,39 @@ export interface KnowledgeConfigureInput {
   knowledgeBaseIds: string[]
   apiKey?: string
 }
+
+/** L7-K2 preflight. No activation code, no key. */
+export interface KnowledgeOnboardPreflight {
+  /** A usable `knowledge-activation.json` is in userData. */
+  activated: boolean
+  /** The file is present but rejected (mode, shape, endpoint or code). */
+  invalidActivation: boolean
+  /** An endpoint is already saved; onboarding will not overwrite it. */
+  alreadyBound: boolean
+  /** `GET {endpoint}/health` was 2xx. Null when there is no usable activation. */
+  reachable: boolean | null
+  formats: readonly ['md', 'markdown', 'txt']
+  maxBytes: number
+}
+
+/** L7-K2 result. A success names the knowledge base only — never the key or the code. */
+export type KnowledgeOnboardResult =
+  /** activeNow: the daemon took the binding now; false when it was not up and takes it later from the saved settings. */
+  | { ok: true; outcome: 'created' | 'existing'; knowledgeBaseId: string; configMismatch: boolean; activeNow: boolean }
+  | {
+    ok: false
+    code:
+      | 'local_only_unavailable'
+      | 'unavailable'
+      | 'already_bound'
+      | 'not_activated'
+      | 'activation_invalid'
+      | 'in_progress'
+      | 'not_offered'
+      | 'unreachable'
+      | 'server_error'
+      | 'not_saved'
+  }
 
 export type {
   KnowledgeViewBounds,

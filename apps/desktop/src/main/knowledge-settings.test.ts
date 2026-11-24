@@ -55,6 +55,45 @@ describe('KnowledgeController (M3)', () => {
     fs.rmSync(dir, { recursive: true, force: true })
   })
 
+  it('L7-K2 adopt: saves endpoint, base and key switched On in one write, even with no daemon up', async () => {
+    const offline = new KnowledgeHost(logins, {
+      connection: () => null,
+      transport,
+      clock: new SequenceClock(() => 1_000),
+      nowSeconds: () => now,
+    })
+    offline.start()
+    const controller = new KnowledgeController(offline, logins, new KnowledgeSettingsStore(dir), { nowSeconds: () => now })
+    const adopted = await controller.adopt({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-default'], apiKey: 'sk-ONBOARD' })
+    expect(adopted.saved).toBe(true)
+    expect(controller.status()).toMatchObject({ enabled: true, endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-default'], hasKey: true })
+    // a second adopt finds the endpoint set and writes nothing
+    expect(await controller.adopt({ endpoint: GOOD.endpoint, knowledgeBaseIds: ['kb-other'], apiKey: 'sk-OTHER' }))
+      .toEqual({ saved: false, reason: 'bound' })
+    expect(controller.status().knowledgeBaseIds).toEqual(['kb-default'])
+    expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-ONBOARD')
+  })
+
+  it('L7-K2 adopt: a user save queued first wins and is never overwritten', async () => {
+    const controller = make()
+    const user = controller.configure(GOOD)
+    const adopted = controller.adopt({ endpoint: 'https://onboard.example', knowledgeBaseIds: ['kb-default'], apiKey: 'sk-ONBOARD' })
+    expect((await user).ok).toBe(true)
+    expect(await adopted).toEqual({ saved: false, reason: 'bound' })
+    expect(controller.status()).toMatchObject({ endpoint: GOOD.endpoint, knowledgeBaseIds: GOOD.knowledgeBaseIds })
+    expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-SECRET')
+  })
+
+  it('L7-K2 adopt: a user save made after onboarding started also wins', async () => {
+    const controller = make()
+    const adopted = controller.adopt({ endpoint: 'https://onboard.example', knowledgeBaseIds: ['kb-default'], apiKey: 'sk-ONBOARD' })
+    const user = controller.configure(GOOD)
+    expect(await adopted).toEqual({ saved: false, reason: 'bound' })
+    expect((await user).ok).toBe(true)
+    expect(controller.status()).toMatchObject({ endpoint: GOOD.endpoint, knowledgeBaseIds: GOOD.knowledgeBaseIds })
+    expect(logins.list().get(KNOWLEDGE_BINDING)?.material).toBe('sk-SECRET')
+  })
+
   it('tells listeners after every change, with the new settings already in effect (KB-C2-03)', async () => {
     const controller = make()
     const seen: Array<{ enabled: boolean; endpoint: string }> = []

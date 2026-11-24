@@ -69,6 +69,7 @@ import { fetchOsPackageRelease, OsInstallPauseError, performOsPackageInstall } f
 import { realOsServicePause, runWhileServiceStopped } from './os-package-service'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { knowledgeOnboarding } from './knowledge-onboard'
 import { knowledgeAppInstanceId } from './knowledge-app-instance'
 import { bindingTag, KnowledgeUiClient } from './knowledge-ui-client'
 import { KnowledgeUiInstance } from './knowledge-ui-instance'
@@ -714,9 +715,16 @@ app.whenReady().then(async () => {
   })
 
   onChatHistoryChange(summary => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.ChatHistoryChanged, summary) })
+  // L7-K2: the activation file lives in userData. The code and the key stay in main.
+  const knowledgeOnboard = knowledgeOnboarding({
+    dir: app.getPath('userData'),
+    controller: () => knowledge,
+    fetch: (url, init) => net.fetch(url, init),
+  })
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,
+    knowledgeOnboard,
     scheduleConversation: (scheduleId) => scheduleConversations().conversationOf(scheduleId),
     backendRefusal: () => enrolRefusal(backendManager.statusDetail()),
     // T1-1/T1-2: what is on disk now. A daemon reads installed packages only
