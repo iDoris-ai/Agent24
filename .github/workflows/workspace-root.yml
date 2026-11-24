@@ -1,7 +1,10 @@
 name: Workspace root authority
 
 on:
+  # push only on main: any other branch is covered by its pull_request run (a task
+  # branch push touching Cargo.lock used to start the 3-OS matrix for nothing).
   push:
+    branches: [main]
     paths: [rust/crates/agent24-workspace/**, rust/Cargo.toml, rust/Cargo.lock, .github/workflows/workspace-root.yml]
   pull_request:
     paths: [rust/crates/agent24-workspace/**, rust/Cargo.toml, rust/Cargo.lock, .github/workflows/workspace-root.yml]

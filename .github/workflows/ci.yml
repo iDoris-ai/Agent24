@@ -13,16 +13,81 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Path filter for pull requests (push runs everything). Downstream jobs skip
+  # with a job-level `if:` rather than workflow `paths:`: a job skipped by `if:`
+  # reports Success to the required checks of the ab-integration ruleset, while
+  # a workflow that never starts leaves them stuck at "Expected". Job display
+  # names are what those required checks match; do not rename them.
+  #
+  # Fail closed: every downstream `if:` is
+  #   !cancelled() && (needs.changes.result != 'success' || <output> == 'true')
+  # so a failed `changes` job runs everything instead of skipping it green.
+  # `!cancelled()` rather than `always()`: a run cancelled by the concurrency
+  # group (a newer push) should not start the long jobs anyway. Unlike the
+  # implicit success(), it also lets `rust` run (and fail at the Hyphae
+  # download) when its Hyphae job failed, instead of being skipped as green.
+  changes:
+    name: Changed paths
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      contract_rust: ${{ steps.filter.outputs.contract_rust }}
+      typecheck: ${{ steps.filter.outputs.typecheck }}
+      contract_node: ${{ steps.filter.outputs.contract_node }}
+      macos: ${{ steps.filter.outputs.macos }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5
+        with:
+          submodules: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Classify changed paths
+        id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != "pull_request" ]; then
+            printf '%s\n' rust=true contract_rust=true typecheck=true contract_node=true macos=true | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git diff --name-only --no-renames "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed.txt"
+          echo "changed files: $(wc -l < "$RUNNER_TEMP/changed.txt")"
+          head -n 200 "$RUNNER_TEMP/changed.txt"
+          bash .github/scripts/ci-changes.sh < "$RUNNER_TEMP/changed.txt" > "$RUNNER_TEMP/filter.txt"
+          rust=$(sed -n 's/^rust=//p' "$RUNNER_TEMP/filter.txt")
+          # macOS jobs: only for PRs into main (and other non-ab/** bases);
+          # ab/** task PRs rely on the developer's local macOS clippy, and the
+          # integration PR into main runs them in full.
+          case "$BASE_REF" in
+            ab/*) macos=false ;;
+            *) macos=$rust ;;
+          esac
+          echo "macos=$macos" >> "$RUNNER_TEMP/filter.txt"
+          tee -a "$GITHUB_OUTPUT" < "$RUNNER_TEMP/filter.txt"
+
   hyphae-linux-x64:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     uses: ./.github/workflows/hyphae-lock-verify.yml
 
   hyphae-darwin-arm64:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true') }}
     uses: ./.github/workflows/hyphae-lock-verify.yml
     with:
       platform: darwin-arm64
 
   typecheck-test:
     name: Typecheck + Test
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.typecheck == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -73,7 +138,8 @@ jobs:
 
   rust:
     name: Rust (fmt + clippy + test)
-    needs: hyphae-linux-x64
+    needs: [changes, hyphae-linux-x64]
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust == 'true') }}
     runs-on: ubuntu-latest
     # Successful runs take 14–19 min; at 20 the post-job cache save was being
     # cancelled after every step had passed (2026-11-09: #1730, #1739).
@@ -174,7 +240,8 @@ jobs:
 
   rust-macos:
     name: Rust macOS (clippy + test)
-    needs: hyphae-darwin-arm64
+    needs: [changes, hyphae-darwin-arm64]
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.macos == 'true') }}
     runs-on: macos-latest
     # Warm runs take 18–23 min. A cold cache (a dev-dependency feature change,
     # #1754) spent 26 min compiling before the first test, and a cancelled job
@@ -243,6 +310,8 @@ jobs:
 
   contract:
     name: Contract Tests + Codegen Drift
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.contract_node == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -319,6 +388,8 @@ jobs:
 
   contract-rust:
     name: Contract (agent24d)
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.contract_rust == 'true') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
