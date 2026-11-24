@@ -416,6 +416,11 @@ impl DaemonKnowledgeBackend {
                         return Err(failed);
                     }
                 }
+                // The transport lost this group (no answer in time, or none
+                // at all): partial, like a group that answered `unavailable`.
+                Err(Failure::Local(refusal)) if refusal.reason == LocalReason::Dependency => {
+                    done.lost(&group, refusal.retryable);
+                }
                 Err(other) => return Err(other),
             }
         }
