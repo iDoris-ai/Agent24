@@ -140,6 +140,21 @@ describe('Sin90 three layers', () => {
     expect(await screen.findByText('人生系统')).toBeInTheDocument()
   })
 
+  it('treats a weekly_review draft as this week’s review for summarize and the start guard', async () => {
+    const period = isoWeekUTC(new Date())
+    reviews = [
+      { id: 'daily', kind: 'daily', period, status: 'draft', body: '' },
+      { id: 'r1', kind: 'weekly_review', period, status: 'draft', body: '' },
+    ]
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('button', { name: '复盘' }))
+    await screen.findByText('最近的复盘')
+    expect(screen.getAllByRole('button', { name: '生成复盘建议' })).toHaveLength(1)
+    expect(screen.getByRole('button', { name: '开始本周复盘' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('button', { name: '生成复盘建议' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'aiSummarize', reviewId: 'r1' }))
+  })
+
   it('captures a quick note and completes a must-do item using the legal transition', async () => {
     today = { must_do: [task('t1', '写完方案')], deep_block: null, inbox: [], carry_over_candidates: [] }
     render(<Sin90Page />)

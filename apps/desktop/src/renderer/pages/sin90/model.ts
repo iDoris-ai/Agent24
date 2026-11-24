@@ -396,9 +396,14 @@ export function readReviews(data: unknown): Sin90Review[] {
   return list(data, 'reviews', parseReview)
 }
 
+/** `weekly` and the stored alias `weekly_review` are the same weekly review. */
+export function isWeeklyReviewKind(kind: string): boolean {
+  return kind === 'weekly' || kind === 'weekly_review'
+}
+
 /** A weekly review that is still a draft. Prefer the one for this ISO week. */
 export function weeklyDraftReviewId(reviews: readonly Sin90Review[], iso: string): string | null {
-  const drafts = reviews.filter((review) => review.kind === 'weekly' && review.status === 'draft')
+  const drafts = reviews.filter((review) => isWeeklyReviewKind(review.kind) && review.status === 'draft')
   return (drafts.find((review) => review.period === iso) ?? drafts[0])?.id ?? null
 }
 
