@@ -249,7 +249,7 @@
 - [ ] FU-209 · C · src=L7-K1 · 2026-11-24 · 跨库后续：按库加权、按库排除；把引用写进文档正文的一键操作；写进 DOCX 批注（目前只在设计文档里，没有实现）。
 - [ ] FU-217 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts 的 `plainTitle` 去扩展名：打开 发票.docx 时说《发票.pdf》会命中打开的那份。改法：比较时带上扩展名或媒体类型。
 - [ ] FU-218 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts：《“”》这类空名，库查找里 `includes('')` 命中所有文档；空名应直接返回 none。
-- [ ] FU-219 · **P1** · src=L7-K1 #2053 PR-Daemon Low 1+2 · 2026-11-24 · 设置页库名两处会踩到（下个小包就修）：①`kb-names.ts` 里 `=` 优先于空白，「kb-1 制度=库」被解析成 id=`kb-1 制度`、name=`库`，名称悄悄丢失、设置框回显原样所以看不出（注释「first blank」也与实现不符），改为取 `=` 与第一个空白中靠前的；②`names[id]` 对普通 `{}` 取值，绑定 id 恰为 `constructor`/`toString` 时标签变成函数源码，改用 `Object.hasOwn`。判据：两种写法都有单测，id 为 constructor 时显示「知识库 N」。
+- [x] FU-219 · **P1** · src=L7-K1 #2053 PR-Daemon Low 1+2 · 2026-11-24 · 设置页库名两处会踩到（下个小包就修）：①`kb-names.ts` 里 `=` 优先于空白，「kb-1 制度=库」被解析成 id=`kb-1 制度`、name=`库`，名称悄悄丢失、设置框回显原样所以看不出（注释「first blank」也与实现不符），改为取 `=` 与第一个空白中靠前的；②`names[id]` 对普通 `{}` 取值，绑定 id 恰为 `constructor`/`toString` 时标签变成函数源码，改用 `Object.hasOwn`。判据：两种写法都有单测，id 为 constructor 时显示「知识库 N」。
 - [ ] FU-220 · C · src=L7-K1 #2053 Low 3 · 2026-11-24 · `found` 封顶 8 条而事实行写「找到 N 段」（`found_passages` 不封顶），卡片最多 8 行且不说明截断。`found_passages > found.length` 时加一行「仅列前 8 段」。
 - [ ] FU-221 · C · src=L7-K1 #2053 Low 4 · 2026-11-24 · `saveKbNames` 在 `configure` 之前落盘，`configure` 失败时名称表已写；已解绑 id 的名称不清理。改为 configure 成功后再存、保存时只留绑定的 id。
 - [ ] FU-222 · C · src=L7-K1 #2053 Low 5+6 · 2026-11-24 · 引用卡的标签按渲染时的绑定表算而非 run 当时的绑定；`status()` 返回前短暂全读「知识库」；多个未绑定库同名成多组分不出。每张卡各调一次 `knowledge.status()`（长对话 N 次 IPC，可由 Chat 统一取一次传 `bound`）。知识问答转后台任务（ongoing → TaskCard）时只有事实行、没有引用卡；`cited` 与 `facts` 一样只在内存里，重开已存对话后卡消失。
