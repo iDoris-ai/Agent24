@@ -6889,6 +6889,14 @@ components:
             L7-K0 (FU-183). The run asked a `knowledge_search` and none
             completed: each was refused by policy or failed. A client says
             「检索没能进行」, never 「知识库里没有」.
+        search_refusal:
+          type: string
+          enum: [policy, failed]
+          description: |
+            L7-K1. Why, when `search_refused` is true: `policy` (the outbound
+            check refused it) or `failed` (it ran and failed). A policy
+            refusal wins when both happened. Absent when not refused, and
+            from an older daemon.
         found_passages:
           type: integer
           minimum: 0
