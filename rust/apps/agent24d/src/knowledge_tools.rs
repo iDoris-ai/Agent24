@@ -245,10 +245,11 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
         for (chunk, title, base) in answers.iter().flat_map(|a| search_found(a)) {
             if let Some(base) = base
                 && knowledge.found.len() < FOUND_HITS
-                && !knowledge
-                    .found
-                    .iter()
-                    .any(|h| h.knowledge_id == chunk.knowledge_id && h.chunk_id == chunk.chunk_id)
+                && !knowledge.found.iter().any(|h| {
+                    h.knowledge_base_id == base
+                        && h.knowledge_id == chunk.knowledge_id
+                        && h.chunk_id == chunk.chunk_id
+                })
             {
                 knowledge.found.push(FoundHit {
                     knowledge_base_id: base,
