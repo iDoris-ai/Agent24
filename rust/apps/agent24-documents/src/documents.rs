@@ -52,6 +52,10 @@ pub struct DocumentDetail {
     #[serde(flatten)]
     pub document: Document,
     pub head: RevisionSummary,
+    /// L6-F2: a PDF head's page count, read from its page tree, for the
+    /// delete card; absent for other formats or when it cannot be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pages: Option<u32>,
 }
 
 /// `DocumentList`.
@@ -177,7 +181,8 @@ pub(crate) async fn list(
     // `?4` is NULL for REST (`only` absent); a tool scope binds its ids.
     let rows: Vec<Document> = match sqlx::query_as(
         "SELECT id, title, media_type, head_revision, created_at, updated_at FROM documents
-         WHERE (?1 IS NULL OR (created_at, id) < (?1, ?2))
+         WHERE deleted_at IS NULL
+           AND (?1 IS NULL OR (created_at, id) < (?1, ?2))
            AND (?4 IS NULL OR id IN (SELECT value FROM json_each(?4)))
          ORDER BY created_at DESC, id DESC LIMIT ?3",
     )
@@ -268,6 +273,7 @@ impl HeadRow {
         Ok(DocumentDetail {
             document: self.document,
             head,
+            pages: None,
         })
     }
 }
@@ -291,17 +297,33 @@ pub(crate) async fn get(storage: &Storage, id: &str) -> Result<DocumentDetail, A
                 r.revision, r.content_sha256, r.size, r.media_type AS head_media_type
          FROM documents d
          LEFT JOIN revisions r ON r.document_id = d.id AND r.revision = d.head_revision
-         WHERE d.id = ?",
+         WHERE d.id = ? AND d.deleted_at IS NULL",
     )
     .bind(id)
     .fetch_optional(storage.db.pool())
     .await;
     let found = row.and_then(|row| row.map(HeadRow::checked).transpose());
     match found {
-        Ok(Some(detail)) => Ok(detail),
+        Ok(Some(mut detail)) => {
+            detail.pages = pdf_pages(storage, &detail.head).await;
+            Ok(detail)
+        }
         Ok(None) => Err(ApiError::not_found("no such document")),
         Err(e) => Err(storage.db_failure(e).await),
     }
+}
+
+/// The page count of a PDF revision, from its metadata (not its pages).
+async fn pdf_pages(storage: &Storage, head: &RevisionSummary) -> Option<u32> {
+    if head.media_type != "application/pdf" {
+        return None;
+    }
+    let path = storage.blobs.path_of(&head.content_sha256).ok()?;
+    tokio::task::spawn_blocking(move || lopdf::Document::load_metadata(path).ok())
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.page_count)
 }
 
 #[cfg(test)]

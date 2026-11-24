@@ -29,7 +29,7 @@ import { handleSkillActivate } from '../skill-activate'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
-import { approvalDialog, type DocumentLookups } from '../approval-dialog'
+import { approvalDialog, wholeLibrary, type DocumentLookups } from '../approval-dialog'
 import { desktopSin90ExportToFile, desktopSin90ImportFromFile, desktopSin90Write, sin90KeyAvailable } from '../sin90-write'
 import { importFile } from '../documents-import'
 import type { ModuleActionResult } from '../documents-module'
@@ -517,6 +517,16 @@ const approvalDocumentLookups: DocumentLookups = {
   title: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
     const title = (data as { title?: unknown } | null)?.title
     return typeof title === 'string' && title ? title : null
+  }),
+  list: () => readDocument({ op: 'list', limit: 200 }, wholeLibrary),
+  detail: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const d = data as { title?: unknown; created_at?: unknown; pages?: unknown } | null
+    if (typeof d?.title !== 'string' || !d.title || typeof d.created_at !== 'string') return null
+    return { title: d.title, pages: typeof d.pages === 'number' ? d.pages : null, importedAt: d.created_at }
+  }),
+  head: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const head = (data as { head_revision?: unknown } | null)?.head_revision
+    return typeof head === 'number' && head >= 1 ? head : null
   }),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs

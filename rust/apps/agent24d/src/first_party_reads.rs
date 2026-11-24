@@ -27,7 +27,11 @@ use sha2::{Digest, Sha256};
 
 /// The first-party module, and its tools the host knows to only read.
 pub const MODULE: &str = "documents";
-pub const DOCUMENTS_READS: &[&str] = &["get", "fields", "list", "paragraphs"];
+/// `compare` is here although, for a PDF or image, it builds and stores the
+/// text layer: that is a cache derived from the document, nothing the user
+/// has not already put in the library, and it sends nothing out (unlike
+/// `read_range` / `find`, which stay External).
+pub const DOCUMENTS_READS: &[&str] = &["get", "fields", "list", "paragraphs", "compare"];
 /// The program of the package, relative to its directory.
 const PROGRAM: &str = "bin/agent24-documents";
 
@@ -137,7 +141,7 @@ mod tests {
         let reads = host_reads(Some((&installed, &spawn(PROGRAM, &[]))), Some(&shipped));
         let mut names: Vec<&str> = reads.iter().map(|(_, t)| t.as_str()).collect();
         names.sort_unstable();
-        assert_eq!(names, ["fields", "get", "list", "paragraphs"]);
+        assert_eq!(names, ["compare", "fields", "get", "list", "paragraphs"]);
         assert!(reads.iter().all(|(m, _)| m == "documents"));
         for write in ["compose", "patch", "fill", "extract", "convert"] {
             assert!(!reads.contains(&("documents".to_owned(), write.to_owned())));
@@ -186,7 +190,7 @@ mod tests {
         // The same package started as the bundle is: first-party.
         assert_eq!(
             host_reads(Some((&decoy, &spawn(PROGRAM, &[]))), Some(&shipped)).len(),
-            4
+            5
         );
     }
 }

@@ -14,6 +14,10 @@ import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 import DocxTools from './DocxTools'
+import DocumentVersions from './DocumentVersions'
+import type { DocFocus } from './doc-focus'
+import { extractFields, type ExtractCardData, type ExtractFailure } from './doc-extract'
+import { ExtractCard } from '../chat/ExtractCard'
 
 const OFFICE_TYPE = new Set([
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
@@ -38,8 +42,10 @@ export function readableSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, onAdded, autoCheck = false, autoTranslate = null }: {
+export default function DocumentDetail({ documentId, onClose, onOpen, onTranslate, onAdded, autoCheck = false, autoTranslate = null, focus = null }: {
   documentId: string
+  /** F3: open at this page, its block highlighted (a source clicked in a card). */
+  focus?: DocFocus | null
   onClose: () => void
   /** A new document was made here (split, conversion): the list reads itself again. */
   onAdded?: () => void
@@ -70,6 +76,23 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
       setSplitting(null)
       onAdded?.()
     }
+  }
+  // F3: 「抽取字段…」, the second way in: field names typed, comma-separated.
+  const [extracting, setExtracting] = useState<string | null>(null)
+  const [extractBusy, setExtractBusy] = useState(false)
+  const [extracted, setExtracted] = useState<ExtractCardData | ExtractFailure | null>(null)
+  const runExtract = async (id: string, typed: string) => {
+    const names = [...new Set(typed.split(/[,，、;；\n]+/).map((n) => n.trim()).filter(Boolean))].slice(0, 20)
+    if (names.length === 0) return
+    // PR-Daemon #2020: a result for a document no longer open is dropped,
+    // and does not keep the one now open busy (the reset below clears it).
+    const gen = generation.current
+    setExtractBusy(true)
+    setExtracted(null)
+    const out = await extractFields(api, id, names).catch((e: unknown) => ({ error: e instanceof Error ? e.message : String(e) }))
+    if (gen !== generation.current) return
+    setExtractBusy(false)
+    setExtracted(out)
   }
   const api = window.agent24.documents
   // D1: an Office document is stored as-is. Convert it to PDF before preview.
@@ -357,6 +380,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     setCheckError(null)
     setReport(null)
     setHighlight(null)
+    setExtracting(null)
+    setExtracted(null)
+    setExtractBusy(false)
     setTranslating(false)
     setTrDone(0)
     setTrTotal(0)
@@ -383,6 +409,18 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
     }
     // `read` and `show` check their refs; only the document matters.
   }, [api, documentId])
+  // F3: the focused block once its text is read, reading on until it is there.
+  const focused = useRef<DocFocus | null>(null)
+  useEffect(() => {
+    if (!focus || !detail || detail.document_id !== focus.documentId || focused.current === focus || loading || checking) return
+    // A page that failed to read stops it here: the page is shown, the error said (#2019 ②).
+    if (!blocks.some((b) => b.block_id === focus.blockId) && more && !error) {
+      void read(generation.current, detail, more)
+      return
+    }
+    focused.current = focus
+    jumpTo(detail, { block_id: focus.blockId, page: focus.page, quote: '' })
+  })
   // D3: opened to be checked (an Office document's PDF): once, when its text is first read.
   const autoChecked = useRef<string | null>(null)
   useEffect(() => {
@@ -414,6 +452,11 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
               open('assistant', 'other')
             }}>
               {t('detail.ask')}
+            </button>
+          )}
+          {detail && (
+            <button className="btn btn-ghost" onClick={() => { setExtracting(extracting === null ? '' : null); setExtracted(null) }}>
+              {t('extract.button')}
             </button>
           )}
           {detail?.head.media_type === 'application/pdf' && (
@@ -524,6 +567,19 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
           <button className="btn btn-ghost" disabled={splitBusy} onClick={() => setSplitting(null)}>{t('split.cancel')}</button>
         </div>
       )}
+      {detail && extracting !== null && (
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center', margin: '8px 0' }}>
+          <input aria-label={t('extract.fields')} placeholder={t('extract.fields')} value={extracting}
+            onChange={(e) => setExtracting(e.target.value)} style={{ flex: 1 }} />
+          <button className="btn btn-primary" disabled={extractBusy || extracting.trim() === ''} onClick={() => void runExtract(detail.document_id, extracting)}>
+            {t('extract.go')}
+          </button>
+        </div>
+      )}
+      {extractBusy && <p role="status" style={{ fontSize: 12, margin: '4px 0' }}>{t('extract.working')}</p>}
+      {extracted && ('error' in extracted
+        ? <p role="alert" style={ALERT} title={extracted.detail}>{t('extract.failed', { error: extracted.error })}</p>
+        : <ExtractCard card={extracted} />)}
       {splitNote && <p role={splitNote.ok ? 'status' : 'alert'} style={{ fontSize: 12, margin: '4px 0' }}>{splitNote.text}</p>}
       {detail && (
         <p style={{ color: 'var(--muted)', fontSize: 12 }}>
@@ -556,6 +612,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
           {convertNote && <p role={convertNote.ok ? 'status' : 'alert'}>{convertNote.text}</p>}
           {detail.head.media_type === DOCX_TYPE && (
             <DocxTools key={detail.document_id} api={api} documentId={detail.document_id} title={detail.title ?? ''} onAdded={onAdded} />
+          )}
+          {detail.head.media_type === DOCX_TYPE && (
+            <DocumentVersions key={`v${detail.document_id}`} api={api} documentId={detail.document_id} title={detail.title ?? ''} onChanged={onAdded} />
           )}
         </div>
       )}

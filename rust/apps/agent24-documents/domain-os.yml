@@ -65,6 +65,7 @@ tools:
               document_id: { type: string, description: "a PDF document: its id from documents.list, or its file name/title (e.g. report.pdf)" }
               pages: { type: string, description: "\"all\" (default) or 1-based pages and ranges such as \"1-3,5\"; \"2-\" is page 2 to the last" }
         title: { type: string, description: "title of the new document" }
+        save_to: { type: string, enum: [new_document, original], description: "leave it out (a NEW document) unless the user explicitly asked to save into the original file (存到原文件 / 直接改原文件); original saves the result as the original document's next version, its older versions kept and restorable" }
     risk: write_local
     output_privacy: local_only
     timeout_ms: 30000
@@ -73,7 +74,7 @@ tools:
   # E1b/D5a (Loop 3): DOCX paragraphs and template fields. The writes make a
   # NEW document; each call is approved by the user.
   - operation: paragraphs
-    description: "List a DOCX document's paragraphs that have text: each paragraph's index and its first 40 characters (whether in a table). A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List a DOCX document's paragraphs that have text as a table of contents (toc): one line per paragraph, its index and first words. A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
@@ -88,8 +89,25 @@ tools:
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
+  # L6-S05: two documents, or two versions of one, compared by their text.
+  - operation: compare
+    description: "Compare two documents, or two versions of one document, by their text only (formatting is not compared). Give document_id and other_document_id (ids from documents.list, or file names/titles) for two documents; give only document_id (optionally from_revision and to_revision) for one document's versions, default the last two. The answer lists the first changes (id, kind added/removed/changed/unaligned, where, text) and a summary of all of them. Report only what is in changes; never add a change yourself; for the rest tell the user to open the comparison view on the documents page. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+        other_document_id: { type: string, description: "the second document, to compare two documents" }
+        from_revision: { type: integer, minimum: 1, description: "the older version (default: the one before to_revision); with other_document_id, the version of document_id" }
+        to_revision: { type: integer, minimum: 1, description: "the newer version (default: the current one); with other_document_id, the version of other_document_id" }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
   - operation: patch
-    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. By default the original is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the original's next version instead."
     input_schema:
       type: object
       additionalProperties: false
@@ -129,7 +147,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fill
-    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. The template is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
     input_schema:
       type: object
       additionalProperties: false
@@ -141,6 +159,24 @@ tools:
           minProperties: 1
           maxProperties: 200
           additionalProperties: { type: string }
+        save_to: { type: string, enum: [new_document, original], description: "leave it out (a NEW document) unless the user explicitly asked to save into the original file (存到原文件 / 直接改原文件); original saves the result as the original document's next version, its older versions kept and restorable" }
+    risk: write_local
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  # L6-F2 (Loop 6): delete one whole document (soft: it can be restored for
+  # 7 days on the documents page). Each call is approved by the user. The
+  # pattern takes an id only, so the kernel refuses a file name before any
+  # card and the card always names exactly one document (FU-136).
+  - operation: delete
+    description: "Delete ONE whole document from the user's library; it can be restored from the documents page for 7 days. Use it only when the user asks to delete or remove a whole document or file. Removing a paragraph or a sentence INSIDE a document is a rewrite (documents.patch), never this. document_id must be the document's id (doc_...): first look it up with documents.get by its file name; if several documents have that name, list them for the user and ask which one, never choose one yourself."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string, pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", description: "the document's id (doc_...) as documents.get or documents.list returned it: never its file name, never made up, never asked of the user; look it up yourself first" }
     risk: write_local
     output_privacy: local_only
     timeout_ms: 30000
