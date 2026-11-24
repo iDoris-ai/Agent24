@@ -237,3 +237,9 @@
 - [ ] FU-201 · C · src=L6-S05 0.6.110 真机（General 11-24） · 2026-11-24 · CLI 的 `documents compare` 弹「允许发起方写入 documents 模块的数据（delegate）」：daemon 对 FirstPartyShell 的非 GET 模块路由一律要 delegation（middleware.rs，按 HTTP 方法判断，不看是否只读），compare 和 find 是只读 POST，也被算作写。桌面（ProductHost）不受影响。改法：给只读 POST 的白名单或改读委托。判据：CLI 跑 compare/find 不弹写入委托框。
 - [ ] FU-203 · C · src=PR-Daemon #2044 · 2026-11-24 · 授权清单表测只绑了 DOC_AGENT_TOOLS：加一条由 domain-os.yml 驱动的表测，把 first_party_reads.rs 的 DOCUMENTS_READS、approval-dialog.ts 的 READ_ONLY / NAMED_BY_TITLE / TOOL_KEYS 也绑上，新增只读工具漏一张表就变红。
 - [ ] FU-202 · C · src=L6-S05 0.6.111 真机（General 11-24） · 2026-11-24 · 文档页勾两份 PDF 时，「合并所选」和「对比所选的两份」同时出现，顶部一排按钮和状态文字挤在一起换行；手滑点到「合并所选」会立刻生成一份合并 PDF。改法：顶部按钮区允许换行并分组；合并前加确认。判据：两份 PDF 勾选时按钮不挤；合并要先确认。
+- [ ] FU-213 · C · src=PR-Daemon #2047 · 2026-11-24 · `documents.fill` 的 `save_to=original`：`expect_revision` 取执行时的 head，不是审批卡上看到的版本，批准间隔内有人存新版会被覆盖（历史保留、可恢复；与 FU-191 部分重叠）。改法：审批时记下 head 并在执行时校验。
+- [ ] FU-214 · C · src=PR-Daemon #2047 · 2026-11-24 · compare 对 PDF/图片会建并落盘文本层（FU-199），却在 `first_party_reads.rs` 归为免审批只读，而同样建层的 read_range/find 是 External：至少在该文件写明理由。另：单侧 unit 上限（5000，payload_too_large 的 422）的路由级测试未补（需构造超大 docx）。
+- [ ] FU-215 · C · src=PR-Daemon #2052 · 2026-11-24 · compare 的 `MAX_UNITS` 只限条数不限 Replace 组 n×m 的 ratio() 工作量（已在 blocking 线程，不饿死运行时）：可限 Replace 组内打分对数。
+- [ ] FU-216 · C · src=PR-Daemon #2052 · 2026-11-24 · compare 超限 422 复用 `payload_too_large`（闭集里没有别的码），桌面主进程里同名码指 502 超大响应，且 message 是英文：换独立码或补桌面中文映射。
+- [ ] FU-217 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts 的 `plainTitle` 去扩展名：打开 发票.docx 时说《发票.pdf》会命中打开的那份。改法：比较时带上扩展名或媒体类型。
+- [ ] FU-218 · C · src=PR-Daemon #2052 · 2026-11-24 · delete-target.ts：《“”》这类空名，库查找里 `includes('')` 命中所有文档；空名应直接返回 none。
