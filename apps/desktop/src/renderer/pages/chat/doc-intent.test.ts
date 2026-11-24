@@ -349,6 +349,14 @@ describe('L7-K0 (FU-184): taking a numbered part out of a document is a rewrite'
     ['删除第 2 段', true],
     ['第三条去掉', true],
     ['把第 5 句删了吧', true],
+    // PR-Daemon #2055: a limit after the delete, or a title with a negation in it.
+    ['删掉第3段，其他不要动', true],
+    ['把第3段删掉，不要改别的', true],
+    ['删除第 3 段，不用保留', true],
+    ['把第3段删掉，不必解释', true],
+    ['把《不对的合同.docx》第3段删掉', false],
+    ['把《不要动.docx》里的第3段删掉', false],
+    ['把《不能说的秘密.docx》的第3段删掉', false],
   ])('%s → documents tools', (text, inDocument) => {
     expect(asksDeleteParagraph(text, inDocument)).toBe(true)
     expect(wantsDocTool(text, inDocument)).toBe(true)
@@ -367,6 +375,10 @@ describe('L7-K0 (FU-184): taking a numbered part out of a document is a rewrite'
     ['删除一份文件需要多久', false],
     ['这份合同的违约金是多少', true],
     ['把《合同.pdf》删了', false],
+    ['第 3 段删掉算了', true],
+    ['第3段不需要删', true],
+    ['不许删第3段', true],
+    ['禁止删除第3段', true],
     // PR-Daemon #2048: told not to, or asking, inside a document's conversation.
     ['不要删第 3 段', true],
     ['别删第3段', true],

@@ -767,7 +767,9 @@ fn what_the_first_search_puts_in_is_three_short_passages() {
     assert_eq!(evidence[2]["snippet"].as_str().unwrap().chars().count(), 251);
     assert_eq!(evidence[0]["knowledge_id"], "k1");
     assert_eq!(evidence[0]["title"], "烧水指南");
-    assert!(evidence[0].get("knowledge_base_id").is_none());
+    // L7-K1: the library's id stays (a short string, not a passage), for
+    // agent24d's record of where each hit sits.
+    assert_eq!(evidence[0]["knowledge_base_id"], "kb");
     // PR-Daemon #1976 F1: `kind` stays, for agent24d's record of the hits.
     assert_eq!(v["kind"], "knowledge.search");
     assert_eq!(evidence[0]["use"], "clue");

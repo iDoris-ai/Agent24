@@ -159,11 +159,18 @@ const PART_QUESTION = /怎么|如何|能不能|可以吗|吗|呢|[？?]|为什�
  * NOT_DELETE (a refusal just before the verb): a miss costs a rewording, a
  * false hit proposes the opposite of what was said. 「别」 counts only before a
  * verb (not 「区别」「特别」). */
-const PART_NEGATED = /不要|不用|不必|无需|不想|先不|甭|不删|不能|别(?=\s*(?:把|删|去|移|拿|动))/
+const PART_NEGATED = /不要|不用|不必|无需|不需要|没必要|不想|先不|不许|不准|禁止|甭|不删|不能|别(?=\s*(?:把|删|去|移|拿|动))/
 
 /** Whether a turn asks to take one numbered part out of a document. */
 export function asksDeleteParagraph(text: string, inDocument: boolean): boolean {
-  return aboutDocument(text, inDocument) && !NOT_DELETE.test(text) && !PART_NEGATED.test(text) && !PART_QUESTION.test(text) && DELETE_PART.test(text)
+  if (!aboutDocument(text, inDocument)) return false
+  // A title is never the sentence (《不对的合同.docx》); as asksDeleteDocument does.
+  const said = text.replace(/《[^》]{1,200}》/g, '《》')
+  if (/[？?]\s*$/.test(said)) return false
+  // Told not to, or asking, only within the clause that holds the delete
+  // (「删掉第3段，其他不要动」 is a request with a limit, not a refusal).
+  return said.split(/[，。！？,.!?]/).some((clause) =>
+    DELETE_PART.test(clause) && !NOT_DELETE.test(clause) && !PART_NEGATED.test(clause) && !PART_QUESTION.test(clause))
 }
 
 /** Whether a turn goes to the Agent with the documents tools. */

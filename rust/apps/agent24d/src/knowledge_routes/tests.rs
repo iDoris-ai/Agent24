@@ -519,7 +519,7 @@ async fn a_bound_run_reads_back_what_its_knowledge_tools_did() {
         knowledge(&bound).await,
         serde_json::json!({
             "searched": false, "read_chunks": [],
-            "search_refused": false, "found_passages": 0, "found_titles": []
+            "search_refused": false, "found_passages": 0, "found_titles": [], "found": []
         })
     );
     assert!(knowledge(&unbound).await.is_null());
@@ -554,7 +554,7 @@ async fn a_bound_run_reads_back_what_its_knowledge_tools_did() {
         serde_json::json!({
             "searched": true,
             "read_chunks": [{ "knowledge_id": "doc-7", "chunk_id": "chk-71" }],
-            "search_refused": false, "found_passages": 0, "found_titles": []
+            "search_refused": false, "found_passages": 0, "found_titles": [], "found": []
         })
     );
     // A list of runs does not say.
