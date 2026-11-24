@@ -19,7 +19,7 @@ describe('jobOutcome', () => {
       .mockResolvedValueOnce({ ok: true, data: { job_id: 'j', status: 'running' } })
       .mockResolvedValueOnce({ ok: true, data: { job_id: 'j', status: 'succeeded', result: { document_id: 'doc_1' } } })
       .mockResolvedValueOnce({ ok: true, data: { document_id: 'doc_1', title: '合同（修改）' } })
-    expect(await jobOutcome({ request } as never, 'j', async () => {})).toEqual({ kind: 'made', title: '合同（修改）' })
+    expect(await jobOutcome({ request } as never, 'j', async () => {})).toEqual({ kind: 'made', title: '合同（修改）', documentId: 'doc_1' })
   })
   it('a failed import made nothing', async () => {
     const request = vi.fn().mockResolvedValue({ ok: true, data: { job_id: 'j', status: 'failed' } })

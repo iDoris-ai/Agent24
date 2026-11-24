@@ -16,6 +16,12 @@ export function focusDocument(focus: DocFocus): void {
   for (const l of listeners) l()
 }
 
+/** L7-K0 (FU-139): open a document's details by its id, no block in view: a
+ * line in the conversation (「已生成：《…》」) points at the document it made. */
+export function openDocument(documentId: string): void {
+  focusDocument({ documentId, blockId: '' })
+}
+
 export function pendingDocFocus(): DocFocus | null {
   return pending
 }
