@@ -325,17 +325,23 @@ export function knowledgeUploads(deps: UploadDeps): {
       markUnreachable(upload)
       return
     }
+    // A 2xx whose body cannot be used (cut off, too large, another request's, not a job): the upload may
+    // have landed, so it is unknown, never failed.
+    if (posted.status >= 200 && posted.status < 300) {
+      const job = posted.kind !== 'unreadable' && isObj(posted.json) && posted.json.request_id === requestId
+        ? parseJob(posted.json.job)
+        : null
+      if (!job) {
+        markUnreachable(upload)
+        return
+      }
+      adopt(upload, job)
+      upload.reason = job.status === 'failed' ? job.failureReason : null
+      return
+    }
     if (posted.kind === 'unreadable') {
       applyOutcome(upload, refusedOrFailed(posted.status, null))
       return
-    }
-    if (posted.status === 200 && isObj(posted.json) && posted.json.request_id === requestId) {
-      const job = parseJob(posted.json.job)
-      if (job) {
-        adopt(upload, job)
-        upload.reason = job.status === 'failed' ? job.failureReason : null
-        return
-      }
     }
     applyOutcome(upload, refusedOrFailed(posted.status, posted.json))
   }
