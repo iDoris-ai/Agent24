@@ -16,8 +16,9 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use crate::provider::budget::CallBudget;
 use crate::provider::state::{LocalReason, Refusal};
 use crate::tool::call::{Failure, KnowledgeBackend, ReadQuery, SearchQuery};
 use crate::{
@@ -97,6 +98,7 @@ fn local(reason: LocalReason, retryable: bool) -> Failure {
 type Ready = (Arc<dyn KnowledgeTransport>, u64, Vec<String>);
 
 /// The call as sent: where it went and under which activation and C.
+#[derive(Clone)]
 struct Sent {
     pin: RunBinding,
     generation: u64,
@@ -260,9 +262,26 @@ impl DaemonKnowledgeBackend {
         request: &Req,
         echo: impl Fn(&Resp) -> (&str, u64),
     ) -> Result<Resp, Failure> {
+        self.exchange_within(op, transport, sent, request_id, request, DEADLINE_MS, echo)
+            .await
+    }
+
+    /// [`Self::exchange`] with the time the server is given (the request's
+    /// own `deadline_ms`): a group request gets what is left of the call's.
+    #[allow(clippy::too_many_arguments)]
+    async fn exchange_within<Req: Serialize, Resp: DeserializeOwned>(
+        &self,
+        op: KnowledgeOperation,
+        transport: &dyn KnowledgeTransport,
+        sent: Sent,
+        request_id: &str,
+        request: &Req,
+        deadline_ms: u64,
+        echo: impl Fn(&Resp) -> (&str, u64),
+    ) -> Result<Resp, Failure> {
         let body =
             serde_json::to_vec(request).map_err(|_| local(LocalReason::Incompatible, false))?;
-        let deadline = Duration::from_millis(DEADLINE_MS) + TRANSPORT_SLACK;
+        let deadline = Duration::from_millis(deadline_ms) + TRANSPORT_SLACK;
         // A change to the binding while the call is out abandons it there
         // and then (S4.5): the transport's future is dropped.
         // Not even the first poll of `send` if the binding already moved.
@@ -329,6 +348,78 @@ impl DaemonKnowledgeBackend {
             }
             notified.await;
         }
+    }
+
+    /// R3.7(b): the first request was refused as `mixed_score_space`; each
+    /// group the server named is searched on its own, within what is left of
+    /// the call's budget, and the answers are merged by rank. A group's scope
+    /// is the server's own list, checked to lie inside what was asked (which
+    /// lies inside the binding) before anything is sent; every group's answer
+    /// and the merged one are checked to stay inside it again.
+    async fn search_groups(
+        &self,
+        transport: &dyn KnowledgeTransport,
+        sent: Sent,
+        first: SearchRequest,
+        found: Vec<Vec<String>>,
+        mut budget: CallBudget,
+    ) -> Result<(SearchRequest, SearchResponse), Failure> {
+        let asked = first.scope.knowledge_base_ids.as_slice();
+        let Some(found) = groups::checked(asked, found) else {
+            return Err(local(LocalReason::Incompatible, false));
+        };
+        let mut done = groups::Collected::default();
+        for group in found {
+            let Some(deadline_ms) = budget.take(Instant::now()) else {
+                // The call's requests or time are spent: said, not retried.
+                done.unsent(&group);
+                continue;
+            };
+            let Ok(ids) = NonEmpty::try_from(group.clone()) else {
+                return Err(local(LocalReason::Incompatible, false));
+            };
+            let request_id = uuid::Uuid::new_v4().to_string();
+            let request = SearchRequest {
+                protocol_version: ProtocolVersion,
+                request_id: request_id.clone(),
+                generation: first.generation,
+                query: first.query.clone(),
+                scope: Scope {
+                    knowledge_base_ids: ids,
+                },
+                budget: Budget {
+                    deadline_ms,
+                    max_results: first.budget.max_results,
+                    max_concurrency: first.budget.max_concurrency,
+                },
+            };
+            let answer = self
+                .exchange_within(
+                    KnowledgeOperation::Search,
+                    transport,
+                    sent.clone(),
+                    &request_id,
+                    &request,
+                    deadline_ms.get(),
+                    |r: &SearchResponse| (r.request_id.as_str(), r.generation),
+                )
+                .await;
+            match answer {
+                Ok(response) => {
+                    if !groups::inside(&group, &response) {
+                        return Err(local(LocalReason::Incompatible, false));
+                    }
+                    done.answered(response);
+                }
+                Err(Failure::Envelope(envelope)) => {
+                    if let Some(failed) = done.refused(&group, envelope) {
+                        return Err(failed);
+                    }
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        done.merge(first)
     }
 
     /// Whether the activation and C a call went out under are still there.
@@ -436,30 +527,36 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
             generation,
             credential_seq,
         };
-        let response = self
+        // L7-K1: one call's budget covers the first request and any group
+        // requests after it (R3.3, R3.7(b)).
+        let started = Instant::now();
+        let mut budget = CallBudget::new(started);
+        let _ = budget.take(started);
+        let first = self
             .exchange(
                 KnowledgeOperation::Search,
                 transport.as_ref(),
-                sent,
+                sent.clone(),
                 &request_id,
                 &request,
                 |r: &SearchResponse| (r.request_id.as_str(), r.generation),
             )
-            .await?;
+            .await;
+        let response = match first {
+            Ok(response) => response,
+            // R3.6: the knowledge bases sit in more than one score space.
+            Err(Failure::Envelope(envelope)) => match groups::score_groups(&envelope) {
+                Some(found) => {
+                    return self
+                        .search_groups(transport.as_ref(), sent, request, found, budget)
+                        .await;
+                }
+                None => return Err(Failure::Envelope(envelope)),
+            },
+            Err(other) => return Err(other),
+        };
         // What comes back stays inside what was asked (R2.1, R3.8).
-        let asked = request.scope.knowledge_base_ids.as_slice();
-        let effective = response.effective_scope.knowledge_base_ids.as_slice();
-        let failed = response
-            .partial_failures
-            .as_ref()
-            .map_or(&[][..], NonEmpty::as_slice);
-        let inside = effective.iter().all(|id| asked.contains(id))
-            && response
-                .hits
-                .iter()
-                .all(|hit| effective.contains(&hit.knowledge_base_id))
-            && failed.iter().all(|f| asked.contains(&f.knowledge_base_id));
-        if !inside {
+        if !groups::inside(request.scope.knowledge_base_ids.as_slice(), &response) {
             return Err(local(LocalReason::Incompatible, false));
         }
         Ok((request, response))
@@ -544,5 +641,8 @@ impl KnowledgeBackend for DaemonKnowledgeBackend {
     }
 }
 
+mod groups;
+#[cfg(test)]
+mod groups_tests;
 #[cfg(test)]
 mod tests;
