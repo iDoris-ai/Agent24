@@ -591,6 +591,27 @@ describe('knowledge upload (L7-K2 A3)', () => {
     expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
   })
 
+  it('stops waiting for a final cost after 300 polls, and on dispose', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md', 'a')
+    h.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-a', status: 'cancelled', cost: { final: false, items: [] } }) })
+    await h.uploads.add(['/tmp/docs/a.md'])
+    for (let i = 0; i < 300; i++) {
+      h.queue.get.push({ status: 200, body: saved({ job_id: 'job-a', status: 'cancelled', cost: { final: false, items: [] } }) })
+      await h.firePoll()
+    }
+    expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+    expect(h.uploads.list()[0]).toMatchObject({ state: 'cancelled', costFinal: false })
+
+    const d = harness()
+    put(d, '/tmp/docs/b.md', 'b')
+    d.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-b', status: 'cancelled', cost: { final: false, items: [] } }) })
+    await d.uploads.add(['/tmp/docs/b.md'])
+    expect(d.timers.some((timer) => timer.ms === 2_000)).toBe(true)
+    d.uploads.dispose()
+    expect(d.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+  })
+
   it('cancel takes the job and the cost from the answer', async () => {
     const h = harness()
     put(h, '/tmp/docs/a.md', 'a')
