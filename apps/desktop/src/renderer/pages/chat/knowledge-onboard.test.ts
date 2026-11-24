@@ -128,7 +128,8 @@ describe('onboarding questions', () => {
     expect(done.last?.cancelled).toBeUndefined()
   })
 
-  it.each(['否', '不是', '可以', '没关系', '可以放到服务器', '都行', '否。'])('no word %s may go to the server', (word) => {
+  // QA 11-25: consent to the server is only the 否 the question defines, or a sentence that names the server.
+  it.each(['否', '否。', '可以放到服务器', '可以放服务器', '放到服务器也行'])('consent 「%s」 may go to the server', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toEqual({ localOnly: false })
   })
@@ -146,7 +147,7 @@ describe('onboarding questions', () => {
   })
 
   // A question back is never consent: asked again.
-  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器', '能', '不必', '没必要', '不', '不！', '不用', '不，是', '不、是'])('「%s」 is asked again, never sent', (word) => {
+  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器', '能', '不必', '没必要', '不', '不！', '不用', '不，是', '不、是', '都行', '没关系', '无所谓', '不是', '可以', '可以的'])('「%s」 is asked again, never sent', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toBeUndefined()
     expect(done.last?.reply).toBe(AGAIN)
@@ -262,7 +263,7 @@ describe('uploadLine', () => {
     expect(uploadLine(up({ state: 'indexed', enrichment: 'running' }))).toBe('《制度.md》已可检索，摘要还在生成')
     expect(uploadLine(up({ state: 'failed', reason: 'parse' }))).toBe('《制度.md》处理失败（parse）')
     expect(uploadLine(up({ state: 'cancelled', originalRetained: true }))).toBe('《制度.md》已取消。原件仍保存在服务器上；取消前已发生的处理照实计费')
-    expect(uploadLine(up({ state: 'cancelled' }))).toBe('《制度.md》已取消。取消前已发生的处理照实计费')
+    expect(uploadLine(up({ state: 'cancelled', costFinal: true, costUnknown: true }))).toBe('《制度.md》已取消。取消前已发生的处理照实计费，费用未知')
     expect(uploadLine(up({ state: 'unknown', reason: 'unreachable' }))).toBe('《制度.md》上传后没有收到可用的答复，不确定是否已上传成功')
     expect(uploadLine(up({ state: 'unknown', reason: 'other' }))).toBe('《制度.md》状态不明')
   })
@@ -273,7 +274,10 @@ describe('uploadLine', () => {
     expect(uploadLine({ ...indexed, costFinal: false, costUnknown: true })).toBe('《制度.md》已可检索')
     expect(uploadLine({ ...indexed, costFinal: true, costZero: true, costUnknown: true })).toBe('《制度.md》已可检索，没有产生费用')
     expect(uploadLine({ ...indexed, costFinal: true, costZero: false, costUnknown: true })).toBe('《制度.md》已可检索，费用未知')
-    expect(uploadLine({ ...indexed, costFinal: true, costZero: false, costUnknown: false })).toBe('《制度.md》已可检索，已产生费用（以服务器记录为准）')
+    expect(uploadLine({ ...indexed, costFinal: true, costZero: false, costUnknown: false })).toBe('《制度.md》已可检索，费用以服务器记录为准')
+    // a settled job whose cost is not final yet says so instead of nothing
+    expect(uploadLine(up({ state: 'cancelled', jobId: 'j', costFinal: false }))).toBe('《制度.md》已取消。取消前已发生的处理照实计费，费用暂未结算')
+    expect(uploadLine(up({ state: 'failed', jobId: 'j', reason: 'parse_failed', costFinal: false }))).toBe('《制度.md》处理失败（parse_failed），费用暂未结算')
   })
 })
 

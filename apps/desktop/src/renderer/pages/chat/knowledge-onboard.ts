@@ -100,8 +100,10 @@ export function beginOnboard(text: string): { state: OnboardStep; reply: string 
  * a negated server phrase («不能放到服务器», the question's own words) means the material stays local.
  */
 const NO_ANSWERS = new Set([
-  // Not bare 不 / 不用: at the earlier questions they mean stop, and 不 can echo the question's 「不能放到服务器」.
-  '否', '不是', '可以', '可以的', '都行', '没关系', '无所谓',
+  // Only the 否 the question defines, or a sentence that names the server. Not 不 / 不用 (stop at the earlier
+  // questions, or an echo of 「不能放到服务器」), and not 都行 / 没关系 / 无所谓 / 不是 / 可以, which may only mean
+  // «no preference» or a misheard choice: those are asked again (QA 11-25).
+  '否',
   '可以放服务器', '可以放到服务器', '可以放在服务器', '可以放到服务器上', '可以放在服务器上',
   '能放服务器', '能放到服务器', '放服务器也行', '放服务器也可以', '放到服务器也行', '放到服务器也可以',
 ])
@@ -231,8 +233,13 @@ export function uploadLine(u: KnowledgeUpload): string {
         ? `${name}上传后没有收到可用的答复，不确定是否已上传成功`
         : `${name}状态不明`
   }
-  if (!u.costFinal) return line
+  if (!u.costFinal) {
+    // A job that has stopped but whose cost is not final yet (W5.10): say so; main keeps asking until it is.
+    const settled = u.state === 'cancelled' || u.state === 'failed' || (u.state === 'indexed' && u.enrichment !== 'running')
+    return u.jobId !== null && settled ? `${line}，费用暂未结算` : line
+  }
   if (u.costZero) return `${line}，没有产生费用`
   if (u.costUnknown) return `${line}，费用未知`
-  return `${line}，已产生费用（以服务器记录为准）`
+  // Final, not all exact zero, nothing unknown: the amounts are the server's (estimated items included).
+  return `${line}，费用以服务器记录为准`
 }

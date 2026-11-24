@@ -181,7 +181,9 @@ async function readBody(response: Response, signal: AbortSignal): Promise<unknow
 function needsPoll(upload: KnowledgeUpload): boolean {
   if (upload.jobId === null) return false
   if (upload.state === 'saved' || upload.state === 'processing') return true
-  return upload.state === 'indexed' && upload.enrichment === 'running'
+  if (upload.state === 'indexed' && upload.enrichment === 'running') return true
+  // A job that has stopped is read again until its cost is final (W5.10: final always follows).
+  return (upload.state === 'indexed' || upload.state === 'cancelled' || upload.state === 'failed') && !upload.costFinal
 }
 
 function finished(upload: KnowledgeUpload): boolean {

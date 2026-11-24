@@ -335,7 +335,7 @@ describe('knowledge upload (L7-K2 A3)', () => {
     put(h, filePath, text)
     h.queue.ingest.push({ status: 200, body: saved({ status: 'saved', enrichment: 'none' }) })
     h.queue.get.push({ status: 200, body: saved({ status: 'processing', enrichment: 'none' }) })
-    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none' }) })
+    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none', cost: { final: true, items: [item('exact', 0)] } }) })
     const [upload] = await h.uploads.add([filePath])
     const body = h.calls[0].json
     expect(h.calls[0].url).toBe(`${ORIGIN}/api/v1/agent24/knowledge/ingest`)
@@ -382,7 +382,7 @@ describe('knowledge upload (L7-K2 A3)', () => {
     const h = harness()
     put(h, '/tmp/docs/notes.md')
     h.queue.ingest.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'running' }) })
-    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none' }) })
+    h.queue.get.push({ status: 200, body: saved({ status: 'indexed', enrichment: 'none', cost: { final: true, items: [item('exact', 0)] } }) })
     expect((await h.uploads.add(['/tmp/docs/notes.md']))[0].enrichment).toBe('running')
     expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(true)
     await h.firePoll()
@@ -566,6 +566,28 @@ describe('knowledge upload (L7-K2 A3)', () => {
       reason: 'not_found',
       jobId: 'job-1',
     })
+    expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+  })
+
+  it('keeps polling a cancelled job until its cost is final (W5.10), then stops', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md', 'a')
+    h.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-a' }) })
+    const [added] = await h.uploads.add(['/tmp/docs/a.md'])
+    h.queue.cancel.push({
+      status: 200,
+      body: (req) => ({
+        request_id: req.request_id, cancel_effect: 'cancelled',
+        job: job({ job_id: 'job-a', status: 'cancelled', cost: { final: false, items: [item('unknown', null)] } }),
+      }),
+    })
+    expect(await h.uploads.cancel(added.uploadId)).toMatchObject({ state: 'cancelled', costFinal: false })
+    h.queue.get.push({
+      status: 200,
+      body: saved({ job_id: 'job-a', status: 'cancelled', cost: { final: true, items: [item('exact', 120)] } }),
+    })
+    await h.firePoll()
+    expect(h.uploads.list()[0]).toMatchObject({ state: 'cancelled', costFinal: true, costZero: false })
     expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
   })
 
