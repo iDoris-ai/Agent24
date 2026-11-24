@@ -366,6 +366,7 @@ export interface Sin90Review {
   kind: string
   status: string
   period: string
+  body: string | null
 }
 
 export function parseProposal(v: unknown): Sin90Proposal | null {
@@ -384,7 +385,7 @@ export function parseReview(v: unknown): Sin90Review | null {
   const status = str(v['status'])
   const period = str(v['period'])
   if (!id || !kind || !status || !period) return null
-  return { id, kind, status, period }
+  return { id, kind, status, period, body: optStr(v['body']) }
 }
 
 export function readProposals(data: unknown): Sin90Proposal[] {

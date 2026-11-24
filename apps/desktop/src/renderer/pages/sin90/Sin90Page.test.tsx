@@ -5,6 +5,7 @@ import type { BackendProxyRequest } from '../../../shared/ipc-types'
 import { setLocale } from '../../i18n'
 import { Sin90Page } from './Sin90Page'
 import { isoWeekUTC } from './model'
+import type { CompletionEvidence } from './loop-model'
 import { legalPlanParents, readPeriodPlans } from './model'
 
 let areas: unknown[] = []
@@ -16,6 +17,9 @@ let blocks: unknown[] = []
 let proposals: unknown[] = []
 let reviews: unknown[] = []
 let periodPlans: unknown | null = null
+let priorities: Record<string, unknown> = {}
+let completionDraft: unknown = {}
+let keyAvailable = true
 let failToday = false
 let dataStatus: unknown = {
   template: null,
@@ -30,6 +34,7 @@ const sin90ImportFromFile = vi.fn(async () => ({ ok: true, status: 200, data: { 
 function task(id: string, title: string, status = 'in_progress') { return { id, title, status, direction_id: 'd1', week_id: null } }
 
 beforeEach(() => {
+  priorities = {}; completionDraft = {}; keyAvailable = true
   setLocale('zh'); areas = []; directions = []; tasks = []; weeks = []; blocks = []; proposals = []; reviews = []; periodPlans = null; failToday = false; getPaths.length = 0
   today = { must_do: [], deep_block: null, inbox: [], carry_over_candidates: [] }
   dataStatus = {
@@ -43,11 +48,14 @@ beforeEach(() => {
   sin90ExportToFile.mockReset(); sin90ExportToFile.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
   sin90ImportFromFile.mockReset(); sin90ImportFromFile.mockResolvedValue({ ok: true, status: 200, data: { ok: true } })
   Object.defineProperty(window, 'agent24', { configurable: true, value: {
-    sin90Write, sin90KeyStatus: async () => ({ available: true }),
+    sin90Write, sin90KeyStatus: async () => ({ available: keyAvailable }),
     sin90ExportToFile, sin90ImportFromFile,
     onSin90Event: () => () => undefined,
     backendProxy: async (req: BackendProxyRequest) => {
       getPaths.push(req.path)
+      if (req.path.endsWith('/priority')) return priorities[req.path] ? { ok: true, status: 200, data: priorities[req.path] } : { ok: false, status: 404, data: {} }
+      if (req.path.includes('/review/weekly/draft?')) return { ok: true, status: 200, data: completionDraft }
+      if (req.path.endsWith('/tasks')) return { ok: true, status: 200, data: { tasks } }
       if (req.path.endsWith('/today')) return failToday ? { ok: false, status: 500, data: { error: { message: '不可用' } } } : { ok: true, status: 200, data: today }
       if (req.path.endsWith('/areas')) return { ok: true, status: 200, data: { areas } }
       if (req.path.endsWith('/directions')) return { ok: true, status: 200, data: { directions } }
@@ -397,4 +405,189 @@ describe('Sin90 demo banner & data panel', () => {
     fireEvent.click(screen.getByRole('button', { name: '确认' }))
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'dataReset' }))
   })
+})
+
+
+describe('Sin90 quadrant fallback', () => {
+  it('shows four named quadrants and real unevaluated tasks once on an old module', async () => {
+    directions = [{ id: 'd1', title: '产品', status: 'active', target_window: 'ongoing' }]
+    tasks = [task('t1', '写完方案'), task('t2', '访谈用户', 'backlog')]
+    today = { must_do: [task('t1', '写完方案')], deep_block: null, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
+    const board = await screen.findByRole('region', { name: '优先级四象限' })
+    for (const name of ['重要 · 紧急', '重要 · 不紧急', '不重要 · 紧急', '不重要 · 不紧急', '未评估']) {
+      expect(within(board).getByRole('region', { name })).toBeInTheDocument()
+    }
+    const unassessed = within(board).getByRole('region', { name: '未评估' })
+    expect(within(unassessed).getAllByRole('listitem')).toHaveLength(2)
+    expect(screen.getAllByText('写完方案')).toHaveLength(1)
+    expect(screen.getAllByText('访谈用户')).toHaveLength(1)
+    expect(within(board).getByText(/当前模块未提供优先级评估/)).toBeInTheDocument()
+    expect(within(board).getByLabelText('评估建议（可选）')).toBeDisabled()
+    expect(within(board).getByRole('button', { name: '重新评估优先级' })).toBeDisabled()
+    expect(sin90Write).not.toHaveBeenCalled()
+  })
+
+  it('keeps capture and long-term edits when returning to daily work', async () => {
+    render(<Sin90Page />)
+    fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '待整理的上下文' } })
+    fireEvent.click(screen.getByRole('tab', { name: '方向' }))
+    fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
+    fireEvent.click(screen.getByRole('tab', { name: '今天' }))
+    expect(screen.getByLabelText(/随手记/)).toHaveValue('待整理的上下文')
+    expect(screen.getByRole('tab', { name: '今日概览' })).toHaveAttribute('aria-selected', 'true')
+    fireEvent.click(screen.getByRole('tab', { name: '四象限' }))
+    expect(await screen.findByRole('region', { name: '优先级四象限' })).toBeInTheDocument()
+    expect(screen.getByLabelText(/随手记/)).toHaveValue('待整理的上下文')
+    fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
+    for (const title of ['下一段专注', '今天先做这三件', '收件箱', '本周节奏', '方向']) expect(screen.getAllByText(title).length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: '看本周' })).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+  })
+
+  it('completes an unevaluated backlog task without notes or AI', async () => {
+    today = { must_do: [], deep_block: null, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
+    const row = await screen.findByRole('listitem', { name: '访谈用户' })
+    fireEvent.click(within(row).getByRole('button', { name: '完成' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledTimes(3))
+    expect(sin90Write.mock.calls.map(([body]) => body)).toEqual([
+      { op: 'transitionTask', id: 't2', to: 'planned' },
+      { op: 'transitionTask', id: 't2', to: 'in_progress' },
+      { op: 'transitionTask', id: 't2', to: 'done' },
+    ])
+  })
+})
+
+
+describe('Sin90 loop desktop contract', () => {
+  const assessment = (quadrant: string, rationale: string) => ({ quadrant, rationale, importance: 'high', urgency: quadrant === 'do_first' ? 'high' : 'low', evaluated_at: '2026-11-24T00:00:00Z' })
+  it('allows advice before evaluation and leaves it optional', async () => {
+    tasks = [task('t1', '写完方案')]
+    priorities['/api/v1/sin90/tasks/t1/priority'] = { task_id: 't1', evaluation_status: 'unevaluated', ai: null, human_override: null, effective: null }
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
+    const evaluate = screen.getByRole('button', { name: '重新评估优先级' })
+    await waitFor(() => expect(evaluate).toBeEnabled())
+    const advice = screen.getByLabelText('评估建议（可选）')
+    fireEvent.change(advice, { target: { value: '先安排用户访谈，再写方案' } })
+    expect(sin90Write).not.toHaveBeenCalled()
+    fireEvent.click(evaluate)
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'evaluatePriority', advice: '先安排用户访谈，再写方案' }))
+    await waitFor(() => expect(evaluate).toBeEnabled())
+    fireEvent.change(advice, { target: { value: '' } })
+    fireEvent.click(evaluate)
+    await waitFor(() => expect(sin90Write).toHaveBeenLastCalledWith({ op: 'evaluatePriority' }))
+  })
+
+  it('preserves a human decision after evaluation and displays AI and human reasons separately', async () => {
+    tasks = [task('t1', '写完方案')]
+    const ai = assessment('do_first', '今天交付')
+    let human: { quadrant: string; rationale: string } | null = null
+    const update = () => { priorities['/api/v1/sin90/tasks/t1/priority'] = { task_id: 't1', evaluation_status: 'evaluated', ai, human_override: human, effective: human ?? ai } }
+    update()
+    sin90Write.mockImplementation(async (body) => {
+      if (body['op'] === 'overridePriority') human = { quadrant: String(body['quadrant']), rationale: String(body['rationale']) }
+      if (body['op'] === 'clearPriorityOverride') human = null
+      update()
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
+    let row = await screen.findByRole('listitem', { name: '写完方案' })
+    expect(within(screen.getByRole('region', { name: '重要 · 紧急' })).getByText('写完方案')).toBeInTheDocument()
+    fireEvent.change(within(row).getByLabelText('我的判断'), { target: { value: 'schedule' } })
+    fireEvent.change(within(row).getByLabelText('判断依据 / 建议'), { target: { value: '先访谈再交付' } })
+    fireEvent.click(within(row).getByRole('button', { name: '保存我的判断' }))
+    await waitFor(() => expect(within(screen.getByRole('region', { name: '重要 · 不紧急' })).getByText('写完方案')).toBeInTheDocument())
+    fireEvent.click(screen.getByRole('button', { name: '重新评估优先级' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'evaluatePriority' }))
+    row = await screen.findByRole('listitem', { name: '写完方案' })
+    expect(within(row).getByText(/AI 判断：重要 · 紧急 · 今天交付/)).toBeInTheDocument()
+    expect(within(row).getByText(/我的判断：重要 · 不紧急 · 先访谈再交付/)).toBeInTheDocument()
+    fireEvent.click(within(row).getByRole('button', { name: '清除我的判断' }))
+    await waitFor(() => expect(within(screen.getByRole('region', { name: '重要 · 紧急' })).getByText('写完方案')).toBeInTheDocument())
+  })
+
+  it('completes without a note, enriches the same weekly event and changes plans only on acceptance', async () => {
+    const completed: CompletionEvidence = { task_id: 't1', title: '写完方案', completed_at: '2026-11-24T00:00:00Z', quadrant: null, note: null }
+    tasks = [task('t1', '写完方案')]
+    completionDraft = { completed_tasks: [] }
+    today = { must_do: [task('t1', '写完方案')], deep_block: null, inbox: [], carry_over_candidates: [] }
+    sin90Write.mockImplementation(async (body) => {
+      if (body['op'] === 'transitionTask' && body['to'] === 'done') {
+        tasks = [task('t1', '写完方案', 'done')]
+        today = { must_do: [task('t1', '写完方案', 'done')], deep_block: null, inbox: [], carry_over_candidates: [] }
+        completionDraft = { completed_tasks: [completed] }
+      }
+      if (body['op'] === 'completionNote') { completed.note = String(body['note']) }
+      if (body['op'] === 'createWeeklyReview') reviews = [{ id: 'r1', kind: 'weekly', period: isoWeekUTC(new Date()), status: 'draft', body: '' }]
+      if (body['op'] === 'aiSummarize') proposals = [{ id: 'p1', status: 'pending', source: 'local_brain', ops: [{ op: 'reorder_week_tasks', week_id: 'w1', task_ids: ['t2'] }] }]
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<Sin90Page />)
+    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
+    fireEvent.click(within(await screen.findByRole('listitem', { name: '写完方案' })).getByRole('button', { name: '完成' }))
+    await screen.findByText('尚无备注，不推断成效。')
+    fireEvent.change(screen.getByLabelText('完成备注'), { target: { value: '得到用户反馈' } })
+    fireEvent.click(screen.getByRole('button', { name: '保存备注' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'completionNote', id: 't1', note: '得到用户反馈' }))
+    fireEvent.click(screen.getByRole('button', { name: '复盘' }))
+    const material = await screen.findByRole('region', { name: '本周完成素材' })
+    expect(within(material).getAllByRole('article')).toHaveLength(1)
+    expect(await within(material).findByText('得到用户反馈', { selector: 'p' })).toBeInTheDocument()
+    expect(sin90Write.mock.calls.map(([body]) => body['op'])).toEqual(['transitionTask', 'completionNote'])
+    fireEvent.click(screen.getByRole('button', { name: '开始本周复盘' }))
+    const summarize = await screen.findByRole('button', { name: '生成复盘建议' })
+    await waitFor(() => expect(summarize).toBeEnabled())
+    fireEvent.click(summarize)
+    await screen.findByRole('button', { name: '采纳' })
+    expect(sin90Write.mock.calls.map(([body]) => body['op'])).toEqual(['transitionTask', 'completionNote', 'createWeeklyReview', 'aiSummarize'])
+    fireEvent.click(screen.getByRole('button', { name: '采纳' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'acceptProposal', id: 'p1' }))
+    fireEvent.click(screen.getByRole('tab', { name: '今天' }))
+    fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
+    const finishedRow = screen.getByRole('listitem', { name: '写完方案' })
+    expect(within(finishedRow).getByRole('button', { name: '已完成' })).toBeDisabled()
+  })
+
+  it('retains overview actions and disabled states after a round trip on an old module', async () => {
+    keyAvailable = false
+    today = { must_do: [task('t1', '写完方案', 'planned')], deep_block: { id: 'b1', task_id: 't1', direction_id: 'd1', status: 'planned', planned_minutes: 90 }, inbox: [], carry_over_candidates: [] }
+    render(<Sin90Page />)
+    const overviewRow = await screen.findByRole('listitem', { name: '写完方案' })
+    expect(within(overviewRow).getByRole('button', { name: '完成' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('tab', { name: '四象限' }))
+    await screen.findByText(/当前模块未提供优先级评估/)
+    expect(screen.getByRole('button', { name: '重新评估优先级' })).toBeDisabled()
+    fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
+    expect(screen.getByRole('button', { name: '开始专注' })).toBeDisabled()
+    const row = screen.getByRole('listitem', { name: '写完方案' })
+    expect(within(row).getByLabelText('更多任务操作')).toBeInTheDocument()
+    expect(sin90Write).not.toHaveBeenCalled()
+  })
+})
+
+
+it('keeps focus, more task actions and classification proposals reachable after returning to overview', async () => {
+  today = { must_do: [task('t1', '写完方案', 'planned')], deep_block: { id: 'b1', task_id: 't1', direction_id: 'd1', status: 'planned', planned_minutes: 90 }, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
+  proposals = [{ id: 'p1', status: 'pending', source: 'local_brain', ops: [{ op: 'assign_task_direction', task_id: 't2', direction_id: 'd1' }] }]
+  render(<Sin90Page />)
+  fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
+  await screen.findByRole('region', { name: '未评估' })
+  fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
+  const row = screen.getByRole('listitem', { name: '写完方案' })
+  fireEvent.click(within(row).getByLabelText('更多任务操作'))
+  fireEvent.click(within(row).getByRole('button', { name: '开始' }))
+  await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionTask', id: 't1', to: 'in_progress' }))
+  await waitFor(() => expect(screen.getByRole('button', { name: '开始专注' })).toBeEnabled())
+  fireEvent.click(screen.getByRole('button', { name: '开始专注' }))
+  await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionBlock', id: 'b1', to: 'started' }))
+  fireEvent.click(screen.getByRole('button', { name: '逐条看看' }))
+  const accept = await screen.findByRole('button', { name: '采纳' })
+  await waitFor(() => expect(accept).toBeEnabled())
+  fireEvent.click(accept)
+  await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'acceptProposal', id: 'p1' }))
 })

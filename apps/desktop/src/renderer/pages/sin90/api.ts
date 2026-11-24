@@ -1,3 +1,4 @@
+import { readPriority, readCompletedTasks } from './loop-model'
 // Read-only Sin90 calls. Writes do not go through this proxy.
 
 import {
@@ -60,7 +61,8 @@ export function fetchDirections(): Promise<Sin90Direction[]> {
   return sin90Get('/api/v1/sin90/directions').then(readDirections)
 }
 
-export function fetchTasks(directionId: string): Promise<Sin90Task[]> {
+export function fetchTasks(directionId?: string): Promise<Sin90Task[]> {
+  if (!directionId) return sin90Get('/api/v1/sin90/tasks').then(readTasks)
   return sin90Get(`/api/v1/sin90/tasks?direction_id=${encodeURIComponent(directionId)}`).then(readTasks)
 }
 
@@ -144,4 +146,13 @@ export async function importFromFile(): Promise<void> {
     if (code === 'cancelled') return
     throw new WriteFailed(message || 'Import failed', code)
   }
+}
+
+
+/** Optional loop capabilities: a missing endpoint never blocks the old workbench. */
+export async function fetchPriority(taskId: string) {
+  return sin90Get(`/api/v1/sin90/tasks/${encodeURIComponent(taskId)}/priority`).then(readPriority)
+}
+export async function fetchCompletionMaterial(week: string) {
+  return sin90Get(`/api/v1/sin90/review/weekly/draft?week=${encodeURIComponent(week)}`).then(readCompletedTasks)
 }
