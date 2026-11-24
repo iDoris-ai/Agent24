@@ -166,6 +166,13 @@ export const IpcChannels = {
   KnowledgeOnboardPreflight: 'knowledge:onboard-preflight',
   /** L7-K2: run mock onboarding. The activation code and the key never come back. */
   KnowledgeOnboardRun: 'knowledge:onboard-run',
+  /** L7-K2 A3: pick files in main and upload them. Paths never come back. */
+  KnowledgeUploadPick: 'knowledge:upload-pick',
+  KnowledgeUploadList: 'knowledge:upload-list',
+  /** Arg is the uploadId, a string of at most 64 characters. */
+  KnowledgeUploadCancel: 'knowledge:upload-cancel',
+  /** Main → renderer. The full upload list. No path, bytes, credential or URL. */
+  KnowledgeUploadChanged: 'knowledge:upload-changed',
   // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
   // sends only where to draw it; the address, partition and policy are main's.
   KnowledgeViewShow: 'knowledge-view:show',
@@ -265,6 +272,24 @@ export type KnowledgeOnboardResult =
       | 'server_error'
       | 'not_saved'
   }
+
+/** L7-K2 A3: one picked file, as the renderer may see it. No path, bytes, credential or URL. */
+export interface KnowledgeUpload {
+  uploadId: string
+  fileName: string
+  state: 'refused' | 'sending' | 'saved' | 'processing' | 'indexed' | 'failed' | 'cancelled' | 'unknown'
+  reason: string | null
+  jobId: string | null
+  enrichment: string | null
+  /** The server marked this cost final. */
+  costFinal: boolean
+  /** True only when the cost is final and every item is measured exact with units 0. */
+  costZero: boolean
+  /** True when any cost item is measured unknown. */
+  costUnknown: boolean
+  originalRetained: boolean
+  updatedAt: number
+}
 
 export type {
   KnowledgeViewBounds,
