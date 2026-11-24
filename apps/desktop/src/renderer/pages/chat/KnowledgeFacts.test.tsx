@@ -15,7 +15,11 @@ describe('L7-K0: the fact line from the run record', () => {
     expect(knowledgeFacts(record({ found_passages: 2, found_titles: ['制度.pdf', '手册'] }))).toEqual({ kind: 'found', passages: 2, titles: ['制度.pdf', '手册'] })
     // Human-made zero: a search that returned nothing is 「没找到」.
     expect(knowledgeFacts(record({}))).toEqual({ kind: 'none' })
-    expect(knowledgeFacts(record({ searched: false, search_refused: true }))).toEqual({ kind: 'refused' })
+    // L7-K1: the reason comes from the record; one without it (an older
+    // daemon) is not claimed to be the policy.
+    expect(knowledgeFacts(record({ searched: false, search_refused: true, search_refusal: 'policy' }))).toEqual({ kind: 'refused', reason: 'policy' })
+    expect(knowledgeFacts(record({ searched: false, search_refused: true, search_refusal: 'failed' }))).toEqual({ kind: 'refused', reason: 'failed' })
+    expect(knowledgeFacts(record({ searched: false, search_refused: true }))).toEqual({ kind: 'refused', reason: 'failed' })
     expect(knowledgeFacts(record({ searched: false }))).toBeNull()
     expect(knowledgeFacts(null)).toBeNull()
     // Only a read-back is not a search that found nothing.
@@ -31,8 +35,12 @@ describe('L7-K0: the fact line from the run record', () => {
     expect(screen.getByText('以上是检索到的内容，不表示回答用了哪一段。')).toBeInTheDocument()
     rerender(<KnowledgeFacts facts={{ kind: 'none' }} />)
     expect(screen.getByText('已检索知识库：没找到')).toBeInTheDocument()
-    rerender(<KnowledgeFacts facts={{ kind: 'refused' }} />)
-    expect(screen.getByText(/检索没能进行/)).toBeInTheDocument()
+    rerender(<KnowledgeFacts facts={{ kind: 'refused', reason: 'policy' }} />)
+    expect(screen.getByText(/检索没能进行（这次对话里有不能外发的内容）/)).toBeInTheDocument()
+    // Not every refusal is the outbound check: a failed search says so.
+    rerender(<KnowledgeFacts facts={{ kind: 'refused', reason: 'failed' }} />)
+    expect(screen.getByText(/知识库这次没有给出结果/)).toBeInTheDocument()
+    expect(screen.queryByText(/不能外发/)).toBeNull()
     rerender(<KnowledgeFacts facts={null} />)
     expect(screen.queryByText(/检索/)).toBeNull()
   })

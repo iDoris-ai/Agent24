@@ -296,6 +296,7 @@ fn a_run_answered_without_the_tools_read_nothing() {
             searched: false,
             read_chunks: vec![],
             search_refused: false,
+            search_refusal: None,
             found_passages: 0,
             found_titles: vec![],
             found: vec![],
@@ -321,6 +322,7 @@ fn a_run_answered_without_the_tools_read_nothing() {
             searched: false,
             read_chunks: vec![],
             search_refused: true,
+            search_refusal: Some("policy"),
             found_passages: 0,
             found_titles: vec![],
             found: vec![],
@@ -354,6 +356,7 @@ fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
             searched: true,
             read_chunks: vec![chunk("doc-7", "chk-71"), chunk("doc-7", "chk-72")],
             search_refused: false,
+            search_refusal: None,
             found_passages: 0,
             found_titles: vec![],
             found: vec![],
@@ -394,6 +397,7 @@ fn a_completed_searchs_hits_count_as_read() {
             searched: true,
             read_chunks: vec![chunk("doc-1", "chk-1"), chunk("doc-2", "chk-2")],
             search_refused: false,
+            search_refusal: None,
             found_passages: 2,
             found_titles: vec![],
             found: vec![],
@@ -577,4 +581,32 @@ fn found_hits_name_the_library_and_carry_no_passage_text() {
         json!({ "query": "q" }),
     )];
     assert!(run_knowledge_with(&failed, &[full]).found.is_empty());
+}
+
+/// L7-K1: why a search was refused, for a client that says it in words: the
+/// policy (outbound check) refused it, or it ran and failed (the service did
+/// not answer, the scopes could not be searched). A policy refusal wins when
+/// both happened.
+#[test]
+fn a_refused_search_says_whether_the_policy_or_a_failure_refused_it() {
+    let calls = |statuses: &[ToolCallStatus]| {
+        statuses
+            .iter()
+            .map(|s| stored(SEARCH, *s, json!({ "query": "q" })))
+            .collect::<Vec<_>>()
+    };
+    let refusal =
+        |statuses: &[ToolCallStatus]| run_knowledge_with(&calls(statuses), &[]).search_refusal;
+    assert_eq!(refusal(&[ToolCallStatus::Denied]), Some("policy"));
+    assert_eq!(refusal(&[ToolCallStatus::Failed]), Some("failed"));
+    assert_eq!(
+        refusal(&[ToolCallStatus::Failed, ToolCallStatus::Denied]),
+        Some("policy")
+    );
+    // A search that completed, or none asked, is no refusal.
+    assert_eq!(
+        refusal(&[ToolCallStatus::Denied, ToolCallStatus::Completed]),
+        None
+    );
+    assert_eq!(refusal(&[]), None);
 }
