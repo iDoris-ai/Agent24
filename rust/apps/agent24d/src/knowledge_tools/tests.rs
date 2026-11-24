@@ -432,13 +432,18 @@ fn the_first_searchs_compacted_hits_count_as_read() {
         ToolCallStatus::Completed,
         json!({ "query": "q", "max_results": 3 }),
     )];
+    let k = run_knowledge_with(&done, &[compact]);
     assert_eq!(
-        run_knowledge_with(&done, &[compact]).read_chunks,
+        k.read_chunks,
         vec![ReadChunk {
             knowledge_id: "doc-1".into(),
             chunk_id: "chk-1".into()
         }]
     );
+    // L7-K1: and names the library, which the user most often meets through
+    // the search first.
+    assert_eq!(k.found.len(), 1);
+    assert_eq!(k.found[0].knowledge_base_id, "kb");
 }
 
 /// L7-K0 (FU-183): a search the policy refused is said as refused, not as
@@ -505,9 +510,11 @@ fn found_passages_and_titles_come_from_the_completed_search_answers() {
     assert_eq!(run_knowledge_with(&failed, &answers).found_passages, 0);
 }
 
-/// L7-K1: each hit's library, document, chunk and title, from the same answers;
-/// never the passage text; each chunk once; at most eight; a hit with no
-/// library id (a malformed entry) is not listed.
+/// L7-K1: each hit's library, document, chunk and title, from the answers as
+/// production makes them: the full answer (`knowledge_base_id`, `display`, no
+/// top-level `title`) and the search first's compacted one (`title`, and the
+/// library id). Never the passage text; each chunk once; at most eight; a hit
+/// with no library id is not listed.
 #[test]
 fn found_hits_name_the_library_and_carry_no_passage_text() {
     let done = [stored(
@@ -515,45 +522,59 @@ fn found_hits_name_the_library_and_carry_no_passage_text() {
         ToolCallStatus::Completed,
         json!({ "query": "q" }),
     )];
+    let hit = |kb: &str, doc: &str, chunk: &str, display: serde_json::Value| {
+        json!({ "rank": 1, "use": "clue", "possibly_stale": false, "knowledge_base_id": kb,
+                "knowledge_id": doc, "chunk_id": chunk, "content_tag": "t",
+                "snippet": "秘密正文", "snippet_truncated": false, "display": display })
+    };
     let mut evidence = vec![
-        json!({ "knowledge_base_id": "kb-a", "knowledge_id": "d1", "chunk_id": "c1", "title": "制度.pdf", "snippet": "秘密正文" }),
-        json!({ "knowledge_base_id": "kb-b", "knowledge_id": "d2", "chunk_id": "c2", "display": { "file_name": "项目.docx" } }),
-        json!({ "knowledge_base_id": "kb-a", "knowledge_id": "d1", "chunk_id": "c1", "title": "制度.pdf" }),
-        json!({ "knowledge_id": "d9", "chunk_id": "c9", "title": "no library" }),
+        hit("kb-a", "d1", "c1", json!({ "title": "制度.pdf" })),
+        hit("kb-b", "d2", "c2", json!({ "file_name": "项目.docx" })),
+        hit("kb-a", "d1", "c1", json!({ "title": "制度.pdf" })),
     ];
     for i in 0..10 {
-        evidence.push(json!({ "knowledge_base_id": "kb-a", "knowledge_id": format!("x{i}"), "chunk_id": "c", "title": "t" }));
+        evidence.push(hit("kb-a", &format!("x{i}"), "c", json!({ "title": "t" })));
     }
-    let answers = [json!({ "kind": "knowledge.search", "evidence": evidence }).to_string()];
-    let k = run_knowledge_with(&done, &answers);
-    assert_eq!(k.found.len(), 8);
-    assert_eq!(
-        k.found[..2],
-        [
-            FoundHit {
-                knowledge_base_id: "kb-a".into(),
-                knowledge_id: "d1".into(),
-                chunk_id: "c1".into(),
-                title: "制度.pdf".into()
-            },
-            FoundHit {
-                knowledge_base_id: "kb-b".into(),
-                knowledge_id: "d2".into(),
-                chunk_id: "c2".into(),
-                title: "项目.docx".into()
-            },
-        ]
-    );
-    assert!(
-        !serde_json::to_string(&k.found)
-            .unwrap()
-            .contains("秘密正文")
-    );
-    assert!(k.found.iter().all(|h| h.knowledge_id != "d9"));
+    let full = json!({ "notice": "n", "kind": "knowledge.search", "completeness": "complete",
+        "scope_narrowed": false, "evidence": evidence })
+    .to_string();
+    let expect = [
+        ("kb-a", "d1", "c1", "制度.pdf"),
+        ("kb-b", "d2", "c2", "项目.docx"),
+    ];
+    // The compacted answer keeps the first three hits only.
+    for (answer, len) in [
+        (full.clone(), 8),
+        (agent24_agent::compact_evidence_for_tests(&full).unwrap(), 2),
+    ] {
+        let k = run_knowledge_with(&done, &[answer]);
+        assert_eq!(k.found.len(), len);
+        for (found, (kb, doc, chunk, title)) in k.found.iter().zip(expect) {
+            assert_eq!(
+                found,
+                &FoundHit {
+                    knowledge_base_id: kb.into(),
+                    knowledge_id: doc.into(),
+                    chunk_id: chunk.into(),
+                    title: title.into()
+                }
+            );
+        }
+        assert!(
+            !serde_json::to_string(&k.found)
+                .unwrap()
+                .contains("秘密正文")
+        );
+    }
+    // A hit without a library id is not listed; a failed search lists nothing.
+    let no_base = json!({ "kind": "knowledge.search", "evidence": [
+        { "knowledge_id": "d9", "chunk_id": "c9", "display": { "title": "x" } }] })
+    .to_string();
+    assert!(run_knowledge_with(&done, &[no_base]).found.is_empty());
     let failed = [stored(
         SEARCH,
         ToolCallStatus::Failed,
         json!({ "query": "q" }),
     )];
-    assert!(run_knowledge_with(&failed, &answers).found.is_empty());
+    assert!(run_knowledge_with(&failed, &[full]).found.is_empty());
 }
