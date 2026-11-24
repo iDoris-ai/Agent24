@@ -1503,7 +1503,7 @@ describe('ChatPage: knowledge onboarding in the conversation (L7-K2)', () => {
     say('合同')
     expect(await screen.findByText(/是否必须只留在这台电脑上/)).toBeInTheDocument()
     say('否')
-    expect(await screen.findByText(/已为你建好默认知识库/)).toBeInTheDocument()
+    expect(await screen.findByText(/为你建好默认知识库/)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '上传文档' })).toBeInTheDocument()
     expect(onboardRun).toHaveBeenCalledTimes(1)
     expect(onboardRun).toHaveBeenCalledWith({ localOnly: false })

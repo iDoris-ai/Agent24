@@ -443,6 +443,17 @@ describe('knowledge upload (L7-K2 A3)', () => {
     expect(b).toMatchObject({ state: 'unknown', reason: 'unreachable' })
   })
 
+  it('any 2xx is read the same way: 202 with a job is saved, 204 with no body is unknown', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md')
+    put(h, '/tmp/docs/b.md')
+    h.queue.ingest.push({ status: 202, body: saved() })
+    h.queue.ingest.push({ status: 204 })
+    const [a, b] = await h.uploads.add(['/tmp/docs/a.md', '/tmp/docs/b.md'])
+    expect(a).toMatchObject({ state: 'saved' })
+    expect(b).toMatchObject({ state: 'unknown', reason: 'unreachable' })
+  })
+
   it('reports a timeout as unknown', async () => {
     const h = harness()
     put(h, '/tmp/docs/notes.md')

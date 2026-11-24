@@ -6,8 +6,8 @@ import {
 
 const PURPOSE = '好的，我来帮你开通知识库。先问三个问题。\n1. 这个知识库主要做什么用？（例如：合同审核、公司制度）'
 const TYPES = '主要会放哪些类型的文档？（目前只支持 Markdown（.md）和纯文本（.txt），PDF、Word 暂不支持）'
-const LOCAL = '这些资料是否必须只留在这台电脑上、不能放到服务器？（是 / 否）'
-const AGAIN = '请回答“是”或“否”：资料是否必须只留在这台电脑上？'
+const LOCAL = '3. 这些资料是否必须只留在这台电脑上、不能放到服务器？请回答“是”（只能留在本机）或“否”（可以放到服务器）。'
+const AGAIN = '没能确定你的意思。请只回答“是”（资料只能留在本机）或“否”（可以放到服务器）。'
 const CANCEL = '好的，先不开通。'
 const UNCLEAR = '没听明白，先不开通了；需要时再说“帮我开通知识库”。'
 const FORMAT = '现在可以上传文档：目前支持 .md 和 .txt，单个不超过 10 MB；PDF、Word 暂不支持。'
@@ -128,9 +128,42 @@ describe('onboarding questions', () => {
     expect(done.last?.cancelled).toBeUndefined()
   })
 
-  it.each(['否', '不是', '不用', '可以', '没关系', '放服务器', '都行'])('no word %s may go to the server', (word) => {
+  it.each(['否', '不是', '不用', '可以', '没关系', '可以放到服务器', '都行', '否。'])('no word %s may go to the server', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toEqual({ localOnly: false })
+  })
+
+  // #2075 B1: the question's own words, negated server phrases and «是，» + echo all keep the material local.
+  it.each([
+    '不能放服务器', '不能放到服务器', '不要放服务器', '不可以放服务器', '不放服务器', '别放服务器',
+    '资料不能放在服务器上', '要保密不能放服务器', '是，不能放到服务器', '必须只留在这台电脑上、不能放到服务器',
+    '只留在这台电脑上', '只留在本机',
+  ])('「%s」 stays on this computer', (word) => {
+    const done = walk('帮我开通知识库', ['合同审核', '合同', word])
+    expect(done.last?.run).toEqual({ localOnly: true })
+  })
+
+  // A question back is never consent: asked again.
+  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器'])('「%s」 is asked again, never sent', (word) => {
+    const done = walk('帮我开通知识库', ['合同审核', '合同', word])
+    expect(done.last?.run).toBeUndefined()
+    expect(done.last?.reply).toBe(AGAIN)
+  })
+
+  // #2075 B2: refusals do not start it, and bare refusals at the first two questions stop it.
+  it.each(['不需要开通知识库', '没必要开通知识库', '无需开通知识库'])('「%s」 does not start onboarding', (text) => {
+    expect(asksOnboarding(text)).toBe(false)
+  })
+
+  it.each(['不用', '不要', '不需要'])('a bare 「%s」 at the first question stops it', (word) => {
+    const done = walk('帮我开通知识库', [word])
+    expect(done.last).toEqual({ state: null, reply: CANCEL, cancelled: true })
+  })
+
+  it('a purpose that contains 取消 is a purpose, not a cancel', () => {
+    const done = walk('帮我开通知识库', ['合同取消条款审核'])
+    expect(done.last?.reply).toBe(TYPES)
+    expect(done.last?.state).toMatchObject({ step: 'types', purpose: '合同取消条款审核' })
   })
 
   it('asks once more when the local answer is unclear, then stops', () => {
@@ -177,8 +210,8 @@ describe('preflightReply', () => {
 })
 
 describe('resultReply', () => {
-  const created = '已为你建好默认知识库。' + FORMAT
-  const existing = '你的默认知识库之前已经建好了，没有再建新的。' + FORMAT
+  const created = '已在知识库服务器上为你建好默认知识库，之后上传的文档都存放在服务器上。' + FORMAT
+  const existing = '你在知识库服务器上的默认知识库之前已经建好了，没有再建新的；上传的文档存放在服务器上。' + FORMAT
 
   it('describes a new library, and names office formats the user asked for', () => {
     const ok: KnowledgeOnboardResult = { ok: true, outcome: 'created', knowledgeBaseId: 'kb', configMismatch: false, activeNow: true }
@@ -226,8 +259,9 @@ describe('uploadLine', () => {
     expect(uploadLine(up({ state: 'indexed' }))).toBe('《制度.md》已可检索')
     expect(uploadLine(up({ state: 'indexed', enrichment: 'running' }))).toBe('《制度.md》已可检索，摘要还在生成')
     expect(uploadLine(up({ state: 'failed', reason: 'parse' }))).toBe('《制度.md》处理失败（parse）')
-    expect(uploadLine(up({ state: 'cancelled' }))).toBe('《制度.md》已取消。原件仍保存在服务器上；取消前已发生的处理照实计费')
-    expect(uploadLine(up({ state: 'unknown', reason: 'unreachable' }))).toBe('《制度.md》上传时网络中断，不确定是否已上传成功')
+    expect(uploadLine(up({ state: 'cancelled', originalRetained: true }))).toBe('《制度.md》已取消。原件仍保存在服务器上；取消前已发生的处理照实计费')
+    expect(uploadLine(up({ state: 'cancelled' }))).toBe('《制度.md》已取消。取消前已发生的处理照实计费')
+    expect(uploadLine(up({ state: 'unknown', reason: 'unreachable' }))).toBe('《制度.md》上传后没有收到可用的答复，不确定是否已上传成功')
     expect(uploadLine(up({ state: 'unknown', reason: 'other' }))).toBe('《制度.md》状态不明')
   })
 

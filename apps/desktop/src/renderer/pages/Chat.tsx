@@ -255,10 +255,11 @@ export default function ChatPage() {
     if (ongoing) {
       const step = nextOnboard(ongoing, said)
       if (step.run) {
+        // The flow ends here whatever the run answers: a failed run is not read as the next answer.
+        onboard.current.delete(sessionId)
         const run = api?.onboardRun
         if (!run) return { role: 'assistant', content: ONBOARD_APP_ERROR }
         const result = await run(step.run)
-        onboard.current.delete(sessionId)
         return {
           role: 'assistant',
           content: resultReply(result, ongoing.types),
@@ -301,7 +302,7 @@ export default function ChatPage() {
     // Not when `answer` is set (the extraction card's 「让助手回答」).
     if (!answer) {
       const said = text.trim()
-      if (onboard.current.has(sessionId) || asksOnboarding(said) || asksUpload(said)) {
+      if (chosen === null && (onboard.current.has(sessionId) || asksOnboarding(said) || asksUpload(said))) {
         const index = messages.length
         requestInFlight.current = true
         setLoading(true)

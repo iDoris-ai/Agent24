@@ -4,18 +4,22 @@
 import type { KnowledgeOnboardPreflight, KnowledgeOnboardResult, KnowledgeUpload } from '../../../shared/ipc-types'
 
 const QUESTION_END = /(?:了吗|没有)[。！!？?\s]*$/
-const REFUSAL = /不(?:用|要|想|必)?\s*开通|(?:^|[^特])别\s*开通/
+const REFUSAL = /(?:不(?:用|要|想|必|需要)?|没必要|无需|没有必要)\s*(?:再)?\s*开通|(?:^|[^特])别\s*开通/
 const OPEN = /(?:开通|启用).{0,16}知识库|知识库.{0,16}(?:开通|启用)/
 const BUILD_KB = /建(?:立)?(?:一个|个)?知识库/
 // 「建个库」 only with something to put in it. 「建个数据库」 is not that 库.
 const BUILD_SHORT = /建(?:立)?(?:一个|个)库(?!数据)/
 const SHORT_ABOUT = /合同|文档|资料|知识|放进去/
-const CANCEL = /算了|取消|不开通了|先不用/
+// A whole answer that stops onboarding, or one that starts with these words. Not a substring: 「合同取消条款审核」
+// is a purpose, not a cancel.
+const CANCEL = /^(?:算了|取消|不开通了|先不用|先不开通|不开通|不用了|不要了)/
+/** Bare refusals at the purpose and types questions also stop onboarding. */
+const BARE_NO = /^(?:不|不用|不要|不需要|没有|没|不了)$/
 
 const PURPOSE_QUESTION = '好的，我来帮你开通知识库。先问三个问题。\n1. 这个知识库主要做什么用？（例如：合同审核、公司制度）'
 const TYPES_QUESTION = '主要会放哪些类型的文档？（目前只支持 Markdown（.md）和纯文本（.txt），PDF、Word 暂不支持）'
-const LOCAL_QUESTION = '这些资料是否必须只留在这台电脑上、不能放到服务器？（是 / 否）'
-const LOCAL_AGAIN = '请回答“是”或“否”：资料是否必须只留在这台电脑上？'
+const LOCAL_QUESTION = '3. 这些资料是否必须只留在这台电脑上、不能放到服务器？请回答“是”（只能留在本机）或“否”（可以放到服务器）。'
+const LOCAL_AGAIN = '没能确定你的意思。请只回答“是”（资料只能留在本机）或“否”（可以放到服务器）。'
 const CANCEL_REPLY = '好的，先不开通。'
 const UNCLEAR_REPLY = '没听明白，先不开通了；需要时再说“帮我开通知识库”。'
 
@@ -91,17 +95,23 @@ export function beginOnboard(text: string): { state: OnboardStep; reply: string 
   return { state: { step: 'purpose' }, reply: PURPOSE_QUESTION }
 }
 
+/**
+ * The answer to the privacy question. A consent gate: anything not clearly one or the other is asked again, and
+ * a negated server phrase («不能放到服务器», the question's own words) means the material stays local.
+ */
 function localChoice(text: string): 'yes' | 'no' | null {
-  const s = text.replace(/[。！!？?，,、\s]/g, '')
+  if (/[？?]|吗|会不会|安全不|行不行/.test(text)) return null
+  const s = text.replace(/[。！!，,、；;：:\s]/g, '')
   if (!s) return null
-  const yesPlace = /只在本机|只放本地|不能上传/.test(s)
-  const noPlace = /放在服务器|放到服务器|放服务器|都行|没关系/.test(s)
-  if (yesPlace && noPlace) return null
-  if (yesPlace) return 'yes'
-  if (noPlace) return 'no'
-  if (/^(?:否|不是|不用|可以|可以的)$/.test(s)) return 'no'
-  if (/^(?:是|是的|对|对的|必须|必须的)$/.test(s)) return 'yes'
-  if (/必须/.test(s) && !/不是|不用|不必/.test(s)) return 'yes'
+  // «不能/不要/不可以/别/不 … 服务器» or «不能上传»: must stay on this computer.
+  if (/(?:不能|不要|不可以|不可|不允许|不准|别|不)(?:放|存|传|上传|放到|放在|存到|传到)?.{0,6}(?:服务器|云端|网上|外面)/.test(s)
+    || /(?:不能|不要|不可以|别)上传/.test(s)) return 'yes'
+  if (/^(?:是|是的|对|对的|必须|必须的|要|需要)(?:$|[^不].*$)/.test(s) && !/不是|不用|不必|不需要/.test(s)) return 'yes'
+  if (/^(?:只在本机|只留在本机|只留在这台电脑上?|只放本地|只能在本机|只能放本地)/.test(s)) return 'yes'
+  if (/^(?:否|不是|不用|不必|不需要|没必要|可以|可以的|可以放|能|能放|都行|没关系|无所谓)(?:放(?:到|在)?服务器(?:上)?(?:也行|也可以)?)?$/.test(s)) {
+    return 'no'
+  }
+  if (/^(?:可以|能)放(?:到|在)?服务器(?:上)?(?:也行|也可以)?$/.test(s)) return 'no'
   return null
 }
 
@@ -112,7 +122,9 @@ export function nextOnboard(state: OnboardStep, answer: string): {
   cancelled?: boolean
 } {
   const said = answer.trim()
-  if (CANCEL.test(said)) return { state: null, reply: CANCEL_REPLY, cancelled: true }
+  const bare = said.replace(/[。！!，,、\s]/g, '')
+  if (CANCEL.test(bare)) return { state: null, reply: CANCEL_REPLY, cancelled: true }
+  if (state.step !== 'local' && BARE_NO.test(bare)) return { state: null, reply: CANCEL_REPLY, cancelled: true }
   if (state.step === 'purpose') return { state: { step: 'types', purpose: said }, reply: TYPES_QUESTION }
   if (state.step === 'types') {
     return { state: { step: 'local', purpose: state.purpose, types: said }, reply: LOCAL_QUESTION }
@@ -141,8 +153,8 @@ function mentionsOffice(types: string): boolean {
 export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): string {
   if (r.ok) {
     const lead = r.outcome === 'created'
-      ? '已为你建好默认知识库。'
-      : '你的默认知识库之前已经建好了，没有再建新的。'
+      ? '已在知识库服务器上为你建好默认知识库，之后上传的文档都存放在服务器上。'
+      : '你在知识库服务器上的默认知识库之前已经建好了，没有再建新的；上传的文档存放在服务器上。'
     const note = r.outcome === 'created' && typesAnswer && mentionsOffice(typesAnswer) ? OFFICE_NOTE : ''
     // Saved, but the local service did not take it now (not up, or refused): say so without promising when.
     const later = r.activeNow ? '' : '设置已保存，但本机服务这会儿还没接上这个知识库；如果提问时没有用上知识库，请到“设置 → 知识库”看一下。'
@@ -204,11 +216,11 @@ export function uploadLine(u: KnowledgeUpload): string {
       line = `${name}处理失败（${u.reason ?? ''}）`
       break
     case 'cancelled':
-      line = `${name}已取消。原件仍保存在服务器上；取消前已发生的处理照实计费`
+      line = `${name}已取消。${u.originalRetained ? '原件仍保存在服务器上；' : ''}取消前已发生的处理照实计费`
       break
     default:
       line = u.reason === 'unreachable'
-        ? `${name}上传时网络中断，不确定是否已上传成功`
+        ? `${name}上传后没有收到可用的答复，不确定是否已上传成功`
         : `${name}状态不明`
   }
   if (!u.costFinal) return line
