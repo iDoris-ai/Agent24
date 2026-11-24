@@ -9,7 +9,7 @@ import type { KnowledgeFacts as Facts } from '../knowledge-grounding'
 export default function KnowledgeFacts({ facts }: { facts: Facts | null | undefined }) {
   const t = useT(chatMessages)
   if (!facts) return null
-  if (facts.kind === 'refused') return <div role="note" className="task-card-knowledge">{t('knowledge.facts.refused')}</div>
+  if (facts.kind === 'refused') return <div role="note" className="task-card-knowledge">{t(facts.reason === 'policy' ? 'knowledge.facts.refused' : 'knowledge.facts.refusedFailed')}</div>
   if (facts.kind === 'none') return <div role="note" className="task-card-knowledge">{t('knowledge.facts.none')}</div>
   const names = facts.titles.map((x) => `《${x}》`).join('')
   return (

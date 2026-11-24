@@ -70,7 +70,8 @@ impl Tool for KnowledgeTool {
                 SEARCH,
                 "Search the user's knowledge bases. Leave knowledge_base_ids \
                  out unless the user named one: the search then covers all of \
-                 them. Returns ranked passages as \
+                 them. knowledge_base_ids takes knowledge base IDs, never \
+                 their names. Returns ranked passages as \
                  clues, each with the document and chunk it came from. Before \
                  relying on a passage, read it back with knowledge_read (its \
                  knowledge_id, chunk_id and content_tag): only evidence whose \
@@ -164,6 +165,11 @@ pub struct RunKnowledge {
     /// each was refused (policy) or failed. Said so a client can write 「检索没能
     /// 进行」 instead of letting it pass for 「知识库里没有」.
     pub search_refused: bool,
+    /// L7-K1: why, when `search_refused`: `policy` (the outbound check refused
+    /// it) or `failed` (it ran and failed). A policy refusal wins when both
+    /// happened. Absent when the search was not refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_refusal: Option<&'static str>,
     /// L7-K0: passages the run's completed searches returned, each
     /// (document, chunk) once. 0 with `searched` is 「没找到」.
     pub found_passages: usize,
@@ -205,6 +211,7 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
         searched: false,
         read_chunks: Vec::new(),
         search_refused: false,
+        search_refusal: None,
         found_passages: 0,
         found_titles: Vec::new(),
         found: Vec::new(),
@@ -236,10 +243,18 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
     let search_done = calls
         .iter()
         .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed);
-    knowledge.search_refused = !search_done
-        && calls.iter().any(|c| {
-            c.tool == SEARCH && matches!(c.status, ToolCallStatus::Denied | ToolCallStatus::Failed)
-        });
+    let refused =
+        |status: ToolCallStatus| calls.iter().any(|c| c.tool == SEARCH && c.status == status);
+    knowledge.search_refusal = if search_done {
+        None
+    } else if refused(ToolCallStatus::Denied) {
+        Some("policy")
+    } else if refused(ToolCallStatus::Failed) {
+        Some("failed")
+    } else {
+        None
+    };
+    knowledge.search_refused = knowledge.search_refusal.is_some();
     if search_done {
         let mut seen: Vec<ReadChunk> = Vec::new();
         for (chunk, title, base) in answers.iter().flat_map(|a| search_found(a)) {
