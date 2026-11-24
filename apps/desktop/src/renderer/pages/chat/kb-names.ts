@@ -16,12 +16,17 @@ export type KbNames = Record<string, string>
 export function parseKbNames(text: string): KbNames {
   const out: KbNames = {}
   for (const line of text.split('\n')) {
-    // 「id=名称」 or 「id 名称」: an id has no blank in it, so the first one ends it.
-    const eq = line.indexOf('=')
-    const at = eq >= 0 ? eq : line.search(/\s/)
+    // 「id=名称」 or 「id 名称」: an id has neither 「=」 nor a blank in it, so
+    // whichever of the two comes first ends it (FU-219); a name may hold 「=」,
+    // and 「id = 名称」 drops the one 「=」 right after the id.
+    const text = line.trim()
+    const eq = text.indexOf('=')
+    const blank = text.search(/\s/)
+    const at = eq < 0 ? blank : blank < 0 ? eq : Math.min(eq, blank)
     if (at < 0) continue
-    const id = line.slice(0, at).trim()
-    const name = [...line.slice(at + 1).replace(STRIP, '').replace(/\s+/g, ' ').trim()].slice(0, MAX).join('')
+    const id = text.slice(0, at)
+    const rest = text.slice(at).replace(/^\s*=?/, '')
+    const name = [...rest.replace(STRIP, '').replace(/\s+/g, ' ').trim()].slice(0, MAX).join('')
     if (id !== '' && name !== '') out[id] = name
   }
   return out
@@ -43,5 +48,6 @@ export function saveKbNames(names: KbNames): void {
 export function libraryLabel(id: string, bound: readonly string[], names: KbNames, numbered: string, plain = '知识库'): string {
   const at = bound.indexOf(id)
   if (at < 0) return plain
-  return names[id] ?? numbered.replace('{n}', String(at + 1))
+  // Own keys only: an id like 「constructor」 must not read Object.prototype (FU-219).
+  return (Object.hasOwn(names, id) ? names[id] : undefined) ?? numbered.replace('{n}', String(at + 1))
 }

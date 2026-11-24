@@ -22,4 +22,13 @@ describe('L7-K1: library names the user gave', () => {
     expect(parseKbNames('kb-a=制‮度\n库')).toEqual({ 'kb-a': '制度' })
     expect(parseKbNames(`kb-a=${'长'.repeat(80)}`)['kb-a']).toHaveLength(40)
   })
+  it('FU-219: splits at whichever of 「=」 and the first blank comes first, so a name may hold 「=」', () => {
+    expect(parseKbNames('kb-1 制度=库\nkb-2=a=b\nkb-3 = 项目库')).toEqual({ 'kb-1': '制度=库', 'kb-2': 'a=b', 'kb-3': '项目库' })
+  })
+  it('FU-219: an id that is an Object.prototype key still gets 「知识库 N」, not a function', () => {
+    const bound = ['constructor', 'toString']
+    expect(libraryLabel('constructor', bound, {}, '知识库 {n}')).toBe('知识库 1')
+    expect(libraryLabel('toString', bound, parseKbNames(''), '知识库 {n}')).toBe('知识库 2')
+    expect(libraryLabel('constructor', bound, parseKbNames('constructor=制度库'), '知识库 {n}')).toBe('制度库')
+  })
 })
