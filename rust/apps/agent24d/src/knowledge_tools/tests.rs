@@ -298,6 +298,7 @@ fn a_run_answered_without_the_tools_read_nothing() {
             search_refused: false,
             found_passages: 0,
             found_titles: vec![],
+            found: vec![],
         }
     );
     // Calls that did not complete, or other tools, read nothing either.
@@ -322,6 +323,7 @@ fn a_run_answered_without_the_tools_read_nothing() {
             search_refused: true,
             found_passages: 0,
             found_titles: vec![],
+            found: vec![],
         }
     );
 }
@@ -354,6 +356,7 @@ fn the_chunks_a_run_read_are_those_its_completed_reads_named() {
             search_refused: false,
             found_passages: 0,
             found_titles: vec![],
+            found: vec![],
         }
     );
     // A search alone is a search, with nothing read back.
@@ -393,6 +396,7 @@ fn a_completed_searchs_hits_count_as_read() {
             search_refused: false,
             found_passages: 2,
             found_titles: vec![],
+            found: vec![],
         }
     );
     let failed = [stored(
@@ -428,13 +432,18 @@ fn the_first_searchs_compacted_hits_count_as_read() {
         ToolCallStatus::Completed,
         json!({ "query": "q", "max_results": 3 }),
     )];
+    let k = run_knowledge_with(&done, &[compact]);
     assert_eq!(
-        run_knowledge_with(&done, &[compact]).read_chunks,
+        k.read_chunks,
         vec![ReadChunk {
             knowledge_id: "doc-1".into(),
             chunk_id: "chk-1".into()
         }]
     );
+    // L7-K1: and names the library, which the user most often meets through
+    // the search first.
+    assert_eq!(k.found.len(), 1);
+    assert_eq!(k.found[0].knowledge_base_id, "kb");
 }
 
 /// L7-K0 (FU-183): a search the policy refused is said as refused, not as
@@ -499,4 +508,73 @@ fn found_passages_and_titles_come_from_the_completed_search_answers() {
         json!({ "query": "q" }),
     )];
     assert_eq!(run_knowledge_with(&failed, &answers).found_passages, 0);
+}
+
+/// L7-K1: each hit's library, document, chunk and title, from the answers as
+/// production makes them: the full answer (`knowledge_base_id`, `display`, no
+/// top-level `title`) and the search first's compacted one (`title`, and the
+/// library id). Never the passage text; each chunk once; at most eight; a hit
+/// with no library id is not listed.
+#[test]
+fn found_hits_name_the_library_and_carry_no_passage_text() {
+    let done = [stored(
+        SEARCH,
+        ToolCallStatus::Completed,
+        json!({ "query": "q" }),
+    )];
+    let hit = |kb: &str, doc: &str, chunk: &str, display: serde_json::Value| {
+        json!({ "rank": 1, "use": "clue", "possibly_stale": false, "knowledge_base_id": kb,
+                "knowledge_id": doc, "chunk_id": chunk, "content_tag": "t",
+                "snippet": "秘密正文", "snippet_truncated": false, "display": display })
+    };
+    let mut evidence = vec![
+        hit("kb-a", "d1", "c1", json!({ "title": "制度.pdf" })),
+        hit("kb-b", "d2", "c2", json!({ "file_name": "项目.docx" })),
+        hit("kb-a", "d1", "c1", json!({ "title": "制度.pdf" })),
+    ];
+    for i in 0..10 {
+        evidence.push(hit("kb-a", &format!("x{i}"), "c", json!({ "title": "t" })));
+    }
+    let full = json!({ "notice": "n", "kind": "knowledge.search", "completeness": "complete",
+        "scope_narrowed": false, "evidence": evidence })
+    .to_string();
+    let expect = [
+        ("kb-a", "d1", "c1", "制度.pdf"),
+        ("kb-b", "d2", "c2", "项目.docx"),
+    ];
+    // The compacted answer keeps the first three hits only.
+    for (answer, len) in [
+        (full.clone(), 8),
+        (agent24_agent::compact_evidence_for_tests(&full).unwrap(), 2),
+    ] {
+        let k = run_knowledge_with(&done, &[answer]);
+        assert_eq!(k.found.len(), len);
+        for (found, (kb, doc, chunk, title)) in k.found.iter().zip(expect) {
+            assert_eq!(
+                found,
+                &FoundHit {
+                    knowledge_base_id: kb.into(),
+                    knowledge_id: doc.into(),
+                    chunk_id: chunk.into(),
+                    title: title.into()
+                }
+            );
+        }
+        assert!(
+            !serde_json::to_string(&k.found)
+                .unwrap()
+                .contains("秘密正文")
+        );
+    }
+    // A hit without a library id is not listed; a failed search lists nothing.
+    let no_base = json!({ "kind": "knowledge.search", "evidence": [
+        { "knowledge_id": "d9", "chunk_id": "c9", "display": { "title": "x" } }] })
+    .to_string();
+    assert!(run_knowledge_with(&done, &[no_base]).found.is_empty());
+    let failed = [stored(
+        SEARCH,
+        ToolCallStatus::Failed,
+        json!({ "query": "q" }),
+    )];
+    assert!(run_knowledge_with(&failed, &[full]).found.is_empty());
 }

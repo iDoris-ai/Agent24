@@ -5,7 +5,9 @@
 // patch, and later delete or a saved version); a translation exported on the
 // page says its own outcome already.
 
-import { useEffect, useState } from 'react'
+import { useContext, useEffect, useState, type ReactNode } from 'react'
+import { CapabilitiesContext } from '../../capabilities/types'
+import { openDocument } from '../documents/doc-focus'
 import { useT } from '../../i18n'
 import { chatMessages } from '../Chat.i18n'
 
@@ -13,7 +15,7 @@ import { chatMessages } from '../Chat.i18n'
 export interface RunDocuments { attempted: boolean; jobs: string[]; failed: string[]; revisions?: SavedRevision[] }
 export interface SavedRevision { document_id: string; title: string; revision: number }
 
-type Made = { kind: 'made'; title: string } | { kind: 'failed' } | { kind: 'pending' }
+type Made = { kind: 'made'; title: string; documentId?: string } | { kind: 'failed' } | { kind: 'pending' }
 
 const LINE = { fontSize: 12, marginTop: 2 } as const
 
@@ -71,12 +73,24 @@ export async function jobOutcome(
       const id = job.result?.document_id
       if (!id) return { kind: 'made', title: '' }
       const doc = await api.request({ op: 'get', documentId: id }).catch(() => null)
-      return { kind: 'made', title: doc && doc.ok ? doc.data.title : '' }
+      return { kind: 'made', title: doc && doc.ok ? doc.data.title : '', documentId: id }
     }
     if (job.status !== 'queued' && job.status !== 'running') return { kind: 'failed' }
     await sleep(1000)
   }
   return { kind: 'pending' }
+}
+
+/** L7-K0 (FU-139): a line that names a document opens it on the documents
+ * page; one that cannot say which (no id) stays a plain line. */
+function DocLine({ documentId, children }: { documentId?: string; children: ReactNode }) {
+  const { open } = useContext(CapabilitiesContext)
+  if (!documentId) return <div>{children}</div>
+  return (
+    <div>
+      <button type="button" className="btn btn-ghost" onClick={() => { openDocument(documentId); open('documents', 'other') }}>{children}</button>
+    </div>
+  )
 }
 
 /** The line under an answer: 「已生成：《…》」 for each new document, or
@@ -109,12 +123,12 @@ export function DocumentsOutcome({ documents }: { documents: RunDocuments | null
   if (unchanged) return <div role="note" style={{ ...LINE, color: 'var(--danger, #c0392b)' }}>{t('task.documentUnchanged')}</div>
   return (
     <div role="note" style={{ ...LINE, color: 'var(--muted)' }}>
-      {saved.map((r, i) => <div key={`s${i}`}>{t('task.documentSaved', { title: r.title || t('task.documentUntitled'), v: String(r.revision) })}</div>)}
+      {saved.map((r, i) => <DocLine key={`s${i}`} documentId={r.document_id}>{t('task.documentSaved', { title: r.title || t('task.documentUntitled'), v: String(r.revision) })}</DocLine>)}
       {(made ?? documents.jobs.map(() => ({ kind: 'pending' as const }))).map((m, i) => (
-        <div key={i}>
+        <DocLine key={i} documentId={m.kind === 'made' ? m.documentId : undefined}>
           {m.kind === 'made' ? t('task.documentMade', { title: m.title || t('task.documentUntitled') })
             : m.kind === 'failed' ? t('task.documentFailed') : t('task.documentMaking')}
-        </div>
+        </DocLine>
       ))}
       {failed.map((title, i) => (
         <div key={`f${i}`} style={{ color: 'var(--danger, #c0392b)' }}>{t('task.documentNotChanged', { title })}</div>
