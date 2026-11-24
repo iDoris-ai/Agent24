@@ -12,7 +12,7 @@ const BUILD_SHORT = /建(?:立)?(?:一个|个)库(?!数据)/
 const SHORT_ABOUT = /合同|文档|资料|知识|放进去/
 // A whole answer that stops onboarding. Not a substring or a prefix: 「合同取消条款审核」「取消订单的处理流程」
 // are purposes, not a cancel.
-const CANCEL = /^(?:算了|取消|不开通了|先不用|先不开通|不开通|不用了|不要了)(?:吧|了|吧不开通了)?$/
+const CANCEL = /^(?:算了|取消|先不用了?|先不开通了?|不开通了?|不用了|不要了|我不想开通了|算了不弄了|取消取消)(?:吧|了)?(?:不开通了?|开通|谢谢)?吧?$/
 /** Bare refusals at the purpose and types questions also stop onboarding. */
 const BARE_NO = /^(?:不|不用|不要|不需要|没有|没|不了)$/
 
@@ -100,7 +100,8 @@ export function beginOnboard(text: string): { state: OnboardStep; reply: string 
  * a negated server phrase («不能放到服务器», the question's own words) means the material stays local.
  */
 const NO_ANSWERS = new Set([
-  '否', '不是', '不', '不用', '可以', '可以的', '都行', '没关系', '无所谓',
+  // Not bare 不 / 不用: at the earlier questions they mean stop, and 不 can echo the question's 「不能放到服务器」.
+  '否', '不是', '可以', '可以的', '都行', '没关系', '无所谓',
   '可以放服务器', '可以放到服务器', '可以放在服务器', '可以放到服务器上', '可以放在服务器上',
   '能放服务器', '能放到服务器', '放服务器也行', '放服务器也可以', '放到服务器也行', '放到服务器也可以',
 ])
@@ -117,7 +118,8 @@ function localChoice(text: string): 'yes' | 'no' | null {
   if (/^(?:是|是的|对|对的|必须|必须的|要|需要)(?:$|[^不].*$)/.test(s) && !/不是|不用|不必|不需要/.test(s)) return 'yes'
   if (/^(?:只在本机|只留在本机|只留在这台电脑上?|只放本地|只能在本机|只能放本地)/.test(s)) return 'yes'
   // Consent to the server is a closed list of whole answers; anything else is asked again.
-  if (NO_ANSWERS.has(s)) return 'no'
+  // Only trailing punctuation is dropped here: 「不，是」 is a self-correction, not 「不是」.
+  if (NO_ANSWERS.has(text.trim().replace(/[。！!，,、；;\s]+$/, ''))) return 'no'
   return null
 }
 

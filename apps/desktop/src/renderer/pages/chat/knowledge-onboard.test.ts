@@ -128,7 +128,7 @@ describe('onboarding questions', () => {
     expect(done.last?.cancelled).toBeUndefined()
   })
 
-  it.each(['否', '不是', '不用', '可以', '没关系', '可以放到服务器', '都行', '否。'])('no word %s may go to the server', (word) => {
+  it.each(['否', '不是', '可以', '没关系', '可以放到服务器', '都行', '否。'])('no word %s may go to the server', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toEqual({ localOnly: false })
   })
@@ -146,7 +146,7 @@ describe('onboarding questions', () => {
   })
 
   // A question back is never consent: asked again.
-  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器', '能', '不必', '没必要'])('「%s」 is asked again, never sent', (word) => {
+  it.each(['放服务器安全吗？', '放到服务器会不会泄露', '放服务器', '能', '不必', '没必要', '不', '不！', '不用', '不，是', '不、是'])('「%s」 is asked again, never sent', (word) => {
     const done = walk('帮我开通知识库', ['合同审核', '合同', word])
     expect(done.last?.run).toBeUndefined()
     expect(done.last?.reply).toBe(AGAIN)
@@ -274,5 +274,26 @@ describe('uploadLine', () => {
     expect(uploadLine({ ...indexed, costFinal: true, costZero: true, costUnknown: true })).toBe('《制度.md》已可检索，没有产生费用')
     expect(uploadLine({ ...indexed, costFinal: true, costZero: false, costUnknown: true })).toBe('《制度.md》已可检索，费用未知')
     expect(uploadLine({ ...indexed, costFinal: true, costZero: false, costUnknown: false })).toBe('《制度.md》已可检索，已产生费用（以服务器记录为准）')
+  })
+})
+
+describe('onboarding cancel phrases (#2075 B2″)', () => {
+  const phrases = ['算了，不开通了', '取消开通', '不用了，谢谢', '先不开通了吧', '我不想开通了', '算了不弄了', '取消取消', '算了吧', '取消']
+  it.each(phrases)('「%s」 at the first question stops it', (p) => {
+    const first = beginOnboard('帮我开通知识库')
+    expect(nextOnboard(first.state, p)).toMatchObject({ state: null, cancelled: true })
+  })
+  it.each(phrases)('「%s」 at the second question stops it', (p) => {
+    expect(nextOnboard({ step: 'types', purpose: '合同审核' }, p)).toMatchObject({ state: null, cancelled: true })
+  })
+  it('cancel phrases and a bare 不 never lead to a run', () => {
+    let step: OnboardStep | null = beginOnboard('帮我开通知识库').state
+    for (const said of ['算了，不开通了', '不用了，谢谢', '不']) {
+      if (!step) break
+      const next = nextOnboard(step, said)
+      expect(next.run).toBeUndefined()
+      step = next.state
+    }
+    expect(step).toBeNull()
   })
 })
