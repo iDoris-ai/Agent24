@@ -196,7 +196,8 @@ pub fn compare(left: &[Unit], right: &[Unit]) -> Comparison {
     // One to one: each removed paragraph pairs with at most one added paragraph
     // of the same text, so a deleted duplicate stays a deletion.
     let mut added: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
-    for (i, c) in changes.iter().enumerate() {
+    // Reversed, so `pop` pairs the earliest added paragraph first.
+    for (i, c) in changes.iter().enumerate().rev() {
         if let (Kind::Added, Some(s)) = (c.kind, &c.right) {
             added.entry(s.text.clone()).or_default().push(i);
         }

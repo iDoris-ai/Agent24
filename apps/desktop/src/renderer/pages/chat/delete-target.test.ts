@@ -39,6 +39,11 @@ describe('L6-F2: the App names the document a delete is for', () => {
     // naming the open document itself needs no lookup
     expect(await deleteTargetOf(api(lib), a, '把《发票》删了')).toEqual({ kind: 'one', id: 'doc_A', title: '发票.pdf' })
   })
+  it('a title that merely contains the name does not win over the exact one (PR-Daemon #2052)', async () => {
+    const l2 = [doc(1, '发票-2024.pdf'), doc(2, '发票.pdf')]
+    expect(await deleteTargetOf(api(l2), { id: l2[0]!.document_id, title: '发票-2024.pdf' }, '把《发票》删了'))
+      .toEqual({ kind: 'one', id: l2[1]!.document_id, title: '发票.pdf' })
+  })
   it('the prompt fixes the id and says not to ask the user for one', () => {
     const p = deletePrompt({ id: 'doc_X', title: 'X.pdf' }, '把这份删了')
     expect(p).toContain('document_id: doc_X')
