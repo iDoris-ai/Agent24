@@ -17,6 +17,8 @@ use crate::state::{AppState, Ready, Storage, blob_cause, blocking};
 
 const DEFAULT_LIMIT: usize = 100;
 const MAX_LIMIT: usize = 500;
+/// Units on one side; the diff is quadratic in a changed run (FU-198).
+const MAX_UNITS: usize = 5000;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -187,12 +189,18 @@ pub(crate) async fn run(
         units(state, storage, &l, by.clone()).await?,
         units(state, storage, &r, by).await?,
     );
+    if lu.len() > MAX_UNITS || ru.len() > MAX_UNITS {
+        return Err(ApiError::unprocessable(
+            "payload_too_large",
+            format!("a side has over {MAX_UNITS} paragraphs or blocks; compare smaller documents"),
+        ));
+    }
     let Comparison {
         identical,
         only_text,
         summary,
         changes,
-    } = diff(&lu, &ru);
+    } = blocking(move || diff(&lu, &ru)).await;
     let total = changes.len();
     let page: Vec<Change> = changes.into_iter().skip(offset).take(limit).collect();
     let end = offset.saturating_add(page.len());

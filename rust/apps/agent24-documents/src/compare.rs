@@ -193,24 +193,26 @@ pub fn compare(left: &[Unit], right: &[Unit]) -> Comparison {
     }
     // A paragraph removed in one place and added word for word in another
     // moved: neither is an edit.
-    let moved: Vec<String> = changes
-        .iter()
-        .filter(|c| c.kind == Kind::Removed)
-        .filter_map(|c| c.left.as_ref().map(|s| s.text.clone()))
-        .filter(|t| {
-            changes
-                .iter()
-                .any(|c| c.kind == Kind::Added && c.right.as_ref().is_some_and(|s| &s.text == t))
-        })
-        .collect();
-    for c in &mut changes {
-        let t = match (c.kind, &c.left, &c.right) {
-            (Kind::Removed, Some(s), _) | (Kind::Added, _, Some(s)) => &s.text,
-            _ => continue,
-        };
-        if moved.contains(t) {
-            c.kind = Kind::Unaligned;
+    // One to one: each removed paragraph pairs with at most one added paragraph
+    // of the same text, so a deleted duplicate stays a deletion.
+    let mut added: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    // Reversed, so `pop` pairs the earliest added paragraph first.
+    for (i, c) in changes.iter().enumerate().rev() {
+        if let (Kind::Added, Some(s)) = (c.kind, &c.right) {
+            added.entry(s.text.clone()).or_default().push(i);
         }
+    }
+    let mut paired = Vec::new();
+    for (i, c) in changes.iter().enumerate() {
+        if let (Kind::Removed, Some(s)) = (c.kind, &c.left)
+            && let Some(j) = added.get_mut(&s.text).and_then(Vec::pop)
+        {
+            paired.push((i, j));
+        }
+    }
+    for (i, j) in paired {
+        changes[i].kind = Kind::Unaligned;
+        changes[j].kind = Kind::Unaligned;
     }
     let mut summary = Summary {
         total: changes.len(),
