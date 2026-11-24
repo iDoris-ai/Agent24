@@ -80,3 +80,4 @@ export const appMessages = defineMessages({
     'llm.daemonDefault': '{model} · ค่าเริ่มต้นของ Agent24',
   },
 })
+// CI-01 tmp
