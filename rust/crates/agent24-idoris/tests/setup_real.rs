@@ -5,42 +5,17 @@ use agent24_idoris::{
     IdorisLock,
     download::{DownloadOptions, download_locked_asset},
     install::{Codesign, InstallOptions, install_locked_asset},
-    omlx_probe::{Endpoint, OmlxProbe, ProbeStatus, ServiceIdentity, read_settings_key},
-    setup::{Role, SetupBudget, run_setup},
+    setup::{Role, SetupBudget, run_setup_auto},
+    upstream::read_settings_key,
 };
-use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 /// Run manually with A24_IL05_MODEL_ID and A24_IL05_CORE_RESERVED_BYTES set.
-/// Credentials come only from the existing IL-04 in-memory settings reader.
+/// Credentials come only from the in-memory oMLX settings reader.
 #[tokio::test]
-#[ignore = "requires signed v0.5.0, local oMLX:8088, and explicit model/core selection"]
-async fn real_v0_4_0_setup_with_local_omlx() {
-    let endpoint = Endpoint::parse("http://127.0.0.1:8088").unwrap();
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    if client
-        .get("http://127.0.0.1:8088/v1/models")
-        .send()
-        .await
-        .is_err()
-    {
-        eprintln!("SKIP real setup: local oMLX:8088 is unreachable");
-        return;
-    }
+#[ignore = "requires signed v0.6.0, local oMLX:8088, and explicit model/core selection"]
+async fn real_v0_6_0_setup_with_local_omlx() {
     let key = read_settings_key().ok();
-    let probe = OmlxProbe::new()
-        .unwrap()
-        .probe(Some(&endpoint), key.as_ref())
-        .await
-        .into_iter()
-        .find(|p| p.endpoint == endpoint)
-        .unwrap();
-    assert_eq!(probe.identity, ServiceIdentity::Omlx);
-    assert!(matches!(probe.status, ProbeStatus::Ready { .. }));
     let model = std::env::var("A24_IL05_MODEL_ID").unwrap();
     let core = std::env::var("A24_IL05_CORE_RESERVED_BYTES")
         .unwrap()
@@ -73,10 +48,9 @@ async fn real_v0_4_0_setup_with_local_omlx() {
     )
     .await
     .unwrap();
-    let result = run_setup(
+    let result = run_setup_auto(
         &installed,
         &dir.path().join("instances/smoke"),
-        &probe,
         key.map(|k| k.into_secret()),
         &[(Role::Daily, model.clone())],
         Some(budget),
@@ -88,7 +62,7 @@ async fn real_v0_4_0_setup_with_local_omlx() {
     assert!(result.components_dir.join("omlx.yaml").is_file());
     assert!(result.components_dir.join("subscription.yaml").is_file());
     eprintln!(
-        "PASS real v0.5.0 setup: validated generation, daily binding, budget={} bytes",
+        "PASS real v0.6.0 setup: validated generation, daily binding, budget={} bytes",
         budget.bytes()
     );
 }

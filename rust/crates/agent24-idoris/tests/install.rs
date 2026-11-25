@@ -402,8 +402,8 @@ fn insufficient_and_unknown_space_are_rejected() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test]
-#[ignore = "downloads and installs signed iDoris v0.5.0; runs real Apple codesign"]
-async fn real_v0_4_0_download_install_and_l6() {
+#[ignore = "downloads and installs signed iDoris v0.6.0; runs real Apple codesign"]
+async fn real_v0_6_0_download_install_and_l6() {
     use agent24_idoris::{
         download::{DownloadOptions, download_locked_asset},
         install::Codesign,
@@ -455,7 +455,7 @@ async fn real_v0_4_0_download_install_and_l6() {
     .unwrap();
     assert_eq!(again.directory(), installed.directory());
     eprintln!(
-        "PASS: v0.5.0 archive {}, five files installed, strict requirement + TeamIdentifier={}, existing version reverified",
+        "PASS: v0.6.0 archive {}, five files installed, strict requirement + TeamIdentifier={}, existing version reverified",
         archive.sha256, lock.team_id
     );
 }
