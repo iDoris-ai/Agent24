@@ -166,6 +166,18 @@ async fn lists_a_templates_fields_fills_them_into_a_new_document_and_sends_the_f
     assert_eq!(&bytes[..], TEMPLATE);
 }
 
+#[test]
+fn a_title_already_ending_in_the_suffix_is_not_extended() {
+    assert_eq!(
+        derived_title(Some("X（填写）.docx".into()), "（填写）"),
+        "X（填写）"
+    );
+    assert_eq!(
+        derived_title(Some("租赁模板.docx".into()), "（填写）"),
+        "租赁模板（填写）"
+    );
+}
+
 // ── L6-F5: saved as the document's next version ──
 
 /// The paragraph 「押金为…」 of the head: its index and text.

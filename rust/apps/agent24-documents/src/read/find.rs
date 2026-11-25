@@ -44,7 +44,7 @@ pub struct FindRequest {
 pub struct FindResult {
     parse_status: ParseStatus,
     unparsed_regions: Vec<Value>,
-    matches: Vec<Value>,
+    pub(crate) matches: Vec<Value>,
     next_cursor: Option<String>,
 }
 

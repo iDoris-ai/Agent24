@@ -148,7 +148,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fields
-    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Each field has a kind: identity (name, ID number, phone, address, bank card: fill only from the user's own material or what the user said; never make one up — ask), manual (signature, photo, checkbox, attachment: never fill, tell the user to do it by hand), text. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
@@ -161,7 +161,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fill
-    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. An identity field is written only when its value appears in source_document_id, or the user said it in the conversation (its name is in user_said); never make one up. Ask the user for each name in ask_user, tell them to handle manual by hand, and list unfilled. written is false when nothing was written and no document was generated. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
     input_schema:
       type: object
       additionalProperties: false
@@ -173,6 +173,12 @@ tools:
           minProperties: 1
           maxProperties: 200
           additionalProperties: { type: string }
+        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; an identity value is filled only when this document's text contains it" }
+        user_said:
+          type: array
+          maxItems: 200
+          description: "field names the user stated a value for in this conversation; an identity field named here may be filled from values"
+          items: { type: string, minLength: 1, maxLength: 64 }
         save_to: { type: string, enum: [new_document, original], description: "leave it out (a NEW document) unless the user explicitly asked to save into the original file (存到原文件 / 直接改原文件); original saves the result as the original document's next version, its older versions kept and restorable" }
     risk: write_local
     output_privacy: local_only

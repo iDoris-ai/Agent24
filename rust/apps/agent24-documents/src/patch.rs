@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::docx_patch::{self, MAX_EDITS, ParaEdit, PatchError};
 use crate::error::ApiError;
+use crate::form::{self, FieldKind};
 use crate::id::{IdKind, is_id};
 use crate::jobs::Job;
 use crate::office::DOCX;
@@ -314,14 +315,20 @@ pub(crate) async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> 
 }
 
 /// `<original title, extension aside><suffix>`, at most 500 characters.
+/// A stem that already ends with `suffix` is not extended, so filling
+/// 「X（填写）」 again stays 「X（填写）」.
 pub(crate) fn derived_title(original: Option<String>, suffix: &str) -> String {
     let base = original.unwrap_or_else(|| "文档".to_owned());
     let stem = base
         .strip_suffix(".docx")
         .or_else(|| base.strip_suffix(".DOCX"))
-        .unwrap_or(&base)
-        .to_owned();
-    format!("{stem}{suffix}").chars().take(500).collect()
+        .unwrap_or(&base);
+    let titled = if stem.ends_with(suffix) {
+        stem.to_owned()
+    } else {
+        format!("{stem}{suffix}")
+    };
+    titled.chars().take(500).collect()
 }
 
 /// The new DOCX imported as a document of its own.
@@ -340,21 +347,23 @@ pub(crate) async fn import_docx(
 
 #[derive(Debug, Serialize)]
 pub struct Field {
-    name: String,
+    pub(crate) name: String,
     count: usize,
+    /// `text`, `identity` or `manual`.
+    pub(crate) kind: FieldKind,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Fields {
     document_id: String,
     revision: i64,
-    fields: Vec<Field>,
+    pub(crate) fields: Vec<Field>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FillRequest {
-    values: std::collections::BTreeMap<String, String>,
+    pub(crate) values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -387,6 +396,7 @@ pub async fn fields_of(storage: &Arc<Storage>, id: String) -> Result<Fields, Api
         fields: listed
             .into_iter()
             .map(|f| Field {
+                kind: form::field_kind(&f.name),
                 name: f.name,
                 count: f.count,
             })
