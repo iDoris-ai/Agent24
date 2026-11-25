@@ -278,3 +278,4 @@
 - [ ] FU-245 · C · src=WeKnora#178 · 2026-11-26 · 无头 Lite 制品：生产签名密钥由谁保管、何时配置 `AGENT24_LITE_SIGNING_KEY` 未定（现在 workflow 没有这个 secret 就失败，本地用一次性 key）；归档不能逐字节复现；只验证了 darwin/arm64；Lite 只内置 Simple 解析，PDF/DOCX 解析能力没测。
 - [ ] FU-246 · C · src=KB-LITE-EVAL David MacBook 实测 · 2026-11-26 · 平衡档下 oMLX 拒绝加载日常模型（`507: Model 'Qwen3-8B-4bit' (4.51GB) does not fit under the dynamic memory ceiling (3.38GB)`，与精简版无关），日常对话本身被拒；Loop 计划里「内存相关用例在平衡档复跑」的口径另行确定，本 Loop 不处理（11-26 David 经监工定）。
 - [ ] FU-247 · C · src=L8 DOC-4 真机验收 · 2026-11-26 · 对话分流 `asksDeliver` 只在文档对话里、或这句话用《》点了名时才算「关于文档」；普通对话里先说「《合同》发出去前帮我检查一下」，下一句「去掉修订和批注，导出一份 PDF 放桌面」不带文件名，就交给了模型，没有出确定性的检查和卡片（第一张卡片上的按钮能正常用）。要承接上一轮点过名的文档。另：检查报告不列 app.xml 的 Company（副本里会清掉），已在 FU-238。
+- [ ] FU-248 · C · src=L8 iDoris 随包升级 · 2026-11-26 · 随包 iDoris 升版本后，旧版本回执在 open 时按未安装处理、重装并重新连接；旧版本目录（如 `~/.agent24/components/idoris/0.5.0`）、旧数据 key 的钥匙串条目和旧组件代留在原处不清理（托管根内没有按版本清理的 gc）。升级中途崩溃留下的 `pending-connect.json` 若是旧版本回执，restore 仍会判无效（极少见，未处理）。
