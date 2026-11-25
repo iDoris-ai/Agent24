@@ -308,6 +308,21 @@ pub(crate) fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchErro
     Ok(out)
 }
 
+/// Paragraph text of the body, tables, headers and footers, in that order.
+/// A fill looks for an identity value in this text (L8-S02).
+pub(crate) fn plain_text(docx: &[u8]) -> Result<String, PatchError> {
+    let mut out = String::new();
+    for (_, xml) in text_parts(docx)? {
+        for para in scan_all_paragraphs(&xml)? {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&paragraph_text(&xml[para.start..para.end]));
+        }
+    }
+    Ok(out)
+}
+
 /// One `w:t` of a paragraph: where its text lies in the slice, and the text.
 struct TextSpan {
     open_start: usize,
