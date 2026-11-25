@@ -414,3 +414,92 @@ async fn a_receipt_needs_an_absolute_path_a_real_version_and_a_copy_in_the_libra
     let (_, all) = call(&state, get("/receipts")).await;
     assert_eq!(all["receipts"], json!([]));
 }
+
+#[test]
+fn footnotes_endnotes_comment_authors_and_the_company_are_cleaned_too() {
+    // PR-Daemon #2087 B1: read the copy's parts themselves, not through preflight.
+    let note = |root: &str| {
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?><w:{root} {W}><w:footnote w:id="1"><w:p><w:r><w:t>脚注</w:t></w:r><w:del w:id="3" w:author="张三"><w:r><w:delText>脚注里删掉的底价</w:delText></w:r></w:del><w:ins w:id="4" w:author="张三"><w:r><w:t>新价</w:t></w:r></w:ins></w:p></w:footnote></w:{root}>"#
+        )
+    };
+    let people = r#"<?xml version="1.0" encoding="UTF-8"?><w15:people xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:person w15:author="张三"/></w15:people>"#;
+    let ext = r#"<?xml version="1.0" encoding="UTF-8"?><w15:commentsEx xmlns:w15="http://schemas.microsoft.com/office/word/2012/wordml"><w15:commentEx w15:paraId="1" w15:done="0"/></w15:commentsEx>"#;
+    let app = r#"<?xml version="1.0" encoding="UTF-8"?><Properties xmlns="http://schemas.openxmlformats.org/officeDocument/2006/extended-properties"><Company>内部公司</Company><Manager>王五</Manager><Pages>1</Pages></Properties>"#;
+    let src = docx(&[
+        ("word/document.xml", body("<w:p/>")),
+        ("word/footnotes.xml", note("footnotes")),
+        ("word/endnotes.xml", note("endnotes")),
+        ("word/people.xml", people.to_owned()),
+        ("word/commentsExtended.xml", ext.to_owned()),
+        ("docProps/app.xml", app.to_owned()),
+    ]);
+    let out = clean_docx(&src, NOW).unwrap();
+    for part in ["word/footnotes.xml", "word/endnotes.xml"] {
+        let xml = entry(&out, part).unwrap();
+        assert!(
+            !xml.contains("底价")
+                && !xml.contains("w:del")
+                && !xml.contains("w:ins")
+                && !xml.contains("张三"),
+            "{xml}"
+        );
+        assert!(xml.contains("新价") && xml.contains("脚注"), "{xml}");
+    }
+    let people = entry(&out, "word/people.xml").unwrap();
+    assert!(
+        !people.contains("张三") && people.contains("w15:people"),
+        "{people}"
+    );
+    assert!(
+        !entry(&out, "word/commentsExtended.xml")
+            .unwrap()
+            .contains("commentEx ")
+    );
+    let app = entry(&out, "docProps/app.xml").unwrap();
+    assert!(
+        !app.contains("内部公司") && !app.contains("王五") && app.contains("<Pages>1</Pages>"),
+        "{app}"
+    );
+}
+
+#[tokio::test]
+async fn again_is_only_the_same_document_version_and_format() {
+    let (_d, state, storage) = setup().await;
+    let other = "doc_01K74Z3QJ8V5N2W9RTX6Y00035";
+    let sha: String =
+        sqlx::query_scalar("SELECT content_sha256 FROM revisions WHERE document_id = ?")
+            .bind(DOC)
+            .fetch_one(storage.db.pool())
+            .await
+            .unwrap();
+    sqlx::raw_sql(&format!(
+        "INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                VALUES ('{DOC}', 2, '{sha}', 1, '{DOCX}', 'import');
+         INSERT INTO documents (id, title, media_type, head_revision) VALUES ('{other}', '另一份.docx', '{DOCX}', 1);
+         INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                VALUES ('{other}', 1, '{sha}', 1, '{DOCX}', 'import');"
+    ))
+    .execute(storage.db.pool())
+    .await
+    .unwrap();
+    let save = |doc: &str, revision: i64| {
+        let doc = doc.to_owned();
+        let state = state.clone();
+        async move {
+            let body =
+                json!({"revision": revision, "copy_document_id": PDF_COPY, "saved_to": "/x.pdf"});
+            call(&state, post(&format!("/documents/{doc}/receipts"), body))
+                .await
+                .1
+        }
+    };
+    assert_eq!(save(DOC, 1).await["again"], false);
+    assert_eq!(save(DOC, 2).await["again"], false, "another version");
+    assert_eq!(save(other, 1).await["again"], false, "another document");
+    let r = save(DOC, 1).await;
+    assert_eq!(
+        (r["again"].as_bool(), r["revision"].as_i64()),
+        (Some(true), Some(1))
+    );
+}

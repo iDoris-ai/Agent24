@@ -3,8 +3,12 @@
 //! picked in the system save dialog, then records the receipt here.
 //!
 //! `POST /documents/{id}/deliveries` (`expect_revision`: the version the user
-//! checked): the head revision of a DOCX with its tracked changes accepted,
-//! its comments removed and its author / last modifier emptied, imported as a
+//! checked): the head revision of a DOCX with, in every `word/*.xml` part
+//! (body, headers, footers, footnotes, endnotes ...), its tracked changes
+//! accepted and its comment marks removed; the comments, their extensions
+//! and `people.xml` emptied; the author / last modifier (core.xml) and
+//! company / manager (app.xml) emptied. Not cleaned: unfilled fields, hidden
+//! text, custom properties, embedded objects. Imported as a
 //! NEW document 「<title>（交付）」. The original is not changed. The answer is
 //! the new document's import job (202), as a patch answers. A PDF copy is the
 //! desktop's next step: the existing conversion of that new document.
@@ -41,26 +45,93 @@ pub const RECEIPTS_SHOWN: i64 = 20;
 /// A saved path, at most this many characters.
 const PATH_MAX: usize = 1024;
 
-/// The DOCX with its tracked changes accepted, its comments removed and its
-/// author / last modifier emptied; every other part copied as stored.
+/// The DOCX cleaned as the module docs say; every other part copied as stored.
 pub fn clean_docx(docx: &[u8], now_iso: &str) -> Result<Vec<u8>, PatchError> {
     let mut parts = std::collections::BTreeMap::new();
-    for (name, xml) in docx_patch::text_parts(docx)? {
-        let cleaned = clean_part(&xml)?;
+    // PR-Daemon #2087 B1: every `word/*.xml` part (body, headers, footers,
+    // footnotes, endnotes, ...), not only the text parts the fill reads; the
+    // comments' and their authors' parts emptied.
+    let names = word_parts(docx)?;
+    let mut total: u64 = 0;
+    for name in names {
+        let Some(xml) = read_part(docx, &name)? else {
+            continue;
+        };
+        total += xml.len() as u64;
+        if total > docx_patch::MAX_TEXT_PARTS_BYTES {
+            return Err(PatchError::TooLarge);
+        }
+        let cleaned = if EMPTIED.contains(&name.as_str()) {
+            empty_comments(&xml)?
+        } else {
+            clean_part(&xml)?
+        };
         if cleaned != xml {
             parts.insert(name, cleaned);
         }
     }
-    if let Some(comments) = read_part(docx, "word/comments.xml")? {
-        parts.insert("word/comments.xml".to_owned(), empty_comments(&comments)?);
-    }
     if let Some(core) = read_part(docx, "docProps/core.xml")? {
         parts.insert("docProps/core.xml".to_owned(), clean_core(&core, now_iso)?);
+    }
+    if let Some(app) = read_part(docx, "docProps/app.xml")? {
+        let cleaned = clean_app(&app)?;
+        if cleaned != app {
+            parts.insert("docProps/app.xml".to_owned(), cleaned);
+        }
     }
     docx_patch::splice_parts(docx, &parts, now_iso)
 }
 
-/// One text part (body, header, footer) with:
+/// The comments and the people who wrote them or revised: kept as empty
+/// roots, so their relationships and content types stay valid.
+const EMPTIED: &[&str] = &[
+    "word/comments.xml",
+    "word/commentsExtended.xml",
+    "word/commentsIds.xml",
+    "word/commentsExtensible.xml",
+    "word/people.xml",
+];
+/// `word/*.xml` parts read, at most.
+const WORD_PARTS_MAX: usize = 64;
+
+/// The zip's `word/<name>.xml` entries (not in `_rels/`, not in a folder).
+fn word_parts(docx: &[u8]) -> Result<Vec<String>, PatchError> {
+    let archive = zip::ZipArchive::new(std::io::Cursor::new(docx))
+        .map_err(|e| PatchError::NotDocx(e.to_string()))?;
+    let names: Vec<String> = archive
+        .file_names()
+        .filter(|n| {
+            n.strip_prefix("word/")
+                .is_some_and(|rest| !rest.contains('/') && rest.ends_with(".xml"))
+        })
+        .map(str::to_owned)
+        .collect();
+    if names.len() > WORD_PARTS_MAX {
+        return Err(PatchError::TooLarge);
+    }
+    Ok(names)
+}
+
+/// `docProps/app.xml` with the text of `Company` and `Manager` emptied.
+pub fn clean_app(xml: &str) -> Result<String, PatchError> {
+    const EXT: &str = "http://schemas.openxmlformats.org/officeDocument/2006/extended-properties";
+    let spans = {
+        let doc = parse_part(xml)?;
+        let mut spans = Vec::new();
+        for el in doc
+            .descendants()
+            .filter(|n| n.has_tag_name((EXT, "Company")) || n.has_tag_name((EXT, "Manager")))
+        {
+            clear_text(el, &mut spans);
+        }
+        spans
+    };
+    let out = apply_spans(xml, spans);
+    require_xml(&out)?;
+    Ok(out)
+}
+
+/// One `word/*.xml` part (body, header, footer, footnotes, ...) with:
 /// - `w:del` and `w:moveFrom` removed with everything in them (accepted:
 ///   the deleted text is gone), unless the parent is `w:rPr`;
 /// - `w:ins` and `w:moveTo` unwrapped (their children stay where they were),
@@ -594,9 +665,17 @@ pub async fn record_receipt(
     {
         return Err(storage.db_failure(e).await);
     }
+    // PR-Daemon #2087: the row just written, not the latest of the document.
+    let seq: i64 = match sqlx::query_scalar("SELECT last_insert_rowid()")
+        .fetch_one(&mut *conn)
+        .await
+    {
+        Ok(seq) => seq,
+        Err(e) => return Err(storage.db_failure(e).await),
+    };
     drop(conn);
-    let latest = receipts_of(&storage, Some(&id)).await?;
-    let receipt = latest
+    let receipt = receipts_where(&storage, Some(&id), Some(seq))
+        .await?
         .into_iter()
         .next()
         .ok_or_else(|| ApiError::internal("the receipt was not written"))?;
@@ -608,6 +687,15 @@ type ReceiptRow = (String, Option<String>, i64, String, String, i64);
 
 /// The latest receipts, newest first: of one document, or of all.
 pub async fn receipts_of(storage: &Storage, id: Option<&str>) -> Result<Vec<Receipt>, ApiError> {
+    receipts_where(storage, id, None).await
+}
+
+/// [`receipts_of`], or only the row `seq`.
+async fn receipts_where(
+    storage: &Storage,
+    id: Option<&str>,
+    seq: Option<i64>,
+) -> Result<Vec<Receipt>, ApiError> {
     if id.is_some_and(|id| !is_id(IdKind::Document, id)) {
         return Err(ApiError::invalid_request("not a document id"));
     }
@@ -619,10 +707,12 @@ pub async fn receipts_of(storage: &Storage, id: Option<&str>) -> Result<Vec<Rece
                            AND json_extract(p.details, '$.format') = json_extract(o.details, '$.format'))
            FROM oplog o LEFT JOIN documents d ON d.id = o.document_id
           WHERE o.op = 'deliver' AND (?1 IS NULL OR o.document_id = ?1)
+            AND (?3 IS NULL OR o.seq = ?3)
           ORDER BY o.seq DESC LIMIT ?2",
     )
     .bind(id)
     .bind(RECEIPTS_SHOWN)
+    .bind(seq)
     .fetch_all(storage.db.pool())
     .await;
     let rows = match rows {
