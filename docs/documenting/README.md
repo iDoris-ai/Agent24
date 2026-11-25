@@ -651,6 +651,20 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 | **V2 日常成稿 — Everyday drafting** | Produce a usable document from material/template, review it, export it | S03, S08 | 1, 3, 7 |
 
 - **Form filling (S02)** is not in the first slices. Before it is promised, the supported form types and the manual-completion path for unsupported ones must be declared.
+
+### 15.1 Form filling (S02) first version — supported types (Loop 8, David 2026-11-26: option A)
+
+| Form | Supported | What the user does instead |
+|---|---|---|
+| Word (DOCX) template with `{{field}}` placeholders (body, tables, headers, footers) | **Yes** | — |
+| Word (DOCX) form without `{{}}` (「姓名：____」, a table with empty cells) | No (blank detection is FU-247) | Put `{{field}}` where each answer goes, then ask again; or print it and fill it in by hand |
+| Interactive PDF form (AcroForm) | No | Export it to Word and make it a `{{}}` template, or print it and fill it in by hand |
+| Flat PDF, scanned form, photo of a form | No | The same: export to Word, or print and fill in by hand |
+
+- 「这张表能填吗？」 is answered from this table: a PDF or a form without `{{}}` is said plainly not to be supported, with the manual path; it is never filled.
+- What the first version does (`documents.fields` / `documents.fill`): each field has a kind. **Identity** fields (name, ID number, phone, address, bank card, contact person) are filled only with what the user's own material (`source_document_id`) contains or what the user said in the conversation (`user_said`); anything else is not written and is asked for, field by field. **Manual** fields (signature, photo, checkbox, attachment) are never filled; the user is told to do them by hand. A field the user leaves empty stays `{{field}}`. The answer lists what was filled, what to ask, what is manual and what is still empty.
+- The result is always a NEW document 「<template>（填写）」; the template is not changed (as F5's default; `save_to=original` is not used for forms).
+- Known limit: whether a value was really said by the user (`user_said`) is the model's claim; the per-call approval card shows every value before anything is written.
 - If only one slice ships first, it is called “first slice”. It must not be described as covering the T005 first-release recommendation.
 
 ## 16. Dependencies and Team Inputs
