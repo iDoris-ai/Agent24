@@ -595,6 +595,26 @@ async fn candidates_expose_identity_models_and_source_but_never_credentials() {
     assert!(!value.to_string().contains("sk-upstream"));
 }
 #[tokio::test]
+async fn connect_journal_during_setup_has_no_unvalidated_omlx_url() {
+    // #2077 review: bootstrap can pass endpoint "", and a crash during setup
+    // must not leave a journal whose candidate fails validation on restore.
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"snapshot_journal": true}));
+    let op =
+        x.f.host
+            .connect(x.request(), Some("journal"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+    x.f.host.shutdown().await.unwrap();
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("journal-during-setup.json")).unwrap())
+            .unwrap();
+    assert_eq!(journal["committed"], false);
+    assert!(journal["candidate"]["omlx_url"].is_null());
+}
+#[tokio::test]
 async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
     let x = ConnectedFixture::new().await;
     x.installed().await;

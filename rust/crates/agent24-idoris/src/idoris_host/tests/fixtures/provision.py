@@ -29,6 +29,8 @@ if sys.argv[1] == 'setup':
         print(json.dumps({'status': 'ok', 'id': card_id, 'card_file': card.name,
                           'models': list(bindings.values()), 'bindings': bindings}))
         sys.exit(0)
+    if settings.get('snapshot_journal'):
+        (fixture_root / 'journal-during-setup.json').write_bytes((fixture_root / 'pending-connect.json').read_bytes())
     assert args[1] == 'omlx'
     endpoint = settings.get('auto_endpoint', 'http://127.0.0.1:8088')
     if '--auto' in args:

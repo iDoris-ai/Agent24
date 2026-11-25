@@ -940,7 +940,9 @@ impl IdorisHost {
         pending.candidate.key_id = None;
         pending.candidate.omlx_key_id = None;
         pending.candidate.connection = Some(request.clone());
-        pending.candidate.omlx_url = (!compat).then(|| request.endpoint.clone());
+        // Unvalidated until setup resolves it (bootstrap may pass ""); a crash
+        // here must leave a journal that recovery can still validate.
+        pending.candidate.omlx_url = None;
         pending.candidate.roles = bindings.iter().map(|b| b.0).collect();
         pending.candidate.core_reserved_bytes =
             request.core_reserved_bytes.or(previous.core_reserved_bytes);
