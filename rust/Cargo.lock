@@ -263,7 +263,6 @@ dependencies = [
  "agent24-protocol",
  "async-trait",
  "axum",
- "base64",
  "chrono",
  "flate2",
  "fs2",
