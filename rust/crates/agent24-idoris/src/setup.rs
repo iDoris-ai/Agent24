@@ -2,17 +2,14 @@
 //!
 //! Each attempt gets a fresh `instances/<id>/components/gen-<random>` directory.
 //! Generations are never overwritten: no `--force` or default model selection.
-//! v0.5.0 uses the IL-04 probe; v0.6.0 delegates discovery to setup --auto.
+//! iDoris discovers the endpoint and validates model bindings via setup --auto.
 //! The caller serializes instance operations.
 //!
-//! Contract source: iDoris tag v0.5.0, crates/idoris-router/src/{cli,setup_omlx}.rs
+//! Contract source: iDoris tag v0.6.0, crates/idoris-router/src/{cli,setup_omlx}.rs
 //! and docs/interfaces/iDoris-Agent24-边界与接口规范.md (L2). The released
 //! binary's `setup --help` prints the same unified usage as `cli.rs`.
 
-use crate::{
-    install::InstalledVersion,
-    omlx_probe::{Endpoint, ProbeResult, ProbeStatus, ServiceIdentity},
-};
+use crate::{install::InstalledVersion, upstream::Endpoint};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -105,7 +102,7 @@ pub enum SetupError {
     BudgetUnavailable,
     #[error("oMLX authentication required at {endpoint}")]
     AuthRequired { endpoint: String },
-    #[error("setup requires a ready oMLX probe and unique daily/deep bindings including daily")]
+    #[error("setup requires unique role bindings including daily")]
     InvalidBindings,
     #[error("setup path is outside the managed instance")]
     UnsafePath,
@@ -168,56 +165,6 @@ pub struct Engine {
     pub executable: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-}
-
-/// Create a fresh single-card OpenAI-compatible component generation. Values
-/// are validated by the host before reaching this writer.
-// Remove this v0.5.0 writer when the embedded lock is bumped to v0.6.0.
-pub fn write_openai_compat_card(
-    instance_root: &Path,
-    endpoint: &str,
-    daily: &str,
-    deep: &str,
-    embed: Option<&str>,
-) -> Result<SetupOutcome, SetupError> {
-    let components = components_root(instance_root)?;
-    let generation = tempfile::Builder::new()
-        .prefix("gen-")
-        .tempdir_in(&components)
-        .map_err(|_| SetupError::Io)?;
-    let capabilities = if embed.is_some() {
-        "chat, embedding"
-    } else {
-        "chat"
-    };
-    let embed_line = embed
-        .map(|id| format!("    embed: \"{id}\"\n"))
-        .unwrap_or_default();
-    let card = format!(
-        "provider:\n  id: lmstudio\n  family: local\n  tier: local\n  capabilities: [{capabilities}]\n  privacy_class: local_only\n  cost: {{ input_per_m: 0, output_per_m: 0 }}\n  locality: loopback\nform: http_service\nendpoint: \"{endpoint}\"\nversion_pin: \"lmstudio@0\"\nprivacy_class: local_only\nallowed_egress: [loopback]\nfallback_policy: fail_closed\nfail_closed: true\nload_policy: {{ mode: resident, keepalive: {{ pinned: true }}, admission: coexist }}\nextensions:\n  _degradation: \"Removing these bindings disables role aliases on this backend.\"\n  idoris_role_models:\n    daily: \"{daily}\"\n    deep: \"{deep}\"\n"
-    );
-    std::fs::write(generation.path().join("lmstudio.yaml"), card + &embed_line)
-        .map_err(|_| SetupError::Io)?;
-    let path = generation.keep();
-    Ok(SetupOutcome {
-        components_dir: path,
-        bindings: [
-            (Role::Daily, daily.to_owned()),
-            (Role::Deep, deep.to_owned()),
-        ]
-        .into_iter()
-        .chain(embed.map(|id| (Role::Embed, id.to_owned())))
-        .collect(),
-        auth_required: false,
-        omlx: None,
-    })
-}
-
-/// Shared gate for setup features introduced in iDoris v0.6.0.
-pub(crate) fn upstream_setup_enabled(lock: &crate::IdorisLock) -> bool {
-    semver::Version::parse(lock.tag.trim_start_matches('v'))
-        .is_ok_and(|version| version >= semver::Version::new(0, 6, 0))
-        || (cfg!(debug_assertions) && std::env::var("AGENT24_DEV_IDORIS_V6").as_deref() == Ok("1"))
 }
 
 /// Generate a loopback OpenAI-compatible card using iDoris's upstream contract.
@@ -400,60 +347,7 @@ enum UpstreamReply {
     },
 }
 
-/// A daily binding must be selected from the probe; deep is opt-in. Missing
-/// budget means disconnected, while a computed zero is passed through intact.
-/// `instance_root` is an absolute `<managed-root>/instances/<instance-id>` path;
-/// the managed root must already exist. Only its components generations are
-/// handed to setup. Successful generations stay in place for caller activation.
-#[allow(clippy::too_many_arguments)]
-pub async fn run_setup(
-    installed_version: &InstalledVersion,
-    instance_root: &Path,
-    omlx_endpoint: &ProbeResult,
-    omlx_key: Option<Zeroizing<String>>,
-    bindings: &[(Role, String)],
-    budget: Option<SetupBudget>,
-    cancel: &CancellationToken,
-) -> Result<SetupOutcome, SetupError> {
-    run_setup_with_timeout(
-        installed_version,
-        instance_root,
-        omlx_endpoint,
-        omlx_key,
-        bindings,
-        budget,
-        cancel,
-        Duration::from_secs(30),
-    )
-    .await
-}
-
 const MAX_OUTPUT_BYTES: u64 = 1024 * 1024;
-
-#[allow(clippy::too_many_arguments)]
-async fn run_setup_with_timeout(
-    installed: &InstalledVersion,
-    instance: &Path,
-    probe: &ProbeResult,
-    key: Option<Zeroizing<String>>,
-    bindings: &[(Role, String)],
-    budget: Option<SetupBudget>,
-    cancel: &CancellationToken,
-    timeout: Duration,
-) -> Result<SetupOutcome, SetupError> {
-    run_omlx_setup(
-        installed,
-        instance,
-        Some(probe),
-        None,
-        key,
-        bindings,
-        budget,
-        cancel,
-        timeout,
-    )
-    .await
-}
 
 /// v0.6.0 delegates endpoint discovery and model validation to iDoris.
 pub async fn run_setup_auto(
@@ -469,7 +363,6 @@ pub async fn run_setup_auto(
         instance,
         None,
         None,
-        None,
         bindings,
         budget,
         cancel,
@@ -481,7 +374,6 @@ pub async fn run_setup_auto(
             run_omlx_setup(
                 installed,
                 instance,
-                None,
                 Some(&endpoint),
                 key,
                 bindings,
@@ -499,7 +391,6 @@ pub async fn run_setup_auto(
 async fn run_omlx_setup(
     installed: &InstalledVersion,
     instance: &Path,
-    probe: Option<&ProbeResult>,
     discovered_endpoint: Option<&str>,
     key: Option<Zeroizing<String>>,
     bindings: &[(Role, String)],
@@ -522,16 +413,6 @@ async fn run_omlx_setup(
             .any(|(_, model)| model.is_empty() || model.chars().any(char::is_control))
     {
         return Err(SetupError::InvalidBindings);
-    }
-    if let Some(probe) = probe {
-        let ProbeStatus::Ready { models } = &probe.status else {
-            return Err(SetupError::InvalidBindings);
-        };
-        if probe.identity != ServiceIdentity::Omlx
-            || bindings.iter().any(|(_, model)| !models.contains(model))
-        {
-            return Err(SetupError::InvalidBindings);
-        }
     }
     if key.as_ref().is_some_and(|key| {
         key.is_empty()
@@ -556,30 +437,23 @@ async fn run_omlx_setup(
             .map_err(|_| SetupError::Io)?,
     );
     cmd.env_clear()
-        .env("PATH", "/usr/bin:/bin")
         .env("IDORIS_ALLOCATED_BUDGET_BYTES", budget.bytes().to_string())
         .current_dir(&components)
         .args(["setup", "omlx"]);
-    if let Some(probe) = probe {
-        cmd.args(["--endpoint", probe.endpoint.as_str(), "--out-dir"])
-            .arg(&out_dir)
-            .args(["--load-mode", "resident"]);
+    cmd.arg("--out-dir").arg(&out_dir);
+    if let Some(endpoint) = discovered_endpoint {
+        cmd.args(["--endpoint", endpoint]);
     } else {
-        cmd.arg("--out-dir").arg(&out_dir);
-        if let Some(endpoint) = discovered_endpoint {
-            cmd.args(["--endpoint", endpoint]);
-        } else {
-            cmd.arg("--auto");
-        }
-        // iDoris reads the local model directory and discovers the installed engine.
-        if let Some(home) = std::env::var_os("HOME") {
-            cmd.env("HOME", home);
-        }
-        cmd.env(
-            "PATH",
-            std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
-        );
+        cmd.arg("--auto");
     }
+    // iDoris reads the local model directory and discovers the installed engine.
+    if let Some(home) = std::env::var_os("HOME") {
+        cmd.env("HOME", home);
+    }
+    cmd.env(
+        "PATH",
+        std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+    );
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -638,7 +512,7 @@ async fn run_omlx_setup(
         Reply::Error {
             code: SetupCode::AuthRequired,
             endpoint: Some(endpoint),
-        } if !status.success() && probe.is_none() => {
+        } if !status.success() => {
             Endpoint::parse(&endpoint).map_err(|_| SetupError::InvalidResponse)?;
             Err(SetupError::AuthRequired { endpoint })
         }
@@ -653,28 +527,23 @@ async fn run_omlx_setup(
             mode,
             engine,
         } if status.success() => {
-            if probe.is_some_and(|p| Endpoint::parse(&endpoint).ok().as_ref() != Some(&p.endpoint))
-                || bindings != expected
+            if bindings != expected
                 || bindings.values().any(|model| !models.contains(model))
                 || !matches!(auth.as_str(), "none" | "required")
                 || next.env.get("IDORIS_COMPONENTS_DIR") != Some(&components_dir)
             {
                 return Err(SetupError::InvalidResponse);
             }
-            let omlx = if probe.is_none() {
-                let mode = mode.ok_or(SetupError::InvalidResponse)?;
-                let engine = engine
-                    .filter(|e| e.engine_kind == "omlx")
-                    .ok_or(SetupError::InvalidResponse)?;
-                Endpoint::parse(&endpoint).map_err(|_| SetupError::InvalidResponse)?;
-                Some(OmlxSetup {
-                    endpoint,
-                    mode,
-                    engine: *engine,
-                })
-            } else {
-                None
-            };
+            let mode = mode.ok_or(SetupError::InvalidResponse)?;
+            let engine = engine
+                .filter(|e| e.engine_kind == "omlx")
+                .ok_or(SetupError::InvalidResponse)?;
+            Endpoint::parse(&endpoint).map_err(|_| SetupError::InvalidResponse)?;
+            let omlx = Some(OmlxSetup {
+                endpoint,
+                mode,
+                engine: *engine,
+            });
             let returned = Path::new(&components_dir)
                 .canonicalize()
                 .map_err(|_| SetupError::UnsafePath)?;
@@ -780,7 +649,7 @@ fn components_root(instance: &Path) -> Result<PathBuf, SetupError> {
     Ok(current)
 }
 
-// v0.5.0 has no closed JSON schema. Ignore additive fields but require the
+// Ignore additive fields but require the
 // consumed success fields and the frozen status/code discriminants. Error
 // messages and unused `next` fields are never retained in public results.
 #[derive(Deserialize)]

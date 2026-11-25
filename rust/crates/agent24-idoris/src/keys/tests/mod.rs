@@ -421,14 +421,14 @@ async fn list_and_revoke_reject_unrecognized_or_mismatched_responses() {
 }
 
 #[tokio::test]
-#[ignore = "requires the pinned real v0.5.0 binary via IDORIS_TEST_BINARY"]
-async fn real_v040_issue_list_revoke() {
+#[ignore = "requires the pinned real v0.6.0 binary via IDORIS_TEST_BINARY"]
+async fn real_v060_issue_list_revoke() {
     let mut f = Fixture::new("ok", false);
     f.keys.binary = fs::canonicalize(std::env::var_os("IDORIS_TEST_BINARY").unwrap()).unwrap();
     // Hold the exact serve lock: real key commands must remain available.
     let instance_lock = fs::File::create(f.keys.db_path.with_extension("sqlite3.lock")).unwrap();
     fs2::FileExt::try_lock_exclusive(&instance_lock).unwrap();
-    let issued = f.keys.issue("real-v040-test", &[]).await.unwrap();
+    let issued = f.keys.issue("real-v060-test", &[]).await.unwrap();
     let listed = f.keys.list(None).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].key_id, issued.key_id);
