@@ -25,7 +25,12 @@ function deps(over: Partial<DeliverDeps> = {}) {
     jobEnd: vi.fn(async (j: { job_id: string }) => ({ ok: true as const, job: (j.job_id === 'job_1' ? job('job_1', 'succeeded', COPY) : job('job_2', 'succeeded', PDF)) as never })),
     desktopDir: () => '/Users/u/Desktop',
     exists: (p: string) => files.has(p),
-    writeFile: vi.fn((p: string, b: Buffer) => { files.set(p, b) }),
+    // As `wx`: a file already there is EEXIST, never written over.
+    writeFile: vi.fn((p: string, b: Buffer) => {
+      if (files.has(p)) throw Object.assign(new Error('exists'), { code: 'EEXIST' })
+      files.set(p, b)
+    }),
+    remove: vi.fn((p: string) => { files.delete(p) }),
     ...over,
   }
   return { d, files, calls }
@@ -65,6 +70,8 @@ describe('L8 DOC-4: delivering a clean copy', () => {
     expect(calls[1]).toEqual({ op: 'content', documentId: COPY })
     expect(files.get('/Users/u/Desktop/合同（交付）.docx')?.toString()).toBe('doc')
     expect(out.ok).toBe(true)
+    // The receipt names the Word copy, not a PDF.
+    expect(calls[2]).toEqual({ op: 'receipt', documentId: DOC, revision: 3, copyDocumentId: COPY, savedTo: '/Users/u/Desktop/合同（交付）.docx' })
   })
 
   it('never writes over a file already there: 「名称 (2)」, and the receipt says that path', async () => {
@@ -81,17 +88,32 @@ describe('L8 DOC-4: delivering a clean copy', () => {
     const copyFails = deps({ call: vi.fn(async () => ({ ok: false, status: 409, error: { code: 'revision_conflict', message: 'at 4' } })) as never })
     expect(await deliverDocument(copyFails.d, REQ)).toMatchObject({ ok: false, stage: 'copy', code: 'revision_conflict' })
     expect(copyFails.files.size).toBe(0)
+    expect((copyFails.d.call as ReturnType<typeof vi.fn>).mock.calls.map(([r]) => (r as { op: string }).op)).toEqual(['deliver'])
 
     const convertFails = deps({ jobEnd: vi.fn(async (j: { job_id: string }) => (j.job_id === 'job_1' ? { ok: true as const, job: job('job_1', 'succeeded', COPY) as never } : { ok: false as const, code: 'engine_unavailable', message: 'no LibreOffice' })) })
     expect(await deliverDocument(convertFails.d, REQ)).toMatchObject({ ok: false, stage: 'convert', code: 'engine_unavailable' })
     expect(convertFails.calls.map((c) => c.op)).toEqual(['deliver', 'convert'])
     expect(convertFails.files.size).toBe(0)
 
-    const writeFails = deps({ writeFile: vi.fn(() => { throw new Error('EACCES') }) })
+    // PR-Daemon #2088 P2-1: a write that fails midway leaves no part of the file.
+    const writeFails = deps()
+    writeFails.d.writeFile = vi.fn((p: string) => {
+      writeFails.files.set(p, Buffer.from('half'))
+      throw Object.assign(new Error('file too large'), { code: 'EFBIG' })
+    })
     const w = await deliverDocument(writeFails.d, REQ)
-    expect(w).toMatchObject({ ok: false, stage: 'write' })
+    expect(w).toMatchObject({ ok: false, stage: 'write', code: 'EFBIG' })
     expect(w).not.toHaveProperty('savedTo')
     expect(writeFails.calls.map((c) => c.op)).not.toContain('receipt')
+    expect(writeFails.files.size).toBe(0)
+
+    // Someone else's file that appeared meanwhile (EEXIST) is never removed.
+    const raced = deps()
+    raced.d.exists = () => false
+    raced.files.set('/Users/u/Desktop/合同（交付）.pdf', Buffer.from('theirs'))
+    expect(await deliverDocument(raced.d, REQ)).toMatchObject({ ok: false, stage: 'write', code: 'EEXIST' })
+    expect(raced.files.get('/Users/u/Desktop/合同（交付）.pdf')?.toString()).toBe('theirs')
+    expect(raced.d.remove).not.toHaveBeenCalled()
   })
 
   it('a receipt not recorded is said, with the file that was saved', async () => {
@@ -102,12 +124,25 @@ describe('L8 DOC-4: delivering a clean copy', () => {
   })
 })
 
+describe('L8 DOC-4: the dialog path', () => {
+  it('a path whose extension is not the format gets the format (PR-Daemon #2088 P2-2)', async () => {
+    const { d, files } = deps({ showSaveDialog: vi.fn(async () => ({ canceled: false, filePath: '/tmp/report.docx' })) })
+    const out = await deliverDocument(d, REQ)
+    expect(out).toMatchObject({ ok: true, savedTo: '/tmp/report.docx.pdf' })
+    expect(files.has('/tmp/report.docx')).toBe(false)
+  })
+})
+
 describe('L8 DOC-4: the file name', () => {
   it('is the title with its extension replaced and （交付） added, safe for a file name', () => {
     expect(offeredName('合同.docx', 'pdf')).toBe('合同（交付）.pdf')
     expect(offeredName('合同.DOCX', 'docx')).toBe('合同（交付）.docx')
     expect(offeredName('a/b:c', 'docx')).toBe('a_b_c（交付）.docx')
     expect(offeredName('   ', 'pdf')).toBe('文档（交付）.pdf')
+    // PR-Daemon #2088 P3: control characters out; an emoji never cut in half.
+    expect(offeredName('a\u0000b', 'pdf')).toBe('a_b（交付）.pdf')
+    const long = offeredName(`${'a'.repeat(191)}😀😀`, 'pdf')
+    expect(long.endsWith('（交付）.pdf') && !/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/.test(long)).toBe(true)
   })
 
   it('takes the first 「 (n)」 not there', () => {

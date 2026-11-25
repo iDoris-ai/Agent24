@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { deliverRequestOf } from './doc-deliver'
+import { deliverRequestOf } from '../doc-deliver'
 
 const DOC = 'doc_01M679KMY6D75P0EZACBS95JYA'
 

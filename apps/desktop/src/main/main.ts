@@ -884,6 +884,7 @@ app.whenReady().then(async () => {
       exists: (p) => fs.existsSync(p),
       // `wx`: never over a file that appeared after the check (PR-Daemon style: no overwrite).
       writeFile: (p, bytes) => fs.writeFileSync(p, bytes, { flag: 'wx' }),
+      remove: (p) => fs.rmSync(p, { force: true }),
     }, req),
   })
   registerDocAgentAccess({

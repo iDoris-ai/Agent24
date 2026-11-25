@@ -34,19 +34,39 @@ export interface DeliverDeps {
   desktopDir: () => string
   exists: (path: string) => boolean
   writeFile: (path: string, bytes: Buffer) => void
+  /** A file this delivery began to write and could not finish. */
+  remove: (path: string) => void
 }
 
 /** How long the copy's import and the PDF conversion may take. */
 export const IMPORT_MS = 120_000
 export const CONVERT_MS = 300_000
 
-const ILLEGAL = /[/\\:*?"<>|]/g
+/** PR-Daemon #2088 B1: pure, so its test needs no Electron. */
+const DOCUMENT_ID = /^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$/
+
+/** One `{ documentId, revision, format, title }`, or null. */
+export function deliverRequestOf(raw: unknown): DeliverRequest | null {
+  if (!raw || typeof raw !== 'object') return null
+  const r = raw as Record<string, unknown>
+  if (Object.keys(r).some((k) => !['documentId', 'revision', 'format', 'title'].includes(k))) return null
+  if (typeof r.documentId !== 'string' || !DOCUMENT_ID.test(r.documentId)) return null
+  if (typeof r.revision !== 'number' || !Number.isSafeInteger(r.revision) || r.revision < 1) return null
+  if (r.format !== 'docx' && r.format !== 'pdf') return null
+  if (typeof r.title !== 'string' || r.title.length > 500) return null
+  return { documentId: r.documentId, revision: r.revision, format: r.format, title: r.title }
+}
+
+// Also control characters (PR-Daemon #2088 P3: Node refuses a path with NUL).
+// eslint-disable-next-line no-control-regex
+const ILLEGAL = /[/\\:*?"<>|\u0000-\u001f\u007f]/g
 
 /** `<title, extension aside>（交付）.<ext>`, with nothing a file name cannot hold. */
 export function offeredName(title: string, format: DeliverFormat): string {
   const stripped = title.replace(/\.(docx|pdf|doc)$/i, '').replace(ILLEGAL, '_').trim()
   const suffix = `（交付）.${format}`
-  let stem = (stripped || '文档').slice(0, Math.max(0, 200 - suffix.length)).trim()
+  // By characters, not UTF-16 units: an emoji is never cut in half (PR-Daemon #2088 P3).
+  let stem = Array.from(stripped || '文档').slice(0, Math.max(0, 200 - suffix.length)).join('').trim()
   if (!stem) stem = '文档'
   return `${stem}${suffix}`
 }
@@ -107,6 +127,9 @@ export async function deliverDocument(deps: DeliverDeps, req: DeliverRequest): P
     filters: req.format === 'pdf' ? [{ name: 'PDF', extensions: ['pdf'] }] : [{ name: 'Word', extensions: ['docx'] }],
   })
   if (picked.canceled || !picked.filePath) return { ok: false, canceled: true }
+  // PR-Daemon #2088 P2-2: the file is named for what it holds.
+  const ext = `.${req.format}`
+  const chosen = path.extname(picked.filePath).toLowerCase() === ext ? picked.filePath : `${picked.filePath}${ext}`
 
   const copied = await imported(deps, { op: 'deliver', documentId: req.documentId, expectRevision: req.revision }, 'copy', IMPORT_MS)
   if ('result' in copied) return copied.result
@@ -117,23 +140,30 @@ export async function deliverDocument(deps: DeliverDeps, req: DeliverRequest): P
     documentId = converted.id
   }
 
-  let savedTo: string
+  let savedTo = ''
   try {
     const res = await deps.call({ op: 'content', documentId })
     if (!res.ok) return failed('write', res.error)
     const data = res.data && typeof res.data === 'object' ? (res.data as { data?: unknown }).data : undefined
     if (typeof data !== 'string') return failed('write', { message: '没有文件内容' })
-    savedTo = unusedPath(picked.filePath, deps.exists)
+    savedTo = unusedPath(chosen, deps.exists)
     deps.writeFile(savedTo, Buffer.from(data, 'base64'))
   } catch (error) {
+    // PR-Daemon #2088 P2-1: a write that failed midway leaves no part of a
+    // file behind. The path was not there before (`unusedPath`, `wx`), so a
+    // file there now is this write's; EEXIST is another's, never removed.
+    const code = (error as { code?: unknown } | null)?.code
+    if (savedTo !== '' && code !== 'EEXIST' && deps.exists(savedTo)) {
+      try { deps.remove(savedTo) } catch { /* said below: nothing saved */ }
+    }
     return failed('write', error)
   }
 
   try {
-    const res = await deps.call({ op: 'receipt', documentId: req.documentId, revision: req.revision, copyDocumentId: documentId, savedTo })
+    const res = await deps.call({ op: 'receipt', documentId: req.documentId, revision: req.revision, copyDocumentId: documentId, savedTo: savedTo })
     if (!res.ok) return failed('receipt', res.error, savedTo)
     if (!isReceipt(res.data)) return failed('receipt', { message: '没有回执' }, savedTo)
-    return { ok: true, savedTo, fileName: path.basename(savedTo), receipt: res.data }
+    return { ok: true, savedTo: savedTo, fileName: path.basename(savedTo), receipt: res.data }
   } catch (error) {
     return failed('receipt', error, savedTo)
   }
