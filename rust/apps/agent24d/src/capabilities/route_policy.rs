@@ -68,6 +68,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/components/{id}/report", Operation::ComponentsReport, AssuranceLevel::Everyday),
     row("GET", "/api/v1/idoris/upstream-models", Operation::IdorisRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/idoris/status", Operation::IdorisRead, AssuranceLevel::Everyday),
+    row("GET", "/api/v1/idoris/engines", Operation::IdorisRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/idoris/install", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
     row("POST", "/api/v1/idoris/connect", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
     row("GET", "/api/v1/idoris/omlx/candidates", Operation::IdorisLifecycle, AssuranceLevel::Elevated),

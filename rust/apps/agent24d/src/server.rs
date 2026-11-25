@@ -230,6 +230,7 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             post(crate::component_routes::report),
         )
         .route("/api/v1/idoris/status", get(crate::idoris_routes::status))
+        .route("/api/v1/idoris/engines", get(crate::idoris_routes::engines))
         .route(
             "/api/v1/idoris/install",
             post(crate::idoris_routes::install),

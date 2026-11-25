@@ -22,6 +22,8 @@ use tokio::signal::unix::{Signal, SignalKind, signal};
 pub enum IdorisAction {
     /// Show the daemon's managed iDoris status
     Status(Output),
+    /// List live iDoris engine states
+    Engines(Output),
     /// Download, verify and install the locked release
     Install {
         /// Accept the locked release and installation risks without prompting
@@ -103,6 +105,7 @@ const FALLBACK: &str = "The daemon operation failed. Check agent24 idoris status
 fn english(code: &str) -> &'static str {
     match code {
         "consent_required" => "Consent required. Use --yes in a non-interactive terminal.",
+        "idoris_unavailable" => "Could not read health from the iDoris gateway.",
         "not_installed" => "iDoris is not installed. Run agent24 idoris install first.",
         "not_configured" => "iDoris is not configured. Run agent24 idoris connect first.",
         "instance_conflict" => "Another iDoris instance owns the database.",
@@ -183,6 +186,20 @@ struct Status {
     roles: Vec<String>,
     last_error: Option<String>,
     current_operation: Option<String>,
+}
+#[derive(Deserialize, Serialize)]
+struct Engines {
+    engines: Vec<Engine>,
+}
+#[derive(Deserialize, Serialize)]
+struct Engine {
+    id: String,
+    engine_kind: String,
+    state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    managed: bool,
+    owned: bool,
 }
 #[derive(Deserialize, Serialize)]
 struct Candidate {
@@ -455,6 +472,7 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
             (Method::GET, "/api/v1/idoris/upstream-models", None)
         }
         IdorisAction::Status(_) => (Method::GET, "/api/v1/idoris/status", None),
+        IdorisAction::Engines(_) => (Method::GET, "/api/v1/idoris/engines", None),
         IdorisAction::Candidates(_) => (Method::GET, "/api/v1/idoris/omlx/candidates", None),
         IdorisAction::Install { yes, .. } => {
             consent(
@@ -539,6 +557,9 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
         } else if path == "/api/v1/idoris/status" {
             let status: Status = decode(response).await?;
             serde_json::to_value(status).map_err(|_| Failure::local("invalid_response"))
+        } else if path == "/api/v1/idoris/engines" {
+            let engines: Engines = decode(response).await?;
+            serde_json::to_value(engines).map_err(|_| Failure::local("invalid_response"))
         } else if path == "/api/v1/idoris/upstream-models" {
             let models: UpstreamModels = decode(response).await?;
             serde_json::to_value(models).map_err(|_| Failure::local("invalid_response"))
@@ -555,6 +576,7 @@ async fn execute(action: IdorisAction, json_output: bool) -> Result<Value, Failu
 pub async fn run(action: IdorisAction) -> Result<(), String> {
     let json_output = match &action {
         IdorisAction::Status(o)
+        | IdorisAction::Engines(o)
         | IdorisAction::Start(o)
         | IdorisAction::Stop(o)
         | IdorisAction::Candidates(o)
@@ -596,6 +618,26 @@ fn print_human(value: &Value) {
     } else if let Some(models) = value["models"].as_array() {
         for model in models {
             println!("{}", model.as_str().unwrap_or_default());
+        }
+    } else if let Some(engines) = value["engines"].as_array() {
+        if engines.is_empty() {
+            println!("No iDoris engines reported.");
+            return;
+        }
+        println!(
+            "{:<20} {:<15} {:<12} {:<8} {:<6} REASON",
+            "ENGINE", "KIND", "STATE", "MANAGED", "OWNED"
+        );
+        for engine in engines {
+            println!(
+                "{:<20} {:<15} {:<12} {:<8} {:<6} {}",
+                engine["id"].as_str().unwrap_or_default(),
+                engine["engine_kind"].as_str().unwrap_or_default(),
+                engine["state"].as_str().unwrap_or_default(),
+                engine["managed"].as_bool().unwrap_or_default(),
+                engine["owned"].as_bool().unwrap_or_default(),
+                engine["reason"].as_str().unwrap_or_default(),
+            );
         }
     } else if let Some(state) = value["state"].as_str() {
         println!(

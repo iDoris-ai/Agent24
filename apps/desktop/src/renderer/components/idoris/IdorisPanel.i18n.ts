@@ -3,6 +3,16 @@ import { defineMessages, type Locale } from '../../i18n'
 
 export const idorisMessages = defineMessages({
   "en": {
+    "engines.title": "Engines",
+    "engines.empty": "iDoris reported no engines.",
+    "engines.state.starting": "Starting",
+    "engines.state.restarting": "Restarting",
+    "engines.state.ready": "Ready",
+    "engines.state.absent": "Missing",
+    "engines.state.failed": "Failed",
+    "engines.state.unavailable": "Unavailable",
+    "engines.state.stopped": "Stopped",
+    "engines.state.unknown": "Unknown",
     "title": "Local models (iDoris)",
     "loading": "Checking iDoris…",
     "retry": "Refresh",
@@ -81,6 +91,16 @@ export const idorisMessages = defineMessages({
     "verificationTime": "Verified at: {time}"
   },
   "zh": {
+    "engines.title": "引擎",
+    "engines.empty": "iDoris 未报告任何引擎。",
+    "engines.state.starting": "启动中",
+    "engines.state.restarting": "重启中",
+    "engines.state.ready": "就绪",
+    "engines.state.absent": "未找到",
+    "engines.state.failed": "失败",
+    "engines.state.unavailable": "不可用",
+    "engines.state.stopped": "已停止",
+    "engines.state.unknown": "未知",
     "title": "本地模型（iDoris）",
     "loading": "正在检测 iDoris…",
     "retry": "刷新",
@@ -159,6 +179,16 @@ export const idorisMessages = defineMessages({
     "verificationTime": "验证时间：{time}"
   },
   "th": {
+    "engines.title": "เอนจิน",
+    "engines.empty": "iDoris ไม่ได้รายงานเอนจิน",
+    "engines.state.starting": "กำลังเริ่ม",
+    "engines.state.restarting": "กำลังเริ่มใหม่",
+    "engines.state.ready": "พร้อม",
+    "engines.state.absent": "ไม่พบ",
+    "engines.state.failed": "ล้มเหลว",
+    "engines.state.unavailable": "ไม่พร้อมใช้งาน",
+    "engines.state.stopped": "หยุดแล้ว",
+    "engines.state.unknown": "ไม่ทราบ",
     "title": "โมเดลในเครื่อง (iDoris)",
     "loading": "กำลังตรวจสอบ iDoris…",
     "retry": "รีเฟรช",
@@ -239,6 +269,11 @@ export const idorisMessages = defineMessages({
 })
 
 export const idorisErrors = {
+  "idoris_unavailable": {
+    "en": "Engine status is unavailable.",
+    "zh": "无法读取引擎状态。",
+    "th": "อ่านสถานะเอนจินไม่ได้"
+  },
   "not_installed": {
     "en": "iDoris is not installed. Download and install it first.",
     "zh": "尚未安装 iDoris，请先下载安装。",

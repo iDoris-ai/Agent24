@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { IdorisError, parseOperation, parseStatus, type IdorisOperation, type IdorisStatus } from './api'
+import { IdorisError, parseEngines, parseOperation, parseStatus, type IdorisOperation, type IdorisStatus } from './api'
 
 const verification = { model_id: 'model', record_id: 'record', locality: 'loopback', verified_at: '2026-10-28T12:00:00Z' } satisfies NonNullable<IdorisStatus['verification']>
 const status = {
@@ -15,6 +15,22 @@ const operation = {
 const invalidResponse = new IdorisError('invalid_response')
 
 describe('iDoris response validation', () => {
+  const engine = { id: 'omlx', engine_kind: 'omlx', state: 'ready', managed: true, owned: true }
+
+  it('reads engine states and preserves optional reasons', () => {
+    const engines = [engine, { ...engine, id: 'external', state: 'unavailable', reason: 'connection refused', managed: false, owned: false }]
+    expect(parseEngines({ engines })).toEqual({ engines })
+    expect(parseEngines({ engines: [] })).toEqual({ engines: [] })
+  })
+
+  it.each([
+    {}, { engines: null }, { engines: [null] },
+    { engines: [{ ...engine, id: 1 }] }, { engines: [{ ...engine, engine_kind: null }] },
+    { engines: [{ ...engine, state: false }] }, { engines: [{ ...engine, reason: null }] },
+    { engines: [{ ...engine, managed: 'true' }] }, { engines: [{ ...engine, owned: 0 }] },
+  ])('rejects malformed engine responses: %j', value => {
+    expect(() => parseEngines(value)).toThrow(invalidResponse)
+  })
   it('accepts degraded recovery snapshots and keeps separate failure counters', () => {
     const recovery = { ...status, state: 'degraded', crashes: 6, hangs: 2, circuit_open: true }
     expect(parseStatus(recovery)).toEqual(recovery)
