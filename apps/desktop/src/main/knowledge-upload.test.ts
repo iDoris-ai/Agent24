@@ -612,6 +612,26 @@ describe('knowledge upload (L7-K2 A3)', () => {
     expect(d.timers.some((timer) => timer.ms === 2_000)).toBe(false)
   })
 
+  it('polls spent while enrichment runs do not use up the wait for the final cost', async () => {
+    const h = harness()
+    put(h, '/tmp/docs/a.md', 'a')
+    h.queue.ingest.push({ status: 200, body: saved({ job_id: 'job-a', status: 'indexed', enrichment: 'running' }) })
+    await h.uploads.add(['/tmp/docs/a.md'])
+    for (let i = 0; i < 300; i++) {
+      h.queue.get.push({ status: 200, body: saved({ job_id: 'job-a', status: 'indexed', enrichment: 'running' }) })
+      await h.firePoll()
+    }
+    h.queue.get.push({ status: 200, body: saved({ job_id: 'job-a', status: 'indexed', enrichment: 'none' }) })
+    await h.firePoll()
+    expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(true)
+    h.queue.get.push({
+      status: 200,
+      body: saved({ job_id: 'job-a', status: 'indexed', enrichment: 'none', cost: { final: true, items: [item('exact', 0)] } }),
+    })
+    await h.firePoll()
+    expect(h.uploads.list()[0]).toMatchObject({ state: 'indexed', costFinal: true, costZero: true })
+  })
+
   it('cancel takes the job and the cost from the answer', async () => {
     const h = harness()
     put(h, '/tmp/docs/a.md', 'a')
