@@ -106,6 +106,20 @@ tools:
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
+  # L8 DOC-4: what a document still carries before it is sent out.
+  - operation: preflight
+    description: "Check a document before it is sent to someone, without changing it: for a Word (DOCX) document, tracked changes, comments, unfilled {{fields}}, author / last modified by, hidden text; for a PDF, its author, a form and annotations. Give document_id (an id from documents.list, or the file name/title). The answer lists findings by kind with a count and examples; report only those. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
   - operation: patch
     description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. By default the original is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the original's next version instead."
     input_schema:

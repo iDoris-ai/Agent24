@@ -147,6 +147,22 @@ async fn head_docx(
     storage: &Arc<Storage>,
     id: &str,
 ) -> Result<(i64, Option<String>, Vec<u8>), ApiError> {
+    let (head, title, media_type, bytes) = head_bytes(storage, id).await?;
+    if media_type != DOCX {
+        return Err(ApiError::unprocessable(
+            "unsupported_format",
+            "only Word (DOCX) documents can be edited paragraph by paragraph",
+        ));
+    }
+    Ok((head, title, bytes))
+}
+
+/// L8-DOC-4: the document's head revision, whatever its format: its number,
+/// title, media type and bytes (verified against their SHA-256).
+pub(crate) async fn head_bytes(
+    storage: &Arc<Storage>,
+    id: &str,
+) -> Result<(i64, Option<String>, String, Vec<u8>), ApiError> {
     if !is_id(IdKind::Document, id) {
         return Err(ApiError::invalid_request("not a document id"));
     }
@@ -161,12 +177,6 @@ async fn head_docx(
         };
     let (head, title) = row.ok_or_else(|| ApiError::not_found("no such document"))?;
     let revision = crate::read::revision(storage, id, head).await?;
-    if revision.media_type != DOCX {
-        return Err(ApiError::unprocessable(
-            "unsupported_format",
-            "only Word (DOCX) documents can be edited paragraph by paragraph",
-        ));
-    }
     let blobs = storage.clone();
     let sha = revision.content_sha256.clone();
     let bytes = blocking(move || blobs.blobs.read_verified(&sha))
@@ -175,7 +185,7 @@ async fn head_docx(
     if bytes.len() > CONTENT_MAX {
         return Err(ApiError::payload_too_large(CONTENT_MAX));
     }
-    Ok((head, title, bytes))
+    Ok((head, title, revision.media_type, bytes))
 }
 
 pub async fn paragraphs(

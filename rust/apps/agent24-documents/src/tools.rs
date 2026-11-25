@@ -239,6 +239,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "fill" => fill(state, run, arguments).await,
             "delete" => delete(state, run, arguments).await,
             "compare" => compare(state, accepted, arguments).await,
+            "preflight" => preflight(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -876,6 +877,20 @@ async fn compare(state: &AppState, by: Accepted, arguments: Map<String, Value>) 
     completed(crate::compare::tool::call(state, &storage, args, Requester::Tool(by)).await)
 }
 
+/// L8 DOC-4: what the document still carries before it is sent (read).
+async fn preflight(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let (id, rest) = split_document(arguments)?;
+    if !rest.is_empty() {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    let storage = ready(state).await?;
+    completed(
+        crate::preflight::preflight_of(&storage, id)
+            .await
+            .map(crate::preflight::for_the_model),
+    )
+}
+
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
     let args: JobGetArgs = parse(arguments)?;
     let storage = ready(state).await?;
@@ -1025,7 +1040,7 @@ enum Resource {
 fn resource(op: &str) -> Option<Resource> {
     match op {
         "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill"
-        | "delete" | "compare" => Some(Resource::Document),
+        | "delete" | "compare" | "preflight" => Some(Resource::Document),
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
@@ -1048,7 +1063,7 @@ async fn named_by_title(
     arguments: &mut Map<String, Value>,
 ) -> Result<(), Envelope> {
     let mut slots: Vec<&mut Value> = match op {
-        "get" | "paragraphs" | "patch" | "fields" | "fill" => {
+        "get" | "paragraphs" | "patch" | "fields" | "fill" | "preflight" => {
             arguments.get_mut("document_id").into_iter().collect()
         }
         // L6-S05: both documents may be named by title.
@@ -1336,6 +1351,7 @@ mod tests {
     mod compare;
     mod extract;
     mod extraction;
+    mod preflight;
     mod read;
     mod scope;
 
