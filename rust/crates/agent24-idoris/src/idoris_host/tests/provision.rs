@@ -2197,3 +2197,140 @@ async fn auto_connect_uses_local_models_and_upstream_discovery() {
     );
     x.f.host.shutdown().await.unwrap();
 }
+
+/// 随包 iDoris 升版本后（#2077 0.5.0→0.6.0），旧版本的回执要能升上去，不能让 lifecycle 整体起不来。
+fn bundled_version() -> &'static str {
+    IdorisLock::embedded().tag.trim_start_matches('v')
+}
+fn write_receipt(x: &ConnectedFixture, record: &Installation) {
+    fs::write(
+        x.f.host.root.join("installation.json"),
+        serde_json::to_vec(record).unwrap(),
+    )
+    .unwrap();
+}
+fn reopen(x: &ConnectedFixture) -> io::Result<Arc<IdorisHost>> {
+    let host = IdorisHost::open(
+        x.f.host.root.clone(),
+        x.f.host.managed.clone(),
+        x.f.host.router.clone(),
+        x.f.runtime.clone(),
+        x.f.host.secrets.clone(),
+    )?;
+    Ok(host
+        .with_provisioner(x.provision.clone(), x.data.clone(), x.upstream.clone())
+        .unwrap())
+}
+fn older_receipt(x: &ConnectedFixture) -> Installation {
+    let mut record = x.f.record.clone();
+    record.version = "0.5.0".into();
+    record
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_opens_as_not_installed_and_install_upgrades_it() {
+    let x = ConnectedFixture::new().await;
+    write_receipt(&x, &older_receipt(&x));
+    let host = reopen(&x).expect("an older bundled version must not fail open");
+    let status = host.status().await;
+    assert_eq!(status.state, State::NotInstalled);
+    assert_eq!(status.version, None);
+    // restore must not try to start the old release (desired_running is true in the receipt).
+    host.restore().await.unwrap();
+    assert!(host.inner.lock().await.active.is_none());
+    assert_eq!(host.status().await.state, State::NotInstalled);
+    // Only open() reads an older receipt as not installed; committing one is still refused.
+    assert_eq!(
+        host.record_installation(older_receipt(&x)).await,
+        Err(Code::InvalidRequest)
+    );
+    // The ordinary Install (the panel's button) installs the bundled version.
+    let op = host
+        .install(InstallRequest { consent: true }, Some("upgrade-1"))
+        .await
+        .unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let op = host.operation(&op.operation_id).await.unwrap();
+            if op.result.is_some() {
+                break op;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done.result, Some(Outcome::Succeeded));
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    let status = host.status().await;
+    assert_eq!(status.version.as_deref(), Some(bundled_version()));
+    assert_eq!(status.state, State::NotConfigured);
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(host.root.join("installation.json")).unwrap()).unwrap();
+    assert_eq!(saved.version, bundled_version());
+    // The upgraded receipt opens normally next time.
+    assert_eq!(
+        reopen(&x).unwrap().status().await.state,
+        State::NotConfigured
+    );
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_is_upgraded_by_the_startup_bootstrap() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    write_receipt(&x, &older_receipt(&x));
+    let host = reopen(&x).unwrap();
+    host.restore().await.unwrap();
+    host.bootstrap_core_with_candidates(Candidates {
+        setup: None,
+        candidates: vec![Candidate {
+            endpoint: x.endpoint.clone(),
+            identity: "omlx",
+            authentication: "ready",
+            models: vec!["real-model".into()],
+        }],
+        key_from_local_settings: true,
+    })
+    .await
+    .unwrap();
+    let status = host.status().await;
+    assert_eq!(status.state, State::Running);
+    assert_eq!(status.version.as_deref(), Some(bundled_version()));
+    assert_eq!(host.daily_model().await.as_deref(), Some("real-model"));
+    let stop = host.submit(Action::Stop, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while host
+            .operation(&stop.operation_id)
+            .await
+            .unwrap()
+            .result
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_with_invalid_fields_is_still_rejected() {
+    let x = ConnectedFixture::new().await;
+    let invalid: [fn(&mut Installation); 5] = [
+        |r| r.release_dir = PathBuf::from("relative/release"),
+        |r| r.data_port = 0,
+        |r| r.admin_port = r.data_port,
+        |r| r.key_id = Some(format!("idk_{}", "a".repeat(64))),
+        |r| r.omlx_url = Some("http://example.com:8000".into()),
+    ];
+    for (index, break_it) in invalid.into_iter().enumerate() {
+        let mut record = older_receipt(&x);
+        break_it(&mut record);
+        write_receipt(&x, &record);
+        let error = reopen(&x)
+            .err()
+            .unwrap_or_else(|| panic!("case {index} opened"));
+        assert_eq!(error.to_string(), "invalid iDoris installation receipt");
+    }
+}
