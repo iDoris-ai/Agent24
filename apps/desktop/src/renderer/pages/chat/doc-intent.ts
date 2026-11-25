@@ -207,7 +207,7 @@ const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说
 
 /** L8-S02 (David 11-26, 方案 A): only on a form turn, or an answer to one. */
 export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）模板。先用 documents.fields 看字段和 kind，再读用户给的资料文档（Word 用 documents.paragraphs，PDF 用 documents.read_range）；值只从资料或用户说的话里取，不要自己编；缺的先逐项问用户，问齐了或用户说先空着，再调用一次 documents.fill，用户给了资料文档就把它作为 source_document_id；'
-  + 'kind 为 identity 的字段（姓名、证件号、电话、地址、银行卡、联系人）资料里没有、用户也没说，就不要填；用户在对话里亲口给的值，把字段名放进 user_said；kind 为 manual 的（签名、照片、勾选框、附件）不要填，告诉用户需要手工处理；用户说先空着的不填。'
+  + 'kind 为 identity 的字段（姓名、证件号、电话、地址、银行卡、联系人、甲乙方等）资料里没有、用户也没说，就不要填；用户在对话里亲口给的值，把字段名放进 user_said；kind 为 manual 的（签名、照片、勾选框、附件）不要填，告诉用户需要手工处理；用户说先空着的不填。'
   + '填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
   + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
 
