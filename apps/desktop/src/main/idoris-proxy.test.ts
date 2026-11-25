@@ -5,12 +5,12 @@ import { isAllowedProxyRoute, proxyRequest } from './backend-proxy'
 describe('IL-13 exact daemon proxy capability', () => {
   it('allows only implemented lifecycle methods and paths', () => {
     for (const [method, path] of [
-      ['GET', '/api/v1/idoris/status'], ['GET', '/api/v1/idoris/omlx/candidates'],
+      ['GET', '/api/v1/idoris/status'], ['GET', '/api/v1/idoris/engines'], ['GET', '/api/v1/idoris/omlx/candidates'],
       ['GET', '/api/v1/idoris/operations/op-1'], ['POST', '/api/v1/idoris/operations/op-1/cancel'],
       ...['install', 'connect', 'start', 'stop'].map(action => ['POST', `/api/v1/idoris/${action}`]),
     ]) expect(isAllowedProxyRoute(method, path), `${method} ${path}`).toBe(true)
     for (const [method, path] of [
-      ['POST', '/api/v1/idoris/status'], ['GET', '/api/v1/idoris/connect'],
+      ['POST', '/api/v1/idoris/status'], ['POST', '/api/v1/idoris/engines'], ['GET', '/api/v1/idoris/connect'],
       ['POST', '/api/v1/idoris/upgrade'], ['POST', '/api/v1/idoris/keys/rotate'],
       ['GET', '/admin/api/v1/status'], ['POST', '/api/v1/idoris/operations/%2e%2e/cancel'],
     ]) expect(isAllowedProxyRoute(method, path), `${method} ${path}`).toBe(false)
