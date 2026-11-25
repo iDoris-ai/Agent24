@@ -222,7 +222,9 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         named_by_title(state, scope, op, &mut arguments).await?;
         admit(state, scope, op, &arguments).await?;
         if op == "compare" {
-            admit_other(state, scope, &arguments).await?;
+            admit_named(state, scope, &arguments, "other_document_id").await?;
+        } else if op == "fill" {
+            admit_named(state, scope, &arguments, "source_document_id").await?;
         }
         match op {
             "extract" => extract(state, run, accepted, claim_holds, arguments).await,
@@ -236,7 +238,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "paragraphs" => paragraphs(state, arguments).await,
             "patch" => patch(state, run, arguments).await,
             "fields" => fields(state, arguments).await,
-            "fill" => fill(state, run, arguments).await,
+            "fill" => fill(state, run, accepted, arguments).await,
             "delete" => delete(state, run, arguments).await,
             "compare" => compare(state, accepted, arguments).await,
             "preflight" => preflight(state, arguments).await,
@@ -818,13 +820,25 @@ async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
 /// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
-async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+/// L8-S02: an identity value is written only from the user's material or their words.
+async fn fill(
+    state: &AppState,
+    run: Run,
+    accepted: Accepted,
+    arguments: Map<String, Value>,
+) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
     rest.remove("title");
     let save_to: AgentSaveTo = match rest.remove("save_to") {
         Some(v) => serde_json::from_value(v).map_err(|_| Envelope::error(INVALID_INPUT, false))?,
         None => AgentSaveTo::NewDocument,
     };
+    let source_id = match rest.remove("source_document_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s),
+        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
+    };
+    let user_said = spoken(rest.remove("user_said"))?;
     let mut body = Value::Object(rest);
     let storage = ready(state).await?;
     if save_to == AgentSaveTo::Original {
@@ -835,25 +849,213 @@ async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outc
             .head_revision;
         save_fields(&mut body, save_to, head);
     }
-    let req: crate::patch::FillRequest =
+    let mut req: crate::patch::FillRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    match crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
+    let listed = crate::patch::fields_of(&storage, id.clone())
         .await
-        .map_err(|e| refused(&e))?
+        .map_err(|e| refused(&e))?;
+    let fields: Vec<_> = listed
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.kind))
+        .collect();
+    let found = identity_in_material(
+        state,
+        &storage,
+        source_id.as_deref(),
+        &accepted,
+        &req.values,
+        &user_said,
+    )
+    .await?;
+    let report = crate::form::plan_fill(&fields, &req.values, &user_said, &found);
+    // Nothing left that may be written: do not import an unchanged copy.
+    if report.write.is_empty() && !req.values.is_empty() {
+        return completed(Ok(json!({
+            "written": false,
+            "filled": report.filled,
+            "ask_user": report.ask_user,
+            "manual": report.manual,
+            "unfilled": report.unfilled,
+            "note": report.note,
+        })));
+    }
+    req.values.clone_from(&report.write);
+    let saved = crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
+        .await
+        .map_err(|e| refused(&e))?;
+    let mut payload = match saved {
+        crate::patch::Saved::Document(job) => settled(&storage, job).await,
+        crate::patch::Saved::Revision(c) => match saved_version(state, &run.run_id, &id, &c)? {
+            Envelope::Completed { payload, .. } => payload,
+            error => return Ok(error),
+        },
+    };
+    stamp_fill(&mut payload, &report);
+    completed(Ok(payload))
+}
+
+/// `user_said`: at most 200 field names, each 1 to 64 characters.
+fn spoken(value: Option<Value>) -> Result<Vec<String>, Envelope> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> =
+        serde_json::from_value(value).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
+    if names.len() > 200 || names.iter().any(|n| !(1..=64).contains(&n.chars().count())) {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    Ok(names)
+}
+
+/// Whitespace removed, so 「张 三」 in a resume matches the value 张三.
+fn compact(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+enum Material {
+    /// A DOCX's paragraph text, whitespace removed.
+    Text(String),
+    /// Not a DOCX: look the value up with `documents.find`.
+    Find { revision: i64 },
+    /// The file could not be read: treat every value as absent.
+    Absent,
+}
+
+async fn load_material(storage: &Arc<Storage>, id: &str) -> Result<Material, Envelope> {
+    let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
+    if detail.head.media_type != crate::office::DOCX {
+        return Ok(Material::Find {
+            revision: detail.document.head_revision,
+        });
+    }
+    match crate::patch::head_bytes(
+        storage,
+        id,
+        &[crate::office::DOCX],
+        "only a Word document can be read as material",
+    )
+    .await
     {
-        crate::patch::Saved::Document(job) => completed::<Value>(Ok(settled(&storage, job).await)),
-        crate::patch::Saved::Revision(c) => saved_version(state, &run.run_id, &id, &c),
+        Ok((_, _, _, bytes)) => {
+            let parsed =
+                crate::state::blocking(move || crate::docx_patch::plain_text(&bytes)).await;
+            Ok(match parsed {
+                Ok(text) => Material::Text(compact(&text)),
+                Err(_) => Material::Absent,
+            })
+        }
+        // Unreadable material is "not in the document", not a failed fill.
+        Err(e) if e.code() == "unsupported_format" || e.code() == "payload_too_large" => {
+            Ok(Material::Absent)
+        }
+        Err(e) => Err(refused(&e)),
     }
 }
 
-/// `compare`'s second document is in the scope too, or the call reads as
-/// naming a document that is not here (K1-06a §2.4).
-async fn admit_other(
+/// Identity field names whose value occurs in the material document.
+async fn identity_in_material(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    source_id: Option<&str>,
+    accepted: &Accepted,
+    values: &std::collections::BTreeMap<String, String>,
+    user_said: &[String],
+) -> Result<std::collections::HashSet<String>, Envelope> {
+    let mut found = std::collections::HashSet::new();
+    let Some(source_id) = source_id else {
+        return Ok(found);
+    };
+    // A title nothing resolved to is the same as no such document.
+    if !is_id(IdKind::Document, source_id) {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    let material = load_material(storage, source_id).await?;
+    for (name, value) in values {
+        if crate::form::field_kind(name) != crate::form::FieldKind::Identity
+            || value.trim().is_empty()
+        {
+            continue;
+        }
+        if user_said.iter().any(|s| s == name) {
+            continue;
+        }
+        if material_has(state, storage, source_id, accepted, &material, value).await {
+            found.insert(name.clone());
+        }
+    }
+    Ok(found)
+}
+
+async fn material_has(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    id: &str,
+    accepted: &Accepted,
+    material: &Material,
+    value: &str,
+) -> bool {
+    match material {
+        Material::Text(text) => {
+            let needle = compact(value);
+            !needle.is_empty() && text.contains(&needle)
+        }
+        Material::Find { revision } => {
+            // `find` refuses a query longer than 500 characters.
+            if value.chars().count() > 500 {
+                return false;
+            }
+            let req = FindRequest {
+                revision: *revision,
+                query: value.to_owned(),
+                cursor: None,
+                limit: Some(1),
+                require_complete: false,
+            };
+            find::search(
+                state,
+                storage,
+                id,
+                req,
+                PAYLOAD_BYTES,
+                Requester::Tool(accepted.clone()),
+            )
+            .await
+            .ok()
+            .is_some_and(|found| !found.matches.is_empty())
+        }
+        Material::Absent => false,
+    }
+}
+
+/// The fill report, on top of the import's own answer. The import's note
+/// stays, so the model is still told not to call the tool again.
+fn stamp_fill(payload: &mut Value, report: &crate::form::FillReport) {
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    map.insert("written".to_owned(), json!(true));
+    map.insert("filled".to_owned(), json!(report.filled));
+    map.insert("ask_user".to_owned(), json!(report.ask_user));
+    map.insert("manual".to_owned(), json!(report.manual));
+    map.insert("unfilled".to_owned(), json!(report.unfilled));
+    let note = match map.get("note").and_then(Value::as_str) {
+        Some(prev) if !prev.is_empty() => format!("{}{prev}", report.note),
+        _ => report.note.clone(),
+    };
+    map.insert("note".to_owned(), Value::String(note));
+}
+
+/// A second document named by the call (`compare`'s other, `fill`'s material)
+/// is in the scope too, or the call reads as naming a document that is not
+/// here (K1-06a §2.4).
+async fn admit_named(
     state: &AppState,
     scope: &Scope,
     arguments: &Map<String, Value>,
+    key: &str,
 ) -> Result<(), Envelope> {
-    let id = match arguments.get("other_document_id") {
+    let id = match arguments.get(key) {
         None => return Ok(()),
         Some(Value::String(id)) => id,
         Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
@@ -1063,7 +1265,12 @@ async fn named_by_title(
     arguments: &mut Map<String, Value>,
 ) -> Result<(), Envelope> {
     let mut slots: Vec<&mut Value> = match op {
-        "get" | "paragraphs" | "patch" | "fields" | "fill" | "preflight" => {
+        "fill" => arguments
+            .iter_mut()
+            .filter(|(k, _)| *k == "document_id" || *k == "source_document_id")
+            .map(|(_, v)| v)
+            .collect(),
+        "get" | "paragraphs" | "patch" | "fields" | "preflight" => {
             arguments.get_mut("document_id").into_iter().collect()
         }
         // L6-S05: both documents may be named by title.
@@ -1351,6 +1558,7 @@ mod tests {
     mod compare;
     mod extract;
     mod extraction;
+    mod fill;
     mod preflight;
     mod read;
     mod scope;
