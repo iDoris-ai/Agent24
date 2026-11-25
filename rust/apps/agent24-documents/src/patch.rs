@@ -126,7 +126,7 @@ async fn save(
     }
 }
 
-fn patch_failure(e: PatchError) -> ApiError {
+pub(crate) fn patch_failure(e: PatchError) -> ApiError {
     match e {
         PatchError::NotDocx(why) => ApiError::unprocessable("parse_failed", why),
         PatchError::TooLarge => {
@@ -303,7 +303,7 @@ pub async fn patch_run(
 }
 
 /// The time now in UTC, ISO 8601 (a revision's w:date, core.xml's modified).
-async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> {
+pub(crate) async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> {
     match sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
         .fetch_one(storage.db.pool())
         .await
@@ -314,7 +314,7 @@ async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> {
 }
 
 /// `<original title, extension aside><suffix>`, at most 500 characters.
-fn derived_title(original: Option<String>, suffix: &str) -> String {
+pub(crate) fn derived_title(original: Option<String>, suffix: &str) -> String {
     let base = original.unwrap_or_else(|| "文档".to_owned());
     let stem = base
         .strip_suffix(".docx")
@@ -325,7 +325,7 @@ fn derived_title(original: Option<String>, suffix: &str) -> String {
 }
 
 /// The new DOCX imported as a document of its own.
-async fn import_docx(
+pub(crate) async fn import_docx(
     storage: &Arc<Storage>,
     title: String,
     bytes: Vec<u8>,

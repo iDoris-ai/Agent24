@@ -822,3 +822,40 @@ fn compare_maps_to_its_route_and_checks_both_sides() {
         assert!(route(&bad).is_none(), "{bad}");
     }
 }
+
+#[test]
+fn deliver_receipt_and_receipts_map_to_their_routes_and_refuse_what_the_service_would() {
+    const COPY: &str = "doc_01HZX5W3K9Q8R7T6Y5V4A3S2R9";
+    let d = route(&json!({"op": "deliver", "documentId": DOC, "expectRevision": 2})).unwrap();
+    assert_eq!(d.method, Method::Post);
+    assert_eq!(
+        d.path,
+        format!("/api/v1/documents/documents/{DOC}/deliveries")
+    );
+    let r = route(&json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": COPY, "savedTo": "/Users/u/Desktop/合同.pdf"})).unwrap();
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(
+        r.path,
+        format!("/api/v1/documents/documents/{DOC}/receipts")
+    );
+    assert_eq!(
+        route_of(&json!({"op": "receipts", "documentId": DOC})),
+        Some((
+            Method::Get,
+            format!("/api/v1/documents/documents/{DOC}/receipts")
+        ))
+    );
+    assert_eq!(
+        route_of(&json!({"op": "receipts"})),
+        Some((Method::Get, "/api/v1/documents/receipts".to_owned()))
+    );
+    for bad in [
+        json!({"op": "deliver", "documentId": DOC}),
+        json!({"op": "deliver", "documentId": DOC, "expectRevision": 0}),
+        json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": COPY, "savedTo": "Desktop/a.pdf"}),
+        json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": "x", "savedTo": "/a.pdf"}),
+        json!({"op": "receipts", "documentId": "x"}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}

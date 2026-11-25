@@ -178,6 +178,34 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let path = format!("{BASE}/documents/{document}/revisions/{revision}/restore");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
+        // L8 DOC-4: a clean copy of the version checked, as a new document;
+        // the receipt once its file is saved; the latest receipts.
+        "deliver" => {
+            let document = k.id("documentId", "doc_")?;
+            let body = json!({"expect_revision": k.number("expectRevision")?});
+            let path = format!("{BASE}/documents/{document}/deliveries");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        "receipt" => {
+            let document = k.id("documentId", "doc_")?;
+            let saved_to =
+                k.0.get("savedTo")?
+                    .as_str()
+                    .filter(|p| p.starts_with('/') && (2..=1024).contains(&p.chars().count()))?;
+            let body = json!({
+                "revision": k.number("revision")?,
+                "copy_document_id": k.id("copyDocumentId", "doc_")?,
+                "saved_to": saved_to,
+            });
+            let path = format!("{BASE}/documents/{document}/receipts");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        "receipts" => {
+            match k.optional("documentId", |v| v.as_str().filter(|v| ulid_id(v, "doc_")))? {
+                Some(document) => get(format!("{BASE}/documents/{document}/receipts")),
+                None => get(format!("{BASE}/receipts")),
+            }
+        }
         // L6-S05: two documents, or two versions of one, compared by text.
         "compare" => {
             let side = |key: &str| -> Option<Value> {
