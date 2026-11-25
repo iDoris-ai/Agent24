@@ -16,8 +16,14 @@
   --success: #5fbf7a;
   --warning: #e0a35a;
   --danger: #e07a6a;
+  /* VI v0.1（docs/brand/VI.md §4.2）隐私语义：本地 / 远端 / 待确认。菌丝绿只作辅助色 */
+  --local: #7fb77e;
+  --remote: #6fa8dc;
+  --approve: var(--accent);
   --radius: 8px;
+  --radius-card: 12px;
   --font: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Segoe UI', sans-serif;
+  --font-mono: 'SF Mono', 'JetBrains Mono', Menlo, monospace;
   --sidebar-w: 220px;
 }
 
@@ -39,6 +45,8 @@
   --success: #247a43;
   --warning: #9a5e16;
   --danger: #b74436;
+  --local: #3f7f45;
+  --remote: #2f6fa8;
 }
 
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -88,7 +96,9 @@ button { cursor: pointer; font-family: var(--font); }
 }
 .sidebar-logo span { font-size: 11px; font-weight: 400; color: var(--muted); display: block; margin-top: 2px; }
 .sidebar-logo-text { flex: 1; white-space: nowrap; }
-.sidebar-logo-img { width: 30px; height: 30px; margin-right: 8px; flex-shrink: 0; image-rendering: pixelated; }
+.sidebar-logo-img { width: 28px; height: 28px; margin: 0 8px 0 0; flex-shrink: 0; }
+/* VI-04: clear the macOS traffic lights (hiddenInset puts them at the top-left, ~28px tall). */
+.app.mac .sidebar-logo { padding-top: 40px; }
 
 /* Collapse button inside sidebar */
 .sidebar-collapse-btn {
@@ -262,8 +272,8 @@ button { cursor: pointer; font-family: var(--font); }
   cursor: pointer;
 }
 .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #555; flex-shrink: 0; }
-.status-dot.online { background: #4caf50; box-shadow: 0 0 4px #4caf5066; }
-.status-dot.offline { background: #f44336; }
+.status-dot.online { background: var(--success); }
+.status-dot.offline { background: var(--danger); }
 .backend-refused-hint { margin: 6px 0 0; font-size: 11px; line-height: 1.4; color: var(--muted); }
 
 /* ── Main area ── */
@@ -293,7 +303,7 @@ button { cursor: pointer; font-family: var(--font); }
 .theme-toggle-btn:hover { color: var(--text); background: var(--surface2); border-color: var(--muted); }
 .content { flex: 1; overflow-y: auto; padding: 24px; }
 .creative-host { flex: 1; min-height: 0; position: relative; background: var(--bg); }
-.creative-error { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; padding: 24px; color: #ff8b8b; font-size: 13px; text-align: center; }
+.creative-error { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; padding: 24px; color: var(--danger); font-size: 13px; text-align: center; }
 .knowledge-host { flex: 1; min-height: 0; position: relative; background: var(--bg); }
 .knowledge-message { position: absolute; inset: 0; display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; padding: 24px; color: var(--muted); font-size: 13px; text-align: center; }
 .knowledge-page { display: flex; flex-direction: column; flex: 1; min-height: 0; }
@@ -509,8 +519,8 @@ button { cursor: pointer; font-family: var(--font); }
 .voice-row-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
 .voice-row-truncated { color: var(--muted); font-size: 11px; }
 .voice-row-note { flex: 0 0 auto; font-size: 10px; color: var(--muted); }
-.voice-row-error { border-color: #e05050; }
-.voice-row-error .voice-row-badge { color: #e05050; }
+.voice-row-error { border-color: var(--danger); }
+.voice-row-error .voice-row-badge { color: var(--danger); }
 
 /* ── Capabilities page ── */
 .cap-overview { margin-bottom: 14px; }
@@ -545,8 +555,8 @@ button { cursor: pointer; font-family: var(--font); }
 .skill-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .skill-table th, .skill-table td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: top; }
 .skill-table th { font-size: 12px; color: var(--muted); font-weight: 600; }
-.skill-row-bad { color: #c0392b; }
-.skill-dep-bad { color: #c0392b; font-weight: 700; }
+.skill-row-bad { color: var(--danger); }
+.skill-dep-bad { color: var(--danger); font-weight: 700; }
 .skill-actions { display: flex; gap: 6px; white-space: nowrap; }
 .chat-skill { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
 .chat-skill select { font-size: 12px; }
@@ -566,7 +576,7 @@ button { cursor: pointer; font-family: var(--font); }
 .task-card-deny-input:focus { outline: none; border-color: var(--accent); }
 .task-card-status { font-weight: 600; }
 .task-card-time { color: var(--muted); font-variant-numeric: tabular-nums; }
-.task-card-error { color: var(--danger, #c0392b); }
+.task-card-error { color: var(--danger); }
 /* M1: a patch lists each paragraph on its own line. */
 .task-card-ask { white-space: pre-line; }
 .task-card-actions { display: flex; gap: 6px; margin-left: auto; }
@@ -607,3 +617,9 @@ button { cursor: pointer; font-family: var(--font); }
 .compare-ins { color: var(--success); text-decoration: none; background: var(--accent-dim); }
 .compare-note, .compare-where { color: var(--muted); font-size: 12px; }
 .compare-wheres { display: flex; gap: 8px; align-items: center; margin-top: 2px; }
+
+/* VI-02 隐私徽标（docs/brand/VI.md §4.2）：字 + 形状，不只靠颜色 */
+.reply-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-size: 11px; color: var(--muted); }
+.privacy-badge { display: inline-flex; align-items: center; gap: 4px; padding: 0 7px; line-height: 17px; border: 1px solid currentColor; border-radius: 999px; font-size: 11px; white-space: nowrap; }
+.privacy-badge-local { color: var(--local); border-color: color-mix(in srgb, var(--local) 40%, transparent); }
+.privacy-badge-remote { color: var(--remote); border-color: color-mix(in srgb, var(--remote) 40%, transparent); }

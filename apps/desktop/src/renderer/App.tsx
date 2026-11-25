@@ -29,7 +29,7 @@ import { revokeKernelConsent } from './kernel-consent/kernelConsentApi'
 import { CapabilitiesProvider, NavPrefsProvider, useCapabilityRoute } from './capabilities/providers'
 import { CapabilitiesContext, NavPrefsContext } from './capabilities/types'
 import { capabilitiesMessages } from './capabilities/capabilities.i18n'
-import logoSidebar from './assets/logo-sidebar.png'
+import { BrandMark } from './components/BrandMark'
 import { useT } from './i18n'
 import { appMessages } from './App.i18n'
 import { QuickSwitch } from './components/QuickSwitch'
@@ -80,11 +80,15 @@ function BackendOffline({ failure, reasonOpen, onToggleReason, onRetry }: {
   )
 }
 
+// VI-04: the macOS traffic lights sit over the sidebar's top-left (hiddenInset).
+const isMacPlatform = (): boolean => typeof navigator !== 'undefined' && navigator.platform.startsWith('Mac')
+
 export function App(): JSX.Element {
   return <CapabilitiesProvider><NavPrefsProvider><AppShell /></NavPrefsProvider></CapabilitiesProvider>
 }
 
 function AppShell(): JSX.Element {
+  const isMac = isMacPlatform()
   const { route, navigate } = useCapabilityRoute()
   const { defs, open } = useContext(CapabilitiesContext)
   const { prefs } = useContext(NavPrefsContext)
@@ -170,7 +174,7 @@ function AppShell(): JSX.Element {
   const activeId = selected?.id ?? page ?? ''
 
   return (
-    <div className={`app${darkMode ? '' : ' light'}`}>
+    <div className={`app${darkMode ? '' : ' light'}${isMac ? ' mac' : ''}`}>
       <QuickSwitch />
       {!sidebarOpen && (
         <button className="sidebar-expand-btn" onClick={() => setSidebarOpen(true)}>›</button>
@@ -179,7 +183,7 @@ function AppShell(): JSX.Element {
       {/* ── Sidebar ── */}
       <aside className={`sidebar${sidebarOpen ? '' : ' collapsed'}`}>
         <div className="sidebar-logo">
-          <img className="sidebar-logo-img" src={logoSidebar} alt="" />
+          <BrandMark className="sidebar-logo-img" />
           <div className="sidebar-logo-text">
             Agent24
             <span>v{version || '…'}</span>
