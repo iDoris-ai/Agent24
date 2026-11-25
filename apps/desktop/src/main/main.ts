@@ -1,6 +1,7 @@
 // Agent24 main process entry — M2: integrates BackendManager daemon.
 
 import { app, BrowserWindow, dialog, Menu, Tray, WebContentsView, nativeImage, net, safeStorage, session, ipcMain, shell, type MenuItemConstructorOptions } from 'electron'
+import fs from 'node:fs'
 import path from 'node:path'
 import { ensureOwnedOmlxQuit, registerIpcHandlers } from './ipc/index'
 import { stopsOwnedOmlxOnQuit } from './omlx-quit-policy'
@@ -69,6 +70,8 @@ import { fetchOsPackageRelease, OsInstallPauseError, performOsPackageInstall } f
 import { realOsServicePause, runWhileServiceStopped } from './os-package-service'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { knowledgeOnboarding } from './knowledge-onboard'
+import { knowledgeUploads } from './knowledge-upload'
 import { knowledgeAppInstanceId } from './knowledge-app-instance'
 import { bindingTag, KnowledgeUiClient } from './knowledge-ui-client'
 import { KnowledgeUiInstance } from './knowledge-ui-instance'
@@ -714,9 +717,49 @@ app.whenReady().then(async () => {
   })
 
   onChatHistoryChange(summary => { if (mainWin && !mainWin.isDestroyed()) mainWin.webContents.send(IpcChannels.ChatHistoryChanged, summary) })
+  // L7-K2: the activation file lives in userData. The code and the key stay in main.
+  const knowledgeOnboard = knowledgeOnboarding({
+    dir: app.getPath('userData'),
+    controller: () => knowledge,
+    fetch: (url, init) => net.fetch(url, init),
+  })
+  // L7-K2 A3: same origin and credential as the entry submission, for the default base.
+  const knowledgeUpload = knowledgeUploads({
+    provider: () => {
+      if (!knowledge) return null
+      const binding = knowledge.viewBinding()
+      const inputs = binding === null ? null : knowledge.uiSessionInputs(binding)
+      const origin = settingsKnowledgeViewTarget(knowledge.status().endpoint)?.origin
+      if (!inputs || !origin) return null
+      return {
+        origin,
+        // Asked again at each request: a key changed meanwhile is not used for the old binding.
+        credential: () => (knowledge?.uiSessionInputs(binding as string)?.credential ?? null),
+        fetch: (url, init) => net.fetch(url, init),
+        newRequestId: () => newUlid(),
+      }
+    },
+    knowledgeBaseId: () => {
+      const id = knowledge?.status().knowledgeBaseIds[0]
+      return typeof id === 'string' && id.length > 0 ? id : null
+    },
+    readFile: (filePath) => fs.promises.readFile(filePath),
+    stat: async (filePath) => {
+      const info = await fs.promises.stat(filePath)
+      return { size: info.size, isFile: info.isFile() }
+    },
+    onChange: (uploads) => {
+      if (mainWin && !mainWin.isDestroyed()) {
+        mainWin.webContents.send(IpcChannels.KnowledgeUploadChanged, uploads)
+      }
+    },
+  })
+  app.on('before-quit', () => knowledgeUpload.dispose())
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,
+    knowledgeOnboard,
+    knowledgeUpload,
     scheduleConversation: (scheduleId) => scheduleConversations().conversationOf(scheduleId),
     backendRefusal: () => enrolRefusal(backendManager.statusDetail()),
     // T1-1/T1-2: what is on disk now. A daemon reads installed packages only

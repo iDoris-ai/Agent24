@@ -1446,3 +1446,86 @@ describe('ChatPage: one sentence extracts fields (F3)', () => {
     expect(request.mock.calls.some(([r]) => r.op === 'extract')).toBe(false)
   })
 })
+
+describe('ChatPage: knowledge onboarding in the conversation (L7-K2)', () => {
+  const onboardPreflight = vi.fn()
+  const onboardRun = vi.fn()
+  const ready = {
+    activated: true,
+    invalidActivation: false,
+    alreadyBound: false,
+    reachable: true,
+    formats: ['md', 'markdown', 'txt'] as const,
+    maxBytes: 10_485_760,
+  }
+
+  beforeEach(() => {
+    setLocale('zh')
+    onboardPreflight.mockReset()
+    onboardPreflight.mockResolvedValue(ready)
+    onboardRun.mockReset()
+    onboardRun.mockResolvedValue({ ok: true, outcome: 'created', knowledgeBaseId: 'kb_1', configMismatch: false, activeNow: true })
+    mockBackendProxy.mockReset()
+    mockBackendProxy.mockResolvedValue({ ok: true, status: 200, data: { message: { content: 'model answer' } } })
+    Object.defineProperty(window, 'agent24', {
+      value: {
+        backendProxy: aside(mockBackendProxy),
+        knowledge: {
+          status: vi.fn().mockResolvedValue({ enabled: false, active: false }),
+          onboardPreflight,
+          onboardRun,
+          uploadPick: vi.fn().mockResolvedValue([]),
+          uploadList: vi.fn().mockResolvedValue([]),
+          uploadCancel: vi.fn().mockResolvedValue(null),
+          onUploadChanged: vi.fn(() => () => {}),
+        },
+      },
+      writable: true,
+      configurable: true,
+    })
+  })
+
+  const say = (text: string) => {
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: text } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+  }
+
+  it('asks the first question, then opens the library and shows an upload button', async () => {
+    render(<ChatPage />)
+    say('帮我开通知识库')
+    expect(await screen.findByText(/这个知识库主要做什么用/)).toBeInTheDocument()
+    expect(onboardPreflight).toHaveBeenCalledTimes(1)
+    expect(mockBackendProxy).not.toHaveBeenCalled()
+
+    say('合同审核')
+    expect(await screen.findByText(/主要会放哪些类型的文档/)).toBeInTheDocument()
+    say('合同')
+    expect(await screen.findByText(/是否必须只留在这台电脑上/)).toBeInTheDocument()
+    say('否')
+    expect(await screen.findByText(/为你建好默认知识库/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '上传文档' })).toBeInTheDocument()
+    expect(onboardRun).toHaveBeenCalledTimes(1)
+    expect(onboardRun).toHaveBeenCalledWith({ localOnly: false })
+    expect(mockBackendProxy).not.toHaveBeenCalled()
+  })
+
+  it('does not open a library that is already connected', async () => {
+    onboardPreflight.mockResolvedValue({ ...ready, alreadyBound: true })
+    render(<ChatPage />)
+    say('帮我开通知识库')
+    expect(await screen.findByText(/你已经连着知识库了/)).toBeInTheDocument()
+    expect(onboardRun).not.toHaveBeenCalled()
+    expect(screen.queryByText(/这个知识库主要做什么用/)).toBeNull()
+    expect(mockBackendProxy).not.toHaveBeenCalled()
+  })
+
+  it('does not start onboarding for a question about what is in the library', async () => {
+    render(<ChatPage />)
+    say('知识库里有没有违约金的规定')
+    expect(await screen.findByText('model answer')).toBeInTheDocument()
+    expect(onboardPreflight).not.toHaveBeenCalled()
+    expect(onboardRun).not.toHaveBeenCalled()
+    expect(screen.queryByText(/先问三个问题/)).toBeNull()
+  })
+})

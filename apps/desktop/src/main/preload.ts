@@ -18,6 +18,9 @@ import {
   type DocumentsModuleStatus,
   type OsPackageProgress,
   type KnowledgeConfigureInput,
+  type KnowledgeOnboardPreflight,
+  type KnowledgeOnboardResult,
+  type KnowledgeUpload,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
   type KnowledgeViewBounds,
@@ -261,6 +264,21 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+    /** L7-K2: mock onboarding. The activation code and the key stay in main. */
+    onboardPreflight: (): Promise<KnowledgeOnboardPreflight> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeOnboardPreflight),
+    onboardRun: (input: { localOnly: boolean }): Promise<KnowledgeOnboardResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeOnboardRun, input),
+    /** L7-K2 A3: pick files and upload them. Paths stay in main. */
+    uploadPick: (): Promise<KnowledgeUpload[]> => ipcRenderer.invoke(IpcChannels.KnowledgeUploadPick),
+    uploadList: (): Promise<KnowledgeUpload[]> => ipcRenderer.invoke(IpcChannels.KnowledgeUploadList),
+    uploadCancel: (id: string): Promise<KnowledgeUpload | null> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeUploadCancel, id),
+    onUploadChanged: (cb: (uploads: KnowledgeUpload[]) => void): (() => void) => {
+      const listener = (_event: unknown, uploads: KnowledgeUpload[]): void => cb(uploads)
+      ipcRenderer.on(IpcChannels.KnowledgeUploadChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeUploadChanged, listener)
+    },
   },
   // KB-C2-03: where to draw the KnowledgeView; main owns everything else.
   knowledgeView: {
