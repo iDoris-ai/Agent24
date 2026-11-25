@@ -2335,84 +2335,69 @@ async fn an_older_bundled_version_with_invalid_fields_is_still_rejected() {
     }
 }
 
-/// A fake oMLX `/v1/models` that records every request it received.
-async fn fake_omlx_models(ids: &[&str]) -> (String, Arc<SyncMutex<Vec<String>>>) {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}/", listener.local_addr().unwrap());
-    let body = json!({"object": "list", "data": ids.iter().map(|id| json!({"id": id})).collect::<Vec<_>>()}).to_string();
-    let requests = Arc::new(SyncMutex::new(Vec::new()));
-    let seen = requests.clone();
-    tokio::spawn(async move {
-        while let Ok((mut socket, _)) = listener.accept().await {
-            let mut request = vec![0u8; 8192];
-            let n = socket.read(&mut request).await.unwrap_or(0);
-            seen.lock()
-                .unwrap()
-                .push(String::from_utf8_lossy(&request[..n]).into_owned());
-            let reply = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = socket.write_all(reply.as_bytes()).await;
-        }
-    });
-    (endpoint, requests)
+/// `~/.omlx/models` laid out like David's MacBook (11-26): every model one organisation
+/// folder down, which iDoris v0.6.0 `models local` does not see.
+fn nested_models_dir(x: &ConnectedFixture) -> PathBuf {
+    let dir = x.f.host.root.join("omlx-models");
+    for model in ["Qwen3-8B-4bit", "bge-m3-mlx-fp16"] {
+        let path = dir.join("mlx-community").join(model);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.json"), "{}").unwrap();
+    }
+    // Not models: no config.json, a dot folder, and a symlinked model.
+    fs::create_dir_all(dir.join("mlx-community/partial-download")).unwrap();
+    fs::create_dir_all(dir.join(".cache/hidden-model")).unwrap();
+    fs::write(dir.join(".cache/hidden-model/config.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("mlx-community/Qwen3-8B-4bit"),
+        dir.join("mlx-community/linked-model"),
+    )
+    .unwrap();
+    dir
 }
 
 #[tokio::test]
-async fn candidates_fall_back_to_the_running_omlx_when_the_local_scan_finds_no_chat_model() {
-    // iDoris v0.6.0 `models local` scans one level, so `~/.omlx/models/mlx-community/<model>`
-    // comes back empty although oMLX serves those models (David's MacBook, 11-26).
+async fn candidates_add_models_one_folder_down_when_the_idoris_scan_finds_no_chat_model() {
     let mut x = ConnectedFixture::new().await;
     x.installed().await;
     x.scenario(json!({"local_models": [
         {"omlx_id":"bge-m3-mlx-fp16", "kind":"embedding", "size_bytes":42}
     ]}));
-    let (endpoint, requests) = fake_omlx_models(&["Qwen3-8B-4bit", "bge-m3-mlx-fp16"]).await;
-    Arc::get_mut(&mut x.f.host).unwrap().omlx_default_endpoint = endpoint;
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
     let discovery = x.f.host.candidates(None).await.unwrap();
     assert_eq!(discovery.candidates[0].models, ["Qwen3-8B-4bit"]);
-    // The candidate endpoint is still left to iDoris's own discovery.
+    // The endpoint is still left to iDoris's own discovery.
     assert_eq!(discovery.candidates[0].endpoint, "");
-    let request = requests.lock().unwrap()[0].clone();
-    assert!(request.starts_with("GET /v1/models HTTP/1.1"), "{request}");
-    // oMLX's own key, sent only to the loopback oMLX it belongs to.
-    assert!(
-        request
-            .to_ascii_lowercase()
-            .contains("authorization: bearer sk-upstream-sensitive"),
-        "{request}"
-    );
 }
 
 #[tokio::test]
-async fn candidates_keep_the_local_scan_when_it_finds_a_chat_model() {
+async fn candidates_keep_the_idoris_scan_when_it_finds_a_chat_model() {
     let mut x = ConnectedFixture::new().await;
     x.installed().await;
-    // Nothing listens here: a fallback request would fail, but none must be made.
-    Arc::get_mut(&mut x.f.host).unwrap().omlx_default_endpoint = "http://127.0.0.1:9/".into();
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
     let discovery = x.f.host.candidates(None).await.unwrap();
     assert_eq!(discovery.candidates[0].models, ["real-model"]);
 }
 
 #[tokio::test]
-async fn candidates_stay_empty_when_neither_the_scan_nor_omlx_lists_a_chat_model() {
+async fn candidates_stay_empty_without_models_in_either_layout() {
     let mut x = ConnectedFixture::new().await;
     x.installed().await;
     x.scenario(json!({"local_models": []}));
-    Arc::get_mut(&mut x.f.host).unwrap().omlx_default_endpoint = "http://127.0.0.1:9/".into();
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(x.f.host.root.join("missing"));
     let discovery = x.f.host.candidates(None).await.unwrap();
     assert!(discovery.candidates[0].models.is_empty());
 }
 
 #[tokio::test]
-async fn bootstrap_connects_and_starts_with_models_only_the_running_omlx_lists() {
+async fn bootstrap_connects_and_starts_with_models_one_folder_down() {
     let _serial = BOOTSTRAP_SERIAL.lock().await;
     let mut x = ConnectedFixture::new().await;
     x.scenario(json!({"local_models": []}));
-    let (endpoint, requests) = fake_omlx_models(&["Qwen3-8B-4bit", "bge-m3-mlx-fp16"]).await;
-    Arc::get_mut(&mut x.f.host).unwrap().omlx_default_endpoint = endpoint;
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
     x.f.host.bootstrap_core().await.unwrap();
     assert_eq!(x.f.host.status().await.state, State::Running);
     assert_eq!(
@@ -2424,6 +2409,5 @@ async fn bootstrap_connects_and_starts_with_models_only_the_running_omlx_lists()
         x.keys()[0]["allowed_roles"],
         json!(["daily", "deep", "embed"])
     );
-    assert!(requests.lock().unwrap().len() >= 2);
     x.f.host.shutdown().await.unwrap();
 }

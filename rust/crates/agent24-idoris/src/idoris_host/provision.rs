@@ -308,22 +308,17 @@ pub(super) async fn wait_operation(host: &Arc<IdorisHost>, id: &str) -> Result<(
 /// Read only the local upstream's model catalogue, never sending credentials.
 pub async fn upstream_models(input: &str) -> Result<Vec<String>, Code> {
     let endpoint = Endpoint::parse_openai_compat(input).map_err(|_| Code::InvalidRequest)?;
-    listed_models(&endpoint, None).await
-}
-/// `GET /v1/models` on a validated loopback endpoint. `key` is only ever the
-/// upstream's own credential, sent back to that same upstream.
-async fn listed_models(endpoint: &Endpoint, key: Option<&str>) -> Result<Vec<String>, Code> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| Code::OmlxUnreachable)?;
-    let mut request = client.get(format!("{}v1/models", endpoint.as_str()));
-    if let Some(key) = key {
-        request = request.bearer_auth(key);
-    }
-    let response = request.send().await.map_err(|_| Code::OmlxUnreachable)?;
+    let response = client
+        .get(format!("{}v1/models", endpoint.as_str()))
+        .send()
+        .await
+        .map_err(|_| Code::OmlxUnreachable)?;
     if !response.status().is_success() {
         return Err(Code::OmlxUnreachable);
     }
@@ -461,7 +456,7 @@ impl IdorisHost {
             .as_ref()
             .and_then(|r| r.omlx_setup.clone());
         let models = self
-            .omlx_models(setup.as_ref().map(|s| s.endpoint.as_str()))
+            .omlx_models()
             .await?
             .into_iter()
             .filter_map(|(id, chat)| chat.then_some(id))
@@ -481,27 +476,13 @@ impl IdorisHost {
             setup,
         })
     }
-    /// Models the running oMLX lists, authenticated with oMLX's own key; empty when
-    /// it cannot be reached (the caller then reports no candidate, as before).
-    async fn running_omlx_models(&self, endpoint: Option<&str>) -> Vec<String> {
-        let Ok(endpoint) = Endpoint::parse(endpoint.unwrap_or(&self.omlx_default_endpoint)) else {
-            return Vec::new();
-        };
-        let key = self.provisioner.upstream_key().await.ok().flatten();
-        let key = key.map(ApiKey::into_secret);
-        listed_models(&endpoint, key.as_ref().map(|k| k.as_str()))
-            .await
-            .unwrap_or_else(|code| {
-                tracing::warn!(?code, "oMLX model list unavailable for iDoris candidates");
-                Vec::new()
-            })
-    }
     /// Every oMLX model id with whether it can serve chat. iDoris v0.6.0 `models local`
     /// scans only one level below `~/.omlx/models`, so models kept under an organisation
-    /// folder (`mlx-community/<model>`) are missed although oMLX serves them. When the
-    /// scan finds no chat model, the running oMLX's own list is added; setup then checks
-    /// the bindings against that same live list.
-    async fn omlx_models(&self, endpoint: Option<&str>) -> Result<Vec<(String, bool)>, Code> {
+    /// folder (`mlx-community/<model>`, which oMLX serves under the leaf name) are missed.
+    /// When its scan has no chat model, the two-level ones are added from the directory.
+    /// Nothing is sent anywhere: iDoris setup still probes oMLX (with its own listener
+    /// check) and refuses bindings the running oMLX does not list.
+    async fn omlx_models(&self) -> Result<Vec<(String, bool)>, Code> {
         let mut models: Vec<(String, bool)> = self
             .local_omlx_models()
             .await?
@@ -511,8 +492,13 @@ impl IdorisHost {
                 (m.omlx_id, chat)
             })
             .collect();
-        if !models.iter().any(|(_, chat)| *chat) {
-            for id in self.running_omlx_models(endpoint).await {
+        if !models.iter().any(|(_, chat)| *chat)
+            && let Some(dir) = self.omlx_models_dir.clone()
+        {
+            let nested = tokio::task::spawn_blocking(move || nested_omlx_models(&dir))
+                .await
+                .unwrap_or_default();
+            for id in nested {
                 if !models.iter().any(|(known, _)| *known == id) {
                     let chat = is_chat_model_id(&id);
                     models.push((id, chat));
@@ -941,11 +927,11 @@ impl IdorisHost {
                 result = upstream_models(&request.endpoint) => result?,
             }
         } else {
-            let endpoint = Some(request.endpoint.as_str()).filter(|e| !e.is_empty());
-            tokio::select! {
-                biased; _ = cancel.cancelled() => return Err(Code::Cancelled),
-                result = self.omlx_models(endpoint) => result?.into_iter().map(|(id, _)| id).collect(),
-            }
+            self.omlx_models()
+                .await?
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
         };
         if !models.contains(&request.daily_model)
             || request
@@ -1387,6 +1373,48 @@ mod chat_model_filter_tests {
         }
         assert!(super::is_chat_model_id("Qwen3-8B-4bit"));
     }
+}
+
+/// `<dir>/<org>/<model>/config.json` model folders, named by the leaf. Symlinks, dot
+/// names and anything but a plain id are skipped; each level is capped.
+fn nested_omlx_models(dir: &Path) -> Vec<String> {
+    const MAX_ENTRIES: usize = 1024;
+    let plain = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+    let id = |name: &std::ffi::OsStr| {
+        name.to_str()
+            .filter(|n| {
+                !n.starts_with('.')
+                    && n.len() <= 128
+                    && n.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            })
+            .map(str::to_owned)
+    };
+    let children = |p: &Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(p)
+            .map(|entries| entries.flatten().take(MAX_ENTRIES).collect())
+            .unwrap_or_default()
+    };
+    let mut found = Vec::new();
+    for org in children(dir) {
+        if id(&org.file_name()).is_none() || !plain(&org.path()) {
+            continue;
+        }
+        for model in children(&org.path()) {
+            let Some(name) = id(&model.file_name()) else {
+                continue;
+            };
+            let config = model.path().join("config.json");
+            if plain(&model.path())
+                && std::fs::symlink_metadata(&config).is_ok_and(|m| m.file_type().is_file())
+                && !found.contains(&name)
+            {
+                found.push(name);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 #[derive(Deserialize)]
