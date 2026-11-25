@@ -418,7 +418,7 @@ fn fill_paragraph(
 }
 
 /// Like [`splice`], with any number of parts rewritten.
-fn splice_parts(
+pub(crate) fn splice_parts(
     docx: &[u8],
     parts: &std::collections::BTreeMap<String, String>,
     now_iso: &str,

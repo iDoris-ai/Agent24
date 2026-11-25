@@ -14,6 +14,7 @@ pub mod blob;
 pub mod compare;
 pub mod compose;
 pub mod db;
+pub mod deliver;
 pub mod derived;
 pub mod documents;
 pub mod docx_patch;
@@ -237,6 +238,15 @@ pub fn router(state: AppState) -> Router {
             "/documents/{document_id}/preflight",
             get(preflight::preflight),
         )
+        .route(
+            "/documents/{document_id}/deliveries",
+            post(deliver::deliver),
+        )
+        .route(
+            "/documents/{document_id}/receipts",
+            get(deliver::document_receipts).post(deliver::record_receipt),
+        )
+        .route("/receipts", get(deliver::all_receipts))
         .route("/documents/{document_id}/fill", post(patch::fill))
         .route("/documents/{document_id}/content", get(patch::content))
         .route("/jobs/{job_id}", get(jobs::get_job))

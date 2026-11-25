@@ -664,6 +664,11 @@ export type DocumentsRequest =
   | { op: 'fields'; documentId: DocSchemas['DocumentIdString'] }
   /** L8 DOC-4: what a DOCX/PDF still carries before it is sent (read-only). */
   | { op: 'preflight'; documentId: DocSchemas['DocumentIdString'] }
+  /** L8 DOC-4: a clean copy of the version checked (a new document), the
+   * receipt once its file is saved, and the latest receipts. */
+  | { op: 'deliver'; documentId: DocSchemas['DocumentIdString']; expectRevision: number }
+  | { op: 'receipt'; documentId: DocSchemas['DocumentIdString']; revision: number; copyDocumentId: DocSchemas['DocumentIdString']; savedTo: string }
+  | { op: 'receipts'; documentId?: DocSchemas['DocumentIdString'] }
   /** D5a: the template with its fields filled, as a new document. */
   | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
   /** D5a: the head revision's file (base64), to be saved. */
@@ -703,6 +708,9 @@ export interface DocumentsResults {
   fields: { document_id: string; revision: number; fields: Array<{ name: string; count: number }> }
   fill: DocSchemas['DocumentsJob']
   preflight: DocumentPreflight
+  deliver: DocSchemas['DocumentsJob']
+  receipt: DeliveryReceipt
+  receipts: { receipts: DeliveryReceipt[] }
   content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
@@ -727,6 +735,21 @@ export interface DocumentPreflight {
   findings: Array<{ kind: PreflightKind; count: number; examples: string[] }>
   /** A DOCX (a clean copy can be made of it from L8 DOC-4 PR2 on); a PDF is only reported. */
   cleanable: boolean
+}
+
+/** L8 DOC-4: agent24-documents `deliver.rs`; the hash and format are the
+ * library copy's own. `again`: the same file was saved for it before. */
+export interface DeliveryReceipt {
+  document_id: string
+  title: string | null
+  revision: number
+  at: string
+  format: 'docx' | 'pdf'
+  file_name: string
+  saved_to: string
+  sha256: string
+  copy_document_id: string
+  again: boolean
 }
 
 export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }
