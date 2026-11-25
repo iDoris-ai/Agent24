@@ -657,7 +657,7 @@ The first end-to-end acceptance is two vertical slices, not the whole capability
 | Form | Supported | What the user does instead |
 |---|---|---|
 | Word (DOCX) template with `{{field}}` placeholders (body, tables, headers, footers) | **Yes** | — |
-| Word (DOCX) form without `{{}}` (「姓名：____」, a table with empty cells) | No (blank detection is FU-248) | Put `{{field}}` where each answer goes, then ask again; or print it and fill it in by hand |
+| Word (DOCX) form without `{{}}` (「姓名：____」, a table with empty cells) | No (blank detection is FU-249) | Put `{{field}}` where each answer goes, then ask again; or print it and fill it in by hand |
 | Interactive PDF form (AcroForm) | No | Export it to Word and make it a `{{}}` template, or print it and fill it in by hand |
 | Flat PDF, scanned form, photo of a form | No | The same: export to Word, or print and fill in by hand |
 
