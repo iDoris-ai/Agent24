@@ -192,11 +192,15 @@ function needsPoll(upload: KnowledgeUpload): boolean {
 }
 
 /** needsPoll, with the wait for a stopped job's final cost bounded (it also stops on dispose, like every poll). */
+/** The job has stopped and only its final cost is awaited (not while enrichment is still running). */
+function waitingForCost(upload: KnowledgeUpload): boolean {
+  return upload.state === 'cancelled' || upload.state === 'failed'
+    || (upload.state === 'indexed' && upload.enrichment !== 'running')
+}
+
 function slotNeedsPoll(slot: Slot): boolean {
   if (!needsPoll(slot.upload)) return false
-  const waitingForCost = slot.upload.state === 'cancelled' || slot.upload.state === 'failed'
-    || (slot.upload.state === 'indexed' && slot.upload.enrichment !== 'running')
-  return !waitingForCost || (slot.costPolls ?? 0) < COST_WAIT_POLLS
+  return !waitingForCost(slot.upload) || (slot.costPolls ?? 0) < COST_WAIT_POLLS
 }
 
 function finished(upload: KnowledgeUpload): boolean {
@@ -462,9 +466,8 @@ export function knowledgeUploads(deps: UploadDeps): {
   async function pollOne(slot: Slot): Promise<void> {
     const jobId = slot.upload.jobId
     if (!jobId || !slotNeedsPoll(slot)) return
-    if (slot.upload.state === 'cancelled' || slot.upload.state === 'failed' || slot.upload.state === 'indexed') {
-      slot.costPolls = (slot.costPolls ?? 0) + 1
-    }
+    // Only the wait for the final cost counts against its budget, never the polls of a running enrichment.
+    if (waitingForCost(slot.upload)) slot.costPolls = (slot.costPolls ?? 0) + 1
     const epoch = slot.epoch
     const provider = deps.provider()
     const credential = provider?.credential() ?? null
