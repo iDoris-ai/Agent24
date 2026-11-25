@@ -2,7 +2,7 @@
 
 > Loop 8 第 3 项。本轮只做服务端托管档、固定 SHA 制品和实测，App 不接线（David 11-26 确认，`knowledge-materials/plan/loop-8-draft.md`「已定的范围」第 1 条）。依据：`docs/knowledge/PLAN-KNOWLEDGE-TASKS.md` WS4（KB-LITE-01a/01b）、D6、§6；WeKnora `docs/agent24/CAPABILITY-MATRIX.md` #15；`CONTRACT-READONLY-v1.md` R1.4。
 > 代码基线：WeKnora fork `iDoris-ai/WeKnora` `a24/develop`：托管档 #177（合入 46a882c6，PR-Daemon APPROVE）、制品入口 #178（合入 308cc352）、M5 修复 #179（a24/kb-lite-01c-m1cpu）。实测制品源码 **70c8d1d2f8cc**（a24/develop 46a882c6 加 #179），两台机器用的是同一个签名制品。
-> **建议结论：按需下载**；本 Loop **不追加** KB-LITE-02 接线（理由见 §5）。David 在 §7 确认后才算收口。
+> **结论：按需下载**；本 Loop **不追加** KB-LITE-02 接线，接线放到 Loop 9（理由见 §5）。11-26 David 确认（经监工 3EFCCC44），见 §7。
 
 ## 1. 摘要
 
@@ -103,7 +103,7 @@
 
 ## 7. David 确认
 
-（待填：是否同意「按需下载」，以及本 Loop 不追加接线）
+11-26 David 确认（经监工 3EFCCC44）：按需下载，接线放到 Loop 9。
 
 ## 8. 留下的事（FU，已登记在 `docs/agent/followups.md`）
 
@@ -111,4 +111,5 @@
 - FU-242：setup_token 改成单次使用或可轮换；回环端口加 Host/Origin 白名单（#177 N6、G4、G5）。
 - FU-243：模型就绪只在启动时探测一次，chat 只看状态不实际调用；接线时宿主改用 `/agent24/knowledge/ready` 持续探测。
 - FU-244：`SSRF_WHITELIST` 只能按主机放行，放行 127.0.0.1 等于放行本机所有端口；本机单用户实例下可以接受，多用户或远端部署前要改成按端口放行。
+- FU-246：平衡档下日常对话本身会被拒（oMLX 返回 507，日常模型 4.51 GB 超过动态上限 3.38 GB），所以「内存相关用例在平衡档复跑」这条验收口径另行确定，本 Loop 不处理。
 - FU-245：制品的生产签名密钥由谁保管、`AGENT24_LITE_SIGNING_KEY` 何时配置；归档不能逐字节复现；只验证了 darwin/arm64；Lite 只内置 Simple 解析，PDF/DOCX 的解析能力还没测。

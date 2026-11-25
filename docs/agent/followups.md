@@ -274,3 +274,4 @@
 - [ ] FU-243 · C · src=KB-LITE-01a · 2026-11-26 · 托管档握手的模型就绪只在启动时探测一次，chat 只看 DB 状态（`configured`），不实际调用；模型后来掉线不会再报告。接线时宿主改用 `/agent24/knowledge/ready` 持续探测，需要时再给 chat 加一次真实调用。
 - [ ] FU-244 · C · src=KB-LITE-EVAL 实测 · 2026-11-26 · Lite 调本机 iDoris/oMLX 的模型端点要设 `SSRF_WHITELIST=127.0.0.1`，白名单只能按主机放行，放行回环地址等于放行本机所有端口。本机单用户实例下可以接受；多用户或远端部署前改成按端口放行。
 - [ ] FU-245 · C · src=WeKnora#178 · 2026-11-26 · 无头 Lite 制品：生产签名密钥由谁保管、何时配置 `AGENT24_LITE_SIGNING_KEY` 未定（现在 workflow 没有这个 secret 就失败，本地用一次性 key）；归档不能逐字节复现；只验证了 darwin/arm64；Lite 只内置 Simple 解析，PDF/DOCX 解析能力没测。
+- [ ] FU-246 · C · src=KB-LITE-EVAL David MacBook 实测 · 2026-11-26 · 平衡档下 oMLX 拒绝加载日常模型（`507: Model 'Qwen3-8B-4bit' (4.51GB) does not fit under the dynamic memory ceiling (3.38GB)`，与精简版无关），日常对话本身被拒；Loop 计划里「内存相关用例在平衡档复跑」的口径另行确定，本 Loop 不处理（11-26 David 经监工定）。
