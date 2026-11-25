@@ -10,7 +10,7 @@ struct Fixture {
 impl Fixture {
     fn new(body: &str) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let version = dir.path().join("0.5.0");
+        let version = dir.path().join("0.6.0");
         fs::create_dir(&version).unwrap();
         let script = format!(
             "#!/bin/sh\nset -eu\n{}\n{}\n",

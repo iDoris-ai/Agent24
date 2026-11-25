@@ -234,7 +234,7 @@ impl Fixture {
         let record = Installation {
             omlx_setup: None,
             connection: None,
-            version: "0.5.0".into(),
+            version: "0.6.0".into(),
             release_dir: root.join("release"),
             archive_path,
             components_dir: Some(root.join("components")),
@@ -709,9 +709,9 @@ async fn real_v040_install_existing_start_running_stop() {
     )
     .await
     .unwrap();
-    let installed_dir = root.join("releases/0.5.0");
+    let installed_dir = root.join("releases/0.6.0");
     for part in [
-        "releases/0.5.0/config/components",
+        "releases/0.6.0/config/components",
         "components",
         "data/state",
     ] {
@@ -724,9 +724,9 @@ async fn real_v040_install_existing_start_running_stop() {
     }
     for part in [
         "releases",
-        "releases/0.5.0",
-        "releases/0.5.0/config",
-        "releases/0.5.0/config/components",
+        "releases/0.6.0",
+        "releases/0.6.0/config",
+        "releases/0.6.0/config/components",
     ] {
         mode(&root.join(part), 0o700);
     }
@@ -765,7 +765,7 @@ async fn real_v040_install_existing_start_running_stop() {
     host.record_installation(Installation {
         omlx_setup: None,
         connection: None,
-        version: "0.5.0".into(),
+        version: "0.6.0".into(),
         release_dir: installed.directory().into(),
         archive_path: archive.path,
         components_dir: Some(root.join("components")),

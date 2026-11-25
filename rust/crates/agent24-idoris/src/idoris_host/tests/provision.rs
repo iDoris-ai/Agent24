@@ -154,7 +154,7 @@ impl Provisioner for Provision {
         }
         // A managed root other than the fixture's own receives a fresh copy, like a real install.
         if Some(root) != self.record.release_dir.parent() {
-            let release = root.join("v0.5.0");
+            let release = root.join("v0.6.0");
             // Like the real installer: an existing version directory is verified, not rewritten.
             if !release.exists() {
                 copy_release(&self.record.release_dir, &release);
@@ -1625,7 +1625,7 @@ async fn inputs_reads_the_injected_upstream_key() {
     let mut record = Installation {
         omlx_setup: None,
         connection: None,
-        version: "0.5.0".into(),
+        version: "0.6.0".into(),
         release_dir: dir.path().join("release"),
         archive_path: dir.path().join("archive.tar.gz"),
         components_dir: None,
