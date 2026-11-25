@@ -276,7 +276,7 @@ pub fn fill(
 }
 
 /// Each text part of the DOCX, by name, as text.
-fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
+pub(crate) fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
     let (mut archive, _) = read_document(docx)?;
     let names: Vec<String> = archive
         .file_names()

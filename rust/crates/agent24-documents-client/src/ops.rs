@@ -385,6 +385,13 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
                 get(format!("{BASE}/documents/{document}/fields"));
             (method, path, body, headers, Answer::Json)
         }
+        // L8 DOC-4: what the document still carries before it is sent (read).
+        "preflight" => {
+            let document = k.id("documentId", "doc_")?;
+            let (method, path, body, headers, _) =
+                get(format!("{BASE}/documents/{document}/preflight"));
+            (method, path, body, headers, Answer::Json)
+        }
         // D5a: the template with its fields filled, as a new document.
         "fill" => {
             let document = k.id("documentId", "doc_")?;

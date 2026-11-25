@@ -30,6 +30,7 @@ pub mod office;
 pub mod oplog;
 pub mod patch;
 pub mod pdf_compose;
+pub mod preflight;
 pub mod read;
 pub mod scope;
 pub mod state;
@@ -232,6 +233,10 @@ pub fn router(state: AppState) -> Router {
         .route("/documents/{document_id}/patches", post(patch::patch))
         // D5a: a template's `{{fields}}`, and a new document with them filled.
         .route("/documents/{document_id}/fields", get(patch::fields))
+        .route(
+            "/documents/{document_id}/preflight",
+            get(preflight::preflight),
+        )
         .route("/documents/{document_id}/fill", post(patch::fill))
         .route("/documents/{document_id}/content", get(patch::content))
         .route("/jobs/{job_id}", get(jobs::get_job))
@@ -309,6 +314,7 @@ mod tests {
                 "compose",
                 "paragraphs",
                 "compare",
+                "preflight",
                 "patch",
                 "fields",
                 "fill",
