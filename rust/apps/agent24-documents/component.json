@@ -25,6 +25,7 @@
         "documents.fields",
         "documents.fill",
         "documents.compare",
+        "documents.preflight",
         "documents.delete"
       ]
     }

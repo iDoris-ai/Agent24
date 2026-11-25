@@ -662,6 +662,8 @@ export type DocumentsRequest =
     }
   /** D5a: a DOCX template's `{{fields}}`. */
   | { op: 'fields'; documentId: DocSchemas['DocumentIdString'] }
+  /** L8 DOC-4: what a DOCX/PDF still carries before it is sent (read-only). */
+  | { op: 'preflight'; documentId: DocSchemas['DocumentIdString'] }
   /** D5a: the template with its fields filled, as a new document. */
   | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
   /** D5a: the head revision's file (base64), to be saved. */
@@ -700,6 +702,7 @@ export interface DocumentsResults {
   patch: DocSchemas['DocumentsJob']
   fields: { document_id: string; revision: number; fields: Array<{ name: string; count: number }> }
   fill: DocSchemas['DocumentsJob']
+  preflight: DocumentPreflight
   content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
@@ -709,6 +712,21 @@ export interface DocumentsResults {
   revisions: DocumentVersions
   restoreRevision: SavedVersion
   compare: DocumentComparison
+}
+
+/** L8 DOC-4: agent24-documents `preflight.rs`; only kinds found are listed. */
+export type PreflightKind =
+  | 'tracked_insertions' | 'tracked_deletions' | 'comments' | 'unfilled_fields'
+  | 'author' | 'last_modified_by' | 'hidden_text' | 'pdf_form' | 'pdf_annotations'
+export interface DocumentPreflight {
+  document_id: string
+  revision: number
+  title: string | null
+  format: 'docx' | 'pdf'
+  clean: boolean
+  findings: Array<{ kind: PreflightKind; count: number; examples: string[] }>
+  /** A DOCX (a clean copy can be made of it from L8 DOC-4 PR2 on); a PDF is only reported. */
+  cleanable: boolean
 }
 
 export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }

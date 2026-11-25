@@ -679,7 +679,11 @@ fn paragraphs_and_patch_map_to_their_routes_and_refuse_what_the_service_would() 
 
 #[test]
 fn fields_fill_and_content_map_to_their_routes_and_refuse_what_the_service_would() {
-    for (op, tail) in [("fields", "fields"), ("content", "content")] {
+    for (op, tail) in [
+        ("fields", "fields"),
+        ("content", "content"),
+        ("preflight", "preflight"),
+    ] {
         assert_eq!(
             route_of(&json!({"op": op, "documentId": DOC})),
             Some((
