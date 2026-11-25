@@ -3,6 +3,7 @@ import type { BackendProxyRequest } from '../../../shared/ipc-types'
 
 export type ModelSource = NonNullable<components['schemas']['IdorisConnectRequest']['source']>
 export type IdorisStatus = components['schemas']['IdorisStatus'] & { source?: ModelSource }
+export type IdorisEngine = components['schemas']['IdorisEngine']
 export type IdorisOperation = Omit<components['schemas']['IdorisOperation'], 'error_code' | 'setup_code'> & { error_code: string | null; setup_code?: string; setup_endpoint?: string }
 export type IdorisCandidates = components['schemas']['IdorisCandidates'] & { setup?: ReturnType<typeof parseOmlxSetup> }
 export type ConnectRequest = components['schemas']['IdorisConnectRequest']
@@ -82,6 +83,16 @@ export function parseStatus(value: unknown): IdorisStatus {
     budget_unavailable_reason: v.budget_unavailable_reason === null ? null : choice(v.budget_unavailable_reason, ['hardware_memory_unavailable', 'hardware_probe_failed', 'host_unavailable']),
   }
 }
+export function parseEngines(value: unknown): components['schemas']['IdorisEngines'] {
+  return { engines: array(object(value).engines).map(value => {
+    const engine = object(value)
+    return {
+      id: text(engine.id), engine_kind: text(engine.engine_kind), state: text(engine.state),
+      ...(engine.reason === undefined ? {} : { reason: text(engine.reason) }),
+      managed: bool(engine.managed), owned: bool(engine.owned),
+    }
+  }) }
+}
 export function parseOperation(value: unknown): IdorisOperation {
   const v = object(value)
   return {
@@ -129,6 +140,7 @@ async function request<T>(req: BackendProxyRequest, parse: (value: unknown) => T
   return parse(res.data)
 }
 export const getStatus = () => request({ method: 'GET', path: '/api/v1/idoris/status' }, parseStatus)
+export const getEngines = () => request({ method: 'GET', path: '/api/v1/idoris/engines' }, parseEngines)
 export const getUpstreamModels = (endpoint: string) => request({ method: 'GET', path: `/api/v1/idoris/upstream-models?endpoint=${encodeURIComponent(endpoint)}` }, value => ({ models: array(object(value).models).map(text) }))
 export const getOperation = (id: string) => request({ method: 'GET', path: `/api/v1/idoris/operations/${encodeURIComponent(id)}` }, parseOperation)
 const candidatesPath = '/api/v1/idoris/omlx/candidates'

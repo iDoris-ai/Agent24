@@ -5020,6 +5020,26 @@ paths:
         "500":
           $ref: "#/components/responses/IdorisFailure"
 
+  /idoris/engines:
+    get:
+      operationId: getIdorisEngines
+      tags: [idoris]
+      summary: Read live iDoris engine health
+      description: Requires the same host authorization as /idoris/status. Engine states come from the gateway's per-upstream health.
+      responses:
+        "200":
+          description: Current engine states
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisEngines"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+
   /idoris/install:
     post:
       operationId: installIdoris
@@ -5932,7 +5952,7 @@ components:
               anyOf:
                 - $ref: "#/components/schemas/IdorisErrorCode"
                 - type: string
-                  enum: [unauthorized, forbidden]
+                  enum: [unauthorized, forbidden, idoris_unavailable]
             message: { type: string }
             retryable: { type: boolean }
             next_action: { type: string }
@@ -5960,6 +5980,28 @@ components:
       properties:
         core_reserved_bytes: { type: integer, minimum: 0 }
         idoris_budget_bytes: { type: integer, minimum: 0 }
+    IdorisEngine:
+      type: object
+      additionalProperties: false
+      required: [id, engine_kind, state, managed, owned]
+      properties:
+        id: { type: string }
+        engine_kind: { type: string }
+        state:
+          type: string
+          description: Gateway state such as starting, restarting, ready, absent, failed, unavailable, or stopped.
+        reason: { type: string }
+        managed: { type: boolean }
+        owned: { type: boolean }
+    IdorisEngines:
+      type: object
+      additionalProperties: false
+      required: [engines]
+      properties:
+        engines:
+          type: array
+          items:
+            $ref: "#/components/schemas/IdorisEngine"
     IdorisStatus:
       type: object
       additionalProperties: false

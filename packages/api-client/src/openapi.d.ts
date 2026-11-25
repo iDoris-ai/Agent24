@@ -2318,6 +2318,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/idoris/engines": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read live iDoris engine health
+         * @description Requires the same host authorization as /idoris/status. Engine states come from the gateway's per-upstream health.
+         */
+        get: operations["getIdorisEngines"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/idoris/install": {
         parameters: {
             query?: never;
@@ -2651,7 +2671,7 @@ export interface components {
         IdorisErrorCode: "not_installed" | "not_configured" | "instance_conflict" | "keychain_locked" | "key_unavailable" | "contract_mismatch" | "start_failed" | "stop_timeout" | "busy" | "cancelled" | "not_found" | "not_cancellable" | "shutting_down" | "invalid_request" | "persistence_failed" | "omlx_unreachable" | "omlx_auth_required" | "omlx_auth_rejected" | "unknown_service" | "model_not_found" | "consent_required" | "setup_failed" | "verify_failed" | "replace_required";
         IdorisError: {
             error: {
-                code: components["schemas"]["IdorisErrorCode"] | ("unauthorized" | "forbidden");
+                code: components["schemas"]["IdorisErrorCode"] | ("unauthorized" | "forbidden" | "idoris_unavailable");
                 message: string;
                 retryable?: boolean;
                 next_action?: string;
@@ -2673,6 +2693,18 @@ export interface components {
         IdorisBudgetSuggestion: {
             core_reserved_bytes: number;
             idoris_budget_bytes: number;
+        };
+        IdorisEngine: {
+            id: string;
+            engine_kind: string;
+            /** @description Gateway state such as starting, restarting, ready, absent, failed, unavailable, or stopped. */
+            state: string;
+            reason?: string;
+            managed: boolean;
+            owned: boolean;
+        };
+        IdorisEngines: {
+            engines: components["schemas"]["IdorisEngine"][];
         };
         IdorisStatus: {
             registered?: boolean;
@@ -9964,6 +9996,29 @@ export interface operations {
             502: components["responses"]["IdorisFailure"];
             503: components["responses"]["IdorisFailure"];
             504: components["responses"]["IdorisFailure"];
+        };
+    };
+    getIdorisEngines: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current engine states */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisEngines"];
+                };
+            };
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
         };
     };
     installIdoris: {
