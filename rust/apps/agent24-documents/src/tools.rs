@@ -914,19 +914,36 @@ fn compact(s: &str) -> String {
 }
 
 enum Material {
-    /// A DOCX's paragraph text, whitespace removed.
+    /// The material's text (a DOCX's paragraphs, a PDF's text layer), whitespace removed.
     Text(String),
-    /// Not a DOCX: look the value up with `documents.find`.
-    Find { revision: i64 },
     /// The file could not be read: treat every value as absent.
     Absent,
 }
 
-async fn load_material(storage: &Arc<Storage>, id: &str) -> Result<Material, Envelope> {
+async fn load_material(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    id: &str,
+    accepted: &Accepted,
+) -> Result<Material, Envelope> {
     let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
     if detail.head.media_type != crate::office::DOCX {
-        return Ok(Material::Find {
-            revision: detail.document.head_revision,
+        // A PDF or an image: its text layer, compared as a DOCX's text is
+        // (whitespace removed, case kept), never `find`'s relaxed match
+        // (Codex C1/C2: it folds ASCII case and does not skip a space).
+        let read = async {
+            let r = crate::read::revision(storage, id, detail.document.head_revision).await?;
+            crate::read::current_layer(state, storage, &r, Requester::Tool(accepted.clone())).await
+        };
+        return Ok(match read.await {
+            Ok((_, layer)) => Material::Text(compact(
+                &layer
+                    .blocks
+                    .iter()
+                    .map(|b| b.text.as_str())
+                    .collect::<String>(),
+            )),
+            Err(_) => Material::Absent,
         });
     }
     match crate::patch::head_bytes(
@@ -970,7 +987,7 @@ async fn identity_in_material(
     if !is_id(IdKind::Document, source_id) {
         return Err(refused(&ApiError::not_found("no such document")));
     }
-    let material = load_material(storage, source_id).await?;
+    let material = load_material(state, storage, source_id, accepted).await?;
     for (name, value) in values {
         if crate::form::field_kind(name) != crate::form::FieldKind::Identity
             || value.trim().is_empty()
@@ -980,49 +997,18 @@ async fn identity_in_material(
         if user_said.iter().any(|s| s == name) {
             continue;
         }
-        if material_has(state, storage, source_id, accepted, &material, value).await {
+        if material_has(&material, value) {
             found.insert(name.clone());
         }
     }
     Ok(found)
 }
 
-async fn material_has(
-    state: &AppState,
-    storage: &Arc<Storage>,
-    id: &str,
-    accepted: &Accepted,
-    material: &Material,
-    value: &str,
-) -> bool {
+fn material_has(material: &Material, value: &str) -> bool {
     match material {
         Material::Text(text) => {
             let needle = compact(value);
             !needle.is_empty() && text.contains(&needle)
-        }
-        Material::Find { revision } => {
-            // `find` refuses a query longer than 500 characters.
-            if value.chars().count() > 500 {
-                return false;
-            }
-            let req = FindRequest {
-                revision: *revision,
-                query: value.to_owned(),
-                cursor: None,
-                limit: Some(1),
-                require_complete: false,
-            };
-            find::search(
-                state,
-                storage,
-                id,
-                req,
-                PAYLOAD_BYTES,
-                Requester::Tool(accepted.clone()),
-            )
-            .await
-            .ok()
-            .is_some_and(|found| !found.matches.is_empty())
         }
         Material::Absent => false,
     }

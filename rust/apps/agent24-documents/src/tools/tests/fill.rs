@@ -223,3 +223,15 @@ async fn a_source_outside_the_scope_is_not_found() {
     .await;
     assert_module_error(&body, "not_found", false);
 }
+
+/// Codex C1/C2: a PDF's text is compared as a DOCX's is: whitespace removed
+/// on both sides, case kept.
+#[test]
+fn material_matches_without_whitespace_and_with_case() {
+    let text = Material::Text(compact("姓名：张 三\n账号：AbC 123"));
+    assert!(material_has(&text, "张三"));
+    assert!(material_has(&text, "AbC123"));
+    assert!(!material_has(&text, "abc123"));
+    assert!(!material_has(&text, " "));
+    assert!(!material_has(&Material::Absent, "张三"));
+}
