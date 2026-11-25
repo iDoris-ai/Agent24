@@ -308,17 +308,22 @@ pub(super) async fn wait_operation(host: &Arc<IdorisHost>, id: &str) -> Result<(
 /// Read only the local upstream's model catalogue, never sending credentials.
 pub async fn upstream_models(input: &str) -> Result<Vec<String>, Code> {
     let endpoint = Endpoint::parse_openai_compat(input).map_err(|_| Code::InvalidRequest)?;
+    listed_models(&endpoint, None).await
+}
+/// `GET /v1/models` on a validated loopback endpoint. `key` is only ever the
+/// upstream's own credential, sent back to that same upstream.
+async fn listed_models(endpoint: &Endpoint, key: Option<&str>) -> Result<Vec<String>, Code> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()
         .map_err(|_| Code::OmlxUnreachable)?;
-    let response = client
-        .get(format!("{}v1/models", endpoint.as_str()))
-        .send()
-        .await
-        .map_err(|_| Code::OmlxUnreachable)?;
+    let mut request = client.get(format!("{}v1/models", endpoint.as_str()));
+    if let Some(key) = key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.map_err(|_| Code::OmlxUnreachable)?;
     if !response.status().is_success() {
         return Err(Code::OmlxUnreachable);
     }
@@ -448,7 +453,6 @@ impl IdorisHost {
         operation_lock(&self.root.join("transactions")).map_err(install_code)
     }
     pub async fn candidates(&self, _confirmed: Option<&str>) -> Result<Candidates, Code> {
-        let models = self.local_omlx_models().await?;
         let setup = self
             .inner
             .lock()
@@ -456,6 +460,12 @@ impl IdorisHost {
             .installation
             .as_ref()
             .and_then(|r| r.omlx_setup.clone());
+        let models = self
+            .omlx_models(setup.as_ref().map(|s| s.endpoint.as_str()))
+            .await?
+            .into_iter()
+            .filter_map(|(id, chat)| chat.then_some(id))
+            .collect();
         // Compatibility envelope for the desktop: models come from the local inventory.
         Ok(Candidates {
             candidates: vec![Candidate {
@@ -465,15 +475,51 @@ impl IdorisHost {
                     .unwrap_or_default(),
                 identity: "omlx",
                 authentication: "ready",
-                models: models
-                    .into_iter()
-                    .filter(|m| matches!(m.kind.as_str(), "chat" | "vision"))
-                    .map(|m| m.omlx_id)
-                    .collect(),
+                models,
             }],
             key_from_local_settings: self.provisioner.upstream_key().await?.is_some(),
             setup,
         })
+    }
+    /// Models the running oMLX lists, authenticated with oMLX's own key; empty when
+    /// it cannot be reached (the caller then reports no candidate, as before).
+    async fn running_omlx_models(&self, endpoint: Option<&str>) -> Vec<String> {
+        let Ok(endpoint) = Endpoint::parse(endpoint.unwrap_or(&self.omlx_default_endpoint)) else {
+            return Vec::new();
+        };
+        let key = self.provisioner.upstream_key().await.ok().flatten();
+        let key = key.map(ApiKey::into_secret);
+        listed_models(&endpoint, key.as_ref().map(|k| k.as_str()))
+            .await
+            .unwrap_or_else(|code| {
+                tracing::warn!(?code, "oMLX model list unavailable for iDoris candidates");
+                Vec::new()
+            })
+    }
+    /// Every oMLX model id with whether it can serve chat. iDoris v0.6.0 `models local`
+    /// scans only one level below `~/.omlx/models`, so models kept under an organisation
+    /// folder (`mlx-community/<model>`) are missed although oMLX serves them. When the
+    /// scan finds no chat model, the running oMLX's own list is added; setup then checks
+    /// the bindings against that same live list.
+    async fn omlx_models(&self, endpoint: Option<&str>) -> Result<Vec<(String, bool)>, Code> {
+        let mut models: Vec<(String, bool)> = self
+            .local_omlx_models()
+            .await?
+            .into_iter()
+            .map(|m| {
+                let chat = matches!(m.kind.as_str(), "chat" | "vision");
+                (m.omlx_id, chat)
+            })
+            .collect();
+        if !models.iter().any(|(_, chat)| *chat) {
+            for id in self.running_omlx_models(endpoint).await {
+                if !models.iter().any(|(known, _)| *known == id) {
+                    let chat = is_chat_model_id(&id);
+                    models.push((id, chat));
+                }
+            }
+        }
+        Ok(models)
     }
     async fn local_omlx_models(&self) -> Result<Vec<LocalModel>, Code> {
         let value = self
@@ -895,11 +941,11 @@ impl IdorisHost {
                 result = upstream_models(&request.endpoint) => result?,
             }
         } else {
-            self.local_omlx_models()
-                .await?
-                .into_iter()
-                .map(|m| m.omlx_id)
-                .collect()
+            let endpoint = Some(request.endpoint.as_str()).filter(|e| !e.is_empty());
+            tokio::select! {
+                biased; _ = cancel.cancelled() => return Err(Code::Cancelled),
+                result = self.omlx_models(endpoint) => result?.into_iter().map(|(id, _)| id).collect(),
+            }
         };
         if !models.contains(&request.daily_model)
             || request

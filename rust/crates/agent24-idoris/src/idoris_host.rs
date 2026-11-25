@@ -596,6 +596,9 @@ pub struct IdorisHost {
     budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
     omlx_keys: Arc<dyn Keychain>,
+    /// Where `candidates` asks the running oMLX for its models before a setup has
+    /// recorded the real endpoint (oMLX's default port). Tests point it at a fake.
+    omlx_default_endpoint: String,
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     let parent = path.parent().ok_or(Code::PersistenceFailed)?;
@@ -717,6 +720,7 @@ impl IdorisHost {
             budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
             omlx_keys: Arc::new(crate::keychain::OmlxKeychain),
+            omlx_default_endpoint: "http://127.0.0.1:8000/".into(),
             inner: Mutex::new(Inner {
                 installation,
                 state,
