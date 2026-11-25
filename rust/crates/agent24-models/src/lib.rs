@@ -22,7 +22,7 @@ mod embedding;
 mod idoris;
 mod idoris_slot;
 pub use embedding::{DEFAULT_EMBED_MODEL, EMBED_DIMS, EmbeddingClient};
-pub use idoris::{ConnectionVerification, IdorisEvidence, IdorisGateway};
+pub use idoris::{ConnectionVerification, IdorisEvidence, IdorisGateway, UpstreamHealth};
 pub mod router;
 mod stream;
 

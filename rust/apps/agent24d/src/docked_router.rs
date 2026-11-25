@@ -470,6 +470,7 @@ mod tests {
             ("GET", "/api/v1/memory/assertions"),
             ("GET", "/api/v1/comm/identity"),
             ("GET", "/api/v1/idoris/status"),
+            ("GET", "/api/v1/idoris/engines"),
             ("POST", "/api/v1/shutdown"),
             ("POST", "/api/v1/capabilities/creative"),
             ("GET", "/api/v1/presence/challenges/next"),

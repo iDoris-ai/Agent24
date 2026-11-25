@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useId, useState } from 'react'
 import { useLocale, useT } from '../../i18n'
 import { listComponents, type ComponentView } from '../componentApi'
-import { getCandidates, getStatus, IdorisError, submitOperation, type IdorisStatus } from './api'
+import { getCandidates, getEngines, getStatus, IdorisError, submitOperation, type IdorisEngine, type IdorisStatus } from './api'
 import { idorisErrors, idorisMessages } from './IdorisPanel.i18n'
 import './idoris.css'
 import { isChatModelId } from '../../pages/settings/chatModels'
 
 type PanelState = { kind: 'loading' } | { kind: 'ready'; component: ComponentView | null } | { kind: 'error' }
+
+const engineStates = ['starting', 'restarting', 'ready', 'absent', 'failed', 'unavailable', 'stopped'] as const
 
 function stateText(t: (key: keyof typeof idorisMessages.en, vars?: Record<string, string | number>) => string, component: ComponentView): string {
   switch (component.state) {
@@ -26,12 +28,14 @@ export default function IdorisPanel() {
   const t = useT(idorisMessages)
   const locale = useLocale()
   const id = useId()
+  const [engines, setEngines] = useState<IdorisEngine[] | null>()
   const [status, setStatus] = useState<IdorisStatus | null>(null)
   const [componentState, setComponentState] = useState<PanelState>({ kind: 'loading' })
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
 
   const refresh = useCallback(async () => {
+    void getEngines().then(({ engines: next }) => setEngines(next), () => setEngines(null))
     try {
       const [next, components] = await Promise.all([getStatus(), listComponents()])
       setStatus(next)
@@ -84,6 +88,20 @@ export default function IdorisPanel() {
       {status.version && <p>{t('version', { version: status.version })}</p>}
       {(status.data_port !== null || status.admin_port !== null) && <p>{t('ports', { data: status.data_port ?? t('unknown'), admin: status.admin_port ?? t('unknown') })}</p>}
       {status.last_error && <p role="status">{t('errorGeneric')}</p>}
+      <section className="idoris-engines" aria-labelledby={`${id}-engines`}>
+        <h3 id={`${id}-engines`}>{t('engines.title')}</h3>
+        {engines === undefined ? <p>{t('loading')}</p>
+          : engines === null ? <p>{idorisErrors.idoris_unavailable[locale]}</p>
+          : engines.length === 0 ? <p>{t('engines.empty')}</p>
+          : <ul>{engines.map(engine => {
+            const state = engineStates.find(value => value === engine.state) ?? 'unknown'
+            return <li key={engine.id}>
+              <strong>{engine.id}</strong>
+              <span className="idoris-engine-state" data-state={state}>{t(`engines.state.${state}`)}</span>
+              {engine.reason && <span className="idoris-engine-reason">{engine.reason}</span>}
+            </li>
+          })}</ul>}
+      </section>
       <button className="btn" disabled={pending} onClick={() => void reconnect()}>{pending ? t('phase.connecting') : t('connect')}</button>
       <button className="btn" disabled={pending} onClick={() => void refresh()}>{t('retry')}</button>
     </>}

@@ -148,6 +148,12 @@ fn section_3_rows_match_operation_and_level() {
             AssuranceLevel::Everyday,
         ),
         (
+            "GET",
+            "/idoris/engines",
+            "IdorisRead",
+            AssuranceLevel::Everyday,
+        ),
+        (
             "POST",
             "/idoris/install",
             "IdorisLifecycle",

@@ -11,7 +11,7 @@ const FIXTURE_FILES: [&str; 3] = [
 
 fn healthy() -> serde_json::Value {
     serde_json::json!({
-        "status": "ok", "service": "idoris", "version": "0.5.0",
+        "status": "ok", "service": "idoris", "version": "0.6.0",
         "contract_version": IdorisLock::embedded().tested_contract_version,
         "instance_id": "fixture-instance", "dev_no_key_enabled": false
     })
@@ -54,7 +54,6 @@ use std::{
     os::unix::fs::PermissionsExt,
     sync::atomic::{AtomicUsize, Ordering},
 };
-use tokio::net::TcpListener;
 
 struct Fixture {
     _root: tempfile::TempDir,
@@ -65,17 +64,6 @@ struct Fixture {
 /// them. Ports come from 20000-29999, below every kernel ephemeral range, so
 /// no concurrent `bind(0)` can be handed one; each port is issued once per
 /// test process, and a per-process offset separates parallel worktrees.
-fn reserve_port() -> u16 {
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let offset = std::process::id() as usize * 397;
-    loop {
-        let port = 20_000 + (offset + NEXT.fetch_add(1, Ordering::SeqCst)) % 10_000;
-        let port = port as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
-}
 impl Fixture {
     fn new(scenario: serde_json::Value) -> Self {
         let temp = tempfile::tempdir().unwrap();
@@ -129,11 +117,6 @@ impl Fixture {
         };
         let mut config = StartConfig::new(installed, components, data).unwrap();
         config.log_dir = self.root.join("logs");
-        config.diagnostic_output = true;
-        config.ports = Ports {
-            data: reserve_port(),
-            admin: reserve_port(),
-        };
         // Tests that expect readiness must not depend on scheduling: a fresh
         // fixture executable can take seconds to start on a loaded host (the
         // F8 reproductions saw load average 51 with XProtect scanning). Tests
@@ -173,7 +156,7 @@ async fn inputs() -> Result<LaunchInputs, SupervisorError> {
 }
 
 #[tokio::test]
-async fn stdin_frame_environment_readiness_stop_and_log_redaction() {
+async fn launcher_frame_environment_readiness_and_stop() {
     let fixture = Fixture::new(serde_json::json!({"mode": "flood"}));
     let config = fixture.config().await;
     let supervisor = Supervisor::start(config, inputs, || async {})
@@ -181,19 +164,27 @@ async fn stdin_frame_environment_readiness_stop_and_log_redaction() {
         .unwrap();
     let accepting = supervisor.accepting_requests();
     assert!(*accepting.borrow());
+    let discovery_path = fixture.root.join("run/idoris.json");
+    let discovered = discovery::read_any(&discovery_path).unwrap();
+    let status = supervisor.runtime_status().borrow().clone();
+    assert_eq!(
+        status.instance_id.as_deref(),
+        Some(discovered.instance_id.as_str())
+    );
+    assert_eq!(status.ports.unwrap().data, discovered.data_port);
+    assert_eq!(status.ports.unwrap().admin, discovered.admin_port);
     let attempts = fixture.attempts();
     assert_eq!(attempts.len(), 1);
     let report = &attempts[0];
     assert_eq!(
         report["argv"],
-        serde_json::json!(["serve", "--admin-token-stdin"])
+        serde_json::json!(["serve", "--launcher-stdin"])
     );
-    assert_eq!(report["length"], 65);
+    assert!(report["length"].as_u64().unwrap() <= 4096);
     assert_eq!(report["valid_frame"], true);
     assert_eq!(report["token_in_env"], false);
     assert_eq!(report["pid"], report["group"]);
-    // v0.5.0 keeps process_group(0); only launcher generations call setsid.
-    assert_ne!(report["pid"], report["session"]);
+    assert_eq!(report["pid"], report["session"]);
     assert_eq!(report["budget"], "0");
     let allowed = [
         "PATH",
@@ -234,8 +225,10 @@ async fn stdin_frame_environment_readiness_stop_and_log_redaction() {
     assert!(!stopped.forced);
     assert!(!*drained_flag.borrow());
     assert!(!fixture.record().exists());
+    assert!(!discovery_path.exists());
     let logs = fs::read_to_string(fixture.root.join("logs/idoris.log")).unwrap();
-    assert!(logs.contains("[REDACTED]"));
+    assert!(logs.contains("idoris: ready"));
+    assert!(logs.contains("idoris: stopped"));
     assert!(!logs.contains("fixture-upstream-secret"));
     assert!(!logs.contains("idk_"));
     assert!(!logs.contains(&"x".repeat(100)));
@@ -265,7 +258,7 @@ async fn sigterm_timeout_kills_and_reaps_own_group_after_drain() {
 
 #[tokio::test]
 async fn exit_three_is_l4_other_exit_codes_are_failed() {
-    for code in [3, 1, 2] {
+    for code in [3, 2] {
         let fixture = Fixture::new(serde_json::json!({"mode": "exit", "code": code}));
         let result = Supervisor::start(fixture.config().await, inputs, || async {}).await;
         let error = match result {
@@ -291,7 +284,7 @@ async fn exit_three_is_l4_other_exit_codes_are_failed() {
 async fn unread_stdin_and_no_health_fail_start_and_reap() {
     let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
     let mut config = fixture.config().await;
-    // A 65-byte pipe write can succeed before its reader consumes anything.
+    // A small launcher frame can succeed before its reader consumes anything.
     // The externally observable failure is absence of /health readiness.
     config.timings.ready = Duration::from_millis(100);
     let result = Supervisor::start(config, inputs, || async {}).await;
@@ -429,7 +422,8 @@ async fn crash_restarts_three_times_with_fresh_inputs_and_tokens() {
 
 #[tokio::test]
 async fn no_restart_for_l4_config_auth_budget_contract_or_user_stop() {
-    for error_code in [1, 3] {
+    {
+        let error_code = 3;
         let fixture = Fixture::new(
             serde_json::json!({"mode": "exit_after_ready", "code": error_code, "wait_for_exit": true, "after": 0.0}),
         );
@@ -562,10 +556,10 @@ async fn leftover_four_fields_must_match_before_any_signal() {
 }
 
 #[tokio::test]
-#[ignore = "requires IDORIS_REAL_V040_DIR with the verified v0.5.0 release; runs real serve"]
-async fn real_v040_ready_then_stop() {
+#[ignore = "requires IDORIS_REAL_V060_DIR with the verified v0.6.0 release; runs real serve"]
+async fn real_v060_ready_then_stop() {
     let release =
-        PathBuf::from(std::env::var_os("IDORIS_REAL_V040_DIR").expect("set release directory"));
+        PathBuf::from(std::env::var_os("IDORIS_REAL_V060_DIR").expect("set release directory"));
     let fixture = Fixture::new(serde_json::json!({}));
     // Use the upstream oMLX card without probing or modifying a user's setup.
     // Readiness needs no model inference or data key with a personal loopback bind.
@@ -580,7 +574,6 @@ async fn real_v040_ready_then_stop() {
         InstalledVersion::fixture(fs::canonicalize(release).unwrap(), &FIXTURE_FILES).unwrap();
     config.ports = Ports::default();
     config.timings = Timings::default();
-    config.diagnostic_output = false;
     let supervisor = Supervisor::start(
         config,
         || async {
@@ -800,45 +793,6 @@ async fn reused_pid_is_cleared_without_signalling_new_owner() {
 }
 
 #[tokio::test]
-async fn foreign_health_without_child_admin_never_becomes_ready() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
-    let mut config = fixture.config().await;
-    config.ports.data = listener.local_addr().unwrap().port();
-    let server = tokio::spawn(async move {
-        loop {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 2048];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            let body = healthy().to_string();
-            socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await
-                .unwrap();
-        }
-    });
-    let result = Supervisor::start(config, inputs, || async {}).await;
-    server.abort();
-    // The foreign data listener is now identified as a port conflict (L4).
-    let rejected = matches!(result, Err(SupervisorError::InstanceConflict));
-    if let Ok(supervisor) = result {
-        supervisor.stop().await.unwrap();
-    }
-    assert!(
-        rejected,
-        "foreign /health admitted a child that never bound"
-    );
-    assert!(!fixture.record().exists());
-}
-
-#[tokio::test]
 async fn modified_installed_files_are_rejected_before_spawn() {
     for name in [
         "idoris",
@@ -999,90 +953,6 @@ async fn recovery_waits_for_reaping_before_checking_group() {
     reaper.await.unwrap();
     assert!(result.is_ok(), "zombie group blocked recovery: {result:?}");
     assert!(!fixture.record().exists());
-}
-
-/// Serves every request with `status` and `body`, recording any bearer token.
-fn foreign_server(
-    listener: TcpListener,
-    status: u16,
-    body: String,
-    saw_bearer: Arc<std::sync::atomic::AtomicBool>,
-) -> JoinHandle<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut socket, _)) = listener.accept().await else {
-                return;
-            };
-            let mut request = vec![0; 4096];
-            let read = socket.read(&mut request).await.unwrap_or(0);
-            let text = String::from_utf8_lossy(&request[..read]).to_ascii_lowercase();
-            if text.contains("authorization: bearer") {
-                saw_bearer.store(true, Ordering::SeqCst);
-            }
-            let _ = socket
-                .write_all(
-                    format!(
-                        "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .await;
-        }
-    })
-}
-
-async fn foreign_ports(
-    config: &mut StartConfig,
-) -> (Arc<std::sync::atomic::AtomicBool>, [JoinHandle<()>; 2]) {
-    let data = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let admin = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    config.ports = Ports {
-        data: data.local_addr().unwrap().port(),
-        admin: admin.local_addr().unwrap().port(),
-    };
-    let saw_bearer = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let servers = [
-        foreign_server(data, 200, healthy().to_string(), saw_bearer.clone()),
-        // Accepts any token: a status code cannot authenticate the server.
-        foreign_server(admin, 200, "{}".into(), saw_bearer.clone()),
-    ];
-    (saw_bearer, servers)
-}
-
-#[tokio::test]
-async fn probe_foreign_data_and_admin_listeners_admit_unbound_child() {
-    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
-    let mut config = fixture.config().await;
-    let (_, servers) = foreign_ports(&mut config).await;
-    let result = Supervisor::start(config, inputs, || async {}).await;
-    servers.iter().for_each(JoinHandle::abort);
-    let admitted = result.is_ok();
-    if let Ok(supervisor) = result {
-        supervisor.stop().await.unwrap();
-    }
-    assert!(
-        !admitted,
-        "foreign data+admin listeners admitted a child that never bound"
-    );
-    assert!(!fixture.record().exists());
-}
-
-#[tokio::test]
-async fn admin_token_is_never_sent_to_an_unowned_listener() {
-    let fixture = Fixture::new(serde_json::json!({"mode": "no_read"}));
-    let mut config = fixture.config().await;
-    let (saw_bearer, servers) = foreign_ports(&mut config).await;
-    let result = Supervisor::start(config, inputs, || async {}).await;
-    servers.iter().for_each(JoinHandle::abort);
-    if let Ok(supervisor) = result {
-        supervisor.stop().await.unwrap();
-    }
-    assert!(
-        !saw_bearer.load(Ordering::SeqCst),
-        "Admin token sent before listener ownership was proven"
-    );
 }
 
 fn workers(fixture: &Fixture) -> Vec<u32> {
@@ -1309,47 +1179,6 @@ fn live_member_keeps_eperm_an_error() {
 }
 
 #[test]
-fn only_a_confirmed_foreign_listener_is_a_conflict() {
-    let group = Pid::from_raw(4242);
-    let listening = |pids: Vec<u32>, unattributed| Ok(identity::Listeners { pids, unattributed });
-    let pgid = |pid: u32| match pid {
-        1 => Some(Pid::from_raw(4242)),
-        2 => Some(Pid::from_raw(7)),
-        _ => None,
-    };
-    // Query failure or timeout: not ready yet, retried until the deadline.
-    assert!(matches!(
-        judge_listeners(Err(io::Error::other("lsof timed out")), group, pgid),
-        Ok(false)
-    ));
-    assert!(matches!(
-        judge_listeners(listening(vec![], false), group, pgid),
-        Ok(false)
-    ));
-    assert!(matches!(
-        judge_listeners(listening(vec![1], true), group, pgid),
-        Ok(false)
-    ));
-    // Holder exited before its PGID was read: unconfirmed, keep waiting.
-    assert!(matches!(
-        judge_listeners(listening(vec![1, 3], false), group, pgid),
-        Ok(false)
-    ));
-    assert!(matches!(
-        judge_listeners(listening(vec![1, 2], false), group, pgid),
-        Err(SupervisorError::InstanceConflict)
-    ));
-    assert!(matches!(
-        judge_listeners(listening(vec![2], false), group, pgid),
-        Err(SupervisorError::InstanceConflict)
-    ));
-    assert!(matches!(
-        judge_listeners(listening(vec![1], false), group, pgid),
-        Ok(true)
-    ));
-}
-
-#[test]
 fn s1_4_health_contract_uses_only_lock_threshold() {
     let mut lock = IdorisLock::embedded().clone();
     for major in [1, 2] {
@@ -1400,22 +1229,21 @@ fn ic3a_sixth_failure_opens_circuit_without_giving_up() {
 
 #[test]
 fn ic3a_exit_classification() {
-    for launcher in [false, true] {
-        assert!(!retry_exit(Some(0), launcher));
-        assert!(!retry_exit(Some(3), launcher));
-        assert!(!retry_exit(Some(4), launcher));
-        assert!(retry_exit(Some(5), launcher));
-        assert!(retry_exit(None, launcher));
+    for code in [Some(0), Some(3), Some(4)] {
+        assert!(!retry_exit(code));
     }
-    assert!(!retry_exit(Some(1), false)); // v0.5.0 keeps its configuration failure behavior.
-    assert!(retry_exit(Some(1), true)); // Frozen launcher contract: startup failure retries.
+    for code in [Some(1), Some(5), None] {
+        assert!(retry_exit(code));
+    }
+    assert!(!expected_exit(Some(1), true));
+    assert!(!expected_exit(Some(5), true));
+    assert!(expected_exit(Some(0), false));
 }
 
 #[tokio::test]
-#[ignore = "requires AGENT24_IDORIS_S1_BIN; real unsigned S1 binary"]
-async fn ic3a_real_s1_launcher() {
+#[ignore = "requires AGENT24_IDORIS_S1_BIN; real unsigned iDoris v0.6.0 binary"]
+async fn real_v060_launcher_discovery() {
     let binary = PathBuf::from(std::env::var_os("AGENT24_IDORIS_S1_BIN").unwrap());
-    assert!(std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref() == Ok("1"));
     let fixture = Fixture::new(serde_json::json!({"mode":"normal"}));
     let mut config = fixture.config().await;
     config.installed =
@@ -1515,13 +1343,9 @@ async fn ic3a_orphan_expiry_stops_without_crash_accounting() {
 }
 
 #[tokio::test]
-#[ignore = "requires AGENT24_IDORIS_S2_BIN and both launcher/unsigned debug switches"]
-async fn ic3b_real_s2_register_and_adopt() {
+#[ignore = "requires AGENT24_IDORIS_S2_BIN and AGENT24_DEV_ALLOW_UNSIGNED_IDORIS=1 for iDoris v0.6.0"]
+async fn real_v060_register_and_adopt() {
     let binary = PathBuf::from(std::env::var_os("AGENT24_IDORIS_S2_BIN").unwrap());
-    assert_eq!(
-        std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref(),
-        Ok("1")
-    );
     assert_eq!(
         std::env::var("AGENT24_DEV_ALLOW_UNSIGNED_IDORIS").as_deref(),
         Ok("1")
@@ -1626,39 +1450,52 @@ async fn ic3b_real_s2_register_and_adopt() {
     std::mem::forget(cleanup);
 }
 
-fn launcher_lock() -> &'static IdorisLock {
-    static LOCK: std::sync::OnceLock<IdorisLock> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| IdorisLock {
-        tag: "v0.6.0".into(),
-        ..IdorisLock::embedded().clone()
-    })
-}
-
 #[tokio::test]
-async fn ic3b_supervisor_rejects_unowned_ports() {
-    let fixture = Fixture::new(serde_json::json!({}));
+async fn admin_token_is_never_sent_to_an_unowned_discovered_listener() {
+    use std::sync::atomic::AtomicBool;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let fixture = Fixture::new(serde_json::json!({
+        "discovery_admin_port": listener.local_addr().unwrap().port()
+    }));
+    let saw_request = Arc::new(AtomicBool::new(false));
+    let observed = saw_request.clone();
+    let foreign = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            axum::Router::new().fallback(move || {
+                let observed = observed.clone();
+                async move {
+                    observed.store(true, Ordering::SeqCst);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        )
+        .await
+        .unwrap();
+    });
     let mut config = fixture.config().await;
-    config.lock = launcher_lock();
-    config.port_ownership = Some(false);
-    assert!(
-        !listeners_owned(&config, config.ports, Some(Pid::this()))
-            .await
-            .unwrap()
-    );
+    // Platforms without port ownership support still exercise the rejection.
+    #[cfg(not(target_os = "macos"))]
+    {
+        config.port_ownership = Some(false);
+    }
+    config.timings.ready = Duration::from_secs(5);
+    let started = Supervisor::start(config, inputs, || async {}).await;
+    foreign.abort();
+    assert!(matches!(started, Err(SupervisorError::StartupTimeout)));
+    assert_eq!(fixture.attempts().len(), 1);
+    assert!(!saw_request.load(Ordering::SeqCst));
 }
 
-async fn check_drop(launcher: bool, register_socket: bool, survives: bool) {
+async fn check_drop(register_socket: bool, survives: bool) {
     use std::os::unix::process::ExitStatusExt;
     let fixture = Fixture::new(serde_json::json!({}));
     let mut config = fixture.config().await;
-    if launcher {
-        config.lock = launcher_lock();
-    }
     if register_socket {
         config.register_socket = Some(fixture.root.join("register.sock"));
     }
     let token = Arc::new(Zeroizing::new("a".repeat(64)));
-    let output = logs::Output::new(&config.log_dir, token.clone(), None, false).unwrap();
+    let output = logs::Output::new(&config.log_dir).unwrap();
     let mut child = Command::new("/bin/sleep")
         .arg("60")
         .process_group(0)
@@ -1668,7 +1505,7 @@ async fn check_drop(launcher: bool, register_socket: bool, survives: bool) {
     let record = ProcessRecord::capture(child.id().unwrap()).unwrap();
     let process = ManagedProcess {
         ports: config.ports,
-        discovery: None,
+        discovery: discovery::path(&config.data).unwrap(),
         instance_id: None,
         group: Some(Pid::from_raw(record.pid as i32)),
         child: ProcessHandle::Orphan {
@@ -1701,18 +1538,13 @@ async fn check_drop(launcher: bool, register_socket: bool, survives: bool) {
 }
 
 #[tokio::test]
-async fn ic3b_drop_kills_non_launcher() {
-    check_drop(false, true, false).await;
-}
-
-#[tokio::test]
 async fn ic3b_drop_preserves_registered_launcher() {
-    check_drop(true, true, true).await;
+    check_drop(true, true).await;
 }
 
 #[tokio::test]
 async fn ic3b_drop_kills_launcher_without_register_socket() {
-    check_drop(true, false, false).await;
+    check_drop(false, false).await;
 }
 
 /// Child process for `ic3b_adoption_requires_launch`; never runs on its own.
