@@ -725,7 +725,7 @@ export interface DocumentPreflight {
   format: 'docx' | 'pdf'
   clean: boolean
   findings: Array<{ kind: PreflightKind; count: number; examples: string[] }>
-  /** DOCX: a clean copy can be made; PDF: only reported. */
+  /** A DOCX (a clean copy can be made of it from L8 DOC-4 PR2 on); a PDF is only reported. */
   cleanable: boolean
 }
 

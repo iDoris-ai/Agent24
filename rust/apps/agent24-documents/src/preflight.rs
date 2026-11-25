@@ -35,7 +35,7 @@ pub const CLIP: usize = 60;
 pub struct Finding {
     pub kind: Kind,
     /// How many: revisions, comments, hidden runs, distinct unfilled fields
-    /// (with their occurrences in `examples`), 1 for a property or a form.
+    /// (the first ones as `{{name}}` in `examples`), 1 for a property or a form.
     pub count: usize,
     /// At most [`EXAMPLES`], each at most [`CLIP`] characters (then `…`):
     /// the text inserted / deleted / hidden, `author：text` of a comment,
@@ -67,7 +67,8 @@ pub struct Preflight {
     /// Nothing found.
     pub clean: bool,
     pub findings: Vec<Finding>,
-    /// DOCX: `deliver` can make a clean copy; PDF: only reported.
+    /// A DOCX (a clean copy can be made of it from L8 DOC-4 PR2 on, on the
+    /// documents page); a PDF is only reported.
     pub cleanable: bool,
 }
 
@@ -358,7 +359,8 @@ fn pdf_annotations(doc: &lopdf::Document) -> (usize, Vec<String>) {
             let Ok(name) = annot.get(b"Subtype").and_then(lopdf::Object::as_name) else {
                 continue;
             };
-            if name == b"Link" || name == b"Widget" {
+            // A Popup is the window of another annotation, not one of its own.
+            if name == b"Link" || name == b"Widget" || name == b"Popup" {
                 continue;
             }
             count += 1;
@@ -382,7 +384,13 @@ fn failure(e: PatchError) -> ApiError {
 
 /// The service behind the route and the tool: the head revision checked.
 pub async fn preflight_of(storage: &Arc<Storage>, id: String) -> Result<Preflight, ApiError> {
-    let (revision, title, media_type, bytes) = crate::patch::head_bytes(storage, &id).await?;
+    let (revision, title, media_type, bytes) = crate::patch::head_bytes(
+        storage,
+        &id,
+        &[DOCX, PDF],
+        "only Word (DOCX) and PDF documents can be checked before sending",
+    )
+    .await?;
     let (format, findings) = match media_type.as_str() {
         DOCX => ("docx", blocking(move || docx_findings(&bytes)).await),
         PDF => ("pdf", blocking(move || pdf_findings(&bytes)).await),
@@ -407,13 +415,24 @@ pub async fn preflight_of(storage: &Arc<Storage>, id: String) -> Result<Prefligh
 
 /// The tool's answer: the same facts, and how to tell them.
 pub fn for_the_model(p: Preflight) -> serde_json::Value {
-    let note = if p.clean {
-        "检查完毕，没有发现修订、批注、未填字段、作者信息或隐藏文字。如实告诉用户可以放心发出。"
-    } else if p.cleanable {
-        "这是只读检查，文档没有被改动。逐类告诉用户 findings 里列出的内容（kind 是类别，count 是数量，examples 是例子），不要补充没列出的东西。用户要清理时，可以生成一份去掉修订、批注和作者信息的新副本，原文档不变。"
+    // PR-Daemon #2086 B1/B2: say only what was checked, and promise no
+    // cleaning the module cannot do.
+    let scope = if p.cleanable {
+        "只检查了 Word 正文、页眉和页脚里的修订（插入/删除）、批注、未填的 {{字段}}、作者和最后修改者、隐藏文字；脚注、尾注、移动修订、格式修订、样式里设的隐藏没有检查。"
     } else {
-        "这是只读检查，文档没有被改动。逐类告诉用户 findings 里列出的内容；PDF 只能检查，不能清理，要清理请改用原来的 Word 文档。"
+        "这是 PDF，只检查了作者、有没有表单、有没有批注；修订、未填字段、隐藏文字和其他属性都没有检查。"
     };
+    let what = if p.clean {
+        "检查过的这几类里没有发现问题。照实告诉用户检查了哪些、没检查哪些，不要说「放心发出」或「完全干净」。"
+    } else {
+        "逐类告诉用户 findings 里列出的内容（kind 是类别，count 是数量，examples 是例子），不要补充没列出的东西。"
+    };
+    let fix = if p.cleanable {
+        "这是只读检查，文档没有被改动。要清理时，请用户在 Word 里接受或拒绝修订、删除批注，并在文件属性里清掉作者。"
+    } else {
+        "这是只读检查，文档没有被改动。PDF 不能清理；要清理请改用原来的 Word 文档。"
+    };
+    let note = format!("{scope}{what}{fix}");
     let mut v = serde_json::to_value(p).unwrap_or_default();
     v["note"] = serde_json::Value::from(note);
     v

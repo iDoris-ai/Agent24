@@ -230,3 +230,40 @@ fn a_pdf_reports_its_author_form_and_annotations_but_not_links() {
 fn clip_flattens_whitespace() {
     assert_eq!(clip("  a\n\tb  "), "a b");
 }
+
+fn note_of(format: &'static str, findings: Vec<Finding>) -> String {
+    let p = Preflight {
+        document_id: "doc_x".into(),
+        revision: 1,
+        title: None,
+        format,
+        clean: findings.is_empty(),
+        cleanable: format == "docx",
+        findings,
+    };
+    for_the_model(p)["note"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn the_note_says_what_was_not_checked_and_promises_no_cleaning() {
+    // PR-Daemon #2086 B1: never 「放心」; PDF says what it did not check.
+    let of_pdf = note_of("pdf", Vec::new());
+    assert!(
+        of_pdf.contains("只检查了作者") && of_pdf.contains("没有检查"),
+        "{of_pdf}"
+    );
+    let docx = note_of("docx", Vec::new());
+    assert!(docx.contains("脚注") && docx.contains("没有检查"), "{docx}");
+    for n in [&of_pdf, &docx] {
+        assert!(n.contains("不要说「放心发出」"), "{n}");
+    }
+    // B2: no copy promised that no operation makes.
+    let dirty = note_of("docx", docx_findings(&dirty()).unwrap());
+    assert!(
+        !dirty.contains("副本") && dirty.contains("在 Word 里"),
+        "{dirty}"
+    );
+    // A Popup is not counted as an annotation of its own.
+    let f = pdf_findings(&pdf(None, false, &["Text", "Popup"])).unwrap();
+    assert_eq!(f[0].count, 1);
+}

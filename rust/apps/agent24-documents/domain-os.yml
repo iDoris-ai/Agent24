@@ -108,7 +108,7 @@ tools:
     resource_kinds: [doc]
   # L8 DOC-4: what a document still carries before it is sent out.
   - operation: preflight
-    description: "Check a document before it is sent to someone, without changing it: for a Word (DOCX) document, tracked changes, comments, unfilled {{fields}}, author / last modified by, hidden text; for a PDF, its author, a form and annotations. Give document_id (an id from documents.list, or the file name/title). The answer lists findings by kind with a count and examples; report only those. Read-only, local."
+    description: "Check a document before it is sent to someone, without changing it: for a Word (DOCX) document, in its body, headers and footers only (not footnotes, endnotes or styles): tracked insertions/deletions, comments, unfilled {{fields}}, author / last modified by, hidden text; for a PDF, only its author, a form and annotations. Give document_id (an id from documents.list, or the file name/title). The answer lists findings by kind with a count and examples; report only those, say what was not checked (the note), and never call the document safe to send. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
