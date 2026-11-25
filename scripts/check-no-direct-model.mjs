@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // IC-2: chat and embeddings must not name a direct oMLX or Ollama endpoint.
 // IC-4 deletes the desktop and node-daemon hits and empties that part of the
-// whitelist. agent24-idoris probe code stays: it configures oMLX for iDoris
-// itself (management plane), not an Agent24 model path.
+// whitelist. iDoris owns oMLX endpoint discovery.
 
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -39,9 +38,6 @@ const ALLOWED = new Map([
   ['apps/desktop/src/renderer/pages/Chat.i18n.ts', 3],
   ['apps/desktop/src/renderer/pages/settings/ModelServiceSettings.tsx', 2],
   ['packages/node-daemon/src/llm-gateway.ts', 12],
-  // iDoris management plane: probe the local oMLX iDoris itself is configured
-  // to use. Not an Agent24 chat or embedding client.
-  ['rust/crates/agent24-idoris/src/omlx_probe.rs', 1],
   // The names appear only in the LaunchAgent env deny list and its tests.
   ['rust/apps/agent24-cli/src/service.rs', 4],
   // The hits are in this file's test module.
@@ -108,13 +104,13 @@ function selfTest() {
       writeFileSync(abs, text);
     };
     plant('rust/crates/x/src/latest.rs', 'const URL: &str = "OMLX_URL";\n');
-    plant('rust/crates/agent24-idoris/src/omlx_probe.rs', '8088\n8088\n');
+    plant('rust/apps/agent24-cli/src/service.rs', 'OMLX_URL\n'.repeat(5));
     plant('rust/crates/x/src/lib.test.ts', 'OMLX_URL\n');
     plant('rust/crates/x/tests/it.rs', 'OMLX_URL\n');
     const hits = scanTree(dir);
     const caught = (rel) => hits.some((hit) => hit.startsWith(rel));
     const ok = caught('rust/crates/x/src/latest.rs')
-      && caught('rust/crates/agent24-idoris/src/omlx_probe.rs')
+      && caught('rust/apps/agent24-cli/src/service.rs')
       && !caught('rust/crates/x/src/lib.test.ts')
       && !caught('rust/crates/x/tests/it.rs');
     if (!ok) {

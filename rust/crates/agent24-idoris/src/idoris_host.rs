@@ -8,12 +8,12 @@ use crate::{
     download::VerifiedArchive,
     install::{Codesign, InstalledVersion, SignatureVerifier, VerifyMode},
     keychain::{Keychain, KeychainError, SystemKeychain},
-    omlx_probe::{ApiKey, Endpoint, OmlxProbe, ProbeStatus},
     setup::Role,
     supervisor::{
         Budget, ComponentsDir, DataPaths, LaunchInputs, Ports, StartConfig, Supervisor,
         SupervisorError,
     },
+    upstream::{ApiKey, Endpoint},
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -546,30 +546,6 @@ impl Runtime for SystemRuntime {
                 .clone();
             provisioner.upstream_key().await?.map(ApiKey::into_secret)
         };
-        if !crate::setup::upstream_setup_enabled(IdorisLock::embedded()) {
-            let url = r.omlx_url.as_deref().ok_or(Code::NotConfigured)?;
-            let endpoint = Endpoint::parse(url).map_err(|_| Code::NotConfigured)?;
-            let api_key = key
-                .clone()
-                .map(ApiKey::new)
-                .transpose()
-                .map_err(|_| Code::NotConfigured)?;
-            let provisioner = self
-                .provisioner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let results = provisioner
-                .omlx_probe()?
-                .probe(Some(&endpoint), api_key.as_ref())
-                .await;
-            if !results
-                .iter()
-                .any(|p| p.endpoint == endpoint && matches!(p.status, ProbeStatus::Ready { .. }))
-            {
-                return Err(Code::NotConfigured);
-            }
-        }
         Ok(LaunchInputs {
             budget: Budget {
                 allocated_bytes: budget,
