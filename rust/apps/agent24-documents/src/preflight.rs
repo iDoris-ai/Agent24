@@ -67,8 +67,8 @@ pub struct Preflight {
     /// Nothing found.
     pub clean: bool,
     pub findings: Vec<Finding>,
-    /// A DOCX (a clean copy can be made of it from L8 DOC-4 PR2 on, on the
-    /// documents page); a PDF is only reported.
+    /// A DOCX (a clean copy can be made of it: `deliver.rs`, from the
+    /// conversation's card); a PDF is only reported.
     pub cleanable: bool,
 }
 
@@ -428,7 +428,7 @@ pub fn for_the_model(p: Preflight) -> serde_json::Value {
         "逐类告诉用户 findings 里列出的内容（kind 是类别，count 是数量，examples 是例子），不要补充没列出的东西。"
     };
     let fix = if p.cleanable {
-        "这是只读检查，文档没有被改动。要清理时，请用户在 Word 里接受或拒绝修订、删除批注，并在文件属性里清掉作者。"
+        "这是只读检查，文档没有被改动。要清理时，请用户在对话里说「去掉修订和批注，存一份干净的副本」，App 会给出按钮，让用户选好位置后另存一份接受修订、删除批注、清空作者的新副本（原文档不动）；你自己不能做这一步。"
     } else {
         "这是只读检查，文档没有被改动。PDF 不能清理；要清理请改用原来的 Word 文档。"
     };

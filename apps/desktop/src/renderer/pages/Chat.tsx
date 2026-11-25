@@ -27,6 +27,8 @@ import { ExtractCard } from './chat/ExtractCard'
 import { DeleteChoice } from './chat/DeleteChoice'
 import { RestoreCard } from './chat/RestoreCard'
 import { CompareCard } from './chat/CompareCard'
+import { DeliverCard } from './chat/DeliverCard'
+import { asksDeliver, runPreflight, runReceipts, type DeliverCardData } from './chat/doc-deliver'
 import { asksCompare, runCompare, type CompareCardData } from './chat/doc-compare'
 import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
 import { KnowledgeUploadCard } from './chat/KnowledgeUploadCard'
@@ -90,6 +92,8 @@ interface AssistantMessage {
   restore?: RestoreCardData
   /** L6-S05: the summary of a comparison, a line per change; text only in the history. */
   compare?: CompareCardData
+  /** L8 DOC-4: the check before sending, with the clean copy's buttons; text only in the history. */
+  deliver?: DeliverCardData
   /** L7-K2: upload after onboarding or 「上传文档」; the history keeps the text only. */
   knowledgeUpload?: { uploadIds: string[] }
 }
@@ -333,6 +337,36 @@ export default function ChatPage() {
         if (found) return found
       }
       return null
+    }
+    // L8 DOC-4: 「发给对方前帮我检查一下」「去掉修订和批注，导出一份 PDF 放桌面」
+    // 「我上次发出去的是哪个版本？」 — the App checks and reads the receipts; a
+    // clean copy is made only from the card's button, never by the model.
+    const deliverAsk = answer ? null : asksDeliver(text, doc !== null)
+    if (deliverAsk !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      const named = /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? (deliverAsk.kind === 'receipts' ? null : lastNamed())
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? (named ? await namedDocument(api, named).catch(() => '没能读取文档列表。') : null)
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else if (deliverAsk.kind === 'receipts') reply = { role: 'assistant', content: await runReceipts(api, subject ? { id: subject.id, title: subject.title } : null) }
+        else if (!subject) reply = { role: 'assistant', content: '请先打开要发送的文档，或用《文件名》说明是哪一份。' }
+        else {
+          const out = await runPreflight(api, { id: subject.id, title: subject.title }, deliverAsk)
+          reply = { role: 'assistant', content: out.text, ...(out.card ? { deliver: out.card } : {}) }
+        }
+      } catch (e) {
+        reply = { role: 'assistant', content: '没能完成检查，文档没有改动。', detail: e instanceof Error ? e.message : String(e) }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
     }
     const restoreOf = restoreAsk === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? lastNamed()
     if (restoreAsk !== null && restoreOf !== null && window.agent24.documents) {
@@ -950,6 +984,7 @@ export default function ChatPage() {
                 if (asked) void send(asked.content, true)
               }} />
                 : m.role === 'assistant' && m.compare ? <><Markdown text={m.content} /><CompareCard card={m.compare} /></>
+                : m.role === 'assistant' && m.deliver ? <><Markdown text={m.content} /><DeliverCard card={m.deliver} /></>
                 : m.role === 'assistant' && m.restore ? <><Markdown text={m.content} /><RestoreCard card={m.restore} onRestore={loading || archived ? undefined : () => {
                   const card = m.restore!
                   setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' ? { ...p, restore: undefined } : p)))
