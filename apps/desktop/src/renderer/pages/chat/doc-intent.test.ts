@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -396,5 +396,47 @@ describe('L7-K0 (FU-184): taking a numbered part out of a document is a rewrite'
     expect(asksDeleteParagraph(text, inDocument)).toBe(false)
     // Neither sent to the Agent with the opposite hint nor given it.
     expect(docAgentPrompt({ id: 'doc_x', title: 't' }, text)).not.toContain(PARAGRAPH_HINT_PART)
+  })
+})
+
+describe('L8-S02: filling a form', () => {
+  it.each([
+    ['把这张入职登记表填一下，资料在《个人信息.docx》里', false],
+    ['这张表能填吗？', false],
+    ['用我的资料把这张表填了', false],
+    ['按《入职登记表模板.docx》填写', false],
+    ['帮我填一下', true],
+  ])('%s is a form fill (in a document: %s)', (text, inDocument) => {
+    expect(asksFillForm(text, inDocument)).toBe(true)
+    expect(wantsDocTool(text, inDocument)).toBe(true)
+  })
+
+  it.each([
+    ['烧开水要多久', false],
+    ['这份合同的甲方是谁', true],
+    ['帮我填一下', false],
+  ])('%s is not', (text, inDocument) => {
+    expect(asksFillForm(text, inDocument)).toBe(false)
+  })
+
+  it('a form turn carries the form hint: support, identity, manual fields, one by one', () => {
+    const prompt = docAgentPrompt(null, '把这张入职登记表填一下，资料在《个人信息.docx》里')
+    expect(prompt).toContain(FORM_HINT)
+    expect(prompt.endsWith('\n把这张入职登记表填一下，资料在《个人信息.docx》里')).toBe(true)
+    for (const said of ['source_document_id', 'user_said', 'ask_user', '不要自己编', '手工处理', 'PDF', '打印后手填', '逐项']) {
+      expect(FORM_HINT).toContain(said)
+    }
+    expect(docAgentPrompt(null, '把两份合并')).not.toContain(FORM_HINT)
+  })
+
+  it('an answer right after a form turn is part of it: it reaches the tools with the hint', () => {
+    const before = ['把这张入职登记表填一下，资料在《个人信息.docx》里']
+    expect(continuesFormFill(before, '电话是 13912345678')).toBe(true)
+    expect(continuesFormFill(before, '紧急联系人那栏我还没想好，先空着')).toBe(true)
+    expect(docAgentPrompt(null, '电话是 13912345678', true)).toContain(FORM_HINT)
+    // Up to three turns back, never further, and never without a form turn.
+    expect(continuesFormFill([...before, '电话 139', '地址北京', '身份证 110'], '好了吗')).toBe(false)
+    expect(continuesFormFill(['烧开水要多久'], '电话是 13912345678')).toBe(false)
+    expect(continuesFormFill([], '电话是 13912345678')).toBe(false)
   })
 })

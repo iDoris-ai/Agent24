@@ -17,7 +17,7 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { asksDeleteDocument, docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -454,7 +454,10 @@ export default function ChatPage() {
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    if ((chosen !== null || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
+    // L8-S02: an answer to what a form fill asked goes back to it, with the form hint.
+    const earlier = messages.filter((m) => m.role === 'user').map((m) => m.content)
+    const form = asksFillForm(text, doc !== null) || continuesFormFill(earlier, text, doc !== null)
+    if ((chosen !== null || form || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -475,7 +478,7 @@ export default function ChatPage() {
           setLoading(false)
           return
         }
-        if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim())
+        if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim(), form)
         await replyWithKnowledge(messages.length, request, false)
         return
       }
