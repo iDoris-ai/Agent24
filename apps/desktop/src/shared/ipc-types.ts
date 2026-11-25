@@ -155,6 +155,8 @@ export const IpcChannels = {
   DocumentsRevealDownload: 'documents:reveal-download',
   /** D5a: a library document's file saved to Downloads (its id, its title). */
   DocumentsSaveDownload: 'documents:save-download',
+  /** L8 DOC-4: a clean copy saved where the user picks, then its receipt. */
+  DocumentsDeliver: 'documents:deliver',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -733,7 +735,7 @@ export interface DocumentPreflight {
   format: 'docx' | 'pdf'
   clean: boolean
   findings: Array<{ kind: PreflightKind; count: number; examples: string[] }>
-  /** A DOCX (a clean copy can be made of it from L8 DOC-4 PR2 on); a PDF is only reported. */
+  /** A DOCX (a clean copy can be made of it from the delivery card); a PDF is only reported. */
   cleanable: boolean
 }
 
@@ -751,6 +753,21 @@ export interface DeliveryReceipt {
   copy_document_id: string
   again: boolean
 }
+
+/** L8 DOC-4: `documents:deliver` (main `doc-deliver.ts`). */
+export interface DeliverRequest {
+  documentId: string
+  /** The version the user checked (preflight's `revision`). */
+  revision: number
+  format: 'docx' | 'pdf'
+  /** The source document's title, for the file name offered. */
+  title: string
+}
+export type DeliverResult =
+  | { ok: true; savedTo: string; fileName: string; receipt: DeliveryReceipt }
+  | { ok: false; canceled: true }
+  /** `savedTo` only when the file was written (stage `receipt`). */
+  | { ok: false; canceled?: false; stage: 'copy' | 'convert' | 'write' | 'receipt'; code: string; message: string; savedTo?: string }
 
 export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }
 

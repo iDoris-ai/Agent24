@@ -257,13 +257,35 @@ fn the_note_says_what_was_not_checked_and_promises_no_cleaning() {
     for n in [&of_pdf, &docx] {
         assert!(n.contains("不要说「放心发出」"), "{n}");
     }
-    // B2: no copy promised that no operation makes.
+    // B2 (PR2 on): the copy is the App's button, never the model's.
     let dirty = note_of("docx", docx_findings(&dirty()).unwrap());
     assert!(
-        !dirty.contains("副本") && dirty.contains("在 Word 里"),
+        dirty.contains("App 会给出按钮") && dirty.contains("你自己不能做"),
         "{dirty}"
     );
-    // A Popup is not counted as an annotation of its own.
-    let f = pdf_findings(&pdf(None, false, &["Text", "Popup"])).unwrap();
-    assert_eq!(f[0].count, 1);
+    // PR-Daemon #2086 (non-blocking): no affirmative 「放心发出」 anywhere,
+    // a dirty PDF too; a Popup alone counts 0, a Text alone 1.
+    let dirty_pdf = note_of(
+        "pdf",
+        pdf_findings(&pdf(Some("A"), false, &["Text"])).unwrap(),
+    );
+    for n in [&of_pdf, &docx, &dirty, &dirty_pdf] {
+        assert!(!n.replace("不要说「放心发出」", "").contains("放心"), "{n}");
+    }
+    assert!(dirty_pdf.contains("PDF 不能清理"), "{dirty_pdf}");
+    let count = |annots: &[&str]| {
+        pdf_findings(&pdf(None, false, annots))
+            .unwrap()
+            .iter()
+            .find(|f| f.kind == Kind::PdfAnnotations)
+            .map_or(0, |f| f.count)
+    };
+    assert_eq!(
+        (
+            count(&["Text"]),
+            count(&["Popup"]),
+            count(&["Text", "Popup"])
+        ),
+        (1, 0, 1)
+    );
 }

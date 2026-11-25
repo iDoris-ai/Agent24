@@ -14,6 +14,8 @@ import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
 import { registerOfficeEngine } from './ipc/office-engine'
 import { registerTranslationExport } from './ipc/translation-export'
+import { registerDocDeliver } from './ipc/doc-deliver'
+import { deliverDocument } from './doc-deliver'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
@@ -867,6 +869,22 @@ app.whenReady().then(async () => {
         return { ok: true, data: file.data, mediaType: file.media_type }
       },
     },
+  })
+  // L8 DOC-4: the delivery card's button; the save dialog is this window's.
+  registerDocDeliver({
+    guard,
+    deliver: (req) => deliverDocument({
+      showSaveDialog: (options) => {
+        const win = BrowserWindow.getFocusedWindow()
+        return win ? dialog.showSaveDialog(win, options) : dialog.showSaveDialog(options)
+      },
+      call: (r) => withDocumentsDelegation(() => documentsCall(r, daemonCliEndpoint)),
+      jobEnd: documentsJobEnd,
+      desktopDir: () => app.getPath('desktop'),
+      exists: (p) => fs.existsSync(p),
+      // `wx`: never over a file that appeared after the check (PR-Daemon style: no overwrite).
+      writeFile: (p, bytes) => fs.writeFileSync(p, bytes, { flag: 'wx' }),
+    }, req),
   })
   registerDocAgentAccess({
     guard,

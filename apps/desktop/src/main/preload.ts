@@ -43,6 +43,8 @@ import {
   type DocAgentAccess,
   type OfficeEngineStatus,
   type TranslationExportResult,
+  type DeliverRequest,
+  type DeliverResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type ApprovalDecisionInput,
@@ -370,6 +372,8 @@ const api = {
       revision === undefined
         ? ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title)
         : ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title, revision),
+    /** L8 DOC-4: a clean copy saved where the user picks in the save dialog, then its receipt. */
+    deliver: (req: DeliverRequest): Promise<DeliverResult> => ipcRenderer.invoke(IpcChannels.DocumentsDeliver, req),
     exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean; level?: 1 | 2 | 3 }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
       ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
