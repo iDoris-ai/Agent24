@@ -360,6 +360,12 @@ impl FirstPartyAuthority {
         match target.template.as_str() {
             "/api/v1/idoris/start" => return Some("start managed iDoris".to_owned()),
             "/api/v1/idoris/stop" => return Some("stop managed iDoris".to_owned()),
+            "/api/v1/comm/install" => {
+                return Some(
+                    "download, verify and set up the pinned Hyphae communication component"
+                        .to_owned(),
+                );
+            }
             "/api/v1/idoris/omlx/candidates" => {
                 return Some(
                     "list local oMLX endpoints, their identity, authentication and model IDs"
@@ -688,6 +694,12 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                     | ("POST", "/api/v1/idoris/stop")
                     | ("POST", "/api/v1/idoris/operations/{id}/cancel")
                     | ("GET", "/api/v1/idoris/omlx/candidates")
+            ))
+        // The Hyphae component install: the bytes are pinned by the embedded lock.
+        || (policy.operation == Operation::ComponentInstall
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/comm/install")
             ))
         || (policy.operation == Operation::CapabilityMint
             && matches!(
@@ -1839,6 +1851,19 @@ mod tests {
             body_sha256: body_digest(body),
             client_summary: "CLIENT SECRET".into(),
         }
+    }
+
+    #[test]
+    fn hyphae_install_is_elevatable_with_a_fixed_summary() {
+        // Service mode routes the desktop's install through elevation; without
+        // this row the daemon refused it and Hyphae could not be installed.
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let target = resolve_target(&idoris("POST", "/api/v1/comm/install", b"")).unwrap();
+        assert_eq!(target.operation, Operation::ComponentInstall);
+        let summary = authority.target_summary("id", &target).unwrap();
+        assert!(summary.contains("Hyphae"), "{summary}");
+        let with_body = resolve_target(&idoris("POST", "/api/v1/comm/install", b"{}")).unwrap();
+        assert!(authority.target_summary("id", &with_body).is_none());
     }
 
     #[test]
