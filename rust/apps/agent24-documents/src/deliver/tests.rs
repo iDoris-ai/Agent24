@@ -503,3 +503,18 @@ async fn again_is_only_the_same_document_version_and_format() {
         (Some(true), Some(1))
     );
 }
+
+#[test]
+fn a_moved_paragraphs_marks_and_their_author_are_removed() {
+    // PR-Daemon #2087 B2: move marks on the paragraph mark (`w:pPr/w:rPr`).
+    let xml = body(concat!(
+        r#"<w:p><w:pPr><w:rPr><w:moveFrom w:id="11" w:author="张三" w:date="2026-11-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:t>甲</w:t></w:r></w:p>"#,
+        r#"<w:p><w:pPr><w:rPr><w:moveTo w:id="12" w:author="张三" w:date="2026-11-01T00:00:00Z"/></w:rPr></w:pPr><w:r><w:t>乙</w:t></w:r></w:p>"#,
+    ));
+    let out = clean_part(&xml).unwrap();
+    assert!(
+        !out.contains("moveFrom") && !out.contains("moveTo") && !out.contains("张三"),
+        "{out}"
+    );
+    assert!(out.contains("甲") && out.contains("乙"), "{out}");
+}

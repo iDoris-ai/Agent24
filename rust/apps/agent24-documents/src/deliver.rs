@@ -8,7 +8,10 @@
 //! accepted and its comment marks removed; the comments, their extensions
 //! and `people.xml` emptied; the author / last modifier (core.xml) and
 //! company / manager (app.xml) emptied. Not cleaned: unfilled fields, hidden
-//! text, custom properties, embedded objects. Imported as a
+//! text, custom properties, embedded objects, `word/glossary/`, `customXml/`,
+//! the attached template's path (`settings.xml.rels`), app.xml's Template
+//! and HyperlinkBase, cell revisions (`w:cellIns/cellDel/cellMerge`)
+//! (FU-238). Imported as a
 //! NEW document 「<title>（交付）」. The original is not changed. The answer is
 //! the new document's import job (202), as a patch answers. A PDF copy is the
 //! desktop's next step: the existing conversion of that new document.
@@ -136,8 +139,8 @@ pub fn clean_app(xml: &str) -> Result<String, PatchError> {
 ///   the deleted text is gone), unless the parent is `w:rPr`;
 /// - `w:ins` and `w:moveTo` unwrapped (their children stay where they were),
 ///   unless the parent is `w:rPr`;
-/// - `w:ins` / `w:del` that are children of `w:rPr` (paragraph-mark or run
-///   marks) removed;
+/// - `w:ins` / `w:del` / `w:moveFrom` / `w:moveTo` that are children of
+///   `w:rPr` (paragraph-mark or run marks) removed;
 /// - `w:rPrChange`, `w:pPrChange`, `w:sectPrChange`, `w:tblPrChange`,
 ///   `w:trPrChange`, `w:tcPrChange`, `w:tblGridChange`, `w:numberingChange`
 ///   removed (the current formatting stays);
@@ -264,8 +267,9 @@ fn part_action(node: roxmltree::Node<'_, '_>) -> PartAction {
         "ins" | "moveTo" if !in_rpr => PartAction::Unwrap,
         // Deleted or moved-out content goes, except a move mark kept on `w:rPr`.
         "moveFrom" if !in_rpr => PartAction::Delete,
-        "del" | "ins" | "rPrChange" | "pPrChange" | "sectPrChange" | "tblPrChange"
-        | "trPrChange" | "tcPrChange" | "tblGridChange" | "numberingChange"
+        // PR-Daemon #2087 B2: a move mark on `w:rPr` (a paragraph moved) goes too.
+        "del" | "ins" | "moveFrom" | "moveTo" | "rPrChange" | "pPrChange" | "sectPrChange"
+        | "tblPrChange" | "trPrChange" | "tcPrChange" | "tblGridChange" | "numberingChange"
         | "moveFromRangeStart" | "moveFromRangeEnd" | "moveToRangeStart" | "moveToRangeEnd"
         | "commentRangeStart" | "commentRangeEnd" | "commentReference" => PartAction::Delete,
         _ => PartAction::Keep,
