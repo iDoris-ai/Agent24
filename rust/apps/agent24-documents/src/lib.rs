@@ -23,6 +23,7 @@ pub mod error;
 pub mod events;
 pub mod extract;
 pub mod extractions;
+pub mod form;
 pub mod id;
 pub mod idem;
 pub mod imports;

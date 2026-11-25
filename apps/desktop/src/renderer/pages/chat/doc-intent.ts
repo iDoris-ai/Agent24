@@ -173,9 +173,26 @@ export function asksDeleteParagraph(text: string, inDocument: boolean): boolean 
     DELETE_PART.test(clause) && !NOT_DELETE.test(clause) && !PART_NEGATED.test(clause) && !PART_QUESTION.test(clause))
 }
 
+/** L8-S02: 「把这张入职登记表填一下」「这张表能填吗？」「按《模板》填写」: a verb of
+ * filling, about a form (表, a template) or a document. */
+const FILL_VERB = /填写|填好|填入|填上|填一下|填了|填完|填表|能填|可以填|能不能填/
+const FORM_NOUN = /表|模板|《[^》]{1,200}》/
+
+/** Whether a turn asks to fill a form, or whether one can be. */
+export function asksFillForm(text: string, inDocument: boolean): boolean {
+  return FILL_VERB.test(text) && (inDocument || FORM_NOUN.test(text))
+}
+
+/** L8-S02: the answers to what a fill asked (「电话是 139…」「紧急联系人先空着」)
+ * belong to it: a form turn among the last three before this one (`before`:
+ * the earlier user turns, oldest first). */
+export function continuesFormFill(before: readonly string[], text: string, inDocument = false): boolean {
+  return text.trim() !== '' && before.slice(-3).some((t) => asksFillForm(t, inDocument))
+}
+
 /** Whether a turn goes to the Agent with the documents tools. */
 export function wantsDocTool(text: string, inDocument: boolean): boolean {
-  if (DOC_TOOL_WORDS.test(text) || asksDeleteDocument(text, inDocument) || asksDeleteParagraph(text, inDocument)) return true
+  if (DOC_TOOL_WORDS.test(text) || asksFillForm(text, inDocument) || asksDeleteDocument(text, inDocument) || asksDeleteParagraph(text, inDocument)) return true
   return aboutDocument(text, inDocument) && !asksTranslation(text, inDocument) && DOC_EDIT_WORDS.test(text)
 }
 
@@ -188,14 +205,21 @@ const PARAGRAPH_HINT = '（删掉文档里的某一段是改写，用 documents.
 const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id，不要自己编，也不要向用户要：当前对话的文档直接用它的 document_id，'
   + '「上一份」「刚才拆出来的」先用 documents.list 按导入时间找，按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
 
-export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
+/** L8-S02 (David 11-26, 方案 A): only on a form turn, or an answer to one. */
+export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）模板。先用 documents.fields 看字段和 kind，再读用户给的资料文档（Word 用 documents.paragraphs，PDF 用 documents.read_range）；值只从资料或用户说的话里取，不要自己编；缺的先逐项问用户，问齐了或用户说先空着，再调用一次 documents.fill，用户给了资料文档就把它作为 source_document_id；'
+  + 'kind 为 identity 的字段（姓名、证件号、电话、地址、银行卡、联系人、甲乙方等）资料里没有、用户也没说，就不要填；用户在对话里亲口给的值，把字段名放进 user_said；kind 为 manual 的（签名、照片、勾选框、附件）不要填，告诉用户需要手工处理；用户说先空着的不填。'
+  + '填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
+  + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
+
+/** `form`: the turn fills a form, or answers what one asked (Chat.tsx, `continuesFormFill`). */
+export function docAgentPrompt(doc: { id: string; title: string } | null, text: string, form = asksFillForm(text, doc !== null)): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
     + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
   // L6-F5: only a turn the App judged to save into the original says so.
   const save = asksSaveToOriginal(text) ? SAVE_HINT : ''
-  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}\n${text}`
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}${form ? FORM_HINT : ''}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(
