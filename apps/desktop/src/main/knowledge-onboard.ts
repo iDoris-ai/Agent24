@@ -14,6 +14,7 @@ export type OnboardResult = KnowledgeOnboardResult
 
 export interface Activation {
   endpoint: string
+  origin: string
   activation_code: string
 }
 
@@ -24,6 +25,7 @@ export interface OnboardDeps {
   sleep?: (ms: number) => Promise<void>
 }
 
+const API_PREFIX = '/api/v1'
 const ACTIVATION_FILE = 'knowledge-activation.json'
 const PENDING_FILE = 'knowledge-onboard-pending.json'
 const ACTIVATION_MAX_BYTES = 4 * 1024
@@ -51,8 +53,12 @@ function pendingPath(dir: string): string {
   return path.join(dir, PENDING_FILE)
 }
 
-function joinUrl(endpoint: string, suffix: string): string {
-  return `${endpoint.replace(/\/+$/, '')}${suffix}`
+function validActivationEndpoint(endpoint: unknown): endpoint is string {
+  if (!validEndpoint(endpoint)) return false
+  // Check the supplied path before URL parsing can normalize dot segments.
+  const parts = /^https?:\/\/[^/\\@?#\s]+(\/[^\\?#\s]*)?$/i.exec(endpoint)
+  if (!parts || parts[0] !== endpoint) return false
+  return parts[1] === undefined || parts[1] === '/' || parts[1] === API_PREFIX || parts[1] === `${API_PREFIX}/`
 }
 
 /** Missing file → null. Anything that is not a private, well-formed activation → 'invalid'. */
@@ -79,8 +85,8 @@ export function readActivation(dir: string): Activation | null | 'invalid' {
   if (keys.length !== 2 || !Object.hasOwn(parsed, 'endpoint') || !Object.hasOwn(parsed, 'activation_code')) return 'invalid'
   const endpoint = parsed.endpoint
   const code = parsed.activation_code
-  if (!validEndpoint(endpoint) || typeof code !== 'string' || !ACTIVATION_CODE.test(code)) return 'invalid'
-  return { endpoint, activation_code: code }
+  if (!validActivationEndpoint(endpoint) || typeof code !== 'string' || !ACTIVATION_CODE.test(code)) return 'invalid'
+  return { endpoint, origin: new URL(endpoint).origin, activation_code: code }
 }
 
 /** What the pending key was made for: the endpoint and the activation code, hashed. A new activation gets a new key. */
@@ -209,16 +215,16 @@ function classify(status: number, json: unknown, parsed: boolean): Posted {
   return { kind: 'server_error' }
 }
 
-async function postInit(fetch: OnboardDeps['fetch'], activation: Activation, key: string): Promise<Posted> {
+async function postInit(fetch: OnboardDeps['fetch'], apiBase: string, code: string, key: string): Promise<Posted> {
   const timeout = new AbortController()
   const timer = setTimeout(() => timeout.abort(), INIT_TIMEOUT_MS)
   try {
     let response: Response
     try {
-      response = await fetch(joinUrl(activation.endpoint, '/api/v1/agent24/knowledge/init'), {
+      response = await fetch(`${apiBase}/agent24/knowledge/init`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ activation_code: activation.activation_code, idempotency_key: key }),
+        body: JSON.stringify({ activation_code: code, idempotency_key: key }),
         redirect: 'error',
         cache: 'no-store',
         signal: timeout.signal,
@@ -240,11 +246,11 @@ async function postInit(fetch: OnboardDeps['fetch'], activation: Activation, key
   }
 }
 
-async function serverUp(fetch: OnboardDeps['fetch'], endpoint: string): Promise<boolean> {
+async function serverUp(fetch: OnboardDeps['fetch'], origin: string): Promise<boolean> {
   const timeout = new AbortController()
   const timer = setTimeout(() => timeout.abort(), HEALTH_TIMEOUT_MS)
   try {
-    const response = await fetch(joinUrl(endpoint, '/health'), {
+    const response = await fetch(`${origin}/health`, {
       method: 'GET',
       redirect: 'error',
       cache: 'no-store',
@@ -272,7 +278,7 @@ async function preflight(deps: OnboardDeps): Promise<OnboardPreflight> {
     activated: usable !== null,
     invalidActivation: activation === 'invalid',
     alreadyBound: endpoint !== '',
-    reachable: usable ? await serverUp(deps.fetch, usable.endpoint) : null,
+    reachable: usable ? await serverUp(deps.fetch, usable.origin) : null,
     formats: FORMATS,
     maxBytes: MAX_UPLOAD_BYTES,
   }
@@ -289,10 +295,13 @@ async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promis
   if (activation === null) return { ok: false, code: 'not_activated' }
   if (activation === 'invalid') return { ok: false, code: 'activation_invalid' }
 
+  // Health belongs at the server root even if the activation file names the API base.
+  // Init and the persisted binding use the same API base.
+  const apiBase = `${activation.origin}${API_PREFIX}`
   const key = await idempotencyKey(deps.dir, activation)
   const sleep = deps.sleep ?? ((ms: number) => new Promise((resolve) => { setTimeout(resolve, ms) }))
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const posted = await postInit(deps.fetch, activation, key)
+    const posted = await postInit(deps.fetch, apiBase, activation.activation_code, key)
     if (posted.kind === 'in_progress') {
       if (attempt === MAX_ATTEMPTS) return { ok: false, code: 'in_progress' }
       await sleep(RETRY_WAIT_MS)
@@ -302,7 +311,7 @@ async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promis
     // One write, judged inside the controller's write queue: a user's own save that landed during the
     // network call wins, and onboarding then reports already_bound instead of overwriting it.
     const adopted = await controller.adopt({
-      endpoint: activation.endpoint,
+      endpoint: apiBase,
       knowledgeBaseIds: [posted.knowledgeBaseId],
       apiKey: posted.apiKey,
     })

@@ -1,11 +1,18 @@
 // L7-K2 mock activation onboarding.
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { knowledgeOnboarding, type OnboardDeps } from './knowledge-onboard'
-import type { KnowledgeController } from './knowledge-settings'
+import { KnowledgeHost, type HostTransport } from './knowledge-host'
+import { KnowledgeLoginStore } from './knowledge-logins'
+import { KnowledgeReachability } from './knowledge-reachability'
+import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
+import { knowledgeUploads } from './knowledge-upload'
+import { settingsKnowledgeViewTarget } from './knowledge-view'
+
+vi.mock('./backend-manager', () => ({ daemonConnection: () => null, daemonElevation: () => null }))
 
 const ACTIVATION = 'knowledge-activation.json'
 const PENDING = 'knowledge-onboard-pending.json'
@@ -144,11 +151,17 @@ describe('knowledge onboarding (L7-K2)', () => {
     }],
     ['unknown field', (root: string) => writeActivation(root, { ...GOOD_FILE, note: 'x' })],
     ['bad endpoint', (root: string) => writeActivation(root, { endpoint: 'http://kb.example', activation_code: CODE })],
+    ['endpoint with user info', (root: string) => writeActivation(root, { ...GOOD_FILE, endpoint: 'https://user@kb.example/api/v1' })],
+    ['endpoint with query', (root: string) => writeActivation(root, { ...GOOD_FILE, endpoint: `${ENDPOINT}/api/v1?x=1` })],
+    ['endpoint with fragment', (root: string) => writeActivation(root, { ...GOOD_FILE, endpoint: `${ENDPOINT}/api/v1#x` })],
+    ['endpoint with arbitrary path', (root: string) => writeActivation(root, { ...GOOD_FILE, endpoint: `${ENDPOINT}/prefix/api/v1` })],
+    ['endpoint with dot segments', (root: string) => writeActivation(root, { ...GOOD_FILE, endpoint: `${ENDPOINT}/prefix/../api/v1` })],
     ['bad json', (root: string) => writeActivation(root, '{')],
     ['short code', (root: string) => writeActivation(root, { endpoint: ENDPOINT, activation_code: 'short' })],
   ])('%s activation is invalid and does not call the server', async (_name, setup) => {
     setup(dir)
     const { onboarding, calls } = harness()
+    expect(await onboarding.preflight()).toMatchObject({ invalidActivation: true, reachable: null })
     expect(await onboarding.run({ localOnly: false })).toEqual({ ok: false, code: 'activation_invalid' })
     expect(calls).toEqual([])
     expect(fs.existsSync(path.join(dir, PENDING))).toBe(false)
@@ -178,9 +191,101 @@ describe('knowledge onboarding (L7-K2)', () => {
     expect(headers.get('x-api-key')).toBeNull()
     expect(sent.activation_code).toBe(CODE)
     expect(sent.idempotency_key).toMatch(/^[A-Za-z0-9_-]{43}$/)
-    expect(configures).toEqual([{ endpoint: ENDPOINT, knowledgeBaseIds: [KB], apiKey: API_KEY }])
+    expect(configures).toEqual([{ endpoint: `${ENDPOINT}/api/v1`, knowledgeBaseIds: [KB], apiKey: API_KEY }])
     expect(enables).toEqual([true])
     expect(fs.existsSync(path.join(dir, PENDING))).toBe(false)
+  })
+
+  it.each(['/', '/api/v1/'])('hands activation path %s off to one binding for daemon retrieval, readiness and uploads', async (activationPath) => {
+    const root = 'http://127.0.0.1:18283'
+    const apiBase = `${root}/api/v1`
+    const providerBase = `${apiBase}/agent24/knowledge`
+    writeActivation(dir, { ...GOOD_FILE, endpoint: `${root}${activationPath}` })
+    const logins = new KnowledgeLoginStore(dir, {
+      isEncryptionAvailable: () => true,
+      encryptString: (plain) => Buffer.from(plain),
+      decryptString: (cipher) => cipher.toString(),
+    }, 'darwin')
+    const daemon = vi.fn<HostTransport>(async () => ({ status: 204 }))
+    const host = new KnowledgeHost(logins, {
+      connection: () => ({ port: 1, authHeaders: { Authorization: 'Bearer fixture' } }),
+      transport: daemon,
+    })
+    host.start()
+    const store = new KnowledgeSettingsStore(dir)
+    const controller = new KnowledgeController(host, logins, store)
+    const fetch = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === `${root}/health` && init.method === 'GET') return new Response(null, { status: 204 })
+      if (url === `${providerBase}/init` && init.method === 'POST') return Response.json(okInit())
+      if (new Headers(init.headers).get('x-api-key') !== API_KEY) return new Response(null, { status: 401 })
+      if (url === `${providerBase}/ready`) return Response.json({ live: true })
+      const statuses = new Map([
+        [`${providerBase}/ingest`, 'saved'],
+        [`${providerBase}/jobs/get`, 'processing'],
+        [`${providerBase}/jobs/cancel`, 'cancelled'],
+      ])
+      const status = statuses.get(url)
+      if (!status) return new Response(null, { status: 404 })
+      const body = JSON.parse(String(init.body)) as { request_id: string }
+      return Response.json({
+        request_id: body.request_id,
+        job: { job_id: 'job-1', status, cost: { final: status === 'cancelled', items: [] } },
+        cancel_effect: 'cancelled',
+      })
+    })
+    const reachability = new KnowledgeReachability({ inputs: () => controller.probeInputs(), fetch })
+    const onboarding = knowledgeOnboarding({ dir, controller: () => controller, fetch })
+    expect(await onboarding.preflight()).toMatchObject({ reachable: true, alreadyBound: false })
+    expect(await onboarding.run({ localOnly: false })).toMatchObject({ ok: true, activeNow: true })
+    controller.attachReachability(reachability)
+    expect((await controller.checkReachability()).reachability?.state).toBe('ok')
+    expect(store.load()).toEqual({ enabled: true, endpoint: apiBase, knowledgeBaseIds: [KB] })
+    expect(logins.list().get(KNOWLEDGE_BINDING)).toMatchObject({ profileId: apiBase, material: API_KEY })
+    expect(controller.bindingForRun()).toBe(KNOWLEDGE_BINDING)
+    const route = `/api/v1/host/knowledge/bindings/${KNOWLEDGE_BINDING}`
+    const activation = daemon.mock.calls.find(([, method, p]) => method === 'PUT' && p === route)
+    expect(JSON.parse(activation?.[3] ?? '{}')).toMatchObject({ endpoint: apiBase, knowledge_base_ids: [KB] })
+    const credential = daemon.mock.calls.find(([, method, p]) => method === 'PUT' && p === `${route}/credential`)
+    expect(JSON.parse(credential?.[3] ?? '{}')).toMatchObject({ kind: 'api_key', value: API_KEY })
+
+    // Upload uses the same timer dependency for request deadlines and job polling.
+    const timers = new Map<number, () => void>()
+    let nextTimer = 0
+    const uploads = knowledgeUploads({
+      provider: () => {
+        // Same projection as the upload provider in main.ts: upload owns /api/v1.
+        const binding = controller.viewBinding()
+        const origin = settingsKnowledgeViewTarget(controller.status().endpoint)?.origin
+        if (binding === null || !origin || !controller.uiSessionInputs(binding)) return null
+        return { origin, credential: () => controller.uiSessionInputs(binding)?.credential ?? null, fetch, newRequestId: () => 'request-1' }
+      },
+      knowledgeBaseId: () => controller.status().knowledgeBaseIds[0] ?? null,
+      readFile: async () => Buffer.from('hello'),
+      stat: async () => ({ size: 5, isFile: true }),
+      onChange: () => {},
+      setTimer: (fn) => {
+        const id = ++nextTimer
+        timers.set(id, fn)
+        return id
+      },
+      clearTimer: (id) => { timers.delete(id as number) },
+    })
+    try {
+      const [upload] = await uploads.add([path.join(dir, 'fixture.md')])
+      expect(upload).toMatchObject({ state: 'saved', jobId: 'job-1' })
+      expect(timers.size).toBe(1)
+      const [pollId, poll] = [...timers][0]!
+      timers.delete(pollId)
+      poll()
+      await vi.waitFor(() => expect(uploads.list()[0]?.state).toBe('processing'))
+      expect(await uploads.cancel(upload!.uploadId)).toMatchObject({ state: 'cancelled' })
+      expect(fetch.mock.calls.map(([url]) => url)).toEqual([
+        `${root}/health`, `${providerBase}/init`, `${providerBase}/ready`,
+        `${providerBase}/ingest`, `${providerBase}/jobs/get`, `${providerBase}/jobs/cancel`,
+      ])
+    } finally {
+      uploads.dispose()
+    }
   })
 
   it('two concurrent runs share one fetch', async () => {
