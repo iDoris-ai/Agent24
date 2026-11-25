@@ -862,6 +862,7 @@ async fn fill(
     let found = identity_in_material(
         state,
         &storage,
+        &id,
         source_id.as_deref(),
         &accepted,
         &req.values,
@@ -884,14 +885,20 @@ async fn fill(
     let saved = crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
         .await
         .map_err(|e| refused(&e))?;
-    let mut payload = match saved {
-        crate::patch::Saved::Document(job) => settled(&storage, job).await,
+    // PR-Daemon #2092 B2: written only when a document was made (or is being
+    // made) or a version was saved; a failed import is not written.
+    let (mut payload, written) = match saved {
+        crate::patch::Saved::Document(job) => {
+            let payload = settled(&storage, job).await;
+            let made = made_document(&payload);
+            (payload, made)
+        }
         crate::patch::Saved::Revision(c) => match saved_version(state, &run.run_id, &id, &c)? {
-            Envelope::Completed { payload, .. } => payload,
+            Envelope::Completed { payload, .. } => (payload, c.committed),
             error => return Ok(error),
         },
     };
-    stamp_fill(&mut payload, &report);
+    stamp_fill(&mut payload, &report, written);
     completed(Ok(payload))
 }
 
@@ -974,6 +981,7 @@ async fn load_material(
 async fn identity_in_material(
     state: &AppState,
     storage: &Arc<Storage>,
+    template_id: &str,
     source_id: Option<&str>,
     accepted: &Accepted,
     values: &std::collections::BTreeMap<String, String>,
@@ -983,6 +991,10 @@ async fn identity_in_material(
     let Some(source_id) = source_id else {
         return Ok(found);
     };
+    // PR-Daemon #2092 N1: the template is not the user's material.
+    if source_id == template_id {
+        return Ok(found);
+    }
     // A title nothing resolved to is the same as no such document.
     if !is_id(IdKind::Document, source_id) {
         return Err(refused(&ApiError::not_found("no such document")));
@@ -1014,20 +1026,36 @@ fn material_has(material: &Material, value: &str) -> bool {
     }
 }
 
+/// The import job `settled` answered with made a document, or is making one.
+fn made_document(job: &Value) -> bool {
+    matches!(
+        job.get("status").and_then(Value::as_str),
+        Some("succeeded" | "queued" | "running")
+    )
+}
+
 /// The fill report, on top of the import's own answer. The import's note
 /// stays, so the model is still told not to call the tool again.
-fn stamp_fill(payload: &mut Value, report: &crate::form::FillReport) {
+fn stamp_fill(payload: &mut Value, report: &crate::form::FillReport, written: bool) {
     let Some(map) = payload.as_object_mut() else {
         return;
     };
-    map.insert("written".to_owned(), json!(true));
-    map.insert("filled".to_owned(), json!(report.filled));
+    // Nothing written: nothing is said to be filled.
+    let filled: &[String] = if written { &report.filled } else { &[] };
+    let own = if written {
+        report.note.clone()
+    } else {
+        crate::form::fill_note(filled, &report.ask_user, &report.manual, &report.unfilled)
+    };
+    map.insert("written".to_owned(), json!(written));
+    map.insert("filled".to_owned(), json!(filled));
     map.insert("ask_user".to_owned(), json!(report.ask_user));
     map.insert("manual".to_owned(), json!(report.manual));
     map.insert("unfilled".to_owned(), json!(report.unfilled));
     let note = match map.get("note").and_then(Value::as_str) {
-        Some(prev) if !prev.is_empty() => format!("{}{prev}", report.note),
-        _ => report.note.clone(),
+        Some(prev) if !prev.is_empty() && written => format!("{own}{prev}"),
+        Some(prev) if !prev.is_empty() => format!("{prev}{own}"),
+        _ => own,
     };
     map.insert("note".to_owned(), Value::String(note));
 }
@@ -2588,7 +2616,8 @@ mod tests {
             ),
         )
         .await;
-        let args = json!({ "document_id": id, "values": { "出租方": "明远" }, "title": "房屋租赁合同-李四" });
+        // 出租方 is identity (L8-S02): the user said it.
+        let args = json!({ "document_id": id, "values": { "出租方": "明远" }, "user_said": ["出租方"], "title": "房屋租赁合同-李四" });
         let body = call_in(&state, "fill", &[id], args).await;
         assert_eq!(
             payload(&body)["kind"],

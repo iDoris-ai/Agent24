@@ -235,3 +235,63 @@ fn material_matches_without_whitespace_and_with_case() {
     assert!(!material_has(&text, " "));
     assert!(!material_has(&Material::Absent, "张三"));
 }
+
+/// PR-Daemon #2092 B1: the identity names its review found as `text`.
+#[test]
+fn common_identity_names_and_english_whole_words_are_identity() {
+    for name in [
+        "户名",
+        "收款人",
+        "持卡人",
+        "开户行",
+        "邮箱",
+        "电子邮件",
+        "出生日期",
+        "性别",
+        "学号",
+        "微信",
+        "甲方",
+        "乙方",
+        "承租人",
+        "出租方",
+        "法定代表人",
+        "申请人",
+        "工作单位",
+        "Name",
+        "Phone",
+        "Email",
+        "Address",
+        "ID",
+        "full_name",
+        "EmailAddress",
+    ] {
+        assert_eq!(field_kind(name), FieldKind::Identity, "{name}");
+    }
+    for name in ["valid", "width", "Amount", "面积", "月租金", "签订日期"] {
+        assert_eq!(field_kind(name), FieldKind::Text, "{name}");
+    }
+}
+
+/// PR-Daemon #2092 B2: a failed import is not written, and says so.
+#[test]
+fn a_failed_import_is_not_written() {
+    let fields = vec![("部门".to_owned(), FieldKind::Text)];
+    let values = std::collections::BTreeMap::from([("部门".to_owned(), "研发".to_owned())]);
+    let report = crate::form::plan_fill(&fields, &values, &[], &Default::default());
+    let mut failed = json!({ "status": "failed", "note": "没能生成新文档（导入失败）。" });
+    assert!(!made_document(&failed));
+    let made = made_document(&failed);
+    stamp_fill(&mut failed, &report, made);
+    assert_eq!(failed["written"], false);
+    assert_eq!(failed["filled"], json!([]));
+    let note = failed["note"].as_str().unwrap();
+    assert!(
+        note.starts_with("没能生成新文档") && !note.contains("已填"),
+        "{note}"
+    );
+    let mut ok = json!({ "status": "succeeded", "note": "已完成。" });
+    let made = made_document(&ok);
+    stamp_fill(&mut ok, &report, made);
+    assert_eq!(ok["written"], true);
+    assert_eq!(ok["filled"], json!(["部门"]));
+}

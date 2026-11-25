@@ -22,20 +22,73 @@ const MANUAL: &[&str] = &[
 const IDENTITY: &[&str] = &[
     "姓名",
     "名字",
+    "户名",
     "身份证",
     "证件",
     "护照",
     "电话",
     "手机",
-    "联系方式",
-    "联系人",
+    "联系",
+    "邮箱",
+    "电子邮件",
+    "微信",
+    "QQ",
     "地址",
     "住址",
     "户籍",
     "银行",
+    "开户",
     "卡号",
     "账号",
+    "收款",
+    "持卡",
+    "出生",
+    "生日",
+    "性别",
+    "民族",
+    "学号",
+    "工号",
+    "工作单位",
+    "甲方",
+    "乙方",
+    "承租",
+    "出租",
+    "法定代表人",
+    "法人",
+    "申请人",
+    "当事人",
+    "委托人",
+    "代理人",
+    "担保人",
+    "签约人",
 ];
+/// English, as whole words, any case: 「Phone」「full_name」「EmailAddress」,
+/// never 「valid」 or 「width」 for `id`.
+const IDENTITY_WORDS: &[&str] = &[
+    "name", "phone", "tel", "mobile", "email", "mail", "address", "id", "passport", "birthday",
+];
+
+/// The ASCII words of a name, lower case: split at anything not a letter or
+/// digit and before an upper-case letter that follows a lower-case one.
+fn words(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut word = String::new();
+    let mut prev_lower = false;
+    for c in name.chars() {
+        let boundary = !c.is_ascii_alphanumeric() || (c.is_ascii_uppercase() && prev_lower);
+        if boundary && !word.is_empty() {
+            out.push(std::mem::take(&mut word));
+        }
+        if c.is_ascii_alphanumeric() {
+            word.push(c.to_ascii_lowercase());
+        }
+        prev_lower = c.is_ascii_lowercase();
+    }
+    if !word.is_empty() {
+        out.push(word);
+    }
+    out
+}
 
 /// `manual` when the name asks for a signature, photo, checkbox or attachment;
 /// else `identity` for a name, id, phone, address or account; else `text`.
@@ -43,7 +96,11 @@ const IDENTITY: &[&str] = &[
 pub fn field_kind(name: &str) -> FieldKind {
     if MANUAL.iter().any(|k| name.contains(k)) {
         FieldKind::Manual
-    } else if IDENTITY.iter().any(|k| name.contains(k)) {
+    } else if IDENTITY.iter().any(|k| name.contains(k))
+        || words(name)
+            .iter()
+            .any(|w| IDENTITY_WORDS.contains(&w.as_str()))
+    {
         FieldKind::Identity
     } else {
         FieldKind::Text
@@ -118,7 +175,12 @@ pub(crate) fn plan_fill(
     }
 }
 
-fn fill_note(filled: &[String], ask: &[String], manual: &[String], unfilled: &[String]) -> String {
+pub(crate) fn fill_note(
+    filled: &[String],
+    ask: &[String],
+    manual: &[String],
+    unfilled: &[String],
+) -> String {
     let mut s = String::new();
     if !filled.is_empty() {
         s.push_str(&format!(
