@@ -175,6 +175,15 @@ export async function resolveFormEntry(api: Api, input: FormEntryInput): Promise
     else plain.push(found.ref)
   }
   if (material === null && plain.length === 1) material = plain[0]!
+  // An answer that only names the template (「《入职登记表（2026版）.docx》」 after
+  // 「要填的是哪一份？」) keeps the material told before (Codex L9-1b C2).
+  if (material === null && !input.asks && plain.length === 0 && namedPdf === null && templates.length === 1) {
+    const before = formMaterial(input.earlier, '')
+    if (before !== null) {
+      const found = lookUp(docs, before)
+      if (typeof found !== 'string') material = found.ref
+    }
+  }
   if (templates.length === 1) return { kind: 'fill', template: templates[0]!, material }
   if (templates.length > 1) return { kind: 'choose', formName: null, candidates: templates.map((t) => t.title) }
   // 3–5

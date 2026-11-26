@@ -118,6 +118,13 @@ describe('L9-1b FU-252: the template is told apart from the material', () => {
     expect(await resolveFormEntry(api, input('再把这张报销单填一下', { remembered })))
       .toEqual({ kind: 'choose', formName: '报销单', candidates: [] })
   })
+  it('keeps the material told before when the answer to 「要填的是哪一份？」 names the template (C2)', async () => {
+    const lib = [...LIB, docx('doc_form2', '入职登记表（2026版）.docx')]
+    const { api } = fakeApi(lib, { ...FIELDS, doc_form2: ['姓名'] })
+    const earlier = ['把这张入职登记表填一下，资料在《个人信息.docx》里']
+    expect(await resolveFormEntry(api, input('《入职登记表（2026版）.docx》', { asks: false, earlier })))
+      .toMatchObject({ kind: 'fill', template: { id: 'doc_form2' }, material: { id: 'doc_info' } })
+  })
   it('says a named Word document without {{}} cannot be filled when no form is named otherwise', async () => {
     const { api } = fakeApi(LIB, FIELDS)
     expect(await resolveFormEntry(api, input('《会议纪要.docx》这张表能帮我填吗'))).toEqual({ kind: 'noFields', title: '会议纪要.docx' })

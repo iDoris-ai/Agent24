@@ -519,6 +519,19 @@ describe('ChatPage with Knowledge', () => {
     expect(prompts).toEqual([])
   })
 
+  it('lets a delete after a PDF form answer go to the documents tools (C1)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '把《租赁合同.pdf》删了' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('documents.delete')
+  })
+
   it('sends the template found by the form\'s name, apart from the named material (FU-252)', async () => {
     const { prompts } = formLibrary()
     render(<ChatPage />)

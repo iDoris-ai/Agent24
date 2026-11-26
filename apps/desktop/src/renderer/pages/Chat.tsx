@@ -463,13 +463,16 @@ export default function ChatPage() {
     // L9-1b (FU-252/253): the App tells the template from the material, and
     // answers a PDF form or an unclear template itself, before any model.
     let formSaid: string | null = null
-    if (form && chosen === null && window.agent24.documents) {
+    // An answer turn that itself asks for another documents operation (「把《X》删了」)
+    // is that operation, not the form's (Codex L9-1b C1).
+    const asksForm = asksFillForm(text, doc !== null)
+    if (form && chosen === null && (asksForm || !wantsDocTool(text, doc !== null)) && window.agent24.documents) {
       requestInFlight.current = true
       setLoading(true)
       let direct: string | null = null
       try {
         const entry = await resolveFormEntry(window.agent24.documents, {
-          doc, text: text.trim(), earlier, asks: asksFillForm(text, doc !== null), remembered: formTemplate.current.get(sessionId) ?? null,
+          doc, text: text.trim(), earlier, asks: asksForm, remembered: formTemplate.current.get(sessionId) ?? null,
         })
         direct = formEntryReply(entry)
         if (entry.kind === 'fill') {
