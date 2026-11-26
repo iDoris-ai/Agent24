@@ -11,7 +11,7 @@ const FIXTURE_FILES: [&str; 3] = [
 
 fn healthy() -> serde_json::Value {
     serde_json::json!({
-        "status": "ok", "service": "idoris", "version": "0.6.0",
+        "status": "ok", "service": "idoris", "version": "0.6.1",
         "contract_version": IdorisLock::embedded().tested_contract_version,
         "instance_id": "fixture-instance", "dev_no_key_enabled": false
     })
