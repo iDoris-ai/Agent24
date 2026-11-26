@@ -834,11 +834,10 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
         return Err(refused(&ApiError::not_found("no such document")));
     }
     let names: Vec<String> = listed.fields.iter().map(|f| f.name.clone()).collect();
-    let (read, unread) =
-        match load_material(state, &storage, &source_id, &accepted, Some(names)).await? {
-            Material::Text(_, read) => (read, false),
-            Material::Absent => (crate::form::Labelled::default(), true),
-        };
+    let (read, unread) = match load_material(state, &storage, &source_id, &accepted, names).await? {
+        Material::Text(read) => (read, false),
+        Material::Absent => (crate::form::Labelled::default(), true),
+    };
     let mut payload = serde_json::to_value(&listed)
         .map_err(|_| refused(&ApiError::internal("cannot serialize")))?;
     let mut found = Vec::new();
@@ -914,11 +913,11 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
 /// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
-/// L8-S02: an identity value is written only from the user's material or their words.
+/// L8-S02: an identity value is written only when the user said it (`user_said`).
 async fn fill(
     state: &AppState,
     run: Run,
-    accepted: Accepted,
+    _accepted: Accepted,
     arguments: Map<String, Value>,
 ) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
@@ -953,17 +952,14 @@ async fn fill(
         .iter()
         .map(|f| (f.name.clone(), f.kind))
         .collect();
-    let found = identity_in_material(
-        state,
-        &storage,
-        &id,
-        source_id.as_deref(),
-        &accepted,
-        &req.values,
-        &user_said,
-    )
-    .await?;
-    let report = crate::form::plan_fill(&fields, &req.values, &user_said, &found);
+    // The material only resolves and is scope-checked (admit_named): no
+    // identity value is taken from it (r11 B2, 方案 B).
+    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id)
+        && !is_id(IdKind::Document, source_id)
+    {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    let report = crate::form::plan_fill(&fields, &req.values, &user_said);
     // Nothing left that may be written: do not import an unchanged copy.
     if report.write.is_empty() && !req.values.is_empty() {
         return completed(Ok(json!({
@@ -1009,15 +1005,9 @@ fn spoken(value: Option<Value>) -> Result<Vec<String>, Envelope> {
     Ok(names)
 }
 
-/// Whitespace removed, so 「张 三」 in a resume matches the value 张三.
-fn compact(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
 enum Material {
-    /// The material's text (a DOCX's paragraphs, a PDF's text layer),
-    /// whitespace removed, and the values it states by label.
-    Text(String, crate::form::Labelled),
+    /// The values the material states by label.
+    Text(crate::form::Labelled),
     /// The file could not be read: treat every value as absent.
     Absent,
 }
@@ -1027,15 +1017,12 @@ async fn load_material(
     storage: &Arc<Storage>,
     id: &str,
     accepted: &Accepted,
-    // The template's fields, to read the material's labelled values for
-    // (`fields`); None when only the text is wanted (`fill`'s check).
-    names: Option<Vec<String>>,
+    // The template's fields, to read the material's labelled values for.
+    names: Vec<String>,
 ) -> Result<Material, Envelope> {
     let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
     if detail.head.media_type != crate::office::DOCX {
-        // A PDF or an image: its text layer, compared as a DOCX's text is
-        // (whitespace removed, case kept), never `find`'s relaxed match
-        // (Codex C1/C2: it folds ASCII case and does not skip a space).
+        // A PDF or an image: its text layer, read as a DOCX's lines are.
         let read = async {
             let r = crate::read::revision(storage, id, detail.document.head_revision).await?;
             crate::read::current_layer(state, storage, &r, Requester::Tool(accepted.clone())).await
@@ -1043,9 +1030,7 @@ async fn load_material(
         return Ok(match read.await {
             Ok((_, layer)) => {
                 let lines: Vec<String> = layer.blocks.iter().map(|b| b.text.clone()).collect();
-                let read =
-                    names.map_or_else(Default::default, |n| crate::form::labelled(&lines, &[], &n));
-                Material::Text(compact(&lines.concat()), read)
+                Material::Text(crate::form::labelled(&lines, &[], &names))
             }
             Err(_) => Material::Absent,
         });
@@ -1060,20 +1045,14 @@ async fn load_material(
     {
         Ok((_, _, _, bytes)) => {
             let parsed = crate::state::blocking(move || {
-                let read = match names {
-                    Some(n) => {
-                        crate::form::labelled_blocks(&crate::docx_patch::blocks(&bytes)?, &n)
-                    }
-                    None => crate::form::Labelled::default(),
-                };
-                Ok::<_, crate::docx_patch::PatchError>((
-                    crate::docx_patch::plain_text(&bytes)?,
-                    read,
+                Ok::<_, crate::docx_patch::PatchError>(crate::form::labelled_blocks(
+                    &crate::docx_patch::blocks(&bytes)?,
+                    &names,
                 ))
             })
             .await;
             Ok(match parsed {
-                Ok((text, read)) => Material::Text(compact(&text), read),
+                Ok(read) => Material::Text(read),
                 Err(_) => Material::Absent,
             })
         }
@@ -1082,56 +1061,6 @@ async fn load_material(
             Ok(Material::Absent)
         }
         Err(e) => Err(refused(&e)),
-    }
-}
-
-/// Identity field names whose value occurs in the material document.
-async fn identity_in_material(
-    state: &AppState,
-    storage: &Arc<Storage>,
-    template_id: &str,
-    source_id: Option<&str>,
-    accepted: &Accepted,
-    values: &std::collections::BTreeMap<String, String>,
-    user_said: &[String],
-) -> Result<std::collections::HashSet<String>, Envelope> {
-    let mut found = std::collections::HashSet::new();
-    let Some(source_id) = source_id else {
-        return Ok(found);
-    };
-    // PR-Daemon #2092 N1: the template is not the user's material.
-    if source_id == template_id {
-        return Ok(found);
-    }
-    // A title nothing resolved to is the same as no such document.
-    if !is_id(IdKind::Document, source_id) {
-        return Err(refused(&ApiError::not_found("no such document")));
-    }
-    // PR-Daemon #2095 M2: the check needs only the text.
-    let material = load_material(state, storage, source_id, accepted, None).await?;
-    for (name, value) in values {
-        if crate::form::field_kind(name) != crate::form::FieldKind::Identity
-            || value.trim().is_empty()
-        {
-            continue;
-        }
-        if user_said.iter().any(|s| s == name) {
-            continue;
-        }
-        if material_has(&material, value) {
-            found.insert(name.clone());
-        }
-    }
-    Ok(found)
-}
-
-fn material_has(material: &Material, value: &str) -> bool {
-    match material {
-        Material::Text(text, _) => {
-            let needle = compact(value);
-            !needle.is_empty() && text.contains(&needle)
-        }
-        Material::Absent => false,
     }
 }
 

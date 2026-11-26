@@ -109,7 +109,7 @@ fn values() -> Value {
 }
 
 #[tokio::test]
-async fn fill_writes_only_text_and_identity_the_user_or_the_material_gave() {
+async fn fill_writes_only_text_and_identity_the_user_said() {
     let (_dir, state) = opened().await;
     let template = docx(&["{{姓名}}{{电话}}{{部门}}{{本人签名}}{{紧急联系人}}"]);
     // The name is split by a space: matching ignores whitespace.
@@ -170,13 +170,15 @@ async fn fill_writes_only_text_and_identity_the_user_or_the_material_gave() {
     let mut args = json!({ "document_id": TPL, "source_document_id": SRC });
     args["values"] = values();
     let answer = payload(&call(&state, "fill", args).await);
+    // r11 B2 (方案 B): a value in the material is not the user's word: the
+    // name 张三 (in the material) is not written without user_said.
     assert_eq!(answer["written"], true, "{answer}");
-    assert_eq!(strings(&answer["filled"]), ["姓名", "部门"]);
-    assert_eq!(strings(&answer["ask_user"]), ["电话", "紧急联系人"]);
+    assert_eq!(strings(&answer["filled"]), ["部门"]);
+    assert_eq!(strings(&answer["ask_user"]), ["姓名", "电话", "紧急联系人"]);
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
     let note = answer["note"].as_str().unwrap();
     assert!(
-        note.contains("已填 2 项：姓名、部门")
+        note.contains("已填 1 项：部门")
             && note.contains("电话")
             && note.contains("紧急联系人")
             && note.contains("本人签名")
@@ -185,7 +187,7 @@ async fn fill_writes_only_text_and_identity_the_user_or_the_material_gave() {
     );
     let new_id = answer["result"]["document_id"].as_str().unwrap();
     let text = head_text(&state, new_id).await;
-    assert!(text.contains("张三") && text.contains("研发"), "{text}");
+    assert!(!text.contains("张三") && text.contains("研发"), "{text}");
     assert!(
         text.contains("{{电话}}") && text.contains("{{本人签名}}"),
         "{text}"
@@ -196,7 +198,7 @@ async fn fill_writes_only_text_and_identity_the_user_or_the_material_gave() {
     let mut args = json!({
         "document_id": TPL,
         "source_document_id": SRC,
-        "user_said": ["电话"],
+        "user_said": ["姓名", "电话"],
     });
     args["values"] = values();
     let answer = payload(&call(&state, "fill", args).await);
@@ -228,18 +230,6 @@ async fn a_source_outside_the_scope_is_not_found() {
     assert_module_error(&body, "not_found", false);
 }
 
-/// Codex C1/C2: a PDF's text is compared as a DOCX's is: whitespace removed
-/// on both sides, case kept.
-#[test]
-fn material_matches_without_whitespace_and_with_case() {
-    let text = Material::Text(compact("姓名：张 三\n账号：AbC 123"), Default::default());
-    assert!(material_has(&text, "张三"));
-    assert!(material_has(&text, "AbC123"));
-    assert!(!material_has(&text, "abc123"));
-    assert!(!material_has(&text, " "));
-    assert!(!material_has(&Material::Absent, "张三"));
-}
-
 /// PR-Daemon #2092 B1: the identity names its review found as `text`.
 #[test]
 fn common_identity_names_and_english_whole_words_are_identity() {
@@ -268,6 +258,12 @@ fn common_identity_names_and_english_whole_words_are_identity() {
         "ID",
         "full_name",
         "EmailAddress",
+        // r11 B1‴: spaced as forms align them, and the official labels.
+        "姓 名",
+        "电　话",
+        "身份号码",
+        "公民身份号码",
+        "户口所在地",
     ] {
         assert_eq!(field_kind(name), FieldKind::Identity, "{name}");
     }
@@ -281,7 +277,7 @@ fn common_identity_names_and_english_whole_words_are_identity() {
 fn a_failed_import_is_not_written() {
     let fields = vec![("部门".to_owned(), FieldKind::Text)];
     let values = std::collections::BTreeMap::from([("部门".to_owned(), "研发".to_owned())]);
-    let report = crate::form::plan_fill(&fields, &values, &[], &Default::default());
+    let report = crate::form::plan_fill(&fields, &values, &[]);
     let mut failed = json!({ "status": "failed", "note": "没能生成新文档（导入失败）。" });
     assert!(!made_document(&failed));
     let made = made_document(&failed);
@@ -434,8 +430,23 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
     );
     assert_eq!(strings(&answer["unfilled"]), ["紧急联系人"]);
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
-    // ② The user says the three: all are written (their words, user_said).
+    // r11 B2: the material's 陈晓明 without user_said is not written.
     values.insert("姓名".to_owned(), json!("陈晓明"));
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": TPL, "source_document_id": SRC, "values": values.clone() }),
+        )
+        .await,
+    );
+    assert!(
+        strings(&answer["ask_user"]).contains(&"姓名".into()),
+        "{answer}"
+    );
+    // ② The user says the three: all are written (their words, user_said),
+    // a name the material does not have too.
+    values.insert("姓名".to_owned(), json!("王小明"));
     values.insert("联系电话".to_owned(), json!("13800001111"));
     values.insert("身份证号".to_owned(), json!("110101199001011234"));
     let answer = payload(
@@ -1435,4 +1446,47 @@ fn a_label_stated_twice_stops_the_reading_whatever_its_value() {
     assert_eq!(value(&r, "电话").as_deref(), Some("138"), "{r:?}");
     assert_eq!(value(&r, "姓名"), None);
     assert!(r.ambiguous.contains(&"姓名".to_owned()), "{r:?}");
+}
+
+/// r11 B1‴: a field name spaced as forms align it (「姓 名」「电　话」) is an
+/// identity field too: never from the material.
+#[tokio::test]
+async fn a_spaced_identity_field_is_never_from_the_material() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["{{姓 名}}{{电　话}}{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "个人信息.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：陈晓明",
+            "电话：13800000000",
+            "部门：研发",
+        ]),
+    )
+    .await;
+    let listed = payload(
+        &call(
+            &state,
+            "fields",
+            json!({ "document_id": TPL, "source_document_id": SRC }),
+        )
+        .await,
+    );
+    for f in listed["fields"].as_array().unwrap() {
+        let name = f["name"].as_str().unwrap();
+        if name == "部门" {
+            assert_eq!(f["from_source"], json!("研发"), "{listed}");
+        } else {
+            assert_eq!(f["kind"], "identity", "{listed}");
+            assert!(f.get("from_source").is_none(), "{listed}");
+        }
+    }
 }

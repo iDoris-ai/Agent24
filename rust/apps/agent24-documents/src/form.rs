@@ -21,6 +21,8 @@ const MANUAL: &[&str] = &[
 ];
 const IDENTITY: &[&str] = &[
     "姓名",
+    "身份号码",
+    "户口所在地",
     "名字",
     "户名",
     "身份证",
@@ -94,9 +96,12 @@ fn words(name: &str) -> Vec<String> {
 /// else `identity` for a name, id, phone, address or account; else `text`.
 #[must_use]
 pub fn field_kind(name: &str) -> FieldKind {
-    if MANUAL.iter().any(|k| name.contains(k)) {
+    // r11 B1‴: the label as the material is read (whitespace out, 「姓 名」
+    // 「电　话」 as forms align them); English words from the name as it is.
+    let key = label_key(name);
+    if MANUAL.iter().any(|k| key.contains(k)) {
         FieldKind::Manual
-    } else if IDENTITY.iter().any(|k| name.contains(k))
+    } else if IDENTITY.iter().any(|k| key.contains(k))
         || words(name)
             .iter()
             .any(|w| IDENTITY_WORDS.contains(&w.as_str()))
@@ -117,13 +122,13 @@ pub(crate) struct FillReport {
     pub(crate) note: String,
 }
 
-/// `found` is the identity fields whose value occurs in the user's material.
-/// A name the template does not have stays in `write`, so fill still refuses it.
+/// An identity value is written only when the user said it (`user_said`);
+/// never because it occurs in the material (r11 B2, 方案 B). A name the
+/// template does not have stays in `write`, so fill still refuses it.
 pub(crate) fn plan_fill(
     fields: &[(String, FieldKind)],
     values: &BTreeMap<String, String>,
     user_said: &[String],
-    found: &HashSet<String>,
 ) -> FillReport {
     let known: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     let said = |name: &str| user_said.iter().any(|s| s == name);
@@ -138,7 +143,7 @@ pub(crate) fn plan_fill(
         }
         match field_kind(name) {
             FieldKind::Manual => {}
-            FieldKind::Identity if said(name) || found.contains(name) => {
+            FieldKind::Identity if said(name) => {
                 write.insert(name.clone(), value.clone());
             }
             FieldKind::Identity => {}
@@ -190,7 +195,7 @@ pub(crate) fn fill_note(
         ));
     }
     if !ask.is_empty() {
-        s.push_str(&format!("资料里没有、需要问用户：{}。", ask.join("、")));
+        s.push_str(&format!("身份类要问用户：{}。", ask.join("、")));
     }
     if !manual.is_empty() {
         s.push_str(&format!("需要你手工处理：{}。", manual.join("、")));
@@ -198,7 +203,7 @@ pub(crate) fn fill_note(
     if !unfilled.is_empty() {
         s.push_str(&format!("还没填：{}。", unfilled.join("、")));
     }
-    s.push_str("身份类信息只能用资料或用户亲口说的，不要自己补。");
+    s.push_str("身份类信息只能用用户亲口说的，不要自己补，也不要从资料里抄。");
     s
 }
 

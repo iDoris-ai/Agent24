@@ -308,21 +308,6 @@ pub(crate) fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchErro
     Ok(out)
 }
 
-/// Paragraph text of the body, tables, headers and footers, in that order.
-/// A fill looks for an identity value in this text (L8-S02).
-pub(crate) fn plain_text(docx: &[u8]) -> Result<String, PatchError> {
-    let mut out = String::new();
-    for (_, xml) in text_parts(docx)? {
-        for para in scan_all_paragraphs(&xml)? {
-            if !out.is_empty() {
-                out.push('\n');
-            }
-            out.push_str(&paragraph_text(&xml[para.start..para.end]));
-        }
-    }
-    Ok(out)
-}
-
 /// L8-S02: the material in document order (PR-Daemon #2095 round 4: one
 /// reading state across paragraphs and tables): each paragraph outside a
 /// table as a line, and each table row as its cells' text (a cell's

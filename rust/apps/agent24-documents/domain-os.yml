@@ -162,7 +162,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fill
-    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. An identity field is written only when its value appears in source_document_id, or the user said it in the conversation (its name is in user_said); never make one up. Ask the user for each name in ask_user, tell them to handle manual by hand, and list unfilled. written is false when nothing was written and no document was generated. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. An identity field is written only when the user said it in the conversation (its name is in user_said); never make one up, and never copy one from the material. Ask the user for each name in ask_user, tell them to handle manual by hand, and list unfilled. written is false when nothing was written and no document was generated. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
     input_schema:
       type: object
       additionalProperties: false
