@@ -483,6 +483,12 @@ describe('监工 0.7.123: the material a form fill was told', () => {
       expect(formMaterial([], no)).toBeNull()
     }
     expect(formMaterial(['资料是《李四.docx》'], '资料别用《李四.docx》')).toBeNull()
+    // r3 D2/D3 (监工): any word of no or of taking it back in the turn: none, no fall back.
+    for (const no of ['别用《李四.docx》里的资料', '不要用《李四.docx》里的资料，部门先空着', '请勿用《李四.docx》中的资料', '别说资料是《李四.docx》',
+      '资料是《李四.docx》，这份别用，改用《王小明.docx》里的资料']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '刚才那份资料不要用了')).toBeNull()
   })
 
   it('goes into the prompt by its id, for fields and fill', () => {

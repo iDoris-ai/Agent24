@@ -1799,3 +1799,88 @@ async fn a_material_s_job_fields_are_written_only_for_the_user_it_names() {
     );
     assert!(strings(&answer["filled"]).is_empty(), "{answer}");
 }
+
+/// PR-Daemon #2100 r3 D1/D4 (监工): plainly the user's means the whole
+/// material is one clean record: past the opening heading every non-empty
+/// block is a 「标签：值」 line to the end (no 「家属档案」 and a second block);
+/// a name field is any whose key ends with 姓名 for the user (员工姓名).
+#[tokio::test]
+async fn a_material_is_plainly_the_users_only_as_one_clean_record() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：王小明",
+            "家属档案",
+            "姓名：李四",
+            "部门：财务部",
+        ]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL, "source_document_id": SRC,
+                "values": { "姓名": "王小明", "部门": "财务部" }, "user_said": ["姓名"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // An extra 「标签：值」 line (爱好) is still one clean record.
+    let own = "doc_01K74Z3QJ8V5N2W9RTX6Y00095";
+    put_docx(
+        &state,
+        own,
+        "王.docx",
+        &docx(&["个人信息", "姓名：王小明", "部门：研发部", "爱好：跑步"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": TPL, "source_document_id": own, "values": { "姓名": "王小明" }, "user_said": ["姓名"] }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名", "部门"], "{answer}");
+    // D4: 员工姓名.
+    let tpl2 = "doc_01K74Z3QJ8V5N2W9RTX6Y00096";
+    put_docx(
+        &state,
+        tpl2,
+        "表2.docx",
+        &docx(&["员工姓名：{{员工姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    let src2 = "doc_01K74Z3QJ8V5N2W9RTX6Y00097";
+    put_docx(
+        &state,
+        src2,
+        "王2.docx",
+        &docx(&["员工姓名：王小明", "部门：研发部"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": tpl2, "source_document_id": src2, "values": { "员工姓名": "王小明" }, "user_said": ["员工姓名"] }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["员工姓名", "部门"], "{answer}");
+}

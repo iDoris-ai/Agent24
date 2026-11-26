@@ -180,18 +180,24 @@ pub(crate) fn plainly_users(
     if read.cut || read.layout_unknown || !read.ambiguous.is_empty() {
         return false;
     }
-    let Some(stated) = read
-        .values
-        .iter()
-        .find(|(k, _)| safe_key(k) == "姓名")
-        .map(|(_, v)| safe_key(v))
-    else {
-        return false;
-    };
-    user_said
-        .iter()
-        .filter(|n| safe_key(n) == "姓名")
-        .any(|n| values.get(n).is_some_and(|v| safe_key(v) == stated))
+    // r3 D4: a name field of the user's own (姓名, 员工姓名, 申请人姓名…),
+    // compared by the same field in the material and in what was said.
+    user_said.iter().filter(|n| own_name_field(n)).any(|n| {
+        let key = safe_key(n);
+        let stated = read.values.iter().find(|(k, _)| safe_key(k) == key);
+        match (stated, values.get(n)) {
+            (Some((_, stated)), Some(said)) => safe_key(stated) == safe_key(said),
+            _ => false,
+        }
+    })
+}
+
+/// A field for the user's own name: 「姓名」 after one of these (never
+/// 紧急联系人姓名, 配偶姓名).
+fn own_name_field(name: &str) -> bool {
+    safe_key(name).strip_suffix("姓名").is_some_and(|who| {
+        ["", "员工", "申请人", "本人", "职工", "应聘人", "入职人员"].contains(&who)
+    })
 }
 
 /// What a fill will write, and what it tells the model to pass on.
@@ -506,6 +512,26 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
             continue;
         }
         if !field_block(block) {
+            // PR-Daemon #2100 r3 D1 (监工): the rest must be one clean record
+            // too, or the material is not plainly the user's: only other
+            // 「标签：值」 lines of labels the template does not have (「爱好：跑步」).
+            // A heading (「家属档案」), a table row or a template field again
+            // is another record, maybe another person's.
+            out.cut = blocks[at - 1..].iter().any(|b| match b {
+                _ if empty(b) => false,
+                Block::Row(_) => true,
+                Block::Line(l) => {
+                    let l = l.trim();
+                    let Some(colon) = l.find(['：', ':']) else {
+                        return true;
+                    };
+                    let label = l[..colon].trim();
+                    label.is_empty()
+                        || label.chars().count() > 12
+                        || l[colon..].trim_start_matches(['：', ':']).trim().is_empty()
+                        || !markers(l, &names).is_empty()
+                }
+            });
             break;
         }
         // What this block gives, kept apart until the block is known to be
