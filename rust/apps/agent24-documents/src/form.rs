@@ -247,6 +247,17 @@ pub(crate) enum Block {
     Row(Vec<String>),
 }
 
+/// A value as [`labelled_blocks`] reads it.
+enum Take {
+    Value(String),
+    Spread,
+    None,
+}
+
+/// Fields that say whose a block is: a value other than 「本人」「自己」 is
+/// another person's (r8, 监工).
+const RELATIONS: &[&str] = &["与本人关系", "关系", "称谓"];
+
 /// [`labelled_blocks`] of `lines`, then `rows`.
 pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]) -> Labelled {
     let blocks: Vec<Block> = lines
@@ -293,6 +304,9 @@ fn own_heading(t: &str) -> bool {
 ///    anything else first and nothing is read (`layout_unknown`).
 /// 2. From the first field block on, field blocks are read; the first block
 ///    that is not one ends the reading, whatever it is.
+/// 3. Only the first person's block is read (r8, 监工): a block with a sign
+///    of a second person (a field given another value than before, or a
+///    relation not 「本人」「自己」) is not read, and the reading stops there.
 ///
 /// A field block: a line with exactly one 「字段：」 opening it (after leading
 /// space and a number 「1.」「（一）」); a table row strictly 「字段 | 值 | 字段 |
@@ -314,19 +328,16 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
         .collect();
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unsure: Vec<String> = Vec::new();
-    let mut put = |name: &str, value: &str| {
+    // A value as read: one to keep, a spread one (ambiguous), or one that is
+    // no value (a blank 「____」, another field's name).
+    let take = |value: &str| -> Take {
         let value = unbracket(value.trim());
         if spread(value) {
-            if !unsure.iter().any(|n| n == name) {
-                unsure.push(name.to_owned());
-            }
-            return;
-        }
-        if usable(value, &names) {
-            let seen = found.entry(name.to_owned()).or_default();
-            if !seen.iter().any(|v| v == value) {
-                seen.push(value.to_owned());
-            }
+            Take::Spread
+        } else if usable(value, &names) {
+            Take::Value(value.to_owned())
+        } else {
+            Take::None
         }
     };
     let is_field = |t: &str| names.contains(&label_key(t));
@@ -397,20 +408,25 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
         if !field_block(block) {
             break;
         }
+        // What this block gives, kept apart until the block is known to be
+        // the same person's (r8).
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut doubt: Vec<String> = Vec::new();
+        let mut give = |name: String, t: Take, pairs: &mut Vec<(String, String)>| match t {
+            Take::Value(v) => pairs.push((name, v)),
+            Take::Spread => doubt.push(name),
+            Take::None => {}
+        };
         match block {
             Block::Line(line) => {
                 if let Some((colon_end, name)) = field_line(line) {
                     let value = line[colon_end..]
                         .trim()
                         .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
-                    put(&name, value);
+                    give(name, take(value), &mut pairs);
                 }
             }
             Block::Row(row) => {
-                let below = match blocks.get(at) {
-                    Some(Block::Row(n)) if n.len() == row.len() => Some(n),
-                    _ => None,
-                };
                 if header(row) {
                     // r7 (监工): a header row (a row of field names only) is
                     // never read. Under it may be one row or a roster with
@@ -424,20 +440,63 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                     }
                     break;
                 }
+                let below = match blocks.get(at) {
+                    Some(Block::Row(n)) if n.len() == row.len() => Some(n),
+                    _ => None,
+                };
                 for i in (0..row.len()).step_by(2) {
                     let Some(right) = row.get(i + 1).filter(|c| !c.trim().is_empty()) else {
                         continue;
                     };
-                    put(&label_key(&row[i]), right);
+                    let name = label_key(&row[i]);
+                    let right = take(right);
+                    if matches!(right, Take::None) {
+                        // r8 B2: a blank here is not filled from the row under
+                        // it (「姓名 | ____」 over 「李四 | 配偶」): ambiguous.
+                        give(name, Take::Spread, &mut pairs);
+                        continue;
+                    }
+                    give(name.clone(), right, &mut pairs);
                     // F1: the row under it could give a value here too; if
                     // it differs, which is meant cannot be told.
                     if let Some(down) = below
                         .map(|n| &n[i])
                         .filter(|c| !c.trim().is_empty() && !label_like(c))
                     {
-                        put(&label_key(&row[i]), down);
+                        give(name, take(down), &mut pairs);
                     }
                 }
+            }
+        }
+        // r8 (监工): only the first person's block is read; at a sign of a
+        // second person the reading stops before this block. A sign: a
+        // relation that is not the user's own (「关系：配偶」), or a field
+        // with another value than the blocks before gave it (a second 「姓名」).
+        let other = pairs.iter().any(|(n, v)| {
+            RELATIONS.contains(&n.as_str()) && !["本人", "自己"].contains(&v.as_str())
+        });
+        let clash: Vec<String> = pairs
+            .iter()
+            .filter(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)))
+            .map(|(n, _)| n.clone())
+            .collect();
+        if other || !clash.is_empty() {
+            for n in clash {
+                if !unsure.contains(&n) {
+                    unsure.push(n);
+                }
+            }
+            break;
+        }
+        for n in doubt {
+            if !unsure.contains(&n) {
+                unsure.push(n);
+            }
+        }
+        for (n, v) in pairs {
+            let seen = found.entry(n).or_default();
+            if !seen.contains(&v) {
+                seen.push(v);
             }
         }
     }
@@ -460,9 +519,22 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
 /// A value without the brackets around it (「（李四）」 → 「李四」), or without a
 /// closing one it does not open (「李四）」 → 「李四」).
 fn unbracket(value: &str) -> &str {
+    // r8 N1: only a pair around the whole value comes off, not
+    // 「（研发部）（上海）」's first and last.
     let v = value
         .strip_prefix(['（', '('])
         .and_then(|v| v.strip_suffix(['）', ')']))
+        .filter(|inner| {
+            let mut depth = 0i32;
+            inner.chars().all(|c| {
+                match c {
+                    '（' | '(' => depth += 1,
+                    '）' | ')' => depth -= 1,
+                    _ => {}
+                }
+                depth >= 0
+            })
+        })
         .unwrap_or(value);
     let opens = v.matches(['（', '(']).count();
     let closes = v.matches(['）', ')']).count();

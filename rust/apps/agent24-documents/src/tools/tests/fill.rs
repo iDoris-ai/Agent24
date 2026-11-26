@@ -428,8 +428,8 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
 }
 
-/// Codex C1: a header row over a row of values is read by column, never as
-/// 「姓名 → 联系电话」; Codex C2: several 「标签：值」 on one line are each their own.
+/// r7 (监工): a header row over a row of values is not read at all; r3: nor
+/// are several 「标签：值」 on one line.
 #[test]
 fn header_rows_and_several_labels_on_a_line_are_not_read() {
     let names: Vec<String> = ["姓名", "联系电话", "部门", "性别", "入职日期"]
@@ -1099,8 +1099,8 @@ async fn fields_say_when_the_material_is_not_plainly_the_user_s() {
     assert!(listed["fields"][0].get("from_source").is_none());
 }
 
-/// PR-Daemon #2095 r6 B1: a header over two or more rows of data is a list
-/// (a roster, a family table): whose the first row is cannot be told.
+/// PR-Daemon #2095 r6 B1 / r7 B1': under a header may be a roster; r7 (监工):
+/// a header row is never read, whatever is under it.
 #[test]
 fn a_header_row_is_never_read_whatever_is_under_it() {
     use crate::form::Block::{Line, Row};
@@ -1189,4 +1189,134 @@ fn every_suffix_of_an_own_heading_comes_off() {
             "{title}: {r:?}"
         );
     }
+}
+
+/// r8 (监工): only the first person's block is read; at a sign of a second
+/// person (a field's second value, a relation not 「本人」) the reading stops.
+#[test]
+fn only_the_first_persons_block_is_read() {
+    use crate::form::Block::{Line, Row};
+    let row = |c: &[&str]| Row(names(c));
+    let line = |t: &str| Line(t.into());
+    // r8 B1 (PR-Daemon #2095): a second person's block after the user's.
+    for (blocks, fields) in [
+        (
+            vec![
+                row(&["姓名", "陈晓明", "性别", "男"]),
+                row(&["姓名", "李四", "电话", "139"]),
+            ],
+            &["姓名", "性别", "电话"][..],
+        ),
+        (
+            vec![
+                row(&["姓名", "陈晓明", "性别", "男"]),
+                line(""),
+                row(&["姓名", "李四", "电话", "139"]),
+            ],
+            &["姓名", "性别", "电话"][..],
+        ),
+        (
+            vec![
+                row(&["姓名", "陈晓明"]),
+                row(&["性别", "男"]),
+                row(&["姓名", "李四"]),
+                row(&["电话", "139"]),
+            ],
+            &["姓名", "性别", "电话"][..],
+        ),
+        (
+            vec![
+                line("个人信息"),
+                line("姓名：陈晓明"),
+                line("性别：男"),
+                line("姓名：李四"),
+                line("电话：139"),
+            ],
+            &["姓名", "性别", "电话"][..],
+        ),
+        (
+            vec![
+                row(&["姓名", "张三", "部门", "研发"]),
+                row(&["", "", "", ""]),
+                row(&["关系", "配偶", "电话", "13900000000"]),
+            ],
+            &["姓名", "部门", "关系", "电话"][..],
+        ),
+        (
+            vec![
+                row(&["姓名", "张三"]),
+                line("关系：配偶"),
+                line("电话：13900000000"),
+            ],
+            &["姓名", "关系", "电话"][..],
+        ),
+        (
+            vec![
+                row(&["姓名", "张三"]),
+                line("关系：配偶"),
+                line("电话：13900000000"),
+            ],
+            &["姓名", "电话"][..],
+        ),
+    ] {
+        let r = crate::form::labelled_blocks(&blocks, &names(fields));
+        assert_eq!(value(&r, "电话"), None, "{blocks:?}: {r:?}");
+        assert_eq!(value(&r, "关系"), None, "{blocks:?}: {r:?}");
+    }
+    // 「本人」 is the user's own relation: read on.
+    let r = crate::form::labelled_blocks(
+        &[
+            row(&["姓名", "张三", "关系", "本人"]),
+            row(&["电话", "138"]),
+        ],
+        &names(&["姓名", "关系", "电话"]),
+    );
+    assert_eq!(value(&r, "电话").as_deref(), Some("138"), "{r:?}");
+    // r8 B2: a blank is not filled from the row under it.
+    for blocks in [
+        vec![row(&["姓名", "____"]), row(&["李四", "配偶"])],
+        vec![
+            row(&["姓名", "____", "电话", "138"]),
+            row(&["李四", "配偶", "", ""]),
+        ],
+    ] {
+        let r = crate::form::labelled_blocks(&blocks, &names(&["姓名", "电话"]));
+        assert_eq!(value(&r, "姓名"), None, "{blocks:?}: {r:?}");
+        assert!(r.ambiguous.contains(&"姓名".to_owned()), "{r:?}");
+    }
+    // Controls: one person's blocks still read.
+    let r = crate::form::labelled_blocks(
+        &[
+            row(&["姓名", "陈晓明", "电话", "138"]),
+            row(&["性别", "男", "部门", "研发"]),
+        ],
+        &names(&["姓名", "电话", "性别", "部门"]),
+    );
+    assert_eq!(
+        (
+            value(&r, "姓名").as_deref(),
+            value(&r, "电话").as_deref(),
+            value(&r, "部门").as_deref()
+        ),
+        (Some("陈晓明"), Some("138"), Some("研发")),
+        "{r:?}"
+    );
+    let r = crate::form::labelled_blocks(
+        &[row(&["姓名", "陈晓明"]), row(&["电话", "138"])],
+        &names(&["姓名", "电话"]),
+    );
+    assert_eq!(
+        (value(&r, "姓名").as_deref(), value(&r, "电话").as_deref()),
+        (Some("陈晓明"), Some("138")),
+        "{r:?}"
+    );
+    // r8 N1: two bracket pairs are not taken apart.
+    let r = crate::form::labelled_blocks(&[line("部门：（研发部）（上海）")], &names(&["部门"]));
+    assert_eq!(
+        value(&r, "部门").as_deref(),
+        Some("（研发部）（上海）"),
+        "{r:?}"
+    );
+    let r = crate::form::labelled_blocks(&[line("部门：（研发部）")], &names(&["部门"]));
+    assert_eq!(value(&r, "部门").as_deref(), Some("研发部"), "{r:?}");
 }
