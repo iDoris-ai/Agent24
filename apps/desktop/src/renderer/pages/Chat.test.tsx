@@ -478,6 +478,71 @@ describe('ChatPage with Knowledge', () => {
     expect(prompts[0]).toContain('删除第 2 份')
   })
 
+  // L9-1b (FU-252/253): which document a form fills is told by the App.
+  const formLibrary = () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    const docs = [
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYI', title: '个人信息.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYF', title: '入职登记表.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYL', title: '租赁合同.pdf', media_type: 'application/pdf', head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+    ]
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : req.op === 'fields'
+        ? { ok: true, data: { document_id: req.documentId, revision: 1, fields: req.documentId?.endsWith('F') ? [{ name: '部门', count: 1 }] : [] } }
+        : { ok: false, error: { code: 'x', message: 'x' } })
+    const agentAccess = vi.fn().mockResolvedValue({ enabled: true, until: '2026-12-23T00:00:00.000Z', ok: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request, agentAccess } },
+      writable: true,
+      configurable: true,
+    })
+    const prompts: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        prompts.push(req.body?.prompt ?? '')
+        return { ok: true, status: 201, data: { id: 'r_fill' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '请告诉我姓名' } } }
+    })
+    return { prompts }
+  }
+
+  it('answers a PDF form itself and never asks the model (FU-253)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    expect(prompts).toEqual([])
+  })
+
+  it('lets a delete after a PDF form answer go to the documents tools (C1)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '把《租赁合同.pdf》删了' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('documents.delete')
+  })
+
+  it('sends the template found by the form\'s name, apart from the named material (FU-252)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把这张入职登记表填一下，资料在《个人信息.docx》里' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('这次要填的模板是《入职登记表.docx》，document_id=doc_01M679KMY6D75P0EZACBS95JYF')
+    expect(prompts[0]).toContain('source_document_id=doc_01M679KMY6D75P0EZACBS95JYI')
+  })
+
   // L9-1c (FU-247): the second turn of a delivery names no document; the one
   // the conversation named before is checked, and the card comes again.
   it('checks the document named a turn before when the second turn asks for a clean PDF', async () => {

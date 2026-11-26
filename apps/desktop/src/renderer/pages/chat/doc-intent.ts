@@ -177,7 +177,8 @@ export function asksDeleteParagraph(text: string, inDocument: boolean): boolean 
 
 /** L8-S02: 「把这张入职登记表填一下」「这张表能填吗？」「按《模板》填写」: a verb of
  * filling, about a form (表, a template) or a document. */
-const FILL_VERB = /填写|填好|填入|填上|填一下|填了|填完|填表|能填|可以填|能不能填/
+/** L9-1b (FU-253): 「这张表能帮我填吗」 too: 填 right after who it is done for. */
+const FILL_VERB = /填写|填好|填入|填上|填一下|填了|填完|填表|能填|可以填|能不能填|(?:帮我|帮忙|替我|给我)填/
 const FORM_NOUN = /表|模板|《[^》]{1,200}》/
 
 /** Whether a turn asks to fill a form, or whether one can be. */
