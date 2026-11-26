@@ -12,6 +12,7 @@ import KnowledgeFactsRow from './chat/KnowledgeFacts'
 import KnowledgeCitationCard from './chat/KnowledgeCitationCard'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
+import { PrivacyBadge } from '../components/PrivacyBadge'
 import { activeTurn, buildTurns } from './chat/turns'
 import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/title'
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
@@ -1057,7 +1058,10 @@ export default function ChatPage() {
               {m.role === 'user' && m.delivery.kind === 'notSent' && <div role="status">{t('status.notSent')}</div>}
               {m.role === 'user' && m.delivery.kind === 'sent' && !archived && !loading && <HandOver conversation={sessionId} prompt={m.content} />}
               {m.role === 'assistant' && m.suffix && (
-                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{formatReplySuffix(m.suffix)}</div>
+                <div className="reply-meta">
+                  <PrivacyBadge tier={m.suffix.tier} />
+                  <span>{formatReplySuffix({ ...m.suffix, tier: null })}</span>
+                </div>
               )}
               {/* Lines the daemon's record of the run backs, not the reply:
                   the reply may name sources the run never read. */}
