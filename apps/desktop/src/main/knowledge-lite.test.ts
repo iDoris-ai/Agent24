@@ -85,6 +85,25 @@ describe('LiteKnowledge', () => {
     expect(host.stops).toBe(2)
   })
 
+  it('Codex C2: switched away and back while it was starting, it starts again instead of joining the stopped start', async () => {
+    const installer = new FakeInstaller()
+    installer.current = { state: 'installed', dir: '/x' }
+    const host = new FakeHost()
+    let open = () => {}
+    const gate = new Promise<void>((resolve) => { open = resolve })
+    host.start = async () => { host.starts++; await gate; if (host.stops === 0) host.current = { state: 'healthy', gaveUp: false }; return host.current }
+    const lite = new LiteKnowledge({ installer, host })
+    const first = lite.enable()
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(host.starts).toBe(1)
+    await lite.disable()
+    const second = lite.enable()
+    expect(second).not.toBe(first)
+    open()
+    await second
+    expect(host.starts).toBe(2)
+  })
+
   it('says when it gave up, and whether the embedding (iDoris) was the reason', async () => {
     const installer = new FakeInstaller()
     installer.current = { state: 'installed', dir: '/x' }

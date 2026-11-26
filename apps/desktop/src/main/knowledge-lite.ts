@@ -88,6 +88,9 @@ export class LiteKnowledge {
   private wanted = false
   /** The run of install-then-start under way, so a second click joins it. */
   private running: Promise<void> | null = null
+  /** Bumped by disable(): a run started before it has been stopped and is not joined. */
+  private epoch = 0
+  private runningEpoch = -1
 
   constructor(private readonly deps: LiteKnowledgeDeps) {}
 
@@ -121,17 +124,21 @@ export class LiteKnowledge {
    * the retry after an install failed or the Lite gave up. Never throws. */
   enable(): Promise<void> {
     this.wanted = true
-    if (this.running) return this.running
-    const run = this.installThenStart().finally(() => {
+    if (this.running && this.runningEpoch === this.epoch) return this.running
+    // A run from before a disable() was told to stop: start again once it is over (Codex C2).
+    const previous = this.running ?? Promise.resolve()
+    const run = previous.then(() => this.installThenStart()).finally(() => {
       if (this.running === run) this.running = null
     })
     this.running = run
+    this.runningEpoch = this.epoch
     return run
   }
 
   /** Back to the remote source: the Lite stops; what it installed and stored stays. */
   async disable(): Promise<void> {
     this.wanted = false
+    this.epoch++
     await this.deps.host.stop()
   }
 
