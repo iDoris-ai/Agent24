@@ -254,9 +254,13 @@ enum Take {
     None,
 }
 
-/// Fields that say whose a block is: a value other than 「本人」「自己」 is
-/// another person's (r8, 监工).
-const RELATIONS: &[&str] = &["与本人关系", "关系", "称谓"];
+/// The plain value read, if it is one.
+fn plain(t: &Take) -> Option<String> {
+    match t {
+        Take::Value(v) => Some(v.clone()),
+        _ => None,
+    }
+}
 
 /// [`labelled_blocks`] of `lines`, then `rows`.
 pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]) -> Labelled {
@@ -304,9 +308,11 @@ fn own_heading(t: &str) -> bool {
 ///    anything else first and nothing is read (`layout_unknown`).
 /// 2. From the first field block on, field blocks are read; the first block
 ///    that is not one ends the reading, whatever it is.
-/// 3. Only the first person's block is read (r8, 监工): a block with a sign
-///    of a second person (a field given another value than before, or a
-///    relation not 「本人」「自己」) is not read, and the reading stops there.
+/// 3. Only the first person's block is read: the material must be one
+///    record (r8, r9, 监工). A block with a sign of a second person (a
+///    label stated before, unless with the same one plain value; a label
+///    twice in the block; a relation field not exactly 「本人」「自己」) is
+///    not read, and the reading stops there.
 ///
 /// A field block: a line with exactly one 「字段：」 opening it (after leading
 /// space and a number 「1.」「（一）」); a table row strictly 「字段 | 值 | 字段 |
@@ -327,6 +333,8 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
         .filter(|k| !k.is_empty())
         .collect();
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    // Labels stated by the blocks read so far (r9).
+    let mut seen: Vec<String> = Vec::new();
     let mut unsure: Vec<String> = Vec::new();
     // A value as read: one to keep, a spread one (ambiguous), or one that is
     // no value (a blank 「____」, another field's name).
@@ -412,6 +420,9 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
         // the same person's (r8).
         let mut pairs: Vec<(String, String)> = Vec::new();
         let mut doubt: Vec<String> = Vec::new();
+        // r9: each label this block states, with its plain value if it has
+        // one (a blank, spread or unreadable value is still the label).
+        let mut labels: Vec<(String, Option<String>)> = Vec::new();
         let mut give = |name: String, t: Take, pairs: &mut Vec<(String, String)>| match t {
             Take::Value(v) => pairs.push((name, v)),
             Take::Spread => doubt.push(name),
@@ -423,7 +434,9 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                     let value = line[colon_end..]
                         .trim()
                         .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
-                    give(name, take(value), &mut pairs);
+                    let t = take(value);
+                    labels.push((name.clone(), plain(&t)));
+                    give(name, t, &mut pairs);
                 }
             }
             Block::Row(row) => {
@@ -445,11 +458,15 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                     _ => None,
                 };
                 for i in (0..row.len()).step_by(2) {
+                    let name = label_key(&row[i]);
                     let Some(right) = row.get(i + 1).filter(|c| !c.trim().is_empty()) else {
+                        if !name.is_empty() {
+                            labels.push((name, None));
+                        }
                         continue;
                     };
-                    let name = label_key(&row[i]);
                     let right = take(right);
+                    labels.push((name.clone(), plain(&right)));
                     if matches!(right, Take::None) {
                         // r8 B2: a blank here is not filled from the row under
                         // it (「姓名 | ____」 over 「李四 | 配偶」): ambiguous.
@@ -472,22 +489,39 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
         // second person the reading stops before this block. A sign: a
         // relation that is not the user's own (「关系：配偶」), or a field
         // with another value than the blocks before gave it (a second 「姓名」).
-        let other = pairs.iter().any(|(n, v)| {
-            RELATIONS.contains(&n.as_str()) && !["本人", "自己"].contains(&v.as_str())
-        });
-        let clash: Vec<String> = pairs
+        // r9 (监工): the material must be one record.
+        // 1. A label stated once: stated again in a later block, the reading
+        //    stops before it, unless it is the same one plain value again.
+        // 2. A label twice in one block: the block is not read, and stop.
+        // 3. A relation field (「关系」「称谓」 in its name) not exactly
+        //    「本人」「自己」 (unreadable or spread too): stop.
+        let mut stop: Vec<String> = Vec::new();
+        for (i, (n, v)) in labels.iter().enumerate() {
+            let again = labels[..i].iter().any(|(m, _)| m == n)
+                || (seen.contains(n)
+                    && !v.as_ref().is_some_and(|v| {
+                        found
+                            .get(n)
+                            .is_some_and(|f| f.as_slice() == std::slice::from_ref(v))
+                    }));
+            let other = (n.contains("关系") || n.contains("称谓"))
+                && !v.as_deref().is_some_and(|v| ["本人", "自己"].contains(&v));
+            if again || other {
+                stop.push(n.clone());
+            }
+        }
+        let clash = pairs
             .iter()
-            .filter(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)))
-            .map(|(n, _)| n.clone())
-            .collect();
-        if other || !clash.is_empty() {
-            for n in clash {
+            .any(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)));
+        if !stop.is_empty() || clash {
+            for n in stop {
                 if !unsure.contains(&n) {
                     unsure.push(n);
                 }
             }
             break;
         }
+        seen.extend(labels.into_iter().map(|(n, _)| n));
         for n in doubt {
             if !unsure.contains(&n) {
                 unsure.push(n);

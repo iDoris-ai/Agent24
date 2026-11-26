@@ -1320,3 +1320,88 @@ fn only_the_first_persons_block_is_read() {
     let r = crate::form::labelled_blocks(&[line("部门：（研发部）")], &names(&["部门"]));
     assert_eq!(value(&r, "部门").as_deref(), Some("研发部"), "{r:?}");
 }
+
+/// r9 (监工): the material must be one record. A label stated again stops
+/// the reading, whatever its value reads as (spread, with a colon or a
+/// field's name, or in the same row), and so does a relation field (any
+/// name with 「关系」「称谓」) that is not exactly 「本人」「自己」.
+#[test]
+fn a_label_stated_twice_stops_the_reading_whatever_its_value() {
+    use crate::form::Block::{Line, Row};
+    let row = |c: &[&str]| Row(names(c));
+    let line = |t: &str| Line(t.into());
+    let tel = "电话：13900000000";
+    for (blocks, fields) in [
+        (
+            vec![line("姓名：张三"), line("姓名：李  四"), line(tel)],
+            &["姓名", "电话"][..],
+        ),
+        (
+            vec![line("姓名：陈  晓明"), line("姓名：李四"), line(tel)],
+            &["姓名", "电话"][..],
+        ),
+        (
+            vec![
+                line("姓名：张三"),
+                line("姓名：李四（备注：配偶）"),
+                line(tel),
+            ],
+            &["姓名", "电话"][..],
+        ),
+        (
+            vec![
+                line("姓名：张三"),
+                line("姓名：李四（电话见下）"),
+                line(tel),
+            ],
+            &["姓名", "电话"][..],
+        ),
+        (
+            vec![row(&[
+                "姓名",
+                "张三",
+                "姓名",
+                "李四",
+                "电话",
+                "13900000000",
+            ])],
+            &["姓名", "电话"][..],
+        ),
+        (
+            vec![
+                row(&["姓名", "张三", "姓名", "李四"]),
+                row(&["姓名", "李四", "电话", "13900000000"]),
+            ],
+            &["姓名", "电话"][..],
+        ),
+        (
+            vec![line("姓名：张三"), line("关系：配  偶"), line(tel)],
+            &["姓名", "关系", "电话"][..],
+        ),
+        (
+            vec![line("姓名：张三"), line("与申请人关系：配偶"), line(tel)],
+            &["姓名", "与申请人关系", "电话"][..],
+        ),
+    ] {
+        let r = crate::form::labelled_blocks(&blocks, &names(fields));
+        assert_eq!(value(&r, "电话"), None, "{blocks:?}: {r:?}");
+    }
+    // The same person written twice reads on.
+    let r = crate::form::labelled_blocks(
+        &[
+            line("姓名：陈晓明"),
+            line("姓名：陈晓明"),
+            line("电话：138"),
+        ],
+        &names(&["姓名", "电话"]),
+    );
+    assert_eq!(value(&r, "电话").as_deref(), Some("138"), "{r:?}");
+    // One person with a spread name: 电话 read, 姓名 ambiguous.
+    let r = crate::form::labelled_blocks(
+        &[line("姓名：陈  晓明"), line("电话：138")],
+        &names(&["姓名", "电话"]),
+    );
+    assert_eq!(value(&r, "电话").as_deref(), Some("138"), "{r:?}");
+    assert_eq!(value(&r, "姓名"), None);
+    assert!(r.ambiguous.contains(&"姓名".to_owned()), "{r:?}");
+}
