@@ -107,6 +107,16 @@ export function parseWeknoraLiteHandshake(value: unknown, expectedPid: number): 
   }
 }
 
+/** JSON.parse's own message quotes the text around the error, which here may
+ * be the instance key: replace it with a fixed one (PR-Daemon #2108 G5). */
+export function parseHandshakeLine(line: string): unknown {
+  try {
+    return JSON.parse(line)
+  } catch {
+    throw new Error('WeKnora Lite handshake line is not JSON')
+  }
+}
+
 /** `builtin_models.yaml` for BUILTIN_MODELS_CONFIG. The key stays a `${VAR}` placeholder. */
 export function weknoraLiteModelsYaml(embedding: WeknoraLiteEmbedding): string {
   const quote = (s: string) => JSON.stringify(s)
@@ -136,19 +146,6 @@ export function weknoraLitePolicy(embedding: WeknoraLiteEmbedding): string {
     destinations: [{ category: 'embedding', endpoint: url.origin, model: embedding.model }],
     budget: { max_external_calls: 64, max_input_bytes: 1_048_576, max_inflight_external: 4 },
   })
-}
-
-/** The handshake's first line. A JSON syntax error is reported with a fixed
- * message: V8 quotes the text around the error position, which can be the key
- * (PR-Daemon #2108 G5); the message reaches `status.error` and the log. */
-export function parseWeknoraLiteHandshakeLine(line: string, expectedPid: number): WeknoraLiteHandshake {
-  let value: unknown
-  try {
-    value = JSON.parse(line)
-  } catch {
-    throw new Error('WeKnora Lite handshake is not valid JSON')
-  }
-  return parseWeknoraLiteHandshake(value, expectedPid)
 }
 
 export function validateWeknoraLiteEmbedding(embedding: WeknoraLiteEmbedding): void {
@@ -308,7 +305,7 @@ export class WeknoraLiteLauncher implements SidecarLauncher {
       }
       const onLine = (line: string): void => {
         if (!first) {
-          try { first = parseWeknoraLiteHandshakeLine(line, pid) } catch (error) {
+          try { first = parseWeknoraLiteHandshake(parseHandshakeLine(line), pid) } catch (error) {
             done(error instanceof Error ? error : new Error(String(error)))
             return
           }
