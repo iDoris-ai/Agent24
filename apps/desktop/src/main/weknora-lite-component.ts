@@ -232,7 +232,7 @@ export class WeknoraLiteInstaller {
       this.unavailableReason = `WeKnora Lite is pinned for ${this.pin.os}-${this.pin.arch}, not ${platform}-${arch}`
     } else {
       this.url = this.override ? new URL(this.pin.archive, this.override).href : this.pin.url
-      this.unavailableReason = this.url ? null : 'This build has no WeKnora Lite download source'
+      this.unavailableReason = null
     }
     if (this.url && this.override) {
       console.warn(`[weknora-lite] ${WEKNORA_LITE_LOCAL_BASE_URL_ENV} active: downloading from ${this.url} (loopback only; hashes still checked against the pin)`)
@@ -250,16 +250,23 @@ export class WeknoraLiteInstaller {
     return { state: 'installed', dir, binaryPath: path.join(dir, WEKNORA_LITE_BINARY) }
   }
 
+  /** An existing valid install is recognised even when this run has no
+   * download source (installed via the loopback override, relaunched without it). */
   private computeInitialStatus(): WeknoraLiteStatus {
     if (this.unavailableReason) return { state: 'unavailable', reason: this.unavailableReason }
     if (quickValidateWeknoraLiteInstall(weknoraLiteInstallDir(this.componentsRoot, this.pin), this.pin)) return this.installedStatus()
+    return this.notInstalledStatus()
+  }
+
+  private notInstalledStatus(): WeknoraLiteStatus {
+    if (!this.url) return { state: 'unavailable', reason: 'This build has no WeKnora Lite download source' }
     return { state: 'not-installed', total: this.pin.archiveSize }
   }
 
   /** Current status; an `installed` status is re-validated against disk on every read. */
   status(): WeknoraLiteStatus {
     if (this.current.state === 'installed' && !quickValidateWeknoraLiteInstall(this.current.dir ?? '', this.pin)) {
-      this.current = { state: 'not-installed', total: this.pin.archiveSize }
+      this.current = this.notInstalledStatus()
     }
     return this.override && this.url ? { ...this.current, overrideActive: true } : { ...this.current }
   }

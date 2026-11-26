@@ -202,6 +202,15 @@ describe('WeknoraLiteInstaller install', () => {
     expect(hits()).toBe(1)
   })
 
+  it('an install made through the override is still installed after relaunching without it', async () => {
+    const f = buildFixture()
+    const { base } = await serve((_req, res) => res.end(f.archive))
+    await installer(f, base).install()
+    const relaunched = installer(f, null)
+    expect(relaunched.status()).toMatchObject({ state: 'installed', binaryPath: path.join(weknoraLiteInstallDir(f.componentsRoot, f.pin), 'WeKnora-lite') })
+    expect((await relaunched.install()).state).toBe('installed')
+  })
+
   it('a different pinned archive sha256 treats the old install as not installed', async () => {
     const f = buildFixture()
     const { base } = await serve((_req, res) => res.end(f.archive))
