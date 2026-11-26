@@ -605,11 +605,14 @@ async fn terminal_child_failure_closes_gateway_and_updates_status() {
 async fn self_stopped_generation_is_started_again() {
     let f = Fixture::new().await;
     f.install().await;
-    f.scenario(json!({"mode":"exit_after_ready", "after":4.0, "code":4}));
+    f.scenario(json!({"mode":"exit_after_ready", "wait_for_exit":true, "after":0.0, "code":4}));
     let op = f.host.submit(Action::Start, None).await.unwrap();
     assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
-    // The next generation reads a healthy scenario.
+    // The next generation reads a healthy scenario. Release the exit only once
+    // this generation has run past the restart threshold.
     f.scenario(json!({}));
+    tokio::time::sleep(AUTO_RESTART_MIN_UPTIME + Duration::from_millis(200)).await;
+    fs::write(f.host.root.join("data/state/release-exit"), "exit").unwrap();
     tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let starts = f
@@ -655,6 +658,23 @@ async fn early_self_stop_is_not_restarted() {
     assert_eq!(f.host.status().await.state, State::Stopped);
     assert_eq!(f.host.inner.lock().await.operations.len(), 1);
     f.assert_clean();
+}
+
+/// An automatic restart that loses the race to a user Stop is not admitted.
+#[tokio::test]
+async fn automatic_restart_respects_a_stop_that_came_first() {
+    let f = Fixture::new().await;
+    f.install().await;
+    let stop = f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(f.complete(&stop).await.result, Some(Outcome::Succeeded));
+    assert!(matches!(
+        f.host
+            .submit_checked(Action::Start, Some("auto-restart-test"), true)
+            .await,
+        Err(Code::Cancelled)
+    ));
+    assert_eq!(f.host.status().await.state, State::Stopped);
+    assert_eq!(f.host.inner.lock().await.operations.len(), 1);
 }
 
 #[tokio::test]

@@ -932,12 +932,29 @@ impl IdorisHost {
         action: Action,
         idempotency: Option<&str>,
     ) -> Result<Operation, Code> {
+        self.submit_checked(action, idempotency, false).await
+    }
+    /// `restart_if_wanted`: an automatic restart (FU-254) is admitted only if,
+    /// under the same lock that admits it, nothing is running and the user still
+    /// wants iDoris running, so a Stop that won the race is not undone.
+    async fn submit_checked(
+        self: &Arc<Self>,
+        action: Action,
+        idempotency: Option<&str>,
+        restart_if_wanted: bool,
+    ) -> Result<Operation, Code> {
         if !matches!(action, Action::Start | Action::Stop) {
             return Err(Code::InvalidRequest);
         }
         let mut i = self.inner.lock().await;
         if i.closing {
             return Err(Code::ShuttingDown);
+        }
+        if restart_if_wanted
+            && (i.supervisor.is_some()
+                || !i.installation.as_ref().is_some_and(|r| r.desired_running))
+        {
+            return Err(Code::Cancelled);
         }
         let key = idempotency
             .map(str::to_owned)
@@ -1394,7 +1411,9 @@ impl IdorisHost {
                             if wanted && born.elapsed() >= AUTO_RESTART_MIN_UPTIME {
                                 tracing::warn!("iDoris stopped by itself; starting it again");
                                 let key = format!("auto-restart-{}", uuid::Uuid::new_v4().simple());
-                                if let Err(code) = host.submit(Action::Start, Some(&key)).await {
+                                if let Err(code) =
+                                    host.submit_checked(Action::Start, Some(&key), true).await
+                                {
                                     tracing::warn!(?code, "iDoris automatic restart not admitted");
                                 }
                             } else if wanted {
