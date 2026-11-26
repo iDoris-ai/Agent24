@@ -344,7 +344,7 @@ export default function ChatPage() {
     // L8 DOC-4: 「发给对方前帮我检查一下」「去掉修订和批注，导出一份 PDF 放桌面」
     // 「我上次发出去的是哪个版本？」 — the App checks and reads the receipts; a
     // clean copy is made only from the card's button, never by the model.
-    const deliverAsk = answer ? null : asksDeliver(text, doc !== null)
+    const deliverAsk = answer ? null : asksDeliver(text, doc !== null, lastNamed() !== null)
     if (deliverAsk !== null && window.agent24.documents) {
       const api = window.agent24.documents
       const named = /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? (deliverAsk.kind === 'receipts' ? null : lastNamed())

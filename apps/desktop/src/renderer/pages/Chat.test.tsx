@@ -543,6 +543,36 @@ describe('ChatPage with Knowledge', () => {
     expect(prompts[0]).toContain('source_document_id=doc_01M679KMY6D75P0EZACBS95JYI')
   })
 
+  // L9-1c (FU-247): the second turn of a delivery names no document; the one
+  // the conversation named before is checked, and the card comes again.
+  it('checks the document named a turn before when the second turn asks for a clean PDF', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { document_id: A, revision: 2, title: '合同.docx', format: 'docx', clean: false, cleanable: true, findings: [{ kind: 'comments', count: 1, examples: ['张三：改'] }] } })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《合同》发出去前帮我检查一下' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getAllByRole('group', { name: '发送前检查' })).toHaveLength(1), { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '去掉修订和批注，导出一份 PDF 放桌面' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getAllByRole('group', { name: '发送前检查' })).toHaveLength(2), { timeout: 3000 })
+    expect(request.mock.calls.filter(([r]) => r.op === 'preflight')).toHaveLength(2)
+    expect(runs.filter((p) => p === '/api/v1/runs')).toEqual([])
+  })
+
   // L6-F5: 「回到上一个版本」 never goes to the model: the App finds the version,
   // offers it on a card, and restores it over the version shown when clicked.
   it('restores the version before the current one from a card, never through the model', async () => {
