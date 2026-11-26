@@ -834,24 +834,27 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
         return Err(refused(&ApiError::not_found("no such document")));
     }
     let names: Vec<String> = listed.fields.iter().map(|f| f.name.clone()).collect();
-    let pairs = match load_material(state, &storage, &source_id, &accepted, names).await? {
-        Material::Text(_, pairs) => pairs,
-        Material::Absent => Vec::new(),
-    };
+    let (read, unread) =
+        match load_material(state, &storage, &source_id, &accepted, Some(names)).await? {
+            Material::Text(_, read) => (read, false),
+            Material::Absent => (crate::form::Labelled::default(), true),
+        };
     let mut payload = serde_json::to_value(&listed)
         .map_err(|_| refused(&ApiError::internal("cannot serialize")))?;
     let mut found = Vec::new();
     let mut missing = Vec::new();
+    let mut ambiguous = Vec::new();
     if let Some(Value::Array(fields)) = payload.get_mut("fields") {
         for f in fields.iter_mut() {
             let Some(name) = f.get("name").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
             };
-            match crate::form::from_source(&name, &pairs) {
+            match crate::form::from_source(&name, &read) {
                 Some(v) => {
                     f["from_source"] = json!(v);
                     found.push(format!("{name}={v}"));
                 }
+                None if read.ambiguous.contains(&name) => ambiguous.push(name),
                 None if crate::form::field_kind(&name) != crate::form::FieldKind::Manual => {
                     missing.push(name);
                 }
@@ -860,7 +863,10 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
         }
     }
     let mut note = String::new();
-    if !found.is_empty() {
+    // PR-Daemon #2095 L3: not read is not 「nothing matched」.
+    if unread {
+        note.push_str("没能读到资料的文字（格式不支持或解析失败），资料里的值都要问用户。");
+    } else if !found.is_empty() {
         note.push_str(&format!(
             "资料里对上的值：{}。调用 documents.fill 时把这些值原样放进 values，并带上同一个 source_document_id。",
             found.join("，")
@@ -868,7 +874,13 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
     } else {
         note.push_str("资料里没有对上任何字段。");
     }
-    if !missing.is_empty() {
+    if !ambiguous.is_empty() {
+        note.push_str(&format!(
+            "资料里有多处、读法不确定，要问用户：{}。",
+            ambiguous.join("、")
+        ));
+    }
+    if !missing.is_empty() && !unread {
         note.push_str(&format!(
             "资料里没有：{}。身份类的要问用户，不要自己编；用户说先空着的，values 里给空字符串。",
             missing.join("、")
@@ -984,7 +996,7 @@ fn compact(s: &str) -> String {
 enum Material {
     /// The material's text (a DOCX's paragraphs, a PDF's text layer),
     /// whitespace removed, and the values it states by label.
-    Text(String, Vec<(String, String)>),
+    Text(String, crate::form::Labelled),
     /// The file could not be read: treat every value as absent.
     Absent,
 }
@@ -994,7 +1006,9 @@ async fn load_material(
     storage: &Arc<Storage>,
     id: &str,
     accepted: &Accepted,
-    names: Vec<String>,
+    // The template's fields, to read the material's labelled values for
+    // (`fields`); None when only the text is wanted (`fill`'s check).
+    names: Option<Vec<String>>,
 ) -> Result<Material, Envelope> {
     let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
     if detail.head.media_type != crate::office::DOCX {
@@ -1008,10 +1022,9 @@ async fn load_material(
         return Ok(match read.await {
             Ok((_, layer)) => {
                 let lines: Vec<String> = layer.blocks.iter().map(|b| b.text.clone()).collect();
-                Material::Text(
-                    compact(&lines.concat()),
-                    crate::form::labelled(&lines, &[], &names),
-                )
+                let read =
+                    names.map_or_else(Default::default, |n| crate::form::labelled(&lines, &[], &n));
+                Material::Text(compact(&lines.concat()), read)
             }
             Err(_) => Material::Absent,
         });
@@ -1026,15 +1039,21 @@ async fn load_material(
     {
         Ok((_, _, _, bytes)) => {
             let parsed = crate::state::blocking(move || {
-                let (lines, rows) = crate::docx_patch::lines_and_rows(&bytes)?;
+                let read = match names {
+                    Some(n) => {
+                        let (lines, rows) = crate::docx_patch::lines_and_rows(&bytes)?;
+                        crate::form::labelled(&lines, &rows, &n)
+                    }
+                    None => crate::form::Labelled::default(),
+                };
                 Ok::<_, crate::docx_patch::PatchError>((
                     crate::docx_patch::plain_text(&bytes)?,
-                    crate::form::labelled(&lines, &rows, &names),
+                    read,
                 ))
             })
             .await;
             Ok(match parsed {
-                Ok((text, pairs)) => Material::Text(compact(&text), pairs),
+                Ok((text, read)) => Material::Text(compact(&text), read),
                 Err(_) => Material::Absent,
             })
         }
@@ -1068,8 +1087,8 @@ async fn identity_in_material(
     if !is_id(IdKind::Document, source_id) {
         return Err(refused(&ApiError::not_found("no such document")));
     }
-    let names: Vec<String> = values.keys().cloned().collect();
-    let material = load_material(state, storage, source_id, accepted, names).await?;
+    // PR-Daemon #2095 M2: the check needs only the text.
+    let material = load_material(state, storage, source_id, accepted, None).await?;
     for (name, value) in values {
         if crate::form::field_kind(name) != crate::form::FieldKind::Identity
             || value.trim().is_empty()

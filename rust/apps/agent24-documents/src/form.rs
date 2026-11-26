@@ -202,112 +202,167 @@ pub(crate) fn fill_note(
     s
 }
 
-/// L8-S02 round 2 (监工 11-26 真机): the values the user's material states
-/// by label: 「姓名：陈晓明」 in a paragraph or a line (several per line too,
-/// 「姓名：陈晓明；性别：男」「姓名：陈晓明    性别：男」), 「姓名 | 陈晓明」 in two cells
-/// side by side, or a header row 「姓名 | 部门」 over a row of values. `fields`
-/// are the template's names: a cell that is one of them is a label, never a
-/// value (Codex C1). A label is at most 32 characters; a value that is empty
-/// or still a `{{field}}` is not one. First found wins.
-pub(crate) fn labelled(
-    lines: &[String],
-    rows: &[Vec<String>],
-    fields: &[String],
-) -> Vec<(String, String)> {
-    let names: Vec<String> = fields.iter().map(|f| label_key(f)).collect();
-    let is_name = |t: &str| {
-        let k = label_key(t);
-        !k.is_empty() && names.contains(&k)
-    };
-    let mut out: Vec<(String, String)> = Vec::new();
-    let mut put = |label: &str, value: &str| {
-        let label = label_key(label);
+/// L8-S02 round 2 (监工 11-26 真机): what the user's material states for
+/// the template's fields, read by the App, not the model. Precision first
+/// (PR-Daemon #2095): a reading that is not certain gives no value, and the
+/// user is asked; a wrong value would come with the App's authority.
+#[derive(Debug, Default)]
+pub(crate) struct Labelled {
+    /// A field's one value.
+    pub(crate) values: BTreeMap<String, String>,
+    /// Fields the material states more than one way: asked, never guessed.
+    pub(crate) ambiguous: Vec<String>,
+}
+
+/// Common labels of a form that are not values (a header cell 「年龄」).
+const COMMON_LABELS: &[&str] = &[
+    "年龄",
+    "部门",
+    "职位",
+    "职务",
+    "岗位",
+    "关系",
+    "日期",
+    "备注",
+    "学历",
+    "专业",
+    "婚姻",
+    "籍贯",
+    "政治面貌",
+    "序号",
+    "项目",
+    "内容",
+    "说明",
+];
+
+/// Only labels equal to one of `fields` (whitespace and a trailing colon
+/// aside) are read. Lines: 「字段：值」, cut only where the next 「字段：」 starts;
+/// a value with another colon (not a time's), another field's name, or a
+/// blank (「____」「□」「（请填写）」) is none. Tables: a field's cell with the
+/// value to its right (when that cell is not a label), or under it (when its
+/// row is all labels); both possible and different is none. A field found
+/// with two different values is ambiguous.
+pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]) -> Labelled {
+    let names: Vec<String> = fields
+        .iter()
+        .map(|f| label_key(f))
+        .filter(|k| !k.is_empty())
+        .collect();
+    let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut put = |name: &str, value: &str| {
         let value = value.trim();
-        if label.is_empty()
-            || label.chars().count() > 32
-            || value.is_empty()
-            || value.contains("{{")
-            || is_name(value)
-            || out.iter().any(|(l, _)| *l == label)
-        {
-            return;
+        if usable(value, &names) {
+            let seen = found.entry(name.to_owned()).or_default();
+            if !seen.iter().any(|v| v == value) {
+                seen.push(value.to_owned());
+            }
         }
-        out.push((label, value.to_owned()));
     };
     for line in lines.iter().flat_map(|l| l.lines()) {
-        for segment in segments(line) {
-            // 「姓名：陈晓明 性别：男」: one label after another.
-            let mut rest = segment;
-            while let Some(at) = rest.find(['：', ':']) {
-                let sep = rest[at..].chars().next().map_or(1, char::len_utf8);
-                let after = &rest[at + sep..];
-                let value = until_next_label(after);
-                put(&rest[..at], value);
-                if value.is_empty() || value.len() == after.len() {
-                    break;
-                }
-                rest = after[value.len()..].trim_start();
-            }
+        let marks = markers(line, &names);
+        for (i, (_, colon_end, name)) in marks.iter().enumerate() {
+            let end = marks.get(i + 1).map_or(line.len(), |m| m.0);
+            let value = line[*colon_end..end]
+                .trim()
+                .trim_end_matches(['；', ';', '，', ',', '、', '|']);
+            put(name, value);
         }
     }
+    let is_field = |t: &str| names.contains(&label_key(t));
+    let label_like = |t: &str| {
+        let t = t.trim();
+        is_field(t)
+            || t.ends_with(['：', ':'])
+            || field_kind(t) != FieldKind::Text
+            || COMMON_LABELS.contains(&label_key(t).as_str())
+    };
     for (r, row) in rows.iter().enumerate() {
-        // A header row over values: each name's column, one row down.
-        if let Some(next) = rows.get(r + 1).filter(|n| n.len() == row.len())
-            && row.iter().filter(|c| is_name(c)).count() >= 2
-        {
-            for (h, v) in row.iter().zip(next) {
-                if is_name(h) {
-                    put(h, v);
+        let header = row.iter().all(|c| c.trim().is_empty() || label_like(c));
+        let below = rows.get(r + 1).filter(|n| n.len() == row.len());
+        for (i, cell) in row.iter().enumerate() {
+            if !is_field(cell) {
+                continue;
+            }
+            // 「紧急联系人 | 姓名 | 李四」: a field under another label is not the user's.
+            if i > 0 && label_like(&row[i - 1]) && !header {
+                continue;
+            }
+            let right = row
+                .get(i + 1)
+                .filter(|c| !c.trim().is_empty() && !label_like(c));
+            let down = below
+                .filter(|_| header)
+                .map(|n| &n[i])
+                .filter(|c| !c.trim().is_empty() && !label_like(c));
+            match (right, down) {
+                (Some(a), Some(b)) if a.trim() != b.trim() => {
+                    put(&label_key(cell), a);
+                    put(&label_key(cell), b);
                 }
-            }
-            continue;
-        }
-        for pair in row.windows(2) {
-            // A label cell holds no 「：值」 of its own (that is a line, above).
-            if !pair[0].trim_end_matches(['：', ':']).contains(['：', ':']) {
-                put(&pair[0], &pair[1]);
+                (Some(v), _) | (None, Some(v)) => put(&label_key(cell), v),
+                (None, None) => {}
             }
         }
     }
-    out
-}
-
-/// A line cut where one 「标签：值」 ends and the next may start (Codex C2):
-/// at 「；」「;」, a tab, or two or more spaces.
-fn segments(line: &str) -> Vec<&str> {
-    let mut out = Vec::new();
-    let mut start = 0;
-    let mut spaces = 0;
-    for (i, c) in line.char_indices() {
-        if c == '；' || c == ';' || c == '\t' || c == '\u{3000}' {
-            out.push(&line[start..i]);
-            start = i + c.len_utf8();
-            spaces = 0;
-        } else if c == ' ' {
-            spaces += 1;
-            if spaces == 2 {
-                out.push(&line[start..i - 1]);
-            }
+    let mut out = Labelled::default();
+    for (name, values) in found {
+        if values.len() == 1 {
+            out.values
+                .insert(name, values.into_iter().next().unwrap_or_default());
         } else {
-            if spaces >= 2 {
-                start = i;
-            }
-            spaces = 0;
+            out.ambiguous.push(name);
         }
     }
-    out.push(&line[start..]);
     out
 }
 
-/// A value up to the next label: 「陈晓明 性别：男」 is 「陈晓明」; a value with a
-/// colon and no space before it (a time, 「12:30」) is cut there too.
-fn until_next_label(value: &str) -> &str {
-    match value.find(['：', ':']) {
-        None => value,
-        Some(at) => value[..at]
-            .rfind(char::is_whitespace)
-            .map_or("", |space| &value[..space]),
+/// Where each 「字段：」 of `line` starts and its colon ends, in order: a field
+/// name at the start or after a space or separator, then a colon.
+fn markers(line: &str, names: &[String]) -> Vec<(usize, usize, String)> {
+    let mut marks: Vec<(usize, usize, String)> = Vec::new();
+    for name in names {
+        for (at, _) in line.match_indices(name.as_str()) {
+            let before = line[..at].chars().next_back();
+            if before.is_some_and(|c| !c.is_whitespace() && !"；;，,、|（(）)".contains(c)) {
+                continue;
+            }
+            let after = &line[at + name.len()..];
+            let gap = after.len() - after.trim_start().len();
+            let rest = &after[gap..];
+            if let Some(c) = rest.chars().next().filter(|c| *c == '：' || *c == ':') {
+                marks.push((at, at + name.len() + gap + c.len_utf8(), name.clone()));
+            }
+        }
     }
+    marks.sort_by_key(|m| m.0);
+    marks.dedup_by_key(|m| m.0);
+    marks
+}
+
+/// A value worth giving: not empty, not long, not a blank to fill in, no
+/// colon but a time's (「9:30」), no other field's name.
+fn usable(value: &str, names: &[String]) -> bool {
+    if value.is_empty() || value.chars().count() > 200 || value.contains("{{") {
+        return false;
+    }
+    let blank = |c: char| c.is_whitespace() || "_＿-－—…·.．□☐■○●（）()".contains(c);
+    if value.chars().all(blank)
+        || ["请填写", "待填写", "请填入", "待补充"]
+            .iter()
+            .any(|w| value.contains(w))
+    {
+        return false;
+    }
+    let chars: Vec<char> = value.chars().collect();
+    let odd_colon = chars.iter().enumerate().any(|(i, c)| {
+        (*c == '：' || *c == ':')
+            && !(*c == ':'
+                && i > 0
+                && chars[i - 1].is_ascii_digit()
+                && chars.get(i + 1).is_some_and(char::is_ascii_digit))
+    });
+    let compact: String = value.chars().filter(|c| !c.is_whitespace()).collect();
+    !odd_colon && !names.iter().any(|n| compact.contains(n.as_str()))
 }
 
 /// A label as compared with a field name: whitespace and a trailing colon
@@ -321,15 +376,10 @@ fn label_key(label: &str) -> String {
         .collect()
 }
 
-/// The material's value for `field`: the label equal to its name (whitespace
-/// aside). A manual field never has one.
-pub(crate) fn from_source<'a>(field: &str, pairs: &'a [(String, String)]) -> Option<&'a str> {
+/// The material's value for `field`. A manual field never has one.
+pub(crate) fn from_source<'a>(field: &str, read: &'a Labelled) -> Option<&'a str> {
     if field_kind(field) == FieldKind::Manual {
         return None;
     }
-    let key = label_key(field);
-    pairs
-        .iter()
-        .find(|(l, _)| *l == key)
-        .map(|(_, v)| v.as_str())
+    read.values.get(&label_key(field)).map(String::as_str)
 }

@@ -232,7 +232,7 @@ async fn a_source_outside_the_scope_is_not_found() {
 /// on both sides, case kept.
 #[test]
 fn material_matches_without_whitespace_and_with_case() {
-    let text = Material::Text(compact("姓名：张 三\n账号：AbC 123"), Vec::new());
+    let text = Material::Text(compact("姓名：张 三\n账号：AbC 123"), Default::default());
     assert!(material_has(&text, "张三"));
     assert!(material_has(&text, "AbC123"));
     assert!(!material_has(&text, "abc123"));
@@ -340,7 +340,11 @@ fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
     assert_eq!(get("身份证号"), None);
     assert_eq!(get("紧急联系人"), None);
     // A manual field never takes a value from the material.
-    let signed = crate::form::labelled(&["本人签名：陈晓明".to_owned()], &[], &[]);
+    let signed = crate::form::labelled(
+        &["本人签名：陈晓明".to_owned()],
+        &[],
+        &["本人签名".to_owned()],
+    );
     assert_eq!(crate::form::from_source("本人签名", &signed), None);
 }
 
@@ -400,15 +404,20 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
     let plain = payload(&call(&state, "fields", json!({ "document_id": TPL })).await);
     assert!(plain.get("note").is_none() && plain["fields"][0].get("from_source").is_none());
 
+    // PR-Daemon #2095 L4: the values are `fields`' own from_source, as the
+    // model is told to pass them, plus the user's 「先空着」.
+    let mut values = serde_json::Map::new();
+    for f in listed["fields"].as_array().unwrap() {
+        if let Some(v) = f.get("from_source") {
+            values.insert(f["name"].as_str().unwrap().to_owned(), v.clone());
+        }
+    }
+    values.insert("紧急联系人".to_owned(), json!(""));
     let answer = payload(
         &call(
             &state,
             "fill",
-            json!({
-                "document_id": TPL,
-                "source_document_id": SRC,
-                "values": { "姓名": "陈晓明", "部门": "产品研发部", "入职日期": "2026年12月1日", "紧急联系人": "" },
-            }),
+            json!({ "document_id": TPL, "source_document_id": SRC, "values": values }),
         )
         .await,
     );
@@ -435,7 +444,8 @@ fn header_rows_and_several_labels_on_a_line_give_the_right_values() {
         ],
     ];
     let pairs = crate::form::labelled(&[], &rows, &names);
-    let get = |p: &[(String, String)], f: &str| crate::form::from_source(f, p).map(str::to_owned);
+    let get =
+        |p: &crate::form::Labelled, f: &str| crate::form::from_source(f, p).map(str::to_owned);
     assert_eq!(get(&pairs, "姓名").as_deref(), Some("陈晓明"), "{pairs:?}");
     assert_eq!(get(&pairs, "联系电话").as_deref(), Some("13800000000"));
     assert_eq!(get(&pairs, "部门").as_deref(), Some("研发部"));
@@ -459,4 +469,187 @@ fn header_rows_and_several_labels_on_a_line_give_the_right_values() {
     // A label cell beside another label is not its value.
     let pairs = crate::form::labelled(&[], &[vec!["姓名".to_owned(), "部门".to_owned()]], &names);
     assert_eq!(get(&pairs, "姓名"), None);
+}
+
+fn names(n: &[&str]) -> Vec<String> {
+    n.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn cells(rows: &[&[&str]]) -> Vec<Vec<String>> {
+    rows.iter().map(|r| names(r)).collect()
+}
+
+fn read(lines: &[&str], rows: &[&[&str]], fields: &[&str]) -> crate::form::Labelled {
+    crate::form::labelled(&names(lines), &cells(rows), &names(fields))
+}
+
+fn value(read: &crate::form::Labelled, f: &str) -> Option<String> {
+    crate::form::from_source(f, read).map(str::to_owned)
+}
+
+/// PR-Daemon #2095 B1: 「label | 值 | label | 值」 rows are not a header over
+/// the next row; B1b: a header row with one template field is not read
+/// sideways (姓名 ≠ 性别).
+#[test]
+fn label_value_rows_are_not_headers_and_a_header_is_never_read_sideways() {
+    let r = read(
+        &[],
+        &[
+            &["姓名", "陈晓明", "性别", "男"],
+            &["部门", "产品研发部", "职位", "工程师"],
+        ],
+        &["姓名", "性别"],
+    );
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"), "{r:?}");
+    assert_eq!(value(&r, "性别").as_deref(), Some("男"));
+    // Values under 「label | 值」 cells are not read down either.
+    let r = read(
+        &[],
+        &[
+            &["姓名", "陈晓明", "性别", "男"],
+            &["研发", "产品研发部", "高级", "工程师"],
+        ],
+        &["姓名", "性别"],
+    );
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"), "{r:?}");
+    // A label to the right is never a value, with no row below too.
+    let r = read(&[], &[&["姓名", "性别", "年龄"]], &["姓名"]);
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    let r = read(
+        &[],
+        &[&["姓名", "性别", "年龄"], &["陈晓明", "男", "30"]],
+        &["姓名", "电话"],
+    );
+    assert_ne!(value(&r, "姓名").as_deref(), Some("性别"), "{r:?}");
+    // A real header still reads by column.
+    let r = read(
+        &[],
+        &[&["姓名", "联系电话"], &["陈晓明", "13800000000"]],
+        &["姓名", "联系电话"],
+    );
+    assert_eq!(value(&r, "联系电话").as_deref(), Some("13800000000"));
+}
+
+/// PR-Daemon #2095 B2: a label with two different values gives none, and is
+/// named ambiguous (the user's and a family member's, 甲方 and 乙方).
+#[test]
+fn a_label_with_two_values_is_ambiguous_and_gives_none() {
+    let r = read(&["姓名：张三", "姓名：李四"], &[], &["姓名"]);
+    assert_eq!(value(&r, "姓名"), None);
+    assert_eq!(r.ambiguous, ["姓名"]);
+    let r = read(
+        &[
+            "甲方",
+            "姓名：张三",
+            "电话：13800000001",
+            "乙方",
+            "姓名：李四",
+            "电话：13800000002",
+        ],
+        &[],
+        &["姓名", "电话"],
+    );
+    assert_eq!(
+        (value(&r, "姓名"), value(&r, "电话")),
+        (None, None),
+        "{r:?}"
+    );
+    let r = read(
+        &["姓名：陈晓明"],
+        &[&["姓名", "关系", "电话"], &["李四", "父亲", "139"]],
+        &["姓名", "电话"],
+    );
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    // The same value twice is one value.
+    let r = read(&["姓名：陈晓明"], &[&["姓名", "陈晓明"]], &["姓名"]);
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
+}
+
+/// PR-Daemon #2095 M1: a value is cut only where the next template field
+/// starts; another colon in it (not a time's) gives none.
+#[test]
+fn a_value_is_cut_only_at_the_next_field_and_an_odd_colon_gives_none() {
+    let r = read(
+        &["住址：北京市海淀区 中关村大街1号（备注:近地铁）"],
+        &[],
+        &["住址"],
+    );
+    assert_eq!(value(&r, "住址"), None, "{r:?}");
+    let r = read(&["时间：9:30"], &[], &["时间"]);
+    assert_eq!(value(&r, "时间").as_deref(), Some("9:30"));
+    let r = read(&["姓名：陈晓明 性别 男"], &[], &["姓名", "性别"]);
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    let r = read(&["姓名： 性别：男"], &[], &["姓名", "性别"]);
+    assert_eq!(
+        (value(&r, "姓名"), value(&r, "性别").as_deref()),
+        (None, Some("男"))
+    );
+    let r = read(&["地址：北京市 朝阳区 1号"], &[], &["地址"]);
+    assert_eq!(value(&r, "地址").as_deref(), Some("北京市 朝阳区 1号"));
+}
+
+/// PR-Daemon #2095 M2: only the template's fields are read.
+#[test]
+fn only_the_template_s_fields_are_read() {
+    let lines: Vec<String> = (0..5000).map(|i| format!("k{i}：v{i}")).collect();
+    let r = crate::form::labelled(&lines, &[], &names(&["姓名"]));
+    assert!(r.values.is_empty() && r.ambiguous.is_empty());
+}
+
+/// PR-Daemon #2095 M3: a blank to fill in is not a value.
+#[test]
+fn a_blank_to_fill_in_is_not_a_value() {
+    for line in [
+        "姓名：________",
+        "姓名：（请填写）",
+        "姓名：□",
+        "姓名：……",
+        "姓名：＿＿",
+    ] {
+        assert_eq!(
+            value(&read(&[line], &[], &["姓名"]), "姓名"),
+            None,
+            "{line}"
+        );
+    }
+    let r = read(&[], &[&["姓名", "____"]], &["姓名"]);
+    assert_eq!(value(&r, "姓名"), None);
+}
+
+/// PR-Daemon #2095 L3: material that cannot be read says so.
+#[tokio::test]
+async fn material_that_cannot_be_read_says_so() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "入职登记表模板.docx",
+        &docx(&["姓名：{{姓名}}"]),
+    )
+    .await;
+    let storage = state.storage().await.unwrap();
+    let bytes = b"not a document";
+    let sha = storage.blobs.put_bytes(bytes).unwrap().sha256;
+    exec(
+        &state,
+        &format!(
+            "INSERT INTO documents (id, title, media_type, head_revision)
+                    VALUES ('{SRC}', '资料.zip', 'application/zip', 1);
+             INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                    VALUES ('{SRC}', 1, '{sha}', {n}, 'application/zip', 'import');",
+            n = bytes.len()
+        ),
+    )
+    .await;
+    let listed = payload(
+        &call(
+            &state,
+            "fields",
+            json!({ "document_id": TPL, "source_document_id": SRC }),
+        )
+        .await,
+    );
+    let note = listed["note"].as_str().unwrap();
+    assert!(note.starts_with("没能读到资料"), "{note}");
+    assert!(listed["fields"][0].get("from_source").is_none());
 }
