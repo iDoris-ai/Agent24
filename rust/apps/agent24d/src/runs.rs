@@ -407,6 +407,7 @@ const DOCUMENT_READS: &[&str] = &[
     "get",
     "paragraphs",
     "compare",
+    "preflight",
     "fields",
     "read_range",
     "find",

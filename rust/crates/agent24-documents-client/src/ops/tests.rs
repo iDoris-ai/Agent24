@@ -679,7 +679,11 @@ fn paragraphs_and_patch_map_to_their_routes_and_refuse_what_the_service_would() 
 
 #[test]
 fn fields_fill_and_content_map_to_their_routes_and_refuse_what_the_service_would() {
-    for (op, tail) in [("fields", "fields"), ("content", "content")] {
+    for (op, tail) in [
+        ("fields", "fields"),
+        ("content", "content"),
+        ("preflight", "preflight"),
+    ] {
         assert_eq!(
             route_of(&json!({"op": op, "documentId": DOC})),
             Some((
@@ -705,6 +709,38 @@ fn fields_fill_and_content_map_to_their_routes_and_refuse_what_the_service_would
         json!({"op": "fill", "documentId": DOC, "values": {"": "x"}}),
         json!({"op": "fill", "documentId": "x", "values": {"a": "b"}}),
         json!({"op": "content", "documentId": "nope"}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
+
+/// L8-S02 (PR-Daemon #2100, 监工 裁决 C): the approval box's read of what a
+/// fill with a material takes from it.
+#[test]
+fn fill_preview_posts_the_fill_s_material_and_words() {
+    const SRC: &str = "doc_01K74Z3QJ8V5N2W9RTX6Y00092";
+    let r = route(&json!({
+        "op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC,
+        "values": {"姓名": "陈晓明"}, "userSaid": ["姓名"],
+    }))
+    .unwrap();
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(
+        r.path,
+        format!("/api/v1/documents/documents/{DOC}/fill/preview")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"source_document_id": SRC, "values": {"姓名": "陈晓明"}, "user_said": ["姓名"]})
+    );
+    assert!(
+        route(&json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC})).is_some()
+    );
+    for bad in [
+        json!({"op": "fillPreview", "documentId": DOC}),
+        json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": "x"}),
+        json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC, "values": {"a": 3}}),
+        json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC, "userSaid": [""]}),
     ] {
         assert!(route(&bad).is_none(), "{bad}");
     }
@@ -814,6 +850,43 @@ fn compare_maps_to_its_route_and_checks_both_sides() {
         json!({"op": "compare", "left": {"documentId": "x"}, "right": {"documentId": DOC}}),
         json!({"op": "compare", "left": {"documentId": DOC, "revision": 0}, "right": {"documentId": DOC}}),
         json!({"op": "compare", "left": {"documentId": DOC}, "right": {"documentId": DOC}, "limit": 0}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn deliver_receipt_and_receipts_map_to_their_routes_and_refuse_what_the_service_would() {
+    const COPY: &str = "doc_01HZX5W3K9Q8R7T6Y5V4A3S2R9";
+    let d = route(&json!({"op": "deliver", "documentId": DOC, "expectRevision": 2})).unwrap();
+    assert_eq!(d.method, Method::Post);
+    assert_eq!(
+        d.path,
+        format!("/api/v1/documents/documents/{DOC}/deliveries")
+    );
+    let r = route(&json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": COPY, "savedTo": "/Users/u/Desktop/合同.pdf"})).unwrap();
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(
+        r.path,
+        format!("/api/v1/documents/documents/{DOC}/receipts")
+    );
+    assert_eq!(
+        route_of(&json!({"op": "receipts", "documentId": DOC})),
+        Some((
+            Method::Get,
+            format!("/api/v1/documents/documents/{DOC}/receipts")
+        ))
+    );
+    assert_eq!(
+        route_of(&json!({"op": "receipts"})),
+        Some((Method::Get, "/api/v1/documents/receipts".to_owned()))
+    );
+    for bad in [
+        json!({"op": "deliver", "documentId": DOC}),
+        json!({"op": "deliver", "documentId": DOC, "expectRevision": 0}),
+        json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": COPY, "savedTo": "Desktop/a.pdf"}),
+        json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": "x", "savedTo": "/a.pdf"}),
+        json!({"op": "receipts", "documentId": "x"}),
     ] {
         assert!(route(&bad).is_none(), "{bad}");
     }

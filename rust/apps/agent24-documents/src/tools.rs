@@ -222,7 +222,9 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         named_by_title(state, scope, op, &mut arguments).await?;
         admit(state, scope, op, &arguments).await?;
         if op == "compare" {
-            admit_other(state, scope, &arguments).await?;
+            admit_named(state, scope, &arguments, "other_document_id").await?;
+        } else if op == "fill" || op == "fields" {
+            admit_named(state, scope, &arguments, "source_document_id").await?;
         }
         match op {
             "extract" => extract(state, run, accepted, claim_holds, arguments).await,
@@ -235,10 +237,11 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "compose" => compose(state, arguments).await,
             "paragraphs" => paragraphs(state, arguments).await,
             "patch" => patch(state, run, arguments).await,
-            "fields" => fields(state, arguments).await,
-            "fill" => fill(state, run, arguments).await,
+            "fields" => fields(state, accepted, arguments).await,
+            "fill" => fill(state, run, accepted, arguments).await,
             "delete" => delete(state, run, arguments).await,
             "compare" => compare(state, accepted, arguments).await,
+            "preflight" => preflight(state, arguments).await,
             _ => Err(Envelope::error(OPERATION_UNAVAILABLE, false)),
         }
     };
@@ -806,24 +809,142 @@ async fn patch(state: &AppState, run: Run, arguments: Map<String, Value>) -> Out
 }
 
 /// D5a: a template's `{{fields}}` (read).
-async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
-    let (id, rest) = split_document(arguments)?;
+/// L8-S02 round 2: with `source_document_id`, each field the user's material
+/// states by label (「姓名：陈晓明」) carries that value as `from_source`, for
+/// the model to pass to `fill` as it is: the App reads the material, not the
+/// model (监工 11-26 真机: an 8B model reported it backwards).
+async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Value>) -> Outcome {
+    let (id, mut rest) = split_document(arguments)?;
+    let source_id = match rest.remove("source_document_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s),
+        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
+    };
     if !rest.is_empty() {
         return Err(Envelope::error(INVALID_INPUT, false));
     }
     let storage = ready(state).await?;
-    completed(crate::patch::fields_of(&storage, id).await)
+    let listed = crate::patch::fields_of(&storage, id.clone())
+        .await
+        .map_err(|e| refused(&e))?;
+    let Some(source_id) = source_id.filter(|s| *s != id) else {
+        return completed(Ok(listed));
+    };
+    if !is_id(IdKind::Document, &source_id) {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    let names: Vec<String> = listed.fields.iter().map(|f| f.name.clone()).collect();
+    let (read, unread) = match load_material(
+        state,
+        &storage,
+        &source_id,
+        Requester::Tool(accepted.clone()),
+        names,
+    )
+    .await
+    .map_err(|e| refused(&e))?
+    {
+        Material::Text(read) => (read, false),
+        Material::Absent => (crate::form::Labelled::default(), true),
+    };
+    let mut payload = serde_json::to_value(&listed)
+        .map_err(|_| refused(&ApiError::internal("cannot serialize")))?;
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut identity = Vec::new();
+    if let Some(Value::Array(fields)) = payload.get_mut("fields") {
+        for f in fields.iter_mut() {
+            let Some(name) = f.get("name").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            // PR-Daemon #2095 r10, 监工 方案 B: no identity value comes
+            // from the material. Whose a name or a phone in it is cannot be
+            // told for sure (another person's block hides in many ways),
+            // and a wrong one would come with the App's authority: it is
+            // asked, always. Its label is still read, for the layout and
+            // for a second person's sign.
+            // R0 一致裁决 (监工 11-26): and only an allowlisted safe text
+            // field comes from the material; any other spelling is asked.
+            if !crate::form::from_material(&name) {
+                if crate::form::field_kind(&name) != crate::form::FieldKind::Manual {
+                    identity.push(name);
+                }
+                continue;
+            }
+            match crate::form::from_source(&name, &read) {
+                Some(v) => {
+                    f["from_source"] = json!(v);
+                    found.push(format!("{name}={v}"));
+                }
+                None if read.ambiguous.contains(&name) => ambiguous.push(name),
+                None if crate::form::field_kind(&name) != crate::form::FieldKind::Manual => {
+                    missing.push(name);
+                }
+                None => {}
+            }
+        }
+    }
+    let mut note = String::new();
+    // PR-Daemon #2095 L3: not read is not 「nothing matched」.
+    if unread {
+        note.push_str("没能读到资料的文字（格式不支持或解析失败），资料里的值都要问用户。");
+    } else if read.layout_unknown {
+        note.push_str(
+            "资料版式无法确定是本人信息，请直接告诉我：资料里的值都要问用户，不要从资料里取。",
+        );
+    } else if !found.is_empty() {
+        note.push_str(&format!(
+            "资料里对上的值：{}。调用 documents.fill 时把这些值原样放进 values，并带上同一个 source_document_id。",
+            found.join("，")
+        ));
+    } else {
+        note.push_str("资料里没有对上任何字段。");
+    }
+    if !ambiguous.is_empty() {
+        note.push_str(&format!(
+            "资料里有多处、读法不确定，要问用户：{}。",
+            ambiguous.join("、")
+        ));
+    }
+    if !missing.is_empty() && !unread && !read.layout_unknown {
+        note.push_str(&format!(
+            "资料里没有：{}。用户说先空着的，values 里给空字符串。",
+            missing.join("、")
+        ));
+    }
+    if !identity.is_empty() {
+        note.push_str(&format!(
+            "这些字段不从资料取，要问用户：{}。用户亲口给的值放进 values，字段名放进 user_said；不要自己编，也不要从资料里抄。",
+            identity.join("、")
+        ));
+    }
+    payload["source_document_id"] = json!(source_id);
+    payload["note"] = json!(note);
+    completed(Ok(payload))
 }
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
 /// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
-async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outcome {
+/// L8-S02: an identity value is written only when the user said it (`user_said`).
+async fn fill(
+    state: &AppState,
+    run: Run,
+    accepted: Accepted,
+    arguments: Map<String, Value>,
+) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
     rest.remove("title");
     let save_to: AgentSaveTo = match rest.remove("save_to") {
         Some(v) => serde_json::from_value(v).map_err(|_| Envelope::error(INVALID_INPUT, false))?,
         None => AgentSaveTo::NewDocument,
     };
+    let source_id = match rest.remove("source_document_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s),
+        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
+    };
+    let user_said = spoken(rest.remove("user_said"))?;
     let mut body = Value::Object(rest);
     let storage = ready(state).await?;
     if save_to == AgentSaveTo::Original {
@@ -834,25 +955,312 @@ async fn fill(state: &AppState, run: Run, arguments: Map<String, Value>) -> Outc
             .head_revision;
         save_fields(&mut body, save_to, head);
     }
-    let req: crate::patch::FillRequest =
+    let mut req: crate::patch::FillRequest =
         serde_json::from_value(body).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
-    match crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
+    let listed = crate::patch::fields_of(&storage, id.clone())
         .await
-        .map_err(|e| refused(&e))?
+        .map_err(|e| refused(&e))?;
+    let fields: Vec<_> = listed
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.kind))
+        .collect();
+    // The material resolves and is scope-checked (admit_named): no identity
+    // value is taken from it (r11 B2, 方案 B).
+    let mut material = None;
+    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id) {
+        if !is_id(IdKind::Document, source_id) {
+            return Err(refused(&ApiError::not_found("no such document")));
+        }
+        // 监工 0.7.123 真机: an allowlisted field the values leave out comes
+        // from the material, read by the App as `fields` reads it (an 8B
+        // model knew 部门 and 入职日期 and still did not pass them); only when
+        // the material is plainly the user's own (PR-Daemon #2100).
+        let (used, taken) = material_fill(
+            state,
+            &storage,
+            &fields,
+            source_id,
+            &req.values,
+            &user_said,
+            Requester::Tool(accepted.clone()),
+        )
+        .await
+        .map_err(|e| refused(&e))?;
+        req.values.extend(taken);
+        material = Some(used);
+    }
+    let mut report = crate::form::plan_fill(
+        &fields,
+        &req.values,
+        &user_said,
+        material.map(|m| m == MaterialUse::Plain),
+    );
+    if material == Some(MaterialUse::NotWord) {
+        report
+            .note
+            .insert_str(0, "这份资料不是 Word，部门等请直接告诉我。");
+    }
+    // Nothing left that may be written: do not import an unchanged copy.
+    if report.write.is_empty() && !req.values.is_empty() {
+        return completed(Ok(json!({
+            "written": false,
+            "filled": report.filled,
+            "ask_user": report.ask_user,
+            "manual": report.manual,
+            "unfilled": report.unfilled,
+            "note": report.note,
+        })));
+    }
+    req.values.clone_from(&report.write);
+    let saved = crate::patch::fill_run(&storage, id.clone(), req, &Origin::Run(run.clone()))
+        .await
+        .map_err(|e| refused(&e))?;
+    // PR-Daemon #2092 B2: written only when a document was made (or is being
+    // made) or a version was saved; a failed import is not written.
+    let (mut payload, written) = match saved {
+        crate::patch::Saved::Document(job) => {
+            let payload = settled(&storage, job).await;
+            let made = made_document(&payload);
+            (payload, made)
+        }
+        crate::patch::Saved::Revision(c) => match saved_version(state, &run.run_id, &id, &c)? {
+            Envelope::Completed { payload, .. } => (payload, c.committed),
+            error => return Ok(error),
+        },
+    };
+    stamp_fill(&mut payload, &report, written);
+    completed(Ok(payload))
+}
+
+/// `user_said`: at most 200 field names, each 1 to 64 characters.
+fn spoken(value: Option<Value>) -> Result<Vec<String>, Envelope> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let names: Vec<String> =
+        serde_json::from_value(value).map_err(|_| Envelope::error(INVALID_INPUT, false))?;
+    if names.len() > 200 || names.iter().any(|n| !(1..=64).contains(&n.chars().count())) {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    Ok(names)
+}
+
+enum Material {
+    /// The values the material states by label.
+    Text(crate::form::Labelled),
+    /// The file could not be read: treat every value as absent.
+    Absent,
+}
+
+async fn load_material(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    id: &str,
+    requester: Requester,
+    // The template's fields, to read the material's labelled values for.
+    names: Vec<String>,
+) -> Result<Material, ApiError> {
+    let detail = documents::get(storage, id).await?;
+    if detail.head.media_type != crate::office::DOCX {
+        // A PDF or an image: its text layer, read as a DOCX's lines are.
+        let read = async {
+            let r = crate::read::revision(storage, id, detail.document.head_revision).await?;
+            crate::read::current_layer(state, storage, &r, requester).await
+        };
+        return Ok(match read.await {
+            Ok((_, layer)) => {
+                let lines: Vec<String> = layer.blocks.iter().map(|b| b.text.clone()).collect();
+                Material::Text(crate::form::labelled(&lines, &[], &names))
+            }
+            Err(_) => Material::Absent,
+        });
+    }
+    match crate::patch::head_bytes(
+        storage,
+        id,
+        &[crate::office::DOCX],
+        "only a Word document can be read as material",
+    )
+    .await
     {
-        crate::patch::Saved::Document(job) => completed::<Value>(Ok(settled(&storage, job).await)),
-        crate::patch::Saved::Revision(c) => saved_version(state, &run.run_id, &id, &c),
+        Ok((_, _, _, bytes)) => {
+            let parsed = crate::state::blocking(move || {
+                Ok::<_, crate::docx_patch::PatchError>(crate::form::labelled_blocks(
+                    &crate::docx_patch::blocks(&bytes)?,
+                    &names,
+                ))
+            })
+            .await;
+            Ok(match parsed {
+                Ok(read) => Material::Text(read),
+                Err(_) => Material::Absent,
+            })
+        }
+        // Unreadable material is "not in the document", not a failed fill.
+        Err(e) if e.code() == "unsupported_format" || e.code() == "payload_too_large" => {
+            Ok(Material::Absent)
+        }
+        Err(e) => Err(e),
     }
 }
 
-/// `compare`'s second document is in the scope too, or the call reads as
-/// naming a document that is not here (K1-06a §2.4).
-async fn admit_other(
+/// What [`material_fill`] made of the material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterialUse {
+    /// Not a Word document: nothing is taken (PR-Daemon #2100 r6 G1: a PDF's
+    /// text layer may be built between the box's preview and the fill).
+    NotWord,
+    /// A Word document that could not be read: nothing is taken.
+    Unread,
+    /// Read, but not plainly the user's own: nothing is taken.
+    NotPlain,
+    /// Plainly the user's own.
+    Plain,
+}
+
+/// PR-Daemon #2100 r5, 监工 裁决 C: what a fill with `source_id` takes from
+/// the material, shared by the fill tool and the approval box's preview
+/// (`POST …/fill/preview`), so the box shows exactly what is written:
+/// whether the material is plainly the user's own (`plainly_users`), and
+/// the allowlisted fields the values leave out (in any spelling) with the
+/// material's value for each. Only a Word material, read the same way at
+/// both (r6 G1); anything else: nothing.
+pub(crate) async fn material_fill(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    fields: &[(String, crate::form::FieldKind)],
+    source_id: &str,
+    values: &std::collections::BTreeMap<String, String>,
+    user_said: &[String],
+    requester: Requester,
+) -> Result<(MaterialUse, Vec<(String, String)>), ApiError> {
+    if documents::get(storage, source_id).await?.head.media_type != crate::office::DOCX {
+        return Ok((MaterialUse::NotWord, Vec::new()));
+    }
+    let names = fields.iter().map(|(n, _)| n.clone()).collect();
+    let Material::Text(read) = load_material(state, storage, source_id, requester, names).await?
+    else {
+        return Ok((MaterialUse::Unread, Vec::new()));
+    };
+    if !crate::form::plainly_users(&read, values, user_said) {
+        return Ok((MaterialUse::NotPlain, Vec::new()));
+    }
+    // PR-Daemon #2100 B2: a field the values name in any spelling is the model's.
+    let given: std::collections::HashSet<String> =
+        values.keys().map(|k| crate::form::safe_key(k)).collect();
+    let taken = fields
+        .iter()
+        .map(|(n, _)| n)
+        .filter(|n| crate::form::from_material(n) && !given.contains(&crate::form::safe_key(n)))
+        .filter_map(|n| crate::form::from_source(n, &read).map(|v| (n.clone(), v.to_owned())))
+        .collect();
+    Ok((MaterialUse::Plain, taken))
+}
+
+/// The approval box's preview of a fill with a material (read): the values
+/// [`material_fill`] would add, each with the material's title.
+pub async fn fill_preview(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    path: Result<axum::extract::Path<String>, axum::extract::rejection::PathRejection>,
+    body: Result<axum::Json<FillPreview>, axum::extract::rejection::JsonRejection>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let axum::extract::Path(id) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    let axum::Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    if !is_id(IdKind::Document, &id) || !is_id(IdKind::Document, &req.source_document_id) {
+        return Err(ApiError::not_found("no such document"));
+    }
+    let storage = state
+        .storage()
+        .await
+        .map_err(ApiError::storage_unavailable)?;
+    let listed = crate::patch::fields_of(&storage, id.clone()).await?;
+    let fields: Vec<_> = listed
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.kind))
+        .collect();
+    let source = documents::get(&storage, &req.source_document_id).await?;
+    let (used, taken) = if req.source_document_id == id {
+        (MaterialUse::NotPlain, Vec::new())
+    } else {
+        material_fill(
+            &state,
+            &storage,
+            &fields,
+            &req.source_document_id,
+            &req.values,
+            &req.user_said,
+            Requester::Page,
+        )
+        .await?
+    };
+    Ok(axum::Json(json!({
+        "source_title": source.document.title,
+        "plainly_users": used == MaterialUse::Plain,
+        "material_word": used != MaterialUse::NotWord,
+        "material_read": used != MaterialUse::Unread,
+        "from_material": taken
+            .into_iter()
+            .map(|(field, value)| json!({ "field": field, "value": value }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillPreview {
+    source_document_id: String,
+    #[serde(default)]
+    values: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    user_said: Vec<String>,
+}
+
+/// The import job `settled` answered with made a document, or is making one.
+fn made_document(job: &Value) -> bool {
+    matches!(
+        job.get("status").and_then(Value::as_str),
+        Some("succeeded" | "queued" | "running")
+    )
+}
+
+/// The fill report, on top of the import's own answer. The import's note
+/// stays, so the model is still told not to call the tool again.
+fn stamp_fill(payload: &mut Value, report: &crate::form::FillReport, written: bool) {
+    let Some(map) = payload.as_object_mut() else {
+        return;
+    };
+    // Nothing written: nothing is said to be filled.
+    let filled: &[String] = if written { &report.filled } else { &[] };
+    let own = if written {
+        report.note.clone()
+    } else {
+        crate::form::fill_note(filled, &report.ask_user, &report.manual, &report.unfilled)
+    };
+    map.insert("written".to_owned(), json!(written));
+    map.insert("filled".to_owned(), json!(filled));
+    map.insert("ask_user".to_owned(), json!(report.ask_user));
+    map.insert("manual".to_owned(), json!(report.manual));
+    map.insert("unfilled".to_owned(), json!(report.unfilled));
+    let note = match map.get("note").and_then(Value::as_str) {
+        Some(prev) if !prev.is_empty() && written => format!("{own}{prev}"),
+        Some(prev) if !prev.is_empty() => format!("{prev}{own}"),
+        _ => own,
+    };
+    map.insert("note".to_owned(), Value::String(note));
+}
+
+/// A second document named by the call (`compare`'s other, `fill`'s material)
+/// is in the scope too, or the call reads as naming a document that is not
+/// here (K1-06a §2.4).
+async fn admit_named(
     state: &AppState,
     scope: &Scope,
     arguments: &Map<String, Value>,
+    key: &str,
 ) -> Result<(), Envelope> {
-    let id = match arguments.get("other_document_id") {
+    let id = match arguments.get(key) {
         None => return Ok(()),
         Some(Value::String(id)) => id,
         Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
@@ -874,6 +1282,20 @@ async fn compare(state: &AppState, by: Accepted, arguments: Map<String, Value>) 
     let args: crate::compare::tool::Args = parse(arguments)?;
     let storage = ready(state).await?;
     completed(crate::compare::tool::call(state, &storage, args, Requester::Tool(by)).await)
+}
+
+/// L8 DOC-4: what the document still carries before it is sent (read).
+async fn preflight(state: &AppState, arguments: Map<String, Value>) -> Outcome {
+    let (id, rest) = split_document(arguments)?;
+    if !rest.is_empty() {
+        return Err(Envelope::error(INVALID_INPUT, false));
+    }
+    let storage = ready(state).await?;
+    completed(
+        crate::preflight::preflight_of(&storage, id)
+            .await
+            .map(crate::preflight::for_the_model),
+    )
 }
 
 async fn job_get(state: &AppState, arguments: Map<String, Value>) -> Outcome {
@@ -1025,7 +1447,7 @@ enum Resource {
 fn resource(op: &str) -> Option<Resource> {
     match op {
         "get" | "read_range" | "find" | "extract" | "paragraphs" | "patch" | "fields" | "fill"
-        | "delete" | "compare" => Some(Resource::Document),
+        | "delete" | "compare" | "preflight" => Some(Resource::Document),
         "job_get" => Some(Resource::Job),
         "extraction_get" => Some(Resource::Extraction),
         "list" => Some(Resource::Listing),
@@ -1048,7 +1470,12 @@ async fn named_by_title(
     arguments: &mut Map<String, Value>,
 ) -> Result<(), Envelope> {
     let mut slots: Vec<&mut Value> = match op {
-        "get" | "paragraphs" | "patch" | "fields" | "fill" => {
+        "fill" | "fields" => arguments
+            .iter_mut()
+            .filter(|(k, _)| *k == "document_id" || *k == "source_document_id")
+            .map(|(_, v)| v)
+            .collect(),
+        "get" | "paragraphs" | "patch" | "preflight" => {
             arguments.get_mut("document_id").into_iter().collect()
         }
         // L6-S05: both documents may be named by title.
@@ -1336,6 +1763,8 @@ mod tests {
     mod compare;
     mod extract;
     mod extraction;
+    mod fill;
+    mod preflight;
     mod read;
     mod scope;
 
@@ -2203,8 +2632,7 @@ mod tests {
         );
         assert_eq!(answer["source_document_id"], a);
         assert!(answer["message"].as_str().unwrap().contains("第 2 版"));
-        let fill =
-            json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" } });
+        let fill = json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" }, "user_said": ["押金"] });
         let filled = payload(&call_in(&state, "fill", &[b], fill).await);
         assert_eq!(
             (&filled["saved_as"], &filled["revision"]),
@@ -2378,7 +2806,8 @@ mod tests {
             ),
         )
         .await;
-        let args = json!({ "document_id": id, "values": { "出租方": "明远" }, "title": "房屋租赁合同-李四" });
+        // 出租方 is identity (L8-S02): the user said it.
+        let args = json!({ "document_id": id, "values": { "出租方": "明远" }, "user_said": ["出租方"], "title": "房屋租赁合同-李四" });
         let body = call_in(&state, "fill", &[id], args).await;
         assert_eq!(
             payload(&body)["kind"],

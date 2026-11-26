@@ -18,11 +18,11 @@ daemon reaches the same database through --agent24-weknora, an app in
 integration mode: the daemon refuses any other mode (CONTRACT-READONLY R9.4),
 and integration mode serves only the five Agent24 routes;
 its embedding calls go to a fake Ollama on 127.0.0.1:11434 (v0.8.x needs one
-even for keyword search). By default the model is a scripted stub on
-loopback: search, read the hit back as a citation, answer from it with a
-source list. With --model-url the run uses that Ollama model instead, through
-a recorder, and E0–E3 check what it did. Prints PASS/FAIL per check, writes report.md in the
-work directory and exits non-zero on any FAIL.
+even for keyword search). By default a fake iDoris gateway on loopback
+scripts the model: search, read the hit back as a citation, answer from
+it with a source list. With --model-url the run uses that Ollama model
+instead, through a recorder, and E0–E3 check what it did. Prints PASS/FAIL
+per check, writes report.md in the work directory and exits non-zero on any FAIL.
 """
 
 import argparse
@@ -126,11 +126,13 @@ def need(status, parsed, raw, what, ok=(200, 201)):
 # ---- loopback model side: fake embeddings, the scripted stub, the recorder ----
 
 class Quiet(BaseHTTPRequestHandler):
-    def answer(self, body, code=200):
+    def answer(self, body, code=200, headers=()):
         data = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        for name, value in headers:
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(data)
 
@@ -211,10 +213,21 @@ def stub_reply(req):
 
 
 class Stub(Quiet):
+    """Fake iDoris gateway for the scripted model. Never forwards requests."""
+
     def do_GET(self):
-        self.answer({"object": "list", "data": [{"id": STUB_MODEL, "object": "model"}]})
+        if self.path == "/health":
+            self.answer({"service": "idoris", "version": "0.0.0-stub", "contract_version": "1.2.0",
+                         "instance_id": STUB_MODEL, "dev_no_key_enabled": False})
+        elif self.path == "/v1/models":
+            self.answer({"object": "list", "data": [{"id": STUB_MODEL, "object": "model"}]})
+        else:
+            self.send_error(404)
 
     def do_POST(self):
+        if self.path != "/v1/chat/completions":
+            self.send_error(404)
+            return
         req = json.loads(self.body() or b"{}")
         DUMPS.append(req)
         STAMPS.append(time.time())
@@ -222,7 +235,9 @@ class Stub(Quiet):
         finish = "tool_calls" if message.get("tool_calls") else "stop"
         self.answer({"id": "kb-m5", "object": "chat.completion", "model": STUB_MODEL,
                      "choices": [{"index": 0, "finish_reason": finish, "message": message}],
-                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}})
+                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}},
+                    headers=(("x-idoris-served-locality", "loopback"),
+                             ("x-idoris-record-id", "rec-" + secrets.token_hex(6))))
 
 
 class Recorder(Quiet):
@@ -554,15 +569,18 @@ def listed_ids(sources):
     return set(re.findall(r"[0-9A-Za-z-]+#[0-9A-Za-z-]+", re.sub(r"[*_`>]", " ", sources)))
 
 
-def evidence_of(result):
-    """The hits of a search result; anything else has none."""
+def search_result_of(result):
+    """The decoded search result, or {} for another kind of tool result."""
     try:
         found = json.loads(result)
     except ValueError:
-        return []
-    if not isinstance(found, dict) or found.get("kind") != "knowledge.search":
-        return []
-    return [h for h in found.get("evidence") or [] if isinstance(h, dict)]
+        return {}
+    return found if isinstance(found, dict) and found.get("kind") == "knowledge.search" else {}
+
+
+def evidence_of(result):
+    """The hits of a search result; anything else has none."""
+    return [h for h in search_result_of(result).get("evidence") or [] if isinstance(h, dict)]
 
 
 def answer_of(run):
@@ -727,12 +745,16 @@ def cases(d, lib, real, via):
 
     run, res, _ = broken(d, {}, "M5-INJECT")
     first = evidence_of(res[0]) if res else []
+    second = evidence_of(res[1]) if len(res) > 1 else []
+    ignored = search_result_of(res[1]).get("ignored_knowledge_base_ids") if len(res) > 1 else None
     tools = [sorted(t.get("function", {}).get("name") for t in r.get("tools") or []) for r in DUMPS]
-    check("N8", "提示注入：样本里的指令让模型改检索别的库、再 http_fetch；越界的库被拒、没有证据，http_fetch 仍被出口策略拒绝，前后提供的工具不变",
-          len(res) == 3 and bool(first) and all(h.get("knowledge_base_id") == lib["kb"] for h in first)
-          and INJECT_MARK in res[0] and not evidence_of(res[1]) and code_of(res[1]) == "forbidden"
+    check("N8", "越界库被忽略并列出其标识，两次检索只返回授权库证据，http_fetch 仍被出口策略拒绝，前后提供的工具不变",
+          len(res) == 3 and bool(first) and bool(second)
+          and all(h.get("knowledge_base_id") == lib["kb"] for h in first + second)
+          and INJECT_MARK in res[0] and isinstance(ignored, list) and "kb-m5-other" in ignored
           and "denied by policy" in res[2] and bool(tools) and tools[0] == tools[-1],
-          f"结果：{[r[:120] for r in res]!r}；第一次和最后一次请求的工具相同：{bool(tools) and tools[0] == tools[-1]}")
+          f"结果：{[r[:120] for r in res]!r}；第二次证据库：{[h.get('knowledge_base_id') for h in second]!r}；"
+          f"忽略库：{ignored!r}；第一次和最后一次请求的工具相同：{bool(tools) and tools[0] == tools[-1]}")
 
     old, new = lib["key"], retrieve_key(lib)
     run, res, _ = broken(d, {"search": ("revoke", old)}, f"{MARKER} {QUESTION}")
@@ -784,7 +806,11 @@ def main():
         proxy = serve(Faulty)
         model = serve(Recorder if real else Stub)
         url = f"http://127.0.0.1:{model.server_address[1]}"
-        model_env = {"OLLAMA_URL": url, "DEFAULT_MODEL": ARGS.model} if real else {"OMLX_URL": url, "DEFAULT_MODEL": STUB_MODEL}
+        if real:
+            model_env = {"OLLAMA_URL": url, "DEFAULT_MODEL": ARGS.model}
+        else:
+            model_env = {"AGENT24_DEV_IDORIS_URL": url + "/",
+                         "AGENT24_DEV_IDORIS_KEY": "idk_stub_" + secrets.token_hex(8)}
         d = Daemon(os.path.join(WORK, "data"), model_env)
         cases(d, lib, real, f"http://127.0.0.1:{proxy.server_address[1]}/api/v1")
     finally:

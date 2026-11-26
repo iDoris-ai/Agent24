@@ -20,6 +20,12 @@ export interface DocumentLookups {
   detail: (id: string) => Promise<{ title: string; pages: number | null; importedAt: string } | null>
   /** L6-F5: a document's current version, for the one a save makes. */
   head?: (id: string) => Promise<number | null>
+  /** L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
+   * material takes from it, by the module's own rule; null when the preview
+   * failed, `read: false` when the module could not read the Word material
+   * (PR-Daemon #2100 r6 G1). */
+  fillPreview?: (template: string, source: string, values: Record<string, string>, userSaid: string[]) =>
+    Promise<{ sourceTitle: string; values: Array<[string, string]>; read?: boolean } | null>
 }
 
 export type ApprovalDialog =
@@ -33,13 +39,13 @@ const EXCERPT = 60
 
 const TOOL_KEYS: Record<string, MainMessageKey> = {
   'documents.list': 'approval.tool.list', 'documents.get': 'approval.tool.get',
-  'documents.paragraphs': 'approval.tool.paragraphs', 'documents.fields': 'approval.tool.fields', 'documents.compare': 'approval.tool.compare',
+  'documents.paragraphs': 'approval.tool.paragraphs', 'documents.fields': 'approval.tool.fields', 'documents.compare': 'approval.tool.compare', 'documents.preflight': 'approval.tool.preflight',
   shell_exec: 'approval.tool.exec', fs_write: 'approval.tool.write', http_fetch: 'approval.tool.fetch',
 }
 
 /** UI polish 10 (General 0.6.96): read-only documents tools: nothing to show
  *  past the document they read, and they change nothing. */
-const READ_ONLY = new Set(['documents.list', 'documents.get', 'documents.paragraphs', 'documents.fields', 'documents.compare'])
+const READ_ONLY = new Set(['documents.list', 'documents.get', 'documents.paragraphs', 'documents.fields', 'documents.compare', 'documents.preflight'])
 
 /** PR-Daemon #2006 B1: text the model controls never makes a line of its
  *  own in the box. Line breaks, other control characters and the characters
@@ -96,7 +102,7 @@ const str = (v: unknown): string => (typeof v === 'string' ? v : '')
  *  Anything else the module looks up by title, so the box does too. */
 const isDocId = (ref: string): boolean => /^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(ref)
 /** The tools whose `document_id` the module looks up by title (`named_by_title`). */
-const NAMED_BY_TITLE = new Set(['documents.get', 'documents.paragraphs', 'documents.patch', 'documents.fields', 'documents.fill', 'documents.compose', 'documents.compare'])
+const NAMED_BY_TITLE = new Set(['documents.get', 'documents.paragraphs', 'documents.patch', 'documents.fields', 'documents.fill', 'documents.compose', 'documents.compare', 'documents.preflight'])
 
 /** The library's documents from a `documents list` answer, or null when it
  *  is not the whole library (PR-Daemon #2006 N1): the module matches a name
@@ -227,6 +233,27 @@ export async function approvalDialog(
       ? Object.entries(args['values'] as Record<string, unknown>).map(([k, v]) => `${k}=${str(v)}`).join('，')
       : ''
     lines.push(say('approval.fill.values', { values: clip(values, 300) }))
+    // 监工 裁决 C (PR-Daemon #2100): each value the fill takes from the user's
+    // material, on its own line with the material, as the module's preview
+    // (the fill's own rule) says; none when the material is not plainly the
+    // user's; said so when it cannot be read before the fill.
+    const ref = str(args['source_document_id'])
+    if (ref) {
+      const source = await docOf(ref, lookups)
+      const given = args['values'] && typeof args['values'] === 'object'
+        ? Object.fromEntries(Object.entries(args['values'] as Record<string, unknown>).map(([k, v]) => [k, str(v)]))
+        : {}
+      const said = Array.isArray(args['user_said']) ? (args['user_said'] as unknown[]).map(str) : []
+      const preview = source.id && named.id && lookups.fillPreview
+        ? await lookups.fillPreview(named.id, source.id, given, said).catch(() => null)
+        : null
+      if (!preview || preview.read === false) lines.push(say('approval.fill.fromSourceUnread', { doc: source.title }))
+      else {
+        for (const [field, value] of preview.values) {
+          lines.push(say('approval.fill.fromSource', { field: clip(field, 64), value: clip(value, 200), doc: preview.sourceTitle || source.title }))
+        }
+      }
+    }
     if (original) lines.push(mt('approval.fill.original', { v: await nextVersion(named.id, lookups) }), mt('approval.versionsKept'))
     else lines.push(mt('approval.unchanged'))
   } else if (tool === 'documents.compose' && Array.isArray(args['parts'])) {

@@ -1,4 +1,6 @@
 import { SAVE_HINT, asksSaveToOriginal } from './doc-version'
+import type { RunDocuments } from './DocumentsOutcome'
+import type { DocumentRef } from './doc-context'
 
 // D2b（轻量版）: in a conversation about a document (F1, doc-context.ts), a
 // plain sentence asks to split pages out of it or to merge it with another
@@ -173,9 +175,26 @@ export function asksDeleteParagraph(text: string, inDocument: boolean): boolean 
     DELETE_PART.test(clause) && !NOT_DELETE.test(clause) && !PART_NEGATED.test(clause) && !PART_QUESTION.test(clause))
 }
 
+/** L8-S02: 「把这张入职登记表填一下」「这张表能填吗？」「按《模板》填写」: a verb of
+ * filling, about a form (表, a template) or a document. */
+const FILL_VERB = /填写|填好|填入|填上|填一下|填了|填完|填表|能填|可以填|能不能填/
+const FORM_NOUN = /表|模板|《[^》]{1,200}》/
+
+/** Whether a turn asks to fill a form, or whether one can be. */
+export function asksFillForm(text: string, inDocument: boolean): boolean {
+  return FILL_VERB.test(text) && (inDocument || FORM_NOUN.test(text))
+}
+
+/** L8-S02: the answers to what a fill asked (「电话是 139…」「紧急联系人先空着」)
+ * belong to it: a form turn among the last three before this one (`before`:
+ * the earlier user turns, oldest first). */
+export function continuesFormFill(before: readonly string[], text: string, inDocument = false): boolean {
+  return text.trim() !== '' && before.slice(-3).some((t) => asksFillForm(t, inDocument))
+}
+
 /** Whether a turn goes to the Agent with the documents tools. */
 export function wantsDocTool(text: string, inDocument: boolean): boolean {
-  if (DOC_TOOL_WORDS.test(text) || asksDeleteDocument(text, inDocument) || asksDeleteParagraph(text, inDocument)) return true
+  if (DOC_TOOL_WORDS.test(text) || asksFillForm(text, inDocument) || asksDeleteDocument(text, inDocument) || asksDeleteParagraph(text, inDocument)) return true
   return aboutDocument(text, inDocument) && !asksTranslation(text, inDocument) && DOC_EDIT_WORDS.test(text)
 }
 
@@ -188,14 +207,84 @@ const PARAGRAPH_HINT = '（删掉文档里的某一段是改写，用 documents.
 const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说的那一份；document_id 必须是 doc_ 开头的 id，不要自己编，也不要向用户要：当前对话的文档直接用它的 document_id，'
   + '「上一份」「刚才拆出来的」先用 documents.list 按导入时间找，按文件名先用 documents.get 查；同名的有多份时把候选列给用户选，不要自己挑；删一次就结束。删掉文档里的某一段、某一句是改写，不是删除文档。）'
 
-export function docAgentPrompt(doc: { id: string; title: string } | null, text: string): string {
+/** L8-S02 (David 11-26, 方案 A): only on a form turn, or an answer to one. */
+export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）模板。用户给了资料文档时，每次调用 documents.fill 之前先调用 documents.fields，带 source_document_id=资料文档；不用自己读资料：字段里的 from_source 就是资料里对上的值（只有部门、岗位、入职日期、学历这类岗位字段），原样放进 documents.fill 的 values。'
+  + '其余字段（包括 kind 为 identity 的姓名、证件号、电话、地址、银行卡、联系人、甲乙方等）一律不从资料里取，即使资料里看得到也要逐项问用户，不要自己编；用户亲口给的值放进 values，字段名放进 user_said；用户说先空着的，values 里给空字符串；kind 为 manual 的（签名、照片、勾选框、附件）不要填，告诉用户需要手工处理。'
+  + '带资料时，资料里的岗位字段要等用户亲口说了姓名（放进 user_said）、并且和资料里的姓名一致才会写入；问齐了或用户说先空着、确认生成时，必须调用 documents.fill，带同一个 source_document_id；没有调用成功就不要说已生成或已保存。填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
+  + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
+
+/** PR-Daemon #2100 r4 E1/E3 (监工): a clause (split at 「，。；,;!?！？」 and line
+ * breaks) names the material only when the whole of it is one of these, with
+ * nothing before or after: no list of words of no to keep up. */
+const CLAUSE = /[，。；,;!?！？\n]/
+const SHAPES = [
+  /^(?:请|我的|这个)?资料(?:在|是|就在)《([^》]{1,200})》(?:里|中)?$/,
+  /^(?:请)?用《([^》]{1,200})》(?:里|中)的资料(?:来)?(?:填(?:表|写)?)?$/,
+]
+/** r4 E2: a turn with any of these names no earlier material either. Not a
+ * word of no (监工: 「没有其他了，…直接生成吧」 is the turn a fill is confirmed in;
+ * a material it takes back unnamed has the Rust check behind it). */
+const TAKE_BACK = /资料|那份|这份|上份|《|》/
+/** Another clause about a material (「这份别用」「改用…的资料」). */
+const OTHER_MATERIAL = /资料|那份|这份|上份/
+
+/** The material a turn names, or null: exactly one clause in one of the
+ * shapes, and no other clause about a material. */
+function namedMaterial(t: string): string | null {
+  const clauses = t.split(CLAUSE).map((c) => c.trim()).filter((c) => c !== '')
+  let title: string | null = null
+  for (const c of clauses) {
+    const m = SHAPES.map((s) => s.exec(c)).find((x) => x !== null)
+    if (m) {
+      if (title !== null) return null
+      title = m[1]!.trim()
+    } else if (OTHER_MATERIAL.test(c)) return null
+  }
+  return title
+}
+
+/** 监工 0.7.123 真机: the material a form fill was told, as a title; null when
+ * none. This turn first; an earlier one (the last three, newest first) only
+ * when this turn says nothing of a material or of no (宁可不认). */
+export function formMaterial(before: readonly string[], text: string): string | null {
+  const here = namedMaterial(text)
+  if (here !== null) return here
+  if (TAKE_BACK.test(text)) return null
+  for (const t of before.slice(-3).reverse()) {
+    const m = namedMaterial(t)
+    if (m !== null) return m
+  }
+  return null
+}
+
+/** The material by its id, so the model need not find it (it called fields
+ * without it and left the material's values out of fill). */
+export function materialHint(doc: DocumentRef): string {
+  return `（这次的资料文档是《${doc.title}》，source_document_id=${doc.id}：调用 documents.fields 和 documents.fill 时都带上它。）`
+}
+
+/** 「已生成」「已保存为…」「填好了」: an answer that says a document was made or saved. */
+const CLAIMS_MADE = /已(?:经)?(?:为(?:你|您))?(?:生成|保存|填好|填写完|创建|做好)|(?:生成|填|做)好了|生成了|保存(?:为|到|在|了)|文档已/
+
+/** L8-S02 真机 0.7.122 (监工): a form turn's answer said 「已生成…，已保存为…」
+ * while the run called only documents.fields. Said by the page from the run's
+ * record, never the model's words: no write in a form turn whose answer
+ * claims one reads as 「这次没有改动文档」. Any other turn, or a run that did
+ * write, keeps what it had. */
+export function formClaimUnbacked(prompt: string, answer: string, documents: RunDocuments | null | undefined): RunDocuments | null | undefined {
+  if (documents || !prompt.includes(FORM_HINT) || !CLAIMS_MADE.test(answer)) return documents ?? null
+  return { attempted: true, jobs: [], failed: [] }
+}
+
+/** `form`: the turn fills a form, or answers what one asked (Chat.tsx, `continuesFormFill`). */
+export function docAgentPrompt(doc: { id: string; title: string } | null, text: string, form = asksFillForm(text, doc !== null), material = ''): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
-    + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
+    + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息，这些字段名都放进 user_said；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
   // L6-F5: only a turn the App judged to save into the original says so.
   const save = asksSaveToOriginal(text) ? SAVE_HINT : ''
-  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}\n${text}`
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}${form ? FORM_HINT + material : ''}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(

@@ -4332,6 +4332,7 @@ const DOC_TOOLS: &[&str] = &[
     "documents.list",
     "documents.paragraphs",
     "documents.patch",
+    "documents.preflight",
     "documents.read_range",
 ];
 
