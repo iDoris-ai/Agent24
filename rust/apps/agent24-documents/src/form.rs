@@ -182,6 +182,18 @@ pub(crate) fn plainly_users(
     }
     // r3 D4: a name field of the user's own (姓名, 员工姓名, 申请人姓名…),
     // compared by the same field in the material and in what was said.
+    // r5 F4: the material's own name fields all one name, or it is not one
+    // person's record (姓名：王小明, 员工姓名：李四).
+    let mut names = read
+        .values
+        .iter()
+        .filter(|(k, _)| own_name_field(k))
+        .map(|(_, v)| safe_key(v));
+    if let Some(first) = names.next()
+        && names.any(|n| n != first)
+    {
+        return false;
+    }
     // r4 E4: every one of them the user said, not any one.
     let said: Vec<&String> = user_said.iter().filter(|n| own_name_field(n)).collect();
     !said.is_empty()

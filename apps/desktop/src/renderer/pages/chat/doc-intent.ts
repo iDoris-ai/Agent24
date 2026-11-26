@@ -218,8 +218,8 @@ export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）
  * nothing before or after: no list of words of no to keep up. */
 const CLAUSE = /[，。；,;!?！？\n]/
 const SHAPES = [
-  /^(?:请|我的|这个)?资料(?:在|是)《([^》]{1,200})》(?:里|中)?$/,
-  /^用《([^》]{1,200})》(?:里|中)的资料(?:来)?(?:填)?$/,
+  /^(?:请|我的|这个)?资料(?:在|是|就在)《([^》]{1,200})》(?:里|中)?$/,
+  /^(?:请)?用《([^》]{1,200})》(?:里|中)的资料(?:来)?(?:填(?:表|写)?)?$/,
 ]
 /** r4 E2: a turn with any of these names no earlier material either. Not a
  * word of no (监工: 「没有其他了，…直接生成吧」 is the turn a fill is confirmed in;

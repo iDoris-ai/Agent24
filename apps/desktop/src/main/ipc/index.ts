@@ -531,6 +531,18 @@ const approvalDocumentLookups: DocumentLookups = {
     const head = (data as { head_revision?: unknown } | null)?.head_revision
     return typeof head === 'number' && head >= 1 ? head : null
   }),
+  fillPreview: (template, source, values, userSaid) => readDocument(
+    { op: 'fillPreview', documentId: template, sourceDocumentId: source, values, userSaid },
+    (data) => {
+      const d = data as { source_title?: unknown; from_material?: unknown } | null
+      if (!d || !Array.isArray(d.from_material)) return null
+      return {
+        sourceTitle: typeof d.source_title === 'string' ? d.source_title : '',
+        values: d.from_material.flatMap((v: { field?: unknown; value?: unknown }) =>
+          typeof v?.field === 'string' && typeof v.value === 'string' ? [[v.field, v.value] as [string, string]] : []),
+      }
+    },
+  ),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs
     if (!Array.isArray(list)) return null

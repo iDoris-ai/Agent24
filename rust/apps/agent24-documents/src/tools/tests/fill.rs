@@ -1922,3 +1922,110 @@ async fn every_name_the_user_said_must_be_the_materials() {
         "{answer}"
     );
 }
+
+async fn preview(state: &AppState, body: Value) -> (u16, Value) {
+    use tower::ServiceExt;
+    let req = axum::http::Request::post(format!("/documents/{TPL}/fill/preview"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let res = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = res.status().as_u16();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// 监工 裁决 C (PR-Daemon #2100 r5): the approval box lists, field by field,
+/// what the App adds from the material; the preview is the fill's own rule,
+/// so what it lists is what the fill writes, and nothing when the material
+/// is not plainly the user's.
+#[tokio::test]
+async fn the_preview_lists_what_the_fill_takes_from_the_material() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "入职日期：{{入职日期}}",
+        "岗位：{{岗位}}",
+    ]);
+    put_docx(&state, TPL, "入职登记表模板.docx", &template).await;
+    put_docx(
+        &state,
+        SRC,
+        "个人信息.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：陈晓明",
+            "部门：产品研发部",
+            "入职日期：2026年12月1日",
+            "岗位：工程师",
+        ]),
+    )
+    .await;
+    let ask = |name: &str| {
+        json!({
+            "source_document_id": SRC,
+            "values": { "姓名": name, "岗位": "" },
+            "user_said": ["姓名"],
+        })
+    };
+    let (status, shown) = preview(&state, ask("陈晓明")).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["source_title"], "个人信息.docx");
+    assert_eq!(
+        shown["from_material"],
+        json!([{ "field": "部门", "value": "产品研发部" }, { "field": "入职日期", "value": "2026年12月1日" }]),
+        "{shown}"
+    );
+    // The fill writes exactly those.
+    let mut args = ask("陈晓明");
+    args["document_id"] = json!(TPL);
+    let answer = payload(&call(&state, "fill", args).await);
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    for v in shown["from_material"].as_array().unwrap() {
+        assert!(text.contains(v["value"].as_str().unwrap()), "{text}");
+    }
+    assert!(text.contains("{{岗位}}"), "{text}");
+    // Not the user's: nothing listed, nothing taken.
+    let (_, shown) = preview(&state, ask("王小明")).await;
+    assert_eq!(shown["from_material"], json!([]), "{shown}");
+    assert_eq!(shown["plainly_users"], false);
+}
+
+/// PR-Daemon #2100 r5 F4: two name fields of the user's own with different
+/// values in the material: not one person's record.
+#[tokio::test]
+async fn two_different_own_names_in_the_material_are_not_plainly_the_users() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["{{姓名}}{{员工姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["姓名：王小明", "员工姓名：李四", "部门：财务部"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL, "source_document_id": SRC,
+                "values": { "姓名": "王小明" }, "user_said": ["姓名"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+}

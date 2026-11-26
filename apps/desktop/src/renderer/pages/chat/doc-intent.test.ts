@@ -499,6 +499,9 @@ describe('监工 0.7.123: the material a form fill was told', () => {
     expect(formMaterial([], '资料是《莫小明.docx》')).toBe('莫小明.docx')
     expect(formMaterial([], '资料在《个人信息.docx》里，部门没有的先空着')).toBe('个人信息.docx')
     expect(formMaterial([], '把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
+    // r5 F3: two more affirmative forms.
+    expect(formMaterial([], '请用《个人信息.docx》里的资料来填表')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料就在《个人信息.docx》里')).toBe('个人信息.docx')
   })
 
   it('goes into the prompt by its id, for fields and fill', () => {

@@ -52,13 +52,26 @@ describe('approvalDialog (UI polish 01)', () => {
     const SRC = 'doc_01M8035XWKZJGGD3NHF3X0HJ0J'
     const look = lookups('入职登记表模板.docx', null)
     look.title = vi.fn(async (id: string) => (id === SRC ? '个人信息.docx' : '入职登记表模板.docx'))
-    const out = await box({ summary: 'documents.fill: …', payload: { document_id: DOC, source_document_id: SRC, values: { 姓名: '陈晓明' } } },
-      'approve', '批准', undefined, look, clip)
-    expect(out.detail).toContain('填写：姓名=陈晓明')
-    expect(out.detail).toContain('没给的部门、岗位、入职日期、学历这类岗位字段，从《个人信息.docx》里写明的值补上。')
+    // 监工 裁决 C: each value the fill takes from the material, on its own line,
+    // as the module's own preview says (the fill's rule), with the material.
+    look.fillPreview = vi.fn(async () => ({ sourceTitle: '个人信息.docx', values: [['部门', '产品研发部'], ['入职日期', '2026年12月1日']] as Array<[string, string]> }))
+    const payload = { document_id: DOC, source_document_id: SRC, values: { 姓名: '陈晓明' }, user_said: ['姓名'] }
+    const out = await box({ summary: 'documents.fill: …', payload }, 'approve', '批准', undefined, look, clip)
+    expect(look.fillPreview).toHaveBeenCalledWith(DOC, SRC, { 姓名: '陈晓明' }, ['姓名'])
+    expect(out.detail.split('\n')).toEqual(expect.arrayContaining([
+      '填写：姓名=陈晓明', '部门 = 产品研发部（来自《个人信息.docx》）', '入职日期 = 2026年12月1日（来自《个人信息.docx》）']))
+    expect(out.detail).not.toContain('这类岗位字段')
+    // Not plainly the user's: nothing is taken, no line.
+    look.fillPreview = vi.fn(async () => ({ sourceTitle: '个人信息.docx', values: [] as Array<[string, string]> }))
+    const none = await box({ summary: 'documents.fill: …', payload }, 'approve', '批准', undefined, look, clip)
+    expect(none.detail).not.toContain('来自《')
+    // Unread: said so, never left blank.
+    look.fillPreview = vi.fn(async () => null)
+    const unread = await box({ summary: 'documents.fill: …', payload }, 'approve', '批准', undefined, look, clip)
+    expect(unread.detail).toContain('没能预先读到')
     const plain = await box({ summary: 'documents.fill: …', payload: { document_id: DOC, values: { 姓名: '陈晓明' } } },
       'approve', '批准', undefined, look, clip)
-    expect(plain.detail).not.toContain('补上')
+    expect(plain.detail).not.toContain('来自《')
   })
 
   // L6-F2: the delete box names one document: title, pages, import time; a

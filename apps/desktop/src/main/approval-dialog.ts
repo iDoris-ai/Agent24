@@ -20,6 +20,10 @@ export interface DocumentLookups {
   detail: (id: string) => Promise<{ title: string; pages: number | null; importedAt: string } | null>
   /** L6-F5: a document's current version, for the one a save makes. */
   head?: (id: string) => Promise<number | null>
+  /** L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
+   * material takes from it, by the module's own rule; null when unread. */
+  fillPreview?: (template: string, source: string, values: Record<string, string>, userSaid: string[]) =>
+    Promise<{ sourceTitle: string; values: Array<[string, string]> } | null>
 }
 
 export type ApprovalDialog =
@@ -227,9 +231,27 @@ export async function approvalDialog(
       ? Object.entries(args['values'] as Record<string, unknown>).map(([k, v]) => `${k}=${str(v)}`).join('，')
       : ''
     lines.push(say('approval.fill.values', { values: clip(values, 300) }))
-    // 监工 0.7.123: the job fields the values leave out come from the material.
-    const source = str(args['source_document_id'])
-    if (source) lines.push(say('approval.fill.fromSource', { doc: await titleOf(source, lookups) }))
+    // 监工 裁决 C (PR-Daemon #2100): each value the fill takes from the user's
+    // material, on its own line with the material, as the module's preview
+    // (the fill's own rule) says; none when the material is not plainly the
+    // user's; said so when it cannot be read before the fill.
+    const ref = str(args['source_document_id'])
+    if (ref) {
+      const source = await docOf(ref, lookups)
+      const given = args['values'] && typeof args['values'] === 'object'
+        ? Object.fromEntries(Object.entries(args['values'] as Record<string, unknown>).map(([k, v]) => [k, str(v)]))
+        : {}
+      const said = Array.isArray(args['user_said']) ? (args['user_said'] as unknown[]).map(str) : []
+      const preview = source.id && named.id && lookups.fillPreview
+        ? await lookups.fillPreview(named.id, source.id, given, said).catch(() => null)
+        : null
+      if (!preview) lines.push(say('approval.fill.fromSourceUnread', { doc: source.title }))
+      else {
+        for (const [field, value] of preview.values) {
+          lines.push(say('approval.fill.fromSource', { field: clip(field, 64), value: clip(value, 200), doc: preview.sourceTitle || source.title }))
+        }
+      }
+    }
     if (original) lines.push(mt('approval.fill.original', { v: await nextVersion(named.id, lookups) }), mt('approval.versionsKept'))
     else lines.push(mt('approval.unchanged'))
   } else if (tool === 'documents.compose' && Array.isArray(args['parts'])) {
