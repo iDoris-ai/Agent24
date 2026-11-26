@@ -172,7 +172,7 @@ export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): st
   }
   switch (r.code) {
     case 'local_only_unavailable':
-      return '目前只提供放在服务器上的知识库，只在本机的版本还没有，这次没有开通。'
+      return '对话里只能开通服务器上的知识库；要用本机知识库，请到“设置 → 知识库”选「本机知识库（精简版）」。这次没有开通。'
     case 'already_bound':
       return ALREADY_BOUND
     case 'not_activated':

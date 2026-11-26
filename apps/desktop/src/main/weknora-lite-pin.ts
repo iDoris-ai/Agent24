@@ -39,14 +39,14 @@ export interface WeknoraLitePin {
 // built 11-26 on the mini, signed manifest verified with verify-lite-headless.sh.
 // To be re-pinned after the L9-2 hardening PR merges.
 export const WEKNORA_LITE_PIN: WeknoraLitePin = {
-  sourceSha: '1733cee20169b3228045ee65fdfd628dd473b556',
+  sourceSha: 'e47a6821214915b704426d8779e37a8b60c32d20',
   version: '0.9.0',
   os: 'darwin',
   arch: 'arm64',
-  archive: 'WeKnora-lite-headless_0.9.0_1733cee20169_darwin_arm64.tar.gz',
-  archiveSha256: '3b1ee04bd01221139aabf10c343aeddd136f28d5f9db43b97287bef4f4a53854',
-  archiveSize: 82_272_526,
-  binarySha256: 'ec012b021f34ed7bfa0b875600f341347752aecede49b4366623577b2458d6a5',
+  archive: 'WeKnora-lite-headless_0.9.0_e47a68212149_darwin_arm64.tar.gz',
+  archiveSha256: '2b72ee284dbc1762a1de09ba7ef0a1cf702810d792ae947e94503bac8ff68a25',
+  archiveSize: 82_280_558,
+  binarySha256: 'a0794eca730832109362225a57de81b79824487923d3667e8a184b3b01e83b88',
   license: 'Tencent is pleased to support the open source community by making  WeKnora available.',
   licenseSha256: '5935f49975d7daf97857d7053b6fe45500a3b2ec31cc92a42a89a5fd98a86cea',
   noticesSha256: 'f5e311909a349f76d3776423036a29245f73052c1cf72f614dc6479ecc43b05a',

@@ -234,7 +234,7 @@ describe('resultReply', () => {
   })
 
   it.each([
-    ['local_only_unavailable', '目前只提供放在服务器上的知识库，只在本机的版本还没有，这次没有开通。'],
+    ['local_only_unavailable', '对话里只能开通服务器上的知识库；要用本机知识库，请到“设置 → 知识库”选「本机知识库（精简版）」。这次没有开通。'],
     ['already_bound', BOUND],
     ['not_activated', '这台电脑还没有激活知识库服务，暂时不能开通，请先完成激活。'],
     ['activation_invalid', '这台电脑上的激活信息无效，开通不了，请联系提供激活的人重新激活。'],
