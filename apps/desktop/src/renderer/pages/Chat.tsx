@@ -466,9 +466,9 @@ export default function ChatPage() {
     // An answer turn that itself asks for another documents operation (「把《X》删了」)
     // is that operation, not the form's (Codex L9-1b C1).
     // A title is never the operation (0.7.125: the answer 「《入职登记表模板.docx》」
-    // has 模板 in it): judged with each 《…》 as 《》.
+    // has 模板 in it): judged with each 《…》 as 《_》, still a named document.
     const asksForm = asksFillForm(text, doc !== null)
-    const otherOp = wantsDocTool(text.replace(/《[^》]{1,200}》/g, '《》'), doc !== null)
+    const otherOp = wantsDocTool(text.replace(/《[^》]{1,200}》/g, '《_》'), doc !== null)
     if (form && chosen === null && (asksForm || !otherOp) && window.agent24.documents) {
       requestInFlight.current = true
       setLoading(true)
