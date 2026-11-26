@@ -50,6 +50,17 @@ export default function KnowledgeCitationCard({ found, bound: given, names: give
     })()
     return () => { live = false }
   }, [given])
+  // The source may have changed since this card was shown (the chat page stays
+  // mounted): asked again on the click, and a local one has no page to open.
+  const openPage = async () => {
+    let s: Awaited<ReturnType<typeof window.agent24.knowledge.status>> | null = null
+    try { s = (await window.agent24.knowledge?.status()) ?? null } catch { /* open as before */ }
+    if (s?.source === 'local') {
+      setLocal(true)
+      return
+    }
+    open('knowledgeBase', 'other')
+  }
   if (!found || found.length === 0) return null
   const lines = citationLines(found, bound, givenNames ?? loadKbNames(), t('library'), t('plain'))
   const text = (l: CitationLine) => `${l.library} · ${l.title === '' ? t('untitled') : `《${l.title}》`} · ${t('place', { n: String(l.place) })}`
@@ -64,7 +75,7 @@ export default function KnowledgeCitationCard({ found, bound: given, names: give
       <div>{t('title')}</div>
       <ul>{lines.map((l, i) => <li key={i}>{text(l)}</li>)}</ul>
       <div>{t('note')}</div>
-      {!local && <button type="button" className="btn btn-ghost" onClick={() => open('knowledgeBase', 'other')}>{t('open')}</button>}
+      {!local && <button type="button" className="btn btn-ghost" onClick={() => void openPage()}>{t('open')}</button>}
       <button type="button" className="btn btn-ghost" onClick={() => void copy()}>{copied ? t('copied') : t('copy')}</button>
     </div>
   )

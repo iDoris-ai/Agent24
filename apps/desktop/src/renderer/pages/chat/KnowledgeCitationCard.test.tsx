@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from 'vitest'
-import { fireEvent, render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import KnowledgeCitationCard, { citationLines } from './KnowledgeCitationCard'
 import { CapabilitiesContext } from '../../capabilities/types'
 import { setLocale } from '../../i18n'
@@ -25,7 +25,7 @@ describe('L7-K1: the citation card', () => {
     expect(screen.getByText('制度库 · 《差旅制度》 · 第 1 段命中')).toBeInTheDocument()
     expect(screen.getByText('项目库 · 《项目手册》 · 第 1 段命中')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '到知识页查看原文' }))
-    expect(open).toHaveBeenCalledWith('knowledgeBase', 'other')
+    await waitFor(() => expect(open).toHaveBeenCalledWith('knowledgeBase', 'other'))
     fireEvent.click(screen.getByRole('button', { name: '复制出处' }))
     expect(writeText).toHaveBeenCalledWith('出处（知识库 · 文档 · 位置）\n制度库 · 《差旅制度》 · 第 1 段命中\n项目库 · 《项目手册》 · 第 1 段命中')
     expect(await screen.findByRole('button', { name: '已复制' })).toBeInTheDocument()
@@ -36,6 +36,22 @@ describe('L7-K1: the citation card', () => {
     render(<KnowledgeCitationCard found={[hit('kb-secret', 'd1', '甲')]} bound={['kb-a']} names={{ 'kb-secret': '不该显示' }} />)
     expect(screen.getByText('知识库 · 《甲》 · 第 1 段命中')).toBeInTheDocument()
     expect(screen.queryByText(/kb-secret|不该显示/)).toBeNull()
+  })
+
+  it('Loop 9 3c: a card shown before a switch to the local Lite does not open a page it has not got', async () => {
+    setLocale('zh')
+    const open = vi.fn()
+    const status = vi.fn().mockResolvedValue({ source: 'remote', knowledgeBaseIds: ['kb-a'], activeKnowledgeBaseIds: ['kb-a'] })
+    Object.defineProperty(window, 'agent24', { value: { knowledge: { status } }, writable: true, configurable: true })
+    render(<CapabilitiesContext.Provider value={{ defs: [], open }}>
+      <KnowledgeCitationCard found={[hit('kb-a', 'd1', '请假制度')]} />
+    </CapabilitiesContext.Provider>)
+    const button = await screen.findByRole('button', { name: '到知识页查看原文' })
+    status.mockResolvedValue({ source: 'local', knowledgeBaseIds: ['kb-a'], activeKnowledgeBaseIds: ['kb-local'] })
+    fireEvent.click(button)
+    await waitFor(() => expect(screen.queryByRole('button', { name: '到知识页查看原文' })).toBeNull())
+    expect(open).not.toHaveBeenCalled()
+    expect(screen.getByRole('button', { name: '复制出处' })).toBeInTheDocument()
   })
 
   it('renders nothing without hits', () => {
