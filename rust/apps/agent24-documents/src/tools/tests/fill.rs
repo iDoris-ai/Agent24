@@ -921,10 +921,180 @@ fn paragraphs_and_tables_share_one_reading_state() {
         ],
         &f,
     );
+    // r5 (监工): a material that does not open with the user's own fields
+    // is not read at all, whatever comes later.
     assert_eq!(
-        (value(&r, "姓名").as_deref(), value(&r, "电话")),
-        (Some("陈晓明"), None)
+        (value(&r, "姓名"), value(&r, "电话")),
+        (None, None),
+        "{r:?}"
     );
+    assert!(r.layout_unknown);
     let r = read(&["姓名：（陈晓明）"], &[], &["姓名"]);
     assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
+}
+
+/// r5 (监工, after PR-Daemon #2095 round 5): only the run of field blocks
+/// opening the material is read. B1: a heading that is not exactly the
+/// user's own (「共同申请人」「本人前雇主」) and nothing is read.
+#[test]
+fn a_heading_not_exactly_the_user_s_own_reads_nothing() {
+    use crate::form::Block::{Line, Row};
+    let f = names(&["姓名", "电话"]);
+    for title in [
+        "共同申请人",
+        "第二申请人",
+        "申请人（二）",
+        "申请人兄弟姐妹",
+        "申请人同事",
+        "申请人室友",
+        "本人亲友",
+        "申请人同行人员",
+        "本人及同住人",
+        "本人前雇主",
+        "个人信息（代填人）",
+        "兄弟姐妹",
+        "共同借款人",
+    ] {
+        let r = crate::form::labelled_blocks(
+            &[
+                Row(names(&[title])),
+                Row(names(&["姓名", "李四"])),
+                Row(names(&["电话", "139"])),
+            ],
+            &f,
+        );
+        assert!(
+            r.values.is_empty() && r.layout_unknown,
+            "table {title}: {r:?}"
+        );
+        let r = crate::form::labelled_blocks(
+            &[
+                Line(title.into()),
+                Line("姓名：李四".into()),
+                Line("电话：139".into()),
+            ],
+            &f,
+        );
+        assert!(
+            r.values.is_empty() && r.layout_unknown,
+            "lines {title}: {r:?}"
+        );
+    }
+    for title in [
+        "个人信息",
+        "个人基本信息",
+        "本人资料",
+        "基本情况",
+        "申请人信息",
+        "入职登记表",
+        "员工信息",
+        "简历",
+    ] {
+        let r =
+            crate::form::labelled_blocks(&[Line(title.into()), Line("姓名：陈晓明".into())], &f);
+        assert_eq!(
+            value(&r, "姓名").as_deref(),
+            Some("陈晓明"),
+            "{title}: {r:?}"
+        );
+    }
+}
+
+/// r5 B2: however a heading of someone else looks (a colon, a 「（选填）」
+/// cell, a sentence), it ends the reading; a heading between fields too.
+#[test]
+fn whatever_follows_the_opening_fields_ends_the_reading() {
+    use crate::form::Block::{Line, Row};
+    let f = names(&["姓名", "电话"]);
+    let cases: Vec<Vec<crate::form::Block>> = vec![
+        vec![
+            Line("紧急联系人：".into()),
+            Line("姓名：李四".into()),
+            Line("电话：139".into()),
+        ],
+        vec![
+            Row(names(&["紧急联系人", "（选填）"])),
+            Row(names(&["姓名", "李四"])),
+            Row(names(&["电话", "139"])),
+        ],
+        vec![
+            Line("紧急联系人（请填写亲属或朋友的姓名及电话以便联络）".into()),
+            Line("姓名：李四".into()),
+        ],
+        vec![
+            Line("如遇紧急情况，联系人信息".into()),
+            Line("姓名：李四".into()),
+        ],
+    ];
+    for blocks in &cases {
+        let r = crate::form::labelled_blocks(blocks, &f);
+        assert!(r.values.is_empty(), "{blocks:?}: {r:?}");
+    }
+    // The user's fields, then anything that is no field block: the rest is not read.
+    for between in [
+        "紧急联系人",
+        "紧急联系人：",
+        "毕业于北京大学",
+        "联系人（选填）",
+    ] {
+        let r = crate::form::labelled_blocks(
+            &[
+                Line("姓名：陈晓明".into()),
+                Line(between.into()),
+                Line("电话：139".into()),
+            ],
+            &f,
+        );
+        assert_eq!(
+            (value(&r, "姓名").as_deref(), value(&r, "电话")),
+            (Some("陈晓明"), None),
+            "{between}"
+        );
+    }
+    // Control: plain field paragraphs with no heading, and blank lines among them.
+    let r = crate::form::labelled_blocks(
+        &[
+            Line("".into()),
+            Line("姓名：陈晓明".into()),
+            Line("".into()),
+            Line("电话：13800000000".into()),
+        ],
+        &f,
+    );
+    assert_eq!(
+        (value(&r, "姓名").as_deref(), value(&r, "电话").as_deref()),
+        (Some("陈晓明"), Some("13800000000"))
+    );
+    assert!(!r.layout_unknown);
+}
+
+/// r5: `fields` says when the material's layout is not plainly the user's.
+#[tokio::test]
+async fn fields_say_when_the_material_is_not_plainly_the_user_s() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "入职登记表模板.docx",
+        &docx(&["姓名：{{姓名}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["紧急联系人", "姓名：李四"]),
+    )
+    .await;
+    let listed = payload(
+        &call(
+            &state,
+            "fields",
+            json!({ "document_id": TPL, "source_document_id": SRC }),
+        )
+        .await,
+    );
+    let note = listed["note"].as_str().unwrap();
+    assert!(note.starts_with("资料版式无法确定是本人信息"), "{note}");
+    assert!(listed["fields"][0].get("from_source").is_none());
 }

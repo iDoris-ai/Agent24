@@ -212,6 +212,10 @@ pub(crate) struct Labelled {
     pub(crate) values: BTreeMap<String, String>,
     /// Fields the material states more than one way: asked, never guessed.
     pub(crate) ambiguous: Vec<String>,
+    /// The material does not open with the user's own fields (a heading
+    /// that is not exactly the user's, or something else first): nothing is
+    /// read, and the user is asked to say them.
+    pub(crate) layout_unknown: bool,
 }
 
 /// Common labels of a form that are not values (a header cell 「年龄」).
@@ -254,64 +258,51 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
     labelled_blocks(&blocks, fields)
 }
 
-/// Words that say a heading is the user's own.
+/// What a heading before the user's fields may be, once its whitespace and
+/// a suffix 「信息」「资料」「情况」「表」「登记表」 are taken off: exactly one of these.
 const OWN_HEADINGS: &[&str] = &[
     "个人",
     "本人",
-    "基本信息",
+    "基本",
     "申请人",
-    "入职",
     "简历",
-    "员工信息",
-];
-/// Words that say a heading is someone else's, even with an own word in it
-/// (「申请人家庭成员」).
-const OTHERS: &[&str] = &[
-    "紧急",
-    "联系人",
-    "联络",
-    "配偶",
-    "家属",
-    "家庭",
-    "亲属",
-    "监护",
-    "推荐",
-    "介绍",
-    "担保",
-    "代理",
-    "证明人",
-    "父",
-    "母",
-    "子女",
-    "法定代表",
-    "委托",
+    "员工",
+    "入职",
+    "个人基本",
 ];
 
-/// A heading (a line or a one-cell row that is no field) is the user's own
-/// only when it says so: anything else heads someone else's details (fails
-/// closed, PR-Daemon #2095 round 4).
+/// The heading is exactly the user's own (「个人信息」「个人基本信息」「入职登记表」),
+/// never one with any other word (「共同申请人」「本人前雇主」).
 fn own_heading(t: &str) -> bool {
-    OWN_HEADINGS.iter().any(|w| t.contains(w)) && !OTHERS.iter().any(|w| t.contains(w))
+    let mut k: String = t.chars().filter(|c| !c.is_whitespace()).collect();
+    for suffix in ["登记表", "信息", "资料", "情况", "表"] {
+        if let Some(stem) = k.strip_suffix(suffix) {
+            k = stem.to_owned();
+        }
+    }
+    OWN_HEADINGS.contains(&k.as_str())
 }
 
-/// Only labels equal to one of `fields` (whitespace and a trailing colon
-/// aside) are read, by the most cautious rules (监工 11-26, PR-Daemon #2095
-/// rounds 3–4), so that someone else's details are never read as the user's:
-/// - Headings: a short line with no 「字段：」 and no colon, or a row of one
-///   filled cell that is no field. What follows a heading is read only if
-///   the heading is plainly the user's own (「个人信息」「基本信息」「申请人」);
-///   any other (「紧急联络人」「监护人」) closes it, in paragraphs and tables
-///   alike, until the next heading. Before the first heading, read.
-/// - A line: exactly one 「字段：」 in it, opening it (after leading space and a
-///   number 「1.」「（一）」); any other line is not read.
-/// - A table row: strictly 「字段 | 值 | 字段 | 值…」 from its first cell; any
-///   other cell and the row is not read. A row of fields only is a header,
-///   read down to the next row. A value that the next row could also give
-///   (F1) and differs is ambiguous.
-/// - A value with two or more spaces in a row, a tab or U+3000 is ambiguous;
-///   one with another colon (not a time's), another field's name, or a blank
-///   (「____」「□」「（请填写）」) is none; one in brackets loses them. A field
-///   found with two different values is ambiguous.
+/// L8-S02, the rule 监工 set after PR-Daemon #2095 round 5 (independent of
+/// any word list for others and of how a heading looks): **only the run of
+/// field blocks that opens the material is read.**
+/// 1. Empty blocks aside, at most one heading may come before the first
+///    field block, and it must be exactly the user's own ([`own_heading`]);
+///    anything else first and nothing is read (`layout_unknown`).
+/// 2. From the first field block on, field blocks are read; the first block
+///    that is not one ends the reading, whatever it is.
+///
+/// A field block: a line with exactly one 「字段：」 opening it (after leading
+/// space and a number 「1.」「（一）」); a table row strictly 「字段 | 值 | 字段 |
+/// 值…」 from its first cell; or a header row (every filled cell a field)
+/// with the row under it. Only labels equal to one of `fields` (whitespace
+/// and a trailing colon aside) count.
+///
+/// A value: with two or more spaces in a row, a tab or U+3000, ambiguous;
+/// with another colon (not a time's), another field's name, or a blank
+/// (「____」「□」「（请填写）」), none; in brackets, without them. A field with
+/// two different values, or a strict row's value that the row under it
+/// could give differently (F1), is ambiguous.
 pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
     let names: Vec<String> = fields
         .iter()
@@ -343,70 +334,90 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
             || field_kind(t) != FieldKind::Text
             || COMMON_LABELS.contains(&label_key(t).as_str())
     };
-    let mut open = true;
-    for (b, block) in blocks.iter().enumerate() {
+    let empty = |b: &Block| match b {
+        Block::Line(l) => l.trim().is_empty(),
+        Block::Row(r) => r.iter().all(|c| c.trim().is_empty()),
+    };
+    // The one 「字段：」 opening a line, if it is a field line.
+    let field_line = |line: &str| -> Option<(usize, String)> {
+        let marks = markers(line, &names);
+        let [(at, colon_end, name)] = marks.as_slice() else {
+            return None;
+        };
+        numbering_only(&line[..*at]).then(|| (*colon_end, name.clone()))
+    };
+    let header = |row: &[String]| {
+        let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
+        filled.len() >= 2 && filled.iter().all(|c| is_field(c))
+    };
+    let strict = |row: &[String]| {
+        is_field(&row[0])
+            && row.iter().enumerate().all(|(i, c)| {
+                if i % 2 == 0 {
+                    // A trailing blank cell (merged or unused) is allowed.
+                    is_field(c)
+                        || (c.trim().is_empty() && row[i..].iter().all(|c| c.trim().is_empty()))
+                } else {
+                    c.trim().is_empty() || !label_like(c)
+                }
+            })
+    };
+    let field_block = |b: &Block| match b {
+        Block::Line(l) => field_line(l).is_some(),
+        Block::Row(r) => !r.is_empty() && (header(r) || strict(r)),
+    };
+    let mut out = Labelled::default();
+    let mut at = blocks
+        .iter()
+        .position(|b| !empty(b))
+        .unwrap_or(blocks.len());
+    if at < blocks.len() && !field_block(&blocks[at]) {
+        let heading = match &blocks[at] {
+            Block::Line(l) => Some(l.as_str()),
+            Block::Row(r) => {
+                let filled: Vec<&String> = r.iter().filter(|c| !c.trim().is_empty()).collect();
+                (filled.len() == 1).then(|| filled[0].as_str())
+            }
+        };
+        if !heading.is_some_and(own_heading) {
+            out.layout_unknown = true;
+            return out;
+        }
+        at += 1;
+    }
+    while at < blocks.len() {
+        let block = &blocks[at];
+        at += 1;
+        if empty(block) {
+            continue;
+        }
+        if !field_block(block) {
+            break;
+        }
         match block {
             Block::Line(line) => {
-                let t = line.trim();
-                if t.is_empty() {
-                    continue;
+                if let Some((colon_end, name)) = field_line(line) {
+                    let value = line[colon_end..]
+                        .trim()
+                        .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
+                    put(&name, value);
                 }
-                let marks = markers(line, &names);
-                if marks.is_empty() {
-                    if heading_line(t) && !is_field(t) {
-                        open = own_heading(t);
-                    }
-                    continue;
-                }
-                if !open {
-                    continue;
-                }
-                let [(at, colon_end, name)] = marks.as_slice() else {
-                    continue;
-                };
-                if !numbering_only(&line[..*at]) {
-                    continue;
-                }
-                let value = line[*colon_end..]
-                    .trim()
-                    .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
-                put(name, value);
             }
             Block::Row(row) => {
-                let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
-                if filled.len() == 1 && !is_field(filled[0]) {
-                    open = own_heading(filled[0].trim());
-                    continue;
-                }
-                if !open {
-                    continue;
-                }
-                let below = match blocks.get(b + 1) {
+                let below = match blocks.get(at) {
                     Some(Block::Row(n)) if n.len() == row.len() => Some(n),
                     _ => None,
                 };
-                // A header: every filled cell a field, read down.
-                if filled.len() >= 2 && filled.iter().all(|c| is_field(c)) {
+                if header(row) {
+                    // A header with the row under it: one field block.
                     if let Some(below) = below {
                         for (h, v) in row.iter().zip(below) {
                             if is_field(h) && !v.trim().is_empty() && !label_like(v) {
                                 put(&label_key(h), v);
                             }
                         }
+                        at += 1;
                     }
-                    continue;
-                }
-                // Strictly 「字段 | 值 | 字段 | 值…」 from the first cell.
-                let strict = row.iter().enumerate().all(|(i, c)| {
-                    if i % 2 == 0 {
-                        // A trailing blank cell (merged or unused) is allowed.
-                        is_field(c)
-                            || (c.trim().is_empty() && row[i..].iter().all(|c| c.trim().is_empty()))
-                    } else {
-                        c.trim().is_empty() || !label_like(c)
-                    }
-                });
-                if !strict {
                     continue;
                 }
                 for i in (0..row.len()).step_by(2) {
@@ -414,8 +425,8 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                         continue;
                     };
                     put(&label_key(&row[i]), right);
-                    // F1: the next row could give a value here too; if it
-                    // differs, which is meant cannot be told.
+                    // F1: the row under it could give a value here too; if
+                    // it differs, which is meant cannot be told.
                     if let Some(down) = below
                         .map(|n| &n[i])
                         .filter(|c| !c.trim().is_empty() && !label_like(c))
@@ -426,7 +437,6 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
             }
         }
     }
-    let mut out = Labelled::default();
     for (name, values) in found {
         if values.len() == 1 && !unsure.contains(&name) {
             out.values
@@ -441,11 +451,6 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
         }
     }
     out
-}
-
-/// A heading line: short, no colon, not a sentence.
-fn heading_line(t: &str) -> bool {
-    t.chars().count() <= 20 && !t.contains(['：', ':', '。', '，', ','])
 }
 
 /// A value without the brackets around it (「（李四）」 → 「李四」), or without a

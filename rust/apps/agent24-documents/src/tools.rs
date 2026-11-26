@@ -866,6 +866,10 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
     // PR-Daemon #2095 L3: not read is not 「nothing matched」.
     if unread {
         note.push_str("没能读到资料的文字（格式不支持或解析失败），资料里的值都要问用户。");
+    } else if read.layout_unknown {
+        note.push_str(
+            "资料版式无法确定是本人信息，请直接告诉我：资料里的值都要问用户，不要从资料里取。",
+        );
     } else if !found.is_empty() {
         note.push_str(&format!(
             "资料里对上的值：{}。调用 documents.fill 时把这些值原样放进 values，并带上同一个 source_document_id。",
@@ -880,7 +884,7 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
             ambiguous.join("、")
         ));
     }
-    if !missing.is_empty() && !unread {
+    if !missing.is_empty() && !unread && !read.layout_unknown {
         note.push_str(&format!(
             "资料里没有：{}。身份类的要问用户，不要自己编；用户说先空着的，values 里给空字符串。",
             missing.join("、")
