@@ -1041,8 +1041,7 @@ async fn load_material(
             let parsed = crate::state::blocking(move || {
                 let read = match names {
                     Some(n) => {
-                        let (lines, rows) = crate::docx_patch::lines_and_rows(&bytes)?;
-                        crate::form::labelled(&lines, &rows, &n)
+                        crate::form::labelled_blocks(&crate::docx_patch::blocks(&bytes)?, &n)
                     }
                     None => crate::form::Labelled::default(),
                 };

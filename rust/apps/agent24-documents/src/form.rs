@@ -214,9 +214,6 @@ pub(crate) struct Labelled {
     pub(crate) ambiguous: Vec<String>,
 }
 
-/// Headings of someone else's details in a form.
-const PERSON_SECTIONS: &[&str] = &["配偶", "家属", "家庭成员", "父亲", "母亲", "子女", "亲属"];
-
 /// Common labels of a form that are not values (a header cell 「年龄」).
 const COMMON_LABELS: &[&str] = &[
     "年龄",
@@ -238,21 +235,84 @@ const COMMON_LABELS: &[&str] = &[
     "说明",
 ];
 
+/// A piece of the material, in document order: a paragraph (or a PDF line)
+/// outside a table, or a table row's cells.
+#[derive(Debug, Clone)]
+pub(crate) enum Block {
+    Line(String),
+    Row(Vec<String>),
+}
+
+/// [`labelled_blocks`] of `lines`, then `rows`.
+pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]) -> Labelled {
+    let blocks: Vec<Block> = lines
+        .iter()
+        .flat_map(|l| l.lines())
+        .map(|l| Block::Line(l.to_owned()))
+        .chain(rows.iter().cloned().map(Block::Row))
+        .collect();
+    labelled_blocks(&blocks, fields)
+}
+
+/// Words that say a heading is the user's own.
+const OWN_HEADINGS: &[&str] = &[
+    "个人",
+    "本人",
+    "基本信息",
+    "申请人",
+    "入职",
+    "简历",
+    "员工信息",
+];
+/// Words that say a heading is someone else's, even with an own word in it
+/// (「申请人家庭成员」).
+const OTHERS: &[&str] = &[
+    "紧急",
+    "联系人",
+    "联络",
+    "配偶",
+    "家属",
+    "家庭",
+    "亲属",
+    "监护",
+    "推荐",
+    "介绍",
+    "担保",
+    "代理",
+    "证明人",
+    "父",
+    "母",
+    "子女",
+    "法定代表",
+    "委托",
+];
+
+/// A heading (a line or a one-cell row that is no field) is the user's own
+/// only when it says so: anything else heads someone else's details (fails
+/// closed, PR-Daemon #2095 round 4).
+fn own_heading(t: &str) -> bool {
+    OWN_HEADINGS.iter().any(|w| t.contains(w)) && !OTHERS.iter().any(|w| t.contains(w))
+}
+
 /// Only labels equal to one of `fields` (whitespace and a trailing colon
 /// aside) are read, by the most cautious rules (监工 11-26, PR-Daemon #2095
-/// round 3), so that someone else's details are never read as the user's:
+/// rounds 3–4), so that someone else's details are never read as the user's:
+/// - Headings: a short line with no 「字段：」 and no colon, or a row of one
+///   filled cell that is no field. What follows a heading is read only if
+///   the heading is plainly the user's own (「个人信息」「基本信息」「申请人」);
+///   any other (「紧急联络人」「监护人」) closes it, in paragraphs and tables
+///   alike, until the next heading. Before the first heading, read.
 /// - A line: exactly one 「字段：」 in it, opening it (after leading space and a
 ///   number 「1.」「（一）」); any other line is not read.
-/// - A table row: strictly 「字段 | 值 | 字段 | 值…」 from its first cell, every
-///   even cell a field and every odd one a value; any other cell
-///   (「紧急联系人」) and the row is not read. A row of fields only is a header,
-///   read down to the row under it. A value that could also be read down (the
-///   row under it has a value in that column) and differs is ambiguous (F1).
-/// - A value with two or more spaces in a row, a tab or U+3000 in it
-///   (「陈  晓明」「张三  部门 研发」) is ambiguous; so is one with another colon
-///   (not a time's), another field's name, or a blank (「____」「□」「（请填写）」)
-///   is none. A field found with two different values is ambiguous.
-pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]) -> Labelled {
+/// - A table row: strictly 「字段 | 值 | 字段 | 值…」 from its first cell; any
+///   other cell and the row is not read. A row of fields only is a header,
+///   read down to the next row. A value that the next row could also give
+///   (F1) and differs is ambiguous.
+/// - A value with two or more spaces in a row, a tab or U+3000 is ambiguous;
+///   one with another colon (not a time's), another field's name, or a blank
+///   (「____」「□」「（请填写）」) is none; one in brackets loses them. A field
+///   found with two different values is ambiguous.
+pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
     let names: Vec<String> = fields
         .iter()
         .map(|f| label_key(f))
@@ -261,7 +321,7 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut unsure: Vec<String> = Vec::new();
     let mut put = |name: &str, value: &str| {
-        let value = value.trim();
+        let value = unbracket(value.trim());
         if spread(value) {
             if !unsure.iter().any(|n| n == name) {
                 unsure.push(name.to_owned());
@@ -275,19 +335,6 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
             }
         }
     };
-    for line in lines.iter().flat_map(|l| l.lines()) {
-        let marks = markers(line, &names);
-        let [(at, colon_end, name)] = marks.as_slice() else {
-            continue;
-        };
-        if !numbering_only(&line[..*at]) {
-            continue;
-        }
-        let value = line[*colon_end..]
-            .trim()
-            .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
-        put(name, value);
-    }
     let is_field = |t: &str| names.contains(&label_key(t));
     let label_like = |t: &str| {
         let t = t.trim();
@@ -296,65 +343,86 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
             || field_kind(t) != FieldKind::Text
             || COMMON_LABELS.contains(&label_key(t).as_str())
     };
-    // A row of one cell that heads someone else's details (「紧急联系人」
-    // 「配偶」): the rows under it are not the user's, up to the next heading.
-    let person_heading = |row: &[String]| {
-        let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
-        filled.len() == 1
-            && !is_field(filled[0])
-            && (field_kind(filled[0]) == FieldKind::Identity
-                || PERSON_SECTIONS.iter().any(|w| filled[0].contains(w)))
-    };
-    let mut someone_else = false;
-    for (r, row) in rows.iter().enumerate() {
-        let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
-        if person_heading(row) {
-            someone_else = true;
-            continue;
-        }
-        if filled.len() == 1 && !is_field(filled[0]) {
-            // A title (「个人基本信息」) ends someone else's section.
-            someone_else = false;
-            continue;
-        }
-        if someone_else {
-            continue;
-        }
-        let below = rows.get(r + 1).filter(|n| n.len() == row.len());
-        // A header: every filled cell a field, read down.
-        if filled.len() >= 2 && filled.iter().all(|c| is_field(c)) {
-            if let Some(below) = below {
-                for (h, v) in row.iter().zip(below) {
-                    if is_field(h) && !v.trim().is_empty() && !label_like(v) {
-                        put(&label_key(h), v);
+    let mut open = true;
+    for (b, block) in blocks.iter().enumerate() {
+        match block {
+            Block::Line(line) => {
+                let t = line.trim();
+                if t.is_empty() {
+                    continue;
+                }
+                let marks = markers(line, &names);
+                if marks.is_empty() {
+                    if heading_line(t) && !is_field(t) {
+                        open = own_heading(t);
+                    }
+                    continue;
+                }
+                if !open {
+                    continue;
+                }
+                let [(at, colon_end, name)] = marks.as_slice() else {
+                    continue;
+                };
+                if !numbering_only(&line[..*at]) {
+                    continue;
+                }
+                let value = line[*colon_end..]
+                    .trim()
+                    .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
+                put(name, value);
+            }
+            Block::Row(row) => {
+                let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
+                if filled.len() == 1 && !is_field(filled[0]) {
+                    open = own_heading(filled[0].trim());
+                    continue;
+                }
+                if !open {
+                    continue;
+                }
+                let below = match blocks.get(b + 1) {
+                    Some(Block::Row(n)) if n.len() == row.len() => Some(n),
+                    _ => None,
+                };
+                // A header: every filled cell a field, read down.
+                if filled.len() >= 2 && filled.iter().all(|c| is_field(c)) {
+                    if let Some(below) = below {
+                        for (h, v) in row.iter().zip(below) {
+                            if is_field(h) && !v.trim().is_empty() && !label_like(v) {
+                                put(&label_key(h), v);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                // Strictly 「字段 | 值 | 字段 | 值…」 from the first cell.
+                let strict = row.iter().enumerate().all(|(i, c)| {
+                    if i % 2 == 0 {
+                        // A trailing blank cell (merged or unused) is allowed.
+                        is_field(c)
+                            || (c.trim().is_empty() && row[i..].iter().all(|c| c.trim().is_empty()))
+                    } else {
+                        c.trim().is_empty() || !label_like(c)
+                    }
+                });
+                if !strict {
+                    continue;
+                }
+                for i in (0..row.len()).step_by(2) {
+                    let Some(right) = row.get(i + 1).filter(|c| !c.trim().is_empty()) else {
+                        continue;
+                    };
+                    put(&label_key(&row[i]), right);
+                    // F1: the next row could give a value here too; if it
+                    // differs, which is meant cannot be told.
+                    if let Some(down) = below
+                        .map(|n| &n[i])
+                        .filter(|c| !c.trim().is_empty() && !label_like(c))
+                    {
+                        put(&label_key(&row[i]), down);
                     }
                 }
-            }
-            continue;
-        }
-        // Strictly 「字段 | 值 | 字段 | 值…」 from the first cell.
-        let strict = row.iter().enumerate().all(|(i, c)| {
-            if i % 2 == 0 {
-                // A trailing blank cell (merged or unused) is allowed.
-                is_field(c) || (c.trim().is_empty() && row[i..].iter().all(|c| c.trim().is_empty()))
-            } else {
-                c.trim().is_empty() || !label_like(c)
-            }
-        });
-        if !strict {
-            continue;
-        }
-        for i in (0..row.len()).step_by(2) {
-            let Some(right) = row.get(i + 1).filter(|c| !c.trim().is_empty()) else {
-                continue;
-            };
-            let down = below
-                .map(|n| &n[i])
-                .filter(|c| !c.trim().is_empty() && !label_like(c));
-            put(&label_key(&row[i]), right);
-            // F1: read two ways, differently: ambiguous.
-            if let Some(down) = down {
-                put(&label_key(&row[i]), down);
             }
         }
     }
@@ -375,6 +443,27 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
     out
 }
 
+/// A heading line: short, no colon, not a sentence.
+fn heading_line(t: &str) -> bool {
+    t.chars().count() <= 20 && !t.contains(['：', ':', '。', '，', ','])
+}
+
+/// A value without the brackets around it (「（李四）」 → 「李四」), or without a
+/// closing one it does not open (「李四）」 → 「李四」).
+fn unbracket(value: &str) -> &str {
+    let v = value
+        .strip_prefix(['（', '('])
+        .and_then(|v| v.strip_suffix(['）', ')']))
+        .unwrap_or(value);
+    let opens = v.matches(['（', '(']).count();
+    let closes = v.matches(['）', ')']).count();
+    if closes > opens {
+        v.trim_end_matches(['）', ')']).trim()
+    } else {
+        v.trim()
+    }
+}
+
 /// A value spread by two or more spaces, a tab or U+3000: 「陈  晓明」 is one
 /// name or 「张三  部门 研发」 is a value and other words; which, cannot be told.
 fn spread(value: &str) -> bool {
@@ -385,8 +474,15 @@ fn spread(value: &str) -> bool {
 /// 「(1)」「（一）」「一、」.
 fn numbering_only(before: &str) -> bool {
     let t = before.trim();
-    t.is_empty()
-        || t.chars().all(|c| {
+    if t.is_empty() {
+        return true;
+    }
+    // r4 N2: 「（姓名：…」 is not a number (no digit); 「（一）」「(1)」 are.
+    let digits = t
+        .chars()
+        .any(|c| c.is_ascii_digit() || "一二三四五六七八九十".contains(c));
+    digits
+        && t.chars().all(|c| {
             c.is_ascii_digit()
                 || "一二三四五六七八九十".contains(c)
                 || ".、．()（）".contains(c)

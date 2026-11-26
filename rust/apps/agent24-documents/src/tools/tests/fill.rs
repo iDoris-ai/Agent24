@@ -320,7 +320,7 @@ fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
         row(&["入职日期", "2026年12月1日"]),
         row(&["紧急联系人：", ""]),
     );
-    let (lines, rows) = crate::docx_patch::lines_and_rows(&docx_body(&body)).unwrap();
+    let blocks = crate::docx_patch::blocks(&docx_body(&body)).unwrap();
     let names: Vec<String> = [
         "姓名",
         "部门",
@@ -331,7 +331,7 @@ fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
     ]
     .map(String::from)
     .to_vec();
-    let pairs = crate::form::labelled(&lines, &rows, &names);
+    let pairs = crate::form::labelled_blocks(&blocks, &names);
     let get = |f: &str| crate::form::from_source(f, &pairs).map(str::to_owned);
     assert_eq!(get("姓名").as_deref(), Some("陈晓明"));
     assert_eq!(get("部门").as_deref(), Some("产品研发部"));
@@ -806,8 +806,13 @@ fn the_acceptance_materials_give_the_three_values_they_state() {
         .into_iter()
         .map(|f| f.name)
         .collect();
-    let (lines, rows) = crate::docx_patch::lines_and_rows(src).unwrap();
-    let r = crate::form::labelled(&lines, &rows, &names);
+    let blocks = crate::docx_patch::blocks(src).unwrap();
+    // 监工: the material's first line is 「个人信息」, a heading of the user's own.
+    assert!(
+        matches!(blocks.first(), Some(crate::form::Block::Line(l)) if l.trim() == "个人信息"),
+        "{blocks:?}"
+    );
+    let r = crate::form::labelled_blocks(&blocks, &names);
     assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
     assert_eq!(value(&r, "部门").as_deref(), Some("产品研发部"));
     assert_eq!(value(&r, "入职日期").as_deref(), Some("2026年12月1日"));
@@ -815,4 +820,111 @@ fn the_acceptance_materials_give_the_three_values_they_state() {
         assert_eq!(value(&r, f), None, "{f}");
     }
     assert!(r.ambiguous.is_empty(), "{r:?}");
+}
+
+/// PR-Daemon #2095 r4 B1: a heading is someone else's unless it is plainly
+/// the user's own (个人 / 本人 / 基本信息 / 申请人…): one outside any list
+/// (紧急联络人、监护人、推荐人、介绍人) closes what follows, in a table and in
+/// paragraphs.
+#[test]
+fn a_heading_is_someone_else_s_unless_plainly_the_user_s() {
+    let f = &["姓名", "电话"];
+    for title in [
+        "紧急联络人",
+        "监护人",
+        "推荐人",
+        "介绍人",
+        "紧急联系人",
+        "联系人",
+        "担保人",
+        "法定代表人",
+        "委托代理人",
+        "其他联系人",
+        "配偶信息",
+        "家庭成员信息",
+        "直系亲属",
+        "申请人家庭成员",
+        "本人紧急联系人",
+    ] {
+        let r = read(&[], &[&[title], &["姓名", "李四"], &["电话", "139"]], f);
+        assert_eq!(
+            (value(&r, "姓名"), value(&r, "电话")),
+            (None, None),
+            "table {title}: {r:?}"
+        );
+        let r = read(&[title, "姓名：李四", "电话：139"], &[], f);
+        assert_eq!(
+            (value(&r, "姓名"), value(&r, "电话")),
+            (None, None),
+            "lines {title}: {r:?}"
+        );
+    }
+    for title in ["个人基本信息", "本人信息", "申请人信息", "入职资料"] {
+        let r = read(&[], &[&[title], &["姓名", "陈晓明"]], f);
+        assert_eq!(
+            value(&r, "姓名").as_deref(),
+            Some("陈晓明"),
+            "table {title}: {r:?}"
+        );
+        let r = read(&[title, "姓名：陈晓明"], &[], f);
+        assert_eq!(
+            value(&r, "姓名").as_deref(),
+            Some("陈晓明"),
+            "lines {title}: {r:?}"
+        );
+    }
+    // The user's own, then someone else's: only the first.
+    let r = read(&["姓名：陈晓明", "紧急联络人", "电话：139"], &[], f);
+    assert_eq!(
+        (value(&r, "姓名").as_deref(), value(&r, "电话")),
+        (Some("陈晓明"), None)
+    );
+}
+
+/// PR-Daemon #2095 r4 N2: an opening bracket is not a number: 「（姓名：李四）」
+/// is not read.
+#[test]
+fn an_open_bracket_before_a_field_is_not_numbering() {
+    let r = read(&["（姓名：李四）"], &[], &["姓名"]);
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    let r = read(&["（一）姓名：陈晓明"], &[], &["姓名"]);
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
+}
+
+/// r4 (监工): paragraphs and tables share one reading state, in document
+/// order: a paragraph heading closes the table under it, and the user's own
+/// heading opens it again; a value in brackets loses them.
+#[test]
+fn paragraphs_and_tables_share_one_reading_state() {
+    use crate::form::Block::{Line, Row};
+    let f = names(&["姓名", "电话"]);
+    let row = |c: &[&str]| Row(names(c));
+    let r = crate::form::labelled_blocks(
+        &[
+            Line("紧急联络人".into()),
+            row(&["姓名", "李四"]),
+            row(&["电话", "139"]),
+        ],
+        &f,
+    );
+    assert_eq!(
+        (value(&r, "姓名"), value(&r, "电话")),
+        (None, None),
+        "{r:?}"
+    );
+    let r = crate::form::labelled_blocks(
+        &[
+            Line("监护人".into()),
+            Line("电话：139".into()),
+            Line("个人基本信息".into()),
+            row(&["姓名", "陈晓明"]),
+        ],
+        &f,
+    );
+    assert_eq!(
+        (value(&r, "姓名").as_deref(), value(&r, "电话")),
+        (Some("陈晓明"), None)
+    );
+    let r = read(&["姓名：（陈晓明）"], &[], &["姓名"]);
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
 }

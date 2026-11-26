@@ -323,26 +323,40 @@ pub(crate) fn plain_text(docx: &[u8]) -> Result<String, PatchError> {
     Ok(out)
 }
 
-/// L8-S02 round 2: the material's paragraphs (body, tables, headers and
-/// footers, each its own text) and its table rows (each cell's text), for
-/// 「标签：值」 and 「label cell | value cell」.
-pub(crate) fn lines_and_rows(docx: &[u8]) -> Result<(Vec<String>, Vec<Vec<String>>), PatchError> {
-    let mut lines = Vec::new();
-    let mut rows = Vec::new();
+/// L8-S02: the material in document order (PR-Daemon #2095 round 4: one
+/// reading state across paragraphs and tables): each paragraph outside a
+/// table as a line, and each table row as its cells' text (a cell's
+/// paragraphs joined; a nested table's rows are rows of their own). A
+/// paragraph inside a table cell is part of its cell, not a line.
+pub(crate) fn blocks(docx: &[u8]) -> Result<Vec<crate::form::Block>, PatchError> {
+    use crate::form::Block;
+    let mut out = Vec::new();
     for (_, xml) in text_parts(docx)? {
-        for para in scan_all_paragraphs(&xml)? {
-            lines.push(paragraph_text(&xml[para.start..para.end]));
-        }
-        // Each `w:tc`'s paragraphs, joined, row by row; a nested table's
-        // cells are cells of their own row.
+        let mut tables = 0usize;
+        let mut para_depth = 0usize;
+        let mut para_start = 0usize;
         let mut row_stack: Vec<Vec<String>> = Vec::new();
         let mut cell_start: Vec<usize> = Vec::new();
         for tag in tags(&xml)? {
             match (tag.kind, tag.name) {
+                (TagKind::Open, "w:tbl") => tables += 1,
+                (TagKind::Close, "w:tbl") => tables = tables.saturating_sub(1),
+                (TagKind::Open, "w:p") => {
+                    if para_depth == 0 {
+                        para_start = tag.start;
+                    }
+                    para_depth += 1;
+                }
+                (TagKind::Close, "w:p") => {
+                    para_depth = para_depth.saturating_sub(1);
+                    if para_depth == 0 && tables == 0 {
+                        out.push(Block::Line(paragraph_text(&xml[para_start..tag.end])));
+                    }
+                }
                 (TagKind::Open, "w:tr") => row_stack.push(Vec::new()),
                 (TagKind::Close, "w:tr") => {
                     if let Some(row) = row_stack.pop() {
-                        rows.push(row);
+                        out.push(Block::Row(row));
                     }
                 }
                 (TagKind::Open, "w:tc") => cell_start.push(tag.start),
@@ -361,7 +375,7 @@ pub(crate) fn lines_and_rows(docx: &[u8]) -> Result<(Vec<String>, Vec<Vec<String
             }
         }
     }
-    Ok((lines, rows))
+    Ok(out)
 }
 
 /// One `w:t` of a paragraph: where its text lies in the slice, and the text.
