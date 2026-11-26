@@ -46,11 +46,11 @@ const EMBEDDING_MODEL_ID = 'agent24-embedding'
 /** The policy's version: an ingest's `expected_policy_version` must equal it (3c's uploads). */
 export const WEKNORA_LITE_POLICY_VERSION = 'agent24-lite-1'
 
-export function weknoraLiteSidecarSpec(readyPhaseTimeoutMs = WEKNORA_LITE_READY_PHASE_TIMEOUT_MS): SidecarSpec {
+export function weknoraLiteSidecarSpec(readyPhaseTimeoutMs = WEKNORA_LITE_READY_PHASE_TIMEOUT_MS, healthIntervalMs = WEKNORA_LITE_HEALTH_INTERVAL_MS): SidecarSpec {
   return {
     sidecarId: WEKNORA_LITE_SIDECAR_ID,
     readyTimeoutMs: readyPhaseTimeoutMs * 2 + 2_000,
-    healthIntervalMs: WEKNORA_LITE_HEALTH_INTERVAL_MS,
+    healthIntervalMs,
     healthTimeoutMs: WEKNORA_LITE_HEALTH_TIMEOUT_MS,
     maxHealthFailures: WEKNORA_LITE_MAX_HEALTH_FAILURES,
     shutdown: { termGraceMs: WEKNORA_LITE_TERM_GRACE_MS, killAfterMs: WEKNORA_LITE_KILL_AFTER_MS },
@@ -136,6 +136,19 @@ export function weknoraLitePolicy(embedding: WeknoraLiteEmbedding): string {
     destinations: [{ category: 'embedding', endpoint: url.origin, model: embedding.model }],
     budget: { max_external_calls: 64, max_input_bytes: 1_048_576, max_inflight_external: 4 },
   })
+}
+
+/** The handshake's first line. A JSON syntax error is reported with a fixed
+ * message: V8 quotes the text around the error position, which can be the key
+ * (PR-Daemon #2108 G5); the message reaches `status.error` and the log. */
+export function parseWeknoraLiteHandshakeLine(line: string, expectedPid: number): WeknoraLiteHandshake {
+  let value: unknown
+  try {
+    value = JSON.parse(line)
+  } catch {
+    throw new Error('WeKnora Lite handshake is not valid JSON')
+  }
+  return parseWeknoraLiteHandshake(value, expectedPid)
 }
 
 export function validateWeknoraLiteEmbedding(embedding: WeknoraLiteEmbedding): void {
@@ -295,7 +308,7 @@ export class WeknoraLiteLauncher implements SidecarLauncher {
       }
       const onLine = (line: string): void => {
         if (!first) {
-          try { first = parseWeknoraLiteHandshake(JSON.parse(line), pid) } catch (error) {
+          try { first = parseWeknoraLiteHandshakeLine(line, pid) } catch (error) {
             done(error instanceof Error ? error : new Error(String(error)))
             return
           }

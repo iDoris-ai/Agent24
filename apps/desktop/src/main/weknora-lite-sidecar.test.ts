@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import {
   parseWeknoraLiteHandshake,
+  parseWeknoraLiteHandshakeLine,
   validateWeknoraLiteEmbedding,
   weknoraLiteChildEnvironment,
   weknoraLiteModelsYaml,
@@ -49,6 +50,19 @@ describe('parseWeknoraLiteHandshake', () => {
       parseWeknoraLiteHandshake(line({}, { api_key: `${KEY}\n` }), 4242)
     } catch (error) {
       expect(String(error)).not.toContain(KEY)
+    }
+  })
+
+  it('PR-Daemon #2108 G5: a broken handshake line never quotes the key back', () => {
+    // A syntax error right after the key: V8 would quote the text around it.
+    for (const broken of [
+      `{"type":"ready","protocol":2,"credential":{"api_key":"${KEY}"x}}`,
+      `{"credential":{"api_key":"${KEY}`,
+      `{"credential":{"api_key":"${KEY}",}`,
+    ]) {
+      let message = ''
+      try { parseWeknoraLiteHandshakeLine(broken, 4242) } catch (error) { message = String(error) }
+      expect(message).toBe('Error: WeKnora Lite handshake is not valid JSON')
     }
   })
 })
