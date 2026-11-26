@@ -296,9 +296,10 @@ fn own_heading(t: &str) -> bool {
 ///
 /// A field block: a line with exactly one 「字段：」 opening it (after leading
 /// space and a number 「1.」「（一）」); a table row strictly 「字段 | 值 | 字段 |
-/// 值…」 from its first cell; or a header row (every filled cell a field)
-/// with the row under it. Only labels equal to one of `fields` (whitespace
-/// and a trailing colon aside) count.
+/// 值…」 from its first cell. A header row (every filled cell a field) is
+/// never read: its fields are ambiguous and the reading stops there (r7,
+/// 监工). Only labels equal to one of `fields` (whitespace and a trailing
+/// colon aside) count.
 ///
 /// A value: with two or more spaces in a row, a tab or U+3000, ambiguous;
 /// with another colon (not a time's), another field's name, or a blank
@@ -411,34 +412,17 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                     _ => None,
                 };
                 if header(row) {
-                    // r6 B1: a header over two or more rows of data is a list
-                    // (a roster, a family table): whose the first row is
-                    // cannot be told. Not read, and the reading stops.
-                    let data =
-                        |n: &[String]| n.iter().any(|c| !c.trim().is_empty() && !label_like(c));
-                    let second = match blocks.get(at + 1) {
-                        Some(Block::Row(n)) if n.len() == row.len() => data(n),
-                        _ => false,
-                    };
-                    if below.is_some_and(|b| data(b)) && second {
-                        for h in row.iter().filter(|h| is_field(h)) {
-                            let k = label_key(h);
-                            if !unsure.contains(&k) {
-                                unsure.push(k);
-                            }
+                    // r7 (监工): a header row (a row of field names only) is
+                    // never read. Under it may be one row or a roster with
+                    // blank or merged rows: whose the data is cannot be told.
+                    // Its fields go to the user, and the reading stops.
+                    for h in row.iter().filter(|h| is_field(h)) {
+                        let k = label_key(h);
+                        if !unsure.contains(&k) {
+                            unsure.push(k);
                         }
-                        break;
                     }
-                    // A header with the one row under it: one field block.
-                    if let Some(below) = below {
-                        for (h, v) in row.iter().zip(below) {
-                            if is_field(h) && !v.trim().is_empty() && !label_like(v) {
-                                put(&label_key(h), v);
-                            }
-                        }
-                        at += 1;
-                    }
-                    continue;
+                    break;
                 }
                 for i in (0..row.len()).step_by(2) {
                     let Some(right) = row.get(i + 1).filter(|c| !c.trim().is_empty()) else {

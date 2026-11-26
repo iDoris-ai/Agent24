@@ -431,7 +431,7 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
 /// Codex C1: a header row over a row of values is read by column, never as
 /// 「姓名 → 联系电话」; Codex C2: several 「标签：值」 on one line are each their own.
 #[test]
-fn header_rows_and_several_labels_on_a_line_give_the_right_values() {
+fn header_rows_and_several_labels_on_a_line_are_not_read() {
     let names: Vec<String> = ["姓名", "联系电话", "部门", "性别", "入职日期"]
         .map(String::from)
         .to_vec();
@@ -446,9 +446,9 @@ fn header_rows_and_several_labels_on_a_line_give_the_right_values() {
     let pairs = crate::form::labelled(&[], &rows, &names);
     let get =
         |p: &crate::form::Labelled, f: &str| crate::form::from_source(f, p).map(str::to_owned);
-    assert_eq!(get(&pairs, "姓名").as_deref(), Some("陈晓明"), "{pairs:?}");
-    assert_eq!(get(&pairs, "联系电话").as_deref(), Some("13800000000"));
-    assert_eq!(get(&pairs, "部门").as_deref(), Some("研发部"));
+    // r7 (监工): a header table is not read; the user is asked.
+    assert!(pairs.values.is_empty(), "{pairs:?}");
+    assert!(pairs.ambiguous.contains(&"姓名".to_owned()), "{pairs:?}");
     // r3 (监工): several fields on one line are not read: the user is asked.
     for line in [
         "姓名：陈晓明；联系电话：13800000000",
@@ -515,13 +515,13 @@ fn label_value_rows_are_not_headers_and_a_header_is_never_read_sideways() {
         &["姓名", "电话"],
     );
     assert_ne!(value(&r, "姓名").as_deref(), Some("性别"), "{r:?}");
-    // A real header still reads by column.
+    // r7 (监工): a header is not read by column either.
     let r = read(
         &[],
         &[&["姓名", "联系电话"], &["陈晓明", "13800000000"]],
         &["姓名", "联系电话"],
     );
-    assert_eq!(value(&r, "联系电话").as_deref(), Some("13800000000"));
+    assert_eq!(value(&r, "联系电话"), None, "{r:?}");
 }
 
 /// PR-Daemon #2095 B2: a label with two different values gives none, and is
@@ -1102,10 +1102,12 @@ async fn fields_say_when_the_material_is_not_plainly_the_user_s() {
 /// PR-Daemon #2095 r6 B1: a header over two or more rows of data is a list
 /// (a roster, a family table): whose the first row is cannot be told.
 #[test]
-fn a_header_over_several_rows_is_a_list_and_ambiguous() {
+fn a_header_row_is_never_read_whatever_is_under_it() {
     use crate::form::Block::{Line, Row};
     let row = |c: &[&str]| Row(names(c));
     let f = names(&["姓名", "电话", "关系"]);
+    // r7 (监工): a row of field names only is not read, with one row of
+    // data under it or a roster (r6), blank (r7 B1') or merged rows.
     for blocks in [
         vec![
             row(&["姓名", "电话"]),
@@ -1124,22 +1126,43 @@ fn a_header_over_several_rows_is_a_list_and_ambiguous() {
             row(&["陈晓明", "138"]),
             row(&["李四", "139"]),
         ],
+        vec![
+            row(&["姓名", "电话"]),
+            row(&["李四", "139"]),
+            row(&["王五"]),
+        ],
+        vec![
+            row(&["姓名", "电话"]),
+            row(&["李四", "139"]),
+            row(&["", ""]),
+            row(&["王五", "138"]),
+        ],
+        vec![
+            row(&["姓名", "电话"]),
+            row(&["李四", "139"]),
+            row(&["王五", "138", "x"]),
+        ],
+        vec![row(&["姓名", "电话"]), row(&["陈晓明", "138"])],
+        vec![
+            row(&["姓名", "电话"]),
+            row(&["陈晓明", "138"]),
+            Line("以上信息属实".into()),
+        ],
     ] {
         let r = crate::form::labelled_blocks(&blocks, &f);
         assert!(r.values.is_empty(), "{blocks:?}: {r:?}");
         assert!(r.ambiguous.contains(&"姓名".to_owned()), "{r:?}");
     }
-    // Control: a header and its one row, then no more data, is read.
-    for after in [None, Some(Line("以上信息属实".into()))] {
-        let mut blocks = vec![row(&["姓名", "电话"]), row(&["陈晓明", "138"])];
-        blocks.extend(after);
-        let r = crate::form::labelled_blocks(&blocks, &f);
-        assert_eq!(
-            (value(&r, "姓名").as_deref(), value(&r, "电话").as_deref()),
-            (Some("陈晓明"), Some("138")),
-            "{blocks:?}"
-        );
-    }
+    // Reading stops at the header: a strict row after it is not read either.
+    let r = crate::form::labelled_blocks(
+        &[
+            row(&["姓名", "电话"]),
+            row(&["陈晓明", "138"]),
+            row(&["关系", "本人"]),
+        ],
+        &f,
+    );
+    assert!(r.values.is_empty(), "{r:?}");
 }
 
 /// r6 N1: a heading's suffixes come off until none is left
