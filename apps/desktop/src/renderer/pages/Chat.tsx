@@ -18,7 +18,7 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, extractionFields, formClaimUnbacked, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -885,7 +885,7 @@ export default function ChatPage() {
         const facts = withKnowledge ? knowledgeFacts(turn.knowledge) : null
         // A refused search says so itself; 「没有检索知识库」 beside it would say it twice.
         const knowledge = checked?.kind === 'notSearched' && (query === null || facts?.kind === 'refused') && checked.unread.length === 0 ? undefined : checked
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents, facts, cited: withKnowledge ? turn.knowledge?.found : undefined }])
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: formClaimUnbacked(prompt, turn.text, turn.documents), facts, cited: withKnowledge ? turn.knowledge?.found : undefined }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.

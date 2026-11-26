@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -438,5 +438,29 @@ describe('L8-S02: filling a form', () => {
     expect(continuesFormFill([...before, '电话 139', '地址北京', '身份证 110'], '好了吗')).toBe(false)
     expect(continuesFormFill(['烧开水要多久'], '电话是 13912345678')).toBe(false)
     expect(continuesFormFill([], '电话是 13912345678')).toBe(false)
+  })
+})
+
+describe('L8-S02 真机 0.7.122: a form turn that says it made a document it did not', () => {
+  const prompt = docAgentPrompt(null, '没有其他了，紧急联系人留空，签名我自己手写，直接生成吧', true)
+  const said = '已生成《入职登记表》最终版，文档已保存为《入职登记表模板（填写）》。'
+
+  it('reads as unchanged when the run wrote nothing', () => {
+    expect(formClaimUnbacked(prompt, said, null)).toEqual({ attempted: true, jobs: [], failed: [] })
+    expect(formClaimUnbacked(prompt, said, undefined)).toEqual({ attempted: true, jobs: [], failed: [] })
+    for (const s of ['表已经填好了。', '已保存到文档页。', '生成好了，请查看。', '已为你创建新文档。']) {
+      expect(formClaimUnbacked(prompt, s, null)).not.toBeNull()
+    }
+  })
+
+  it('leaves a write the run did, a question, and a turn that is not a form alone', () => {
+    const wrote = { attempted: true, jobs: ['job_1'], failed: [] }
+    expect(formClaimUnbacked(prompt, said, wrote)).toBe(wrote)
+    expect(formClaimUnbacked(prompt, '请告诉我你的姓名、电话和身份证号。', null)).toBeNull()
+    expect(formClaimUnbacked(docAgentPrompt(null, '这份合同讲了什么', false), said, null)).toBeNull()
+  })
+
+  it('tells the model a confirmed fill must call documents.fill', () => {
+    expect(FORM_HINT).toContain('必须调用 documents.fill')
   })
 })
