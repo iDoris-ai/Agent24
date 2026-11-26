@@ -5173,6 +5173,49 @@ paths:
         "500":
           $ref: "#/components/responses/IdorisFailure"
 
+  /idoris/lite-embedding:
+    post:
+      operationId: liteEmbeddingKey
+      x-milestone: L9-3c
+      tags: [idoris]
+      summary: The embed-only iDoris key for the desktop's local WeKnora Lite
+      x-tui-exemption: "L9-3c: only the desktop that launches the local Lite asks for this key."
+      description: |
+        ProductHost audience only; legacy mode, first-party and Creative tokens get 403.
+        Needs the managed iDoris running with the embed role (422 `not_configured` otherwise).
+        The key may call the `embed` role only (no `daily`), `local_only`; it is issued once and
+        reused (its id is kept, the secret stays in the keychain), and issued again only when the
+        keychain no longer has it. 409 `busy` while an install or connect is under way.
+        The answer is never cached (`Cache-Control: no-store`) and the key is never logged.
+      responses:
+        "200":
+          description: The running gateway and the key
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [base_url, api_key, model, dimension]
+                properties:
+                  base_url: { type: string, description: "http://127.0.0.1:<data port>/v1" }
+                  api_key: { type: string }
+                  model: { type: string, enum: ["idoris/embed"] }
+                  dimension: { type: integer, enum: [1024] }
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "409":
+          $ref: "#/components/responses/IdorisFailure"
+        "422":
+          $ref: "#/components/responses/IdorisFailure"
+        "500":
+          $ref: "#/components/responses/IdorisFailure"
+        "502":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+
   /idoris/start:
     post:
       operationId: startIdoris

@@ -47,13 +47,16 @@ pub(crate) async fn auth(
 /// user's identities, so a bearer that merely proves "same user, same
 /// machine" (the legacy shared token, any FirstPartyShell or Creative token)
 /// must not reach it: it would let any local process produce a backup it can
-/// decrypt. The inbound writes are the same kind of host action: a shell
+/// decrypt. The Lite's embed-only iDoris key (Loop 9 3c) is a secret of the
+/// same kind: only the desktop that launches the Lite receives it. The inbound writes are the same kind of host action: a shell
 /// token, even one that could elevate, must not change who is admitted.
 fn host_only_route(method: &Method, path: &str) -> bool {
     (method == Method::POST
         && (matches!(
             path,
-            "/api/v1/comm/identity/export" | "/api/v1/comm/identity/import"
+            "/api/v1/comm/identity/export"
+                | "/api/v1/comm/identity/import"
+                | "/api/v1/idoris/lite-embedding"
         ) || is_component_report(path)))
         || (method == Method::PUT
             && matches!(path, "/api/v1/inbound/allowlist" | "/api/v1/inbound/policy"))
