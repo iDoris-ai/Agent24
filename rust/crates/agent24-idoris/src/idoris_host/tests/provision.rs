@@ -2481,3 +2481,62 @@ async fn lite_embedding_needs_the_embed_role() {
     assert_eq!(x.keys().len(), before);
     x.f.host.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn lite_embedding_issues_again_when_idoris_no_longer_has_the_saved_key() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    running_with(&x, &["real-model", "bge-m3-mlx-fp16"]).await;
+    let first = x.f.host.lite_embedding().await.unwrap();
+    let issued = x.keys().len();
+    let saved_id = || -> String {
+        let body = fs::read_to_string(x.f.host.root.join("lite-embed-key.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["key_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let id1 = saved_id();
+    // Confirmed once in this run: not listed again.
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), issued);
+    // A new daemon run after iDoris revoked it (or a reinstall with a new key database).
+    let path = x.f.host.root.join("fake-keys.json");
+    let mut keys: Vec<serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for key in keys.iter_mut().filter(|k| k["key_id"] == id1.as_str()) {
+        key["status"] = json!("revoked");
+    }
+    fs::write(&path, serde_json::to_string(&keys).unwrap()).unwrap();
+    *x.f.host.lite_key_checked.lock().unwrap() = None;
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), issued + 1, "a revoked key is replaced");
+    let id2 = saved_id();
+    assert_ne!(id2, id1);
+    assert_eq!(x.keys().last().unwrap()["allowed_roles"], json!(["embed"]));
+    // Gone from iDoris altogether (a recreated key database): replaced as well.
+    let keys: Vec<serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let kept: Vec<_> = keys
+        .into_iter()
+        .filter(|k| k["key_id"] != id2.as_str())
+        .collect();
+    let remaining = kept.len();
+    fs::write(&path, serde_json::to_string(&kept).unwrap()).unwrap();
+    *x.f.host.lite_key_checked.lock().unwrap() = None;
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(
+        x.keys().len(),
+        remaining + 1,
+        "a key iDoris no longer has is replaced"
+    );
+    assert_eq!(x.keys().last().unwrap()["key_id"], json!(saved_id()));
+    // Still active: kept.
+    *x.f.host.lite_key_checked.lock().unwrap() = None;
+    let id3 = saved_id();
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(saved_id(), id3);
+    drop(first);
+    x.assert_safe();
+    x.f.host.shutdown().await.unwrap();
+}

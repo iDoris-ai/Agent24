@@ -606,6 +606,9 @@ pub struct IdorisHost {
     omlx_keys: Arc<dyn Keychain>,
     /// oMLX's model directory (`~/.omlx/models`, the same default iDoris scans).
     omlx_models_dir: Option<PathBuf>,
+    /// Loop 9 3c: the Lite's embed key id last confirmed active in iDoris, and
+    /// the release it was confirmed against (checked again after a reinstall).
+    lite_key_checked: SyncMutex<Option<(String, PathBuf)>>,
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     let parent = path.parent().ok_or(Code::PersistenceFailed)?;
@@ -731,6 +734,7 @@ impl IdorisHost {
                 .map(PathBuf::from)
                 .filter(|home| home.is_absolute())
                 .map(|home| home.join(".omlx/models")),
+            lite_key_checked: SyncMutex::new(None),
             inner: Mutex::new(Inner {
                 installation,
                 state,
