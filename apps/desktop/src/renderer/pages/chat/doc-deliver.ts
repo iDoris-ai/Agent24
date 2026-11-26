@@ -44,8 +44,11 @@ const QUESTION = /[吗呢？?]\s*$|能不能|可以吗/
 /** What is still in the document. Bare 「检查语法」 or 「批注是什么意思」 is not this. */
 const CHECK = new RegExp(`(?:检查|查一下|查一查|看看|看一下|核对).{0,16}${LEFT}|(?:检查|查一下|查一查|看看|看一下|核对).{0,16}没删干净|有没有(?:没)?删干净|还有没有\\s*${LEFT}|有没有\\s*${LEFT}|没删干净|(?:发给|发出|发送).{0,8}(?:之前|前).{0,16}(?:检查|查一下|查一查|看看)`)
 
-export function asksDeliver(text: string, inDocument: boolean): DeliverAsk | null {
-  const about = inDocument || /《[^》]{1,200}》/.test(text)
+/** `namedBefore` (L9-1c, FU-247): an earlier turn of this conversation named a
+ * document in 《》, so 「去掉修订和批注，导出一份 PDF 放桌面」 after 「《合同》发出去前帮我检查一下」
+ * is about it (the caller takes that document, `lastNamed`). */
+export function asksDeliver(text: string, inDocument: boolean, namedBefore = false): DeliverAsk | null {
+  const about = inDocument || namedBefore || /《[^》]{1,200}》/.test(text)
   const said = text.replace(/《[^》]{0,200}》/g, ' ')
   if (NEGATED.test(said)) return null
   if (RECEIPTS.test(said)) return { kind: 'receipts' }
