@@ -201,3 +201,63 @@ pub(crate) fn fill_note(
     s.push_str("身份类信息只能用资料或用户亲口说的，不要自己补。");
     s
 }
+
+/// L8-S02 round 2 (监工 11-26 真机): the values the user's material states
+/// by label, 「姓名：陈晓明」 in a paragraph or a line, or 「姓名 | 陈晓明」 in two
+/// cells side by side. A label is at most 32 characters; a value that is
+/// empty or still a `{{field}}` is not one. First found wins.
+pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut put = |label: &str, value: &str| {
+        let label = label_key(label);
+        let value = value.trim();
+        if label.is_empty()
+            || label.chars().count() > 32
+            || value.is_empty()
+            || value.contains("{{")
+            || out.iter().any(|(l, _)| *l == label)
+        {
+            return;
+        }
+        out.push((label, value.to_owned()));
+    };
+    for line in lines.iter().flat_map(|l| l.lines()) {
+        if let Some(at) = line.find(['：', ':']) {
+            let sep = line[at..].chars().next().map_or(1, char::len_utf8);
+            put(&line[..at], &line[at + sep..]);
+        }
+    }
+    for row in rows {
+        for pair in row.windows(2) {
+            // A label cell holds no 「：值」 of its own (that is a line, above).
+            if !pair[0].trim_end_matches(['：', ':']).contains(['：', ':']) {
+                put(&pair[0], &pair[1]);
+            }
+        }
+    }
+    out
+}
+
+/// A label as compared with a field name: whitespace and a trailing colon
+/// removed.
+fn label_key(label: &str) -> String {
+    label
+        .trim()
+        .trim_end_matches(['：', ':'])
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect()
+}
+
+/// The material's value for `field`: the label equal to its name (whitespace
+/// aside). A manual field never has one.
+pub(crate) fn from_source<'a>(field: &str, pairs: &'a [(String, String)]) -> Option<&'a str> {
+    if field_kind(field) == FieldKind::Manual {
+        return None;
+    }
+    let key = label_key(field);
+    pairs
+        .iter()
+        .find(|(l, _)| *l == key)
+        .map(|(_, v)| v.as_str())
+}

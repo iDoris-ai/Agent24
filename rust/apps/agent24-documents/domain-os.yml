@@ -148,13 +148,14 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fields
-    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Each field has a kind: identity (name, ID number, phone, address, bank card: fill only from the user's own material or what the user said; never make one up — ask), manual (signature, photo, checkbox, attachment: never fill, tell the user to do it by hand), text. Read-only, local."
+    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Each field has a kind: identity (name, ID number, phone, address, bank card: fill only from the user's own material or what the user said; never make one up — ask), manual (signature, photo, checkbox, attachment: never fill, tell the user to do it by hand), text. With source_document_id (the user's own material), each field the material states by label (「姓名：陈晓明」, or a label cell beside its value) has that value as from_source: pass those values to documents.fill as they are, with the same source_document_id; do not read the material yourself. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
       required: [document_id]
       properties:
         document_id: { type: string }
+        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; its labelled values come back as from_source" }
     risk: read
     output_privacy: local_only
     timeout_ms: 30000

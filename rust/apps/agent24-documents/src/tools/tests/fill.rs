@@ -23,12 +23,16 @@ fn field_kind_marks_identity_manual_and_text() {
     assert_eq!(field_kind("签名"), FieldKind::Manual);
 }
 
+fn para(p: &str) -> String {
+    format!(r#"<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>"#)
+}
+
 fn docx(paragraphs: &[&str]) -> Vec<u8> {
+    docx_body(&paragraphs.iter().map(|p| para(p)).collect::<String>())
+}
+
+fn docx_body(body: &str) -> Vec<u8> {
     let w = r#"xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main""#;
-    let body: String = paragraphs
-        .iter()
-        .map(|p| format!(r#"<w:p><w:r><w:t xml:space="preserve">{p}</w:t></w:r></w:p>"#))
-        .collect();
     let xml = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document {w}><w:body>{body}</w:body></w:document>"#
     );
@@ -228,7 +232,7 @@ async fn a_source_outside_the_scope_is_not_found() {
 /// on both sides, case kept.
 #[test]
 fn material_matches_without_whitespace_and_with_case() {
-    let text = Material::Text(compact("姓名：张 三\n账号：AbC 123"));
+    let text = Material::Text(compact("姓名：张 三\n账号：AbC 123"), Vec::new());
     assert!(material_has(&text, "张三"));
     assert!(material_has(&text, "AbC123"));
     assert!(!material_has(&text, "abc123"));
@@ -294,4 +298,113 @@ fn a_failed_import_is_not_written() {
     stamp_fill(&mut ok, &report, made);
     assert_eq!(ok["written"], true);
     assert_eq!(ok["filled"], json!(["部门"]));
+}
+
+/// L8-S02 round 2: 「标签：值」 in paragraphs (either colon), and a label cell
+/// beside its value cell; an empty value or a `{{field}}` is none.
+#[test]
+fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
+    let row = |c: &[&str]| -> String {
+        let cells: String = c
+            .iter()
+            .map(|t| format!("<w:tc>{}</w:tc>", para(t)))
+            .collect();
+        format!("<w:tr>{cells}</w:tr>")
+    };
+    let body = format!(
+        "{}{}{}{}<w:tbl>{}{}</w:tbl>",
+        para("姓名：陈晓明"),
+        para("部门: 产品研发部"),
+        para("联系电话："),
+        para("身份证号：{{身份证号}}"),
+        row(&["入职日期", "2026年12月1日"]),
+        row(&["紧急联系人：", ""]),
+    );
+    let (lines, rows) = crate::docx_patch::lines_and_rows(&docx_body(&body)).unwrap();
+    let pairs = crate::form::labelled(&lines, &rows);
+    let get = |f: &str| crate::form::from_source(f, &pairs).map(str::to_owned);
+    assert_eq!(get("姓名").as_deref(), Some("陈晓明"));
+    assert_eq!(get("部门").as_deref(), Some("产品研发部"));
+    assert_eq!(get("入职日期").as_deref(), Some("2026年12月1日"));
+    assert_eq!(get("联系电话"), None);
+    assert_eq!(get("身份证号"), None);
+    assert_eq!(get("紧急联系人"), None);
+    // A manual field never takes a value from the material.
+    let signed = crate::form::labelled(&["本人签名：陈晓明".to_owned()], &[]);
+    assert_eq!(crate::form::from_source("本人签名", &signed), None);
+}
+
+/// 监工 11-26 真机 ①: the acceptance materials. `fields` with the material
+/// gives the values it states; `fill` with them writes all three, the
+/// identity one too (it is in the material), and asks only for the rest.
+#[tokio::test]
+async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "入职日期：{{入职日期}}",
+        "联系电话：{{联系电话}}",
+        "身份证号：{{身份证号}}",
+        "紧急联系人：{{紧急联系人}}",
+        "本人签名：{{本人签名}}",
+    ]);
+    let source = docx(&[
+        "姓名：陈晓明",
+        "部门：产品研发部",
+        "入职日期：2026年12月1日",
+        "爱好：跑步、摄影",
+    ]);
+    put_docx(&state, TPL, "入职登记表模板.docx", &template).await;
+    put_docx(&state, SRC, "个人信息.docx", &source).await;
+
+    let listed = payload(
+        &call(
+            &state,
+            "fields",
+            json!({ "document_id": TPL, "source_document_id": SRC }),
+        )
+        .await,
+    );
+    let from = |name: &str| {
+        listed["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["name"] == name)
+            .unwrap()
+            .get("from_source")
+            .cloned()
+    };
+    assert_eq!(from("姓名"), Some(json!("陈晓明")), "{listed}");
+    assert_eq!(from("部门"), Some(json!("产品研发部")));
+    assert_eq!(from("入职日期"), Some(json!("2026年12月1日")));
+    assert_eq!(from("联系电话"), None);
+    assert_eq!(from("本人签名"), None);
+    let note = listed["note"].as_str().unwrap();
+    assert!(
+        note.contains("姓名=陈晓明") && note.contains("联系电话"),
+        "{note}"
+    );
+    // Without the material, `fields` answers as before.
+    let plain = payload(&call(&state, "fields", json!({ "document_id": TPL })).await);
+    assert!(plain.get("note").is_none() && plain["fields"][0].get("from_source").is_none());
+
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL,
+                "source_document_id": SRC,
+                "values": { "姓名": "陈晓明", "部门": "产品研发部", "入职日期": "2026年12月1日", "紧急联系人": "" },
+            }),
+        )
+        .await,
+    );
+    assert_eq!(answer["written"], true, "{answer}");
+    assert_eq!(strings(&answer["filled"]), ["姓名", "部门", "入职日期"]);
+    assert_eq!(strings(&answer["ask_user"]), ["联系电话", "身份证号"]);
+    assert_eq!(strings(&answer["unfilled"]), ["紧急联系人"]);
+    assert_eq!(strings(&answer["manual"]), ["本人签名"]);
 }

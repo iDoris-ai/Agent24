@@ -323,6 +323,47 @@ pub(crate) fn plain_text(docx: &[u8]) -> Result<String, PatchError> {
     Ok(out)
 }
 
+/// L8-S02 round 2: the material's paragraphs (body, tables, headers and
+/// footers, each its own text) and its table rows (each cell's text), for
+/// 「标签：值」 and 「label cell | value cell」.
+pub(crate) fn lines_and_rows(docx: &[u8]) -> Result<(Vec<String>, Vec<Vec<String>>), PatchError> {
+    let mut lines = Vec::new();
+    let mut rows = Vec::new();
+    for (_, xml) in text_parts(docx)? {
+        for para in scan_all_paragraphs(&xml)? {
+            lines.push(paragraph_text(&xml[para.start..para.end]));
+        }
+        // Each `w:tc`'s paragraphs, joined, row by row; a nested table's
+        // cells are cells of their own row.
+        let mut row_stack: Vec<Vec<String>> = Vec::new();
+        let mut cell_start: Vec<usize> = Vec::new();
+        for tag in tags(&xml)? {
+            match (tag.kind, tag.name) {
+                (TagKind::Open, "w:tr") => row_stack.push(Vec::new()),
+                (TagKind::Close, "w:tr") => {
+                    if let Some(row) = row_stack.pop() {
+                        rows.push(row);
+                    }
+                }
+                (TagKind::Open, "w:tc") => cell_start.push(tag.start),
+                (TagKind::Close, "w:tc") => {
+                    if let (Some(start), Some(row)) = (cell_start.pop(), row_stack.last_mut()) {
+                        let cell = &xml[start..tag.end];
+                        let text: Vec<String> = scan_all_paragraphs(cell)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| paragraph_text(&cell[p.start..p.end]))
+                            .collect();
+                        row.push(text.join("\n"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok((lines, rows))
+}
+
 /// One `w:t` of a paragraph: where its text lies in the slice, and the text.
 struct TextSpan {
     open_start: usize,
