@@ -260,9 +260,22 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
     };
     for line in lines.iter().flat_map(|l| l.lines()) {
         let marks = markers(line, &names);
+        // PR-Daemon #2095 r2 F2: the first 「字段：」 opens the line; one after
+        // other words (「紧急联系人 姓名：李四」「…（姓名：李四」) is someone else's.
+        if marks.first().is_none_or(|m| !line[..m.0].trim().is_empty()) {
+            continue;
+        }
         for (i, (_, colon_end, name)) in marks.iter().enumerate() {
             let end = marks.get(i + 1).map_or(line.len(), |m| m.0);
-            let value = line[*colon_end..end]
+            let value = line[*colon_end..end].trim_start();
+            // F4: a value ends at two spaces, a tab or U+3000.
+            let value = value
+                .find(['\t', '\u{3000}'])
+                .into_iter()
+                .chain(value.find("  "))
+                .min()
+                .map_or(value, |cut| &value[..cut]);
+            let value = value
                 .trim()
                 .trim_end_matches(['；', ';', '，', ',', '、', '|']);
             put(name, value);
@@ -276,22 +289,33 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
             || field_kind(t) != FieldKind::Text
             || COMMON_LABELS.contains(&label_key(t).as_str())
     };
+    // F2: a row of one cell that is not a field (「紧急联系人」) heads a section
+    // of someone else's: its next row is not read.
+    let section = |row: &[String]| {
+        let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
+        filled.len() == 1 && !is_field(filled[0])
+    };
     for (r, row) in rows.iter().enumerate() {
+        if r > 0 && section(&rows[r - 1]) {
+            continue;
+        }
         let header = row.iter().all(|c| c.trim().is_empty() || label_like(c));
         let below = rows.get(r + 1).filter(|n| n.len() == row.len());
         for (i, cell) in row.iter().enumerate() {
             if !is_field(cell) {
                 continue;
             }
-            // 「紧急联系人 | 姓名 | 李四」: a field under another label is not the user's.
-            if i > 0 && label_like(&row[i - 1]) && !header {
+            // F2: 「配偶 | 姓名 | 李四」: a field is the user's only first in its
+            // row, or right after another field's value (「姓名 | 陈晓明 | 性别 | 男」).
+            if !header && i > 0 && !(i >= 2 && is_field(&row[i - 2])) {
                 continue;
             }
             let right = row
                 .get(i + 1)
                 .filter(|c| !c.trim().is_empty() && !label_like(c));
+            // F1: the cell below is always weighed, whatever the header words
+            // are (no list knows them all); right and down disagreeing is ambiguous.
             let down = below
-                .filter(|_| header)
                 .map(|n| &n[i])
                 .filter(|c| !c.trim().is_empty() && !label_like(c));
             match (right, down) {
@@ -335,8 +359,15 @@ fn markers(line: &str, names: &[String]) -> Vec<(usize, usize, String)> {
         }
     }
     marks.sort_by_key(|m| m.0);
-    marks.dedup_by_key(|m| m.0);
-    marks
+    // F3: a marker starting inside the one before (「联系人、电话：」 and
+    // 「电话：」) is dropped, so a value's range never runs backwards.
+    let mut kept: Vec<(usize, usize, String)> = Vec::new();
+    for m in marks {
+        if kept.last().is_none_or(|k| m.0 >= k.1) {
+            kept.push(m);
+        }
+    }
+    kept
 }
 
 /// A value worth giving: not empty, not long, not a blank to fill in, no

@@ -502,7 +502,8 @@ fn label_value_rows_are_not_headers_and_a_header_is_never_read_sideways() {
     );
     assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"), "{r:?}");
     assert_eq!(value(&r, "性别").as_deref(), Some("男"));
-    // Values under 「label | 值」 cells are not read down either.
+    // A row under 「label | 值」 cells whose words could be values reads
+    // two ways (陈晓明 to the right, 研发 below): precision first (F1), none.
     let r = read(
         &[],
         &[
@@ -511,7 +512,8 @@ fn label_value_rows_are_not_headers_and_a_header_is_never_read_sideways() {
         ],
         &["姓名", "性别"],
     );
-    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"), "{r:?}");
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    assert_eq!(r.ambiguous, ["姓名", "性别"]);
     // A label to the right is never a value, with no row below too.
     let r = read(&[], &[&["姓名", "性别", "年龄"]], &["姓名"]);
     assert_eq!(value(&r, "姓名"), None, "{r:?}");
@@ -652,4 +654,77 @@ async fn material_that_cannot_be_read_says_so() {
     let note = listed["note"].as_str().unwrap();
     assert!(note.starts_with("没能读到资料"), "{note}");
     assert!(listed["fields"][0].get("from_source").is_none());
+}
+
+/// PR-Daemon #2095 r2 F1: a header word outside any list is not a value:
+/// 「姓名 | 职称」 over 「陈晓明 | 工程师」 reads both ways, so neither is given.
+#[test]
+fn a_header_word_outside_any_list_is_not_a_value() {
+    let r = read(&[], &[&["姓名", "职称"], &["陈晓明", "工程师"]], &["姓名"]);
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    let r = read(
+        &[],
+        &[&["姓名", "毕业院校"], &["陈晓明", "北京大学"]],
+        &["姓名"],
+    );
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+}
+
+/// PR-Daemon #2095 r2 F2: someone else's identity (an emergency contact, a
+/// spouse) is not the user's.
+#[test]
+fn someone_else_s_identity_is_not_the_user_s() {
+    let f = &["姓名", "电话"];
+    for line in [
+        "紧急联系人 姓名：李四",
+        "紧急联系人（姓名：李四，电话：139）",
+    ] {
+        let r = read(&[line], &[], f);
+        assert_eq!(
+            (value(&r, "姓名"), value(&r, "电话")),
+            (None, None),
+            "{line}: {r:?}"
+        );
+    }
+    for rows in [
+        &[&["配偶", "姓名", "李四"][..]][..],
+        &[&["紧急联系人", "", "姓名", "李四"][..]][..],
+        &[
+            &["紧急联系人", ""][..],
+            &["姓名", "电话"][..],
+            &["李四", "139"][..],
+        ][..],
+    ] {
+        let r = read(&[], rows, f);
+        assert_eq!(
+            (value(&r, "姓名"), value(&r, "电话")),
+            (None, None),
+            "{rows:?}: {r:?}"
+        );
+    }
+}
+
+/// PR-Daemon #2095 r2 F3: field names inside one another never panic.
+#[test]
+fn overlapping_field_names_never_panic() {
+    let r = read(&["联系人、电话：139"], &[], &["联系人、电话", "电话"]);
+    assert_eq!(value(&r, "联系人、电话").as_deref(), Some("139"), "{r:?}");
+    let r = read(&["(1)姓名：陈晓明"], &[], &["(1)姓名", "姓名"]);
+    assert_ne!(value(&r, "姓名").as_deref(), Some(""), "{r:?}");
+}
+
+/// PR-Daemon #2095 r2 F4: a value ends at two spaces, a tab or U+3000.
+#[test]
+fn a_value_ends_at_two_spaces_a_tab_or_an_ideographic_space() {
+    for line in [
+        "姓名：张三  部门 研发",
+        "姓名：张三\t部门 研发",
+        "姓名：张三\u{3000}部门",
+    ] {
+        assert_eq!(
+            value(&read(&[line], &[], &["姓名"]), "姓名").as_deref(),
+            Some("张三"),
+            "{line}"
+        );
+    }
 }
