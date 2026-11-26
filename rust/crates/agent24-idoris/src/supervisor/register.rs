@@ -28,11 +28,13 @@ use zeroize::Zeroizing;
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
-/// Code-signing identifier of the released iDoris binary (`codesign -dv` on
-/// v0.6.0 and v0.6.1 prints `Identifier=idoris`). FU-254: the earlier value
-/// `ai.idoris.cli` matched no release, so every registration was rejected and
-/// iDoris stopped itself (exit 4) when its 900 s orphan timer ran out.
-pub(super) const SIGNING_IDENTIFIERS: &[&str] = &["idoris"];
+/// Code-signing identifiers accepted for iDoris (team HYAP444FN9 and the
+/// Developer ID chain are required separately). `ai.idoris.cli` is the one the
+/// frozen contract names (interface spec §2.10.9); the released v0.6.0 and
+/// v0.6.1 binaries are signed `idoris` instead (`codesign -dv`). Accepting only
+/// the contract value rejected every registration, so iDoris stopped itself
+/// (exit 4) when its 900 s orphan timer ran out (FU-254; upstream FU-258).
+pub(super) const SIGNING_IDENTIFIERS: &[&str] = &["ai.idoris.cli", "idoris"];
 type Result<T> = std::result::Result<T, &'static str>;
 
 #[derive(Clone, Debug)]
