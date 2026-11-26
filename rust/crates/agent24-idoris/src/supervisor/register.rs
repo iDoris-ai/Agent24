@@ -28,6 +28,11 @@ use zeroize::Zeroizing;
 
 const FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 const SESSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// Code-signing identifier of the released iDoris binary (`codesign -dv` on
+/// v0.6.0 and v0.6.1 prints `Identifier=idoris`). FU-254: the earlier value
+/// `ai.idoris.cli` matched no release, so every registration was rejected and
+/// iDoris stopped itself (exit 4) when its 900 s orphan timer ran out.
+pub(super) const SIGNING_IDENTIFIERS: &[&str] = &["idoris"];
 type Result<T> = std::result::Result<T, &'static str>;
 
 #[derive(Clone, Debug)]
@@ -256,7 +261,7 @@ impl Peer {
         agent24_os_proc::verify_code_identity(
             self.token.ok_or("identity_rejected")?,
             "HYAP444FN9",
-            &["ai.idoris.cli"],
+            SIGNING_IDENTIFIERS,
         )
         .map(|_| ())
         .map_err(|_| "identity_rejected")
@@ -457,7 +462,12 @@ async fn answer(stream: UnixStream, path: PathBuf, handle: Handle, test_unsigned
             }
         }
         Ok(None) => {}
-        Err(code) => error(&mut write, code).await,
+        Err(code) => {
+            // iDoris keeps retrying, and gives up after its orphan timeout; without
+            // this line a persistent rejection leaves no trace on the host side.
+            tracing::warn!(code, "iDoris registration rejected");
+            error(&mut write, code).await;
+        }
     }
 }
 type Accepted = (String, mpsc::Receiver<Rotation>, CancellationToken);

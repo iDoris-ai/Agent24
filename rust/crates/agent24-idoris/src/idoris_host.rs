@@ -565,6 +565,14 @@ impl Runtime for SystemRuntime {
         })
     }
 }
+/// A generation that stopped by itself is started again only if it had run at
+/// least this long (FU-254), so a binary that exits at once does not loop.
+const AUTO_RESTART_MIN_UPTIME: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(60)
+};
+
 struct Inner {
     installation: Option<Installation>,
     state: State,
@@ -1333,6 +1341,7 @@ impl IdorisHost {
         refresh_failure: Arc<SyncMutex<Option<Code>>>,
     ) {
         let host = Arc::downgrade(self);
+        let born = tokio::time::Instant::now();
         tokio::spawn(async move {
             loop {
                 let changed = signal.changed().await;
@@ -1375,6 +1384,24 @@ impl IdorisHost {
                                 Some(_) => State::Failed,
                                 None => State::Stopped,
                             };
+                            // FU-254: iDoris stopped by itself (orphan expiry, exit 4,
+                            // or an unannounced clean exit) while the user still wants
+                            // it running. Start it again in the background, unless it
+                            // stopped soon after starting: that would only loop.
+                            let wanted = error.is_none()
+                                && i.installation.as_ref().is_some_and(|r| r.desired_running);
+                            drop(i);
+                            if wanted && born.elapsed() >= AUTO_RESTART_MIN_UPTIME {
+                                tracing::warn!("iDoris stopped by itself; starting it again");
+                                let key = format!("auto-restart-{}", uuid::Uuid::new_v4().simple());
+                                if let Err(code) = host.submit(Action::Start, Some(&key)).await {
+                                    tracing::warn!(?code, "iDoris automatic restart not admitted");
+                                }
+                            } else if wanted {
+                                tracing::warn!(
+                                    "iDoris stopped soon after starting; not restarting it"
+                                );
+                            }
                         }
                         return;
                     }
