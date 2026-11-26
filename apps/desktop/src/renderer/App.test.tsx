@@ -52,6 +52,20 @@ describe('App', () => {
   // These assertions predate i18n and are written against the zh copy.
   beforeEach(() => { setLocale('zh') })
 
+  // VI-04: on macOS the hiddenInset title bar puts the traffic lights over the
+  // sidebar's top-left corner; the root gets a `mac` class so the logo row can
+  // clear them (styles.css). Elsewhere there are no traffic lights.
+  it('marks the root with `mac` only on macOS', async () => {
+    const spy = vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel')
+    const { container, unmount } = await act(async () => render(<App />))
+    expect(container.querySelector('.app')).toHaveClass('mac')
+    unmount()
+    spy.mockReturnValue('Win32')
+    const other = await act(async () => render(<App />))
+    expect(other.container.querySelector('.app')).not.toHaveClass('mac')
+    spy.mockRestore()
+  })
+
   it('renders the fixed sidebar and default pins without Workbench', async () => {
     await act(async () => { render(<App />) })
     expect(screen.getAllByText('助理').length).toBeGreaterThan(0)
