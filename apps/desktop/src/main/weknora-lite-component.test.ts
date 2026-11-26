@@ -307,6 +307,28 @@ describe('WeknoraLiteInstaller install', () => {
     expect(result.state).toBe('failed')
   })
 
+  it('rejects a redirect that comes back to the loopback override origin', async () => {
+    const f = buildFixture()
+    const { base } = await serve((req, res) => {
+      if (req.url === `/lite/${f.pin.archive}`) { res.writeHead(302, { location: '/again.tar.gz' }); res.end(); return }
+      res.end(f.archive)
+    })
+    expect((await installer(f, base).install()).state).toBe('failed')
+  })
+
+  it('fails as network when the server ends cleanly before the pinned size', async () => {
+    const f = buildFixture()
+    const half = f.archive.subarray(0, Math.floor(f.archive.length / 2))
+    const { base } = await serve((_req, res) => { res.writeHead(200, { 'content-length': String(half.length) }); res.end(half) })
+    expect(await installer(f, base).install()).toMatchObject({ state: 'failed', failure: 'network' })
+  })
+
+  it('rejects a program without the execute bit', async () => {
+    const f = buildFixture((stage) => fs.chmodSync(path.join(stage, 'WeKnora-lite'), 0o644))
+    const { base } = await serve((_req, res) => res.end(f.archive))
+    expect(await installer(f, base).install()).toMatchObject({ state: 'failed', failure: 'integrity' })
+  })
+
   it('refuses a non-https pinned URL', async () => {
     const f = buildFixture()
     const result = await new WeknoraLiteInstaller({
