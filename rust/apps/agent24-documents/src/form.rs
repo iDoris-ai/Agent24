@@ -182,14 +182,17 @@ pub(crate) fn plainly_users(
     }
     // r3 D4: a name field of the user's own (姓名, 员工姓名, 申请人姓名…),
     // compared by the same field in the material and in what was said.
-    user_said.iter().filter(|n| own_name_field(n)).any(|n| {
-        let key = safe_key(n);
-        let stated = read.values.iter().find(|(k, _)| safe_key(k) == key);
-        match (stated, values.get(n)) {
-            (Some((_, stated)), Some(said)) => safe_key(stated) == safe_key(said),
-            _ => false,
-        }
-    })
+    // r4 E4: every one of them the user said, not any one.
+    let said: Vec<&String> = user_said.iter().filter(|n| own_name_field(n)).collect();
+    !said.is_empty()
+        && said.into_iter().all(|n| {
+            let key = safe_key(n);
+            let stated = read.values.iter().find(|(k, _)| safe_key(k) == key);
+            match (stated, values.get(n)) {
+                (Some((_, stated)), Some(said)) => safe_key(stated) == safe_key(said),
+                _ => false,
+            }
+        })
 }
 
 /// A field for the user's own name: 「姓名」 after one of these (never

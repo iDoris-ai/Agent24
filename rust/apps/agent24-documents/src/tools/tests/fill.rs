@@ -1884,3 +1884,41 @@ async fn a_material_is_plainly_the_users_only_as_one_clean_record() {
     );
     assert_eq!(strings(&answer["filled"]), ["员工姓名", "部门"], "{answer}");
 }
+
+/// PR-Daemon #2100 r4 E4: every name field the user said must be the
+/// material's, not any one of them.
+#[tokio::test]
+async fn every_name_the_user_said_must_be_the_materials() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["{{本人姓名}}{{申请人姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["本人姓名：王小明", "申请人姓名：王小明", "部门：研发部"]),
+    )
+    .await;
+    let fill = |me: &str| {
+        json!({
+            "document_id": TPL, "source_document_id": SRC,
+            "values": { "本人姓名": me, "申请人姓名": "王小明" },
+            "user_said": ["本人姓名", "申请人姓名"],
+        })
+    };
+    let answer = payload(&call(&state, "fill", fill("李四")).await);
+    assert!(
+        !strings(&answer["filled"]).contains(&"部门".into()),
+        "{answer}"
+    );
+    let answer = payload(&call(&state, "fill", fill("王小明")).await);
+    assert!(
+        strings(&answer["filled"]).contains(&"部门".into()),
+        "{answer}"
+    );
+}

@@ -213,27 +213,44 @@ export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）
   + '带资料时，资料里的岗位字段要等用户亲口说了姓名（放进 user_said）、并且和资料里的姓名一致才会写入；问齐了或用户说先空着、确认生成时，必须调用 documents.fill，带同一个 source_document_id；没有调用成功就不要说已生成或已保存。填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
   + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
 
-/** PR-Daemon #2100 r2 C3 (监工): only these affirmative forms name the
- * material: 「资料在《X》(里|中)」「资料是《X》」「用《X》(里|中)的资料」. */
-const MATERIAL = /资料(?:在|是)《([^》]{1,200})》|用《([^》]{1,200})》(?:里|中)的资料/
-/** PR-Daemon #2100 r3 D2/D3 (监工): a word of no or of taking it back. */
-const TAKE_BACK = /不|别|没|勿|无需|莫|非|忽略|改用|换|撤|算了/
-/** Any other mention of a material by title (「资料别用《X》」「资料勿用《X》」). */
-const MENTION = /资料[^《》\n]{0,12}《|《[^》]{1,200}》[^《》\n]{0,6}资料/
+/** PR-Daemon #2100 r4 E1/E3 (监工): a clause (split at 「，。；,;!?！？」 and line
+ * breaks) names the material only when the whole of it is one of these, with
+ * nothing before or after: no list of words of no to keep up. */
+const CLAUSE = /[，。；,;!?！？\n]/
+const SHAPES = [
+  /^(?:请|我的|这个)?资料(?:在|是)《([^》]{1,200})》(?:里|中)?$/,
+  /^用《([^》]{1,200})》(?:里|中)的资料(?:来)?(?:填)?$/,
+]
+/** r4 E2: a turn with any of these names no earlier material either. */
+const TAKE_BACK = /资料|那份|这份|上份|《|》|不|别|没|勿|无需|莫|非|忽略|改用|换|撤|算了/
+/** Another clause about a material (「这份别用」「改用…的资料」). */
+const OTHER_MATERIAL = /资料|那份|这份|上份/
 
-/** 监工 0.7.123 真机: the material a form fill was told, in this turn or the
- * last three user turns (newest first), as a title; null when none. A turn
- * that mentions a material by title in any other form says none, and the
- * earlier turns are not looked at (「资料是《X》」 then 「资料别用《X》」). */
+/** The material a turn names, or null: exactly one clause in one of the
+ * shapes, and no other clause about a material. */
+function namedMaterial(t: string): string | null {
+  const clauses = t.split(CLAUSE).map((c) => c.trim()).filter((c) => c !== '')
+  let title: string | null = null
+  for (const c of clauses) {
+    const m = SHAPES.map((s) => s.exec(c)).find((x) => x !== null)
+    if (m) {
+      if (title !== null) return null
+      title = m[1]!.trim()
+    } else if (OTHER_MATERIAL.test(c)) return null
+  }
+  return title
+}
+
+/** 监工 0.7.123 真机: the material a form fill was told, as a title; null when
+ * none. This turn first; an earlier one (the last three, newest first) only
+ * when this turn says nothing of a material or of no (宁可不认). */
 export function formMaterial(before: readonly string[], text: string): string | null {
-  for (const t of [text, ...before.slice(-3).reverse()]) {
-    // A turn about a material or a title with a word of no or of taking it
-    // back (「别用《X》里的资料」「刚才那份资料不要用了」) names none, and stops.
-    if (/资料|《/.test(t) && TAKE_BACK.test(t)) return null
-    const m = MATERIAL.exec(t)
-    const title = (m?.[1] ?? m?.[2])?.trim()
-    if (title) return title
-    if (MENTION.test(t)) return null
+  const here = namedMaterial(text)
+  if (here !== null) return here
+  if (TAKE_BACK.test(text)) return null
+  for (const t of before.slice(-3).reverse()) {
+    const m = namedMaterial(t)
+    if (m !== null) return m
   }
   return null
 }

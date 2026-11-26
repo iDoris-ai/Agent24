@@ -489,6 +489,14 @@ describe('监工 0.7.123: the material a form fill was told', () => {
       expect(formMaterial([], no)).toBeNull()
     }
     expect(formMaterial(['资料是《李四.docx》'], '刚才那份资料不要用了')).toBeNull()
+    // r4 E1–E3 (监工): a clause the whole of which names it, no word list.
+    for (const no of ['禁用《李四.docx》里的资料', '资料是《李四.docx》（作废）', '禁止用《李四.docx》里的资料', '取消用《李四.docx》里的资料']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '那份不用了')).toBeNull()
+    expect(formMaterial([], '资料是《莫小明.docx》')).toBe('莫小明.docx')
+    expect(formMaterial([], '资料在《个人信息.docx》里，部门没有的先空着')).toBe('个人信息.docx')
+    expect(formMaterial([], '把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
   })
 
   it('goes into the prompt by its id, for fields and fill', () => {
