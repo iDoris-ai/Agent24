@@ -377,12 +377,14 @@ impl<K: Ord + Clone> BindingState<K> {
         self.credentials.issue(&self.connection).map(Retry::Issue)
     }
 
-    /// A manual retry, a configuration change, a sidecar restart or a new
-    /// handshake of the same instance (S1.4): every kept reason is let go,
+    /// A manual retry or a configuration change, persisted first (S1.4):
+    /// every kept reason is let go,
     /// and an `unavailable` binding enters `loading` in a new round. Leaving
     /// a reason that does not retry by itself is a loosening the caller has
-    /// persisted first (S1.10, I1). A retired binding is out of the
-    /// connection phase for good, so it never enters `loading` here.
+    /// persisted first (S1.10, I1). A sidecar restart is not one: it goes
+    /// through [`BindingState::restarted`], which lets nothing go. A retired
+    /// binding is out of the connection phase for good, so it never enters
+    /// `loading` here.
     pub fn retry(&mut self) -> Option<Round> {
         self.connection.release_all();
         match self.connection.phase()? {
@@ -421,15 +423,18 @@ impl<K: Ord + Clone> BindingState<K> {
     /// issuances no longer count and the round issues afresh. Not a
     /// revocation: no placeholder rule, no invalidation, no increment (S5.6).
     /// A reason that does not retry by itself stays, in the phase or kept by
-    /// leaving: only a written loosening lets it go (S1.10, I1).
+    /// leaving: only a written loosening lets it go (S1.10, I1); the old
+    /// credential still goes in the phase, so that loosening issues afresh.
     pub fn restarted(&mut self) -> Option<Round> {
         let phase = self.connection.phase()?;
+        // The old process's key is dead whatever the phase; dropping it lets
+        // go of nothing, so a later `loading` can issue again.
+        self.credentials.discard();
         if let ConnectionPhase::Unavailable(cause) = phase
             && !cause.retries_automatically()
         {
             return None;
         }
-        self.credentials.discard();
         self.connection.start_loading()
     }
 }
