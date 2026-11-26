@@ -3,8 +3,8 @@
 //! rotation of the instance secret, on a local-managed profile.
 //!
 //! The managed WeKnora Lite issues a fresh instance key on every start and
-//! revokes the previous one (WeKnora#180). `starting` drops the old one, and
-//! the new key is the new `loading` round's credential, answered to
+//! revokes the previous one (WeKnora#180). `starting` drops the old one and
+//! opens a new round, and the new key is the new `loading` round's credential, answered to
 //! [`Host::issue`] as `Issued::Granted`; it is
 //! not a rotation. A revocation in `loading` or `unavailable` is
 //! `access_revoked` (credential.rs), so treating each restart's key as one
@@ -24,15 +24,15 @@ use crate::provider::record::Ids;
 
 impl<I: Ids> Host<I> {
     /// S2.2: `id`'s sidecar is in `sidecar`. A binding takes it as
-    /// [`crate::provider::binding::BindingState::sidecar`]: `starting`
-    /// retries into `loading` (in `Output::loading`), a sidecar going down
-    /// makes it `unavailable(dependency)`; nothing is written. `starting`
-    /// drops the binding's credential (a new process has a new key), and
-    /// leaves a persisted reason that does not retry by itself in place: only
-    /// a written loosening lets that go (S1.10, I1). On `starting`,
-    /// a placeholder that retries by backoff makes a handshake attempt, which
-    /// the caller runs and reports to [`Host::identified`] or
-    /// [`Host::attempt_failed`].
+    /// [`crate::provider::binding::BindingState::sidecar`]: a sidecar going
+    /// down makes it `unavailable(dependency)`; `starting` is the same
+    /// instance with a new key, so in the connection phase the old credential
+    /// goes and a new `loading` round (in `Output::loading`) issues again,
+    /// even if the down was missed. A persisted reason that does not retry by
+    /// itself stays, in the phase or kept by leaving (S1.10, I1). Nothing is
+    /// written. On `starting`, a placeholder that retries by backoff makes a
+    /// handshake attempt, which the caller runs and reports to
+    /// [`Host::identified`] or [`Host::attempt_failed`].
     pub fn sidecar(&mut self, id: &I::Profile, sidecar: Sidecar) -> (Output<I>, Option<Attempt>) {
         let off = self.off;
         let mut out = Output::default();

@@ -393,19 +393,13 @@ impl<K: Ord + Clone> BindingState<K> {
         }
     }
 
-    /// S2.2: `starting` retries as [`BindingState::retry`]; a sidecar going
-    /// down makes the binding `unavailable(dependency)` in the connection
-    /// phase, no increment. A reason that does not retry by itself, or
-    /// `local_storage`, stays: `dependency` would retry it by backoff.
+    /// S2.2: a sidecar going down makes the binding `unavailable(dependency)`
+    /// in the connection phase, no increment. A reason that does not retry by
+    /// itself, or `local_storage`, stays: `dependency` would retry it by
+    /// backoff. `starting` is [`BindingState::restarted`].
     pub fn sidecar(&mut self, sidecar: Sidecar) -> Option<Round> {
-        // A new process is a new instance key: a managed Lite issues one on
-        // every start and revokes the old (WeKnora#180), so the `loading` round
-        // this starts issues afresh instead of probing with a dead key.
-        if sidecar == Sidecar::Starting {
-            self.credentials.discard();
-        }
         let down = match sidecar {
-            Sidecar::Starting => return self.retry(),
+            Sidecar::Starting => return self.restarted(),
             Sidecar::Ready | Sidecar::Healthy => false,
             Sidecar::Degraded | Sidecar::Failed | Sidecar::Stopping | Sidecar::Stopped => true,
         };
@@ -418,6 +412,25 @@ impl<K: Ord + Clone> BindingState<K> {
             self.connection.fail(UnavailableCause::Dependency);
         }
         None
+    }
+
+    /// The same instance starts again and will hand over a new key (S2.1,
+    /// S2.2; a managed Lite issues one on every start and revokes the old,
+    /// WeKnora#180): in the connection phase the old credential goes and the
+    /// binding enters `loading` in a new round, so earlier probes and
+    /// issuances no longer count and the round issues afresh. Not a
+    /// revocation: no placeholder rule, no invalidation, no increment (S5.6).
+    /// A reason that does not retry by itself stays, in the phase or kept by
+    /// leaving: only a written loosening lets it go (S1.10, I1).
+    pub fn restarted(&mut self) -> Option<Round> {
+        let phase = self.connection.phase()?;
+        if let ConnectionPhase::Unavailable(cause) = phase
+            && !cause.retries_automatically()
+        {
+            return None;
+        }
+        self.credentials.discard();
+        self.connection.start_loading()
     }
 }
 

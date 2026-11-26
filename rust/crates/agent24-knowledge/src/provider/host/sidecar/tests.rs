@@ -182,3 +182,51 @@ fn a_rotation_while_running_is_written_as_a_revocation() {
     assert_eq!(host.rotated(&"b", Instant::now()), Output::default());
     assert_eq!(host.rotated(&"zz", Instant::now()), Output::default());
 }
+
+/// A plain restart, even with the down missed: a new round that issues
+/// again, nothing written, no placeholder rule, no increment (S5.6).
+#[test]
+fn a_restart_places_no_placeholder_and_writes_nothing() {
+    let mut host = host();
+    grant(&mut host);
+    let generation = |host: &H| match host.profile(&"a").unwrap().slot() {
+        Slot::Bound(binding) => binding.connection().gate().generation(),
+        Slot::Placeholder(_) => unreachable!(),
+    };
+    let before = generation(&host);
+    let (out, attempt) = host.sidecar(&"a", Sidecar::Starting);
+    assert_eq!(attempt, None);
+    assert_eq!(out.loading.len(), 1);
+    assert_eq!(phase(&host, "a"), Some(ConnectionPhase::Loading));
+    assert!(
+        host.take_write().is_none(),
+        "no rule, no generation written"
+    );
+    assert_eq!(generation(&host), before);
+    grant(&mut host);
+}
+
+/// Off keeps a stuck reason; a sidecar start meanwhile does not release it,
+/// so On brings it back (PR-Daemon F2).
+#[test]
+fn a_start_while_off_keeps_a_stuck_reason() {
+    let mut host = host();
+    host.rotated(&"a", Instant::now());
+    let (attempt, _, _) = write(&mut host);
+    host.written(attempt, Written::Durable);
+    host.turn_off();
+    let (attempt, _, _) = write(&mut host);
+    host.written(attempt, Written::Durable);
+    assert_eq!(
+        host.sidecar(&"a", Sidecar::Starting),
+        (Output::default(), None)
+    );
+    host.turn_on().unwrap();
+    while let Some((attempt, _)) = host.take_write() {
+        host.written(attempt, Written::Durable);
+    }
+    assert_eq!(
+        phase(&host, "a"),
+        unavailable(UnavailableCause::AccessRevoked)
+    );
+}
