@@ -448,7 +448,6 @@ impl IdorisHost {
         operation_lock(&self.root.join("transactions")).map_err(install_code)
     }
     pub async fn candidates(&self, _confirmed: Option<&str>) -> Result<Candidates, Code> {
-        let models = self.local_omlx_models().await?;
         let setup = self
             .inner
             .lock()
@@ -456,6 +455,12 @@ impl IdorisHost {
             .installation
             .as_ref()
             .and_then(|r| r.omlx_setup.clone());
+        let models = self
+            .omlx_models()
+            .await?
+            .into_iter()
+            .filter_map(|(id, chat)| chat.then_some(id))
+            .collect();
         // Compatibility envelope for the desktop: models come from the local inventory.
         Ok(Candidates {
             candidates: vec![Candidate {
@@ -465,15 +470,42 @@ impl IdorisHost {
                     .unwrap_or_default(),
                 identity: "omlx",
                 authentication: "ready",
-                models: models
-                    .into_iter()
-                    .filter(|m| matches!(m.kind.as_str(), "chat" | "vision"))
-                    .map(|m| m.omlx_id)
-                    .collect(),
+                models,
             }],
             key_from_local_settings: self.provisioner.upstream_key().await?.is_some(),
             setup,
         })
+    }
+    /// Every oMLX model id with whether it can serve chat. iDoris v0.6.0 `models local`
+    /// scans only one level below `~/.omlx/models`, so models kept under an organisation
+    /// folder (`mlx-community/<model>`, which oMLX serves under the leaf name) are missed.
+    /// When its scan has no chat model, the two-level ones are added from the directory.
+    /// Nothing is sent anywhere: iDoris setup still probes oMLX (with its own listener
+    /// check) and refuses bindings the running oMLX does not list.
+    async fn omlx_models(&self) -> Result<Vec<(String, bool)>, Code> {
+        let mut models: Vec<(String, bool)> = self
+            .local_omlx_models()
+            .await?
+            .into_iter()
+            .map(|m| {
+                let chat = matches!(m.kind.as_str(), "chat" | "vision");
+                (m.omlx_id, chat)
+            })
+            .collect();
+        if !models.iter().any(|(_, chat)| *chat)
+            && let Some(dir) = self.omlx_models_dir.clone()
+        {
+            let nested = tokio::task::spawn_blocking(move || nested_omlx_models(&dir))
+                .await
+                .unwrap_or_default();
+            for id in nested {
+                if !models.iter().any(|(known, _)| *known == id) {
+                    let chat = is_chat_model_id(&id);
+                    models.push((id, chat));
+                }
+            }
+        }
+        Ok(models)
     }
     async fn local_omlx_models(&self) -> Result<Vec<LocalModel>, Code> {
         let value = self
@@ -895,10 +927,10 @@ impl IdorisHost {
                 result = upstream_models(&request.endpoint) => result?,
             }
         } else {
-            self.local_omlx_models()
+            self.omlx_models()
                 .await?
                 .into_iter()
-                .map(|m| m.omlx_id)
+                .map(|(id, _)| id)
                 .collect()
         };
         if !models.contains(&request.daily_model)
@@ -1341,6 +1373,48 @@ mod chat_model_filter_tests {
         }
         assert!(super::is_chat_model_id("Qwen3-8B-4bit"));
     }
+}
+
+/// `<dir>/<org>/<model>/config.json` model folders, named by the leaf. Symlinks, dot
+/// names and anything but a plain id are skipped; each level is capped.
+fn nested_omlx_models(dir: &Path) -> Vec<String> {
+    const MAX_ENTRIES: usize = 1024;
+    let plain = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_dir());
+    let id = |name: &std::ffi::OsStr| {
+        name.to_str()
+            .filter(|n| {
+                !n.starts_with('.')
+                    && n.len() <= 128
+                    && n.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            })
+            .map(str::to_owned)
+    };
+    let children = |p: &Path| -> Vec<std::fs::DirEntry> {
+        std::fs::read_dir(p)
+            .map(|entries| entries.flatten().take(MAX_ENTRIES).collect())
+            .unwrap_or_default()
+    };
+    let mut found = Vec::new();
+    for org in children(dir) {
+        if id(&org.file_name()).is_none() || !plain(&org.path()) {
+            continue;
+        }
+        for model in children(&org.path()) {
+            let Some(name) = id(&model.file_name()) else {
+                continue;
+            };
+            let config = model.path().join("config.json");
+            if plain(&model.path())
+                && std::fs::symlink_metadata(&config).is_ok_and(|m| m.file_type().is_file())
+                && !found.contains(&name)
+            {
+                found.push(name);
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 #[derive(Deserialize)]

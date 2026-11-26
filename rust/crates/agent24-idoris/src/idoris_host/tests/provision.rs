@@ -2334,3 +2334,80 @@ async fn an_older_bundled_version_with_invalid_fields_is_still_rejected() {
         assert_eq!(error.to_string(), "invalid iDoris installation receipt");
     }
 }
+
+/// `~/.omlx/models` laid out like David's MacBook (11-26): every model one organisation
+/// folder down, which iDoris v0.6.0 `models local` does not see.
+fn nested_models_dir(x: &ConnectedFixture) -> PathBuf {
+    let dir = x.f.host.root.join("omlx-models");
+    for model in ["Qwen3-8B-4bit", "bge-m3-mlx-fp16"] {
+        let path = dir.join("mlx-community").join(model);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.json"), "{}").unwrap();
+    }
+    // Not models: no config.json, a dot folder, and a symlinked model.
+    fs::create_dir_all(dir.join("mlx-community/partial-download")).unwrap();
+    fs::create_dir_all(dir.join(".cache/hidden-model")).unwrap();
+    fs::write(dir.join(".cache/hidden-model/config.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("mlx-community/Qwen3-8B-4bit"),
+        dir.join("mlx-community/linked-model"),
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn candidates_add_models_one_folder_down_when_the_idoris_scan_finds_no_chat_model() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"local_models": [
+        {"omlx_id":"bge-m3-mlx-fp16", "kind":"embedding", "size_bytes":42}
+    ]}));
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert_eq!(discovery.candidates[0].models, ["Qwen3-8B-4bit"]);
+    // The endpoint is still left to iDoris's own discovery.
+    assert_eq!(discovery.candidates[0].endpoint, "");
+}
+
+#[tokio::test]
+async fn candidates_keep_the_idoris_scan_when_it_finds_a_chat_model() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert_eq!(discovery.candidates[0].models, ["real-model"]);
+}
+
+#[tokio::test]
+async fn candidates_stay_empty_without_models_in_either_layout() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"local_models": []}));
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(x.f.host.root.join("missing"));
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert!(discovery.candidates[0].models.is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_connects_and_starts_with_models_one_folder_down() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let mut x = ConnectedFixture::new().await;
+    x.scenario(json!({"local_models": []}));
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    x.f.host.bootstrap_core().await.unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+    assert_eq!(
+        x.f.host.daily_model().await.as_deref(),
+        Some("Qwen3-8B-4bit")
+    );
+    // connect checked the selection against the same list and bound embed too.
+    assert_eq!(
+        x.keys()[0]["allowed_roles"],
+        json!(["daily", "deep", "embed"])
+    );
+    x.f.host.shutdown().await.unwrap();
+}

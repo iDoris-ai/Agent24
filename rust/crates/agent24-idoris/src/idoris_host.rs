@@ -596,6 +596,8 @@ pub struct IdorisHost {
     budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
     omlx_keys: Arc<dyn Keychain>,
+    /// oMLX's model directory (`~/.omlx/models`, the same default iDoris scans).
+    omlx_models_dir: Option<PathBuf>,
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     let parent = path.parent().ok_or(Code::PersistenceFailed)?;
@@ -717,6 +719,10 @@ impl IdorisHost {
             budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
             omlx_keys: Arc::new(crate::keychain::OmlxKeychain),
+            omlx_models_dir: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join(".omlx/models")),
             inner: Mutex::new(Inner {
                 installation,
                 state,
