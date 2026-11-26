@@ -1098,3 +1098,72 @@ async fn fields_say_when_the_material_is_not_plainly_the_user_s() {
     assert!(note.starts_with("资料版式无法确定是本人信息"), "{note}");
     assert!(listed["fields"][0].get("from_source").is_none());
 }
+
+/// PR-Daemon #2095 r6 B1: a header over two or more rows of data is a list
+/// (a roster, a family table): whose the first row is cannot be told.
+#[test]
+fn a_header_over_several_rows_is_a_list_and_ambiguous() {
+    use crate::form::Block::{Line, Row};
+    let row = |c: &[&str]| Row(names(c));
+    let f = names(&["姓名", "电话", "关系"]);
+    for blocks in [
+        vec![
+            row(&["姓名", "电话"]),
+            row(&["陈晓明", "138"]),
+            row(&["李四", "139"]),
+            row(&["王五", "137"]),
+        ],
+        vec![
+            row(&["姓名", "关系", "电话"]),
+            row(&["李四", "父亲", "139"]),
+            row(&["王五", "母亲", "138"]),
+        ],
+        vec![
+            Line("个人信息".into()),
+            row(&["姓名", "电话"]),
+            row(&["陈晓明", "138"]),
+            row(&["李四", "139"]),
+        ],
+    ] {
+        let r = crate::form::labelled_blocks(&blocks, &f);
+        assert!(r.values.is_empty(), "{blocks:?}: {r:?}");
+        assert!(r.ambiguous.contains(&"姓名".to_owned()), "{r:?}");
+    }
+    // Control: a header and its one row, then no more data, is read.
+    for after in [None, Some(Line("以上信息属实".into()))] {
+        let mut blocks = vec![row(&["姓名", "电话"]), row(&["陈晓明", "138"])];
+        blocks.extend(after);
+        let r = crate::form::labelled_blocks(&blocks, &f);
+        assert_eq!(
+            (value(&r, "姓名").as_deref(), value(&r, "电话").as_deref()),
+            (Some("陈晓明"), Some("138")),
+            "{blocks:?}"
+        );
+    }
+}
+
+/// r6 N1: a heading's suffixes come off until none is left
+/// (「个人信息表」「个人基本情况表」).
+#[test]
+fn every_suffix_of_an_own_heading_comes_off() {
+    use crate::form::Block::Line;
+    for title in [
+        "个人信息表",
+        "员工信息表",
+        "个人资料表",
+        "申请人情况表",
+        "个人基本情况表",
+        "基本信息表",
+        "个人信息登记表",
+    ] {
+        let r = crate::form::labelled_blocks(
+            &[Line(title.into()), Line("姓名：陈晓明".into())],
+            &names(&["姓名"]),
+        );
+        assert_eq!(
+            value(&r, "姓名").as_deref(),
+            Some("陈晓明"),
+            "{title}: {r:?}"
+        );
+    }
+}

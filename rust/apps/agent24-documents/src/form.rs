@@ -275,10 +275,12 @@ const OWN_HEADINGS: &[&str] = &[
 /// never one with any other word (「共同申请人」「本人前雇主」).
 fn own_heading(t: &str) -> bool {
     let mut k: String = t.chars().filter(|c| !c.is_whitespace()).collect();
-    for suffix in ["登记表", "信息", "资料", "情况", "表"] {
-        if let Some(stem) = k.strip_suffix(suffix) {
-            k = stem.to_owned();
-        }
+    // r6 N1: until none is left (「个人基本情况表」→「个人基本情况」→「个人基本」).
+    while let Some(stem) = ["登记表", "信息", "资料", "情况", "表"]
+        .iter()
+        .find_map(|suffix| k.strip_suffix(suffix))
+    {
+        k = stem.to_owned();
     }
     OWN_HEADINGS.contains(&k.as_str())
 }
@@ -409,7 +411,25 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                     _ => None,
                 };
                 if header(row) {
-                    // A header with the row under it: one field block.
+                    // r6 B1: a header over two or more rows of data is a list
+                    // (a roster, a family table): whose the first row is
+                    // cannot be told. Not read, and the reading stops.
+                    let data =
+                        |n: &[String]| n.iter().any(|c| !c.trim().is_empty() && !label_like(c));
+                    let second = match blocks.get(at + 1) {
+                        Some(Block::Row(n)) if n.len() == row.len() => data(n),
+                        _ => false,
+                    };
+                    if below.is_some_and(|b| data(b)) && second {
+                        for h in row.iter().filter(|h| is_field(h)) {
+                            let k = label_key(h);
+                            if !unsure.contains(&k) {
+                                unsure.push(k);
+                            }
+                        }
+                        break;
+                    }
+                    // A header with the one row under it: one field block.
                     if let Some(below) = below {
                         for (h, v) in row.iter().zip(below) {
                             if is_field(h) && !v.trim().is_empty() && !label_like(v) {
