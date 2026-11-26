@@ -203,10 +203,22 @@ pub(crate) fn fill_note(
 }
 
 /// L8-S02 round 2 (监工 11-26 真机): the values the user's material states
-/// by label, 「姓名：陈晓明」 in a paragraph or a line, or 「姓名 | 陈晓明」 in two
-/// cells side by side. A label is at most 32 characters; a value that is
-/// empty or still a `{{field}}` is not one. First found wins.
-pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>]) -> Vec<(String, String)> {
+/// by label: 「姓名：陈晓明」 in a paragraph or a line (several per line too,
+/// 「姓名：陈晓明；性别：男」「姓名：陈晓明    性别：男」), 「姓名 | 陈晓明」 in two cells
+/// side by side, or a header row 「姓名 | 部门」 over a row of values. `fields`
+/// are the template's names: a cell that is one of them is a label, never a
+/// value (Codex C1). A label is at most 32 characters; a value that is empty
+/// or still a `{{field}}` is not one. First found wins.
+pub(crate) fn labelled(
+    lines: &[String],
+    rows: &[Vec<String>],
+    fields: &[String],
+) -> Vec<(String, String)> {
+    let names: Vec<String> = fields.iter().map(|f| label_key(f)).collect();
+    let is_name = |t: &str| {
+        let k = label_key(t);
+        !k.is_empty() && names.contains(&k)
+    };
     let mut out: Vec<(String, String)> = Vec::new();
     let mut put = |label: &str, value: &str| {
         let label = label_key(label);
@@ -215,6 +227,7 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>]) -> Vec<(String, S
             || label.chars().count() > 32
             || value.is_empty()
             || value.contains("{{")
+            || is_name(value)
             || out.iter().any(|(l, _)| *l == label)
         {
             return;
@@ -222,12 +235,33 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>]) -> Vec<(String, S
         out.push((label, value.to_owned()));
     };
     for line in lines.iter().flat_map(|l| l.lines()) {
-        if let Some(at) = line.find(['：', ':']) {
-            let sep = line[at..].chars().next().map_or(1, char::len_utf8);
-            put(&line[..at], &line[at + sep..]);
+        for segment in segments(line) {
+            // 「姓名：陈晓明 性别：男」: one label after another.
+            let mut rest = segment;
+            while let Some(at) = rest.find(['：', ':']) {
+                let sep = rest[at..].chars().next().map_or(1, char::len_utf8);
+                let after = &rest[at + sep..];
+                let value = until_next_label(after);
+                put(&rest[..at], value);
+                if value.is_empty() || value.len() == after.len() {
+                    break;
+                }
+                rest = after[value.len()..].trim_start();
+            }
         }
     }
-    for row in rows {
+    for (r, row) in rows.iter().enumerate() {
+        // A header row over values: each name's column, one row down.
+        if let Some(next) = rows.get(r + 1).filter(|n| n.len() == row.len())
+            && row.iter().filter(|c| is_name(c)).count() >= 2
+        {
+            for (h, v) in row.iter().zip(next) {
+                if is_name(h) {
+                    put(h, v);
+                }
+            }
+            continue;
+        }
         for pair in row.windows(2) {
             // A label cell holds no 「：值」 of its own (that is a line, above).
             if !pair[0].trim_end_matches(['：', ':']).contains(['：', ':']) {
@@ -236,6 +270,44 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>]) -> Vec<(String, S
         }
     }
     out
+}
+
+/// A line cut where one 「标签：值」 ends and the next may start (Codex C2):
+/// at 「；」「;」, a tab, or two or more spaces.
+fn segments(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut spaces = 0;
+    for (i, c) in line.char_indices() {
+        if c == '；' || c == ';' || c == '\t' || c == '\u{3000}' {
+            out.push(&line[start..i]);
+            start = i + c.len_utf8();
+            spaces = 0;
+        } else if c == ' ' {
+            spaces += 1;
+            if spaces == 2 {
+                out.push(&line[start..i - 1]);
+            }
+        } else {
+            if spaces >= 2 {
+                start = i;
+            }
+            spaces = 0;
+        }
+    }
+    out.push(&line[start..]);
+    out
+}
+
+/// A value up to the next label: 「陈晓明 性别：男」 is 「陈晓明」; a value with a
+/// colon and no space before it (a time, 「12:30」) is cut there too.
+fn until_next_label(value: &str) -> &str {
+    match value.find(['：', ':']) {
+        None => value,
+        Some(at) => value[..at]
+            .rfind(char::is_whitespace)
+            .map_or("", |space| &value[..space]),
+    }
 }
 
 /// A label as compared with a field name: whitespace and a trailing colon

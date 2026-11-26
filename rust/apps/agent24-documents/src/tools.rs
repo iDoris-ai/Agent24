@@ -833,7 +833,8 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
     if !is_id(IdKind::Document, &source_id) {
         return Err(refused(&ApiError::not_found("no such document")));
     }
-    let pairs = match load_material(state, &storage, &source_id, &accepted).await? {
+    let names: Vec<String> = listed.fields.iter().map(|f| f.name.clone()).collect();
+    let pairs = match load_material(state, &storage, &source_id, &accepted, names).await? {
         Material::Text(_, pairs) => pairs,
         Material::Absent => Vec::new(),
     };
@@ -993,6 +994,7 @@ async fn load_material(
     storage: &Arc<Storage>,
     id: &str,
     accepted: &Accepted,
+    names: Vec<String>,
 ) -> Result<Material, Envelope> {
     let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
     if detail.head.media_type != crate::office::DOCX {
@@ -1006,7 +1008,10 @@ async fn load_material(
         return Ok(match read.await {
             Ok((_, layer)) => {
                 let lines: Vec<String> = layer.blocks.iter().map(|b| b.text.clone()).collect();
-                Material::Text(compact(&lines.concat()), crate::form::labelled(&lines, &[]))
+                Material::Text(
+                    compact(&lines.concat()),
+                    crate::form::labelled(&lines, &[], &names),
+                )
             }
             Err(_) => Material::Absent,
         });
@@ -1021,16 +1026,15 @@ async fn load_material(
     {
         Ok((_, _, _, bytes)) => {
             let parsed = crate::state::blocking(move || {
+                let (lines, rows) = crate::docx_patch::lines_and_rows(&bytes)?;
                 Ok::<_, crate::docx_patch::PatchError>((
                     crate::docx_patch::plain_text(&bytes)?,
-                    crate::docx_patch::lines_and_rows(&bytes)?,
+                    crate::form::labelled(&lines, &rows, &names),
                 ))
             })
             .await;
             Ok(match parsed {
-                Ok((text, (lines, rows))) => {
-                    Material::Text(compact(&text), crate::form::labelled(&lines, &rows))
-                }
+                Ok((text, pairs)) => Material::Text(compact(&text), pairs),
                 Err(_) => Material::Absent,
             })
         }
@@ -1064,7 +1068,8 @@ async fn identity_in_material(
     if !is_id(IdKind::Document, source_id) {
         return Err(refused(&ApiError::not_found("no such document")));
     }
-    let material = load_material(state, storage, source_id, accepted).await?;
+    let names: Vec<String> = values.keys().cloned().collect();
+    let material = load_material(state, storage, source_id, accepted, names).await?;
     for (name, value) in values {
         if crate::form::field_kind(name) != crate::form::FieldKind::Identity
             || value.trim().is_empty()

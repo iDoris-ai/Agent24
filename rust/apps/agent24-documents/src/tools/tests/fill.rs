@@ -321,7 +321,17 @@ fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
         row(&["紧急联系人：", ""]),
     );
     let (lines, rows) = crate::docx_patch::lines_and_rows(&docx_body(&body)).unwrap();
-    let pairs = crate::form::labelled(&lines, &rows);
+    let names: Vec<String> = [
+        "姓名",
+        "部门",
+        "入职日期",
+        "联系电话",
+        "身份证号",
+        "紧急联系人",
+    ]
+    .map(String::from)
+    .to_vec();
+    let pairs = crate::form::labelled(&lines, &rows, &names);
     let get = |f: &str| crate::form::from_source(f, &pairs).map(str::to_owned);
     assert_eq!(get("姓名").as_deref(), Some("陈晓明"));
     assert_eq!(get("部门").as_deref(), Some("产品研发部"));
@@ -330,7 +340,7 @@ fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
     assert_eq!(get("身份证号"), None);
     assert_eq!(get("紧急联系人"), None);
     // A manual field never takes a value from the material.
-    let signed = crate::form::labelled(&["本人签名：陈晓明".to_owned()], &[]);
+    let signed = crate::form::labelled(&["本人签名：陈晓明".to_owned()], &[], &[]);
     assert_eq!(crate::form::from_source("本人签名", &signed), None);
 }
 
@@ -407,4 +417,46 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
     assert_eq!(strings(&answer["ask_user"]), ["联系电话", "身份证号"]);
     assert_eq!(strings(&answer["unfilled"]), ["紧急联系人"]);
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
+}
+
+/// Codex C1: a header row over a row of values is read by column, never as
+/// 「姓名 → 联系电话」; Codex C2: several 「标签：值」 on one line are each their own.
+#[test]
+fn header_rows_and_several_labels_on_a_line_give_the_right_values() {
+    let names: Vec<String> = ["姓名", "联系电话", "部门", "性别", "入职日期"]
+        .map(String::from)
+        .to_vec();
+    let rows = vec![
+        vec!["姓名".to_owned(), "联系电话".to_owned(), "部门".to_owned()],
+        vec![
+            "陈晓明".to_owned(),
+            "13800000000".to_owned(),
+            "研发部".to_owned(),
+        ],
+    ];
+    let pairs = crate::form::labelled(&[], &rows, &names);
+    let get = |p: &[(String, String)], f: &str| crate::form::from_source(f, p).map(str::to_owned);
+    assert_eq!(get(&pairs, "姓名").as_deref(), Some("陈晓明"), "{pairs:?}");
+    assert_eq!(get(&pairs, "联系电话").as_deref(), Some("13800000000"));
+    assert_eq!(get(&pairs, "部门").as_deref(), Some("研发部"));
+    for line in [
+        "姓名：陈晓明；联系电话：13800000000",
+        "姓名：陈晓明    联系电话：13800000000",
+        "姓名：陈晓明 联系电话：13800000000",
+    ] {
+        let pairs = crate::form::labelled(&[line.to_owned()], &[], &names);
+        assert_eq!(
+            get(&pairs, "姓名").as_deref(),
+            Some("陈晓明"),
+            "{line}: {pairs:?}"
+        );
+        assert_eq!(
+            get(&pairs, "联系电话").as_deref(),
+            Some("13800000000"),
+            "{line}"
+        );
+    }
+    // A label cell beside another label is not its value.
+    let pairs = crate::form::labelled(&[], &[vec!["姓名".to_owned(), "部门".to_owned()]], &names);
+    assert_eq!(get(&pairs, "姓名"), None);
 }
