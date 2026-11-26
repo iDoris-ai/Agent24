@@ -168,6 +168,32 @@ pub(crate) fn from_material(name: &str) -> bool {
     field_kind(name) == FieldKind::Text && SAFE_TEXT.contains(&safe_key(name).as_str())
 }
 
+/// PR-Daemon #2100 r2 (监工): the material is plainly the user's own record:
+/// read whole (no early stop, nothing ambiguous), it states a 姓名, and that
+/// is the 姓名 the user said (safe_key equal). Only the name is compared: a
+/// job field the user said otherwise vetoes nothing (C4).
+pub(crate) fn plainly_users(
+    read: &Labelled,
+    values: &BTreeMap<String, String>,
+    user_said: &[String],
+) -> bool {
+    if read.cut || read.layout_unknown || !read.ambiguous.is_empty() {
+        return false;
+    }
+    let Some(stated) = read
+        .values
+        .iter()
+        .find(|(k, _)| safe_key(k) == "姓名")
+        .map(|(_, v)| safe_key(v))
+    else {
+        return false;
+    };
+    user_said
+        .iter()
+        .filter(|n| safe_key(n) == "姓名")
+        .any(|n| values.get(n).is_some_and(|v| safe_key(v) == stated))
+}
+
 /// What a fill will write, and what it tells the model to pass on.
 pub(crate) struct FillReport {
     pub(crate) write: BTreeMap<String, String>,
@@ -183,10 +209,14 @@ pub(crate) struct FillReport {
 /// said it (`user_said`), never because it occurs in the material (r11 B2,
 /// R0 一致裁决). A name the template does not have stays in `write`, so fill
 /// still refuses it.
+/// `material`: with a material, whether it is plainly the user's own
+/// ([`plainly_users`]); when it is not, an allowlisted field is written only
+/// as said, like any other (PR-Daemon #2100 r2 C2).
 pub(crate) fn plan_fill(
     fields: &[(String, FieldKind)],
     values: &BTreeMap<String, String>,
     user_said: &[String],
+    material: Option<bool>,
 ) -> FillReport {
     let known: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     let said = |name: &str| user_said.iter().any(|s| s == name);
@@ -199,7 +229,8 @@ pub(crate) fn plan_fill(
         if value.trim().is_empty() {
             continue;
         }
-        if field_kind(name) != FieldKind::Manual && (from_material(name) || said(name)) {
+        let unsaid_ok = from_material(name) && material != Some(false);
+        if field_kind(name) != FieldKind::Manual && (unsaid_ok || said(name)) {
             write.insert(name.clone(), value.clone());
         }
     }
@@ -273,6 +304,10 @@ pub(crate) struct Labelled {
     /// that is not exactly the user's, or something else first): nothing is
     /// read, and the user is asked to say them.
     pub(crate) layout_unknown: bool,
+    /// The reading stopped early, at a sign of another record (a header, a
+    /// relation, a label stated again), not at the end of the field run:
+    /// what was read may not be all of the user's (PR-Daemon #2100 r2).
+    pub(crate) cut: bool,
 }
 
 /// Common labels of a form that are not values (a header cell 「年龄」).
@@ -508,6 +543,7 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                             unsure.push(k);
                         }
                     }
+                    out.cut = true;
                     break;
                 }
                 let below = match blocks.get(at) {
@@ -571,7 +607,13 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
             .iter()
             .any(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)));
         if !stop.is_empty() || clash {
-            for n in stop {
+            out.cut = true;
+            for n in stop.into_iter().chain(
+                pairs
+                    .iter()
+                    .filter(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)))
+                    .map(|(n, _)| n.clone()),
+            ) {
                 if !unsure.contains(&n) {
                     unsure.push(n);
                 }
@@ -721,11 +763,6 @@ fn usable(value: &str, names: &[String]) -> bool {
 
 /// A label as compared with a field name: whitespace and a trailing colon
 /// removed.
-/// [`label_key`], for a caller outside: the key `Labelled::values` uses.
-pub(crate) fn label_key_of(label: &str) -> String {
-    label_key(label)
-}
-
 fn label_key(label: &str) -> String {
     label
         .trim()

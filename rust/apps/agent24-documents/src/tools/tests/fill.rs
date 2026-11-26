@@ -167,7 +167,9 @@ async fn fill_writes_only_text_and_identity_the_user_said() {
     );
     assert_eq!(uploads(&state).await, 0);
 
-    let mut args = json!({ "document_id": TPL, "source_document_id": SRC });
+    // PR-Daemon #2100 r2: without a material (one is the user's only when it
+    // names them), as a template fill.
+    let mut args = json!({ "document_id": TPL });
     args["values"] = values();
     let answer = payload(&call(&state, "fill", args).await);
     // r11 B2 (方案 B): a value in the material is not the user's word: the
@@ -197,7 +199,6 @@ async fn fill_writes_only_text_and_identity_the_user_said() {
     // The user said the phone number: that identity field is written.
     let mut args = json!({
         "document_id": TPL,
-        "source_document_id": SRC,
         "user_said": ["姓名", "电话"],
     });
     args["values"] = values();
@@ -277,7 +278,7 @@ fn common_identity_names_and_english_whole_words_are_identity() {
 fn a_failed_import_is_not_written() {
     let fields = vec![("部门".to_owned(), FieldKind::Text)];
     let values = std::collections::BTreeMap::from([("部门".to_owned(), "研发".to_owned())]);
-    let report = crate::form::plan_fill(&fields, &values, &[]);
+    let report = crate::form::plan_fill(&fields, &values, &[], None);
     let mut failed = json!({ "status": "failed", "note": "没能生成新文档（导入失败）。" });
     assert!(!made_document(&failed));
     let made = made_document(&failed);
@@ -422,11 +423,12 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
         )
         .await,
     );
-    assert_eq!(answer["written"], true, "{answer}");
-    assert_eq!(strings(&answer["filled"]), ["部门", "入职日期"]);
+    // PR-Daemon #2100 r2: no 姓名 said yet: the material is not known to be
+    // the user's, so its job fields wait too.
+    assert_eq!(answer["written"], false, "{answer}");
     assert_eq!(
         strings(&answer["ask_user"]),
-        ["姓名", "联系电话", "身份证号"]
+        ["姓名", "部门", "入职日期", "联系电话", "身份证号"]
     );
     assert_eq!(strings(&answer["unfilled"]), ["紧急联系人"]);
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
@@ -445,8 +447,8 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
         "{answer}"
     );
     // ② The user says the three: all are written (their words, user_said),
-    // a name the material does not have too.
-    values.insert("姓名".to_owned(), json!("王小明"));
+    // and the material, now known to be theirs, gives the job fields.
+    values.insert("姓名".to_owned(), json!("陈晓明"));
     values.insert("联系电话".to_owned(), json!("13800001111"));
     values.insert("身份证号".to_owned(), json!("110101199001011234"));
     let answer = payload(
@@ -1557,7 +1559,8 @@ async fn only_allowlisted_fields_come_from_the_material_or_are_written_unsaid() 
         &call(
             &state,
             "fill",
-            json!({ "document_id": TPL, "source_document_id": SRC, "values": values }),
+            // Without a material: only the allowlist is written unsaid.
+            json!({ "document_id": TPL, "values": values }),
         )
         .await,
     );
@@ -1696,4 +1699,103 @@ async fn fill_takes_nothing_from_a_material_not_plainly_the_users() {
     args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
     let answer = payload(&call(&state, "fill", args).await);
     assert_eq!(strings(&answer["filled"]), ["姓名", "岗位"], "{answer}");
+}
+
+/// PR-Daemon #2100 r2 (监工: a positive test, one round): with a material,
+/// an allowlisted field not in user_said is written, the App's or the
+/// model's own, only when the material was read whole (no early stop), it
+/// states a 姓名, and that 姓名 is the one the user said.
+#[tokio::test]
+async fn a_material_s_job_fields_are_written_only_for_the_user_it_names() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}", "岗位：{{岗位}}"]),
+    )
+    .await;
+    let other = "doc_01K74Z3QJ8V5N2W9RTX6Y00093";
+    let fill = |src: &str, values: Value, said: Value| {
+        json!({
+            "document_id": TPL, "source_document_id": src, "values": values, "user_said": said,
+        })
+    };
+    // C1: someone else's, the name never read (it stops at 关系).
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["部门：财务部", "关系：配偶", "姓名：李四"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(SRC, json!({ "姓名": "王小明" }), json!(["姓名"])),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // C2: the model copied 财务部 into values itself, the material is 陈晓明's.
+    put_docx(
+        &state,
+        other,
+        "陈.docx",
+        &docx(&["个人信息", "姓名：陈晓明", "部门：财务部"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(
+                other,
+                json!({ "姓名": "王小明", "部门": "财务部" }),
+                json!(["姓名"]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    assert!(
+        strings(&answer["ask_user"]).contains(&"部门".into()),
+        "{answer}"
+    );
+    // C4 and the control: the user's own, 部门 said empty: 岗位 still comes.
+    put_docx(
+        &state,
+        "doc_01K74Z3QJ8V5N2W9RTX6Y00094",
+        "王.docx",
+        &docx(&["个人信息", "姓名：王小明", "部门：研发部", "岗位：会计"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(
+                "doc_01K74Z3QJ8V5N2W9RTX6Y00094",
+                json!({ "姓名": "王 小明", "部门": "" }),
+                json!(["姓名", "部门"]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名", "岗位"], "{answer}");
+    // No 姓名 said: nothing from the material.
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(
+                "doc_01K74Z3QJ8V5N2W9RTX6Y00094",
+                json!({ "部门": "研发部" }),
+                json!([]),
+            ),
+        )
+        .await,
+    );
+    assert!(strings(&answer["filled"]).is_empty(), "{answer}");
 }

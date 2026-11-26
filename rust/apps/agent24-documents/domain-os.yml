@@ -174,7 +174,7 @@ tools:
           minProperties: 1
           maxProperties: 200
           additionalProperties: { type: string }
-        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; only the safe job fields come back as from_source from documents.fields, and those the values leave out are filled from it; any other value is never taken from it, only from user_said" }
+        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; only the safe job fields come back as from_source from documents.fields; they are written (and those the values leave out filled from it) only when the user's 姓名 is in user_said and the material states that same 姓名, read as one record; any other value is never taken from it, only from user_said" }
         user_said:
           type: array
           maxItems: 200

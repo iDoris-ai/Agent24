@@ -958,6 +958,7 @@ async fn fill(
         .collect();
     // The material resolves and is scope-checked (admit_named): no identity
     // value is taken from it (r11 B2, 方案 B).
+    let mut material = None;
     if let Some(source_id) = source_id.as_deref().filter(|s| *s != id) {
         if !is_id(IdKind::Document, source_id) {
             return Err(refused(&ApiError::not_found("no such document")));
@@ -973,41 +974,34 @@ async fn fill(
             .keys()
             .map(|k| crate::form::safe_key(k))
             .collect();
-        let left_out: Vec<&String> = fields
+        let left_out: Vec<String> = fields
             .iter()
             .map(|(n, _)| n)
             .filter(|n| crate::form::from_material(n) && !given.contains(&crate::form::safe_key(n)))
+            .cloned()
             .collect();
-        if !left_out.is_empty() {
-            let names = fields.iter().map(|(n, _)| n.clone()).collect();
-            // PR-Daemon #2100 B1: the App writes from the material only when
-            // it is plainly one person's and the user's: nothing is taken
-            // when the reading met a second person's sign or another
-            // ambiguity, or when a value the user said is stated otherwise
-            // in it (王小明 said, 陈晓明 in the material).
-            let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-            if let Material::Text(read) =
-                load_material(state, &storage, source_id, &accepted, names).await?
-                && read.ambiguous.is_empty()
-                && !user_said.iter().any(|n| {
-                    match (
-                        req.values.get(n),
-                        read.values.get(&crate::form::label_key_of(n)),
-                    ) {
-                        (Some(said), Some(stated)) => compact(said) != compact(stated),
-                        _ => false,
-                    }
-                })
-            {
-                for n in left_out {
-                    if let Some(v) = crate::form::from_source(n, &read) {
-                        req.values.insert(n.clone(), v.to_owned());
-                    }
+        // PR-Daemon #2100 r2 (监工: a positive test): the material counts
+        // only when it is plainly the user's own record (`plainly_users`);
+        // then the App fills what the values left out, and else no job
+        // field of it is written unsaid, the App's or the model's.
+        let names = fields.iter().map(|(n, _)| n.clone()).collect();
+        let read = match load_material(state, &storage, source_id, &accepted, names).await? {
+            Material::Text(read) => Some(read),
+            Material::Absent => None,
+        };
+        let ok = read
+            .as_ref()
+            .is_some_and(|r| crate::form::plainly_users(r, &req.values, &user_said));
+        if let Some(read) = read.filter(|_| ok) {
+            for n in left_out {
+                if let Some(v) = crate::form::from_source(&n, &read) {
+                    req.values.insert(n.clone(), v.to_owned());
                 }
             }
         }
+        material = Some(ok);
     }
-    let report = crate::form::plan_fill(&fields, &req.values, &user_said);
+    let report = crate::form::plan_fill(&fields, &req.values, &user_said, material);
     // Nothing left that may be written: do not import an unchanged copy.
     if report.write.is_empty() && !req.values.is_empty() {
         return completed(Ok(json!({

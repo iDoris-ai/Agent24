@@ -210,19 +210,25 @@ const DELETE_HINT = '（删除整份文档用 documents.delete，只删用户说
 /** L8-S02 (David 11-26, 方案 A): only on a form turn, or an answer to one. */
 export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）模板。用户给了资料文档时，每次调用 documents.fill 之前先调用 documents.fields，带 source_document_id=资料文档；不用自己读资料：字段里的 from_source 就是资料里对上的值（只有部门、岗位、入职日期、学历这类岗位字段），原样放进 documents.fill 的 values。'
   + '其余字段（包括 kind 为 identity 的姓名、证件号、电话、地址、银行卡、联系人、甲乙方等）一律不从资料里取，即使资料里看得到也要逐项问用户，不要自己编；用户亲口给的值放进 values，字段名放进 user_said；用户说先空着的，values 里给空字符串；kind 为 manual 的（签名、照片、勾选框、附件）不要填，告诉用户需要手工处理。'
-  + '问齐了或用户说先空着、确认生成时，必须调用 documents.fill，带同一个 source_document_id；没有调用成功就不要说已生成或已保存。填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
+  + '带资料时，资料里的岗位字段要等用户亲口说了姓名（放进 user_said）、并且和资料里的姓名一致才会写入；问齐了或用户说先空着、确认生成时，必须调用 documents.fill，带同一个 source_document_id；没有调用成功就不要说已生成或已保存。填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
   + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
 
-/** 「资料在《X》里」「资料是《X》」: the title the user named as their material;
- * never one told against (「资料不要用《X》」「别用」「没有」, PR-Daemon #2100 B3). */
-const MATERIAL = /资料[^《》，。！？\n不别没]{0,8}《([^》]{1,200})》/
+/** PR-Daemon #2100 r2 C3 (监工): only these affirmative forms name the
+ * material: 「资料在《X》(里|中)」「资料是《X》」「用《X》(里|中)的资料」. */
+const MATERIAL = /资料(?:在|是)《([^》]{1,200})》|用《([^》]{1,200})》(?:里|中)的资料/
+/** Any other mention of a material by title (「资料别用《X》」「资料勿用《X》」). */
+const MENTION = /资料[^《》\n]{0,12}《|《[^》]{1,200}》[^《》\n]{0,6}资料/
 
 /** 监工 0.7.123 真机: the material a form fill was told, in this turn or the
- * last three user turns (newest first), as a title; null when none. */
+ * last three user turns (newest first), as a title; null when none. A turn
+ * that mentions a material by title in any other form says none, and the
+ * earlier turns are not looked at (「资料是《X》」 then 「资料别用《X》」). */
 export function formMaterial(before: readonly string[], text: string): string | null {
   for (const t of [text, ...before.slice(-3).reverse()]) {
     const m = MATERIAL.exec(t)
-    if (m?.[1]?.trim()) return m[1].trim()
+    const title = (m?.[1] ?? m?.[2])?.trim()
+    if (title) return title
+    if (MENTION.test(t)) return null
   }
   return null
 }

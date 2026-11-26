@@ -475,7 +475,14 @@ describe('监工 0.7.123: the material a form fill was told', () => {
     for (const no of ['资料不要用《李四.docx》，部门先空着', '资料别用《李四.docx》', '资料没有《李四.docx》']) {
       expect(formMaterial([], no)).toBeNull()
     }
-    expect(formMaterial([], '资料用《个人信息.docx》')).toBe('个人信息.docx')
+    // r2 C3 (监工): only 「资料在《X》(里|中)」「资料是《X》」「用《X》(里|中)的资料」; any
+    // other 「资料…《X》」 in this turn is none, with no fall back to earlier turns.
+    expect(formMaterial([], '用《个人信息.docx》里的资料')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料在《个人信息.docx》中')).toBe('个人信息.docx')
+    for (const no of ['资料勿用《X.docx》', '资料无需《X.docx》', '资料请忽略《X.docx》', '资料莫用《X.docx》', '资料非《X.docx》', '资料用《X.docx》']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '资料别用《李四.docx》')).toBeNull()
   })
 
   it('goes into the prompt by its id, for fields and fill', () => {
