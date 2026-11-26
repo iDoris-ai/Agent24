@@ -7,17 +7,17 @@ fn embedded_release_and_asset_are_pinned() {
     let lock = IdorisLock::embedded();
     assert!(std::ptr::eq(lock, IdorisLock::embedded()));
     assert_eq!(lock.schema, 2);
-    assert_eq!(lock.tag, "v0.6.0");
-    assert_eq!(lock.commit, "2903eb005ffcb25612cd2344af41114e7d3b3bab");
+    assert_eq!(lock.tag, "v0.6.1");
+    assert_eq!(lock.commit, "33ea2be3d69580f08d35e1b5466d3d219edec09d");
     assert_eq!(lock.team_id, "HYAP444FN9");
     assert_eq!((lock.contract_major, lock.min_contract_minor), (1, 1));
     assert_eq!(lock.tested_contract_version, "1.3.0");
     assert_eq!(lock.assets.len(), 1);
     let asset = lock.asset_for("aarch64-apple-darwin").unwrap();
-    assert_eq!(asset.name, "idoris-v0.6.0-aarch64-apple-darwin.tar.gz");
+    assert_eq!(asset.name, "idoris-v0.6.1-aarch64-apple-darwin.tar.gz");
     assert_eq!(
         asset.sha256,
-        "7f5fbd1f6d2786962d6b8abf161e1eb50179b1c111b0660b4c6c90c123f88247"
+        "941a2620bac2bad0913f7a5d9df1c9749b7b0642c323cca24586c2972464237d"
     );
     assert_eq!(
         asset.files,
@@ -35,7 +35,7 @@ fn embedded_release_and_asset_are_pinned() {
     );
     assert_eq!(
         lock.asset_url(asset),
-        "https://github.com/iDoris-ai/iDoris/releases/download/v0.6.0/idoris-v0.6.0-aarch64-apple-darwin.tar.gz"
+        "https://github.com/iDoris-ai/iDoris/releases/download/v0.6.1/idoris-v0.6.1-aarch64-apple-darwin.tar.gz"
     );
     assert!(lock.asset_for("x86_64-unknown-linux-gnu").is_none());
     assert_eq!(lock.capabilities.len(), 6);
@@ -48,8 +48,8 @@ fn embedded_release_and_asset_are_pinned() {
         (
             "L6",
             vec![
-                "v0.6.0",
-                "https://github.com/iDoris-ai/iDoris/releases/tag/v0.6.0",
+                "v0.6.1",
+                "https://github.com/iDoris-ai/iDoris/releases/tag/v0.6.1",
             ],
         ),
     ]) {
@@ -163,7 +163,7 @@ fn asset_triples_reject_path_and_url_syntax() {
     ] {
         let mut value: serde_json::Value = serde_json::from_str(EMBEDDED).unwrap();
         let mut asset = value["assets"]["darwin-arm64"].take();
-        asset["name"] = json!(format!("idoris-v0.6.0-{triple}.tar.gz"));
+        asset["name"] = json!(format!("idoris-v0.6.1-{triple}.tar.gz"));
         value["assets"] = json!({triple: asset});
         assert!(
             IdorisLock::parse(&value.to_string()).is_err(),

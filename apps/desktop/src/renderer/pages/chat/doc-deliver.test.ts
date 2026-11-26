@@ -40,6 +40,19 @@ describe('L8 DOC-4: what a turn asks', () => {
   })
 })
 
+describe('L9-1c FU-247: a two-turn delivery', () => {
+  it('reads the second turn as about the document an earlier turn named', () => {
+    expect(asksDeliver('去掉修订和批注，导出一份 PDF 放桌面', false, true)).toEqual({ kind: 'deliver', format: 'pdf' })
+    expect(asksDeliver('看看还有没有批注', false, true)).toEqual({ kind: 'check' })
+  })
+  it('still needs a document in sight when none was named', () => {
+    expect(asksDeliver('去掉修订和批注，导出一份 PDF 放桌面', false, false)).toBeNull()
+  })
+  it('still refuses what is told not to, whatever was named', () => {
+    expect(asksDeliver('不要删批注，导出 PDF', false, true)).toBeNull()
+  })
+})
+
 const P = (over: Partial<DocumentPreflight>): DocumentPreflight => ({ document_id: DOC, revision: 3, title: '合同.docx', format: 'docx', clean: false, cleanable: true, findings: [], ...over })
 
 describe('L8 DOC-4: the check in words', () => {
