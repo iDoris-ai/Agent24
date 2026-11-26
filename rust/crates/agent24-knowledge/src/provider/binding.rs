@@ -398,6 +398,12 @@ impl<K: Ord + Clone> BindingState<K> {
     /// phase, no increment. A reason that does not retry by itself, or
     /// `local_storage`, stays: `dependency` would retry it by backoff.
     pub fn sidecar(&mut self, sidecar: Sidecar) -> Option<Round> {
+        // A new process is a new instance key: a managed Lite issues one on
+        // every start and revokes the old (WeKnora#180), so the `loading` round
+        // this starts issues afresh instead of probing with a dead key.
+        if sidecar == Sidecar::Starting {
+            self.credentials.discard();
+        }
         let down = match sidecar {
             Sidecar::Starting => return self.retry(),
             Sidecar::Ready | Sidecar::Healthy => false,

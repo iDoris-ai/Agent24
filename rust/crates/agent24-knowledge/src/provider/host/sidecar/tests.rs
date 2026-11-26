@@ -9,6 +9,7 @@ use crate::provider::journal::Written;
 use crate::provider::member::Member;
 use crate::provider::placeholder::Placeholder;
 use crate::provider::profile::{Profile, Slot};
+use crate::provider::record::StuckCause;
 use crate::provider::state::{ConnectionPhase, PlaceholderFailure, UnavailableCause};
 
 fn unavailable(cause: UnavailableCause) -> Option<ConnectionPhase> {
@@ -58,32 +59,63 @@ fn a_crash_and_restart_move_the_binding_without_writing() {
     assert!(host.take_write().is_none());
 }
 
-/// The restarted instance's new key is the round's credential: the binding
-/// is not revoked. (Taken as a rotation it would be `access_revoked` and
-/// stay so: the case `rotated` must not be used for.)
-#[test]
-fn each_restarts_key_is_the_rounds_credential_not_a_rotation() {
-    let mut host = host();
-    host.sidecar(&"a", Sidecar::Failed);
-    host.sidecar(&"a", Sidecar::Starting);
-    assert_eq!(host.handshake("a", created("id")), Output::default());
+fn grant(host: &mut H) {
     let (of_a, ticket) = host.issue(&"a").unwrap();
-    assert_eq!(of_a, of("a", 7));
     host.issued(
         of_a,
         ticket,
         Issued::Granted { narrowed: false },
         Instant::now(),
     );
+}
+
+/// The restarted instance's new key is the new round's credential: the dead
+/// key is dropped with the process, so the round issues again (Codex C1),
+/// and nothing is revoked or written.
+#[test]
+fn each_restarts_key_is_the_rounds_credential_not_a_rotation() {
+    let mut host = host();
+    grant(&mut host);
+    host.sidecar(&"a", Sidecar::Failed);
+    host.sidecar(&"a", Sidecar::Starting);
+    assert_eq!(host.handshake("a", created("id")), Output::default());
+    // Panics if the dead key still blocked the issuance.
+    grant(&mut host);
     assert_eq!(phase(&host, "a"), Some(ConnectionPhase::Loading));
     assert!(host.take_write().is_none());
+}
 
-    let mut wrong = super::super::tests::host();
-    wrong.sidecar(&"a", Sidecar::Failed);
-    wrong.sidecar(&"a", Sidecar::Starting);
-    wrong.rotated(&"a", Instant::now());
+/// A rotation in `loading` is `access_revoked`, written as stuck with the
+/// revocation (Codex C2): why `rotated` is not for restarts.
+#[test]
+fn a_rotation_in_loading_is_written_stuck() {
+    let mut host = host();
+    host.rotated(&"a", Instant::now());
     assert_eq!(
-        phase(&wrong, "a"),
+        phase(&host, "a"),
+        unavailable(UnavailableCause::AccessRevoked)
+    );
+    let (_, _, changes) = write(&mut host);
+    assert!(
+        changes.contains(&C::Stuck {
+            of: of("a", 7),
+            cause: StuckCause::AccessRevoked
+        }),
+        "{changes:?}"
+    );
+    assert!(changes.contains(&C::Revoked(of("a", 7))), "{changes:?}");
+}
+
+/// A sidecar start does not let go of a persisted reason, which only a
+/// written loosening may do (Codex C3).
+#[test]
+fn starting_leaves_a_stuck_binding_stuck() {
+    let mut host = host();
+    host.rotated(&"a", Instant::now());
+    let (out, attempt) = host.sidecar(&"a", Sidecar::Starting);
+    assert_eq!((out, attempt), (Output::default(), None));
+    assert_eq!(
+        phase(&host, "a"),
         unavailable(UnavailableCause::AccessRevoked)
     );
 }
@@ -141,6 +173,7 @@ fn starting_retries_a_placeholder_held_by_dependency() {
 #[test]
 fn a_rotation_while_running_is_written_as_a_revocation() {
     let mut host = host();
+    grant(&mut host);
     let out = host.rotated(&"a", Instant::now());
     assert!(out.loading.is_empty());
     let (_, _, changes) = write(&mut host);

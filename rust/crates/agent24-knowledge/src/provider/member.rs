@@ -215,6 +215,16 @@ impl<I: Ids> Member<I> {
             off,
             profile_disabled: self.disabled,
         };
+        // A persisted reason that does not retry by itself is let go only by a
+        // loosening written first (S1.10, I1); a sidecar start does not write
+        // one, so it leaves such a binding as it is (manual retry clears it).
+        if let Slot::Bound(state) = self.profile.slot()
+            && sidecar == Sidecar::Starting
+            && let Some(ConnectionPhase::Unavailable(cause)) = state.connection().phase()
+            && StuckCause::try_from(cause).is_ok()
+        {
+            return None;
+        }
         self.profile.sidecar(sidecar, switches)
     }
 
@@ -230,6 +240,7 @@ impl<I: Ids> Member<I> {
             return false;
         };
         let revoked = state.credentials().revoked_before();
+        let phase = state.connection().phase();
         let WithRule {
             value: outcome,
             rule,
@@ -238,6 +249,16 @@ impl<I: Ids> Member<I> {
             return false;
         };
         record(of.clone(), effects, rule, left);
+        let after = state.connection().phase();
+        if let Some(ConnectionPhase::Unavailable(cause)) = after
+            && after != phase
+            && let Ok(stuck) = StuckCause::try_from(cause)
+        {
+            left.changes.push(Change::Stuck {
+                of: of.clone(),
+                cause: stuck,
+            });
+        }
         if !revoked && state.credentials().revoked_before() {
             left.changes.push(Change::Revoked(of));
         }

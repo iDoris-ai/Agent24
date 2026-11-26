@@ -3,8 +3,9 @@
 //! rotation of the instance secret, on a local-managed profile.
 //!
 //! The managed WeKnora Lite issues a fresh instance key on every start and
-//! revokes the previous one (WeKnora#180). That key is the new `loading`
-//! round's credential, answered to [`Host::issue`] as `Issued::Granted`; it is
+//! revokes the previous one (WeKnora#180). `starting` drops the old one, and
+//! the new key is the new `loading` round's credential, answered to
+//! [`Host::issue`] as `Issued::Granted`; it is
 //! not a rotation. A revocation in `loading` or `unavailable` is
 //! `access_revoked` (credential.rs), so treating each restart's key as one
 //! would leave the binding stuck after every restart. [`Host::rotated`] is
@@ -25,7 +26,10 @@ impl<I: Ids> Host<I> {
     /// S2.2: `id`'s sidecar is in `sidecar`. A binding takes it as
     /// [`crate::provider::binding::BindingState::sidecar`]: `starting`
     /// retries into `loading` (in `Output::loading`), a sidecar going down
-    /// makes it `unavailable(dependency)`; nothing is written. On `starting`,
+    /// makes it `unavailable(dependency)`; nothing is written. `starting`
+    /// drops the binding's credential (a new process has a new key), and
+    /// leaves a persisted reason that does not retry by itself in place: only
+    /// a written loosening lets that go (S1.10, I1). On `starting`,
     /// a placeholder that retries by backoff makes a handshake attempt, which
     /// the caller runs and reports to [`Host::identified`] or
     /// [`Host::attempt_failed`].
