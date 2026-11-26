@@ -30,8 +30,8 @@ use zeroize::Zeroizing;
 
 mod provision;
 pub use provision::{
-    Candidates, ConnectConsent, ConnectRequest, InstallRequest, Provisioner, SystemProvisioner,
-    is_chat_model_id, upstream_models,
+    Candidates, ConnectConsent, ConnectRequest, InstallRequest, LiteEmbedding, Provisioner,
+    SystemProvisioner, is_chat_model_id, upstream_models,
 };
 
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.

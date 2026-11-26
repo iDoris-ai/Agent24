@@ -1337,6 +1337,112 @@ impl IdorisHost {
     }
 }
 
+/// Loop 9 3c: what the local WeKnora Lite embeds with — the running gateway and
+/// a key that may call the `embed` role only. Main-process only; never logged.
+pub struct LiteEmbedding {
+    /// `http://127.0.0.1:<data port>/v1`, read now: the port is the running gateway's.
+    pub base_url: String,
+    pub api_key: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for LiteEmbedding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiteEmbedding")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Where the Lite's key id is kept (the secret is in the data-key keychain, as
+/// the data key's is). Only the id reaches disk.
+pub(super) const LITE_EMBED_KEY_FILE: &str = "lite-embed-key.json";
+/// The owner name of the Lite's key in iDoris (`agent24d:<this>:<uuid>`).
+const LITE_EMBED_OWNER: &str = "weknora-lite";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteEmbedKey {
+    key_id: String,
+}
+
+impl IdorisHost {
+    /// The embed-only key for the local WeKnora Lite, issued once and reused
+    /// (decision 2026-11-27-lite-3c-slot-embedkey, R0: issue once, keep the id,
+    /// read the secret from the keychain). Issued again only when the saved one is
+    /// missing from the keychain. Needs a running gateway with the embed role.
+    pub async fn lite_embedding(&self) -> Result<LiteEmbedding, Code> {
+        let record = {
+            let inner = self.inner.lock().await;
+            if inner.state != State::Running {
+                return Err(Code::NotConfigured);
+            }
+            inner.installation.clone().ok_or(Code::NotInstalled)?
+        };
+        if !record.roles.contains(&Role::Embed) {
+            return Err(Code::NotConfigured);
+        }
+        let base_url = format!("http://127.0.0.1:{}/v1", record.data_port);
+        if let Some(api_key) = self.saved_lite_key().await? {
+            return Ok(LiteEmbedding { base_url, api_key });
+        }
+        // Issued under the install/connect lock, never inside a connect: the key
+        // journal is shared, and a second issue would compensate (revoke) the
+        // data key a connect has issued but not yet committed.
+        let _guard = self.coordinator_lock()?;
+        if self.root.join("pending-connect.json").exists() {
+            return Err(Code::Busy);
+        }
+        if let Some(api_key) = self.saved_lite_key().await? {
+            return Ok(LiteEmbedding { base_url, api_key });
+        }
+        let installed = self.provisioner.verify(&record, VerifyMode::AtRest).await?;
+        let keys = Keys::new(
+            &installed,
+            &self.root.join("data/idoris.sqlite3"),
+            self.data_keys.clone(),
+        )
+        .map_err(key_code)?
+        .with_timeout(KEY_COMMAND_TIMEOUT);
+        let issued = keys
+            .issue_embed_only(LITE_EMBED_OWNER)
+            .await
+            .map_err(key_code)?;
+        write_json(
+            &self.root.join(LITE_EMBED_KEY_FILE),
+            &LiteEmbedKey {
+                key_id: issued.key_id.clone(),
+            },
+        )?;
+        Ok(LiteEmbedding {
+            base_url,
+            api_key: issued.secret,
+        })
+    }
+
+    /// The saved key's secret; `None` when there is none to reuse (no record, an
+    /// unreadable one, or the keychain no longer has it).
+    async fn saved_lite_key(&self) -> Result<Option<Zeroizing<String>>, Code> {
+        let saved: LiteEmbedKey = match std::fs::read(self.root.join(LITE_EMBED_KEY_FILE)) {
+            Ok(body) => match serde_json::from_slice(&body) {
+                Ok(saved) => saved,
+                Err(_) => return Ok(None),
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(Code::PersistenceFailed),
+        };
+        let store = self.data_keys.clone();
+        match tokio::task::spawn_blocking(move || store.get(&saved.key_id))
+            .await
+            .map_err(|_| Code::KeyUnavailable)?
+        {
+            Ok(secret) => Ok(Some(secret)),
+            Err(KeychainError::NotFound) => Ok(None),
+            Err(e) => Err(keychain_code(e)),
+        }
+    }
+}
+
 /// oMLX lists every model it serves; the daily role needs a chat model, not an
 /// embedding, speech, OCR or image one. Same exclusions as the desktop picker.
 pub fn is_chat_model_id(id: &str) -> bool {

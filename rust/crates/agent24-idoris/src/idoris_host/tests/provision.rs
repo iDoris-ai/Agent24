@@ -2411,3 +2411,73 @@ async fn bootstrap_connects_and_starts_with_models_one_folder_down() {
     );
     x.f.host.shutdown().await.unwrap();
 }
+
+/// Running managed iDoris whose oMLX serves `models` (chat or embedding by name).
+async fn running_with(x: &ConnectedFixture, models: &[&str]) {
+    x.installed().await;
+    let local: Vec<serde_json::Value> = models
+        .iter()
+        .map(|m| {
+            let kind = if m.starts_with("bge") {
+                "embedding"
+            } else {
+                "chat"
+            };
+            json!({"omlx_id": m, "kind": kind, "size_bytes": 42})
+        })
+        .collect();
+    x.scenario(json!({ "local_models": local }));
+    x.f.host.bootstrap_core().await.unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+}
+
+#[tokio::test]
+async fn lite_embedding_issues_one_embed_only_key_and_reuses_it() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    // No running gateway: refused, nothing issued.
+    assert!(matches!(
+        x.f.host.lite_embedding().await,
+        Err(Code::NotConfigured)
+    ));
+    running_with(&x, &["real-model", "bge-m3-mlx-fp16"]).await;
+    let before = x.keys().len();
+    let first = x.f.host.lite_embedding().await.unwrap();
+    let keys = x.keys();
+    assert_eq!(keys.len(), before + 1);
+    let issued = keys.last().unwrap();
+    assert_eq!(issued["allowed_roles"], json!(["embed"]));
+    assert_eq!(issued["allowed_privacy"], json!(["local_only"]));
+    let port = x.f.host.status().await.data_port.unwrap();
+    assert_eq!(first.base_url, format!("http://127.0.0.1:{port}/v1"));
+    // Reused: no second issue, same secret.
+    let second = x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), before + 1);
+    assert_eq!(second.api_key.as_str(), first.api_key.as_str());
+    // Only the id is on disk.
+    let saved = fs::read_to_string(x.f.host.root.join("lite-embed-key.json")).unwrap();
+    assert!(saved.contains(issued["key_id"].as_str().unwrap()));
+    assert!(!saved.contains(first.api_key.as_str()));
+    // Gone from the keychain: issued again.
+    x.data.delete(issued["key_id"].as_str().unwrap()).unwrap();
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), before + 2);
+    assert_eq!(x.keys().last().unwrap()["allowed_roles"], json!(["embed"]));
+    assert!(!format!("{first:?}").contains(first.api_key.as_str()));
+    x.assert_safe();
+    x.f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lite_embedding_needs_the_embed_role() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    running_with(&x, &["real-model"]).await;
+    let before = x.keys().len();
+    assert!(matches!(
+        x.f.host.lite_embedding().await,
+        Err(Code::NotConfigured)
+    ));
+    assert_eq!(x.keys().len(), before);
+    x.f.host.shutdown().await.unwrap();
+}

@@ -248,6 +248,10 @@ pub fn build_router_with_modules(state: AppState, modules: Router) -> Router {
             get(crate::idoris_routes::upstream_models),
         )
         .route("/api/v1/idoris/start", post(crate::idoris_routes::start))
+        .route(
+            "/api/v1/idoris/lite-embedding",
+            post(crate::idoris_routes::lite_embedding),
+        )
         .route("/api/v1/idoris/stop", post(crate::idoris_routes::stop))
         .route(
             "/api/v1/idoris/operations/{id}",

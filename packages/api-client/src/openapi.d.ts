@@ -2408,6 +2408,31 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/idoris/lite-embedding": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * The embed-only iDoris key for the desktop's local WeKnora Lite
+         * @description ProductHost audience only; legacy mode, first-party and Creative tokens get 403.
+         *     Needs the managed iDoris running with the embed role (422 `not_configured` otherwise).
+         *     The key may call the `embed` role only (no `daily`), `local_only`; it is issued once and
+         *     reused (its id is kept, the secret stays in the keychain), and issued again only when the
+         *     keychain no longer has it. 409 `busy` while an install or connect is under way.
+         *     The answer is never cached (`Cache-Control: no-store`) and the key is never logged.
+         */
+        post: operations["liteEmbeddingKey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/idoris/start": {
         parameters: {
             query?: never;
@@ -10118,6 +10143,41 @@ export interface operations {
             502: components["responses"]["IdorisFailure"];
             503: components["responses"]["IdorisFailure"];
             504: components["responses"]["IdorisFailure"];
+        };
+    };
+    liteEmbeddingKey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The running gateway and the key */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @description http://127.0.0.1:<data port>/v1 */
+                        base_url: string;
+                        api_key: string;
+                        /** @enum {string} */
+                        model: "idoris/embed";
+                        /** @enum {integer} */
+                        dimension: 1024;
+                    };
+                };
+            };
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            409: components["responses"]["IdorisFailure"];
+            422: components["responses"]["IdorisFailure"];
+            500: components["responses"]["IdorisFailure"];
+            502: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
         };
     };
     startIdoris: {
