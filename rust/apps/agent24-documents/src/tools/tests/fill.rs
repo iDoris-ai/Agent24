@@ -349,8 +349,9 @@ fn the_material_s_labelled_values_are_read_from_lines_and_table_rows() {
 }
 
 /// 监工 11-26 真机 ①: the acceptance materials. `fields` with the material
-/// gives the values it states; `fill` with them writes all three, the
-/// identity one too (it is in the material), and asks only for the rest.
+/// gives the text values it states; an identity field never comes from the
+/// material (PR-Daemon #2095 r10, 监工 方案 B: whose a value is cannot be
+/// told for sure) and is asked; once the user says them, `fill` writes them.
 #[tokio::test]
 async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
     let (_dir, state) = opened().await;
@@ -390,14 +391,18 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
             .get("from_source")
             .cloned()
     };
-    assert_eq!(from("姓名"), Some(json!("陈晓明")), "{listed}");
+    assert_eq!(from("姓名"), None, "{listed}");
     assert_eq!(from("部门"), Some(json!("产品研发部")));
     assert_eq!(from("入职日期"), Some(json!("2026年12月1日")));
     assert_eq!(from("联系电话"), None);
     assert_eq!(from("本人签名"), None);
     let note = listed["note"].as_str().unwrap();
     assert!(
-        note.contains("姓名=陈晓明") && note.contains("联系电话"),
+        note.contains("部门=产品研发部") && !note.contains("陈晓明"),
+        "{note}"
+    );
+    assert!(
+        note.contains("身份类字段不从资料里取，要逐项问用户：姓名、联系电话、身份证号、紧急联系人"),
         "{note}"
     );
     // Without the material, `fields` answers as before.
@@ -417,15 +422,41 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
         &call(
             &state,
             "fill",
-            json!({ "document_id": TPL, "source_document_id": SRC, "values": values }),
+            json!({ "document_id": TPL, "source_document_id": SRC, "values": values.clone() }),
         )
         .await,
     );
     assert_eq!(answer["written"], true, "{answer}");
-    assert_eq!(strings(&answer["filled"]), ["姓名", "部门", "入职日期"]);
-    assert_eq!(strings(&answer["ask_user"]), ["联系电话", "身份证号"]);
+    assert_eq!(strings(&answer["filled"]), ["部门", "入职日期"]);
+    assert_eq!(
+        strings(&answer["ask_user"]),
+        ["姓名", "联系电话", "身份证号"]
+    );
     assert_eq!(strings(&answer["unfilled"]), ["紧急联系人"]);
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
+    // ② The user says the three: all are written (their words, user_said).
+    values.insert("姓名".to_owned(), json!("陈晓明"));
+    values.insert("联系电话".to_owned(), json!("13800001111"));
+    values.insert("身份证号".to_owned(), json!("110101199001011234"));
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL,
+                "source_document_id": SRC,
+                "values": values,
+                "user_said": ["姓名", "联系电话", "身份证号"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        strings(&answer["filled"]),
+        ["姓名", "部门", "入职日期", "联系电话", "身份证号"],
+        "{answer}"
+    );
+    assert!(strings(&answer["ask_user"]).is_empty(), "{answer}");
 }
 
 /// r7 (监工): a header row over a row of values is not read at all; r3: nor

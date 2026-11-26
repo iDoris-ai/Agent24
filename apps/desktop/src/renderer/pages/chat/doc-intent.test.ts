@@ -423,7 +423,7 @@ describe('L8-S02: filling a form', () => {
     const prompt = docAgentPrompt(null, '把这张入职登记表填一下，资料在《个人信息.docx》里')
     expect(prompt).toContain(FORM_HINT)
     expect(prompt.endsWith('\n把这张入职登记表填一下，资料在《个人信息.docx》里')).toBe(true)
-    for (const said of ['source_document_id', 'user_said', 'ask_user', 'from_source', '不用自己读资料', '空字符串', '不要自己编', '手工处理', 'PDF', '打印后手填', '逐项']) {
+    for (const said of ['source_document_id', 'user_said', 'ask_user', 'from_source', '不用自己读资料', '一律不从资料里取', '空字符串', '不要自己编', '手工处理', 'PDF', '打印后手填', '逐项']) {
       expect(FORM_HINT).toContain(said)
     }
     expect(docAgentPrompt(null, '把两份合并')).not.toContain(FORM_HINT)

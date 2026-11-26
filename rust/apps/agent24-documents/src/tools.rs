@@ -844,11 +844,22 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
     let mut found = Vec::new();
     let mut missing = Vec::new();
     let mut ambiguous = Vec::new();
+    let mut identity = Vec::new();
     if let Some(Value::Array(fields)) = payload.get_mut("fields") {
         for f in fields.iter_mut() {
             let Some(name) = f.get("name").and_then(Value::as_str).map(str::to_owned) else {
                 continue;
             };
+            // PR-Daemon #2095 r10, 监工 方案 B: no identity value comes
+            // from the material. Whose a name or a phone in it is cannot be
+            // told for sure (another person's block hides in many ways),
+            // and a wrong one would come with the App's authority: it is
+            // asked, always. Its label is still read, for the layout and
+            // for a second person's sign.
+            if crate::form::field_kind(&name) == crate::form::FieldKind::Identity {
+                identity.push(name);
+                continue;
+            }
             match crate::form::from_source(&name, &read) {
                 Some(v) => {
                     f["from_source"] = json!(v);
@@ -886,8 +897,14 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
     }
     if !missing.is_empty() && !unread && !read.layout_unknown {
         note.push_str(&format!(
-            "资料里没有：{}。身份类的要问用户，不要自己编；用户说先空着的，values 里给空字符串。",
+            "资料里没有：{}。用户说先空着的，values 里给空字符串。",
             missing.join("、")
+        ));
+    }
+    if !identity.is_empty() {
+        note.push_str(&format!(
+            "身份类字段不从资料里取，要逐项问用户：{}。用户亲口给的值放进 values，字段名放进 user_said；不要自己编，也不要从资料里抄。",
+            identity.join("、")
         ));
     }
     payload["source_document_id"] = json!(source_id);
