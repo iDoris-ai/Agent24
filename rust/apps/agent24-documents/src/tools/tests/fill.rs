@@ -167,7 +167,9 @@ async fn fill_writes_only_text_and_identity_the_user_said() {
     );
     assert_eq!(uploads(&state).await, 0);
 
-    let mut args = json!({ "document_id": TPL, "source_document_id": SRC });
+    // PR-Daemon #2100 r2: without a material (one is the user's only when it
+    // names them), as a template fill.
+    let mut args = json!({ "document_id": TPL });
     args["values"] = values();
     let answer = payload(&call(&state, "fill", args).await);
     // r11 B2 (方案 B): a value in the material is not the user's word: the
@@ -197,7 +199,6 @@ async fn fill_writes_only_text_and_identity_the_user_said() {
     // The user said the phone number: that identity field is written.
     let mut args = json!({
         "document_id": TPL,
-        "source_document_id": SRC,
         "user_said": ["姓名", "电话"],
     });
     args["values"] = values();
@@ -277,7 +278,7 @@ fn common_identity_names_and_english_whole_words_are_identity() {
 fn a_failed_import_is_not_written() {
     let fields = vec![("部门".to_owned(), FieldKind::Text)];
     let values = std::collections::BTreeMap::from([("部门".to_owned(), "研发".to_owned())]);
-    let report = crate::form::plan_fill(&fields, &values, &[]);
+    let report = crate::form::plan_fill(&fields, &values, &[], None);
     let mut failed = json!({ "status": "failed", "note": "没能生成新文档（导入失败）。" });
     assert!(!made_document(&failed));
     let made = made_document(&failed);
@@ -422,11 +423,12 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
         )
         .await,
     );
-    assert_eq!(answer["written"], true, "{answer}");
-    assert_eq!(strings(&answer["filled"]), ["部门", "入职日期"]);
+    // PR-Daemon #2100 r2: no 姓名 said yet: the material is not known to be
+    // the user's, so its job fields wait too.
+    assert_eq!(answer["written"], false, "{answer}");
     assert_eq!(
         strings(&answer["ask_user"]),
-        ["姓名", "联系电话", "身份证号"]
+        ["姓名", "部门", "入职日期", "联系电话", "身份证号"]
     );
     assert_eq!(strings(&answer["unfilled"]), ["紧急联系人"]);
     assert_eq!(strings(&answer["manual"]), ["本人签名"]);
@@ -445,8 +447,8 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
         "{answer}"
     );
     // ② The user says the three: all are written (their words, user_said),
-    // a name the material does not have too.
-    values.insert("姓名".to_owned(), json!("王小明"));
+    // and the material, now known to be theirs, gives the job fields.
+    values.insert("姓名".to_owned(), json!("陈晓明"));
     values.insert("联系电话".to_owned(), json!("13800001111"));
     values.insert("身份证号".to_owned(), json!("110101199001011234"));
     let answer = payload(
@@ -1557,7 +1559,8 @@ async fn only_allowlisted_fields_come_from_the_material_or_are_written_unsaid() 
         &call(
             &state,
             "fill",
-            json!({ "document_id": TPL, "source_document_id": SRC, "values": values }),
+            // Without a material: only the allowlist is written unsaid.
+            json!({ "document_id": TPL, "values": values }),
         )
         .await,
     );
@@ -1572,4 +1575,558 @@ async fn only_allowlisted_fields_come_from_the_material_or_are_written_unsaid() 
         !text.contains("13900000000") && !text.contains("北京"),
         "{text}"
     );
+}
+
+/// 监工 0.7.123 真机: the model knew 部门 and 入职日期 from the material but
+/// left them out of fill's values. With source_document_id, an allowlisted
+/// field the values do not name comes from the material (App, not model);
+/// one the values name (「先空着」 too) is the model's; identity is never.
+#[tokio::test]
+async fn fill_takes_allowlisted_fields_the_values_left_out_from_the_material() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "入职日期：{{入职日期}}",
+        "岗位：{{岗位}}",
+    ]);
+    let source = docx(&[
+        "个人信息",
+        "姓名：陈晓明",
+        "部门：产品研发部",
+        "入职日期：2026年12月1日",
+        "岗位：工程师",
+    ]);
+    put_docx(&state, TPL, "入职登记表模板.docx", &template).await;
+    put_docx(&state, SRC, "个人信息.docx", &source).await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL,
+                "source_document_id": SRC,
+                "values": { "姓名": "陈晓明", "岗位": "" },
+                "user_said": ["姓名"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        strings(&answer["filled"]),
+        ["姓名", "部门", "入职日期"],
+        "{answer}"
+    );
+    assert_eq!(strings(&answer["unfilled"]), ["岗位"], "{answer}");
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(
+        text.contains("陈晓明") && text.contains("产品研发部") && text.contains("2026年12月1日"),
+        "{text}"
+    );
+    assert!(text.contains("{{岗位}}"), "{text}");
+    // Without the material nothing is taken.
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": TPL, "values": { "姓名": "王小明" }, "user_said": ["姓名"] }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+}
+
+/// PR-Daemon #2100 B1/B2: the App writes from the material only when it is
+/// plainly one person's and plainly the user's: a second person's sign, or a
+/// name the user said that the material states otherwise, and nothing is
+/// taken; a field the values name in another spelling is not taken either.
+#[tokio::test]
+async fn fill_takes_nothing_from_a_material_not_plainly_the_users() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "岗位：{{部 门}}{{岗位}}",
+    ]);
+    put_docx(&state, TPL, "表.docx", &template).await;
+    let fill = |values: Value| {
+        json!({
+            "document_id": TPL,
+            "source_document_id": SRC,
+            "values": values,
+            "user_said": ["姓名"],
+        })
+    };
+    // B1: two people.
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：陈晓明",
+            "部门：财务部",
+            "姓名：王小明",
+            "部门：研发部",
+        ]),
+    )
+    .await;
+    let answer = payload(&call(&state, "fill", fill(json!({ "姓名": "王小明" }))).await);
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // B1: one person, not the one the user is.
+    put_docx(
+        &state,
+        "doc_01K74Z3QJ8V5N2W9RTX6Y00093",
+        "别人.docx",
+        &docx(&["个人信息", "姓名：陈晓明", "部门：财务部", "岗位：会计"]),
+    )
+    .await;
+    let mut args = fill(json!({ "姓名": "王小明" }));
+    args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
+    let answer = payload(&call(&state, "fill", args).await);
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // Control: the user's own: taken.
+    let mut args = fill(json!({ "姓名": "陈晓明" }));
+    args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
+    let answer = payload(&call(&state, "fill", args).await);
+    assert_eq!(
+        strings(&answer["filled"]),
+        ["姓名", "部门", "部 门", "岗位"],
+        "{answer}"
+    );
+    // B2: 「部门」 left empty is 「部 门」 left empty too.
+    let mut args = fill(json!({ "姓名": "陈晓明", "部门": "" }));
+    args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
+    let answer = payload(&call(&state, "fill", args).await);
+    assert_eq!(strings(&answer["filled"]), ["姓名", "岗位"], "{answer}");
+}
+
+/// PR-Daemon #2100 r2 (监工: a positive test, one round): with a material,
+/// an allowlisted field not in user_said is written, the App's or the
+/// model's own, only when the material was read whole (no early stop), it
+/// states a 姓名, and that 姓名 is the one the user said.
+#[tokio::test]
+async fn a_material_s_job_fields_are_written_only_for_the_user_it_names() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}", "岗位：{{岗位}}"]),
+    )
+    .await;
+    let other = "doc_01K74Z3QJ8V5N2W9RTX6Y00093";
+    let fill = |src: &str, values: Value, said: Value| {
+        json!({
+            "document_id": TPL, "source_document_id": src, "values": values, "user_said": said,
+        })
+    };
+    // C1: someone else's, the name never read (it stops at 关系).
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["部门：财务部", "关系：配偶", "姓名：李四"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(SRC, json!({ "姓名": "王小明" }), json!(["姓名"])),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // C2: the model copied 财务部 into values itself, the material is 陈晓明's.
+    put_docx(
+        &state,
+        other,
+        "陈.docx",
+        &docx(&["个人信息", "姓名：陈晓明", "部门：财务部"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(
+                other,
+                json!({ "姓名": "王小明", "部门": "财务部" }),
+                json!(["姓名"]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    assert!(
+        strings(&answer["ask_user"]).contains(&"部门".into()),
+        "{answer}"
+    );
+    // C4 and the control: the user's own, 部门 said empty: 岗位 still comes.
+    put_docx(
+        &state,
+        "doc_01K74Z3QJ8V5N2W9RTX6Y00094",
+        "王.docx",
+        &docx(&["个人信息", "姓名：王小明", "部门：研发部", "岗位：会计"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(
+                "doc_01K74Z3QJ8V5N2W9RTX6Y00094",
+                json!({ "姓名": "王 小明", "部门": "" }),
+                json!(["姓名", "部门"]),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名", "岗位"], "{answer}");
+    // No 姓名 said: nothing from the material.
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            fill(
+                "doc_01K74Z3QJ8V5N2W9RTX6Y00094",
+                json!({ "部门": "研发部" }),
+                json!([]),
+            ),
+        )
+        .await,
+    );
+    assert!(strings(&answer["filled"]).is_empty(), "{answer}");
+}
+
+/// PR-Daemon #2100 r3 D1/D4 (监工): plainly the user's means the whole
+/// material is one clean record: past the opening heading every non-empty
+/// block is a 「标签：值」 line to the end (no 「家属档案」 and a second block);
+/// a name field is any whose key ends with 姓名 for the user (员工姓名).
+#[tokio::test]
+async fn a_material_is_plainly_the_users_only_as_one_clean_record() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：王小明",
+            "家属档案",
+            "姓名：李四",
+            "部门：财务部",
+        ]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL, "source_document_id": SRC,
+                "values": { "姓名": "王小明", "部门": "财务部" }, "user_said": ["姓名"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // An extra 「标签：值」 line (爱好) is still one clean record.
+    let own = "doc_01K74Z3QJ8V5N2W9RTX6Y00095";
+    put_docx(
+        &state,
+        own,
+        "王.docx",
+        &docx(&["个人信息", "姓名：王小明", "部门：研发部", "爱好：跑步"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": TPL, "source_document_id": own, "values": { "姓名": "王小明" }, "user_said": ["姓名"] }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名", "部门"], "{answer}");
+    // D4: 员工姓名.
+    let tpl2 = "doc_01K74Z3QJ8V5N2W9RTX6Y00096";
+    put_docx(
+        &state,
+        tpl2,
+        "表2.docx",
+        &docx(&["员工姓名：{{员工姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    let src2 = "doc_01K74Z3QJ8V5N2W9RTX6Y00097";
+    put_docx(
+        &state,
+        src2,
+        "王2.docx",
+        &docx(&["员工姓名：王小明", "部门：研发部"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": tpl2, "source_document_id": src2, "values": { "员工姓名": "王小明" }, "user_said": ["员工姓名"] }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["员工姓名", "部门"], "{answer}");
+}
+
+/// PR-Daemon #2100 r4 E4: every name field the user said must be the
+/// material's, not any one of them.
+#[tokio::test]
+async fn every_name_the_user_said_must_be_the_materials() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["{{本人姓名}}{{申请人姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["本人姓名：王小明", "申请人姓名：王小明", "部门：研发部"]),
+    )
+    .await;
+    let fill = |me: &str| {
+        json!({
+            "document_id": TPL, "source_document_id": SRC,
+            "values": { "本人姓名": me, "申请人姓名": "王小明" },
+            "user_said": ["本人姓名", "申请人姓名"],
+        })
+    };
+    let answer = payload(&call(&state, "fill", fill("李四")).await);
+    assert!(
+        !strings(&answer["filled"]).contains(&"部门".into()),
+        "{answer}"
+    );
+    let answer = payload(&call(&state, "fill", fill("王小明")).await);
+    assert!(
+        strings(&answer["filled"]).contains(&"部门".into()),
+        "{answer}"
+    );
+}
+
+async fn preview(state: &AppState, body: Value) -> (u16, Value) {
+    use tower::ServiceExt;
+    let req = axum::http::Request::post(format!("/documents/{TPL}/fill/preview"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(body.to_string()))
+        .unwrap();
+    let res = crate::router(state.clone()).oneshot(req).await.unwrap();
+    let status = res.status().as_u16();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+/// 监工 裁决 C (PR-Daemon #2100 r5): the approval box lists, field by field,
+/// what the App adds from the material; the preview is the fill's own rule,
+/// so what it lists is what the fill writes, and nothing when the material
+/// is not plainly the user's.
+#[tokio::test]
+async fn the_preview_lists_what_the_fill_takes_from_the_material() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "入职日期：{{入职日期}}",
+        "岗位：{{岗位}}",
+    ]);
+    put_docx(&state, TPL, "入职登记表模板.docx", &template).await;
+    put_docx(
+        &state,
+        SRC,
+        "个人信息.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：陈晓明",
+            "部门：产品研发部",
+            "入职日期：2026年12月1日",
+            "岗位：工程师",
+        ]),
+    )
+    .await;
+    let ask = |name: &str| {
+        json!({
+            "source_document_id": SRC,
+            "values": { "姓名": name, "岗位": "" },
+            "user_said": ["姓名"],
+        })
+    };
+    let (status, shown) = preview(&state, ask("陈晓明")).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["source_title"], "个人信息.docx");
+    assert_eq!(
+        shown["from_material"],
+        json!([{ "field": "部门", "value": "产品研发部" }, { "field": "入职日期", "value": "2026年12月1日" }]),
+        "{shown}"
+    );
+    // The fill writes exactly those.
+    let mut args = ask("陈晓明");
+    args["document_id"] = json!(TPL);
+    let answer = payload(&call(&state, "fill", args).await);
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    for v in shown["from_material"].as_array().unwrap() {
+        assert!(text.contains(v["value"].as_str().unwrap()), "{text}");
+    }
+    assert!(text.contains("{{岗位}}"), "{text}");
+    // Not the user's: nothing listed, nothing taken.
+    let (_, shown) = preview(&state, ask("王小明")).await;
+    assert_eq!(shown["from_material"], json!([]), "{shown}");
+    assert_eq!(shown["plainly_users"], false);
+}
+
+/// PR-Daemon #2100 r5 F4: two name fields of the user's own with different
+/// values in the material: not one person's record.
+#[tokio::test]
+async fn two_different_own_names_in_the_material_are_not_plainly_the_users() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "表.docx",
+        &docx(&["{{姓名}}{{员工姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&["姓名：王小明", "员工姓名：李四", "部门：财务部"]),
+    )
+    .await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL, "source_document_id": SRC,
+                "values": { "姓名": "王小明" }, "user_said": ["姓名"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+}
+
+/// PR-Daemon #2100 r6 G1, 监工: only a Word material is filled from. A PDF's
+/// text layer may still be building when the box's preview reads it and be
+/// built by the time the fill runs, so it would write values the box never
+/// listed: neither takes anything from it, and the fill says why.
+#[tokio::test]
+async fn a_material_that_is_not_word_is_not_filled_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = super::read::fixed(
+        vec![
+            [
+                "个人信息",
+                "姓名：陈晓明",
+                "部门：产品研发部",
+                "入职日期：2026年12月1日",
+            ]
+            .map(String::from)
+            .to_vec(),
+        ],
+        vec![],
+        0,
+    )
+    .unwrap();
+    let layers =
+        crate::engine::Layers::new(Some(Arc::new(engine) as Arc<dyn crate::engine::Engine>));
+    let state = AppState::open_serving(dir.path(), crate::events::Events::default(), layers).await;
+    put_docx(
+        &state,
+        TPL,
+        "入职登记表模板.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}", "入职日期：{{入职日期}}"]),
+    )
+    .await;
+    let storage = state.storage().await.unwrap();
+    let blob = storage.blobs.put_bytes(b"%PDF-1.7 bytes").unwrap();
+    exec(
+        &state,
+        &format!(
+            "INSERT INTO documents (id, title, media_type, head_revision)
+                    VALUES ('{SRC}', '个人信息.pdf', 'application/pdf', 1);
+             INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                    VALUES ('{SRC}', 1, '{}', {}, 'application/pdf', 'import');",
+            blob.sha256, blob.size
+        ),
+    )
+    .await;
+    let ask = json!({
+        "source_document_id": SRC,
+        "values": { "姓名": "陈晓明" },
+        "user_said": ["姓名"],
+    });
+    let (status, shown) = preview(&state, ask.clone()).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["from_material"], json!([]), "{shown}");
+    assert_eq!(shown["material_word"], false, "{shown}");
+    let mut args = ask;
+    args["document_id"] = json!(TPL);
+    let answer = payload(&call(&state, "fill", args).await);
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(
+        text.contains("{{部门}}") && text.contains("{{入职日期}}"),
+        "{text}"
+    );
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap()
+            .contains("这份资料不是 Word"),
+        "{answer}"
+    );
+}
+
+/// PR-Daemon #2100 r6 G1: a Word material that cannot be read is its own
+/// state: the preview says it was not read (the box says so), and the fill
+/// takes nothing from it.
+#[tokio::test]
+async fn an_unreadable_word_material_is_shown_unread_and_not_filled_from() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "入职登记表模板.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(&state, SRC, "个人信息.docx", b"not a zip at all").await;
+    let ask = json!({
+        "source_document_id": SRC,
+        "values": { "姓名": "陈晓明" },
+        "user_said": ["姓名"],
+    });
+    let (status, shown) = preview(&state, ask.clone()).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["material_read"], false, "{shown}");
+    assert_eq!(shown["from_material"], json!([]), "{shown}");
+    let mut args = ask;
+    args["document_id"] = json!(TPL);
+    let answer = payload(&call(&state, "fill", args).await);
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(text.contains("{{部门}}"), "{text}");
 }

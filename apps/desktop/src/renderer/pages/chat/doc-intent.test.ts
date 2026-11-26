@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, formMaterial, materialHint, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -462,5 +462,56 @@ describe('L8-S02 真机 0.7.122: a form turn that says it made a document it did
 
   it('tells the model a confirmed fill must call documents.fill', () => {
     expect(FORM_HINT).toContain('必须调用 documents.fill')
+  })
+})
+
+describe('监工 0.7.123: the material a form fill was told', () => {
+  it('is the title after 资料 in this turn or the last three', () => {
+    expect(formMaterial([], '把《入职登记表模板.docx》填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
+    expect(formMaterial(['把这张表填一下，资料是《个人信息.docx》', '电话 139'], '确认无误，生成吧')).toBe('个人信息.docx')
+    expect(formMaterial([], '把《入职登记表模板.docx》填一下')).toBeNull()
+    expect(formMaterial(['资料在《旧.docx》里', 'a', 'b', 'c'], '生成吧')).toBeNull()
+    // PR-Daemon #2100 B3: told not to use it is not the material.
+    for (const no of ['资料不要用《李四.docx》，部门先空着', '资料别用《李四.docx》', '资料没有《李四.docx》']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    // r2 C3 (监工): only 「资料在《X》(里|中)」「资料是《X》」「用《X》(里|中)的资料」; any
+    // other 「资料…《X》」 in this turn is none, with no fall back to earlier turns.
+    expect(formMaterial([], '用《个人信息.docx》里的资料')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料在《个人信息.docx》中')).toBe('个人信息.docx')
+    for (const no of ['资料勿用《X.docx》', '资料无需《X.docx》', '资料请忽略《X.docx》', '资料莫用《X.docx》', '资料非《X.docx》', '资料用《X.docx》']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '资料别用《李四.docx》')).toBeNull()
+    // r3 D2/D3 (监工): any word of no or of taking it back in the turn: none, no fall back.
+    for (const no of ['别用《李四.docx》里的资料', '不要用《李四.docx》里的资料，部门先空着', '请勿用《李四.docx》中的资料', '别说资料是《李四.docx》',
+      '资料是《李四.docx》，这份别用，改用《王小明.docx》里的资料']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '刚才那份资料不要用了')).toBeNull()
+    // r4 E1–E3 (监工): a clause the whole of which names it, no word list.
+    for (const no of ['禁用《李四.docx》里的资料', '资料是《李四.docx》（作废）', '禁止用《李四.docx》里的资料', '取消用《李四.docx》里的资料']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '那份不用了')).toBeNull()
+    // 监工: the confirming turn keeps the material its fill was asked with.
+    expect(formMaterial(['把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里'], '没有其他了，紧急联系人留空，签名我自己手写，直接生成吧')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料是《莫小明.docx》')).toBe('莫小明.docx')
+    expect(formMaterial([], '资料在《个人信息.docx》里，部门没有的先空着')).toBe('个人信息.docx')
+    expect(formMaterial([], '把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
+    // r5 F3: two more affirmative forms.
+    expect(formMaterial([], '请用《个人信息.docx》里的资料来填表')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料就在《个人信息.docx》里')).toBe('个人信息.docx')
+  })
+
+  it('goes into the prompt by its id, for fields and fill', () => {
+    const hint = materialHint({ id: 'doc_01M8035XWKZJGGD3NHF3X0HJ0J', title: '个人信息.docx', revision: 1 })
+    expect(hint).toContain('《个人信息.docx》')
+    expect(hint).toContain('source_document_id=doc_01M8035XWKZJGGD3NHF3X0HJ0J')
+    expect(hint).toContain('documents.fill')
+    const prompt = docAgentPrompt(null, '生成吧', true, hint)
+    expect(prompt).toContain(hint)
+    expect(prompt.endsWith('\n生成吧')).toBe(true)
+    expect(docAgentPrompt(null, '生成吧', true)).not.toContain('source_document_id=doc_')
   })
 })

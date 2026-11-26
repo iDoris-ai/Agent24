@@ -151,7 +151,7 @@ const SAFE_TEXT: &[&str] = &[
 /// A label as the allowlist is matched: whitespace and a trailing colon out
 /// (`label_key`), NFKC (「ＱＱ」→「QQ」), lower case, and no format character
 /// (Cf: a zero-width space in 「姓\u{200b}名」).
-fn safe_key(name: &str) -> String {
+pub(crate) fn safe_key(name: &str) -> String {
     use unicode_general_category::{GeneralCategory, get_general_category};
     use unicode_normalization::UnicodeNormalization;
     let k: String = label_key(name).nfkc().collect();
@@ -166,6 +166,53 @@ fn safe_key(name: &str) -> String {
 /// material, and written without `user_said`.
 pub(crate) fn from_material(name: &str) -> bool {
     field_kind(name) == FieldKind::Text && SAFE_TEXT.contains(&safe_key(name).as_str())
+}
+
+/// PR-Daemon #2100 r2 (监工): the material is plainly the user's own record:
+/// read whole (no early stop, nothing ambiguous), it states a 姓名, and that
+/// is the 姓名 the user said (safe_key equal). Only the name is compared: a
+/// job field the user said otherwise vetoes nothing (C4).
+pub(crate) fn plainly_users(
+    read: &Labelled,
+    values: &BTreeMap<String, String>,
+    user_said: &[String],
+) -> bool {
+    if read.cut || read.layout_unknown || !read.ambiguous.is_empty() {
+        return false;
+    }
+    // r3 D4: a name field of the user's own (姓名, 员工姓名, 申请人姓名…),
+    // compared by the same field in the material and in what was said.
+    // r5 F4: the material's own name fields all one name, or it is not one
+    // person's record (姓名：王小明, 员工姓名：李四).
+    let mut names = read
+        .values
+        .iter()
+        .filter(|(k, _)| own_name_field(k))
+        .map(|(_, v)| safe_key(v));
+    if let Some(first) = names.next()
+        && names.any(|n| n != first)
+    {
+        return false;
+    }
+    // r4 E4: every one of them the user said, not any one.
+    let said: Vec<&String> = user_said.iter().filter(|n| own_name_field(n)).collect();
+    !said.is_empty()
+        && said.into_iter().all(|n| {
+            let key = safe_key(n);
+            let stated = read.values.iter().find(|(k, _)| safe_key(k) == key);
+            match (stated, values.get(n)) {
+                (Some((_, stated)), Some(said)) => safe_key(stated) == safe_key(said),
+                _ => false,
+            }
+        })
+}
+
+/// A field for the user's own name: 「姓名」 after one of these (never
+/// 紧急联系人姓名, 配偶姓名).
+fn own_name_field(name: &str) -> bool {
+    safe_key(name).strip_suffix("姓名").is_some_and(|who| {
+        ["", "员工", "申请人", "本人", "职工", "应聘人", "入职人员"].contains(&who)
+    })
 }
 
 /// What a fill will write, and what it tells the model to pass on.
@@ -183,10 +230,14 @@ pub(crate) struct FillReport {
 /// said it (`user_said`), never because it occurs in the material (r11 B2,
 /// R0 一致裁决). A name the template does not have stays in `write`, so fill
 /// still refuses it.
+/// `material`: with a material, whether it is plainly the user's own
+/// ([`plainly_users`]); when it is not, an allowlisted field is written only
+/// as said, like any other (PR-Daemon #2100 r2 C2).
 pub(crate) fn plan_fill(
     fields: &[(String, FieldKind)],
     values: &BTreeMap<String, String>,
     user_said: &[String],
+    material: Option<bool>,
 ) -> FillReport {
     let known: HashSet<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     let said = |name: &str| user_said.iter().any(|s| s == name);
@@ -199,7 +250,8 @@ pub(crate) fn plan_fill(
         if value.trim().is_empty() {
             continue;
         }
-        if field_kind(name) != FieldKind::Manual && (from_material(name) || said(name)) {
+        let unsaid_ok = from_material(name) && material != Some(false);
+        if field_kind(name) != FieldKind::Manual && (unsaid_ok || said(name)) {
             write.insert(name.clone(), value.clone());
         }
     }
@@ -273,6 +325,10 @@ pub(crate) struct Labelled {
     /// that is not exactly the user's, or something else first): nothing is
     /// read, and the user is asked to say them.
     pub(crate) layout_unknown: bool,
+    /// The reading stopped early, at a sign of another record (a header, a
+    /// relation, a label stated again), not at the end of the field run:
+    /// what was read may not be all of the user's (PR-Daemon #2100 r2).
+    pub(crate) cut: bool,
 }
 
 /// Common labels of a form that are not values (a header cell 「年龄」).
@@ -471,6 +527,26 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
             continue;
         }
         if !field_block(block) {
+            // PR-Daemon #2100 r3 D1 (监工): the rest must be one clean record
+            // too, or the material is not plainly the user's: only other
+            // 「标签：值」 lines of labels the template does not have (「爱好：跑步」).
+            // A heading (「家属档案」), a table row or a template field again
+            // is another record, maybe another person's.
+            out.cut = blocks[at - 1..].iter().any(|b| match b {
+                _ if empty(b) => false,
+                Block::Row(_) => true,
+                Block::Line(l) => {
+                    let l = l.trim();
+                    let Some(colon) = l.find(['：', ':']) else {
+                        return true;
+                    };
+                    let label = l[..colon].trim();
+                    label.is_empty()
+                        || label.chars().count() > 12
+                        || l[colon..].trim_start_matches(['：', ':']).trim().is_empty()
+                        || !markers(l, &names).is_empty()
+                }
+            });
             break;
         }
         // What this block gives, kept apart until the block is known to be
@@ -508,6 +584,7 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
                             unsure.push(k);
                         }
                     }
+                    out.cut = true;
                     break;
                 }
                 let below = match blocks.get(at) {
@@ -571,7 +648,13 @@ pub(crate) fn labelled_blocks(blocks: &[Block], fields: &[String]) -> Labelled {
             .iter()
             .any(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)));
         if !stop.is_empty() || clash {
-            for n in stop {
+            out.cut = true;
+            for n in stop.into_iter().chain(
+                pairs
+                    .iter()
+                    .filter(|(n, v)| found.get(n).is_some_and(|seen| !seen.contains(v)))
+                    .map(|(n, _)| n.clone()),
+            ) {
                 if !unsure.contains(&n) {
                     unsure.push(n);
                 }

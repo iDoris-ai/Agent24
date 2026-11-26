@@ -249,6 +249,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/receipts", get(deliver::all_receipts))
         .route("/documents/{document_id}/fill", post(patch::fill))
+        // L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
+        // material takes from it, for the approval box (read).
+        .route(
+            "/documents/{document_id}/fill/preview",
+            post(tools::fill_preview),
+        )
         .route("/documents/{document_id}/content", get(patch::content))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))

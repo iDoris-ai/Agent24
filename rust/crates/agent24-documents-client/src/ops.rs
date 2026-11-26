@@ -443,6 +443,36 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let path = format!("{BASE}/documents/{document}/fill");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
+        // L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
+        // material takes from it (read), for the approval box.
+        "fillPreview" => {
+            let document = k.id("documentId", "doc_")?;
+            let source = k.id("sourceDocumentId", "doc_")?;
+            let empty = Map::new();
+            let values = k.optional("values", Value::as_object)?.unwrap_or(&empty);
+            if values.len() > 200
+                || values.iter().any(|(name, value)| {
+                    !(1..=64).contains(&name.chars().count())
+                        || value.as_str().is_none_or(|v| v.chars().count() > 100_000)
+                })
+            {
+                return None;
+            }
+            let said = k
+                .optional("userSaid", |v| {
+                    let a = v.as_array().filter(|a| a.len() <= 200)?;
+                    a.iter()
+                        .all(|n| {
+                            n.as_str()
+                                .is_some_and(|n| (1..=64).contains(&n.chars().count()))
+                        })
+                        .then(|| a.clone())
+                })?
+                .unwrap_or_default();
+            let body = json!({"source_document_id": source, "values": values, "user_said": said});
+            let path = format!("{BASE}/documents/{document}/fill/preview");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
         // D5a: the head revision's file, to be saved (at most the reply limit).
         "content" => {
             let document = k.id("documentId", "doc_")?;
