@@ -1603,7 +1603,7 @@ async fn fill_takes_allowlisted_fields_the_values_left_out_from_the_material() {
             json!({
                 "document_id": TPL,
                 "source_document_id": SRC,
-                "values": { "姓名": "王小明", "岗位": "" },
+                "values": { "姓名": "陈晓明", "岗位": "" },
                 "user_said": ["姓名"],
             }),
         )
@@ -1617,13 +1617,10 @@ async fn fill_takes_allowlisted_fields_the_values_left_out_from_the_material() {
     assert_eq!(strings(&answer["unfilled"]), ["岗位"], "{answer}");
     let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
     assert!(
-        text.contains("王小明") && text.contains("产品研发部") && text.contains("2026年12月1日"),
+        text.contains("陈晓明") && text.contains("产品研发部") && text.contains("2026年12月1日"),
         "{text}"
     );
-    assert!(
-        !text.contains("陈晓明") && text.contains("{{岗位}}"),
-        "{text}"
-    );
+    assert!(text.contains("{{岗位}}"), "{text}");
     // Without the material nothing is taken.
     let answer = payload(
         &call(
@@ -1634,4 +1631,69 @@ async fn fill_takes_allowlisted_fields_the_values_left_out_from_the_material() {
         .await,
     );
     assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+}
+
+/// PR-Daemon #2100 B1/B2: the App writes from the material only when it is
+/// plainly one person's and plainly the user's: a second person's sign, or a
+/// name the user said that the material states otherwise, and nothing is
+/// taken; a field the values name in another spelling is not taken either.
+#[tokio::test]
+async fn fill_takes_nothing_from_a_material_not_plainly_the_users() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "岗位：{{部 门}}{{岗位}}",
+    ]);
+    put_docx(&state, TPL, "表.docx", &template).await;
+    let fill = |values: Value| {
+        json!({
+            "document_id": TPL,
+            "source_document_id": SRC,
+            "values": values,
+            "user_said": ["姓名"],
+        })
+    };
+    // B1: two people.
+    put_docx(
+        &state,
+        SRC,
+        "资料.docx",
+        &docx(&[
+            "个人信息",
+            "姓名：陈晓明",
+            "部门：财务部",
+            "姓名：王小明",
+            "部门：研发部",
+        ]),
+    )
+    .await;
+    let answer = payload(&call(&state, "fill", fill(json!({ "姓名": "王小明" }))).await);
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // B1: one person, not the one the user is.
+    put_docx(
+        &state,
+        "doc_01K74Z3QJ8V5N2W9RTX6Y00093",
+        "别人.docx",
+        &docx(&["个人信息", "姓名：陈晓明", "部门：财务部", "岗位：会计"]),
+    )
+    .await;
+    let mut args = fill(json!({ "姓名": "王小明" }));
+    args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
+    let answer = payload(&call(&state, "fill", args).await);
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+    // Control: the user's own: taken.
+    let mut args = fill(json!({ "姓名": "陈晓明" }));
+    args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
+    let answer = payload(&call(&state, "fill", args).await);
+    assert_eq!(
+        strings(&answer["filled"]),
+        ["姓名", "部门", "部 门", "岗位"],
+        "{answer}"
+    );
+    // B2: 「部门」 left empty is 「部 门」 left empty too.
+    let mut args = fill(json!({ "姓名": "陈晓明", "部门": "" }));
+    args["source_document_id"] = json!("doc_01K74Z3QJ8V5N2W9RTX6Y00093");
+    let answer = payload(&call(&state, "fill", args).await);
+    assert_eq!(strings(&answer["filled"]), ["姓名", "岗位"], "{answer}");
 }

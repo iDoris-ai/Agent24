@@ -966,15 +966,38 @@ async fn fill(
         // from the material, read by the App as `fields` reads it: an 8B
         // model knew 部门 and 入职日期 and still did not pass them. A field
         // the values name (「先空着」 too) stays the model's.
+        // PR-Daemon #2100 B2: a field the values name in any spelling
+        // (「部门」 left empty is 「部 门」 left empty too) is the model's.
+        let given: std::collections::HashSet<String> = req
+            .values
+            .keys()
+            .map(|k| crate::form::safe_key(k))
+            .collect();
         let left_out: Vec<&String> = fields
             .iter()
             .map(|(n, _)| n)
-            .filter(|n| crate::form::from_material(n) && !req.values.contains_key(*n))
+            .filter(|n| crate::form::from_material(n) && !given.contains(&crate::form::safe_key(n)))
             .collect();
         if !left_out.is_empty() {
             let names = fields.iter().map(|(n, _)| n.clone()).collect();
+            // PR-Daemon #2100 B1: the App writes from the material only when
+            // it is plainly one person's and the user's: nothing is taken
+            // when the reading met a second person's sign or another
+            // ambiguity, or when a value the user said is stated otherwise
+            // in it (王小明 said, 陈晓明 in the material).
+            let compact = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
             if let Material::Text(read) =
                 load_material(state, &storage, source_id, &accepted, names).await?
+                && read.ambiguous.is_empty()
+                && !user_said.iter().any(|n| {
+                    match (
+                        req.values.get(n),
+                        read.values.get(&crate::form::label_key_of(n)),
+                    ) {
+                        (Some(said), Some(stated)) => compact(said) != compact(stated),
+                        _ => false,
+                    }
+                })
             {
                 for n in left_out {
                     if let Some(v) = crate::form::from_source(n, &read) {

@@ -213,8 +213,9 @@ export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）
   + '问齐了或用户说先空着、确认生成时，必须调用 documents.fill，带同一个 source_document_id；没有调用成功就不要说已生成或已保存。填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
   + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
 
-/** 「资料在《X》里」「资料是《X》」: the title the user named as their material. */
-const MATERIAL = /资料[^《》，。！？\n]{0,8}《([^》]{1,200})》/
+/** 「资料在《X》里」「资料是《X》」: the title the user named as their material;
+ * never one told against (「资料不要用《X》」「别用」「没有」, PR-Daemon #2100 B3). */
+const MATERIAL = /资料[^《》，。！？\n不别没]{0,8}《([^》]{1,200})》/
 
 /** 监工 0.7.123 真机: the material a form fill was told, in this turn or the
  * last three user turns (newest first), as a title; null when none. */

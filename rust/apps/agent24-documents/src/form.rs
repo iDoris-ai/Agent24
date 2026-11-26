@@ -151,7 +151,7 @@ const SAFE_TEXT: &[&str] = &[
 /// A label as the allowlist is matched: whitespace and a trailing colon out
 /// (`label_key`), NFKC (「ＱＱ」→「QQ」), lower case, and no format character
 /// (Cf: a zero-width space in 「姓\u{200b}名」).
-fn safe_key(name: &str) -> String {
+pub(crate) fn safe_key(name: &str) -> String {
     use unicode_general_category::{GeneralCategory, get_general_category};
     use unicode_normalization::UnicodeNormalization;
     let k: String = label_key(name).nfkc().collect();
@@ -721,6 +721,11 @@ fn usable(value: &str, names: &[String]) -> bool {
 
 /// A label as compared with a field name: whitespace and a trailing colon
 /// removed.
+/// [`label_key`], for a caller outside: the key `Labelled::values` uses.
+pub(crate) fn label_key_of(label: &str) -> String {
+    label_key(label)
+}
+
 fn label_key(label: &str) -> String {
     label
         .trim()

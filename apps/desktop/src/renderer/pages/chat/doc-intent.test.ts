@@ -471,6 +471,11 @@ describe('监工 0.7.123: the material a form fill was told', () => {
     expect(formMaterial(['把这张表填一下，资料是《个人信息.docx》', '电话 139'], '确认无误，生成吧')).toBe('个人信息.docx')
     expect(formMaterial([], '把《入职登记表模板.docx》填一下')).toBeNull()
     expect(formMaterial(['资料在《旧.docx》里', 'a', 'b', 'c'], '生成吧')).toBeNull()
+    // PR-Daemon #2100 B3: told not to use it is not the material.
+    for (const no of ['资料不要用《李四.docx》，部门先空着', '资料别用《李四.docx》', '资料没有《李四.docx》']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial([], '资料用《个人信息.docx》')).toBe('个人信息.docx')
   })
 
   it('goes into the prompt by its id, for fields and fill', () => {
