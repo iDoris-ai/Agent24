@@ -834,7 +834,16 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
         return Err(refused(&ApiError::not_found("no such document")));
     }
     let names: Vec<String> = listed.fields.iter().map(|f| f.name.clone()).collect();
-    let (read, unread) = match load_material(state, &storage, &source_id, &accepted, names).await? {
+    let (read, unread) = match load_material(
+        state,
+        &storage,
+        &source_id,
+        Requester::Tool(accepted.clone()),
+        names,
+    )
+    .await
+    .map_err(|e| refused(&e))?
+    {
         Material::Text(read) => (read, false),
         Material::Absent => (crate::form::Labelled::default(), true),
     };
@@ -921,7 +930,7 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
 async fn fill(
     state: &AppState,
     run: Run,
-    _accepted: Accepted,
+    accepted: Accepted,
     arguments: Map<String, Value>,
 ) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
@@ -956,14 +965,42 @@ async fn fill(
         .iter()
         .map(|f| (f.name.clone(), f.kind))
         .collect();
-    // The material only resolves and is scope-checked (admit_named): no
-    // identity value is taken from it (r11 B2, 方案 B).
-    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id)
-        && !is_id(IdKind::Document, source_id)
-    {
-        return Err(refused(&ApiError::not_found("no such document")));
+    // The material resolves and is scope-checked (admit_named): no identity
+    // value is taken from it (r11 B2, 方案 B).
+    let mut material = None;
+    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id) {
+        if !is_id(IdKind::Document, source_id) {
+            return Err(refused(&ApiError::not_found("no such document")));
+        }
+        // 监工 0.7.123 真机: an allowlisted field the values leave out comes
+        // from the material, read by the App as `fields` reads it (an 8B
+        // model knew 部门 and 入职日期 and still did not pass them); only when
+        // the material is plainly the user's own (PR-Daemon #2100).
+        let (used, taken) = material_fill(
+            state,
+            &storage,
+            &fields,
+            source_id,
+            &req.values,
+            &user_said,
+            Requester::Tool(accepted.clone()),
+        )
+        .await
+        .map_err(|e| refused(&e))?;
+        req.values.extend(taken);
+        material = Some(used);
     }
-    let report = crate::form::plan_fill(&fields, &req.values, &user_said);
+    let mut report = crate::form::plan_fill(
+        &fields,
+        &req.values,
+        &user_said,
+        material.map(|m| m == MaterialUse::Plain),
+    );
+    if material == Some(MaterialUse::NotWord) {
+        report
+            .note
+            .insert_str(0, "这份资料不是 Word，部门等请直接告诉我。");
+    }
     // Nothing left that may be written: do not import an unchanged copy.
     if report.write.is_empty() && !req.values.is_empty() {
         return completed(Ok(json!({
@@ -1020,16 +1057,16 @@ async fn load_material(
     state: &AppState,
     storage: &Arc<Storage>,
     id: &str,
-    accepted: &Accepted,
+    requester: Requester,
     // The template's fields, to read the material's labelled values for.
     names: Vec<String>,
-) -> Result<Material, Envelope> {
-    let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
+) -> Result<Material, ApiError> {
+    let detail = documents::get(storage, id).await?;
     if detail.head.media_type != crate::office::DOCX {
         // A PDF or an image: its text layer, read as a DOCX's lines are.
         let read = async {
             let r = crate::read::revision(storage, id, detail.document.head_revision).await?;
-            crate::read::current_layer(state, storage, &r, Requester::Tool(accepted.clone())).await
+            crate::read::current_layer(state, storage, &r, requester).await
         };
         return Ok(match read.await {
             Ok((_, layer)) => {
@@ -1064,8 +1101,120 @@ async fn load_material(
         Err(e) if e.code() == "unsupported_format" || e.code() == "payload_too_large" => {
             Ok(Material::Absent)
         }
-        Err(e) => Err(refused(&e)),
+        Err(e) => Err(e),
     }
+}
+
+/// What [`material_fill`] made of the material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterialUse {
+    /// Not a Word document: nothing is taken (PR-Daemon #2100 r6 G1: a PDF's
+    /// text layer may be built between the box's preview and the fill).
+    NotWord,
+    /// A Word document that could not be read: nothing is taken.
+    Unread,
+    /// Read, but not plainly the user's own: nothing is taken.
+    NotPlain,
+    /// Plainly the user's own.
+    Plain,
+}
+
+/// PR-Daemon #2100 r5, 监工 裁决 C: what a fill with `source_id` takes from
+/// the material, shared by the fill tool and the approval box's preview
+/// (`POST …/fill/preview`), so the box shows exactly what is written:
+/// whether the material is plainly the user's own (`plainly_users`), and
+/// the allowlisted fields the values leave out (in any spelling) with the
+/// material's value for each. Only a Word material, read the same way at
+/// both (r6 G1); anything else: nothing.
+pub(crate) async fn material_fill(
+    state: &AppState,
+    storage: &Arc<Storage>,
+    fields: &[(String, crate::form::FieldKind)],
+    source_id: &str,
+    values: &std::collections::BTreeMap<String, String>,
+    user_said: &[String],
+    requester: Requester,
+) -> Result<(MaterialUse, Vec<(String, String)>), ApiError> {
+    if documents::get(storage, source_id).await?.head.media_type != crate::office::DOCX {
+        return Ok((MaterialUse::NotWord, Vec::new()));
+    }
+    let names = fields.iter().map(|(n, _)| n.clone()).collect();
+    let Material::Text(read) = load_material(state, storage, source_id, requester, names).await?
+    else {
+        return Ok((MaterialUse::Unread, Vec::new()));
+    };
+    if !crate::form::plainly_users(&read, values, user_said) {
+        return Ok((MaterialUse::NotPlain, Vec::new()));
+    }
+    // PR-Daemon #2100 B2: a field the values name in any spelling is the model's.
+    let given: std::collections::HashSet<String> =
+        values.keys().map(|k| crate::form::safe_key(k)).collect();
+    let taken = fields
+        .iter()
+        .map(|(n, _)| n)
+        .filter(|n| crate::form::from_material(n) && !given.contains(&crate::form::safe_key(n)))
+        .filter_map(|n| crate::form::from_source(n, &read).map(|v| (n.clone(), v.to_owned())))
+        .collect();
+    Ok((MaterialUse::Plain, taken))
+}
+
+/// The approval box's preview of a fill with a material (read): the values
+/// [`material_fill`] would add, each with the material's title.
+pub async fn fill_preview(
+    axum::extract::State(state): axum::extract::State<AppState>,
+    path: Result<axum::extract::Path<String>, axum::extract::rejection::PathRejection>,
+    body: Result<axum::Json<FillPreview>, axum::extract::rejection::JsonRejection>,
+) -> Result<axum::Json<Value>, ApiError> {
+    let axum::extract::Path(id) = path.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    let axum::Json(req) = body.map_err(|e| ApiError::invalid_request(e.body_text()))?;
+    if !is_id(IdKind::Document, &id) || !is_id(IdKind::Document, &req.source_document_id) {
+        return Err(ApiError::not_found("no such document"));
+    }
+    let storage = state
+        .storage()
+        .await
+        .map_err(ApiError::storage_unavailable)?;
+    let listed = crate::patch::fields_of(&storage, id.clone()).await?;
+    let fields: Vec<_> = listed
+        .fields
+        .iter()
+        .map(|f| (f.name.clone(), f.kind))
+        .collect();
+    let source = documents::get(&storage, &req.source_document_id).await?;
+    let (used, taken) = if req.source_document_id == id {
+        (MaterialUse::NotPlain, Vec::new())
+    } else {
+        material_fill(
+            &state,
+            &storage,
+            &fields,
+            &req.source_document_id,
+            &req.values,
+            &req.user_said,
+            Requester::Page,
+        )
+        .await?
+    };
+    Ok(axum::Json(json!({
+        "source_title": source.document.title,
+        "plainly_users": used == MaterialUse::Plain,
+        "material_word": used != MaterialUse::NotWord,
+        "material_read": used != MaterialUse::Unread,
+        "from_material": taken
+            .into_iter()
+            .map(|(field, value)| json!({ "field": field, "value": value }))
+            .collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FillPreview {
+    source_document_id: String,
+    #[serde(default)]
+    values: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    user_said: Vec<String>,
 }
 
 /// The import job `settled` answered with made a document, or is making one.

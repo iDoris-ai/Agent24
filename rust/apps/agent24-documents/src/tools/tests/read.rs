@@ -12,7 +12,7 @@ const DOC: &str = "doc_01K74Z3QJ8V5N2W9RTX6YB4M00"; // shadows the parent's
 
 /// An engine that reads `pages` (each page's block texts) and an unread
 /// region of `rects` rectangles on each page in `unread`.
-struct Fixed {
+pub(super) struct Fixed {
     pages: Vec<Vec<String>>,
     unread: Vec<u32>,
     rects: usize,
@@ -76,7 +76,7 @@ impl Engine for Fixed {
     }
 }
 
-fn fixed(pages: Vec<Vec<String>>, unread: Vec<u32>, rects: usize) -> Option<Fixed> {
+pub(super) fn fixed(pages: Vec<Vec<String>>, unread: Vec<u32>, rects: usize) -> Option<Fixed> {
     Some(Fixed {
         pages,
         unread,
