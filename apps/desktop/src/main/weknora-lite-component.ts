@@ -94,6 +94,8 @@ export class WeknoraLiteIntegrityError extends Error {}
 
 /** Thrown for transport problems — maps to failure `network`. */
 export class WeknoraLiteNetworkError extends Error {}
+/** A local write failed while downloading (disk full, read-only volume): failure `other`. */
+export class WeknoraLiteLocalError extends Error {}
 
 export function defaultWeknoraLiteComponentsRoot(): string {
   return joinLiteral(dataDir(), 'components', 'weknora-lite')
@@ -279,8 +281,18 @@ export class WeknoraLiteInstaller {
 
   private setStatus(status: WeknoraLiteStatus): void {
     this.current = status
+    // A final status ends the install before anyone hears of it, so a listener
+    // may call install() again at once and get a new attempt (PR-Daemon #2104 Low 2).
+    if (status.state === 'installed' || status.state === 'failed') this.installing = null
     queueMicrotask(() => {
-      for (const listener of this.listeners) listener(this.status())
+      for (const listener of [...this.listeners]) {
+        // A throwing listener neither reaches the process nor stops the others (Low 5).
+        try {
+          listener(this.status())
+        } catch (error) {
+          console.warn('[weknora-lite] install listener failed', error instanceof Error ? error.message : String(error))
+        }
+      }
     })
   }
 
@@ -462,7 +474,12 @@ export class WeknoraLiteInstaller {
           received += chunk.length
           if (received > total) throw new WeknoraLiteIntegrityError('WeKnora Lite download exceeded the pinned size')
           hash.update(chunk)
-          fs.writeSync(fd, chunk)
+          try {
+            fs.writeSync(fd, chunk)
+          } catch (error) {
+            // Local I/O (disk full, say), not the network: `other` (PR-Daemon #2104 Low 4).
+            throw new WeknoraLiteLocalError(`WeKnora Lite download could not be written: ${(error as NodeJS.ErrnoException).code ?? (error as Error).message}`)
+          }
           const now = Date.now()
           if (received === total || now - lastEmit >= PROGRESS_THROTTLE_MS) {
             this.setStatus({ state: 'downloading', received, total })
@@ -471,12 +488,12 @@ export class WeknoraLiteInstaller {
         }
       } catch (error) {
         void response.body.cancel().catch(() => {})
-        if (error instanceof WeknoraLiteIntegrityError) throw error
+        if (error instanceof WeknoraLiteIntegrityError || error instanceof WeknoraLiteLocalError) throw error
         if (controller.signal.aborted && !idleFired) throw controller.signal.reason
         throw new WeknoraLiteNetworkError(`WeKnora Lite download interrupted: ${idleFired ? (controller.signal.reason as Error).message : (error as Error).message}`)
       }
     } catch (error) {
-      if (controller.signal.aborted && !idleFired && !(error instanceof WeknoraLiteIntegrityError)) throw controller.signal.reason
+      if (controller.signal.aborted && !idleFired && !(error instanceof WeknoraLiteIntegrityError) && !(error instanceof WeknoraLiteLocalError)) throw controller.signal.reason
       throw error
     } finally {
       clearTimeout(idleTimer)

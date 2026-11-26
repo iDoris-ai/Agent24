@@ -266,6 +266,11 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+    /** Loop 9 3c: remote server or the local Lite. */
+    setSource: (source: 'remote' | 'local'): Promise<KnowledgeSettingsResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeSetSource, source),
+    /** Loop 9 3c: install or launch the local Lite again. */
+    liteRetry: (): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeLiteRetry),
     /** L7-K2: mock onboarding. The activation code and the key stay in main. */
     onboardPreflight: (): Promise<KnowledgeOnboardPreflight> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeOnboardPreflight),

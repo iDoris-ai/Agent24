@@ -46,11 +46,11 @@ const EMBEDDING_MODEL_ID = 'agent24-embedding'
 /** The policy's version: an ingest's `expected_policy_version` must equal it (3c's uploads). */
 export const WEKNORA_LITE_POLICY_VERSION = 'agent24-lite-1'
 
-export function weknoraLiteSidecarSpec(readyPhaseTimeoutMs = WEKNORA_LITE_READY_PHASE_TIMEOUT_MS): SidecarSpec {
+export function weknoraLiteSidecarSpec(readyPhaseTimeoutMs = WEKNORA_LITE_READY_PHASE_TIMEOUT_MS, healthIntervalMs = WEKNORA_LITE_HEALTH_INTERVAL_MS): SidecarSpec {
   return {
     sidecarId: WEKNORA_LITE_SIDECAR_ID,
     readyTimeoutMs: readyPhaseTimeoutMs * 2 + 2_000,
-    healthIntervalMs: WEKNORA_LITE_HEALTH_INTERVAL_MS,
+    healthIntervalMs,
     healthTimeoutMs: WEKNORA_LITE_HEALTH_TIMEOUT_MS,
     maxHealthFailures: WEKNORA_LITE_MAX_HEALTH_FAILURES,
     shutdown: { termGraceMs: WEKNORA_LITE_TERM_GRACE_MS, killAfterMs: WEKNORA_LITE_KILL_AFTER_MS },

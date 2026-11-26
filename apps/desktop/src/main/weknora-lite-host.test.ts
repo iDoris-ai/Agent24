@@ -23,12 +23,17 @@ if (mode === 'fail') process.exit(1)
 const key = 'k' + run + '-'.repeat(40)
 const life = new (require('node:net').Socket)({ fd: 4, readable: true, writable: false })
 life.on('data', () => {}); life.on('end', () => process.exit(0)); life.on('error', () => process.exit(0))
+const born = Date.now()
 const server = http.createServer((req, res) => {
   res.statusCode = req.method === 'POST' && req.url === '/api/v1/agent24/knowledge/ready' && req.headers['x-api-key'] === key ? 200 : 401
+  // degrade-once: the first run stops answering its probes after a while, but stays alive.
+  if (mode === 'degrade-once' && run === 1 && Date.now() - born > 400) res.statusCode = 503
   res.end('{}')
 })
 server.listen(0, '127.0.0.1', () => {
   const origin = 'http://127.0.0.1:' + server.address().port
+  // bad-handshake: a syntax error right after the key, so a quoting parser would echo it.
+  if (mode === 'bad-handshake') { fs.writeSync(3, '{"type":"ready","protocol":2,"credential":{"api_key":"BADKEYabcdefghijklmnopqrstuvwxyz"x}}\\n'); return }
   fs.writeSync(3, JSON.stringify({ type: 'ready', protocol: 2, phase: 'process', origin, pid: process.pid, version: 'fake', commit: 'x', edition: 'lite',
     credential: { api_key: key, knowledge_base_id: 'kb-1', expires_at: null } }) + '\\n')
   fs.writeSync(3, JSON.stringify({ type: 'models', protocol: 2, embedding: { state: 'ready' }, chat: { state: 'missing' } }) + '\\n')
@@ -58,7 +63,7 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true })
 })
 
-function host(overrides: { mode?: string; embedding?: () => Promise<WeknoraLiteEmbedding> } = {}): WeknoraLiteHost {
+function host(overrides: { mode?: string; embedding?: () => Promise<WeknoraLiteEmbedding>; healthIntervalMs?: number } = {}): WeknoraLiteHost {
   if (overrides.mode) fs.writeFileSync(path.join(program, 'mode'), overrides.mode)
   const h = new WeknoraLiteHost({
     program: () => ({ binary: path.join(program, 'WeKnora-lite'), dir: program }),
@@ -69,6 +74,7 @@ function host(overrides: { mode?: string; embedding?: () => Promise<WeknoraLiteE
     logger: silent,
     readyPhaseTimeoutMs: 5_000,
     restartDelaysMs: [20, 20, 20, 20, 20],
+    ...(overrides.healthIntervalMs ? { healthIntervalMs: overrides.healthIntervalMs } : {}),
   })
   hosts.push(h)
   return h
@@ -165,5 +171,64 @@ describe('WeknoraLiteHost', () => {
     expect((await h.start()).state).toBe('stopped')
     await new Promise((r) => setTimeout(r, 150))
     expect(runs()).toBe(1)
+  })
+
+  it('PR-Daemon #2108 G1: a start right after a stop (still reaping) brings the Lite up again', async () => {
+    const h = host()
+    await h.start()
+    await until(h, (x) => x.state === 'healthy')
+    const stopping = h.stop()
+    await h.start()
+    await stopping
+    await until(h, (x) => x.state === 'healthy')
+    expect(runs()).toBe(2)
+  })
+
+  it('G2: stopped while preparing, it reads stopped and never launches', async () => {
+    let release: (e: WeknoraLiteEmbedding) => void = () => {}
+    const h = host({ embedding: () => new Promise((resolve) => { release = resolve }) })
+    const seen: string[] = []
+    h.onStatus((s) => seen.push(s.state))
+    const started = h.start()
+    await until(h, (x) => x.state === 'starting')
+    await h.stop()
+    expect(h.status().state).toBe('stopped')
+    release(embedding)
+    await started
+    await new Promise((r) => setTimeout(r, 100))
+    expect(h.status().state).toBe('stopped')
+    expect(seen.at(-1)).toBe('stopped')
+    expect(fs.existsSync(path.join(root, 'data', 'weknora-lite', 'runs'))).toBe(false)
+  })
+
+  it('G3: alive but no longer answering (degraded) is restarted like a crash', async () => {
+    const h = host({ mode: 'degrade-once', healthIntervalMs: 50 })
+    await h.start()
+    await until(h, (x) => x.state === 'healthy')
+    await until(h, (x) => x.state === 'healthy' && runs() === 2, 10_000)
+    expect(h.credential()?.apiKey).toBe(`k2${'-'.repeat(40)}`)
+  })
+
+  it('PR-Daemon #2108: a broken handshake line through the launcher never puts the key in the error or the log', async () => {
+    const warnings: string[] = []
+    if (fs.existsSync(path.join(program, 'mode'))) fs.rmSync(path.join(program, 'mode'))
+    fs.writeFileSync(path.join(program, 'mode'), 'bad-handshake')
+    const h = new WeknoraLiteHost({
+      program: () => ({ binary: path.join(program, 'WeKnora-lite'), dir: program }),
+      embedding: async () => embedding,
+      dataDir: path.join(root, 'data', 'weknora-lite'),
+      logPath: path.join(root, 'logs', 'weknora-lite.log'),
+      logger: { info: () => {}, warn: (event, fields) => warnings.push(`${event} ${JSON.stringify(fields ?? {})}`) },
+      readyPhaseTimeoutMs: 5_000,
+      restartDelaysMs: [20],
+    })
+    hosts.push(h)
+    await h.start()
+    const s = await until(h, (x) => x.gaveUp)
+    expect(s.error ?? '').toContain('not JSON')
+    for (const text of [s.error ?? '', JSON.stringify(s), ...warnings]) {
+      for (const piece of ['BADKEY', 'mnop', 'wxyz']) expect(text).not.toContain(piece)
+    }
+    expect(h.credential()).toBeNull()
   })
 })

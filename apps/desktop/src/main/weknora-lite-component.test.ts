@@ -5,7 +5,7 @@ import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
   WEKNORA_LITE_LOCAL_BASE_URL_ENV,
@@ -242,6 +242,49 @@ describe('WeknoraLiteInstaller install', () => {
     const second = await inst.install()
     expect(second.state).toBe('installed')
     expect(hits()).toBe(2)
+  })
+
+  it('Loop 9 3c (PR-Daemon #2104 Low 2): a listener that retries on failed gets a new attempt, not the failed one', async () => {
+    const f = buildFixture()
+    const { base, hits } = await serve((_req, res, n) => {
+      if (n === 0) { res.writeHead(500); res.end(); return }
+      res.writeHead(200, { 'content-length': String(f.archive.length) })
+      res.end(f.archive)
+    })
+    const inst = installer(f, base)
+    let retried: Promise<WeknoraLiteStatus> | null = null
+    inst.onProgress((status) => {
+      if (status.state === 'failed' && !retried) retried = inst.install()
+    })
+    expect(await inst.install()).toMatchObject({ state: 'failed', failure: 'network' })
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(retried).not.toBeNull()
+    expect(await retried).toMatchObject({ state: 'installed' })
+    expect(hits()).toBe(2)
+  })
+
+  it('Loop 9 3c (Low 5): a throwing listener neither escapes nor keeps the others from hearing', async () => {
+    const f = buildFixture()
+    const { base } = await serve((_req, res) => { res.writeHead(200, { 'content-length': String(f.archive.length) }); res.end(f.archive) })
+    const inst = installer(f, base)
+    const heard: string[] = []
+    inst.onProgress(() => { throw new Error('listener broke') })
+    inst.onProgress((status) => { heard.push(status.state) })
+    expect(await inst.install()).toMatchObject({ state: 'installed' })
+    await new Promise((resolve) => setImmediate(resolve))
+    expect(heard).toContain('installed')
+  })
+
+  it('Loop 9 3c (Low 4): a disk that fills up while downloading is other, not network', async () => {
+    const f = buildFixture()
+    const { base } = await serve((_req, res) => { res.writeHead(200, { 'content-length': String(f.archive.length) }); res.end(f.archive) })
+    const full = Object.assign(new Error('no space left on device'), { code: 'ENOSPC' })
+    const write = vi.spyOn(fs, 'writeSync').mockImplementationOnce(() => { throw full })
+    try {
+      expect(await installer(f, base).install()).toMatchObject({ state: 'failed', failure: 'other' })
+    } finally {
+      write.mockRestore()
+    }
   })
 
   it('fails as network on an HTTP error and when the source is unreachable', async () => {

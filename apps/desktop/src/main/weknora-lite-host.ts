@@ -83,6 +83,8 @@ export interface WeknoraLiteHostDeps {
   readonly kill?: (pid: number, signal: NodeJS.Signals | 0) => unknown
   readonly readyPhaseTimeoutMs?: number
   readonly restartDelaysMs?: readonly number[]
+  /** Tests only: how often a running Lite is probed (`degraded` after 3 misses). */
+  readonly healthIntervalMs?: number
 }
 
 const consoleLogger: SidecarLogger = {
@@ -109,6 +111,8 @@ export class WeknoraLiteHost {
   private gaveUp = false
   private error: string | undefined
   private preparing = false
+  /** The stop under way (ours or the give-up's): a start waits for it (PR-Daemon #2108 G1). */
+  private stopping: Promise<unknown> | null = null
 
   constructor(private readonly deps: WeknoraLiteHostDeps) {
     this.logger = deps.logger ?? consoleLogger
@@ -116,7 +120,7 @@ export class WeknoraLiteHost {
     this.dataDirPath = deps.dataDir ?? defaultWeknoraLiteDataDir()
     const fetchFn = deps.fetchFn ?? fetch
     this.manager = new SidecarManager(
-      weknoraLiteSidecarSpec(deps.readyPhaseTimeoutMs ?? WEKNORA_LITE_READY_PHASE_TIMEOUT_MS),
+      weknoraLiteSidecarSpec(deps.readyPhaseTimeoutMs ?? WEKNORA_LITE_READY_PHASE_TIMEOUT_MS, deps.healthIntervalMs),
       new WeknoraLiteLauncher(
         () => {
           if (!this.plan) throw new Error('WeKnora Lite launch plan is unavailable')
@@ -165,22 +169,35 @@ export class WeknoraLiteHost {
     this.gaveUp = false
     this.restarts = 0
     this.clearTimer()
-    await this.attempt()
+    // G1: the manager's start is a no-op while a stop is reaping the last
+    // instance, and while `degraded` (G3): wait for the stop, or stop first.
+    if (this.stopping) await this.stopping.catch(() => {})
+    if (this.manager.status().state === 'degraded') await this.stopManager()
+    if (this.closed || !this.wanted) return this.status()
+    await this.attempt(false)
     return this.status()
   }
 
   async stop(): Promise<WeknoraLiteHostStatus> {
     this.wanted = false
+    // G2: a stop during preparation must not leave the state reading `starting`.
+    this.preparing = false
     this.clearTimer()
-    try {
-      await this.manager.stop()
-    } catch (error) {
-      // The tree did not empty in time; the manager keeps it `failed` and owned.
-      this.logger.warn('weknora-lite.stop_failed', { error: message(error) })
-    }
+    await this.stopManager()
     this.handshake = null
     this.emit()
     return this.status()
+  }
+
+  /** One stop of the manager at a time; start() waits for it. */
+  private stopManager(): Promise<void> {
+    const run = this.manager.stop().then(() => {}, (error: unknown) => {
+      // The tree did not empty in time; the manager keeps it `failed` and owned.
+      this.logger.warn('weknora-lite.stop_failed', { error: message(error) })
+    })
+    this.stopping = run
+    void run.finally(() => { if (this.stopping === run) this.stopping = null })
+    return run
   }
 
   /** App quit: stop and reap the process tree; nothing starts again. */
@@ -196,19 +213,32 @@ export class WeknoraLiteHost {
     return { origin: handshake.origin, apiKey: handshake.apiKey, knowledgeBaseId: handshake.knowledgeBaseId, expiresAt: handshake.expiresAt }
   }
 
-  private async attempt(): Promise<void> {
+  /** `reuse`: only waiting for the last instance to be reaped; the plan made
+   * for this start is still good, so the program is not hashed again and the
+   * embedding not asked for again (G4). */
+  private async attempt(reuse: boolean): Promise<void> {
     if (this.closed || !this.wanted) return
-    this.preparing = true
-    this.emit()
-    try {
-      this.plan = await this.prepare()
-    } catch (error) {
+    if (!reuse || !this.plan) {
+      this.preparing = true
+      this.emit()
+      try {
+        this.plan = await this.prepare()
+      } catch (error) {
+        this.preparing = false
+        if (this.closed || !this.wanted) {
+          this.emit()
+          return
+        }
+        this.fail(message(error))
+        return
+      }
       this.preparing = false
-      this.fail(message(error))
-      return
+      // G2: stopped while preparing: say so (the state is no longer `starting`).
+      if (this.closed || !this.wanted) {
+        this.emit()
+        return
+      }
     }
-    this.preparing = false
-    if (this.closed || !this.wanted) return
     try {
       const status = await this.manager.start()
       // Still `failed` without having launched: the last instance is being reaped. Try again later.
@@ -243,6 +273,13 @@ export class WeknoraLiteHost {
 
   private onManagerStatus(state: SidecarState): void {
     if (state === 'healthy') this.restarts = 0
+    // G3: alive but not answering its probes is treated as a crash: stop it,
+    // then restart on the same backoff (it counts against the 5 restarts).
+    if (state === 'degraded' && this.wanted && !this.closed) {
+      this.handshake = null
+      this.logger.warn('weknora-lite.degraded_restart', {})
+      void this.stopManager().then(() => { if (this.wanted && !this.closed) this.schedule(true) })
+    }
     if (state === 'failed') {
       this.handshake = null
       if (this.wanted && !this.closed) this.schedule(true)
@@ -264,15 +301,15 @@ export class WeknoraLiteHost {
       this.wanted = false
       this.gaveUp = true
       this.logger.warn('weknora-lite.gave_up', { restarts: this.restarts })
-      // Back to `stopped` once the failed instance is reaped.
-      void this.manager.stop().finally(() => this.emit())
+      // Back to `stopped` once the failed instance is reaped; a retry waits for it (G1).
+      void this.stopManager().finally(() => this.emit())
       return
     }
     const delay = this.delays[Math.min(this.restarts, this.delays.length - 1)]
     if (counts) this.restarts += 1
     this.timer = setTimeout(() => {
       this.timer = null
-      void this.attempt()
+      void this.attempt(!counts)
     }, delay)
     this.timer.unref?.()
   }
