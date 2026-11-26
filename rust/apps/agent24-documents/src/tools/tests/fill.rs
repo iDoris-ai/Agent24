@@ -449,22 +449,14 @@ fn header_rows_and_several_labels_on_a_line_give_the_right_values() {
     assert_eq!(get(&pairs, "姓名").as_deref(), Some("陈晓明"), "{pairs:?}");
     assert_eq!(get(&pairs, "联系电话").as_deref(), Some("13800000000"));
     assert_eq!(get(&pairs, "部门").as_deref(), Some("研发部"));
+    // r3 (监工): several fields on one line are not read: the user is asked.
     for line in [
         "姓名：陈晓明；联系电话：13800000000",
         "姓名：陈晓明    联系电话：13800000000",
         "姓名：陈晓明 联系电话：13800000000",
     ] {
         let pairs = crate::form::labelled(&[line.to_owned()], &[], &names);
-        assert_eq!(
-            get(&pairs, "姓名").as_deref(),
-            Some("陈晓明"),
-            "{line}: {pairs:?}"
-        );
-        assert_eq!(
-            get(&pairs, "联系电话").as_deref(),
-            Some("13800000000"),
-            "{line}"
-        );
+        assert!(pairs.values.is_empty(), "{line}: {pairs:?}");
     }
     // A label cell beside another label is not its value.
     let pairs = crate::form::labelled(&[], &[vec!["姓名".to_owned(), "部门".to_owned()]], &names);
@@ -561,7 +553,10 @@ fn a_label_with_two_values_is_ambiguous_and_gives_none() {
         &[&["姓名", "关系", "电话"], &["李四", "父亲", "139"]],
         &["姓名", "电话"],
     );
-    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    // r3 (监工): a family table with a cell that is no field is not read at
+    // all, so the user's own 姓名 stands; 电话 (only in it) is not given.
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"), "{r:?}");
+    assert_eq!(value(&r, "电话"), None, "{r:?}");
     // The same value twice is one value.
     let r = read(&["姓名：陈晓明"], &[&["姓名", "陈晓明"]], &["姓名"]);
     assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
@@ -581,11 +576,9 @@ fn a_value_is_cut_only_at_the_next_field_and_an_odd_colon_gives_none() {
     assert_eq!(value(&r, "时间").as_deref(), Some("9:30"));
     let r = read(&["姓名：陈晓明 性别 男"], &[], &["姓名", "性别"]);
     assert_eq!(value(&r, "姓名"), None, "{r:?}");
+    // r3 (监工): two fields on one line: neither is read.
     let r = read(&["姓名： 性别：男"], &[], &["姓名", "性别"]);
-    assert_eq!(
-        (value(&r, "姓名"), value(&r, "性别").as_deref()),
-        (None, Some("男"))
-    );
+    assert_eq!((value(&r, "姓名"), value(&r, "性别")), (None, None));
     let r = read(&["地址：北京市 朝阳区 1号"], &[], &["地址"]);
     assert_eq!(value(&r, "地址").as_deref(), Some("北京市 朝阳区 1号"));
 }
@@ -715,16 +708,111 @@ fn overlapping_field_names_never_panic() {
 
 /// PR-Daemon #2095 r2 F4: a value ends at two spaces, a tab or U+3000.
 #[test]
-fn a_value_ends_at_two_spaces_a_tab_or_an_ideographic_space() {
+fn a_value_spread_by_two_spaces_a_tab_or_an_ideographic_space_is_ambiguous() {
+    // r3 (监工): never cut there; 「张三  部门 研发」 gives none, and is ambiguous.
     for line in [
         "姓名：张三  部门 研发",
         "姓名：张三\t部门 研发",
         "姓名：张三\u{3000}部门",
     ] {
+        let r = read(&[line], &[], &["姓名"]);
+        assert_eq!(value(&r, "姓名"), None, "{line}");
+        assert_eq!(r.ambiguous, ["姓名"], "{line}");
+    }
+}
+
+/// PR-Daemon #2095 r3 B1: a later field after someone else's label, in a
+/// line or a table row, is not the user's either.
+#[test]
+fn a_later_field_after_someone_else_s_label_is_not_the_user_s() {
+    let f = &["姓名", "电话", "性别"];
+    let r = read(&[], &[&["紧急联系人", "姓名", "李四", "电话", "139"]], f);
+    assert_eq!(
+        (value(&r, "姓名"), value(&r, "电话")),
+        (None, None),
+        "{r:?}"
+    );
+    for line in [
+        "姓名：陈晓明  紧急联系人 电话：139",
+        "姓名：陈晓明；紧急联系人 电话：139",
+        "姓名：陈晓明 紧急联系人 电话：139",
+    ] {
+        let r = read(&[line], &[], f);
+        assert_eq!(value(&r, "电话"), None, "{line}: {r:?}");
+        assert_ne!(
+            value(&r, "姓名").as_deref(),
+            Some("陈晓明；紧急联系人"),
+            "{line}"
+        );
+        assert!(
+            value(&r, "姓名").is_none_or(|v| v == "陈晓明"),
+            "{line}: {r:?}"
+        );
+    }
+    let r = read(&[], &[&["姓名", "陈晓明", "性别", "男"]], f);
+    assert_eq!(
+        (value(&r, "姓名").as_deref(), value(&r, "性别").as_deref()),
+        (Some("陈晓明"), Some("男"))
+    );
+}
+
+/// PR-Daemon #2095 r3 B2: a name spread by two spaces is never cut to one
+/// character.
+#[test]
+fn a_name_spread_by_spaces_is_never_cut_to_one_character() {
+    for line in ["姓名：陈  晓明", "姓名：张  三", "姓名：张\u{3000}三"] {
+        let v = value(&read(&[line], &[], &["姓名"]), "姓名");
+        assert!(
+            v.as_deref()
+                .is_none_or(|v| v.chars().filter(|c| !c.is_whitespace()).count() > 1),
+            "{line}: {v:?}"
+        );
+    }
+    for line in ["姓名：陈  晓明", "姓名：张  三", "姓名：张\u{3000}三"] {
         assert_eq!(
-            value(&read(&[line], &[], &["姓名"]), "姓名").as_deref(),
-            Some("张三"),
+            value(&read(&[line], &[], &["姓名"]), "姓名"),
+            None,
             "{line}"
         );
     }
+    // A numbered line with one field is read.
+    for line in ["1. 姓名：陈晓明", "（一）姓名：陈晓明", "  姓名：陈晓明"] {
+        let v = value(&read(&[line], &[], &["姓名"]), "姓名");
+        assert_eq!(v.as_deref(), Some("陈晓明"), "{line}");
+    }
+}
+
+/// PR-Daemon #2095 r3 N1: a title row 「个人基本信息」 does not hide the table under it.
+#[test]
+fn a_title_row_does_not_hide_the_table_under_it() {
+    let r = read(
+        &[],
+        &[&["个人基本信息", "", ""], &["姓名", "陈晓明", ""]],
+        &["姓名"],
+    );
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"), "{r:?}");
+    let r = read(&[], &[&["配偶", ""], &["姓名", "李四"]], &["姓名"]);
+    assert_eq!(value(&r, "姓名"), None, "{r:?}");
+}
+
+/// 监工 11-26 真机验收的两份原件（tests/fixtures/s02-*.docx）: the three the
+/// material states are read, the rest are not, nothing is ambiguous.
+#[test]
+fn the_acceptance_materials_give_the_three_values_they_state() {
+    let tpl: &[u8] = include_bytes!("../../../tests/fixtures/s02-template.docx");
+    let src: &[u8] = include_bytes!("../../../tests/fixtures/s02-material.docx");
+    let names: Vec<String> = crate::docx_patch::list_fields(tpl)
+        .unwrap()
+        .into_iter()
+        .map(|f| f.name)
+        .collect();
+    let (lines, rows) = crate::docx_patch::lines_and_rows(src).unwrap();
+    let r = crate::form::labelled(&lines, &rows, &names);
+    assert_eq!(value(&r, "姓名").as_deref(), Some("陈晓明"));
+    assert_eq!(value(&r, "部门").as_deref(), Some("产品研发部"));
+    assert_eq!(value(&r, "入职日期").as_deref(), Some("2026年12月1日"));
+    for f in ["联系电话", "身份证号", "紧急联系人", "本人签名"] {
+        assert_eq!(value(&r, f), None, "{f}");
+    }
+    assert!(r.ambiguous.is_empty(), "{r:?}");
 }

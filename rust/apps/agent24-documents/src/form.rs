@@ -214,6 +214,9 @@ pub(crate) struct Labelled {
     pub(crate) ambiguous: Vec<String>,
 }
 
+/// Headings of someone else's details in a form.
+const PERSON_SECTIONS: &[&str] = &["配偶", "家属", "家庭成员", "父亲", "母亲", "子女", "亲属"];
+
 /// Common labels of a form that are not values (a header cell 「年龄」).
 const COMMON_LABELS: &[&str] = &[
     "年龄",
@@ -236,12 +239,19 @@ const COMMON_LABELS: &[&str] = &[
 ];
 
 /// Only labels equal to one of `fields` (whitespace and a trailing colon
-/// aside) are read. Lines: 「字段：值」, cut only where the next 「字段：」 starts;
-/// a value with another colon (not a time's), another field's name, or a
-/// blank (「____」「□」「（请填写）」) is none. Tables: a field's cell with the
-/// value to its right (when that cell is not a label), or under it (when its
-/// row is all labels); both possible and different is none. A field found
-/// with two different values is ambiguous.
+/// aside) are read, by the most cautious rules (监工 11-26, PR-Daemon #2095
+/// round 3), so that someone else's details are never read as the user's:
+/// - A line: exactly one 「字段：」 in it, opening it (after leading space and a
+///   number 「1.」「（一）」); any other line is not read.
+/// - A table row: strictly 「字段 | 值 | 字段 | 值…」 from its first cell, every
+///   even cell a field and every odd one a value; any other cell
+///   (「紧急联系人」) and the row is not read. A row of fields only is a header,
+///   read down to the row under it. A value that could also be read down (the
+///   row under it has a value in that column) and differs is ambiguous (F1).
+/// - A value with two or more spaces in a row, a tab or U+3000 in it
+///   (「陈  晓明」「张三  部门 研发」) is ambiguous; so is one with another colon
+///   (not a time's), another field's name, or a blank (「____」「□」「（请填写）」)
+///   is none. A field found with two different values is ambiguous.
 pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]) -> Labelled {
     let names: Vec<String> = fields
         .iter()
@@ -249,8 +259,15 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
         .filter(|k| !k.is_empty())
         .collect();
     let mut found: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut unsure: Vec<String> = Vec::new();
     let mut put = |name: &str, value: &str| {
         let value = value.trim();
+        if spread(value) {
+            if !unsure.iter().any(|n| n == name) {
+                unsure.push(name.to_owned());
+            }
+            return;
+        }
         if usable(value, &names) {
             let seen = found.entry(name.to_owned()).or_default();
             if !seen.iter().any(|v| v == value) {
@@ -260,26 +277,16 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
     };
     for line in lines.iter().flat_map(|l| l.lines()) {
         let marks = markers(line, &names);
-        // PR-Daemon #2095 r2 F2: the first 「字段：」 opens the line; one after
-        // other words (「紧急联系人 姓名：李四」「…（姓名：李四」) is someone else's.
-        if marks.first().is_none_or(|m| !line[..m.0].trim().is_empty()) {
+        let [(at, colon_end, name)] = marks.as_slice() else {
+            continue;
+        };
+        if !numbering_only(&line[..*at]) {
             continue;
         }
-        for (i, (_, colon_end, name)) in marks.iter().enumerate() {
-            let end = marks.get(i + 1).map_or(line.len(), |m| m.0);
-            let value = line[*colon_end..end].trim_start();
-            // F4: a value ends at two spaces, a tab or U+3000.
-            let value = value
-                .find(['\t', '\u{3000}'])
-                .into_iter()
-                .chain(value.find("  "))
-                .min()
-                .map_or(value, |cut| &value[..cut]);
-            let value = value
-                .trim()
-                .trim_end_matches(['；', ';', '，', ',', '、', '|']);
-            put(name, value);
-        }
+        let value = line[*colon_end..]
+            .trim()
+            .trim_end_matches(['；', ';', '，', ',', '、', '|', '。']);
+        put(name, value);
     }
     let is_field = |t: &str| names.contains(&label_key(t));
     let label_like = |t: &str| {
@@ -289,55 +296,102 @@ pub(crate) fn labelled(lines: &[String], rows: &[Vec<String>], fields: &[String]
             || field_kind(t) != FieldKind::Text
             || COMMON_LABELS.contains(&label_key(t).as_str())
     };
-    // F2: a row of one cell that is not a field (「紧急联系人」) heads a section
-    // of someone else's: its next row is not read.
-    let section = |row: &[String]| {
+    // A row of one cell that heads someone else's details (「紧急联系人」
+    // 「配偶」): the rows under it are not the user's, up to the next heading.
+    let person_heading = |row: &[String]| {
         let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
-        filled.len() == 1 && !is_field(filled[0])
+        filled.len() == 1
+            && !is_field(filled[0])
+            && (field_kind(filled[0]) == FieldKind::Identity
+                || PERSON_SECTIONS.iter().any(|w| filled[0].contains(w)))
     };
+    let mut someone_else = false;
     for (r, row) in rows.iter().enumerate() {
-        if r > 0 && section(&rows[r - 1]) {
+        let filled: Vec<&String> = row.iter().filter(|c| !c.trim().is_empty()).collect();
+        if person_heading(row) {
+            someone_else = true;
             continue;
         }
-        let header = row.iter().all(|c| c.trim().is_empty() || label_like(c));
+        if filled.len() == 1 && !is_field(filled[0]) {
+            // A title (「个人基本信息」) ends someone else's section.
+            someone_else = false;
+            continue;
+        }
+        if someone_else {
+            continue;
+        }
         let below = rows.get(r + 1).filter(|n| n.len() == row.len());
-        for (i, cell) in row.iter().enumerate() {
-            if !is_field(cell) {
-                continue;
+        // A header: every filled cell a field, read down.
+        if filled.len() >= 2 && filled.iter().all(|c| is_field(c)) {
+            if let Some(below) = below {
+                for (h, v) in row.iter().zip(below) {
+                    if is_field(h) && !v.trim().is_empty() && !label_like(v) {
+                        put(&label_key(h), v);
+                    }
+                }
             }
-            // F2: 「配偶 | 姓名 | 李四」: a field is the user's only first in its
-            // row, or right after another field's value (「姓名 | 陈晓明 | 性别 | 男」).
-            if !header && i > 0 && !(i >= 2 && is_field(&row[i - 2])) {
-                continue;
+            continue;
+        }
+        // Strictly 「字段 | 值 | 字段 | 值…」 from the first cell.
+        let strict = row.iter().enumerate().all(|(i, c)| {
+            if i % 2 == 0 {
+                // A trailing blank cell (merged or unused) is allowed.
+                is_field(c) || (c.trim().is_empty() && row[i..].iter().all(|c| c.trim().is_empty()))
+            } else {
+                c.trim().is_empty() || !label_like(c)
             }
-            let right = row
-                .get(i + 1)
-                .filter(|c| !c.trim().is_empty() && !label_like(c));
-            // F1: the cell below is always weighed, whatever the header words
-            // are (no list knows them all); right and down disagreeing is ambiguous.
+        });
+        if !strict {
+            continue;
+        }
+        for i in (0..row.len()).step_by(2) {
+            let Some(right) = row.get(i + 1).filter(|c| !c.trim().is_empty()) else {
+                continue;
+            };
             let down = below
                 .map(|n| &n[i])
                 .filter(|c| !c.trim().is_empty() && !label_like(c));
-            match (right, down) {
-                (Some(a), Some(b)) if a.trim() != b.trim() => {
-                    put(&label_key(cell), a);
-                    put(&label_key(cell), b);
-                }
-                (Some(v), _) | (None, Some(v)) => put(&label_key(cell), v),
-                (None, None) => {}
+            put(&label_key(&row[i]), right);
+            // F1: read two ways, differently: ambiguous.
+            if let Some(down) = down {
+                put(&label_key(&row[i]), down);
             }
         }
     }
     let mut out = Labelled::default();
     for (name, values) in found {
-        if values.len() == 1 {
+        if values.len() == 1 && !unsure.contains(&name) {
             out.values
                 .insert(name, values.into_iter().next().unwrap_or_default());
         } else {
             out.ambiguous.push(name);
         }
     }
+    for name in unsure {
+        if !out.ambiguous.contains(&name) {
+            out.ambiguous.push(name);
+        }
+    }
     out
+}
+
+/// A value spread by two or more spaces, a tab or U+3000: 「陈  晓明」 is one
+/// name or 「张三  部门 研发」 is a value and other words; which, cannot be told.
+fn spread(value: &str) -> bool {
+    value.contains("  ") || value.contains(['\t', '\u{3000}'])
+}
+
+/// Text before a line's field that is only space and a number: 「1.」「1、」
+/// 「(1)」「（一）」「一、」.
+fn numbering_only(before: &str) -> bool {
+    let t = before.trim();
+    t.is_empty()
+        || t.chars().all(|c| {
+            c.is_ascii_digit()
+                || "一二三四五六七八九十".contains(c)
+                || ".、．()（）".contains(c)
+                || c.is_whitespace()
+        })
 }
 
 /// Where each 「字段：」 of `line` starts and its colon ends, in order: a field
@@ -347,7 +401,8 @@ fn markers(line: &str, names: &[String]) -> Vec<(usize, usize, String)> {
     for name in names {
         for (at, _) in line.match_indices(name.as_str()) {
             let before = line[..at].chars().next_back();
-            if before.is_some_and(|c| !c.is_whitespace() && !"；;，,、|（(）)".contains(c)) {
+            if before.is_some_and(|c| !c.is_whitespace() && !"；;，,、|（(）).．".contains(c))
+            {
                 continue;
             }
             let after = &line[at + name.len()..];
