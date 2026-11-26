@@ -35,9 +35,9 @@ export interface WeknoraLitePin {
   url: string | null
 }
 
-// a24/develop 1733cee2 (#177 managed mode + #178 artifact + #179 M5 fix),
-// built 11-26 on the mini, signed manifest verified with verify-lite-headless.sh.
-// To be re-pinned after the L9-2 hardening PR merges.
+// a24/develop e47a6821 (WeKnora#181 hardening + #180 managed provisioning,
+// handshake protocol 2; csv/json allowed in managed mode), built 11-27 on the
+// mini by L9-2, signed manifest verified with verify-lite-headless.sh.
 export const WEKNORA_LITE_PIN: WeknoraLitePin = {
   sourceSha: 'e47a6821214915b704426d8779e37a8b60c32d20',
   version: '0.9.0',
