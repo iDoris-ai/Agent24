@@ -227,6 +227,9 @@ export async function approvalDialog(
       ? Object.entries(args['values'] as Record<string, unknown>).map(([k, v]) => `${k}=${str(v)}`).join('，')
       : ''
     lines.push(say('approval.fill.values', { values: clip(values, 300) }))
+    // 监工 0.7.123: the job fields the values leave out come from the material.
+    const source = str(args['source_document_id'])
+    if (source) lines.push(say('approval.fill.fromSource', { doc: await titleOf(source, lookups) }))
     if (original) lines.push(mt('approval.fill.original', { v: await nextVersion(named.id, lookups) }), mt('approval.versionsKept'))
     else lines.push(mt('approval.unchanged'))
   } else if (tool === 'documents.compose' && Array.isArray(args['parts'])) {

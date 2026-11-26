@@ -1573,3 +1573,65 @@ async fn only_allowlisted_fields_come_from_the_material_or_are_written_unsaid() 
         "{text}"
     );
 }
+
+/// 监工 0.7.123 真机: the model knew 部门 and 入职日期 from the material but
+/// left them out of fill's values. With source_document_id, an allowlisted
+/// field the values do not name comes from the material (App, not model);
+/// one the values name (「先空着」 too) is the model's; identity is never.
+#[tokio::test]
+async fn fill_takes_allowlisted_fields_the_values_left_out_from_the_material() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "姓名：{{姓名}}",
+        "部门：{{部门}}",
+        "入职日期：{{入职日期}}",
+        "岗位：{{岗位}}",
+    ]);
+    let source = docx(&[
+        "个人信息",
+        "姓名：陈晓明",
+        "部门：产品研发部",
+        "入职日期：2026年12月1日",
+        "岗位：工程师",
+    ]);
+    put_docx(&state, TPL, "入职登记表模板.docx", &template).await;
+    put_docx(&state, SRC, "个人信息.docx", &source).await;
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({
+                "document_id": TPL,
+                "source_document_id": SRC,
+                "values": { "姓名": "王小明", "岗位": "" },
+                "user_said": ["姓名"],
+            }),
+        )
+        .await,
+    );
+    assert_eq!(
+        strings(&answer["filled"]),
+        ["姓名", "部门", "入职日期"],
+        "{answer}"
+    );
+    assert_eq!(strings(&answer["unfilled"]), ["岗位"], "{answer}");
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(
+        text.contains("王小明") && text.contains("产品研发部") && text.contains("2026年12月1日"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("陈晓明") && text.contains("{{岗位}}"),
+        "{text}"
+    );
+    // Without the material nothing is taken.
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": TPL, "values": { "姓名": "王小明" }, "user_said": ["姓名"] }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
+}

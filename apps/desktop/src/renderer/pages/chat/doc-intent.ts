@@ -1,5 +1,6 @@
 import { SAVE_HINT, asksSaveToOriginal } from './doc-version'
 import type { RunDocuments } from './DocumentsOutcome'
+import type { DocumentRef } from './doc-context'
 
 // D2b（轻量版）: in a conversation about a document (F1, doc-context.ts), a
 // plain sentence asks to split pages out of it or to merge it with another
@@ -212,6 +213,25 @@ export const FORM_HINT = '（填表：只支持带 {{字段}} 的 Word（DOCX）
   + '问齐了或用户说先空着、确认生成时，必须调用 documents.fill，带同一个 source_document_id；没有调用成功就不要说已生成或已保存。填完把答复里的 note 转告用户，ask_user 里的逐项问，written 为 false 表示没有生成文档。'
   + 'PDF 表单（可填写的 PDF、普通 PDF、扫描件）和没有 {{}} 的表都填不了：如实说现在不支持，建议导出成 Word 后改成带 {{字段}} 的模板，或打印后手填，不要调用 documents.fill。）'
 
+/** 「资料在《X》里」「资料是《X》」: the title the user named as their material. */
+const MATERIAL = /资料[^《》，。！？\n]{0,8}《([^》]{1,200})》/
+
+/** 监工 0.7.123 真机: the material a form fill was told, in this turn or the
+ * last three user turns (newest first), as a title; null when none. */
+export function formMaterial(before: readonly string[], text: string): string | null {
+  for (const t of [text, ...before.slice(-3).reverse()]) {
+    const m = MATERIAL.exec(t)
+    if (m?.[1]?.trim()) return m[1].trim()
+  }
+  return null
+}
+
+/** The material by its id, so the model need not find it (it called fields
+ * without it and left the material's values out of fill). */
+export function materialHint(doc: DocumentRef): string {
+  return `（这次的资料文档是《${doc.title}》，source_document_id=${doc.id}：调用 documents.fields 和 documents.fill 时都带上它。）`
+}
+
 /** 「已生成」「已保存为…」「填好了」: an answer that says a document was made or saved. */
 const CLAIMS_MADE = /已(?:经)?(?:为(?:你|您))?(?:生成|保存|填好|填写完|创建|做好)|(?:生成|填|做)好了|生成了|保存(?:为|到|在|了)|文档已/
 
@@ -226,14 +246,14 @@ export function formClaimUnbacked(prompt: string, answer: string, documents: Run
 }
 
 /** `form`: the turn fills a form, or answers what one asked (Chat.tsx, `continuesFormFill`). */
-export function docAgentPrompt(doc: { id: string; title: string } | null, text: string, form = asksFillForm(text, doc !== null)): string {
+export function docAgentPrompt(doc: { id: string; title: string } | null, text: string, form = asksFillForm(text, doc !== null), material = ''): string {
   const hint = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
     + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息，这些字段名都放进 user_said；'
     + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
   const head = doc ? `当前对话的文档：《${doc.title}》（document_id: ${doc.id}）。\n` : ''
   // L6-F5: only a turn the App judged to save into the original says so.
   const save = asksSaveToOriginal(text) ? SAVE_HINT : ''
-  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}${form ? FORM_HINT : ''}\n${text}`
+  return `${head}${hint}${asksDeleteDocument(text, doc !== null) ? DELETE_HINT : ''}${asksDeleteParagraph(text, doc !== null) ? PARAGRAPH_HINT : ''}${save}${form ? FORM_HINT + material : ''}\n${text}`
 }
 
 export function findByTitle<T extends { document_id: string; title: string; created_at?: string }>(

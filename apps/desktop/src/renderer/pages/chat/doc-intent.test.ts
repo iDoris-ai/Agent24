@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, formMaterial, materialHint, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -462,5 +462,25 @@ describe('L8-S02 真机 0.7.122: a form turn that says it made a document it did
 
   it('tells the model a confirmed fill must call documents.fill', () => {
     expect(FORM_HINT).toContain('必须调用 documents.fill')
+  })
+})
+
+describe('监工 0.7.123: the material a form fill was told', () => {
+  it('is the title after 资料 in this turn or the last three', () => {
+    expect(formMaterial([], '把《入职登记表模板.docx》填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
+    expect(formMaterial(['把这张表填一下，资料是《个人信息.docx》', '电话 139'], '确认无误，生成吧')).toBe('个人信息.docx')
+    expect(formMaterial([], '把《入职登记表模板.docx》填一下')).toBeNull()
+    expect(formMaterial(['资料在《旧.docx》里', 'a', 'b', 'c'], '生成吧')).toBeNull()
+  })
+
+  it('goes into the prompt by its id, for fields and fill', () => {
+    const hint = materialHint({ id: 'doc_01M8035XWKZJGGD3NHF3X0HJ0J', title: '个人信息.docx', revision: 1 })
+    expect(hint).toContain('《个人信息.docx》')
+    expect(hint).toContain('source_document_id=doc_01M8035XWKZJGGD3NHF3X0HJ0J')
+    expect(hint).toContain('documents.fill')
+    const prompt = docAgentPrompt(null, '生成吧', true, hint)
+    expect(prompt).toContain(hint)
+    expect(prompt.endsWith('\n生成吧')).toBe(true)
+    expect(docAgentPrompt(null, '生成吧', true)).not.toContain('source_document_id=doc_')
   })
 })

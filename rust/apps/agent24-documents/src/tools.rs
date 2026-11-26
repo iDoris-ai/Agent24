@@ -921,7 +921,7 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
 async fn fill(
     state: &AppState,
     run: Run,
-    _accepted: Accepted,
+    accepted: Accepted,
     arguments: Map<String, Value>,
 ) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
@@ -956,12 +956,33 @@ async fn fill(
         .iter()
         .map(|f| (f.name.clone(), f.kind))
         .collect();
-    // The material only resolves and is scope-checked (admit_named): no
-    // identity value is taken from it (r11 B2, 方案 B).
-    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id)
-        && !is_id(IdKind::Document, source_id)
-    {
-        return Err(refused(&ApiError::not_found("no such document")));
+    // The material resolves and is scope-checked (admit_named): no identity
+    // value is taken from it (r11 B2, 方案 B).
+    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id) {
+        if !is_id(IdKind::Document, source_id) {
+            return Err(refused(&ApiError::not_found("no such document")));
+        }
+        // 监工 0.7.123 真机: an allowlisted field the values leave out comes
+        // from the material, read by the App as `fields` reads it: an 8B
+        // model knew 部门 and 入职日期 and still did not pass them. A field
+        // the values name (「先空着」 too) stays the model's.
+        let left_out: Vec<&String> = fields
+            .iter()
+            .map(|(n, _)| n)
+            .filter(|n| crate::form::from_material(n) && !req.values.contains_key(*n))
+            .collect();
+        if !left_out.is_empty() {
+            let names = fields.iter().map(|(n, _)| n.clone()).collect();
+            if let Material::Text(read) =
+                load_material(state, &storage, source_id, &accepted, names).await?
+            {
+                for n in left_out {
+                    if let Some(v) = crate::form::from_source(n, &read) {
+                        req.values.insert(n.clone(), v.to_owned());
+                    }
+                }
+            }
+        }
     }
     let report = crate::form::plan_fill(&fields, &req.values, &user_said);
     // Nothing left that may be written: do not import an unchanged copy.

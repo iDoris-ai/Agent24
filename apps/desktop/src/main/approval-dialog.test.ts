@@ -46,6 +46,21 @@ describe('approvalDialog (UI polish 01)', () => {
     expect(unread.detail).toContain('新版本 （版本号没读到）')
   })
 
+  // 监工 0.7.123: a fill with the user's material says the job fields it
+  // leaves out are taken from that material, by its title.
+  it('a fill with a material names it and what it fills from it', async () => {
+    const SRC = 'doc_01M8035XWKZJGGD3NHF3X0HJ0J'
+    const look = lookups('入职登记表模板.docx', null)
+    look.title = vi.fn(async (id: string) => (id === SRC ? '个人信息.docx' : '入职登记表模板.docx'))
+    const out = await box({ summary: 'documents.fill: …', payload: { document_id: DOC, source_document_id: SRC, values: { 姓名: '陈晓明' } } },
+      'approve', '批准', undefined, look, clip)
+    expect(out.detail).toContain('填写：姓名=陈晓明')
+    expect(out.detail).toContain('没给的部门、岗位、入职日期、学历这类岗位字段，从《个人信息.docx》里写明的值补上。')
+    const plain = await box({ summary: 'documents.fill: …', payload: { document_id: DOC, values: { 姓名: '陈晓明' } } },
+      'approve', '批准', undefined, look, clip)
+    expect(plain.detail).not.toContain('补上')
+  })
+
   // L6-F2: the delete box names one document: title, pages, import time; a
   // same-titled one in the library is pointed out; restorable for 7 days.
   it('a delete: title, pages and import time, and the other documents of that title', async () => {

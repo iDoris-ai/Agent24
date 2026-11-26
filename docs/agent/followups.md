@@ -284,3 +284,4 @@
 - [ ] FU-251 · C · src=L8 iDoris 0.6.0 真机 · 2026-11-26 · iDoris v0.6.0 的 `models local`（`idoris-recommender/src/local_models.rs` 的 `scan_with`）只扫 `~/.omlx/models` 下一层，`mlx-community/<model>` 这种两层布局一个都找不到；它的 managed 模式 setup（`installed_models`）也用同一份扫描。Agent24 侧在它的扫描没有 chat 模型时，自己从目录补两层的模型名（只认 `config.json`，不做完整性检查，绑定仍由 iDoris setup 按运行中 oMLX 的列表核对）；oMLX 没在跑、要 iDoris 托管拉起时仍会被 iDoris 拒绝，要 iDoris 上游修扫描。另：只靠两层补充发现的 `-vl` 模型按 `is_chat_model_id` 不进候选。
 - [ ] FU-252 · C · src=L8-S02 真机 0.7.122 · 2026-11-26 · 不点名模板、只说「把这张入职登记表填一下，资料在《个人信息.docx》里」时，8B 模型对资料文档调 `documents.fields`（把资料当模板），回「没有可填字段」；App 侧没有替它分辨哪份是模板、哪份是资料。
 - [ ] FU-253 · C · src=L8-S02 真机 0.7.122 · 2026-11-26 · 用「《…pdf》这张表能帮我填吗」问时模型没调任何工具，编出 `{{乙方名称}}` 等字段去问用户（README §15.1 要求如实说 PDF 不支持）；只靠 FORM_HINT 的文字约束，App 侧没有对 PDF 表单问题给确定性答复。
+- [ ] FU-254 · C · src=L8-S02 真机 0.7.123 · 2026-11-26 · iDoris 在 0.7.123 上几次以 code 4 退出，没有自动重启，要用户手动点「连接」才恢复；退出原因和重启策略都没查。
