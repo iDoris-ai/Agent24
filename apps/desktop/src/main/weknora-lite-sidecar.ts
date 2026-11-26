@@ -107,6 +107,16 @@ export function parseWeknoraLiteHandshake(value: unknown, expectedPid: number): 
   }
 }
 
+/** JSON.parse's own message quotes the text around the error, which here may
+ * be the instance key: replace it with a fixed one (PR-Daemon #2108 G5). */
+export function parseHandshakeLine(line: string): unknown {
+  try {
+    return JSON.parse(line)
+  } catch {
+    throw new Error('WeKnora Lite handshake line is not JSON')
+  }
+}
+
 /** `builtin_models.yaml` for BUILTIN_MODELS_CONFIG. The key stays a `${VAR}` placeholder. */
 export function weknoraLiteModelsYaml(embedding: WeknoraLiteEmbedding): string {
   const quote = (s: string) => JSON.stringify(s)
@@ -295,7 +305,7 @@ export class WeknoraLiteLauncher implements SidecarLauncher {
       }
       const onLine = (line: string): void => {
         if (!first) {
-          try { first = parseWeknoraLiteHandshake(JSON.parse(line), pid) } catch (error) {
+          try { first = parseWeknoraLiteHandshake(parseHandshakeLine(line), pid) } catch (error) {
             done(error instanceof Error ? error : new Error(String(error)))
             return
           }

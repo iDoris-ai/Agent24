@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  parseHandshakeLine,
   parseWeknoraLiteHandshake,
   validateWeknoraLiteEmbedding,
   weknoraLiteChildEnvironment,
@@ -49,6 +50,17 @@ describe('parseWeknoraLiteHandshake', () => {
       parseWeknoraLiteHandshake(line({}, { api_key: `${KEY}\n` }), 4242)
     } catch (error) {
       expect(String(error)).not.toContain(KEY)
+    }
+  })
+})
+
+describe('parseHandshakeLine', () => {
+  it('never quotes the line in its error', () => {
+    // V8 quotes text around an unexpected token: here the key's characters.
+    const broken = '{"credential":{"api_key":zzzzzzzzzzzzzzzz}}'
+    expect(() => parseHandshakeLine(broken)).toThrow('WeKnora Lite handshake line is not JSON')
+    try { parseHandshakeLine(broken) } catch (error) {
+      expect(String(error)).not.toMatch(/z{3}/)
     }
   })
 })
