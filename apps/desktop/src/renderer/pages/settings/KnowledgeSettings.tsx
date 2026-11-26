@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
-import type { KnowledgeSettingsResult, KnowledgeStatus } from '../../../shared/ipc-types'
-import { useT } from '../../i18n'
+import type { KnowledgeSettingsResult, KnowledgeStatus, LiteKnowledgeStatus } from '../../../shared/ipc-types'
+import { useT, type T } from '../../i18n'
 import { knowledgeMessages } from './KnowledgeSettings.i18n'
 import { formatKbNames, loadKbNames, parseKbNames, saveKbNames } from '../chat/kb-names'
 
@@ -8,6 +8,23 @@ import { formatKbNames, loadKbNames, parseKbNames, saveKbNames } from '../chat/k
 export function parseKnowledgeBaseIds(text: string): string[] {
   return text.split(/[\n,]/).map((id) => id.trim()).filter((id) => id !== '')
 }
+
+type KnowledgeKey = keyof typeof knowledgeMessages.en & string
+const MB = (bytes: number | undefined) => (bytes === undefined ? '?' : (bytes / 1_048_576).toFixed(1))
+
+/** Loop 9 3c: the local knowledge base's install and launch, as one line. */
+export function localLine(local: LiteKnowledgeStatus, t: T<KnowledgeKey>): string {
+  switch (local.phase) {
+    case 'not_installed': return t('local.not_installed', { size: MB(local.total) })
+    case 'downloading': return t('local.downloading', { received: MB(local.received), total: MB(local.total) })
+    case 'install_failed': return t(`local.install_failed.${local.failure}`)
+    case 'failed': return t(`local.failed.${local.reason}`)
+    default: return t(`local.${local.phase}`)
+  }
+}
+
+/** Phases that move on their own: the page asks again every second. */
+const MOVING = new Set<LiteKnowledgeStatus['phase']>(['not_installed', 'downloading', 'verifying', 'starting'])
 
 // The key goes to main and never comes back: the field starts empty, and an
 // empty field keeps the saved key.
@@ -59,7 +76,8 @@ export function KnowledgeSettings() {
     }).then((r) => { if (r.ok) setApiKey(''); return r })
   })
 
-  const statusText = !status?.enabled ? t('statusOff') : status.active ? t('statusActive') : t('statusIncomplete')
+  const statusText = !status?.enabled ? t('statusOff') : status.active ? t('statusActive')
+    : status.source === 'local' ? t('statusLocalPending') : t('statusIncomplete')
   // K2: what the last check of the server found, red unless it answered.
   const reach = status?.enabled ? status.reachability : undefined
   const reachTime = reach?.checkedAt ? new Date(reach.checkedAt).toLocaleTimeString() : ''
@@ -76,16 +94,44 @@ export function KnowledgeSettings() {
       setChecking(false)
     }
   }
-  // While this page is open, show what main finds without a reload.
+  // While this page is open, show what main finds without a reload; every
+  // second while the local knowledge base is downloading or starting.
+  const local = status?.source === 'local' ? status.local : undefined
+  const moving = local !== undefined && MOVING.has(local.phase)
   useEffect(() => {
     if (!status?.enabled) return
-    const timer = setInterval(() => { void refresh(false) }, 15_000)
+    const timer = setInterval(() => { void refresh(false) }, moving ? 1_000 : 15_000)
     return () => clearInterval(timer)
-  }, [status?.enabled])
+  }, [status?.enabled, moving])
+  const source = status?.source ?? 'remote'
+  const choose = (next: 'remote' | 'local') => {
+    if (next !== source) void run(() => window.agent24.knowledge.setSource(next))
+  }
+  const retry = async () => {
+    try { await window.agent24.knowledge.liteRetry() } catch { /* the status says what happened */ }
+    await refresh(false)
+  }
 
   return <section className="settings-section" aria-labelledby="knowledge-title">
     <h3 id="knowledge-title">{t('title')}</h3>
     <p className="settings-note">{t('hint')}</p>
+    {status?.local && (
+      <fieldset className="setting-row" disabled={busy}>
+        <legend>{t('source')}</legend>
+        <label><input type="radio" name="knowledge-source" checked={source === 'remote'} onChange={() => choose('remote')} /> {t('source.remote')}</label>
+        <label><input type="radio" name="knowledge-source" checked={source === 'local'} onChange={() => choose('local')} /> {t('source.local')}</label>
+        <p>{t('source.localHint')}</p>
+        {local && local.phase !== 'off' && (
+          <p role={local.phase === 'install_failed' || local.phase === 'failed' ? 'alert' : 'status'}>
+            {localLine(local, t)}
+            {local.phase === 'downloading' && local.total ? <> <progress max={local.total} value={local.received} /></> : null}
+            {(local.phase === 'install_failed' || local.phase === 'failed') && (
+              <> <button type="button" className="btn btn-ghost" onClick={() => void retry()}>{t('local.retry')}</button></>
+            )}
+          </p>
+        )}
+      </fieldset>
+    )}
     <div className="setting-row">
       <div>
         <label htmlFor="knowledge-enabled">{t('enabled')}</label>
@@ -102,6 +148,7 @@ export function KnowledgeSettings() {
       <input id="knowledge-enabled" type="checkbox" checked={status?.enabled ?? false} disabled={busy || !status}
         onChange={(e) => { const on = e.target.checked; void run(() => window.agent24.knowledge.setEnabled(on)) }} />
     </div>
+    {source === 'remote' && <>
     <div className="setting-row">
       <div><label htmlFor="knowledge-endpoint">{t('endpoint')}</label><p>{t('endpointHint')}</p></div>
       <input id="knowledge-endpoint" type="url" value={endpoint} onChange={(e) => setEndpoint(e.target.value)} />
@@ -122,7 +169,8 @@ export function KnowledgeSettings() {
       <button type="button" className="btn" disabled={busy || !status} onClick={() => void save()}>
         {busy ? t('saving') : t('save')}
       </button>
-      {result && <p role="alert">{result.ok ? t('saved') : t(`error.${result.reason}`)}</p>}
     </div>
+    </>}
+    {result && <p role="alert">{result.ok ? t('saved') : t(`error.${result.reason}`)}</p>}
   </section>
 }

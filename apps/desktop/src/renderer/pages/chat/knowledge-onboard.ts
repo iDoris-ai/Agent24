@@ -197,6 +197,8 @@ export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): st
 
 function refuseReason(reason: string | null): string {
   if (reason === 'unsupported_format') return '这种格式暂不支持（只支持 .md、.txt）'
+  // Loop 9 3c: the local Lite takes md/txt/csv/json only (David 11-26).
+  if (reason === 'unsupported_format_local') return '本机知识库暂不支持这种格式，可用远端知识库或先转成文本'
   if (reason === 'too_large') return '超过 10 MB'
   if (reason === 'not_a_file') return '不是文件'
   if (reason === 'not_connected') return '还没有连上知识库'
@@ -231,7 +233,10 @@ export function uploadLine(u: KnowledgeUpload): string {
     default:
       line = u.reason === 'unreachable'
         ? `${name}上传后没有收到可用的答复，不确定是否已上传成功`
-        : `${name}状态不明`
+        // FU-235: the knowledge base was switched after the upload; its progress is not followed on the new one.
+        : u.reason === 'rebound'
+          ? `${name}提交后换了知识库，不再跟进它的进度（它在原来的知识库里）`
+          : `${name}状态不明`
   }
   if (!u.costFinal) {
     // A job that has stopped but whose cost is not final yet (W5.10): say so; main keeps asking until it is.
