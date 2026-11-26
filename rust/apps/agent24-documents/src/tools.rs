@@ -223,7 +223,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
         admit(state, scope, op, &arguments).await?;
         if op == "compare" {
             admit_named(state, scope, &arguments, "other_document_id").await?;
-        } else if op == "fill" {
+        } else if op == "fill" || op == "fields" {
             admit_named(state, scope, &arguments, "source_document_id").await?;
         }
         match op {
@@ -237,7 +237,7 @@ async fn dispatch(state: &AppState, op: &str, call: ToolCall, budget: Duration) 
             "compose" => compose(state, arguments).await,
             "paragraphs" => paragraphs(state, arguments).await,
             "patch" => patch(state, run, arguments).await,
-            "fields" => fields(state, arguments).await,
+            "fields" => fields(state, accepted, arguments).await,
             "fill" => fill(state, run, accepted, arguments).await,
             "delete" => delete(state, run, arguments).await,
             "compare" => compare(state, accepted, arguments).await,
@@ -809,22 +809,119 @@ async fn patch(state: &AppState, run: Run, arguments: Map<String, Value>) -> Out
 }
 
 /// D5a: a template's `{{fields}}` (read).
-async fn fields(state: &AppState, arguments: Map<String, Value>) -> Outcome {
-    let (id, rest) = split_document(arguments)?;
+/// L8-S02 round 2: with `source_document_id`, each field the user's material
+/// states by label (「姓名：陈晓明」) carries that value as `from_source`, for
+/// the model to pass to `fill` as it is: the App reads the material, not the
+/// model (监工 11-26 真机: an 8B model reported it backwards).
+async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Value>) -> Outcome {
+    let (id, mut rest) = split_document(arguments)?;
+    let source_id = match rest.remove("source_document_id") {
+        None => None,
+        Some(Value::String(s)) => Some(s),
+        Some(_) => return Err(Envelope::error(INVALID_INPUT, false)),
+    };
     if !rest.is_empty() {
         return Err(Envelope::error(INVALID_INPUT, false));
     }
     let storage = ready(state).await?;
-    completed(crate::patch::fields_of(&storage, id).await)
+    let listed = crate::patch::fields_of(&storage, id.clone())
+        .await
+        .map_err(|e| refused(&e))?;
+    let Some(source_id) = source_id.filter(|s| *s != id) else {
+        return completed(Ok(listed));
+    };
+    if !is_id(IdKind::Document, &source_id) {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    let names: Vec<String> = listed.fields.iter().map(|f| f.name.clone()).collect();
+    let (read, unread) = match load_material(state, &storage, &source_id, &accepted, names).await? {
+        Material::Text(read) => (read, false),
+        Material::Absent => (crate::form::Labelled::default(), true),
+    };
+    let mut payload = serde_json::to_value(&listed)
+        .map_err(|_| refused(&ApiError::internal("cannot serialize")))?;
+    let mut found = Vec::new();
+    let mut missing = Vec::new();
+    let mut ambiguous = Vec::new();
+    let mut identity = Vec::new();
+    if let Some(Value::Array(fields)) = payload.get_mut("fields") {
+        for f in fields.iter_mut() {
+            let Some(name) = f.get("name").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            // PR-Daemon #2095 r10, 监工 方案 B: no identity value comes
+            // from the material. Whose a name or a phone in it is cannot be
+            // told for sure (another person's block hides in many ways),
+            // and a wrong one would come with the App's authority: it is
+            // asked, always. Its label is still read, for the layout and
+            // for a second person's sign.
+            // R0 一致裁决 (监工 11-26): and only an allowlisted safe text
+            // field comes from the material; any other spelling is asked.
+            if !crate::form::from_material(&name) {
+                if crate::form::field_kind(&name) != crate::form::FieldKind::Manual {
+                    identity.push(name);
+                }
+                continue;
+            }
+            match crate::form::from_source(&name, &read) {
+                Some(v) => {
+                    f["from_source"] = json!(v);
+                    found.push(format!("{name}={v}"));
+                }
+                None if read.ambiguous.contains(&name) => ambiguous.push(name),
+                None if crate::form::field_kind(&name) != crate::form::FieldKind::Manual => {
+                    missing.push(name);
+                }
+                None => {}
+            }
+        }
+    }
+    let mut note = String::new();
+    // PR-Daemon #2095 L3: not read is not 「nothing matched」.
+    if unread {
+        note.push_str("没能读到资料的文字（格式不支持或解析失败），资料里的值都要问用户。");
+    } else if read.layout_unknown {
+        note.push_str(
+            "资料版式无法确定是本人信息，请直接告诉我：资料里的值都要问用户，不要从资料里取。",
+        );
+    } else if !found.is_empty() {
+        note.push_str(&format!(
+            "资料里对上的值：{}。调用 documents.fill 时把这些值原样放进 values，并带上同一个 source_document_id。",
+            found.join("，")
+        ));
+    } else {
+        note.push_str("资料里没有对上任何字段。");
+    }
+    if !ambiguous.is_empty() {
+        note.push_str(&format!(
+            "资料里有多处、读法不确定，要问用户：{}。",
+            ambiguous.join("、")
+        ));
+    }
+    if !missing.is_empty() && !unread && !read.layout_unknown {
+        note.push_str(&format!(
+            "资料里没有：{}。用户说先空着的，values 里给空字符串。",
+            missing.join("、")
+        ));
+    }
+    if !identity.is_empty() {
+        note.push_str(&format!(
+            "这些字段不从资料取，要问用户：{}。用户亲口给的值放进 values，字段名放进 user_said；不要自己编，也不要从资料里抄。",
+            identity.join("、")
+        ));
+    }
+    payload["source_document_id"] = json!(source_id);
+    payload["note"] = json!(note);
+    completed(Ok(payload))
 }
 
 /// D5a: a new document of the template with its fields filled (write; approved per call).
 /// Always named 「<template>（填写）」: a title the model made up is dropped (General 11-19).
-/// L8-S02: an identity value is written only from the user's material or their words.
+/// L8-S02: an identity value is written only when the user said it (`user_said`).
 async fn fill(
     state: &AppState,
     run: Run,
-    accepted: Accepted,
+    _accepted: Accepted,
     arguments: Map<String, Value>,
 ) -> Outcome {
     let (id, mut rest) = split_document(arguments)?;
@@ -859,17 +956,14 @@ async fn fill(
         .iter()
         .map(|f| (f.name.clone(), f.kind))
         .collect();
-    let found = identity_in_material(
-        state,
-        &storage,
-        &id,
-        source_id.as_deref(),
-        &accepted,
-        &req.values,
-        &user_said,
-    )
-    .await?;
-    let report = crate::form::plan_fill(&fields, &req.values, &user_said, &found);
+    // The material only resolves and is scope-checked (admit_named): no
+    // identity value is taken from it (r11 B2, 方案 B).
+    if let Some(source_id) = source_id.as_deref().filter(|s| *s != id)
+        && !is_id(IdKind::Document, source_id)
+    {
+        return Err(refused(&ApiError::not_found("no such document")));
+    }
+    let report = crate::form::plan_fill(&fields, &req.values, &user_said);
     // Nothing left that may be written: do not import an unchanged copy.
     if report.write.is_empty() && !req.values.is_empty() {
         return completed(Ok(json!({
@@ -915,14 +1009,9 @@ fn spoken(value: Option<Value>) -> Result<Vec<String>, Envelope> {
     Ok(names)
 }
 
-/// Whitespace removed, so 「张 三」 in a resume matches the value 张三.
-fn compact(s: &str) -> String {
-    s.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
 enum Material {
-    /// The material's text (a DOCX's paragraphs, a PDF's text layer), whitespace removed.
-    Text(String),
+    /// The values the material states by label.
+    Text(crate::form::Labelled),
     /// The file could not be read: treat every value as absent.
     Absent,
 }
@@ -932,24 +1021,21 @@ async fn load_material(
     storage: &Arc<Storage>,
     id: &str,
     accepted: &Accepted,
+    // The template's fields, to read the material's labelled values for.
+    names: Vec<String>,
 ) -> Result<Material, Envelope> {
     let detail = documents::get(storage, id).await.map_err(|e| refused(&e))?;
     if detail.head.media_type != crate::office::DOCX {
-        // A PDF or an image: its text layer, compared as a DOCX's text is
-        // (whitespace removed, case kept), never `find`'s relaxed match
-        // (Codex C1/C2: it folds ASCII case and does not skip a space).
+        // A PDF or an image: its text layer, read as a DOCX's lines are.
         let read = async {
             let r = crate::read::revision(storage, id, detail.document.head_revision).await?;
             crate::read::current_layer(state, storage, &r, Requester::Tool(accepted.clone())).await
         };
         return Ok(match read.await {
-            Ok((_, layer)) => Material::Text(compact(
-                &layer
-                    .blocks
-                    .iter()
-                    .map(|b| b.text.as_str())
-                    .collect::<String>(),
-            )),
+            Ok((_, layer)) => {
+                let lines: Vec<String> = layer.blocks.iter().map(|b| b.text.clone()).collect();
+                Material::Text(crate::form::labelled(&lines, &[], &names))
+            }
             Err(_) => Material::Absent,
         });
     }
@@ -962,10 +1048,15 @@ async fn load_material(
     .await
     {
         Ok((_, _, _, bytes)) => {
-            let parsed =
-                crate::state::blocking(move || crate::docx_patch::plain_text(&bytes)).await;
+            let parsed = crate::state::blocking(move || {
+                Ok::<_, crate::docx_patch::PatchError>(crate::form::labelled_blocks(
+                    &crate::docx_patch::blocks(&bytes)?,
+                    &names,
+                ))
+            })
+            .await;
             Ok(match parsed {
-                Ok(text) => Material::Text(compact(&text)),
+                Ok(read) => Material::Text(read),
                 Err(_) => Material::Absent,
             })
         }
@@ -974,55 +1065,6 @@ async fn load_material(
             Ok(Material::Absent)
         }
         Err(e) => Err(refused(&e)),
-    }
-}
-
-/// Identity field names whose value occurs in the material document.
-async fn identity_in_material(
-    state: &AppState,
-    storage: &Arc<Storage>,
-    template_id: &str,
-    source_id: Option<&str>,
-    accepted: &Accepted,
-    values: &std::collections::BTreeMap<String, String>,
-    user_said: &[String],
-) -> Result<std::collections::HashSet<String>, Envelope> {
-    let mut found = std::collections::HashSet::new();
-    let Some(source_id) = source_id else {
-        return Ok(found);
-    };
-    // PR-Daemon #2092 N1: the template is not the user's material.
-    if source_id == template_id {
-        return Ok(found);
-    }
-    // A title nothing resolved to is the same as no such document.
-    if !is_id(IdKind::Document, source_id) {
-        return Err(refused(&ApiError::not_found("no such document")));
-    }
-    let material = load_material(state, storage, source_id, accepted).await?;
-    for (name, value) in values {
-        if crate::form::field_kind(name) != crate::form::FieldKind::Identity
-            || value.trim().is_empty()
-        {
-            continue;
-        }
-        if user_said.iter().any(|s| s == name) {
-            continue;
-        }
-        if material_has(&material, value) {
-            found.insert(name.clone());
-        }
-    }
-    Ok(found)
-}
-
-fn material_has(material: &Material, value: &str) -> bool {
-    match material {
-        Material::Text(text) => {
-            let needle = compact(value);
-            !needle.is_empty() && text.contains(&needle)
-        }
-        Material::Absent => false,
     }
 }
 
@@ -1279,12 +1321,12 @@ async fn named_by_title(
     arguments: &mut Map<String, Value>,
 ) -> Result<(), Envelope> {
     let mut slots: Vec<&mut Value> = match op {
-        "fill" => arguments
+        "fill" | "fields" => arguments
             .iter_mut()
             .filter(|(k, _)| *k == "document_id" || *k == "source_document_id")
             .map(|(_, v)| v)
             .collect(),
-        "get" | "paragraphs" | "patch" | "fields" | "preflight" => {
+        "get" | "paragraphs" | "patch" | "preflight" => {
             arguments.get_mut("document_id").into_iter().collect()
         }
         // L6-S05: both documents may be named by title.
@@ -2441,8 +2483,7 @@ mod tests {
         );
         assert_eq!(answer["source_document_id"], a);
         assert!(answer["message"].as_str().unwrap().contains("第 2 版"));
-        let fill =
-            json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" } });
+        let fill = json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" }, "user_said": ["押金"] });
         let filled = payload(&call_in(&state, "fill", &[b], fill).await);
         assert_eq!(
             (&filled["saved_as"], &filled["revision"]),
