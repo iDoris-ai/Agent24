@@ -287,3 +287,7 @@
 - [ ] FU-254 · C · src=L8-S02 真机 0.7.123 · 2026-11-26 · iDoris 在 0.7.123 上几次以 code 4 退出，没有自动重启，要用户手动点「连接」才恢复；退出原因和重启策略都没查。
 - [ ] FU-255 · C · src=L9-3a KB-LITE-03a · 2026-11-26 · 精简版安装只做首次安装和失败后重试：重试从 0 字节重下（不做断点续传、暂停），不预检磁盘空间，两个 App 实例同时安装不加锁；换钉值后旧的 `<sha7>-darwin-arm64` 程序目录不清理。
 - [ ] FU-256 · C · src=L9-3a KB-LITE-03a · 2026-11-26 · 精简版正式下载源未定：`weknora-lite-pin.ts` 的 `url` 为 null，本轮只能用回环覆盖源 `A24_WEKNORA_LITE_LOCAL_BASE_URL` 安装；发版前要定 Release 资产、`release-desktop.yml` 和签名钥匙（FU-245），钉值要换成那次正式构建的制品。
+- [ ] FU-267 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 本机库的实例身份用握手里的 `credential.knowledge_base_id`（协议 2 没有 instance_id；裁决 2026-11-27-lite-host-credential-instance）：同一数据目录里默认库被删重建或以后一个实例多库时会误判为换实例；握手 key 365 天到期不续（单进程连续运行才会碰到）。WeKnora#180 合入后请服务端加持久 instance_id，宿主只换取值点。
+- [ ] FU-268 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 精简版拉起只做主干：两个 App 实例同时拉起时第二个 Lite 因实例锁退出码 3，会被当成失败退避 5 次后放弃；崩溃后刚到 healthy 就再崩的反复循环不限次数；端口被占、数据目录被篡改不处理。
+- [ ] FU-269 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 精简版日志 `~/.agent24/logs/weknora-lite.log` 只追加，不轮转、不限大小。
+- [ ] FU-270 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · embedding 配置只在每次拉起时读：运行中 iDoris 网关换端口或换 key 后，精简版要重启才能继续导入/向量检索（3c 接 embedding 来源时决定是否订阅 iDoris 状态触发重启）。
