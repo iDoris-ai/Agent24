@@ -1898,26 +1898,36 @@ mod tests {
     fn desktop_comm_writes_are_elevatable_and_secrets_stay_unelevatable() {
         // Service mode routes every desktop Hyphae write through elevation;
         // without these rows send, rename and group chat were all refused.
-        for (method, path) in [
-            ("POST", "/api/v1/comm/send"),
-            ("PATCH", "/api/v1/comm/contact/bob"),
-            ("DELETE", "/api/v1/comm/contact/bob"),
-            ("POST", "/api/v1/comm/groupchat"),
-            (
-                "POST",
-                "/api/v1/comm/groupchat/00112233445566778899aabbccddeeff/messages",
-            ),
-            (
-                "POST",
-                "/api/v1/comm/groupchat/invites/00112233445566778899aabbccddeeff/accept",
-            ),
-        ] {
-            let target = resolve_target(&idoris(method, path, b"{}")).unwrap();
-            assert_eq!(target.operation, Operation::CommWrite, "{method} {path}");
-        }
-        for path in ["/api/v1/comm/identity/export", "/api/v1/comm/unlock"] {
+        for (method, template) in COMM_DERIVED_ROUTES {
+            let target = resolve_target(&idoris(method, template, b"{}")).unwrap();
             assert_eq!(
-                resolve_target(&idoris("POST", path, b"{}")).unwrap_err(),
+                target.operation,
+                Operation::CommWrite,
+                "{method} {template}"
+            );
+        }
+        // Every other Elevated comm.write row stays unelevatable.
+        let excluded = [
+            ("POST", "/api/v1/comm/identity/export"),
+            ("POST", "/api/v1/comm/identity/import"),
+            ("POST", "/api/v1/comm/unlock"),
+            ("POST", "/api/v1/comm/import"),
+            ("POST", "/api/v1/comm/inbox/pull"),
+            ("POST", "/api/v1/comm/outbox/clear"),
+        ];
+        let mut rest: Vec<(&str, &str)> = policies()
+            .iter()
+            .filter(|p| p.operation == Operation::CommWrite && p.level == AssuranceLevel::Elevated)
+            .map(|p| (p.method, p.template))
+            .filter(|row| !COMM_DERIVED_ROUTES.contains(row))
+            .collect();
+        rest.sort();
+        let mut expected = excluded.to_vec();
+        expected.sort();
+        assert_eq!(rest, expected);
+        for (method, path) in excluded {
+            assert_eq!(
+                resolve_target(&idoris(method, path, b"{}")).unwrap_err(),
                 EnrollErrorCode::NotElevatedOperation
             );
         }

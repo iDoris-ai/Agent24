@@ -494,14 +494,16 @@ async fn schedule_name(state: &AppState, id: &str) -> Option<String> {
 
 /// A Hyphae write from `COMM_DERIVED_ROUTES`. Names, npubs, ids and relay
 /// URLs are shown as `shown` quotes them; a message body never is, only its
-/// length in characters.
+/// length in characters. Each route names the body keys its text accounts
+/// for: any other key (a signing `identity`, `from`, `max_retries`, plain-text
+/// `encrypt:false`) leaves no text, so the elevate is refused.
 fn comm(method: &str, template: &str, path: &str, body: &[u8]) -> Option<String> {
-    let object = || -> Option<Map<String, Value>> {
+    let object = |keys: &[&str]| -> Option<Map<String, Value>> {
         if body.is_empty() {
             return Some(Map::new());
         }
         match serde_json::from_slice(body).ok()? {
-            Value::Object(map) => Some(map),
+            Value::Object(map) if map.keys().all(|k| keys.contains(&k.as_str())) => Some(map),
             _ => None,
         }
     };
@@ -509,29 +511,43 @@ fn comm(method: &str, template: &str, path: &str, body: &[u8]) -> Option<String>
         |map: &Map<String, Value>, key: &str| -> Option<String> { shown(map.get(key)?.as_str()?) };
     let text = match (method, template) {
         ("POST", "/api/v1/comm/identity") => {
-            format!("创建通信身份 {}", field(&object()?, "nickname")?)
+            let map = object(&["nickname", "default"])?;
+            let nickname = field(&map, "nickname")?;
+            match map.get("default") {
+                None | Some(Value::Bool(false)) => format!("创建通信身份 {nickname}"),
+                Some(Value::Bool(true)) => format!("创建通信身份 {nickname} 并设为默认发送身份"),
+                Some(_) => return None,
+            }
         }
         ("POST", "/api/v1/comm/identity/default") => {
-            format!("把默认通信身份设为 {}", field(&object()?, "nickname")?)
+            format!(
+                "把默认通信身份设为 {}",
+                field(&object(&["nickname"])?, "nickname")?
+            )
         }
         ("POST", "/api/v1/comm/contact") => {
-            let map = object()?;
-            format!(
+            let map = object(&["nickname", "npub", "role"])?;
+            let head = format!(
                 "添加联系人 {}（{}）",
                 field(&map, "nickname")?,
                 field(&map, "npub")?
-            )
+            );
+            match map.get("role") {
+                None | Some(Value::Null) => head,
+                Some(_) => format!("{head}，角色 {}", field(&map, "role")?),
+            }
         }
         ("PATCH", "/api/v1/comm/contact/{name}") => format!(
             "把联系人 {} 改名为 {}",
             decoded_segment(path)?,
-            field(&object()?, "nickname")?
+            field(&object(&["nickname"])?, "nickname")?
         ),
         ("DELETE", "/api/v1/comm/contact/{name}") => {
+            empty(body)?;
             format!("删除联系人 {}（保留聊天记录）", decoded_segment(path)?)
         }
         ("PUT", "/api/v1/comm/relay") => {
-            let relays = object()?.get("relays")?.as_array()?.clone();
+            let relays = object(&["relays"])?.get("relays")?.as_array()?.clone();
             if relays.is_empty() {
                 return None;
             }
@@ -541,51 +557,86 @@ fn comm(method: &str, template: &str, path: &str, body: &[u8]) -> Option<String>
                 .collect::<Option<Vec<_>>>()?;
             format!("把通信中继改为 {}", shown_relays.join(", "))
         }
-        ("POST", "/api/v1/comm/relay/probe") => match object()?.get("url") {
+        ("POST", "/api/v1/comm/relay/probe") => match object(&["url"])?.get("url") {
             None | Some(Value::Null) => "检测当前通信中继是否可连".to_owned(),
+            Some(Value::String(url)) if url.is_empty() => "检测当前通信中继是否可连".to_owned(),
             Some(url) => format!("检测通信中继 {} 是否可连", shown(url.as_str()?)?),
         },
-        ("POST", "/api/v1/comm/daemon/start") => "启动 Hyphae 通信后台".to_owned(),
-        ("POST", "/api/v1/comm/daemon/stop") => "停止 Hyphae 通信后台".to_owned(),
+        ("POST", "/api/v1/comm/daemon/start") => {
+            object(&[])?;
+            "启动 Hyphae 通信后台".to_owned()
+        }
+        ("POST", "/api/v1/comm/daemon/stop") => {
+            object(&[])?;
+            "停止 Hyphae 通信后台".to_owned()
+        }
         ("POST", "/api/v1/comm/send") => {
-            let map = object()?;
-            let content = map.get("content")?.as_str()?;
+            let map = object(&["to", "content", "encrypt"])?;
+            if !matches!(map.get("encrypt"), None | Some(Value::Bool(true))) {
+                return None;
+            }
             format!(
-                "给 {} 发送一条 {} 字的消息",
+                "给 {} 发送一条 {} 字的加密消息",
                 field(&map, "to")?,
-                content.chars().count()
+                map.get("content")?.as_str()?.chars().count()
             )
         }
         ("POST", "/api/v1/comm/outbox/{event_id}/retry") => {
-            format!("重发一条未送达的消息 {}", shown(last_segment(path)?)?)
-        }
-        ("POST", "/api/v1/comm/groupchat") => {
-            let map = object()?;
-            let invitees = map.get("invitees")?.as_array()?;
+            empty(body)?;
             format!(
-                "创建群聊 {} 并邀请 {} 人",
-                field(&map, "name")?,
-                invitees.len()
-            )
-        }
-        ("POST", "/api/v1/comm/groupchat/{group_id}/messages") => {
-            let map = object()?;
-            let content = map.get("body")?.as_str()?;
-            format!(
-                "在群 {} 发送一条 {} 字的消息",
-                shown(segment_before(path, "messages")?)?,
-                content.chars().count()
-            )
-        }
-        ("POST", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry") => {
-            object()?;
-            format!(
-                "重试群消息 {} 的失败收件人",
+                "重发一条未送达的消息 {}",
                 shown(segment_before(path, "retry")?)?
             )
         }
+        ("POST", "/api/v1/comm/groupchat") => {
+            let map = object(&["name", "invitees"])?;
+            let invitees = map
+                .get("invitees")?
+                .as_array()?
+                .iter()
+                .map(|npub| shown(npub.as_str()?))
+                .collect::<Option<Vec<_>>>()?;
+            if invitees.is_empty() {
+                return None;
+            }
+            format!(
+                "创建群聊 {} 并邀请 {}（他们会收到之后的群消息）",
+                field(&map, "name")?,
+                invitees.join(", ")
+            )
+        }
+        ("POST", "/api/v1/comm/groupchat/{group_id}/messages") => {
+            let map = object(&["body", "logical_id"])?;
+            format!(
+                "在群 {} 发送一条 {} 字的消息",
+                shown(segment_before(path, "messages")?)?,
+                map.get("body")?.as_str()?.chars().count()
+            )
+        }
+        ("POST", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry") => {
+            let map = object(&["recipient"])?;
+            let mut segments = path.rsplit('/');
+            let (Some("retry"), Some(logical_id), Some("messages"), Some(group_id)) = (
+                segments.next(),
+                segments.next(),
+                segments.next(),
+                segments.next(),
+            ) else {
+                return None;
+            };
+            let (logical_id, group_id) = (plain(logical_id)?, plain(group_id)?);
+            let who = match map.get("recipient") {
+                None | Some(Value::Null) => "全部失败收件人".to_owned(),
+                Some(_) => format!("收件人 {}", field(&map, "recipient")?),
+            };
+            format!(
+                "重试群 {} 的消息 {}：{who}",
+                shown(group_id)?,
+                shown(logical_id)?
+            )
+        }
         ("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept") => {
-            object()?;
+            object(&[])?;
             format!("接受群邀请 {}", shown(segment_before(path, "accept")?)?)
         }
         _ => return None,
@@ -611,56 +662,224 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
 
+    fn c(method: &str, template: &str, path: &str, body: &str) -> Option<String> {
+        comm(method, template, path, body.as_bytes())
+    }
+
+    const NPUB: &str = "npub15dfn3f5nwfggwuef5jv0fputrfnmwafq6ed5cz5ehl9mf09z6f5sws07h2";
+    const HEX: &str = "00112233445566778899aabbccddeeff";
+
     #[test]
     fn comm_writes_have_summaries_that_hide_message_bodies() {
-        let send = comm(
+        let send = c(
             "POST",
             "/api/v1/comm/send",
             "/api/v1/comm/send",
-            br#"{"to":"bob","content":"secret plan"}"#,
-        )
-        .unwrap();
-        assert!(send.contains("\"bob\"") && send.contains("11"), "{send}");
-        assert!(!send.contains("secret"), "{send}");
-        let rename = comm(
-            "PATCH",
-            "/api/v1/comm/contact/{name}",
-            "/api/v1/comm/contact/%E5%B0%8F%E6%98%8E",
-            br#"{"nickname":"Ming"}"#,
+            r#"{"to":"bob","content":"secret plan","encrypt":true}"#,
         )
         .unwrap();
         assert!(
-            rename.contains("\"小明\"") && rename.contains("\"Ming\""),
-            "{rename}"
+            send.contains("\"bob\"") && send.contains("11") && send.contains("加密"),
+            "{send}"
         );
-        let group = comm(
+        assert!(!send.contains("secret"), "{send}");
+        let group = c(
             "POST",
             "/api/v1/comm/groupchat/{group_id}/messages",
-            "/api/v1/comm/groupchat/00112233445566778899aabbccddeeff/messages",
-            br#"{"body":"hi\nall","logical_id":"00112233445566778899aabbccddeeff"}"#,
+            &format!("/api/v1/comm/groupchat/{HEX}/messages"),
+            &format!(r#"{{"body":"hi\nall","logical_id":"{HEX}"}}"#),
         )
         .unwrap();
-        assert!(!group.contains("hi"), "{group}");
-        assert!(
-            comm(
+        assert!(!group.contains("hi") && group.contains(HEX), "{group}");
+    }
+
+    #[test]
+    fn every_comm_route_has_a_text_naming_what_runs() {
+        let rows: [(&str, &str, String, String, &[&str]); 15] = [
+            (
+                "POST",
+                "/api/v1/comm/identity",
+                "/api/v1/comm/identity".into(),
+                r#"{"nickname":"work","default":true}"#.into(),
+                &["\"work\"", "默认"],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/identity/default",
+                "/api/v1/comm/identity/default".into(),
+                r#"{"nickname":"work"}"#.into(),
+                &["\"work\""],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/contact",
+                "/api/v1/comm/contact".into(),
+                format!(r#"{{"nickname":"bob","npub":"{NPUB}","role":"agent"}}"#),
+                &["\"bob\"", NPUB, "\"agent\""],
+            ),
+            (
+                "PATCH",
+                "/api/v1/comm/contact/{name}",
+                "/api/v1/comm/contact/%E5%B0%8F%E6%98%8E".into(),
+                r#"{"nickname":"Ming"}"#.into(),
+                &["\"小明\"", "\"Ming\""],
+            ),
+            (
+                "DELETE",
+                "/api/v1/comm/contact/{name}",
+                "/api/v1/comm/contact/bob".into(),
+                String::new(),
+                &["\"bob\""],
+            ),
+            (
+                "PUT",
+                "/api/v1/comm/relay",
+                "/api/v1/comm/relay".into(),
+                r#"{"relays":["wss://r.example"]}"#.into(),
+                &["\"wss://r.example\""],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/relay/probe",
+                "/api/v1/comm/relay/probe".into(),
+                r#"{"url":"wss://r.example"}"#.into(),
+                &["\"wss://r.example\""],
+            ),
+            (
                 "POST",
                 "/api/v1/comm/daemon/start",
-                "/api/v1/comm/daemon/start",
-                b""
-            )
-            .is_some()
-        );
-        // A body the handler would refuse, or a hidden character, leaves no text.
-        assert!(comm("POST", "/api/v1/comm/send", "/api/v1/comm/send", b"[]").is_none());
-        assert!(
-            comm(
+                "/api/v1/comm/daemon/start".into(),
+                String::new(),
+                &["启动"],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/daemon/stop",
+                "/api/v1/comm/daemon/stop".into(),
+                "{}".into(),
+                &["停止"],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/send",
+                "/api/v1/comm/send".into(),
+                r#"{"to":"bob","content":"hi"}"#.into(),
+                &["\"bob\"", "2"],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/outbox/{event_id}/retry",
+                "/api/v1/comm/outbox/abc123/retry".into(),
+                String::new(),
+                &["\"abc123\""],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat",
+                "/api/v1/comm/groupchat".into(),
+                format!(r#"{{"name":"g","invitees":["{NPUB}"]}}"#),
+                &["\"g\"", NPUB],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/{group_id}/messages",
+                format!("/api/v1/comm/groupchat/{HEX}/messages"),
+                r#"{"body":"hey"}"#.into(),
+                &[HEX, "3"],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry",
+                format!(
+                    "/api/v1/comm/groupchat/{HEX}/messages/ffeeddccbbaa99887766554433221100/retry"
+                ),
+                format!(r#"{{"recipient":"{NPUB}"}}"#),
+                &[HEX, "\"ffeeddccbbaa99887766554433221100\"", NPUB],
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/invites/{invite_id}/accept",
+                format!("/api/v1/comm/groupchat/invites/{HEX}/accept"),
+                "{}".into(),
+                &[HEX],
+            ),
+        ];
+        for (method, template, path, body, wants) in &rows {
+            let text = c(method, template, path, body)
+                .unwrap_or_else(|| panic!("{method} {template}: no text"));
+            for want in *wants {
+                assert!(
+                    text.contains(want),
+                    "{method} {template}: {text} lacks {want}"
+                );
+            }
+        }
+        let mut listed: Vec<_> = rows.iter().map(|r| (r.0, r.1)).collect();
+        let mut routes = crate::capabilities::first_party::COMM_DERIVED_ROUTES.to_vec();
+        listed.sort();
+        routes.sort();
+        assert_eq!(listed, routes);
+    }
+
+    #[test]
+    fn comm_keys_the_text_does_not_show_leave_no_text() {
+        for (method, template, path, body) in [
+            (
+                "POST",
+                "/api/v1/comm/send",
+                "/api/v1/comm/send",
+                r#"{"to":"bob","content":"hi","encrypt":false}"#.to_owned(),
+            ),
+            (
+                "POST",
+                "/api/v1/comm/send",
+                "/api/v1/comm/send",
+                r#"{"to":"bob","content":"hi","from":"work"}"#.to_owned(),
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat",
+                "/api/v1/comm/groupchat",
+                format!(r#"{{"name":"g","invitees":["{NPUB}"],"identity":"work"}}"#),
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/{group_id}/messages",
+                &format!("/api/v1/comm/groupchat/{HEX}/messages"),
+                r#"{"body":"hi","max_retries":0}"#.to_owned(),
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/invites/{invite_id}/accept",
+                &format!("/api/v1/comm/groupchat/invites/{HEX}/accept"),
+                r#"{"identity":"work"}"#.to_owned(),
+            ),
+            (
+                "POST",
+                "/api/v1/comm/send",
+                "/api/v1/comm/send",
+                "[]".to_owned(),
+            ),
+            (
                 "POST",
                 "/api/v1/comm/contact",
                 "/api/v1/comm/contact",
-                br#"{"nickname":"a\u202eb","npub":"npub1x"}"#
-            )
-            .is_none()
-        );
+                format!(r#"{{"nickname":"a\u202eb","npub":"{NPUB}"}}"#),
+            ),
+        ] {
+            assert!(
+                c(method, template, path, &body).is_none(),
+                "{method} {template} {body}"
+            );
+        }
+        let probe = c(
+            "POST",
+            "/api/v1/comm/relay/probe",
+            "/api/v1/comm/relay/probe",
+            r#"{"url":""}"#,
+        )
+        .unwrap();
+        assert!(!probe.contains("\"\""), "{probe}");
     }
 
     #[test]
