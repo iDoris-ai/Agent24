@@ -284,16 +284,12 @@
 - [ ] FU-251 · C · src=L8 iDoris 0.6.0 真机 · 2026-11-26 · iDoris v0.6.0 的 `models local`（`idoris-recommender/src/local_models.rs` 的 `scan_with`）只扫 `~/.omlx/models` 下一层，`mlx-community/<model>` 这种两层布局一个都找不到；它的 managed 模式 setup（`installed_models`）也用同一份扫描。Agent24 侧在它的扫描没有 chat 模型时，自己从目录补两层的模型名（只认 `config.json`，不做完整性检查，绑定仍由 iDoris setup 按运行中 oMLX 的列表核对）；oMLX 没在跑、要 iDoris 托管拉起时仍会被 iDoris 拒绝，要 iDoris 上游修扫描。另：只靠两层补充发现的 `-vl` 模型按 `is_chat_model_id` 不进候选。
 - [ ] FU-252 · C · src=L8-S02 真机 0.7.122 · 2026-11-26 · 不点名模板、只说「把这张入职登记表填一下，资料在《个人信息.docx》里」时，8B 模型对资料文档调 `documents.fields`（把资料当模板），回「没有可填字段」；App 侧没有替它分辨哪份是模板、哪份是资料。
 - [ ] FU-253 · C · src=L8-S02 真机 0.7.122 · 2026-11-26 · 用「《…pdf》这张表能帮我填吗」问时模型没调任何工具，编出 `{{乙方名称}}` 等字段去问用户（README §15.1 要求如实说 PDF 不支持）；只靠 FORM_HINT 的文字约束，App 侧没有对 PDF 表单问题给确定性答复。
-- [ ] FU-254 · C · src=L8-S02 真机 0.7.123 · 2026-11-26 · iDoris 在 0.7.123 上几次以 code 4 退出，没有自动重启，要用户手动点「连接」才恢复；退出原因和重启策略都没查。
+- [x] FU-254 · C · src=L8-S02 真机 0.7.123 · 2026-11-26 · iDoris 在 0.7.123 上几次以 code 4 退出，没有自动重启，要用户手动点「连接」才恢复；退出原因和重启策略都没查。已修（L9-1a）：宿主登记校验只认签名标识 `ai.idoris.cli`，发布的 iDoris 签的是 `idoris`，每次登记都被拒，启动 900 s 后孤儿到期退出 4；同时认 `idoris`（契约写的 `ai.idoris.cli` 保留），并在 iDoris 自己停下（运行满 60 s）且用户仍要它运行时后台重新拉起。
 - [ ] FU-255 · C · src=L9-3a KB-LITE-03a · 2026-11-26 · 精简版安装只做首次安装和失败后重试：重试从 0 字节重下（不做断点续传、暂停），不预检磁盘空间，两个 App 实例同时安装不加锁；换钉值后旧的 `<sha7>-darwin-arm64` 程序目录不清理。
 - [ ] FU-256 · C · src=L9-3a KB-LITE-03a · 2026-11-26 · 精简版正式下载源未定：`weknora-lite-pin.ts` 的 `url` 为 null，本轮只能用回环覆盖源 `A24_WEKNORA_LITE_LOCAL_BASE_URL` 安装；发版前要定 Release 资产、`release-desktop.yml` 和签名钥匙（FU-245），钉值要换成那次正式构建的制品。
+- [ ] FU-257 · C · src=L9-1a FU-254 · 2026-11-26 · iDoris 登记 socket 的 accept 循环遇到任何一次 accept 错误（如 fd 用尽）就退出且不记日志，之后 iDoris 登记不上、900 s 后孤儿到期；L9-1a 的自动重新拉起会兜住（新一代会新建 socket），但 accept 出错应退避重试而不是退出。
+- [ ] FU-258 · C · src=L9-1a FU-254 · 2026-11-26 · 给 iDoris 上游：契约（边界与接口规范 §2.10.9、修订 1.6 Q1）和签名脚本 `scripts/macos_signed_release.py:313` 都写签名标识 `ai.idoris.cli`，但发布的 v0.6.0、v0.6.1 二进制实际是 `Identifier=idoris`；上游应按契约签名或修订契约，届时 Agent24 去掉 `idoris`。
 - [ ] FU-267 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 本机库的实例身份用握手里的 `credential.knowledge_base_id`（协议 2 没有 instance_id；裁决 2026-11-27-lite-host-credential-instance）：同一数据目录里默认库被删重建或以后一个实例多库时会误判为换实例；握手 key 365 天到期不续（单进程连续运行才会碰到）。WeKnora#180 合入后请服务端加持久 instance_id，宿主只换取值点。
 - [ ] FU-268 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 精简版拉起只做主干：两个 App 实例同时拉起时第二个 Lite 因实例锁退出码 3，会被当成失败退避 5 次后放弃；崩溃后刚到 healthy 就再崩的反复循环不限次数；端口被占、数据目录被篡改不处理。
 - [ ] FU-269 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 精简版日志 `~/.agent24/logs/weknora-lite.log` 只追加，不轮转、不限大小。
 - [ ] FU-270 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · embedding 配置只在每次拉起时读：运行中 iDoris 网关换端口或换 key 后，精简版要重启才能继续导入/向量检索（3c 接 embedding 来源时决定是否订阅 iDoris 状态触发重启）。
-- [ ] FU-271 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 本机档的出处卡没有「打开知识库」：精简版是 headless 制品（无网页前端），知识页打不开，只列「库名·文档名·第 n 段」并可复制。以后用精简版的 read 路由在 App 里做段落预览。
-- [ ] FU-272 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 服务模式（常驻 daemon）下，远端/本机切换以及精简版每次重启换发的新 key 都会让绑定或 C 变化，各要一次在场确认（K1 按 key 哈希记）；App 托管模式不受影响。
-- [ ] FU-273 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 精简版的 embed-only iDoris key 首签后长期复用、无到期：只在钥匙串里找不到时重签，不查 iDoris 里是否已吊销；iDoris 重装换库后旧 key 失效，精简版导入会 401，要手动删 `lite-embed-key.json` 才重签。重连 iDoris 时一并作废、或用 key list 查状态。
-- [ ] FU-274 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 精简版在上传处理中崩溃重启（换发新 key → 绑定变化），进行中的上传卡显示「提交后换了知识库，不再跟进」，而不是用新 key 继续跟进同一实例的作业。
-- [ ] FU-275 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 桌面还没把 weknora-lite 组件状态上报 daemon（#2107 已登记组件名），能力页里这一行一直是 absent/not_reported；本机知识库状态目前只在知识库设置里看。
-- [ ] FU-276 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 精简版 ingest 白名单（WeKnora `agent24_ingest_format.go`）只有 md/markdown/txt，桌面本机档按 David 定的 md/txt/csv/json 放行，csv/json 目前会被服务端拒（unsupported_format）；待服务端加白名单并重出制品。另：本机档的知识条目提交（candidate.propose）未验证。
