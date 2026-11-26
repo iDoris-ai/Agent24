@@ -65,6 +65,7 @@ import {
 } from './creative-serve-web'
 import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { WeknoraLiteHost, installedWeknoraLiteProgram } from './weknora-lite-host'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { fileAppliedStore, KnowledgeHost } from './knowledge-host'
 import { serviceDaemonOf } from './service-daemon'
@@ -331,6 +332,8 @@ let presencePoller: PresencePoller | null = null
 // M5 B3: the same, over the presence connection, with the daemon the LaunchAgent runs.
 let presenceConnection: PresenceConnection | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
+// KB-LITE-02 (3b): the local knowledge base's WeKnora Lite. 3c starts it and supplies the embedding.
+let weknoraLite: WeknoraLiteHost | null = null
 let openDesignReporter: OpenDesignStatusReporter | null = null
 let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
@@ -555,6 +558,10 @@ app.whenReady().then(async () => {
     runtimeExecutable: resolveNodeRuntimeExecutable(),
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
+  })
+  weknoraLite = new WeknoraLiteHost({
+    program: installedWeknoraLiteProgram,
+    embedding: () => Promise.reject(new Error('the local knowledge base embedding is not configured')),
   })
   // ADR-038 C3b: main owns the ProductHost credential and reports Open Design.
   // The renderer never receives this client or the report route.
@@ -1258,6 +1265,7 @@ const shutdown = createCreativeShutdown({
   stop: async () => {
     await Promise.all([
       creativeServeWeb?.shutdown(),
+      weknoraLite?.shutdown(),
       ensureOwnedOmlxQuit(),
     ])
   },
