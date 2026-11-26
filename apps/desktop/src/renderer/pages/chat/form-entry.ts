@@ -118,7 +118,8 @@ const strip = (t: string) => t.trim().toLowerCase().replace(/\.(pdf|docx?|xlsx?|
 /** The library's non-PDF documents with fields, among those whose title holds `name` (all when null); at most 10 asked. */
 async function templatesIn(api: Api, docs: readonly Listed[], name: string | null): Promise<Listed[]> {
   const want = name === null ? null : name.toLowerCase()
-  const asked = docs.filter((d) => !isPdf(d) && (want === null || strip(d.title).includes(want))).slice(0, 10)
+  // A document a fill made (「<template>（填写）」, tools.rs) is a filled form, not a template.
+  const asked = docs.filter((d) => !isPdf(d) && !/（填写）$/.test(strip(d.title)) && (want === null || strip(d.title).includes(want))).slice(0, 10)
   const out: Listed[] = []
   for (const d of asked) if (await hasFields(api, d.document_id)) out.push(d)
   return out
