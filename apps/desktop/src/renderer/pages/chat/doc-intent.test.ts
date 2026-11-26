@@ -45,7 +45,7 @@ describe('D2b document intents in a conversation about a document', () => {
 })
 
 const HINT = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
-  + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
+  + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息，这些字段名都放进 user_said；'
   + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
 
 describe('docAgentPrompt', () => {
@@ -423,7 +423,7 @@ describe('L8-S02: filling a form', () => {
     const prompt = docAgentPrompt(null, '把这张入职登记表填一下，资料在《个人信息.docx》里')
     expect(prompt).toContain(FORM_HINT)
     expect(prompt.endsWith('\n把这张入职登记表填一下，资料在《个人信息.docx》里')).toBe(true)
-    for (const said of ['source_document_id', 'user_said', 'ask_user', '不要自己编', '手工处理', 'PDF', '打印后手填', '逐项']) {
+    for (const said of ['source_document_id', 'user_said', 'ask_user', 'from_source', '不用自己读资料', '一律不从资料里取', '岗位字段', '空字符串', '不要自己编', '手工处理', 'PDF', '打印后手填', '逐项']) {
       expect(FORM_HINT).toContain(said)
     }
     expect(docAgentPrompt(null, '把两份合并')).not.toContain(FORM_HINT)
