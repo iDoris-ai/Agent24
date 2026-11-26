@@ -55,6 +55,23 @@ pub enum Sidecar {
     Stopped,
 }
 
+impl Sidecar {
+    /// The desktop's `SidecarState` (`apps/desktop/src/main/sidecar-contract.ts`),
+    /// which uses the same seven names.
+    pub fn from_state(state: &str) -> Option<Self> {
+        Some(match state {
+            "starting" => Self::Starting,
+            "ready" => Self::Ready,
+            "healthy" => Self::Healthy,
+            "degraded" => Self::Degraded,
+            "failed" => Self::Failed,
+            "stopping" => Self::Stopping,
+            "stopped" => Self::Stopped,
+            _ => return None,
+        })
+    }
+}
+
 /// What a backoff tick in `dependency` or `not_ready` sends (S1.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
