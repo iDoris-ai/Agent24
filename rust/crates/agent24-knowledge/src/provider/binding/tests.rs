@@ -448,18 +448,79 @@ fn a_sidecar_going_down_is_dependency_without_increment() {
 }
 
 #[test]
-fn a_sidecar_starting_retries_an_unavailable_binding_only() {
-    use state::UnavailableCause::Incompatible;
+fn a_sidecar_starting_is_a_new_round_that_keeps_persisted_reasons() {
+    use state::UnavailableCause::{AccessRevoked, Incompatible};
+    // A persisted reason stays: only a written loosening lets it go (I1).
     let mut binding = stuck(Incompatible);
-    assert!(binding.sidecar(Sidecar::Starting).is_some());
-    assert_eq!(binding.connection().phase(), Some(Loading));
+    assert_eq!(binding.sidecar(Sidecar::Starting), None);
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(Incompatible))
+    );
+    // Down, then up again: a new `loading` round.
     let mut binding = ready();
     binding.sidecar(Sidecar::Stopped);
     assert!(binding.sidecar(Sidecar::Starting).is_some());
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    // Missed the down: still a new round, without the old credential, no increment.
     let mut binding = ready();
     let round = binding.connection().round();
+    let generation = binding.connection().gate().reported();
+    assert!(binding.credentials().current().is_some());
+    assert!(binding.sidecar(Sidecar::Starting).is_some());
+    assert!(!binding.connection().is_current(round));
+    assert_eq!(binding.connection().phase(), Some(Loading));
+    assert!(binding.credentials().current().is_none());
+    assert_eq!(binding.connection().gate().reported(), generation);
+    // Outside the connection phase a kept reason is not released (PR-Daemon F2).
+    let mut binding = stuck(AccessRevoked);
+    let off = binding.leave(Leave::Off).value;
+    persisted(&mut binding, &off);
     assert_eq!(binding.sidecar(Sidecar::Starting), None);
-    assert!(binding.connection().is_current(round));
+    assert_eq!(binding.connection().phase(), None);
+    binding.connect(CLEAR);
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(AccessRevoked))
+    );
+}
+
+/// PR-Daemon F1 (second round): a restart in a phase that does not retry by
+/// itself still drops the dead key, so the way out issues again.
+#[test]
+fn a_restart_drops_the_key_even_where_it_retries_nothing() {
+    use state::UnavailableCause::{Incompatible, LocalStorage};
+    // First `ready` not yet persisted: `unavailable(local_storage)`.
+    let mut binding = B::new(
+        Connection::new(Gate::new(1), false),
+        Credentials::new(false),
+        true,
+    );
+    binding.connect(CLEAR).unwrap();
+    let ticket = binding.issue().unwrap();
+    let _ = binding.issued(ticket, Issued::Granted { narrowed: false }, Instant::now());
+    let connection = binding.connection_mut();
+    let probe = connection.probe().unwrap();
+    connection.apply_probe(probe, READY);
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(LocalStorage))
+    );
+    assert_eq!(binding.sidecar(Sidecar::Starting), None);
+    assert!(binding.credentials().current().is_none());
+    assert!(binding.connection_mut().confirm_once_servable().is_some());
+    assert!(binding.issue().is_some());
+    // `incompatible` with a key: stays, the key goes, a manual retry issues.
+    let mut binding = stuck(Incompatible);
+    assert!(binding.credentials().current().is_some());
+    assert_eq!(binding.sidecar(Sidecar::Starting), None);
+    assert_eq!(
+        binding.connection().phase(),
+        Some(Unavailable(Incompatible))
+    );
+    assert!(binding.credentials().current().is_none());
+    assert!(binding.retry().is_some());
+    assert!(binding.issue().is_some());
 }
 
 #[test]
