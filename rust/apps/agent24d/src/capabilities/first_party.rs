@@ -82,6 +82,7 @@ impl FirstPartyAuthority {
         token_id: &str,
         bytes: &[u8],
         registrations: &[agent24_protocol::AttachedView],
+        relax: impl FnOnce(&str) -> Result<Option<String>, String>,
     ) {
         let Ok(body) = serde_json::from_slice::<agent24_protocol::AttachedAddRequest>(bytes) else {
             return;
@@ -89,8 +90,19 @@ impl FirstPartyAuthority {
         let Ok(manifest) = agent24_domain::DomainOsManifest::from_yaml(&body.manifest) else {
             return;
         };
+        // In service mode this dialog is the host confirmation §3.5 asks for:
+        // approving a registration that widens privacy confirms the widening,
+        // so the text names it (`post_attached_at` honours the grant).
+        // A registry that cannot be read leaves no text: fail closed.
+        let Ok(widens) = relax(&body.manifest) else {
+            return;
+        };
+        let widens = match widens {
+            Some(what) => format!("; WIDENS PRIVACY ({what}) — allowing confirms it"),
+            None => String::new(),
+        };
         let summary = format!(
-            "register attached module '{}'; {}; allow_relax: {}; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]",
+            "register attached module '{}'; {}; allow_relax: {}; model_access: {}; kernel_capabilities: [{}]; host_commands: [{}]{widens}",
             manifest.name(),
             if registrations.iter().any(|r| r.name == manifest.name()) {
                 "replace existing registration"
@@ -737,6 +749,7 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                 | Operation::Shutdown
                 | Operation::ModelsAdmin
                 | Operation::CommWrite
+                | Operation::ModuleAdmin
         ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -929,9 +942,18 @@ pub(crate) const COMM_DERIVED_ROUTES: [(&str, &str); 15] = [
     ("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept"),
 ];
 
+/// Disabling, re-enabling and unpairing an attached module (the desktop's
+/// AgentEar switch and unpair button), summarised by
+/// `crate::elevation_summaries`.
+pub(crate) const ATTACHED_DERIVED_ROUTES: [(&str, &str); 2] = [
+    ("PATCH", "/api/v1/attached/{name}"),
+    ("DELETE", "/api/v1/attached/{name}"),
+];
+
 pub(crate) fn derived_route(method: &str, template: &str) -> bool {
     DERIVED_ROUTES.contains(&(method, template))
         || COMM_DERIVED_ROUTES.contains(&(method, template))
+        || ATTACHED_DERIVED_ROUTES.contains(&(method, template))
 }
 
 /// Binding id from the request path: the last segment, or the one before
@@ -1169,7 +1191,7 @@ mod tests {
         peer: &EnrolledPeer,
         id: &str,
     ) -> ElevationGrant {
-        authority.remember_attached_request(id, &attached_body(), &[]);
+        authority.remember_attached_request(id, &attached_body(), &[], |_| Ok(None));
         let (tx, _rx) = tokio::sync::oneshot::channel();
         authority
             .elevate(peer, id, request(), tx, CancellationToken::new())
@@ -1446,7 +1468,7 @@ mod tests {
         for allow in [false, true] {
             body["allow_relax"] = allow.into();
             let bytes = serde_json::to_vec(&body).unwrap();
-            authority.remember_attached_request("id", &bytes, &[]);
+            authority.remember_attached_request("id", &bytes, &[], |_| Ok(None));
             let mut req = request();
             req.body_sha256 = body_digest(&bytes);
             let summary = authority
@@ -1465,7 +1487,7 @@ mod tests {
                 attach_status: "detached".into(),
                 generation: None,
             };
-            authority.remember_attached_request("id", &bytes, &[registered]);
+            authority.remember_attached_request("id", &bytes, &[registered], |_| Ok(None));
             let summary = authority
                 .target_summary("id", &resolve_target(&req).unwrap())
                 .unwrap();
@@ -1475,6 +1497,17 @@ mod tests {
             );
             assert!(
                 summary.contains(&format!("allow_relax: {allow}")),
+                "{summary}"
+            );
+            assert!(!summary.contains("WIDENS PRIVACY"), "{summary}");
+            authority.remember_attached_request("id", &bytes, &[], |_| {
+                Ok(Some("new kernel_capabilities [assistant]".into()))
+            });
+            let summary = authority
+                .target_summary("id", &resolve_target(&req).unwrap())
+                .unwrap();
+            assert!(
+                summary.contains("WIDENS PRIVACY (new kernel_capabilities [assistant])"),
                 "{summary}"
             );
         }
@@ -1685,7 +1718,7 @@ mod tests {
         let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
         let peer = test_peer("g");
         let token = authority.issue(&peer).unwrap();
-        authority.remember_attached_request(&token.token_id, &attached_body(), &[]);
+        authority.remember_attached_request(&token.token_id, &attached_body(), &[], |_| Ok(None));
         for (outcome, code) in [
             (PresenceOutcome::Denied, EnrollErrorCode::PresenceDenied),
             (

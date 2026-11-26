@@ -117,6 +117,21 @@ pub async fn derive(
             format!("把默认聊天模型改为 {}", shown(&model)?)
         }
         (_, t) if t.starts_with("/api/v1/comm/") => comm(method, template, path, body)?,
+        ("PATCH", "/api/v1/attached/{name}") => {
+            let update: agent24_protocol::AttachedUpdate = serde_json::from_slice(body).ok()?;
+            format!(
+                "{} attached module {}",
+                if update.enabled { "enable" } else { "disable" },
+                shown(last_segment(path)?)?
+            )
+        }
+        ("DELETE", "/api/v1/attached/{name}") => {
+            empty(body)?;
+            format!(
+                "unpair attached module {} (it has to pair again to come back)",
+                shown(last_segment(path)?)?
+            )
+        }
         _ => return None,
     };
     // The length is checked where it is authoritative: `remember` on the
@@ -819,6 +834,57 @@ mod tests {
         listed.sort();
         routes.sort();
         assert_eq!(listed, routes);
+    }
+
+    #[tokio::test]
+    async fn attached_switch_and_unpair_name_the_module() {
+        let state = crate::server::tests::state().await;
+        let patch = |body: &str| {
+            let state = state.clone();
+            let body = body.to_owned();
+            async move {
+                derive(
+                    &state,
+                    "PATCH",
+                    "/api/v1/attached/{name}",
+                    "/api/v1/attached/agentear",
+                    body.as_bytes(),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            patch(r#"{"enabled":false}"#).await.as_deref(),
+            Some("disable attached module \"agentear\"")
+        );
+        assert_eq!(
+            patch(r#"{"enabled":true}"#).await.as_deref(),
+            Some("enable attached module \"agentear\"")
+        );
+        assert!(patch("{}").await.is_none());
+        let unpair = derive(
+            &state,
+            "DELETE",
+            "/api/v1/attached/{name}",
+            "/api/v1/attached/agentear",
+            b"",
+        )
+        .await
+        .unwrap();
+        assert!(
+            unpair.starts_with("unpair attached module \"agentear\""),
+            "{unpair}"
+        );
+        for (method, template) in crate::capabilities::first_party::ATTACHED_DERIVED_ROUTES {
+            let request = crate::enroll_api::ElevateRequest {
+                method: method.into(),
+                path: "/api/v1/attached/agentear".into(),
+                body_sha256: crate::capabilities::first_party::body_digest(b""),
+                client_summary: String::new(),
+            };
+            let target = crate::capabilities::first_party::resolve_target(&request).unwrap();
+            assert_eq!(target.template, template);
+        }
     }
 
     #[test]

@@ -31,6 +31,11 @@ use axum::response::{IntoResponse, Response};
 use crate::server::AppState;
 use agent24_attach::attached::{self, RegisterError, RegisterOutcome};
 
+/// Set by the capabilities middleware when a first-party shell's request
+/// carries a consumed presence grant whose text named any privacy widening.
+#[derive(Clone, Copy, Debug)]
+pub struct PresenceConfirmed;
+
 pub async fn post_attached(state: State<AppState>, req: Request<Body>) -> Response {
     let Some(path) = attached::config_path() else {
         return error_response(
@@ -51,6 +56,7 @@ pub(crate) async fn post_attached_at(
     req: Request<Body>,
     path: &Path,
 ) -> Response {
+    let confirmed = req.extensions().get::<PresenceConfirmed>().is_some();
     let bytes = match read_body_or_response(req).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -82,7 +88,7 @@ pub(crate) async fn post_attached_at(
     match attached::register(
         path,
         &body.manifest,
-        body.allow_relax,
+        body.allow_relax || confirmed,
         name_taken,
         |change| {
             state.attach_registry.on_change(change);
@@ -342,6 +348,36 @@ mod tests {
         )
         .await;
         assert_eq!(r.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn a_presence_approved_rotation_may_add_a_capability() {
+        // AgentEar paired with [events, models] re-registers with `assistant`
+        // unattended (allow_relax: false). In service mode the presence dialog
+        // that named the widening is the confirmation.
+        let state = crate::server::tests::state().await;
+        let path = tmp_path();
+        let caps = |c: &str| {
+            format!(
+                "name: agentear\nversion: \"1\"\nroute_namespace: /api/v1/agentear\n\
+                 event_module: agentear\ndata_dir: ~/.agent24/os/agentear/\n\
+                 impl_kind: attached_process\nkernel_capabilities: [{c}]\nmodel_access: local_only\n"
+            )
+        };
+        let first = post_attached_at(
+            State(state.clone()),
+            req(serde_json::json!({"manifest": caps("events, models")})),
+            &path,
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let wider = serde_json::json!({"manifest": caps("events, models, assistant")});
+        let refused = post_attached_at(State(state.clone()), req(wider.clone()), &path).await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        let mut approved = req(wider);
+        approved.extensions_mut().insert(PresenceConfirmed);
+        let r = post_attached_at(State(state), approved, &path).await;
+        assert_eq!(r.status(), StatusCode::OK);
     }
 
     #[tokio::test]

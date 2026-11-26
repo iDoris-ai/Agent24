@@ -561,6 +561,7 @@ async fn authorize(
                                 &authorization.claims.capability_id,
                                 &bytes,
                                 &registrations,
+                                |manifest| agent24_attach::attached::relaxation(&path, manifest),
                             );
                         }
                     } else if matches!(
@@ -765,6 +766,12 @@ async fn authorize(
                         );
                     }
                     req = Request::from_parts(parts, Body::from(bytes));
+                    // The approved text named any privacy widening of this
+                    // registration, so the approval is its §3.5 confirmation.
+                    if method == Method::POST && template == "/api/v1/attached" {
+                        req.extensions_mut()
+                            .insert(crate::attached_routes::PresenceConfirmed);
+                    }
                 }
             }
             req.extensions_mut().insert(authorization);
