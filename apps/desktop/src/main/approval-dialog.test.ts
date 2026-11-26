@@ -69,6 +69,12 @@ describe('approvalDialog (UI polish 01)', () => {
     look.fillPreview = vi.fn(async () => null)
     const unread = await box({ summary: 'documents.fill: …', payload }, 'approve', '批准', undefined, look, clip)
     expect(unread.detail).toContain('没能预先读到')
+    // PR-Daemon #2100 r6 G1: a Word material the module could not read is its
+    // own state, and the box says so.
+    look.fillPreview = vi.fn(async () => ({ sourceTitle: '个人信息.docx', values: [] as Array<[string, string]>, read: false }))
+    const failed = await box({ summary: 'documents.fill: …', payload }, 'approve', '批准', undefined, look, clip)
+    expect(failed.detail).toContain('没能预先读到')
+    expect(failed.detail).not.toContain('= ')
     const plain = await box({ summary: 'documents.fill: …', payload: { document_id: DOC, values: { 姓名: '陈晓明' } } },
       'approve', '批准', undefined, look, clip)
     expect(plain.detail).not.toContain('来自《')

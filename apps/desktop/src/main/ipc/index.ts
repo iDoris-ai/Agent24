@@ -534,10 +534,11 @@ const approvalDocumentLookups: DocumentLookups = {
   fillPreview: (template, source, values, userSaid) => readDocument(
     { op: 'fillPreview', documentId: template, sourceDocumentId: source, values, userSaid },
     (data) => {
-      const d = data as { source_title?: unknown; from_material?: unknown } | null
+      const d = data as { source_title?: unknown; from_material?: unknown; material_read?: unknown } | null
       if (!d || !Array.isArray(d.from_material)) return null
       return {
         sourceTitle: typeof d.source_title === 'string' ? d.source_title : '',
+        read: d.material_read !== false,
         values: d.from_material.flatMap((v: { field?: unknown; value?: unknown }) =>
           typeof v?.field === 'string' && typeof v.value === 'string' ? [[v.field, v.value] as [string, string]] : []),
       }

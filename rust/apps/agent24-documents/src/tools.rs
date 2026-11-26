@@ -976,7 +976,7 @@ async fn fill(
         // from the material, read by the App as `fields` reads it (an 8B
         // model knew 部门 and 入职日期 and still did not pass them); only when
         // the material is plainly the user's own (PR-Daemon #2100).
-        let (ok, taken) = material_fill(
+        let (used, taken) = material_fill(
             state,
             &storage,
             &fields,
@@ -988,9 +988,19 @@ async fn fill(
         .await
         .map_err(|e| refused(&e))?;
         req.values.extend(taken);
-        material = Some(ok);
+        material = Some(used);
     }
-    let report = crate::form::plan_fill(&fields, &req.values, &user_said, material);
+    let mut report = crate::form::plan_fill(
+        &fields,
+        &req.values,
+        &user_said,
+        material.map(|m| m == MaterialUse::Plain),
+    );
+    if material == Some(MaterialUse::NotWord) {
+        report
+            .note
+            .insert_str(0, "这份资料不是 Word，部门等请直接告诉我。");
+    }
     // Nothing left that may be written: do not import an unchanged copy.
     if report.write.is_empty() && !req.values.is_empty() {
         return completed(Ok(json!({
@@ -1095,12 +1105,27 @@ async fn load_material(
     }
 }
 
+/// What [`material_fill`] made of the material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MaterialUse {
+    /// Not a Word document: nothing is taken (PR-Daemon #2100 r6 G1: a PDF's
+    /// text layer may be built between the box's preview and the fill).
+    NotWord,
+    /// A Word document that could not be read: nothing is taken.
+    Unread,
+    /// Read, but not plainly the user's own: nothing is taken.
+    NotPlain,
+    /// Plainly the user's own.
+    Plain,
+}
+
 /// PR-Daemon #2100 r5, 监工 裁决 C: what a fill with `source_id` takes from
 /// the material, shared by the fill tool and the approval box's preview
 /// (`POST …/fill/preview`), so the box shows exactly what is written:
 /// whether the material is plainly the user's own (`plainly_users`), and
 /// the allowlisted fields the values leave out (in any spelling) with the
-/// material's value for each. Not plainly the user's: nothing.
+/// material's value for each. Only a Word material, read the same way at
+/// both (r6 G1); anything else: nothing.
 pub(crate) async fn material_fill(
     state: &AppState,
     storage: &Arc<Storage>,
@@ -1109,14 +1134,17 @@ pub(crate) async fn material_fill(
     values: &std::collections::BTreeMap<String, String>,
     user_said: &[String],
     requester: Requester,
-) -> Result<(bool, Vec<(String, String)>), ApiError> {
+) -> Result<(MaterialUse, Vec<(String, String)>), ApiError> {
+    if documents::get(storage, source_id).await?.head.media_type != crate::office::DOCX {
+        return Ok((MaterialUse::NotWord, Vec::new()));
+    }
     let names = fields.iter().map(|(n, _)| n.clone()).collect();
     let Material::Text(read) = load_material(state, storage, source_id, requester, names).await?
     else {
-        return Ok((false, Vec::new()));
+        return Ok((MaterialUse::Unread, Vec::new()));
     };
     if !crate::form::plainly_users(&read, values, user_said) {
-        return Ok((false, Vec::new()));
+        return Ok((MaterialUse::NotPlain, Vec::new()));
     }
     // PR-Daemon #2100 B2: a field the values name in any spelling is the model's.
     let given: std::collections::HashSet<String> =
@@ -1127,7 +1155,7 @@ pub(crate) async fn material_fill(
         .filter(|n| crate::form::from_material(n) && !given.contains(&crate::form::safe_key(n)))
         .filter_map(|n| crate::form::from_source(n, &read).map(|v| (n.clone(), v.to_owned())))
         .collect();
-    Ok((true, taken))
+    Ok((MaterialUse::Plain, taken))
 }
 
 /// The approval box's preview of a fill with a material (read): the values
@@ -1153,8 +1181,8 @@ pub async fn fill_preview(
         .map(|f| (f.name.clone(), f.kind))
         .collect();
     let source = documents::get(&storage, &req.source_document_id).await?;
-    let (plain, taken) = if req.source_document_id == id {
-        (false, Vec::new())
+    let (used, taken) = if req.source_document_id == id {
+        (MaterialUse::NotPlain, Vec::new())
     } else {
         material_fill(
             &state,
@@ -1169,7 +1197,9 @@ pub async fn fill_preview(
     };
     Ok(axum::Json(json!({
         "source_title": source.document.title,
-        "plainly_users": plain,
+        "plainly_users": used == MaterialUse::Plain,
+        "material_word": used != MaterialUse::NotWord,
+        "material_read": used != MaterialUse::Unread,
         "from_material": taken
             .into_iter()
             .map(|(field, value)| json!({ "field": field, "value": value }))

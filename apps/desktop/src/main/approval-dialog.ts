@@ -21,9 +21,11 @@ export interface DocumentLookups {
   /** L6-F5: a document's current version, for the one a save makes. */
   head?: (id: string) => Promise<number | null>
   /** L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
-   * material takes from it, by the module's own rule; null when unread. */
+   * material takes from it, by the module's own rule; null when the preview
+   * failed, `read: false` when the module could not read the Word material
+   * (PR-Daemon #2100 r6 G1). */
   fillPreview?: (template: string, source: string, values: Record<string, string>, userSaid: string[]) =>
-    Promise<{ sourceTitle: string; values: Array<[string, string]> } | null>
+    Promise<{ sourceTitle: string; values: Array<[string, string]>; read?: boolean } | null>
 }
 
 export type ApprovalDialog =
@@ -245,7 +247,7 @@ export async function approvalDialog(
       const preview = source.id && named.id && lookups.fillPreview
         ? await lookups.fillPreview(named.id, source.id, given, said).catch(() => null)
         : null
-      if (!preview) lines.push(say('approval.fill.fromSourceUnread', { doc: source.title }))
+      if (!preview || preview.read === false) lines.push(say('approval.fill.fromSourceUnread', { doc: source.title }))
       else {
         for (const [field, value] of preview.values) {
           lines.push(say('approval.fill.fromSource', { field: clip(field, 64), value: clip(value, 200), doc: preview.sourceTitle || source.title }))

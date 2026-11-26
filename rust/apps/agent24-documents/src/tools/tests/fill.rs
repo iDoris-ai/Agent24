@@ -2029,3 +2029,104 @@ async fn two_different_own_names_in_the_material_are_not_plainly_the_users() {
     );
     assert_eq!(strings(&answer["filled"]), ["姓名"], "{answer}");
 }
+
+/// PR-Daemon #2100 r6 G1, 监工: only a Word material is filled from. A PDF's
+/// text layer may still be building when the box's preview reads it and be
+/// built by the time the fill runs, so it would write values the box never
+/// listed: neither takes anything from it, and the fill says why.
+#[tokio::test]
+async fn a_material_that_is_not_word_is_not_filled_from() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = super::read::fixed(
+        vec![
+            [
+                "个人信息",
+                "姓名：陈晓明",
+                "部门：产品研发部",
+                "入职日期：2026年12月1日",
+            ]
+            .map(String::from)
+            .to_vec(),
+        ],
+        vec![],
+        0,
+    )
+    .unwrap();
+    let layers =
+        crate::engine::Layers::new(Some(Arc::new(engine) as Arc<dyn crate::engine::Engine>));
+    let state = AppState::open_serving(dir.path(), crate::events::Events::default(), layers).await;
+    put_docx(
+        &state,
+        TPL,
+        "入职登记表模板.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}", "入职日期：{{入职日期}}"]),
+    )
+    .await;
+    let storage = state.storage().await.unwrap();
+    let blob = storage.blobs.put_bytes(b"%PDF-1.7 bytes").unwrap();
+    exec(
+        &state,
+        &format!(
+            "INSERT INTO documents (id, title, media_type, head_revision)
+                    VALUES ('{SRC}', '个人信息.pdf', 'application/pdf', 1);
+             INSERT INTO revisions (document_id, revision, content_sha256, size, media_type, origin)
+                    VALUES ('{SRC}', 1, '{}', {}, 'application/pdf', 'import');",
+            blob.sha256, blob.size
+        ),
+    )
+    .await;
+    let ask = json!({
+        "source_document_id": SRC,
+        "values": { "姓名": "陈晓明" },
+        "user_said": ["姓名"],
+    });
+    let (status, shown) = preview(&state, ask.clone()).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["from_material"], json!([]), "{shown}");
+    assert_eq!(shown["material_word"], false, "{shown}");
+    let mut args = ask;
+    args["document_id"] = json!(TPL);
+    let answer = payload(&call(&state, "fill", args).await);
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(
+        text.contains("{{部门}}") && text.contains("{{入职日期}}"),
+        "{text}"
+    );
+    assert!(
+        answer["note"]
+            .as_str()
+            .unwrap()
+            .contains("这份资料不是 Word"),
+        "{answer}"
+    );
+}
+
+/// PR-Daemon #2100 r6 G1: a Word material that cannot be read is its own
+/// state: the preview says it was not read (the box says so), and the fill
+/// takes nothing from it.
+#[tokio::test]
+async fn an_unreadable_word_material_is_shown_unread_and_not_filled_from() {
+    let (_dir, state) = opened().await;
+    put_docx(
+        &state,
+        TPL,
+        "入职登记表模板.docx",
+        &docx(&["姓名：{{姓名}}", "部门：{{部门}}"]),
+    )
+    .await;
+    put_docx(&state, SRC, "个人信息.docx", b"not a zip at all").await;
+    let ask = json!({
+        "source_document_id": SRC,
+        "values": { "姓名": "陈晓明" },
+        "user_said": ["姓名"],
+    });
+    let (status, shown) = preview(&state, ask.clone()).await;
+    assert_eq!(status, 200, "{shown}");
+    assert_eq!(shown["material_read"], false, "{shown}");
+    assert_eq!(shown["from_material"], json!([]), "{shown}");
+    let mut args = ask;
+    args["document_id"] = json!(TPL);
+    let answer = payload(&call(&state, "fill", args).await);
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(text.contains("{{部门}}"), "{text}");
+}
