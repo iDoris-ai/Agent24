@@ -1383,8 +1383,28 @@ impl IdorisHost {
             return Err(Code::NotConfigured);
         }
         let base_url = format!("http://127.0.0.1:{}/v1", record.data_port);
-        if let Some(api_key) = self.saved_lite_key().await? {
-            return Ok(LiteEmbedding { base_url, api_key });
+        // A saved key is used only while iDoris still has it active: a reinstall
+        // with a new key database, or a revocation, leaves a secret that would
+        // only get 401 (PR-Daemon #2110 G2). Checked once per daemon run and
+        // release; a check that cannot run keeps the saved key.
+        let mut stale = None;
+        if let Some((key_id, api_key)) = self.saved_lite_key().await? {
+            if self.lite_key_confirmed(&key_id, &record) {
+                return Ok(LiteEmbedding { base_url, api_key });
+            }
+            match self.lite_key_active(&record, &key_id).await {
+                Some(true) => {
+                    self.confirm_lite_key(&key_id, &record);
+                    return Ok(LiteEmbedding { base_url, api_key });
+                }
+                None => return Ok(LiteEmbedding { base_url, api_key }),
+                Some(false) => {
+                    tracing::warn!(
+                        "the local knowledge base's embed key is no longer active in iDoris; issuing a new one"
+                    );
+                    stale = Some(key_id);
+                }
+            }
         }
         // Issued under the install/connect lock, never inside a connect: the key
         // journal is shared, and a second issue would compensate (revoke) the
@@ -1393,7 +1413,9 @@ impl IdorisHost {
         if self.root.join("pending-connect.json").exists() {
             return Err(Code::Busy);
         }
-        if let Some(api_key) = self.saved_lite_key().await? {
+        if let Some((key_id, api_key)) = self.saved_lite_key().await?
+            && stale.as_ref() != Some(&key_id)
+        {
             return Ok(LiteEmbedding { base_url, api_key });
         }
         let installed = self.provisioner.verify(&record, VerifyMode::AtRest).await?;
@@ -1414,15 +1436,59 @@ impl IdorisHost {
                 key_id: issued.key_id.clone(),
             },
         )?;
+        self.confirm_lite_key(&issued.key_id, &record);
         Ok(LiteEmbedding {
             base_url,
             api_key: issued.secret,
         })
     }
 
-    /// The saved key's secret; `None` when there is none to reuse (no record, an
-    /// unreadable one, or the keychain no longer has it).
-    async fn saved_lite_key(&self) -> Result<Option<Zeroizing<String>>, Code> {
+    fn lite_key_confirmed(&self, key_id: &str, record: &Installation) -> bool {
+        self.lite_key_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(id, release)| id == key_id && *release == record.release_dir)
+    }
+
+    fn confirm_lite_key(&self, key_id: &str, record: &Installation) {
+        *self
+            .lite_key_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((key_id.to_owned(), record.release_dir.clone()));
+    }
+
+    /// Whether iDoris lists `key_id` as active; `None` when the check could not run.
+    async fn lite_key_active(&self, record: &Installation, key_id: &str) -> Option<bool> {
+        let installed = self
+            .provisioner
+            .verify(record, VerifyMode::AtRest)
+            .await
+            .ok()?;
+        let keys = Keys::new(
+            &installed,
+            &self.root.join("data/idoris.sqlite3"),
+            self.data_keys.clone(),
+        )
+        .ok()?
+        .with_timeout(KEY_COMMAND_TIMEOUT);
+        match keys.list(None).await {
+            Ok(list) => {
+                Some(list.iter().any(|key| {
+                    key.key_id == key_id && key.status == crate::keys::KeyStatus::Active
+                }))
+            }
+            Err(_) => {
+                tracing::warn!("could not check the local knowledge base's embed key in iDoris");
+                None
+            }
+        }
+    }
+
+    /// The saved key's id and secret; `None` when there is none to reuse (no
+    /// record, an unreadable one, or the keychain no longer has it).
+    async fn saved_lite_key(&self) -> Result<Option<(String, Zeroizing<String>)>, Code> {
         let saved: LiteEmbedKey = match std::fs::read(self.root.join(LITE_EMBED_KEY_FILE)) {
             Ok(body) => match serde_json::from_slice(&body) {
                 Ok(saved) => saved,
@@ -1432,11 +1498,12 @@ impl IdorisHost {
             Err(_) => return Err(Code::PersistenceFailed),
         };
         let store = self.data_keys.clone();
-        match tokio::task::spawn_blocking(move || store.get(&saved.key_id))
+        let key_id = saved.key_id.clone();
+        match tokio::task::spawn_blocking(move || store.get(&key_id))
             .await
             .map_err(|_| Code::KeyUnavailable)?
         {
-            Ok(secret) => Ok(Some(secret)),
+            Ok(secret) => Ok(Some((saved.key_id, secret))),
             Err(KeychainError::NotFound) => Ok(None),
             Err(e) => Err(keychain_code(e)),
         }
