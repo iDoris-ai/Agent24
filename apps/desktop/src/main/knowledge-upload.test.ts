@@ -126,6 +126,8 @@ function harness(): {
   timers: Timer[]
   queue: { ingest: Step[]; get: Step[]; cancel: Step[] }
   connected: { value: boolean }
+  binding: { value: string }
+  local: { value: boolean }
   credential: { value: string | null }
   kb: { value: string | null }
   hold: { current: Promise<void> | null }
@@ -139,6 +141,8 @@ function harness(): {
   const timers: Timer[] = []
   const queue = { ingest: [] as Step[], get: [] as Step[], cancel: [] as Step[] }
   const connected = { value: true }
+  const binding = { value: 'default#1' }
+  const local = { value: false }
   const credential = { value: CREDENTIAL as string | null }
   const kb = { value: KB as string | null }
   const hold = { current: null as Promise<void> | null }
@@ -176,6 +180,8 @@ function harness(): {
     provider: () =>
       connected.value
         ? {
+            binding: binding.value,
+            local: local.value,
             origin: ORIGIN,
             credential: () => credential.value,
             fetch,
@@ -215,6 +221,8 @@ function harness(): {
     timers,
     queue,
     connected,
+    binding,
+    local,
     credential,
     kb,
     hold,
@@ -248,6 +256,47 @@ describe('knowledge upload (L7-K2 A3)', () => {
     }
     expect(h.calls).toEqual([])
     expect(h.reads).toEqual([])
+  })
+
+  it('Loop 9 3c: the local Lite also takes csv and json, and says plainly it does not take pdf or Word', async () => {
+    const h = harness()
+    h.local.value = true
+    for (const name of ['notes.pdf', 'notes.docx', 'notes.doc']) {
+      const [upload] = await h.uploads.add([`/tmp/${name}`])
+      expect(upload).toMatchObject({ state: 'refused', reason: 'unsupported_format_local', fileName: name })
+    }
+    h.kb.value = null
+    for (const name of ['a.csv', 'b.JSON', 'c.md', 'd.txt']) {
+      put(h, `/tmp/${name}`)
+      const [upload] = await h.uploads.add([`/tmp/${name}`])
+      expect(upload).toMatchObject({ state: 'refused', reason: 'not_connected', fileName: name })
+    }
+    // The remote server keeps its own list.
+    h.local.value = false
+    const [remote] = await h.uploads.add(['/tmp/a.csv'])
+    expect(remote).toMatchObject({ state: 'refused', reason: 'unsupported_format' })
+    expect(h.calls).toEqual([])
+  })
+
+  it('FU-235: after a switch of binding, an upload is no longer asked about with the new key, and says so', async () => {
+    const h = harness()
+    put(h, '/tmp/a.md')
+    put(h, '/tmp/b.md')
+    h.queue.ingest.push({ status: 200, body: saved({ status: 'saved', enrichment: 'none' }) })
+    h.queue.ingest.push({ status: 200, body: saved({ status: 'saved', enrichment: 'none', job_id: 'job-2' }) })
+    await h.uploads.add(['/tmp/a.md'])
+    await h.uploads.add(['/tmp/b.md'])
+    const [first] = h.uploads.list()
+    // Switched (say, remote to the local Lite): another origin and key behind the same slot name.
+    h.binding.value = 'default#2'
+    h.credential.value = 'OTHER_KEY'
+    await h.firePoll()
+    expect(h.uploads.list().map((u) => [u.state, u.reason])).toEqual([['unknown', 'rebound'], ['unknown', 'rebound']])
+    expect(h.calls.filter((c) => !c.url.endsWith('/ingest'))).toEqual([])
+    expect(h.timers.some((timer) => timer.ms === 2_000)).toBe(false)
+    // Cancelling it does not reach the new server either.
+    expect(await h.uploads.cancel(first.uploadId)).toMatchObject({ state: 'unknown', reason: 'rebound' })
+    expect(h.calls.filter((c) => !c.url.endsWith('/ingest'))).toEqual([])
   })
 
   it('accepts md, markdown and txt regardless of case', async () => {

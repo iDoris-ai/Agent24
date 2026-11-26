@@ -291,3 +291,9 @@
 - [ ] FU-268 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 精简版拉起只做主干：两个 App 实例同时拉起时第二个 Lite 因实例锁退出码 3，会被当成失败退避 5 次后放弃；崩溃后刚到 healthy 就再崩的反复循环不限次数；端口被占、数据目录被篡改不处理。
 - [ ] FU-269 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · 精简版日志 `~/.agent24/logs/weknora-lite.log` 只追加，不轮转、不限大小。
 - [ ] FU-270 · C · src=L9-3b KB-LITE-02 · 2026-11-27 · embedding 配置只在每次拉起时读：运行中 iDoris 网关换端口或换 key 后，精简版要重启才能继续导入/向量检索（3c 接 embedding 来源时决定是否订阅 iDoris 状态触发重启）。
+- [ ] FU-271 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 本机档的出处卡没有「打开知识库」：精简版是 headless 制品（无网页前端），知识页打不开，只列「库名·文档名·第 n 段」并可复制。以后用精简版的 read 路由在 App 里做段落预览。
+- [ ] FU-272 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 服务模式（常驻 daemon）下，远端/本机切换以及精简版每次重启换发的新 key 都会让绑定或 C 变化，各要一次在场确认（K1 按 key 哈希记）；App 托管模式不受影响。
+- [ ] FU-273 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 精简版的 embed-only iDoris key 首签后长期复用、无到期：只在钥匙串里找不到时重签，不查 iDoris 里是否已吊销；iDoris 重装换库后旧 key 失效，精简版导入会 401，要手动删 `lite-embed-key.json` 才重签。重连 iDoris 时一并作废、或用 key list 查状态。
+- [ ] FU-274 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 精简版在上传处理中崩溃重启（换发新 key → 绑定变化），进行中的上传卡显示「提交后换了知识库，不再跟进」，而不是用新 key 继续跟进同一实例的作业。
+- [ ] FU-275 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 桌面还没把 weknora-lite 组件状态上报 daemon（#2107 已登记组件名），能力页里这一行一直是 absent/not_reported；本机知识库状态目前只在知识库设置里看。
+- [ ] FU-276 · C · src=L9-3c KB-LITE-02 · 2026-11-27 · 精简版 ingest 白名单（WeKnora `agent24_ingest_format.go`）只有 md/markdown/txt，桌面本机档按 David 定的 md/txt/csv/json 放行，csv/json 目前会被服务端拒（unsupported_format）；待服务端加白名单并重出制品。另：本机档的知识条目提交（candidate.propose）未验证。

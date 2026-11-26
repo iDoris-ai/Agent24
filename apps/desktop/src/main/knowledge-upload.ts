@@ -1,5 +1,8 @@
 // L7-K2 A3 (KB-C4-04 first round): upload md, markdown and txt into the
 // default knowledge base. The path, the bytes, the credential and the URL stay here.
+// Loop 9 3c: the local Lite also takes csv and json (David 11-26: md/txt/csv/json
+// only; anything else is refused there with its own reason). FU-235: an upload
+// is followed only on the binding it was sent to; after a switch it stops.
 
 import { createHash, randomBytes } from 'node:crypto'
 import path from 'node:path'
@@ -7,6 +10,10 @@ import type { KnowledgeUpload } from '../shared/ipc-types'
 
 export interface UploadDeps {
   provider: () => {
+    /** The binding in effect (`viewBinding()`): an upload is followed on its own only. */
+    binding: string
+    /** The local Lite (wider formats). */
+    local?: boolean
     origin: string
     credential: () => string | null
     fetch: (url: string, init: RequestInit) => Promise<Response>
@@ -30,11 +37,14 @@ const INGEST_TIMEOUT_MS = 60_000
 const POLL_TIMEOUT_MS = 15_000
 const POLL_MS = 2_000
 const ALLOWED = new Set(['md', 'markdown', 'txt'])
+const ALLOWED_LOCAL = new Set(['md', 'markdown', 'txt', 'csv', 'json'])
 const JOB_STATUS = new Set(['saved', 'processing', 'indexed', 'failed', 'cancelled'])
 const REASON = /^[a-z_]{1,64}$/
 
 interface Slot {
   upload: KnowledgeUpload
+  /** The binding the upload was sent to; null for one never sent. */
+  binding: string | null
   /** Bumped when a cancel starts, so an older poll cannot overwrite it. */
   epoch: number
   /** Polls spent waiting for the cost of a stopped job to become final; capped at COST_WAIT_POLLS. */
@@ -414,7 +424,16 @@ export function knowledgeUploads(deps: UploadDeps): {
 
   async function processOne(filePath: string): Promise<KnowledgeUpload> {
     const fileName = path.basename(filePath)
-    if (!ALLOWED.has(extensionOf(fileName))) return refuse(fileName, 'unsupported_format')
+    let provider: UploadProvider | null = null
+    try {
+      provider = deps.provider()
+    } catch {
+      provider = null
+    }
+    const local = provider?.local === true
+    if (!(local ? ALLOWED_LOCAL : ALLOWED).has(extensionOf(fileName))) {
+      return refuse(fileName, local ? 'unsupported_format_local' : 'unsupported_format')
+    }
     let info: { size: number; isFile: boolean }
     try {
       info = await deps.stat(filePath)
@@ -423,12 +442,6 @@ export function knowledgeUploads(deps: UploadDeps): {
     }
     if (!info.isFile) return refuse(fileName, 'not_a_file')
     if (info.size > MAX_BYTES) return refuse(fileName, 'too_large')
-    let provider: UploadProvider | null = null
-    try {
-      provider = deps.provider()
-    } catch {
-      provider = null
-    }
     let knowledgeBaseId: string | null = null
     try {
       knowledgeBaseId = deps.knowledgeBaseId()
@@ -444,7 +457,7 @@ export function knowledgeUploads(deps: UploadDeps): {
       return refuse(fileName, 'not_a_file')
     }
     if (bytes.length > MAX_BYTES) return refuse(fileName, 'too_large')
-    const slot: Slot = { upload: fresh(fileName, 'sending', null), epoch: 0 }
+    const slot: Slot = { upload: fresh(fileName, 'sending', null), binding: provider.binding, epoch: 0 }
     slots.push(slot)
     publish()
     try {
@@ -458,9 +471,21 @@ export function knowledgeUploads(deps: UploadDeps): {
 
   function refuse(fileName: string, reason: string): KnowledgeUpload {
     const upload = fresh(fileName, 'refused', reason)
-    slots.push({ upload, epoch: 0 })
+    slots.push({ upload, binding: null, epoch: 0 })
     publish()
     return upload
+  }
+
+  /** FU-235: the binding changed since the upload was sent (another server, the
+   * local Lite, another key). Its job is not this binding's to ask about: it
+   * stops here and says so, and is never asked about with the new key. */
+  function rebound(slot: Slot, provider: UploadProvider): boolean {
+    if (slot.binding === null || slot.binding === provider.binding) return false
+    slot.upload.state = 'unknown'
+    slot.upload.reason = 'rebound'
+    slot.upload.updatedAt = now()
+    publish()
+    return true
   }
 
   async function pollOne(slot: Slot): Promise<void> {
@@ -470,6 +495,7 @@ export function knowledgeUploads(deps: UploadDeps): {
     if (waitingForCost(slot.upload)) slot.costPolls = (slot.costPolls ?? 0) + 1
     const epoch = slot.epoch
     const provider = deps.provider()
+    if (provider && rebound(slot, provider)) return
     const credential = provider?.credential() ?? null
     if (!provider || !credential) return
     const requestId = provider.newRequestId()
@@ -536,6 +562,7 @@ export function knowledgeUploads(deps: UploadDeps): {
     const jobId = slot.upload.jobId
     if (!jobId) return copy(slot.upload)
     const provider = deps.provider()
+    if (provider && rebound(slot, provider)) return copy(slot.upload)
     const credential = provider?.credential() ?? null
     if (!provider || !credential) return copy(slot.upload)
     const epoch = ++slot.epoch
