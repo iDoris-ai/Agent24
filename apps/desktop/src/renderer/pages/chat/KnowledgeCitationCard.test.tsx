@@ -51,6 +51,8 @@ describe('L7-K1: the citation card', () => {
     fireEvent.click(button)
     await waitFor(() => expect(screen.queryByRole('button', { name: '到知识页查看原文' })).toBeNull())
     expect(open).not.toHaveBeenCalled()
+    expect(screen.getByText(/原文就是你在这台电脑上传的文件/)).toBeInTheDocument()
+    expect(screen.queryByText(/请到知识页/)).toBeNull()
     expect(screen.getByRole('button', { name: '复制出处' })).toBeInTheDocument()
   })
 

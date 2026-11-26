@@ -74,7 +74,7 @@ export default function KnowledgeCitationCard({ found, bound: given, names: give
     <div role="group" aria-label={t('title')} className="task-card-knowledge">
       <div>{t('title')}</div>
       <ul>{lines.map((l, i) => <li key={i}>{text(l)}</li>)}</ul>
-      <div>{t('note')}</div>
+      <div>{local ? t('noteLocal') : t('note')}</div>
       {!local && <button type="button" className="btn btn-ghost" onClick={() => void openPage()}>{t('open')}</button>}
       <button type="button" className="btn btn-ghost" onClick={() => void copy()}>{copied ? t('copied') : t('copy')}</button>
     </div>
