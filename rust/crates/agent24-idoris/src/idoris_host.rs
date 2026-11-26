@@ -565,6 +565,14 @@ impl Runtime for SystemRuntime {
         })
     }
 }
+/// A generation that stopped by itself is started again only if it had run at
+/// least this long (FU-254), so a binary that exits at once does not loop.
+const AUTO_RESTART_MIN_UPTIME: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(60)
+};
+
 struct Inner {
     installation: Option<Installation>,
     state: State,
@@ -924,12 +932,29 @@ impl IdorisHost {
         action: Action,
         idempotency: Option<&str>,
     ) -> Result<Operation, Code> {
+        self.submit_checked(action, idempotency, false).await
+    }
+    /// `restart_if_wanted`: an automatic restart (FU-254) is admitted only if,
+    /// under the same lock that admits it, nothing is running and the user still
+    /// wants iDoris running, so a Stop that won the race is not undone.
+    async fn submit_checked(
+        self: &Arc<Self>,
+        action: Action,
+        idempotency: Option<&str>,
+        restart_if_wanted: bool,
+    ) -> Result<Operation, Code> {
         if !matches!(action, Action::Start | Action::Stop) {
             return Err(Code::InvalidRequest);
         }
         let mut i = self.inner.lock().await;
         if i.closing {
             return Err(Code::ShuttingDown);
+        }
+        if restart_if_wanted
+            && (i.supervisor.is_some()
+                || !i.installation.as_ref().is_some_and(|r| r.desired_running))
+        {
+            return Err(Code::Cancelled);
         }
         let key = idempotency
             .map(str::to_owned)
@@ -1333,6 +1358,7 @@ impl IdorisHost {
         refresh_failure: Arc<SyncMutex<Option<Code>>>,
     ) {
         let host = Arc::downgrade(self);
+        let born = tokio::time::Instant::now();
         tokio::spawn(async move {
             loop {
                 let changed = signal.changed().await;
@@ -1375,6 +1401,26 @@ impl IdorisHost {
                                 Some(_) => State::Failed,
                                 None => State::Stopped,
                             };
+                            // FU-254: iDoris stopped by itself (orphan expiry, exit 4,
+                            // or an unannounced clean exit) while the user still wants
+                            // it running. Start it again in the background, unless it
+                            // stopped soon after starting: that would only loop.
+                            let wanted = error.is_none()
+                                && i.installation.as_ref().is_some_and(|r| r.desired_running);
+                            drop(i);
+                            if wanted && born.elapsed() >= AUTO_RESTART_MIN_UPTIME {
+                                tracing::warn!("iDoris stopped by itself; starting it again");
+                                let key = format!("auto-restart-{}", uuid::Uuid::new_v4().simple());
+                                if let Err(code) =
+                                    host.submit_checked(Action::Start, Some(&key), true).await
+                                {
+                                    tracing::warn!(?code, "iDoris automatic restart not admitted");
+                                }
+                            } else if wanted {
+                                tracing::warn!(
+                                    "iDoris stopped soon after starting; not restarting it"
+                                );
+                            }
                         }
                         return;
                     }
