@@ -103,7 +103,7 @@ if mode == 'worker_then_crash_before_ready':
 
 instance_id = str(uuid.uuid4())
 health = {
-    'status': 'ok', 'service': 'idoris', 'version': '0.6.0',
+    'status': 'ok', 'service': 'idoris', 'version': '0.6.1',
     'phase': 'ready', 'ready': True,
     'upstreams': [{'id': 'fixture-upstream', 'engine_kind': 'omlx', 'state': 'ready',
                    'managed': False, 'owned': False}],
@@ -171,7 +171,7 @@ record = {
     'instance_nonce': os.urandom(32).hex(), 'instance_id': instance_id,
     'data_port': server.server_port,
     'admin_port': scenario.get('discovery_admin_port', admin.server_port),
-    'started_at_ms': int(time.time() * 1000), 'version': '0.6.0',
+    'started_at_ms': int(time.time() * 1000), 'version': '0.6.1',
     'contract_version': '1.3.0',
     'launch': {'db_path': os.environ['IDORIS_DB_PATH'], 'state_dir': str(state),
                'components_dir': str(root), 'allocated_budget_bytes': int(report['budget'])},

@@ -203,7 +203,7 @@ impl Fixture {
         let record = Installation {
             omlx_setup: None,
             connection: None,
-            version: "0.6.0".into(),
+            version: "0.6.1".into(),
             release_dir: root.join("release"),
             archive_path,
             components_dir: Some(root.join("components")),
