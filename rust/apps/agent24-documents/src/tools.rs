@@ -855,8 +855,12 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
             // and a wrong one would come with the App's authority: it is
             // asked, always. Its label is still read, for the layout and
             // for a second person's sign.
-            if crate::form::field_kind(&name) == crate::form::FieldKind::Identity {
-                identity.push(name);
+            // R0 一致裁决 (监工 11-26): and only an allowlisted safe text
+            // field comes from the material; any other spelling is asked.
+            if !crate::form::from_material(&name) {
+                if crate::form::field_kind(&name) != crate::form::FieldKind::Manual {
+                    identity.push(name);
+                }
                 continue;
             }
             match crate::form::from_source(&name, &read) {
@@ -902,7 +906,7 @@ async fn fields(state: &AppState, accepted: Accepted, arguments: Map<String, Val
     }
     if !identity.is_empty() {
         note.push_str(&format!(
-            "身份类字段不从资料里取，要逐项问用户：{}。用户亲口给的值放进 values，字段名放进 user_said；不要自己编，也不要从资料里抄。",
+            "这些字段不从资料取，要问用户：{}。用户亲口给的值放进 values，字段名放进 user_said；不要自己编，也不要从资料里抄。",
             identity.join("、")
         ));
     }
@@ -2479,8 +2483,7 @@ mod tests {
         );
         assert_eq!(answer["source_document_id"], a);
         assert!(answer["message"].as_str().unwrap().contains("第 2 版"));
-        let fill =
-            json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" } });
+        let fill = json!({ "document_id": b, "save_to": "original", "values": { "押金": "17,000" }, "user_said": ["押金"] });
         let filled = payload(&call_in(&state, "fill", &[b], fill).await);
         assert_eq!(
             (&filled["saved_as"], &filled["revision"]),

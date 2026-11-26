@@ -148,7 +148,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fields
-    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Each field has a kind: identity (name, ID number, phone, address, bank card: fill only from the user's own material or what the user said; never make one up — ask), manual (signature, photo, checkbox, attachment: never fill, tell the user to do it by hand), text. With source_document_id (the user's own material), each text field the material states by label (「部门：产品研发部」, or a label cell beside its value) has that value as from_source: pass those values to documents.fill as they are, with the same source_document_id; do not read the material yourself. An identity field never has from_source, even when the material shows one: ask the user for it, and put what they say in user_said. Read-only, local."
+    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Each field has a kind: identity (name, ID number, phone, address, bank card: never taken from the material, only from what the user said, with its name in user_said; never make one up — ask), manual (signature, photo, checkbox, attachment: never fill, tell the user to do it by hand), text. With source_document_id (the user's own material), only the safe job fields of a form (department, position, title, entry date, education, major, school and the like) the material states by label (「部门：产品研发部」, or a label cell beside its value) have that value as from_source: pass those values to documents.fill as they are, with the same source_document_id; do not read the material yourself. Every other field never has from_source, even when the material shows one: ask the user for it, and put what they say in user_said. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
@@ -162,7 +162,7 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fill
-    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. An identity field is written only when the user said it in the conversation (its name is in user_said); never make one up, and never copy one from the material. Ask the user for each name in ask_user, tell them to handle manual by hand, and list unfilled. written is false when nothing was written and no document was generated. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. Only the safe job fields of a form (department, position, title, entry date, education, major, school and the like) are written as given; every other field (identity, and any field not among them) is written only when the user said it in the conversation (its name is in user_said), otherwise it comes back in ask_user; never make a value up, and never copy one from the material. Ask the user for each name in ask_user, tell them to handle manual by hand, and list unfilled. written is false when nothing was written and no document was generated. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
     input_schema:
       type: object
       additionalProperties: false
@@ -174,7 +174,7 @@ tools:
           minProperties: 1
           maxProperties: 200
           additionalProperties: { type: string }
-        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; an identity value is filled only when this document's text contains it" }
+        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; only the safe job fields come back as from_source from documents.fields; any other value is never taken from it, only from user_said" }
         user_said:
           type: array
           maxItems: 200

@@ -30,6 +30,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 similar = "2"
+# L8-S02 (R0 一致裁决): a field label is matched to the allowlist of safe
+# text fields after NFKC, without format (Cf) characters.
+unicode-general-category = "1.1"
+unicode-normalization = "0.1"
 
 [dev-dependencies]
 # The kernel's own manifest validator, so the test proves the daemon would accept domain-os.yml.

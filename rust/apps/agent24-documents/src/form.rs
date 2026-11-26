@@ -1,6 +1,8 @@
 //! L8-S02: a template field's kind, and which values a fill may write.
-//! Identity is written only from the user's material or their own words:
-//! a model must not invent a name, a phone number or an address.
+//! The material gives `from_source` only for text fields; an identity value
+//! is never taken from the material, only from what the user said
+//! (`user_said`): a model must not invent or copy a name, a phone number or
+//! an address.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -112,6 +114,60 @@ pub fn field_kind(name: &str) -> FieldKind {
     }
 }
 
+/// Safe text fields of a form (R0 一致裁决, 监工 11-26): an HR form's facts
+/// about the job, never about a person's identity or contact. Only these
+/// come from the material (`from_source`) and are written without
+/// `user_said`; any other field, whatever its spelling, is asked.
+const SAFE_TEXT: &[&str] = &[
+    "部门",
+    "所属部门",
+    "部门名称",
+    "入职部门",
+    "岗位",
+    "岗位名称",
+    "职位",
+    "职务",
+    "职级",
+    "职称",
+    "入职日期",
+    "入职时间",
+    "到岗日期",
+    "报到日期",
+    "试用期",
+    "合同期限",
+    "工作地点",
+    "用工形式",
+    "学历",
+    "最高学历",
+    "学位",
+    "专业",
+    "所学专业",
+    "毕业院校",
+    "毕业学校",
+    "毕业时间",
+    "毕业日期",
+];
+
+/// A label as the allowlist is matched: whitespace and a trailing colon out
+/// (`label_key`), NFKC (「ＱＱ」→「QQ」), lower case, and no format character
+/// (Cf: a zero-width space in 「姓\u{200b}名」).
+fn safe_key(name: &str) -> String {
+    use unicode_general_category::{GeneralCategory, get_general_category};
+    use unicode_normalization::UnicodeNormalization;
+    let k: String = label_key(name).nfkc().collect();
+    label_key(&k)
+        .to_lowercase()
+        .chars()
+        .filter(|c| get_general_category(*c) != GeneralCategory::Format)
+        .collect()
+}
+
+/// The field is on the allowlist of safe text fields: read from the user's
+/// material, and written without `user_said`.
+pub(crate) fn from_material(name: &str) -> bool {
+    field_kind(name) == FieldKind::Text && SAFE_TEXT.contains(&safe_key(name).as_str())
+}
+
 /// What a fill will write, and what it tells the model to pass on.
 pub(crate) struct FillReport {
     pub(crate) write: BTreeMap<String, String>,
@@ -122,9 +178,11 @@ pub(crate) struct FillReport {
     pub(crate) note: String,
 }
 
-/// An identity value is written only when the user said it (`user_said`);
-/// never because it occurs in the material (r11 B2, 方案 B). A name the
-/// template does not have stays in `write`, so fill still refuses it.
+/// A field on the safe allowlist ([`from_material`]) is written as given;
+/// any other (identity, or a spelling not on the list) only when the user
+/// said it (`user_said`), never because it occurs in the material (r11 B2,
+/// R0 一致裁决). A name the template does not have stays in `write`, so fill
+/// still refuses it.
 pub(crate) fn plan_fill(
     fields: &[(String, FieldKind)],
     values: &BTreeMap<String, String>,
@@ -141,15 +199,8 @@ pub(crate) fn plan_fill(
         if value.trim().is_empty() {
             continue;
         }
-        match field_kind(name) {
-            FieldKind::Manual => {}
-            FieldKind::Identity if said(name) => {
-                write.insert(name.clone(), value.clone());
-            }
-            FieldKind::Identity => {}
-            FieldKind::Text => {
-                write.insert(name.clone(), value.clone());
-            }
+        if field_kind(name) != FieldKind::Manual && (from_material(name) || said(name)) {
+            write.insert(name.clone(), value.clone());
         }
     }
     let written: HashSet<&str> = write.keys().map(String::as_str).collect();
@@ -158,14 +209,15 @@ pub(crate) fn plan_fill(
     let mut manual = Vec::new();
     let mut unfilled = Vec::new();
     for (name, kind) in fields {
+        let given = values.get(name).map(|v| !v.trim().is_empty());
         match kind {
             FieldKind::Manual => manual.push(name.clone()),
-            FieldKind::Identity if written.contains(name.as_str()) => filled.push(name.clone()),
-            FieldKind::Identity if values.get(name).is_some_and(|v| v.trim().is_empty()) => {
-                unfilled.push(name.clone());
-            }
+            _ if written.contains(name.as_str()) => filled.push(name.clone()),
+            // 「先空着」.
+            _ if given == Some(false) => unfilled.push(name.clone()),
             FieldKind::Identity => ask_user.push(name.clone()),
-            FieldKind::Text if written.contains(name.as_str()) => filled.push(name.clone()),
+            // A value the user did not say, for a field not on the list.
+            FieldKind::Text if given == Some(true) => ask_user.push(name.clone()),
             FieldKind::Text => unfilled.push(name.clone()),
         }
     }
@@ -195,7 +247,7 @@ pub(crate) fn fill_note(
         ));
     }
     if !ask.is_empty() {
-        s.push_str(&format!("身份类要问用户：{}。", ask.join("、")));
+        s.push_str(&format!("要问用户：{}。", ask.join("、")));
     }
     if !manual.is_empty() {
         s.push_str(&format!("需要你手工处理：{}。", manual.join("、")));
@@ -203,7 +255,7 @@ pub(crate) fn fill_note(
     if !unfilled.is_empty() {
         s.push_str(&format!("还没填：{}。", unfilled.join("、")));
     }
-    s.push_str("身份类信息只能用用户亲口说的，不要自己补，也不要从资料里抄。");
+    s.push_str("身份类和不在常见岗位字段里的值只能用用户亲口说的（字段名放进 user_said），不要自己补，也不要从资料里抄。");
     s
 }
 

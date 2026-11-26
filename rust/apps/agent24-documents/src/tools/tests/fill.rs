@@ -112,7 +112,7 @@ fn values() -> Value {
 async fn fill_writes_only_text_and_identity_the_user_said() {
     let (_dir, state) = opened().await;
     let template = docx(&["{{姓名}}{{电话}}{{部门}}{{本人签名}}{{紧急联系人}}"]);
-    // The name is split by a space: matching ignores whitespace.
+    // The material has the name; it is still not the user's word.
     let source = docx(&["入职资料 姓名：张 三"]);
     put_docx(&state, TPL, "入职表.docx", &template).await;
     put_docx(&state, SRC, "个人资料.docx", &source).await;
@@ -398,7 +398,7 @@ async fn fields_with_the_material_give_its_values_and_fill_writes_them() {
         "{note}"
     );
     assert!(
-        note.contains("身份类字段不从资料里取，要逐项问用户：姓名、联系电话、身份证号、紧急联系人"),
+        note.contains("这些字段不从资料取，要问用户：姓名、联系电话、身份证号、紧急联系人"),
         "{note}"
     );
     // Without the material, `fields` answers as before.
@@ -1480,7 +1480,9 @@ async fn a_spaced_identity_field_is_never_from_the_material() {
         )
         .await,
     );
-    for f in listed["fields"].as_array().unwrap() {
+    let fields = listed["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 3, "{listed}");
+    for f in fields {
         let name = f["name"].as_str().unwrap();
         if name == "部门" {
             assert_eq!(f["from_source"], json!("研发"), "{listed}");
@@ -1489,4 +1491,85 @@ async fn a_spaced_identity_field_is_never_from_the_material() {
             assert!(f.get("from_source").is_none(), "{listed}");
         }
     }
+}
+
+/// R0 一致裁决 (监工 11-26, decisions/2026-11-26-s02-from-source-allowlist):
+/// only fields on an allowlist of safe text fields come from the material
+/// (label_key, NFKC, lower case, no Cf), and only they are written without
+/// user_said. Any other spelling (「P h o n e」「ＱＱ」「WeChat」「居住地」
+/// 「姓\u{200b}名」) is asked: this ends the bypasses by spelling.
+#[tokio::test]
+async fn only_allowlisted_fields_come_from_the_material_or_are_written_unsaid() {
+    let (_dir, state) = opened().await;
+    let template = docx(&[
+        "{{部门}}{{所属部门}}{{入职日期}}{{P h o n e}}{{ＱＱ}}{{WeChat}}{{居住地}}{{姓\u{200b}名}}",
+    ]);
+    let source = docx(&[
+        "个人信息",
+        "部门：研发",
+        "入职日期：2026年12月1日",
+        "所属部门：研发",
+        "P h o n e：13900000000",
+        "ＱＱ：12345",
+        "WeChat：wx1",
+        "居住地：北京",
+        "姓\u{200b}名：陈晓明",
+    ]);
+    put_docx(&state, TPL, "表.docx", &template).await;
+    put_docx(&state, SRC, "个人信息.docx", &source).await;
+    let listed = payload(
+        &call(
+            &state,
+            "fields",
+            json!({ "document_id": TPL, "source_document_id": SRC }),
+        )
+        .await,
+    );
+    let fields = listed["fields"].as_array().unwrap();
+    assert_eq!(fields.len(), 8, "{listed}");
+    let safe = ["部门", "所属部门", "入职日期"];
+    for f in fields {
+        let name = f["name"].as_str().unwrap();
+        if safe.contains(&name) {
+            assert!(f.get("from_source").is_some(), "{name}: {listed}");
+        } else {
+            assert!(f.get("from_source").is_none(), "{name}: {listed}");
+        }
+    }
+    let note = listed["note"].as_str().unwrap();
+    assert!(note.contains("不从资料取，要问用户"), "{note}");
+    assert!(
+        note.contains("居住地") && !note.contains("资料里没有"),
+        "{note}"
+    );
+
+    let values = json!({
+        "部门": "研发",
+        "所属部门": "研发",
+        "入职日期": "2026年12月1日",
+        "P h o n e": "13900000000",
+        "ＱＱ": "12345",
+        "WeChat": "wx1",
+        "居住地": "北京",
+        "姓\u{200b}名": "陈晓明",
+    });
+    let answer = payload(
+        &call(
+            &state,
+            "fill",
+            json!({ "document_id": TPL, "source_document_id": SRC, "values": values }),
+        )
+        .await,
+    );
+    assert_eq!(strings(&answer["filled"]), safe, "{answer}");
+    assert_eq!(
+        strings(&answer["ask_user"]),
+        ["P h o n e", "ＱＱ", "WeChat", "居住地", "姓\u{200b}名"],
+        "{answer}"
+    );
+    let text = head_text(&state, answer["result"]["document_id"].as_str().unwrap()).await;
+    assert!(
+        !text.contains("13900000000") && !text.contains("北京"),
+        "{text}"
+    );
 }
