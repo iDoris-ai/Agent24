@@ -221,8 +221,10 @@ const SHAPES = [
   /^(?:请|我的|这个)?资料(?:在|是)《([^》]{1,200})》(?:里|中)?$/,
   /^用《([^》]{1,200})》(?:里|中)的资料(?:来)?(?:填)?$/,
 ]
-/** r4 E2: a turn with any of these names no earlier material either. */
-const TAKE_BACK = /资料|那份|这份|上份|《|》|不|别|没|勿|无需|莫|非|忽略|改用|换|撤|算了/
+/** r4 E2: a turn with any of these names no earlier material either. Not a
+ * word of no (监工: 「没有其他了，…直接生成吧」 is the turn a fill is confirmed in;
+ * a material it takes back unnamed has the Rust check behind it). */
+const TAKE_BACK = /资料|那份|这份|上份|《|》/
 /** Another clause about a material (「这份别用」「改用…的资料」). */
 const OTHER_MATERIAL = /资料|那份|这份|上份/
 

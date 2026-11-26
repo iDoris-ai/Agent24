@@ -494,6 +494,8 @@ describe('监工 0.7.123: the material a form fill was told', () => {
       expect(formMaterial([], no)).toBeNull()
     }
     expect(formMaterial(['资料是《李四.docx》'], '那份不用了')).toBeNull()
+    // 监工: the confirming turn keeps the material its fill was asked with.
+    expect(formMaterial(['把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里'], '没有其他了，紧急联系人留空，签名我自己手写，直接生成吧')).toBe('个人信息.docx')
     expect(formMaterial([], '资料是《莫小明.docx》')).toBe('莫小明.docx')
     expect(formMaterial([], '资料在《个人信息.docx》里，部门没有的先空着')).toBe('个人信息.docx')
     expect(formMaterial([], '把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
