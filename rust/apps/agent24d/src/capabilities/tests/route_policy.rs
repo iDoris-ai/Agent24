@@ -238,6 +238,8 @@ fn section_3_rows_match_operation_and_level() {
     for (method, path, operation) in [
         ("GET", "/components", "ComponentsRead"),
         ("POST", "/components/{id}/report", "ComponentsReport"),
+        // Loop 9 3c: host-only at the route, like the report.
+        ("POST", "/idoris/lite-embedding", "IdorisLiteEmbedding"),
     ] {
         fixed.push(DesignRow {
             method: method.into(),

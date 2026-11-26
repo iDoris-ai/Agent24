@@ -519,6 +519,60 @@ describe('ChatPage with Knowledge', () => {
     expect(prompts).toEqual([])
   })
 
+  it('keeps the material when the answer to 「要填的是哪一份？」 is a title with 模板 in it (0.7.125)', async () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    const I = 'doc_01M679KMY6D75P0EZACBS95JYI'
+    const T = 'doc_01M679KMY6D75P0EZACBS95JYT'
+    const docs = [
+      { document_id: I, title: '个人信息.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: T, title: '入职登记表模板.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYU', title: '入职登记表模板（2026版）.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+    ]
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { document_id: req.documentId, revision: 1, fields: req.documentId === I ? [] : [{ name: '部门', count: 1 }] } })
+    const agentAccess = vi.fn().mockResolvedValue({ enabled: true, until: '2026-12-23T00:00:00.000Z', ok: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request, agentAccess } },
+      writable: true,
+      configurable: true,
+    })
+    const prompts: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        prompts.push(req.body?.prompt ?? '')
+        return { ok: true, status: 201, data: { id: 'r_fill' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '请告诉我姓名' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把这张入职登记表填一下，资料在《个人信息.docx》里' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/要填的是哪一份？/, {}, { timeout: 3000 })
+    expect(prompts).toEqual([])
+    fireEvent.change(textarea, { target: { value: '《入职登记表模板.docx》' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain(`这次要填的模板是《入职登记表模板.docx》，document_id=${T}`)
+    expect(prompts[0]).toContain(`source_document_id=${I}`)
+  })
+
+  it('lets a paragraph delete after a PDF form answer go to the documents tools (#2113 C1)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '把《个人信息.docx》第3段删掉' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('documents.patch')
+    expect(prompts[0]).toContain('删掉文档里的某一段是改写')
+  })
+
   it('lets a delete after a PDF form answer go to the documents tools (C1)', async () => {
     const { prompts } = formLibrary()
     render(<ChatPage />)

@@ -6,13 +6,13 @@
 
 use std::time::Instant;
 
-use super::binding::{Leave, WithRule};
+use super::binding::{Leave, Sidecar, WithRule};
 use super::connection::{Connection, Round};
 use super::credential::{Credentials, Effects, Issuance, Issued, Outcome};
 use super::evidence::Rule;
 use super::gate::{CallId, Gate};
 use super::placeholder::{Attempt, Attempted, Placeholder, Settled};
-use super::profile::{IdentityChange, Profile, Slot};
+use super::profile::{IdentityChange, Profile, Retried, Slot};
 use super::record::{Change, Ids, Of, StuckCause};
 use super::state::{ConnectionPhase, PlaceholderFailure, Switches};
 
@@ -206,6 +206,53 @@ impl<I: Ids> Member<I> {
             }
             _ => false,
         }
+    }
+
+    /// S2.2 for a local-managed profile, as [`Profile::sidecar`] under the
+    /// host's Off and this profile's disabled flag.
+    pub fn sidecar(&mut self, sidecar: Sidecar, off: bool) -> Option<Retried> {
+        let switches = Switches {
+            off,
+            profile_disabled: self.disabled,
+        };
+        self.profile.sidecar(sidecar, switches)
+    }
+
+    /// A revocation signal from outside a response on this member's binding
+    /// (a local-managed rotation of the instance secret, S2.1, S5.4), with
+    /// what it persists into `left` as [`Member::issued`] does. False without
+    /// a binding.
+    pub fn revoke(&mut self, now: Instant, left: &mut Left<I>) -> bool {
+        let Some(of) = self.of() else {
+            return false;
+        };
+        let Slot::Bound(state) = self.profile.slot_mut() else {
+            return false;
+        };
+        let revoked = state.credentials().revoked_before();
+        let phase = state.connection().phase();
+        let WithRule {
+            value: outcome,
+            rule,
+        } = state.revoke(now);
+        let Outcome::Done(effects) = outcome else {
+            return false;
+        };
+        record(of.clone(), effects, rule, left);
+        let after = state.connection().phase();
+        if let Some(ConnectionPhase::Unavailable(cause)) = after
+            && after != phase
+            && let Ok(stuck) = StuckCause::try_from(cause)
+        {
+            left.changes.push(Change::Stuck {
+                of: of.clone(),
+                cause: stuck,
+            });
+        }
+        if !revoked && state.credentials().revoked_before() {
+            left.changes.push(Change::Revoked(of));
+        }
+        true
     }
 
     /// Whether the placeholder still creates `attempt`'s binding.

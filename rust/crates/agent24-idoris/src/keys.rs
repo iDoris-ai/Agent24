@@ -104,6 +104,14 @@ struct Operation {
     pending_key_ids: Vec<String>,
 }
 
+/// What a key may call: the data key always has `daily` (plus `deep`/`embed`
+/// when asked); the Lite's key has `embed` alone.
+#[derive(Clone, Copy)]
+enum Roles<'a> {
+    Data(&'a [&'a str]),
+    EmbedOnly,
+}
+
 pub struct Keys {
     binary: PathBuf,
     db_path: PathBuf,
@@ -171,7 +179,16 @@ impl Keys {
     }
 
     pub async fn issue(&self, install_id: &str, roles: &[&str]) -> Result<IssuedKey, KeyError> {
-        self.issue_transaction(install_id, roles, false).await
+        self.issue_transaction(install_id, Roles::Data(roles), false)
+            .await
+    }
+
+    /// Loop 9 3c: a key that may call the `embed` role only (no `daily`), for the
+    /// local WeKnora Lite's indexing. Same journal, keychain and compensation as
+    /// [`Self::issue`]; only the role set differs.
+    pub async fn issue_embed_only(&self, install_id: &str) -> Result<IssuedKey, KeyError> {
+        self.issue_transaction(install_id, Roles::EmbedOnly, false)
+            .await
     }
 
     /// Keep the compensation journal until the host has committed the connection.
@@ -180,7 +197,8 @@ impl Keys {
         install_id: &str,
         roles: &[&str],
     ) -> Result<IssuedKey, KeyError> {
-        self.issue_transaction(install_id, roles, true).await
+        self.issue_transaction(install_id, Roles::Data(roles), true)
+            .await
     }
 
     pub fn commit_issue(&self) -> Result<(), KeyError> {
@@ -191,7 +209,7 @@ impl Keys {
     async fn issue_transaction(
         &self,
         install_id: &str,
-        roles: &[&str],
+        roles: Roles<'_>,
         retain: bool,
     ) -> Result<IssuedKey, KeyError> {
         let _lock = self.operation_lock()?;
@@ -204,9 +222,9 @@ impl Keys {
             || !install_id
                 .bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"-_".contains(&b))
-            || roles
+            || matches!(roles, Roles::Data(roles) if roles
                 .iter()
-                .any(|role| !matches!(*role, "daily" | "deep" | "embed"))
+                .any(|role| !matches!(*role, "daily" | "deep" | "embed")))
         {
             return Err(KeyError::InvalidRequest);
         }
@@ -241,15 +259,21 @@ impl Keys {
     async fn issue_inner(
         &self,
         operation: &mut Operation,
-        roles: &[&str],
+        roles: Roles<'_>,
     ) -> Result<IssuedKey, KeyError> {
-        let mut allowed_roles = vec!["daily"];
-        if roles.contains(&"deep") {
-            allowed_roles.push("deep");
-        }
-        if roles.contains(&"embed") {
-            allowed_roles.push("embed");
-        }
+        let allowed_roles = match roles {
+            Roles::EmbedOnly => vec!["embed"],
+            Roles::Data(roles) => {
+                let mut allowed = vec!["daily"];
+                if roles.contains(&"deep") {
+                    allowed.push("deep");
+                }
+                if roles.contains(&"embed") {
+                    allowed.push("embed");
+                }
+                allowed
+            }
+        };
         let spec = serde_json::to_vec(&serde_json::json!({
             "owner": operation.owner,
             "allowed_privacy": ["local_only"],

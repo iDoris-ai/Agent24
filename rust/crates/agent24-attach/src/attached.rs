@@ -160,8 +160,14 @@ pub fn is_reserved_kernel_segment(name: &str) -> bool {
 /// `component_routes::attach_items` drops same-named entries from registrations
 /// that predate the rule. Pinned by `a_builtin_component_id_cannot_be_attached`.
 /// Single definition — `component_routes` re-exports it.
-pub const BUILTIN_COMPONENT_IDS: &[&str] =
-    &["idoris", "hyphae", "documents", "knowledge", "open-design"];
+pub const BUILTIN_COMPONENT_IDS: &[&str] = &[
+    "idoris",
+    "hyphae",
+    "documents",
+    "knowledge",
+    "open-design",
+    "weknora-lite",
+];
 
 /// Parse and validate a submitted `domain-os.yml` as an ATTACHED manifest
 /// (§3.1): full `agent24_domain::DomainOsManifest` validation (A3-1 added
@@ -1212,7 +1218,14 @@ mod tests {
         // deliberate edit of both.
         assert_eq!(
             BUILTIN_COMPONENT_IDS,
-            ["idoris", "hyphae", "documents", "knowledge", "open-design"]
+            [
+                "idoris",
+                "hyphae",
+                "documents",
+                "knowledge",
+                "open-design",
+                "weknora-lite"
+            ]
         );
         for name in BUILTIN_COMPONENT_IDS {
             let dir = tmp();
