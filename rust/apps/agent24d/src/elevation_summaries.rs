@@ -116,6 +116,7 @@ pub async fn derive(
             let model = crate::default_model::validate_model_id(&parsed.model).ok()?;
             format!("把默认聊天模型改为 {}", shown(&model)?)
         }
+        (_, t) if t.starts_with("/api/v1/comm/") => comm(method, template, path, body)?,
         _ => return None,
     };
     // The length is checked where it is authoritative: `remember` on the
@@ -491,10 +492,176 @@ async fn schedule_name(state: &AppState, id: &str) -> Option<String> {
     ))
 }
 
+/// A Hyphae write from `COMM_DERIVED_ROUTES`. Names, npubs, ids and relay
+/// URLs are shown as `shown` quotes them; a message body never is, only its
+/// length in characters.
+fn comm(method: &str, template: &str, path: &str, body: &[u8]) -> Option<String> {
+    let object = || -> Option<Map<String, Value>> {
+        if body.is_empty() {
+            return Some(Map::new());
+        }
+        match serde_json::from_slice(body).ok()? {
+            Value::Object(map) => Some(map),
+            _ => None,
+        }
+    };
+    let field =
+        |map: &Map<String, Value>, key: &str| -> Option<String> { shown(map.get(key)?.as_str()?) };
+    let text = match (method, template) {
+        ("POST", "/api/v1/comm/identity") => {
+            format!("创建通信身份 {}", field(&object()?, "nickname")?)
+        }
+        ("POST", "/api/v1/comm/identity/default") => {
+            format!("把默认通信身份设为 {}", field(&object()?, "nickname")?)
+        }
+        ("POST", "/api/v1/comm/contact") => {
+            let map = object()?;
+            format!(
+                "添加联系人 {}（{}）",
+                field(&map, "nickname")?,
+                field(&map, "npub")?
+            )
+        }
+        ("PATCH", "/api/v1/comm/contact/{name}") => format!(
+            "把联系人 {} 改名为 {}",
+            decoded_segment(path)?,
+            field(&object()?, "nickname")?
+        ),
+        ("DELETE", "/api/v1/comm/contact/{name}") => {
+            format!("删除联系人 {}（保留聊天记录）", decoded_segment(path)?)
+        }
+        ("PUT", "/api/v1/comm/relay") => {
+            let relays = object()?.get("relays")?.as_array()?.clone();
+            if relays.is_empty() {
+                return None;
+            }
+            let shown_relays = relays
+                .iter()
+                .map(|r| shown(r.as_str()?))
+                .collect::<Option<Vec<_>>>()?;
+            format!("把通信中继改为 {}", shown_relays.join(", "))
+        }
+        ("POST", "/api/v1/comm/relay/probe") => match object()?.get("url") {
+            None | Some(Value::Null) => "检测当前通信中继是否可连".to_owned(),
+            Some(url) => format!("检测通信中继 {} 是否可连", shown(url.as_str()?)?),
+        },
+        ("POST", "/api/v1/comm/daemon/start") => "启动 Hyphae 通信后台".to_owned(),
+        ("POST", "/api/v1/comm/daemon/stop") => "停止 Hyphae 通信后台".to_owned(),
+        ("POST", "/api/v1/comm/send") => {
+            let map = object()?;
+            let content = map.get("content")?.as_str()?;
+            format!(
+                "给 {} 发送一条 {} 字的消息",
+                field(&map, "to")?,
+                content.chars().count()
+            )
+        }
+        ("POST", "/api/v1/comm/outbox/{event_id}/retry") => {
+            format!("重发一条未送达的消息 {}", shown(last_segment(path)?)?)
+        }
+        ("POST", "/api/v1/comm/groupchat") => {
+            let map = object()?;
+            let invitees = map.get("invitees")?.as_array()?;
+            format!(
+                "创建群聊 {} 并邀请 {} 人",
+                field(&map, "name")?,
+                invitees.len()
+            )
+        }
+        ("POST", "/api/v1/comm/groupchat/{group_id}/messages") => {
+            let map = object()?;
+            let content = map.get("body")?.as_str()?;
+            format!(
+                "在群 {} 发送一条 {} 字的消息",
+                shown(segment_before(path, "messages")?)?,
+                content.chars().count()
+            )
+        }
+        ("POST", "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry") => {
+            object()?;
+            format!(
+                "重试群消息 {} 的失败收件人",
+                shown(segment_before(path, "retry")?)?
+            )
+        }
+        ("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept") => {
+            object()?;
+            format!("接受群邀请 {}", shown(segment_before(path, "accept")?)?)
+        }
+        _ => return None,
+    };
+    Some(text)
+}
+
+/// The last path segment percent-decoded as axum's `Path` decodes it, so a
+/// contact nickname in any script reads as the handler will see it.
+fn decoded_segment(path: &str) -> Option<String> {
+    let raw = path.rsplit('/').next()?;
+    let name = percent_encoding::percent_decode_str(raw)
+        .decode_utf8()
+        .ok()?;
+    if name.is_empty() {
+        return None;
+    }
+    shown(&name)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
+
+    #[test]
+    fn comm_writes_have_summaries_that_hide_message_bodies() {
+        let send = comm(
+            "POST",
+            "/api/v1/comm/send",
+            "/api/v1/comm/send",
+            br#"{"to":"bob","content":"secret plan"}"#,
+        )
+        .unwrap();
+        assert!(send.contains("\"bob\"") && send.contains("11"), "{send}");
+        assert!(!send.contains("secret"), "{send}");
+        let rename = comm(
+            "PATCH",
+            "/api/v1/comm/contact/{name}",
+            "/api/v1/comm/contact/%E5%B0%8F%E6%98%8E",
+            br#"{"nickname":"Ming"}"#,
+        )
+        .unwrap();
+        assert!(
+            rename.contains("\"小明\"") && rename.contains("\"Ming\""),
+            "{rename}"
+        );
+        let group = comm(
+            "POST",
+            "/api/v1/comm/groupchat/{group_id}/messages",
+            "/api/v1/comm/groupchat/00112233445566778899aabbccddeeff/messages",
+            br#"{"body":"hi\nall","logical_id":"00112233445566778899aabbccddeeff"}"#,
+        )
+        .unwrap();
+        assert!(!group.contains("hi"), "{group}");
+        assert!(
+            comm(
+                "POST",
+                "/api/v1/comm/daemon/start",
+                "/api/v1/comm/daemon/start",
+                b""
+            )
+            .is_some()
+        );
+        // A body the handler would refuse, or a hidden character, leaves no text.
+        assert!(comm("POST", "/api/v1/comm/send", "/api/v1/comm/send", b"[]").is_none());
+        assert!(
+            comm(
+                "POST",
+                "/api/v1/comm/contact",
+                "/api/v1/comm/contact",
+                br#"{"nickname":"a\u202eb","npub":"npub1x"}"#
+            )
+            .is_none()
+        );
+    }
 
     #[test]
     fn credential_keys_by_name_and_suffix_any_case() {

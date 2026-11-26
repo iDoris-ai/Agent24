@@ -736,6 +736,7 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                 | Operation::ScheduleManage
                 | Operation::Shutdown
                 | Operation::ModelsAdmin
+                | Operation::CommWrite
         ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -902,8 +903,35 @@ pub(crate) const DERIVED_ROUTES: [(&str, &str); 12] = [
     ("PUT", "/api/v1/models/default"),
 ];
 
+/// The Hyphae writes the desktop makes in service mode, each summarised by
+/// `crate::elevation_summaries` from its path and body. Kept apart from
+/// [`DERIVED_ROUTES`]: not every `comm.write` row is here (identity export
+/// and import, unlock, HOME import and the inbox/outbox maintenance stay
+/// unelevatable).
+pub(crate) const COMM_DERIVED_ROUTES: [(&str, &str); 15] = [
+    ("POST", "/api/v1/comm/identity"),
+    ("POST", "/api/v1/comm/identity/default"),
+    ("POST", "/api/v1/comm/contact"),
+    ("PATCH", "/api/v1/comm/contact/{name}"),
+    ("DELETE", "/api/v1/comm/contact/{name}"),
+    ("PUT", "/api/v1/comm/relay"),
+    ("POST", "/api/v1/comm/relay/probe"),
+    ("POST", "/api/v1/comm/daemon/start"),
+    ("POST", "/api/v1/comm/daemon/stop"),
+    ("POST", "/api/v1/comm/send"),
+    ("POST", "/api/v1/comm/outbox/{event_id}/retry"),
+    ("POST", "/api/v1/comm/groupchat"),
+    ("POST", "/api/v1/comm/groupchat/{group_id}/messages"),
+    (
+        "POST",
+        "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry",
+    ),
+    ("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept"),
+];
+
 pub(crate) fn derived_route(method: &str, template: &str) -> bool {
     DERIVED_ROUTES.contains(&(method, template))
+        || COMM_DERIVED_ROUTES.contains(&(method, template))
 }
 
 /// Binding id from the request path: the last segment, or the one before
@@ -1864,6 +1892,35 @@ mod tests {
         assert!(summary.contains("Hyphae"), "{summary}");
         let with_body = resolve_target(&idoris("POST", "/api/v1/comm/install", b"{}")).unwrap();
         assert!(authority.target_summary("id", &with_body).is_none());
+    }
+
+    #[test]
+    fn desktop_comm_writes_are_elevatable_and_secrets_stay_unelevatable() {
+        // Service mode routes every desktop Hyphae write through elevation;
+        // without these rows send, rename and group chat were all refused.
+        for (method, path) in [
+            ("POST", "/api/v1/comm/send"),
+            ("PATCH", "/api/v1/comm/contact/bob"),
+            ("DELETE", "/api/v1/comm/contact/bob"),
+            ("POST", "/api/v1/comm/groupchat"),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/00112233445566778899aabbccddeeff/messages",
+            ),
+            (
+                "POST",
+                "/api/v1/comm/groupchat/invites/00112233445566778899aabbccddeeff/accept",
+            ),
+        ] {
+            let target = resolve_target(&idoris(method, path, b"{}")).unwrap();
+            assert_eq!(target.operation, Operation::CommWrite, "{method} {path}");
+        }
+        for path in ["/api/v1/comm/identity/export", "/api/v1/comm/unlock"] {
+            assert_eq!(
+                resolve_target(&idoris("POST", path, b"{}")).unwrap_err(),
+                EnrollErrorCode::NotElevatedOperation
+            );
+        }
     }
 
     #[test]
