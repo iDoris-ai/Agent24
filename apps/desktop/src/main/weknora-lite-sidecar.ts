@@ -43,6 +43,8 @@ export const WEKNORA_LITE_KILL_AFTER_MS = 5_000
 export const WEKNORA_LITE_EMBED_KEY_ENV = 'A24LITE_EMBED_KEY'
 const HANDSHAKE_LINE_LIMIT_BYTES = 16_384
 const EMBEDDING_MODEL_ID = 'agent24-embedding'
+/** The policy's version: an ingest's `expected_policy_version` must equal it (3c's uploads). */
+export const WEKNORA_LITE_POLICY_VERSION = 'agent24-lite-1'
 
 export function weknoraLiteSidecarSpec(readyPhaseTimeoutMs = WEKNORA_LITE_READY_PHASE_TIMEOUT_MS): SidecarSpec {
   return {
@@ -130,7 +132,7 @@ export function weknoraLiteModelsYaml(embedding: WeknoraLiteEmbedding): string {
 export function weknoraLitePolicy(embedding: WeknoraLiteEmbedding): string {
   const url = new URL(embedding.baseUrl)
   return JSON.stringify({
-    version: 'agent24-lite-1',
+    version: WEKNORA_LITE_POLICY_VERSION,
     destinations: [{ category: 'embedding', endpoint: url.origin, model: embedding.model }],
     budget: { max_external_calls: 64, max_input_bytes: 1_048_576, max_inflight_external: 4 },
   })
