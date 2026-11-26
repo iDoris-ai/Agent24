@@ -27,9 +27,9 @@ pub enum UnavailableCause {
 
 impl UnavailableCause {
     /// `dependency` and `not_ready` are retried with backoff. The others wait
-    /// for a manual retry, a configuration change, a sidecar restart, a new
-    /// handshake or a new login; `local_storage` goes back to `loading` once
-    /// `persist_pending` clears.
+    /// for a manual retry, a configuration change or a new login, written
+    /// first (a sidecar restart alone does not let them go); `local_storage`
+    /// goes back to `loading` once `persist_pending` clears.
     pub fn retries_automatically(self) -> bool {
         matches!(self, Self::Dependency | Self::NotReady)
     }

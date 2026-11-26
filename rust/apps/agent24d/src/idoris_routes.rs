@@ -127,6 +127,31 @@ pub(crate) fn failure(code: Code) -> Response {
         "next_action": if code == Code::KeychainLocked { "unlock_keychain" } else { "check_status" }
     }}))).into_response()
 }
+/// Loop 9 3c: what the desktop's local WeKnora Lite embeds with — the running
+/// gateway and an embed-only key (issued once, reused). Host audience only
+/// ([`crate::capabilities`] `host_only_route`); the key is never logged.
+pub async fn lite_embedding(State(state): State<AppState>) -> Response {
+    let Some(host) = state.idoris_host else {
+        return failure(Code::NotInstalled);
+    };
+    match host.lite_embedding().await {
+        Ok(embedding) => (
+            [(axum::http::header::CACHE_CONTROL, "no-store")],
+            Json(serde_json::json!({
+                "base_url": embedding.base_url,
+                "api_key": embedding.api_key.as_str(),
+                // The gateway routes by role; a concrete model name is refused (403).
+                "model": LITE_EMBED_MODEL,
+                "dimension": LITE_EMBED_DIMENSION,
+            })),
+        )
+            .into_response(),
+        Err(code) => failure(code),
+    }
+}
+/// The role name the gateway routes embeddings by (agent24-models `embedding.rs`).
+const LITE_EMBED_MODEL: &str = "idoris/embed";
+const LITE_EMBED_DIMENSION: usize = agent24_models::EMBED_DIMS;
 pub async fn status(State(state): State<AppState>) -> Response {
     let status = match state.idoris_host {
         Some(host) => host.status().await,

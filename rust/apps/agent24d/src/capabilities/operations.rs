@@ -53,6 +53,9 @@ pub enum Operation {
     // allowlist; report is the desktop's (ProductHost only, enforced at the route).
     ComponentsRead,
     ComponentsReport,
+    // Loop 9 3c: the embed-only iDoris key for the desktop's local WeKnora Lite
+    // (ProductHost only, enforced at the route).
+    IdorisLiteEmbedding,
     // X11-2f: inbound allowlist / policy / event list. Read and write are
     // separate so `assurance_level()` stays a single level. One operation
     // used at both Everyday and Elevated returns None and the elevation
@@ -154,6 +157,7 @@ impl Operation {
             Self::DiagnosticRead => "diagnostic.read",
             Self::ComponentsRead => "components.read",
             Self::ComponentsReport => "components.report",
+            Self::IdorisLiteEmbedding => "idoris.lite_embedding",
             Self::InboundRead => "inbound.read",
             Self::InboundWrite => "inbound.write",
             Self::SkillsRead => "skills.read",
@@ -226,6 +230,7 @@ impl Operation {
             "diagnostic.read" => Self::DiagnosticRead,
             "components.read" => Self::ComponentsRead,
             "components.report" => Self::ComponentsReport,
+            "idoris.lite_embedding" => Self::IdorisLiteEmbedding,
             "inbound.read" => Self::InboundRead,
             "inbound.write" => Self::InboundWrite,
             "skills.read" => Self::SkillsRead,

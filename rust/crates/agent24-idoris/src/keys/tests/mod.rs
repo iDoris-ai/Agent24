@@ -252,6 +252,23 @@ async fn failed_revoke_persists_private_record_and_restart_retries_without_issui
 }
 
 #[tokio::test]
+async fn embed_only_key_has_no_daily_role_and_stays_local_only() {
+    let f = Fixture::new("ok", false);
+    let issued = f.keys.issue_embed_only("weknora-lite").await.unwrap();
+    let spec: Value = serde_json::from_str(&f.read("spec")).unwrap();
+    assert_eq!(spec["allowed_roles"], json!(["embed"]));
+    assert_eq!(spec["allowed_privacy"], json!(["local_only"]));
+    assert_eq!(spec["admin_scopes"], json!([]));
+    // Same keychain path as the data key: the secret is stored under its id.
+    assert_eq!(
+        f.store.get(&issued.key_id).unwrap().as_str(),
+        issued.secret.as_str()
+    );
+    // The role name is not a way into the embed-only set through `issue`.
+    assert!(f.keys.issue("weknora-lite", &["embed-only"]).await.is_err());
+}
+
+#[tokio::test]
 async fn explicit_deep_and_unique_owner_but_no_other_roles() {
     let f = Fixture::new("ok", false);
     f.keys.issue("installation", &["deep"]).await.unwrap();

@@ -32,6 +32,8 @@ const server = http.createServer((req, res) => {
 })
 server.listen(0, '127.0.0.1', () => {
   const origin = 'http://127.0.0.1:' + server.address().port
+  // bad-handshake: a syntax error right after the key, so a quoting parser would echo it.
+  if (mode === 'bad-handshake') { fs.writeSync(3, '{"type":"ready","protocol":2,"credential":{"api_key":"BADKEYabcdefghijklmnopqrstuvwxyz"x}}\\n'); return }
   fs.writeSync(3, JSON.stringify({ type: 'ready', protocol: 2, phase: 'process', origin, pid: process.pid, version: 'fake', commit: 'x', edition: 'lite',
     credential: { api_key: key, knowledge_base_id: 'kb-1', expires_at: null } }) + '\\n')
   fs.writeSync(3, JSON.stringify({ type: 'models', protocol: 2, embedding: { state: 'ready' }, chat: { state: 'missing' } }) + '\\n')
@@ -205,5 +207,28 @@ describe('WeknoraLiteHost', () => {
     await until(h, (x) => x.state === 'healthy')
     await until(h, (x) => x.state === 'healthy' && runs() === 2, 10_000)
     expect(h.credential()?.apiKey).toBe(`k2${'-'.repeat(40)}`)
+  })
+
+  it('PR-Daemon #2108: a broken handshake line through the launcher never puts the key in the error or the log', async () => {
+    const warnings: string[] = []
+    if (fs.existsSync(path.join(program, 'mode'))) fs.rmSync(path.join(program, 'mode'))
+    fs.writeFileSync(path.join(program, 'mode'), 'bad-handshake')
+    const h = new WeknoraLiteHost({
+      program: () => ({ binary: path.join(program, 'WeKnora-lite'), dir: program }),
+      embedding: async () => embedding,
+      dataDir: path.join(root, 'data', 'weknora-lite'),
+      logPath: path.join(root, 'logs', 'weknora-lite.log'),
+      logger: { info: () => {}, warn: (event, fields) => warnings.push(`${event} ${JSON.stringify(fields ?? {})}`) },
+      readyPhaseTimeoutMs: 5_000,
+      restartDelaysMs: [20],
+    })
+    hosts.push(h)
+    await h.start()
+    const s = await until(h, (x) => x.gaveUp)
+    expect(s.error ?? '').toContain('not JSON')
+    for (const text of [s.error ?? '', JSON.stringify(s), ...warnings]) {
+      for (const piece of ['BADKEY', 'mnop', 'wxyz']) expect(text).not.toContain(piece)
+    }
+    expect(h.credential()).toBeNull()
   })
 })

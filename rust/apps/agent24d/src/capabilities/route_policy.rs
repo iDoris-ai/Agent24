@@ -76,6 +76,7 @@ const POLICIES: &[RoutePolicy] = &[
     row("POST", "/api/v1/idoris/stop", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
     row("GET", "/api/v1/idoris/operations/{id}", Operation::IdorisRead, AssuranceLevel::Everyday),
     row("POST", "/api/v1/idoris/operations/{id}/cancel", Operation::IdorisLifecycle, AssuranceLevel::Elevated),
+    row("POST", "/api/v1/idoris/lite-embedding", Operation::IdorisLiteEmbedding, AssuranceLevel::Everyday),
     row("POST", "/api/v1/chat", Operation::ChatCreate, AssuranceLevel::Everyday),
     row("GET", "/api/v1/models", Operation::ModelsRead, AssuranceLevel::Everyday),
     row("GET", "/api/v1/models/recommendation", Operation::ModelsRead, AssuranceLevel::Everyday),

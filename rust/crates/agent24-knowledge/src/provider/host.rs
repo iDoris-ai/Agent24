@@ -27,6 +27,7 @@ mod create;
 mod identity;
 mod issue;
 mod run;
+mod sidecar;
 
 pub use create::Created;
 pub use run::RunCall;
