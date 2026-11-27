@@ -120,6 +120,12 @@ export class LiteKnowledge {
     return { phase: 'starting' }
   }
 
+  /** L11-1: this build can have the Lite: it has a download source, or the Lite is already installed.
+   * False exactly when the installer reports 'unavailable'. Does not depend on enable()/disable(). */
+  offered(): boolean {
+    return this.deps.installer.status().state !== 'unavailable'
+  }
+
   /** Turn the local knowledge base on: install if needed, then launch. Also
    * the retry after an install failed or the Lite gave up. Never throws. */
   enable(): Promise<void> {
