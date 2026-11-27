@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#24241f"/><stop offset="1" stop-color="#0b0b0a"/></linearGradient><radialGradient id="glow"><stop offset="0" stop-color="#E8C547" stop-opacity=".5"/><stop offset="1" stop-color="#E8C547" stop-opacity="0"/></radialGradient></defs>
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#g)"/>
+  <rect x="101" y="101" width="822" height="822" rx="184" fill="none" stroke="#3a3a33" stroke-width="2"/>
+  <line x1="512" y1="512" x2="383.00" y2="288.57" stroke="#6a6a60" stroke-width="46" stroke-linecap="round"/>
+  <line x1="512" y1="512" x2="770.00" y2="512.00" stroke="#6a6a60" stroke-width="46" stroke-linecap="round"/>
+  <line x1="512" y1="512" x2="383.00" y2="735.43" stroke="#6a6a60" stroke-width="46" stroke-linecap="round"/>
+  <circle cx="383.00" cy="288.57" r="64" fill="#F0F0E8"/>
+  <circle cx="770.00" cy="512.00" r="64" fill="#F0F0E8"/>
+  <circle cx="383.00" cy="735.43" r="64" fill="#F0F0E8"/>
+  <circle cx="512" cy="512" r="190" fill="url(#glow)"/>
+  <circle cx="512" cy="512" r="112" fill="#E8C547"/>
+</svg>
