@@ -320,4 +320,10 @@
 - [ ] FU-291 · C · src=L10 裁决（Fable 核出） · 2026-11-27 · 一句话点了两份《》、但没走确定性分流时（例如文档不在库里的是非问交回模型），App 只把第一份《》的正文拼进消息（`Chat.tsx` 普通路径 `.exec(text)?.[1]` 只取第一个标题），第二份不带。L10-1 之后只剩不在库或概念类问法会走到这里。
 - [ ] FU-292 · C · src=PR-Daemon #2124 FU1 · 2026-11-27 · L10-1 判断「是非问点名的文档不在库」靠 `namedDocument` 失败文案的前缀（`doc-compare.ts` 里 `startsWith('没有找到')`，文案在 `doc-intent-run.ts:17`）。以后改这句文案，是非问会静默落回「没有找到」而不交给模型。改成 `namedDocument` 返回带 kind 的结果。
 - [ ] FU-293 · C · src=PR-Daemon #2124 FU2 · 2026-11-27 · YESNO 里的「有变化吗／有改动吗」碰上恰好点了两份《》的非对比句（例如「把《A》改成《B》有变化吗」）会被当成对比；两份都在库时出的是对比卡，代价低。真机见到再收窄。
-- [ ] FU-294 · B · src=Loop 10 出包 · 2026-11-27 · a05df547（SIN90-LOOP-04）把 `apps/desktop/scripts/sin90-pin.json` 钉到 0.7.1，但 iDoris-ai/Sin90 没有 v0.7.1 发布（最新 v0.7.0），ab/ui、main 出包在 `stage-sin90-module.sh` 下载处 404。0.7.130 开发包是在打包分支上临时回到 0.7.0 出的。判据：Sin90 v0.7.1 发布、资产 sha256 与钉值一致，从 main 出包通过。
+- [x] FU-294 · B · src=Loop 10 出包 · 2026-11-27 · a05df547（SIN90-LOOP-04）把 `apps/desktop/scripts/sin90-pin.json` 钉到 0.7.1，但 iDoris-ai/Sin90 没有 v0.7.1 发布（最新 v0.7.0），ab/ui、main 出包在 `stage-sin90-module.sh` 下载处 404。0.7.130 开发包是在打包分支上临时回到 0.7.0 出的。判据：Sin90 v0.7.1 发布、资产 sha256 与钉值一致，从 main 出包通过。 已解决（11-27）：Sin90 v0.7.1 已发布，资产 sha256 与钉值一致；0.7.132 用 0.7.1 出包成功，David Mac 能力中心显示「已安装 v0.7.1」。
+- [ ] FU-295 · C · src=PR-Daemon #2127 FU1 · 2026-11-28 · L11-1 本机开通失败回滚时没看 `setSource('remote')` 的结果（`apps/desktop/src/main/knowledge-onboard.ts` `executeLocal`）：回滚存盘也失败时会留下 source=local 而 Lite 已停，再说一次被判 already_bound。回滚后按 `controller.status().source` 判断，没改回就如实报。
+- [ ] FU-296 · C · src=PR-Daemon #2127 FU2 + 监工核对 · 2026-11-28 · L11-1 失败文案说「你的知识库设置也没有改动」，但 `setSource('local')` 会把 enabled 置 true，回滚到 remote 后保持 true（无 endpoint，不生效，设置页同行为）。改措辞，或回滚时还原原来的 enabled。
+- [ ] FU-297 · C · src=PR-Daemon #2127 FU3 · 2026-11-28 · 远端开通 `execute` 只查 `endpoint !== ''`，不查 `source === 'local'`：两个对话里 A 预检通过、B 走本机开通后，A 再答「否」会用掉一次性激活码且绑定不生效。远端路径加同样的 already_bound 判断。
+- [ ] FU-298 · C · src=PR-Daemon #2127 FU4 · 2026-11-28 · 本机开通 `not_saved`（来源没存上）复用了远端文案「知识库已在服务器上建好…」，与本机承诺矛盾；加本机专用文案。
+- [ ] FU-299 · C · src=PR-Daemon #2127 FU5 · 2026-11-28 · 并发边缘：回滚的 `disable()` 可能关掉设置页刚选的本机；`enable()` 期间设置页关掉知识库仍可能报 activeNow:true。
+- [ ] FU-300 · C · src=L11-1 真机（监工 11-27） · 2026-11-28 · 对话里的上传卡片小字固定写「支持 .md、.txt…」（本机档已收 md/txt/csv/json），与开通成功文案不一致。按当前来源显示格式。
