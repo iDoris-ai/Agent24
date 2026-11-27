@@ -692,6 +692,52 @@ describe('ChatPage with Knowledge', () => {
     expect(runs).toEqual([])
   })
 
+  // L10-1 (research 11-27: 8B 10/10 made up an answer here): 「《A》和《B》有区别吗」
+  // with both in the library is compared by the App, never asked of the model.
+  it('answers 「《A》和《B》有区别吗」 with a comparison when both are in the library', async () => {
+    const [A, B] = ['doc_01M679KMY6D75P0EZACBS95JYA', 'doc_01M679KMY6D75P0EZACBS95JYB']
+    const docs = [
+      { document_id: A, title: '劳动合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 1 },
+      { document_id: B, title: '劳动合同（副本）.docx', created_at: '2026-11-20T02:00:00.000Z', head_revision: 1 },
+    ]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { left: { document_id: A, revision: 1, media_type: 'd' }, right: { document_id: B, revision: 1, media_type: 'd' }, identical: true, only_text: true, truncated: false, next_offset: null,
+        summary: { total: 0, added: 0, removed: 0, changed: 0, unaligned: 0 }, changes: [] } })
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《劳动合同.docx》和《劳动合同（副本）.docx》有区别吗？' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/没有文字差异 · 只比较文字/, {}, { timeout: 3000 })
+    expect(request).toHaveBeenCalledWith(expect.objectContaining({ op: 'compare' }))
+    expect(runs).toEqual([])
+  })
+
+  // L10-1: the same question about documents not in the library is a
+  // question of knowledge (「《劳动法》和《劳动合同法》有区别吗」): the model answers.
+  it('asks the model 「《劳动法》和《劳动合同法》有区别吗」 when neither is in the library', async () => {
+    const request = vi.fn(async () => ({ ok: true, data: { documents: [], next_cursor: null } }))
+    Object.defineProperty(window, 'agent24', { value: { backendProxy: aside(mockBackendProxy), documents: { request } }, writable: true, configurable: true })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《劳动法》和《劳动合同法》有区别吗？' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(runs.length).toBeGreaterThan(0), { timeout: 3000 })
+    expect(request).not.toHaveBeenCalledWith(expect.objectContaining({ op: 'compare' }))
+    expect(screen.queryByText(/没有找到标题含/)).toBeNull()
+  })
+
   // L6-S05: a question about a contract is not a comparison.
   it('does not take 「合同里写一个月押金对吗」 for a comparison', async () => {
     const request = vi.fn(async () => ({ ok: true, data: { documents: [], next_cursor: null } }))
