@@ -427,8 +427,17 @@ describe('CreativeServeWeb', () => {
     const next = new FakeChild()
     next.pid = 4322
     const spawnFn = vi.fn().mockReturnValueOnce(child as unknown as ChildProcess).mockReturnValueOnce(next as unknown as ChildProcess)
+    // Stop polls every 10ms against Date.now(). Faking the real 15s grace is ~1500
+    // turns and exceeds the 5s budget under load. 40ms still crosses one poll.
+    const termGraceMs = 40
     const service = new CreativeServeWeb(
-      { resourcesPath: resources, stateRoot, runtimeExecutable, readyTimeoutMs: 500 },
+      {
+        resourcesPath: resources,
+        stateRoot,
+        runtimeExecutable,
+        readyTimeoutMs: 500,
+        sidecarTimings: { termGraceMs, killAfterMs: termGraceMs },
+      },
       spawnFn as never,
       vi.fn(async () => new Response('{}', { status: 200 })),
     )
@@ -436,22 +445,27 @@ describe('CreativeServeWeb', () => {
     child.stdout.write(`${JSON.stringify(headlessReady(child.pid, 17460, 17461, 'creative-slow'))}\n`)
     await expect(starting).resolves.toMatchObject({ state: 'ready', origin: 'http://127.0.0.1:17460' })
 
-    vi.useFakeTimers()
+    // Date and the timers stay locked. Leaving Date real makes the poll's deadline
+    // a wall clock while setTimeout jumps, so the grace never elapses.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval', 'Date'] })
     const stopping = service.stop()
     const concurrentStart = service.start()
-    expect(spawnFn).toHaveBeenCalledTimes(1)
-    expect(service.headlessSidecarState()).toBe('stopping')
-    // Inside the 15 s grace nothing but the launcher's SIGTERM has been sent.
-    await vi.advanceTimersByTimeAsync(14_000)
-    expect(child.signals.filter(([, signal]) => signal === 'SIGKILL')).toEqual([])
-    await vi.advanceTimersByTimeAsync(1_000)
-    await expect(stopping).resolves.toEqual({ state: 'stopped' })
-    expect(child.signals.filter(([, signal]) => signal !== 0)).toEqual([[4321, 'SIGTERM'], [-4321, 'SIGKILL']])
-    expect(child.kill).not.toHaveBeenCalled()
-    // The queued start proceeds only after the stop settled, and gets a fresh launch.
-    expect(spawnFn).toHaveBeenCalledTimes(2)
-    expect(service.headlessSidecarState()).toBe('starting')
-    vi.useRealTimers()
+    try {
+      expect(spawnFn).toHaveBeenCalledTimes(1)
+      expect(service.headlessSidecarState()).toBe('stopping')
+      // Inside the grace nothing but the launcher's SIGTERM has been sent.
+      await vi.advanceTimersByTimeAsync(15)
+      expect(child.signals.filter(([, signal]) => signal === 'SIGKILL')).toEqual([])
+      await vi.advanceTimersByTimeAsync(termGraceMs - 15)
+      await expect(stopping).resolves.toEqual({ state: 'stopped' })
+      expect(child.signals.filter(([, signal]) => signal !== 0)).toEqual([[4321, 'SIGTERM'], [-4321, 'SIGKILL']])
+      expect(child.kill).not.toHaveBeenCalled()
+      // The queued start proceeds only after the stop settled, and gets a fresh launch.
+      expect(spawnFn).toHaveBeenCalledTimes(2)
+      expect(service.headlessSidecarState()).toBe('starting')
+    } finally {
+      vi.useRealTimers()
+    }
     next.stdout.write(`${JSON.stringify(headlessReady(next.pid, 17462, 17463, 'creative-next'))}\n`)
     await expect(concurrentStart).resolves.toMatchObject({ state: 'ready', origin: 'http://127.0.0.1:17462' })
     await service.stop()
@@ -932,18 +946,33 @@ describe('CreativeServeWeb', () => {
     // dev checkout to fall back to — must reproduce the exact pre-existing
     // "Open Design runtime not found" failure, not a download prompt for a
     // component this build never baked a manifest for.
-    const emptyResources = fs.mkdtempSync(path.join(process.cwd(), '.tmp-creative-empty-resources-'))
-    tempDirs.push(emptyResources)
-    const service = new CreativeServeWeb({
-      resourcesPath: emptyResources,
-      component: { status: () => ({ state: 'unavailable', reason: 'no manifest baked' }) },
+    // Sandbox is deep enough that sibling discovery (`../` and `../../../`)
+    // stays inside it, away from a developer checkout next to this repo.
+    const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'creative-no-checkout-'))
+    tempDirs.push(sandbox)
+    const cwd = path.join(sandbox, 'work', 'a', 'b', 'c')
+    const emptyResources = path.join(sandbox, 'resources')
+    fs.mkdirSync(cwd, { recursive: true })
+    fs.mkdirSync(emptyResources)
+    const spawnFn = vi.fn(() => {
+      throw new Error('must not launch a process')
     })
+    const service = new CreativeServeWeb(
+      {
+        cwd,
+        resourcesPath: emptyResources,
+        environment: {},
+        component: { status: () => ({ state: 'unavailable', reason: 'no manifest baked' }) },
+      },
+      spawnFn as never,
+    )
 
     await expect(service.start()).resolves.toEqual({
       state: 'failed',
       error: 'Open Design runtime not found; set A24_OPEN_DESIGN_DIR or package resources/open-design',
       notInstalled: true,
     })
+    expect(spawnFn).not.toHaveBeenCalled()
   })
 
   it('H1: needs-download (not the dev fallback) when the component truly is not-installed/downloading/failed', async () => {
