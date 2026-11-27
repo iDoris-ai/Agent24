@@ -203,3 +203,55 @@ describe('performSin90Write', () => {
     expect(formatErrRes.status).toBe(400)
   })
 })
+
+
+describe('Sin90 loop contract writes', () => {
+  it('sends evaluation, human override, clear and retrospective note through the human key', async () => {
+    const { api, request } = caller(true)
+    await performSin90Write({ op: 'evaluatePriority' }, api)
+    await performSin90Write({ op: 'overridePriority', id: 't1', quadrant: 'schedule', rationale: '用户访谈优先' }, api)
+    await performSin90Write({ op: 'clearPriorityOverride', id: 't1' }, api)
+    await performSin90Write({ op: 'completionNote', id: 't1', note: '拿到了反馈' }, api)
+    expect(request.mock.calls).toEqual([
+      [{ method: 'POST', path: '/api/v1/sin90/ai/priority/evaluate', body: {} }, HUMAN],
+      [{ method: 'PUT', path: '/api/v1/sin90/tasks/t1/priority/override', body: { quadrant: 'schedule', rationale: '用户访谈优先' } }, HUMAN],
+      [{ method: 'DELETE', path: '/api/v1/sin90/tasks/t1/priority/override' }, HUMAN],
+      [{ method: 'PUT', path: '/api/v1/sin90/tasks/t1/completion-note', body: { note: '拿到了反馈' } }, HUMAN],
+    ])
+  })
+  it('forwards optional evaluation advice with the human key', async () => {
+    const { api, request } = caller(true)
+    await performSin90Write({ op: 'evaluatePriority', advice: '先安排用户访谈，再写方案' }, api)
+    expect(request).toHaveBeenCalledWith({
+      method: 'POST', path: '/api/v1/sin90/ai/priority/evaluate',
+      body: { advice: '先安排用户访谈，再写方案' },
+    }, HUMAN)
+  })
+
+  it('rejects non-string evaluation advice before sending a request', async () => {
+    const { api, request } = caller(true)
+    expect((await performSin90Write({ op: 'evaluatePriority', advice: 42 }, api)).ok).toBe(false)
+    expect(request).not.toHaveBeenCalled()
+  })
+
+  it('rejects invalid quadrants and refuses loop writes without a human key', async () => {
+    const { api, request } = caller(true)
+    expect((await performSin90Write({ op: 'overridePriority', id: 't1', quadrant: 'urgent', rationale: '' }, api)).ok).toBe(false)
+    const locked = caller(false)
+    for (const op of ['evaluatePriority', 'overridePriority', 'clearPriorityOverride', 'completionNote']) expect((await performSin90Write({ op, id: 't1' }, locked.api)).ok).toBe(false)
+    expect(request).not.toHaveBeenCalled()
+    expect(locked.request).not.toHaveBeenCalled()
+  })
+})
+
+
+it('starts a weekly review without changing plans and requests advisory summarization', async () => {
+  const { api, request } = caller(true)
+  expect((await performSin90Write({ op: 'createWeeklyReview', isoWeek: 'bad' }, api)).ok).toBe(false)
+  await performSin90Write({ op: 'createWeeklyReview', isoWeek: '2026-W48' }, api)
+  await performSin90Write({ op: 'aiSummarize', reviewId: 'r1' }, api)
+  expect(request.mock.calls).toEqual([
+    [{ method: 'POST', path: '/api/v1/sin90/reviews', body: { kind: 'weekly', period: '2026-W48' } }, HUMAN],
+    [{ method: 'POST', path: '/api/v1/sin90/ai/summarize', body: { review_id: 'r1' } }, HUMAN],
+  ])
+})
