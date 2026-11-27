@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, formMaterial, materialHint, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksToWord, asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, formMaterial, materialHint, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -513,5 +513,35 @@ describe('监工 0.7.123: the material a form fill was told', () => {
     expect(prompt).toContain(hint)
     expect(prompt.endsWith('\n生成吧')).toBe(true)
     expect(docAgentPrompt(null, '生成吧', true)).not.toContain('source_document_id=doc_')
+  })
+})
+
+describe('L13-1 asksToWord', () => {
+  it.each([
+    ['把《合同.pdf》转成 Word', false],
+    ['把《合同.pdf》转换为word文档', false],
+    ['《采购清单.pdf》导出为 docx', false],
+    ['把《报告.pdf》转成可编辑的 Word', false],
+    ['帮我把《报告.pdf》另存为一份 Word 文件', false],
+    ['把这份转成Word', true],
+    ['转为 doc 格式', true],
+    ['导出成 DOCX', true],
+  ] as const)('%s converts to Word', (text, inDocument) => {
+    expect(asksToWord(text, inDocument)).toBe(true)
+  })
+
+  it.each([
+    ['把这份转成 Word', false],
+    ['把《合同.pdf》转成 PDF', false],
+    ['把《合同.pdf》转成可编辑的', false],
+    ['把这份翻成英文并导出 Word', true],
+    ['把《合同.pdf》翻译成英文，导出为 Word', false],
+    ['《转成Word的方法.pdf》讲了什么', false],
+    ['把《Word 转换说明.pdf》第 2 页拆出来', false],
+    ['Word 怎么转成 PDF', true],
+    ['把《A.pdf》和《B.pdf》合并后转成 Word', false],
+    ['这份 Word 写得怎么样', true],
+  ] as const)('%s does not', (text, inDocument) => {
+    expect(asksToWord(text, inDocument)).toBe(false)
   })
 })

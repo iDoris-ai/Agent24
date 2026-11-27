@@ -115,6 +115,18 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
     && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
 }
 
+/** L13-1: 「把《X》转成 Word」「把这份导出为 docx」 — PDF → Word, done by the App
+ * (chat/pdf-word-chat.ts), not the model. Only a turn that names Word, docx or
+ * doc after 转成/转为/转换成/转换为/导出为/导出成/存成/另存为 (an optional
+ * 「可编辑的」「一份」 between) counts; titles in 《…》 never do (they are
+ * replaced by 《》 first). A translation (「翻成英文并导出 Word」), a split or
+ * merge (parseDocIntent), or a turn with no document (not in a document's
+ * conversation and no 《》) is not this. 裁决 2026-11-28-loop13-chat-to-word Q1 甲. */
+export function asksToWord(text: string, inDocument: boolean): boolean {
+  void text; void inDocument
+  throw new Error('L13-1: not implemented')
+}
+
 /** L6-F2 (PR-Daemon #2028 round 2): a delete of a whole document needs
  * positive evidence, never 「a delete verb and none of some words」: the
  * sentence is the verb with one whole document as its object (「把这份删了」
