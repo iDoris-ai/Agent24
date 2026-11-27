@@ -310,3 +310,7 @@
 - [ ] FU-281 · C · src=PR-Daemon #2107/#2108 Low · 2026-11-27 · #2107 `restarted()` 在非重试相位后，issuing 里可能留旧轮 ticket（无害，`issuing_in` 按当前轮判），应清掉并写明不变量；#2107 `Host::rotated` 中 `m.revoke` 在 `left.changes` 为空早退前已改内存态，补测钉住「Done 且无 changes 即无需持久化」；#2108 G5 只测了 helper，launcher 调用点无测试。
 - [ ] FU-282 · C · src=PR-Daemon #2109 · 2026-11-27 · CONTRACT-STATE-v1 S2.1 措辞：「宿主丢弃当前凭据」补上「此前已因 S2.2 的 stopped/failed 进入 unavailable」，并定义「在用凭据」；该句旁「#2107 合入前仍是约定」的注可删（#2107 已合）。
 - [ ] FU-283 · C · src=L9 CI · 2026-11-27 · 两处偶发红，重跑都过：`packages/wechat-bridge` e2e「keeps the cursor when the inbound POST fails」（11-27 两次）；`agent24-idoris` setup 测试偶发 Io 错（#2109）。
+- [ ] FU-284 · C · src=L9 真机 0.7.127 · 2026-11-27 · 界面上没有停止 iDoris 的入口：本地模型页只有「连接」「刷新」，能力中心的「停止」是停止模块授权；`POST /api/v1/idoris/stop` 是 Elevated、CLI `idoris stop` 弹在场确认。#2106 的「用户停止后不自动拉起」因此没法在真机上验（由单测覆盖）。要给用户停止入口时一起做。
+- [ ] FU-285 · C · src=L9 真机 0.7.127/0.7.128 · 2026-11-27 · 本机档的对话上传卡仍写「支持 .md、.txt」，设置页和实际放行的是 md/txt/csv/json；本机档出处卡库名显示「知识库 1」（精简版默认库没有名字，`loadKbNames` 取不到）。
+- [ ] FU-286 · C · src=PR-Daemon #2120 · 2026-11-27 · #2120 把本机档 endpoint 改成 `origin/api/v1` 后，已存的本机档草稿 `entryTarget` 哈希会变，升级后读作「需要重新选目标库」一次（预期内，发版说明带一句）；main 里另有 5 处硬写 `/api/v1`（candidates / readonly / ui-client / upload / sidecar），收成一个 `LITE_API_BASE` 常量防止再漂移。
+- [ ] FU-287 · C · src=L9 真机验收 · 2026-11-27 · 本机知识库验收第 7 项（平衡档下 Lite 仍就绪、日常模型 507 时对话如实报不可用）没验：App 里没有切换激进/平衡档的入口，改档要动 oMLX 自身配置。与 FU-246 一起处理。
