@@ -478,6 +478,155 @@ describe('ChatPage with Knowledge', () => {
     expect(prompts[0]).toContain('删除第 2 份')
   })
 
+  // L9-1b (FU-252/253): which document a form fills is told by the App.
+  const formLibrary = () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    const docs = [
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYI', title: '个人信息.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYF', title: '入职登记表.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYL', title: '租赁合同.pdf', media_type: 'application/pdf', head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+    ]
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : req.op === 'fields'
+        ? { ok: true, data: { document_id: req.documentId, revision: 1, fields: req.documentId?.endsWith('F') ? [{ name: '部门', count: 1 }] : [] } }
+        : { ok: false, error: { code: 'x', message: 'x' } })
+    const agentAccess = vi.fn().mockResolvedValue({ enabled: true, until: '2026-12-23T00:00:00.000Z', ok: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request, agentAccess } },
+      writable: true,
+      configurable: true,
+    })
+    const prompts: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        prompts.push(req.body?.prompt ?? '')
+        return { ok: true, status: 201, data: { id: 'r_fill' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '请告诉我姓名' } } }
+    })
+    return { prompts }
+  }
+
+  it('answers a PDF form itself and never asks the model (FU-253)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    expect(prompts).toEqual([])
+  })
+
+  it('keeps the material when the answer to 「要填的是哪一份？」 is a title with 模板 in it (0.7.125)', async () => {
+    const DOCX = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    const I = 'doc_01M679KMY6D75P0EZACBS95JYI'
+    const T = 'doc_01M679KMY6D75P0EZACBS95JYT'
+    const docs = [
+      { document_id: I, title: '个人信息.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: T, title: '入职登记表模板.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+      { document_id: 'doc_01M679KMY6D75P0EZACBS95JYU', title: '入职登记表模板（2026版）.docx', media_type: DOCX, head_revision: 1, created_at: '2026-11-20T01:00:00.000Z' },
+    ]
+    const request = vi.fn(async (req: { op: string; documentId?: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { document_id: req.documentId, revision: 1, fields: req.documentId === I ? [] : [{ name: '部门', count: 1 }] } })
+    const agentAccess = vi.fn().mockResolvedValue({ enabled: true, until: '2026-12-23T00:00:00.000Z', ok: true })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request, agentAccess } },
+      writable: true,
+      configurable: true,
+    })
+    const prompts: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string; body?: { prompt?: string } }) => {
+      if (req.path === '/api/v1/sessions') return { ok: true, status: 201, data: { id: 's1' } }
+      if (req.method === 'POST' && req.path === '/api/v1/runs') {
+        prompts.push(req.body?.prompt ?? '')
+        return { ok: true, status: 201, data: { id: 'r_fill' } }
+      }
+      return { ok: true, status: 200, data: { status: 'completed', output: { text: '请告诉我姓名' } } }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把这张入职登记表填一下，资料在《个人信息.docx》里' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/要填的是哪一份？/, {}, { timeout: 3000 })
+    expect(prompts).toEqual([])
+    fireEvent.change(textarea, { target: { value: '《入职登记表模板.docx》' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain(`这次要填的模板是《入职登记表模板.docx》，document_id=${T}`)
+    expect(prompts[0]).toContain(`source_document_id=${I}`)
+  })
+
+  it('lets a paragraph delete after a PDF form answer go to the documents tools (#2113 C1)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '把《个人信息.docx》第3段删掉' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('documents.patch')
+    expect(prompts[0]).toContain('删掉文档里的某一段是改写')
+  })
+
+  it('lets a delete after a PDF form answer go to the documents tools (C1)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《租赁合同.pdf》这张表能帮我填吗' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await screen.findByText(/《租赁合同.pdf》是 PDF，现在填不了/, {}, { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '把《租赁合同.pdf》删了' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('documents.delete')
+  })
+
+  it('sends the template found by the form\'s name, apart from the named material (FU-252)', async () => {
+    const { prompts } = formLibrary()
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '把这张入职登记表填一下，资料在《个人信息.docx》里' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(prompts).toHaveLength(1), { timeout: 3000 })
+    expect(prompts[0]).toContain('这次要填的模板是《入职登记表.docx》，document_id=doc_01M679KMY6D75P0EZACBS95JYF')
+    expect(prompts[0]).toContain('source_document_id=doc_01M679KMY6D75P0EZACBS95JYI')
+  })
+
+  // L9-1c (FU-247): the second turn of a delivery names no document; the one
+  // the conversation named before is checked, and the card comes again.
+  it('checks the document named a turn before when the second turn asks for a clean PDF', async () => {
+    const A = 'doc_01M679KMY6D75P0EZACBS95JYA'
+    const docs = [{ document_id: A, title: '合同.docx', created_at: '2026-11-20T01:00:00.000Z', head_revision: 2 }]
+    const request = vi.fn(async (req: { op: string }) => req.op === 'list'
+      ? { ok: true, data: { documents: docs, next_cursor: null } }
+      : { ok: true, data: { document_id: A, revision: 2, title: '合同.docx', format: 'docx', clean: false, cleanable: true, findings: [{ kind: 'comments', count: 1, examples: ['张三：改'] }] } })
+    Object.defineProperty(window, 'agent24', {
+      value: { backendProxy: aside(mockBackendProxy), documents: { request } },
+      writable: true,
+      configurable: true,
+    })
+    const runs: string[] = []
+    mockBackendProxy.mockImplementation(async (req: { method: string; path: string }) => {
+      if (req.method === 'POST') runs.push(req.path)
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<ChatPage />)
+    const textarea = screen.getByPlaceholderText(/输入消息/)
+    fireEvent.change(textarea, { target: { value: '《合同》发出去前帮我检查一下' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getAllByRole('group', { name: '发送前检查' })).toHaveLength(1), { timeout: 3000 })
+    fireEvent.change(textarea, { target: { value: '去掉修订和批注，导出一份 PDF 放桌面' } })
+    fireEvent.keyDown(textarea, { key: 'Enter', shiftKey: false })
+    await waitFor(() => expect(screen.getAllByRole('group', { name: '发送前检查' })).toHaveLength(2), { timeout: 3000 })
+    expect(request.mock.calls.filter(([r]) => r.op === 'preflight')).toHaveLength(2)
+    expect(runs.filter((p) => p === '/api/v1/runs')).toEqual([])
+  })
+
   // L6-F5: 「回到上一个版本」 never goes to the model: the App finds the version,
   // offers it on a card, and restores it over the version shown when clicked.
   it('restores the version before the current one from a card, never through the model', async () => {

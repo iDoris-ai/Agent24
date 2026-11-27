@@ -12,6 +12,7 @@ export const citationMessages = defineMessages({
     copied: 'Copied',
     copyHeader: 'Sources (knowledge base · document · passage)',
     note: 'These are what the search found, not which passage the answer used. Open the knowledge page to read the original and copy the wording yourself.',
+    noteLocal: 'These are what the search found in the local knowledge base, not which passage the answer used. The originals are the files you uploaded on this computer.',
   },
   zh: {
     title: '从你的知识库检索到',
@@ -24,6 +25,7 @@ export const citationMessages = defineMessages({
     copied: '已复制',
     copyHeader: '出处（知识库 · 文档 · 位置）',
     note: '以上是检索到的内容，不表示回答用了哪一段。要看原文、复制原话，请到知识页自己查看。',
+    noteLocal: '以上是在本机知识库里检索到的内容，不表示回答用了哪一段。原文就是你在这台电脑上传的文件。',
   },
   th: {
     title: 'ที่ค้นพบจากคลังความรู้ของคุณ',
@@ -36,5 +38,6 @@ export const citationMessages = defineMessages({
     copied: 'คัดลอกแล้ว',
     copyHeader: 'แหล่งที่มา (คลังความรู้ · เอกสาร · ตำแหน่ง)',
     note: 'นี่คือสิ่งที่การค้นหาพบ ไม่ได้บอกว่าคำตอบใช้ส่วนไหน เปิดหน้าคลังความรู้เพื่ออ่านต้นฉบับและคัดลอกเอง',
+    noteLocal: 'นี่คือสิ่งที่ค้นพบในคลังความรู้ในเครื่อง ไม่ได้บอกว่าคำตอบใช้ส่วนไหน ต้นฉบับคือไฟล์ที่คุณอัปโหลดบนเครื่องนี้',
   },
 })

@@ -131,9 +131,9 @@ impl Connection {
         }
     }
 
-    /// Lets `loading` try again whatever reason was kept: a manual retry, a
-    /// configuration change, a sidecar restart or a new handshake (S1.4),
-    /// persisted by the caller first (S1.10).
+    /// Lets `loading` try again whatever reason was kept: a manual retry or a
+    /// configuration change (S1.4), persisted by the caller first (S1.10). A
+    /// sidecar restart does not call it (`BindingState::restarted`).
     pub fn release_all(&mut self) {
         self.held = None;
     }

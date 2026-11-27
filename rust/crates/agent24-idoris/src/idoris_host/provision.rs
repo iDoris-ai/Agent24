@@ -1337,6 +1337,179 @@ impl IdorisHost {
     }
 }
 
+/// Loop 9 3c: what the local WeKnora Lite embeds with — the running gateway and
+/// a key that may call the `embed` role only. Main-process only; never logged.
+pub struct LiteEmbedding {
+    /// `http://127.0.0.1:<data port>/v1`, read now: the port is the running gateway's.
+    pub base_url: String,
+    pub api_key: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for LiteEmbedding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiteEmbedding")
+            .field("base_url", &self.base_url)
+            .field("api_key", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// Where the Lite's key id is kept (the secret is in the data-key keychain, as
+/// the data key's is). Only the id reaches disk.
+pub(super) const LITE_EMBED_KEY_FILE: &str = "lite-embed-key.json";
+/// The owner name of the Lite's key in iDoris (`agent24d:<this>:<uuid>`).
+const LITE_EMBED_OWNER: &str = "weknora-lite";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiteEmbedKey {
+    key_id: String,
+}
+
+impl IdorisHost {
+    /// The embed-only key for the local WeKnora Lite, issued once and reused
+    /// (decision 2026-11-27-lite-3c-slot-embedkey, R0: issue once, keep the id,
+    /// read the secret from the keychain). Issued again only when the saved one is
+    /// missing from the keychain. Needs a running gateway with the embed role.
+    pub async fn lite_embedding(&self) -> Result<LiteEmbedding, Code> {
+        let record = {
+            let inner = self.inner.lock().await;
+            if inner.state != State::Running {
+                return Err(Code::NotConfigured);
+            }
+            inner.installation.clone().ok_or(Code::NotInstalled)?
+        };
+        if !record.roles.contains(&Role::Embed) {
+            return Err(Code::NotConfigured);
+        }
+        let base_url = format!("http://127.0.0.1:{}/v1", record.data_port);
+        // A saved key is used only while iDoris still has it active: a reinstall
+        // with a new key database, or a revocation, leaves a secret that would
+        // only get 401 (PR-Daemon #2110 G2). Checked once per daemon run and
+        // release; a check that cannot run keeps the saved key.
+        let mut stale = None;
+        if let Some((key_id, api_key)) = self.saved_lite_key().await? {
+            if self.lite_key_confirmed(&key_id, &record) {
+                return Ok(LiteEmbedding { base_url, api_key });
+            }
+            match self.lite_key_active(&record, &key_id).await {
+                Some(true) => {
+                    self.confirm_lite_key(&key_id, &record);
+                    return Ok(LiteEmbedding { base_url, api_key });
+                }
+                None => return Ok(LiteEmbedding { base_url, api_key }),
+                Some(false) => {
+                    tracing::warn!(
+                        "the local knowledge base's embed key is no longer active in iDoris; issuing a new one"
+                    );
+                    stale = Some(key_id);
+                }
+            }
+        }
+        // Issued under the install/connect lock, never inside a connect: the key
+        // journal is shared, and a second issue would compensate (revoke) the
+        // data key a connect has issued but not yet committed.
+        let _guard = self.coordinator_lock()?;
+        if self.root.join("pending-connect.json").exists() {
+            return Err(Code::Busy);
+        }
+        if let Some((key_id, api_key)) = self.saved_lite_key().await?
+            && stale.as_ref() != Some(&key_id)
+        {
+            return Ok(LiteEmbedding { base_url, api_key });
+        }
+        let installed = self.provisioner.verify(&record, VerifyMode::AtRest).await?;
+        let keys = Keys::new(
+            &installed,
+            &self.root.join("data/idoris.sqlite3"),
+            self.data_keys.clone(),
+        )
+        .map_err(key_code)?
+        .with_timeout(KEY_COMMAND_TIMEOUT);
+        let issued = keys
+            .issue_embed_only(LITE_EMBED_OWNER)
+            .await
+            .map_err(key_code)?;
+        write_json(
+            &self.root.join(LITE_EMBED_KEY_FILE),
+            &LiteEmbedKey {
+                key_id: issued.key_id.clone(),
+            },
+        )?;
+        self.confirm_lite_key(&issued.key_id, &record);
+        Ok(LiteEmbedding {
+            base_url,
+            api_key: issued.secret,
+        })
+    }
+
+    fn lite_key_confirmed(&self, key_id: &str, record: &Installation) -> bool {
+        self.lite_key_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(id, release)| id == key_id && *release == record.release_dir)
+    }
+
+    fn confirm_lite_key(&self, key_id: &str, record: &Installation) {
+        *self
+            .lite_key_checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) =
+            Some((key_id.to_owned(), record.release_dir.clone()));
+    }
+
+    /// Whether iDoris lists `key_id` as active; `None` when the check could not run.
+    async fn lite_key_active(&self, record: &Installation, key_id: &str) -> Option<bool> {
+        let installed = self
+            .provisioner
+            .verify(record, VerifyMode::AtRest)
+            .await
+            .ok()?;
+        let keys = Keys::new(
+            &installed,
+            &self.root.join("data/idoris.sqlite3"),
+            self.data_keys.clone(),
+        )
+        .ok()?
+        .with_timeout(KEY_COMMAND_TIMEOUT);
+        match keys.list(None).await {
+            Ok(list) => {
+                Some(list.iter().any(|key| {
+                    key.key_id == key_id && key.status == crate::keys::KeyStatus::Active
+                }))
+            }
+            Err(_) => {
+                tracing::warn!("could not check the local knowledge base's embed key in iDoris");
+                None
+            }
+        }
+    }
+
+    /// The saved key's id and secret; `None` when there is none to reuse (no
+    /// record, an unreadable one, or the keychain no longer has it).
+    async fn saved_lite_key(&self) -> Result<Option<(String, Zeroizing<String>)>, Code> {
+        let saved: LiteEmbedKey = match std::fs::read(self.root.join(LITE_EMBED_KEY_FILE)) {
+            Ok(body) => match serde_json::from_slice(&body) {
+                Ok(saved) => saved,
+                Err(_) => return Ok(None),
+            },
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(Code::PersistenceFailed),
+        };
+        let store = self.data_keys.clone();
+        let key_id = saved.key_id.clone();
+        match tokio::task::spawn_blocking(move || store.get(&key_id))
+            .await
+            .map_err(|_| Code::KeyUnavailable)?
+        {
+            Ok(secret) => Ok(Some((saved.key_id, secret))),
+            Err(KeychainError::NotFound) => Ok(None),
+            Err(e) => Err(keychain_code(e)),
+        }
+    }
+}
+
 /// oMLX lists every model it serves; the daily role needs a chat model, not an
 /// embedding, speech, OCR or image one. Same exclusions as the desktop picker.
 pub fn is_chat_model_id(id: &str) -> bool {

@@ -239,7 +239,7 @@ describe('knowledge onboarding (L7-K2)', () => {
     expect(await onboarding.run({ localOnly: false })).toMatchObject({ ok: true, activeNow: true })
     controller.attachReachability(reachability)
     expect((await controller.checkReachability()).reachability?.state).toBe('ok')
-    expect(store.load()).toEqual({ enabled: true, endpoint: apiBase, knowledgeBaseIds: [KB] })
+    expect(store.load()).toEqual({ enabled: true, endpoint: apiBase, knowledgeBaseIds: [KB], source: 'remote' })
     expect(logins.list().get(KNOWLEDGE_BINDING)).toMatchObject({ profileId: apiBase, material: API_KEY })
     expect(controller.bindingForRun()).toBe(KNOWLEDGE_BINDING)
     const route = `/api/v1/host/knowledge/bindings/${KNOWLEDGE_BINDING}`

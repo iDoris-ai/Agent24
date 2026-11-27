@@ -15,6 +15,14 @@
 // The key is kept with the endpoint it was given for, and used for that
 // endpoint only: a new address needs the key again, so a renderer cannot send
 // a saved key somewhere else.
+//
+// Loop 9 3c: the source is the remote server or the local WeKnora Lite, one at
+// a time (David 11-26). Both drive the same daemon binding 'default' (decision
+// 2026-11-27-lite-3c-slot-embedkey, R0: one slot, switched source). The remote
+// endpoint, bases and key stay where they are while the local one is in use,
+// so switching back finds them as they were. The local origin, default base
+// and key come from the running Lite and stay in main's memory: the key is
+// pushed as C (`pushCredential`), never written to the login store.
 
 import { randomBytes } from 'node:crypto'
 import fs from 'node:fs'
@@ -24,6 +32,9 @@ import { isPlainHostname } from './knowledge-hostname'
 import type { KnowledgeLoginStore } from './knowledge-logins'
 import type { KnowledgeSettingsResult, KnowledgeStatus } from '../shared/ipc-types'
 import type { KnowledgeReachability, ProbeInputs } from './knowledge-reachability'
+
+/** Where the Lite serves the Agent24 knowledge routes, below its origin. */
+const LITE_API_BASE = '/api/v1'
 
 /** The binding the settings drive: one per desktop for now. */
 export const KNOWLEDGE_BINDING = 'default'
@@ -35,15 +46,32 @@ const MAX_KNOWLEDGE_BASE_ID_CHARS = 256
 const CREDENTIAL_LIFETIME_S = 24 * 3600
 const REFRESH_BEFORE_S = 3600
 
+export type KnowledgeSource = 'remote' | 'local'
+
 export interface KnowledgeSettings {
   enabled: boolean
   endpoint: string
   knowledgeBaseIds: string[]
+  /** Absent in a file written before Loop 9: remote. */
+  source?: KnowledgeSource
+}
+
+/** The running local Lite, as main holds it (weknora-lite-host.ts). */
+export interface LocalKnowledgeSource {
+  credential(): { origin: string; apiKey: string; knowledgeBaseId: string } | null
+  onStatus(listener: () => void): () => void
+}
+
+/** Where the binding's calls go now, with the key they use. Main-process only. */
+interface Target {
+  endpoint: string
+  knowledgeBaseIds: string[]
+  key: string
 }
 
 type SettingsResult = KnowledgeSettingsResult
 
-const EMPTY: KnowledgeSettings = { enabled: false, endpoint: '', knowledgeBaseIds: [] }
+const EMPTY: KnowledgeSettings = { enabled: false, endpoint: '', knowledgeBaseIds: [], source: 'remote' }
 
 /** The daemon's own rule (knowledge_host.rs `endpoint_of`): `https`, or `http`
  * to a loopback IP literal; no user info, query or fragment. Stricter on the
@@ -72,6 +100,7 @@ function isSettings(value: unknown): value is KnowledgeSettings {
   const v = value as Record<string, unknown>
   return typeof v['enabled'] === 'boolean' && typeof v['endpoint'] === 'string' && Array.isArray(v['knowledgeBaseIds'])
     && v['knowledgeBaseIds'].every((id) => typeof id === 'string')
+    && (v['source'] === undefined || v['source'] === 'remote' || v['source'] === 'local')
 }
 
 export class KnowledgeSettingsStore {
@@ -86,8 +115,8 @@ export class KnowledgeSettingsStore {
     try {
       const record = JSON.parse(fs.readFileSync(this.file, 'utf8')) as { v?: unknown; settings?: unknown }
       if (record?.v === VERSION && isSettings(record.settings)) {
-        const { enabled, endpoint, knowledgeBaseIds } = record.settings
-        return { enabled, endpoint, knowledgeBaseIds: [...knowledgeBaseIds] }
+        const { enabled, endpoint, knowledgeBaseIds, source } = record.settings
+        return { enabled, endpoint, knowledgeBaseIds: [...knowledgeBaseIds], source: source ?? 'remote' }
       }
     } catch {
       // Missing or unreadable: Off.
@@ -111,6 +140,8 @@ export class KnowledgeSettingsStore {
 export interface KnowledgeControllerDeps {
   /** Unix seconds. */
   nowSeconds?: () => number
+  /** Loop 9 3c: the local Lite; without it the local source is never complete. */
+  local?: LocalKnowledgeSource
 }
 
 export class KnowledgeController {
@@ -137,12 +168,66 @@ export class KnowledgeController {
   ) {
     this.settings = store.load()
     this.nowSeconds = deps.nowSeconds ?? (() => Math.floor(Date.now() / 1000))
+    this.local = deps.local ?? null
+    // A Lite that comes up, restarts with a new key or port, or goes away is a
+    // new target: a new view partition and the binding brought in line.
+    this.local?.onStatus(() => {
+      const seen = this.localSeen
+      this.localSeen = this.localFingerprint()
+      if (this.source() === 'local' && seen !== this.localSeen) {
+        this.identity++
+        void this.apply()
+      }
+    })
+    this.localSeen = this.localFingerprint()
+  }
+
+  private readonly local: LocalKnowledgeSource | null
+  /** The Lite's origin, base and key as last seen, to notice a change. */
+  private localSeen = ''
+
+  private localFingerprint(): string {
+    const c = this.local?.credential()
+    return c ? `${c.origin}\u0000${c.knowledgeBaseId}\u0000${c.apiKey}` : ''
+  }
+
+  private source(): KnowledgeSource {
+    return this.settings.source ?? 'remote'
+  }
+
+  /** Where the binding's calls go now: the local Lite while it is the source
+   * and running, the saved remote settings otherwise; null when incomplete. */
+  private target(): Target | null {
+    if (this.source() === 'local') {
+      const c = this.local?.credential()
+      // The handshake gives the origin; the endpoint is the API base, the same
+      // shape as a remote one (`…/api/v1`): the daemon and the K2 check append
+      // `/agent24/knowledge/<op>` to it (0.7.127 acceptance).
+      const endpoint = c ? `${c.origin}${LITE_API_BASE}` : ''
+      return c && validEndpoint(endpoint) && validKnowledgeBaseIds([c.knowledgeBaseId])
+        ? { endpoint, knowledgeBaseIds: [c.knowledgeBaseId], key: c.apiKey }
+        : null
+    }
+    const key = this.key()
+    return validEndpoint(this.settings.endpoint) && validKnowledgeBaseIds(this.settings.knowledgeBaseIds) && key !== null
+      ? { endpoint: this.settings.endpoint, knowledgeBaseIds: [...this.settings.knowledgeBaseIds], key }
+      : null
+  }
+
+  /** Loop 9 3c: the endpoint and bases in effect (no key), for main's own
+   * callers (upload, the view, entries); null while Off or incomplete. */
+  activeTarget(): { endpoint: string; knowledgeBaseIds: string[] } | null {
+    const target = this.settings.enabled ? this.target() : null
+    return target && { endpoint: target.endpoint, knowledgeBaseIds: target.knowledgeBaseIds }
   }
 
   status(): KnowledgeStatus {
     return {
-      ...this.settings,
+      enabled: this.settings.enabled,
+      endpoint: this.settings.endpoint,
       knowledgeBaseIds: [...this.settings.knowledgeBaseIds],
+      source: this.source(),
+      activeKnowledgeBaseIds: this.activeTarget()?.knowledgeBaseIds ?? [],
       hasKey: this.key() !== null,
       active: this.bindingForRun() !== null,
       ...(this.reachability ? { reachability: this.reachability.current() } : {}),
@@ -165,11 +250,9 @@ export class KnowledgeController {
 
   /** K2: what the server check asks with, or null while Off or incomplete. */
   probeInputs(): ProbeInputs | null {
-    const key = this.key()
-    const knowledgeBaseId = this.settings.knowledgeBaseIds[0]
-    return this.settings.enabled && this.complete() && key !== null && knowledgeBaseId
-      ? { endpoint: this.settings.endpoint, knowledgeBaseId, key }
-      : null
+    const target = this.settings.enabled ? this.target() : null
+    const knowledgeBaseId = target?.knowledgeBaseIds[0]
+    return target && knowledgeBaseId ? { endpoint: target.endpoint, knowledgeBaseId, key: target.key } : null
   }
 
   /** Called whenever the settings in effect may have changed (KB-C2-03: the
@@ -195,7 +278,7 @@ export class KnowledgeController {
    */
   uiSessionInputs(binding: string): { credential: string; generation: number } | null {
     if (this.viewBinding() !== binding) return null
-    const credential = this.key()
+    const credential = this.target()?.key ?? null
     // U7.1: generations are 1..2^53-1; identity starts at 0 on every launch.
     return credential === null ? null : { credential, generation: this.identity + 1 }
   }
@@ -213,7 +296,7 @@ export class KnowledgeController {
     if (!validEndpoint(endpoint) || !validKnowledgeBaseIds(knowledgeBaseIds) || !keyOk) return { ok: false, reason: 'invalid' }
     const mine = ++this.version
     const overtaken = () => mine !== this.version
-    const next: KnowledgeSettings = { enabled: this.settings.enabled, endpoint, knowledgeBaseIds: [...knowledgeBaseIds] }
+    const next: KnowledgeSettings = { enabled: this.settings.enabled, endpoint, knowledgeBaseIds: [...knowledgeBaseIds], source: this.source() }
     try {
       // The key and the settings take their turn with every other write, so
       // an older `enabled` never lands after a later Off; a change overtaken
@@ -242,7 +325,7 @@ export class KnowledgeController {
       return { ok: false, reason: 'not_saved' }
     }
     if (overtaken()) return { ok: false, reason: 'not_saved' }
-    if (next.endpoint !== this.settings.endpoint) this.identity++
+    if (next.endpoint !== this.settings.endpoint && this.source() === 'remote') this.identity++
     this.settings = next
     return this.apply()
   }
@@ -264,7 +347,8 @@ export class KnowledgeController {
     // Any change made after this call (its number moves `version`) makes onboarding stand back.
     const seen = this.version
     let mine = -1
-    const next: KnowledgeSettings = { enabled: true, endpoint, knowledgeBaseIds: [...knowledgeBaseIds] }
+    // The source stays as the user chose it: onboarding fills the remote settings only.
+    const next: KnowledgeSettings = { enabled: true, endpoint, knowledgeBaseIds: [...knowledgeBaseIds], source: this.source() }
     let wrote = false
     try {
       await this.serial(async () => {
@@ -320,6 +404,31 @@ export class KnowledgeController {
     return this.apply()
   }
 
+  /** Loop 9 3c: the remote server or the local Lite. Choosing local turns
+   * Knowledge On; the remote endpoint, bases and key are kept as they are.
+   * Takes effect once saved. */
+  async setSource(source: KnowledgeSource): Promise<SettingsResult> {
+    if (source !== 'remote' && source !== 'local') return { ok: false, reason: 'invalid' }
+    const mine = ++this.version
+    const next: KnowledgeSettings = {
+      ...this.settings,
+      knowledgeBaseIds: [...this.settings.knowledgeBaseIds],
+      source,
+      enabled: source === 'local' ? true : this.settings.enabled,
+    }
+    try {
+      await this.save(next)
+    } catch {
+      return { ok: false, reason: 'not_saved' }
+    }
+    if (mine !== this.version) return { ok: false, reason: 'not_saved' }
+    // Another source is another server: the view must not carry its page session over.
+    if (next.source !== this.source()) this.identity++
+    this.settings = next
+    this.localSeen = this.localFingerprint()
+    return this.apply()
+  }
+
   /** Brings the daemon in line with the settings: the binding activated with
    * its endpoint and a fresh C, or dropped. Also run once at startup. */
   async apply(): Promise<SettingsResult> {
@@ -331,10 +440,11 @@ export class KnowledgeController {
         console.warn('[knowledge] settings listener failed', error)
       }
     }
-    if (!this.settings.enabled || !this.complete()) {
+    const target = this.settings.enabled ? this.target() : null
+    if (!target) {
       return asResult(await this.host.deactivate(KNOWLEDGE_BINDING))
     }
-    const { endpoint, knowledgeBaseIds } = this.settings
+    const { endpoint, knowledgeBaseIds } = target
     const activated = await this.host.activate(KNOWLEDGE_BINDING, { endpoint, knowledgeBaseIds })
     // A daemon not up yet is fine: the host replays the activation and C.
     if (!activated.ok && activated.reason !== 'daemon_unavailable') return asResult(activated)
@@ -375,10 +485,21 @@ export class KnowledgeController {
   private async pushOnce(): Promise<HostResult> {
     const expiresAt = this.nowSeconds() + CREDENTIAL_LIFETIME_S
     const endpoint = this.settings.endpoint
-    const result = await this.host.refresh(KNOWLEDGE_BINDING, async (login) => {
-      if (login.profileId !== endpoint || this.settings.endpoint !== endpoint) throw new Error('key is for another endpoint')
-      return { kind: 'api_key', value: login.material, expiresAt }
-    })
+    let result: HostResult
+    if (this.source() === 'local') {
+      // The Lite's key is in main's memory only: pushed as it is, never through the login store.
+      const target = this.target()
+      result = target
+        ? await this.host.pushCredential(KNOWLEDGE_BINDING, { kind: 'api_key', value: target.key, expiresAt })
+        : { ok: false, reason: 'credential_unavailable' }
+    } else {
+      result = await this.host.refresh(KNOWLEDGE_BINDING, async (login) => {
+        if (login.profileId !== endpoint || this.settings.endpoint !== endpoint || this.source() !== 'remote') {
+          throw new Error('key is for another endpoint')
+        }
+        return { kind: 'api_key', value: login.material, expiresAt }
+      })
+    }
     // Replayed by the host on a daemon not up yet, or after the backoff of a
     // confirmation not answered in time or not asked at all (#1852 B1).
     // K1: the daemon kept the one it had (same key): refresh by that one's expiry.
@@ -388,7 +509,7 @@ export class KnowledgeController {
   }
 
   private complete(): boolean {
-    return validEndpoint(this.settings.endpoint) && validKnowledgeBaseIds(this.settings.knowledgeBaseIds) && this.key() !== null
+    return this.target() !== null
   }
 
   /** The saved key, if it was given for the endpoint in the settings. */

@@ -164,6 +164,10 @@ export const IpcChannels = {
   KnowledgeCheck: 'knowledge:check',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  /** Loop 9 3c: remote server or the local Lite (one at a time); local also installs and launches it. */
+  KnowledgeSetSource: 'knowledge:set-source',
+  /** Loop 9 3c: install or launch the local Lite again after it failed. */
+  KnowledgeLiteRetry: 'knowledge:lite-retry',
   /** L7-K2: whether mock onboarding can start, and whether the server answers. */
   KnowledgeOnboardPreflight: 'knowledge:onboard-preflight',
   /** L7-K2: run mock onboarding. The activation code and the key never come back. */
@@ -226,14 +230,30 @@ export interface DocumentsModuleStatus {
 /** What the renderer sees of the Knowledge settings: never the key. */
 export interface KnowledgeStatus {
   enabled: boolean
+  /** The saved remote server (kept while the local source is in use). */
   endpoint: string
   knowledgeBaseIds: string[]
+  /** Loop 9 3c: which knowledge base is in use. */
+  source: 'remote' | 'local'
+  /** The bases searched now (the local default base while local); empty while Off or incomplete. */
+  activeKnowledgeBaseIds: string[]
+  /** Loop 9 3c: the local Lite's install and launch, when main has one. */
+  local?: LiteKnowledgeStatus
   hasKey: boolean
   /** On, complete and activated in the daemon. */
   active: boolean
   /** K2: whether the server answered the last check (absent: not checked by this main). */
   reachability?: { state: 'unknown' | 'ok' | 'unreachable' | 'unauthorized' | 'not_found'; checkedAt: string | null }
 }
+
+/** Loop 9 3c: the local knowledge base as the settings page sees it. No path, port or key. */
+export type LiteKnowledgeStatus =
+  | { phase: 'off' | 'unavailable' | 'verifying' | 'starting' | 'ready' }
+  | { phase: 'not_installed'; total?: number }
+  | { phase: 'downloading'; received: number; total?: number }
+  | { phase: 'install_failed'; failure: 'network' | 'integrity' | 'other' }
+  /** Gave up starting; `embedding_unavailable`: iDoris (the embedding) was not ready. */
+  | { phase: 'failed'; reason: 'embedding_unavailable' | 'start_failed' }
 
 /** The key is optional: left out, the saved one is kept. */
 export interface KnowledgeConfigureInput {

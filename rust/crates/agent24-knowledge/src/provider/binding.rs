@@ -55,6 +55,23 @@ pub enum Sidecar {
     Stopped,
 }
 
+impl Sidecar {
+    /// The desktop's `SidecarState` (`apps/desktop/src/main/sidecar-contract.ts`),
+    /// which uses the same seven names.
+    pub fn from_state(state: &str) -> Option<Self> {
+        Some(match state {
+            "starting" => Self::Starting,
+            "ready" => Self::Ready,
+            "healthy" => Self::Healthy,
+            "degraded" => Self::Degraded,
+            "failed" => Self::Failed,
+            "stopping" => Self::Stopping,
+            "stopped" => Self::Stopped,
+            _ => return None,
+        })
+    }
+}
+
 /// What a backoff tick in `dependency` or `not_ready` sends (S1.4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Retry {
@@ -360,12 +377,14 @@ impl<K: Ord + Clone> BindingState<K> {
         self.credentials.issue(&self.connection).map(Retry::Issue)
     }
 
-    /// A manual retry, a configuration change, a sidecar restart or a new
-    /// handshake of the same instance (S1.4): every kept reason is let go,
+    /// A manual retry or a configuration change, persisted first (S1.4):
+    /// every kept reason is let go,
     /// and an `unavailable` binding enters `loading` in a new round. Leaving
     /// a reason that does not retry by itself is a loosening the caller has
-    /// persisted first (S1.10, I1). A retired binding is out of the
-    /// connection phase for good, so it never enters `loading` here.
+    /// persisted first (S1.10, I1). A sidecar restart is not one: it goes
+    /// through [`BindingState::restarted`], which lets nothing go. A retired
+    /// binding is out of the connection phase for good, so it never enters
+    /// `loading` here.
     pub fn retry(&mut self) -> Option<Round> {
         self.connection.release_all();
         match self.connection.phase()? {
@@ -376,13 +395,13 @@ impl<K: Ord + Clone> BindingState<K> {
         }
     }
 
-    /// S2.2: `starting` retries as [`BindingState::retry`]; a sidecar going
-    /// down makes the binding `unavailable(dependency)` in the connection
-    /// phase, no increment. A reason that does not retry by itself, or
-    /// `local_storage`, stays: `dependency` would retry it by backoff.
+    /// S2.2: a sidecar going down makes the binding `unavailable(dependency)`
+    /// in the connection phase, no increment. A reason that does not retry by
+    /// itself, or `local_storage`, stays: `dependency` would retry it by
+    /// backoff. `starting` is [`BindingState::restarted`].
     pub fn sidecar(&mut self, sidecar: Sidecar) -> Option<Round> {
         let down = match sidecar {
-            Sidecar::Starting => return self.retry(),
+            Sidecar::Starting => return self.restarted(),
             Sidecar::Ready | Sidecar::Healthy => false,
             Sidecar::Degraded | Sidecar::Failed | Sidecar::Stopping | Sidecar::Stopped => true,
         };
@@ -395,6 +414,28 @@ impl<K: Ord + Clone> BindingState<K> {
             self.connection.fail(UnavailableCause::Dependency);
         }
         None
+    }
+
+    /// The same instance starts again and will hand over a new key (S2.1,
+    /// S2.2; a managed Lite issues one on every start and revokes the old,
+    /// WeKnora#180): in the connection phase the old credential goes and the
+    /// binding enters `loading` in a new round, so earlier probes and
+    /// issuances no longer count and the round issues afresh. Not a
+    /// revocation: no placeholder rule, no invalidation, no increment (S5.6).
+    /// A reason that does not retry by itself stays, in the phase or kept by
+    /// leaving: only a written loosening lets it go (S1.10, I1); the old
+    /// credential still goes in the phase, so that loosening issues afresh.
+    pub fn restarted(&mut self) -> Option<Round> {
+        let phase = self.connection.phase()?;
+        // The old process's key is dead whatever the phase; dropping it lets
+        // go of nothing, so a later `loading` can issue again.
+        self.credentials.discard();
+        if let ConnectionPhase::Unavailable(cause) = phase
+            && !cause.retries_automatically()
+        {
+            return None;
+        }
+        self.connection.start_loading()
     }
 }
 

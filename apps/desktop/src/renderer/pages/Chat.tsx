@@ -21,7 +21,7 @@ import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, ex
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
-import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
+import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument, type DocumentRef } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import { ExtractCard } from './chat/ExtractCard'
 import { DeleteChoice } from './chat/DeleteChoice'
@@ -29,6 +29,7 @@ import { RestoreCard } from './chat/RestoreCard'
 import { CompareCard } from './chat/CompareCard'
 import { DeliverCard } from './chat/DeliverCard'
 import { asksDeliver, runPreflight, runReceipts, type DeliverCardData } from './chat/doc-deliver'
+import { formEntryReply, resolveFormEntry, templateHint } from './chat/form-entry'
 import { asksCompare, runCompare, type CompareCardData } from './chat/doc-compare'
 import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
 import { KnowledgeUploadCard } from './chat/KnowledgeUploadCard'
@@ -180,6 +181,8 @@ export default function ChatPage() {
   const requestInFlight = useRef(false)
   // L7-K2: onboarding in progress for this chat, keyed by session. Not the model.
   const onboard = useRef(new Map<string, OnboardStep>())
+  /** L9-1b: the template each conversation's form fill uses, for the turns that answer it. */
+  const formTemplate = useRef(new Map<string, DocumentRef>())
   // Knowledge on: turns go to /runs, in a real session created once.
   const [awaitingApproval, setAwaitingApproval] = useState(false)
   const runSession = useRef<string | null>(null)
@@ -341,7 +344,7 @@ export default function ChatPage() {
     // L8 DOC-4: 「发给对方前帮我检查一下」「去掉修订和批注，导出一份 PDF 放桌面」
     // 「我上次发出去的是哪个版本？」 — the App checks and reads the receipts; a
     // clean copy is made only from the card's button, never by the model.
-    const deliverAsk = answer ? null : asksDeliver(text, doc !== null)
+    const deliverAsk = answer ? null : asksDeliver(text, doc !== null, lastNamed() !== null)
     if (deliverAsk !== null && window.agent24.documents) {
       const api = window.agent24.documents
       const named = /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? (deliverAsk.kind === 'receipts' ? null : lastNamed())
@@ -457,6 +460,38 @@ export default function ChatPage() {
     // L8-S02: an answer to what a form fill asked goes back to it, with the form hint.
     const earlier = messages.filter((m) => m.role === 'user').map((m) => m.content)
     const form = asksFillForm(text, doc !== null) || continuesFormFill(earlier, text, doc !== null)
+    // L9-1b (FU-252/253): the App tells the template from the material, and
+    // answers a PDF form or an unclear template itself, before any model.
+    let formSaid: string | null = null
+    // An answer turn that itself asks for another documents operation (「把《X》删了」)
+    // is that operation, not the form's (Codex L9-1b C1).
+    // A title is never the operation (0.7.125: the answer 「《入职登记表模板.docx》」
+    // has 模板 in it): judged with each 《…》 as 《_》, still a named document.
+    const asksForm = asksFillForm(text, doc !== null)
+    const otherOp = wantsDocTool(text.replace(/《[^》]{1,200}》/g, '《_》'), doc !== null)
+    if (form && chosen === null && (asksForm || !otherOp) && window.agent24.documents) {
+      requestInFlight.current = true
+      setLoading(true)
+      let direct: string | null = null
+      try {
+        const entry = await resolveFormEntry(window.agent24.documents, {
+          doc, text: text.trim(), earlier, asks: asksForm, remembered: formTemplate.current.get(sessionId) ?? null,
+        })
+        direct = formEntryReply(entry)
+        if (entry.kind === 'fill') {
+          formTemplate.current.set(sessionId, entry.template)
+          formSaid = templateHint(entry.template) + (entry.material ? materialHint(entry.material) : '')
+        }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      if (direct !== null) {
+        setDelivery(messages.length, { kind: 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: direct }])
+        return
+      }
+    }
     if ((chosen !== null || form || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
@@ -479,9 +514,9 @@ export default function ChatPage() {
           return
         }
         // 监工 0.7.123: the material the user named goes in by its id.
-        const named = form && !target ? formMaterial(earlier, text) : null
+        const named = form && !target && formSaid === null ? formMaterial(earlier, text) : null
         const material = named ? await namedDocument(window.agent24.documents, named).catch(() => null) : null
-        const said = material && typeof material !== 'string' ? materialHint(material) : ''
+        const said = formSaid ?? (material && typeof material !== 'string' ? materialHint(material) : '')
         if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim(), form, said)
         await replyWithKnowledge(messages.length, request, false)
         return

@@ -41,7 +41,7 @@ pub const REPORT_TTL: Duration = Duration::from_secs(90);
 /// Single definition is [`agent24_attach::attached::BUILTIN_COMPONENT_IDS`].
 pub(crate) use agent24_attach::attached::BUILTIN_COMPONENT_IDS;
 /// Components whose state the desktop owns. Anything else is the daemon's to say.
-const DESKTOP_OWNED: &[&str] = &["open-design"];
+const DESKTOP_OWNED: &[&str] = &["open-design", "weknora-lite"];
 
 #[derive(Serialize, Clone)]
 pub struct Provide {
@@ -1211,9 +1211,11 @@ async fn knowledge_item(
     })
 }
 
-fn open_design_item(state: &AppState, now: Instant) -> Item {
-    let item = Item::new("open-design", Form::Sidecar, ComponentState::Absent);
-    match state.component_reports.current("open-design", now) {
+/// A sidecar the desktop owns and reports (Open Design; the local knowledge
+/// base's WeKnora Lite, KB-LITE-02).
+fn desktop_item(state: &AppState, id: &str, now: Instant) -> Item {
+    let item = Item::new(id, Form::Sidecar, ComponentState::Absent);
+    match state.component_reports.current(id, now) {
         Some(r) => item.with(|i| {
             i.state = r.state;
             i.version = r.version;
@@ -1232,7 +1234,8 @@ async fn collect(state: &AppState, now: Instant) -> Vec<Item> {
     items.push(documents_item(state));
     items.extend(os_module_items(state));
     items.push(knowledge_item(&state.knowledge_host, now).await);
-    items.push(open_design_item(state, now));
+    items.push(desktop_item(state, "open-design", now));
+    items.push(desktop_item(state, "weknora-lite", now));
     items.extend(mcp_items(state));
     dedupe_component_ids(&mut items);
     overlay_kernel_consent(state, &mut items).await;

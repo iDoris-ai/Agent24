@@ -23,7 +23,7 @@ const LOCAL_AGAIN = '没能确定你的意思。请只回答“是”（资料�
 const CANCEL_REPLY = '好的，先不开通。'
 const UNCLEAR_REPLY = '没听明白，先不开通了；需要时再说“帮我开通知识库”。'
 
-const ALREADY_BOUND = '你已经连着知识库了。开通只用于还没有连知识库的情况，这次不会改动你现在的知识库设置；要换库请到“设置 → 知识库”里修改。'
+const ALREADY_BOUND = '你已经连着知识库了。开通只用于还没有连知识库的情况，这次不会改动你现在的知识库设置；要换库请到“设置 → 连接 → 知识库（WeKnora）”里修改。'
 const INVALID_ACTIVATION = '这台电脑上的激活信息无效，开通不了，请联系提供激活的人重新激活。'
 const NOT_ACTIVATED = '这台电脑还没有激活知识库服务，暂时不能开通，请先完成激活。'
 const FORMAT_LINE = '现在可以上传文档：目前支持 .md 和 .txt，单个不超过 10 MB；PDF、Word 暂不支持。'
@@ -167,12 +167,12 @@ export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): st
       : '你在知识库服务器上的默认知识库之前已经建好了，没有再建新的；上传的文档存放在服务器上。'
     const note = r.outcome === 'created' && typesAnswer && mentionsOffice(typesAnswer) ? OFFICE_NOTE : ''
     // Saved, but the local service did not take it now (not up, or refused): say so without promising when.
-    const later = r.activeNow ? '' : '设置已保存，但本机服务这会儿还没接上这个知识库；如果提问时没有用上知识库，请到“设置 → 知识库”看一下。'
+    const later = r.activeNow ? '' : '设置已保存，但本机服务这会儿还没接上这个知识库；如果提问时没有用上知识库，请到“设置 → 连接 → 知识库（WeKnora）”看一下。'
     return `${lead}${FORMAT_LINE}${note}${later}`
   }
   switch (r.code) {
     case 'local_only_unavailable':
-      return '目前只提供放在服务器上的知识库，只在本机的版本还没有，这次没有开通。'
+      return '对话里只能开通服务器上的知识库；要用本机知识库，请到“设置 → 连接 → 知识库（WeKnora）”选「本机知识库（精简版）」。这次没有开通。'
     case 'already_bound':
       return ALREADY_BOUND
     case 'not_activated':
@@ -197,6 +197,8 @@ export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): st
 
 function refuseReason(reason: string | null): string {
   if (reason === 'unsupported_format') return '这种格式暂不支持（只支持 .md、.txt）'
+  // Loop 9 3c: the local Lite takes md/txt/csv/json only (David 11-26).
+  if (reason === 'unsupported_format_local') return '本机知识库暂不支持这种格式，可用远端知识库或先转成文本'
   if (reason === 'too_large') return '超过 10 MB'
   if (reason === 'not_a_file') return '不是文件'
   if (reason === 'not_connected') return '还没有连上知识库'
@@ -231,7 +233,10 @@ export function uploadLine(u: KnowledgeUpload): string {
     default:
       line = u.reason === 'unreachable'
         ? `${name}上传后没有收到可用的答复，不确定是否已上传成功`
-        : `${name}状态不明`
+        // FU-235: the knowledge base was switched after the upload; its progress is not followed on the new one.
+        : u.reason === 'rebound'
+          ? `${name}提交后换了知识库，不再跟进它的进度（它在原来的知识库里）`
+          : `${name}状态不明`
   }
   if (!u.costFinal) {
     // A job that has stopped but whose cost is not final yet (W5.10): say so; main keeps asking until it is.

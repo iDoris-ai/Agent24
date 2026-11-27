@@ -45,6 +45,7 @@ import type {
   KnowledgeUpload,
   KnowledgeSettingsResult,
   KnowledgeStatus,
+  LiteKnowledgeStatus,
   BackendEndpointResult,
   BackendRefusalResult,
   BackendProxyRequest,
@@ -642,6 +643,12 @@ export function registerIpcHandlers(options: {
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** Loop 9 3c: the local knowledge base (WeKnora Lite): install, launch, stop. */
+  knowledgeLite?: {
+    status: () => LiteKnowledgeStatus
+    enable: () => Promise<void>
+    disable: () => Promise<void>
+  }
   /** L7-K2: mock onboarding, built in main with the userData dir and net.fetch. */
   knowledgeOnboard?: {
     preflight: () => Promise<KnowledgeOnboardPreflight>
@@ -707,6 +714,7 @@ export function registerIpcHandlers(options: {
   const knowledge = options.knowledge ?? (() => null)
   const knowledgeOnboard = options.knowledgeOnboard ?? null
   const knowledgeUpload = options.knowledgeUpload ?? null
+  const knowledgeLite = options.knowledgeLite ?? null
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
@@ -872,8 +880,24 @@ export function registerIpcHandlers(options: {
     return proxyToBackend(forwarded, timeoutFor(route))
   })
 
-  handle(IpcChannels.KnowledgeStatus, (): KnowledgeStatus | null => knowledge()?.status() ?? null)
-  handle(IpcChannels.KnowledgeCheck, (): Promise<KnowledgeStatus | null> => knowledge()?.checkReachability() ?? Promise.resolve(null))
+  const withLocal = (status: KnowledgeStatus | null): KnowledgeStatus | null =>
+    status && knowledgeLite ? { ...status, local: knowledgeLite.status() } : status
+  handle(IpcChannels.KnowledgeStatus, (): KnowledgeStatus | null => withLocal(knowledge()?.status() ?? null))
+  handle(IpcChannels.KnowledgeCheck, async (): Promise<KnowledgeStatus | null> => withLocal(await (knowledge()?.checkReachability() ?? Promise.resolve(null))))
+  handle(IpcChannels.KnowledgeSetSource, async (_event, source: unknown): Promise<KnowledgeSettingsResult> => {
+    const controller = knowledge()
+    if (!controller || !knowledgeLite || (source !== 'remote' && source !== 'local')) {
+      return { ok: false, reason: controller && knowledgeLite ? 'invalid' : 'unavailable' }
+    }
+    const result = await controller.setSource(source)
+    // Saved or not, the Lite follows what is in effect: the local one runs only while it is the source.
+    if (controller.status().source === 'local') void knowledgeLite.enable()
+    else void knowledgeLite.disable()
+    return result
+  })
+  handle(IpcChannels.KnowledgeLiteRetry, async (): Promise<void> => {
+    if (knowledgeLite && knowledge()?.status().source === 'local') await knowledgeLite.enable()
+  })
   handle(IpcChannels.KnowledgeConfigure, (_event, input: unknown): Promise<KnowledgeSettingsResult> => {
     const controller = knowledge()
     if (!controller || typeof input !== 'object' || input === null) {
@@ -887,7 +911,14 @@ export function registerIpcHandlers(options: {
     if (!controller || typeof enabled !== 'boolean') {
       return Promise.resolve({ ok: false, reason: controller ? 'invalid' : 'unavailable' })
     }
-    return controller.setEnabled(enabled)
+    const result = controller.setEnabled(enabled)
+    // Loop 9 3c: the local Lite runs only while Knowledge is On with it as the source.
+    void result.then(() => {
+      if (!knowledgeLite || controller.status().source !== 'local') return
+      if (controller.status().enabled) void knowledgeLite.enable()
+      else void knowledgeLite.disable()
+    })
+    return result
   })
   handle(IpcChannels.KnowledgeOnboardPreflight, (): Promise<KnowledgeOnboardPreflight> => (
     knowledgeOnboard?.preflight() ?? Promise.resolve({

@@ -2002,6 +2002,7 @@ async fn an_enrolled_shell_never_reaches_host_only_routes() {
         ("PUT", "/api/v1/inbound/policy"),
         ("PUT", "/api/v1/host/knowledge/bindings/b1"),
         ("PUT", "/api/v1/host/knowledge/bindings/b1/credential"),
+        ("POST", "/api/v1/idoris/lite-embedding"),
     ] {
         let response = build_router(state.clone())
             .oneshot(request(&token.secret, method, path, "{}", None))
