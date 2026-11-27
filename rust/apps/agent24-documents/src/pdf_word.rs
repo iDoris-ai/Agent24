@@ -16,7 +16,8 @@
 //! (`parse_failed`).
 
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// The engine build the desktop installs (pinned with its sha256 there).
 pub const PDF2DOCX_VERSION: &str = "0.5.13-a24.1";
@@ -37,8 +38,13 @@ pub fn engine_dir(data_dir: &Path) -> PathBuf {
 /// (`READY.json` is there, and so is `a24-pdf2docx/a24-pdf2docx`).
 #[must_use]
 pub fn program(data_dir: &Path) -> Option<PathBuf> {
-    let _ = data_dir;
-    todo!("L12-2: engine_dir/a24-pdf2docx/a24-pdf2docx when READY.json and the file exist")
+    let dir = engine_dir(data_dir);
+    let program = dir.join("a24-pdf2docx/a24-pdf2docx");
+    if dir.join("READY.json").is_file() && program.is_file() {
+        Some(program)
+    } else {
+        None
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq)]
@@ -52,6 +58,21 @@ pub enum PdfWordError {
     Failed(String),
 }
 
+fn random_hex() -> Result<String, PdfWordError> {
+    crate::office::random_hex().map_err(|error| PdfWordError::Failed(error.to_string()))
+}
+
+/// Removes the scratch directory however the conversion ends.
+#[cfg(unix)]
+struct RemoveOnDrop(PathBuf);
+
+#[cfg(unix)]
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Converts `input` (a PDF) to DOCX at `out` with the engine `program`.
 /// Runs it in a scratch directory under `<data_dir>/engines/pdf2docx/work/`
 /// (`TMPDIR` points there; removed however it ends), stdin/stdout/stderr not
@@ -63,16 +84,96 @@ pub fn convert_to_docx(
     input: &Path,
     out: &Path,
 ) -> Result<(), PdfWordError> {
-    let _ = (data_dir, program, input, out);
-    todo!("L12-2")
+    #[cfg(not(unix))]
+    {
+        let _ = (data_dir, program, input, out);
+        return Err(PdfWordError::Failed(
+            "converting to Word needs a unix process".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        let work = data_dir
+            .join("engines")
+            .join("pdf2docx")
+            .join("work")
+            .join(random_hex()?);
+        if let Err(e) = std::fs::create_dir_all(&work) {
+            let _ = std::fs::remove_dir_all(&work);
+            return Err(PdfWordError::Failed(format!(
+                "creating the work directory failed: {e}"
+            )));
+        }
+        let _remove = RemoveOnDrop(work.clone());
+        let input_pdf = work.join("input.pdf");
+        std::fs::copy(input, &input_pdf)
+            .map_err(|e| PdfWordError::Failed(format!("copying the input failed: {e}")))?;
+        let output_docx = work.join("output.docx");
+        let absolute = std::path::absolute(&work)
+            .map_err(|e| PdfWordError::Failed(format!("the work path: {e}")))?;
+        let mut child = Command::new(program)
+            .arg("convert")
+            .arg(&input_pdf)
+            .arg(&output_docx)
+            .env("TMPDIR", &absolute)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| PdfWordError::Failed(format!("starting a24-pdf2docx failed: {e}")))?;
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() > CONVERT_TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(PdfWordError::TooSlow);
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(100)),
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(PdfWordError::Failed(format!(
+                        "waiting for a24-pdf2docx failed: {e}"
+                    )));
+                }
+            }
+        };
+        if status.code() == Some(3) {
+            return Err(PdfWordError::Scanned);
+        }
+        if !status.success() {
+            return Err(PdfWordError::Failed(format!(
+                "a24-pdf2docx exited with {status}"
+            )));
+        }
+        if !output_docx.is_file() {
+            return Err(PdfWordError::Failed(format!(
+                "a24-pdf2docx wrote no docx at {}",
+                output_docx.display()
+            )));
+        }
+        if std::fs::rename(&output_docx, out).is_err() {
+            std::fs::copy(&output_docx, out)
+                .map_err(|e| PdfWordError::Failed(format!("writing the docx failed: {e}")))?;
+        }
+        Ok(())
+    }
 }
 
 /// The stored title with `.pdf` (any case) replaced by `.docx`; `.docx`
 /// appended when it has no `.pdf` ending.
 #[must_use]
 pub fn docx_title(stored: &str) -> String {
-    let _ = stored;
-    todo!("L12-2")
+    let ext = ".pdf";
+    let stem = match stored.len().checked_sub(ext.len()) {
+        Some(cut) if stored.is_char_boundary(cut) && stored[cut..].eq_ignore_ascii_case(ext) => {
+            stored[..cut].to_owned()
+        }
+        _ => stored.to_owned(),
+    };
+    format!("{stem}.docx")
 }
 
 #[cfg(test)]
@@ -174,7 +275,10 @@ mod tests {
         ));
 
         // Exit 0 but nothing written: a failure, not a success.
-        fake_engine(&bin, "echo '{\"ok\": true, \"pages\": 1, \"seconds\": 0}'\nexit 0");
+        fake_engine(
+            &bin,
+            "echo '{\"ok\": true, \"pages\": 1, \"seconds\": 0}'\nexit 0",
+        );
         assert!(matches!(
             convert_to_docx(&data, &bin, &input, &out),
             Err(PdfWordError::Failed(_))
@@ -235,7 +339,10 @@ mod tests {
             if job.status != "running" {
                 return job;
             }
-            assert!(started.elapsed() < Duration::from_secs(30), "the job never ended");
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "the job never ended"
+            );
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
@@ -267,7 +374,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::open(dir.path()).await;
         let data = state.storage().await.unwrap().data_dir().to_path_buf();
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/template-lease.docx");
+        let fixture =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/template-lease.docx");
         install_engine(
             &data,
             &format!(
@@ -316,7 +424,10 @@ mod tests {
         assert_eq!(job.status, "failed");
         assert_eq!(job.error.unwrap()["code"], "unsupported_format");
 
-        install_engine(&data, "echo '{\"ok\": false, \"error\": \"convert_failed\"}'\nexit 4");
+        install_engine(
+            &data,
+            "echo '{\"ok\": false, \"error\": \"convert_failed\"}'\nexit 4",
+        );
         let (_, job) = post_conversion(&state, &doc).await;
         let job = ended(&state, job["job_id"].as_str().unwrap()).await;
         assert_eq!(job.status, "failed");

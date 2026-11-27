@@ -170,7 +170,7 @@ pub enum ConvertError {
     Failed(String),
 }
 
-fn random_hex() -> Result<String, ConvertError> {
+pub(crate) fn random_hex() -> Result<String, ConvertError> {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).map_err(|e| ConvertError::Failed(format!("no randomness: {e}")))?;
     let mut hex = String::with_capacity(bytes.len() * 2);
@@ -316,6 +316,25 @@ fn convert_failure(error: ConvertError) -> ApiError {
     }
 }
 
+fn pdf_word_failure(error: crate::pdf_word::PdfWordError) -> ApiError {
+    match error {
+        crate::pdf_word::PdfWordError::Scanned => ApiError::unprocessable(
+            "unsupported_format",
+            crate::pdf_word::PdfWordError::Scanned.to_string(),
+        ),
+        crate::pdf_word::PdfWordError::TooSlow => ApiError::unprocessable(
+            "parse_failed",
+            format!(
+                "the conversion took longer than {} s: the file may be too large or complex",
+                crate::pdf_word::CONVERT_TIMEOUT.as_secs()
+            ),
+        ),
+        crate::pdf_word::PdfWordError::Failed(message) => {
+            ApiError::unprocessable("parse_failed", message)
+        }
+    }
+}
+
 fn io_failure(error: &std::io::Error) -> ApiError {
     ApiError::storage_unavailable(io_cause(error))
 }
@@ -340,6 +359,17 @@ async fn default_title(storage: &crate::state::Storage, id: &str) -> Option<Stri
             .unwrap_or_else(|| title.clone());
         format!("{stem}.pdf")
     })
+}
+
+/// The stored title as `.docx`, when this request did not name one.
+async fn default_docx_title(storage: &crate::state::Storage, id: &str) -> Option<String> {
+    let title: Option<String> = sqlx::query_scalar("SELECT title FROM documents WHERE id = ?")
+        .bind(id)
+        .fetch_optional(storage.db.pool())
+        .await
+        .ok()
+        .flatten();
+    title.map(|title| crate::pdf_word::docx_title(&title))
 }
 
 /// `POST /documents/{document_id}/conversions`: the head revision of an
@@ -378,10 +408,78 @@ pub async fn convert(
         };
     let head = head.ok_or_else(|| ApiError::not_found("no such document"))?;
     let revision = crate::read::revision(&storage, &id, head).await?;
+    if revision.media_type == crate::pdf_word::PDF {
+        let Some(program) = crate::pdf_word::program(storage.data_dir()) else {
+            return Err(ApiError::engine_unavailable(
+                "pdf2docx",
+                "the PDF to Word converter is not installed",
+            ));
+        };
+        let source = storage
+            .blobs
+            .path_of(&revision.content_sha256)
+            .map_err(|e| ApiError::storage_unavailable(blob_cause(&e)))?;
+        let title = match req.title {
+            Some(title) => Some(title),
+            None => default_docx_title(&storage, &id).await,
+        };
+        // PR-Daemon #1909 ③: the conversion can take far longer than the kernel
+        // waits for an answer (10 s to the head), so the answer is a `convert`
+        // job, running; it ends when the new document is imported, its result
+        // that document. A restart ends it `interrupted` (`jobs::recover`).
+        let job_id =
+            new_id(IdKind::Job).map_err(|_| ApiError::internal("could not generate a job id"))?;
+        let inserted = sqlx::query(
+            "INSERT INTO jobs (id, kind, document_id, revision, status, origin)
+             VALUES (?, 'convert', ?, ?, 'running', json_object('kind', 'page'))",
+        )
+        .bind(&job_id)
+        .bind(&id)
+        .bind(head)
+        .execute(storage.db.pool())
+        .await;
+        if let Err(e) = inserted {
+            return Err(storage.db_failure(e).await);
+        }
+        let job = match crate::jobs::load(storage.db.pool(), &job_id).await {
+            Ok(Some(job)) => job,
+            Ok(None) => return Err(ApiError::internal("the convert job was not written")),
+            Err(e) => return Err(storage.db_failure(e).await),
+        };
+        let data_dir = storage.data_dir().to_path_buf();
+        let owned = storage.clone();
+        let watched = storage.clone();
+        let this_job = job_id.clone();
+        let runtime = tokio::runtime::Handle::current();
+        let make = move |out: &Path| {
+            let _held = match CONVERTING.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Cancelled while it waited for the one conversion before it: not
+            // started at all (PR-Daemon #1915); `finish_convert` ends it cancelled.
+            let status: Option<String> = runtime
+                .block_on(
+                    sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
+                        .bind(&this_job)
+                        .fetch_optional(watched.db.pool()),
+                )
+                .ok()
+                .flatten();
+            if status.as_deref() == Some("cancelling") {
+                return Err(ApiError::invalid_request("the conversion was cancelled"));
+            }
+            crate::pdf_word::convert_to_docx(&data_dir, &program, &source, out)
+                .map_err(pdf_word_failure)
+        };
+        let made = async move { crate::derived::import_derived(&owned, title, "docx", make).await };
+        tokio::spawn(finish_convert(storage, job_id, made));
+        return Ok((StatusCode::ACCEPTED, Json(job)));
+    }
     let Some(ext) = extension(&revision.media_type) else {
         return Err(ApiError::unprocessable(
             "unsupported_format",
-            "only DOCX, XLSX and PPTX documents can be converted to PDF",
+            "only DOCX, XLSX and PPTX documents convert to PDF, and PDF documents to Word",
         ));
     };
     let Some(soffice_bin) = soffice(storage.data_dir()) else {
