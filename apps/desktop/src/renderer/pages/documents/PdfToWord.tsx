@@ -2,6 +2,9 @@
 // converts with the a24-pdf2docx engine (rust/apps/agent24-documents/src/pdf_word.rs),
 // downloaded on demand like LibreOffice (main/pdf-word-engine.ts); the new DOCX
 // document is imported next to the PDF. A scan (no text layer) is refused.
+// L12-4: the new document has one version, so its page offers no way out of
+// the app; 「保存到下载」 here writes it to Downloads (named after the PDF, as
+// .docx) and shows it in Finder.
 
 import { useState } from 'react'
 import { useT } from '../../i18n'
@@ -12,27 +15,29 @@ type Api = Window['agent24']['documents']
 
 type Note =
   | { kind: 'working' }
-  | { kind: 'done' }
+  | { kind: 'done'; documentId: string | null }
   | { kind: 'need' }
   | { kind: 'downloadFailed'; error: string }
   | { kind: 'scanned' }
   | { kind: 'failed'; error: string }
 
-export default function PdfToWord(props: { api: Api; documentId: string; onAdded?: () => void }) {
-  const { api, documentId, onAdded } = props
+export default function PdfToWord(props: { api: Api; documentId: string; title: string; onAdded?: () => void }) {
+  const { api, documentId, title, onAdded } = props
   const t = useT(documentsMessages)
   const [busy, setBusy] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [downloadText, setDownloadText] = useState<string | null>(null)
   const [note, setNote] = useState<Note | null>(null)
+  const [saved, setSaved] = useState<{ ok: boolean; text: string } | null>(null)
 
   const run = async () => {
     setBusy(true)
     setNote({ kind: 'working' })
+    setSaved(null)
     const out = await convert(api, documentId)
     setBusy(false)
     if (out.ok) {
-      setNote({ kind: 'done' })
+      setNote({ kind: 'done', documentId: out.documentId })
       onAdded?.()
       return
     }
@@ -45,6 +50,15 @@ export default function PdfToWord(props: { api: Api; documentId: string; onAdded
       return
     }
     setNote({ kind: 'failed', error: out.message })
+  }
+
+  const save = async (wordId: string) => {
+    setSaved(null)
+    const out = await api.saveDownload(wordId, title)
+    if (out.ok && out.docxName) {
+      setSaved({ ok: true, text: t('word.saved', { name: out.docxName }) })
+      void api.revealDownload(out.docxName)
+    } else setSaved({ ok: false, text: t('word.saveFailed', { error: out.message ?? out.code ?? '' }) })
   }
 
   const download = async () => {
@@ -82,6 +96,12 @@ export default function PdfToWord(props: { api: Api; documentId: string; onAdded
       </button>
       {note?.kind === 'working' && <p role="status">{t('word.working')}</p>}
       {note?.kind === 'done' && <p role="status">{t('word.done')}</p>}
+      {note?.kind === 'done' && note.documentId && (
+        <button type="button" className="btn btn-ghost" onClick={() => { void save(note.documentId as string) }}>
+          {t('word.save')}
+        </button>
+      )}
+      {saved && <p role={saved.ok ? 'status' : 'alert'}>{saved.text}</p>}
       {note?.kind === 'need' && (
         <>
           <p>{t('word.needEngine')}</p>
