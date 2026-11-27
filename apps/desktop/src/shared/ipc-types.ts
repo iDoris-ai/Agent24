@@ -155,6 +155,8 @@ export const IpcChannels = {
   DocumentsRevealDownload: 'documents:reveal-download',
   /** D5a: a library document's file saved to Downloads (its id, its title). */
   DocumentsSaveDownload: 'documents:save-download',
+  /** L8 DOC-4: a clean copy saved where the user picks, then its receipt. */
+  DocumentsDeliver: 'documents:deliver',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -162,6 +164,17 @@ export const IpcChannels = {
   KnowledgeCheck: 'knowledge:check',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  /** L7-K2: whether mock onboarding can start, and whether the server answers. */
+  KnowledgeOnboardPreflight: 'knowledge:onboard-preflight',
+  /** L7-K2: run mock onboarding. The activation code and the key never come back. */
+  KnowledgeOnboardRun: 'knowledge:onboard-run',
+  /** L7-K2 A3: pick files in main and upload them. Paths never come back. */
+  KnowledgeUploadPick: 'knowledge:upload-pick',
+  KnowledgeUploadList: 'knowledge:upload-list',
+  /** Arg is the uploadId, a string of at most 64 characters. */
+  KnowledgeUploadCancel: 'knowledge:upload-cancel',
+  /** Main → renderer. The full upload list. No path, bytes, credential or URL. */
+  KnowledgeUploadChanged: 'knowledge:upload-changed',
   // KB-C2-03 (main/knowledge-view.ts): the KnowledgeView container. The page
   // sends only where to draw it; the address, partition and policy are main's.
   KnowledgeViewShow: 'knowledge-view:show',
@@ -227,6 +240,57 @@ export interface KnowledgeConfigureInput {
   endpoint: string
   knowledgeBaseIds: string[]
   apiKey?: string
+}
+
+/** L7-K2 preflight. No activation code, no key. */
+export interface KnowledgeOnboardPreflight {
+  /** A usable `knowledge-activation.json` is in userData. */
+  activated: boolean
+  /** The file is present but rejected (mode, shape, endpoint or code). */
+  invalidActivation: boolean
+  /** An endpoint is already saved; onboarding will not overwrite it. */
+  alreadyBound: boolean
+  /** `GET {endpoint}/health` was 2xx. Null when there is no usable activation. */
+  reachable: boolean | null
+  formats: readonly ['md', 'markdown', 'txt']
+  maxBytes: number
+}
+
+/** L7-K2 result. A success names the knowledge base only — never the key or the code. */
+export type KnowledgeOnboardResult =
+  /** activeNow: the daemon took the binding now; false when it was not up and takes it later from the saved settings. */
+  | { ok: true; outcome: 'created' | 'existing'; knowledgeBaseId: string; configMismatch: boolean; activeNow: boolean }
+  | {
+    ok: false
+    code:
+      | 'local_only_unavailable'
+      | 'unavailable'
+      | 'already_bound'
+      | 'not_activated'
+      | 'activation_invalid'
+      | 'in_progress'
+      | 'not_offered'
+      | 'unreachable'
+      | 'server_error'
+      | 'not_saved'
+  }
+
+/** L7-K2 A3: one picked file, as the renderer may see it. No path, bytes, credential or URL. */
+export interface KnowledgeUpload {
+  uploadId: string
+  fileName: string
+  state: 'refused' | 'sending' | 'saved' | 'processing' | 'indexed' | 'failed' | 'cancelled' | 'unknown'
+  reason: string | null
+  jobId: string | null
+  enrichment: string | null
+  /** The server marked this cost final. */
+  costFinal: boolean
+  /** True only when the cost is final and every item is measured exact with units 0. */
+  costZero: boolean
+  /** True when any cost item is measured unknown. */
+  costUnknown: boolean
+  originalRetained: boolean
+  updatedAt: number
 }
 
 export type {
@@ -600,12 +664,30 @@ export type DocumentsRequest =
     }
   /** D5a: a DOCX template's `{{fields}}`. */
   | { op: 'fields'; documentId: DocSchemas['DocumentIdString'] }
+  /** L8 DOC-4: what a DOCX/PDF still carries before it is sent (read-only). */
+  | { op: 'preflight'; documentId: DocSchemas['DocumentIdString'] }
+  /** L8 DOC-4: a clean copy of the version checked (a new document), the
+   * receipt once its file is saved, and the latest receipts. */
+  | { op: 'deliver'; documentId: DocSchemas['DocumentIdString']; expectRevision: number }
+  | { op: 'receipt'; documentId: DocSchemas['DocumentIdString']; revision: number; copyDocumentId: DocSchemas['DocumentIdString']; savedTo: string }
+  | { op: 'receipts'; documentId?: DocSchemas['DocumentIdString'] }
   /** D5a: the template with its fields filled, as a new document. */
   | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
   /** D5a: the head revision's file (base64), to be saved. */
-  | { op: 'content'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'content'; documentId: DocSchemas['DocumentIdString']; revision?: number }
   | { op: 'cancelJob'; jobId: DocSchemas['JobIdString'] }
   | { op: 'retryJob'; jobId: DocSchemas['JobIdString'] }
+  /** L6-F2: soft delete, restore within 7 days, and what can be restored. */
+  | { op: 'delete'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'restore'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'recentlyDeleted' }
+  /** L6-F5: a document's versions, and an old one made current again over
+   * the version the user saw (`expectRevision`). */
+  | { op: 'revisions'; documentId: DocSchemas['DocumentIdString'] }
+  | { op: 'restoreRevision'; documentId: DocSchemas['DocumentIdString']; revision: number; expectRevision: number }
+  /** L6-S05: two documents, or two versions of one, compared by their text
+   * (no `revision` = the current version). */
+  | { op: 'compare'; left: CompareTarget; right: CompareTarget; limit?: number; offset?: number }
 
 /** What each operation returns on success. */
 export interface DocumentsResults {
@@ -627,9 +709,114 @@ export interface DocumentsResults {
   patch: DocSchemas['DocumentsJob']
   fields: { document_id: string; revision: number; fields: Array<{ name: string; count: number }> }
   fill: DocSchemas['DocumentsJob']
+  preflight: DocumentPreflight
+  deliver: DocSchemas['DocumentsJob']
+  receipt: DeliveryReceipt
+  receipts: { receipts: DeliveryReceipt[] }
   content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
+  delete: DeletedDocument
+  restore: DocSchemas['DocumentDetail']
+  recentlyDeleted: { documents: DeletedDocument[] }
+  revisions: DocumentVersions
+  restoreRevision: SavedVersion
+  compare: DocumentComparison
+}
+
+/** L8 DOC-4: agent24-documents `preflight.rs`; only kinds found are listed. */
+export type PreflightKind =
+  | 'tracked_insertions' | 'tracked_deletions' | 'comments' | 'unfilled_fields'
+  | 'author' | 'last_modified_by' | 'hidden_text' | 'pdf_form' | 'pdf_annotations'
+export interface DocumentPreflight {
+  document_id: string
+  revision: number
+  title: string | null
+  format: 'docx' | 'pdf'
+  clean: boolean
+  findings: Array<{ kind: PreflightKind; count: number; examples: string[] }>
+  /** A DOCX (a clean copy can be made of it from the delivery card); a PDF is only reported. */
+  cleanable: boolean
+}
+
+/** L8 DOC-4: agent24-documents `deliver.rs`; the hash and format are the
+ * library copy's own. `again`: the same file was saved for it before. */
+export interface DeliveryReceipt {
+  document_id: string
+  title: string | null
+  revision: number
+  at: string
+  format: 'docx' | 'pdf'
+  file_name: string
+  saved_to: string
+  sha256: string
+  copy_document_id: string
+  again: boolean
+}
+
+/** L8 DOC-4: `documents:deliver` (main `doc-deliver.ts`). */
+export interface DeliverRequest {
+  documentId: string
+  /** The version the user checked (preflight's `revision`). */
+  revision: number
+  format: 'docx' | 'pdf'
+  /** The source document's title, for the file name offered. */
+  title: string
+}
+export type DeliverResult =
+  | { ok: true; savedTo: string; fileName: string; receipt: DeliveryReceipt }
+  | { ok: false; canceled: true }
+  /** `savedTo` only when the file was written (stage `receipt`). */
+  | { ok: false; canceled?: false; stage: 'copy' | 'convert' | 'write' | 'receipt'; code: string; message: string; savedTo?: string }
+
+export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }
+
+/** L6-S05: where a change is in its document (agent24-documents `compare.rs`). */
+export type CompareBlockRef = { paragraph_index: number } | { block_id: string; page: number }
+export interface CompareSide { block_ref: CompareBlockRef; text: string }
+export interface DocumentChange {
+  id: string
+  kind: 'added' | 'removed' | 'changed' | 'unaligned'
+  left: CompareSide | null
+  right: CompareSide | null
+  spans: Array<{ op: 'equal' | 'insert' | 'delete'; text: string }>
+}
+/** `summary` counts every change; `changes` is one page of them. */
+export interface DocumentComparison {
+  left: { document_id: string; revision: number; media_type: string }
+  right: { document_id: string; revision: number; media_type: string }
+  identical: boolean
+  only_text: boolean
+  summary: { total: number; added: number; removed: number; changed: number; unaligned: number }
+  changes: DocumentChange[]
+  truncated: boolean
+  next_offset: number | null
+}
+
+/** L6-F5: a document's versions, newest first (agent24-documents `versions.rs`). */
+export interface DocumentVersions {
+  document_id: string
+  head_revision: number
+  revisions: Array<{ revision: number; content_sha256: string; size: number; media_type: string; origin: 'import' | 'commit'; created_at: string }>
+}
+
+/** L6-F5: a version saved; `committed` false when nothing was written. */
+export interface SavedVersion {
+  document_id: string
+  title: string
+  revision: number
+  previous_revision: number
+  committed: boolean
+}
+
+/** L6-F2: a document deleted less than 7 days ago (agent24-documents `trash.rs`). */
+export interface DeletedDocument {
+  document_id: string
+  title: string
+  media_type: string
+  created_at: string
+  deleted_at: string
+  restorable_until: string
 }
 
 /** The error envelope: the OS's or the kernel's, or one main makes for a

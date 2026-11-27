@@ -11,8 +11,10 @@
 
 pub mod authorization;
 pub mod blob;
+pub mod compare;
 pub mod compose;
 pub mod db;
+pub mod deliver;
 pub mod derived;
 pub mod documents;
 pub mod docx_patch;
@@ -21,6 +23,7 @@ pub mod error;
 pub mod events;
 pub mod extract;
 pub mod extractions;
+pub mod form;
 pub mod id;
 pub mod idem;
 pub mod imports;
@@ -29,13 +32,16 @@ pub mod office;
 pub mod oplog;
 pub mod patch;
 pub mod pdf_compose;
+pub mod preflight;
 pub mod read;
 pub mod scope;
 pub mod state;
 pub mod text_layer;
 pub mod timestamp;
 pub mod tools;
+pub mod trash;
 pub mod uploads;
+pub mod versions;
 
 use axum::extract::{DefaultBodyLimit, State};
 use axum::routing::{get, post};
@@ -177,7 +183,27 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/capabilities", get(get_capabilities))
         .route("/documents", get(documents::list_documents))
+        .route("/documents/compare", post(compare::route::compare))
         .route("/documents/{document_id}", get(documents::get_document))
+        // L6-F2: soft delete, restore within 7 days, and what can be restored.
+        .route(
+            "/documents/{document_id}/delete",
+            post(trash::delete_document),
+        )
+        .route(
+            "/documents/{document_id}/restore",
+            post(trash::restore_document),
+        )
+        .route("/recently-deleted", get(trash::list_recently_deleted))
+        // L6-F5: a document's versions, and an old one made current again.
+        .route(
+            "/documents/{document_id}/revisions",
+            get(versions::list_revisions),
+        )
+        .route(
+            "/documents/{document_id}/revisions/{revision}/restore",
+            post(versions::restore_revision),
+        )
         .route(
             "/documents/{document_id}/revisions/{revision}/text",
             get(read::text::read_text),
@@ -209,7 +235,26 @@ pub fn router(state: AppState) -> Router {
         .route("/documents/{document_id}/patches", post(patch::patch))
         // D5a: a template's `{{fields}}`, and a new document with them filled.
         .route("/documents/{document_id}/fields", get(patch::fields))
+        .route(
+            "/documents/{document_id}/preflight",
+            get(preflight::preflight),
+        )
+        .route(
+            "/documents/{document_id}/deliveries",
+            post(deliver::deliver),
+        )
+        .route(
+            "/documents/{document_id}/receipts",
+            get(deliver::document_receipts).post(deliver::record_receipt),
+        )
+        .route("/receipts", get(deliver::all_receipts))
         .route("/documents/{document_id}/fill", post(patch::fill))
+        // L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
+        // material takes from it, for the approval box (read).
+        .route(
+            "/documents/{document_id}/fill/preview",
+            post(tools::fill_preview),
+        )
         .route("/documents/{document_id}/content", get(patch::content))
         .route("/jobs/{job_id}", get(jobs::get_job))
         .route("/jobs/{job_id}/cancel", post(jobs::cancel_job))
@@ -224,6 +269,10 @@ pub fn router(state: AppState) -> Router {
         // segment after the namespace canonicalises to `_a24`.
         .route("/_a24/tools/{op}", post(tools::call_tool))
         .route("/_a24/authorization/revoked", post(authorization::revoked))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            trash::hide_deleted,
+        ))
         .with_state(state)
 }
 
@@ -281,9 +330,12 @@ mod tests {
                 "get",
                 "compose",
                 "paragraphs",
+                "compare",
+                "preflight",
                 "patch",
                 "fields",
-                "fill"
+                "fill",
+                "delete"
             ]
         );
     }

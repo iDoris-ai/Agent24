@@ -1,7 +1,7 @@
 //! Managed iDoris lifecycle. Setup, key storage and budget discovery stay injected.
 //!
-//! v0.5.0 (`01484547`) reads exactly 64 lowercase hex bytes plus LF from stdin,
-//! uses IDORIS_OMLX_API_KEY for serve, and exposes contract_version in /health.
+//! iDoris reads the launcher frame from stdin and publishes private discovery.
+//! Readiness uses the discovered ports and the /health contract.
 //! No readiness or error classification is inferred from diagnostic output.
 
 mod discovery;
@@ -181,8 +181,6 @@ pub struct StartConfig {
     pub data: DataPaths,
     pub ports: Ports,
     pub log_dir: PathBuf,
-    /// Opt-in sanitized child output; default logs only controlled phases.
-    pub diagnostic_output: bool,
     pub timings: Timings,
     /// Cancel even while start, input refresh or restart backoff is pending.
     pub shutdown: CancellationToken,
@@ -205,7 +203,6 @@ impl StartConfig {
             data,
             ports: Ports::default(),
             log_dir: PathBuf::from(home).join("Library/Logs/Agent24/idoris"),
-            diagnostic_output: false,
             timings: Timings::default(),
             shutdown: CancellationToken::new(),
             lock: IdorisLock::embedded(),
@@ -277,22 +274,18 @@ impl Supervisor {
         }
         config.data = config.data.canonical()?;
         let lease = Lease::acquire(&config.data.state)?;
-        let registration = if launcher_enabled(&config) {
-            match discovery::path(&config.data).and_then(|path| {
-                register::Server::start(path, config.lock).map_err(SupervisorError::Io)
-            }) {
-                Ok(server) => {
-                    config.register_socket = Some(server.socket_path().to_path_buf());
-                    config.registration = Some(server.handle());
-                    Some(server)
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "iDoris registration unavailable");
-                    None
-                }
+        let registration = match discovery::path(&config.data).and_then(|path| {
+            register::Server::start(path, config.lock).map_err(SupervisorError::Io)
+        }) {
+            Ok(server) => {
+                config.register_socket = Some(server.socket_path().to_path_buf());
+                config.registration = Some(server.handle());
+                Some(server)
             }
-        } else {
-            None
+            Err(error) => {
+                tracing::warn!(%error, "iDoris registration unavailable");
+                None
+            }
         };
         let config = Arc::new(config);
         let adopted = if registration.is_some() {
@@ -545,7 +538,7 @@ where
                 lease.clear()?;
                 return Ok(StopReport::default());
             }
-            if !retry_exit(status.code(), launcher_enabled(&config)) {
+            if !retry_exit(status.code()) {
                 lease.clear()?;
                 return Err(exit_error(status));
             }
@@ -609,8 +602,8 @@ fn expected_exit(code: Option<i32>, bye: bool) -> bool {
     matches!(code, Some(0 | 4)) || (bye && !matches!(code, Some(1 | 5)))
 }
 
-fn retry_exit(code: Option<i32>, launcher: bool) -> bool {
-    matches!(code, None | Some(5)) || (launcher && code == Some(1))
+fn retry_exit(code: Option<i32>) -> bool {
+    matches!(code, None | Some(1 | 5))
 }
 
 async fn launch<F, Fut>(
@@ -633,8 +626,7 @@ where
         };
         match ManagedProcess::start(config.clone(), inputs, lease).await {
             Err(SupervisorError::Failed { code })
-                if retry_exit(code, launcher_enabled(config))
-                    && !config.shutdown.is_cancelled() =>
+                if retry_exit(code) && !config.shutdown.is_cancelled() =>
             {
                 let delay = policy.delay(Instant::now(), stable_since, &config.timings)?;
                 // Before the first start no handle exists to publish the circuit,
@@ -791,18 +783,13 @@ where
             return Ok(None);
         }
         let token = Arc::new(token);
-        let output = logs::Output::new(
-            &config.log_dir,
-            token.clone(),
-            inputs.omlx_key.map(Arc::new),
-            config.diagnostic_output,
-        )?;
+        let output = logs::Output::new(&config.log_dir)?;
         let mut process = ManagedProcess {
             ports: Ports {
                 data: discovered.data_port,
                 admin: discovered.admin_port,
             },
-            discovery: Some(path),
+            discovery: path,
             instance_id: Some(discovered.instance_id),
             child: ProcessHandle::Orphan {
                 record,
@@ -835,7 +822,7 @@ where
 
 struct ManagedProcess {
     ports: Ports,
-    discovery: Option<PathBuf>,
+    discovery: PathBuf,
     instance_id: Option<String>,
     child: ProcessHandle,
     group: Option<Pid>,
@@ -859,24 +846,18 @@ impl ManagedProcess {
             return Err(SupervisorError::Configuration);
         }
         let token = Arc::new(mint_token()?);
-        let mut output = logs::Output::new(
-            &config.log_dir,
-            token.clone(),
-            inputs.omlx_key.map(Arc::new),
-            config.diagnostic_output,
+        let output = logs::Output::new(&config.log_dir)?;
+        let mut command = serve_command(
+            &config,
+            &inputs.budget,
+            inputs.omlx_key.as_ref().map(|key| key.as_str()),
         )?;
-        let mut command = serve_command(&config, &inputs.budget, output.omlx_key())?;
-        let discovery = if launcher_enabled(&config) {
-            Some(discovery::path(&config.data)?)
-        } else {
-            None
-        };
-        let mut child = command.spawn()?;
+        let discovery = discovery::path(&config.data)?;
+        let child = command.spawn()?;
         let spawned = Instant::now();
         let pid = child
             .id()
             .ok_or_else(|| io::Error::other("missing child PID"))?;
-        output.attach(child.stdout.take(), child.stderr.take());
         let mut process = Self {
             ports: config.ports,
             discovery,
@@ -894,14 +875,11 @@ impl ManagedProcess {
                 .child
                 .take_stdin()
                 .ok_or(SupervisorError::TokenHandoff)?;
-            let frame = match &process.discovery {
-                Some(path) => discovery::frame(
-                    &process._admin,
-                    path,
-                    process.config.register_socket.as_deref(),
-                )?,
-                None => Zeroizing::new(process._admin.to_string()),
-            };
+            let frame = discovery::frame(
+                &process._admin,
+                &process.discovery,
+                process.config.register_socket.as_deref(),
+            )?;
             let handoff = write_token(
                 &mut stdin,
                 &frame,
@@ -1023,24 +1001,22 @@ impl ManagedProcess {
             .build()
             .map_err(|_| SupervisorError::Configuration)?;
         loop {
-            if let Some(path) = &self.discovery {
-                match discovery::read_any(path) {
-                    Ok(record) if Some(record.pid) != self.child.id() => {}
-                    Ok(record) => {
-                        self.ports = Ports {
-                            data: record.data_port,
-                            admin: record.admin_port,
-                        };
-                        self.instance_id = Some(record.instance_id);
-                    }
-                    Err(SupervisorError::StaleDiscovery) => {}
-                    Err(SupervisorError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error),
+            match discovery::read_any(&self.discovery) {
+                Ok(record) if Some(record.pid) != self.child.id() => {}
+                Ok(record) => {
+                    self.ports = Ports {
+                        data: record.data_port,
+                        admin: record.admin_port,
+                    };
+                    self.instance_id = Some(record.instance_id);
                 }
+                Err(SupervisorError::StaleDiscovery) => {}
+                Err(SupervisorError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
             let url = format!("http://127.0.0.1:{}/health", self.ports.data);
             let check = async {
-                if self.discovery.is_some() && self.instance_id.is_none() {
+                if self.instance_id.is_none() {
                     return Ok(false);
                 }
                 if let Ok(mut response) = client.get(&url).send().await {
@@ -1069,7 +1045,7 @@ impl ManagedProcess {
                         {
                             return Err(SupervisorError::Contract);
                         }
-                        if !listeners_owned(&self.config, self.ports, self.group).await? {
+                        if !listeners_owned(&self.config, self.ports, self.group)? {
                             return Ok(false);
                         }
                         let admin_url =
@@ -1207,52 +1183,17 @@ pub(crate) fn ownership_verdict(result: io::Result<bool>, allow_unsupported: boo
 /// F3/N1: loopback has no peer identity, so a 200 from a port proves
 /// nothing. Before the Admin token leaves this process, every visible
 /// LISTEN socket on both ports must be held by this generation's group.
-async fn listeners_owned(
-    config: &StartConfig,
+fn listeners_owned(
+    _config: &StartConfig,
     ports: Ports,
     group: Option<Pid>,
 ) -> Result<bool, SupervisorError> {
     let group = group.ok_or(SupervisorError::InstanceConflict)?;
-    if launcher_enabled(config) {
-        let ownership =
-            agent24_os_proc::owns_listening_ports(group.as_raw(), &[ports.data, ports.admin]);
-        #[cfg(test)]
-        let ownership = config.port_ownership.map_or(ownership, Ok);
-        return Ok(ownership_verdict(ownership, cfg!(test)));
-    }
-    for port in [ports.data, ports.admin] {
-        let found = identity::listeners(port, config.timings.health_request).await;
-        if !judge_listeners(found, group, |pid| {
-            nix::unistd::getpgid(Some(Pid::from_raw(i32::try_from(pid).ok()?))).ok()
-        })? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-/// Only a listener confirmed to sit in another process group is a port
-/// conflict (L4, never retried). A failed or timed-out query, a socket whose
-/// holder is not visible, or a holder gone before its PGID was read proves
-/// nothing either way: not ready yet, retried until the readiness deadline,
-/// and the Admin token is still withheld.
-fn judge_listeners(
-    found: io::Result<identity::Listeners>,
-    group: Pid,
-    pgid_of: impl Fn(u32) -> Option<Pid>,
-) -> Result<bool, SupervisorError> {
-    let Ok(found) = found else {
-        return Ok(false);
-    };
-    let mut proven = !found.unattributed && !found.pids.is_empty();
-    for pid in found.pids {
-        match pgid_of(pid) {
-            Some(pgid) if pgid == group => {}
-            Some(_) => return Err(SupervisorError::InstanceConflict),
-            None => proven = false,
-        }
-    }
-    Ok(proven)
+    let ownership =
+        agent24_os_proc::owns_listening_ports(group.as_raw(), &[ports.data, ports.admin]);
+    #[cfg(test)]
+    let ownership = _config.port_ownership.map_or(ownership, Ok);
+    Ok(ownership_verdict(ownership, cfg!(test)))
 }
 
 /// A zombie-only group holds no ports, files or CPU and cannot be signalled
@@ -1294,7 +1235,7 @@ impl Drop for ManagedProcess {
         // agent24d is going away abnormally. Only a launcher with a registration
         // socket has an armed orphan timer, so leave that generation for adoption.
         // Without the timer, kill it to avoid leaving an unmanaged process.
-        if launcher_enabled(&self.config) && self.config.register_socket.is_some() {
+        if self.config.register_socket.is_some() {
             return;
         }
         let _ = self.signal_owned_group(Signal::SIGKILL);
@@ -1308,13 +1249,6 @@ fn signal_group(group: Pid, signal: Signal) -> io::Result<()> {
         identity::group_has_live_member(group)
     })?;
     Ok(())
-}
-
-fn launcher_enabled(config: &StartConfig) -> bool {
-    semver::Version::parse(config.lock.tag.trim_start_matches('v'))
-        .is_ok_and(|v| v >= semver::Version::new(0, 6, 0))
-        || (cfg!(debug_assertions)
-            && std::env::var("AGENT24_DEV_IDORIS_LAUNCHER").as_deref() == Ok("1"))
 }
 
 fn serve_command(
@@ -1339,31 +1273,14 @@ fn serve_command(
     command
         .env_clear()
         .current_dir(&directory)
-        .args([
-            "serve",
-            if launcher_enabled(config) {
-                "--launcher-stdin"
-            } else {
-                "--admin-token-stdin"
-            },
-        ])
-        .kill_on_drop(true)
+        .args(["serve", "--launcher-stdin"])
         .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    // Only the launcher generation survives agent24d in its own session; v0.5.0
-    // has no adopt path, so a surviving instance would block the next start.
-    if launcher_enabled(config) {
-        // A pipe would close with agent24d and make the surviving iDoris panic
-        // on its next log write (iDoris #621), so its output goes to /dev/null.
-        command
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(false);
-        agent24_os_proc::independent_session(command.as_std_mut());
-    } else {
-        command.process_group(0);
-    }
+        // A pipe would close with agent24d and make a surviving iDoris panic
+        // on its next log write (iDoris #621).
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(false);
+    agent24_os_proc::independent_session(command.as_std_mut());
     // Fixed PATH prevents parent PATH injection into any runtime subprocess.
     command.env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
     for name in ["HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TZ"] {
@@ -1384,22 +1301,8 @@ fn serve_command(
             "IDORIS_ALLOCATED_BUDGET_BYTES",
             budget.allocated_bytes.to_string(),
         )
-        .env(
-            "IDORIS_PORT",
-            if launcher_enabled(config) {
-                "0".into()
-            } else {
-                config.ports.data.to_string()
-            },
-        )
-        .env(
-            "IDORIS_ADMIN_PORT",
-            if launcher_enabled(config) {
-                "0".into()
-            } else {
-                config.ports.admin.to_string()
-            },
-        )
+        .env("IDORIS_PORT", "0")
+        .env("IDORIS_ADMIN_PORT", "0")
         .env("IDORIS_BIND_HOST", "127.0.0.1")
         .env("IDORIS_DEPLOY_MODE", "personal");
     if let Some(key) = key {

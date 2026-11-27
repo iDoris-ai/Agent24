@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import type { KnowledgeSettingsResult, KnowledgeStatus } from '../../../shared/ipc-types'
 import { useT } from '../../i18n'
 import { knowledgeMessages } from './KnowledgeSettings.i18n'
+import { formatKbNames, loadKbNames, parseKbNames, saveKbNames } from '../chat/kb-names'
 
 /** Splits the knowledge base field on new lines and commas. */
 export function parseKnowledgeBaseIds(text: string): string[] {
@@ -15,6 +16,7 @@ export function KnowledgeSettings() {
   const [status, setStatus] = useState<KnowledgeStatus | null>(null)
   const [endpoint, setEndpoint] = useState('')
   const [bases, setBases] = useState('')
+  const [names, setNames] = useState(() => formatKbNames(loadKbNames()))
   const [apiKey, setApiKey] = useState('')
   const [busy, setBusy] = useState(false)
   const [result, setResult] = useState<KnowledgeSettingsResult | null>(null)
@@ -47,11 +49,15 @@ export function KnowledgeSettings() {
     }
   }
 
-  const save = () => run(() => window.agent24.knowledge.configure({
+  const save = () => run(() => {
+    // L7-K1: a display label per library, kept on this machine only.
+    saveKbNames(parseKbNames(names))
+    return window.agent24.knowledge.configure({
     endpoint: endpoint.trim(),
     knowledgeBaseIds: parseKnowledgeBaseIds(bases),
     ...(apiKey === '' ? {} : { apiKey }),
-  }).then((r) => { if (r.ok) setApiKey(''); return r }))
+    }).then((r) => { if (r.ok) setApiKey(''); return r })
+  })
 
   const statusText = !status?.enabled ? t('statusOff') : status.active ? t('statusActive') : t('statusIncomplete')
   // K2: what the last check of the server found, red unless it answered.
@@ -103,6 +109,10 @@ export function KnowledgeSettings() {
     <div className="setting-row">
       <div><label htmlFor="knowledge-bases">{t('knowledgeBases')}</label><p>{t('knowledgeBasesHint')}</p></div>
       <textarea id="knowledge-bases" rows={3} value={bases} onChange={(e) => setBases(e.target.value)} />
+    </div>
+    <div className="setting-row">
+      <div><label htmlFor="knowledge-names">{t('libraryNames')}</label><p>{t('libraryNamesHint')}</p></div>
+      <textarea id="knowledge-names" rows={3} value={names} onChange={(e) => setNames(e.target.value)} />
     </div>
     <div className="setting-row">
       <div><label htmlFor="knowledge-key">{t('apiKey')}</label><p>{status?.hasKey ? t('apiKeyKept') : t('apiKeyNone')}</p></div>

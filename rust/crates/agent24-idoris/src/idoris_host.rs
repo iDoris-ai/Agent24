@@ -8,12 +8,12 @@ use crate::{
     download::VerifiedArchive,
     install::{Codesign, InstalledVersion, SignatureVerifier, VerifyMode},
     keychain::{Keychain, KeychainError, SystemKeychain},
-    omlx_probe::{ApiKey, Endpoint, OmlxProbe, ProbeStatus},
     setup::Role,
     supervisor::{
         Budget, ComponentsDir, DataPaths, LaunchInputs, Ports, StartConfig, Supervisor,
         SupervisorError,
     },
+    upstream::{ApiKey, Endpoint},
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,18 @@ pub struct VerificationReceipt {
 
 impl Installation {
     fn validate(&self) -> Result<(), Code> {
+        if !self.is_bundled_version() {
+            return Err(Code::InvalidRequest);
+        }
+        self.validate_fields()
+    }
+    /// The receipt names the release this build bundles. A receipt from another
+    /// bundled version is an install to be redone, not a broken receipt.
+    fn is_bundled_version(&self) -> bool {
+        self.version == IdorisLock::embedded().tag.trim_start_matches('v')
+    }
+    /// Every check except the version.
+    fn validate_fields(&self) -> Result<(), Code> {
         let reference = |id: &str| {
             !id.is_empty()
                 && id.len() <= 128
@@ -94,8 +106,7 @@ impl Installation {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
         };
-        if self.version != IdorisLock::embedded().tag.trim_start_matches('v')
-            || !self.release_dir.is_absolute()
+        if !self.release_dir.is_absolute()
             || !self.archive_path.is_absolute()
             || self
                 .components_dir
@@ -546,30 +557,6 @@ impl Runtime for SystemRuntime {
                 .clone();
             provisioner.upstream_key().await?.map(ApiKey::into_secret)
         };
-        if !crate::setup::upstream_setup_enabled(IdorisLock::embedded()) {
-            let url = r.omlx_url.as_deref().ok_or(Code::NotConfigured)?;
-            let endpoint = Endpoint::parse(url).map_err(|_| Code::NotConfigured)?;
-            let api_key = key
-                .clone()
-                .map(ApiKey::new)
-                .transpose()
-                .map_err(|_| Code::NotConfigured)?;
-            let provisioner = self
-                .provisioner
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone();
-            let results = provisioner
-                .omlx_probe()?
-                .probe(Some(&endpoint), api_key.as_ref())
-                .await;
-            if !results
-                .iter()
-                .any(|p| p.endpoint == endpoint && matches!(p.status, ProbeStatus::Ready { .. }))
-            {
-                return Err(Code::NotConfigured);
-            }
-        }
         Ok(LaunchInputs {
             budget: Budget {
                 allocated_bytes: budget,
@@ -609,6 +596,8 @@ pub struct IdorisHost {
     budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
     omlx_keys: Arc<dyn Keychain>,
+    /// oMLX's model directory (`~/.omlx/models`, the same default iDoris scans).
+    omlx_models_dir: Option<PathBuf>,
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     let parent = path.parent().ok_or(Code::PersistenceFailed)?;
@@ -678,9 +667,25 @@ impl IdorisHost {
         };
         if let Some(record) = &installation {
             record
-                .validate()
+                .validate_fields()
                 .map_err(|_| io::Error::other("invalid iDoris installation receipt"))?;
         }
+        // After the bundled iDoris is bumped, an otherwise valid receipt from the
+        // previous version reads as not installed: the ordinary Install (startup
+        // bootstrap or the panel's button) installs the bundled release and the
+        // connect that follows configures it afresh. The old file is replaced when
+        // the new receipt is written; the old release directory is left in place.
+        let installation = installation.filter(|record| {
+            let current = record.is_bundled_version();
+            if !current {
+                tracing::warn!(
+                    found = %record.version,
+                    bundled = IdorisLock::embedded().tag.trim_start_matches('v'),
+                    "iDoris receipt is from another bundled version; it will be reinstalled"
+                );
+            }
+            current
+        });
         let mut operations: BTreeMap<String, Operation> =
             match std::fs::read(root.join("operations.json")) {
                 Ok(body) => serde_json::from_slice(&body).map_err(io::Error::other)?,
@@ -714,6 +719,10 @@ impl IdorisHost {
             budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
             omlx_keys: Arc::new(crate::keychain::OmlxKeychain),
+            omlx_models_dir: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join(".omlx/models")),
             inner: Mutex::new(Inner {
                 installation,
                 state,

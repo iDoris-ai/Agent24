@@ -367,6 +367,38 @@ struct RunDocuments {
     /// new document's title), so a run that made A and failed on B says both.
     /// A document a later write did make is not here.
     failed: Vec<String>,
+    /// L6-F5: the writes saved as a document's next version (no import
+    /// job): which document, its title and the new version.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    revisions: Vec<SavedRevision>,
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+struct SavedRevision {
+    document_id: String,
+    title: String,
+    revision: i64,
+}
+
+/// L6-F5: a patch or fill the module saved as the document's next version.
+fn saved_revision(payload: Option<&serde_json::Value>) -> Option<SavedRevision> {
+    let p = payload?;
+    // `committed: false` is content equal to the head: the module wrote
+    // nothing (and told the model so), so it is no saved version.
+    if p.get("saved_as").and_then(|v| v.as_str()) != Some("new_revision")
+        || p.get("committed").and_then(|v| v.as_bool()) != Some(true)
+    {
+        return None;
+    }
+    Some(SavedRevision {
+        document_id: p.get("document_id")?.as_str()?.to_owned(),
+        title: p
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_owned(),
+        revision: p.get("revision")?.as_i64()?,
+    })
 }
 
 /// The documents operations that only read.
@@ -374,6 +406,8 @@ const DOCUMENT_READS: &[&str] = &[
     "list",
     "get",
     "paragraphs",
+    "compare",
+    "preflight",
     "fields",
     "read_range",
     "find",
@@ -395,6 +429,8 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
     let mut jobs = Vec::new();
     let mut made: Vec<String> = Vec::new();
     let mut tried: Vec<String> = Vec::new();
+    let mut deleted_any = false;
+    let mut revisions: Vec<SavedRevision> = Vec::new();
     // PR-Daemon #1994 B1: a document named by its file name in one call and
     // by its id in another is one document. What the module answered (the
     // `document_id` of a read, the `source_document_id` of a write) says
@@ -444,6 +480,50 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
         if !write {
             continue;
         }
+        // L6-F2: a delete that went through makes no document and changed
+        // what it was asked to; it is not a write that came to nothing, and
+        // it settles earlier tries at that document (refused by the user,
+        // then approved). PR-Daemon #2026 ①.
+        if payload
+            .as_ref()
+            .is_some_and(|p| p.get("deleted") == Some(&serde_json::Value::Bool(true)))
+        {
+            if let Some(id) = payload
+                .as_ref()
+                .and_then(|p| p.get("document_id"))
+                .and_then(|d| d.as_str())
+                && !target.is_empty()
+            {
+                alias.insert(target.clone(), id.to_owned());
+            }
+            made.push(target.clone());
+            deleted_any = true;
+            continue;
+        }
+        // L6-F5: saved as the document's next version: a write that went
+        // through, with no import job.
+        if let Some(saved) = saved_revision(payload.as_ref()) {
+            attempted = true;
+            made.push(target.clone());
+            if !revisions.contains(&saved) {
+                revisions.push(saved);
+            }
+            continue;
+        }
+        // A delete the kernel refused before any card (a file name for its
+        // id, `off_pattern`) asked nothing of the user: the model is told
+        // to call again with the id, so it is not a try that failed.
+        // Only the two pre-card refusals (`missing_required`, `off_pattern`);
+        // an approved call refused later (`unknown tool`) still counts.
+        if name == "documents.delete"
+            && m.content.as_deref().is_some_and(|c| {
+                c.starts_with("tool error: invalid: ")
+                    && (c.contains(" needs the argument ")
+                        || c.contains(" is not in the form it needs "))
+            })
+        {
+            continue;
+        }
         attempted = true;
         let job = payload
             .as_ref()
@@ -466,10 +546,20 @@ fn run_documents(messages: &[agent24_store::RunMessage]) -> Option<RunDocuments>
             failed.push(t);
         }
     }
+    // PR-Daemon #2026 round 2: every try was a delete that a later delete of
+    // the same document settled (refused, then approved): nothing reads as
+    // unchanged. A try with no target (never settled) keeps it as before.
+    let unsettled = tried
+        .iter()
+        .any(|t| t.is_empty() || !made.contains(&key(t)));
+    if deleted_any && jobs.is_empty() && !unsettled {
+        return None;
+    }
     attempted.then_some(RunDocuments {
         attempted,
         jobs,
         failed,
+        revisions,
     })
 }
 
@@ -710,7 +800,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec![],
-                failed: vec![]
+                failed: vec![],
+                revisions: vec![]
             })
         );
         // The module's own refusal and an error: asked, no job.
@@ -725,7 +816,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec![],
-                failed: vec![]
+                failed: vec![],
+                revisions: vec![]
             })
         );
         // Sent back, then retried right: the job.
@@ -740,7 +832,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec!["job_1".into()],
-                failed: vec![]
+                failed: vec![],
+                revisions: vec![]
             })
         );
         // PR-Daemon #1986 Low 1: the same call id reused, a read then a write:
@@ -756,7 +849,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec!["job_1".into()],
-                failed: vec![]
+                failed: vec![],
+                revisions: vec![]
             })
         );
         let reused_back = [
@@ -770,7 +864,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec![],
-                failed: vec![]
+                failed: vec![],
+                revisions: vec![]
             })
         );
         // General 0.6.94: two documents in one run, A made, B refused by the
@@ -807,7 +902,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec!["job_1".into()],
-                failed: vec!["doc_B".into()]
+                failed: vec!["doc_B".into()],
+                revisions: vec![]
             })
         );
         // PR-Daemon #1994 B1: refused under its file name, made under its id:
@@ -847,7 +943,8 @@ mod documents_tests {
             Some(RunDocuments {
                 attempted: true,
                 jobs: vec!["job_9".into()],
-                failed: vec![]
+                failed: vec![],
+                revisions: vec![]
             })
         );
         // The same the other way: the write's own answer names the document.
@@ -886,6 +983,138 @@ mod documents_tests {
         );
         // fill and a later write operation are writes too.
         assert!(is_document_write("documents.fill") && is_document_write("documents.delete"));
+        // L6-F2: a delete that went through is not 「没有改动」; a denied one is.
+        let delete = |id: &str, result: &str| {
+            vec![
+                msg(
+                    "assistant",
+                    None,
+                    json!([{ "id": id, "name": "documents.delete", "arguments": { "document_id": "doc_A" } }]),
+                    None,
+                ),
+                msg("tool", Some(result), json!([]), Some(id)),
+            ]
+        };
+        let done = delete(
+            "d1",
+            r#"{"kind":"completed","payload":{"deleted":true,"document_id":"doc_A"}}"#,
+        );
+        assert_eq!(run_documents(&done), None);
+        let denied = delete("d2", "denied by user: 不删");
+        assert_eq!(
+            run_documents(&denied).map(|d| d.failed),
+            Some(vec!["doc_A".to_owned()])
+        );
+        // PR-Daemon #2026 ①: a file name refused before any card, then the id
+        // (with or without a get between), or a refusal then an approval of
+        // the same id: the delete went through, nothing reads as unchanged.
+        let refused = delete(
+            "d3",
+            "tool error: invalid: documents.delete: the argument \"document_id\" is not in the form it needs (its id); call it again with such a value",
+        );
+        let mut by_name = refused.clone();
+        by_name[0].tool_calls = json!([{ "id": "d3", "name": "documents.delete", "arguments": { "document_id": "合同.pdf" } }]);
+        let get = vec![
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "g", "name": "documents.get", "arguments": { "document_id": "合同.pdf" } }]),
+                None,
+            ),
+            msg(
+                "tool",
+                Some(r#"{"kind":"completed","payload":{"document_id":"doc_A"}}"#),
+                json!([]),
+                Some("g"),
+            ),
+        ];
+        for between in [vec![], get] {
+            let thread: Vec<_> = by_name
+                .iter()
+                .chain(between.iter())
+                .chain(done.iter())
+                .cloned()
+                .collect();
+            assert_eq!(run_documents(&thread), None);
+        }
+        let again: Vec<_> = denied.iter().chain(done.iter()).cloned().collect();
+        assert_eq!(run_documents(&again), None);
+        // An approved delete the kernel could not run afterwards still counts.
+        let lost = delete("d4", "tool error: invalid: unknown tool: documents.delete");
+        assert_eq!(
+            run_documents(&lost).map(|d| d.failed),
+            Some(vec!["doc_A".to_owned()])
+        );
+    }
+
+    /// L6-F5: a rewrite saved as the original's next version is a write
+    /// that went through (no import job): it is listed with its version,
+    /// and an earlier denied try at the same document is settled by it.
+    #[test]
+    fn a_write_saved_as_a_new_version_is_made_not_unchanged() {
+        let to = |id: &str, doc: &str| {
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": id, "name": "documents.patch", "arguments": { "document_id": doc } }]),
+                None,
+            )
+        };
+        let saved = r#"{"kind":"completed","payload":{"document_id":"doc_X","title":"合同.docx","revision":2,"previous_revision":1,"committed":true,"saved_as":"new_revision","source_document_id":"doc_X"}}"#;
+        let run = [
+            to("a", "合同.docx"),
+            msg(
+                "tool",
+                Some("denied by policy: denied by user: 不对"),
+                json!([]),
+                Some("a"),
+            ),
+            to("b", "合同.docx"),
+            msg("tool", Some(saved), json!([]), Some("b")),
+        ];
+        assert_eq!(
+            run_documents(&run),
+            Some(RunDocuments {
+                attempted: true,
+                jobs: vec![],
+                failed: vec![],
+                revisions: vec![SavedRevision {
+                    document_id: "doc_X".into(),
+                    title: "合同.docx".into(),
+                    revision: 2,
+                }],
+            })
+        );
+        let shown = serde_json::to_value(run_documents(&run)).ok();
+        assert_eq!(
+            shown.as_ref().map(|v| &v["revisions"][0]["revision"]),
+            Some(&json!(2))
+        );
+        // Without one, the field is left out, as an older daemon's answer.
+        let none = serde_json::to_value(run_documents(&[to("c", "doc_Y")])).ok();
+        assert!(none.is_some_and(|v| v.get("revisions").is_none()));
+    }
+
+    /// PR-Daemon #2034 Medium: a save whose content equals the head wrote
+    /// nothing (`committed: false`); it is no saved version, and the run
+    /// still reads as unchanged.
+    #[test]
+    fn a_save_that_wrote_nothing_is_not_a_saved_version() {
+        let same = r#"{"kind":"completed","payload":{"document_id":"doc_X","title":"合同.docx","revision":1,"previous_revision":1,"committed":false,"saved_as":"new_revision","source_document_id":"doc_X"}}"#;
+        let run = [
+            msg(
+                "assistant",
+                None,
+                json!([{ "id": "a", "name": "documents.fill", "arguments": { "document_id": "doc_X" } }]),
+                None,
+            ),
+            msg("tool", Some(same), json!([]), Some("a")),
+        ];
+        let got = run_documents(&run);
+        assert!(
+            got.as_ref()
+                .is_some_and(|d| d.revisions.is_empty() && d.jobs.is_empty())
+        );
     }
 
     /// PR-Daemon #1979 Low: every documents operation the module declares is

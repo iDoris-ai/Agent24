@@ -29,7 +29,7 @@ import { handleSkillActivate } from '../skill-activate'
 import { stopWithin } from '../creative-serve-web'
 import type { IpcGuard } from './guard'
 import { documentsCall } from '../documents'
-import { approvalDialog, type DocumentLookups } from '../approval-dialog'
+import { approvalDialog, wholeLibrary, type DocumentLookups } from '../approval-dialog'
 import { desktopSin90ExportToFile, desktopSin90ImportFromFile, desktopSin90Write, sin90KeyAvailable } from '../sin90-write'
 import { importFile } from '../documents-import'
 import type { ModuleActionResult } from '../documents-module'
@@ -40,6 +40,9 @@ import type {
   CommImportPickResult,
   DocumentsModuleStatus,
   OsPackageProgress,
+  KnowledgeOnboardPreflight,
+  KnowledgeOnboardResult,
+  KnowledgeUpload,
   KnowledgeSettingsResult,
   KnowledgeStatus,
   BackendEndpointResult,
@@ -518,6 +521,29 @@ const approvalDocumentLookups: DocumentLookups = {
     const title = (data as { title?: unknown } | null)?.title
     return typeof title === 'string' && title ? title : null
   }),
+  list: () => readDocument({ op: 'list', limit: 200 }, wholeLibrary),
+  detail: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const d = data as { title?: unknown; created_at?: unknown; pages?: unknown } | null
+    if (typeof d?.title !== 'string' || !d.title || typeof d.created_at !== 'string') return null
+    return { title: d.title, pages: typeof d.pages === 'number' ? d.pages : null, importedAt: d.created_at }
+  }),
+  head: (id) => readDocument({ op: 'get', documentId: id }, (data) => {
+    const head = (data as { head_revision?: unknown } | null)?.head_revision
+    return typeof head === 'number' && head >= 1 ? head : null
+  }),
+  fillPreview: (template, source, values, userSaid) => readDocument(
+    { op: 'fillPreview', documentId: template, sourceDocumentId: source, values, userSaid },
+    (data) => {
+      const d = data as { source_title?: unknown; from_material?: unknown; material_read?: unknown } | null
+      if (!d || !Array.isArray(d.from_material)) return null
+      return {
+        sourceTitle: typeof d.source_title === 'string' ? d.source_title : '',
+        read: d.material_read !== false,
+        values: d.from_material.flatMap((v: { field?: unknown; value?: unknown }) =>
+          typeof v?.field === 'string' && typeof v.value === 'string' ? [[v.field, v.value] as [string, string]] : []),
+      }
+    },
+  ),
   paragraphs: (id) => readDocument({ op: 'paragraphs', documentId: id }, (data) => {
     const list = (data as { paragraphs?: unknown } | null)?.paragraphs
     if (!Array.isArray(list)) return null
@@ -604,11 +630,29 @@ function moduleActionResponse(result: ModuleActionResult, externalDaemon: boolea
   return { ok: false, status, data: { error: { code: result.code, message: `${mt('err.docmodFailed', { reason: clip(result.message, 300) })}${hint}` } } }
 }
 
+/** The renderer may send only `{ localOnly: boolean }`. */
+function isKnowledgeOnboardRun(input: unknown): input is { localOnly: boolean } {
+  if (typeof input !== 'object' || input === null || Array.isArray(input)) return false
+  const keys = Object.keys(input)
+  return keys.length === 1 && keys[0] === 'localOnly' && typeof (input as { localOnly?: unknown }).localOnly === 'boolean'
+}
+
 export function registerIpcHandlers(options: {
   /** A3: every handler below is registered through this (sender validation). */
   guard: IpcGuard
   /** The Knowledge settings, once main has built them. */
   knowledge?: () => KnowledgeController | null
+  /** L7-K2: mock onboarding, built in main with the userData dir and net.fetch. */
+  knowledgeOnboard?: {
+    preflight: () => Promise<KnowledgeOnboardPreflight>
+    run: (input: { localOnly: boolean }) => Promise<KnowledgeOnboardResult>
+  }
+  /** L7-K2 A3: uploads into the default knowledge base. Paths stay in main. */
+  knowledgeUpload?: {
+    add: (paths: string[]) => Promise<KnowledgeUpload[]>
+    list: () => KnowledgeUpload[]
+    cancel: (uploadId: string) => Promise<KnowledgeUpload | null>
+  }
   /** QA 0.6.1 §3c: why the service daemon did not enrol this app, if it did not. */
   backendRefusal?: () => BackendRefusalResult | null
   /** M4 A6: the conversation a schedule's runs go to (schedule-conversations.ts). */
@@ -661,6 +705,8 @@ export function registerIpcHandlers(options: {
   const promptHomeImportPassword = options.promptHomeImportPassword ?? openHomeImportPasswordWindow
   const exportTimeout = options.exportTimeoutMs ?? { current: EXPORT_TIMEOUT_MS }
   const knowledge = options.knowledge ?? (() => null)
+  const knowledgeOnboard = options.knowledgeOnboard ?? null
+  const knowledgeUpload = options.knowledgeUpload ?? null
   const documentsModule = options.documentsModule
     ?? ((): DocumentsModuleStatus => ({ bundled: false, installed: false, externalDaemon: false }))
   const documentsModuleActions = options.documentsModuleActions ?? null
@@ -842,6 +888,41 @@ export function registerIpcHandlers(options: {
       return Promise.resolve({ ok: false, reason: controller ? 'invalid' : 'unavailable' })
     }
     return controller.setEnabled(enabled)
+  })
+  handle(IpcChannels.KnowledgeOnboardPreflight, (): Promise<KnowledgeOnboardPreflight> => (
+    knowledgeOnboard?.preflight() ?? Promise.resolve({
+      activated: false,
+      invalidActivation: false,
+      alreadyBound: false,
+      reachable: null,
+      formats: ['md', 'markdown', 'txt'] as const,
+      maxBytes: 10_485_760,
+    })
+  ))
+  handle(IpcChannels.KnowledgeOnboardRun, (_event, input: unknown): Promise<KnowledgeOnboardResult> => {
+    if (!knowledgeOnboard || !isKnowledgeOnboardRun(input)) return Promise.resolve({ ok: false, code: 'unavailable' })
+    return knowledgeOnboard.run(input)
+  })
+  // The dialog stays in main. The renderer gets statuses, never the paths.
+  handle(IpcChannels.KnowledgeUploadPick, async (event): Promise<KnowledgeUpload[]> => {
+    if (!knowledgeUpload) return []
+    const win = BrowserWindow.fromWebContents(event.sender)
+    const options: Electron.OpenDialogOptions = { properties: ['openFile', 'multiSelections'] }
+    let picked: Electron.OpenDialogReturnValue
+    try {
+      picked = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options)
+    } catch {
+      return []
+    }
+    if (picked.canceled || picked.filePaths.length === 0) return []
+    return knowledgeUpload.add(picked.filePaths)
+  })
+  handle(IpcChannels.KnowledgeUploadList, (): KnowledgeUpload[] => knowledgeUpload?.list() ?? [])
+  handle(IpcChannels.KnowledgeUploadCancel, (_event, uploadId: unknown): Promise<KnowledgeUpload | null> => {
+    if (!knowledgeUpload || typeof uploadId !== 'string' || uploadId.length < 1 || uploadId.length > 64) {
+      return Promise.resolve(null)
+    }
+    return knowledgeUpload.cancel(uploadId)
   })
 
   // Executable installation is elevated and must never use the generic proxy.

@@ -156,6 +156,21 @@ pub async fn status(State(state): State<AppState>) -> Response {
     };
     Json(status).into_response()
 }
+pub async fn engines(State(state): State<AppState>) -> Response {
+    if let Ok(gateway) = state.router.idoris_gateway()
+        && let Ok(engines) = gateway
+            .engines(&tokio_util::sync::CancellationToken::new())
+            .await
+    {
+        return Json(serde_json::json!({"engines": engines})).into_response();
+    }
+    crate::server::error_response(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "idoris_unavailable",
+        "Could not read health from the iDoris gateway",
+    )
+}
+
 async fn submit(state: AppState, headers: HeaderMap, action: Action) -> Response {
     let Some(host) = state.idoris_host else {
         return failure(if state.idoris_unavailable {
@@ -279,6 +294,7 @@ mod tests {
         let app = crate::server::build_router(state);
         for (method, path) in [
             (Method::GET, "/api/v1/idoris/status"),
+            (Method::GET, "/api/v1/idoris/engines"),
             (
                 Method::GET,
                 "/api/v1/idoris/upstream-models?endpoint=http%3A%2F%2Fexample.com",
@@ -333,6 +349,65 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn engines_report_upstream_health_even_when_idoris_is_degraded() {
+        use serde_json::{Value, json};
+
+        let (state, host, _) = crate::server::tests::capability_state().await;
+        let request = || {
+            Request::builder()
+                .uri("/api/v1/idoris/engines")
+                .header("authorization", format!("Bearer {host}"))
+                .body(Body::empty())
+                .unwrap()
+        };
+        let app = crate::server::build_router(state.clone());
+        let response = app.clone().oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["error"]["code"],
+            "idoris_unavailable"
+        );
+
+        let engines = json!([
+            {"id":"omlx","engine_kind":"omlx","state":"restarting","managed":true,"owned":true},
+            {"id":"external","engine_kind":"openai_compat","state":"unavailable","reason":"connection refused","managed":false,"owned":false}
+        ]);
+        let health = json!({
+            "service":"idoris", "version":"0.6.0", "contract_version":"1.3.0",
+            "instance_id":"test", "dev_no_key_enabled":false, "phase":"degraded",
+            "ready":false, "upstreams":engines
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gateway = agent24_models::IdorisGateway::from_credentials(
+            &format!("http://{}", listener.local_addr().unwrap()),
+            zeroize::Zeroizing::new("idk_test".into()),
+        )
+        .unwrap();
+        let upstream = tokio::spawn(async move {
+            let router = axum::Router::new().route(
+                "/health",
+                axum::routing::get(move || async move { axum::Json(health) }),
+            );
+            axum::serve(listener, router).await.unwrap();
+        });
+        state.router.replace_idoris(gateway);
+
+        let response = app.oneshot(request()).await.unwrap();
+        upstream.abort();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 8192)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap(),
+            json!({"engines":engines})
+        );
+    }
+
     #[tokio::test]
     async fn upstream_models_returns_catalogue_only_to_host_and_rejects_remote_origin() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

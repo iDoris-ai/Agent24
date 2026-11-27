@@ -360,6 +360,12 @@ impl FirstPartyAuthority {
         match target.template.as_str() {
             "/api/v1/idoris/start" => return Some("start managed iDoris".to_owned()),
             "/api/v1/idoris/stop" => return Some("stop managed iDoris".to_owned()),
+            "/api/v1/comm/install" => {
+                return Some(
+                    "download, verify and set up the pinned Hyphae communication component"
+                        .to_owned(),
+                );
+            }
             "/api/v1/idoris/omlx/candidates" => {
                 return Some(
                     "list local oMLX endpoints, their identity, authentication and model IDs"
@@ -689,6 +695,12 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                     | ("POST", "/api/v1/idoris/operations/{id}/cancel")
                     | ("GET", "/api/v1/idoris/omlx/candidates")
             ))
+        // The Hyphae component install: the bytes are pinned by the embedded lock.
+        || (policy.operation == Operation::ComponentInstall
+            && matches!(
+                (method.as_str(), policy.template),
+                ("POST", "/api/v1/comm/install")
+            ))
         || (policy.operation == Operation::CapabilityMint
             && matches!(
                 (method.as_str(), policy.template),
@@ -724,6 +736,7 @@ pub fn resolve_target(request: &ElevateRequest) -> Result<Target, EnrollErrorCod
                 | Operation::ScheduleManage
                 | Operation::Shutdown
                 | Operation::ModelsAdmin
+                | Operation::CommWrite
         ) && derived_route(method.as_str(), policy.template));
     if policy.level != AssuranceLevel::Elevated || !supported {
         return Err(EnrollErrorCode::NotElevatedOperation);
@@ -890,8 +903,35 @@ pub(crate) const DERIVED_ROUTES: [(&str, &str); 12] = [
     ("PUT", "/api/v1/models/default"),
 ];
 
+/// The Hyphae writes the desktop makes in service mode, each summarised by
+/// `crate::elevation_summaries` from its path and body. Kept apart from
+/// [`DERIVED_ROUTES`]: not every `comm.write` row is here (identity export
+/// and import, unlock, HOME import and the inbox/outbox maintenance stay
+/// unelevatable).
+pub(crate) const COMM_DERIVED_ROUTES: [(&str, &str); 15] = [
+    ("POST", "/api/v1/comm/identity"),
+    ("POST", "/api/v1/comm/identity/default"),
+    ("POST", "/api/v1/comm/contact"),
+    ("PATCH", "/api/v1/comm/contact/{name}"),
+    ("DELETE", "/api/v1/comm/contact/{name}"),
+    ("PUT", "/api/v1/comm/relay"),
+    ("POST", "/api/v1/comm/relay/probe"),
+    ("POST", "/api/v1/comm/daemon/start"),
+    ("POST", "/api/v1/comm/daemon/stop"),
+    ("POST", "/api/v1/comm/send"),
+    ("POST", "/api/v1/comm/outbox/{event_id}/retry"),
+    ("POST", "/api/v1/comm/groupchat"),
+    ("POST", "/api/v1/comm/groupchat/{group_id}/messages"),
+    (
+        "POST",
+        "/api/v1/comm/groupchat/{group_id}/messages/{logical_id}/retry",
+    ),
+    ("POST", "/api/v1/comm/groupchat/invites/{invite_id}/accept"),
+];
+
 pub(crate) fn derived_route(method: &str, template: &str) -> bool {
     DERIVED_ROUTES.contains(&(method, template))
+        || COMM_DERIVED_ROUTES.contains(&(method, template))
 }
 
 /// Binding id from the request path: the last segment, or the one before
@@ -1838,6 +1878,58 @@ mod tests {
             path: path.into(),
             body_sha256: body_digest(body),
             client_summary: "CLIENT SECRET".into(),
+        }
+    }
+
+    #[test]
+    fn hyphae_install_is_elevatable_with_a_fixed_summary() {
+        // Service mode routes the desktop's install through elevation; without
+        // this row the daemon refused it and Hyphae could not be installed.
+        let authority = FirstPartyAuthority::new(CapabilityStore::new("g"));
+        let target = resolve_target(&idoris("POST", "/api/v1/comm/install", b"")).unwrap();
+        assert_eq!(target.operation, Operation::ComponentInstall);
+        let summary = authority.target_summary("id", &target).unwrap();
+        assert!(summary.contains("Hyphae"), "{summary}");
+        let with_body = resolve_target(&idoris("POST", "/api/v1/comm/install", b"{}")).unwrap();
+        assert!(authority.target_summary("id", &with_body).is_none());
+    }
+
+    #[test]
+    fn desktop_comm_writes_are_elevatable_and_secrets_stay_unelevatable() {
+        // Service mode routes every desktop Hyphae write through elevation;
+        // without these rows send, rename and group chat were all refused.
+        for (method, template) in COMM_DERIVED_ROUTES {
+            let target = resolve_target(&idoris(method, template, b"{}")).unwrap();
+            assert_eq!(
+                target.operation,
+                Operation::CommWrite,
+                "{method} {template}"
+            );
+        }
+        // Every other Elevated comm.write row stays unelevatable.
+        let excluded = [
+            ("POST", "/api/v1/comm/identity/export"),
+            ("POST", "/api/v1/comm/identity/import"),
+            ("POST", "/api/v1/comm/unlock"),
+            ("POST", "/api/v1/comm/import"),
+            ("POST", "/api/v1/comm/inbox/pull"),
+            ("POST", "/api/v1/comm/outbox/clear"),
+        ];
+        let mut rest: Vec<(&str, &str)> = policies()
+            .iter()
+            .filter(|p| p.operation == Operation::CommWrite && p.level == AssuranceLevel::Elevated)
+            .map(|p| (p.method, p.template))
+            .filter(|row| !COMM_DERIVED_ROUTES.contains(row))
+            .collect();
+        rest.sort();
+        let mut expected = excluded.to_vec();
+        expected.sort();
+        assert_eq!(rest, expected);
+        for (method, path) in excluded {
+            assert_eq!(
+                resolve_target(&idoris(method, path, b"{}")).unwrap_err(),
+                EnrollErrorCode::NotElevatedOperation
+            );
         }
     }
 

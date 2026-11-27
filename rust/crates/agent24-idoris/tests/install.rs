@@ -112,7 +112,7 @@ impl Fixture {
             .map(|installed| installed.directory().to_owned())
     }
     fn clean(&self) {
-        assert!(!self.opts.root.join("0.5.0").exists());
+        assert!(!self.opts.root.join("0.6.1").exists());
         assert!(!fs::read_dir(&self.opts.root).unwrap().any(|e| {
             e.unwrap()
                 .file_name()
@@ -161,11 +161,11 @@ fn success_permissions_and_existing_version_reverification() {
     let installed = f.install(true).unwrap();
     for (path, mode) in [
         ("", 0o700),
-        ("0.5.0", 0o700),
-        ("0.5.0/config", 0o700),
-        ("0.5.0/config/components", 0o700),
-        ("0.5.0/idoris", 0o500),
-        ("0.5.0/config/catalog.yaml", 0o400),
+        ("0.6.1", 0o700),
+        ("0.6.1/config", 0o700),
+        ("0.6.1/config/components", 0o700),
+        ("0.6.1/idoris", 0o500),
+        ("0.6.1/config/catalog.yaml", 0o400),
     ] {
         assert_eq!(
             fs::metadata(f.opts.root.join(path))
@@ -298,7 +298,7 @@ impl SignatureVerifier for WatchesFinalDir {
 fn a_failing_signature_never_creates_the_final_directory() {
     let f = Fixture::new(None);
     let watcher = std::sync::Arc::new(WatchesFinalDir {
-        final_dir: f.opts.root.join("0.5.0"),
+        final_dir: f.opts.root.join("0.6.1"),
         saw_final: Default::default(),
     });
     struct Shared(std::sync::Arc<WatchesFinalDir>);
@@ -311,7 +311,7 @@ fn a_failing_signature_never_creates_the_final_directory() {
     assert!(matches!(result, Err(InstallError::SignatureMismatch)));
     // Verified once, inside staging, before the rename: no final directory then or after.
     assert_eq!(*watcher.saw_final.lock().unwrap(), [false]);
-    assert!(!f.opts.root.join("0.5.0").exists());
+    assert!(!f.opts.root.join("0.6.1").exists());
     f.clean();
 }
 
@@ -402,8 +402,8 @@ fn insufficient_and_unknown_space_are_rejected() {
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[tokio::test]
-#[ignore = "downloads and installs signed iDoris v0.5.0; runs real Apple codesign"]
-async fn real_v0_4_0_download_install_and_l6() {
+#[ignore = "downloads and installs signed iDoris v0.6.1; runs real Apple codesign"]
+async fn real_v0_6_0_download_install_and_l6() {
     use agent24_idoris::{
         download::{DownloadOptions, download_locked_asset},
         install::Codesign,
@@ -455,7 +455,7 @@ async fn real_v0_4_0_download_install_and_l6() {
     .unwrap();
     assert_eq!(again.directory(), installed.directory());
     eprintln!(
-        "PASS: v0.5.0 archive {}, five files installed, strict requirement + TeamIdentifier={}, existing version reverified",
+        "PASS: v0.6.1 archive {}, five files installed, strict requirement + TeamIdentifier={}, existing version reverified",
         archive.sha256, lock.team_id
     );
 }

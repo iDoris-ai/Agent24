@@ -767,7 +767,9 @@ fn what_the_first_search_puts_in_is_three_short_passages() {
     assert_eq!(evidence[2]["snippet"].as_str().unwrap().chars().count(), 251);
     assert_eq!(evidence[0]["knowledge_id"], "k1");
     assert_eq!(evidence[0]["title"], "烧水指南");
-    assert!(evidence[0].get("knowledge_base_id").is_none());
+    // L7-K1: the library's id stays (a short string, not a passage), for
+    // agent24d's record of where each hit sits.
+    assert_eq!(evidence[0]["knowledge_base_id"], "kb");
     // PR-Daemon #1976 F1: `kind` stays, for agent24d's record of the hits.
     assert_eq!(v["kind"], "knowledge.search");
     assert_eq!(evidence[0]["use"], "clue");
@@ -816,6 +818,73 @@ async fn a_failed_first_search_or_a_plan_run_goes_on_without_it() {
             assert!(first.iter().all(|m| m.role != "tool"), "a failed search put nothing in");
         }
     }
+}
+
+/// L7-K0 (FU-183): a `knowledge_search` the policy refuses (a run carrying
+/// restricted material has no egress gate) is not the end of the turn: it is
+/// recorded as Denied, so the run's record says the search was refused rather
+/// than found nothing; nothing goes into the thread, the answer still comes and
+/// the model is still offered the tool.
+struct DeniedSearchStub;
+
+#[async_trait]
+impl agent24_tools::Tool for DeniedSearchStub {
+    fn requires_outbound_policy(&self) -> bool {
+        false
+    }
+    fn info(&self) -> agent24_protocol::ToolInfo {
+        agent24_protocol::ToolInfo::new(
+            "knowledge_search",
+            "builtin",
+            "searches Knowledge",
+            agent24_protocol::RiskClass::Read,
+        )
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn needs_knowledge_binding(&self) -> bool {
+        true
+    }
+    async fn call(
+        &self,
+        _ctx: &agent24_tools::ToolContext,
+        _input: &serde_json::Map<String, serde_json::Value>,
+        _cancel: &CancellationToken,
+    ) -> Result<String, agent24_tools::ToolError> {
+        Err(agent24_tools::ToolError::Denied("outbound policy unavailable".into()))
+    }
+}
+
+#[tokio::test]
+async fn a_refused_first_search_is_recorded_as_denied_and_the_answer_still_comes() {
+    let provider = Arc::new(SeenProvider {
+        seen: StdMutex::new(vec![]),
+        tools: StdMutex::new(vec![]),
+    });
+    let (manager, _sink, store) = manager_with_tools(
+        provider.clone(),
+        ToolRegistry::new().with(Arc::new(DeniedSearchStub)),
+    )
+    .await;
+    let run = manager
+        .start_run(RunCreate {
+            prompt: "烧开水要多久".into(),
+            knowledge_binding_id: Some("b1".into()),
+            knowledge_query: Some("烧开水要多久".into()),
+            ..create()
+        })
+        .await
+        .unwrap();
+    let done = wait_terminal(&store, &run.id).await;
+    assert_eq!(done.status, RunStatus::Completed);
+    let calls = store.list_tool_calls(&run.id).await.unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].tool, "knowledge_search");
+    assert_eq!(calls[0].status, agent24_protocol::ToolCallStatus::Denied);
+    let first = provider.seen.lock().unwrap()[0].clone();
+    assert!(first.iter().all(|m| m.role != "tool"), "a refused search put nothing in");
+    assert!(provider.tools.lock().unwrap()[0].contains(&"knowledge_search".to_owned()));
 }
 
 /// About what a local tokenizer makes of `text`: a CJK character one token,

@@ -70,7 +70,8 @@ impl Tool for KnowledgeTool {
                 SEARCH,
                 "Search the user's knowledge bases. Leave knowledge_base_ids \
                  out unless the user named one: the search then covers all of \
-                 them. Returns ranked passages as \
+                 them. knowledge_base_ids takes knowledge base IDs, never \
+                 their names. Returns ranked passages as \
                  clues, each with the document and chunk it came from. Before \
                  relying on a passage, read it back with knowledge_read (its \
                  knowledge_id, chunk_id and content_tag): only evidence whose \
@@ -160,6 +161,33 @@ pub struct RunKnowledge {
     /// the run did receive that passage from the knowledge base (qwen3-8b
     /// cites search passages without reading them back).
     pub read_chunks: Vec<ReadChunk>,
+    /// L7-K0 (FU-183): the run asked a `knowledge_search` and none completed:
+    /// each was refused (policy) or failed. Said so a client can write 「检索没能
+    /// 进行」 instead of letting it pass for 「知识库里没有」.
+    pub search_refused: bool,
+    /// L7-K1: why, when `search_refused`: `policy` (the outbound check refused
+    /// it) or `failed` (it ran and failed). A policy refusal wins when both
+    /// happened. Absent when the search was not refused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_refusal: Option<&'static str>,
+    /// L7-K0: passages the run's completed searches returned, each
+    /// (document, chunk) once. 0 with `searched` is 「没找到」.
+    pub found_passages: usize,
+    /// L7-K0: the titles of those passages, each once, first five.
+    pub found_titles: Vec<String>,
+    /// L7-K1: the same passages by where they sit, each (document, chunk)
+    /// once, first `FOUND_HITS`: ids and a title only, never the passage text
+    /// (R3.8: a snippet is a clue, not a quotation). A client names the
+    /// library from `knowledge_base_id` and reads the text back itself.
+    pub found: Vec<FoundHit>,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct FoundHit {
+    pub knowledge_base_id: String,
+    pub knowledge_id: String,
+    pub chunk_id: String,
+    pub title: String,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -182,6 +210,11 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
     let mut knowledge = RunKnowledge {
         searched: false,
         read_chunks: Vec::new(),
+        search_refused: false,
+        search_refusal: None,
+        found_passages: 0,
+        found_titles: Vec::new(),
+        found: Vec::new(),
     };
     for call in calls {
         if call.status != ToolCallStatus::Completed || ![SEARCH, READ].contains(&call.tool.as_str())
@@ -207,22 +240,71 @@ pub fn run_knowledge_with(calls: &[ToolCall], answers: &[String]) -> RunKnowledg
             }
         }
     }
-    if calls
+    let search_done = calls
         .iter()
-        .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed)
-    {
-        for chunk in answers.iter().flat_map(|a| search_hits(a)) {
+        .any(|c| c.tool == SEARCH && c.status == ToolCallStatus::Completed);
+    let refused =
+        |status: ToolCallStatus| calls.iter().any(|c| c.tool == SEARCH && c.status == status);
+    knowledge.search_refusal = if search_done {
+        None
+    } else if refused(ToolCallStatus::Denied) {
+        Some("policy")
+    } else if refused(ToolCallStatus::Failed) {
+        Some("failed")
+    } else {
+        None
+    };
+    knowledge.search_refused = knowledge.search_refusal.is_some();
+    if search_done {
+        let mut seen: Vec<ReadChunk> = Vec::new();
+        for (chunk, title, base) in answers.iter().flat_map(|a| search_found(a)) {
+            if let Some(base) = base
+                && knowledge.found.len() < FOUND_HITS
+                && !knowledge.found.iter().any(|h| {
+                    h.knowledge_base_id == base
+                        && h.knowledge_id == chunk.knowledge_id
+                        && h.chunk_id == chunk.chunk_id
+                })
+            {
+                knowledge.found.push(FoundHit {
+                    knowledge_base_id: base,
+                    knowledge_id: chunk.knowledge_id.clone(),
+                    chunk_id: chunk.chunk_id.clone(),
+                    title: title.clone().unwrap_or_default(),
+                });
+            }
+            if let Some(title) = title
+                && !title.is_empty()
+                && knowledge.found_titles.len() < FOUND_TITLES
+                && !knowledge.found_titles.contains(&title)
+            {
+                knowledge.found_titles.push(title);
+            }
+            if !seen.contains(&chunk) {
+                seen.push(ReadChunk {
+                    knowledge_id: chunk.knowledge_id.clone(),
+                    chunk_id: chunk.chunk_id.clone(),
+                });
+            }
             if !knowledge.read_chunks.contains(&chunk) {
                 knowledge.read_chunks.push(chunk);
             }
         }
+        knowledge.found_passages = seen.len();
     }
     knowledge
 }
 
+/// Titles a run's record names, at most.
+const FOUND_TITLES: usize = 5;
+
+/// Hits a run's record names, at most (L7-K1).
+const FOUND_HITS: usize = 8;
+
 /// The chunks a search answer returned (K3): each evidence entry naming both
-/// its document and its chunk.
-fn search_hits(answer: &str) -> Vec<ReadChunk> {
+/// its document and its chunk, with the passage's title: `title` (the search
+/// first's compact entry) or the hit's `display` title or file name.
+fn search_found(answer: &str) -> Vec<(ReadChunk, Option<String>, Option<String>)> {
     let Ok(value) = serde_json::from_str::<Value>(answer) else {
         return Vec::new();
     };
@@ -235,10 +317,22 @@ fn search_hits(answer: &str) -> Vec<ReadChunk> {
         .into_iter()
         .flatten()
         .filter_map(|hit| {
-            Some(ReadChunk {
-                knowledge_id: hit.get("knowledge_id")?.as_str()?.to_owned(),
-                chunk_id: hit.get("chunk_id")?.as_str()?.to_owned(),
-            })
+            let title = hit
+                .get("title")
+                .or_else(|| hit.get("display").and_then(|d| d.get("title")))
+                .or_else(|| hit.get("display").and_then(|d| d.get("file_name")))
+                .and_then(Value::as_str)
+                .map(|t| t.trim().to_owned());
+            Some((
+                ReadChunk {
+                    knowledge_id: hit.get("knowledge_id")?.as_str()?.to_owned(),
+                    chunk_id: hit.get("chunk_id")?.as_str()?.to_owned(),
+                },
+                title,
+                hit.get("knowledge_base_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            ))
         })
         .collect()
 }

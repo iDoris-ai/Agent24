@@ -118,21 +118,6 @@ impl Runtime for FixtureRuntime {
             data: r.data_port,
             admin: r.admin_port,
         };
-        // Bootstrap's production ports may belong to the owner's live iDoris.
-        // Keep fixture listeners isolated; the host must use supervisor endpoints.
-        if r.data_port == 9011 && r.admin_port == 9012 {
-            fn free_port() -> u16 {
-                std::net::TcpListener::bind("127.0.0.1:0")
-                    .unwrap()
-                    .local_addr()
-                    .unwrap()
-                    .port()
-            }
-            config.ports = Ports {
-                data: free_port(),
-                admin: free_port(),
-            };
-        }
         config.log_dir = root.join("logs");
         config.shutdown = cancel;
         // Readiness is a liveness bound, not a speed assertion: a freshly written fixture
@@ -162,22 +147,6 @@ struct Fixture {
 }
 fn mode(path: &Path, permissions: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(permissions)).unwrap();
-}
-/// Fixture ports come from 20000-29999, below every kernel ephemeral range (Linux
-/// 32768+, macOS 49152+). Asking the kernel for `bind(0)` and releasing the port
-/// lets a concurrent test's own `bind(0)` be handed the very same number before the
-/// fixture child binds it, which made the child fail to start. Each number is issued
-/// once per test process and a per-process offset separates parallel test processes.
-async fn port() -> u16 {
-    use std::sync::atomic::AtomicUsize;
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    let offset = std::process::id() as usize * 397;
-    loop {
-        let port = (20_000 + (offset + NEXT.fetch_add(1, Ordering::SeqCst)) % 10_000) as u16;
-        if std::net::TcpListener::bind(("127.0.0.1", port)).is_ok() {
-            return port;
-        }
-    }
 }
 impl Fixture {
     async fn new() -> Self {
@@ -234,13 +203,13 @@ impl Fixture {
         let record = Installation {
             omlx_setup: None,
             connection: None,
-            version: "0.5.0".into(),
+            version: "0.6.1".into(),
             release_dir: root.join("release"),
             archive_path,
             components_dir: Some(root.join("components")),
             key_id: Some("vk_fixture".into()),
-            data_port: port().await,
-            admin_port: port().await,
+            data_port: Ports::default().data,
+            admin_port: Ports::default().admin,
             roles: vec![Role::Daily],
             core_reserved_bytes: Some(0),
             omlx_url: None,
@@ -448,7 +417,7 @@ async fn l4_and_contract_failures_are_mapped_and_reaped() {
             State::Failed,
         ),
         (
-            json!({"mode":"exit", "code":1}),
+            json!({"mode":"exit", "code":2}),
             Code::StartFailed,
             State::Failed,
         ),
@@ -686,14 +655,14 @@ impl Runtime for SmokeRuntime {
 }
 
 #[tokio::test]
-#[ignore = "requires IDORIS_REAL_V040_DIR; verifies signed v0.5.0 and runs real serve"]
-async fn real_v040_install_existing_start_running_stop() {
+#[ignore = "requires IDORIS_REAL_V060_DIR; verifies signed v0.6.0 and runs real serve"]
+async fn real_v060_install_existing_start_running_stop() {
     use crate::{
         download::{DownloadOptions, download_locked_asset},
         install::{InstallOptions, install_locked_asset},
     };
     let release =
-        PathBuf::from(std::env::var_os("IDORIS_REAL_V040_DIR").expect("set release directory"));
+        PathBuf::from(std::env::var_os("IDORIS_REAL_V060_DIR").expect("set release directory"));
     let dir = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(dir.path()).unwrap().join("idoris");
     fs::create_dir(&root).unwrap();
@@ -709,9 +678,9 @@ async fn real_v040_install_existing_start_running_stop() {
     )
     .await
     .unwrap();
-    let installed_dir = root.join("releases/0.5.0");
+    let installed_dir = root.join("releases/0.6.0");
     for part in [
-        "releases/0.5.0/config/components",
+        "releases/0.6.0/config/components",
         "components",
         "data/state",
     ] {
@@ -724,9 +693,9 @@ async fn real_v040_install_existing_start_running_stop() {
     }
     for part in [
         "releases",
-        "releases/0.5.0",
-        "releases/0.5.0/config",
-        "releases/0.5.0/config/components",
+        "releases/0.6.0",
+        "releases/0.6.0/config",
+        "releases/0.6.0/config/components",
     ] {
         mode(&root.join(part), 0o700);
     }
@@ -765,13 +734,13 @@ async fn real_v040_install_existing_start_running_stop() {
     host.record_installation(Installation {
         omlx_setup: None,
         connection: None,
-        version: "0.5.0".into(),
+        version: "0.6.0".into(),
         release_dir: installed.directory().into(),
         archive_path: archive.path,
         components_dir: Some(root.join("components")),
         key_id: Some("vk_smoke".into()),
-        data_port: port().await,
-        admin_port: port().await,
+        data_port: Ports::default().data,
+        admin_port: Ports::default().admin,
         roles: vec![],
         core_reserved_bytes: Some(0),
         omlx_url: None,

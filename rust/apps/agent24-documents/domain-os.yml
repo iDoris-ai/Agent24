@@ -65,6 +65,7 @@ tools:
               document_id: { type: string, description: "a PDF document: its id from documents.list, or its file name/title (e.g. report.pdf)" }
               pages: { type: string, description: "\"all\" (default) or 1-based pages and ranges such as \"1-3,5\"; \"2-\" is page 2 to the last" }
         title: { type: string, description: "title of the new document" }
+        save_to: { type: string, enum: [new_document, original], description: "leave it out (a NEW document) unless the user explicitly asked to save into the original file (存到原文件 / 直接改原文件); original saves the result as the original document's next version, its older versions kept and restorable" }
     risk: write_local
     output_privacy: local_only
     timeout_ms: 30000
@@ -73,7 +74,7 @@ tools:
   # E1b/D5a (Loop 3): DOCX paragraphs and template fields. The writes make a
   # NEW document; each call is approved by the user.
   - operation: paragraphs
-    description: "List a DOCX document's paragraphs that have text: each paragraph's index and its first 40 characters (whether in a table). A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List a DOCX document's paragraphs that have text as a table of contents (toc): one line per paragraph, its index and first words. A long document comes in parts: total and next_from say what is left; ask again with from, or with query to find paragraphs containing a word. Asked with from/count or query for up to 10 paragraphs, they come whole (whole: true): get the paragraphs you rewrite this way before documents.patch. document_id is its id from documents.list, or its file name/title. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
@@ -88,8 +89,39 @@ tools:
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
+  # L6-S05: two documents, or two versions of one, compared by their text.
+  - operation: compare
+    description: "Compare two documents, or two versions of one document, by their text only (formatting is not compared). Give document_id and other_document_id (ids from documents.list, or file names/titles) for two documents; give only document_id (optionally from_revision and to_revision) for one document's versions, default the last two. The answer lists the first changes (id, kind added/removed/changed/unaligned, where, text) and a summary of all of them. Report only what is in changes; never add a change yourself; for the rest tell the user to open the comparison view on the documents page. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+        other_document_id: { type: string, description: "the second document, to compare two documents" }
+        from_revision: { type: integer, minimum: 1, description: "the older version (default: the one before to_revision); with other_document_id, the version of document_id" }
+        to_revision: { type: integer, minimum: 1, description: "the newer version (default: the current one); with other_document_id, the version of other_document_id" }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  # L8 DOC-4: what a document still carries before it is sent out.
+  - operation: preflight
+    description: "Check a document before it is sent to someone, without changing it: for a Word (DOCX) document, in its body, headers and footers only (not footnotes, endnotes or styles): tracked insertions/deletions, comments, unfilled {{fields}}, author / last modified by, hidden text; for a PDF, only its author, a form and annotations. Give document_id (an id from documents.list, or the file name/title). The answer lists findings by kind with a count and examples; report only those, say what was not checked (the note), and never call the document safe to send. Read-only, local."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string }
+    risk: read
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
   - operation: patch
-    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. The original is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX with some paragraphs rewritten, by index from documents.paragraphs (each edit gives the paragraph's opening words as anchor); tracked=true writes the change as a Word revision. By default the original is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the original's next version instead."
     input_schema:
       type: object
       additionalProperties: false
@@ -116,20 +148,21 @@ tools:
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fields
-    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Read-only, local."
+    description: "List the {{field}} placeholders of a DOCX template. document_id is its id from documents.list, or its file name/title. Each field has a kind: identity (name, ID number, phone, address, bank card: never taken from the material, only from what the user said, with its name in user_said; never make one up — ask), manual (signature, photo, checkbox, attachment: never fill, tell the user to do it by hand), text. With source_document_id (the user's own material), only the safe job fields of a form (department, position, title, entry date, education, major, school and the like) the material states by label (「部门：产品研发部」, or a label cell beside its value) have that value as from_source: pass those values to documents.fill as they are, with the same source_document_id; do not read the material yourself. Every other field never has from_source, even when the material shows one: ask the user for it, and put what they say in user_said. Read-only, local."
     input_schema:
       type: object
       additionalProperties: false
       required: [document_id]
       properties:
         document_id: { type: string }
+        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; its labelled text values come back as from_source (never an identity one)" }
     risk: read
     output_privacy: local_only
     timeout_ms: 30000
     inline_wait_ms: 25000
     resource_kinds: [doc]
   - operation: fill
-    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. The template is never changed. Returns the import job."
+    description: "Make a NEW DOCX document from a DOCX template with its {{field}} placeholders filled, keeping all formatting; it is named \"<template>（填写）\". values maps a field name (without braces, as listed by documents.fields) to its text. Only the safe job fields of a form (department, position, title, entry date, education, major, school and the like) are written as given; every other field (identity, and any field not among them) is written only when the user said it in the conversation (its name is in user_said), otherwise it comes back in ask_user; never make a value up, and never copy one from the material. Ask the user for each name in ask_user, tell them to handle manual by hand, and list unfilled. written is false when nothing was written and no document was generated. By default the template is not changed and the answer is the new document's import job; save_to=original (only when the user asked for it) saves it as the template's next version instead."
     input_schema:
       type: object
       additionalProperties: false
@@ -141,6 +174,30 @@ tools:
           minProperties: 1
           maxProperties: 200
           additionalProperties: { type: string }
+        source_document_id: { type: string, description: "id or file name/title of a document the user gave as their own material; only the safe job fields come back as from_source from documents.fields; they are written (and those the values leave out filled from it) only when the user's 姓名 is in user_said and the material states that same 姓名, read as one record; any other value is never taken from it, only from user_said" }
+        user_said:
+          type: array
+          maxItems: 200
+          description: "field names the user stated a value for in this conversation; an identity field named here may be filled from values"
+          items: { type: string, minLength: 1, maxLength: 64 }
+        save_to: { type: string, enum: [new_document, original], description: "leave it out (a NEW document) unless the user explicitly asked to save into the original file (存到原文件 / 直接改原文件); original saves the result as the original document's next version, its older versions kept and restorable" }
+    risk: write_local
+    output_privacy: local_only
+    timeout_ms: 30000
+    inline_wait_ms: 25000
+    resource_kinds: [doc]
+  # L6-F2 (Loop 6): delete one whole document (soft: it can be restored for
+  # 7 days on the documents page). Each call is approved by the user. The
+  # pattern takes an id only, so the kernel refuses a file name before any
+  # card and the card always names exactly one document (FU-136).
+  - operation: delete
+    description: "Delete ONE whole document from the user's library; it can be restored from the documents page for 7 days. Use it only when the user asks to delete or remove a whole document or file. Removing a paragraph or a sentence INSIDE a document is a rewrite (documents.patch), never this. document_id must be the document's id (doc_...): first look it up with documents.get by its file name; if several documents have that name, list them for the user and ask which one, never choose one yourself."
+    input_schema:
+      type: object
+      additionalProperties: false
+      required: [document_id]
+      properties:
+        document_id: { type: string, pattern: "^doc_[0-7][0-9A-HJKMNP-TV-Z]{25}$", description: "the document's id (doc_...) as documents.get or documents.list returned it: never its file name, never made up, never asked of the user; look it up yourself first" }
     risk: write_local
     output_privacy: local_only
     timeout_ms: 30000

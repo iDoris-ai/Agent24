@@ -61,16 +61,22 @@ export async function convert(api: Api, documentId: string, title?: string, slee
   return waitJob(api, res.data, sleep)
 }
 
-/** The title of the PDF a document is converted to for checking or translating. */
-export function convertedTitle(title: string): string {
-  return `${title.replace(/\.(docx?|xlsx?|pptx?)$/i, '')}（转换）.pdf`.slice(0, 500)
+/** The title of the PDF a document is converted to for checking or translating.
+ * L6-F5: version 2 on has its own (「<名>（第 2 版，转换）.pdf」), so a later
+ * version is never read from an earlier version's PDF; version 1 keeps the
+ * title it always had, so its conversions made before are still found. */
+export function convertedTitle(title: string, revision = 1): string {
+  const version = revision > 1 ? `第 ${revision} 版，` : ''
+  return `${title.replace(/\.(docx?|xlsx?|pptx?)$/i, '')}（${version}转换）.pdf`.slice(0, 500)
 }
 
-/** D3/D4: the PDF of an Office document, the one converted before if there is
- * one (newest), else converted now under 「<名>（转换）.pdf」, so neither the
- * original's own PDF nor a heap of same-named copies is mistaken for it. */
+/** D3/D4: the PDF of an Office document's current version, the one
+ * converted before if there is one (newest), else converted now under
+ * {@link convertedTitle}, so neither the original's own PDF nor a heap of
+ * same-named copies is mistaken for it. */
 export async function convertedPdf(api: Api, documentId: string, title: string): Promise<ComposeOutcome> {
-  const want = convertedTitle(title)
+  const got = await api.request({ op: 'get', documentId })
+  const want = convertedTitle(title, got.ok ? got.data.head_revision : 1)
   const listed = await api.request({ op: 'list', limit: 200 })
   if (listed.ok) {
     const done = listed.data.documents

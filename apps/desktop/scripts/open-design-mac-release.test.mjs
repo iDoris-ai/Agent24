@@ -28,23 +28,23 @@ import {
 } from './open-design-mac-release.mjs'
 
 test('versionFromReleaseTag strips the leading v and keeps the prerelease suffix', () => {
-  assert.equal(desktopPackageVersion(), '0.6.0')
-  assert.equal(versionFromReleaseTag('v0.6.0-preview.20261028.10'), '0.6.0-preview.20261028.10')
-  assert.equal(versionFromReleaseTag('v0.6.0'), '0.6.0')
-  assert.equal(versionFromReleaseTag('v0.6.0-rc.1'), '0.6.0-rc.1')
+  assert.equal(desktopPackageVersion(), '0.7.0')
+  assert.equal(versionFromReleaseTag('v0.7.0-preview.20261028.10'), '0.7.0-preview.20261028.10')
+  assert.equal(versionFromReleaseTag('v0.7.0'), '0.7.0')
+  assert.equal(versionFromReleaseTag('v0.7.0-rc.1'), '0.7.0-rc.1')
 })
 
 test('versionFromReleaseTag refuses a tag that does not start with the desktop package version', () => {
-  assert.throws(() => versionFromReleaseTag('v1.2.3'), /package\.json version 0\.6\.0/)
-  assert.throws(() => versionFromReleaseTag('v0.6.1'), /package\.json version 0\.6\.0/)
-  assert.throws(() => versionFromReleaseTag('v0.6.1-preview.1'), /package\.json version 0\.6\.0/)
+  assert.throws(() => versionFromReleaseTag('v1.2.3'), /package\.json version 0\.7\.0/)
+  assert.throws(() => versionFromReleaseTag('v0.6.1'), /package\.json version 0\.7\.0/)
+  assert.throws(() => versionFromReleaseTag('v0.6.1-preview.1'), /package\.json version 0\.7\.0/)
 })
 
 test('versionFromReleaseTag refuses a missing or malformed tag (never falls back to package.json)', () => {
   for (const bad of [undefined, null, '', '   ']) {
     assert.throws(() => versionFromReleaseTag(bad), /A24_RELEASE_TAG is required/)
   }
-  for (const bad of ['0.6.0', 'v0.6', 'release-1', 'v0.6.0/../x', 'v0.6.0 -x']) {
+  for (const bad of ['0.7.0', 'v0.6', 'release-1', 'v0.7.0/../x', 'v0.7.0 -x']) {
     assert.throws(() => versionFromReleaseTag(bad), /must look like v<semver>/)
   }
 })
@@ -653,7 +653,7 @@ test('release-mac.sh refuses a non-empty A24_OD_SKIP_CODESIGN before any build s
       env: {
         ...process.env,
         A24_OD_SKIP_CODESIGN: value,
-        A24_RELEASE_TAG: 'v0.6.0',
+        A24_RELEASE_TAG: 'v0.7.0',
       },
     })
     const output = `${result.stdout}\n${result.stderr}`
@@ -672,7 +672,7 @@ test('release-mac.sh refuses a dirty checkout when Open Design resources are reu
       timeout: 20000,
       env: {
         ...process.env,
-        A24_RELEASE_TAG: 'v0.6.0',
+        A24_RELEASE_TAG: 'v0.7.0',
         A24_OPEN_DESIGN_SOURCE_DIR: checkout,
         A24_OPEN_DESIGN_RESOURCES_DIR: resources,
         SKIP_NOTARIZE: '1',
@@ -731,7 +731,7 @@ function verifyFixture(dir, mutate) {
     odSha: OPEN_DESIGN_SHA,
     platform: 'darwin',
     arch: 'arm64',
-    url: `https://github.com/iDoris-ai/Agent24/releases/download/v0.6.0/${asset}`,
+    url: `https://github.com/iDoris-ai/Agent24/releases/download/v0.7.0/${asset}`,
     sha256,
     size,
   }
@@ -744,7 +744,7 @@ function verifyFixture(dir, mutate) {
 
 function runVerify(dir, mutate) {
   const fixture = verifyFixture(dir, mutate)
-  return spawnSync('bash', [verifyScript, fixture.app, fixture.dmg, fixture.tarballDir, '0.6.0'], {
+  return spawnSync('bash', [verifyScript, fixture.app, fixture.dmg, fixture.tarballDir, '0.7.0'], {
     encoding: 'utf8',
     env: { ...process.env, A24_OD_SKIP_CODESIGN: '1' },
   })

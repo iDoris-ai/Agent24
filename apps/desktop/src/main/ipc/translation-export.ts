@@ -52,12 +52,14 @@ export function registerTranslationExport(options: { guard: IpcGuard; deps: Expo
     if (!('title' in req)) return req
     return exportTranslation(options.deps, req)
   }))
-  // D5a: a library document saved to Downloads (`documentId`, `title`).
+  // D5a: a library document saved to Downloads (`documentId`, `title`);
+  // L6-F5: one of its versions, with `revision`.
   ipcMain.handle(IpcChannels.DocumentsSaveDownload, options.guard(async (_event, ...args: unknown[]) => {
-    const [id, title] = args
-    if (args.length !== 2 || typeof id !== 'string' || !/^doc_[0-9A-Z]{26}$/.test(id) || typeof title !== 'string' || title.length > MAX_TITLE) {
-      throw new Error('documents:save-download takes a document id and a title')
+    const [id, title, revision] = args
+    const versionOk = revision === undefined || (typeof revision === 'number' && Number.isSafeInteger(revision) && revision >= 1)
+    if (args.length < 2 || args.length > 3 || typeof id !== 'string' || !/^doc_[0-9A-Z]{26}$/.test(id) || typeof title !== 'string' || title.length > MAX_TITLE || !versionOk) {
+      throw new Error('documents:save-download takes a document id, a title and maybe a version')
     }
-    return saveToDownloads(options.deps, id, title)
+    return saveToDownloads(options.deps, id, title, revision as number | undefined)
   }))
 }
