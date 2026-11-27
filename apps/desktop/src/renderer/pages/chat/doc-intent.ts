@@ -115,6 +115,11 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
     && (inDocument || /[《「“"][^》」”"]{1,200}[》」”"]/.test(text))
 }
 
+/** Told not to (Codex L13-1 C2): 「不要把《X》转成 Word」「先别转」 write nothing. */
+const TO_WORD_REFUSED = /(?:不要|不用|不必|不想|先别|(?<![特区])别)[^，。！？!?]{0,12}(?:转|导出|存成|另存)/
+/** A question about how a conversion would turn out (「转成 Word 会乱版吗」「会不会丢表格」)
+ * is asked, not done; 「能帮我转成 Word 吗」 is a request and converts. */
+const TO_WORD_WONDERS = /会不会|会[^，。！？!?]{0,10}[吗呢？?]\s*$/
 /** Word, docx or doc after a convert verb. Longer verbs first; titles are already 《》. */
 const TO_WORD = /(?:转换成|转换为|导出为|导出成|另存为|转成|转为|存成)\s*(?:可编辑的)?\s*(?:一份)?\s*(?:docx|doc|word)(?![a-z])/i
 
@@ -129,7 +134,7 @@ export function asksToWord(text: string, inDocument: boolean): boolean {
   if (asksTranslation(text, inDocument) || parseDocIntent(text) !== null) return false
   if (!inDocument && !/《[^》]{1,200}》/.test(text)) return false
   const said = text.replace(/《[^》]{1,200}》/g, '《》')
-  return TO_WORD.test(said)
+  return TO_WORD.test(said) && !TO_WORD_REFUSED.test(said) && !TO_WORD_WONDERS.test(said)
 }
 
 /** L6-F2 (PR-Daemon #2028 round 2): a delete of a whole document needs

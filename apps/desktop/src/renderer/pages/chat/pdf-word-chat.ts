@@ -37,5 +37,5 @@ export async function runToWord(
     const where = `已把《${subject.title}》转换为 Word：下载/${saved.docxName}；新文档也在文档库里。`
     return /\bdoc\b/i.test(said) ? `${where}（文件格式是 .docx。）` : where
   }
-  return `已把《${subject.title}》转换为 Word，新文档在文档库里；没能存进「下载」：${saved.message ?? saved.code}`
+  return `已把《${subject.title}》转换为 Word，新文档在文档库里；没能存进「下载」：${saved.message ?? saved.code ?? ''}`
 }
