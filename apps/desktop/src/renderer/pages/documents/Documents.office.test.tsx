@@ -67,6 +67,7 @@ describe('DocumentsPage: Office documents', () => {
     expect(screen.getByText('Word/Excel/PowerPoint 文档：先转换为 PDF 才能预览和提问。')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '在对话里问' })).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '拆分…' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '转换为 Word' })).not.toBeInTheDocument()
     await waitFor(() => expect(request.mock.calls.some(([r]) => r.op === 'get')).toBe(true))
     expect(request.mock.calls.filter(([r]) => r.op === 'renderPage')).toHaveLength(0)
     expect(request.mock.calls.filter(([r]) => r.op === 'readText')).toHaveLength(0)
@@ -99,5 +100,14 @@ describe('DocumentsPage: Office documents', () => {
     const before = request.mock.calls.filter(([r]) => r.op === 'list').length
     fireEvent.click(await screen.findByRole('button', { name: '转换为 PDF' }))
     await waitFor(() => expect(request.mock.calls.filter(([r]) => r.op === 'list').length).toBeGreaterThan(before))
+  })
+
+  // L12-3: a PDF document offers 「转换为 Word」.
+  it('offers Convert to Word on a PDF document', async () => {
+    mount([doc(1, 'application/pdf')], () => ok(detail(1, 'application/pdf')))
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    expect(await screen.findByRole('button', { name: '转换为 Word' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '转换为 PDF' })).not.toBeInTheDocument()
   })
 })
