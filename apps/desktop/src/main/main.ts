@@ -759,6 +759,7 @@ app.whenReady().then(async () => {
   const knowledgeOnboard = knowledgeOnboarding({
     dir: app.getPath('userData'),
     controller: () => knowledge,
+    lite: () => knowledgeLite,
     fetch: (url, init) => net.fetch(url, init),
   })
   // L7-K2 A3: same origin and credential as the entry submission, for the default base.

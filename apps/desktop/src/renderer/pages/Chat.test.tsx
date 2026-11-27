@@ -1649,6 +1649,7 @@ describe('ChatPage: knowledge onboarding in the conversation (L7-K2)', () => {
     activated: true,
     invalidActivation: false,
     alreadyBound: false,
+    localOffered: false,
     reachable: true,
     formats: ['md', 'markdown', 'txt'] as const,
     maxBytes: 10_485_760,
@@ -1702,6 +1703,24 @@ describe('ChatPage: knowledge onboarding in the conversation (L7-K2)', () => {
     expect(screen.getByRole('button', { name: '上传文档' })).toBeInTheDocument()
     expect(onboardRun).toHaveBeenCalledTimes(1)
     expect(onboardRun).toHaveBeenCalledWith({ localOnly: false })
+    expect(mockBackendProxy).not.toHaveBeenCalled()
+  })
+
+  it('opens the local knowledge base from the chat without an activation (L11-1)', async () => {
+    onboardPreflight.mockResolvedValue({ ...ready, activated: false, reachable: null, localOffered: true })
+    onboardRun.mockResolvedValue({ ok: true, source: 'local', activeNow: true })
+    render(<ChatPage />)
+    say('帮我开通知识库')
+    expect(await screen.findByText(/这个知识库主要做什么用/)).toBeInTheDocument()
+    say('合同审核')
+    expect(await screen.findByText(/主要会放哪些类型的文档/)).toBeInTheDocument()
+    say('合同')
+    expect(await screen.findByText(/是否必须只留在这台电脑上/)).toBeInTheDocument()
+    say('是')
+    expect(await screen.findByText(/已在这台电脑上开通本机知识库/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '上传文档' })).toBeInTheDocument()
+    expect(onboardRun).toHaveBeenCalledTimes(1)
+    expect(onboardRun).toHaveBeenCalledWith({ localOnly: true })
     expect(mockBackendProxy).not.toHaveBeenCalled()
   })
 
