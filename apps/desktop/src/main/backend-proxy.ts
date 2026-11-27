@@ -145,6 +145,9 @@ export const ALLOWED_PROXY_ROUTES: readonly ProxyRoute[] = [
   r('POST', '/api/v1/comm/daemon/stop'), // [E]
   // Sin90 reads are Everyday. Writes stay on the main-process Sin90 IPC,
   // which attaches the human key. Do not add POST/PATCH/PUT here.
+  r('GET', '/api/v1/sin90/tasks/{id}/priority'),
+  r('GET', '/api/v1/sin90/tasks/{id}/completion-evidence'),
+  r('GET', '/api/v1/sin90/review/weekly/draft'),
   r('GET', '/api/v1/sin90/today'),
   r('GET', '/api/v1/sin90/directions'),
   r('GET', '/api/v1/sin90/tasks'),

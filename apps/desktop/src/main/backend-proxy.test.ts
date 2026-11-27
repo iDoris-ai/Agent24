@@ -124,6 +124,13 @@ describe('A1 findAllowedRoute', () => {
     expect(ALLOWED_PROXY_ROUTES.some((route) => route.template.includes('/report'))).toBe(false)
   })
   it('allows Sin90 reads and keeps Sin90 writes off the proxy', () => {
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/tasks/t1/priority')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/tasks/t1/completion-evidence')).toBe(true)
+    expect(isAllowedProxyRoute('GET', '/api/v1/sin90/review/weekly/draft?week=2026-W48')).toBe(true)
+    expect(isAllowedProxyRoute('PUT', '/api/v1/sin90/tasks/t1/priority/override')).toBe(false)
+    expect(isAllowedProxyRoute('DELETE', '/api/v1/sin90/tasks/t1/priority/override')).toBe(false)
+    expect(isAllowedProxyRoute('PUT', '/api/v1/sin90/tasks/t1/completion-note')).toBe(false)
+    expect(isAllowedProxyRoute('POST', '/api/v1/sin90/ai/priority/evaluate')).toBe(false)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/today')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/directions')).toBe(true)
     expect(isAllowedProxyRoute('GET', '/api/v1/sin90/tasks?direction_id=d1')).toBe(true)

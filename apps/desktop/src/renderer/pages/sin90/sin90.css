@@ -90,3 +90,18 @@
 
 .sin90-progress-track { height: 5px; overflow: hidden; border-radius: 999px; background: var(--border); }
 .sin90-progress-track > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
+
+.sin90-quadrants { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.sin90-quadrant { min-width: 0; border-top: 4px solid var(--quadrant-color); border-radius: 8px; padding: 16px; background: var(--surface2); background: color-mix(in srgb, var(--quadrant-color) 10%, var(--surface)); }
+.sin90-quadrant h3 { margin: 0 0 6px; color: var(--text); }
+.sin90-quadrant-do_first { --quadrant-color: #a74934; }
+.sin90-quadrant-schedule { --quadrant-color: #286951; }
+.sin90-quadrant-delegate { --quadrant-color: #94601e; }
+.sin90-quadrant-eliminate { --quadrant-color: #626989; }
+.sin90-quadrant-unevaluated { --quadrant-color: var(--muted); grid-column: 1 / -1; }
+.sin90-queue .sin90-quadrant-task { display: flex; flex-direction: column; align-items: stretch; padding: 10px; border-radius: 6px; background: var(--surface); overflow-wrap: anywhere; }
+.sin90-quadrant-task details { width: 100%; }
+.sin90-quadrant-task summary { cursor: pointer; margin-top: 8px; }
+.sin90-quadrant-task .ui-field { margin-top: 8px; }
+@media (max-width: 650px) { .sin90-quadrants { grid-template-columns: 1fr; } .sin90-capture { flex-wrap: wrap; } }
+.sin90-review-body { white-space: pre-wrap; overflow-wrap: anywhere; }
