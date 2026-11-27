@@ -26,3 +26,10 @@
 .idoris-panel :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .idoris-candidates { padding-inline-start: 20px; }
 .idoris-candidates li { margin-block: 8px; }
+.idoris-engines h3 { margin: 12px 0 8px; font-size: 14px; }
+.idoris-engines ul { list-style: none; margin: 0; padding: 0; }
+.idoris-engines li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin: 6px 0; }
+.idoris-engine-state, .idoris-engine-reason { color: var(--muted); }
+.idoris-engine-state[data-state="ready"] { color: var(--success); }
+.idoris-engine-state:is([data-state="starting"], [data-state="restarting"]) { color: var(--warning); }
+.idoris-engine-state:is([data-state="failed"], [data-state="unavailable"]) { color: var(--danger); }

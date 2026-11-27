@@ -18,6 +18,9 @@ import {
   type DocumentsModuleStatus,
   type OsPackageProgress,
   type KnowledgeConfigureInput,
+  type KnowledgeOnboardPreflight,
+  type KnowledgeOnboardResult,
+  type KnowledgeUpload,
   type KnowledgeSettingsResult,
   type KnowledgeStatus,
   type KnowledgeViewBounds,
@@ -40,6 +43,8 @@ import {
   type DocAgentAccess,
   type OfficeEngineStatus,
   type TranslationExportResult,
+  type DeliverRequest,
+  type DeliverResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type ApprovalDecisionInput,
@@ -261,6 +266,21 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+    /** L7-K2: mock onboarding. The activation code and the key stay in main. */
+    onboardPreflight: (): Promise<KnowledgeOnboardPreflight> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeOnboardPreflight),
+    onboardRun: (input: { localOnly: boolean }): Promise<KnowledgeOnboardResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeOnboardRun, input),
+    /** L7-K2 A3: pick files and upload them. Paths stay in main. */
+    uploadPick: (): Promise<KnowledgeUpload[]> => ipcRenderer.invoke(IpcChannels.KnowledgeUploadPick),
+    uploadList: (): Promise<KnowledgeUpload[]> => ipcRenderer.invoke(IpcChannels.KnowledgeUploadList),
+    uploadCancel: (id: string): Promise<KnowledgeUpload | null> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeUploadCancel, id),
+    onUploadChanged: (cb: (uploads: KnowledgeUpload[]) => void): (() => void) => {
+      const listener = (_event: unknown, uploads: KnowledgeUpload[]): void => cb(uploads)
+      ipcRenderer.on(IpcChannels.KnowledgeUploadChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.KnowledgeUploadChanged, listener)
+    },
   },
   // KB-C2-03: where to draw the KnowledgeView; main owns everything else.
   knowledgeView: {
@@ -348,8 +368,12 @@ const api = {
     /** D4: write the translated HTML to a DOCX in Downloads and import its PDF. */
     revealDownload: (name: string): Promise<boolean> => ipcRenderer.invoke(IpcChannels.DocumentsRevealDownload, name),
     /** D5a: a library document saved to Downloads; `docxName` is the file's name. */
-    saveDownload: (documentId: string, title: string): Promise<TranslationExportResult> =>
-      ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title),
+    saveDownload: (documentId: string, title: string, revision?: number): Promise<TranslationExportResult> =>
+      revision === undefined
+        ? ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title)
+        : ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title, revision),
+    /** L8 DOC-4: a clean copy saved where the user picks in the save dialog, then its receipt. */
+    deliver: (req: DeliverRequest): Promise<DeliverResult> => ipcRenderer.invoke(IpcChannels.DocumentsDeliver, req),
     exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean; level?: 1 | 2 | 3 }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
       ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {

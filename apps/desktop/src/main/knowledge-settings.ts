@@ -247,6 +247,58 @@ export class KnowledgeController {
     return this.apply()
   }
 
+  /** L7-K2 onboarding: saves the endpoint, its default knowledge base and the
+   * issued key, switched On, in one write, and only while no endpoint is
+   * configured. The check runs inside the write queue against the saved file,
+   * so a user's own save that got there first wins and is never overwritten.
+   * `saved: true` means the settings are on disk; `result` is whether the
+   * daemon took them now (a daemon not up yet takes them later). */
+  async adopt(input: { endpoint: string; knowledgeBaseIds: string[]; apiKey: string }): Promise<
+    { saved: true; result: SettingsResult } | { saved: false; reason: 'bound' | 'overtaken' | 'invalid' | 'not_saved' }
+  > {
+    const { endpoint, knowledgeBaseIds, apiKey } = input
+    if (!validEndpoint(endpoint) || !validKnowledgeBaseIds(knowledgeBaseIds) || !/^[\x21-\x7e]{1,16384}$/.test(apiKey)) {
+      return { saved: false, reason: 'invalid' }
+    }
+    // No number is taken up front: a user's change queued before this one must not count as overtaken by it.
+    // Any change made after this call (its number moves `version`) makes onboarding stand back.
+    const seen = this.version
+    let mine = -1
+    const next: KnowledgeSettings = { enabled: true, endpoint, knowledgeBaseIds: [...knowledgeBaseIds] }
+    let wrote = false
+    try {
+      await this.serial(async () => {
+        if (seen !== this.version || this.settings.endpoint !== '' || this.store.load().endpoint !== '') return
+        mine = ++this.version
+        const previous = this.logins.list().get(KNOWLEDGE_BINDING)
+        await this.logins.put(KNOWLEDGE_BINDING, { profileId: endpoint, material: apiKey, unusable: false, temporary: false })
+        this.identity++
+        try {
+          await this.store.save(next)
+        } catch (err) {
+          await (previous ? this.logins.put(KNOWLEDGE_BINDING, { ...previous }) : this.logins.remove(KNOWLEDGE_BINDING))
+          throw err
+        }
+        wrote = true
+      })
+    } catch {
+      return { saved: false, reason: 'not_saved' }
+    }
+    // This write landed but a later change overtook it: what ends up saved is that change's, maybe a snapshot
+    // taken before this write. Never `bound` from onboarding's own endpoint: `overtaken`, and onboarding keeps
+    // its files to run again.
+    if (wrote && mine !== this.version) return { saved: false, reason: 'overtaken' }
+    // Nothing written: bound when an endpoint is in place now (the user's own); otherwise another change
+    // without one (say, the switch) went first, and onboarding may simply run again.
+    if (!wrote) {
+      const bound = this.settings.endpoint !== '' || this.store.load().endpoint !== ''
+      return { saved: false, reason: bound ? 'bound' : 'overtaken' }
+    }
+    this.identity++
+    this.settings = next
+    return { saved: true, result: await this.apply() }
+  }
+
   /** Off at once, saved or not; On once saved. */
   async setEnabled(enabled: boolean): Promise<SettingsResult> {
     const mine = ++this.version

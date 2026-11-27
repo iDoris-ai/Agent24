@@ -47,6 +47,18 @@ fn each_allowed_operation_maps_to_its_fixed_route() {
             get(format!("/api/v1/documents/documents/{DOC}")),
         ),
         (
+            json!({"op": "delete", "documentId": DOC}),
+            post(format!("/api/v1/documents/documents/{DOC}/delete")),
+        ),
+        (
+            json!({"op": "restore", "documentId": DOC}),
+            post(format!("/api/v1/documents/documents/{DOC}/restore")),
+        ),
+        (
+            json!({"op": "recentlyDeleted"}),
+            get("/api/v1/documents/recently-deleted".into()),
+        ),
+        (
             json!({"op": "readText", "documentId": DOC, "revision": 2}),
             get(format!(
                 "/api/v1/documents/documents/{DOC}/revisions/2/text"
@@ -667,7 +679,11 @@ fn paragraphs_and_patch_map_to_their_routes_and_refuse_what_the_service_would() 
 
 #[test]
 fn fields_fill_and_content_map_to_their_routes_and_refuse_what_the_service_would() {
-    for (op, tail) in [("fields", "fields"), ("content", "content")] {
+    for (op, tail) in [
+        ("fields", "fields"),
+        ("content", "content"),
+        ("preflight", "preflight"),
+    ] {
         assert_eq!(
             route_of(&json!({"op": op, "documentId": DOC})),
             Some((
@@ -698,6 +714,38 @@ fn fields_fill_and_content_map_to_their_routes_and_refuse_what_the_service_would
     }
 }
 
+/// L8-S02 (PR-Daemon #2100, 监工 裁决 C): the approval box's read of what a
+/// fill with a material takes from it.
+#[test]
+fn fill_preview_posts_the_fill_s_material_and_words() {
+    const SRC: &str = "doc_01K74Z3QJ8V5N2W9RTX6Y00092";
+    let r = route(&json!({
+        "op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC,
+        "values": {"姓名": "陈晓明"}, "userSaid": ["姓名"],
+    }))
+    .unwrap();
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(
+        r.path,
+        format!("/api/v1/documents/documents/{DOC}/fill/preview")
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"source_document_id": SRC, "values": {"姓名": "陈晓明"}, "user_said": ["姓名"]})
+    );
+    assert!(
+        route(&json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC})).is_some()
+    );
+    for bad in [
+        json!({"op": "fillPreview", "documentId": DOC}),
+        json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": "x"}),
+        json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC, "values": {"a": 3}}),
+        json!({"op": "fillPreview", "documentId": DOC, "sourceDocumentId": SRC, "userSaid": [""]}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
+
 #[test]
 fn a_file_reply_is_its_bytes_in_base64_with_its_media_type() {
     let reply = Reply::Http {
@@ -712,5 +760,134 @@ fn a_file_reply_is_its_bytes_in_base64_with_its_media_type() {
             assert_eq!(data["data"], "JVBERi0xLjc=");
         }
         other => panic!("{other:?}"),
+    }
+}
+
+/// L6-F5: versions, restoring one over the version seen, an old version's
+/// file, and a patch or fill saved as the next version.
+#[test]
+fn versions_restore_and_saving_as_a_new_version_map_to_their_routes() {
+    assert_eq!(
+        route_of(&json!({"op": "revisions", "documentId": DOC})),
+        Some((
+            Method::Get,
+            format!("/api/v1/documents/documents/{DOC}/revisions")
+        ))
+    );
+    assert_eq!(
+        route(&json!({"op": "content", "documentId": DOC, "revision": 1})).map(|r| r.path),
+        Some(format!(
+            "/api/v1/documents/documents/{DOC}/content?revision=1"
+        ))
+    );
+    let r = route(
+        &json!({"op": "restoreRevision", "documentId": DOC, "revision": 1, "expectRevision": 2}),
+    )
+    .unwrap();
+    assert_eq!(
+        (r.method, r.path),
+        (
+            Method::Post,
+            format!("/api/v1/documents/documents/{DOC}/revisions/1/restore")
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"expect_revision": 2})
+    );
+    let r = route(
+        &json!({"op": "patch", "documentId": DOC, "saveTo": "new_revision", "expectRevision": 2,
+        "edits": [{"index": 3, "text": "新"}]}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"edits": [{"index": 3, "text": "新"}], "save_to": "new_revision", "expect_revision": 2})
+    );
+    let r = route(
+        &json!({"op": "fill", "documentId": DOC, "saveTo": "new_revision", "expectRevision": 1,
+        "values": {"甲方": "x"}}),
+    )
+    .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap()["expect_revision"],
+        1
+    );
+    let edits = json!([{"index": 0, "text": "t"}]);
+    for bad in [
+        json!({"op": "restoreRevision", "documentId": DOC, "revision": 1}),
+        json!({"op": "restoreRevision", "documentId": DOC, "revision": 0, "expectRevision": 1}),
+        json!({"op": "content", "documentId": DOC, "revision": 0}),
+        json!({"op": "patch", "documentId": DOC, "edits": edits, "saveTo": "new_revision"}),
+        json!({"op": "patch", "documentId": DOC, "edits": edits, "expectRevision": 1}),
+        json!({"op": "patch", "documentId": DOC, "edits": edits, "saveTo": "original", "expectRevision": 1}),
+        json!({"op": "revisions", "documentId": "nope"}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn compare_maps_to_its_route_and_checks_both_sides() {
+    let r = route(&json!({"op": "compare",
+        "left": {"documentId": DOC, "revision": 1}, "right": {"documentId": DOC},
+        "limit": 50, "offset": 100}))
+    .unwrap();
+    assert_eq!(
+        (r.method, r.path),
+        (
+            Method::Post,
+            "/api/v1/documents/documents/compare".to_owned()
+        )
+    );
+    assert_eq!(
+        serde_json::from_slice::<Value>(&r.body.unwrap()).unwrap(),
+        json!({"left": {"document_id": DOC, "revision": 1}, "right": {"document_id": DOC},
+               "limit": 50, "offset": 100})
+    );
+    for bad in [
+        json!({"op": "compare", "left": {"documentId": DOC}}),
+        json!({"op": "compare", "left": {"documentId": "x"}, "right": {"documentId": DOC}}),
+        json!({"op": "compare", "left": {"documentId": DOC, "revision": 0}, "right": {"documentId": DOC}}),
+        json!({"op": "compare", "left": {"documentId": DOC}, "right": {"documentId": DOC}, "limit": 0}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
+    }
+}
+
+#[test]
+fn deliver_receipt_and_receipts_map_to_their_routes_and_refuse_what_the_service_would() {
+    const COPY: &str = "doc_01HZX5W3K9Q8R7T6Y5V4A3S2R9";
+    let d = route(&json!({"op": "deliver", "documentId": DOC, "expectRevision": 2})).unwrap();
+    assert_eq!(d.method, Method::Post);
+    assert_eq!(
+        d.path,
+        format!("/api/v1/documents/documents/{DOC}/deliveries")
+    );
+    let r = route(&json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": COPY, "savedTo": "/Users/u/Desktop/合同.pdf"})).unwrap();
+    assert_eq!(r.method, Method::Post);
+    assert_eq!(
+        r.path,
+        format!("/api/v1/documents/documents/{DOC}/receipts")
+    );
+    assert_eq!(
+        route_of(&json!({"op": "receipts", "documentId": DOC})),
+        Some((
+            Method::Get,
+            format!("/api/v1/documents/documents/{DOC}/receipts")
+        ))
+    );
+    assert_eq!(
+        route_of(&json!({"op": "receipts"})),
+        Some((Method::Get, "/api/v1/documents/receipts".to_owned()))
+    );
+    for bad in [
+        json!({"op": "deliver", "documentId": DOC}),
+        json!({"op": "deliver", "documentId": DOC, "expectRevision": 0}),
+        json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": COPY, "savedTo": "Desktop/a.pdf"}),
+        json!({"op": "receipt", "documentId": DOC, "revision": 2, "copyDocumentId": "x", "savedTo": "/a.pdf"}),
+        json!({"op": "receipts", "documentId": "x"}),
+    ] {
+        assert!(route(&bad).is_none(), "{bad}");
     }
 }

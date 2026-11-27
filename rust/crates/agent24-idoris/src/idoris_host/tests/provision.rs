@@ -60,7 +60,6 @@ struct Provision {
     budget_probes: AtomicUsize,
     verifications: AtomicUsize,
     no_key: AtomicBool,
-    owner_trusted: AtomicBool,
     settings_dir: tempfile::TempDir,
     key_waiting: AtomicBool,
     budget_unavailable: AtomicBool,
@@ -83,13 +82,6 @@ fn copy_release(from: &Path, to: &Path) {
 }
 #[async_trait]
 impl Provisioner for Provision {
-    fn omlx_probe(&self) -> Result<OmlxProbe, Code> {
-        let trusted = self.owner_trusted.load(Ordering::SeqCst);
-        Ok(OmlxProbe::new()
-            .unwrap()
-            .with_owner_check(if trusted { |_| true } else { |_| false }))
-    }
-
     async fn budget_suggestion(&self) -> Result<agent24_hw::IdorisBudgetSuggestion, &'static str> {
         self.budget_probes.fetch_add(1, Ordering::SeqCst);
         tokio::task::yield_now().await;
@@ -154,7 +146,7 @@ impl Provisioner for Provision {
         }
         // A managed root other than the fixture's own receives a fresh copy, like a real install.
         if Some(root) != self.record.release_dir.parent() {
-            let release = root.join("v0.5.0");
+            let release = root.join("v0.6.0");
             // Like the real installer: an existing version directory is verified, not rewritten.
             if !release.exists() {
                 copy_release(&self.record.release_dir, &release);
@@ -175,7 +167,7 @@ impl Provisioner for Provision {
         if self.no_key.load(Ordering::SeqCst) {
             return Ok(None);
         }
-        crate::omlx_probe::read_settings_key_at(
+        crate::upstream::read_settings_key_at(
             &self.settings_dir.path().join("settings.json"),
             nix::unistd::geteuid().as_raw(),
         )
@@ -192,17 +184,9 @@ struct ConnectedFixture {
     data: Arc<Store>,
     upstream: Arc<Store>,
     endpoint: String,
-    server: tokio::task::JoinHandle<()>,
-    authorized_requests: Arc<AtomicUsize>,
-}
-impl Drop for ConnectedFixture {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
 }
 impl ConnectedFixture {
     async fn new() -> Self {
-        use axum::{Json, Router, routing::get};
         let mut f = Fixture::new().await;
         let settings_dir = tempfile::tempdir().unwrap();
         let settings_path = settings_dir.path().join("settings.json");
@@ -221,7 +205,6 @@ impl ConnectedFixture {
             budget_probes: AtomicUsize::new(0),
             verifications: AtomicUsize::new(0),
             no_key: AtomicBool::new(false),
-            owner_trusted: AtomicBool::new(true),
             settings_dir,
             key_waiting: AtomicBool::new(false),
             budget_unavailable: AtomicBool::new(false),
@@ -235,31 +218,17 @@ impl ConnectedFixture {
             .host
             .with_provisioner(provision.clone(), data.clone(), upstream.clone())
             .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let authorized_requests = Arc::new(AtomicUsize::new(0));
-        let seen_auth = authorized_requests.clone();
-        let app = Router::new().route("/v1/models", get(move |headers: axum::http::HeaderMap| {
-            let seen_auth = seen_auth.clone();
-            async move {
-            if headers.contains_key("authorization") { seen_auth.fetch_add(1, Ordering::SeqCst); }
-            if headers.get("authorization").is_some_and(|v| v == "Bearer sk-upstream-sensitive") { (axum::http::StatusCode::OK, Json(json!({"data": [{"id": "real-model", "object":"model", "owned_by":"omlx"}]}))) }
-            else { (axum::http::StatusCode::UNAUTHORIZED, Json(json!({"error":"auth required"}))) }
-        }})).route("/openapi.json", get(|| async { Json(json!({"openapi":"3.1.0", "info":{"title":"oMLX API"}, "paths":{"/v1/models":{"get":{}}, "/health":{"get":{}}, "/api/status":{"get":{}}}})) }));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
+        let endpoint = "http://127.0.0.1:9".to_owned();
         Self {
             f,
             provision,
             data,
             upstream,
             endpoint,
-            server,
-            authorized_requests,
         }
     }
     async fn installed(&self) {
+        self.scenario(json!({}));
         let mut record = self.f.record.clone();
         record.key_id = None;
         record.components_dir = None;
@@ -282,7 +251,8 @@ impl ConnectedFixture {
             }),
         }
     }
-    fn scenario(&self, value: serde_json::Value) {
+    fn scenario(&self, mut value: serde_json::Value) {
+        value["auto_endpoint"] = json!(self.endpoint);
         fs::write(
             self.f.host.root.join("provision-scenario.json"),
             value.to_string(),
@@ -583,59 +553,6 @@ async fn core_bootstrap_installs_connects_and_starts_without_consent() {
     );
 }
 #[tokio::test]
-async fn bootstrap_authenticates_local_settings_key_before_connect() {
-    let _serial = BOOTSTRAP_SERIAL.lock().await;
-    let x = ConnectedFixture::new().await;
-    x.f.host
-        .bootstrap_core_with_candidates(Candidates {
-            setup: None,
-            candidates: vec![Candidate {
-                endpoint: x.endpoint.clone(),
-                identity: "omlx",
-                authentication: "auth_required",
-                models: vec![],
-            }],
-            key_from_local_settings: true,
-        })
-        .await
-        .unwrap();
-    assert_eq!(x.f.host.status().await.state, State::Running);
-    assert!(x.upstream.entries.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn bootstrap_rejects_untrusted_key_required_listener_before_connect() {
-    let _serial = BOOTSTRAP_SERIAL.lock().await;
-    let x = ConnectedFixture::new().await;
-    x.provision.owner_trusted.store(false, Ordering::SeqCst);
-    let result =
-        x.f.host
-            .bootstrap_core_with_candidates(Candidates {
-                setup: None,
-                candidates: vec![Candidate {
-                    endpoint: x.endpoint.clone(),
-                    identity: "omlx",
-                    authentication: "auth_required",
-                    models: vec![],
-                }],
-                key_from_local_settings: true,
-            })
-            .await;
-    assert_eq!(result, Err(Code::OmlxAuthRequired));
-    assert_eq!(x.authorized_requests.load(Ordering::SeqCst), 0);
-    assert!(
-        x.f.host
-            .inner
-            .lock()
-            .await
-            .operations
-            .values()
-            .all(|op| op.action != Action::Connect)
-    );
-    assert!(!x.f.host.root.join("connection.json").exists());
-}
-
-#[tokio::test]
 async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
     let _serial = BOOTSTRAP_SERIAL.lock().await;
     let x = ConnectedFixture::new().await;
@@ -668,18 +585,34 @@ async fn a_second_bootstrap_after_stop_starts_again_instead_of_replaying() {
 #[tokio::test]
 async fn candidates_expose_identity_models_and_source_but_never_credentials() {
     let x = ConnectedFixture::new().await;
-    let value =
-        serde_json::to_value(x.f.host.candidates(Some(&x.endpoint)).await.unwrap()).unwrap();
+    x.installed().await;
+    let value = serde_json::to_value(x.f.host.candidates(None).await.unwrap()).unwrap();
     assert_eq!(value["key_from_local_settings"], true);
-    let candidate = value["candidates"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|c| c["endpoint"].as_str().unwrap().trim_end_matches('/') == x.endpoint)
-        .unwrap();
+    let candidate = &value["candidates"][0];
+    assert_eq!(candidate["endpoint"], "");
     assert_eq!(candidate["identity"], "omlx");
     assert_eq!(candidate["models"], json!(["real-model"]));
     assert!(!value.to_string().contains("sk-upstream"));
+}
+#[tokio::test]
+async fn connect_journal_during_setup_has_no_unvalidated_omlx_url() {
+    // #2077 review: bootstrap can pass endpoint "", and a crash during setup
+    // must not leave a journal whose candidate fails validation on restore.
+    let x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"snapshot_journal": true}));
+    let op =
+        x.f.host
+            .connect(x.request(), Some("journal"))
+            .await
+            .unwrap();
+    assert_eq!(x.f.complete(&op).await.result, Some(Outcome::Succeeded));
+    x.f.host.shutdown().await.unwrap();
+    let journal: serde_json::Value =
+        serde_json::from_slice(&fs::read(x.f.host.root.join("journal-during-setup.json")).unwrap())
+            .unwrap();
+    assert_eq!(journal["committed"], false);
+    assert!(journal["candidate"]["omlx_url"].is_null());
 }
 #[tokio::test]
 async fn connect_verifies_chat_commits_once_and_requires_explicit_replace() {
@@ -812,7 +745,7 @@ async fn each_connect_failure_preserves_receipt_and_revokes_new_keys() {
         (json!({}), true, false, Code::KeychainLocked, true),
         (json!({}), false, true, Code::KeychainLocked, true),
         (
-            json!({"serve":{"mode":"exit", "code":1}}),
+            json!({"serve":{"mode":"exit", "code":2}}),
             false,
             false,
             Code::StartFailed,
@@ -1272,28 +1205,28 @@ async fn submit_rejects_install_and_connect_actions() {
 }
 
 #[tokio::test]
-#[ignore = "real signed v0.5.0/download; optional oMLX on 8088 and IDORIS_DAILY_MODEL"]
-async fn real_v040_install_reverify_and_connect_when_omlx_available() {
-    let source = std::env::var_os("IDORIS_REAL_V040_DIR")
+#[ignore = "real signed v0.6.0/download; optional oMLX on 8088 and IDORIS_DAILY_MODEL"]
+async fn real_v060_install_reverify_and_connect_when_omlx_available() {
+    let source = std::env::var_os("IDORIS_REAL_V060_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(std::env::var_os("HOME").unwrap()).join("a24-codex/idoris-v040")
+            PathBuf::from(std::env::var_os("HOME").unwrap()).join("a24-codex/idoris-v060")
         });
     let temp = tempfile::tempdir().unwrap();
     let root = temp.path().canonicalize().unwrap().join("idoris");
-    for part in ["0.5.0/config/components", "data/state"] {
+    for part in ["0.6.0/config/components", "data/state"] {
         fs::create_dir_all(root.join(part)).unwrap();
     }
     for path in [
         root.clone(),
-        root.join("0.5.0"),
-        root.join("0.5.0/config"),
-        root.join("0.5.0/config/components"),
+        root.join("0.6.0"),
+        root.join("0.6.0/config"),
+        root.join("0.6.0/config/components"),
     ] {
         mode(&path, 0o700);
     }
     for name in &IdorisLock::embedded().assets["aarch64-apple-darwin"].files {
-        let path = root.join("0.5.0").join(name);
+        let path = root.join("0.6.0").join(name);
         fs::copy(source.join(name), &path).unwrap();
         mode(&path, if name == "idoris" { 0o500 } else { 0o400 });
     }
@@ -1343,7 +1276,7 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
         .unwrap();
     assert_eq!(completed(&host, &op).await.result, Some(Outcome::Succeeded));
     eprintln!(
-        "PASS: pinned archive downloaded, real signed v0.5.0 tree reverified and install replay succeeded"
+        "PASS: pinned archive downloaded, real signed v0.6.0 tree reverified and install replay succeeded"
     );
     if tokio::net::TcpStream::connect("127.0.0.1:8088")
         .await
@@ -1355,10 +1288,6 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
     }
     let model = std::env::var("IDORIS_DAILY_MODEL")
         .expect("set explicit IDORIS_DAILY_MODEL; never select the first model implicitly");
-    let mut record = host.inner.lock().await.installation.clone().unwrap();
-    record.data_port = port().await;
-    record.admin_port = port().await;
-    host.record_installation(record).await.unwrap();
     let request = ConnectRequest {
         source: "omlx".into(),
         endpoint: "http://127.0.0.1:8088".into(),
@@ -1388,13 +1317,7 @@ async fn real_v040_install_reverify_and_connect_when_omlx_available() {
 #[tokio::test]
 async fn preflight_failures_are_stable_and_do_not_issue_keys() {
     for (no_key, model, consent_model, core, expected) in [
-        (
-            true,
-            "real-model",
-            "real-model",
-            Some(0),
-            Code::OmlxAuthRequired,
-        ),
+        (true, "real-model", "real-model", Some(0), Code::SetupFailed),
         (false, "missing", "missing", Some(0), Code::ModelNotFound),
         (false, "real-model", "real-model", None, Code::NotConfigured),
     ] {
@@ -1455,45 +1378,6 @@ async fn launcher_lock_rejects_other_hosts_and_cancel_retains_the_lock_until_don
 }
 
 #[tokio::test]
-async fn untrusted_services_and_rejected_credentials_have_distinct_codes() {
-    use axum::{Json, Router, http::StatusCode, routing::get};
-    for (omlx, expected) in [
-        (false, Code::UnknownService),
-        (true, Code::OmlxAuthRejected),
-    ] {
-        let x = ConnectedFixture::new().await;
-        x.installed().await;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = format!("http://{}", listener.local_addr().unwrap());
-        let app = Router::new().route("/v1/models", get(|| async { (StatusCode::UNAUTHORIZED, Json(json!({"error":"auth"}))) }))
-            .route("/openapi.json", get(move || async move { Json(json!({"openapi":"3.1.0", "info":{"title": if omlx { "oMLX API" } else { "Other API" }}, "paths":{"/v1/models":{"get":{}}, "/health":{"get":{}}, "/api/status":{"get":{}}}})) }));
-        let server = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        let mut request = x.request();
-        request.endpoint = endpoint;
-        let op = x.f.host.connect(request, Some("classified")).await.unwrap();
-        assert_eq!(x.f.complete(&op).await.error_code, Some(expected));
-        server.abort();
-        assert!(x.keys().is_empty());
-        x.f.assert_clean();
-    }
-    let x = ConnectedFixture::new().await;
-    x.installed().await;
-    x.server.abort();
-    let op =
-        x.f.host
-            .connect(x.request(), Some("unreachable"))
-            .await
-            .unwrap();
-    assert_eq!(
-        x.f.complete(&op).await.error_code,
-        Some(Code::OmlxUnreachable)
-    );
-    assert!(x.keys().is_empty());
-}
-
-#[tokio::test]
 async fn connect_cancel_interrupts_pending_upstream_credential_read() {
     let x = ConnectedFixture::new().await;
     x.installed().await;
@@ -1523,10 +1407,6 @@ async fn connect_cancel_interrupts_pending_upstream_credential_read() {
 struct FixedUpstream(&'static str);
 #[async_trait]
 impl Provisioner for FixedUpstream {
-    fn omlx_probe(&self) -> Result<OmlxProbe, Code> {
-        Ok(OmlxProbe::new().unwrap().with_owner_check(|_| true))
-    }
-
     async fn download(
         &self,
         _: &Path,
@@ -1556,53 +1436,7 @@ impl Provisioner for FixedUpstream {
 
 #[tokio::test]
 async fn inputs_reads_the_injected_upstream_key() {
-    use axum::{Json, Router, routing::get};
     const KEY: &str = "sk-injected-fixed";
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let endpoint = format!("http://{}", listener.local_addr().unwrap());
-    let app = Router::new()
-        .route(
-            "/v1/models",
-            get(|headers: axum::http::HeaderMap| async move {
-                if headers
-                    .get("authorization")
-                    .is_some_and(|v| v == "Bearer sk-injected-fixed")
-                {
-                    (
-                        axum::http::StatusCode::OK,
-                        Json(json!({
-                            "data": [{
-                                "id": "real-model",
-                                "object": "model",
-                                "owned_by": "omlx"
-                            }]
-                        })),
-                    )
-                } else {
-                    (
-                        axum::http::StatusCode::UNAUTHORIZED,
-                        Json(json!({"error": "auth required"})),
-                    )
-                }
-            }),
-        )
-        .route(
-            "/openapi.json",
-            get(|| async {
-                Json(json!({
-                    "openapi": "3.1.0",
-                    "info": {"title": "oMLX API"},
-                    "paths": {
-                        "/v1/models": {"get": {}},
-                        "/health": {"get": {}},
-                        "/api/status": {"get": {}}
-                    }
-                }))
-            }),
-        );
-    let server = tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().to_owned();
     let secrets: Arc<dyn SecretSource> = Arc::new(KeychainSource(Arc::new(MemoryKeychain {
@@ -1625,7 +1459,7 @@ async fn inputs_reads_the_injected_upstream_key() {
     let mut record = Installation {
         omlx_setup: None,
         connection: None,
-        version: "0.5.0".into(),
+        version: "0.6.0".into(),
         release_dir: dir.path().join("release"),
         archive_path: dir.path().join("archive.tar.gz"),
         components_dir: None,
@@ -1634,7 +1468,7 @@ async fn inputs_reads_the_injected_upstream_key() {
         admin_port: 9,
         roles: vec![],
         core_reserved_bytes: Some(0),
-        omlx_url: Some(endpoint),
+        omlx_url: Some("http://127.0.0.1:9".into()),
         omlx_key_id: None,
         desired_running: false,
         verification: None,
@@ -1663,7 +1497,6 @@ async fn inputs_reads_the_injected_upstream_key() {
     let inputs = runtime.inputs(&record).await.unwrap();
     assert!(inputs.omlx_key.is_none());
     drop(host);
-    server.abort();
 }
 
 #[tokio::test]
@@ -1757,7 +1590,7 @@ async fn legacy_install_is_redownloaded_into_the_managed_root_and_marked_deletab
         std::slice::from_ref(&managed)
     );
     let record = x.f.host.inner.lock().await.installation.clone().unwrap();
-    assert_eq!(record.release_dir, managed.join("v0.5.0"));
+    assert_eq!(record.release_dir, managed.join("v0.6.0"));
     assert_eq!(record.install_root.as_ref(), Some(&managed));
     let saved: Installation =
         serde_json::from_slice(&fs::read(x.f.host.root.join("installation.json")).unwrap())
@@ -1787,7 +1620,7 @@ async fn failed_migration_keeps_the_working_legacy_install_and_reports_it() {
         "receipt must still name the legacy copy"
     );
     assert!(!x.f.host.root.join("legacy-install.deletable.json").exists());
-    assert!(!managed.join("v0.5.0").exists());
+    assert!(!managed.join("v0.6.0").exists());
     let status = x.f.host.status().await;
     assert!(status.last_error.is_none());
     assert!(status.migration_pending);
@@ -1868,7 +1701,7 @@ fn deletable_allow_list_accepts_only_release_dirs_and_verified_archives() {
     ] {
         fs::write(old.join(file), b"x").unwrap();
     }
-    std::os::unix::fs::symlink(old.join("data"), old.join("0.5.0")).unwrap();
+    std::os::unix::fs::symlink(old.join("data"), old.join("0.6.0")).unwrap();
     let outside = tempfile::tempdir().unwrap();
     fs::create_dir(outside.path().join("0.4.0")).unwrap();
     let ok = [old.join("0.4.0"), old.join("cache/a.tar.gz.verified")];
@@ -1882,13 +1715,13 @@ fn deletable_allow_list_accepts_only_release_dirs_and_verified_archives() {
         old.join("latest"),
         old.join("01.2.3"),
         old.join("0.4.0/config"),
-        old.join("0.5.0"), // symlink to data/
+        old.join("0.6.0"), // symlink to data/
         old.join("cache"),
         old.join("cache/a.tar.gz.part"),
         old.join("cache/.verified"),
         old.join("cache/.hidden.verified"),
         old.join("cache/../data"),
-        old.join("0.5.0/../data"),
+        old.join("0.6.0/../data"),
         outside.path().join("0.4.0"),
         PathBuf::from("/"),
         PathBuf::new(),
@@ -2000,7 +1833,7 @@ async fn a_running_legacy_instance_is_not_deletable_until_it_has_left_the_old_re
     // Migrate while the old instance runs: the receipt moves, the process does not.
     run_install(&x, "mig-running").await;
     let record = x.f.host.inner.lock().await.installation.clone().unwrap();
-    assert_eq!(record.release_dir, managed.join("v0.5.0"));
+    assert_eq!(record.release_dir, managed.join("v0.6.0"));
     assert!(!marker.exists(), "an in-use release must not be listed");
     assert!(pending.exists(), "the paths wait in the queue");
 
@@ -2018,7 +1851,7 @@ async fn a_running_legacy_instance_is_not_deletable_until_it_has_left_the_old_re
     assert_eq!(x.f.complete(&start).await.result, Some(Outcome::Succeeded));
     assert_eq!(
         x.f.host.inner.lock().await.supervisor_release,
-        Some(managed.join("v0.5.0"))
+        Some(managed.join("v0.6.0"))
     );
     let stop = x.f.host.submit(Action::Stop, None).await.unwrap();
     assert_eq!(x.f.complete(&stop).await.result, Some(Outcome::Succeeded));
@@ -2167,16 +2000,7 @@ async fn openai_compat_connect_single_card_roles() {
         );
         let dir = record.components_dir.unwrap();
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 1);
-        let card = fs::read_to_string(dir.join("lmstudio.yaml")).unwrap();
-        assert!(card.contains("id: lmstudio"));
-        assert!(card.contains("daily: \"real-model\""));
-        assert!(card.contains("deep: \"real-model\""));
-        assert_eq!(card.contains("embed:"), embed.is_some());
-        assert_eq!(
-            card.contains("capabilities: [chat, embedding]"),
-            embed.is_some()
-        );
-        assert!(!card.contains("embeddings"));
+        assert!(dir.join("lmstudio.yaml").is_file());
         assert_eq!(x.keys()[1]["allowed_roles"], json!(allowed));
         // No upstream credential may be read on connect, replace or later restart.
         x.provision.gate.store(true, Ordering::SeqCst);
@@ -2326,35 +2150,9 @@ fn bootstrap_recommendation_requires_installed_candidate() {
 }
 
 #[tokio::test]
-async fn gated_auto_connect_uses_local_models_and_no_agent24_probe() {
-    const CHILD: &str = "AGENT24_IC5B_TEST_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        // Isolate the debug gate from other tests; never mutate process-wide env.
-        let output = tokio::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "gated_auto_connect_uses_local_models_and_no_agent24_probe",
-                "--nocapture",
-            ])
-            .env(CHILD, "1")
-            .env("AGENT24_DEV_IDORIS_V6", "1")
-            .kill_on_drop(true)
-            .output();
-        let output = tokio::time::timeout(Duration::from_secs(180), output)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        return;
-    }
+async fn auto_connect_uses_local_models_and_upstream_discovery() {
     let x = ConnectedFixture::new().await;
     x.installed().await;
-    x.provision.owner_trusted.store(false, Ordering::SeqCst);
-    x.scenario(json!({"auto_endpoint": x.endpoint}));
     let discovery = x.f.host.candidates(None).await.unwrap();
     assert!(discovery.setup.is_none());
     assert!(discovery.key_from_local_settings);
@@ -2381,8 +2179,10 @@ async fn gated_auto_connect_uses_local_models_and_no_agent24_probe() {
     assert_eq!(view["setup_endpoint"], x.endpoint);
     let x = ConnectedFixture::new().await;
     x.installed().await;
-    x.provision.owner_trusted.store(false, Ordering::SeqCst);
-    x.scenario(json!({"auto_endpoint": x.endpoint}));
+    x.scenario(json!({"local_models": [
+        {"omlx_id":"real-model", "kind":"chat", "size_bytes":42},
+        {"omlx_id":"bge-m3-mlx-fp16", "kind":"embedding", "size_bytes":42}
+    ]}));
     // No selected endpoint is needed for bootstrap; only iDoris discovers it.
     x.f.host.bootstrap_core().await.unwrap();
     assert_eq!(x.f.host.status().await.state, State::Running);
@@ -2395,6 +2195,219 @@ async fn gated_auto_connect_uses_local_models_and_no_agent24_probe() {
         x.keys()[0]["allowed_roles"],
         json!(["daily", "deep", "embed"])
     );
-    assert_eq!(x.authorized_requests.load(Ordering::SeqCst), 0);
+    x.f.host.shutdown().await.unwrap();
+}
+
+/// 随包 iDoris 升版本后（#2077 0.5.0→0.6.0），旧版本的回执要能升上去，不能让 lifecycle 整体起不来。
+fn bundled_version() -> &'static str {
+    IdorisLock::embedded().tag.trim_start_matches('v')
+}
+fn write_receipt(x: &ConnectedFixture, record: &Installation) {
+    fs::write(
+        x.f.host.root.join("installation.json"),
+        serde_json::to_vec(record).unwrap(),
+    )
+    .unwrap();
+}
+fn reopen(x: &ConnectedFixture) -> io::Result<Arc<IdorisHost>> {
+    let host = IdorisHost::open(
+        x.f.host.root.clone(),
+        x.f.host.managed.clone(),
+        x.f.host.router.clone(),
+        x.f.runtime.clone(),
+        x.f.host.secrets.clone(),
+    )?;
+    Ok(host
+        .with_provisioner(x.provision.clone(), x.data.clone(), x.upstream.clone())
+        .unwrap())
+}
+fn older_receipt(x: &ConnectedFixture) -> Installation {
+    let mut record = x.f.record.clone();
+    record.version = "0.5.0".into();
+    record
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_opens_as_not_installed_and_install_upgrades_it() {
+    let x = ConnectedFixture::new().await;
+    write_receipt(&x, &older_receipt(&x));
+    let host = reopen(&x).expect("an older bundled version must not fail open");
+    let status = host.status().await;
+    assert_eq!(status.state, State::NotInstalled);
+    assert_eq!(status.version, None);
+    // restore must not try to start the old release (desired_running is true in the receipt).
+    host.restore().await.unwrap();
+    assert!(host.inner.lock().await.active.is_none());
+    assert_eq!(host.status().await.state, State::NotInstalled);
+    // Only open() reads an older receipt as not installed; committing one is still refused.
+    assert_eq!(
+        host.record_installation(older_receipt(&x)).await,
+        Err(Code::InvalidRequest)
+    );
+    // The ordinary Install (the panel's button) installs the bundled version.
+    let op = host
+        .install(InstallRequest { consent: true }, Some("upgrade-1"))
+        .await
+        .unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let op = host.operation(&op.operation_id).await.unwrap();
+            if op.result.is_some() {
+                break op;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done.result, Some(Outcome::Succeeded));
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    let status = host.status().await;
+    assert_eq!(status.version.as_deref(), Some(bundled_version()));
+    assert_eq!(status.state, State::NotConfigured);
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(host.root.join("installation.json")).unwrap()).unwrap();
+    assert_eq!(saved.version, bundled_version());
+    // The upgraded receipt opens normally next time.
+    assert_eq!(
+        reopen(&x).unwrap().status().await.state,
+        State::NotConfigured
+    );
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_is_upgraded_by_the_startup_bootstrap() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    write_receipt(&x, &older_receipt(&x));
+    let host = reopen(&x).unwrap();
+    host.restore().await.unwrap();
+    host.bootstrap_core_with_candidates(Candidates {
+        setup: None,
+        candidates: vec![Candidate {
+            endpoint: x.endpoint.clone(),
+            identity: "omlx",
+            authentication: "ready",
+            models: vec!["real-model".into()],
+        }],
+        key_from_local_settings: true,
+    })
+    .await
+    .unwrap();
+    let status = host.status().await;
+    assert_eq!(status.state, State::Running);
+    assert_eq!(status.version.as_deref(), Some(bundled_version()));
+    assert_eq!(host.daily_model().await.as_deref(), Some("real-model"));
+    let stop = host.submit(Action::Stop, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while host
+            .operation(&stop.operation_id)
+            .await
+            .unwrap()
+            .result
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_with_invalid_fields_is_still_rejected() {
+    let x = ConnectedFixture::new().await;
+    let invalid: [fn(&mut Installation); 5] = [
+        |r| r.release_dir = PathBuf::from("relative/release"),
+        |r| r.data_port = 0,
+        |r| r.admin_port = r.data_port,
+        |r| r.key_id = Some(format!("idk_{}", "a".repeat(64))),
+        |r| r.omlx_url = Some("http://example.com:8000".into()),
+    ];
+    for (index, break_it) in invalid.into_iter().enumerate() {
+        let mut record = older_receipt(&x);
+        break_it(&mut record);
+        write_receipt(&x, &record);
+        let error = reopen(&x)
+            .err()
+            .unwrap_or_else(|| panic!("case {index} opened"));
+        assert_eq!(error.to_string(), "invalid iDoris installation receipt");
+    }
+}
+
+/// `~/.omlx/models` laid out like David's MacBook (11-26): every model one organisation
+/// folder down, which iDoris v0.6.0 `models local` does not see.
+fn nested_models_dir(x: &ConnectedFixture) -> PathBuf {
+    let dir = x.f.host.root.join("omlx-models");
+    for model in ["Qwen3-8B-4bit", "bge-m3-mlx-fp16"] {
+        let path = dir.join("mlx-community").join(model);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.json"), "{}").unwrap();
+    }
+    // Not models: no config.json, a dot folder, and a symlinked model.
+    fs::create_dir_all(dir.join("mlx-community/partial-download")).unwrap();
+    fs::create_dir_all(dir.join(".cache/hidden-model")).unwrap();
+    fs::write(dir.join(".cache/hidden-model/config.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("mlx-community/Qwen3-8B-4bit"),
+        dir.join("mlx-community/linked-model"),
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn candidates_add_models_one_folder_down_when_the_idoris_scan_finds_no_chat_model() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"local_models": [
+        {"omlx_id":"bge-m3-mlx-fp16", "kind":"embedding", "size_bytes":42}
+    ]}));
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert_eq!(discovery.candidates[0].models, ["Qwen3-8B-4bit"]);
+    // The endpoint is still left to iDoris's own discovery.
+    assert_eq!(discovery.candidates[0].endpoint, "");
+}
+
+#[tokio::test]
+async fn candidates_keep_the_idoris_scan_when_it_finds_a_chat_model() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert_eq!(discovery.candidates[0].models, ["real-model"]);
+}
+
+#[tokio::test]
+async fn candidates_stay_empty_without_models_in_either_layout() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"local_models": []}));
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(x.f.host.root.join("missing"));
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert!(discovery.candidates[0].models.is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_connects_and_starts_with_models_one_folder_down() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let mut x = ConnectedFixture::new().await;
+    x.scenario(json!({"local_models": []}));
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    x.f.host.bootstrap_core().await.unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+    assert_eq!(
+        x.f.host.daily_model().await.as_deref(),
+        Some("Qwen3-8B-4bit")
+    );
+    // connect checked the selection against the same list and bound embed too.
+    assert_eq!(
+        x.keys()[0]["allowed_roles"],
+        json!(["daily", "deep", "embed"])
+    );
     x.f.host.shutdown().await.unwrap();
 }

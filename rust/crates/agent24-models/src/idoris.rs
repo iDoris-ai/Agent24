@@ -42,12 +42,20 @@ struct Identity {
     #[serde(default)]
     upstreams: Vec<UpstreamHealth>,
 }
-#[derive(Deserialize)]
-struct UpstreamHealth {
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UpstreamHealth {
     #[serde(default)]
-    state: String,
+    pub id: String,
     #[serde(default)]
-    reason: Option<String>,
+    pub engine_kind: String,
+    #[serde(default)]
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub managed: bool,
+    #[serde(default)]
+    pub owned: bool,
 }
 
 impl Identity {
@@ -375,6 +383,16 @@ impl IdorisGateway {
 
     pub async fn check_health(&self, cancel: &CancellationToken) -> Result<(), ModelError> {
         self.health_identity(cancel).await.map(|_| ())
+    }
+
+    /// Read per-engine health, including engines that cannot serve inference.
+    pub async fn engines(
+        &self,
+        cancel: &CancellationToken,
+    ) -> Result<Vec<UpstreamHealth>, ModelError> {
+        self.health_identity(cancel)
+            .await
+            .map(|identity| identity.upstreams)
     }
 
     async fn health_identity(&self, cancel: &CancellationToken) -> Result<Identity, ModelError> {

@@ -165,3 +165,144 @@ async fn lists_a_templates_fields_fills_them_into_a_new_document_and_sends_the_f
         .unwrap();
     assert_eq!(&bytes[..], TEMPLATE);
 }
+
+#[test]
+fn a_title_already_ending_in_the_suffix_is_not_extended() {
+    assert_eq!(
+        derived_title(Some("X（填写）.docx".into()), "（填写）"),
+        "X（填写）"
+    );
+    assert_eq!(
+        derived_title(Some("租赁模板.docx".into()), "（填写）"),
+        "租赁模板（填写）"
+    );
+}
+
+// ── L6-F5: saved as the document's next version ──
+
+/// The paragraph 「押金为…」 of the head: its index and text.
+async fn deposit(state: &AppState) -> (u64, String) {
+    let (_, listed) = call(
+        state,
+        Request::get(format!("/documents/{DOC}/paragraphs"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let p = listed["paragraphs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["text"].as_str().unwrap().starts_with("押金为"))
+        .unwrap()
+        .clone();
+    (
+        p["index"].as_u64().unwrap(),
+        p["text"].as_str().unwrap().to_owned(),
+    )
+}
+
+fn to_original(index: u64, text: &str, expect_revision: Option<i64>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "edits": [{ "index": index, "text": text }],
+        "save_to": "new_revision",
+    });
+    if let Some(n) = expect_revision {
+        body["expect_revision"] = serde_json::json!(n);
+    }
+    body
+}
+
+async fn count(storage: &Storage, sql: &str) -> i64 {
+    sqlx::query_scalar(sql)
+        .fetch_one(storage.db.pool())
+        .await
+        .unwrap()
+}
+
+async fn file(state: &AppState, query: &str) -> Vec<u8> {
+    let res = crate::router(state.clone())
+        .oneshot(
+            Request::get(format!("/documents/{DOC}/content{query}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    axum::body::to_bytes(res.into_body(), 1 << 22)
+        .await
+        .unwrap()
+        .to_vec()
+}
+
+#[tokio::test]
+async fn a_patch_saved_to_the_document_is_its_next_version_and_v1_stays() {
+    let (_dir, state, storage) = with_docx().await;
+    let (index, _) = deposit(&state).await;
+    let body = to_original(index, "押金为人民币 17,000 元。", Some(1));
+    let (status, saved) = call(&state, post(&format!("/documents/{DOC}/patches"), body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["revision"], 2);
+    assert_eq!(saved["committed"], true);
+    // No new document; the head moved; v1 is the original, byte for byte.
+    assert_eq!(count(&storage, "SELECT count(*) FROM documents").await, 1);
+    assert_eq!(deposit(&state).await.1, "押金为人民币 17,000 元。");
+    assert_eq!(file(&state, "?revision=1").await, FIXTURE);
+    assert_ne!(file(&state, "").await, FIXTURE);
+    assert_eq!(
+        count(
+            &storage,
+            "SELECT count(*) FROM oplog WHERE op = 'patch' AND revision = 2"
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_patch_of_a_version_not_the_head_writes_nothing() {
+    let (_dir, state, storage) = with_docx().await;
+    let (index, _) = deposit(&state).await;
+    let patches = format!("/documents/{DOC}/patches");
+    let (status, _) = call(
+        &state,
+        post(&patches, to_original(index, "押金为一万元。", Some(1))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    // Read at v1, saved after v2.
+    let (status, body) = call(
+        &state,
+        post(&patches, to_original(index, "押金为两万元。", Some(1))),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["error"]["code"], "revision_conflict");
+    assert_eq!(body["error"]["details"]["current_revision"], 2);
+    assert_eq!(deposit(&state).await.1, "押金为一万元。");
+    // new_revision without the version read, or a version with a new document.
+    let (status, _) = call(&state, post(&patches, to_original(index, "x", None))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let mixed =
+        serde_json::json!({ "edits": [{ "index": index, "text": "x" }], "expect_revision": 2 });
+    let (status, _) = call(&state, post(&patches, mixed)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(count(&storage, "SELECT count(*) FROM revisions").await, 2);
+    assert_eq!(count(&storage, "SELECT count(*) FROM jobs").await, 0);
+}
+
+#[tokio::test]
+async fn a_template_filled_into_its_next_version() {
+    let (_dir, state, storage) = with_file(TEMPLATE).await;
+    let body = serde_json::json!({
+        "values": { "押金": "17,000" },
+        "save_to": "new_revision",
+        "expect_revision": 1,
+    });
+    let (status, saved) = call(&state, post(&format!("/documents/{DOC}/fill"), body)).await;
+    assert_eq!(status, StatusCode::CREATED, "{saved}");
+    assert_eq!(saved["revision"], 2);
+    assert_eq!(count(&storage, "SELECT count(*) FROM documents").await, 1);
+    assert_eq!(file(&state, "?revision=1").await, TEMPLATE);
+}

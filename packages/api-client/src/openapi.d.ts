@@ -2318,6 +2318,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/idoris/engines": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read live iDoris engine health
+         * @description Requires the same host authorization as /idoris/status. Engine states come from the gateway's per-upstream health.
+         */
+        get: operations["getIdorisEngines"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/idoris/install": {
         parameters: {
             query?: never;
@@ -2651,7 +2671,7 @@ export interface components {
         IdorisErrorCode: "not_installed" | "not_configured" | "instance_conflict" | "keychain_locked" | "key_unavailable" | "contract_mismatch" | "start_failed" | "stop_timeout" | "busy" | "cancelled" | "not_found" | "not_cancellable" | "shutting_down" | "invalid_request" | "persistence_failed" | "omlx_unreachable" | "omlx_auth_required" | "omlx_auth_rejected" | "unknown_service" | "model_not_found" | "consent_required" | "setup_failed" | "verify_failed" | "replace_required";
         IdorisError: {
             error: {
-                code: components["schemas"]["IdorisErrorCode"] | ("unauthorized" | "forbidden");
+                code: components["schemas"]["IdorisErrorCode"] | ("unauthorized" | "forbidden" | "idoris_unavailable");
                 message: string;
                 retryable?: boolean;
                 next_action?: string;
@@ -2673,6 +2693,18 @@ export interface components {
         IdorisBudgetSuggestion: {
             core_reserved_bytes: number;
             idoris_budget_bytes: number;
+        };
+        IdorisEngine: {
+            id: string;
+            engine_kind: string;
+            /** @description Gateway state such as starting, restarting, ready, absent, failed, unavailable, or stopped. */
+            state: string;
+            reason?: string;
+            managed: boolean;
+            owned: boolean;
+        };
+        IdorisEngines: {
+            engines: components["schemas"]["IdorisEngine"][];
         };
         IdorisStatus: {
             registered?: boolean;
@@ -3178,10 +3210,48 @@ export interface components {
             jobs: string[];
             /** @description The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid. */
             failed?: string[];
+            /** @description L6-F5. The writes saved as a document's next version (no import job), each with the document, its title and the new version. Absent when there are none. */
+            revisions?: {
+                document_id: string;
+                title: string;
+                revision: number;
+            }[];
         };
         RunKnowledge: {
             /** @description Some `knowledge_search` or `knowledge_read` call of the run completed. */
             searched: boolean;
+            /**
+             * @description L7-K0 (FU-183). The run asked a `knowledge_search` and none
+             *     completed: each was refused by policy or failed. A client says
+             *     「检索没能进行」, never 「知识库里没有」.
+             */
+            search_refused: boolean;
+            /**
+             * @description L7-K1. Why, when `search_refused` is true: `policy` (the outbound
+             *     check refused it) or `failed` (it ran and failed). A policy
+             *     refusal wins when both happened. Absent when not refused, and
+             *     from an older daemon.
+             * @enum {string}
+             */
+            search_refusal?: "policy" | "failed";
+            /** @description Passages the completed searches of the run returned, each (document, chunk) once. 0 with searched true means none found. */
+            found_passages: number;
+            /** @description Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on. */
+            found_titles: string[];
+            /**
+             * @description L7-K1. Optional so a client that meets an older daemon reads it as
+             *     absent. Where the passages of the completed searches sit, each
+             *     (library, document, chunk) once, the first eight: ids and a title, never
+             *     the passage text (a snippet is a clue, not a quotation). A client
+             *     names the library from `knowledge_base_id` and reads the text
+             *     back itself, through the same scope check as a model's read.
+             */
+            found?: {
+                knowledge_base_id: string;
+                knowledge_id: string;
+                chunk_id: string;
+                title: string;
+            }[];
             /**
              * @description Each chunk a completed `knowledge_read` named, in the order first
              *     read. Such a read completes only with that chunk of that
@@ -9926,6 +9996,29 @@ export interface operations {
             502: components["responses"]["IdorisFailure"];
             503: components["responses"]["IdorisFailure"];
             504: components["responses"]["IdorisFailure"];
+        };
+    };
+    getIdorisEngines: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current engine states */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdorisEngines"];
+                };
+            };
+            401: components["responses"]["IdorisFailure"];
+            403: components["responses"]["IdorisFailure"];
+            503: components["responses"]["IdorisFailure"];
         };
     };
     installIdoris: {

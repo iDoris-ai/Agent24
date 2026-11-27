@@ -144,6 +144,13 @@ describe('saveToDownloads (D5a)', () => {
     expect(second.docxName).toBe('租赁合同（填写） (2).docx')
   })
 
+  it('L6-F5: an old version is read as that version', async () => {
+    const fetchContent = vi.fn(async () => ({ ok: true as const, data: Buffer.from('PK-v1').toString('base64'), mediaType: 'application/pdf' }))
+    const deps: ExportDeps = { dataDir: () => null, downloadsDir: () => tempDir(), importAndConvert: vi.fn(), fetchContent }
+    expect(await saveToDownloads(deps, 'doc_x', '合同（第 1 版）', 1)).toEqual({ ok: true, docxName: '合同（第 1 版）.pdf' })
+    expect(fetchContent).toHaveBeenCalledWith('doc_x', 1)
+  })
+
   it('says why when the file cannot be read', async () => {
     const deps: ExportDeps = {
       dataDir: () => null,

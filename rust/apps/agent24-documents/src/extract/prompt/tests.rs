@@ -90,8 +90,8 @@ about another item, row, fee or date because it looks similar."
     );
     assert_eq!(
         crate::extract::EXTRACTOR_VERSION,
-        "6",
-        "this wording was measured as version 6; a new wording is measured again under a new version"
+        "7",
+        "this wording was measured as version 6 (7 changed only the window); a new wording is measured again under a new version"
     );
     for term in ["`present`", "`conflict`", "`missing`", "`not_in_document`"] {
         assert!(INSTRUCTION.contains(term), "{term}");
@@ -616,6 +616,48 @@ fn what_is_not_an_answer_says_why() {
         assert!(
             matches!(parse(&fields, &text), Err(Unanswered::Malformed(_))),
             "{what}"
+        );
+    }
+}
+
+/// F3 (Loop 6): a long Chinese contract is read in windows whose request
+/// stays inside the balanced oMLX budget, about 3.5k tokens (an ASCII token
+/// is about 4 characters, a Chinese one about 1.3). The first pass, which
+/// writes the answer's shape into the instruction, is the longer one; the
+/// second's schema goes as the response format.
+#[test]
+fn a_window_of_a_long_chinese_contract_fits_the_balanced_budget() {
+    let fields: Vec<Field> = ["甲方", "乙方", "金额", "期限"]
+        .iter()
+        .enumerate()
+        .map(|(i, d)| Field {
+            key: format!("f{}", i + 1),
+            description: (*d).into(),
+            kind: None,
+        })
+        .collect();
+    let mut l = layer();
+    l.blocks = (0..300)
+        .map(|n| Block {
+            block_id: format!("p{}/b{}", n / 20 + 1, n % 20 + 1),
+            page: n / 20 + 1,
+            text: "第十二条 乙方应于每月五日前向甲方支付当月租金人民币伍仟元整。".repeat(2),
+            lines: vec![],
+        })
+        .collect();
+    let windows = super::super::window::windows(&l, super::super::window::BUDGET);
+    assert!(windows.len() > 1);
+    for w in &windows {
+        let text: String = messages(&fields, &l, w, Pass::Free)
+            .iter()
+            .map(|m| m.content.as_str())
+            .collect();
+        let ascii = text.chars().filter(char::is_ascii).count();
+        let tokens = ascii / 4 + (text.chars().count() - ascii) * 10 / 13;
+        assert!(
+            tokens <= 3500,
+            "about {tokens} tokens, {ascii} ascii, {} blocks",
+            w.0.len()
         );
     }
 }

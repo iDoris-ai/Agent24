@@ -932,6 +932,95 @@ describe('DocumentsPage: a document and its text', () => {
     expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 
+  // F3: a source clicked in the conversation's 「抽取结果」 card.
+  it('opens the focused document at its page, reading on until the block is there, and highlights it', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [
+      () => ok(text([block('b1', '第一段', 1)], 'cc01')),
+      () => ok(text([block('b2', '甲方：张三', 2)])),
+    ])
+    rendering(m, { 1: png('UDE='), 2: png('UDI=') })
+    const { focusDocument, pendingDocFocus } = await import('./doc-focus')
+    focusDocument({ documentId: doc(1).document_id, page: 2, blockId: 'b2' })
+    render(<DocumentsPage />)
+    expect(await screen.findByRole('img', { name: '第 2 页原图' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByText('甲方：张三')).toHaveStyle({ background: 'var(--accent-soft, rgba(255,200,0,0.25))' }))
+    expect(reads(m)).toHaveLength(2)
+    expect(pendingDocFocus()).toBeNull()
+  })
+
+  // F3: the document page's 「抽取字段…」, field names comma-separated.
+  it('extracts the typed fields and shows them with their sources', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [() => ok(text([block('b1', '甲方：张三', 1)]))])
+    const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+    m.request.mockImplementation((req: { op: string }) => {
+      if (req.op === 'get') return ok(detail(1))
+      if (req.op === 'extract') return ok({ ...job('succeeded'), kind: 'extract', result: { extraction_id: 'ext_1' } })
+      if (req.op === 'getExtraction') return ok({ next_cursor: null, values: [
+        { key: 'f1', status: 'present', value: '张三', anchors: [{ block_id: 'b1', page: 1, quote: '甲方：张三' }] },
+        { key: 'f2', status: 'missing', missing_reason: 'not_in_document' },
+      ] })
+      return base(req)
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    fireEvent.click(await screen.findByRole('button', { name: '抽取字段…' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /字段名/ }), { target: { value: '甲方，开户银行' } })
+    fireEvent.click(screen.getByRole('button', { name: '抽取' }))
+    await waitFor(() => expect(screen.getByRole('group', { name: '抽取结果' })).toBeInTheDocument())
+    const asked = m.request.mock.calls.find(([r]) => r.op === 'extract')![0]
+    expect(asked.schema.fields.map((f: { description: string }) => f.description)).toEqual(['甲方', '开户银行'])
+    expect(within(screen.getByRole('group', { name: '抽取结果' })).getByText('文档里没找到')).toBeInTheDocument()
+  })
+
+  // PR-Daemon #2020 (Medium): switching documents while an extraction runs
+  // leaves the new one idle, and the first one's result never lands in it.
+  it('an extraction still running when another document is opened stays with its own document', async () => {
+    const m = mount({ lists: [page([1, 2])] })
+    const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+    let finish: () => void = () => {}
+    m.request.mockImplementation((req: { op: string; documentId?: string }) => {
+      if (req.op === 'get') return ok(detail(req.documentId === doc(2).document_id ? 2 : 1))
+      if (req.op === 'readText') return ok(text([]))
+      if (req.op === 'extract') return new Promise<Res>((resolve) => { finish = () => resolve({ ok: true, status: 200, data: { ...job('succeeded'), kind: 'extract', result: { extraction_id: 'ext_1' } } }) })
+      if (req.op === 'getExtraction') return ok({ next_cursor: null, values: [{ key: 'f1', status: 'present', value: '张三', anchors: [] }] })
+      return base(req)
+    })
+    render(<DocumentsPage />)
+    fireEvent.click(await screen.findByRole('button', { name: '通告 1' }))
+    fireEvent.click(await screen.findByRole('button', { name: '抽取字段…' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /字段名/ }), { target: { value: '甲方' } })
+    fireEvent.click(screen.getByRole('button', { name: '抽取' }))
+    expect(await screen.findByText('正在抽取…长文档要几分钟')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '通告 2' }))
+    await waitFor(() => expect(screen.getByRole('region', { name: '文档详情' })).toHaveTextContent('通告 2'))
+    expect(screen.queryByText('正在抽取…长文档要几分钟')).toBeNull()
+    fireEvent.click(await screen.findByRole('button', { name: '抽取字段…' }))
+    fireEvent.change(screen.getByRole('textbox', { name: /字段名/ }), { target: { value: '乙方' } })
+    expect(screen.getByRole('button', { name: '抽取' })).toBeEnabled()
+    await act(async () => { finish(); await vi.advanceTimersByTimeAsync(3000) })
+    expect(screen.queryByRole('group', { name: '抽取结果' })).toBeNull()
+  })
+
+  // PR-Daemon #2019 ②: a page of text that fails to read is not asked for again and again.
+  it('stops reading on for the focused block when a page fails, and keeps the page shown', async () => {
+    const m = mount({ lists: [page([1])] })
+    reading(m, [() => ok(detail(1))], [
+      () => ok(text([block('b1', '第一段', 1)], 'cc01')),
+      () => err(400, 'invalid_request', '游标失效'),
+      () => ok(text([block('b9', '不该读到', 3)])),
+    ])
+    rendering(m, { 1: png('UDE='), 2: png('UDI=') })
+    const { focusDocument } = await import('./doc-focus')
+    focusDocument({ documentId: doc(1).document_id, page: 2, blockId: 'b2' })
+    render(<DocumentsPage />)
+    expect(await screen.findByRole('img', { name: '第 2 页原图' })).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('alert')).toHaveTextContent('游标失效'))
+    await tick(100)
+    expect(reads(m)).toHaveLength(2)
+  })
+
   it('a page rendered for a document no longer open is dropped', async () => {
     const m = mount({ lists: [page([1, 2])] })
     let late: () => void = () => {}
@@ -983,4 +1072,58 @@ describe('DocumentsPage: OS events (hints only)', () => {
     unmount()
     expect(m.event).toBeNull()
   })
+})
+
+// L6-F2: delete from the page, see it under 「最近删除」, restore it.
+it('deletes a document after confirming, lists it as recently deleted, and restores it', async () => {
+  setLocale('zh')
+  const m = mount({ lists: [page([1, 2]), page([2]), page([1, 2])] })
+  let deleted: unknown[] = []
+  const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+  m.request.mockImplementation((req: { op: string; documentId?: string }) => {
+    if (req.op === 'delete') {
+      deleted = [{ ...doc(1), deleted_at: '2026-11-22T09:00:00.000Z', restorable_until: '2026-11-29T09:00:00.000Z' }]
+      return ok(deleted[0])
+    }
+    if (req.op === 'recentlyDeleted') return ok({ documents: deleted })
+    if (req.op === 'restore') {
+      deleted = []
+      return ok({ ...doc(1), head: { revision: 1 } })
+    }
+    return base(req)
+  })
+  const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false)
+  render(<DocumentsPage />)
+  fireEvent.click(await screen.findByRole('button', { name: '删除《通告 1》' }))
+  // Not confirmed: nothing is sent.
+  expect(confirm).toHaveBeenCalledWith(expect.stringContaining('7 天内可以在下方「最近删除」里恢复'))
+  expect(m.request).not.toHaveBeenCalledWith({ op: 'delete', documentId: doc(1).document_id })
+  confirm.mockReturnValue(true)
+  fireEvent.click(screen.getByRole('button', { name: '删除《通告 1》' }))
+  await waitFor(() => expect(m.request).toHaveBeenCalledWith({ op: 'delete', documentId: doc(1).document_id }))
+  const trash = await screen.findByRole('region', { name: '最近删除（7 天内可恢复）' })
+  expect(within(trash).getByText('通告 1')).toBeInTheDocument()
+  await waitFor(() => expect(screen.queryByRole('button', { name: '删除《通告 1》' })).toBeNull())
+  fireEvent.click(within(trash).getByRole('button', { name: '恢复' }))
+  await waitFor(() => expect(m.request).toHaveBeenCalledWith({ op: 'restore', documentId: doc(1).document_id }))
+  expect(await screen.findByRole('button', { name: '删除《通告 1》' })).toBeInTheDocument()
+  await waitFor(() => expect(screen.queryByRole('region', { name: '最近删除（7 天内可恢复）' })).toBeNull())
+  confirm.mockRestore()
+})
+
+// General (L6-F2): past 7 days it is never called erased, only past its restore period.
+it('a restore past the 7 days says it is past its restore period, never that it was erased', async () => {
+  setLocale('zh')
+  const m = mount({ lists: [page([2])] })
+  const base = m.request.getMockImplementation() as (req: { op: string }) => Promise<Res>
+  m.request.mockImplementation((req: { op: string }) => {
+    if (req.op === 'recentlyDeleted') return ok({ documents: [{ ...doc(1), deleted_at: '2026-11-15T09:00:00.000Z', restorable_until: '2026-11-22T09:00:00.000Z' }] })
+    if (req.op === 'restore') return err(404, 'not_found', 'no recently deleted document')
+    return base(req)
+  })
+  render(<DocumentsPage />)
+  const trash = await screen.findByRole('region', { name: '最近删除（7 天内可恢复）' })
+  fireEvent.click(within(trash).getByRole('button', { name: '恢复' }))
+  expect(await screen.findByText('《通告 1》已过恢复期，无法恢复。')).toBeInTheDocument()
+  expect(document.body.textContent).not.toMatch(/彻底删除|已清除/)
 })

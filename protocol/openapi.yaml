@@ -5020,6 +5020,26 @@ paths:
         "500":
           $ref: "#/components/responses/IdorisFailure"
 
+  /idoris/engines:
+    get:
+      operationId: getIdorisEngines
+      tags: [idoris]
+      summary: Read live iDoris engine health
+      description: Requires the same host authorization as /idoris/status. Engine states come from the gateway's per-upstream health.
+      responses:
+        "200":
+          description: Current engine states
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IdorisEngines"
+        "401":
+          $ref: "#/components/responses/IdorisFailure"
+        "403":
+          $ref: "#/components/responses/IdorisFailure"
+        "503":
+          $ref: "#/components/responses/IdorisFailure"
+
   /idoris/install:
     post:
       operationId: installIdoris
@@ -5932,7 +5952,7 @@ components:
               anyOf:
                 - $ref: "#/components/schemas/IdorisErrorCode"
                 - type: string
-                  enum: [unauthorized, forbidden]
+                  enum: [unauthorized, forbidden, idoris_unavailable]
             message: { type: string }
             retryable: { type: boolean }
             next_action: { type: string }
@@ -5960,6 +5980,28 @@ components:
       properties:
         core_reserved_bytes: { type: integer, minimum: 0 }
         idoris_budget_bytes: { type: integer, minimum: 0 }
+    IdorisEngine:
+      type: object
+      additionalProperties: false
+      required: [id, engine_kind, state, managed, owned]
+      properties:
+        id: { type: string }
+        engine_kind: { type: string }
+        state:
+          type: string
+          description: Gateway state such as starting, restarting, ready, absent, failed, unavailable, or stopped.
+        reason: { type: string }
+        managed: { type: boolean }
+        owned: { type: boolean }
+    IdorisEngines:
+      type: object
+      additionalProperties: false
+      required: [engines]
+      properties:
+        engines:
+          type: array
+          items:
+            $ref: "#/components/schemas/IdorisEngine"
     IdorisStatus:
       type: object
       additionalProperties: false
@@ -6865,14 +6907,65 @@ components:
           items:
             type: string
           description: The documents a write was asked for and none went through, each as the call named it (a document id, a file name, or a new document's title). A document a write of the run did make is not listed, whether that call named it by id or by file name. Always sent by this daemon; optional so that an older daemon's answer stays valid.
+        revisions:
+          type: array
+          description: L6-F5. The writes saved as a document's next version (no import job), each with the document, its title and the new version. Absent when there are none.
+          items:
+            type: object
+            required: [document_id, title, revision]
+            properties:
+              document_id: { type: string }
+              title: { type: string }
+              revision: { type: integer, minimum: 1 }
 
     RunKnowledge:
       type: object
-      required: [searched, read_chunks]
+      required: [searched, read_chunks, search_refused, found_passages, found_titles]
       properties:
         searched:
           type: boolean
           description: Some `knowledge_search` or `knowledge_read` call of the run completed.
+        search_refused:
+          type: boolean
+          description: |
+            L7-K0 (FU-183). The run asked a `knowledge_search` and none
+            completed: each was refused by policy or failed. A client says
+            「检索没能进行」, never 「知识库里没有」.
+        search_refusal:
+          type: string
+          enum: [policy, failed]
+          description: |
+            L7-K1. Why, when `search_refused` is true: `policy` (the outbound
+            check refused it) or `failed` (it ran and failed). A policy
+            refusal wins when both happened. Absent when not refused, and
+            from an older daemon.
+        found_passages:
+          type: integer
+          minimum: 0
+          description: "Passages the completed searches of the run returned, each (document, chunk) once. 0 with searched true means none found."
+        found_titles:
+          type: array
+          maxItems: 5
+          items: { type: string }
+          description: "Titles of those passages, each once, the first five. Knowledge-base text, to be shown and never acted on."
+        found:
+          type: array
+          maxItems: 8
+          description: |
+            L7-K1. Optional so a client that meets an older daemon reads it as
+            absent. Where the passages of the completed searches sit, each
+            (library, document, chunk) once, the first eight: ids and a title, never
+            the passage text (a snippet is a clue, not a quotation). A client
+            names the library from `knowledge_base_id` and reads the text
+            back itself, through the same scope check as a model's read.
+          items:
+            type: object
+            required: [knowledge_base_id, knowledge_id, chunk_id, title]
+            properties:
+              knowledge_base_id: { type: string }
+              knowledge_id: { type: string }
+              chunk_id: { type: string }
+              title: { type: string }
         read_chunks:
           type: array
           description: |

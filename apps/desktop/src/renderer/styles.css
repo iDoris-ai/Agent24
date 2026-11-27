@@ -382,6 +382,7 @@ button { cursor: pointer; font-family: var(--font); }
 /* M3: a failure's internal code, folded away. */
 .message-detail { margin-top: 6px; font-size: 12px; color: var(--muted); }
 .message-detail summary { cursor: pointer; }
+.message-detail-list { white-space: pre-wrap; word-break: break-word; margin-top: 4px; }
 .message-avatar { width: 28px; height: 28px; border-radius: 50%; background: var(--surface2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; font-size: 14px; flex-shrink: 0; margin-top: 2px; }
 .chat-input-bar {
   border-top: 1px solid var(--border);
@@ -553,6 +554,16 @@ button { cursor: pointer; font-family: var(--font); }
 .task-cards { display: flex; flex-direction: column; gap: 6px; margin: 4px 0 8px 44px; }
 .task-card { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 6px 10px; font-size: 12.5px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
 .task-card.active { border-color: var(--accent); }
+/* UI polish 13: a card waiting on the user stands out; its own buttons are small. */
+.task-card.waiting { border-color: var(--accent); background: var(--accent-surface); box-shadow: 0 0 0 1px var(--accent-border); }
+.task-card.waiting .task-card-status { color: var(--accent); }
+.task-card-button { padding: 3px 12px; font-size: 12px; }
+.task-card-deny { display: flex; gap: 6px; align-items: center; flex-basis: 100%; }
+.task-card-deny-input {
+  flex: 1; font-size: 12px; padding: 4px 8px; background: var(--surface2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
+}
+.task-card-deny-input:focus { outline: none; border-color: var(--accent); }
 .task-card-status { font-weight: 600; }
 .task-card-time { color: var(--muted); font-variant-numeric: tabular-nums; }
 .task-card-error { color: var(--danger, #c0392b); }
@@ -576,3 +587,23 @@ button { cursor: pointer; font-family: var(--font); }
 .md-pre { background: var(--surface2); padding: 8px 10px; border-radius: 6px; overflow-x: auto; margin: 0 0 8px; white-space: pre; }
 .md code { background: var(--surface2); padding: 0 4px; border-radius: 4px; font-size: 0.92em; }
 .md-pre code { background: none; padding: 0; }
+
+/* F3 (Loop 6): 「抽取结果」卡 */
+.extract-card { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; margin-top: 8px; }
+.extract-card-title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.extract-card-table { border-collapse: collapse; font-size: 13px; width: 100%; }
+.extract-card-table th { color: var(--muted); text-align: left; font-weight: normal; }
+.extract-card-table td { border-top: 1px solid var(--border); vertical-align: top; padding: 4px 8px 4px 0; }
+.extract-card-name { white-space: nowrap; }
+.extract-card-muted { color: var(--muted); font-size: 12px; }
+.extract-card-value { margin: 2px 0; }
+.extract-card-answer { font-size: 12px; margin-top: 6px; }
+.extract-card-source { font-size: 12px; padding: 0 4px; margin-left: 4px; }
+
+/* L6-S05: the comparison view. */
+.compare-list { list-style: none; padding: 0; margin: 8px 0; }
+.compare-change { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.compare-del { color: var(--danger); text-decoration: line-through; }
+.compare-ins { color: var(--success); text-decoration: none; background: var(--accent-dim); }
+.compare-note, .compare-where { color: var(--muted); font-size: 12px; }
+.compare-wheres { display: flex; gap: 8px; align-items: center; margin-top: 2px; }

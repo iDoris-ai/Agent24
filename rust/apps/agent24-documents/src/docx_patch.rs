@@ -276,7 +276,7 @@ pub fn fill(
 }
 
 /// Each text part of the DOCX, by name, as text.
-fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
+pub(crate) fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
     let (mut archive, _) = read_document(docx)?;
     let names: Vec<String> = archive
         .file_names()
@@ -305,6 +305,61 @@ fn text_parts(docx: &[u8]) -> Result<Vec<(String, String)>, PatchError> {
         out.push((name, xml));
     }
     out.sort_by_key(|(n, _)| (n != DOCUMENT, n.clone()));
+    Ok(out)
+}
+
+/// L8-S02: the material in document order (PR-Daemon #2095 round 4: one
+/// reading state across paragraphs and tables): each paragraph outside a
+/// table as a line, and each table row as its cells' text (a cell's
+/// paragraphs joined; a nested table's rows are rows of their own). A
+/// paragraph inside a table cell is part of its cell, not a line.
+pub(crate) fn blocks(docx: &[u8]) -> Result<Vec<crate::form::Block>, PatchError> {
+    use crate::form::Block;
+    let mut out = Vec::new();
+    for (_, xml) in text_parts(docx)? {
+        let mut tables = 0usize;
+        let mut para_depth = 0usize;
+        let mut para_start = 0usize;
+        let mut row_stack: Vec<Vec<String>> = Vec::new();
+        let mut cell_start: Vec<usize> = Vec::new();
+        for tag in tags(&xml)? {
+            match (tag.kind, tag.name) {
+                (TagKind::Open, "w:tbl") => tables += 1,
+                (TagKind::Close, "w:tbl") => tables = tables.saturating_sub(1),
+                (TagKind::Open, "w:p") => {
+                    if para_depth == 0 {
+                        para_start = tag.start;
+                    }
+                    para_depth += 1;
+                }
+                (TagKind::Close, "w:p") => {
+                    para_depth = para_depth.saturating_sub(1);
+                    if para_depth == 0 && tables == 0 {
+                        out.push(Block::Line(paragraph_text(&xml[para_start..tag.end])));
+                    }
+                }
+                (TagKind::Open, "w:tr") => row_stack.push(Vec::new()),
+                (TagKind::Close, "w:tr") => {
+                    if let Some(row) = row_stack.pop() {
+                        out.push(Block::Row(row));
+                    }
+                }
+                (TagKind::Open, "w:tc") => cell_start.push(tag.start),
+                (TagKind::Close, "w:tc") => {
+                    if let (Some(start), Some(row)) = (cell_start.pop(), row_stack.last_mut()) {
+                        let cell = &xml[start..tag.end];
+                        let text: Vec<String> = scan_all_paragraphs(cell)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(|p| paragraph_text(&cell[p.start..p.end]))
+                            .collect();
+                        row.push(text.join("\n"));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -418,7 +473,7 @@ fn fill_paragraph(
 }
 
 /// Like [`splice`], with any number of parts rewritten.
-fn splice_parts(
+pub(crate) fn splice_parts(
     docx: &[u8],
     parts: &std::collections::BTreeMap<String, String>,
     now_iso: &str,

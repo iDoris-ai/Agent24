@@ -10,24 +10,37 @@ import hmac
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 root = Path(os.environ['IDORIS_COMPONENTS_DIR'])
 scenario = json.loads((root / 'scenario.json').read_text()) if (root / 'scenario.json').exists() else {}
 mode = scenario.get('mode', 'healthy')
+
+def terminate_during_startup(*_):
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, terminate_during_startup)
 if mode == 'no_read':
     time.sleep(60)
     sys.exit(1)
 if mode == 'exit':
     sys.exit(scenario['code'])
+assert sys.argv[1:] == ['serve', '--launcher-stdin']
 frame = sys.stdin.buffer.read()
+launcher = json.loads(frame)
+secret = launcher['admin_token']
+discovery_path = Path(launcher['discovery_path'])
+assert launcher['v'] == 1 and frame.endswith(b'\n') and frame.count(b'\n') == 1
+assert discovery_path.is_absolute()
+assert launcher['orphan_timeout_s'] == (900 if 'register_socket' in launcher else 0)
 key = os.environ.get('IDORIS_OMLX_API_KEY', '')
 report = {
     'pid': os.getpid(), 'group': os.getpgrp(), 'session': os.getsid(0),
     'argv': sys.argv[1:], 'length': len(frame),
-    'valid_frame': re.fullmatch(b'[0-9a-f]{64}\n', frame) is not None,
-    'token_hash': hashlib.sha256(frame).hexdigest(),
-    'token_in_env': frame[:-1].decode() in os.environ.values(),
+    'valid_frame': re.fullmatch('[0-9a-f]{64}', secret) is not None,
+    'token_hash': hashlib.sha256(secret.encode()).hexdigest(),
+    'token_in_env': secret in os.environ.values(),
     'env_names': sorted(os.environ),
     'budget': os.environ['IDORIS_ALLOCATED_BUDGET_BYTES'],
     'key_hash': hashlib.sha256(key.encode()).hexdigest(),
@@ -36,13 +49,13 @@ report = {
 state = Path(os.environ['IDORIS_STATE_DIR'])
 with (state / 'attempts.jsonl').open('a') as output:
     output.write(json.dumps(report) + '\n')
-# Deliberately split a known secret across pipe writes to catch chunk redaction.
-secret = frame[:-1]
-os.write(1, b'admin=' + secret[:23])
-os.write(1, secret[23:] + b' key=' + key.encode() + b' idk_fixture-data-key\n')
-os.write(2, b'error idk_stderr-key ' + secret + b'\n')
+# The supervisor must discard child output, even when it contains a secret.
+secret_bytes = secret.encode()
+os.write(1, b'admin=' + secret_bytes[:23])
+os.write(1, secret_bytes[23:] + b' key=' + key.encode() + b' idk_fixture-data-key\n')
+os.write(2, b'error idk_stderr-key ' + secret_bytes + b'\n')
 if mode == 'flood':
-    os.write(1, b'x' * 20000 + secret + b'\n')
+    os.write(1, b'x' * 20000 + secret_bytes + b'\n')
 if mode == 'ignore_term':
     signal.signal(signal.SIGTERM, signal.SIG_IGN)
 if mode == 'crash_before_ready':
@@ -88,10 +101,14 @@ if mode == 'worker_then_crash_before_ready':
     fork_worker()
     os.kill(os.getpid(), signal.SIGKILL)
 
+instance_id = str(uuid.uuid4())
 health = {
-    'status': 'ok', 'service': 'idoris', 'version': '0.5.0',
+    'status': 'ok', 'service': 'idoris', 'version': '0.6.1',
+    'phase': 'ready', 'ready': True,
+    'upstreams': [{'id': 'fixture-upstream', 'engine_kind': 'omlx', 'state': 'ready',
+                   'managed': False, 'owned': False}],
     'contract_version': scenario.get('contract', '1.3.0'),
-    'instance_id': 'fixture-instance', 'dev_no_key_enabled': False,
+    'instance_id': instance_id, 'dev_no_key_enabled': False,
 }
 health.update(scenario.get('health', {}))
 for field in scenario.get('missing', []):
@@ -104,7 +121,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.server.is_admin:
             assert self.path == '/admin/api/v1/status'
-            authorized = hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + secret.decode())
+            authorized = hmac.compare_digest(self.headers.get('Authorization', ''), 'Bearer ' + secret)
             status = scenario.get('admin_status', 200) if authorized else 401
             payload = b'{}'
         else:
@@ -143,12 +160,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
 class Server(http.server.HTTPServer):
     allow_reuse_address = True
 
-# Bind the configured ports directly, as the real serve does: the supervisor
-# must find this process group holding both listeners before readiness.
-server = Server(('127.0.0.1', int(os.environ['IDORIS_PORT'])), Handler)
+# The launcher uses ephemeral ports and publishes discovery before readiness.
+assert os.environ['IDORIS_PORT'] == os.environ['IDORIS_ADMIN_PORT'] == '0'
+server = Server(('127.0.0.1', 0), Handler)
 server.is_admin = False
-admin = Server(('127.0.0.1', int(os.environ['IDORIS_ADMIN_PORT'])), Handler)
+admin = Server(('127.0.0.1', 0), Handler)
 admin.is_admin = True
+record = {
+    'schema': 1, 'service': 'idoris', 'pid': os.getpid(),
+    'instance_nonce': os.urandom(32).hex(), 'instance_id': instance_id,
+    'data_port': server.server_port,
+    'admin_port': scenario.get('discovery_admin_port', admin.server_port),
+    'started_at_ms': int(time.time() * 1000), 'version': '0.6.1',
+    'contract_version': '1.3.0',
+    'launch': {'db_path': os.environ['IDORIS_DB_PATH'], 'state_dir': str(state),
+               'components_dir': str(root), 'allocated_budget_bytes': int(report['budget'])},
+}
+temporary = discovery_path.with_name(f'.discovery-{os.getpid()}.json')
+with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as out:
+    json.dump(record, out)
+temporary.replace(discovery_path)
+
+def terminate(*_):
+    discovery_path.unlink(missing_ok=True)
+    sys.exit(0)
+
+if mode != 'ignore_term':
+    signal.signal(signal.SIGTERM, terminate)
 threading.Thread(target=admin.serve_forever, daemon=True).start()
 
 def exit_when_requested(action):

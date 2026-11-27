@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest'
-import { askWithKnowledge, createChatSession, KNOWLEDGE_HINT, knowledgePrompt, knowledgeQuery, MAX_WAIT_MS } from './chat-knowledge'
+import { askWithKnowledge, createChatSession, CROSS_HINT, KNOWLEDGE_HINT, knowledgePrompt, knowledgeQuery, MAX_WAIT_MS } from './chat-knowledge'
 
 type Req = { method: string; path: string; body?: unknown }
 const ok = (data: unknown) => ({ ok: true, status: 200, data })
@@ -99,5 +99,17 @@ describe('knowledgeQuery (M1 retrieval first, David 2026-11-21)', () => {
       .mockResolvedValue({ ok: true, status: 200, data: { status: 'completed', output: { text: 'ok' } } })
     await askWithKnowledge('p', 's1', { proxy, sleep: async () => {} }, false, null, '烧开水要多久')
     expect(proxy.mock.calls[0][0].body).toEqual({ prompt: 'p', session_id: 's1', knowledge_query: '烧开水要多久' })
+  })
+})
+
+describe('knowledgePrompt, L7-K1: across libraries', () => {
+  it('adds the by-library hint only to a question that spans libraries', () => {
+    const across = '公司制度库和项目库里，差旅报销的规定各是怎么说的'
+    expect(knowledgePrompt(across)).toBe(`${KNOWLEDGE_HINT}\n${CROSS_HINT}\n${across}`)
+    // A plain single-library or general question is not rerouted.
+    expect(knowledgePrompt('项目库里的验收标准是什么')).toBe(`${KNOWLEDGE_HINT}\n项目库里的验收标准是什么`)
+    expect(knowledgePrompt('烧开水要多久')).toBe(`${KNOWLEDGE_HINT}\n烧开水要多久`)
+    // 「记住…」 stays as said even when it names libraries.
+    expect(knowledgePrompt('记住各个库里的报销规定不同')).toBe('记住各个库里的报销规定不同')
   })
 })

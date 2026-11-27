@@ -7,7 +7,9 @@ import type { components } from '@agent24/api-client'
 import { askWithKnowledge, createChatSession, knowledgePrompt, knowledgeQuery } from './chat-knowledge'
 import { failureKind, withoutToolNames } from './chat/user-facing'
 import { DocumentsOutcome, type RunDocuments } from './chat/DocumentsOutcome'
-import { grounding, type Grounding } from './knowledge-grounding'
+import { grounding, knowledgeFacts, type Grounding, type KnowledgeFacts as Facts } from './knowledge-grounding'
+import KnowledgeFactsRow from './chat/KnowledgeFacts'
+import KnowledgeCitationCard from './chat/KnowledgeCitationCard'
 import { TurnRail } from './chat/TurnRail'
 import { Markdown } from '../components/Markdown'
 import { activeTurn, buildTurns } from './chat/turns'
@@ -15,12 +17,26 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { docAgentPrompt, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, extractionFields, formClaimUnbacked, formMaterial, materialHint, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
 import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
+import { ExtractCard } from './chat/ExtractCard'
+import { DeleteChoice } from './chat/DeleteChoice'
+import { RestoreCard } from './chat/RestoreCard'
+import { CompareCard } from './chat/CompareCard'
+import { DeliverCard } from './chat/DeliverCard'
+import { asksDeliver, runPreflight, runReceipts, type DeliverCardData } from './chat/doc-deliver'
+import { asksCompare, runCompare, type CompareCardData } from './chat/doc-compare'
+import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
+import { KnowledgeUploadCard } from './chat/KnowledgeUploadCard'
+import {
+  asksOnboarding, asksUpload, beginOnboard, nextOnboard, preflightReply, resultReply, type OnboardStep,
+} from './chat/knowledge-onboard'
+import { choiceText, deletePrompt, deleteTargetOf, type DeleteCandidate } from './chat/delete-target'
+import { extractFields, extractText, fieldNamesFromModel, type ExtractCardData } from './documents/doc-extract'
 import {
   forgetPromotion, getHistoryState, historyAvailable, loadConversation, markConversationSeen, promoteRun, registerChatPage, restoreConversation, saveConversation,
   setActiveConversation, setChatBusy, subscribeHistory, titleConversation,
@@ -52,6 +68,10 @@ interface AssistantMessage {
   /** Answered as a run with the Knowledge tools (chat-knowledge.ts): what
    *  the run read, which the labels under the reply say. */
   knowledge?: Grounding
+  /** L7-K0: what the run's searches found, from its record. */
+  facts?: Facts | null
+  /** L7-K1: where the run's searches found passages, library by library. */
+  cited?: NonNullable<Parameters<typeof KnowledgeCitationCard>[0]['found']>
   /** Answered without Knowledge although its switch is On: main had no
    *  binding for a run, so the turn went to `/api/v1/chat`. */
   knowledgeInactive?: boolean
@@ -64,6 +84,18 @@ interface AssistantMessage {
   detail?: string
   /** M1: what the run's document writes came to, from the daemon's record. */
   documents?: RunDocuments | null
+  /** F3: the 「抽取结果」 card; the history keeps its text only. */
+  extraction?: ExtractCardData
+  /** L6-F2: the documents a delete turn may mean, to pick one; text only in the history. */
+  deleteChoice?: DeleteCandidate[]
+  /** L6-F5: the version a 「回到上一个版本」 turn may restore; text only in the history. */
+  restore?: RestoreCardData
+  /** L6-S05: the summary of a comparison, a line per change; text only in the history. */
+  compare?: CompareCardData
+  /** L8 DOC-4: the check before sending, with the clean copy's buttons; text only in the history. */
+  deliver?: DeliverCardData
+  /** L7-K2: upload after onboarding or 「上传文档」; the history keeps the text only. */
+  knowledgeUpload?: { uploadIds: string[] }
 }
 
 /** UI-03: the conversation as the history keeps it. `stamps[i]` is when
@@ -139,10 +171,15 @@ export default function ChatPage() {
   const messagesRef = useRef<HTMLDivElement>(null)
   const promptRefs = useRef(new Map<number, HTMLDivElement>())
   const turns = useMemo(() => buildTurns(messages), [messages])
+  // UI polish 07: runs whose answer is in the conversation; their task
+  // cards do not show it a second time.
+  const answeredRuns = useMemo(() => new Set(messages.flatMap(m => (m.role === 'assistant' && m.runId ? [m.runId] : []))), [messages])
   const [currentTurn, setCurrentTurn] = useState(0)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const draft = useKnowledgeDraft()
   const requestInFlight = useRef(false)
+  // L7-K2: onboarding in progress for this chat, keyed by session. Not the model.
+  const onboard = useRef(new Map<string, OnboardStep>())
   // Knowledge on: turns go to /runs, in a real session created once.
   const [awaitingApproval, setAwaitingApproval] = useState(false)
   const runSession = useRef<string | null>(null)
@@ -213,7 +250,48 @@ export default function ChatPage() {
     setCurrentTurn(Math.max(0, turns.length - 1))
   }, [messages, turns])
 
-  const send = async (text: string) => {
+  const ONBOARD_APP_ERROR = '开通没有成功（App 出错），稍后再试。'
+
+  /** A knowledge onboarding or upload turn. Null when this text is not one. */
+  const knowledgeTurn = async (said: string): Promise<AssistantMessage | null> => {
+    const api = window.agent24.knowledge
+    const ongoing = onboard.current.get(sessionId)
+    if (ongoing) {
+      const step = nextOnboard(ongoing, said)
+      if (step.run) {
+        // The flow ends here whatever the run answers: a failed run is not read as the next answer.
+        onboard.current.delete(sessionId)
+        const run = api?.onboardRun
+        if (!run) return { role: 'assistant', content: ONBOARD_APP_ERROR }
+        const result = await run(step.run)
+        return {
+          role: 'assistant',
+          content: resultReply(result, ongoing.types),
+          ...(result.ok ? { knowledgeUpload: { uploadIds: [] } } : {}),
+        }
+      }
+      if (step.state) onboard.current.set(sessionId, step.state)
+      else onboard.current.delete(sessionId)
+      return { role: 'assistant', content: step.reply }
+    }
+    if (asksOnboarding(said)) {
+      const preflight = api?.onboardPreflight
+      if (!preflight || !api?.onboardRun) return { role: 'assistant', content: ONBOARD_APP_ERROR }
+      const blocked = preflightReply(await preflight())
+      if (blocked) return { role: 'assistant', content: blocked }
+      const started = beginOnboard(said)
+      onboard.current.set(sessionId, started.state)
+      return { role: 'assistant', content: started.reply }
+    }
+    if (asksUpload(said)) {
+      return { role: 'assistant', content: '选择要放进知识库的文档：', knowledgeUpload: { uploadIds: [] } }
+    }
+    return null
+  }
+
+  /** `answer`: the model answers, never the extraction (the card's 「让助手回答」). */
+  /** `chosen`: L6-F2, the document picked on a delete choice card. */
+  const send = async (text: string, answer = false, chosen: { id: string; title: string } | null = null) => {
     if (!text.trim() || requestInFlight.current || awaitingConfirmation || archivedRef.current) return
     const userMsg: Message = { role: 'user', content: text.trim(), delivery: { kind: 'sending' } }
     const request: ChatRequest = {
@@ -224,12 +302,162 @@ export default function ChatPage() {
     draft.apply(request)
     setMessages(prev => [...prev, userMsg])
     setInput('')
+    // L7-K2: onboarding and upload stay in the chat and never go to the model.
+    // Not when `answer` is set (the extraction card's 「让助手回答」).
+    if (!answer) {
+      const said = text.trim()
+      if (chosen === null && (onboard.current.has(sessionId) || asksOnboarding(said) || asksUpload(said))) {
+        const index = messages.length
+        requestInFlight.current = true
+        setLoading(true)
+        let reply: AssistantMessage
+        try {
+          reply = await knowledgeTurn(said) ?? { role: 'assistant', content: ONBOARD_APP_ERROR }
+        } catch {
+          reply = { role: 'assistant', content: ONBOARD_APP_ERROR }
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, reply])
+        return
+      }
+    }
     // F1: a conversation about a document carries its text with each turn.
     const doc = documentOf(sessionId)
+    // L6-F5: 「回到上一个版本」 — the App finds the version and offers it on a
+    // card; it is restored only when the user clicks, never by the model.
+    const restoreAsk = answer ? null : asksRestoreVersion(text)
+    // No document bound and none named: the one the conversation last named
+    // (the user's 「…《合同.docx》…存到原文件」 a turn ago), newest first.
+    const lastNamed = (): string | null => {
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const found = /《([^》]{1,200})》/.exec(messages[i]!.content)?.[1]?.trim()
+        if (found) return found
+      }
+      return null
+    }
+    // L8 DOC-4: 「发给对方前帮我检查一下」「去掉修订和批注，导出一份 PDF 放桌面」
+    // 「我上次发出去的是哪个版本？」 — the App checks and reads the receipts; a
+    // clean copy is made only from the card's button, never by the model.
+    const deliverAsk = answer ? null : asksDeliver(text, doc !== null)
+    if (deliverAsk !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      const named = /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? (deliverAsk.kind === 'receipts' ? null : lastNamed())
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? (named ? await namedDocument(api, named).catch(() => '没能读取文档列表。') : null)
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else if (deliverAsk.kind === 'receipts') reply = { role: 'assistant', content: await runReceipts(api, subject ? { id: subject.id, title: subject.title } : null) }
+        else if (!subject) reply = { role: 'assistant', content: '请先打开要发送的文档，或用《文件名》说明是哪一份。' }
+        else {
+          const out = await runPreflight(api, { id: subject.id, title: subject.title }, deliverAsk)
+          reply = { role: 'assistant', content: out.text, ...(out.card ? { deliver: out.card } : {}) }
+        }
+      } catch (e) {
+        reply = { role: 'assistant', content: '没能完成检查，文档没有改动。', detail: e instanceof Error ? e.message : String(e) }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
+    const restoreOf = restoreAsk === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? lastNamed()
+    if (restoreAsk !== null && restoreOf !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? await namedDocument(api, restoreOf).catch(() => "没能读取文档列表，这次没有恢复。")
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else {
+          const found = await restoreCardOf(api, subject, restoreAsk)
+          reply = { role: 'assistant', content: found.text, ...(found.card ? { restore: found.card } : {}) }
+        }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
+    // L6-S05: 「对比一下这两份」「这一版和上一版改了哪些地方」 — the App judges
+    // which two, asks the module, and writes the summary from its changes.
+    const compareAsk = answer ? null : asksCompare(text)
+    if (compareAsk !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      const named: string[] = []
+      // The turn's own titles first, then the conversation's, newest first.
+      for (const said of [text, ...messages.map(m => m.content).reverse()]) {
+        for (const m of [...said.matchAll(/《([^》]{1,200})》/g)]) {
+          const title = m[1]!.trim()
+          if (title && !named.includes(title) && named.length < 2) named.push(title)
+        }
+      }
+      let reply: AssistantMessage
+      try {
+        const out = await runCompare(api, compareAsk, doc ? { id: doc.id, title: doc.title } : null, named)
+        reply = { role: 'assistant', content: out.text, ...(out.card ? { compare: out.card } : {}) }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
+    // F3: 「把这份合同的甲方、乙方、金额、期限抽出来」 — the documents OS's extract
+    // job reads the document; the model at most names the fields.
+    const asked = answer ? null : extractionFields(text, doc !== null)
+    const extractFrom = asked === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? null
+    if (asked !== null && extractFrom !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? await namedDocument(api, extractFrom)
+        const names = asked.length > 0 || typeof subject === 'string'
+          ? asked
+          : await fieldNamesFromModel((p) => askWithProxy(window.agent24.backendProxy, p), text).catch(() => [])
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else if (names.length === 0) reply = { role: 'assistant', content: '请说要抽取哪些字段，例如「把甲方、乙方、金额抽出来」。' }
+        else {
+          const card = await extractFields(api, subject.id, names)
+          reply = 'error' in card
+            ? { role: 'assistant', content: card.pending ? card.error : `没能完成抽取：${card.error}`, ...(card.detail ? { detail: card.detail } : {}) }
+            : { role: 'assistant', content: (subject.note ? `${subject.note}\n\n` : '') + extractText(card), extraction: card }
+        }
+      } catch (e) {
+        reply = { role: 'assistant', content: '没能完成抽取。', detail: e instanceof Error ? e.message : String(e) }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    if (wantsDocTool(text, doc !== null) && window.agent24.documents?.agentAccess) {
+    // L8-S02: an answer to what a form fill asked goes back to it, with the form hint.
+    const earlier = messages.filter((m) => m.role === 'user').map((m) => m.content)
+    const form = asksFillForm(text, doc !== null) || continuesFormFill(earlier, text, doc !== null)
+    if ((chosen !== null || form || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -237,7 +465,24 @@ export default function ChatPage() {
       const access = await window.agent24.documents.agentAccess('sync').catch(() => null)
       if (access?.enabled && access.ok !== false) {
         const last = request.messages[request.messages.length - 1]
-        if (last?.role === 'user') last.content = docAgentPrompt(doc, text.trim())
+        // L6-F2: the App names the one document a delete is for, never the model.
+        const target = chosen ? { kind: 'one' as const, ...chosen }
+          : asksDeleteDocument(text, doc !== null) ? await deleteTargetOf(window.agent24.documents, doc, text) : null
+        if (target && target.kind !== 'one') {
+          const index = messages.length
+          setDelivery(index, { kind: 'sent' })
+          setMessages(prev => [...prev, target.kind === 'none'
+            ? { role: 'assistant', content: target.text }
+            : { role: 'assistant', content: choiceText(target.name, target.total, target.candidates.length), deleteChoice: target.candidates }])
+          requestInFlight.current = false
+          setLoading(false)
+          return
+        }
+        // 监工 0.7.123: the material the user named goes in by its id.
+        const named = form && !target ? formMaterial(earlier, text) : null
+        const material = named ? await namedDocument(window.agent24.documents, named).catch(() => null) : null
+        const said = material && typeof material !== 'string' ? materialHint(material) : ''
+        if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim(), form, said)
         await replyWithKnowledge(messages.length, request, false)
         return
       }
@@ -640,8 +885,10 @@ export default function ChatPage() {
         // UI polish 03 (David): 「没有检索知识库」 only under a turn the system
         // searches first; writing, 「记住…」 and a document's rewrite or split
         // are not, so the line said nothing there. Unread sources still show.
-        const knowledge = checked?.kind === 'notSearched' && query === null && checked.unread.length === 0 ? undefined : checked
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents }])
+        const facts = withKnowledge ? knowledgeFacts(turn.knowledge) : null
+        // A refused search says so itself; 「没有检索知识库」 beside it would say it twice.
+        const knowledge = checked?.kind === 'notSearched' && (query === null || facts?.kind === 'refused') && checked.unread.length === 0 ? undefined : checked
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: formClaimUnbacked(prompt, turn.text, turn.documents), facts, cited: withKnowledge ? turn.knowledge?.found : undefined }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
@@ -739,7 +986,27 @@ export default function ChatPage() {
               {m.role === 'user' ? '👤' : '🤖'}
             </div>
             <div className="message-bubble">
-              {m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
+              {m.role === 'assistant' && m.extraction ? <ExtractCard card={m.extraction} onAnswer={loading || archived ? undefined : () => {
+                const asked = messages.slice(0, i).reverse().find(p => p.role === 'user')
+                if (asked) void send(asked.content, true)
+              }} />
+                : m.role === 'assistant' && m.compare ? <><Markdown text={m.content} /><CompareCard card={m.compare} /></>
+                : m.role === 'assistant' && m.deliver ? <><Markdown text={m.content} /><DeliverCard card={m.deliver} /></>
+                : m.role === 'assistant' && m.restore ? <><Markdown text={m.content} /><RestoreCard card={m.restore} onRestore={loading || archived ? undefined : () => {
+                  const card = m.restore!
+                  setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' ? { ...p, restore: undefined } : p)))
+                  void restoreVersion(window.agent24.documents, card).then(said => setMessages(prev => [...prev, { role: 'assistant', content: said }]))
+                }} /></>
+                : m.role === 'assistant' && m.deleteChoice ? <><Markdown text={m.content} /><DeleteChoice candidates={m.deleteChoice} onPick={loading || archived ? undefined : (c, n) => {
+                  void send(`删除第 ${n} 份：《${c.title}》（导入于 ${c.importedAt}）`, false, { id: c.id, title: c.title })
+                }} /></>
+                : m.role === 'assistant' && m.knowledgeUpload ? <><Markdown text={m.content} /><KnowledgeUploadCard uploadIds={m.knowledgeUpload.uploadIds} onPicked={(ids) => {
+                  if (ids.length === 0) return
+                  setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' && p.knowledgeUpload
+                    ? { ...p, knowledgeUpload: { uploadIds: [...p.knowledgeUpload.uploadIds, ...ids] } }
+                    : p)))
+                }} /></>
+                : m.role === 'assistant' ? <Markdown text={withoutToolNames(m.content)} /> : m.content}
               {m.role === 'assistant' && m.detail && (
                 <details className="message-detail"><summary>{t('fail.detail')}</summary>{m.detail}</details>
               )}
@@ -767,6 +1034,8 @@ export default function ChatPage() {
                   {m.knowledge.kind === 'read' ? t('knowledge.via') : t(`knowledge.${m.knowledge.kind}`)}
                 </div>
               )}
+              {m.role === 'assistant' && m.facts && <KnowledgeFactsRow facts={m.facts} />}
+              {m.role === 'assistant' && m.cited && m.cited.length > 0 && <KnowledgeCitationCard found={m.cited} />}
               {m.role === 'assistant' && m.knowledgeInactive && (
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{t('knowledge.inactive')}</div>
               )}
@@ -797,7 +1066,7 @@ export default function ChatPage() {
             </div>
           </div>
         )}
-        <TaskCards conversation={sessionId} />
+        <TaskCards conversation={sessionId} answered={answeredRuns} />
         <div ref={bottomRef} />
       </div>
 
