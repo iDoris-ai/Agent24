@@ -11,10 +11,16 @@ type Api = Window['agent24']['documents']
 
 export type CompareAsk =
   | { kind: 'versions'; from: 'previous' | number; to: 'current' | number }
-  | { kind: 'documents'; names: string[] }
+  /** `yesNo` (L10-1): asked as a yes/no question (「《A》和《B》有区别吗」「这两份
+   * 一样吗」). Such a question about documents not in the library is a
+   * question of knowledge (「《劳动法》和《劳动合同法》有区别吗」), so
+   * runCompare hands it back (null) instead of saying none was found. */
+  | { kind: 'documents'; names: string[]; yesNo?: true }
 
 const VERB = /对比|比较|比对|对照|比一比|比一下/
 const CHANGED = /改了(?:哪些|什么)|有什么(?:不同|区别|差别|变化|改动)|哪些(?:不同|区别|差别|变化|改动)|哪里不同|不一样的地方/
+/** L10-1: a yes/no about two documents is a comparison too. */
+const YESNO = /有区别吗|有没有区别|有差别吗|有不同吗|有没有不同|有变化吗|有没有变化|有改动吗|有没有改动|有出入吗|一样吗|一样不一样|是否一致|是否相同|相同吗|是不是一样|是不是同一份/
 const REFUSED = /(?:不要|别|不用|先别|不想|不必|不)\s*(?:再)?\s*(?:对比|比较|比对|对照)/
 const NOW = '(?:这一版|这个版本|当前版本|现在的版本|最新版本|最新的版本|这版)'
 const BEFORE = '(?:上一版|上一个版本|上个版本|前一版|前一个版本|之前的版本)'
@@ -27,8 +33,10 @@ const TWO = /这两份|两份(?:文档|文件|合同)?|这两个(?:文档|文件
 export function asksCompare(text: string): CompareAsk | null {
   const said = text.replace(/《[^》]{1,200}》/g, '《》')
   if (REFUSED.test(said)) return null
-  const asks = VERB.test(said) || CHANGED.test(said)
-  if (!asks) return null
+  const verb = VERB.test(said)
+  const changed = CHANGED.test(said)
+  const yesNo = YESNO.test(said)
+  if (!verb && !changed && !yesNo) return null
   const numbered = NUMBERED.exec(said)
   if (numbered) {
     const [a, b] = [Number(numbered[1]), Number(numbered[2])]
@@ -36,8 +44,16 @@ export function asksCompare(text: string): CompareAsk | null {
   }
   if (PREVIOUS.test(said)) return { kind: 'versions', from: 'previous', to: 'current' }
   const titles = [...text.matchAll(/《([^》]{1,200})》/g)].map((m) => m[1]!.trim()).filter(Boolean)
-  if (titles.length >= 2) return { kind: 'documents', names: titles.slice(0, 2) }
-  if (TWO.test(said) && VERB.test(said)) return { kind: 'documents', names: [] }
+  // L10-1: yesNo only when this turn hit YESNO and neither VERB nor CHANGED.
+  const asYesNo = yesNo && !verb && !changed
+  if (titles.length >= 2) {
+    if (asYesNo) return { kind: 'documents', names: titles.slice(0, 2), yesNo: true }
+    return { kind: 'documents', names: titles.slice(0, 2) }
+  }
+  if (TWO.test(said) && (verb || changed || yesNo)) {
+    if (asYesNo) return { kind: 'documents', names: [], yesNo: true }
+    return { kind: 'documents', names: [] }
+  }
   return null
 }
 
@@ -92,9 +108,10 @@ function words(sum: CompareSummary): string {
 }
 
 /** The comparison a turn asks for: its summary and the card; or what to
- * say when there is nothing to compare. `named`: titles the conversation
- * named last, to fall back on. */
-export async function runCompare(api: Api, ask: CompareAsk, doc: { id: string; title: string } | null, named: string[]): Promise<{ text: string; card?: CompareCardData }> {
+ * say when there is nothing to compare; or null (L10-1) when a yes/no
+ * question names a document that is not in the library, for the model to
+ * answer. `named`: titles the conversation named last, to fall back on. */
+export async function runCompare(api: Api, ask: CompareAsk, doc: { id: string; title: string } | null, named: string[]): Promise<{ text: string; card?: CompareCardData } | null> {
   if (ask.kind === 'versions') {
     const subject = doc ?? (named[0] ? await namedDocument(api, named[0]).catch(() => '没能读取文档列表，这次没有对比。') : '请说要对比哪份文档的版本，例如「《合同.docx》这一版和上一版改了哪些地方」。')
     if (typeof subject === 'string') return { text: subject }
@@ -113,8 +130,15 @@ export async function runCompare(api: Api, ask: CompareAsk, doc: { id: string; t
   const names = ask.names.length === 2 ? ask.names : named.length >= 2 ? named.slice(0, 2) : []
   if (names.length < 2) return { text: '请说要对比哪两份文档，例如「对比《甲.docx》和《乙.docx》」。' }
   const [a, b] = [await namedDocument(api, names[0]!).catch(() => '没能读取文档列表，这次没有对比。'), await namedDocument(api, names[1]!).catch(() => '没能读取文档列表，这次没有对比。')]
-  if (typeof a === 'string') return { text: a }
-  if (typeof b === 'string') return { text: b }
+  // L10-1: a yes/no about a name not in the library is a knowledge question.
+  if (typeof a === 'string') {
+    if (ask.yesNo && a.startsWith('没有找到')) return null
+    return { text: a }
+  }
+  if (typeof b === 'string') {
+    if (ask.yesNo && b.startsWith('没有找到')) return null
+    return { text: b }
+  }
   if (a.id === b.id) return { text: '这是同一份文档，要看它的两个版本请说「这一版和上一版改了哪些地方」。' }
   return finish(api, { documentId: a.id, label: a.title }, { documentId: b.id, label: b.title }, `《${a.title}》与《${b.title}》：`)
 }

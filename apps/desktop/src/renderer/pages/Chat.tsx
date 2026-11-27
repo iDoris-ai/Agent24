@@ -409,17 +409,20 @@ export default function ChatPage() {
           if (title && !named.includes(title) && named.length < 2) named.push(title)
         }
       }
-      let reply: AssistantMessage
+      let reply: AssistantMessage | null = null
       try {
         const out = await runCompare(api, compareAsk, doc ? { id: doc.id, title: doc.title } : null, named)
-        reply = { role: 'assistant', content: out.text, ...(out.card ? { compare: out.card } : {}) }
+        // L10-1: null means the documents are not in the library; the model answers.
+        if (out !== null) reply = { role: 'assistant', content: out.text, ...(out.card ? { compare: out.card } : {}) }
       } finally {
         requestInFlight.current = false
         setLoading(false)
       }
-      setDelivery(index, { kind: 'sent' })
-      setMessages(prev => [...prev, reply])
-      return
+      if (reply !== null) {
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, reply])
+        return
+      }
     }
     // F3: 「把这份合同的甲方、乙方、金额、期限抽出来」 — the documents OS's extract
     // job reads the document; the model at most names the fields.
