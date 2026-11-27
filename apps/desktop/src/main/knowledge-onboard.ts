@@ -279,14 +279,13 @@ async function serverUp(fetch: OnboardDeps['fetch'], origin: string): Promise<bo
 async function preflight(deps: OnboardDeps): Promise<OnboardPreflight> {
   const activation = readActivation(deps.dir)
   const usable = typeof activation === 'object' && activation !== null ? activation : null
-  const endpoint = deps.controller()?.status().endpoint ?? ''
+  const status = deps.controller()?.status()
+  const endpoint = status?.endpoint ?? ''
   return {
     activated: usable !== null,
     invalidActivation: activation === 'invalid',
-    // L11-1 TODO(grok): alreadyBound is also true when the controller's source is 'local';
-    // localOffered = lite?.offered() === true.
-    alreadyBound: endpoint !== '',
-    localOffered: false,
+    alreadyBound: endpoint !== '' || status?.source === 'local',
+    localOffered: deps.lite?.()?.offered() === true,
     reachable: usable ? await serverUp(deps.fetch, usable.origin) : null,
     formats: FORMATS,
     maxBytes: MAX_UPLOAD_BYTES,
@@ -314,8 +313,26 @@ async function preflight(deps: OnboardDeps): Promise<OnboardPreflight> {
  *     roll back = await controller.setSource('remote'), then await lite.disable().
  */
 async function executeLocal(deps: OnboardDeps): Promise<OnboardResult> {
-  void deps
-  throw new Error('L11-1: executeLocal not implemented')
+  const controller = deps.controller()
+  if (!controller) return { ok: false, code: 'unavailable' }
+  const current = controller.status()
+  if (current.endpoint !== '' || current.source === 'local') return { ok: false, code: 'already_bound' }
+  const lite = deps.lite?.()
+  if (!lite || lite.offered() === false) return { ok: false, code: 'local_unavailable' }
+  const saved = await controller.setSource('local')
+  if (saved.ok !== true) return { ok: false, code: 'not_saved' }
+  await lite.enable()
+  const phase = lite.status().phase
+  if (phase === 'ready') return { ok: true, source: 'local', activeNow: true }
+  if (phase === 'starting') return { ok: true, source: 'local', activeNow: false }
+  if (phase === 'install_failed') {
+    await controller.setSource('remote')
+    await lite.disable()
+    return { ok: false, code: 'local_install_failed' }
+  }
+  await controller.setSource('remote')
+  await lite.disable()
+  return { ok: false, code: 'local_start_failed' }
 }
 
 async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promise<OnboardResult> {

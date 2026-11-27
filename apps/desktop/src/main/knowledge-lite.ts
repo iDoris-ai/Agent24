@@ -123,7 +123,7 @@ export class LiteKnowledge {
   /** L11-1: this build can have the Lite: it has a download source, or the Lite is already installed.
    * False exactly when the installer reports 'unavailable'. Does not depend on enable()/disable(). */
   offered(): boolean {
-    throw new Error('L11-1: offered not implemented')
+    return this.deps.installer.status().state !== 'unavailable'
   }
 
   /** Turn the local knowledge base on: install if needed, then launch. Also
