@@ -82,6 +82,29 @@ export async function performSin90Write(req: unknown, caller: Sin90Caller): Prom
   if (!key.ok) return proxyError('forbidden', 'human key unavailable')
   const human = key.human
   switch (req['op']) {
+    case 'evaluatePriority': {
+      const advice = req['advice']
+      if (advice !== undefined && typeof advice !== 'string') return bad()
+      return caller.request(route('POST', '/api/v1/sin90/ai/priority/evaluate', advice === undefined ? {} : { advice }), human)
+    }
+    case 'overridePriority': {
+      const task = id(req['id'])
+      const quadrant = req['quadrant']
+      const rationale = req['rationale']
+      if (!task || typeof quadrant !== 'string' || !['do_first', 'schedule', 'delegate', 'eliminate'].includes(quadrant)
+        || typeof rationale !== 'string' || rationale.length > 2000) return bad()
+      return caller.request(route('PUT', `/api/v1/sin90/tasks/${task}/priority/override`, { quadrant, rationale }), human)
+    }
+    case 'clearPriorityOverride': {
+      const task = id(req['id'])
+      return task ? caller.request(route('DELETE', `/api/v1/sin90/tasks/${task}/priority/override`), human) : bad()
+    }
+    case 'completionNote': {
+      const task = id(req['id'])
+      const note = req['note']
+      if (!task || typeof note !== 'string' || note.length > 4000) return bad()
+      return caller.request(route('PUT', `/api/v1/sin90/tasks/${task}/completion-note`, { note }), human)
+    }
     case 'capture': {
       const value = text(req['text'])
       return value ? caller.request(route('POST', '/api/v1/sin90/capture', { text: value }), human) : bad()
@@ -230,6 +253,11 @@ export async function performSin90Write(req: unknown, caller: Sin90Caller): Prom
     case 'aiPropose': {
       const week = id(req['weekId'])
       return week ? caller.request(route('POST', '/api/v1/sin90/ai/propose', { week_id: week }), human) : bad()
+    }
+    case 'createWeeklyReview': {
+      const period = req['isoWeek']
+      return typeof period === 'string' && ISO_WEEK.test(period)
+        ? caller.request(route('POST', '/api/v1/sin90/reviews', { kind: 'weekly', period }), human) : bad()
     }
     case 'aiSummarize': {
       const review = id(req['reviewId'])
