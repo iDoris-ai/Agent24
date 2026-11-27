@@ -11,7 +11,11 @@ type Api = Window['agent24']['documents']
 
 export type CompareAsk =
   | { kind: 'versions'; from: 'previous' | number; to: 'current' | number }
-  | { kind: 'documents'; names: string[] }
+  /** `yesNo` (L10-1): asked as a yes/no question (「《A》和《B》有区别吗」「这两份
+   * 一样吗」). Such a question about documents not in the library is a
+   * question of knowledge (「《劳动法》和《劳动合同法》有区别吗」), so
+   * runCompare hands it back (null) instead of saying none was found. */
+  | { kind: 'documents'; names: string[]; yesNo?: true }
 
 const VERB = /对比|比较|比对|对照|比一比|比一下/
 const CHANGED = /改了(?:哪些|什么)|有什么(?:不同|区别|差别|变化|改动)|哪些(?:不同|区别|差别|变化|改动)|哪里不同|不一样的地方/

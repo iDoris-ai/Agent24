@@ -21,6 +21,28 @@ describe('L6-S05: when a turn asks to compare', () => {
   })
 })
 
+describe('L10-1: a yes/no question about two documents is a comparison too', () => {
+  it('reads 「《A》和《B》有区别吗」 and the like as comparing two named documents, marked yes/no', () => {
+    expect(asksCompare('《劳动合同》和《劳动合同（副本）》有区别吗？')).toEqual({ kind: 'documents', names: ['劳动合同', '劳动合同（副本）'], yesNo: true })
+    for (const q of ['《甲.docx》和《乙.docx》一样吗', '《甲.docx》和《乙.docx》是否一致', '《甲.docx》跟《乙.docx》有没有不同', '《甲.docx》和《乙.docx》是不是同一份', '《甲.docx》和《乙.docx》有没有改动', '《甲.docx》与《乙.docx》内容相同吗', '《甲.docx》和《乙.docx》一样不一样']) {
+      expect(asksCompare(q), q).toEqual({ kind: 'documents', names: ['甲.docx', '乙.docx'], yesNo: true })
+    }
+  })
+  it('reads 「这两份一样吗」 and 「这两份有什么不同」 without a verb', () => {
+    expect(asksCompare('这两份一样吗')).toEqual({ kind: 'documents', names: [], yesNo: true })
+    expect(asksCompare('这两份合同有没有区别')).toEqual({ kind: 'documents', names: [], yesNo: true })
+    expect(asksCompare('这两份有什么不同')).toEqual({ kind: 'documents', names: [] })
+  })
+  it('reads a yes/no question about this version and the one before as comparing versions', () => {
+    expect(asksCompare('这一版和上一版有区别吗')).toEqual({ kind: 'versions', from: 'previous', to: 'current' })
+  })
+  it('does not take a yes/no question without two documents, or a refusal, for a comparison', () => {
+    for (const q of ['年假和事假有区别吗', '《合同.docx》改过吗', '《合同.docx》有没有问题', '病假和事假一样吗', '我不想比较这两份是不是一样', '别对比这两份有没有区别']) {
+      expect(asksCompare(q), q).toBeNull()
+    }
+  })
+})
+
 const doc = (n: number, text: string) => ({ block_ref: { paragraph_index: n }, text })
 const comparison = (over: Partial<DocumentComparison> = {}): DocumentComparison => ({
   left: { document_id: 'doc_a', revision: 1, media_type: 'd' }, right: { document_id: 'doc_a', revision: 2, media_type: 'd' },
@@ -74,5 +96,28 @@ describe('L6-S05: running a comparison', () => {
     const refused = vi.fn(async () => ({ ok: false, status: 422, error: { code: 'unsupported_format', message: 'm' } }))
     const r = await runCompare({ request: refused } as never, { kind: 'versions', from: 1, to: 2 }, { id: 'doc_a', title: '合同.docx' }, [])
     expect(r.text).not.toContain('共')
+  })
+})
+
+describe('L10-1: a yes/no question about documents that are not in the library goes to the model', () => {
+  const ok = (data: unknown) => ({ ok: true, status: 200, data })
+  const lib = (titles: string[]) => vi.fn(async (r: { op: string }) => r.op === 'list'
+    ? ok({ documents: titles.map((t, i) => ({ document_id: `doc_${i}`, title: t, head_revision: 1, created_at: '2026-11-27T00:00:00Z', media_type: 'd' })) })
+    : ok(comparison()))
+  it('returns null when a named document is not in the library (「《劳动法》和《劳动合同法》有区别吗」 is a question of law)', async () => {
+    const request = lib(['劳动合同.docx'])
+    expect(await runCompare({ request } as never, { kind: 'documents', names: ['劳动法', '劳动合同法'], yesNo: true }, null, [])).toBeNull()
+    expect(request.mock.calls.some(([r]) => (r as { op: string }).op === 'compare')).toBe(false)
+  })
+  it('still compares when both are in the library', async () => {
+    const request = lib(['劳动合同.docx', '劳动合同（副本）.docx'])
+    const out = await runCompare({ request } as never, { kind: 'documents', names: ['劳动合同.docx', '劳动合同（副本）.docx'], yesNo: true }, null, [])
+    expect(out).not.toBeNull()
+    expect(request.mock.calls.some(([r]) => (r as { op: string }).op === 'compare')).toBe(true)
+  })
+  it('keeps saying a document was not found when the turn asked to compare outright', async () => {
+    const request = lib(['劳动合同.docx'])
+    const out = await runCompare({ request } as never, { kind: 'documents', names: ['劳动法', '劳动合同法'] }, null, [])
+    expect(out?.text).toContain('没有找到')
   })
 })
