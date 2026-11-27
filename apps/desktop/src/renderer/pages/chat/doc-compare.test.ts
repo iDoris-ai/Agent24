@@ -79,22 +79,22 @@ describe('L6-S05: running a comparison', () => {
   const ok = (data: unknown) => ({ ok: true, status: 200, data })
   it('compares a document with its previous version, by revision numbers read from its versions', async () => {
     const request = vi.fn(async (r: { op: string }) => r.op === 'revisions' ? ok({ document_id: 'doc_a', head_revision: 3, revisions: [{ revision: 3 }, { revision: 2 }, { revision: 1 }] }) : ok(comparison()))
-    const out = await runCompare({ request } as never, { kind: 'versions', from: 'previous', to: 'current' }, { id: 'doc_a', title: '合同.docx' }, [])
+    const out = (await runCompare({ request } as never, { kind: 'versions', from: 'previous', to: 'current' }, { id: 'doc_a', title: '合同.docx' }, []))!
     expect(request).toHaveBeenLastCalledWith({ op: 'compare', left: { documentId: 'doc_a', revision: 2 }, right: { documentId: 'doc_a', revision: 3 } })
     expect(out.card?.lines).toHaveLength(3)
     expect(out.text).toContain('共 3 处改动')
   })
   it('says so when there is one version only, or no such version', async () => {
     const one = vi.fn(async () => ok({ document_id: 'doc_a', head_revision: 1, revisions: [{ revision: 1 }] }))
-    expect((await runCompare({ request: one } as never, { kind: 'versions', from: 'previous', to: 'current' }, { id: 'doc_a', title: '合同.docx' }, [])).text).toContain('只有一个版本')
+    expect((await runCompare({ request: one } as never, { kind: 'versions', from: 'previous', to: 'current' }, { id: 'doc_a', title: '合同.docx' }, []))!.text).toContain('只有一个版本')
     const two = vi.fn(async () => ok({ document_id: 'doc_a', head_revision: 2, revisions: [{ revision: 2 }, { revision: 1 }] }))
-    expect((await runCompare({ request: two } as never, { kind: 'versions', from: 5, to: 'current' }, { id: 'doc_a', title: '合同.docx' }, [])).text).toContain('没有第 5 版')
+    expect((await runCompare({ request: two } as never, { kind: 'versions', from: 5, to: 'current' }, { id: 'doc_a', title: '合同.docx' }, []))!.text).toContain('没有第 5 版')
   })
   it('asks which two when it does not know, and explains a refusal', async () => {
-    const out = await runCompare({ request: vi.fn() } as never, { kind: 'documents', names: [] }, null, [])
+    const out = (await runCompare({ request: vi.fn() } as never, { kind: 'documents', names: [] }, null, []))!
     expect(out.text).toContain('请说要对比哪两份')
     const refused = vi.fn(async () => ({ ok: false, status: 422, error: { code: 'unsupported_format', message: 'm' } }))
-    const r = await runCompare({ request: refused } as never, { kind: 'versions', from: 1, to: 2 }, { id: 'doc_a', title: '合同.docx' }, [])
+    const r = (await runCompare({ request: refused } as never, { kind: 'versions', from: 1, to: 2 }, { id: 'doc_a', title: '合同.docx' }, []))!
     expect(r.text).not.toContain('共')
   })
 })
