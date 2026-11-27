@@ -528,6 +528,9 @@ describe('L13-1 asksToWord', () => {
     ['导出成 DOCX', true],
     ['能帮我把《合同.pdf》转成 Word 吗', false],
     ['可以把这份转成 Word 吗？', true],
+    ['不用解释直接把《合同.pdf》转成 Word', false],
+    ['别解释了直接把《合同.pdf》转成 Word', false],
+    ['能把《合同.pdf》转成 Word 开会用吗？', false],
   ] as const)('%s converts to Word', (text, inDocument) => {
     expect(asksToWord(text, inDocument)).toBe(true)
   })
@@ -548,6 +551,9 @@ describe('L13-1 asksToWord', () => {
     ['先别转成 Word', true],
     ['这份转成 Word 会乱版吗', true],
     ['《合同.pdf》转成 Word 会不会丢表格', false],
+    ['不需要把《合同.pdf》转成 Word', false],
+    ['《合同.pdf》先不转成 Word', false],
+    ['《合同.pdf》转成 Word 后格式能保留吗？', false],
   ] as const)('%s does not', (text, inDocument) => {
     expect(asksToWord(text, inDocument)).toBe(false)
   })

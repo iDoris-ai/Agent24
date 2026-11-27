@@ -116,10 +116,11 @@ export function translatesDocument(text: string, inDocument: boolean): boolean {
 }
 
 /** Told not to (Codex L13-1 C2): 「不要把《X》转成 Word」「先别转」 write nothing. */
-const TO_WORD_REFUSED = /(?:不要|不用|不必|不想|先别|(?<![特区])别)[^，。！？!?]{0,12}(?:转|导出|存成|另存)/
-/** A question about how a conversion would turn out (「转成 Word 会乱版吗」「会不会丢表格」)
- * is asked, not done; 「能帮我转成 Word 吗」 is a request and converts. */
-const TO_WORD_WONDERS = /会不会|会[^，。！？!?]{0,10}[吗呢？?]\s*$/
+const TO_WORD_REFUSED = /(?:不要|不用|不必|不想|不需要|先不|先别|(?<![特区])别)\s*(?:再|先)?\s*(?:把\s*(?:《》|这份|它|这个)?)?\s*(?:转|导出|存成|另存)/
+/** A question about how a conversion would turn out (「转成 Word 会乱版吗」「会不会丢表格」
+ * 「格式能保留吗」) is asked, not done; 「能帮我转成 Word 吗」「转成 Word 开会用吗」 are
+ * requests and convert (Codex L13-1 re-review: the outcome words decide). */
+const TO_WORD_WONDERS = /会不会|(?:会|能)[^，。！？!?]{0,8}(?:乱|丢|保留|保持|变|走样|错位|失真)[^，。！？!?]{0,6}[吗呢？?]\s*$/
 /** Word, docx or doc after a convert verb. Longer verbs first; titles are already 《》. */
 const TO_WORD = /(?:转换成|转换为|导出为|导出成|另存为|转成|转为|存成)\s*(?:可编辑的)?\s*(?:一份)?\s*(?:docx|doc|word)(?![a-z])/i
 
