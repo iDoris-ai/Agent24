@@ -20,6 +20,22 @@ export async function runToWord(
   said: string,
   sleep: Sleep = (ms: number) => new Promise((r) => setTimeout(r, ms)),
 ): Promise<string> {
-  void api; void subject; void said; void sleep; void convert
-  throw new Error('L13-1: not implemented')
+  const got = await api.request({ op: 'get', documentId: subject.id })
+  if (!got.ok) return `没能读取《${subject.title}》，转换没有进行。`
+  if (got.data.head.media_type !== 'application/pdf') return `《${subject.title}》不是 PDF，只有 PDF 能转换为 Word。`
+  const out = await convert(api, subject.id, undefined, sleep)
+  if (!out.ok) {
+    if (out.engineMissing && out.engine === 'pdf2docx') {
+      return `需要先下载 Word 转换组件：打开《${subject.title}》的文档页，点「转换为 Word」后按提示下载（约 100 MB，只需一次）。`
+    }
+    if (out.code === 'unsupported_format') return `《${subject.title}》是扫描件（没有文字层），暂时不能转换为 Word。`
+    return `没能转换为 Word：${out.message}`
+  }
+  if (out.documentId === null) return `已把《${subject.title}》转换为 Word，新文档在文档库里。`
+  const saved = await api.saveDownload(out.documentId, subject.title)
+  if (saved.ok && saved.docxName) {
+    const where = `已把《${subject.title}》转换为 Word：下载/${saved.docxName}；新文档也在文档库里。`
+    return /\bdoc\b/i.test(said) ? `${where}（文件格式是 .docx。）` : where
+  }
+  return `已把《${subject.title}》转换为 Word，新文档在文档库里；没能存进「下载」：${saved.message ?? saved.code}`
 }
