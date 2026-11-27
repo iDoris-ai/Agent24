@@ -13,12 +13,14 @@ import { createAssistantApprovals, type AssistantApprovals, type RunOwner } from
 import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
 import { registerOfficeEngine } from './ipc/office-engine'
+import { registerPdfWordEngine } from './ipc/pdf-word-engine'
 import { registerTranslationExport } from './ipc/translation-export'
 import { registerDocDeliver } from './ipc/doc-deliver'
 import { deliverDocument } from './doc-deliver'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
+import { PdfWordEngine, realPdfWordEngineDeps } from './pdf-word-engine'
 import { getMainLocale, initMainLocale, mt, onMainLocaleChange } from './main-i18n'
 import { buildTrayView, type TrayAction } from './tray-menu'
 import { createAppUrlPolicy, createIpcGuard, installNavigationGuards } from './ipc/guard'
@@ -893,6 +895,11 @@ app.whenReady().then(async () => {
   registerOfficeEngine({
     guard,
     engine: new OfficeEngine(realOfficeEngineDeps(() => tryDataDir())),
+    windows: () => BrowserWindow.getAllWindows(),
+  })
+  registerPdfWordEngine({
+    guard,
+    engine: new PdfWordEngine(realPdfWordEngineDeps(() => tryDataDir())),
     windows: () => BrowserWindow.getAllWindows(),
   })
   registerTranslationExport({

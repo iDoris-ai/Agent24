@@ -204,48 +204,56 @@ export class OfficeEngine {
   }
 }
 
+/** Streams `url` to `dest`, calling `progress(bytesSoFar)`; rejects on HTTP or network failure. */
+export async function downloadTo(url: string, dest: string, progress: (bytes: number) => void, signal: AbortSignal): Promise<void> {
+  const res = await fetch(url, { redirect: 'follow', signal })
+  if (!res.ok) {
+    await res.body?.cancel().catch(() => {})
+    throw new Error(`HTTP ${res.status}`)
+  }
+  if (!res.body) throw new Error('empty body')
+  await mkdir(path.dirname(dest), { recursive: true })
+  const ws = fs.createWriteStream(dest)
+  const reader = res.body.getReader()
+  const broken = new Promise<never>((_, reject) => { ws.on('error', reject) })
+  let received = 0
+  try {
+    for (;;) {
+      const { done, value } = await Promise.race([reader.read(), broken])
+      if (done) break
+      received += value.byteLength
+      if (!ws.write(value)) await Promise.race([once(ws, 'drain').then(() => undefined), broken])
+      progress(received)
+    }
+    await Promise.race([
+      new Promise<void>((resolve, reject) => { ws.end((error?: Error | null) => (error ? reject(error) : resolve())) }),
+      broken,
+    ])
+  } catch (error) {
+    ws.destroy()
+    await reader.cancel().catch(() => {})
+    throw error
+  }
+}
+
+/** sha256 hex of a file. */
+export function sha256File(file: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const hash = crypto.createHash('sha256')
+    fs.createReadStream(file)
+      .on('data', (chunk) => hash.update(chunk))
+      .on('error', reject)
+      .on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
 /** The installer the app runs: fetch, sha256, and hdiutil. */
 export function realOfficeEngineDeps(dataDir: () => string | null): OfficeEngineDeps {
   return {
     dataDir,
     arch: process.arch,
-    download: async (url, dest, progress, signal) => {
-      const res = await fetch(url, { redirect: 'follow', signal })
-      if (!res.ok) {
-        await res.body?.cancel().catch(() => {})
-        throw new Error(`HTTP ${res.status}`)
-      }
-      if (!res.body) throw new Error('empty body')
-      await mkdir(path.dirname(dest), { recursive: true })
-      const ws = fs.createWriteStream(dest)
-      const reader = res.body.getReader()
-      const broken = new Promise<never>((_, reject) => { ws.on('error', reject) })
-      let received = 0
-      try {
-        for (;;) {
-          const { done, value } = await Promise.race([reader.read(), broken])
-          if (done) break
-          received += value.byteLength
-          if (!ws.write(value)) await Promise.race([once(ws, 'drain').then(() => undefined), broken])
-          progress(received)
-        }
-        await Promise.race([
-          new Promise<void>((resolve, reject) => { ws.end((error?: Error | null) => (error ? reject(error) : resolve())) }),
-          broken,
-        ])
-      } catch (error) {
-        ws.destroy()
-        await reader.cancel().catch(() => {})
-        throw error
-      }
-    },
-    sha256: (file) => new Promise((resolve, reject) => {
-      const hash = crypto.createHash('sha256')
-      fs.createReadStream(file)
-        .on('data', (chunk) => hash.update(chunk))
-        .on('error', reject)
-        .on('end', () => resolve(hash.digest('hex')))
-    }),
+    download: downloadTo,
+    sha256: sha256File,
     extractApp: async (dmg, destApp) => {
       const parent = await mkdtemp(path.join(path.dirname(dmg), '..', 'mount-'))
       let mount: string | null = null

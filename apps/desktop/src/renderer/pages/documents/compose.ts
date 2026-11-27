@@ -17,7 +17,9 @@ export function pagesOk(spec: string): boolean {
   return spec === 'all' || new RegExp(`^${n}(-(${n})?)?(,${n}(-(${n})?)?)*$`).test(spec)
 }
 
-export type ComposeOutcome = { ok: true; documentId: string | null } | { ok: false; message: string; engineMissing?: true }
+export type ComposeOutcome =
+  | { ok: true; documentId: string | null }
+  | { ok: false; message: string; engineMissing?: true; engine?: string; code?: string }
 
 async function waitJob(api: Api, job: Job, sleep: Sleep): Promise<ComposeOutcome> {
   // An Office conversion runs up to 120 s before its import (PR-Daemon #1909 ③): wait up to 5 minutes.
@@ -28,7 +30,10 @@ async function waitJob(api: Api, job: Job, sleep: Sleep): Promise<ComposeOutcome
     job = next.data
   }
   if (job.status === 'succeeded') return { ok: true, documentId: job.result?.document_id ?? null }
-  return { ok: false, message: job.error?.message ?? job.status }
+  const message = job.error?.message ?? job.status
+  const code = job.error?.code
+  if (typeof code === 'string') return { ok: false, message, code }
+  return { ok: false, message }
 }
 
 export async function compose(api: Api, parts: Parts, title: string, sleep: Sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))): Promise<ComposeOutcome> {
@@ -48,13 +53,14 @@ export async function makeDocx(
   return waitJob(api, res.data as Job, sleep)
 }
 
-/** Office → PDF. `engineMissing` is LibreOffice not installed yet. */
+/** Office → PDF, or PDF → Word. `engineMissing` names libreoffice or pdf2docx. */
 export async function convert(api: Api, documentId: string, title?: string, sleep: Sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))): Promise<ComposeOutcome> {
   const res = await api.request(title === undefined ? { op: 'convert', documentId } : { op: 'convert', documentId, title })
   if (!res.ok) {
     const message = describeError(res)
-    if (res.error.code === 'engine_unavailable' && res.error.details?.engine === 'libreoffice') {
-      return { ok: false, message, engineMissing: true }
+    const engine = res.error.details?.engine
+    if (res.error.code === 'engine_unavailable' && (engine === 'libreoffice' || engine === 'pdf2docx')) {
+      return { ok: false, message, engineMissing: true, engine }
     }
     return { ok: false, message }
   }
