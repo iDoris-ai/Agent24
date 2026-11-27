@@ -304,7 +304,8 @@ async function preflight(deps: OnboardDeps): Promise<OnboardPreflight> {
  *  1. no controller → unavailable
  *  2. endpoint saved or source already local → already_bound (nothing changed)
  *  3. no Lite, or lite.offered() false → local_unavailable (nothing changed)
- *  4. controller.setSource('local') not ok → not_saved (Lite not touched)
+ *  4. after controller.setSource('local'), the source in effect is not local → not_saved (Lite not touched).
+ *     Its answer is not used: a save that landed but failed to apply is still local (Codex C1).
  *  5. await lite.enable(); then lite.status().phase:
  *       ready → { ok: true, source: 'local', activeNow: true }
  *       starting → { ok: true, source: 'local', activeNow: false }   (kept: it is coming up)
@@ -319,8 +320,11 @@ async function executeLocal(deps: OnboardDeps): Promise<OnboardResult> {
   if (current.endpoint !== '' || current.source === 'local') return { ok: false, code: 'already_bound' }
   const lite = deps.lite?.()
   if (!lite || lite.offered() === false) return { ok: false, code: 'local_unavailable' }
-  const saved = await controller.setSource('local')
-  if (saved.ok !== true) return { ok: false, code: 'not_saved' }
+  // Codex C1: setSource saves first, then applies; a failed apply (daemon down, host not started) still
+  // answers ok:false with the source already local. Like the settings page (ipc KnowledgeSetSource), go by
+  // the source in effect, not by the answer.
+  await controller.setSource('local')
+  if (controller.status().source !== 'local') return { ok: false, code: 'not_saved' }
   await lite.enable()
   const phase = lite.status().phase
   if (phase === 'ready') return { ok: true, source: 'local', activeNow: true }

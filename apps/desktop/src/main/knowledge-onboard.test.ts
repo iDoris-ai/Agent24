@@ -526,7 +526,9 @@ describe('local Lite onboarding (L11-1)', () => {
     source?: 'remote' | 'local'
     /** false: this App has no Lite. */
     lite?: false | { offered?: boolean; after?: LiteKnowledgeStatus }
-    setSourceOk?: boolean
+    /** unsaved: nothing written. applied_failed: the real controller saves first, then fails to apply
+     * (daemon down, host not started) and still answers ok:false — the source did change (Codex C1). */
+    setSourceAs?: 'ok' | 'unsaved' | 'apply_failed'
     controller?: boolean
   } = {}): {
     onboarding: ReturnType<typeof knowledgeOnboarding>
@@ -549,8 +551,9 @@ describe('local Lite onboarding (L11-1)', () => {
       },
       setSource: async (next: 'remote' | 'local') => {
         events.push(`setSource:${next}`)
-        if (opts.setSourceOk === false) return { ok: false as const, reason: 'not_saved' as const }
+        if (opts.setSourceAs === 'unsaved') return { ok: false as const, reason: 'not_saved' as const }
         source = next
+        if (opts.setSourceAs === 'apply_failed') return { ok: false as const, reason: 'unavailable' as const }
         return { ok: true as const }
       },
     }
@@ -644,9 +647,21 @@ describe('local Lite onboarding (L11-1)', () => {
   })
 
   it('a source that could not be saved is not_saved and the Lite is not touched', async () => {
-    const h = localHarness({ setSourceOk: false })
+    const h = localHarness({ setSourceAs: 'unsaved' })
     expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'not_saved' })
     expect(h.events).toEqual(['setSource:local'])
+    expect(h.source()).toBe('remote')
+  })
+
+  it('a source saved but not applied (daemon down) still goes on with the Lite, like the settings page', async () => {
+    const h = localHarness({ setSourceAs: 'apply_failed' })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: true, source: 'local', activeNow: true })
+    expect(h.events).toEqual(['setSource:local', 'enable'])
+    expect(h.source()).toBe('local')
+    const failing = localHarness({ setSourceAs: 'apply_failed', lite: { after: { phase: 'failed', reason: 'start_failed' } } })
+    expect(await failing.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_start_failed' })
+    expect(failing.events).toEqual(['setSource:local', 'enable', 'setSource:remote', 'disable'])
+    expect(failing.source()).toBe('remote')
   })
 
   it('two local runs at once share one', async () => {
