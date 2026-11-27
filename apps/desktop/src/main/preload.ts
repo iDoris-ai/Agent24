@@ -386,6 +386,15 @@ const api = {
       ipcRenderer.on(IpcChannels.DocumentsOfficeEngineChanged, listener)
       return () => ipcRenderer.removeListener(IpcChannels.DocumentsOfficeEngineChanged, listener)
     },
+    pdfWordEngineStatus: (): Promise<OfficeEngineStatus> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsPdfWordEngineStatus),
+    installPdfWordEngine: (): Promise<OfficeEngineStatus> =>
+      ipcRenderer.invoke(IpcChannels.DocumentsPdfWordEngineInstall),
+    onPdfWordEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {
+      const listener = (_event: unknown, s: OfficeEngineStatus): void => cb(s)
+      ipcRenderer.on(IpcChannels.DocumentsPdfWordEngineChanged, listener)
+      return () => ipcRenderer.removeListener(IpcChannels.DocumentsPdfWordEngineChanged, listener)
+    },
     /** The OS's job and document events (hints: read the job or list again). */
     onEvent: (cb: (e: DocumentsEvent) => void): (() => void) => {
       const listener = (_event: unknown, e: DocumentsEvent): void => cb(e)
