@@ -32,7 +32,7 @@
 - PyMuPDF 是 AGPL-3.0。按 ADR-DOC-03 D2 的口径处理：
   - 单独下载；
   - 只走进程边界调用；
-  - 组件里附 LICENSE 和对应版本的源码地址；
+  - 组件里附 AGPL-3.0 全文（`licenses/PyMuPDF-COPYING`，取 PyMuPDF 同版本源码仓库，钉 sha256）、pdf2docx 的 MIT 许可，以及对应版本的源码地址（`licenses/SOURCE.txt`）；
   - 我们的补丁和入口源码随组件一起提供（`licenses/` 目录）。
 - **公开 release 资产之前要先过正式许可审查**（ADR-DOC-03:66、196）。开发期的组件只装到验收机，不公开。
 

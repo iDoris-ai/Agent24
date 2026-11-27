@@ -90,6 +90,29 @@ class OutputContract(unittest.TestCase):
         self.assertEqual(result['error'], 'convert_failed')
         self.assertFalse(os.path.exists(bad + '.docx'))
 
+    @unittest.skipIf(os.environ.get('A24_PDF2DOCX'), 'injecting a page failure needs the source entry')
+    def test_a_failing_page_fails_the_whole_conversion(self):
+        # pdf2docx 默认跳过出错的页仍写出文档（Codex L12-1 C1）：这里第 2 页解析失败，整份必须失败、不留文件。
+        src = os.path.join(FIXTURES, 'heilongjiang-decoration.pdf')
+        dst = os.path.join(Converted._tmp, 'page-failure.docx')
+        script = (
+            'import runpy, sys\n'
+            'from pdf2docx.page.Page import Page\n'
+            'original = Page.parse\n'
+            'def parse(self, **kw):\n'
+            '    if self.id == 1:\n'
+            '        raise RuntimeError("injected page failure")\n'
+            '    return original(self, **kw)\n'
+            'Page.parse = parse\n'
+            f'sys.argv = [{CLI!r}, "convert", {src!r}, {dst!r}]\n'
+            f'runpy.run_path({CLI!r}, run_name="__main__")\n'
+        )
+        proc = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=300)
+        lines = [l for l in proc.stdout.splitlines() if l.strip()]
+        self.assertEqual(proc.returncode, 4, proc.stderr[-2000:])
+        self.assertEqual(json.loads(lines[-1]), {'ok': False, 'error': 'convert_failed'})
+        self.assertFalse(os.path.exists(dst))
+
     def test_usage(self):
         engine = os.environ.get('A24_PDF2DOCX')
         cmd = [engine] if engine else [sys.executable, CLI]

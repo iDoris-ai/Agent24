@@ -6,6 +6,9 @@ ENGINE_VERSION=0.5.13-a24.1
 PYTHON_URL="https://github.com/astral-sh/python-build-standalone/releases/download/20261124/cpython-3.12.16%2B20261124-aarch64-apple-darwin-install_only.tar.gz"
 # 与上游 SHA256SUMS 核对过（11-28）。
 PYTHON_SHA256=431b99a9c2cdd37ad9b06e425be0e520d2dbce0552abe454257abef592fe3634
+# PyMuPDF 的 wheel 只带一行许可说明；AGPL-3.0 全文取其源码仓库同版本的 COPYING（钉 sha256）。
+PYMUPDF_COPYING_URL="https://raw.githubusercontent.com/pymupdf/PyMuPDF/1.28.2/COPYING"
+PYMUPDF_COPYING_SHA256=57c8ff33c9c0cfc3ef00e650a1cc910d7ee479a8bc509f6c9209a7c2a11399d6
 
 if [ "$#" -ne 2 ]; then
   echo "usage: build.sh <work_dir> <out_dir>" >&2
@@ -34,6 +37,8 @@ if [ ! -x "$work_dir/python/bin/python3" ]; then
   tar -xzf "$tarball" -C "$work_dir"
 fi
 
+# 每次新建 venv：旧 venv 里已打过补丁的 pdf2docx 会让 patch --forward 失败（Codex L12-1 C3）。
+rm -rf "$work_dir/venv" "$work_dir/wheels"
 "$work_dir/python/bin/python3" -m venv "$work_dir/venv"
 venv="$work_dir/venv"
 # 依赖按 macOS 13 arm64 取 wheel（产品最低系统 13），不用构建机自己的平台：
@@ -95,26 +100,27 @@ if [ -z "$pdf2docx_lic" ]; then
   echo "pdf2docx LICENSE not found" >&2
   exit 1
 fi
-cp "$pdf2docx_lic" "$lic/LICENSE"
+cp "$pdf2docx_lic" "$lic/pdf2docx-LICENSE"
 
-pymupdf_copied=0
-for f in "$site"/pymupdf-*.dist-info/LICENSE "$site"/pymupdf-*.dist-info/COPYING \
-         "$site"/PyMuPDF-*.dist-info/LICENSE "$site"/PyMuPDF-*.dist-info/COPYING; do
-  if [ -f "$f" ]; then
-    cp "$f" "$lic/$(basename "$f")"
-    pymupdf_copied=1
-  fi
-done
-if [ "$pymupdf_copied" -eq 0 ]; then
-  echo "PyMuPDF LICENSE/COPYING not found" >&2
+# PyMuPDF（含 MuPDF）：AGPL-3.0 全文，钉版下载并核对 sha256（wheel 里只有一行说明，Codex L12-1 C2）。
+copying="$work_dir/PyMuPDF-1.28.2-COPYING"
+if [ ! -f "$copying" ]; then
+  curl -fsSL -o "$copying" "$PYMUPDF_COPYING_URL"
+fi
+got=$(shasum -a 256 "$copying")
+got=${got%% *}
+if [ "$got" != "$PYMUPDF_COPYING_SHA256" ]; then
+  echo "sha256 mismatch for PyMuPDF COPYING: got $got" >&2
   exit 1
 fi
+cp "$copying" "$lic/PyMuPDF-COPYING"
 
 pdf2docx_ver=$("$venv/bin/python" -c "from importlib.metadata import version; print(version('pdf2docx'))")
 pymupdf_ver=$("$venv/bin/python" -c "from importlib.metadata import version; print(version('pymupdf'))")
 {
   echo "PyMuPDF ${pymupdf_ver}"
   echo "https://github.com/pymupdf/PyMuPDF/tree/${pymupdf_ver}"
+  echo "MuPDF (bundled in PyMuPDF ${pymupdf_ver}): https://mupdf.com/releases (source of the matching version)"
   echo "pdf2docx ${pdf2docx_ver}"
   echo "https://github.com/ArtifexSoftware/pdf2docx/tree/v0.5.13"
 } > "$lic/SOURCE.txt"

@@ -127,7 +127,9 @@ def main():
         t0 = time.time()
         converter = Converter(src)
         try:
-            converter.convert(tmp_docx, parse_stream_table=False)
+            # ignore_page_error=False：pdf2docx 默认跳过出错的页仍写出文档，
+            # 那样「成功」的 Word 会缺页；这里任何一页出错都算整份失败。
+            converter.convert(tmp_docx, parse_stream_table=False, ignore_page_error=False)
         finally:
             converter.close()
         _postfix(tmp_docx)
