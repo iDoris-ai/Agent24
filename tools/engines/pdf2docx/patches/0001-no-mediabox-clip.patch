@@ -1,0 +1,11 @@
+--- a/pdf2docx/page/RawPageFitz.py
++++ b/pdf2docx/page/RawPageFitz.py
+@@ -65,7 +65,7 @@
+         raw = self.page_engine.get_text(
+                 'rawdict',
+                 flags=0
+-                    | fitz.TEXT_MEDIABOX_CLIP
++                    # a24: no TEXT_MEDIABOX_CLIP (drops hanging CJK punctuation)
+                     | fitz.TEXT_CID_FOR_UNKNOWN_UNICODE
+                     ,
+                 sort=sort,
