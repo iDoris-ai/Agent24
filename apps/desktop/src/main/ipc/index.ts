@@ -925,6 +925,7 @@ export function registerIpcHandlers(options: {
       activated: false,
       invalidActivation: false,
       alreadyBound: false,
+      localOffered: false,
       reachable: null,
       formats: ['md', 'markdown', 'txt'] as const,
       maxBytes: 10_485_760,

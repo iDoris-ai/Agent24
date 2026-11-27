@@ -7,6 +7,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { validEndpoint, validKnowledgeBaseIds, type KnowledgeController } from './knowledge-settings'
+import type { LiteKnowledge } from './knowledge-lite'
 import type { KnowledgeOnboardPreflight, KnowledgeOnboardResult } from '../shared/ipc-types'
 
 export type OnboardPreflight = KnowledgeOnboardPreflight
@@ -18,9 +19,14 @@ export interface Activation {
   activation_code: string
 }
 
+/** L11-1: what onboarding needs of the local Lite (main/knowledge-lite.ts LiteKnowledge). */
+export type OnboardLite = Pick<LiteKnowledge, 'offered' | 'enable' | 'disable' | 'status'>
+
 export interface OnboardDeps {
   dir: string
   controller: () => KnowledgeController | null
+  /** L11-1: the local Lite; absent or null when this App has none. */
+  lite?: () => OnboardLite | null
   fetch: (url: string, init: RequestInit) => Promise<Response>
   sleep?: (ms: number) => Promise<void>
 }
@@ -277,16 +283,43 @@ async function preflight(deps: OnboardDeps): Promise<OnboardPreflight> {
   return {
     activated: usable !== null,
     invalidActivation: activation === 'invalid',
+    // L11-1 TODO(grok): alreadyBound is also true when the controller's source is 'local';
+    // localOffered = lite?.offered() === true.
     alreadyBound: endpoint !== '',
+    localOffered: false,
     reachable: usable ? await serverUp(deps.fetch, usable.origin) : null,
     formats: FORMATS,
     maxBytes: MAX_UPLOAD_BYTES,
   }
 }
 
+/**
+ * L11-1 (KB-C4-05 personal Lite, chat entry): 「只留在本机」 turns the local Lite on the same way the
+ * settings page does (main/ipc/index.ts KnowledgeSetSource): save source=local, then install and launch.
+ * Never reads the activation file or the network. Never overwrites a knowledge base already in use
+ * (a saved remote endpoint, or local already the source) and never falls back to the remote service.
+ * If the Lite cannot be installed or started, the source goes back to remote and the Lite is stopped,
+ * so no half-opened local base is left in use.
+ *
+ * Order and outcomes:
+ *  1. no controller → unavailable
+ *  2. endpoint saved or source already local → already_bound (nothing changed)
+ *  3. no Lite, or lite.offered() false → local_unavailable (nothing changed)
+ *  4. controller.setSource('local') not ok → not_saved (Lite not touched)
+ *  5. await lite.enable(); then lite.status().phase:
+ *       ready → { ok: true, source: 'local', activeNow: true }
+ *       starting → { ok: true, source: 'local', activeNow: false }   (kept: it is coming up)
+ *       install_failed → roll back, local_install_failed
+ *       anything else (failed, unavailable, not_installed, …) → roll back, local_start_failed
+ *     roll back = await controller.setSource('remote'), then await lite.disable().
+ */
+async function executeLocal(deps: OnboardDeps): Promise<OnboardResult> {
+  void deps
+  throw new Error('L11-1: executeLocal not implemented')
+}
+
 async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promise<OnboardResult> {
-  // This round only offers the remote service. Do not read the file or the network.
-  if (input.localOnly) return { ok: false, code: 'local_only_unavailable' }
+  if (input.localOnly) return executeLocal(deps)
   const controller = deps.controller()
   if (!controller) return { ok: false, code: 'unavailable' }
   // Never overwrite a knowledge base the user already configured.
@@ -339,11 +372,15 @@ export function knowledgeOnboarding(deps: OnboardDeps): {
   run: (input: { localOnly: boolean }) => Promise<OnboardResult>
 } {
   let inflight: Promise<OnboardResult> | null = null
+  // L11-1: a local run is never folded into a remote one (and the reverse); two local runs share one.
+  let inflightLocal: Promise<OnboardResult> | null = null
   return {
     preflight: () => preflight(deps),
     run: (input) => {
-      // Local only never reaches the network: it is answered on its own, not folded into a remote run.
-      if (input.localOnly) return Promise.resolve({ ok: false, code: 'local_only_unavailable' })
+      if (input.localOnly) {
+        inflightLocal ??= execute(deps, input).finally(() => { inflightLocal = null })
+        return inflightLocal
+      }
       inflight ??= execute(deps, input).finally(() => { inflight = null })
       return inflight
     },

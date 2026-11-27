@@ -268,8 +268,10 @@ export interface KnowledgeOnboardPreflight {
   activated: boolean
   /** The file is present but rejected (mode, shape, endpoint or code). */
   invalidActivation: boolean
-  /** An endpoint is already saved; onboarding will not overwrite it. */
+  /** An endpoint is already saved, or the local Lite is the source (L11-1); onboarding will not overwrite it. */
   alreadyBound: boolean
+  /** L11-1: this build can install and run the local Lite (it has a download source, or the Lite is already installed). */
+  localOffered: boolean
   /** `GET {endpoint}/health` was 2xx. Null when there is no usable activation. */
   reachable: boolean | null
   formats: readonly ['md', 'markdown', 'txt']
@@ -280,10 +282,17 @@ export interface KnowledgeOnboardPreflight {
 export type KnowledgeOnboardResult =
   /** activeNow: the daemon took the binding now; false when it was not up and takes it later from the saved settings. */
   | { ok: true; outcome: 'created' | 'existing'; knowledgeBaseId: string; configMismatch: boolean; activeNow: boolean }
+  /** L11-1: the local Lite is now the source. activeNow: it answered ready; false while it is still starting. */
+  | { ok: true; source: 'local'; activeNow: boolean }
   | {
     ok: false
     code:
-      | 'local_only_unavailable'
+      /** L11-1: this build has no local Lite (no download source and not installed). Nothing was changed. */
+      | 'local_unavailable'
+      /** L11-1: download or verification of the Lite failed; the source was put back. */
+      | 'local_install_failed'
+      /** L11-1: the Lite was installed but did not start; the source was put back. */
+      | 'local_start_failed'
       | 'unavailable'
       | 'already_bound'
       | 'not_activated'

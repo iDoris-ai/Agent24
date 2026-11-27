@@ -5,13 +5,17 @@ import {
 } from './knowledge-onboard'
 
 const PURPOSE = '好的，我来帮你开通知识库。先问三个问题。\n1. 这个知识库主要做什么用？（例如：合同审核、公司制度）'
-const TYPES = '主要会放哪些类型的文档？（目前只支持 Markdown（.md）和纯文本（.txt），PDF、Word 暂不支持）'
+// L11-1: the formats depend on where the library goes, known only after question 3.
+const TYPES = '主要会放哪些类型的文档？（例如：合同、公司制度、会议纪要）'
 const LOCAL = '3. 这些资料是否必须只留在这台电脑上、不能放到服务器？请回答“是”（只能留在本机）或“否”（可以放到服务器）。'
 const AGAIN = '没能确定你的意思。请只回答“是”（资料只能留在本机）或“否”（可以放到服务器）。'
 const CANCEL = '好的，先不开通。'
 const UNCLEAR = '没听明白，先不开通了；需要时再说“帮我开通知识库”。'
 const FORMAT = '现在可以上传文档：目前支持 .md 和 .txt，单个不超过 10 MB；PDF、Word 暂不支持。'
 const OFFICE = '你提到的 PDF/Word 等格式这一版还不能上传。'
+const LOCAL_CREATED = '已在这台电脑上开通本机知识库，资料只存放在这台电脑上。现在可以上传文档：支持 .md、.txt、.csv、.json，单个不超过 10 MB；PDF、Word 暂不支持。'
+const LOCAL_STARTING = '本机知识库还在启动，稍等一会儿再提问；如果提问时没有用上知识库，请到“设置 → 连接 → 知识库（WeKnora）”看一下。'
+const LOCAL_UNAVAILABLE = '这个版本没有附带本机知识库，暂时开通不了本机知识库，这次没有开通。'
 const BOUND = '你已经连着知识库了。开通只用于还没有连知识库的情况，这次不会改动你现在的知识库设置；要换库请到“设置 → 连接 → 知识库（WeKnora）”里修改。'
 
 function ready(over: Partial<KnowledgeOnboardPreflight> = {}): KnowledgeOnboardPreflight {
@@ -19,6 +23,7 @@ function ready(over: Partial<KnowledgeOnboardPreflight> = {}): KnowledgeOnboardP
     activated: true,
     invalidActivation: false,
     alreadyBound: false,
+    localOffered: false,
     reachable: true,
     formats: ['md', 'markdown', 'txt'],
     maxBytes: 10_485_760,
@@ -234,7 +239,9 @@ describe('resultReply', () => {
   })
 
   it.each([
-    ['local_only_unavailable', '对话里只能开通服务器上的知识库；要用本机知识库，请到“设置 → 连接 → 知识库（WeKnora）”选「本机知识库（精简版）」。这次没有开通。'],
+    ['local_unavailable', LOCAL_UNAVAILABLE],
+    ['local_install_failed', '本机知识库没能装好（下载或校验失败），这次没有开通，你的知识库设置也没有改动；稍后再说一次“帮我开通知识库”。'],
+    ['local_start_failed', '本机知识库装好了但没能启动，这次没有开通，你的知识库设置也没有改动；稍后再试，或到“设置 → 连接 → 知识库（WeKnora）”看一下。'],
     ['already_bound', BOUND],
     ['not_activated', '这台电脑还没有激活知识库服务，暂时不能开通，请先完成激活。'],
     ['activation_invalid', '这台电脑上的激活信息无效，开通不了，请联系提供激活的人重新激活。'],
@@ -301,5 +308,40 @@ describe('onboarding cancel phrases (#2075 B2″)', () => {
     const twice = nextOnboard(once.state!, '不')
     expect(twice.run).toBeUndefined()
     expect(twice.state).toBeNull()
+  })
+})
+
+// L11-1 (KB-C4-05 personal Lite, chat entry).
+describe('local Lite from the chat (L11-1)', () => {
+  it('lets onboarding start without an activation when the local Lite is offered', () => {
+    expect(preflightReply(ready({ activated: false, reachable: null, localOffered: true }))).toBeNull()
+    expect(preflightReply(ready({ activated: false, invalidActivation: true, reachable: null, localOffered: true }))).toBeNull()
+    expect(preflightReply(ready({ reachable: false, localOffered: true }))).toBeNull()
+  })
+
+  it('a library already in use still wins, and without the Lite a missing activation still stops it', () => {
+    expect(preflightReply(ready({ alreadyBound: true, localOffered: true }))).toBe(BOUND)
+    expect(preflightReply(ready({ activated: false, reachable: null, localOffered: false })))
+      .toBe('这台电脑还没有激活知识库服务，暂时不能开通，请先完成激活。')
+  })
+
+  it('describes the local library with the local formats, office formats named when asked', () => {
+    const ok: KnowledgeOnboardResult = { ok: true, source: 'local', activeNow: true }
+    expect(resultReply(ok)).toBe(LOCAL_CREATED)
+    expect(resultReply(ok, '合同')).toBe(LOCAL_CREATED)
+    expect(resultReply(ok, 'PDF 和 Word')).toBe(LOCAL_CREATED + OFFICE)
+    expect(resultReply({ ok: true, source: 'local', activeNow: false })).toBe(LOCAL_CREATED + LOCAL_STARTING)
+  })
+
+  it('the remote library keeps its own formats', () => {
+    const ok: KnowledgeOnboardResult = { ok: true, outcome: 'created', knowledgeBaseId: 'kb', configMismatch: false, activeNow: true }
+    expect(resultReply(ok)).toContain(FORMAT)
+    expect(resultReply(ok)).not.toContain('.csv')
+  })
+
+  it('the types question no longer promises formats', () => {
+    const step = nextOnboard({ step: 'purpose' }, '合同审核')
+    expect(step.reply).toBe(TYPES)
+    expect(step.reply).not.toMatch(/支持|\.md|\.txt/)
   })
 })

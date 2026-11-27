@@ -161,6 +161,10 @@ function mentionsOffice(types: string): boolean {
 }
 
 export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): string {
+  if (r.ok && 'source' in r) {
+    // L11-1 TODO(grok): the local library (LOCAL_CREATED / LOCAL_STARTING / office note), texts pinned in the tests.
+    throw new Error('L11-1: local resultReply not implemented')
+  }
   if (r.ok) {
     const lead = r.outcome === 'created'
       ? '已在知识库服务器上为你建好默认知识库，之后上传的文档都存放在服务器上。'
@@ -171,8 +175,7 @@ export function resultReply(r: KnowledgeOnboardResult, typesAnswer?: string): st
     return `${lead}${FORMAT_LINE}${note}${later}`
   }
   switch (r.code) {
-    case 'local_only_unavailable':
-      return '对话里只能开通服务器上的知识库；要用本机知识库，请到“设置 → 连接 → 知识库（WeKnora）”选「本机知识库（精简版）」。这次没有开通。'
+    // L11-1 TODO(grok): local_unavailable / local_install_failed / local_start_failed (texts pinned in knowledge-onboard.test.ts).
     case 'already_bound':
       return ALREADY_BOUND
     case 'not_activated':
