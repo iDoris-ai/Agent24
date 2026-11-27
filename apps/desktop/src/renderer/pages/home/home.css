@@ -7,7 +7,7 @@
   --mf-a1: var(--accent);
   --mf-a2: color-mix(in srgb, var(--accent) 72%, #000);
   --mf-a3: color-mix(in srgb, var(--accent) 50%, #000);
-  --mf-ok: #4caf7a; --mf-bad: #e05a4f;
+  --mf-ok: var(--success); --mf-bad: var(--danger);
 }
 .app.light .home-page {
   --mf-t1: #ffffff; --mf-t2: #e6e6de; --mf-t3: #d2d2c8; --mf-line: #b4b4a8;

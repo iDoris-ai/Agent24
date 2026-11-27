@@ -71,6 +71,7 @@
     "icon": "assets/icon.png",
     "files": [
       "dist/**/*",
+      "assets/trayTemplate*.png",
       "package.json"
     ],
     "extraResources": [
