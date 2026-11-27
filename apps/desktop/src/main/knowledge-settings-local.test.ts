@@ -81,10 +81,10 @@ describe('KnowledgeController local source (Loop 9 3c)', () => {
     sent = []
     lite.set({ origin: 'http://127.0.0.1:41234', apiKey: 'lite-KEY-1', knowledgeBaseId: 'kb-local' })
     await flush()
-    expect(activations().at(-1)).toMatchObject({ endpoint: 'http://127.0.0.1:41234', knowledge_base_ids: ['kb-local'] })
+    expect(activations().at(-1)).toMatchObject({ endpoint: 'http://127.0.0.1:41234/api/v1', knowledge_base_ids: ['kb-local'] })
     expect(credentials().at(-1)).toMatchObject({ kind: 'api_key', value: 'lite-KEY-1' })
     expect(controller.bindingForRun()).toBe(KNOWLEDGE_BINDING)
-    expect(controller.activeTarget()).toEqual({ endpoint: 'http://127.0.0.1:41234', knowledgeBaseIds: ['kb-local'] })
+    expect(controller.activeTarget()).toEqual({ endpoint: 'http://127.0.0.1:41234/api/v1', knowledgeBaseIds: ['kb-local'] })
     const localView = controller.viewBinding()
     expect(localView).not.toBe(remoteView)
     expect(controller.uiSessionInputs(localView ?? '')?.credential).toBe('lite-KEY-1')
@@ -115,6 +115,20 @@ describe('KnowledgeController local source (Loop 9 3c)', () => {
     expect(make().status().source).toBe('remote')
     await controller.setSource('local')
     expect(make().status().source).toBe('local')
+  })
+
+  it('0.7.127 acceptance: the local endpoint has the same shape as a remote one (the API base, /api/v1)', async () => {
+    const controller = make()
+    lite.current = { origin: 'http://127.0.0.1:41234', apiKey: 'lite-KEY', knowledgeBaseId: 'kb-local' }
+    await controller.setSource('local')
+    // The daemon and the K2 check both append /agent24/knowledge/<op> to the endpoint
+    // (agent24-knowledge http.rs `{base}{op.path()}`, knowledge-reachability.ts); the Lite serves them under /api/v1.
+    const pushed = activations().at(-1)?.endpoint as string
+    expect(pushed).toBe('http://127.0.0.1:41234/api/v1')
+    expect(new URL(`${pushed}/agent24/knowledge/ready`).pathname).toBe('/api/v1/agent24/knowledge/ready')
+    expect(controller.probeInputs()).toMatchObject({ endpoint: 'http://127.0.0.1:41234/api/v1', key: 'lite-KEY' })
+    // Same shape as what the remote settings hold.
+    expect(new URL(pushed).pathname).toBe(new URL(REMOTE.endpoint).pathname)
   })
 
   it('drops the binding when the Lite goes away while it is the source', async () => {

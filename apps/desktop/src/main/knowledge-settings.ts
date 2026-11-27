@@ -33,6 +33,9 @@ import type { KnowledgeLoginStore } from './knowledge-logins'
 import type { KnowledgeSettingsResult, KnowledgeStatus } from '../shared/ipc-types'
 import type { KnowledgeReachability, ProbeInputs } from './knowledge-reachability'
 
+/** Where the Lite serves the Agent24 knowledge routes, below its origin. */
+const LITE_API_BASE = '/api/v1'
+
 /** The binding the settings drive: one per desktop for now. */
 export const KNOWLEDGE_BINDING = 'default'
 const FILE = 'knowledge-settings.json'
@@ -197,8 +200,12 @@ export class KnowledgeController {
   private target(): Target | null {
     if (this.source() === 'local') {
       const c = this.local?.credential()
-      return c && validEndpoint(c.origin) && validKnowledgeBaseIds([c.knowledgeBaseId])
-        ? { endpoint: c.origin, knowledgeBaseIds: [c.knowledgeBaseId], key: c.apiKey }
+      // The handshake gives the origin; the endpoint is the API base, the same
+      // shape as a remote one (`…/api/v1`): the daemon and the K2 check append
+      // `/agent24/knowledge/<op>` to it (0.7.127 acceptance).
+      const endpoint = c ? `${c.origin}${LITE_API_BASE}` : ''
+      return c && validEndpoint(endpoint) && validKnowledgeBaseIds([c.knowledgeBaseId])
+        ? { endpoint, knowledgeBaseIds: [c.knowledgeBaseId], key: c.apiKey }
         : null
     }
     const key = this.key()
