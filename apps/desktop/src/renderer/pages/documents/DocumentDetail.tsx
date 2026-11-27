@@ -593,7 +593,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
         </p>
       )}
       {detail && detail.head.media_type === 'application/pdf' && (
-        <PdfToWord key={detail.document_id} api={api} documentId={detail.document_id} onAdded={onAdded} />
+        <PdfToWord key={detail.document_id} api={api} documentId={detail.document_id} title={detail.title ?? ''} onAdded={onAdded} />
       )}
       {detail && isOffice(detail.head.media_type) && (
         <div style={{ margin: '8px 0' }}>
