@@ -8,8 +8,10 @@
 期望值来自独立参照：PDF 里的字符数用仓内 PDFKit 解析器（agent24-documents-pdfkit parse）数出，
 不用 PyMuPDF，避免和被测对象同库自证（裁决记录 2026-11-28-pdf2word-component C3）。
 """
+import atexit
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
@@ -34,8 +36,9 @@ def run(src, dst):
     cmd = [engine] if engine else [sys.executable, CLI]
     proc = subprocess.run(cmd + ['convert', src, dst], capture_output=True, text=True, timeout=300)
     lines = [l for l in proc.stdout.splitlines() if l.strip()]
-    result = json.loads(lines[-1]) if lines else None
-    return proc.returncode, result
+    # 契约：stdout 只有一行 JSON（日志、警告都去 stderr）。
+    assert len(lines) == 1, proc.stdout
+    return proc.returncode, json.loads(lines[0])
 
 
 def document_xml(path):
@@ -51,6 +54,7 @@ class Converted:
     """每个样本只转一次。"""
     _cache = {}
     _tmp = tempfile.mkdtemp(prefix='a24-pdf2docx-test-')
+    atexit.register(shutil.rmtree, _tmp, True)
 
     @classmethod
     def get(cls, src):
