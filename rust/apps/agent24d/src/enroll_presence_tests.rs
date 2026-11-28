@@ -196,7 +196,7 @@ async fn elevate(daemon: &Daemon) -> (Client, serde_json::Value) {
     daemon
         .authority
         .inner
-        .remember_attached_request(&token_id, &attached_body(), &[]);
+        .remember_attached_request(&token_id, &attached_body(), &[], |_| Ok(None));
     write(
         &mut client,
         serde_json::json!({"v":1,"op":"elevate","method":"POST","path":"/api/v1/attached","body_sha256":body_digest(&attached_body()),"summary":"client words"}),

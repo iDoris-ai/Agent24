@@ -1984,7 +1984,12 @@ pub(crate) mod handshake_tests {
                 crate::capabilities::unix_now(),
             )
             .unwrap();
-        authority.remember_attached_request(&authorization.claims.capability_id, &body, &[]);
+        authority.remember_attached_request(
+            &authorization.claims.capability_id,
+            &body,
+            &[],
+            |_| Ok(None),
+        );
         send(client.get_mut(), frame.clone()).await.unwrap();
         assert_eq!(line(&mut client).await["op"], "elevation_pending");
         assert_eq!(line(&mut client).await["code"], "presence_unavailable");

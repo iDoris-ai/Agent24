@@ -648,6 +648,83 @@ pub enum RegisterError {
     Io(String),
 }
 
+/// What `name` had before: its active record, or else (M2) the tombstone an
+/// earlier `revoke` left, so revoke-then-re-add cannot dodge the relax
+/// confirmation a plain rotation would need (§3.5). `None` is the genuine
+/// first-time case.
+fn previous_facts(store: &AttachedStore, name: &str) -> Result<Option<Facts>, String> {
+    match store.modules.get(name) {
+        Some(r) => parse_manifest(&r.manifest_yaml)
+            .map(|m| Some(Facts::of(&m)))
+            .map_err(|e| format!("the stored manifest for {name:?} no longer parses: {e}")),
+        None => match store.revoked.get(name) {
+            Some(tombstone) => tombstone.clone().into_facts().map(Some).map_err(|e| {
+                format!("the revoked-record tombstone for {name:?} no longer parses: {e}")
+            }),
+            None => Ok(None),
+        },
+    }
+}
+
+/// The §3.5 widening from `previous` to `new`, or `None` when there is none.
+/// A first registration has no stored `local_only` record, so `remote_allowed`
+/// is named as a first registration, not as a transition from `local_only`.
+/// The presence grant stores this string, and [`register_with`] recomputes it
+/// under the file lock.
+fn describe_relax(previous: Option<&Facts>, new: &Facts) -> Option<String> {
+    if !is_relax(previous, new) {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if new.model_access == agent24_domain::ModelAccess::RemoteAllowed {
+        match previous {
+            None => parts.push("first registration with model_access remote_allowed".to_owned()),
+            Some(p) if p.model_access == agent24_domain::ModelAccess::LocalOnly => {
+                parts.push("model_access local_only -> remote_allowed".to_owned());
+            }
+            Some(_) => {}
+        }
+    }
+    let added: Vec<&str> = new
+        .capabilities
+        .iter()
+        .filter(|c| previous.is_some_and(|p| !p.capabilities.contains(c)))
+        .map(|c| c.as_str())
+        .collect();
+    if !added.is_empty() {
+        parts.push(format!("new kernel_capabilities [{}]", added.join(", ")));
+    }
+    Some(parts.join("; "))
+}
+
+/// How registering `manifest_yaml` now would widen privacy against what the
+/// name had before (§3.5). `Ok(None)` when it would not. `Err` when the
+/// manifest or registry cannot be read: the caller shows no dialog, so
+/// nothing is approved. A first registration has no stored `local_only`
+/// record, so `remote_allowed` is named as a first registration, not as a
+/// transition from `local_only`.
+pub fn relaxation(path: &Path, manifest_yaml: &str) -> Result<Option<String>, String> {
+    let manifest = parse_manifest(manifest_yaml)?;
+    let store = AttachedStore::load(path)?;
+    let previous = previous_facts(&store, manifest.name())?;
+    Ok(describe_relax(previous.as_ref(), &Facts::of(&manifest)))
+}
+
+/// Who confirmed a §3.5 widening, if anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaxConsent<'a> {
+    /// No widening is confirmed, so a widening is refused. Also the scope of
+    /// a presence grant whose dialog named no widening.
+    None,
+    /// Direct authorization: `allow_relax: true` on a request that did not
+    /// consume a presence grant (interactive `agent24 os attach add`).
+    Any,
+    /// Service mode consumed a presence grant built with exactly this
+    /// [`relaxation`] text. Only the same widening, recomputed under the
+    /// file lock, is confirmed.
+    Exactly(&'a str),
+}
+
 /// Register (first time) or rotate/re-register (already present) an attached
 /// module (§3.2/§3.4), inside ONE file-lock critical section (§5.2 — A3-2a's
 /// slice of it: there is no live generation to revoke yet, so "commit" here
@@ -666,6 +743,22 @@ pub fn register(
     path: &Path,
     manifest_yaml: &str,
     allow_relax: bool,
+    name_taken: impl Fn(&str) -> bool,
+    on_commit: impl FnOnce(&Change),
+) -> Result<RegisterOutcome, RegisterError> {
+    let consent = if allow_relax {
+        RelaxConsent::Any
+    } else {
+        RelaxConsent::None
+    };
+    register_with(path, manifest_yaml, consent, name_taken, on_commit)
+}
+
+/// [`register`] with the widening confirmation spelled out.
+pub fn register_with(
+    path: &Path,
+    manifest_yaml: &str,
+    consent: RelaxConsent<'_>,
     name_taken: impl Fn(&str) -> bool,
     on_commit: impl FnOnce(&Change),
 ) -> Result<RegisterOutcome, RegisterError> {
@@ -701,35 +794,19 @@ pub fn register(
     // cleared only by `DELETE` (a genuinely fresh registration afterwards has
     // no record to inherit from) or an explicit `PATCH ... {"enabled":true}`.
     let previous_disabled = previous_record.is_some_and(|r| r.disabled);
-    let previous_facts = match previous_record {
-        Some(r) => Some(Facts::of(&parse_manifest(&r.manifest_yaml).map_err(
-            |e| {
-                RegisterError::Io(format!(
-                    "the stored manifest for {name:?} no longer parses: {e}"
-                ))
-            },
-        )?)),
-        // M2: no ACTIVE record, but a tombstone left by an earlier `revoke`
-        // means this name is not really "first-time" — compare against what
-        // it had before, exactly like a rotation, so revoke-then-re-add
-        // cannot dodge the relax confirmation a plain rotation would need
-        // (§3.5). No tombstone at all is the genuine first-time case.
-        None => match store.revoked.get(&name) {
-            Some(tombstone) => Some(tombstone.clone().into_facts().map_err(|e| {
-                RegisterError::Io(format!(
-                    "the revoked-record tombstone for {name:?} no longer parses: {e}"
-                ))
-            })?),
-            None => None,
-        },
-    };
+    let previous_facts = previous_facts(&store, &name).map_err(RegisterError::Io)?;
 
     // §3.2 processing order: validate → name clash → privacy relax → mint →
     // store.
     if previous_record.is_none() && name_taken(&name) {
         return Err(RegisterError::NameTaken(name));
     }
-    if is_relax(previous_facts.as_ref(), &facts) && !allow_relax {
+    let confirmed = match (describe_relax(previous_facts.as_ref(), &facts), consent) {
+        (None, _) | (Some(_), RelaxConsent::Any) => true,
+        (Some(widening), RelaxConsent::Exactly(shown)) => widening == shown,
+        (Some(_), RelaxConsent::None) => false,
+    };
+    if !confirmed {
         return Err(RegisterError::RelaxRequiresConfirmation);
     }
 
@@ -969,6 +1046,39 @@ mod tests {
              impl_kind: attached_process\nkernel_capabilities: [{}]\n{ma}",
             caps.join(", ")
         )
+    }
+
+    #[test]
+    fn relaxation_names_what_a_registration_would_widen() {
+        let dir = tmp();
+        let path = dir.join("attached.json");
+        let old = manifest("agentear", Some("local_only"), &["events", "models"]);
+        assert_eq!(
+            relaxation(&path, &old),
+            Ok(None),
+            "a local first registration widens nothing"
+        );
+        register(&path, &old, false, |_| false, |_| {}).unwrap();
+        assert_eq!(relaxation(&path, &old), Ok(None));
+        let new = manifest(
+            "agentear",
+            Some("local_only"),
+            &["events", "models", "assistant"],
+        );
+        assert_eq!(
+            relaxation(&path, &new).unwrap().as_deref(),
+            Some("new kernel_capabilities [assistant]")
+        );
+        let first_remote = manifest("other", Some("remote_allowed"), &["events", "models"]);
+        assert_eq!(
+            relaxation(&path, &first_remote).unwrap().as_deref(),
+            Some("first registration with model_access remote_allowed")
+        );
+        let remote = manifest("agentear", Some("remote_allowed"), &["events", "models"]);
+        assert_eq!(
+            relaxation(&path, &remote).unwrap().as_deref(),
+            Some("model_access local_only -> remote_allowed")
+        );
     }
 
     #[test]

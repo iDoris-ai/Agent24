@@ -564,6 +564,7 @@ async fn authorize(
                                 &authorization.claims.capability_id,
                                 &bytes,
                                 &registrations,
+                                |manifest| agent24_attach::attached::relaxation(&path, manifest),
                             );
                         }
                     } else if matches!(
@@ -752,14 +753,6 @@ async fn authorize(
                             crate::capabilities::unix_now(),
                         )
                         .is_err()
-                        || !state.first_party.as_ref().is_some_and(|authority| {
-                            authority.consume(
-                                &grant,
-                                &authorization.claims.capability_id,
-                                &target,
-                                crate::capabilities::unix_now(),
-                            )
-                        })
                     {
                         return error_response(
                             StatusCode::FORBIDDEN,
@@ -767,7 +760,31 @@ async fn authorize(
                             "Elevation grant is invalid",
                         );
                     }
+                    let Some(consumed) = state.first_party.as_ref().and_then(|authority| {
+                        authority.consume_approved(
+                            &grant,
+                            &authorization.claims.capability_id,
+                            &target,
+                            crate::capabilities::unix_now(),
+                        )
+                    }) else {
+                        return error_response(
+                            StatusCode::FORBIDDEN,
+                            "elevation_invalid",
+                            "Elevation grant is invalid",
+                        );
+                    };
                     req = Request::from_parts(parts, Body::from(bytes));
+                    // §3.5: the grant carries the widening captured when the
+                    // dialog was built (`None` when it named none). The
+                    // handler confirms only that scope. `allow_relax` on the
+                    // body does not enlarge it.
+                    if method == Method::POST && template == "/api/v1/attached" {
+                        req.extensions_mut()
+                            .insert(crate::attached_routes::PresenceConfirmed(
+                                consumed.approved_scope,
+                            ));
+                    }
                 }
             }
             req.extensions_mut().insert(authorization);
