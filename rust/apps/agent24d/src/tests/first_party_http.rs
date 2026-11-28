@@ -2011,3 +2011,62 @@ async fn an_enrolled_shell_never_reaches_host_only_routes() {
         assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method} {path}");
     }
 }
+
+#[tokio::test]
+async fn an_approved_attached_registration_receives_the_scope_from_the_dialog() {
+    // Normal service-mode path: the handler receives the structured scope
+    // stored when the dialog was built, including when that scope is none.
+    let (state, token) = setup().await;
+    state
+        .first_party
+        .as_ref()
+        .unwrap()
+        .set_provider(Some(Arc::new(Allow)));
+    let router =
+        Router::new()
+            .route(
+                "/api/v1/attached",
+                axum::routing::post(
+                    |confirmed: Option<
+                        axum::Extension<crate::attached_routes::PresenceConfirmed>,
+                    >| async move {
+                        match confirmed {
+                            None => "missing".to_owned(),
+                            Some(c) => c.0.0.clone().unwrap_or_else(|| "none".to_owned()),
+                        }
+                    },
+                ),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(state.clone(), auth));
+    let body = serde_json::json!({"manifest":"name: agentear\nversion: '1'\nroute_namespace: /api/v1/agentear\nevent_module: agentear\ndata_dir: ~/.agent24/os/agentear/\nimpl_kind: attached_process\nkernel_capabilities: [events, models, assistant]\n"}).to_string();
+    for (widening, seen) in [
+        (
+            Some("new kernel_capabilities [assistant]"),
+            "new kernel_capabilities [assistant]",
+        ),
+        (None, "none"),
+    ] {
+        state
+            .first_party
+            .as_ref()
+            .unwrap()
+            .remember_attached_request(&token.token_id, body.as_bytes(), &[], |_| {
+                Ok(widening.map(str::to_owned))
+            });
+        let secret = grant(&state, &token, "POST", "/api/v1/attached", &body).await;
+        let response = router
+            .clone()
+            .oneshot(request(
+                &token.secret,
+                "POST",
+                "/api/v1/attached",
+                &body,
+                Some(&secret),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(std::str::from_utf8(&bytes).unwrap(), seen);
+    }
+}

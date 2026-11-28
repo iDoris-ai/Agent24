@@ -648,20 +648,6 @@ pub enum RegisterError {
     Io(String),
 }
 
-/// Register (first time) or rotate/re-register (already present) an attached
-/// module (§3.2/§3.4), inside ONE file-lock critical section (§5.2 — A3-2a's
-/// slice of it: there is no live generation to revoke yet, so "commit" here
-/// means only "the record is updated and durable").
-///
-/// `name_taken` decides the §3.2 409 case for a BRAND NEW name — it is given
-/// the candidate name and answers whether some other kind of domain OS (an
-/// installed package, a compiled-in module) already claims it. It is never
-/// consulted for a name that is already an attached record: re-adding one is
-/// a rotation/re-registration, not a new claim.
-///
-/// `on_commit` runs exactly once, still inside the file lock, right after the
-/// updated store is durably written — see [`Change`]'s doc comment. It never
-/// runs on any error path (nothing was committed).
 /// What `name` had before: its active record, or else (M2) the tombstone an
 /// earlier `revoke` left, so revoke-then-re-add cannot dodge the relax
 /// confirmation a plain rotation would need (§3.5). `None` is the genuine
@@ -680,46 +666,99 @@ fn previous_facts(store: &AttachedStore, name: &str) -> Result<Option<Facts>, St
     }
 }
 
-/// How registering `manifest_yaml` now would widen privacy against what the
-/// name had before (§3.5), for the presence text: `Ok(None)` when it would
-/// not, `Err` when the manifest or registry cannot be read (no text is shown
-/// then, so the approval cannot confirm a widening it never named).
-pub fn relaxation(path: &Path, manifest_yaml: &str) -> Result<Option<String>, String> {
-    let manifest = parse_manifest(manifest_yaml)?;
-    let facts = Facts::of(&manifest);
-    let store = AttachedStore::load(path)?;
-    let previous = previous_facts(&store, manifest.name())?;
-    if !is_relax(previous.as_ref(), &facts) {
-        return Ok(None);
+/// The §3.5 widening from `previous` to `new`, or `None` when there is none.
+/// A first registration has no stored `local_only` record, so `remote_allowed`
+/// is named as a first registration, not as a transition from `local_only`.
+/// The presence grant stores this string, and [`register_with`] recomputes it
+/// under the file lock.
+fn describe_relax(previous: Option<&Facts>, new: &Facts) -> Option<String> {
+    if !is_relax(previous, new) {
+        return None;
     }
     let mut parts = Vec::new();
-    if facts.model_access == agent24_domain::ModelAccess::RemoteAllowed
-        && previous
-            .as_ref()
-            .is_none_or(|p| p.model_access == agent24_domain::ModelAccess::LocalOnly)
-    {
-        parts.push("model_access local_only -> remote_allowed".to_owned());
+    if new.model_access == agent24_domain::ModelAccess::RemoteAllowed {
+        match previous {
+            None => parts.push("first registration with model_access remote_allowed".to_owned()),
+            Some(p) if p.model_access == agent24_domain::ModelAccess::LocalOnly => {
+                parts.push("model_access local_only -> remote_allowed".to_owned());
+            }
+            Some(_) => {}
+        }
     }
-    let added: Vec<&str> = facts
+    let added: Vec<&str> = new
         .capabilities
         .iter()
-        .filter(|c| {
-            previous
-                .as_ref()
-                .is_some_and(|p| !p.capabilities.contains(c))
-        })
+        .filter(|c| previous.is_some_and(|p| !p.capabilities.contains(c)))
         .map(|c| c.as_str())
         .collect();
     if !added.is_empty() {
         parts.push(format!("new kernel_capabilities [{}]", added.join(", ")));
     }
-    Ok(Some(parts.join("; ")))
+    Some(parts.join("; "))
 }
 
+/// How registering `manifest_yaml` now would widen privacy against what the
+/// name had before (§3.5). `Ok(None)` when it would not. `Err` when the
+/// manifest or registry cannot be read: the caller shows no dialog, so
+/// nothing is approved. A first registration has no stored `local_only`
+/// record, so `remote_allowed` is named as a first registration, not as a
+/// transition from `local_only`.
+pub fn relaxation(path: &Path, manifest_yaml: &str) -> Result<Option<String>, String> {
+    let manifest = parse_manifest(manifest_yaml)?;
+    let store = AttachedStore::load(path)?;
+    let previous = previous_facts(&store, manifest.name())?;
+    Ok(describe_relax(previous.as_ref(), &Facts::of(&manifest)))
+}
+
+/// Who confirmed a §3.5 widening, if anyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelaxConsent<'a> {
+    /// No widening is confirmed, so a widening is refused. Also the scope of
+    /// a presence grant whose dialog named no widening.
+    None,
+    /// Direct authorization: `allow_relax: true` on a request that did not
+    /// consume a presence grant (interactive `agent24 os attach add`).
+    Any,
+    /// Service mode consumed a presence grant built with exactly this
+    /// [`relaxation`] text. Only the same widening, recomputed under the
+    /// file lock, is confirmed.
+    Exactly(&'a str),
+}
+
+/// Register (first time) or rotate/re-register (already present) an attached
+/// module (§3.2/§3.4), inside ONE file-lock critical section (§5.2 — A3-2a's
+/// slice of it: there is no live generation to revoke yet, so "commit" here
+/// means only "the record is updated and durable").
+///
+/// `name_taken` decides the §3.2 409 case for a BRAND NEW name — it is given
+/// the candidate name and answers whether some other kind of domain OS (an
+/// installed package, a compiled-in module) already claims it. It is never
+/// consulted for a name that is already an attached record: re-adding one is
+/// a rotation/re-registration, not a new claim.
+///
+/// `on_commit` runs exactly once, still inside the file lock, right after the
+/// updated store is durably written — see [`Change`]'s doc comment. It never
+/// runs on any error path (nothing was committed).
 pub fn register(
     path: &Path,
     manifest_yaml: &str,
     allow_relax: bool,
+    name_taken: impl Fn(&str) -> bool,
+    on_commit: impl FnOnce(&Change),
+) -> Result<RegisterOutcome, RegisterError> {
+    let consent = if allow_relax {
+        RelaxConsent::Any
+    } else {
+        RelaxConsent::None
+    };
+    register_with(path, manifest_yaml, consent, name_taken, on_commit)
+}
+
+/// [`register`] with the widening confirmation spelled out.
+pub fn register_with(
+    path: &Path,
+    manifest_yaml: &str,
+    consent: RelaxConsent<'_>,
     name_taken: impl Fn(&str) -> bool,
     on_commit: impl FnOnce(&Change),
 ) -> Result<RegisterOutcome, RegisterError> {
@@ -762,7 +801,12 @@ pub fn register(
     if previous_record.is_none() && name_taken(&name) {
         return Err(RegisterError::NameTaken(name));
     }
-    if is_relax(previous_facts.as_ref(), &facts) && !allow_relax {
+    let confirmed = match (describe_relax(previous_facts.as_ref(), &facts), consent) {
+        (None, _) | (Some(_), RelaxConsent::Any) => true,
+        (Some(widening), RelaxConsent::Exactly(shown)) => widening == shown,
+        (Some(_), RelaxConsent::None) => false,
+    };
+    if !confirmed {
         return Err(RegisterError::RelaxRequiresConfirmation);
     }
 
@@ -1024,6 +1068,11 @@ mod tests {
         assert_eq!(
             relaxation(&path, &new).unwrap().as_deref(),
             Some("new kernel_capabilities [assistant]")
+        );
+        let first_remote = manifest("other", Some("remote_allowed"), &["events", "models"]);
+        assert_eq!(
+            relaxation(&path, &first_remote).unwrap().as_deref(),
+            Some("first registration with model_access remote_allowed")
         );
         let remote = manifest("agentear", Some("remote_allowed"), &["events", "models"]);
         assert_eq!(

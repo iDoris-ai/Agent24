@@ -31,10 +31,14 @@ use axum::response::{IntoResponse, Response};
 use crate::server::AppState;
 use agent24_attach::attached::{self, RegisterError, RegisterOutcome};
 
-/// Set by the capabilities middleware when a first-party shell's request
-/// carries a consumed presence grant whose text named any privacy widening.
-#[derive(Clone, Copy, Debug)]
-pub struct PresenceConfirmed;
+/// Set by the capabilities middleware when service mode consumed a presence
+/// grant for `POST /api/v1/attached`. The `Option` is the §3.5 widening
+/// captured when the dialog was built: `Some` is that exact [`attached::relaxation`]
+/// text, `None` means the dialog named no widening. `body.allow_relax` does
+/// not enlarge this scope. A direct registration (no consumed grant) leaves
+/// the extension unset and still follows `allow_relax`.
+#[derive(Clone, Debug)]
+pub struct PresenceConfirmed(pub Option<String>);
 
 pub async fn post_attached(state: State<AppState>, req: Request<Body>) -> Response {
     let Some(path) = attached::config_path() else {
@@ -56,7 +60,9 @@ pub(crate) async fn post_attached_at(
     req: Request<Body>,
     path: &Path,
 ) -> Response {
-    let confirmed = req.extensions().get::<PresenceConfirmed>().is_some();
+    // Present only after a consumed presence grant. Direct authorization
+    // leaves it unset and keeps `allow_relax` as the whole confirmation.
+    let confirmed = req.extensions().get::<PresenceConfirmed>().cloned();
     let bytes = match read_body_or_response(req).await {
         Ok(b) => b,
         Err(r) => return r,
@@ -85,15 +91,16 @@ pub(crate) async fn post_attached_at(
     // rejects the clash then, as a fallback to this check rather than a
     // replacement for it.
     let name_taken = |name: &str| state.os_reports.iter().any(|r| r.name == name);
-    match attached::register(
-        path,
-        &body.manifest,
-        body.allow_relax || confirmed,
-        name_taken,
-        |change| {
-            state.attach_registry.on_change(change);
-        },
-    ) {
+    let consent = match &confirmed {
+        // Service mode: the consumed grant's scope is the whole confirmation.
+        Some(PresenceConfirmed(Some(shown))) => attached::RelaxConsent::Exactly(shown),
+        Some(PresenceConfirmed(None)) => attached::RelaxConsent::None,
+        None if body.allow_relax => attached::RelaxConsent::Any,
+        None => attached::RelaxConsent::None,
+    };
+    match attached::register_with(path, &body.manifest, consent, name_taken, |change| {
+        state.attach_registry.on_change(change);
+    }) {
         Ok(RegisterOutcome::Created(resp)) => (StatusCode::CREATED, Json(resp)).into_response(),
         Ok(RegisterOutcome::Rotated { response, .. }) => {
             (StatusCode::OK, Json(response)).into_response()
@@ -352,9 +359,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_presence_approved_rotation_may_add_a_capability() {
-        // AgentEar paired with [events, models] re-registers with `assistant`
-        // unattended (allow_relax: false). In service mode the presence dialog
-        // that named the widening is the confirmation.
+        // Normal service-mode path: the structured scope from the dialog is
+        // the confirmation. Direct `allow_relax` is covered separately.
         let state = crate::server::tests::state().await;
         let path = tmp_path();
         let caps = |c: &str| {
@@ -374,10 +380,45 @@ mod tests {
         let wider = serde_json::json!({"manifest": caps("events, models, assistant")});
         let refused = post_attached_at(State(state.clone()), req(wider.clone()), &path).await;
         assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        // A grant authorizes exactly the change named by the dialog.
+        for scope in [None, Some("a different change".to_owned())] {
+            let mut request = req(serde_json::json!({
+                "manifest": caps("events, models, assistant"), "allow_relax": true
+            }));
+            request.extensions_mut().insert(PresenceConfirmed(scope));
+            let denied = post_attached_at(State(state.clone()), request, &path).await;
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
         let mut approved = req(wider);
-        approved.extensions_mut().insert(PresenceConfirmed);
-        let r = post_attached_at(State(state), approved, &path).await;
+        approved.extensions_mut().insert(PresenceConfirmed(Some(
+            "new kernel_capabilities [assistant]".into(),
+        )));
+        let r = post_attached_at(State(state.clone()), approved, &path).await;
         assert_eq!(r.status(), StatusCode::OK);
+        // A dialog that named no widening still allows a registration that
+        // does not widen, including one that also carries allow_relax.
+        let mut same = req(serde_json::json!({
+            "manifest": caps("events, models, assistant"),
+            "allow_relax": true
+        }));
+        same.extensions_mut().insert(PresenceConfirmed(None));
+        let r = post_attached_at(State(state.clone()), same, &path).await;
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn a_presence_approved_first_registration_names_remote_allowed() {
+        let state = crate::server::tests::state().await;
+        let path = tmp_path();
+        let mut approved = req(serde_json::json!({
+            "manifest": relaxing_manifest("agentear"),
+            "allow_relax": true
+        }));
+        approved.extensions_mut().insert(PresenceConfirmed(Some(
+            "first registration with model_access remote_allowed".into(),
+        )));
+        let r = post_attached_at(State(state), approved, &path).await;
+        assert_eq!(r.status(), StatusCode::CREATED);
     }
 
     #[tokio::test]

@@ -32,6 +32,10 @@ struct Grant {
     challenge_id: String,
     token_id: String,
     target: Target,
+    /// §3.5 widening captured when the dialog was built. `None` when that
+    /// dialog named no widening, and for every grant that is not an attached
+    /// registration. Not parsed back out of the display sentence.
+    approved_scope: Option<String>,
     expires_at: Instant,
 }
 /// A presence summary the daemon derived from the rejected request's own
@@ -39,6 +43,9 @@ struct Grant {
 struct RequestSummary {
     target: Target,
     summary: String,
+    /// Same structured scope as [`Grant::approved_scope`], copied onto the
+    /// grant when the user allows the dialog.
+    approved_scope: Option<String>,
     expires_at: Instant,
 }
 
@@ -90,14 +97,15 @@ impl FirstPartyAuthority {
         let Ok(manifest) = agent24_domain::DomainOsManifest::from_yaml(&body.manifest) else {
             return;
         };
-        // In service mode this dialog is the host confirmation §3.5 asks for:
-        // approving a registration that widens privacy confirms the widening,
-        // so the text names it (`post_attached_at` honours the grant).
-        // A registry that cannot be read leaves no text: fail closed.
-        let Ok(widens) = relax(&body.manifest) else {
+        // Service mode: this dialog is the §3.5 confirmation. `scope` is the
+        // structured widening (`relaxation`'s text, or none). It is stored on
+        // the grant and handed to the handler as-is. The sentence is only
+        // what the user reads; nothing parses it back. A registry that cannot
+        // be read leaves no dialog, so nothing is approved.
+        let Ok(scope) = relax(&body.manifest) else {
             return;
         };
-        let widens = match widens {
+        let widens = match &scope {
             Some(what) => format!("; WIDENS PRIVACY ({what}) — allowing confirms it"),
             None => String::new(),
         };
@@ -129,6 +137,7 @@ impl FirstPartyAuthority {
                 body_sha256: body_digest(bytes),
             },
             summary,
+            scope,
         );
     }
     /// I-1: derive the presence summary for an iDoris install or connect
@@ -195,6 +204,7 @@ impl FirstPartyAuthority {
                 body_sha256: body_digest(bytes),
             },
             summary,
+            None,
         );
     }
     /// SL-4: the summary the daemon built from stored revisions for a rejected
@@ -217,6 +227,7 @@ impl FirstPartyAuthority {
                 body_sha256: body_digest(bytes),
             },
             summary,
+            None,
         );
     }
     /// K-B6: derive the presence summary for a Knowledge host change from the
@@ -253,6 +264,7 @@ impl FirstPartyAuthority {
                 body_sha256: body_digest(bytes),
             },
             summary,
+            None,
         );
     }
     /// K-B3b: keep a summary the daemon derived (`crate::elevation_summaries`)
@@ -289,6 +301,7 @@ impl FirstPartyAuthority {
                 body_sha256: body_digest(bytes),
             },
             summary,
+            None,
         );
     }
     /// Kernel consent: the summary lists the capabilities about to be stored.
@@ -310,9 +323,16 @@ impl FirstPartyAuthority {
                 body_sha256: body_digest(bytes),
             },
             summary,
+            None,
         );
     }
-    fn remember(&self, token_id: &str, target: Target, summary: String) {
+    fn remember(
+        &self,
+        token_id: &str,
+        target: Target,
+        summary: String,
+        approved_scope: Option<String>,
+    ) {
         // Defence in depth only: this caps `details`, not the dialog string.
         // The authoritative check is in `elevate()`, which measures the full
         // "{identifier} (pid {pid}) wants to: {details}" the desktop clips.
@@ -337,17 +357,25 @@ impl FirstPartyAuthority {
             RequestSummary {
                 target,
                 summary,
+                approved_scope,
                 expires_at: now + Duration::from_secs(GRANT_TTL),
             },
         );
     }
-    pub fn set_module_surfaces(&self, surfaces: Arc<Vec<super::delegation::ModuleSurface>>) {
-        if let Ok(mut slot) = self.module_surfaces.lock() {
-            *slot = surfaces;
-        }
+    /// Display text plus the structured §3.5 scope, for one remembered dialog.
+    fn remembered_dialog(
+        &self,
+        token_id: &str,
+        target: &Target,
+    ) -> Option<(String, Option<String>)> {
+        let summaries = self.request_summaries.lock().ok()?;
+        let summary = summaries
+            .get(token_id)
+            .filter(|s| s.expires_at > Instant::now() && s.target == *target)?;
+        Some((summary.summary.clone(), summary.approved_scope.clone()))
     }
-    fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
-        if matches!(
+    fn uses_remembered_summary(target: &Target) -> bool {
+        matches!(
             target.template.as_str(),
             "/api/v1/attached"
                 | "/api/v1/idoris/install"
@@ -357,14 +385,17 @@ impl FirstPartyAuthority {
                 | "/api/v1/host/knowledge/bindings/{binding_id}/credential"
                 | "/api/v1/os/{name}/kernel-consent"
         ) || derived_route(&target.method, &target.template)
-        {
+    }
+    pub fn set_module_surfaces(&self, surfaces: Arc<Vec<super::delegation::ModuleSurface>>) {
+        if let Ok(mut slot) = self.module_surfaces.lock() {
+            *slot = surfaces;
+        }
+    }
+    fn target_summary(&self, token_id: &str, target: &Target) -> Option<String> {
+        if Self::uses_remembered_summary(target) {
             return self
-                .request_summaries
-                .lock()
-                .ok()?
-                .get(token_id)
-                .filter(|s| s.expires_at > Instant::now() && s.target == *target)
-                .map(|s| s.summary.clone());
+                .remembered_dialog(token_id, target)
+                .map(|(summary, _)| summary);
         }
         if target.body_sha256 != body_digest(b"") {
             return None;
@@ -599,21 +630,32 @@ impl FirstPartyAuthority {
         })
     }
     pub fn consume(&self, secret: &str, token_id: &str, target: &Target, now: UnixSeconds) -> bool {
+        self.consume_approved(secret, token_id, target, now)
+            .is_some()
+    }
+    /// [`Self::consume`], returning the structured §3.5 scope stored when the
+    /// dialog was built. `None` means the grant was not consumed. A consumed
+    /// grant whose dialog named no widening (and every non-attached grant)
+    /// yields `approved_scope: None`.
+    pub fn consume_approved(
+        &self,
+        secret: &str,
+        token_id: &str,
+        target: &Target,
+        now: UnixSeconds,
+    ) -> Option<ConsumedGrant> {
         let Ok(token) = CapabilityToken::parse_bearer(secret) else {
-            return false;
+            return None;
         };
         // Linearize token liveness and grant consumption with revocation and
         // renewal. HTTP's earlier check alone leaves a revocation race.
         let Ok(mut state) = self.store.shared.state.lock() else {
-            return false;
+            return None;
         };
-        let Some(record) = state
+        let record = state
             .ids
             .get(token_id)
-            .and_then(|key| state.records.get(key))
-        else {
-            return false;
-        };
+            .and_then(|key| state.records.get(key))?;
         if record
             .claims
             .first_party
@@ -625,7 +667,7 @@ impl FirstPartyAuthority {
             }
             state.epoch = state.epoch.wrapping_add(1);
             let _ = self.store.shared.changed.send(state.epoch);
-            return false;
+            return None;
         }
         if record.claims.audience != Audience::FirstPartyShell
             || record.claims.first_party.is_none()
@@ -640,10 +682,10 @@ impl FirstPartyAuthority {
                 )
                 .is_err()
         {
-            return false;
+            return None;
         }
         let Ok(mut grants) = self.grants.lock() else {
-            return false;
+            return None;
         };
         grants.retain(|_, grant| grant.expires_at > Instant::now());
         let key = digest(&token);
@@ -652,12 +694,20 @@ impl FirstPartyAuthority {
             .is_some_and(|grant| grant.token_id == token_id && grant.target == *target);
         if valid && let Some(grant) = grants.remove(&key) {
             tracing::info!(event = "elevation_consumed", token_id, challenge_id = grant.challenge_id, operation = ?target.operation, method = target.method, path = target.path, body_sha256 = target.body_sha256);
-        } else if !valid {
-            tracing::info!(event = "elevation_rejected", token_id, operation = ?target.operation, reason = "invalid_or_expired");
+            return Some(ConsumedGrant {
+                approved_scope: grant.approved_scope,
+            });
         }
-        valid
+        tracing::info!(event = "elevation_rejected", token_id, operation = ?target.operation, reason = "invalid_or_expired");
+        None
     }
 }
+/// A presence grant that was just consumed.
+pub(crate) struct ConsumedGrant {
+    /// §3.5 widening captured when the dialog was built, if it named one.
+    pub approved_scope: Option<String>,
+}
+
 pub(crate) fn peer_live(peer: &EnrolledPeer) -> bool {
     let audit_live = match peer.identity.audit_token {
         Some(token) => {
@@ -806,9 +856,16 @@ impl EnrollAuthority for FirstPartyAuthority {
         let challenge_id = random_capability_id()[..16].to_owned();
         let expires_at = unix_now() + GRANT_TTL;
         let deadline = Instant::now() + Duration::from_secs(GRANT_TTL);
-        let details = self
-            .target_summary(id, &target)
-            .ok_or(EnrollErrorCode::NotElevatedOperation)?;
+        let (details, approved_scope) = if Self::uses_remembered_summary(&target) {
+            self.remembered_dialog(id, &target)
+                .ok_or(EnrollErrorCode::NotElevatedOperation)?
+        } else {
+            (
+                self.target_summary(id, &target)
+                    .ok_or(EnrollErrorCode::NotElevatedOperation)?,
+                None,
+            )
+        };
         let kind = super::presence::RequesterKind::of_executable(&peer.identity.executable);
         let summary = format!(
             "{} ({}, pid {}) wants to: {}",
@@ -869,6 +926,7 @@ impl EnrollAuthority for FirstPartyAuthority {
                 challenge_id: challenge_id.clone(),
                 token_id: id.to_owned(),
                 target,
+                approved_scope,
                 expires_at: now + Duration::from_secs(GRANT_TTL),
             },
         );
