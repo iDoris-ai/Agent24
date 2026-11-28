@@ -56,6 +56,14 @@ const DELEGATION_CODES = new Set([
   'presence_timeout',
   'presence_unavailable',
 ])
+const TASK_ID = /^[A-Za-z0-9_-]{1,80}$/
+
+/** Capture returns the task itself. Anything else is not an id, so we do not evaluate the whole queue. */
+function capturedTaskId(data: unknown): string | null {
+  if (typeof data !== 'object' || data === null) return null
+  const value = (data as { id?: unknown }).id
+  return typeof value === 'string' && TASK_ID.test(value) ? value : null
+}
 
 export function Sin90Page() {
   const t = useT(sin90Messages)
@@ -80,7 +88,6 @@ export function Sin90Page() {
   const [confirmAction, setConfirmAction] = useState<ConfirmState | null>(null)
 
   const [layer, setLayer] = useState<Layer>('today')
-  const [todayView, setTodayView] = useState<'overview' | 'quadrants'>('overview')
   const [today, setToday] = useState<Sin90Today | null>(null)
   const [areas, setAreas] = useState<Sin90Area[]>([])
   const [groups, setGroups] = useState<DirectionGroup[] | null>(null)
@@ -113,6 +120,8 @@ export function Sin90Page() {
   const [busy, setBusy] = useState(false)
   const [proposalsOpen, setProposalsOpen] = useState(false)
   const seq = useRef(0)
+  const selectedRef = useRef<string | null>(null)
+  selectedRef.current = selected
   const load = useCallback((directionId: string | null) => {
     const token = ++seq.current
     setFailure(null)
@@ -128,26 +137,33 @@ export function Sin90Page() {
         if (token !== seq.current) return
         const visibleDirections = d.filter((item) => item.id !== 'sin90-triage')
         const gs = groupDirections(a, visibleDirections)
-        const chosen = directionId && d.some((item) => item.id === directionId) ? directionId : firstDirectionId(gs)
+        const still = (id: string | null) => id !== null && d.some((item) => item.id === id)
+        const chosen = still(selectedRef.current) ? selectedRef.current : still(directionId) ? directionId : firstDirectionId(gs)
         // Week data loads even with no direction yet, so a new user can open a week.
         const [ts, data, progressRows, settings] = await Promise.all([chosen ? fetchTasks(chosen) : Promise.resolve([] as Awaited<ReturnType<typeof fetchTasks>>), Promise.all([fetchWeeks(), fetchBlocks(), fetchRoutines(), fetchRhythms(), fetchProposals(), fetchReviews()]), Promise.all(visibleDirections.map((item) => fetchProgress(item.id).catch(() => []))).then((rows) => rows.flat()), fetchReviewSettings().catch(() => ({ auto: true, cadence: 'weekly' as const, weekday: 7, hour: 18 }))])
         const [ws, bs, rs, rys, ps, revs] = data
         const wk = currentWeek(ws, isoWeekUTC(new Date()))
         const att = wk ? await fetchWeekAttention(wk.id).catch(() => null) : null
         if (token !== seq.current) return
-        setToday(td); setAreas(a); setGroups(gs); setDirections(visibleDirections); setSelected(chosen); setTasks([...ts]); setWeeks([...ws]); setBlocks([...bs]); setRoutines([...rs]); setRhythms([...rys]); setProposals([...ps]); setReviews([...revs]); setAttention(att); setPeriodPlans(pp); setProgress(progressRows); setReviewSettings(settings)
+        // A refresh that started earlier must not snap the direction the user has since picked.
+        const latest = still(selectedRef.current) ? selectedRef.current : chosen
+        const taskRows = latest === chosen ? ts : latest ? await fetchTasks(latest) : []
+        if (token !== seq.current) return
+        setToday(td); setAreas(a); setGroups(gs); setDirections(visibleDirections); setSelected(latest); setTasks([...taskRows]); setWeeks([...ws]); setBlocks([...bs]); setRoutines([...rs]); setRhythms([...rys]); setProposals([...ps]); setReviews([...revs]); setAttention(att); setPeriodPlans(pp); setProgress(progressRows); setReviewSettings(settings)
         if (ds) setDataStatus(ds)
       } catch (err) { if (token === seq.current) setFailure(err instanceof Error ? err.message : 'Could not load Sin90.') }
     })()
   }, [])
   useEffect(() => { load(null) }, [load])
-  const selectedRef = useRef<string | null>(null); selectedRef.current = selected
   useEffect(() => { const listen = window.agent24.onSin90Event; if (!listen) return; return listen((event) => { if (sin90ShouldRefresh(event.kind)) load(selectedRef.current) }) }, [load])
   useEffect(() => { let live = true; void writesAvailable().then((available) => { if (live) setCanWrite(available) }); return () => { live = false } }, [])
+  const reportWriteError = (err: unknown) => {
+    setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError'))
+  }
   const write = (body: Record<string, unknown>) => {
     if (!canWrite || busy) return
     setBusy(true); setFailure(null)
-    void sin90Write(body).then(() => { if (body['op'] === 'capture') setNote(''); load(selected) }).catch((err: unknown) => { setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) }).finally(() => setBusy(false))
+    void sin90Write(body).then(() => { load(selectedRef.current) }).catch(reportWriteError).finally(() => setBusy(false))
   }
   const enabled = canWrite && !busy
   const direction = directions.find((item) => item.id === selected) ?? null
@@ -161,7 +177,7 @@ export function Sin90Page() {
   const acceptAll = () => {
     if (!canWrite || busy) return
     setBusy(true); setFailure(null)
-    void (async () => { try { for (const proposal of pending) await sin90Write({ op: 'acceptProposal', id: proposal.id }) } catch (err) { setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) } finally { setBusy(false); load(selected) } })()
+    void (async () => { try { for (const proposal of pending) await sin90Write({ op: 'acceptProposal', id: proposal.id }) } catch (err) { reportWriteError(err) } finally { setBusy(false); load(selectedRef.current) } })()
   }
   const completeTask = (task: Sin90Task) => {
     if (!canWrite || busy) return
@@ -169,9 +185,38 @@ export function Sin90Page() {
     const path = paths[task.status]
     if (!path) { setFailure(t('taskNoCompletePath')); return }
     setBusy(true); setFailure(null)
-    void (async () => { try { for (const to of path) await sin90Write({ op: 'transitionTask', id: task.id, to }) } catch (err) { setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError')) } finally { setBusy(false); load(selected) } })()
+    void (async () => { try { for (const to of path) await sin90Write({ op: 'transitionTask', id: task.id, to }) } catch (err) { reportWriteError(err) } finally { setBusy(false); load(selectedRef.current) } })()
   }
-  const capture = () => { if (note.trim()) write({ op: 'capture', text: note }) }
+  const capture = () => {
+    const text = note.trim()
+    if (!canWrite || busy || !text) return
+    setBusy(true)
+    setFailure(null)
+    void (async () => {
+      let saved: unknown
+      try {
+        saved = await sin90Write({ op: 'capture', text })
+      } catch (err) {
+        reportWriteError(err)
+        setBusy(false)
+        return
+      }
+      setNote((current) => current.trim() === text ? '' : current)
+      setBusy(false)
+      load(selectedRef.current)
+      const taskId = capturedTaskId(saved)
+      let evalError: unknown = null
+      if (taskId) {
+        try {
+          await sin90Write({ op: 'evaluatePriority', id: taskId })
+        } catch (err) {
+          evalError = err
+        }
+      }
+      load(selectedRef.current)
+      if (evalError) reportWriteError(evalError)
+    })()
+  }
   const reviewMode = layer === 'review'
 
   const onBannerClear = () => {
@@ -215,7 +260,7 @@ export function Sin90Page() {
         setBusy(true)
         setFailure(null)
         void importFromFile()
-          .then(() => load(selected))
+          .then(() => load(selectedRef.current))
           .catch((err: unknown) => {
             setFailure(err instanceof WriteFailed && DELEGATION_CODES.has(err.code) ? t('error.moduleDelegation') : err instanceof Error ? err.message : t('loadError'))
           })
@@ -430,18 +475,22 @@ export function Sin90Page() {
     )}
 
     {layer === 'today' && today && <div className="sin90-view">
-      <p className="sin90-capture-hint">{t('captureHint')}</p><form className="sin90-capture" onSubmit={(event) => { event.preventDefault(); capture() }}><TextField label={t('captureLabel')} placeholder={t('capturePlaceholder')} value={note} onChange={(event) => setNote(event.target.value)} /><Button type="submit" variant="primary" aria-label={t('capture')} disabled={!enabled || !note.trim()}>{t('capture')} ↵</Button></form>
-      <SegmentedTabs label={t('todayViews')} tabs={[{ value: 'overview', label: t('overview') }, { value: 'quadrants', label: t('quadrants') }]} value={todayView} onChange={(value) => { if (value === 'overview' || value === 'quadrants') setTodayView(value) }} />
-      {todayView === 'quadrants' ? <><PriorityBoard today={today} enabled={enabled} write={write} complete={completeTask} /><CompletionMaterial revision={today} enabled={enabled} write={write} /></> : <>
-      <div className="sin90-columns">
+      <div className="sin90-today-top">
         <section className="sin90-stack">
-          <Card title={t('nextBlock')}><p className="sin90-muted">{today.deep_block ? <><strong>{today.deep_block.task_id ? taskTitle(today.deep_block.task_id) : dirTitle(today.deep_block.direction_id ?? '')}</strong><br />{today.deep_block.direction_id ? dirTitle(today.deep_block.direction_id) : tasks.find((task) => task.id === today.deep_block?.task_id)?.direction_id ? dirTitle(tasks.find((task) => task.id === today.deep_block?.task_id)?.direction_id ?? '') : ''} · {today.deep_block.planned_minutes} {t('minuteUnit')} · {t('queueBlock', { index: Math.max(1, blocks.findIndex((b) => b.id === today.deep_block?.id) + 1) })}</> : t('emptyFocus')}</p>{today.deep_block?.status === 'planned' && <Button variant="primary" disabled={!enabled} onClick={() => write({ op: 'transitionBlock', id: today.deep_block?.id, to: 'started' })}>{t('action.started')}</Button>}</Card>
+          <p className="sin90-capture-hint">{t('captureHint')}</p>
+          <form className="sin90-capture" onSubmit={(event) => { event.preventDefault(); capture() }}><TextField label={t('captureLabel')} placeholder={t('capturePlaceholder')} value={note} onChange={(event) => setNote(event.target.value)} /><Button type="submit" variant="primary" aria-label={t('capture')} disabled={!enabled || !note.trim()}>{t('capture')} ↵</Button></form>
+        </section>
+        <Card title={t('nextBlock')}><p className="sin90-muted">{today.deep_block ? <><strong>{today.deep_block.task_id ? taskTitle(today.deep_block.task_id) : dirTitle(today.deep_block.direction_id ?? '')}</strong><br />{today.deep_block.direction_id ? dirTitle(today.deep_block.direction_id) : tasks.find((task) => task.id === today.deep_block?.task_id)?.direction_id ? dirTitle(tasks.find((task) => task.id === today.deep_block?.task_id)?.direction_id ?? '') : ''} · {today.deep_block.planned_minutes} {t('minuteUnit')} · {t('queueBlock', { index: Math.max(1, blocks.findIndex((b) => b.id === today.deep_block?.id) + 1) })}</> : t('emptyFocus')}</p>{today.deep_block?.status === 'planned' && <Button variant="primary" disabled={!enabled} onClick={() => write({ op: 'transitionBlock', id: today.deep_block?.id, to: 'started' })}>{t('action.started')}</Button>}</Card>
+      </div>
+      <PriorityBoard today={today} enabled={enabled} write={write} complete={completeTask} />
+      <h2>{t('overview')}</h2>
+      <div className="sin90-today-overview">
+        <section className="sin90-stack">
           <Card title={t('mustDo')}><ul className="sin90-queue">{today.must_do.map((task) => <li key={task.id} aria-label={task.title} className="sin90-task-row"><button type="button" className="sin90-check" aria-label={taskLabel(t, task.status) === t('task.done') ? t('task.done') : t('action.done')} disabled={!enabled || task.status === 'done'} onClick={() => completeTask(task)}>{task.status === 'done' ? '✓' : ''}</button><span className={task.status === 'done' ? 'sin90-task-done' : ''}>{task.title}</span><span className="sin90-task-direction" title={directions.find((item) => item.id === task.direction_id)?.title ?? t('uncategorized')}>{directions.find((item) => item.id === task.direction_id)?.title ?? t('uncategorized')}</span><details className="sin90-menu"><summary aria-label={t('taskActions')}>⋯</summary><div>{taskTransitions(task.status).filter((to) => to !== 'done').map((to) => <button key={to} type="button" disabled={!enabled} onClick={() => write({ op: 'transitionTask', id: task.id, to })}>{to === 'planned' ? t('taskSchedule') : to === 'in_progress' ? t('taskStart') : to === 'dropped' ? t('taskDrop') : t('action.done')}</button>)}</div></details></li>)}</ul>{today.must_do.length === 0 && <EmptyState description={t('none')} action={null} />}</Card>
           <Card title={t('inbox')}><ul className="sin90-queue">{today.inbox.map((task) => <li key={task.id}>{task.title}</li>)}</ul>{today.inbox.length === 0 && <EmptyState description={t('none')} action={null} />}{pending.some((p) => p.ops.some((op) => opKind(op) === 'assign_task_direction')) && <div className="sin90-actions"><Badge tone="accent">{t('classified')}</Badge><Button variant="primary" disabled={!enabled} onClick={acceptAll}>{t('acceptAll')}</Button><Button onClick={() => { setLayer('today'); setProposalsOpen(true) }}>{t('reviewOneByOne')}</Button></div>}</Card>
         </section>
         <aside className="sin90-stack"><Card title={t('weekSummary')} actions={<Button size="sm" onClick={() => setLayer('rhythm')}>{t('seeWeek')}</Button>}>{week ? <><p>{t('thisWeek', { week: week.iso_week })}</p><p>{attentionText ?? t('attentionUnavailable')}</p></> : <p className="sin90-muted">{t('noWeek')}</p>}</Card><Card title={t('directions')}><ul className="sin90-queue">{directions.slice(0, 4).map((item) => <li key={item.id}>{item.title}<Badge tone="accent">{item.target_window === 'n/a' ? t('window.na') : item.target_window === 'ongoing' ? t('window.ongoing') : item.target_window}</Badge></li>)}</ul>{directions.length === 0 && <EmptyState description={t('noDirections')} action={null} />}</Card></aside>
       </div>
-      </>}
     </div>}
 
     {layer === 'direction' && groups && <div className="sin90-view"><div className="sin90-intro"><h2>{t('systemsTitle')}</h2></div>{areas.length === 0 && <Card title={t('systemsEmptyTitle')}><p>{t('systemsEmpty')}</p><Button variant="primary" disabled={!enabled} onClick={() => write({ op: 'installPack' })}>{t('installSystems')}</Button></Card>}<div className="sin90-area-grid">{groupDirections(areas, directions).map((group) => { const area = areas.find((item) => item.id === group.areaId); const draft = area ? areaDrafts[area.id] ?? { current: area.current_state ?? '', ideal: area.ideal_state ?? '' } : null; return <Card key={group.areaId ?? 'loose'} title={group.title ?? t('uncategorized')}>{area && <section className="sin90-area-state"><div className="sin90-area-state-lines"><p><span>{t('currentState')}</span> {area.current_state || '—'}</p><p><span>{t('idealState')}</span> {area.ideal_state || '—'}</p></div><Button size="sm" onClick={() => { setAreaDrafts((rows) => ({ ...rows, [area.id]: { current: area.current_state ?? '', ideal: area.ideal_state ?? '' } })); setAreaEditing((rows) => ({ ...rows, [area.id]: true })) }}>{t('edit')}</Button>{areaEditing[area.id] && draft && <div className="sin90-detail sin90-area-edit"><TextField id={`${area.id}-current`} label={t('currentState')} value={draft.current} onChange={(event) => setAreaDrafts((rows) => ({ ...rows, [area.id]: { ...draft, current: event.target.value } }))} /><TextField id={`${area.id}-ideal`} label={t('idealState')} value={draft.ideal} onChange={(event) => setAreaDrafts((rows) => ({ ...rows, [area.id]: { ...draft, ideal: event.target.value } }))} /><Button size="sm" disabled={!enabled} onClick={() => { setAreas((rows) => rows.map((row) => row.id === area.id ? { ...row, current_state: draft.current, ideal_state: draft.ideal } : row)); setAreaEditing((rows) => ({ ...rows, [area.id]: false })); write({ op: 'updateArea', id: area.id, current_state: draft.current || null, ideal_state: draft.ideal || null }) }}>{t('save')}</Button><Button size="sm" onClick={() => setAreaEditing((rows) => ({ ...rows, [area.id]: false }))}>{t('cancel')}</Button></div>}</section>}<ul className="sin90-queue">{group.directions.map((item) => { const plans = periodPlans.filter((plan) => plan.direction_id === item.id); const parents = legalPlanParents(planKind, planPeriod, plans, item.id); const yearNow = new Date().getFullYear(); const years = [yearNow, yearNow + 1, yearNow + 2].map((year) => plans.find((plan) => plan.kind === 'year' && Number(plan.period) === year)); const shown = plans.filter((plan) => plan.kind === 'year' ? Number(plan.period) >= yearNow && Number(plan.period) <= yearNow + 2 : plan.kind === 'quarter' ? plan.period === `${yearNow}-Q${Math.floor(new Date().getMonth() / 3) + 1}` : plan.kind === 'month' ? plan.period === `${yearNow}-${String(new Date().getMonth() + 1).padStart(2, '0')}` : plan.kind === 'half' && plan.period.startsWith(String(yearNow))); return <li className="sin90-direction-editor" key={item.id}><div className="sin90-direction-heading"><strong>{item.title}</strong><Badge>{item.target_window === 'n/a' ? t('window.na') : item.target_window === 'ongoing' ? t('window.ongoing') : item.target_window}</Badge></div><p className="sin90-three-year-goal"><strong>{t('threeYearGoal')}：</strong>{item.goal_3y || '—'}</p><div className="sin90-year-progress">{years.map((plan, index) => { const state = plan && progress.find((row) => row.plan_id === plan.id); return <div className="sin90-year-progress-item" key={index}><strong>{t(index === 0 ? 'thisYear' : index === 1 ? 'nextYear' : 'yearAfterNext')}</strong><span>{plan?.target || '—'}</span><div className="sin90-progress-track" role="progressbar" aria-label={`${t(index === 0 ? 'thisYear' : index === 1 ? 'nextYear' : 'yearAfterNext')} ${t('progress')}`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={state?.expected && state.actual !== null ? Math.max(0, Math.min(100, Math.round(state.actual / state.expected * 100))) : 0}><span style={{ width: `${state?.expected && state.actual !== null ? Math.max(0, Math.min(100, Math.round(state.actual / state.expected * 100))) : 0}%` }} /></div><small>{plan ? progressLabel(t, state?.status ?? 'on_track') : t('noPlan')}</small></div> })}</div><details><summary className="sin90-plan-edit-toggle">{t('editPlans')}</summary><div className="sin90-direction-content"><div className="sin90-detail"><TextField id={`${item.id}-goal-3y`} label={t('threeYearGoal')} value={item.goal_3y ?? ''} onChange={(event) => setDirections((rows) => rows.map((row) => row.id === item.id ? { ...row, goal_3y: event.target.value } : row))} /><TextField id={`${item.id}-goal-from-year`} label={t('goalFromYear')} inputMode="numeric" value={item.goal_from_year ?? ''} onChange={(event) => setDirections((rows) => rows.map((row) => row.id === item.id ? { ...row, goal_from_year: event.target.value ? Number(event.target.value) : null } : row))} /><Button size="sm" disabled={!enabled} onClick={() => write({ op: 'updateDirection', id: item.id, goal3y: item.goal_3y || null, goalFromYear: item.goal_from_year ?? null })}>{t('save')}</Button></div><ul className="sin90-queue">{shown.map((plan) => { const state = progress.find((row) => row.plan_id === plan.id); return <li key={plan.id}><span><strong>{t(`period.${plan.kind}`)} · {plan.period}</strong><TextField id={`${plan.id}-target-edit`} label={t('planTarget')} value={planEdits[plan.id]?.target ?? plan.target} onChange={(event) => setPlanEdits((rows) => ({ ...rows, [plan.id]: { target: event.target.value, metricTarget: rows[plan.id]?.metricTarget ?? String(plan.metric_target ?? '') } }))} /><TextField id={`${plan.id}-metric-edit`} label={t('metricTarget')} inputMode="numeric" value={planEdits[plan.id]?.metricTarget ?? String(plan.metric_target ?? '')} onChange={(event) => setPlanEdits((rows) => ({ ...rows, [plan.id]: { target: rows[plan.id]?.target ?? plan.target, metricTarget: event.target.value } }))} /></span><Badge tone={state?.status === 'at_risk' ? 'danger' : state?.status === 'behind' ? 'warning' : 'accent'}>{progressLabel(t, state?.status ?? 'on_track')}{state?.status === 'at_risk' ? ` · ${t('missWeeks', { weeks: state.miss_streak })}` : ''}</Badge><Button size="sm" disabled={!enabled} onClick={() => write({ op: 'updatePeriodPlan', id: plan.id, target: planEdits[plan.id]?.target ?? plan.target, metricTarget: planEdits[plan.id]?.metricTarget === '' ? null : Number(planEdits[plan.id]?.metricTarget ?? plan.metric_target) })}>{t('save')}</Button><Button size="sm" disabled={!enabled} onClick={() => write({ op: 'updatePeriodPlan', id: plan.id, status: 'dropped' })}>{t('drop')}</Button></li> })}</ul><div className="sin90-detail"><Select id={`${item.id}-plan-kind`} label={t('planLevel')} value={planKind} onChange={(event) => { const next = event.target.value as typeof planKind; const now = new Date(); const year = now.getFullYear(); setPlanKind(next); setPlanPeriod(next === 'year' ? String(year) : next === 'half' ? `${year}-H${now.getMonth() < 6 ? 1 : 2}` : next === 'quarter' ? `${year}-Q${Math.floor(now.getMonth() / 3) + 1}` : `${year}-${String(now.getMonth() + 1).padStart(2, '0')}`); setPlanParent('') }}>{(['year','half','quarter','month'] as const).map((kind) => <option key={kind} value={kind}>{t(`period.${kind}`)}</option>)}</Select><TextField id={`${item.id}-plan-period`} label={t('planPeriod')} value={planPeriod} onChange={(event) => setPlanPeriod(event.target.value)} /><Select id={`${item.id}-plan-parent`} label={t('planParent')} value={planParent} onChange={(event) => setPlanParent(event.target.value)}><option value="">{t('noParent')}</option>{parents.map((parent) => <option key={parent.id} value={parent.id}>{parent.period} · {parent.target}</option>)}</Select><TextField id={`${item.id}-new-plan-target`} label={t('planTarget')} value={planTarget} onChange={(event) => setPlanTarget(event.target.value)} /><Select id={`${item.id}-plan-metric`} label={t('planMetric')} value={planMetric} onChange={(event) => setPlanMetric(event.target.value as typeof planMetric)}><option value="none">{t('noNumber')}</option><option value="count">{t('count')}</option><option value="minutes">{t('minuteUnit')}</option></Select><TextField id={`${item.id}-plan-metric-target`} label={t('metricTarget')} inputMode="numeric" value={planMetricTarget} onChange={(event) => setPlanMetricTarget(event.target.value)} /><Button size="sm" disabled={!enabled || !planTarget.trim() || (planKind !== 'year' && !planParent)} onClick={() => write({ op: 'createPeriodPlan', directionId: item.id, kind: planKind, period: planPeriod, parentId: planParent || null, target: planTarget, metric: planMetric, metricTarget: planMetricTarget ? Number(planMetricTarget) : null })}>{t('addPlan')}</Button></div></div></details></li> })}</ul></Card> })}</div>{groups.length === 0 && areas.length > 0 && <EmptyState description={t('noDirections')} action={null} />}</div>}
