@@ -85,7 +85,16 @@ export async function performSin90Write(req: unknown, caller: Sin90Caller): Prom
     case 'evaluatePriority': {
       const advice = req['advice']
       if (advice !== undefined && typeof advice !== 'string') return bad()
-      return caller.request(route('POST', '/api/v1/sin90/ai/priority/evaluate', advice === undefined ? {} : { advice }), human)
+      // A present id is targeted. Dropping a bad id would evaluate every unfinished task.
+      if ('taskIds' in req || 'task_ids' in req) return bad()
+      const body: Record<string, unknown> = {}
+      if ('id' in req) {
+        const task = id(req['id'])
+        if (!task) return bad()
+        body['task_ids'] = [task]
+      }
+      if (advice !== undefined) body['advice'] = advice
+      return caller.request(route('POST', '/api/v1/sin90/ai/priority/evaluate', body), human)
     }
     case 'overridePriority': {
       const task = id(req['id'])

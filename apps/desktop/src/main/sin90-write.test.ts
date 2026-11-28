@@ -234,6 +234,28 @@ describe('Sin90 loop contract writes', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
+  it('evaluates only the captured task ids and still attaches the human key', async () => {
+    const { api, request } = caller(true)
+    await performSin90Write({ op: 'evaluatePriority', id: 'task_1' }, api)
+    await performSin90Write({ op: 'evaluatePriority', id: 'task_1', advice: '先安排用户访谈' }, api)
+    expect(request.mock.calls).toEqual([
+      [{ method: 'POST', path: '/api/v1/sin90/ai/priority/evaluate', body: { task_ids: ['task_1'] } }, HUMAN],
+      [{ method: 'POST', path: '/api/v1/sin90/ai/priority/evaluate', body: { task_ids: ['task_1'], advice: '先安排用户访谈' } }, HUMAN],
+    ])
+  })
+
+  it('refuses a targeted evaluation that would fall back to every unfinished task', async () => {
+    const { api, request } = caller(true)
+    for (const body of [
+      { op: 'evaluatePriority', id: '' },
+      { op: 'evaluatePriority', id: '../x' },
+      { op: 'evaluatePriority', id: 'task_1', taskIds: ['task_2'] },
+      { op: 'evaluatePriority', taskIds: [] },
+      { op: 'evaluatePriority', task_ids: [] },
+    ]) expect((await performSin90Write(body, api)).ok).toBe(false)
+    expect(request).not.toHaveBeenCalled()
+  })
+
   it('rejects invalid quadrants and refuses loop writes without a human key', async () => {
     const { api, request } = caller(true)
     expect((await performSin90Write({ op: 'overridePriority', id: 't1', quadrant: 'urgent', rationale: '' }, api)).ok).toBe(false)
