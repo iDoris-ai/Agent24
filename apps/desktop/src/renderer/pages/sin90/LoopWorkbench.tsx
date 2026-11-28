@@ -16,6 +16,7 @@ export function PriorityBoard({ today, enabled, write, complete }: {
   const [priorities, setPriorities] = useState<Map<string, Priority | null>>(new Map())
   const [loading, setLoading] = useState(true)
   const [advice, setAdvice] = useState('')
+  const [panelOpen, setPanelOpen] = useState(false)
   useEffect(() => {
     let live = true
     setLoading(true)
@@ -29,9 +30,18 @@ export function PriorityBoard({ today, enabled, write, complete }: {
     return () => { live = false }
   }, [today])
   const supported = [...priorities.values()].some((priority) => priority !== null)
+  const canEvaluate = enabled && !loading && supported
+  const submitEvaluation = () => {
+    const background = advice.trim()
+    write({ op: 'evaluatePriority', ...(background ? { advice: background } : {}) })
+  }
   return <section aria-label={t('priorityBoard')} className="sin90-stack">
-    <div className="sin90-row"><h2>{t('priorityBoard')}</h2><Button disabled={!enabled || loading || !supported} onClick={() => write({ op: 'evaluatePriority', ...(advice.trim() ? { advice } : {}) })}>{t('evaluatePriority')}</Button></div>
-    <TextArea id="priority-advice" label={t('priorityAdvice')} value={advice} disabled={!enabled || loading || !supported} onChange={(event) => setAdvice(event.target.value)} />
+    <div className="sin90-row"><h2>{t('priorityBoard')}</h2><Button aria-expanded={panelOpen} disabled={!canEvaluate} onClick={() => setPanelOpen(!panelOpen)}>{t('evaluatePriority')}</Button></div>
+    {panelOpen && <div className="sin90-priority-panel" role="region" aria-label={t('evaluatePriority')}>
+      <p className="sin90-muted">{t('priorityPanelNote')}</p>
+      <TextArea id="priority-advice" label={t('priorityAdvice')} value={advice} disabled={!canEvaluate} onChange={(event) => setAdvice(event.target.value)} />
+      <div className="sin90-actions"><Button variant="primary" disabled={!canEvaluate} onClick={submitEvaluation}>{t('startEvaluation')}</Button><Button disabled={!enabled} onClick={() => { setPanelOpen(false); setAdvice('') }}>{t('cancel')}</Button></div>
+    </div>}
     {loading ? <p role="status">{t('loading')}</p> : <>
       {!supported && <p className="sin90-muted">{t('priorityUnavailable')}</p>}
       <div className="sin90-quadrants">{[...quadrants, 'unevaluated' as const].map((quadrant) => {

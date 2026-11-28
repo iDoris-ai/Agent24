@@ -91,6 +91,8 @@
 .sin90-progress-track { height: 5px; overflow: hidden; border-radius: 999px; background: var(--border); }
 .sin90-progress-track > span { display: block; height: 100%; border-radius: inherit; background: var(--accent); }
 
+.sin90-priority-panel { display: flex; flex-direction: column; gap: 8px; max-width: 28rem; padding: 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface2); }
+.sin90-priority-panel .sin90-actions { margin-top: 0; }
 .sin90-quadrants { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
 .sin90-quadrant { min-width: 0; border-top: 4px solid var(--quadrant-color); border-radius: 8px; padding: 16px; background: var(--surface2); background: color-mix(in srgb, var(--quadrant-color) 10%, var(--surface)); }
 .sin90-quadrant h3 { margin: 0 0 6px; color: var(--text); }
