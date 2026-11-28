@@ -162,7 +162,14 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
         .collect();
     assert_eq!(
         ids,
-        ["idoris", "hyphae", "documents", "knowledge", "open-design"]
+        [
+            "idoris",
+            "hyphae",
+            "documents",
+            "knowledge",
+            "open-design",
+            "weknora-lite"
+        ]
     );
     let idoris = find(&body, "idoris");
     assert_eq!(idoris["form"], "resident");
@@ -199,6 +206,11 @@ async fn the_host_sees_everything_and_open_design_is_absent_until_reported() {
             od["reason"].as_str()
         ),
         (Some("absent"), Some("sidecar"), Some("not_reported"))
+    );
+    let lite = find(&body, "weknora-lite");
+    assert_eq!(
+        (lite["state"].as_str(), lite["form"].as_str()),
+        (Some("absent"), Some("sidecar"))
     );
     assert_eq!(find(&body, "knowledge")["state"], "stopped");
     assert_eq!(find(&body, "documents")["state"], "absent");
@@ -1510,6 +1522,18 @@ fn a_report_expires_after_the_ttl_and_the_next_one_is_a_baseline() {
         reports.report("idoris", body(ComponentState::Ready), t0),
         Err(ReportError::UnknownComponent)
     );
+    // KB-LITE-02: the local knowledge base's Lite is the desktop's to report too.
+    reports
+        .report("weknora-lite", body(ComponentState::Starting), t0)
+        .unwrap();
+    assert_eq!(
+        reports.current("weknora-lite", t0).map(|r| r.state),
+        Some(ComponentState::Starting)
+    );
+    assert_eq!(
+        reports.report("weknora", body(ComponentState::Ready), t0),
+        Err(ReportError::UnknownComponent)
+    );
 }
 
 #[test]
@@ -1817,6 +1841,7 @@ async fn domain_os_and_mcp_show_up_with_a_list_and_a_d5_state() {
             "sin90",
             "knowledge",
             "open-design",
+            "weknora-lite",
             "mcp-bad-00000001",
             "mcp-files",
         ]
@@ -2016,9 +2041,9 @@ async fn component_ids_are_unique_across_builtin_attach_os_and_mcp() {
     ] {
         assert!(ids.iter().any(|i| i == id), "{id} missing from {ids:?}");
     }
-    // 5 builtins + attach + 3 os rows (the two builtin-named packages are
-    // dropped) + 1 mcp row = 10. Nothing was swallowed by the dedupe.
-    assert_eq!(ids.len(), 10, "{ids:?}");
+    // 6 builtins + attach + 3 os rows (the two builtin-named packages are
+    // dropped) + 1 mcp row = 11. Nothing was swallowed by the dedupe.
+    assert_eq!(ids.len(), 11, "{ids:?}");
     assert_eq!(find(&body, "agentear")["form"], "attach");
 }
 
@@ -4332,6 +4357,7 @@ const DOC_TOOLS: &[&str] = &[
     "documents.list",
     "documents.paragraphs",
     "documents.patch",
+    "documents.preflight",
     "documents.read_range",
 ];
 

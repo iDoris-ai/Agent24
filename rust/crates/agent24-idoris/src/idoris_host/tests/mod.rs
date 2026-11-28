@@ -599,6 +599,84 @@ async fn terminal_child_failure_closes_gateway_and_updates_status() {
     f.assert_clean();
 }
 
+/// FU-254: a generation that stops by itself (orphan expiry is exit 4) while the
+/// user still wants iDoris running is started again without a manual connect.
+#[tokio::test]
+async fn self_stopped_generation_is_started_again() {
+    let f = Fixture::new().await;
+    f.install().await;
+    f.scenario(json!({"mode":"exit_after_ready", "wait_for_exit":true, "after":0.0, "code":4}));
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
+    // The next generation reads a healthy scenario. Release the exit only once
+    // this generation has run past the restart threshold.
+    f.scenario(json!({}));
+    tokio::time::sleep(AUTO_RESTART_MIN_UPTIME + Duration::from_millis(200)).await;
+    fs::write(f.host.root.join("data/state/release-exit"), "exit").unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let starts = f
+                .host
+                .inner
+                .lock()
+                .await
+                .operations
+                .values()
+                .filter(|o| o.action == Action::Start && o.result == Some(Outcome::Succeeded))
+                .count();
+            if starts == 2 && f.host.status().await.state == State::Running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("iDoris was not started again after it stopped by itself");
+    assert!(router_gateway(&f.router).is_ok());
+    let stop = f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(f.complete(&stop).await.result, Some(Outcome::Succeeded));
+    f.assert_clean();
+}
+
+/// A generation that stops right after starting is not restarted (no loop),
+/// and one the user stopped stays stopped.
+#[tokio::test]
+async fn early_self_stop_is_not_restarted() {
+    let f = Fixture::new().await;
+    f.install().await;
+    f.scenario(json!({"mode":"exit_after_ready", "after":1.0, "code":4}));
+    let op = f.host.submit(Action::Start, None).await.unwrap();
+    assert_eq!(f.complete(&op).await.result, Some(Outcome::Succeeded));
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while f.host.status().await.state != State::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(f.host.status().await.state, State::Stopped);
+    assert_eq!(f.host.inner.lock().await.operations.len(), 1);
+    f.assert_clean();
+}
+
+/// An automatic restart that loses the race to a user Stop is not admitted.
+#[tokio::test]
+async fn automatic_restart_respects_a_stop_that_came_first() {
+    let f = Fixture::new().await;
+    f.install().await;
+    let stop = f.host.submit(Action::Stop, None).await.unwrap();
+    assert_eq!(f.complete(&stop).await.result, Some(Outcome::Succeeded));
+    assert!(matches!(
+        f.host
+            .submit_checked(Action::Start, Some("auto-restart-test"), true)
+            .await,
+        Err(Code::Cancelled)
+    ));
+    assert_eq!(f.host.status().await.state, State::Stopped);
+    assert_eq!(f.host.inner.lock().await.operations.len(), 1);
+}
+
 #[tokio::test]
 async fn stop_blocks_new_gateway_requests_and_drains_retained_snapshot() {
     let f = Fixture::new().await;
@@ -655,17 +733,20 @@ impl Runtime for SmokeRuntime {
 }
 
 #[tokio::test]
-#[ignore = "requires IDORIS_REAL_V060_DIR; verifies signed v0.6.0 and runs real serve"]
-async fn real_v060_install_existing_start_running_stop() {
+#[ignore = "requires IDORIS_REAL_RELEASE_DIR (the extracted locked release); runs the signed binary"]
+async fn real_release_registers_while_running() {
     use crate::{
         download::{DownloadOptions, download_locked_asset},
         install::{InstallOptions, install_locked_asset},
     };
     let release =
-        PathBuf::from(std::env::var_os("IDORIS_REAL_V060_DIR").expect("set release directory"));
+        PathBuf::from(std::env::var_os("IDORIS_REAL_RELEASE_DIR").expect("set release directory"));
     let dir = tempfile::tempdir().unwrap();
-    let root = fs::canonicalize(dir.path()).unwrap().join("idoris");
-    fs::create_dir(&root).unwrap();
+    // The download cache must sit inside a components/<id> tree.
+    let root = fs::canonicalize(dir.path())
+        .unwrap()
+        .join("components/idoris");
+    fs::create_dir_all(&root).unwrap();
     mode(&root, 0o700);
     let lock = IdorisLock::embedded();
     let cancel = CancellationToken::new();
@@ -678,11 +759,12 @@ async fn real_v060_install_existing_start_running_stop() {
     )
     .await
     .unwrap();
-    let installed_dir = root.join("releases/0.6.0");
+    let version = lock.tag.trim_start_matches('v').to_owned();
+    let installed_dir = root.join(format!("releases/{version}"));
     for part in [
-        "releases/0.6.0/config/components",
-        "components",
-        "data/state",
+        format!("releases/{version}/config/components"),
+        "components".into(),
+        "data/state".into(),
     ] {
         fs::create_dir_all(root.join(part)).unwrap();
     }
@@ -692,10 +774,10 @@ async fn real_v060_install_existing_start_running_stop() {
         mode(&target, if name == "idoris" { 0o500 } else { 0o400 });
     }
     for part in [
-        "releases",
-        "releases/0.6.0",
-        "releases/0.6.0/config",
-        "releases/0.6.0/config/components",
+        "releases".into(),
+        format!("releases/{version}"),
+        format!("releases/{version}/config"),
+        format!("releases/{version}/config/components"),
     ] {
         mode(&root.join(part), 0o700);
     }
@@ -734,7 +816,7 @@ async fn real_v060_install_existing_start_running_stop() {
     host.record_installation(Installation {
         omlx_setup: None,
         connection: None,
-        version: "0.6.0".into(),
+        version: version.clone(),
         release_dir: installed.directory().into(),
         archive_path: archive.path,
         components_dir: Some(root.join("components")),
@@ -777,6 +859,15 @@ async fn real_v060_install_existing_start_running_stop() {
         started.error_code
     );
     assert_eq!(host.status().await.state, State::Running);
+    // FU-254: the host must accept the signed release's registration; an
+    // unregistered iDoris stops itself when its 900 s orphan timer runs out.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !host.status().await.registered {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the signed iDoris release did not register with the host");
     let stop = host.submit(Action::Stop, None).await.unwrap();
     assert_eq!(
         complete(&host, &stop.operation_id).await.result,

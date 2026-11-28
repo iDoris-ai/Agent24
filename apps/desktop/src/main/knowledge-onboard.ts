@@ -7,6 +7,7 @@ import { createHash, randomBytes } from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
 import { validEndpoint, validKnowledgeBaseIds, type KnowledgeController } from './knowledge-settings'
+import type { LiteKnowledge } from './knowledge-lite'
 import type { KnowledgeOnboardPreflight, KnowledgeOnboardResult } from '../shared/ipc-types'
 
 export type OnboardPreflight = KnowledgeOnboardPreflight
@@ -18,9 +19,14 @@ export interface Activation {
   activation_code: string
 }
 
+/** L11-1: what onboarding needs of the local Lite (main/knowledge-lite.ts LiteKnowledge). */
+export type OnboardLite = Pick<LiteKnowledge, 'offered' | 'enable' | 'disable' | 'status'>
+
 export interface OnboardDeps {
   dir: string
   controller: () => KnowledgeController | null
+  /** L11-1: the local Lite; absent or null when this App has none. */
+  lite?: () => OnboardLite | null
   fetch: (url: string, init: RequestInit) => Promise<Response>
   sleep?: (ms: number) => Promise<void>
 }
@@ -273,20 +279,68 @@ async function serverUp(fetch: OnboardDeps['fetch'], origin: string): Promise<bo
 async function preflight(deps: OnboardDeps): Promise<OnboardPreflight> {
   const activation = readActivation(deps.dir)
   const usable = typeof activation === 'object' && activation !== null ? activation : null
-  const endpoint = deps.controller()?.status().endpoint ?? ''
+  const status = deps.controller()?.status()
+  const endpoint = status?.endpoint ?? ''
   return {
     activated: usable !== null,
     invalidActivation: activation === 'invalid',
-    alreadyBound: endpoint !== '',
+    alreadyBound: endpoint !== '' || status?.source === 'local',
+    localOffered: deps.lite?.()?.offered() === true,
     reachable: usable ? await serverUp(deps.fetch, usable.origin) : null,
     formats: FORMATS,
     maxBytes: MAX_UPLOAD_BYTES,
   }
 }
 
+/**
+ * L11-1 (KB-C4-05 personal Lite, chat entry): 「只留在本机」 turns the local Lite on the same way the
+ * settings page does (main/ipc/index.ts KnowledgeSetSource): save source=local, then install and launch.
+ * Never reads the activation file or the network. Never overwrites a knowledge base already in use
+ * (a saved remote endpoint, or local already the source) and never falls back to the remote service.
+ * If the Lite cannot be installed or started, the source goes back to remote and the Lite is stopped,
+ * so no half-opened local base is left in use.
+ *
+ * Order and outcomes:
+ *  1. no controller → unavailable
+ *  2. endpoint saved or source already local → already_bound (nothing changed)
+ *  3. no Lite, or lite.offered() false → local_unavailable (nothing changed)
+ *  4. after controller.setSource('local'), the source in effect is not local → not_saved (Lite not touched).
+ *     Its answer is not used: a save that landed but failed to apply is still local (Codex C1).
+ *  5. await lite.enable(); then lite.status().phase:
+ *       ready → { ok: true, source: 'local', activeNow: true }
+ *       starting → { ok: true, source: 'local', activeNow: false }   (kept: it is coming up)
+ *       install_failed → roll back, local_install_failed
+ *       anything else (failed, unavailable, not_installed, …) → roll back, local_start_failed
+ *     roll back = await controller.setSource('remote'), then await lite.disable().
+ */
+async function executeLocal(deps: OnboardDeps): Promise<OnboardResult> {
+  const controller = deps.controller()
+  if (!controller) return { ok: false, code: 'unavailable' }
+  const current = controller.status()
+  if (current.endpoint !== '' || current.source === 'local') return { ok: false, code: 'already_bound' }
+  const lite = deps.lite?.()
+  if (!lite || lite.offered() === false) return { ok: false, code: 'local_unavailable' }
+  // Codex C1: setSource saves first, then applies; a failed apply (daemon down, host not started) still
+  // answers ok:false with the source already local. Like the settings page (ipc KnowledgeSetSource), go by
+  // the source in effect, not by the answer.
+  await controller.setSource('local')
+  if (controller.status().source !== 'local') return { ok: false, code: 'not_saved' }
+  await lite.enable()
+  const phase = lite.status().phase
+  if (phase === 'ready') return { ok: true, source: 'local', activeNow: true }
+  if (phase === 'starting') return { ok: true, source: 'local', activeNow: false }
+  if (phase === 'install_failed') {
+    await controller.setSource('remote')
+    await lite.disable()
+    return { ok: false, code: 'local_install_failed' }
+  }
+  await controller.setSource('remote')
+  await lite.disable()
+  return { ok: false, code: 'local_start_failed' }
+}
+
 async function execute(deps: OnboardDeps, input: { localOnly: boolean }): Promise<OnboardResult> {
-  // This round only offers the remote service. Do not read the file or the network.
-  if (input.localOnly) return { ok: false, code: 'local_only_unavailable' }
+  if (input.localOnly) return executeLocal(deps)
   const controller = deps.controller()
   if (!controller) return { ok: false, code: 'unavailable' }
   // Never overwrite a knowledge base the user already configured.
@@ -339,11 +393,15 @@ export function knowledgeOnboarding(deps: OnboardDeps): {
   run: (input: { localOnly: boolean }) => Promise<OnboardResult>
 } {
   let inflight: Promise<OnboardResult> | null = null
+  // L11-1: a local run is never folded into a remote one (and the reverse); two local runs share one.
+  let inflightLocal: Promise<OnboardResult> | null = null
   return {
     preflight: () => preflight(deps),
     run: (input) => {
-      // Local only never reaches the network: it is answered on its own, not folded into a remote run.
-      if (input.localOnly) return Promise.resolve({ ok: false, code: 'local_only_unavailable' })
+      if (input.localOnly) {
+        inflightLocal ??= execute(deps, input).finally(() => { inflightLocal = null })
+        return inflightLocal
+      }
       inflight ??= execute(deps, input).finally(() => { inflight = null })
       return inflight
     },

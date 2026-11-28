@@ -356,7 +356,7 @@ export function assertResourceSafeBaseAncestryIsSafe(safeBase: string): void {
  * on its parent. Symlinks are left untouched — verifyComponentContract's
  * own symlink walk (run just before this, via the caller) already proved
  * every one of them resolves inside the installed tree. */
-function makeInstalledTreeReadOnly(root: string): void {
+export function makeInstalledTreeReadOnly(root: string): void {
   const stat = fs.lstatSync(root)
   if (stat.isSymbolicLink()) return
   if (stat.isDirectory()) {
@@ -382,7 +382,7 @@ function makeInstalledTreeReadOnly(root: string): void {
  * directory entry needs write on its PARENT, which 0500 deliberately
  * removed. Top-down (parent before children) is fine either way here:
  * 0500 already permits readdir/traversal, this just restores write too. */
-function makeInstalledTreeWritableForRemoval(root: string): void {
+export function makeInstalledTreeWritableForRemoval(root: string): void {
   const stat = fs.lstatSync(root, { throwIfNoEntry: false })
   if (stat == null || stat.isSymbolicLink()) return
   if (stat.isDirectory()) {
@@ -467,7 +467,9 @@ export function verifyComponentContract(root: string, expectedVersion: string): 
  * contains `..` or starts with `/` could still write outside the extraction
  * directory during `tar -x` itself, before any of our verification code
  * runs. Reject the whole tarball before extracting anything. */
-async function assertSafeTarMembers(tarBinary: string, tarballPath: string, signal: AbortSignal): Promise<void> {
+export async function assertSafeTarMembers(
+  tarBinary: string, tarballPath: string, signal: AbortSignal, label = 'Open Design component',
+): Promise<void> {
   // M1 (review finding, 2026-10-05): this used to buffer the whole listing
   // via execFileAsync with a fixed maxBuffer. Real-app verification already
   // showed a real open-design-web-standalone/node_modules tree can exceed
@@ -512,12 +514,12 @@ async function assertSafeTarMembers(tarBinary: string, tarballPath: string, sign
 
   if (unsafeEntry) {
     child.kill()
-    throw new Error(`Open Design component tarball contains an unsafe path entry: ${unsafeEntry}`)
+    throw new Error(`${label} tarball contains an unsafe path entry: ${unsafeEntry}`)
   }
 
   const [exitCode] = await exitPromise
   if (exitCode !== 0) {
-    throw new Error(`Open Design component tarball listing failed (tar -tzf exit ${exitCode}): ${stderr.trim()}`)
+    throw new Error(`${label} tarball listing failed (tar -tzf exit ${exitCode}): ${stderr.trim()}`)
   }
 }
 
@@ -758,8 +760,10 @@ export const OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV = 'A24_OPEN_DESIGN_COMPONE
  *    not added to the global download allowlist.
  * Anything malformed is ignored (production behaviour), never half-applied.
  */
-export function resolveLocalDownloadOverride(env: NodeJS.ProcessEnv): URL | null {
-  const raw = env[OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV]?.trim()
+export function resolveLocalDownloadOverride(
+  env: NodeJS.ProcessEnv, envName: string = OPEN_DESIGN_COMPONENT_LOCAL_BASE_URL_ENV,
+): URL | null {
+  const raw = env[envName]?.trim()
   if (!raw) return null
   let parsed: URL
   try {

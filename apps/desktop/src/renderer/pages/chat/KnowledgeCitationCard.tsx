@@ -36,17 +36,31 @@ export default function KnowledgeCitationCard({ found, bound: given, names: give
   const { open } = useContext(CapabilitiesContext)
   const [bound, setBound] = useState<readonly string[]>(given ?? [])
   const [copied, setCopied] = useState(false)
+  // Loop 9 3c: the local Lite has no knowledge page (a headless build), so the card does not offer to open one.
+  const [local, setLocal] = useState(false)
   useEffect(() => {
-    if (given) return
     let live = true
     void (async () => {
       try {
         const s = await window.agent24.knowledge?.status()
-        if (live && s) setBound(s.knowledgeBaseIds)
+        if (!live || !s) return
+        if (!given) setBound(s.source === 'local' ? s.activeKnowledgeBaseIds : s.knowledgeBaseIds)
+        setLocal(s.source === 'local')
       } catch { /* no ids: the libraries read 「知识库」 */ }
     })()
     return () => { live = false }
   }, [given])
+  // The source may have changed since this card was shown (the chat page stays
+  // mounted): asked again on the click, and a local one has no page to open.
+  const openPage = async () => {
+    let s: Awaited<ReturnType<typeof window.agent24.knowledge.status>> | null = null
+    try { s = (await window.agent24.knowledge?.status()) ?? null } catch { /* open as before */ }
+    if (s?.source === 'local') {
+      setLocal(true)
+      return
+    }
+    open('knowledgeBase', 'other')
+  }
   if (!found || found.length === 0) return null
   const lines = citationLines(found, bound, givenNames ?? loadKbNames(), t('library'), t('plain'))
   const text = (l: CitationLine) => `${l.library} · ${l.title === '' ? t('untitled') : `《${l.title}》`} · ${t('place', { n: String(l.place) })}`
@@ -60,8 +74,8 @@ export default function KnowledgeCitationCard({ found, bound: given, names: give
     <div role="group" aria-label={t('title')} className="task-card-knowledge">
       <div>{t('title')}</div>
       <ul>{lines.map((l, i) => <li key={i}>{text(l)}</li>)}</ul>
-      <div>{t('note')}</div>
-      <button type="button" className="btn btn-ghost" onClick={() => open('knowledgeBase', 'other')}>{t('open')}</button>
+      <div>{local ? t('noteLocal') : t('note')}</div>
+      {!local && <button type="button" className="btn btn-ghost" onClick={() => void openPage()}>{t('open')}</button>}
       <button type="button" className="btn btn-ghost" onClick={() => void copy()}>{copied ? t('copied') : t('copy')}</button>
     </div>
   )

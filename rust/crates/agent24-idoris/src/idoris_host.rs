@@ -30,8 +30,8 @@ use zeroize::Zeroizing;
 
 mod provision;
 pub use provision::{
-    Candidates, ConnectConsent, ConnectRequest, InstallRequest, Provisioner, SystemProvisioner,
-    is_chat_model_id, upstream_models,
+    Candidates, ConnectConsent, ConnectRequest, InstallRequest, LiteEmbedding, Provisioner,
+    SystemProvisioner, is_chat_model_id, upstream_models,
 };
 
 /// Drain (30s), TERM (17s), KILL/reap and scheduling margin.
@@ -85,6 +85,18 @@ pub struct VerificationReceipt {
 
 impl Installation {
     fn validate(&self) -> Result<(), Code> {
+        if !self.is_bundled_version() {
+            return Err(Code::InvalidRequest);
+        }
+        self.validate_fields()
+    }
+    /// The receipt names the release this build bundles. A receipt from another
+    /// bundled version is an install to be redone, not a broken receipt.
+    fn is_bundled_version(&self) -> bool {
+        self.version == IdorisLock::embedded().tag.trim_start_matches('v')
+    }
+    /// Every check except the version.
+    fn validate_fields(&self) -> Result<(), Code> {
         let reference = |id: &str| {
             !id.is_empty()
                 && id.len() <= 128
@@ -94,8 +106,7 @@ impl Installation {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
         };
-        if self.version != IdorisLock::embedded().tag.trim_start_matches('v')
-            || !self.release_dir.is_absolute()
+        if !self.release_dir.is_absolute()
             || !self.archive_path.is_absolute()
             || self
                 .components_dir
@@ -554,6 +565,14 @@ impl Runtime for SystemRuntime {
         })
     }
 }
+/// A generation that stopped by itself is started again only if it had run at
+/// least this long (FU-254), so a binary that exits at once does not loop.
+const AUTO_RESTART_MIN_UPTIME: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    Duration::from_secs(60)
+};
+
 struct Inner {
     installation: Option<Installation>,
     state: State,
@@ -585,6 +604,11 @@ pub struct IdorisHost {
     budget_suggestion: OnceCell<Result<agent24_hw::IdorisBudgetSuggestion, &'static str>>,
     data_keys: Arc<dyn Keychain>,
     omlx_keys: Arc<dyn Keychain>,
+    /// oMLX's model directory (`~/.omlx/models`, the same default iDoris scans).
+    omlx_models_dir: Option<PathBuf>,
+    /// Loop 9 3c: the Lite's embed key id last confirmed active in iDoris, and
+    /// the release it was confirmed against (checked again after a reinstall).
+    lite_key_checked: SyncMutex<Option<(String, PathBuf)>>,
 }
 fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Code> {
     let parent = path.parent().ok_or(Code::PersistenceFailed)?;
@@ -654,9 +678,25 @@ impl IdorisHost {
         };
         if let Some(record) = &installation {
             record
-                .validate()
+                .validate_fields()
                 .map_err(|_| io::Error::other("invalid iDoris installation receipt"))?;
         }
+        // After the bundled iDoris is bumped, an otherwise valid receipt from the
+        // previous version reads as not installed: the ordinary Install (startup
+        // bootstrap or the panel's button) installs the bundled release and the
+        // connect that follows configures it afresh. The old file is replaced when
+        // the new receipt is written; the old release directory is left in place.
+        let installation = installation.filter(|record| {
+            let current = record.is_bundled_version();
+            if !current {
+                tracing::warn!(
+                    found = %record.version,
+                    bundled = IdorisLock::embedded().tag.trim_start_matches('v'),
+                    "iDoris receipt is from another bundled version; it will be reinstalled"
+                );
+            }
+            current
+        });
         let mut operations: BTreeMap<String, Operation> =
             match std::fs::read(root.join("operations.json")) {
                 Ok(body) => serde_json::from_slice(&body).map_err(io::Error::other)?,
@@ -690,6 +730,11 @@ impl IdorisHost {
             budget_suggestion: OnceCell::new(),
             data_keys: Arc::new(SystemKeychain),
             omlx_keys: Arc::new(crate::keychain::OmlxKeychain),
+            omlx_models_dir: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join(".omlx/models")),
+            lite_key_checked: SyncMutex::new(None),
             inner: Mutex::new(Inner {
                 installation,
                 state,
@@ -891,12 +936,29 @@ impl IdorisHost {
         action: Action,
         idempotency: Option<&str>,
     ) -> Result<Operation, Code> {
+        self.submit_checked(action, idempotency, false).await
+    }
+    /// `restart_if_wanted`: an automatic restart (FU-254) is admitted only if,
+    /// under the same lock that admits it, nothing is running and the user still
+    /// wants iDoris running, so a Stop that won the race is not undone.
+    async fn submit_checked(
+        self: &Arc<Self>,
+        action: Action,
+        idempotency: Option<&str>,
+        restart_if_wanted: bool,
+    ) -> Result<Operation, Code> {
         if !matches!(action, Action::Start | Action::Stop) {
             return Err(Code::InvalidRequest);
         }
         let mut i = self.inner.lock().await;
         if i.closing {
             return Err(Code::ShuttingDown);
+        }
+        if restart_if_wanted
+            && (i.supervisor.is_some()
+                || !i.installation.as_ref().is_some_and(|r| r.desired_running))
+        {
+            return Err(Code::Cancelled);
         }
         let key = idempotency
             .map(str::to_owned)
@@ -1300,6 +1362,7 @@ impl IdorisHost {
         refresh_failure: Arc<SyncMutex<Option<Code>>>,
     ) {
         let host = Arc::downgrade(self);
+        let born = tokio::time::Instant::now();
         tokio::spawn(async move {
             loop {
                 let changed = signal.changed().await;
@@ -1342,6 +1405,26 @@ impl IdorisHost {
                                 Some(_) => State::Failed,
                                 None => State::Stopped,
                             };
+                            // FU-254: iDoris stopped by itself (orphan expiry, exit 4,
+                            // or an unannounced clean exit) while the user still wants
+                            // it running. Start it again in the background, unless it
+                            // stopped soon after starting: that would only loop.
+                            let wanted = error.is_none()
+                                && i.installation.as_ref().is_some_and(|r| r.desired_running);
+                            drop(i);
+                            if wanted && born.elapsed() >= AUTO_RESTART_MIN_UPTIME {
+                                tracing::warn!("iDoris stopped by itself; starting it again");
+                                let key = format!("auto-restart-{}", uuid::Uuid::new_v4().simple());
+                                if let Err(code) =
+                                    host.submit_checked(Action::Start, Some(&key), true).await
+                                {
+                                    tracing::warn!(?code, "iDoris automatic restart not admitted");
+                                }
+                            } else if wanted {
+                                tracing::warn!(
+                                    "iDoris stopped soon after starting; not restarting it"
+                                );
+                            }
                         }
                         return;
                     }

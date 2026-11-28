@@ -2197,3 +2197,346 @@ async fn auto_connect_uses_local_models_and_upstream_discovery() {
     );
     x.f.host.shutdown().await.unwrap();
 }
+
+/// 随包 iDoris 升版本后（#2077 0.5.0→0.6.0），旧版本的回执要能升上去，不能让 lifecycle 整体起不来。
+fn bundled_version() -> &'static str {
+    IdorisLock::embedded().tag.trim_start_matches('v')
+}
+fn write_receipt(x: &ConnectedFixture, record: &Installation) {
+    fs::write(
+        x.f.host.root.join("installation.json"),
+        serde_json::to_vec(record).unwrap(),
+    )
+    .unwrap();
+}
+fn reopen(x: &ConnectedFixture) -> io::Result<Arc<IdorisHost>> {
+    let host = IdorisHost::open(
+        x.f.host.root.clone(),
+        x.f.host.managed.clone(),
+        x.f.host.router.clone(),
+        x.f.runtime.clone(),
+        x.f.host.secrets.clone(),
+    )?;
+    Ok(host
+        .with_provisioner(x.provision.clone(), x.data.clone(), x.upstream.clone())
+        .unwrap())
+}
+fn older_receipt(x: &ConnectedFixture) -> Installation {
+    let mut record = x.f.record.clone();
+    record.version = "0.5.0".into();
+    record
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_opens_as_not_installed_and_install_upgrades_it() {
+    let x = ConnectedFixture::new().await;
+    write_receipt(&x, &older_receipt(&x));
+    let host = reopen(&x).expect("an older bundled version must not fail open");
+    let status = host.status().await;
+    assert_eq!(status.state, State::NotInstalled);
+    assert_eq!(status.version, None);
+    // restore must not try to start the old release (desired_running is true in the receipt).
+    host.restore().await.unwrap();
+    assert!(host.inner.lock().await.active.is_none());
+    assert_eq!(host.status().await.state, State::NotInstalled);
+    // Only open() reads an older receipt as not installed; committing one is still refused.
+    assert_eq!(
+        host.record_installation(older_receipt(&x)).await,
+        Err(Code::InvalidRequest)
+    );
+    // The ordinary Install (the panel's button) installs the bundled version.
+    let op = host
+        .install(InstallRequest { consent: true }, Some("upgrade-1"))
+        .await
+        .unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let op = host.operation(&op.operation_id).await.unwrap();
+            if op.result.is_some() {
+                break op;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(done.result, Some(Outcome::Succeeded));
+    assert_eq!(x.provision.downloads.load(Ordering::SeqCst), 1);
+    let status = host.status().await;
+    assert_eq!(status.version.as_deref(), Some(bundled_version()));
+    assert_eq!(status.state, State::NotConfigured);
+    let saved: Installation =
+        serde_json::from_slice(&fs::read(host.root.join("installation.json")).unwrap()).unwrap();
+    assert_eq!(saved.version, bundled_version());
+    // The upgraded receipt opens normally next time.
+    assert_eq!(
+        reopen(&x).unwrap().status().await.state,
+        State::NotConfigured
+    );
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_is_upgraded_by_the_startup_bootstrap() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    write_receipt(&x, &older_receipt(&x));
+    let host = reopen(&x).unwrap();
+    host.restore().await.unwrap();
+    host.bootstrap_core_with_candidates(Candidates {
+        setup: None,
+        candidates: vec![Candidate {
+            endpoint: x.endpoint.clone(),
+            identity: "omlx",
+            authentication: "ready",
+            models: vec!["real-model".into()],
+        }],
+        key_from_local_settings: true,
+    })
+    .await
+    .unwrap();
+    let status = host.status().await;
+    assert_eq!(status.state, State::Running);
+    assert_eq!(status.version.as_deref(), Some(bundled_version()));
+    assert_eq!(host.daily_model().await.as_deref(), Some("real-model"));
+    let stop = host.submit(Action::Stop, None).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        while host
+            .operation(&stop.operation_id)
+            .await
+            .unwrap()
+            .result
+            .is_none()
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn an_older_bundled_version_with_invalid_fields_is_still_rejected() {
+    let x = ConnectedFixture::new().await;
+    let invalid: [fn(&mut Installation); 5] = [
+        |r| r.release_dir = PathBuf::from("relative/release"),
+        |r| r.data_port = 0,
+        |r| r.admin_port = r.data_port,
+        |r| r.key_id = Some(format!("idk_{}", "a".repeat(64))),
+        |r| r.omlx_url = Some("http://example.com:8000".into()),
+    ];
+    for (index, break_it) in invalid.into_iter().enumerate() {
+        let mut record = older_receipt(&x);
+        break_it(&mut record);
+        write_receipt(&x, &record);
+        let error = reopen(&x)
+            .err()
+            .unwrap_or_else(|| panic!("case {index} opened"));
+        assert_eq!(error.to_string(), "invalid iDoris installation receipt");
+    }
+}
+
+/// `~/.omlx/models` laid out like David's MacBook (11-26): every model one organisation
+/// folder down, which iDoris v0.6.0 `models local` does not see.
+fn nested_models_dir(x: &ConnectedFixture) -> PathBuf {
+    let dir = x.f.host.root.join("omlx-models");
+    for model in ["Qwen3-8B-4bit", "bge-m3-mlx-fp16"] {
+        let path = dir.join("mlx-community").join(model);
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("config.json"), "{}").unwrap();
+    }
+    // Not models: no config.json, a dot folder, and a symlinked model.
+    fs::create_dir_all(dir.join("mlx-community/partial-download")).unwrap();
+    fs::create_dir_all(dir.join(".cache/hidden-model")).unwrap();
+    fs::write(dir.join(".cache/hidden-model/config.json"), "{}").unwrap();
+    std::os::unix::fs::symlink(
+        dir.join("mlx-community/Qwen3-8B-4bit"),
+        dir.join("mlx-community/linked-model"),
+    )
+    .unwrap();
+    dir
+}
+
+#[tokio::test]
+async fn candidates_add_models_one_folder_down_when_the_idoris_scan_finds_no_chat_model() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"local_models": [
+        {"omlx_id":"bge-m3-mlx-fp16", "kind":"embedding", "size_bytes":42}
+    ]}));
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert_eq!(discovery.candidates[0].models, ["Qwen3-8B-4bit"]);
+    // The endpoint is still left to iDoris's own discovery.
+    assert_eq!(discovery.candidates[0].endpoint, "");
+}
+
+#[tokio::test]
+async fn candidates_keep_the_idoris_scan_when_it_finds_a_chat_model() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert_eq!(discovery.candidates[0].models, ["real-model"]);
+}
+
+#[tokio::test]
+async fn candidates_stay_empty_without_models_in_either_layout() {
+    let mut x = ConnectedFixture::new().await;
+    x.installed().await;
+    x.scenario(json!({"local_models": []}));
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(x.f.host.root.join("missing"));
+    let discovery = x.f.host.candidates(None).await.unwrap();
+    assert!(discovery.candidates[0].models.is_empty());
+}
+
+#[tokio::test]
+async fn bootstrap_connects_and_starts_with_models_one_folder_down() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let mut x = ConnectedFixture::new().await;
+    x.scenario(json!({"local_models": []}));
+    let dir = nested_models_dir(&x);
+    Arc::get_mut(&mut x.f.host).unwrap().omlx_models_dir = Some(dir);
+    x.f.host.bootstrap_core().await.unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+    assert_eq!(
+        x.f.host.daily_model().await.as_deref(),
+        Some("Qwen3-8B-4bit")
+    );
+    // connect checked the selection against the same list and bound embed too.
+    assert_eq!(
+        x.keys()[0]["allowed_roles"],
+        json!(["daily", "deep", "embed"])
+    );
+    x.f.host.shutdown().await.unwrap();
+}
+
+/// Running managed iDoris whose oMLX serves `models` (chat or embedding by name).
+async fn running_with(x: &ConnectedFixture, models: &[&str]) {
+    x.installed().await;
+    let local: Vec<serde_json::Value> = models
+        .iter()
+        .map(|m| {
+            let kind = if m.starts_with("bge") {
+                "embedding"
+            } else {
+                "chat"
+            };
+            json!({"omlx_id": m, "kind": kind, "size_bytes": 42})
+        })
+        .collect();
+    x.scenario(json!({ "local_models": local }));
+    x.f.host.bootstrap_core().await.unwrap();
+    assert_eq!(x.f.host.status().await.state, State::Running);
+}
+
+#[tokio::test]
+async fn lite_embedding_issues_one_embed_only_key_and_reuses_it() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    // No running gateway: refused, nothing issued.
+    assert!(matches!(
+        x.f.host.lite_embedding().await,
+        Err(Code::NotConfigured)
+    ));
+    running_with(&x, &["real-model", "bge-m3-mlx-fp16"]).await;
+    let before = x.keys().len();
+    let first = x.f.host.lite_embedding().await.unwrap();
+    let keys = x.keys();
+    assert_eq!(keys.len(), before + 1);
+    let issued = keys.last().unwrap();
+    assert_eq!(issued["allowed_roles"], json!(["embed"]));
+    assert_eq!(issued["allowed_privacy"], json!(["local_only"]));
+    let port = x.f.host.status().await.data_port.unwrap();
+    assert_eq!(first.base_url, format!("http://127.0.0.1:{port}/v1"));
+    // Reused: no second issue, same secret.
+    let second = x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), before + 1);
+    assert_eq!(second.api_key.as_str(), first.api_key.as_str());
+    // Only the id is on disk.
+    let saved = fs::read_to_string(x.f.host.root.join("lite-embed-key.json")).unwrap();
+    assert!(saved.contains(issued["key_id"].as_str().unwrap()));
+    assert!(!saved.contains(first.api_key.as_str()));
+    // Gone from the keychain: issued again.
+    x.data.delete(issued["key_id"].as_str().unwrap()).unwrap();
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), before + 2);
+    assert_eq!(x.keys().last().unwrap()["allowed_roles"], json!(["embed"]));
+    assert!(!format!("{first:?}").contains(first.api_key.as_str()));
+    x.assert_safe();
+    x.f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lite_embedding_needs_the_embed_role() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    running_with(&x, &["real-model"]).await;
+    let before = x.keys().len();
+    assert!(matches!(
+        x.f.host.lite_embedding().await,
+        Err(Code::NotConfigured)
+    ));
+    assert_eq!(x.keys().len(), before);
+    x.f.host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn lite_embedding_issues_again_when_idoris_no_longer_has_the_saved_key() {
+    let _serial = BOOTSTRAP_SERIAL.lock().await;
+    let x = ConnectedFixture::new().await;
+    running_with(&x, &["real-model", "bge-m3-mlx-fp16"]).await;
+    let first = x.f.host.lite_embedding().await.unwrap();
+    let issued = x.keys().len();
+    let saved_id = || -> String {
+        let body = fs::read_to_string(x.f.host.root.join("lite-embed-key.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["key_id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let id1 = saved_id();
+    // Confirmed once in this run: not listed again.
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), issued);
+    // A new daemon run after iDoris revoked it (or a reinstall with a new key database).
+    let path = x.f.host.root.join("fake-keys.json");
+    let mut keys: Vec<serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    for key in keys.iter_mut().filter(|k| k["key_id"] == id1.as_str()) {
+        key["status"] = json!("revoked");
+    }
+    fs::write(&path, serde_json::to_string(&keys).unwrap()).unwrap();
+    *x.f.host.lite_key_checked.lock().unwrap() = None;
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(x.keys().len(), issued + 1, "a revoked key is replaced");
+    let id2 = saved_id();
+    assert_ne!(id2, id1);
+    assert_eq!(x.keys().last().unwrap()["allowed_roles"], json!(["embed"]));
+    // Gone from iDoris altogether (a recreated key database): replaced as well.
+    let keys: Vec<serde_json::Value> =
+        serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+    let kept: Vec<_> = keys
+        .into_iter()
+        .filter(|k| k["key_id"] != id2.as_str())
+        .collect();
+    let remaining = kept.len();
+    fs::write(&path, serde_json::to_string(&kept).unwrap()).unwrap();
+    *x.f.host.lite_key_checked.lock().unwrap() = None;
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(
+        x.keys().len(),
+        remaining + 1,
+        "a key iDoris no longer has is replaced"
+    );
+    assert_eq!(x.keys().last().unwrap()["key_id"], json!(saved_id()));
+    // Still active: kept.
+    *x.f.host.lite_key_checked.lock().unwrap() = None;
+    let id3 = saved_id();
+    x.f.host.lite_embedding().await.unwrap();
+    assert_eq!(saved_id(), id3);
+    drop(first);
+    x.assert_safe();
+    x.f.host.shutdown().await.unwrap();
+}

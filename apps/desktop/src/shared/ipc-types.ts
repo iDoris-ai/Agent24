@@ -155,6 +155,8 @@ export const IpcChannels = {
   DocumentsRevealDownload: 'documents:reveal-download',
   /** D5a: a library document's file saved to Downloads (its id, its title). */
   DocumentsSaveDownload: 'documents:save-download',
+  /** L8 DOC-4: a clean copy saved where the user picks, then its receipt. */
+  DocumentsDeliver: 'documents:deliver',
   // Knowledge settings (main/knowledge-settings.ts): the WeKnora endpoint, the
   // knowledge bases and the On/Off switch. The key goes in, never comes back.
   KnowledgeStatus: 'knowledge:status',
@@ -162,6 +164,10 @@ export const IpcChannels = {
   KnowledgeCheck: 'knowledge:check',
   KnowledgeConfigure: 'knowledge:configure',
   KnowledgeSetEnabled: 'knowledge:set-enabled',
+  /** Loop 9 3c: remote server or the local Lite (one at a time); local also installs and launches it. */
+  KnowledgeSetSource: 'knowledge:set-source',
+  /** Loop 9 3c: install or launch the local Lite again after it failed. */
+  KnowledgeLiteRetry: 'knowledge:lite-retry',
   /** L7-K2: whether mock onboarding can start, and whether the server answers. */
   KnowledgeOnboardPreflight: 'knowledge:onboard-preflight',
   /** L7-K2: run mock onboarding. The activation code and the key never come back. */
@@ -224,14 +230,30 @@ export interface DocumentsModuleStatus {
 /** What the renderer sees of the Knowledge settings: never the key. */
 export interface KnowledgeStatus {
   enabled: boolean
+  /** The saved remote server (kept while the local source is in use). */
   endpoint: string
   knowledgeBaseIds: string[]
+  /** Loop 9 3c: which knowledge base is in use. */
+  source: 'remote' | 'local'
+  /** The bases searched now (the local default base while local); empty while Off or incomplete. */
+  activeKnowledgeBaseIds: string[]
+  /** Loop 9 3c: the local Lite's install and launch, when main has one. */
+  local?: LiteKnowledgeStatus
   hasKey: boolean
   /** On, complete and activated in the daemon. */
   active: boolean
   /** K2: whether the server answered the last check (absent: not checked by this main). */
   reachability?: { state: 'unknown' | 'ok' | 'unreachable' | 'unauthorized' | 'not_found'; checkedAt: string | null }
 }
+
+/** Loop 9 3c: the local knowledge base as the settings page sees it. No path, port or key. */
+export type LiteKnowledgeStatus =
+  | { phase: 'off' | 'unavailable' | 'verifying' | 'starting' | 'ready' }
+  | { phase: 'not_installed'; total?: number }
+  | { phase: 'downloading'; received: number; total?: number }
+  | { phase: 'install_failed'; failure: 'network' | 'integrity' | 'other' }
+  /** Gave up starting; `embedding_unavailable`: iDoris (the embedding) was not ready. */
+  | { phase: 'failed'; reason: 'embedding_unavailable' | 'start_failed' }
 
 /** The key is optional: left out, the saved one is kept. */
 export interface KnowledgeConfigureInput {
@@ -246,8 +268,10 @@ export interface KnowledgeOnboardPreflight {
   activated: boolean
   /** The file is present but rejected (mode, shape, endpoint or code). */
   invalidActivation: boolean
-  /** An endpoint is already saved; onboarding will not overwrite it. */
+  /** An endpoint is already saved, or the local Lite is the source (L11-1); onboarding will not overwrite it. */
   alreadyBound: boolean
+  /** L11-1: this build can install and run the local Lite (it has a download source, or the Lite is already installed). */
+  localOffered: boolean
   /** `GET {endpoint}/health` was 2xx. Null when there is no usable activation. */
   reachable: boolean | null
   formats: readonly ['md', 'markdown', 'txt']
@@ -258,10 +282,17 @@ export interface KnowledgeOnboardPreflight {
 export type KnowledgeOnboardResult =
   /** activeNow: the daemon took the binding now; false when it was not up and takes it later from the saved settings. */
   | { ok: true; outcome: 'created' | 'existing'; knowledgeBaseId: string; configMismatch: boolean; activeNow: boolean }
+  /** L11-1: the local Lite is now the source. activeNow: it answered ready; false while it is still starting. */
+  | { ok: true; source: 'local'; activeNow: boolean }
   | {
     ok: false
     code:
-      | 'local_only_unavailable'
+      /** L11-1: this build has no local Lite (no download source and not installed). Nothing was changed. */
+      | 'local_unavailable'
+      /** L11-1: download or verification of the Lite failed; the source was put back. */
+      | 'local_install_failed'
+      /** L11-1: the Lite was installed but did not start; the source was put back. */
+      | 'local_start_failed'
       | 'unavailable'
       | 'already_bound'
       | 'not_activated'
@@ -662,6 +693,13 @@ export type DocumentsRequest =
     }
   /** D5a: a DOCX template's `{{fields}}`. */
   | { op: 'fields'; documentId: DocSchemas['DocumentIdString'] }
+  /** L8 DOC-4: what a DOCX/PDF still carries before it is sent (read-only). */
+  | { op: 'preflight'; documentId: DocSchemas['DocumentIdString'] }
+  /** L8 DOC-4: a clean copy of the version checked (a new document), the
+   * receipt once its file is saved, and the latest receipts. */
+  | { op: 'deliver'; documentId: DocSchemas['DocumentIdString']; expectRevision: number }
+  | { op: 'receipt'; documentId: DocSchemas['DocumentIdString']; revision: number; copyDocumentId: DocSchemas['DocumentIdString']; savedTo: string }
+  | { op: 'receipts'; documentId?: DocSchemas['DocumentIdString'] }
   /** D5a: the template with its fields filled, as a new document. */
   | { op: 'fill'; documentId: DocSchemas['DocumentIdString']; values: Record<string, string>; title?: string }
   /** D5a: the head revision's file (base64), to be saved. */
@@ -700,6 +738,10 @@ export interface DocumentsResults {
   patch: DocSchemas['DocumentsJob']
   fields: { document_id: string; revision: number; fields: Array<{ name: string; count: number }> }
   fill: DocSchemas['DocumentsJob']
+  preflight: DocumentPreflight
+  deliver: DocSchemas['DocumentsJob']
+  receipt: DeliveryReceipt
+  receipts: { receipts: DeliveryReceipt[] }
   content: { media_type: string; bytes: number; data: string }
   cancelJob: DocSchemas['DocumentsJob']
   retryJob: DocSchemas['DocumentsJob']
@@ -710,6 +752,51 @@ export interface DocumentsResults {
   restoreRevision: SavedVersion
   compare: DocumentComparison
 }
+
+/** L8 DOC-4: agent24-documents `preflight.rs`; only kinds found are listed. */
+export type PreflightKind =
+  | 'tracked_insertions' | 'tracked_deletions' | 'comments' | 'unfilled_fields'
+  | 'author' | 'last_modified_by' | 'hidden_text' | 'pdf_form' | 'pdf_annotations'
+export interface DocumentPreflight {
+  document_id: string
+  revision: number
+  title: string | null
+  format: 'docx' | 'pdf'
+  clean: boolean
+  findings: Array<{ kind: PreflightKind; count: number; examples: string[] }>
+  /** A DOCX (a clean copy can be made of it from the delivery card); a PDF is only reported. */
+  cleanable: boolean
+}
+
+/** L8 DOC-4: agent24-documents `deliver.rs`; the hash and format are the
+ * library copy's own. `again`: the same file was saved for it before. */
+export interface DeliveryReceipt {
+  document_id: string
+  title: string | null
+  revision: number
+  at: string
+  format: 'docx' | 'pdf'
+  file_name: string
+  saved_to: string
+  sha256: string
+  copy_document_id: string
+  again: boolean
+}
+
+/** L8 DOC-4: `documents:deliver` (main `doc-deliver.ts`). */
+export interface DeliverRequest {
+  documentId: string
+  /** The version the user checked (preflight's `revision`). */
+  revision: number
+  format: 'docx' | 'pdf'
+  /** The source document's title, for the file name offered. */
+  title: string
+}
+export type DeliverResult =
+  | { ok: true; savedTo: string; fileName: string; receipt: DeliveryReceipt }
+  | { ok: false; canceled: true }
+  /** `savedTo` only when the file was written (stage `receipt`). */
+  | { ok: false; canceled?: false; stage: 'copy' | 'convert' | 'write' | 'receipt'; code: string; message: string; savedTo?: string }
 
 export interface CompareTarget { documentId: DocSchemas['DocumentIdString']; revision?: number }
 

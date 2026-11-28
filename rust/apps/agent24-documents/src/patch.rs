@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::docx_patch::{self, MAX_EDITS, ParaEdit, PatchError};
 use crate::error::ApiError;
+use crate::form::{self, FieldKind};
 use crate::id::{IdKind, is_id};
 use crate::jobs::Job;
 use crate::office::DOCX;
@@ -126,7 +127,7 @@ async fn save(
     }
 }
 
-fn patch_failure(e: PatchError) -> ApiError {
+pub(crate) fn patch_failure(e: PatchError) -> ApiError {
     match e {
         PatchError::NotDocx(why) => ApiError::unprocessable("parse_failed", why),
         PatchError::TooLarge => {
@@ -147,6 +148,26 @@ async fn head_docx(
     storage: &Arc<Storage>,
     id: &str,
 ) -> Result<(i64, Option<String>, Vec<u8>), ApiError> {
+    let (head, title, _, bytes) = head_bytes(
+        storage,
+        id,
+        &[DOCX],
+        "only Word (DOCX) documents can be edited paragraph by paragraph",
+    )
+    .await?;
+    Ok((head, title, bytes))
+}
+
+/// L8-DOC-4: the document's head revision in one of the formats `accept`:
+/// its number, title, media type and bytes (verified against their SHA-256).
+/// Another format is `unsupported_format` with `refused`, before anything
+/// is read (PR-Daemon #2086 non-blocking 1).
+pub(crate) async fn head_bytes(
+    storage: &Arc<Storage>,
+    id: &str,
+    accept: &[&str],
+    refused: &'static str,
+) -> Result<(i64, Option<String>, String, Vec<u8>), ApiError> {
     if !is_id(IdKind::Document, id) {
         return Err(ApiError::invalid_request("not a document id"));
     }
@@ -161,11 +182,8 @@ async fn head_docx(
         };
     let (head, title) = row.ok_or_else(|| ApiError::not_found("no such document"))?;
     let revision = crate::read::revision(storage, id, head).await?;
-    if revision.media_type != DOCX {
-        return Err(ApiError::unprocessable(
-            "unsupported_format",
-            "only Word (DOCX) documents can be edited paragraph by paragraph",
-        ));
+    if !accept.contains(&revision.media_type.as_str()) {
+        return Err(ApiError::unprocessable("unsupported_format", refused));
     }
     let blobs = storage.clone();
     let sha = revision.content_sha256.clone();
@@ -175,7 +193,7 @@ async fn head_docx(
     if bytes.len() > CONTENT_MAX {
         return Err(ApiError::payload_too_large(CONTENT_MAX));
     }
-    Ok((head, title, bytes))
+    Ok((head, title, revision.media_type, bytes))
 }
 
 pub async fn paragraphs(
@@ -286,7 +304,7 @@ pub async fn patch_run(
 }
 
 /// The time now in UTC, ISO 8601 (a revision's w:date, core.xml's modified).
-async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> {
+pub(crate) async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> {
     match sqlx::query_scalar("SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')")
         .fetch_one(storage.db.pool())
         .await
@@ -297,18 +315,24 @@ async fn now_utc(storage: &Arc<Storage>) -> Result<String, ApiError> {
 }
 
 /// `<original title, extension aside><suffix>`, at most 500 characters.
-fn derived_title(original: Option<String>, suffix: &str) -> String {
+/// A stem that already ends with `suffix` is not extended, so filling
+/// 「X（填写）」 again stays 「X（填写）」.
+pub(crate) fn derived_title(original: Option<String>, suffix: &str) -> String {
     let base = original.unwrap_or_else(|| "文档".to_owned());
     let stem = base
         .strip_suffix(".docx")
         .or_else(|| base.strip_suffix(".DOCX"))
-        .unwrap_or(&base)
-        .to_owned();
-    format!("{stem}{suffix}").chars().take(500).collect()
+        .unwrap_or(&base);
+    let titled = if stem.ends_with(suffix) {
+        stem.to_owned()
+    } else {
+        format!("{stem}{suffix}")
+    };
+    titled.chars().take(500).collect()
 }
 
 /// The new DOCX imported as a document of its own.
-async fn import_docx(
+pub(crate) async fn import_docx(
     storage: &Arc<Storage>,
     title: String,
     bytes: Vec<u8>,
@@ -323,21 +347,23 @@ async fn import_docx(
 
 #[derive(Debug, Serialize)]
 pub struct Field {
-    name: String,
+    pub(crate) name: String,
     count: usize,
+    /// `text`, `identity` or `manual`.
+    pub(crate) kind: FieldKind,
 }
 
 #[derive(Debug, Serialize)]
 pub struct Fields {
     document_id: String,
     revision: i64,
-    fields: Vec<Field>,
+    pub(crate) fields: Vec<Field>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FillRequest {
-    values: std::collections::BTreeMap<String, String>,
+    pub(crate) values: std::collections::BTreeMap<String, String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -370,6 +396,7 @@ pub async fn fields_of(storage: &Arc<Storage>, id: String) -> Result<Fields, Api
         fields: listed
             .into_iter()
             .map(|f| Field {
+                kind: form::field_kind(&f.name),
                 name: f.name,
                 count: f.count,
             })

@@ -4,12 +4,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { knowledgeOnboarding, type OnboardDeps } from './knowledge-onboard'
+import { knowledgeOnboarding, type OnboardDeps, type OnboardLite } from './knowledge-onboard'
 import { KnowledgeHost, type HostTransport } from './knowledge-host'
 import { KnowledgeLoginStore } from './knowledge-logins'
 import { KnowledgeReachability } from './knowledge-reachability'
 import { KNOWLEDGE_BINDING, KnowledgeController, KnowledgeSettingsStore } from './knowledge-settings'
 import { knowledgeUploads } from './knowledge-upload'
+import type { LiteKnowledgeStatus } from '../shared/ipc-types'
 import { settingsKnowledgeViewTarget } from './knowledge-view'
 
 vi.mock('./backend-manager', () => ({ daemonConnection: () => null, daemonElevation: () => null }))
@@ -111,10 +112,10 @@ describe('knowledge onboarding (L7-K2)', () => {
     return { calls, configures, enables, sleeps, onboarding, setEndpoint: (value) => { endpoint = value } }
   }
 
-  it('local only does not read the activation or call the server', async () => {
+  it('local only without a Lite does not read the activation or call the server', async () => {
     writeActivation(dir, { endpoint: 'not-a-url', activation_code: 'x' }, 0o600)
     const { onboarding, calls } = harness()
-    expect(await onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_only_unavailable' })
+    expect(await onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_unavailable' })
     expect(calls).toEqual([])
     expect(fs.existsSync(path.join(dir, PENDING))).toBe(false)
   })
@@ -239,7 +240,7 @@ describe('knowledge onboarding (L7-K2)', () => {
     expect(await onboarding.run({ localOnly: false })).toMatchObject({ ok: true, activeNow: true })
     controller.attachReachability(reachability)
     expect((await controller.checkReachability()).reachability?.state).toBe('ok')
-    expect(store.load()).toEqual({ enabled: true, endpoint: apiBase, knowledgeBaseIds: [KB] })
+    expect(store.load()).toEqual({ enabled: true, endpoint: apiBase, knowledgeBaseIds: [KB], source: 'remote' })
     expect(logins.list().get(KNOWLEDGE_BINDING)).toMatchObject({ profileId: apiBase, material: API_KEY })
     expect(controller.bindingForRun()).toBe(KNOWLEDGE_BINDING)
     const route = `/api/v1/host/knowledge/bindings/${KNOWLEDGE_BINDING}`
@@ -451,7 +452,7 @@ describe('knowledge onboarding (L7-K2)', () => {
     writeActivation(dir, GOOD_FILE)
     const { onboarding } = harness({ responses: [{ status: 200, body: okInit() }] })
     const remote = onboarding.run({ localOnly: false })
-    expect(await onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_only_unavailable' })
+    expect(await onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_unavailable' })
     await expect(remote).resolves.toMatchObject({ ok: true })
   })
 
@@ -472,6 +473,7 @@ describe('knowledge onboarding (L7-K2)', () => {
       activated: true,
       invalidActivation: false,
       alreadyBound: false,
+      localOffered: false,
       reachable: true,
       formats: ['md', 'markdown', 'txt'],
       maxBytes: 10_485_760,
@@ -505,5 +507,176 @@ describe('knowledge onboarding (L7-K2)', () => {
       activated: false, invalidActivation: true, reachable: null,
     })
     expect(absent.calls).toEqual([])
+  })
+})
+
+// L11-1 (KB-C4-05 personal Lite, chat entry): 「只留在本机」 opens the local Lite the way the settings page does.
+describe('local Lite onboarding (L11-1)', () => {
+  let dir = ''
+
+  beforeEach(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kb-onboard-local-'))
+  })
+  afterEach(() => {
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+
+  function localHarness(opts: {
+    endpoint?: string
+    source?: 'remote' | 'local'
+    /** false: this App has no Lite. */
+    lite?: false | { offered?: boolean; after?: LiteKnowledgeStatus }
+    /** unsaved: nothing written. applied_failed: the real controller saves first, then fails to apply
+     * (daemon down, host not started) and still answers ok:false — the source did change (Codex C1). */
+    setSourceAs?: 'ok' | 'unsaved' | 'apply_failed'
+    controller?: boolean
+  } = {}): {
+    onboarding: ReturnType<typeof knowledgeOnboarding>
+    events: string[]
+    calls: string[]
+    source: () => 'remote' | 'local'
+  } {
+    const events: string[] = []
+    const calls: string[] = []
+    let source: 'remote' | 'local' = opts.source ?? 'remote'
+    const endpoint = opts.endpoint ?? ''
+    const controller = {
+      status: () => ({
+        enabled: source === 'local', endpoint, knowledgeBaseIds: [] as string[], source,
+        activeKnowledgeBaseIds: [] as string[], hasKey: endpoint !== '', active: false,
+      }),
+      adopt: async () => {
+        events.push('adopt')
+        return { saved: false as const, reason: 'invalid' as const }
+      },
+      setSource: async (next: 'remote' | 'local') => {
+        events.push(`setSource:${next}`)
+        if (opts.setSourceAs === 'unsaved') return { ok: false as const, reason: 'not_saved' as const }
+        source = next
+        if (opts.setSourceAs === 'apply_failed') return { ok: false as const, reason: 'unavailable' as const }
+        return { ok: true as const }
+      },
+    }
+    let on = false
+    const after: LiteKnowledgeStatus = opts.lite && opts.lite.after ? opts.lite.after : { phase: 'ready' }
+    const offered = opts.lite ? opts.lite.offered ?? true : true
+    const lite: OnboardLite | null = opts.lite === false ? null : {
+      offered: () => offered,
+      enable: async () => {
+        events.push('enable')
+        on = true
+        await Promise.resolve()
+      },
+      disable: async () => {
+        events.push('disable')
+        on = false
+      },
+      status: (): LiteKnowledgeStatus => (on ? after : { phase: 'off' }),
+    }
+    const onboarding = knowledgeOnboarding({
+      dir,
+      controller: () => (opts.controller === false ? null : controller as unknown as KnowledgeController),
+      lite: () => lite,
+      fetch: async (url) => {
+        calls.push(url)
+        throw new Error('local onboarding never reaches the network')
+      },
+      sleep: async () => {},
+    })
+    return { onboarding, events, calls, source: () => source }
+  }
+
+  it('saves local, then installs and launches; never reads the activation or the network', async () => {
+    writeActivation(dir, { endpoint: 'not-a-url', activation_code: 'x' }, 0o600)
+    const h = localHarness()
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: true, source: 'local', activeNow: true })
+    expect(h.events).toEqual(['setSource:local', 'enable'])
+    expect(h.calls).toEqual([])
+    expect(h.source()).toBe('local')
+    expect(fs.existsSync(path.join(dir, PENDING))).toBe(false)
+    expect(fs.existsSync(path.join(dir, ACTIVATION))).toBe(true)
+  })
+
+  it('a Lite still starting is kept, reported as not active yet', async () => {
+    const h = localHarness({ lite: { after: { phase: 'starting' } } })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: true, source: 'local', activeNow: false })
+    expect(h.events).toEqual(['setSource:local', 'enable'])
+    expect(h.source()).toBe('local')
+  })
+
+  it('an install failure puts the source back and stops the Lite', async () => {
+    const h = localHarness({ lite: { after: { phase: 'install_failed', failure: 'network' } } })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_install_failed' })
+    expect(h.events).toEqual(['setSource:local', 'enable', 'setSource:remote', 'disable'])
+    expect(h.source()).toBe('remote')
+  })
+
+  it.each([
+    [{ phase: 'failed', reason: 'start_failed' }],
+    [{ phase: 'failed', reason: 'embedding_unavailable' }],
+    [{ phase: 'unavailable' }],
+  ] as Array<[LiteKnowledgeStatus]>)('a Lite that did not come up (%j) puts the source back', async (after) => {
+    const h = localHarness({ lite: { after } })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_start_failed' })
+    expect(h.events).toEqual(['setSource:local', 'enable', 'setSource:remote', 'disable'])
+    expect(h.source()).toBe('remote')
+  })
+
+  it('no Lite in this App, or no download source, changes nothing', async () => {
+    for (const lite of [false, { offered: false }] as const) {
+      const h = localHarness({ lite })
+      expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_unavailable' })
+      expect(h.events).toEqual([])
+      expect(h.source()).toBe('remote')
+    }
+  })
+
+  it('a knowledge base already in use is left alone: a saved remote endpoint, or local already the source', async () => {
+    const remote = localHarness({ endpoint: 'https://already.example' })
+    expect(await remote.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'already_bound' })
+    expect(remote.events).toEqual([])
+    const local = localHarness({ source: 'local' })
+    expect(await local.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'already_bound' })
+    expect(local.events).toEqual([])
+  })
+
+  it('no controller is unavailable and touches nothing', async () => {
+    const h = localHarness({ controller: false })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'unavailable' })
+    expect(h.events).toEqual([])
+  })
+
+  it('a source that could not be saved is not_saved and the Lite is not touched', async () => {
+    const h = localHarness({ setSourceAs: 'unsaved' })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'not_saved' })
+    expect(h.events).toEqual(['setSource:local'])
+    expect(h.source()).toBe('remote')
+  })
+
+  it('a source saved but not applied (daemon down) still goes on with the Lite, like the settings page', async () => {
+    const h = localHarness({ setSourceAs: 'apply_failed' })
+    expect(await h.onboarding.run({ localOnly: true })).toEqual({ ok: true, source: 'local', activeNow: true })
+    expect(h.events).toEqual(['setSource:local', 'enable'])
+    expect(h.source()).toBe('local')
+    const failing = localHarness({ setSourceAs: 'apply_failed', lite: { after: { phase: 'failed', reason: 'start_failed' } } })
+    expect(await failing.onboarding.run({ localOnly: true })).toEqual({ ok: false, code: 'local_start_failed' })
+    expect(failing.events).toEqual(['setSource:local', 'enable', 'setSource:remote', 'disable'])
+    expect(failing.source()).toBe('remote')
+  })
+
+  it('two local runs at once share one', async () => {
+    const h = localHarness()
+    const [a, b] = await Promise.all([h.onboarding.run({ localOnly: true }), h.onboarding.run({ localOnly: true })])
+    expect(a).toEqual({ ok: true, source: 'local', activeNow: true })
+    expect(b).toEqual(a)
+    expect(h.events.filter((e) => e === 'enable')).toHaveLength(1)
+  })
+
+  it('preflight offers the local Lite when this build has one, and counts local as bound', async () => {
+    const offered = await localHarness().onboarding.preflight()
+    expect(offered).toMatchObject({ activated: false, alreadyBound: false, localOffered: true, reachable: null })
+    expect((await localHarness({ lite: { offered: false } }).onboarding.preflight()).localOffered).toBe(false)
+    expect((await localHarness({ lite: false }).onboarding.preflight()).localOffered).toBe(false)
+    expect((await localHarness({ source: 'local' }).onboarding.preflight()).alreadyBound).toBe(true)
   })
 })

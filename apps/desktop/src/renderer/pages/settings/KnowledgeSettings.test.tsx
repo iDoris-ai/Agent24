@@ -79,3 +79,60 @@ describe('KnowledgeSettings: the server check (K2)', () => {
     expect(screen.getByText(/The knowledge server answers/)).toBeInTheDocument()
   })
 })
+
+// Loop 9 3c: remote or the local Lite, one at a time; the Lite's install and launch in one line.
+describe('KnowledgeSettings: the local knowledge base (Loop 9 3c)', () => {
+  const setSource = vi.fn()
+  const liteRetry = vi.fn()
+  const remote = { enabled: true, endpoint: 'https://kb.example/api/v1', knowledgeBaseIds: ['kb-a'], hasKey: true, active: true, source: 'remote', activeKnowledgeBaseIds: ['kb-a'], local: { phase: 'off' } }
+  beforeEach(() => {
+    setSource.mockResolvedValue({ ok: true })
+    liteRetry.mockResolvedValue(undefined)
+    Object.defineProperty(window, 'agent24', {
+      value: { knowledge: { status, configure, setEnabled, setSource, liteRetry } },
+      writable: true,
+      configurable: true,
+    })
+  })
+
+  it('offers the local knowledge base and switches to it; the remote form goes away while local', async () => {
+    status.mockResolvedValue(remote)
+    render(<KnowledgeSettings />)
+    await screen.findByDisplayValue('https://kb.example/api/v1')
+    status.mockResolvedValue({ ...remote, source: 'local', active: false, activeKnowledgeBaseIds: [], local: { phase: 'downloading', received: 41_943_040, total: 83_886_080 } })
+    fireEvent.click(screen.getByLabelText('Local knowledge base (lite)'))
+    await waitFor(() => expect(setSource).toHaveBeenCalledWith('local'))
+    expect(await screen.findByText(/Downloading… 40\.0 \/ 80\.0 MB/)).toBeInTheDocument()
+    expect(screen.queryByLabelText('WeKnora API address')).toBeNull()
+    expect(screen.getByText('On, but the local knowledge base is not ready yet.')).toBeInTheDocument()
+  })
+
+  it('says why it did not start, with a retry; never the words about upgrading', async () => {
+    status.mockResolvedValue({ ...remote, source: 'local', active: false, local: { phase: 'failed', reason: 'embedding_unavailable' } })
+    render(<KnowledgeSettings />)
+    expect(await screen.findByText(/the local model service \(iDoris\) is not ready/)).toBeInTheDocument()
+    status.mockResolvedValue({ ...remote, source: 'local', local: { phase: 'ready' } })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(liteRetry).toHaveBeenCalled())
+    expect(await screen.findByText('Ready. Uploads and searches stay on this computer.')).toBeInTheDocument()
+    expect(document.body.textContent ?? '').not.toMatch(/upgrad/i)
+  })
+
+  it('a failed download says so and offers a retry', async () => {
+    status.mockResolvedValue({ ...remote, source: 'local', active: false, local: { phase: 'install_failed', failure: 'network' } })
+    render(<KnowledgeSettings />)
+    expect(await screen.findByRole('alert')).toHaveTextContent('The download failed. Check the network, then retry.')
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(liteRetry).toHaveBeenCalled())
+  })
+
+  it('switching back to remote shows the saved server again', async () => {
+    status.mockResolvedValue({ ...remote, source: 'local', local: { phase: 'ready' } })
+    render(<KnowledgeSettings />)
+    await screen.findByText('Ready. Uploads and searches stay on this computer.')
+    status.mockResolvedValue(remote)
+    fireEvent.click(screen.getByLabelText('Remote knowledge base (server)'))
+    await waitFor(() => expect(setSource).toHaveBeenCalledWith('remote'))
+    expect(await screen.findByLabelText('WeKnora API address')).toHaveValue('https://kb.example/api/v1')
+  })
+})

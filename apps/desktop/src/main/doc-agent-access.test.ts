@@ -94,7 +94,7 @@ describe('doc-agent-access', () => {
     const key = `${CARD.fingerprint}|${CARD.artifact}|doc_a,doc_b`
     expect(saved.granted).toEqual(Object.fromEntries(DOC_AGENT_TOOLS.map((tool) => [tool, key])))
     // E1b/D5a: the DOCX tools too.
-    expect(DOC_AGENT_TOOLS).toEqual(['list', 'get', 'compose', 'paragraphs', 'compare', 'patch', 'fields', 'fill', 'delete'])
+    expect(DOC_AGENT_TOOLS).toEqual(['list', 'get', 'compose', 'paragraphs', 'compare', 'preflight', 'patch', 'fields', 'fill', 'delete'])
   })
 
   it('A1: a daemon without the batch route gets one grant a tool, as before', async () => {

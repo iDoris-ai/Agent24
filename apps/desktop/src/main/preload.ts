@@ -43,6 +43,8 @@ import {
   type DocAgentAccess,
   type OfficeEngineStatus,
   type TranslationExportResult,
+  type DeliverRequest,
+  type DeliverResult,
   type BackendProxyRequest,
   type BackendProxyResponse,
   type ApprovalDecisionInput,
@@ -264,6 +266,11 @@ const api = {
       ipcRenderer.invoke(IpcChannels.KnowledgeConfigure, input),
     setEnabled: (enabled: boolean): Promise<KnowledgeSettingsResult> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeSetEnabled, enabled),
+    /** Loop 9 3c: remote server or the local Lite. */
+    setSource: (source: 'remote' | 'local'): Promise<KnowledgeSettingsResult> =>
+      ipcRenderer.invoke(IpcChannels.KnowledgeSetSource, source),
+    /** Loop 9 3c: install or launch the local Lite again. */
+    liteRetry: (): Promise<void> => ipcRenderer.invoke(IpcChannels.KnowledgeLiteRetry),
     /** L7-K2: mock onboarding. The activation code and the key stay in main. */
     onboardPreflight: (): Promise<KnowledgeOnboardPreflight> =>
       ipcRenderer.invoke(IpcChannels.KnowledgeOnboardPreflight),
@@ -370,6 +377,8 @@ const api = {
       revision === undefined
         ? ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title)
         : ipcRenderer.invoke(IpcChannels.DocumentsSaveDownload, documentId, title, revision),
+    /** L8 DOC-4: a clean copy saved where the user picks in the save dialog, then its receipt. */
+    deliver: (req: DeliverRequest): Promise<DeliverResult> => ipcRenderer.invoke(IpcChannels.DocumentsDeliver, req),
     exportTranslation: (req: { title: string; paragraphs: Array<{ text: string; pageBreakBefore: boolean; level?: 1 | 2 | 3 }>; lang: 'en' | 'zh' }): Promise<TranslationExportResult> =>
       ipcRenderer.invoke(IpcChannels.DocumentsExportTranslation, req),
     onOfficeEngineChanged: (cb: (s: OfficeEngineStatus) => void): (() => void) => {

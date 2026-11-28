@@ -890,8 +890,15 @@ describe('who started a conversation and what of it is unseen (M6 C1)', () => {
   it('a full conversation main started keeps what is unseen within its runs when the oldest answer makes room', () => {
     const store = createChatHistoryStore(dir)
     const { id } = store.create({ title: '日程：周报', title_source: 'schedule', initiator: 'schedule' })
-    store.save(withReply(id, 'run_ans'))
-    for (let i = 0; i < 999; i++) store.appendRun(id, `run_${i}`, 'schedule')
+    // One valid full file. Appending 999 runs rewrites the record each time and times out.
+    const scheduleRuns = Array.from({ length: 999 }, (_, i) => run(`run_${i}`))
+    const seeded = {
+      ...store.get(id)!,
+      messages: withReply(id, 'run_ans').messages,
+      runs: [run('run_ans', 'answer'), ...scheduleRuns],
+      unseen: scheduleRuns.map(r => r.run_id),
+    }
+    fs.writeFileSync(path.join(dir, 'chat-history', `${id}.json`), JSON.stringify(seeded))
     expect(store.get(id)!.runs).toHaveLength(1000)
     const summary = store.appendRun(id, 'run_new', 'schedule')!
     expect(summary.unseen).toHaveLength(1000)

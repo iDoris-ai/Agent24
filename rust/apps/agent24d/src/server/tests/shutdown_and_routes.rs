@@ -292,6 +292,44 @@
         }
     }
 
+    /// Loop 9 3c: the Lite's embed-only iDoris key goes to the desktop's
+    /// ProductHost only; the host passes auth (no iDoris host here: 422).
+    #[tokio::test]
+    async fn lite_embedding_key_is_product_host_only() {
+        let (capabilities, host, creative) = capability_state().await;
+        let app = build_router(capabilities);
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(creative), StatusCode::FORBIDDEN),
+            (Some(host), StatusCode::UNPROCESSABLE_ENTITY),
+        ] {
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/idoris/lite-embedding");
+            if let Some(bearer) = bearer {
+                req = req.header(header::AUTHORIZATION, format!("Bearer {bearer}"));
+            }
+            let res = app
+                .clone()
+                .oneshot(req.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected);
+        }
+        let legacy = build_router(state().await)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/idoris/lite-embedding")
+                    .header(header::AUTHORIZATION, "Bearer testtoken")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(legacy.status(), StatusCode::FORBIDDEN);
+    }
+
     #[tokio::test]
     async fn key_backup_is_refused_in_legacy_mode_even_with_the_right_token() {
         let modules = Router::new()

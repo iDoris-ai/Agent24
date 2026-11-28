@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { asksDeleteDocument, asksDeleteParagraph, asksTranslation, docAgentPrompt, extractionFields, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
+import { asksDeleteDocument, asksDeleteParagraph, asksFillForm, asksTranslation, continuesFormFill, docAgentPrompt, FORM_HINT, extractionFields, formClaimUnbacked, formMaterial, materialHint, findByTitle, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './doc-intent'
 
 describe('D2b document intents in a conversation about a document', () => {
   it('reads page ranges to split out', () => {
@@ -45,7 +45,7 @@ describe('D2b document intents in a conversation about a document', () => {
 })
 
 const HINT = '需要处理文档时请使用 documents 工具（documents.list 查找；documents.compose 每调用一次生成一份新 PDF：合并是一次调用带多个 parts，拆成 N 份是调用 N 次、每次只带一个 part；'
-  + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息；'
+  + '按模板生成：先 documents.fields 查看模板里的 {{字段}}，再用 documents.fill 填写，values 的键是不带花括号的字段名，值取自用户给的信息，这些字段名都放进 user_said；'
   + '改写 Word 段落：先 documents.paragraphs 查看段落编号，再用 documents.patch 改写（每段给 index、新文字和 anchor，anchor 必须照抄这一段开头至少 12 个字，少于 12 个字会被拒；编号可以不写，写了要对），tracked=true 写成修订；document_id 可以直接填文件名；compose、fill、patch 成功一次就结束，不要重复调用。回答用户时不要提这些工具名）。'
 
 describe('docAgentPrompt', () => {
@@ -396,5 +396,122 @@ describe('L7-K0 (FU-184): taking a numbered part out of a document is a rewrite'
     expect(asksDeleteParagraph(text, inDocument)).toBe(false)
     // Neither sent to the Agent with the opposite hint nor given it.
     expect(docAgentPrompt({ id: 'doc_x', title: 't' }, text)).not.toContain(PARAGRAPH_HINT_PART)
+  })
+})
+
+describe('L8-S02: filling a form', () => {
+  it.each([
+    ['把这张入职登记表填一下，资料在《个人信息.docx》里', false],
+    ['这张表能填吗？', false],
+    ['用我的资料把这张表填了', false],
+    ['按《入职登记表模板.docx》填写', false],
+    ['帮我填一下', true],
+  ])('%s is a form fill (in a document: %s)', (text, inDocument) => {
+    expect(asksFillForm(text, inDocument)).toBe(true)
+    expect(wantsDocTool(text, inDocument)).toBe(true)
+  })
+
+  it.each([
+    ['烧开水要多久', false],
+    ['这份合同的甲方是谁', true],
+    ['帮我填一下', false],
+  ])('%s is not', (text, inDocument) => {
+    expect(asksFillForm(text, inDocument)).toBe(false)
+  })
+
+  it('a form turn carries the form hint: support, identity, manual fields, one by one', () => {
+    const prompt = docAgentPrompt(null, '把这张入职登记表填一下，资料在《个人信息.docx》里')
+    expect(prompt).toContain(FORM_HINT)
+    expect(prompt.endsWith('\n把这张入职登记表填一下，资料在《个人信息.docx》里')).toBe(true)
+    for (const said of ['source_document_id', 'user_said', 'ask_user', 'from_source', '不用自己读资料', '一律不从资料里取', '岗位字段', '空字符串', '不要自己编', '手工处理', 'PDF', '打印后手填', '逐项']) {
+      expect(FORM_HINT).toContain(said)
+    }
+    expect(docAgentPrompt(null, '把两份合并')).not.toContain(FORM_HINT)
+  })
+
+  it('an answer right after a form turn is part of it: it reaches the tools with the hint', () => {
+    const before = ['把这张入职登记表填一下，资料在《个人信息.docx》里']
+    expect(continuesFormFill(before, '电话是 13912345678')).toBe(true)
+    expect(continuesFormFill(before, '紧急联系人那栏我还没想好，先空着')).toBe(true)
+    expect(docAgentPrompt(null, '电话是 13912345678', true)).toContain(FORM_HINT)
+    // Up to three turns back, never further, and never without a form turn.
+    expect(continuesFormFill([...before, '电话 139', '地址北京', '身份证 110'], '好了吗')).toBe(false)
+    expect(continuesFormFill(['烧开水要多久'], '电话是 13912345678')).toBe(false)
+    expect(continuesFormFill([], '电话是 13912345678')).toBe(false)
+  })
+})
+
+describe('L8-S02 真机 0.7.122: a form turn that says it made a document it did not', () => {
+  const prompt = docAgentPrompt(null, '没有其他了，紧急联系人留空，签名我自己手写，直接生成吧', true)
+  const said = '已生成《入职登记表》最终版，文档已保存为《入职登记表模板（填写）》。'
+
+  it('reads as unchanged when the run wrote nothing', () => {
+    expect(formClaimUnbacked(prompt, said, null)).toEqual({ attempted: true, jobs: [], failed: [] })
+    expect(formClaimUnbacked(prompt, said, undefined)).toEqual({ attempted: true, jobs: [], failed: [] })
+    for (const s of ['表已经填好了。', '已保存到文档页。', '生成好了，请查看。', '已为你创建新文档。']) {
+      expect(formClaimUnbacked(prompt, s, null)).not.toBeNull()
+    }
+  })
+
+  it('leaves a write the run did, a question, and a turn that is not a form alone', () => {
+    const wrote = { attempted: true, jobs: ['job_1'], failed: [] }
+    expect(formClaimUnbacked(prompt, said, wrote)).toBe(wrote)
+    expect(formClaimUnbacked(prompt, '请告诉我你的姓名、电话和身份证号。', null)).toBeNull()
+    expect(formClaimUnbacked(docAgentPrompt(null, '这份合同讲了什么', false), said, null)).toBeNull()
+  })
+
+  it('tells the model a confirmed fill must call documents.fill', () => {
+    expect(FORM_HINT).toContain('必须调用 documents.fill')
+  })
+})
+
+describe('监工 0.7.123: the material a form fill was told', () => {
+  it('is the title after 资料 in this turn or the last three', () => {
+    expect(formMaterial([], '把《入职登记表模板.docx》填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
+    expect(formMaterial(['把这张表填一下，资料是《个人信息.docx》', '电话 139'], '确认无误，生成吧')).toBe('个人信息.docx')
+    expect(formMaterial([], '把《入职登记表模板.docx》填一下')).toBeNull()
+    expect(formMaterial(['资料在《旧.docx》里', 'a', 'b', 'c'], '生成吧')).toBeNull()
+    // PR-Daemon #2100 B3: told not to use it is not the material.
+    for (const no of ['资料不要用《李四.docx》，部门先空着', '资料别用《李四.docx》', '资料没有《李四.docx》']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    // r2 C3 (监工): only 「资料在《X》(里|中)」「资料是《X》」「用《X》(里|中)的资料」; any
+    // other 「资料…《X》」 in this turn is none, with no fall back to earlier turns.
+    expect(formMaterial([], '用《个人信息.docx》里的资料')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料在《个人信息.docx》中')).toBe('个人信息.docx')
+    for (const no of ['资料勿用《X.docx》', '资料无需《X.docx》', '资料请忽略《X.docx》', '资料莫用《X.docx》', '资料非《X.docx》', '资料用《X.docx》']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '资料别用《李四.docx》')).toBeNull()
+    // r3 D2/D3 (监工): any word of no or of taking it back in the turn: none, no fall back.
+    for (const no of ['别用《李四.docx》里的资料', '不要用《李四.docx》里的资料，部门先空着', '请勿用《李四.docx》中的资料', '别说资料是《李四.docx》',
+      '资料是《李四.docx》，这份别用，改用《王小明.docx》里的资料']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '刚才那份资料不要用了')).toBeNull()
+    // r4 E1–E3 (监工): a clause the whole of which names it, no word list.
+    for (const no of ['禁用《李四.docx》里的资料', '资料是《李四.docx》（作废）', '禁止用《李四.docx》里的资料', '取消用《李四.docx》里的资料']) {
+      expect(formMaterial([], no)).toBeNull()
+    }
+    expect(formMaterial(['资料是《李四.docx》'], '那份不用了')).toBeNull()
+    // 监工: the confirming turn keeps the material its fill was asked with.
+    expect(formMaterial(['把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里'], '没有其他了，紧急联系人留空，签名我自己手写，直接生成吧')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料是《莫小明.docx》')).toBe('莫小明.docx')
+    expect(formMaterial([], '资料在《个人信息.docx》里，部门没有的先空着')).toBe('个人信息.docx')
+    expect(formMaterial([], '把《入职登记表模板.docx》这张表填一下，资料在《个人信息.docx》里')).toBe('个人信息.docx')
+    // r5 F3: two more affirmative forms.
+    expect(formMaterial([], '请用《个人信息.docx》里的资料来填表')).toBe('个人信息.docx')
+    expect(formMaterial([], '资料就在《个人信息.docx》里')).toBe('个人信息.docx')
+  })
+
+  it('goes into the prompt by its id, for fields and fill', () => {
+    const hint = materialHint({ id: 'doc_01M8035XWKZJGGD3NHF3X0HJ0J', title: '个人信息.docx', revision: 1 })
+    expect(hint).toContain('《个人信息.docx》')
+    expect(hint).toContain('source_document_id=doc_01M8035XWKZJGGD3NHF3X0HJ0J')
+    expect(hint).toContain('documents.fill')
+    const prompt = docAgentPrompt(null, '生成吧', true, hint)
+    expect(prompt).toContain(hint)
+    expect(prompt.endsWith('\n生成吧')).toBe(true)
+    expect(docAgentPrompt(null, '生成吧', true)).not.toContain('source_document_id=doc_')
   })
 })

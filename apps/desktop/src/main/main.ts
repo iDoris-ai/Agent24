@@ -14,6 +14,8 @@ import { registerCliTool } from './ipc/cli-tool'
 import { registerResidentService } from './ipc/resident-service'
 import { registerOfficeEngine } from './ipc/office-engine'
 import { registerTranslationExport } from './ipc/translation-export'
+import { registerDocDeliver } from './ipc/doc-deliver'
+import { deliverDocument } from './doc-deliver'
 import { registerDocAgentAccess } from './ipc/doc-agent-access'
 import { KnowledgeReachability } from './knowledge-reachability'
 import { OfficeEngine, realOfficeEngineDeps } from './office-engine'
@@ -63,6 +65,9 @@ import {
 } from './creative-serve-web'
 import { createCreativeShutdown } from './creative-quit'
 import { OpenDesignComponentInstaller } from './open-design-component'
+import { WeknoraLiteHost, installedWeknoraLiteProgram } from './weknora-lite-host'
+import { WeknoraLiteInstaller } from './weknora-lite-component'
+import { LiteKnowledge, fetchLiteEmbedding } from './knowledge-lite'
 import { OpenDesignStatusReporter, mapOpenDesignReport, postOpenDesignReport } from './open-design-report'
 import { fileAppliedStore, KnowledgeHost } from './knowledge-host'
 import { serviceDaemonOf } from './service-daemon'
@@ -329,6 +334,10 @@ let presencePoller: PresencePoller | null = null
 // M5 B3: the same, over the presence connection, with the daemon the LaunchAgent runs.
 let presenceConnection: PresenceConnection | null = null
 let openDesignComponent: OpenDesignComponentInstaller | null = null
+// KB-LITE-02 (3b): the local knowledge base's WeKnora Lite. 3c starts it and supplies the embedding.
+let weknoraLite: WeknoraLiteHost | null = null
+// Loop 9 3c: install-then-launch of that Lite, driven by the Knowledge settings.
+let knowledgeLite: LiteKnowledge | null = null
 let openDesignReporter: OpenDesignStatusReporter | null = null
 let stopOpenDesignReady: (() => void) | null = null
 let creativeView: WebContentsView | null = null
@@ -554,6 +563,28 @@ app.whenReady().then(async () => {
     pinVersion: OPEN_DESIGN_PIN_VERSION,
     component: openDesignComponent ?? undefined,
   })
+  // Loop 9 3c: one installer per process (PR-Daemon #2104); the embedding is the
+  // daemon's embed-only iDoris key, asked for at every launch and kept in memory.
+  const weknoraLiteInstaller = new WeknoraLiteInstaller()
+  let liteEmbeddingProblem: string | null = null
+  weknoraLite = new WeknoraLiteHost({
+    program: installedWeknoraLiteProgram,
+    embedding: async () => {
+      try {
+        const embedding = await fetchLiteEmbedding(daemonConnection())
+        liteEmbeddingProblem = null
+        return embedding
+      } catch (error) {
+        liteEmbeddingProblem = error instanceof Error ? error.message : 'unavailable'
+        throw error
+      }
+    },
+  })
+  knowledgeLite = new LiteKnowledge({
+    installer: weknoraLiteInstaller,
+    host: weknoraLite,
+    embeddingProblem: () => liteEmbeddingProblem,
+  })
   // ADR-038 C3b: main owns the ProductHost credential and reports Open Design.
   // The renderer never receives this client or the report route.
   openDesignReporter = new OpenDesignStatusReporter({
@@ -691,8 +722,15 @@ app.whenReady().then(async () => {
   const knowledgeLogins = knowledgeHost.start()
   if (!knowledgeLogins.ok) console.warn(`[knowledge] logins unavailable: ${knowledgeLogins.reason}`)
   // The user's Knowledge settings drive the one binding; Off keeps it inactive.
-  knowledge = new KnowledgeController(knowledgeHost, loginStore, new KnowledgeSettingsStore(app.getPath('userData')))
+  knowledge = new KnowledgeController(knowledgeHost, loginStore, new KnowledgeSettingsStore(app.getPath('userData')), {
+    ...(weknoraLite ? { local: weknoraLite } : {}),
+  })
   void knowledge.apply()
+  // Loop 9 3c: the local knowledge base comes back with the app when it is the source in use.
+  if (knowledgeLite) {
+    const s = knowledge.status()
+    if (s.enabled && s.source === 'local') void knowledgeLite.enable()
+  }
   // K2: is the bound Knowledge server answering? Checked every minute while On.
   {
     const controller = knowledge
@@ -721,6 +759,7 @@ app.whenReady().then(async () => {
   const knowledgeOnboard = knowledgeOnboarding({
     dir: app.getPath('userData'),
     controller: () => knowledge,
+    lite: () => knowledgeLite,
     fetch: (url, init) => net.fetch(url, init),
   })
   // L7-K2 A3: same origin and credential as the entry submission, for the default base.
@@ -729,9 +768,11 @@ app.whenReady().then(async () => {
       if (!knowledge) return null
       const binding = knowledge.viewBinding()
       const inputs = binding === null ? null : knowledge.uiSessionInputs(binding)
-      const origin = settingsKnowledgeViewTarget(knowledge.status().endpoint)?.origin
-      if (!inputs || !origin) return null
+      const origin = settingsKnowledgeViewTarget(knowledge.activeTarget()?.endpoint)?.origin
+      if (!inputs || !origin || binding === null) return null
       return {
+        binding,
+        local: knowledge.status().source === 'local',
         origin,
         // Asked again at each request: a key changed meanwhile is not used for the old binding.
         credential: () => (knowledge?.uiSessionInputs(binding as string)?.credential ?? null),
@@ -740,7 +781,7 @@ app.whenReady().then(async () => {
       }
     },
     knowledgeBaseId: () => {
-      const id = knowledge?.status().knowledgeBaseIds[0]
+      const id = knowledge?.activeTarget()?.knowledgeBaseIds[0]
       return typeof id === 'string' && id.length > 0 ? id : null
     },
     readFile: (filePath) => fs.promises.readFile(filePath),
@@ -758,6 +799,7 @@ app.whenReady().then(async () => {
   registerIpcHandlers({
     guard,
     knowledge: () => knowledge,
+    ...(knowledgeLite ? { knowledgeLite } : {}),
     knowledgeOnboard,
     knowledgeUpload,
     scheduleConversation: (scheduleId) => scheduleConversations().conversationOf(scheduleId),
@@ -868,6 +910,23 @@ app.whenReady().then(async () => {
       },
     },
   })
+  // L8 DOC-4: the delivery card's button; the save dialog is this window's.
+  registerDocDeliver({
+    guard,
+    deliver: (req) => deliverDocument({
+      showSaveDialog: (options) => {
+        const win = BrowserWindow.getFocusedWindow()
+        return win ? dialog.showSaveDialog(win, options) : dialog.showSaveDialog(options)
+      },
+      call: (r) => withDocumentsDelegation(() => documentsCall(r, daemonCliEndpoint)),
+      jobEnd: documentsJobEnd,
+      desktopDir: () => app.getPath('desktop'),
+      exists: (p) => fs.existsSync(p),
+      // `wx`: never over a file that appeared after the check (PR-Daemon style: no overwrite).
+      writeFile: (p, bytes) => fs.writeFileSync(p, bytes, { flag: 'wx' }),
+      remove: (p) => fs.rmSync(p, { force: true }),
+    }, req),
+  })
   registerDocAgentAccess({
     guard,
     deps: {
@@ -923,7 +982,7 @@ app.whenReady().then(async () => {
     window: () => mainWin,
     createView: (webPreferences) => new WebContentsView({ webPreferences }),
     sessionFor: (partition) => session.fromPartition(partition, { cache: false }),
-    target: () => resolveKnowledgeViewTarget(process.env, app.isPackaged, knowledge?.status().endpoint),
+    target: () => resolveKnowledgeViewTarget(process.env, app.isPackaged, knowledge?.activeTarget()?.endpoint),
     binding: () => knowledge?.viewBinding() ?? null,
     packaged: app.isPackaged,
     ui: (context) => {
@@ -943,7 +1002,7 @@ app.whenReady().then(async () => {
         setTimer: (fn, ms) => setTimeout(fn, ms),
         clearTimer: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
         onEvent: context.onEvent,
-        selected: () => knowledge?.status().knowledgeBaseIds ?? [],
+        selected: () => knowledge?.activeTarget()?.knowledgeBaseIds ?? [],
         fetch: (url, init) => net.fetch(url, init),
       })
     },
@@ -962,8 +1021,8 @@ app.whenReady().then(async () => {
   const entryDrafts = createEntryDraftStore(app.getPath('userData'))
   const entryTargetNow = (): string | null => {
     if (!knowledge || knowledge.bindingForRun() === null) return null
-    const s = knowledge.status()
-    return entryTarget(s.endpoint, s.knowledgeBaseIds)
+    const s = knowledge.activeTarget()
+    return s && entryTarget(s.endpoint, s.knowledgeBaseIds)
   }
   // KB-SOP-01b (#1670): the Provider's candidate.propose, with C and the
   // generation of the binding in effect (the same ones the UI session uses).
@@ -972,12 +1031,12 @@ app.whenReady().then(async () => {
     drafts: entryDrafts,
     candidates: entryCandidates,
     target: entryTargetNow,
-    knowledgeBaseIds: () => knowledge?.status().knowledgeBaseIds ?? [],
+    knowledgeBaseIds: () => knowledge?.activeTarget()?.knowledgeBaseIds ?? [],
     provider: () => {
       if (!knowledge) return null
       const binding = knowledge.viewBinding()
       const inputs = binding === null ? null : knowledge.uiSessionInputs(binding)
-      const origin = settingsKnowledgeViewTarget(knowledge.status().endpoint)?.origin
+      const origin = settingsKnowledgeViewTarget(knowledge.activeTarget()?.endpoint)?.origin
       if (!inputs || !origin) return null
       return {
         generation: inputs.generation,
@@ -1015,7 +1074,7 @@ app.whenReady().then(async () => {
     target: entryTargetNow,
     locale: getMainLocale,
     pending: knowledgeWaiting,
-    knowledgeBaseIds: () => knowledge?.status().knowledgeBaseIds ?? [],
+    knowledgeBaseIds: () => knowledge?.activeTarget()?.knowledgeBaseIds ?? [],
     submission: (id, draft) => entrySubmission.view(id, draft),
   }, entrySubmission)
   ipcMain.handle(IpcChannels.CreativeShow, guard((_event, bounds: CreativeViewBounds) => showCreativeView(bounds)))
@@ -1239,6 +1298,7 @@ const shutdown = createCreativeShutdown({
   stop: async () => {
     await Promise.all([
       creativeServeWeb?.shutdown(),
+      weknoraLite?.shutdown(),
       ensureOwnedOmlxQuit(),
     ])
   },

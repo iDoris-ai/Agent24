@@ -17,16 +17,19 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { asksDeleteDocument, docAgentPrompt, extractionFields, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, extractionFields, formClaimUnbacked, formMaterial, materialHint, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
-import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument } from './chat/doc-context'
+import { bindPendingDocument, documentOf, documentText, pendingDocument, subscribeDocContext, unbindDocument, withDocument, type DocumentRef } from './chat/doc-context'
 import { HandOver, TaskCards } from './chat/TaskCard'
 import { ExtractCard } from './chat/ExtractCard'
 import { DeleteChoice } from './chat/DeleteChoice'
 import { RestoreCard } from './chat/RestoreCard'
 import { CompareCard } from './chat/CompareCard'
+import { DeliverCard } from './chat/DeliverCard'
+import { asksDeliver, runPreflight, runReceipts, type DeliverCardData } from './chat/doc-deliver'
+import { formEntryReply, resolveFormEntry, templateHint } from './chat/form-entry'
 import { asksCompare, runCompare, type CompareCardData } from './chat/doc-compare'
 import { asksRestoreVersion, restoreCardOf, restoreVersion, type RestoreCardData } from './chat/doc-version'
 import { KnowledgeUploadCard } from './chat/KnowledgeUploadCard'
@@ -90,6 +93,8 @@ interface AssistantMessage {
   restore?: RestoreCardData
   /** L6-S05: the summary of a comparison, a line per change; text only in the history. */
   compare?: CompareCardData
+  /** L8 DOC-4: the check before sending, with the clean copy's buttons; text only in the history. */
+  deliver?: DeliverCardData
   /** L7-K2: upload after onboarding or 「上传文档」; the history keeps the text only. */
   knowledgeUpload?: { uploadIds: string[] }
 }
@@ -176,6 +181,8 @@ export default function ChatPage() {
   const requestInFlight = useRef(false)
   // L7-K2: onboarding in progress for this chat, keyed by session. Not the model.
   const onboard = useRef(new Map<string, OnboardStep>())
+  /** L9-1b: the template each conversation's form fill uses, for the turns that answer it. */
+  const formTemplate = useRef(new Map<string, DocumentRef>())
   // Knowledge on: turns go to /runs, in a real session created once.
   const [awaitingApproval, setAwaitingApproval] = useState(false)
   const runSession = useRef<string | null>(null)
@@ -334,6 +341,36 @@ export default function ChatPage() {
       }
       return null
     }
+    // L8 DOC-4: 「发给对方前帮我检查一下」「去掉修订和批注，导出一份 PDF 放桌面」
+    // 「我上次发出去的是哪个版本？」 — the App checks and reads the receipts; a
+    // clean copy is made only from the card's button, never by the model.
+    const deliverAsk = answer ? null : asksDeliver(text, doc !== null, lastNamed() !== null)
+    if (deliverAsk !== null && window.agent24.documents) {
+      const api = window.agent24.documents
+      const named = /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? (deliverAsk.kind === 'receipts' ? null : lastNamed())
+      requestInFlight.current = true
+      setLoading(true)
+      const index = messages.length
+      let reply: AssistantMessage
+      try {
+        const subject = doc ?? (named ? await namedDocument(api, named).catch(() => '没能读取文档列表。') : null)
+        if (typeof subject === 'string') reply = { role: 'assistant', content: subject }
+        else if (deliverAsk.kind === 'receipts') reply = { role: 'assistant', content: await runReceipts(api, subject ? { id: subject.id, title: subject.title } : null) }
+        else if (!subject) reply = { role: 'assistant', content: '请先打开要发送的文档，或用《文件名》说明是哪一份。' }
+        else {
+          const out = await runPreflight(api, { id: subject.id, title: subject.title }, deliverAsk)
+          reply = { role: 'assistant', content: out.text, ...(out.card ? { deliver: out.card } : {}) }
+        }
+      } catch (e) {
+        reply = { role: 'assistant', content: '没能完成检查，文档没有改动。', detail: e instanceof Error ? e.message : String(e) }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      setDelivery(index, { kind: 'sent' })
+      setMessages(prev => [...prev, reply])
+      return
+    }
     const restoreOf = restoreAsk === null ? null : doc ? '' : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? lastNamed()
     if (restoreAsk !== null && restoreOf !== null && window.agent24.documents) {
       const api = window.agent24.documents
@@ -372,17 +409,20 @@ export default function ChatPage() {
           if (title && !named.includes(title) && named.length < 2) named.push(title)
         }
       }
-      let reply: AssistantMessage
+      let reply: AssistantMessage | null = null
       try {
         const out = await runCompare(api, compareAsk, doc ? { id: doc.id, title: doc.title } : null, named)
-        reply = { role: 'assistant', content: out.text, ...(out.card ? { compare: out.card } : {}) }
+        // L10-1: null means the documents are not in the library; the model answers.
+        if (out !== null) reply = { role: 'assistant', content: out.text, ...(out.card ? { compare: out.card } : {}) }
       } finally {
         requestInFlight.current = false
         setLoading(false)
       }
-      setDelivery(index, { kind: 'sent' })
-      setMessages(prev => [...prev, reply])
-      return
+      if (reply !== null) {
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, reply])
+        return
+      }
     }
     // F3: 「把这份合同的甲方、乙方、金额、期限抽出来」 — the documents OS's extract
     // job reads the document; the model at most names the fields.
@@ -420,7 +460,42 @@ export default function ChatPage() {
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
     // E1b/D5a: 「按《模板》填写…」「把第三条改成…，用修订」 go the same way.
-    if ((chosen !== null || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
+    // L8-S02: an answer to what a form fill asked goes back to it, with the form hint.
+    const earlier = messages.filter((m) => m.role === 'user').map((m) => m.content)
+    const form = asksFillForm(text, doc !== null) || continuesFormFill(earlier, text, doc !== null)
+    // L9-1b (FU-252/253): the App tells the template from the material, and
+    // answers a PDF form or an unclear template itself, before any model.
+    let formSaid: string | null = null
+    // An answer turn that itself asks for another documents operation (「把《X》删了」)
+    // is that operation, not the form's (Codex L9-1b C1).
+    // A title is never the operation (0.7.125: the answer 「《入职登记表模板.docx》」
+    // has 模板 in it): judged with each 《…》 as 《_》, still a named document.
+    const asksForm = asksFillForm(text, doc !== null)
+    const otherOp = wantsDocTool(text.replace(/《[^》]{1,200}》/g, '《_》'), doc !== null)
+    if (form && chosen === null && (asksForm || !otherOp) && window.agent24.documents) {
+      requestInFlight.current = true
+      setLoading(true)
+      let direct: string | null = null
+      try {
+        const entry = await resolveFormEntry(window.agent24.documents, {
+          doc, text: text.trim(), earlier, asks: asksForm, remembered: formTemplate.current.get(sessionId) ?? null,
+        })
+        direct = formEntryReply(entry)
+        if (entry.kind === 'fill') {
+          formTemplate.current.set(sessionId, entry.template)
+          formSaid = templateHint(entry.template) + (entry.material ? materialHint(entry.material) : '')
+        }
+      } finally {
+        requestInFlight.current = false
+        setLoading(false)
+      }
+      if (direct !== null) {
+        setDelivery(messages.length, { kind: 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: direct }])
+        return
+      }
+    }
+    if ((chosen !== null || form || wantsDocTool(text, doc !== null)) && window.agent24.documents?.agentAccess) {
       // Busy from before the wait: no second turn, no switch of conversation
       // while the grants are brought up to date (PR-Daemon #1909 ④).
       requestInFlight.current = true
@@ -441,7 +516,11 @@ export default function ChatPage() {
           setLoading(false)
           return
         }
-        if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim())
+        // 监工 0.7.123: the material the user named goes in by its id.
+        const named = form && !target && formSaid === null ? formMaterial(earlier, text) : null
+        const material = named ? await namedDocument(window.agent24.documents, named).catch(() => null) : null
+        const said = formSaid ?? (material && typeof material !== 'string' ? materialHint(material) : '')
+        if (last?.role === 'user') last.content = target ? deletePrompt(target, text.trim()) : docAgentPrompt(doc, text.trim(), form, said)
         await replyWithKnowledge(messages.length, request, false)
         return
       }
@@ -847,7 +926,7 @@ export default function ChatPage() {
         const facts = withKnowledge ? knowledgeFacts(turn.knowledge) : null
         // A refused search says so itself; 「没有检索知识库」 beside it would say it twice.
         const knowledge = checked?.kind === 'notSearched' && (query === null || facts?.kind === 'refused') && checked.unread.length === 0 ? undefined : checked
-        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: turn.documents, facts, cited: withKnowledge ? turn.knowledge?.found : undefined }])
+        setMessages(prev => [...prev, { role: 'assistant', content: turn.text || t('reply.empty'), suffix, knowledge, runId: turn.runId, documents: formClaimUnbacked(prompt, turn.text, turn.documents), facts, cited: withKnowledge ? turn.knowledge?.found : undefined }])
       } else if (turn.kind === 'ongoing') {
         // M4 A4: the turn stopped waiting, the run goes on as this
         // conversation's task; its card shows how it does.
@@ -950,6 +1029,7 @@ export default function ChatPage() {
                 if (asked) void send(asked.content, true)
               }} />
                 : m.role === 'assistant' && m.compare ? <><Markdown text={m.content} /><CompareCard card={m.compare} /></>
+                : m.role === 'assistant' && m.deliver ? <><Markdown text={m.content} /><DeliverCard card={m.deliver} /></>
                 : m.role === 'assistant' && m.restore ? <><Markdown text={m.content} /><RestoreCard card={m.restore} onRestore={loading || archived ? undefined : () => {
                   const card = m.restore!
                   setMessages(prev => prev.map((p, j) => (j === i && p.role === 'assistant' ? { ...p, restore: undefined } : p)))

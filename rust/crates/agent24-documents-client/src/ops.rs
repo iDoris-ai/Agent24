@@ -178,6 +178,34 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             let path = format!("{BASE}/documents/{document}/revisions/{revision}/restore");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
+        // L8 DOC-4: a clean copy of the version checked, as a new document;
+        // the receipt once its file is saved; the latest receipts.
+        "deliver" => {
+            let document = k.id("documentId", "doc_")?;
+            let body = json!({"expect_revision": k.number("expectRevision")?});
+            let path = format!("{BASE}/documents/{document}/deliveries");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        "receipt" => {
+            let document = k.id("documentId", "doc_")?;
+            let saved_to =
+                k.0.get("savedTo")?
+                    .as_str()
+                    .filter(|p| p.starts_with('/') && (2..=1024).contains(&p.chars().count()))?;
+            let body = json!({
+                "revision": k.number("revision")?,
+                "copy_document_id": k.id("copyDocumentId", "doc_")?,
+                "saved_to": saved_to,
+            });
+            let path = format!("{BASE}/documents/{document}/receipts");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        "receipts" => {
+            match k.optional("documentId", |v| v.as_str().filter(|v| ulid_id(v, "doc_")))? {
+                Some(document) => get(format!("{BASE}/documents/{document}/receipts")),
+                None => get(format!("{BASE}/receipts")),
+            }
+        }
         // L6-S05: two documents, or two versions of one, compared by text.
         "compare" => {
             let side = |key: &str| -> Option<Value> {
@@ -385,6 +413,13 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
                 get(format!("{BASE}/documents/{document}/fields"));
             (method, path, body, headers, Answer::Json)
         }
+        // L8 DOC-4: what the document still carries before it is sent (read).
+        "preflight" => {
+            let document = k.id("documentId", "doc_")?;
+            let (method, path, body, headers, _) =
+                get(format!("{BASE}/documents/{document}/preflight"));
+            (method, path, body, headers, Answer::Json)
+        }
         // D5a: the template with its fields filled, as a new document.
         "fill" => {
             let document = k.id("documentId", "doc_")?;
@@ -406,6 +441,36 @@ fn routed(req: &Value) -> Option<(Request, Answer)> {
             }
             save_to(&k, &mut body)?;
             let path = format!("{BASE}/documents/{document}/fill");
+            (Method::Post, path, Some(body), Vec::new(), Answer::Json)
+        }
+        // L8-S02 (PR-Daemon #2100, 监工 裁决 C): what a fill with the user's
+        // material takes from it (read), for the approval box.
+        "fillPreview" => {
+            let document = k.id("documentId", "doc_")?;
+            let source = k.id("sourceDocumentId", "doc_")?;
+            let empty = Map::new();
+            let values = k.optional("values", Value::as_object)?.unwrap_or(&empty);
+            if values.len() > 200
+                || values.iter().any(|(name, value)| {
+                    !(1..=64).contains(&name.chars().count())
+                        || value.as_str().is_none_or(|v| v.chars().count() > 100_000)
+                })
+            {
+                return None;
+            }
+            let said = k
+                .optional("userSaid", |v| {
+                    let a = v.as_array().filter(|a| a.len() <= 200)?;
+                    a.iter()
+                        .all(|n| {
+                            n.as_str()
+                                .is_some_and(|n| (1..=64).contains(&n.chars().count()))
+                        })
+                        .then(|| a.clone())
+                })?
+                .unwrap_or_default();
+            let body = json!({"source_document_id": source, "values": values, "user_said": said});
+            let path = format!("{BASE}/documents/{document}/fill/preview");
             (Method::Post, path, Some(body), Vec::new(), Answer::Json)
         }
         // D5a: the head revision's file, to be saved (at most the reply limit).
