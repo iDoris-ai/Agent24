@@ -17,7 +17,8 @@ import { answeredTurns, generateTitle, promptTitle, titleDue } from './chat/titl
 import { CHAT_HISTORY_FORMAT, CHAT_HISTORY_VERSION, promotionDue, type ChatHistoryRecord } from '../../shared/chat-history'
 import { DraftAttachments, useKnowledgeDraft } from './chat/knowledge-draft'
 import { namedDocument, runDocIntent } from './chat/doc-intent-run'
-import { asksDeleteDocument, asksFillForm, continuesFormFill, docAgentPrompt, extractionFields, formClaimUnbacked, formMaterial, materialHint, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { asksDeleteDocument, asksFillForm, asksToWord, continuesFormFill, docAgentPrompt, extractionFields, formClaimUnbacked, formMaterial, materialHint, parseDocIntent, subjectOf, translatesDocument, wantsDocTool } from './chat/doc-intent'
+import { runToWord } from './chat/pdf-word-chat'
 import { askWithProxy, checkDocument, readAllCheckBlocks, reportMarkdown } from './documents/doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './documents/doc-translate'
 import { convertedPdf } from './documents/compose'
@@ -456,6 +457,31 @@ export default function ChatPage() {
       setDelivery(index, { kind: 'sent' })
       setMessages(prev => [...prev, reply])
       return
+    }
+    // L13-1: 「把《X》转成 Word」 — PDF → Word by the App, not the model (chat/pdf-word-chat.ts).
+    if (asksToWord(text, doc !== null) && window.agent24.documents) {
+      const named = doc ? null : /《([^》]{1,200})》/.exec(text)?.[1]?.trim() ?? null
+      if (doc || named) {
+        const api = window.agent24.documents
+        requestInFlight.current = true
+        setLoading(true)
+        const index = messages.length
+        let reply: string
+        try {
+          const subject = doc ?? await namedDocument(api, named ?? '')
+          reply = typeof subject === 'string'
+            ? subject
+            : (subject.note ? `${subject.note}\n\n` : '') + await runToWord(api, { id: subject.id, title: subject.title }, text)
+        } catch (e) {
+          reply = `没能转换为 Word：${e instanceof Error ? e.message : String(e)}`
+        } finally {
+          requestInFlight.current = false
+          setLoading(false)
+        }
+        setDelivery(index, { kind: 'sent' })
+        setMessages(prev => [...prev, { role: 'assistant', content: reply }])
+        return
+      }
     }
     // D2b 正式版: granted documents tools go to the Agent; otherwise the
     // lightweight compose path below still handles a named split/merge.
