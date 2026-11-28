@@ -161,7 +161,9 @@ describe('Sin90 three layers', () => {
     fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '给同事回信' } })
     fireEvent.click(screen.getByRole('button', { name: '记下' }))
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'capture', text: '给同事回信' }))
-    fireEvent.click(within(screen.getByRole('listitem', { name: '写完方案' })).getByLabelText('完成'))
+    const mustDo = screen.getByRole('heading', { name: '今天先做这三件' }).closest('section')
+    expect(mustDo).not.toBeNull()
+    fireEvent.click(within(mustDo as HTMLElement).getByRole('listitem', { name: '写完方案' }).querySelector('[aria-label="完成"]') as HTMLElement)
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionTask', id: 't1', to: 'done' }))
   })
 
@@ -181,7 +183,9 @@ describe('Sin90 three layers', () => {
     directions = [{ id: 'd1', area_id: null, title: '一个很长很长的方向名称', status: 'active', target_window: 'ongoing' }]
     today = { must_do: [task('t1', '必做事项标题')], deep_block: null, inbox: [], carry_over_candidates: [] }
     render(<Sin90Page />)
-    const row = await screen.findByRole('listitem', { name: '必做事项标题' })
+    const mustDo = (await screen.findByRole('heading', { name: '今天先做这三件' })).closest('section')
+    expect(mustDo).not.toBeNull()
+    const row = within(mustDo as HTMLElement).getByRole('listitem', { name: '必做事项标题' })
     expect(within(row).getByText('一个很长很长的方向名称')).toHaveClass('sin90-task-direction')
     expect(row.querySelector('.sin90-task-direction')?.getAttribute('title')).toBe('一个很长很长的方向名称')
   })
@@ -423,107 +427,130 @@ describe('Sin90 demo banner & data panel', () => {
 })
 
 
-describe('Sin90 quadrant fallback', () => {
-  it('shows four named quadrants and real unevaluated tasks once on an old module', async () => {
+function cardByHeading(name: string) {
+  const section = screen.getByRole('heading', { name }).closest('section')
+  if (!section) throw new Error(name)
+  return section
+}
+function isBefore(earlier: Element, later: Element) {
+  return Boolean(earlier.compareDocumentPosition(later) & Node.DOCUMENT_POSITION_FOLLOWING)
+}
+function completedRegion() {
+  return screen.queryByRole('region', { name: '已完成' }) ?? screen.getByRole('region', { name: '本周完成素材' })
+}
+
+describe('Sin90 today one screen', () => {
+  it('shows capture, focus, quadrants, unevaluated work and overview together', async () => {
     directions = [{ id: 'd1', title: '产品', status: 'active', target_window: 'ongoing' }]
     tasks = [task('t1', '写完方案'), task('t2', '访谈用户', 'backlog')]
     today = { must_do: [task('t1', '写完方案')], deep_block: null, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
     render(<Sin90Page />)
-    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
-    const board = await screen.findByRole('region', { name: '优先级四象限' })
-    for (const name of ['重要 · 紧急', '重要 · 不紧急', '不重要 · 紧急', '不重要 · 不紧急', '未评估']) {
+    const capture = await screen.findByLabelText(/随手记/)
+    expect(screen.queryByRole('tablist', { name: '今天视图' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '今日概览' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('tab', { name: '四象限' })).not.toBeInTheDocument()
+    await screen.findByRole('region', { name: '重要 · 紧急' })
+    const focus = screen.getByRole('heading', { name: '下一段专注' })
+    const board = screen.getByRole('region', { name: '优先级四象限' })
+    const unassessed = screen.getByRole('region', { name: '未评估' })
+    const overview = screen.getByRole('heading', { name: '今天先做这三件' })
+    expect(isBefore(capture, focus)).toBe(true)
+    expect(isBefore(focus, board)).toBe(true)
+    expect(isBefore(board, overview)).toBe(true)
+    expect(isBefore(unassessed, overview)).toBe(true)
+    expect(isBefore(completedRegion(), overview)).toBe(true)
+    for (const name of ['重要 · 紧急', '重要 · 不紧急', '不重要 · 紧急', '不重要 · 不紧急']) {
       expect(within(board).getByRole('region', { name })).toBeInTheDocument()
     }
-    const unassessed = within(board).getByRole('region', { name: '未评估' })
-    expect(within(unassessed).getAllByRole('listitem')).toHaveLength(2)
-    expect(screen.getAllByText('写完方案')).toHaveLength(1)
-    expect(screen.getAllByText('访谈用户')).toHaveLength(1)
-    expect(within(board).getByText(/当前模块未提供优先级评估/)).toBeInTheDocument()
-    expect(within(board).getByLabelText('评估建议（可选）')).toBeDisabled()
-    expect(within(board).getByRole('button', { name: '重新评估优先级' })).toBeDisabled()
+    expect(within(unassessed).getAllByText('写完方案')).toHaveLength(1)
+    expect(within(unassessed).getAllByText('访谈用户')).toHaveLength(1)
+    for (const title of ['收件箱', '本周节奏', '方向']) expect(screen.getAllByText(title).length).toBeGreaterThan(0)
+    expect(screen.getByRole('button', { name: '看本周' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '重新评估优先级' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '开始评估' })).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('可选背景')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText(/评估建议/)).not.toBeInTheDocument()
+    expect(screen.getByText(/当前模块未提供优先级评估/)).toBeInTheDocument()
     expect(sin90Write).not.toHaveBeenCalled()
   })
 
-  it('keeps capture and long-term edits when returning to daily work', async () => {
+  it('keeps the capture draft while moving across direction, rhythm and today', async () => {
     render(<Sin90Page />)
     fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '待整理的上下文' } })
     fireEvent.click(screen.getByRole('tab', { name: '方向' }))
     fireEvent.click(screen.getByRole('tab', { name: '节奏' }))
     fireEvent.click(screen.getByRole('tab', { name: '今天' }))
     expect(screen.getByLabelText(/随手记/)).toHaveValue('待整理的上下文')
-    expect(screen.getByRole('tab', { name: '今日概览' })).toHaveAttribute('aria-selected', 'true')
-    fireEvent.click(screen.getByRole('tab', { name: '四象限' }))
-    expect(await screen.findByRole('region', { name: '优先级四象限' })).toBeInTheDocument()
-    expect(screen.getByLabelText(/随手记/)).toHaveValue('待整理的上下文')
-    fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
-    for (const title of ['下一段专注', '今天先做这三件', '收件箱', '本周节奏', '方向']) expect(screen.getAllByText(title).length).toBeGreaterThan(0)
-    expect(screen.getByRole('button', { name: '看本周' })).toBeInTheDocument()
+    expect(screen.getByRole('region', { name: '优先级四象限' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '下一段专注' })).toBeInTheDocument()
+    expect(screen.getByRole('heading', { name: '今天先做这三件' })).toBeInTheDocument()
     expect(sin90Write).not.toHaveBeenCalled()
   })
 
   it('completes an unevaluated backlog task without notes or AI', async () => {
     today = { must_do: [], deep_block: null, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
     render(<Sin90Page />)
-    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
-    const row = await screen.findByRole('listitem', { name: '访谈用户' })
-    fireEvent.click(within(row).getByRole('button', { name: '完成' }))
+    const row = await within(await screen.findByRole('region', { name: '未评估' })).findByRole('listitem', { name: '访谈用户' })
+    const done = within(row).getByRole('button', { name: '完成' })
+    await waitFor(() => expect(done).toBeEnabled())
+    fireEvent.click(done)
     await waitFor(() => expect(sin90Write).toHaveBeenCalledTimes(3))
     expect(sin90Write.mock.calls.map(([body]) => body)).toEqual([
       { op: 'transitionTask', id: 't2', to: 'planned' },
       { op: 'transitionTask', id: 't2', to: 'in_progress' },
       { op: 'transitionTask', id: 't2', to: 'done' },
     ])
+    expect(sin90Write.mock.calls.some(([body]) => body['op'] === 'evaluatePriority')).toBe(false)
+  })
+
+  it('lets an unevaluated task choose a quadrant and leaves classified tasks read-only', async () => {
+    tasks = [task('t1', '写完方案'), task('t2', '访谈用户', 'backlog')]
+    today = { must_do: [task('t1', '写完方案')], deep_block: null, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
+    const ai = { quadrant: 'do_first', rationale: '今天交付', importance: 'high', urgency: 'high', evaluated_at: '2026-11-24T00:00:00Z' }
+    const human = { quadrant: 'schedule', rationale: '先访谈再交付' }
+    priorities['/api/v1/sin90/tasks/t1/priority'] = { task_id: 't1', evaluation_status: 'evaluated', ai, human_override: human, effective: human }
+    priorities['/api/v1/sin90/tasks/t2/priority'] = { task_id: 't2', evaluation_status: 'unevaluated', ai: null, human_override: null, effective: null }
+    render(<Sin90Page />)
+    const classified = within(await screen.findByRole('region', { name: '重要 · 不紧急' })).getByRole('listitem', { name: '写完方案' })
+    expect(within(classified).getByRole('button', { name: '完成' })).toBeInTheDocument()
+    expect(within(classified).getByText('写完方案')).toBeInTheDocument()
+    expect(within(classified).getByText('你已归类')).toBeInTheDocument()
+    expect(within(classified).queryByText('系统判断')).not.toBeInTheDocument()
+    expect(classified.querySelector('select, textarea, input, summary')).toBeNull()
+    expect(within(classified).queryByRole('button', { name: '保存我的判断' })).not.toBeInTheDocument()
+    expect(within(classified).queryByRole('button', { name: '清除我的判断' })).not.toBeInTheDocument()
+    const pending = within(screen.getByRole('region', { name: '未评估' })).getByRole('listitem', { name: '访谈用户' })
+    const picker = within(pending).getByLabelText('手动选择象限')
+    await waitFor(() => expect(picker).toBeEnabled())
+    fireEvent.change(picker, { target: { value: 'do_first' } })
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'overridePriority', id: 't2', quadrant: 'do_first', rationale: '' }))
+    expect(sin90Write.mock.calls.some(([body]) => body['op'] === 'evaluatePriority')).toBe(false)
   })
 })
 
 
 describe('Sin90 loop desktop contract', () => {
-  const assessment = (quadrant: string, rationale: string) => ({ quadrant, rationale, importance: 'high', urgency: quadrant === 'do_first' ? 'high' : 'low', evaluated_at: '2026-11-24T00:00:00Z' })
-  it('allows advice before evaluation and leaves it optional', async () => {
-    tasks = [task('t1', '写完方案')]
-    priorities['/api/v1/sin90/tasks/t1/priority'] = { task_id: 't1', evaluation_status: 'unevaluated', ai: null, human_override: null, effective: null }
+  it('shows a completed record read-only on today and still edits the note on review', async () => {
+    const completed: CompletionEvidence = { task_id: 't1', title: '写完方案', completed_at: '2026-11-24T00:00:00Z', quadrant: 'schedule', note: '得到用户反馈' }
+    completionDraft = { completed_tasks: [completed] }
+    tasks = [task('t1', '写完方案', 'done')]
+    today = { must_do: [task('t1', '写完方案', 'done')], deep_block: null, inbox: [], carry_over_candidates: [] }
     render(<Sin90Page />)
-    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
-    const evaluate = screen.getByRole('button', { name: '重新评估优先级' })
-    await waitFor(() => expect(evaluate).toBeEnabled())
-    const advice = screen.getByLabelText('评估建议（可选）')
-    fireEvent.change(advice, { target: { value: '先安排用户访谈，再写方案' } })
-    expect(sin90Write).not.toHaveBeenCalled()
-    fireEvent.click(evaluate)
-    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'evaluatePriority', advice: '先安排用户访谈，再写方案' }))
-    await waitFor(() => expect(evaluate).toBeEnabled())
-    fireEvent.change(advice, { target: { value: '' } })
-    fireEvent.click(evaluate)
-    await waitFor(() => expect(sin90Write).toHaveBeenLastCalledWith({ op: 'evaluatePriority' }))
-  })
-
-  it('preserves a human decision after evaluation and displays AI and human reasons separately', async () => {
-    tasks = [task('t1', '写完方案')]
-    const ai = assessment('do_first', '今天交付')
-    let human: { quadrant: string; rationale: string } | null = null
-    const update = () => { priorities['/api/v1/sin90/tasks/t1/priority'] = { task_id: 't1', evaluation_status: 'evaluated', ai, human_override: human, effective: human ?? ai } }
-    update()
-    sin90Write.mockImplementation(async (body) => {
-      if (body['op'] === 'overridePriority') human = { quadrant: String(body['quadrant']), rationale: String(body['rationale']) }
-      if (body['op'] === 'clearPriorityOverride') human = null
-      update()
-      return { ok: true, status: 200, data: {} }
-    })
-    render(<Sin90Page />)
-    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
-    let row = await screen.findByRole('listitem', { name: '写完方案' })
-    expect(within(screen.getByRole('region', { name: '重要 · 紧急' })).getByText('写完方案')).toBeInTheDocument()
-    fireEvent.change(within(row).getByLabelText('我的判断'), { target: { value: 'schedule' } })
-    fireEvent.change(within(row).getByLabelText('判断依据 / 建议'), { target: { value: '先访谈再交付' } })
-    fireEvent.click(within(row).getByRole('button', { name: '保存我的判断' }))
-    await waitFor(() => expect(within(screen.getByRole('region', { name: '重要 · 不紧急' })).getByText('写完方案')).toBeInTheDocument())
-    fireEvent.click(screen.getByRole('button', { name: '重新评估优先级' }))
-    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'evaluatePriority' }))
-    row = await screen.findByRole('listitem', { name: '写完方案' })
-    expect(within(row).getByText(/AI 判断：重要 · 紧急 · 今天交付/)).toBeInTheDocument()
-    expect(within(row).getByText(/我的判断：重要 · 不紧急 · 先访谈再交付/)).toBeInTheDocument()
-    fireEvent.click(within(row).getByRole('button', { name: '清除我的判断' }))
-    await waitFor(() => expect(within(screen.getByRole('region', { name: '重要 · 紧急' })).getByText('写完方案')).toBeInTheDocument())
+    const done = await screen.findByRole('region', { name: '已完成' })
+    const toggle = await within(done).findByRole('button', { name: /写完方案/ })
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(within(done).queryByText('得到用户反馈')).not.toBeInTheDocument()
+    fireEvent.click(toggle)
+    expect(within(done).getByText(/完成于/)).toBeInTheDocument()
+    expect(within(done).getByText(/完成时分类/)).toBeInTheDocument()
+    expect(within(done).getByText('得到用户反馈')).toBeInTheDocument()
+    expect(within(done).queryByLabelText('完成备注')).not.toBeInTheDocument()
+    expect(within(done).queryByRole('button', { name: '保存备注' })).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '复盘' }))
+    const material = await screen.findByRole('region', { name: '本周完成素材' })
+    fireEvent.change(within(material).getByLabelText('完成备注'), { target: { value: '补充访谈结论' } })
+    fireEvent.click(within(material).getByRole('button', { name: '保存备注' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'completionNote', id: 't1', note: '补充访谈结论' }))
   })
 
   it('completes without a note, enriches the same weekly event and changes plans only on acceptance', async () => {
@@ -537,20 +564,28 @@ describe('Sin90 loop desktop contract', () => {
         today = { must_do: [task('t1', '写完方案', 'done')], deep_block: null, inbox: [], carry_over_candidates: [] }
         completionDraft = { completed_tasks: [completed] }
       }
-      if (body['op'] === 'completionNote') { completed.note = String(body['note']) }
+      if (body['op'] === 'completionNote') { completed.note = String(body['note']); today = { ...(today as Record<string, unknown>) } }
       if (body['op'] === 'createWeeklyReview') reviews = [{ id: 'r1', kind: 'weekly', period: isoWeekUTC(new Date()), status: 'draft', body: '' }]
       if (body['op'] === 'aiSummarize') proposals = [{ id: 'p1', status: 'pending', source: 'local_brain', ops: [{ op: 'reorder_week_tasks', week_id: 'w1', task_ids: ['t2'] }] }]
       return { ok: true, status: 200, data: {} }
     })
     render(<Sin90Page />)
-    fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
-    fireEvent.click(within(await screen.findByRole('listitem', { name: '写完方案' })).getByRole('button', { name: '完成' }))
-    await screen.findByText('尚无备注，不推断成效。')
-    fireEvent.change(screen.getByLabelText('完成备注'), { target: { value: '得到用户反馈' } })
-    fireEvent.click(screen.getByRole('button', { name: '保存备注' }))
-    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'completionNote', id: 't1', note: '得到用户反馈' }))
+    const openRow = await within(await screen.findByRole('region', { name: '未评估' })).findByRole('listitem', { name: '写完方案' })
+    const finish = within(openRow).getByRole('button', { name: '完成' })
+    await waitFor(() => expect(finish).toBeEnabled())
+    fireEvent.click(finish)
+    const done = await screen.findByRole('region', { name: '已完成' })
+    const toggle = await within(done).findByRole('button', { name: /写完方案/ })
+    fireEvent.click(toggle)
+    expect(within(done).getByText(/完成时分类/)).toBeInTheDocument()
+    expect(within(done).queryByText('尚无备注，不推断成效。')).not.toBeInTheDocument()
+    expect(within(done).queryByLabelText('完成备注')).not.toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: '复盘' }))
     const material = await screen.findByRole('region', { name: '本周完成素材' })
+    expect(within(material).getByText('尚无备注，不推断成效。')).toBeInTheDocument()
+    fireEvent.change(within(material).getByLabelText('完成备注'), { target: { value: '得到用户反馈' } })
+    fireEvent.click(within(material).getByRole('button', { name: '保存备注' }))
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'completionNote', id: 't1', note: '得到用户反馈' }))
     expect(within(material).getAllByRole('article')).toHaveLength(1)
     expect(await within(material).findByText('得到用户反馈', { selector: 'p' })).toBeInTheDocument()
     expect(sin90Write.mock.calls.map(([body]) => body['op'])).toEqual(['transitionTask', 'completionNote'])
@@ -563,37 +598,88 @@ describe('Sin90 loop desktop contract', () => {
     fireEvent.click(screen.getByRole('button', { name: '采纳' }))
     await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'acceptProposal', id: 'p1' }))
     fireEvent.click(screen.getByRole('tab', { name: '今天' }))
-    fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
-    const finishedRow = screen.getByRole('listitem', { name: '写完方案' })
+    const finishedRow = within(cardByHeading('今天先做这三件')).getByRole('listitem', { name: '写完方案' })
     expect(within(finishedRow).getByRole('button', { name: '已完成' })).toBeDisabled()
   })
 
-  it('retains overview actions and disabled states after a round trip on an old module', async () => {
+  it('keeps overview actions beside the quadrants when writing is unavailable', async () => {
     keyAvailable = false
     today = { must_do: [task('t1', '写完方案', 'planned')], deep_block: { id: 'b1', task_id: 't1', direction_id: 'd1', status: 'planned', planned_minutes: 90 }, inbox: [], carry_over_candidates: [] }
     render(<Sin90Page />)
-    const overviewRow = await screen.findByRole('listitem', { name: '写完方案' })
+    await screen.findByRole('heading', { name: '今天先做这三件' })
+    const overviewRow = within(cardByHeading('今天先做这三件')).getByRole('listitem', { name: '写完方案' })
+    expect(screen.getByRole('region', { name: '优先级四象限' })).toBeInTheDocument()
     expect(within(overviewRow).getByRole('button', { name: '完成' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('tab', { name: '四象限' }))
-    await screen.findByText(/当前模块未提供优先级评估/)
-    expect(screen.getByRole('button', { name: '重新评估优先级' })).toBeDisabled()
-    fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
+    expect(screen.getByText(/当前模块未提供优先级评估/)).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '重新评估优先级' })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: '开始专注' })).toBeDisabled()
-    const row = screen.getByRole('listitem', { name: '写完方案' })
-    expect(within(row).getByLabelText('更多任务操作')).toBeInTheDocument()
+    expect(within(overviewRow).getByLabelText('更多任务操作')).toBeInTheDocument()
     expect(sin90Write).not.toHaveBeenCalled()
+  })
+
+  it('evaluates only the captured task when capture returns its id', async () => {
+    sin90Write.mockImplementation(async (body) => {
+      if (body['op'] === 'capture') return { ok: true, status: 201, data: { id: 'task-captured', title: '给同事回信', status: 'backlog' } }
+      return { ok: true, status: 200, data: {} }
+    })
+    render(<Sin90Page />)
+    fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '给同事回信' } })
+    fireEvent.click(screen.getByRole('button', { name: '记下' }))
+    await waitFor(() => expect(sin90Write.mock.calls.map(([body]) => body)).toEqual([
+      { op: 'capture', text: '给同事回信' },
+      { op: 'evaluatePriority', id: 'task-captured' },
+    ]))
+    expect(screen.getByLabelText(/随手记/)).toHaveValue('')
+  })
+
+  it('submits capture with enter and skips evaluation when there is no task id', async () => {
+    render(<Sin90Page />)
+    const field = await screen.findByLabelText(/随手记/)
+    fireEvent.change(field, { target: { value: '给同事回信' } })
+    fireEvent.submit(field.closest('form') as HTMLFormElement)
+    await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'capture', text: '给同事回信' }))
+    expect(sin90Write.mock.calls.some(([body]) => body['op'] === 'evaluatePriority')).toBe(false)
+    expect(screen.getByLabelText(/随手记/)).toHaveValue('')
+  })
+
+  it('keeps the draft when capture fails and does not evaluate everything', async () => {
+    sin90Write.mockResolvedValueOnce({ ok: false, status: 500, data: { error: { message: '保存失败' } } })
+    render(<Sin90Page />)
+    fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '给同事回信' } })
+    fireEvent.click(screen.getByRole('button', { name: '记下' }))
+    expect(await screen.findByText('保存失败')).toBeInTheDocument()
+    expect(screen.getByLabelText(/随手记/)).toHaveValue('给同事回信')
+    expect(sin90Write).toHaveBeenCalledTimes(1)
+    expect(sin90Write.mock.calls.some(([body]) => body['op'] === 'evaluatePriority')).toBe(false)
+  })
+
+  it('keeps the captured task when evaluation of that task fails', async () => {
+    sin90Write.mockImplementation(async (body) => {
+      if (body['op'] === 'capture') {
+        today = { must_do: [], deep_block: null, inbox: [task('task-captured', '给同事回信', 'backlog')], carry_over_candidates: [] }
+        return { ok: true, status: 201, data: { id: 'task-captured' } }
+      }
+      return { ok: false, status: 503, data: { error: { message: '模型不可用' } } }
+    })
+    render(<Sin90Page />)
+    fireEvent.change(await screen.findByLabelText(/随手记/), { target: { value: '给同事回信' } })
+    fireEvent.click(screen.getByRole('button', { name: '记下' }))
+    await waitFor(() => expect(sin90Write.mock.calls.map(([body]) => body['op'])).toEqual(['capture', 'evaluatePriority']))
+    expect(sin90Write.mock.calls[1]?.[0]).toEqual({ op: 'evaluatePriority', id: 'task-captured' })
+    expect(sin90Write.mock.calls.filter(([body]) => body['op'] === 'evaluatePriority')).toHaveLength(1)
+    expect(await screen.findByText('模型不可用')).toBeInTheDocument()
+    expect(within(cardByHeading('收件箱')).getByText('给同事回信')).toBeInTheDocument()
+    expect((screen.getByLabelText(/随手记/) as HTMLInputElement).value).toBe('')
   })
 })
 
-
-it('keeps focus, more task actions and classification proposals reachable after returning to overview', async () => {
+it('keeps focus, more task actions and classification proposals on the today screen', async () => {
   today = { must_do: [task('t1', '写完方案', 'planned')], deep_block: { id: 'b1', task_id: 't1', direction_id: 'd1', status: 'planned', planned_minutes: 90 }, inbox: [task('t2', '访谈用户', 'backlog')], carry_over_candidates: [] }
   proposals = [{ id: 'p1', status: 'pending', source: 'local_brain', ops: [{ op: 'assign_task_direction', task_id: 't2', direction_id: 'd1' }] }]
   render(<Sin90Page />)
-  fireEvent.click(await screen.findByRole('tab', { name: '四象限' }))
   await screen.findByRole('region', { name: '未评估' })
-  fireEvent.click(screen.getByRole('tab', { name: '今日概览' }))
-  const row = screen.getByRole('listitem', { name: '写完方案' })
+  expect(screen.getByRole('heading', { name: '下一段专注' })).toBeInTheDocument()
+  const row = within(cardByHeading('今天先做这三件')).getByRole('listitem', { name: '写完方案' })
   fireEvent.click(within(row).getByLabelText('更多任务操作'))
   fireEvent.click(within(row).getByRole('button', { name: '开始' }))
   await waitFor(() => expect(sin90Write).toHaveBeenCalledWith({ op: 'transitionTask', id: 't1', to: 'in_progress' }))

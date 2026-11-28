@@ -147,6 +147,10 @@ export const IpcChannels = {
   DocumentsOfficeEngineStatus: 'documents:office-engine-status',
   DocumentsOfficeEngineInstall: 'documents:office-engine-install',
   DocumentsOfficeEngineChanged: 'documents:office-engine-changed',
+  // L12-3: the a24-pdf2docx build PDF → Word converts with (main/pdf-word-engine.ts).
+  DocumentsPdfWordEngineStatus: 'documents:pdf-word-engine-status',
+  DocumentsPdfWordEngineInstall: 'documents:pdf-word-engine-install',
+  DocumentsPdfWordEngineChanged: 'documents:pdf-word-engine-changed',
   // D2b: grant the Agent documents.list / get / compose for 30 days.
   DocumentsAgentAccess: 'documents:agent-access',
   // D4: translated HTML → a DOCX in Downloads and a PDF in the document library.

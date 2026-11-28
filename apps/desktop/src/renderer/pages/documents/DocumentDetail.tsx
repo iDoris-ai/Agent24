@@ -14,6 +14,7 @@ import { compose, convert, pagesOk, convertedPdf } from './compose'
 import { askWithProxy, checkDocument, readAllCheckBlocks, type CheckReport, type Source } from './doc-check'
 import { paragraphsOf, translateParagraphs, type TargetLang } from './doc-translate'
 import DocxTools from './DocxTools'
+import PdfToWord from './PdfToWord'
 import DocumentVersions from './DocumentVersions'
 import type { DocFocus } from './doc-focus'
 import { extractFields, type ExtractCardData, type ExtractFailure } from './doc-extract'
@@ -117,7 +118,7 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
       else if (thenCheck && out.documentId && onOpen) onOpen(out.documentId, true)
       return
     }
-    if (out.engineMissing) {
+    if (out.engineMissing && out.engine !== 'pdf2docx') {
       setConvertNote(null)
       setNeedEngine(true)
       setTranslateAfterEngine(thenLang)
@@ -590,6 +591,9 @@ export default function DocumentDetail({ documentId, onClose, onOpen, onTranslat
             importedAt: new Date(detail.created_at).toLocaleString(),
           })}
         </p>
+      )}
+      {detail && detail.head.media_type === 'application/pdf' && (
+        <PdfToWord key={detail.document_id} api={api} documentId={detail.document_id} title={detail.title ?? ''} onAdded={onAdded} />
       )}
       {detail && isOffice(detail.head.media_type) && (
         <div style={{ margin: '8px 0' }}>

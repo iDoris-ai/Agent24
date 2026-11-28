@@ -1,0 +1,12 @@
+# a24-pdf2docx 运行依赖：Python 3.12（python-build-standalone 3.12.16+20261124），目标 macOS 13 arm64。
+# 由 pip download --only-binary=:all: --platform macosx_13_0_arm64 --python-version 3.12 解出；一个包只钉一个 wheel 的 hash。
+fire==0.7.1 --hash=sha256:e43fd8a5033a9001e7e2973bab96070694b9f12f2e0ecf96d4683971b5ab1882
+fonttools==4.69.1 --hash=sha256:42d8b7c35023553e4adeaab89266fbcf47871675bea53111c93c030e733c3160
+lxml==6.2.0 --hash=sha256:d8dd8d00d86b1c1054fd2c8aea30b3bfe8fa00c64e8add8300d39fe5642fd693
+numpy==2.5.5 --hash=sha256:b96e9ee49ccbdb5676359f852a4497f7a9c5df6c377d8877f5330d6fd3ff42e4
+opencv-python-headless==5.0.0.93 --hash=sha256:030ca5e0837a2963ab36ef896baa9767eb8d2b83353fb28af5a521e40dd8756f
+pdf2docx==0.5.13 --hash=sha256:a293e9e78d89b12a4a43fcefba1346de220681c3daf20b8a7d3e1fce77f0fe97
+pymupdf==1.28.2 --hash=sha256:7113846b35dbf0a033f088e4f4fb543dabeb4b0b12c112966a1ca1ee2d5eacae
+python-docx==1.2.0 --hash=sha256:3fd478f3250fbbbfd3b94fe1e985955737c145627498896a8a6bf81f4baf66c7
+termcolor==3.3.0 --hash=sha256:cf642efadaf0a8ebbbf4bc7a31cec2f9b5f21a9f726f4ccbb08192c9c26f43a5
+typing-extensions==4.16.0 --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
