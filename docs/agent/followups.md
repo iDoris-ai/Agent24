@@ -339,3 +339,7 @@
 - [ ] FU-310 · C · src=L12 真机 0.7.133 · 2026-11-28 · 只有一个版本的 DOCX（例如直接导入的 Word 文件），详情页上没有存出 App 的入口：版本面板少于 2 个版本不显示，DocxTools 的「保存到下载」只在填写模板或改写段落后出现。L12-4（#2133）只在「转换为 Word」成功后给了按钮。
 - [ ] FU-311 · B · src=L12 计划、ADR-DOC-03 D2 · 2026-11-28 · PDF 转 Word 组件的正式下载地址（release `engine-pdf2docx-0.5.13-a24.1`）还没发布，要先过 PyMuPDF（AGPL）的许可审查，由谁审待 David 定。在这之前，不带 `A24_PDF2DOCX_ENGINE_FILE` 的包点「下载」会失败（HTTP 404），页面显示「下载没有完成」。进 main 发版前必须解决或隐藏入口。
 - [ ] FU-312 · C · src=L12 真机 0.7.134 · 2026-11-28 · 引擎把字体映射成 Noto Serif/Sans SC（照 office.rs 的 FONT_PAIRS），没装 Noto 的 Mac 用 WPS 打开会提示「缺失字体」并换字体，页数变多（黑龙江合同 39 页变 72 页）。改成映射到 macOS 自带的中文字体（苹方、宋体），或在 docx 里给出东亚字体的备用名。
+- [ ] FU-313 · C · src=Codex #2135 C1（Low） · 2026-11-28 · `asksToWord` 排除翻译和拆分合并时，用的是带标题的原文（`doc-intent.ts` 的 `asksTranslation`、`parseDocIntent`）：标题里带「合并」「翻译」时，「把《合并：A + B》转成 Word」会被拆分合并或翻译分支先接走。D4 翻译的写法也一样。
+- [ ] FU-314 · C · src=Codex #2135 C3（Low）、PR-Daemon #2135 FU3 · 2026-11-28 · 对话里「转成 Word」的接线（`Chat.tsx` L13-1 分支）没有页面级测试；FU-315、FU-316 两种情形也没有测试钉住。
+- [ ] FU-315 · C · src=PR-Daemon #2135 FU1 · 2026-11-28 · 在文档 A 的对话里说「把《B.pdf》转成 Word」，转换的是当前文档 A（`doc ?? namedDocument`）。回复里写明《A》，只新增、不覆盖。改法：句子点名的标题和 `doc.title` 不同时，走 `namedDocument` 或先确认。F3 抽取有同样的取舍。
+- [ ] FU-316 · C · src=PR-Daemon #2135 FU2 · 2026-11-28 · 「检查这份转成 Word 后的合同风险」这类混合意图会命中转换分支并提前返回，D3 检查被跳过。改法：在 `asksToWord` 里排除检查、总结类动词。
