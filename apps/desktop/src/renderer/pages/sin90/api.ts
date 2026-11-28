@@ -116,7 +116,8 @@ export async function writesAvailable(): Promise<boolean> {
   }
 }
 
-export async function sin90Write(body: Record<string, unknown>): Promise<void> {
+/** Returns the daemon body. Capture uses the real task `id` from this payload. */
+export async function sin90Write(body: Record<string, unknown>): Promise<unknown> {
   const write = window.agent24.sin90Write
   if (!write) throw new Error('sin90 write is unavailable')
   const res = await write(body)
@@ -124,6 +125,7 @@ export async function sin90Write(body: Record<string, unknown>): Promise<void> {
     const { code, message } = errorOf(res.data)
     throw new WriteFailed(message || 'sin90 write failed', code)
   }
+  return res.data
 }
 
 export async function exportToFile(): Promise<void> {
