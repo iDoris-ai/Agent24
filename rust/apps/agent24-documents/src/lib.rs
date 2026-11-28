@@ -32,6 +32,7 @@ pub mod office;
 pub mod oplog;
 pub mod patch;
 pub mod pdf_compose;
+pub mod pdf_word;
 pub mod preflight;
 pub mod read;
 pub mod scope;
